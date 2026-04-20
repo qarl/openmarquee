@@ -1,0 +1,14 @@
+[project]
+name = "openmarquee"
+version = "0.0.0"
+description = "Self-contained, phone-controlled, no-subscription digital signage platform"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
