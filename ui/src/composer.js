@@ -38,6 +38,16 @@ const TEMPLATE = `
                     <span>Saved slide</span>
                     <select class="bg-slide"><option value="">(pick a slide)</option></select>
                 </label>
+                <div class="bg-generate">
+                    <label class="field">
+                        <span>Generate a new background (requires OPENAI_API_KEY on device)</span>
+                        <input type="text" class="bg-generate-prompt"
+                               placeholder="abstract gradient, minimal, signage-friendly"
+                               maxlength="4000">
+                    </label>
+                    <button type="button" class="bg-generate-btn">Generate background</button>
+                    <p class="bg-generate-status" role="status" aria-live="polite"></p>
+                </div>
             </fieldset>
 
             <fieldset class="composer-layers">
@@ -109,8 +119,13 @@ const LAYER_INNER = `
  *     have `id` and an asset reachable at /api/content/{id}/asset.
  * @param {(payload: object) => Promise<void>} options.onSave — invoked with
  *     an ImageSlide payload: { name, duration_ms, png_base64 }.
+ * @param {({ prompt: string, name?: string }) => Promise<any>} [options.onGenerateBackground]
+ *     — optional hook that posts to the AI-backed background generator. When
+ *     provided, the composer exposes a prompt field + Generate button; when
+ *     omitted (or fails with 503), the button surfaces the status inline
+ *     rather than leaving the feature dangling.
  */
-export function mountComposer(container, { width, height, fetchItems, onSave }) {
+export function mountComposer(container, { width, height, fetchItems, onSave, onGenerateBackground }) {
     container.innerHTML = TEMPLATE;
 
     const canvas = container.querySelector(".composer-canvas");
@@ -358,6 +373,54 @@ export function mountComposer(container, { width, height, fetchItems, onSave }) 
     }
 
     addLayerBtn.addEventListener("click", () => addLayer());
+
+    // --- AI background generation ---
+
+    const generateBtn = container.querySelector(".bg-generate-btn");
+    const generatePromptEl = container.querySelector(".bg-generate-prompt");
+    const generateStatusEl = container.querySelector(".bg-generate-status");
+
+    if (onGenerateBackground) {
+        generateBtn.addEventListener("click", async () => {
+            const prompt = generatePromptEl.value.trim();
+            if (!prompt) {
+                generateStatusEl.textContent = "Type a prompt first.";
+                return;
+            }
+            generateBtn.disabled = true;
+            generateStatusEl.textContent = "Generating… (can take 30-60 seconds)";
+            try {
+                const slide = await onGenerateBackground({ prompt });
+                // Switch the background to the freshly-generated slide so
+                // the operator sees it immediately without another click.
+                bgModeEl.value = "slide";
+                bgModeEl.dispatchEvent(new Event("change"));
+                // populateBgSlideDropdown ran on the mode switch — wait
+                // a microtask, then select the new slide.
+                await Promise.resolve();
+                await populateBgSlideDropdown();
+                bgSlideEl.value = String(slide.id);
+                bgSlideEl.dispatchEvent(new Event("change"));
+                generatePromptEl.value = "";
+                generateStatusEl.textContent = `Generated: ${slide.name}`;
+            } catch (err) {
+                // 503 = "feature turned off on this device" (no API key);
+                // 502 = OpenAI said no (content policy, quota). Either
+                // way, surface the detail so the operator can act.
+                if (err.status === 503) {
+                    generateStatusEl.textContent =
+                        "AI generation isn't set up on this device — see settings.";
+                } else {
+                    generateStatusEl.textContent = `${err.message}`;
+                }
+            } finally {
+                generateBtn.disabled = false;
+            }
+        });
+    } else {
+        generateBtn.disabled = true;
+        generateStatusEl.textContent = "AI generation isn't wired up in this UI build.";
+    }
 
     // Seed with one layer so the simple case (type + save) still works
     // without clicking Add.

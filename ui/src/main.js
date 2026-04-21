@@ -12,6 +12,7 @@
 import {
     deletePlaylistByName,
     deleteContent,
+    generateBackground,
     getPlaybackState,
     getSchedule,
     getSettings,
@@ -104,6 +105,10 @@ function boot() {
         // Composite slides ride the ImageSlide API — a flat PNG is all the
         // server needs. The layer structure lives only in the browser tab.
         onSave: onSaveWithRefresh(saveImage),
+        // Server-side generator — returns an ImageSlide and auto-appends to
+        // the default playlist. Wrap with onSaveWithRefresh so the
+        // generated slide appears in the Saved slides list immediately.
+        onGenerateBackground: onSaveWithRefresh(generateBackground),
     });
 
     mountVideoUploader(root.querySelector(".video-upload-slot"), {

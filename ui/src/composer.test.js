@@ -181,6 +181,89 @@ describe("mountComposer", () => {
         );
     });
 
+    it("disables Generate button when onGenerateBackground isn't wired", async () => {
+        const container = document.createElement("div");
+        mountComposer(container, {
+            width: 128,
+            height: 96,
+            fetchItems: async () => [],
+            onSave: vi.fn(),
+            // onGenerateBackground intentionally omitted
+        });
+        await tick();
+        const btn = container.querySelector(".bg-generate-btn");
+        expect(btn.disabled).toBe(true);
+        expect(container.querySelector(".bg-generate-status").textContent).toMatch(
+            /isn't wired/,
+        );
+    });
+
+    it("Generate button demands a prompt before calling the hook", async () => {
+        const container = document.createElement("div");
+        const onGenerateBackground = vi.fn();
+        mountComposer(container, {
+            width: 128,
+            height: 96,
+            fetchItems: async () => [],
+            onSave: vi.fn(),
+            onGenerateBackground,
+        });
+        await tick();
+        container.querySelector(".bg-generate-btn").click();
+        await tick();
+        expect(onGenerateBackground).not.toHaveBeenCalled();
+        expect(container.querySelector(".bg-generate-status").textContent).toMatch(
+            /prompt first/i,
+        );
+    });
+
+    it("Generate button calls the hook with the typed prompt", async () => {
+        const container = document.createElement("div");
+        const onGenerateBackground = vi
+            .fn()
+            .mockResolvedValue({ id: "bg1", name: "Background — gradient" });
+        mountComposer(container, {
+            width: 128,
+            height: 96,
+            fetchItems: async () => [],
+            onSave: vi.fn(),
+            onGenerateBackground,
+        });
+        await tick();
+
+        container.querySelector(".bg-generate-prompt").value = "abstract gradient";
+        container.querySelector(".bg-generate-btn").click();
+        await tick();
+        await tick();
+
+        expect(onGenerateBackground).toHaveBeenCalledWith({
+            prompt: "abstract gradient",
+        });
+    });
+
+    it("Surfaces a 503 from the hook as a friendly 'not set up' status", async () => {
+        const container = document.createElement("div");
+        const err503 = Object.assign(new Error("nope"), { status: 503 });
+        const onGenerateBackground = vi.fn().mockRejectedValue(err503);
+        mountComposer(container, {
+            width: 128,
+            height: 96,
+            fetchItems: async () => [],
+            onSave: vi.fn(),
+            onGenerateBackground,
+        });
+        await tick();
+
+        container.querySelector(".bg-generate-prompt").value = "x";
+        container.querySelector(".bg-generate-btn").click();
+        await tick();
+        await tick();
+
+        expect(container.querySelector(".bg-generate-status").textContent).toMatch(
+            /isn't set up/,
+        );
+    });
+
     it("editing a layer's text triggers a redraw (no throw)", async () => {
         const container = document.createElement("div");
         mountComposer(container, {

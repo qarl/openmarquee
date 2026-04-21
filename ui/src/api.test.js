@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     deleteContent,
     fetchHealth,
+    generateBackground,
     getPlaybackState,
     getSchedule,
     getSettings,
@@ -137,6 +138,48 @@ describe("saveImage", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad" });
         await expect(saveImage({})).rejects.toThrow("422");
+    });
+});
+
+describe("generateBackground", () => {
+    it("POSTs the prompt to /api/backgrounds/generate and returns the ImageSlide", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ id: "bg1", type: "image", name: "Background — sunset" }),
+        });
+        const result = await generateBackground({ prompt: "sunset gradient" });
+        expect(result.id).toBe("bg1");
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/backgrounds/generate");
+        expect(init.method).toBe("POST");
+        expect(JSON.parse(init.body).prompt).toBe("sunset gradient");
+    });
+
+    it("attaches the HTTP status so callers can branch on 503 vs other errors", async () => {
+        mockFetch({
+            ok: false,
+            status: 503,
+            json: async () => ({ detail: "OPENAI_API_KEY is not set" }),
+        });
+        try {
+            await generateBackground({ prompt: "x" });
+            throw new Error("should have thrown");
+        } catch (err) {
+            expect(err.status).toBe(503);
+            expect(err.message).toMatch(/OPENAI_API_KEY/);
+        }
+    });
+
+    it("falls back to text() when the non-ok body isn't JSON", async () => {
+        mockFetch({
+            ok: false,
+            status: 500,
+            json: async () => {
+                throw new Error("not json");
+            },
+            text: async () => "internal server error",
+        });
+        await expect(generateBackground({ prompt: "x" })).rejects.toThrow(/500/);
     });
 });
 

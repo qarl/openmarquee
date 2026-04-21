@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from openmarquee import __version__
 from openmarquee.api import router as content_router
+from openmarquee.api_backgrounds import router as backgrounds_router
 from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
@@ -68,6 +69,7 @@ app.include_router(content_router)
 app.include_router(playlist_router)
 app.include_router(schedule_router)
 app.include_router(settings_router)
+app.include_router(backgrounds_router)
 app.include_router(playback_router)
 
 # Dev tooling (preview page, manual play endpoint) is mounted by default

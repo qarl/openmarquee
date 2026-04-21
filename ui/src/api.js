@@ -164,6 +164,34 @@ export async function deletePlaylistByName(name) {
     }
 }
 
+/**
+ * Generate a new background via the OpenAI-backed endpoint. On 503 the
+ * caller should treat this as "feature unavailable" (no API key on the
+ * device) rather than a hard failure.
+ */
+export async function generateBackground({ prompt, name }) {
+    const response = await fetch("/api/backgrounds/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, name }),
+    });
+    if (!response.ok) {
+        let detail = "";
+        try {
+            const body = await response.json();
+            detail = body?.detail || "";
+        } catch {
+            detail = await response.text();
+        }
+        const err = new Error(
+            `Background generation failed (${response.status}): ${detail}`,
+        );
+        err.status = response.status;
+        throw err;
+    }
+    return await response.json();
+}
+
 /** Fetch the current schedule (rules + default_playlist_name). */
 export async function getSchedule() {
     const response = await fetch("/api/schedules");
