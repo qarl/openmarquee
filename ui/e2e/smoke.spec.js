@@ -37,14 +37,21 @@ test("Save button is disabled until text is entered", async ({ page }) => {
     await expect(saveBtn).toBeDisabled();
 });
 
-test("welcome wireframe page renders with SSID, password, and QR placeholder", async ({ page }) => {
-    // The wireframe ships at /welcome.html. Phase 7 swaps in real values
-    // and a real backend-rendered QR code; this smoke test ensures the
-    // wireframe stays wired up and shows the expected chrome.
+test("welcome page renders SSID, password, and a real (not placeholder) QR", async ({ page }) => {
+    // Phase 7 swaps in real values from the device side; this smoke test
+    // ensures the page chrome stays wired up AND the welcome.js script
+    // generates a real QR (not the no-JS placeholder fallback).
     await page.goto("/welcome.html");
     await expect(page).toHaveTitle(/OpenMarquee/);
     await expect(page.locator(".brand")).toHaveText("OpenMarquee");
     await expect(page.locator('[data-field="ssid"]')).toBeVisible();
     await expect(page.locator('[data-field="password"]')).toBeVisible();
-    await expect(page.locator(".qr svg")).toBeVisible();
+
+    // The welcome.js script removes the qr-placeholder class once it has
+    // rendered a real QR. If the script ran, the watermark is gone.
+    await expect(page.locator(".qr")).not.toHaveClass(/qr-placeholder/);
+    // And the SVG inside is the qrcode library's output, not the hand-drawn
+    // placeholder pattern (different module count → different viewBox).
+    const viewBox = await page.locator(".qr svg").getAttribute("viewBox");
+    expect(viewBox).not.toBe("0 0 21 21");
 });

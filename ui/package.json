@@ -6,8 +6,8 @@
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
-    "dev": "esbuild src/main.js --bundle --outdir=dist --servedir=. --watch",
-    "build": "esbuild src/main.js --bundle --minify --outdir=dist",
+    "dev": "esbuild src/main.js src/welcome.js --bundle --outdir=dist --servedir=. --watch",
+    "build": "esbuild src/main.js src/welcome.js --bundle --minify --outdir=dist",
     "test": "vitest run",
     "e2e": "playwright test",
     "e2e:install": "playwright install chromium"
@@ -19,6 +19,7 @@
     "vitest": "^1.6.0"
   },
   "dependencies": {
+    "qrcode": "^1.5.4",
     "sortablejs": "^1.15.7"
   }
 }

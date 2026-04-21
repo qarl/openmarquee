@@ -123,10 +123,10 @@
             display: block;
         }
 
-        /* Obvious "placeholder" watermark so a wireframe QR can't sneak onto
-           a real device unnoticed. Phase 7 removes this stamp when it swaps
-           in a real, scannable QR. */
-        .qr::after {
+        /* Visible only while .qr-placeholder is still on the element. The
+           welcome.js script removes that class once it has rendered a real
+           QR, so the watermark only shows in the no-JS / failed-load path. */
+        .qr.qr-placeholder::after {
             content: "PLACEHOLDER";
             position: absolute;
             inset: 0;
@@ -175,12 +175,14 @@
             </dl>
 
             <!--
-                QR code: a WIFI:-format payload that iOS/Android cameras
-                recognize and offer to join. The SVG below is a placeholder
-                pattern for the wireframe; Phase 7 swaps in an actual
-                backend-rendered QR matching the real SSID/password.
+                WiFi QR: encoded as WIFI:T:WPA;S:...;P:...;; — iOS/Android
+                cameras recognize the format and offer to join. welcome.js
+                generates the real QR at page load by reading the SSID +
+                password fields above; the SVG below is the no-JS / failed-
+                load fallback (the .qr-placeholder class triggers the
+                "PLACEHOLDER" watermark).
             -->
-            <div class="qr" aria-label="WiFi QR code (placeholder)">
+            <div class="qr qr-placeholder" aria-label="WiFi QR code">
                 <svg viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
                     <rect width="21" height="21" fill="white"/>
                     <!-- Hand-drawn QR-ish pattern. Real QR goes here in Phase 7. -->
@@ -222,5 +224,6 @@
             If it doesn't, open <code>http://openmarquee.local</code> manually.
         </footer>
     </main>
+    <script type="module" src="/dist/welcome.js"></script>
 </body>
 </html>
