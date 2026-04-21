@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image  # noqa: F401  (used via fixture _write_sample_jpeg)
 
 from openmarquee.content import ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
@@ -34,6 +34,35 @@ def playlist(tmp_path: Path) -> PlaylistStorage:
 @pytest.fixture
 def marker(tmp_path: Path) -> Path:
     return tmp_path / "seeded.json"
+
+
+@pytest.fixture
+def empty_bundled_dir(tmp_path: Path) -> Path:
+    """An empty directory to pin the fallback-gradients seed path in tests
+    that aren't specifically about the bundled-backgrounds branch."""
+    d = tmp_path / "bundled-empty"
+    d.mkdir()
+    return d
+
+
+@pytest.fixture(autouse=True)
+def no_bundled_backgrounds_by_default(tmp_path: Path, monkeypatch):
+    """Hide the repo's committed seed_assets/backgrounds/ from every test by
+    default — otherwise test_seed_creates_starter_slides_when_fresh would
+    see 10 curated images rather than the Pillow-generated fallback it's
+    written for. Tests that want to exercise the bundled-backgrounds path
+    pass an explicit `bundled_backgrounds_dir=` to seed_if_needed."""
+    empty = tmp_path / "auto-empty-bundled"
+    empty.mkdir()
+    monkeypatch.setattr(
+        "openmarquee.seed._default_bundled_backgrounds_dir", lambda: empty
+    )
+
+
+def _write_sample_jpeg(path: Path, color=(100, 100, 100), size=(512, 512)) -> None:
+    """Write a small-but-real JPEG to `path` for bundled-background tests."""
+    img = Image.new("RGB", size, color)
+    img.save(path, format="JPEG")
 
 
 # --- render_gradient_png ---
@@ -175,6 +204,106 @@ def test_seed_rolls_back_partial_items_on_mid_loop_failure(
     # Partial items were cleaned up; no marker.
     assert storage.list_all() == []
     assert not marker.exists()
+
+
+# --- bundled backgrounds ---
+
+
+def test_seed_registers_bundled_backgrounds_over_pillow_fallback(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    tmp_path: Path,
+):
+    bundled = tmp_path / "backgrounds"
+    bundled.mkdir()
+    _write_sample_jpeg(bundled / "parchment.jpg", color=(230, 220, 180))
+    _write_sample_jpeg(bundled / "midnight.jpg", color=(10, 20, 60))
+
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=32,
+        height=32,
+        bundled_backgrounds_dir=bundled,
+    )
+    # Exactly 2 items — the bundled ones. No Pillow-gradient fallback when
+    # bundled backgrounds are present.
+    assert len(created) == 2
+    names = sorted(s.name for s in created)
+    assert names == ["Background — Midnight", "Background — Parchment"]
+
+
+def test_seed_falls_back_to_gradients_when_bundled_dir_is_empty(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    empty_bundled_dir: Path,
+):
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=32,
+        height=32,
+        bundled_backgrounds_dir=empty_bundled_dir,
+    )
+    # Pillow presets land instead — their names don't end in " Jpg" etc.
+    assert len(created) == 4
+    assert all("Background —" in s.name for s in created)
+
+
+def test_seed_bundled_skips_unreadable_files_but_still_seeds_good_ones(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    tmp_path: Path,
+):
+    bundled = tmp_path / "backgrounds"
+    bundled.mkdir()
+    _write_sample_jpeg(bundled / "good.jpg")
+    (bundled / "broken.jpg").write_bytes(b"not an image at all")
+
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=32,
+        height=32,
+        bundled_backgrounds_dir=bundled,
+    )
+    # Only the good one landed; the broken file was logged + skipped.
+    assert len(created) == 1
+    assert created[0].name == "Background — Good"
+
+
+def test_seed_bundled_is_deterministic_across_runs(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    tmp_path: Path,
+):
+    """Order should be filename-sorted so two fresh devices ship the same
+    order in the default playlist."""
+    bundled = tmp_path / "backgrounds"
+    bundled.mkdir()
+    for stem in ["zebra", "alpha", "mango"]:
+        _write_sample_jpeg(bundled / f"{stem}.jpg")
+
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=16,
+        height=16,
+        bundled_backgrounds_dir=bundled,
+    )
+    assert [s.name for s in created] == [
+        "Background — Alpha",
+        "Background — Mango",
+        "Background — Zebra",
+    ]
 
 
 # --- demo video ---

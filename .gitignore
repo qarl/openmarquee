@@ -32,12 +32,14 @@ build/
 openmarquee-content/
 openmarquee-playlist.json
 
-# Seeded assets provisioned by scripts/download-demo-video.sh — large
-# binaries, operator-supplied, not part of the repo. The directory itself
-# ships via .gitkeep so the seed code can find the intended path.
+# Seeded assets:
+# - large operator-supplied binaries (demo.mp4, etc.) are NOT tracked
+# - curated background images ARE tracked (shipped with the repo)
 backend/openmarquee/seed_assets/*
 !backend/openmarquee/seed_assets/.gitkeep
 !backend/openmarquee/seed_assets/README.md
+!backend/openmarquee/seed_assets/backgrounds/
+!backend/openmarquee/seed_assets/backgrounds/**
 
 # Playwright
 playwright-report/

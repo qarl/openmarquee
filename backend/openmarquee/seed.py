@@ -7,10 +7,14 @@ Contract:
 - It runs ONLY if both:
     (a) no seed-marker file exists at `marker_path`, AND
     (b) the content storage has no items.
-- If it runs, it generates a handful of gradient-background ImageSlide
-  entries (produced locally via Pillow so this works offline on a
-  freshly-flashed Pi with no internet), persists them, appends them to
-  the default playlist, and writes the marker so re-running is a no-op.
+- If it runs, seed registers:
+    1. Any bundled curated backgrounds from `seed_assets/backgrounds/`
+       (committed to git; generated once via
+       `scripts/generate-seed-backgrounds.py` calling Pollinations.ai).
+       These are the nicer "shipped with the product" backgrounds.
+    2. A handful of fallback Pillow-generated gradients, but ONLY when
+       no bundled backgrounds are available — keeps a freshly-flashed
+       SD card without the asset directory from ending up blank.
 - If the operator later deletes everything they got, the marker stays,
   so boot doesn't re-seed behind their back.
 
@@ -92,6 +96,18 @@ def render_gradient_png(preset: SeedPreset, width: int, height: int) -> bytes:
     return buf.getvalue()
 
 
+def _default_bundled_backgrounds_dir() -> Path:
+    """Default location of curated backgrounds shipped in the Python
+    package (committed to git by scripts/generate-seed-backgrounds.py)."""
+    return Path(__file__).resolve().parent / "seed_assets" / "backgrounds"
+
+
+def _name_from_filename(stem: str) -> str:
+    """'brick-wall' → 'Background — Brick Wall'."""
+    words = [w.capitalize() for w in stem.replace("_", "-").split("-") if w]
+    return "Background — " + " ".join(words) if words else "Background"
+
+
 def seed_if_needed(
     storage: ContentStorage,
     playlist_storage: PlaylistStorage,
@@ -99,6 +115,7 @@ def seed_if_needed(
     width: int,
     height: int,
     demo_video_path: Path | None = None,
+    bundled_backgrounds_dir: Path | None = None,
 ) -> list:
     """Run the first-boot seed if appropriate; return the list of items
     that were created (empty if the call was a no-op).
@@ -131,12 +148,26 @@ def seed_if_needed(
 
     created: list = []
     try:
-        for preset in _SEED_PRESETS:
-            png = render_gradient_png(preset, width, height)
-            slide = ImageSlide(name=preset.name, duration_ms=5000)
-            storage.save_image(slide, png)
+        bg_dir = (
+            bundled_backgrounds_dir
+            if bundled_backgrounds_dir is not None
+            else _default_bundled_backgrounds_dir()
+        )
+        bundled = _seed_bundled_backgrounds(storage, bg_dir, width, height)
+        for slide in bundled:
             playlist.append(slide.id)
             created.append(slide)
+
+        # Only fall back to the Pillow gradients when no bundled images
+        # were available — operators on a fresh SD image without the
+        # curated pack shouldn't get a blank device.
+        if not bundled:
+            for preset in _SEED_PRESETS:
+                png = render_gradient_png(preset, width, height)
+                slide = ImageSlide(name=preset.name, duration_ms=5000)
+                storage.save_image(slide, png)
+                playlist.append(slide.id)
+                created.append(slide)
 
         # Demo video: optional, best-effort. Any failure (missing / bad
         # bytes / unreadable) falls through silently; the gradients are
@@ -165,6 +196,45 @@ def seed_if_needed(
 
     _write_marker(marker_path, created=len(created), reason="fresh-install")
     logger.info("seed: created %d starter slides", len(created))
+    return created
+
+
+def _seed_bundled_backgrounds(
+    storage: ContentStorage,
+    directory: Path,
+    width: int,
+    height: int,
+) -> list[ImageSlide]:
+    """Register each image under `directory` as an ImageSlide.
+
+    Sorted by filename so the seed order is deterministic across boots.
+    Each file is downscaled + letterboxed onto the panel via the same
+    helper the runtime /api/backgrounds/generate endpoint uses. Unreadable
+    files are logged and skipped — one bad JPEG in the pack shouldn't
+    kill the rest of the seed.
+    """
+    if not directory.is_dir():
+        return []
+
+    # Lazy import so a test that never touches bundled backgrounds
+    # doesn't drag the whole `backgrounds` module into its import graph.
+    from openmarquee.backgrounds import downscale_to_panel
+
+    created: list[ImageSlide] = []
+    candidates = sorted(
+        p for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )
+    for path in candidates:
+        try:
+            raw = path.read_bytes()
+            png = downscale_to_panel(raw, width, height)
+        except Exception:
+            logger.exception("seed: skipping unreadable background %s", path)
+            continue
+        slide = ImageSlide(name=_name_from_filename(path.stem), duration_ms=5000)
+        storage.save_image(slide, png)
+        created.append(slide)
     return created
 
 
