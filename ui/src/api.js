@@ -97,6 +97,41 @@ export async function updateTextSlide(id, payload) {
     return await response.json();
 }
 
+/**
+ * Update an existing image slide. `png_base64` may be null to keep the
+ * stored PNG untouched (metadata-only update).
+ */
+export async function updateImage(id, payload) {
+    const response = await fetch(`/api/content/images/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Update image failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
+ * Update an existing video slide. Both `png_base64` (thumbnail) and
+ * `mp4_base64` may be null to keep the stored bytes — useful for
+ * metadata-only edits where you don't want to re-upload 50 MB.
+ */
+export async function updateVideo(id, payload) {
+    const response = await fetch(`/api/content/videos/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Update video failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
 /** Delete a content item by id. */
 export async function deleteContent(id) {
     const response = await fetch(`/api/content/${id}`, { method: "DELETE" });

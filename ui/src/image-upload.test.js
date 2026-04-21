@@ -50,6 +50,82 @@ describe("mountImageUploader", () => {
         await tick();
         expect(onSave).not.toHaveBeenCalled();
     });
+
+    it("loadForEdit pre-fills name + duration and enables Save without re-pick", async () => {
+        patchCanvasPrototype();
+        // Stub Image so drawUrlToCanvas resolves fast in jsdom.
+        const RealImage = window.Image;
+        window.Image = class {
+            constructor() {
+                setTimeout(() => this.onload && this.onload(), 0);
+            }
+            set src(_) {}
+            set crossOrigin(_) {}
+            set onload(fn) {
+                this._onload = fn;
+            }
+            get onload() {
+                return this._onload;
+            }
+            onerror = null;
+            width = 128;
+            height = 96;
+        };
+
+        const container = document.createElement("div");
+        const onSaveExisting = vi.fn().mockResolvedValue({ id: "img-1" });
+        const handle = mountImageUploader(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting,
+        });
+
+        await handle.loadForEdit({
+            type: "image",
+            id: "img-1",
+            name: "Logo",
+            duration_ms: 8000,
+        });
+        // Wait out Image.onload microtask.
+        await tick();
+
+        expect(container.querySelector(".field-name").value).toBe("Logo");
+        expect(container.querySelector(".field-duration").value).toBe("8");
+        expect(container.querySelector(".image-upload-heading").textContent).toMatch(
+            /Editing: Logo/,
+        );
+        // Save is enabled even without a new file pick — metadata-only
+        // updates are allowed in edit mode.
+        expect(container.querySelector(".field-save").disabled).toBe(false);
+
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await tick();
+        expect(onSaveExisting).toHaveBeenCalledTimes(1);
+        const [id, payload] = onSaveExisting.mock.calls[0];
+        expect(id).toBe("img-1");
+        expect(payload.name).toBe("Logo");
+        expect(payload.duration_ms).toBe(8000);
+        // png_base64 is null — operator didn't re-pick a file.
+        expect(payload.png_base64).toBeNull();
+
+        window.Image = RealImage;
+    });
+
+    it("rejects loadForEdit on a non-image slide with a friendly status", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const handle = mountImageUploader(container, {
+            width: 64,
+            height: 32,
+            onSave: vi.fn(),
+            onSaveExisting: vi.fn(),
+        });
+        await handle.loadForEdit({ type: "text_slide", id: "x" });
+        expect(
+            container.querySelector(".image-upload-status").textContent,
+        ).toMatch(/Only image slides/);
+    });
 });
 
 describe("canvasToBase64", () => {

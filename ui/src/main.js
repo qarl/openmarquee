@@ -28,7 +28,9 @@ import {
     setPlaylistOrder,
     startPlayback,
     stopPlayback,
+    updateImage,
     updateTextSlide,
+    updateVideo,
 } from "./api.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
@@ -138,17 +140,25 @@ async function boot() {
         onGenerateBackground: onSaveWithRefresh(generateBackground),
     });
 
-    mountImageUploader(root.querySelector(".image-upload-slot"), {
-        width: PANEL_WIDTH,
-        height: PANEL_HEIGHT,
-        onSave: onSaveWithRefresh(saveImage),
-    });
+    const imageUploader = mountImageUploader(
+        root.querySelector(".image-upload-slot"),
+        {
+            width: PANEL_WIDTH,
+            height: PANEL_HEIGHT,
+            onSave: onSaveWithRefresh(saveImage),
+            onSaveExisting: onSaveWithRefresh(updateImage),
+        },
+    );
 
-    mountVideoUploader(root.querySelector(".video-upload-slot"), {
-        width: PANEL_WIDTH,
-        height: PANEL_HEIGHT,
-        onSave: onSaveWithRefresh(saveVideo),
-    });
+    const videoUploader = mountVideoUploader(
+        root.querySelector(".video-upload-slot"),
+        {
+            width: PANEL_WIDTH,
+            height: PANEL_HEIGHT,
+            onSave: onSaveWithRefresh(saveVideo),
+            onSaveExisting: onSaveWithRefresh(updateVideo),
+        },
+    );
 
     mountSchedule(root.querySelector(".schedule-slot"), {
         fetchSchedule: getSchedule,
@@ -172,18 +182,33 @@ async function boot() {
     });
 
     // Click-to-edit wiring: playlist-track.js dispatches this event when
-    // an operator clicks the ✎ affordance on a pallet tile. We navigate
-    // to the Text subpage + hydrate the editor with the slide's data.
+    // an operator clicks the ✎ affordance on a pallet tile. We route by
+    // the slide's type to the right subpage + uploader / editor.
+    const EDIT_ROUTES = {
+        text_slide: {
+            section: "slides/text",
+            load: (slide) => editor.loadForEdit(slide),
+        },
+        image: {
+            section: "slides/image",
+            load: (slide) => imageUploader.loadForEdit(slide),
+        },
+        video: {
+            section: "slides/video",
+            load: (slide) => videoUploader.loadForEdit(slide),
+        },
+    };
     document.addEventListener("openmarquee:edit-slide", async (event) => {
         const { id, type } = event.detail || {};
-        if (type !== "text_slide") return;
+        const route = EDIT_ROUTES[type];
+        if (!route) return;
         try {
             const slide = await fetchContentItem(id);
-            window.location.hash = "#/slides/text";
-            await editor.loadForEdit(slide);
+            window.location.hash = `#/${route.section}`;
+            await route.load(slide);
         } catch (err) {
-            // Editor surfaces its own status; console makes the failure
-            // visible during development.
+            // Each uploader/editor surfaces its own status line; console
+            // makes the failure visible during development.
             console.error("[openmarquee] failed to open slide for edit:", err);
         }
     });

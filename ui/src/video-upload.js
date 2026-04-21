@@ -11,7 +11,10 @@
 
 const TEMPLATE = `
     <section class="video-upload">
-        <h2 class="video-upload-heading">Upload a video</h2>
+        <div class="video-upload-header">
+            <h2 class="video-upload-heading">Upload a video</h2>
+            <button type="button" class="video-upload-new" hidden>+ New video</button>
+        </div>
         <div class="preview-wrap">
             <canvas class="video-upload-canvas" aria-label="thumbnail preview"></canvas>
         </div>
@@ -19,6 +22,10 @@ const TEMPLATE = `
             <label class="field">
                 <span>Video file (MP4)</span>
                 <input type="file" accept="video/mp4" class="field-file">
+                <span class="field-hint video-upload-edit-hint" hidden>
+                    Editing an existing video — leave the file picker blank
+                    to just update name / duration.
+                </span>
             </label>
             <p class="field-hint video-upload-hint">
                 Client-side transcoding via ffmpeg.wasm isn't wired into
@@ -38,22 +45,13 @@ const TEMPLATE = `
                     <input type="number" class="field-duration" value="10" min="1" max="3600" step="1">
                 </label>
             </div>
-            <div class="row">
-                <label class="field">
-                    <span>Pipeline</span>
-                    <select class="field-pipeline">
-                        <option value="h264_mp4" selected>H.264 MP4 (HDMI)</option>
-                        <option value="raw_frames">Raw frames (HUB75/WS2812B/composite) — spike only</option>
-                    </select>
-                </label>
-                <label class="field">
-                    <span>Transition into next</span>
-                    <select class="field-transition">
-                        <option value="cut" selected>Cut (instant)</option>
-                        <option value="fade">Fade</option>
-                    </select>
-                </label>
-            </div>
+            <label class="field">
+                <span>Pipeline</span>
+                <select class="field-pipeline">
+                    <option value="h264_mp4" selected>H.264 MP4 (HDMI)</option>
+                    <option value="raw_frames">Raw frames (HUB75/WS2812B/composite) — spike only</option>
+                </select>
+            </label>
             <button type="submit" class="primary field-save" disabled>Save video</button>
             <p class="video-upload-status" role="status" aria-live="polite"></p>
         </form>
@@ -65,12 +63,20 @@ const TEMPLATE = `
  *
  * @param {HTMLElement} container
  * @param {object} options
- * @param {number} options.width  — sign width (thumbnail is scaled to this)
+ * @param {number} options.width  — sign width
  * @param {number} options.height — sign height
- * @param {(payload: object) => Promise<any>} options.onSave — called with
- *     { name, duration_ms, pipeline, transition, png_base64, mp4_base64 }
+ * @param {(payload) => Promise<any>} options.onSave — called with
+ *     { name, duration_ms, pipeline, png_base64, mp4_base64 } for
+ *     new-slide creation.
+ * @param {(id, payload) => Promise<any>} [options.onSaveExisting] —
+ *     called on edit. Payload's asset bodies are included only when
+ *     the operator re-picked a file.
+ * @returns {{ loadForEdit: (slide) => Promise<void> }}
  */
-export function mountVideoUploader(container, { width, height, onSave }) {
+export function mountVideoUploader(
+    container,
+    { width, height, onSave, onSaveExisting },
+) {
     container.innerHTML = TEMPLATE;
 
     const canvas = container.querySelector(".video-upload-canvas");
@@ -78,21 +84,32 @@ export function mountVideoUploader(container, { width, height, onSave }) {
     canvas.height = height;
     canvas.style.aspectRatio = `${width} / ${height}`;
 
+    const headingEl = container.querySelector(".video-upload-heading");
+    const newBtnEl = container.querySelector(".video-upload-new");
+    const editHintEl = container.querySelector(".video-upload-edit-hint");
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const pipelineEl = container.querySelector(".field-pipeline");
-    const transitionEl = container.querySelector(".field-transition");
     const saveBtn = container.querySelector(".field-save");
     const statusEl = container.querySelector(".video-upload-status");
     const form = container.querySelector(".controls");
 
-    // The in-memory video bytes + thumbnail; populated on file pick.
-    let videoBytesBase64 = null;
-    let hasThumbnail = false;
+    const state = {
+        // Populated only when the operator picks a NEW file — the asset
+        // bodies below are null in edit mode when they leave the picker
+        // empty. Save omits the fields so the server retains existing bytes.
+        videoBytesBase64: null,
+        thumbnailCanvasReady: false, // canvas has a fresh first-frame
+        editingId: null,
+    };
 
     function updateSaveEnabled() {
-        saveBtn.disabled = !(hasThumbnail && videoBytesBase64)
+        // In create mode we need both a thumbnail + MP4 bytes. In edit
+        // mode, metadata-only saves are valid.
+        const hasNewFile = state.thumbnailCanvasReady && state.videoBytesBase64;
+        saveBtn.disabled =
+            (!state.editingId && !hasNewFile)
             || saveBtn.dataset.inFlight === "1";
     }
 
@@ -101,22 +118,21 @@ export function mountVideoUploader(container, { width, height, onSave }) {
     fileEl.addEventListener("change", async () => {
         const file = fileEl.files?.[0];
         if (!file) {
-            hasThumbnail = false;
-            videoBytesBase64 = null;
-            clearCanvas(canvas);
+            state.thumbnailCanvasReady = false;
+            state.videoBytesBase64 = null;
+            if (!state.editingId) clearCanvas(canvas);
             updateSaveEnabled();
             return;
         }
 
         statusEl.textContent = "Reading file…";
         try {
-            // Extract thumbnail + detected duration in parallel with the bytes read.
             const [{ durationSeconds }, bytesB64] = await Promise.all([
                 drawFirstFrameToCanvas(file, canvas),
                 fileToBase64(file),
             ]);
-            hasThumbnail = true;
-            videoBytesBase64 = bytesB64;
+            state.thumbnailCanvasReady = true;
+            state.videoBytesBase64 = bytesB64;
             if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
                 durationEl.value = String(Math.round(durationSeconds));
             }
@@ -125,14 +141,16 @@ export function mountVideoUploader(container, { width, height, onSave }) {
             }
             statusEl.textContent = "";
         } catch (err) {
-            hasThumbnail = false;
-            videoBytesBase64 = null;
+            state.thumbnailCanvasReady = false;
+            state.videoBytesBase64 = null;
             clearCanvas(canvas);
             statusEl.textContent = `Could not read video: ${err.message}`;
         } finally {
             updateSaveEnabled();
         }
     });
+
+    newBtnEl.addEventListener("click", () => resetToBlank());
 
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -142,28 +160,111 @@ export function mountVideoUploader(container, { width, height, onSave }) {
         updateSaveEnabled();
         statusEl.textContent = "Saving…";
         try {
-            const png_base64 = canvasToBase64(canvas);
             const durationSeconds = Number(durationEl.value) || 10;
-            await onSave({
+            const includeAssets =
+                state.thumbnailCanvasReady || !state.editingId;
+            const payload = {
                 name: nameEl.value || "Video",
                 duration_ms: Math.round(durationSeconds * 1000),
                 pipeline: pipelineEl.value,
-                transition: transitionEl.value,
-                png_base64,
-                mp4_base64: videoBytesBase64,
-            });
-            statusEl.textContent = "Saved.";
-            // Reset for the next upload.
-            fileEl.value = "";
-            clearCanvas(canvas);
-            hasThumbnail = false;
-            videoBytesBase64 = null;
+                png_base64: includeAssets ? canvasToBase64(canvas) : null,
+                mp4_base64: includeAssets ? state.videoBytesBase64 : null,
+            };
+            if (state.editingId && onSaveExisting) {
+                await onSaveExisting(state.editingId, payload);
+                statusEl.textContent = "Updated.";
+            } else {
+                await onSave(payload);
+                statusEl.textContent = "Saved.";
+            }
+            resetToBlank();
         } catch (err) {
             statusEl.textContent = `Save failed: ${err.message}`;
         } finally {
             delete saveBtn.dataset.inFlight;
             updateSaveEnabled();
         }
+    });
+
+    function resetToBlank() {
+        state.editingId = null;
+        state.thumbnailCanvasReady = false;
+        state.videoBytesBase64 = null;
+        headingEl.textContent = "Upload a video";
+        newBtnEl.hidden = true;
+        editHintEl.hidden = true;
+        fileEl.value = "";
+        nameEl.value = "Video";
+        durationEl.value = "10";
+        clearCanvas(canvas);
+        updateSaveEnabled();
+    }
+
+    async function loadForEdit(slide) {
+        if (!slide || slide.type !== "video") {
+            statusEl.textContent =
+                "Only video slides are editable here — text and image open their own editors.";
+            return;
+        }
+        state.editingId = String(slide.id);
+        state.thumbnailCanvasReady = false;
+        state.videoBytesBase64 = null;
+        headingEl.textContent = `Editing: ${slide.name || "Untitled"}`;
+        newBtnEl.hidden = false;
+        editHintEl.hidden = false;
+        nameEl.value = slide.name || "Video";
+        durationEl.value = String(
+            Math.max(1, (slide.duration_ms || 10000) / 1000),
+        );
+        pipelineEl.value = slide.pipeline || "h264_mp4";
+        // Paint the stored thumbnail into the canvas for visual continuity.
+        try {
+            await drawUrlToCanvas(`/api/content/${slide.id}/asset`, canvas);
+        } catch (err) {
+            statusEl.textContent = `Could not load thumbnail: ${err.message}`;
+        }
+        updateSaveEnabled();
+    }
+
+    return { loadForEdit };
+}
+
+// Duplicated in image-upload.js — deliberately, so neither uploader
+// imports the other. Small helper, not worth a shared module.
+function drawUrlToCanvas(url, canvas) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => {
+            try {
+                const ctx = canvas.getContext("2d");
+                ctx.save();
+                try {
+                    ctx.fillStyle = "#000000";
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    const scale = Math.min(
+                        canvas.width / img.width,
+                        canvas.height / img.height,
+                    );
+                    const drawW = img.width * scale;
+                    const drawH = img.height * scale;
+                    ctx.drawImage(
+                        img,
+                        (canvas.width - drawW) / 2,
+                        (canvas.height - drawH) / 2,
+                        drawW,
+                        drawH,
+                    );
+                } finally {
+                    ctx.restore();
+                }
+                resolve();
+            } catch (err) {
+                reject(err);
+            }
+        };
+        img.onerror = () => reject(new Error("could not load thumbnail"));
+        img.src = url;
     });
 }
 

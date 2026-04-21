@@ -287,32 +287,29 @@ function renderPalletTile(item) {
         item.type === "video" ? "▶" : item.type === "image" ? "🖼" : "Aa",
     );
     const cacheKey = encodeURIComponent(item.created_at || String(item.id));
-    // Text slides get an "edit" affordance — clicking the tile opens the
-    // slide back in the editor. Image + video variants aren't editable
-    // today (no PUT endpoint for images / no reconstruction path for a
-    // flattened composite); clicking does nothing for them.
-    const editable = item.type === "text_slide";
+    // Every slide type has an "edit" affordance — clicking the ✎ opens
+    // the appropriate subpage's editor in edit-existing mode (main.js
+    // routes by `item.type`). For image + video, the editor's file
+    // picker stays optional — metadata-only updates don't force a
+    // re-upload.
     li.innerHTML = `
         <img class="pallet-tile-thumb" alt=""
              src="/api/content/${item.id}/asset?v=${cacheKey}">
         <div class="pallet-tile-name" title="${safeName}">${safeName}</div>
         <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>
-        ${editable ? '<button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>' : ""}
+        <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
     `;
-    if (editable) {
-        const editBtn = li.querySelector(".pallet-tile-edit");
-        editBtn.addEventListener("click", (event) => {
-            // Bubble a custom event so main.js (which owns the editor +
-            // router) can navigate + pre-fill without pallet-track needing
-            // to import either.
-            event.stopPropagation();
-            document.dispatchEvent(
-                new CustomEvent("openmarquee:edit-slide", {
-                    detail: { id: String(item.id), type: item.type },
-                }),
-            );
-        });
-    }
+    li.querySelector(".pallet-tile-edit").addEventListener("click", (event) => {
+        // Bubble a custom event so main.js (which owns the editors +
+        // router) can navigate + pre-fill without playlist-track having
+        // to import either.
+        event.stopPropagation();
+        document.dispatchEvent(
+            new CustomEvent("openmarquee:edit-slide", {
+                detail: { id: String(item.id), type: item.type },
+            }),
+        );
+    });
     return li;
 }
 

@@ -208,6 +208,22 @@ class VideoUpload(BaseModel):
     mp4_base64: str = Field(description="MP4 H.264 video bytes.")
 
 
+class VideoUpdate(BaseModel):
+    """Wire format for PUT /api/content/videos/{id}.
+
+    Both `png_base64` (thumbnail) and `mp4_base64` (video bytes) are
+    optional: omit to keep the existing asset. Metadata (name, duration,
+    pipeline) always updates. Large MP4 bytes don't need to re-travel
+    the wire for a metadata-only rename.
+    """
+
+    name: str
+    duration_ms: int = 5000
+    pipeline: str = "h264_mp4"
+    png_base64: str | None = None
+    mp4_base64: str | None = None
+
+
 @router.post("/videos", response_model=VideoSlide)
 async def upload_video(
     payload: VideoUpload,
@@ -277,6 +293,56 @@ async def upload_image(
     return image
 
 
+class ImageUpdate(BaseModel):
+    """Wire format for PUT /api/content/images/{id}.
+
+    `png_base64` is optional: omit to keep the existing image bytes and
+    update just the metadata (name / duration). Pass a new PNG to replace
+    the stored asset in place — the UUID stays the same so playlist +
+    schedule references are preserved.
+    """
+
+    name: str
+    duration_ms: int = 5000
+    png_base64: str | None = None
+
+
+@router.put("/images/{item_id}", response_model=ImageSlide)
+async def update_image(
+    item_id: UUID,
+    payload: ImageUpdate,
+    storage: StorageDep,
+) -> ImageSlide:
+    try:
+        existing = storage.load(item_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"no image {item_id}") from exc
+    if existing.type != "image":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item_id} is a {existing.type}, not an image",
+        )
+
+    try:
+        updated = ImageSlide(
+            id=item_id,
+            created_at=existing.created_at,
+            name=payload.name,
+            duration_ms=payload.duration_ms,
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    # If the client didn't re-upload the image, keep the existing bytes.
+    png = (
+        _decode_png_payload(payload.png_base64)
+        if payload.png_base64
+        else storage.read_asset(item_id)
+    )
+    storage.save_image(updated, png)
+    return updated
+
+
 @router.get("", response_model=list[ContentItem])
 async def list_content(storage: StorageDep, playlist_storage: PlaylistDep) -> list[ContentItem]:
     """All saved content, ordered by the playlist (orphans appended at end).
@@ -308,6 +374,57 @@ async def get_asset(item_id: UUID, storage: StorageDep) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no asset for {item_id}")
     return FileResponse(path, media_type="image/png")
+
+
+@router.put("/videos/{item_id}", response_model=VideoSlide)
+async def update_video(
+    item_id: UUID,
+    payload: VideoUpdate,
+    storage: StorageDep,
+) -> VideoSlide:
+    try:
+        existing = storage.load(item_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"no video {item_id}") from exc
+    if existing.type != "video":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item_id} is a {existing.type}, not a video",
+        )
+    if payload.pipeline == "raw_frames":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "raw_frames pipeline is not yet accepted by the upload "
+                "endpoint — use /spike.html or pipeline='h264_mp4'."
+            ),
+        )
+
+    try:
+        updated = VideoSlide(
+            id=item_id,
+            created_at=existing.created_at,
+            name=payload.name,
+            duration_ms=payload.duration_ms,
+            pipeline=payload.pipeline,
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    # Missing assets reuse existing bytes — metadata-only rename doesn't
+    # force the operator to re-upload 50 MB of MP4 over the WiFi.
+    thumbnail = (
+        _decode_png_payload(payload.png_base64)
+        if payload.png_base64
+        else storage.read_asset(item_id)
+    )
+    mp4 = (
+        _decode_mp4_payload(payload.mp4_base64)
+        if payload.mp4_base64
+        else storage.read_video(item_id)
+    )
+    storage.save_video(updated, thumbnail, mp4)
+    return updated
 
 
 @router.get(

@@ -433,6 +433,130 @@ def test_delete_video_removes_mp4(client: TestClient, storage: ContentStorage):
     assert not storage.video_path(item_id).exists()
 
 
+def test_put_image_metadata_only_keeps_existing_png(
+    client: TestClient, storage: ContentStorage
+):
+    """Image PUT with png_base64=null preserves the stored bytes —
+    operator renaming a slide shouldn't force a re-upload."""
+    post = client.post("/api/content/images", json=_upload_payload(name="Logo"))
+    item_id = UUID(post.json()["id"])
+    original_bytes = storage.read_asset(item_id)
+
+    response = client.put(
+        f"/api/content/images/{item_id}",
+        json={"name": "Renamed", "duration_ms": 7000, "png_base64": None},
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Renamed"
+    assert response.json()["duration_ms"] == 7000
+    # Bytes untouched.
+    assert storage.read_asset(item_id) == original_bytes
+
+
+def test_put_image_with_png_replaces_bytes(
+    client: TestClient, storage: ContentStorage
+):
+    post = client.post("/api/content/images", json=_upload_payload(name="Old"))
+    item_id = UUID(post.json()["id"])
+    new_png = _real_png_bytes()
+
+    response = client.put(
+        f"/api/content/images/{item_id}",
+        json={
+            "name": "Updated",
+            "duration_ms": 5000,
+            "png_base64": base64.b64encode(new_png).decode("ascii"),
+        },
+    )
+    assert response.status_code == 200
+    assert storage.read_asset(item_id) == new_png
+
+
+def test_put_image_404s_on_unknown_id(client: TestClient):
+    response = client.put(
+        f"/api/content/images/{uuid4()}",
+        json={"name": "ghost", "duration_ms": 5000, "png_base64": None},
+    )
+    assert response.status_code == 404
+
+
+def test_put_image_409s_when_target_is_not_an_image(
+    client: TestClient, playlist_storage: PlaylistStorage
+):
+    """Operator can't use the images PUT route to overwrite a text slide."""
+    post = client.post("/api/content/text-slides", json=_upload_payload(name="T"))
+    item_id = UUID(post.json()["id"])
+    response = client.put(
+        f"/api/content/images/{item_id}",
+        json={"name": "nope", "duration_ms": 5000, "png_base64": None},
+    )
+    assert response.status_code == 409
+    assert "text_slide" in response.json()["detail"]
+
+
+def test_put_video_metadata_only_keeps_existing_assets(
+    client: TestClient, storage: ContentStorage
+):
+    """Renaming a large MP4 shouldn't force re-uploading 50 MB."""
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = UUID(post.json()["id"])
+    original_thumb = storage.read_asset(item_id)
+    original_mp4 = storage.read_video(item_id)
+
+    response = client.put(
+        f"/api/content/videos/{item_id}",
+        json={
+            "name": "Renamed",
+            "duration_ms": 8000,
+            "pipeline": "h264_mp4",
+            "png_base64": None,
+            "mp4_base64": None,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Renamed"
+    assert storage.read_asset(item_id) == original_thumb
+    assert storage.read_video(item_id) == original_mp4
+
+
+def test_put_video_with_new_assets_replaces_them(
+    client: TestClient, storage: ContentStorage
+):
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = UUID(post.json()["id"])
+
+    new_thumb = _real_png_bytes()
+    new_mp4 = b"\x00\x00\x00\x20ftypmp42" + b"\xab" * 120
+
+    response = client.put(
+        f"/api/content/videos/{item_id}",
+        json={
+            "name": "v",
+            "duration_ms": 5000,
+            "pipeline": "h264_mp4",
+            "png_base64": base64.b64encode(new_thumb).decode("ascii"),
+            "mp4_base64": base64.b64encode(new_mp4).decode("ascii"),
+        },
+    )
+    assert response.status_code == 200
+    assert storage.read_asset(item_id) == new_thumb
+    assert storage.read_video(item_id) == new_mp4
+
+
+def test_put_video_404s_on_unknown_id(client: TestClient):
+    response = client.put(
+        f"/api/content/videos/{uuid4()}",
+        json={
+            "name": "ghost",
+            "duration_ms": 5000,
+            "pipeline": "h264_mp4",
+            "png_base64": None,
+            "mp4_base64": None,
+        },
+    )
+    assert response.status_code == 404
+
+
 def test_post_video_rejects_unknown_pipeline(client: TestClient):
     payload = _video_payload(pipeline="vp9")
     response = client.post("/api/content/videos", json=payload)
