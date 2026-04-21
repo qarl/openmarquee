@@ -41,13 +41,6 @@ def get_content_storage() -> ContentStorage:
     return _content_storage_singleton()
 
 
-def _resolve_dev_renderer_dimensions() -> tuple[int, int]:
-    """Display dimensions for the dev MockRenderer. Defaults match SYSTEM_SPEC §3.4."""
-    width = int(os.environ.get("OPENMARQUEE_DEV_WIDTH", "128"))
-    height = int(os.environ.get("OPENMARQUEE_DEV_HEIGHT", "96"))
-    return width, height
-
-
 def _resolve_dev_preview_path() -> Path:
     override = os.environ.get("OPENMARQUEE_DEV_PREVIEW_PATH")
     if override:
@@ -57,8 +50,39 @@ def _resolve_dev_preview_path() -> Path:
 
 @lru_cache
 def _mock_renderer_singleton() -> MockRenderer:
-    width, height = _resolve_dev_renderer_dimensions()
-    return MockRenderer(width, height, _resolve_dev_preview_path())
+    """Build the dev MockRenderer with dims sourced from SystemSettings.
+
+    The renderer re-reads settings on every frame, so changing
+    display_width / display_height / display_rotation in the Settings
+    UI flows through to the preview + the /simulator.html pop-out on
+    the next tick — no backend restart needed. Portrait rotations
+    (90°, 270°) swap the stored landscape-native dims so the dev
+    preview's aspect ratio matches what an installed-rotated sign
+    would show.
+
+    Env-override is retained via OPENMARQUEE_DEV_WIDTH/HEIGHT — tests
+    + CI pin a small canvas for speed, bypassing settings. When either
+    override is present we use static dims; otherwise it's dynamic.
+    """
+    env_w = os.environ.get("OPENMARQUEE_DEV_WIDTH")
+    env_h = os.environ.get("OPENMARQUEE_DEV_HEIGHT")
+    if env_w or env_h:
+        width = int(env_w or "128")
+        height = int(env_h or "96")
+        return MockRenderer(width, height, _resolve_dev_preview_path())
+
+    settings_storage = _settings_storage_singleton()
+
+    def current_dims() -> tuple[int, int]:
+        s = settings_storage.load()
+        if s.display_rotation in (90, 270):
+            return (int(s.display_height), int(s.display_width))
+        return (int(s.display_width), int(s.display_height))
+
+    return MockRenderer(
+        output_path=_resolve_dev_preview_path(),
+        get_dims=current_dims,
+    )
 
 
 def get_mock_renderer() -> MockRenderer:
