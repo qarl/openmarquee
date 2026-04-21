@@ -144,6 +144,33 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 .row { display: flex; gap: 0.75rem; }
 .row .field { flex: 1 1 0; }
 
+.presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.preset {
+    /* 2.75rem ≈ 44pt = Apple HIG min tap target. */
+    width: 2.75rem;
+    height: 2.75rem;
+    border-radius: 0.35rem;
+    border: 1px solid var(--panel-border);
+    font-weight: 700;
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.preset:hover {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
 .editor-status {
     margin: 0;
     color: var(--muted);

@@ -3,6 +3,28 @@
 // for display via CSS (image-rendering: pixelated) so what you see is what
 // the sign will show.
 
+// Signage-friendly color presets. Per SYSTEM_SPEC §5.1: most users just want
+// "white on red" and to be done — not to fiddle with a color picker.
+const PRESETS = [
+    { name: "White on black", text: "#FFFFFF", bg: "#000000" },
+    { name: "White on red", text: "#FFFFFF", bg: "#CC0000" },
+    { name: "Yellow on blue", text: "#FFD23A", bg: "#1538A8" },
+    { name: "Black on yellow", text: "#000000", bg: "#FFD23A" },
+    { name: "White on green", text: "#FFFFFF", bg: "#1F7A3A" },
+    { name: "Green on black", text: "#39FF14", bg: "#000000" },
+];
+
+function presetButtonsHtml() {
+    return PRESETS.map(
+        (p, i) => `
+        <button type="button" class="preset" data-preset-index="${i}"
+                aria-label="${p.name}"
+                title="${p.name}"
+                style="background:${p.bg};color:${p.text};">Aa</button>
+    `,
+    ).join("");
+}
+
 const EDITOR_TEMPLATE = `
     <div class="editor">
         <div class="preview-wrap">
@@ -13,6 +35,10 @@ const EDITOR_TEMPLATE = `
                 <span>Text</span>
                 <textarea class="field-text" rows="3" placeholder="GRAND OPENING"></textarea>
             </label>
+            <div class="field">
+                <span>Quick colors</span>
+                <div class="presets">${presetButtonsHtml()}</div>
+            </div>
             <div class="row">
                 <label class="field field-color">
                     <span>Text color</span>
@@ -85,6 +111,20 @@ export function mountEditor(container, { width, height, onSave }) {
     for (const el of [textEl, textColorEl, bgColorEl, nameEl]) {
         el.addEventListener("input", syncAndRender);
     }
+
+    container.querySelectorAll(".preset").forEach((btn) => {
+        btn.addEventListener("click", () => {
+            const preset = PRESETS[Number(btn.dataset.presetIndex)];
+            if (!preset) return;
+            textColorEl.value = preset.text;
+            bgColorEl.value = preset.bg;
+            // Dispatch synthetic input events so any future listener
+            // (validation, dirty-state, undo) sees preset clicks the same as
+            // user edits.
+            textColorEl.dispatchEvent(new Event("input", { bubbles: true }));
+            bgColorEl.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+    });
 
     form.addEventListener("submit", async (event) => {
         event.preventDefault();

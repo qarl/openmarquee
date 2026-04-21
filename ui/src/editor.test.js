@@ -178,4 +178,20 @@ describe("mountEditor — submit flow", () => {
         const status = container.querySelector(".editor-status").textContent;
         expect(status).toContain("backend boom");
     });
+
+    it("clicking a preset updates the color inputs and re-renders", () => {
+        const fakeCtx = patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, { width: 64, height: 32, onSave: vi.fn() });
+
+        const renderCallsBefore = fakeCtx.fillRect.mock.calls.length;
+        // Pick the second preset (white on red).
+        const preset = container.querySelectorAll(".preset")[1];
+        preset.click();
+
+        expect(container.querySelector(".field-text-color").value).toBe("#ffffff");
+        expect(container.querySelector(".field-bg-color").value).toBe("#cc0000");
+        // Re-render happened.
+        expect(fakeCtx.fillRect.mock.calls.length).toBeGreaterThan(renderCallsBefore);
+    });
 });
