@@ -6,8 +6,8 @@
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
-    "dev": "esbuild src/main.js src/welcome.js --bundle --outdir=dist --servedir=. --watch",
-    "build": "esbuild src/main.js src/welcome.js --bundle --minify --outdir=dist",
+    "dev": "esbuild src/main.js src/welcome.js src/spike.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --outdir=dist --servedir=. --watch",
+    "build": "esbuild src/main.js src/welcome.js src/spike.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --minify --outdir=dist && node scripts/copy-ffmpeg-core.mjs",
     "test": "vitest run",
     "e2e": "playwright test",
     "e2e:install": "playwright install chromium"
@@ -19,6 +19,9 @@
     "vitest": "^1.6.0"
   },
   "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
     "qrcode": "^1.5.4",
     "sortablejs": "^1.15.7"
   }

@@ -171,6 +171,23 @@ async def upload_video(
     storage: StorageDep,
     playlist_storage: PlaylistDep,
 ) -> VideoSlide:
+    # Reject raw_frames uploads until the storage-for-frame-sequences path
+    # lands. The VideoSlide model accepts the value so existing data can
+    # round-trip, but the upload endpoint can only persist `asset.mp4`
+    # today — accepting a raw_frames payload would save an MP4 mis-
+    # labeled as raw_frames and break the panel renderers when they ship.
+    # Operators producing raw RGB frames via the /spike.html page today
+    # should byte-compare against ffmpeg CLI, not upload via this route.
+    if payload.pipeline == "raw_frames":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "raw_frames pipeline is not yet accepted by the upload "
+                "endpoint — use the /spike.html page to produce raw RGB "
+                "frames, or upload H.264 MP4 via pipeline='h264_mp4'."
+            ),
+        )
+
     thumbnail = _decode_png_payload(payload.png_base64)
     mp4 = _decode_mp4_payload(payload.mp4_base64)
 

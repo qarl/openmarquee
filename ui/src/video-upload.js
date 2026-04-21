@@ -21,10 +21,12 @@ const TEMPLATE = `
                 <input type="file" accept="video/mp4" class="field-file">
             </label>
             <p class="field-hint video-upload-hint">
-                Client-side transcoding via ffmpeg.wasm is a follow-up —
-                today you upload what you've got. For smooth HDMI playback
-                on Pi Zero 2 W, pre-encode as H.264 at your target
-                resolution.
+                Client-side transcoding via ffmpeg.wasm isn't wired into
+                this uploader yet — today you upload what you've got. For
+                smooth HDMI playback on Pi Zero 2 W, pre-encode as H.264
+                at your target resolution, or open the
+                <a href="/spike.html" target="_blank">ffmpeg.wasm spike page</a>
+                to transcode in the browser and download the output.
             </p>
             <div class="row">
                 <label class="field">
@@ -41,6 +43,7 @@ const TEMPLATE = `
                     <span>Pipeline</span>
                     <select class="field-pipeline">
                         <option value="h264_mp4" selected>H.264 MP4 (HDMI)</option>
+                        <option value="raw_frames">Raw frames (HUB75/WS2812B/composite) — spike only</option>
                     </select>
                 </label>
                 <label class="field">
@@ -51,11 +54,6 @@ const TEMPLATE = `
                     </select>
                 </label>
             </div>
-            <!--
-                Raw-frames pipeline (for HUB75 / WS2812B / composite panels)
-                re-enters the dropdown when ffmpeg.wasm can actually produce
-                RGB frames client-side; until then the server rejects it.
-            -->
             <button type="submit" class="primary field-save" disabled>Save video</button>
             <p class="video-upload-status" role="status" aria-live="polite"></p>
         </form>

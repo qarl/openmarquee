@@ -59,6 +59,29 @@ test("sidebar nav shows Slides by default and routes to each section on click", 
     await expect(page.locator(".field-display-width")).toHaveValue("128");
 });
 
+test("ffmpeg.wasm spike page renders both pipeline buttons + the file picker", async ({ page }) => {
+    await page.goto("/spike.html");
+    await expect(page).toHaveTitle(/ffmpeg\.wasm spike/);
+    await expect(page.locator("#run-h264")).toBeVisible();
+    await expect(page.locator("#run-rgb")).toBeVisible();
+    await expect(page.locator("#source-file")).toBeVisible();
+    // Initial status line says "ready." after boot() fires.
+    await expect(page.locator("#spike-status")).toContainText("ready");
+});
+
+test("spike page serves the bundled ffmpeg worker + vendored core assets", async ({ page }) => {
+    // Worker and core files must exist on the captive portal — otherwise
+    // the first click on a pipeline button 404s and the operator sees an
+    // ffmpeg.wasm init error. Regression guard for the esbuild worker-
+    // entry-point bundling step.
+    const worker = await page.request.get("/dist/ffmpeg-worker.js");
+    expect(worker.status()).toBe(200);
+    const coreJs = await page.request.get("/dist/vendor/ffmpeg-core/ffmpeg-core.js");
+    expect(coreJs.status()).toBe(200);
+    const coreWasm = await page.request.head("/dist/vendor/ffmpeg-core/ffmpeg-core.wasm");
+    expect(coreWasm.status()).toBe(200);
+});
+
 test("welcome page renders SSID, password, and a real (not placeholder) QR", async ({ page }) => {
     // Phase 7 swaps in real values from the device side; this smoke test
     // ensures the page chrome stays wired up AND the welcome.js script

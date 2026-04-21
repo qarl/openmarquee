@@ -39,7 +39,7 @@ describe("mountVideoUploader", () => {
         expect(container.querySelector(".field-pipeline").value).toBe("h264_mp4");
     });
 
-    it("only offers the h264_mp4 pipeline today (raw_frames pending ffmpeg.wasm)", async () => {
+    it("exposes both pipelines now that the ffmpeg.wasm spike produces raw frames", async () => {
         const container = document.createElement("div");
         mountVideoUploader(container, {
             width: 128,
@@ -50,7 +50,7 @@ describe("mountVideoUploader", () => {
         const options = Array.from(
             container.querySelectorAll(".field-pipeline option"),
         ).map((o) => o.value);
-        expect(options).toEqual(["h264_mp4"]);
+        expect(options).toEqual(["h264_mp4", "raw_frames"]);
     });
 
     it("surfaces a known message when the video can't be read", async () => {

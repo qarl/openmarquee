@@ -112,13 +112,16 @@ class VideoSlide(BaseModel):
     name: str = Field(max_length=200)
     duration_ms: int = Field(default=5000, ge=100)
 
-    # Today's uploader is a direct passthrough — the browser sends an MP4
-    # and we store it. The spec's other pipeline ("raw_frames": decoded RGB
-    # frames for HUB75/WS2812B/composite) needs ffmpeg.wasm to produce the
-    # frames, which hasn't landed — accepting it here would let an operator
-    # save an MP4 mis-labeled as raw_frames and break the panel renderers
-    # when they ship. Re-widen this Literal when the producer does.
-    pipeline: Literal["h264_mp4"] = "h264_mp4"
+    # Re-opened to "raw_frames" now that the ffmpeg.wasm spike page can
+    # actually produce concatenated RGB888 frames (/spike.html exercises
+    # both pipelines client-side). The storage layer still lays down
+    # `asset.mp4` — when a raw_frames VideoSlide lands and the spike is
+    # wired into video-upload.js as the production consumer, storage will
+    # grow a sibling path for frame sequences. Keeping the Literal wide
+    # now lets existing data round-trip even though the production upload
+    # path hasn't shipped yet. Operators saving raw_frames via the /videos
+    # endpoint today should still pass an MP4; this is a stepping stone.
+    pipeline: Literal["h264_mp4", "raw_frames"] = "h264_mp4"
 
     # Same transition contract as TextSlide/ImageSlide — applied on the way
     # out, so a cut/fade into the next slide still works across variants.

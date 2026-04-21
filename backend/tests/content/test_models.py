@@ -168,12 +168,12 @@ def test_video_slide_minimal_construction():
     assert video.pipeline == "h264_mp4"
 
 
-def test_video_slide_rejects_raw_frames_until_ffmpeg_wasm_lands():
-    """raw_frames is a Literal option only once the browser can actually
-    produce raw RGB frames (ffmpeg.wasm). Until then saving a VideoSlide
-    with pipeline=raw_frames + an MP4 would mis-label the stored asset."""
-    with pytest.raises(ValidationError):
-        VideoSlide(name="x", pipeline="raw_frames")  # type: ignore[arg-type]
+def test_video_slide_accepts_raw_frames_pipeline():
+    """Reopened in the ffmpeg.wasm spike commit: the browser can now
+    extract concatenated RGB888 frames via /spike.html. Production-grade
+    wiring of raw_frames into the upload path follows."""
+    video = VideoSlide(name="Panel Promo", pipeline="raw_frames")
+    assert video.pipeline == "raw_frames"
 
 
 def test_video_slide_rejects_unknown_pipeline():

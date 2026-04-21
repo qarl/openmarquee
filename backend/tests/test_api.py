@@ -437,3 +437,14 @@ def test_post_video_rejects_unknown_pipeline(client: TestClient):
     payload = _video_payload(pipeline="vp9")
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 422
+
+
+def test_post_video_rejects_raw_frames_until_storage_supports_it(client: TestClient):
+    """Model accepts raw_frames (for round-tripping existing data), but the
+    upload endpoint won't persist until the frame-sequence storage path
+    lands — otherwise an operator could save an MP4 mis-labeled as
+    raw_frames and break future panel renderers."""
+    payload = _video_payload(pipeline="raw_frames")
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 422
+    assert "raw_frames" in response.json()["detail"]

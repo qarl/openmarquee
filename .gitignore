@@ -58,3 +58,8 @@ test-results/
 
 # Local dev state
 *.log
+
+# rclone mount leaves partial-upload files around when a write gets
+# interrupted; they're ghost files (listable but not unlinkable). Ignore
+# so they don't pollute `git status`.
+*.partial
