@@ -1,15 +1,16 @@
 """FastAPI dependency providers.
 
-Centralizes how API routes get their collaborators (right now just
-ContentStorage) so tests can override them via app.dependency_overrides
-and the production wiring stays in one place.
+Centralizes how API routes get their collaborators so tests can override them
+via app.dependency_overrides and the production wiring stays in one place.
 """
 
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
 from openmarquee.content.storage import ContentStorage
+from openmarquee.rendering.mock import MockRenderer
 
 
 def _resolve_content_root() -> Path:
@@ -34,3 +35,32 @@ def _content_storage_singleton() -> ContentStorage:
 def get_content_storage() -> ContentStorage:
     """Dependency provider for the content storage layer."""
     return _content_storage_singleton()
+
+
+def _resolve_dev_renderer_dimensions() -> tuple[int, int]:
+    """Display dimensions for the dev MockRenderer. Defaults match SYSTEM_SPEC §3.4."""
+    width = int(os.environ.get("OPENMARQUEE_DEV_WIDTH", "128"))
+    height = int(os.environ.get("OPENMARQUEE_DEV_HEIGHT", "96"))
+    return width, height
+
+
+def _resolve_dev_preview_path() -> Path:
+    override = os.environ.get("OPENMARQUEE_DEV_PREVIEW_PATH")
+    if override:
+        return Path(override)
+    return Path(tempfile.gettempdir()) / "openmarquee-preview.png"
+
+
+@lru_cache
+def _mock_renderer_singleton() -> MockRenderer:
+    width, height = _resolve_dev_renderer_dimensions()
+    return MockRenderer(width, height, _resolve_dev_preview_path())
+
+
+def get_mock_renderer() -> MockRenderer:
+    """Dependency provider for the dev-time MockRenderer.
+
+    This is the renderer the /dev/preview page reads from. In production
+    (Phases 6/8/10) the playback engine targets a real renderer instead.
+    """
+    return _mock_renderer_singleton()
