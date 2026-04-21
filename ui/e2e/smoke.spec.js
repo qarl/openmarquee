@@ -52,10 +52,11 @@ test("sidebar nav shows Slides by default and routes to each section on click", 
         await expect(page.locator(`.nav-link[data-section="${name}"]`)).toHaveClass(/active/);
     }
 
-    // Settings section renders the read-only config view.
+    // Settings section renders an editable form hydrated from /api/settings.
     await page.locator('.nav-link[data-section="settings"]').click();
     await expect(page.locator(".settings-heading")).toHaveText("System settings");
-    await expect(page.locator('dd[data-key="output_mode"]')).toHaveText("hdmi");
+    await expect(page.locator(".field-output-mode")).toHaveValue("hdmi");
+    await expect(page.locator(".field-display-width")).toHaveValue("128");
 });
 
 test("welcome page renders SSID, password, and a real (not placeholder) QR", async ({ page }) => {

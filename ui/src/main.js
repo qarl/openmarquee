@@ -21,6 +21,7 @@ import {
     savePlaylistByName,
     saveImage,
     saveSchedule,
+    saveSettings,
     saveTextSlide,
     saveVideo,
     setPlaylistOrder,
@@ -35,7 +36,7 @@ import { mountNav } from "./nav.js";
 import { mountPlaybackControls } from "./playback.js";
 import { mountPlaylistsManager } from "./playlists.js";
 import { mountSchedule } from "./schedule.js";
-import { mountSettingsView } from "./settings-view.js";
+import { mountSettings } from "./settings.js";
 import { mountVideoUploader } from "./video-upload.js";
 
 const PANEL_WIDTH = 128;
@@ -127,8 +128,9 @@ function boot() {
         },
     });
 
-    mountSettingsView(root.querySelector(".settings-slot"), {
+    mountSettings(root.querySelector(".settings-slot"), {
         fetchSettings: getSettings,
+        onSave: saveSettings,
     });
 
     mountNav({
