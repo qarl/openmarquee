@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchHealth, saveTextSlide } from "./api.js";
+import {
+    deleteContent,
+    fetchHealth,
+    listContent,
+    playContent,
+    saveTextSlide,
+} from "./api.js";
 
 afterEach(() => {
     vi.unstubAllGlobals();
@@ -61,5 +67,46 @@ describe("saveTextSlide", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad color" });
         await expect(saveTextSlide({})).rejects.toThrow("422");
+    });
+});
+
+describe("listContent", () => {
+    it("GETs /api/content and returns the array", async () => {
+        const items = [{ id: "a", name: "x" }];
+        const fetchMock = mockFetch({ ok: true, json: async () => items });
+        const result = await listContent();
+        expect(result).toEqual(items);
+        expect(fetchMock).toHaveBeenCalledWith("/api/content");
+    });
+
+    it("throws on non-ok response", async () => {
+        mockFetch({ ok: false, status: 500 });
+        await expect(listContent()).rejects.toThrow("500");
+    });
+});
+
+describe("deleteContent", () => {
+    it("DELETEs /api/content/{id}", async () => {
+        const fetchMock = mockFetch({ ok: true });
+        await deleteContent("abc");
+        expect(fetchMock).toHaveBeenCalledWith("/api/content/abc", { method: "DELETE" });
+    });
+
+    it("throws on non-ok response", async () => {
+        mockFetch({ ok: false, status: 404 });
+        await expect(deleteContent("missing")).rejects.toThrow("404");
+    });
+});
+
+describe("playContent", () => {
+    it("POSTs /dev/play/{id}", async () => {
+        const fetchMock = mockFetch({ ok: true });
+        await playContent("abc");
+        expect(fetchMock).toHaveBeenCalledWith("/dev/play/abc", { method: "POST" });
+    });
+
+    it("throws on non-ok response", async () => {
+        mockFetch({ ok: false, status: 422 });
+        await expect(playContent("bad")).rejects.toThrow("422");
     });
 });

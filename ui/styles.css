@@ -150,3 +150,84 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     font-size: 0.85rem;
     min-height: 1.2em;
 }
+
+/* --- saved-slides list --- */
+
+.list {
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--panel-border);
+}
+
+.list-heading {
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin: 0 0 0.75rem;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+}
+
+.slides {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.slide {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 0.75rem;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.5rem;
+    padding: 0.5rem 0.75rem;
+}
+
+.slide-thumb {
+    width: 3.5rem;
+    height: 2.625rem;
+    background: #000;
+    border: 1px solid var(--panel-border);
+    border-radius: 0.25rem;
+    image-rendering: pixelated;
+    object-fit: contain;
+}
+
+.slide-meta { min-width: 0; }
+
+.slide-name {
+    font-weight: 500;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.slide-text {
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.slide-actions {
+    display: flex;
+    gap: 0.35rem;
+}
+
+.slide-actions button {
+    padding: 0.35rem 0.6rem;
+    font-size: 0.8rem;
+}
+
+.list-status {
+    margin: 0.75rem 0 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+    min-height: 1.2em;
+}

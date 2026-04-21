@@ -26,3 +26,31 @@ export async function saveTextSlide(payload) {
     }
     return await response.json();
 }
+
+/** Fetch the full list of content items. */
+export async function listContent() {
+    const response = await fetch("/api/content");
+    if (!response.ok) {
+        throw new Error(`List failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+/** Delete a content item by id. */
+export async function deleteContent(id) {
+    const response = await fetch(`/api/content/${id}`, { method: "DELETE" });
+    if (!response.ok) {
+        throw new Error(`Delete failed (${response.status})`);
+    }
+}
+
+/**
+ * Push a content item to the dev MockRenderer. Dev-only; replaced by the
+ * real playback engine in Phase 5. Backend returns 204 on success.
+ */
+export async function playContent(id) {
+    const response = await fetch(`/dev/play/${id}`, { method: "POST" });
+    if (!response.ok) {
+        throw new Error(`Play failed (${response.status})`);
+    }
+}
