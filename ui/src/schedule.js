@@ -23,10 +23,16 @@ const SECTION_TEMPLATE = `
             <em>(Backend persists rules; multi-playlist switching lands later.)</em>
         </p>
 
-        <label class="field">
-            <span>Default playlist (when no rule matches)</span>
-            <input type="text" class="field-default-playlist" maxlength="64" pattern="[a-z0-9_-]+">
-        </label>
+        <div class="row">
+            <label class="field">
+                <span>Default playlist (when no rule matches)</span>
+                <input type="text" class="field-default-playlist" maxlength="64" pattern="[a-z0-9_-]+">
+            </label>
+            <label class="field">
+                <span>Timezone (IANA, optional — reserved for future zoned eval)</span>
+                <input type="text" class="field-tz" maxlength="64" placeholder="e.g. America/Los_Angeles">
+            </label>
+        </div>
 
         <ul class="schedule-rules" role="list"></ul>
 
@@ -52,6 +58,7 @@ const SECTION_TEMPLATE = `
 export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistNames }) {
     container.innerHTML = SECTION_TEMPLATE;
     const defaultEl = container.querySelector(".field-default-playlist");
+    const tzEl = container.querySelector(".field-tz");
     const rulesEl = container.querySelector(".schedule-rules");
     const addBtn = container.querySelector(".schedule-add");
     const saveBtn = container.querySelector(".schedule-save");
@@ -71,6 +78,7 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
                 replaceDefaultWithSelect(defaultEl.parentElement, schedule.default_playlist_name);
             }
             setDefaultValue(container, schedule.default_playlist_name || "default");
+            tzEl.value = schedule.tz || "";
             rulesEl.innerHTML = "";
             for (const rule of schedule.rules || []) {
                 rulesEl.appendChild(renderRule(rule, availableNames));
@@ -130,7 +138,7 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
         saveBtn.disabled = true;
         statusEl.textContent = "Saving…";
         try {
-            const payload = collectSchedule(defaultEl, rulesEl);
+            const payload = collectSchedule(defaultEl, rulesEl, tzEl);
             await onSave(payload);
             statusEl.textContent = "Saved.";
         } catch (err) {
@@ -227,7 +235,7 @@ function ensureOption(selectEl, value) {
     }
 }
 
-function collectSchedule(defaultEl, rulesEl) {
+function collectSchedule(defaultEl, rulesEl, tzEl) {
     const rules = Array.from(rulesEl.querySelectorAll(".schedule-rule")).map((li) => ({
         name: li.querySelector(".rule-name").value,
         days: Array.from(li.querySelectorAll(".rule-day-input"))
@@ -238,9 +246,11 @@ function collectSchedule(defaultEl, rulesEl) {
         playlist_name: li.querySelector(".rule-playlist").value,
         enabled: li.querySelector(".rule-enabled").checked,
     }));
+    const tz = tzEl?.value.trim() || null;
     return {
         rules,
         default_playlist_name: defaultEl.value || "default",
+        tz,
     };
 }
 

@@ -229,3 +229,32 @@ def test_schema_version_present_on_save(tmp_path: Path):
     storage.save(Schedule())
     raw = json.loads((tmp_path / "schedules.json").read_text())
     assert raw["schema_version"] == 1
+
+
+def test_tz_field_defaults_to_none():
+    schedule = Schedule()
+    assert schedule.tz is None
+
+
+def test_tz_field_round_trips_via_storage(tmp_path: Path):
+    storage = ScheduleStorage(tmp_path / "schedules.json")
+    storage.save(Schedule(tz="America/Los_Angeles"))
+    assert storage.load().tz == "America/Los_Angeles"
+
+
+def test_tz_field_length_capped():
+    with pytest.raises(ValidationError):
+        Schedule(tz="x" * 65)
+
+
+def test_evaluator_ignores_tz_for_now():
+    """The tz field is reserved — the evaluator still treats `now` as
+    device-local. Pin this so a future zoned implementation is an obvious
+    test-suite change."""
+    schedule = Schedule(
+        rules=[_rule(["tue"], "12:00", "13:00", playlist="lunch")],
+        default_playlist_name="default",
+        tz="America/Los_Angeles",
+    )
+    # The rule fires at the *device's* 12:30, regardless of tz value.
+    assert evaluate_schedule(datetime(2026, 4, 21, 12, 30), schedule) == "lunch"

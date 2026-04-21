@@ -147,6 +147,29 @@ describe("mountSchedule", () => {
         });
     });
 
+    it("loads and round-trips the optional tz field", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [],
+                default_playlist_name: "default",
+                tz: "America/New_York",
+            }),
+            onSave,
+        });
+        await tick();
+
+        // Initial value populated from the schedule.
+        expect(container.querySelector(".field-tz").value).toBe("America/New_York");
+
+        // User clears it; save should send tz=null.
+        container.querySelector(".field-tz").value = "";
+        container.querySelector(".schedule-save").click();
+        await tick();
+        expect(onSave.mock.calls[0][0].tz).toBeNull();
+    });
+
     it("Save error message surfaces in the status", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {

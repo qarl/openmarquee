@@ -49,6 +49,7 @@ def test_put_then_get_round_trip(client: TestClient):
             }
         ],
         "default_playlist_name": "default",
+        "tz": None,
     }
     response = client.put("/api/schedules", json=payload)
     assert response.status_code == 200
@@ -56,6 +57,20 @@ def test_put_then_get_round_trip(client: TestClient):
 
     response = client.get("/api/schedules")
     assert response.json() == payload
+
+
+def test_put_persists_tz_field(client: TestClient):
+    payload = {
+        "rules": [],
+        "default_playlist_name": "default",
+        "tz": "America/New_York",
+    }
+    response = client.put("/api/schedules", json=payload)
+    assert response.status_code == 200
+    assert response.json()["tz"] == "America/New_York"
+
+    response = client.get("/api/schedules")
+    assert response.json()["tz"] == "America/New_York"
 
 
 def test_put_rejects_malformed_time(client: TestClient):

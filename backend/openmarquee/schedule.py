@@ -120,11 +120,22 @@ class Schedule(BaseModel):
 
     `schema_version` bumps on non-backward-compatible format changes — see
     `openmarquee.content.storage` for the same migration discipline.
+
+    `tz` is a reserved IANA timezone string (e.g. `America/New_York`) for a
+    future zoned evaluator. Today the evaluator uses naive datetime + the
+    device's local clock; persisting a tz now means a sign already in the
+    field can be upgraded to zoned semantics without losing user intent.
+    None means "use the device clock as-is" (current behavior).
     """
 
     schema_version: int = Field(default=SCHEDULE_SCHEMA_VERSION)
     rules: list[ScheduleRule] = Field(default_factory=list)
     default_playlist_name: str = Field(default="default", pattern=_PLAYLIST_NAME_PATTERN)
+    tz: str | None = Field(
+        default=None,
+        max_length=64,
+        description="IANA timezone (e.g. America/New_York). Reserved; not yet enforced.",
+    )
 
 
 def evaluate_schedule(now: datetime, schedule: Schedule) -> str:
