@@ -22,6 +22,7 @@ export const E2E_PREVIEW_PATH = "/tmp/openmarquee-e2e-preview.png";
 export const E2E_PLAYLIST_PATH = "/tmp/openmarquee-e2e-playlist.json";
 export const E2E_SCHEDULE_PATH = "/tmp/openmarquee-e2e-schedules.json";
 export const E2E_SETTINGS_PATH = "/tmp/openmarquee-e2e-settings.json";
+export const E2E_SEED_MARKER_PATH = "/tmp/openmarquee-e2e-seeded.json";
 
 export default defineConfig({
     testDir: "./e2e",
@@ -50,6 +51,11 @@ export default defineConfig({
             OPENMARQUEE_PLAYLIST_PATH: E2E_PLAYLIST_PATH,
             OPENMARQUEE_SCHEDULE_PATH: E2E_SCHEDULE_PATH,
             OPENMARQUEE_SETTINGS_PATH: E2E_SETTINGS_PATH,
+            OPENMARQUEE_SEED_MARKER_PATH: E2E_SEED_MARKER_PATH,
+            // e2e specs assume empty state and reset between tests; the
+            // startup seed would pre-populate four slides and break the
+            // smoke tests. Seeding is unit-tested in test_seed.py.
+            OPENMARQUEE_DISABLE_SEED: "1",
             // Resolve the UI dir relative to THIS file, not cwd, so e2e works
             // regardless of where Playwright is launched from.
             OPENMARQUEE_UI_DIR: __dirname,

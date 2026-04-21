@@ -22,6 +22,7 @@ Environment="OPENMARQUEE_UI_DIR=/opt/openmarquee/ui"
 Environment="OPENMARQUEE_PLAYLIST_PATH=/var/openmarquee/playlist.json"
 Environment="OPENMARQUEE_SCHEDULE_PATH=/var/openmarquee/schedules.json"
 Environment="OPENMARQUEE_SETTINGS_PATH=/var/openmarquee/settings.json"
+Environment="OPENMARQUEE_SEED_MARKER_PATH=/var/openmarquee/seeded.json"
 Environment="OPENMARQUEE_DEV_PREVIEW_PATH=/var/openmarquee/preview.png"
 
 # Production: strip the /dev tooling (preview page, manual play endpoint)

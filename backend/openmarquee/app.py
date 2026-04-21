@@ -14,13 +14,41 @@ from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
-from openmarquee.dependencies import get_playback_loop
+from openmarquee.dependencies import (
+    get_content_storage,
+    get_playback_loop,
+    get_playlist_storage,
+    get_seed_marker_path,
+    get_settings_storage,
+)
 from openmarquee.dev import router as dev_router
+from openmarquee.seed import seed_if_needed
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Stop the playback loop on shutdown so the asyncio task doesn't dangle."""
+    """Startup: first-boot seed. Shutdown: stop the playback loop."""
+    # First-boot seed: if no marker file + storage is empty, create a few
+    # starter ImageSlides so the operator has something to hit Play on
+    # immediately. seed_if_needed logs + stamps a marker so this is a
+    # no-op on every boot after the first. Tests pin
+    # OPENMARQUEE_DISABLE_SEED=1 to keep the lifespan path from populating
+    # a test-fixture's tmp_path with surprise content.
+    if os.environ.get("OPENMARQUEE_DISABLE_SEED") != "1":
+        try:
+            settings = get_settings_storage().load()
+            seed_if_needed(
+                storage=get_content_storage(),
+                playlist_storage=get_playlist_storage(),
+                marker_path=get_seed_marker_path(),
+                width=settings.display_width,
+                height=settings.display_height,
+            )
+        except Exception:
+            # Seeding is nice-to-have; never block startup on it.
+            import logging
+
+            logging.getLogger(__name__).exception("startup seed failed")
     yield
     await get_playback_loop().stop()
 

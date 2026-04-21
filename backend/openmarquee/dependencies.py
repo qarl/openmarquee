@@ -128,6 +128,19 @@ def get_settings_storage() -> SettingsStorage:
     return _settings_storage_singleton()
 
 
+def _resolve_seed_marker_path() -> Path:
+    """Where the first-boot seed marker lives. Sibling of content by default."""
+    override = os.environ.get("OPENMARQUEE_SEED_MARKER_PATH")
+    if override:
+        return Path(override)
+    return _resolve_content_root().parent / "openmarquee-seeded.json"
+
+
+def get_seed_marker_path() -> Path:
+    """Dependency provider for the seed-marker path."""
+    return _resolve_seed_marker_path()
+
+
 @lru_cache
 def _playback_loop_singleton() -> PlaybackLoop:
     from datetime import datetime
