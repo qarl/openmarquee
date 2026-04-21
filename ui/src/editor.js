@@ -57,10 +57,38 @@ const EDITOR_TEMPLATE = `
             <canvas class="editor-canvas" aria-label="slide preview"></canvas>
         </div>
         <form class="controls" autocomplete="off">
+            <div class="row">
+                <label class="field">
+                    <span>Slide name</span>
+                    <input type="text" class="field-name" value="Untitled" maxlength="200">
+                </label>
+                <label class="field field-duration-wrap">
+                    <span>Duration (s)</span>
+                    <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
+                </label>
+            </div>
             <label class="field">
                 <span>Text</span>
-                <textarea class="field-text" rows="3" placeholder="GRAND OPENING"></textarea>
+                <textarea class="field-text" rows="3" placeholder="(enter text here)"></textarea>
             </label>
+            <label class="field">
+                <span>Dynamic Text</span>
+                <select class="field-auto-mode">
+                    <option value="" selected>Off</option>
+                    <option value="time">Current time</option>
+                    <option value="date">Today's date</option>
+                    <option value="day">Day of week</option>
+                </select>
+            </label>
+            <label class="field field-auto-format-wrap" hidden>
+                <span>Format</span>
+                <select class="field-auto-format"></select>
+            </label>
+            <p class="field-hint field-auto-mode-hint" hidden>
+                When Dynamic Text is set, the typed text is a preview-only
+                fallback — the device re-renders each second at playback
+                time using the configured timezone.
+            </p>
             <div class="field">
                 <span>Quick colors</span>
                 <div class="presets">${presetButtonsHtml()}</div>
@@ -74,9 +102,15 @@ const EDITOR_TEMPLATE = `
                     <span>Solid background</span>
                     <input type="color" class="field-bg-color" value="#000000">
                 </label>
+            </div>
+            <div class="row">
                 <label class="field">
                     <span>Font</span>
                     <select class="field-font-family"></select>
+                </label>
+                <label class="field field-duration-wrap">
+                    <span>Font size (px)</span>
+                    <input type="number" class="field-font-size" min="4" max="2048" step="1">
                 </label>
             </div>
             <fieldset class="editor-bg-picker">
@@ -104,38 +138,6 @@ const EDITOR_TEMPLATE = `
                     <p class="bg-generate-status field-hint" role="status" aria-live="polite"></p>
                 </div>
             </fieldset>
-            <div class="row">
-                <label class="field">
-                    <span>Slide name</span>
-                    <input type="text" class="field-name" value="Untitled" maxlength="200">
-                </label>
-                <label class="field field-duration-wrap">
-                    <span>Duration (s)</span>
-                    <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
-                </label>
-                <label class="field field-duration-wrap">
-                    <span>Font size (px)</span>
-                    <input type="number" class="field-font-size" min="4" max="2048" step="1">
-                </label>
-            </div>
-            <label class="field">
-                <span>Dynamic content (rendered at playback)</span>
-                <select class="field-auto-mode">
-                    <option value="" selected>Off — use the typed text</option>
-                    <option value="time">Current time</option>
-                    <option value="date">Today's date</option>
-                    <option value="day">Day of week</option>
-                </select>
-            </label>
-            <label class="field field-auto-format-wrap" hidden>
-                <span>Format</span>
-                <select class="field-auto-format"></select>
-            </label>
-            <p class="field-hint field-auto-mode-hint" hidden>
-                When dynamic content is set, the typed text is a preview-only
-                fallback — the device re-renders each second at playback time
-                using the configured timezone.
-            </p>
             <button type="submit" class="primary field-save">Save slide</button>
             <p class="field-hint">
                 <kbd>⌘</kbd> or <kbd>Ctrl</kbd> + <kbd>Enter</kbd> to save.
