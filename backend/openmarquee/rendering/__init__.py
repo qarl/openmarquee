@@ -1,31 +1,38 @@
 """Renderers — how frames get from the playback engine to a physical (or virtual) display.
 
-One interface, five implementations:
+One interface, five implementations. All five exist in the tree today;
+the three hardware paths (HDMI, WS2812B, HUB75) have fully-tested
+byte-prep + config-validation + lifecycle code that runs on a Mac,
+with the actual hardware write gated behind a Pi-day switch (either
+a tmp-file sink for tests or a NotImplementedError for HUB75's
+library path).
 
-- `HUB75Renderer` — drives an LED matrix panel via hzeller/rpi-rgb-led-matrix (Pi only).
-- `HDMIRenderer` — writes frames to /dev/fb0, or hands MP4 files to ffmpeg.
-- `WS2812BRenderer` — pushes pixel data to an addressable LED strip via rpi_ws281x (Pi only).
-- `CompositeRenderer` — HDMIRenderer with /boot/config.txt configured for composite out.
-- `MockRenderer` — writes frames to a PNG file for dev-time preview.
-
-Only `MockRenderer` exists today. The real renderers land in Phases 6, 8, and 10.
-
-Protocol gaps to address when the first hardware renderer lands (Phase 6 / HDMI):
-
-- **Lifecycle.** HUB75 (GPIO/DMA init), WS2812B (GPIO setup), and HDMI (ffmpeg
-  subprocess or framebuffer open) all need `start()` / `stop()` hooks. Likely to
-  become `__enter__` / `__exit__` so `with renderer:` is the one obvious way.
-- **Frame timing contract.** Does `render_frame` block until the frame is on
-  display (vsync), or is it fire-and-forget? Matters for how the playback engine
-  paces itself.
-- **Brightness / per-renderer config.** HUB75 scan-rate, panel layout, HDMI
-  refresh rate, WS2812B pixel remapping. Not in the abstract protocol — they
-  live on the concrete class — but the config shape needs to be defined.
+- `MockRenderer` — writes frames to a PNG file. Used by
+  `scripts/dev.sh` for the live-preview page.
+- `HDMIRenderer` — writes BGRA32 bytes to `/dev/fb0` (Pi HDMI
+  framebuffer) or a tmp file. NEAREST upscale + letterbox keeps
+  small LED-sign pixel-art crisp on a 1920×1080 TV.
+- `CompositeRenderer` — HDMIRenderer subclass with NTSC / PAL
+  default dims. Requires `/boot/config.txt` tweaks on Pi-day; the
+  renderer code path is identical to HDMI.
+- `WS2812BRenderer` — encodes RGB888 frames as the GRB chain byte
+  stream a WS2812B strip consumes. Configurable pixel map
+  (row_major / serpentine / custom) handles strip-built-matrix
+  wirings. Real hardware uses rpi_ws281x on Pi-day.
+- `HUB75Renderer` — stub. Applies the gamma / brightness LUT and
+  validates every hzeller config param today; the panel-write
+  path raises NotImplementedError until Phase-8 bring-up subclasses
+  `_write_to_panel` with the rgb-led-matrix C library calls.
 
 Pixel-format contract (for every renderer, not just Mock): the playback engine
 emits **RGB888 row-major, top-left pixel first**. Renderers are responsible for
-any channel swizzle their hardware needs (HUB75 panels vary; WS2812B strips are
-commonly GRB). Don't push that swizzle up into the engine.
+any channel swizzle their hardware needs (HDMI → BGRA32, WS2812B → GRB24).
+Don't push that swizzle up into the engine.
+
+Lifecycle contract: all hardware renderers support context-manager
+(`with HDMIRenderer(...) as r: r.render_frame(bytes)`) and a bare
+`close()` for manual cleanup. `render_frame` auto-opens the underlying
+sink lazily so ad-hoc usage doesn't require ritual.
 """
 
 from typing import Protocol, runtime_checkable
