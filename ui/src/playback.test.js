@@ -94,16 +94,66 @@ describe("mountPlaybackControls", () => {
             .fn()
             .mockResolvedValueOnce({ is_running: false })
             .mockResolvedValueOnce({ is_running: true });
-        const { refresh } = mountPlaybackControls(container, {
+        const { refresh, stopPolling } = mountPlaybackControls(container, {
             fetchState,
             onStart: vi.fn(),
             onStop: vi.fn(),
         });
+        stopPolling(); // don't let the 5s interval fire during tests
         await tick();
         expect(container.querySelector(".playback-btn").textContent).toBe("Play all");
 
         await refresh();
         expect(container.querySelector(".playback-btn").textContent).toBe("Stop");
         expect(fetchState).toHaveBeenCalledTimes(2);
+    });
+
+    it("shows 'Now playing: <name>' when state has current_playlist_name", async () => {
+        const container = document.createElement("div");
+        const { stopPolling } = mountPlaybackControls(container, {
+            fetchState: async () => ({
+                is_running: true,
+                current_playlist_name: "lunch",
+            }),
+            onStart: vi.fn(),
+            onStop: vi.fn(),
+        });
+        stopPolling();
+        await tick();
+        expect(container.querySelector(".playback-now-playing").textContent).toBe(
+            "Now playing: lunch",
+        );
+    });
+
+    it("shows 'Running…' when running but no current playlist name yet", async () => {
+        const container = document.createElement("div");
+        const { stopPolling } = mountPlaybackControls(container, {
+            fetchState: async () => ({
+                is_running: true,
+                current_playlist_name: null,
+            }),
+            onStart: vi.fn(),
+            onStop: vi.fn(),
+        });
+        stopPolling();
+        await tick();
+        expect(container.querySelector(".playback-now-playing").textContent).toBe(
+            "Running…",
+        );
+    });
+
+    it("clears the now-playing badge when stopped", async () => {
+        const container = document.createElement("div");
+        const { stopPolling } = mountPlaybackControls(container, {
+            fetchState: async () => ({
+                is_running: false,
+                current_playlist_name: null,
+            }),
+            onStart: vi.fn(),
+            onStop: vi.fn(),
+        });
+        stopPolling();
+        await tick();
+        expect(container.querySelector(".playback-now-playing").textContent).toBe("");
     });
 });

@@ -5,6 +5,7 @@
 const TEMPLATE = `
     <section class="playback">
         <button type="button" class="playback-btn primary">Play all</button>
+        <p class="playback-now-playing" role="status" aria-live="polite"></p>
         <p class="playback-status" role="status" aria-live="polite"></p>
     </section>
 `;
@@ -23,19 +24,30 @@ export function mountPlaybackControls(container, { fetchState, onStart, onStop }
     container.innerHTML = TEMPLATE;
     const btn = container.querySelector(".playback-btn");
     const statusEl = container.querySelector(".playback-status");
+    const nowPlayingEl = container.querySelector(".playback-now-playing");
 
     let isRunning = false;
+    let currentPlaylistName = null;
+    let pollTimer = null;
 
     function paint() {
         btn.textContent = isRunning ? "Stop" : "Play all";
         btn.classList.toggle("primary", !isRunning);
         btn.classList.toggle("danger", isRunning);
+        if (isRunning && currentPlaylistName) {
+            nowPlayingEl.textContent = `Now playing: ${currentPlaylistName}`;
+        } else if (isRunning) {
+            nowPlayingEl.textContent = "Running…";
+        } else {
+            nowPlayingEl.textContent = "";
+        }
     }
 
     async function refresh() {
         try {
             const state = await fetchState();
             isRunning = Boolean(state.is_running);
+            currentPlaylistName = state.current_playlist_name || null;
             paint();
         } catch (err) {
             statusEl.textContent = `Could not read playback state: ${err.message}`;
@@ -49,11 +61,15 @@ export function mountPlaybackControls(container, { fetchState, onStart, onStop }
             if (isRunning) {
                 await onStop();
                 isRunning = false;
+                currentPlaylistName = null;
             } else {
                 await onStart();
                 isRunning = true;
             }
             paint();
+            // Right after start, the loop hasn't necessarily set the playlist
+            // name yet. Re-poll quickly to catch up.
+            setTimeout(refresh, 200);
         } catch (err) {
             statusEl.textContent = err.message;
         } finally {
@@ -62,5 +78,18 @@ export function mountPlaybackControls(container, { fetchState, onStart, onStop }
     });
 
     refresh();
-    return { refresh };
+    // Light polling so the UI catches schedule-driven playlist switches and
+    // any external state changes (other tab, etc.). Cheap GET every 5s.
+    pollTimer = setInterval(refresh, 5000);
+
+    return {
+        refresh,
+        // For tests + future cleanup paths.
+        stopPolling: () => {
+            if (pollTimer !== null) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+        },
+    };
 }
