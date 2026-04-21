@@ -1,19 +1,22 @@
 // OpenMarquee web UI — entry point.
 //
-// Phase 3 replaces this skeleton with the real text-slide editor. For now,
-// we just bring up the page, hit /healthz, and report what version the
-// backend is running so the dev knows the UI/backend pair is live.
+// Wires the text-slide editor into #app. Panel dimensions are hardcoded
+// to match the SYSTEM_SPEC defaults (128x96) for now; when we read device
+// config from the backend (Phase 3+ polish), swap in the real values.
 
-import { fetchHealth } from "./api.js";
+import { saveTextSlide } from "./api.js";
+import { mountEditor } from "./editor.js";
 
-async function boot() {
+const PANEL_WIDTH = 128;
+const PANEL_HEIGHT = 96;
+
+function boot() {
     const root = document.getElementById("app");
-    try {
-        const { status, version } = await fetchHealth();
-        root.innerHTML = `<p class="status">Backend ${status} — v${version}. Editor lands in the next commit.</p>`;
-    } catch (err) {
-        root.innerHTML = `<p class="status">Could not reach backend: ${err.message}</p>`;
-    }
+    mountEditor(root, {
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
+        onSave: saveTextSlide,
+    });
 }
 
 if (typeof window !== "undefined") {
