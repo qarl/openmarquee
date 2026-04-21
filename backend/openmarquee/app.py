@@ -16,6 +16,7 @@ from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
 from openmarquee.dependencies import (
     get_content_storage,
+    get_demo_video_path,
     get_playback_loop,
     get_playlist_storage,
     get_seed_marker_path,
@@ -43,6 +44,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 marker_path=get_seed_marker_path(),
                 width=settings.display_width,
                 height=settings.display_height,
+                demo_video_path=get_demo_video_path(),
             )
         except Exception:
             # Seeding is nice-to-have; never block startup on it.

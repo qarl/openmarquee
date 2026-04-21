@@ -141,6 +141,25 @@ def get_seed_marker_path() -> Path:
     return _resolve_seed_marker_path()
 
 
+def _resolve_demo_video_path() -> Path:
+    """Where first-boot seed looks for a bundled demo video.
+
+    Not committed to git — the asset is provisioned out-of-band (see
+    scripts/download-demo-video.sh) or baked into the pi-gen image.
+    Default path sits next to the openmarquee package so the bundled
+    asset travels with the Python install.
+    """
+    override = os.environ.get("OPENMARQUEE_DEMO_VIDEO_PATH")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / "seed_assets" / "demo.mp4"
+
+
+def get_demo_video_path() -> Path:
+    """Dependency provider for the demo-video path (may not exist)."""
+    return _resolve_demo_video_path()
+
+
 @lru_cache
 def _playback_loop_singleton() -> PlaybackLoop:
     from datetime import datetime

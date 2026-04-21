@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from openmarquee.content import ImageSlide, TextSlide
+from openmarquee.content import ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.seed import (
@@ -16,6 +16,9 @@ from openmarquee.seed import (
     render_gradient_png,
     seed_if_needed,
 )
+
+
+_FAKE_MP4 = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 120
 
 
 @pytest.fixture
@@ -172,6 +175,87 @@ def test_seed_rolls_back_partial_items_on_mid_loop_failure(
     # Partial items were cleaned up; no marker.
     assert storage.list_all() == []
     assert not marker.exists()
+
+
+# --- demo video ---
+
+
+def test_seed_registers_demo_video_when_mp4_is_present(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    tmp_path: Path,
+):
+    video_path = tmp_path / "demo.mp4"
+    video_path.write_bytes(_FAKE_MP4)
+
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=16,
+        height=16,
+        demo_video_path=video_path,
+    )
+
+    videos = [s for s in created if isinstance(s, VideoSlide)]
+    assert len(videos) == 1
+    assert "Demo" in videos[0].name
+    # And it round-trips through storage.read_video() — the bytes match.
+    assert storage.read_video(videos[0].id) == _FAKE_MP4
+    # Demo video is also appended to the default playlist.
+    assert videos[0].id in playlist.load().item_ids
+
+
+def test_seed_skips_demo_video_when_path_is_missing(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    tmp_path: Path,
+):
+    """Bundled demo clip is optional — seeding still succeeds without it."""
+    missing_path = tmp_path / "no-such-demo.mp4"
+
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=16,
+        height=16,
+        demo_video_path=missing_path,
+    )
+    # Only the gradient ImageSlides — no video.
+    assert all(isinstance(s, ImageSlide) for s in created)
+
+
+def test_seed_skips_demo_video_when_file_is_not_an_mp4(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    tmp_path: Path,
+):
+    """Defense-in-depth: swapping a .mov or a PNG in doesn't crash seed."""
+    bad_path = tmp_path / "demo.mp4"
+    bad_path.write_bytes(b"\x89PNG\r\nnot an mp4 at all")
+
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=16,
+        height=16,
+        demo_video_path=bad_path,
+    )
+    assert all(isinstance(s, ImageSlide) for s in created)
+
+
+def test_seed_demo_video_none_is_accepted(
+    storage: ContentStorage, playlist: PlaylistStorage, marker: Path
+):
+    """demo_video_path defaults to None; the no-demo-bundled path must work."""
+    created = seed_if_needed(storage, playlist, marker, width=16, height=16)
+    assert created
+    assert all(isinstance(s, ImageSlide) for s in created)
 
 
 def test_seed_skips_when_playlist_has_items_even_if_storage_is_empty(
