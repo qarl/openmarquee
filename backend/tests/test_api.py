@@ -1,0 +1,182 @@
+import base64
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+
+from openmarquee.app import app
+from openmarquee.content.storage import ContentStorage
+from openmarquee.dependencies import get_content_storage
+
+_FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-payload"
+
+
+@pytest.fixture
+def storage(tmp_path: Path) -> ContentStorage:
+    return ContentStorage(tmp_path / "content")
+
+
+@pytest.fixture
+def client(storage: ContentStorage) -> TestClient:
+    app.dependency_overrides[get_content_storage] = lambda: storage
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.clear()
+        # Defense in depth: drop the lru_cache'd singleton so a later test
+        # without an override doesn't pick up a torn-down tmp_path.
+        from openmarquee.dependencies import _content_storage_singleton
+
+        _content_storage_singleton.cache_clear()
+
+
+def _upload_payload(**overrides) -> dict:
+    payload = {
+        "name": "Test Slide",
+        "text": "Hello, world",
+        "png_base64": base64.b64encode(_FAKE_PNG).decode(),
+    }
+    payload.update(overrides)
+    return payload
+
+
+# --- POST /api/content/text-slides ---
+
+
+def test_upload_text_slide_persists_metadata_and_asset(client: TestClient, storage: ContentStorage):
+    response = client.post("/api/content/text-slides", json=_upload_payload(name="Specials"))
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["type"] == "text_slide"
+    assert body["name"] == "Specials"
+    assert body["text"] == "Hello, world"
+    assert body["duration_ms"] == 5000  # default
+
+    item_id = UUID(body["id"])
+    assert storage.exists(item_id)
+    assert storage.read_asset(item_id) == _FAKE_PNG
+
+
+def test_upload_text_slide_normalizes_color(client: TestClient):
+    response = client.post(
+        "/api/content/text-slides",
+        json=_upload_payload(text_color="#ffaa00"),
+    )
+    assert response.status_code == 200
+    assert response.json()["text_color"] == "#FFAA00"
+
+
+def test_upload_text_slide_rejects_bad_base64(client: TestClient):
+    payload = _upload_payload()
+    payload["png_base64"] = "not-valid-base64!!!"
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 400
+    assert "png_base64" in response.json()["detail"]
+
+
+def test_upload_text_slide_rejects_invalid_color(client: TestClient):
+    response = client.post(
+        "/api/content/text-slides",
+        json=_upload_payload(text_color="red"),
+    )
+    assert response.status_code == 422  # Pydantic validation error
+
+
+# --- GET /api/content ---
+
+
+def test_list_content_empty(client: TestClient):
+    response = client.get("/api/content")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_list_content_returns_uploaded_items(client: TestClient):
+    client.post("/api/content/text-slides", json=_upload_payload(name="A", text="A"))
+    client.post("/api/content/text-slides", json=_upload_payload(name="B", text="B"))
+    response = client.get("/api/content")
+    assert response.status_code == 200
+    names = {item["name"] for item in response.json()}
+    assert names == {"A", "B"}
+
+
+# --- GET /api/content/{id} ---
+
+
+def test_get_content_item_returns_metadata(client: TestClient):
+    upload = client.post("/api/content/text-slides", json=_upload_payload(name="Pulled Pork"))
+    item_id = upload.json()["id"]
+
+    response = client.get(f"/api/content/{item_id}")
+    assert response.status_code == 200
+    assert response.json()["name"] == "Pulled Pork"
+
+
+def test_get_content_item_404_when_missing(client: TestClient):
+    response = client.get(f"/api/content/{uuid4()}")
+    assert response.status_code == 404
+
+
+def test_get_content_item_422_when_id_not_uuid(client: TestClient):
+    response = client.get("/api/content/not-a-uuid")
+    assert response.status_code == 422
+
+
+# --- GET /api/content/{id}/asset ---
+
+
+def test_get_asset_returns_png_bytes(client: TestClient):
+    upload = client.post("/api/content/text-slides", json=_upload_payload())
+    item_id = upload.json()["id"]
+
+    response = client.get(f"/api/content/{item_id}/asset")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content == _FAKE_PNG
+
+
+def test_get_asset_404_when_missing(client: TestClient):
+    response = client.get(f"/api/content/{uuid4()}/asset")
+    assert response.status_code == 404
+
+
+def test_get_asset_404_when_metadata_present_but_asset_missing(
+    client: TestClient, storage: ContentStorage, tmp_path: Path
+):
+    """Asset endpoint should 404 cleanly even if the item.json envelope exists."""
+    upload = client.post("/api/content/text-slides", json=_upload_payload())
+    item_id = UUID(upload.json()["id"])
+    storage.asset_path(item_id).unlink()
+
+    response = client.get(f"/api/content/{item_id}/asset")
+    assert response.status_code == 404
+
+
+def test_uploads_with_duplicate_names_both_succeed(client: TestClient):
+    """Names aren't unique; the id keys items, so two slides with the same
+    name should coexist."""
+    a = client.post("/api/content/text-slides", json=_upload_payload(name="Special"))
+    b = client.post("/api/content/text-slides", json=_upload_payload(name="Special"))
+    assert a.status_code == 200
+    assert b.status_code == 200
+    assert a.json()["id"] != b.json()["id"]
+    assert len(client.get("/api/content").json()) == 2
+
+
+# --- DELETE /api/content/{id} ---
+
+
+def test_delete_content_item_removes_it(client: TestClient, storage: ContentStorage):
+    upload = client.post("/api/content/text-slides", json=_upload_payload())
+    item_id = UUID(upload.json()["id"])
+
+    response = client.delete(f"/api/content/{item_id}")
+    assert response.status_code == 204
+    assert not storage.exists(item_id)
+
+
+def test_delete_content_item_404_when_missing(client: TestClient):
+    response = client.delete(f"/api/content/{uuid4()}")
+    assert response.status_code == 404
