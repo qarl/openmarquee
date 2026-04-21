@@ -73,9 +73,10 @@ describe("mountLivePreview", () => {
         const video = container.querySelector("video.live-preview-media");
         expect(video).not.toBeNull();
         expect(video.getAttribute("src")).toBe("/api/content/vid-42/video");
-        expect(video.hasAttribute("autoplay")).toBe(true);
-        expect(video.hasAttribute("muted")).toBe(true);
-        expect(video.hasAttribute("loop")).toBe(true);
+        // Property-based: createElement("video").autoplay is true.
+        expect(video.autoplay).toBe(true);
+        expect(video.muted).toBe(true);
+        expect(video.loop).toBe(true);
         expect(container.querySelector("img")).toBeNull();
     });
 
@@ -143,6 +144,111 @@ describe("mountLivePreview", () => {
         expect(container.querySelector(".live-preview-caption").textContent).toMatch(
             /Preview paused/,
         );
+    });
+
+    it("cross-fades between items when the outgoing transition is 'fade'", async () => {
+        // Three states: mount auto-refresh (item A, fade), first explicit
+        // refresh (item A again), second explicit refresh (item B) — so
+        // the id changes AFTER lastTransition has captured A's 'fade'.
+        const queue = [
+            {
+                is_running: true,
+                current_item_id: "a",
+                current_item_type: "image",
+                current_item_pipeline: null,
+                current_item_transition: "fade",
+                current_item_transition_ms: 500,
+                current_playlist_name: "default",
+            },
+            {
+                is_running: true,
+                current_item_id: "a",
+                current_item_type: "image",
+                current_item_pipeline: null,
+                current_item_transition: "fade",
+                current_item_transition_ms: 500,
+                current_playlist_name: "default",
+            },
+            {
+                is_running: true,
+                current_item_id: "b",
+                current_item_type: "image",
+                current_item_pipeline: null,
+                current_item_transition: "cut",
+                current_item_transition_ms: 0,
+                current_playlist_name: "default",
+            },
+        ];
+        const fetchState = vi.fn().mockImplementation(async () =>
+            queue.shift() ?? queue[queue.length - 1],
+        );
+        const container = document.createElement("div");
+        const stage = () => container.querySelector(".live-preview-stage");
+
+        const handle = mount(container, fetchState);
+        await handle.refresh();
+        // A is on stage; no fade-in on the very first slide.
+        expect(container.querySelectorAll(".live-preview-media").length).toBe(1);
+        expect(
+            stage().classList.contains("live-preview-stage--transitioning"),
+        ).toBe(false);
+
+        // Transition from A → B — should cross-fade (both elements present).
+        await handle.refresh();
+        const mediaDuring = container.querySelectorAll(".live-preview-media");
+        expect(mediaDuring.length).toBe(2);
+        expect(
+            stage().classList.contains("live-preview-stage--transitioning"),
+        ).toBe(true);
+        // Outgoing element has the leaving class; new one has entering.
+        expect(mediaDuring[0].classList.contains("live-preview-media--leaving")).toBe(
+            true,
+        );
+        expect(mediaDuring[1].classList.contains("live-preview-media--entering")).toBe(
+            true,
+        );
+    });
+
+    it("uses an instant cut when the outgoing transition is 'cut'", async () => {
+        const queue = [
+            {
+                is_running: true,
+                current_item_id: "a",
+                current_item_type: "image",
+                current_item_pipeline: null,
+                current_item_transition: "cut",
+                current_item_transition_ms: 0,
+                current_playlist_name: "default",
+            },
+            {
+                is_running: true,
+                current_item_id: "a",
+                current_item_type: "image",
+                current_item_pipeline: null,
+                current_item_transition: "cut",
+                current_item_transition_ms: 0,
+                current_playlist_name: "default",
+            },
+            {
+                is_running: true,
+                current_item_id: "b",
+                current_item_type: "image",
+                current_item_pipeline: null,
+                current_item_transition: "cut",
+                current_item_transition_ms: 0,
+                current_playlist_name: "default",
+            },
+        ];
+        const fetchState = vi.fn().mockImplementation(async () =>
+            queue.shift() ?? queue[queue.length - 1],
+        );
+        const container = document.createElement("div");
+        const handle = mount(container, fetchState);
+        await handle.refresh();
+        await handle.refresh();
+        expect(
+            container.querySelectorAll(".live-preview-media").length,
+        ).toBe(1);
     });
 
     it("stop() halts polling so future ticks don't trigger fetches", async () => {

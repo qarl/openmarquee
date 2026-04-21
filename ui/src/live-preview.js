@@ -1,16 +1,18 @@
 // Live preview: shows the currently-playing slide animating in the
-// browser, mirroring the playlist as the device would render it. Polls
-// /api/playback/state; swaps between <video> and <img> based on the
-// current item's type.
+// browser, mirroring the playlist as the device would render it.
 //
-// Design: purely client-side rendering. The server-side playback loop
-// drives the physical renderer (MockRenderer in dev, HUB75/HDMI etc.
-// on device); this widget is parallel — it watches the same state
-// stream and reproduces the slide locally. That means videos actually
-// play in the preview even though the current loop renders only the
-// thumbnail to disk. Which is the point: the preview shows what the
-// operator's playlist *is*, not what today's MockRenderer happens to
-// draw.
+// Polls /api/playback/state; swaps between <video> and <img> based on
+// the current item's type + pipeline. When /api/playback/state reports
+// an id change AND the *outgoing* item's transition is "fade", the
+// preview cross-fades between the old and new media elements over
+// transition_ms — matching what the server-side loop does frame-by-
+// frame on the device.
+//
+// Client-side rendering deliberately: the server-side loop still
+// drives the physical renderer; this widget is parallel — it watches
+// the same state stream and reproduces the slide locally so the
+// operator sees what their playlist *is*, not what today's mock
+// happens to draw.
 
 const TEMPLATE = `
     <section class="live-preview" aria-label="live playlist preview">
@@ -32,7 +34,8 @@ const POLL_INTERVAL_MS = 500;
  * @param {object} options
  * @param {number} options.width  — sign width in pixels (drives preview aspect)
  * @param {number} options.height — sign height in pixels
- * @param {() => Promise<{is_running, current_item_id, current_item_type, current_playlist_name}>} options.fetchState
+ * @param {() => Promise<object>} options.fetchState — returns the full
+ *     /api/playback/state payload (includes transition + transition_ms).
  * @param {number} [options.pollIntervalMs] — override poll cadence (tests)
  * @returns {{ stop: () => void, refresh: () => Promise<void> }}
  */
@@ -50,11 +53,16 @@ export function mountLivePreview(container, options) {
 
     stage.style.aspectRatio = `${width} / ${height}`;
 
-    // Track what's currently on screen so we can diff against the next
-    // poll and only swap elements when the item actually changes (avoids
+    // Track the last-rendered item so we can diff against the next poll
+    // and only swap elements when the item actually changes (avoids
     // re-loading the <video> every 500ms, which would reset playback).
+    // Also track the PREVIOUS transition so a cut↔fade change between
+    // polls animates correctly — the transition on the outgoing item
+    // is what governs how it leaves the stage.
     let currentId = null;
     let currentType = null;
+    let lastTransition = null;
+    let lastTransitionMs = null;
     let pollTimer = null;
     let stopped = false;
 
@@ -64,28 +72,79 @@ export function mountLivePreview(container, options) {
         currentType = null;
     }
 
-    function renderSlide(id, type, pipeline) {
-        // Bust the cache with the id so replayed playlists pick up any
-        // mid-loop asset edits; not perfect (the asset URL doesn't
-        // include created_at here because we don't fetch the item), but
-        // close enough — a stale-for-500ms preview is fine.
+    function buildMediaElement(id, type, pipeline) {
         const assetUrl = `/api/content/${id}/asset`;
         const videoUrl = `/api/content/${id}/video`;
-        // Raw-frames video has no browser-playable stream (.rgb is
-        // headerless RGB888). Show the stored thumbnail until the
-        // preview grows a client-side rawvideo animator.
+        // Raw-frames video has no browser-playable stream; show the
+        // thumbnail until a client-side RGB animator lands.
         const isHtmlVideo = type === "video" && pipeline !== "raw_frames";
+        let el;
         if (isHtmlVideo) {
-            stage.innerHTML = `
-                <video class="live-preview-media" autoplay muted playsinline loop
-                       src="${videoUrl}" aria-label="live video preview"></video>
-            `;
+            el = document.createElement("video");
+            el.autoplay = true;
+            el.muted = true;
+            el.loop = true;
+            el.playsInline = true;
+            el.setAttribute("aria-label", "live video preview");
+            el.src = videoUrl;
         } else {
-            // text_slide + image + raw_frames video all have a rendered
-            // PNG at /asset.
-            stage.innerHTML = `
-                <img class="live-preview-media" alt="live slide preview" src="${assetUrl}">
-            `;
+            el = document.createElement("img");
+            el.alt = "live slide preview";
+            el.src = assetUrl;
+        }
+        el.className = "live-preview-media";
+        return el;
+    }
+
+    function renderSlide(id, type, pipeline, transition, transitionMs) {
+        const next = buildMediaElement(id, type, pipeline);
+        const outgoing = stage.querySelector(".live-preview-media");
+        const doFade =
+            outgoing !== null
+            && transition === "fade"
+            && Number.isFinite(transitionMs)
+            && transitionMs > 0;
+
+        if (doFade) {
+            // Layer the new element on top of the old; animate opacity
+            // on both via a transition that matches transitionMs. When
+            // the transition completes the outgoing node is removed.
+            stage.classList.add("live-preview-stage--transitioning");
+            next.classList.add("live-preview-media--entering");
+            next.style.transition = `opacity ${transitionMs}ms linear`;
+            next.style.opacity = "0";
+            outgoing.classList.add("live-preview-media--leaving");
+            outgoing.style.transition = `opacity ${transitionMs}ms linear`;
+            stage.appendChild(next);
+            // Next frame: flip opacities so the CSS transition actually
+            // runs (applying opacity=0 in the same frame as insertion
+            // is a no-op in most engines).
+            requestAnimationFrame(() => {
+                next.style.opacity = "1";
+                outgoing.style.opacity = "0";
+            });
+            const finish = () => {
+                outgoing.remove();
+                next.style.transition = "";
+                next.style.opacity = "";
+                stage.classList.remove("live-preview-stage--transitioning");
+            };
+            // Safety net: setTimeout after transitionMs + slack in case
+            // transitionend doesn't fire (e.g. display:none hijinks).
+            const timer = setTimeout(finish, transitionMs + 150);
+            outgoing.addEventListener(
+                "transitionend",
+                () => {
+                    clearTimeout(timer);
+                    finish();
+                },
+                { once: true },
+            );
+        } else {
+            // Cut: instant swap. Clear the stage first so only the new
+            // element is there on next paint.
+            stage.innerHTML = "";
+            stage.appendChild(next);
         }
         currentId = id;
         currentType = type;
@@ -105,10 +164,14 @@ export function mountLivePreview(container, options) {
         const id = state.current_item_id || null;
         const type = state.current_item_type || null;
         const pipeline = state.current_item_pipeline || null;
+        const transition = state.current_item_transition || null;
+        const transitionMs = state.current_item_transition_ms ?? null;
 
         if (!running) {
             renderIdle("Press Play all to preview the playlist.");
             caption.textContent = "";
+            lastTransition = null;
+            lastTransitionMs = null;
             return;
         }
 
@@ -117,12 +180,20 @@ export function mountLivePreview(container, options) {
             caption.textContent = state.current_playlist_name
                 ? `Playing: ${state.current_playlist_name}`
                 : "";
+            lastTransition = null;
+            lastTransitionMs = null;
             return;
         }
 
         if (id !== currentId || type !== currentType) {
-            renderSlide(id, type, pipeline);
+            // The transition governing THIS change is the outgoing
+            // item's transition — which was captured in lastTransition
+            // on the previous poll.
+            renderSlide(id, type, pipeline, lastTransition, lastTransitionMs);
         }
+        // Stash the current item's transition for the next id change.
+        lastTransition = transition;
+        lastTransitionMs = transitionMs;
         caption.textContent = state.current_playlist_name
             ? `Playing: ${state.current_playlist_name}`
             : "";

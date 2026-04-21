@@ -190,6 +190,7 @@ main {
 }
 
 .live-preview-stage {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -209,6 +210,13 @@ main {
     /* Pixel-accurate preview for 128×96 etc. — no smoothing lies about
        what the panels will actually render. */
     image-rendering: pixelated;
+}
+
+/* During a cross-fade, outgoing + incoming elements coexist — stack
+   them so opacity transitions don't push layout around. */
+.live-preview-stage--transitioning .live-preview-media {
+    position: absolute;
+    inset: 0;
 }
 
 .live-preview-idle {

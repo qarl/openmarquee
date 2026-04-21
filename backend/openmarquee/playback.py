@@ -80,6 +80,13 @@ class PlaybackLoop:
         # the right asset endpoint (the raw_frames path has no <video>
         # equivalent, so the preview shows the thumbnail).
         self._current_pipeline: str | None = None
+        # The outgoing transition + transition_ms (set by the PlaylistItem
+        # the loop is currently rendering). The live preview stashes the
+        # most recent non-null values so that when current_item_id changes,
+        # it can run a matching CSS cross-fade against the OLD item's
+        # transition metadata.
+        self._current_transition: str | None = None
+        self._current_transition_ms: int | None = None
         # Set by fetch_items if it carries playlist context (the
         # scheduled_fetch_items closure stamps this each fetch).
         self._current_playlist_name: str | None = None
@@ -99,6 +106,14 @@ class PlaybackLoop:
     @property
     def current_item_pipeline(self) -> str | None:
         return self._current_pipeline
+
+    @property
+    def current_item_transition(self) -> str | None:
+        return self._current_transition
+
+    @property
+    def current_item_transition_ms(self) -> int | None:
+        return self._current_transition_ms
 
     async def start(self) -> None:
         """Start the loop. No-op if already running."""
@@ -126,6 +141,8 @@ class PlaybackLoop:
             self._current_id = None
             self._current_type = None
             self._current_pipeline = None
+            self._current_transition = None
+            self._current_transition_ms = None
             self._current_playlist_name = None
 
     async def _loop(self) -> None:
@@ -141,6 +158,8 @@ class PlaybackLoop:
                 self._current_id = None
                 self._current_type = None
                 self._current_pipeline = None
+                self._current_transition = None
+                self._current_transition_ms = None
                 await self._wait(self._empty_poll)
                 continue
 
@@ -155,6 +174,8 @@ class PlaybackLoop:
                 self._current_pipeline = (
                     getattr(item, "pipeline", None) if item.type == "video" else None
                 )
+                self._current_transition = item.transition
+                self._current_transition_ms = item.transition_ms
 
                 current_image = self._safe_load_image(item)
                 if current_image is None:
