@@ -59,6 +59,19 @@ const EDITOR_TEMPLATE = `
                     <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
                 </label>
             </div>
+            <div class="row">
+                <label class="field">
+                    <span>Transition into next</span>
+                    <select class="field-transition">
+                        <option value="cut" selected>Cut (instant)</option>
+                        <option value="fade">Fade</option>
+                    </select>
+                </label>
+                <label class="field field-duration-wrap">
+                    <span>Fade time (ms)</span>
+                    <input type="number" class="field-transition-ms" value="500" min="0" max="5000" step="50">
+                </label>
+            </div>
             <button type="submit" class="primary field-save">Save slide</button>
             <p class="field-hint">
                 <kbd>⌘</kbd> or <kbd>Ctrl</kbd> + <kbd>Enter</kbd> to save.
@@ -94,6 +107,8 @@ export function mountEditor(container, { width, height, onSave }) {
     const bgColorEl = container.querySelector(".field-bg-color");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
+    const transitionEl = container.querySelector(".field-transition");
+    const transitionMsEl = container.querySelector(".field-transition-ms");
     const form = container.querySelector(".controls");
     const statusEl = container.querySelector(".editor-status");
     const saveBtn = container.querySelector(".field-save");
@@ -166,12 +181,15 @@ export function mountEditor(container, { width, height, onSave }) {
             const png_base64 = canvasToBase64(canvas);
             // Seconds → ms; clamp lightly so an empty input becomes the default.
             const durationSeconds = Number(durationEl.value) || 5;
+            const transitionMs = Number(transitionMsEl.value);
             await onSave({
                 name: state.name || "Untitled",
                 text: state.text,
                 text_color: state.textColor.toUpperCase(),
                 background_color: state.backgroundColor.toUpperCase(),
                 duration_ms: Math.round(durationSeconds * 1000),
+                transition: transitionEl.value,
+                transition_ms: Number.isFinite(transitionMs) ? transitionMs : 500,
                 png_base64,
             });
             statusEl.textContent = "Saved.";

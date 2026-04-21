@@ -108,6 +108,42 @@ def test_image_slide_name_capped():
         ImageSlide(name="x" * 201)
 
 
+# --- Transition fields (text + image) ---
+
+
+def test_text_slide_default_transition_is_cut():
+    slide = TextSlide(name="x", text="x")
+    assert slide.transition == "cut"
+    assert slide.transition_ms == 500
+
+
+def test_text_slide_accepts_fade():
+    slide = TextSlide(name="x", text="x", transition="fade", transition_ms=300)
+    assert slide.transition == "fade"
+    assert slide.transition_ms == 300
+
+
+def test_text_slide_rejects_unknown_transition():
+    with pytest.raises(ValidationError):
+        TextSlide(name="x", text="x", transition="zoom")
+
+
+def test_text_slide_rejects_negative_transition_ms():
+    with pytest.raises(ValidationError):
+        TextSlide(name="x", text="x", transition_ms=-1)
+
+
+def test_text_slide_rejects_excessive_transition_ms():
+    with pytest.raises(ValidationError):
+        TextSlide(name="x", text="x", transition_ms=10_000)
+
+
+def test_image_slide_supports_transition():
+    img = ImageSlide(name="x", transition="fade", transition_ms=250)
+    assert img.transition == "fade"
+    assert img.transition_ms == 250
+
+
 # --- Discriminated union dispatch ---
 
 

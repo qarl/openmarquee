@@ -58,6 +58,8 @@ class TextSlideUpload(BaseModel):
     font_size_px: int | None = None
     text_color: str = "#FFFFFF"
     background_color: str = "#000000"
+    transition: str = "cut"
+    transition_ms: int = 500
     png_base64: str = Field(description="Base64-encoded PNG of the rendered slide.")
 
 
@@ -96,6 +98,8 @@ class ImageUpload(BaseModel):
 
     name: str
     duration_ms: int = 5000
+    transition: str = "cut"
+    transition_ms: int = 500
     png_base64: str = Field(description="Base64-encoded PNG of the scaled image.")
 
 

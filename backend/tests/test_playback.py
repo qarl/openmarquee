@@ -263,6 +263,117 @@ async def test_renderer_raising_is_swallowed(renderer):
     assert renderer.last_frame == bytes((40, 50, 60)) * (renderer.width * renderer.height)
 
 
+def _track_frames(renderer):
+    """Wrap renderer.render_frame so the test can inspect every frame the loop
+    pushes (not just the last one)."""
+    rendered: list[bytes] = []
+    original = renderer.render_frame
+
+    def track(frame: bytes) -> None:
+        rendered.append(frame)
+        original(frame)
+
+    renderer.render_frame = track  # type: ignore[method-assign]
+    return rendered
+
+
+@pytest.mark.asyncio
+async def test_cut_transition_emits_no_intermediate_frames(renderer):
+    """Default cut transition: between slide A's last frame and slide B's
+    first, nothing else gets rendered."""
+    slide_a, png_a = _make_slide("a", (255, 0, 0))
+    slide_b, png_b = _make_slide("b", (0, 255, 0))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i])
+    await loop.start()
+    await asyncio.sleep(0.3)  # >= duration_a + duration_b
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (renderer.width * renderer.height)
+    pure_green = bytes((0, 255, 0)) * (renderer.width * renderer.height)
+    # Only solid red and solid green frames — no intermediates.
+    for frame in rendered:
+        assert frame in (pure_red, pure_green)
+
+
+@pytest.mark.asyncio
+async def test_fade_transition_emits_blended_frames(renderer):
+    """Fade transition: between A and B we should see frames that aren't
+    pure A or pure B (Image.blend producing intermediate alphas)."""
+    slide_a, png_a = _make_slide("a", (255, 0, 0))
+    slide_b, png_b = _make_slide("b", (0, 255, 0))
+    slide_a = slide_a.model_copy(
+        update={"transition": "fade", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i])
+    await loop.start()
+    # 100ms A + 200ms fade + 100ms B = 400ms; give some slack.
+    await asyncio.sleep(0.6)
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (renderer.width * renderer.height)
+    pure_green = bytes((0, 255, 0)) * (renderer.width * renderer.height)
+    has_red = any(f == pure_red for f in rendered)
+    has_green = any(f == pure_green for f in rendered)
+    intermediates = [f for f in rendered if f != pure_red and f != pure_green]
+
+    assert has_red, "expected solid-red frames from slide A"
+    assert has_green, "expected solid-green frames from slide B"
+    assert intermediates, "expected blended frames during the fade"
+
+
+@pytest.mark.asyncio
+async def test_single_item_playlist_with_fade_skips_fade(renderer):
+    """Fade requires a different next slide. With one item, next == current
+    so the fade is a waste — make sure we skip it instead of doing pointless work."""
+    slide, png = _make_slide("solo", (123, 45, 67))
+    slide = slide.model_copy(
+        update={"transition": "fade", "transition_ms": 1000, "duration_ms": 100}
+    )
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(renderer, fetch_items=lambda: [slide], read_asset=lambda _i: png)
+    await loop.start()
+    await asyncio.sleep(0.25)  # > 2x duration; would catch a wasteful fade
+    await loop.stop()
+
+    # Every frame is the solid color of the lone slide.
+    expected = bytes((123, 45, 67)) * (renderer.width * renderer.height)
+    for frame in rendered:
+        assert frame == expected
+
+
+@pytest.mark.asyncio
+async def test_stop_during_fade_returns_promptly(renderer):
+    """Stop request should propagate within tens of ms even mid-fade."""
+    slide_a, png_a = _make_slide("a", (255, 0, 0))
+    slide_b, png_b = _make_slide("b", (0, 255, 0))
+    # Long fade so we definitely catch the loop inside it.
+    slide_a = slide_a.model_copy(
+        update={"transition": "fade", "transition_ms": 5000, "duration_ms": 100}
+    )
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+
+    loop = _new_loop(renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i])
+    await loop.start()
+    # Wait long enough to enter the fade, then stop.
+    await asyncio.sleep(0.15)
+
+    start = asyncio.get_event_loop().time()
+    await loop.stop()
+    elapsed = asyncio.get_event_loop().time() - start
+    assert elapsed < 0.2  # well under the 5s fade
+
+
 @pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go

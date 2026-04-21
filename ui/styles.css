@@ -114,6 +114,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 
 .field input[type="text"],
 .field input[type="number"],
+.field select,
 .field textarea {
     background: var(--panel);
     color: var(--text);

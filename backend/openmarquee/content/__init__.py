@@ -48,6 +48,11 @@ class TextSlide(BaseModel):
     text_color: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
     background_color: str = Field(default="#000000", pattern=_HEX_COLOR_PATTERN)
 
+    # Transition INTO the next slide ("cut" = instant; "fade" = alpha-blend
+    # across `transition_ms` after this slide's duration ends).
+    transition: Literal["cut", "fade"] = "cut"
+    transition_ms: int = Field(default=500, ge=0, le=5000)
+
     created_at: datetime = Field(default_factory=_utcnow)
 
     @field_validator("text_color", "background_color")
@@ -72,6 +77,11 @@ class ImageSlide(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(max_length=200)
     duration_ms: int = Field(default=5000, ge=100)
+
+    # Same transition contract as TextSlide.
+    transition: Literal["cut", "fade"] = "cut"
+    transition_ms: int = Field(default=500, ge=0, le=5000)
+
     created_at: datetime = Field(default_factory=_utcnow)
 
 

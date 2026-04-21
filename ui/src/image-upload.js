@@ -23,6 +23,19 @@ const TEMPLATE = `
                     <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
                 </label>
             </div>
+            <div class="row">
+                <label class="field">
+                    <span>Transition into next</span>
+                    <select class="field-transition">
+                        <option value="cut" selected>Cut (instant)</option>
+                        <option value="fade">Fade</option>
+                    </select>
+                </label>
+                <label class="field field-duration-wrap">
+                    <span>Fade time (ms)</span>
+                    <input type="number" class="field-transition-ms" value="500" min="0" max="5000" step="50">
+                </label>
+            </div>
             <button type="submit" class="primary field-save" disabled>Save image</button>
             <p class="image-upload-status" role="status" aria-live="polite"></p>
         </form>
@@ -49,6 +62,8 @@ export function mountImageUploader(container, { width, height, onSave }) {
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
+    const transitionEl = container.querySelector(".field-transition");
+    const transitionMsEl = container.querySelector(".field-transition-ms");
     const form = container.querySelector(".controls");
     const saveBtn = container.querySelector(".field-save");
     const statusEl = container.querySelector(".image-upload-status");
@@ -94,9 +109,12 @@ export function mountImageUploader(container, { width, height, onSave }) {
         try {
             const png_base64 = canvasToBase64(canvas);
             const durationSeconds = Number(durationEl.value) || 5;
+            const transitionMs = Number(transitionMsEl.value);
             await onSave({
                 name: nameEl.value || "Image",
                 duration_ms: Math.round(durationSeconds * 1000),
+                transition: transitionEl.value,
+                transition_ms: Number.isFinite(transitionMs) ? transitionMs : 500,
                 png_base64,
             });
             statusEl.textContent = "Saved.";

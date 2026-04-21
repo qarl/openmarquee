@@ -31,6 +31,10 @@ from openmarquee.rendering import Renderer
 
 log = logging.getLogger(__name__)
 
+# Frame rate for fade transitions. 30fps is the playback target on both HDMI
+# and HUB75; ~15 frames over a default 500ms fade is plenty smooth.
+_FADE_FPS = 30
+
 
 class PlaybackLoop:
     """Cycles content items through a renderer until told to stop.
@@ -102,12 +106,34 @@ class PlaybackLoop:
                 await self._wait(self._empty_poll)
                 continue
 
-            for item in items:
+            # Pre-load images lazily inside the per-item iteration so a
+            # mid-cycle add/delete is reflected on the next pass without
+            # ballooning memory for a hundred-slide playlist.
+            for i, item in enumerate(items):
                 if self._stop_event.is_set():
                     break
                 self._current_id = item.id
-                self._safe_render(item)
+
+                current_image = self._safe_load_image(item)
+                if current_image is None:
+                    continue
+
+                self._render_image(current_image)
                 await self._wait(item.duration_ms / 1000)
+
+                if self._stop_event.is_set():
+                    break
+
+                # Transition into the next slide (or wrap to first). Skip
+                # for cut (instant), single-item playlists (next == current),
+                # and for the last item if we're about to re-enter the outer
+                # loop and re-fetch (the next iteration's first item handles
+                # its own appearance via cut/fade as configured).
+                if item.transition == "fade" and item.transition_ms > 0 and len(items) > 1:
+                    next_item = items[(i + 1) % len(items)]
+                    next_image = self._safe_load_image(next_item)
+                    if next_image is not None:
+                        await self._fade(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early if stop is requested."""
@@ -115,28 +141,64 @@ class PlaybackLoop:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
 
-    def _safe_render(self, item: ContentItem) -> None:
-        try:
-            self._render_item(item)
-        except Exception:
-            log.exception("playback: failed to render %s", item.id)
+    def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
+        """Load + resize an item's PNG to renderer dimensions.
 
-    def _render_item(self, item: ContentItem) -> None:
+        Returns None on missing asset / corrupt PNG / any other render-time
+        failure — playback continues with the next item.
+        """
         try:
             asset_bytes = self._read_asset(item.id)
         except FileNotFoundError:
             log.warning("playback: asset missing for %s, skipping", item.id)
-            return
+            return None
+        except Exception:
+            log.exception("playback: failed to read asset for %s", item.id)
+            return None
 
         try:
             image = Image.open(io.BytesIO(asset_bytes)).convert("RGB")
         except UnidentifiedImageError:
             log.warning("playback: corrupt asset for %s, skipping", item.id)
-            return
+            return None
 
         if image.size != (self._renderer.width, self._renderer.height):
             image = image.resize(
                 (self._renderer.width, self._renderer.height),
                 resample=Image.Resampling.NEAREST,
             )
-        self._renderer.render_frame(image.tobytes())
+        return image
+
+    def _render_image(self, image: Image.Image) -> None:
+        """Push an already-loaded, correctly-sized image to the renderer.
+
+        Wrapped in try/except so a renderer crash doesn't kill the loop —
+        same survival contract _safe_render had.
+        """
+        try:
+            self._renderer.render_frame(image.tobytes())
+        except Exception:
+            log.exception("playback: renderer raised on render_frame")
+
+    async def _fade(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Alpha-blend from `from_image` to `to_image` over `transition_ms`.
+
+        Returns early if stop is requested mid-fade. Image.blend is the actual
+        per-pixel math — at alpha=0 we get from_image; at alpha=1 we get
+        to_image.
+        """
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            if self._stop_event.is_set():
+                return
+            alpha = i / n_frames
+            blended = Image.blend(from_image, to_image, alpha)
+            self._render_image(blended)
+            await self._wait(frame_period)

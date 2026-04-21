@@ -274,4 +274,40 @@ describe("mountEditor — submit flow", () => {
         textEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
         expect(textEl.value).toBe("");
     });
+
+    it("defaults transition to 'cut' with a 500ms transition_ms", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+
+        mountEditor(container, { width: 128, height: 96, onSave });
+        container.querySelector(".field-text").value = "Hi";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await new Promise((r) => setTimeout(r, 0));
+
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.transition).toBe("cut");
+        expect(payload.transition_ms).toBe(500);
+    });
+
+    it("sends transition='fade' and the user's transition_ms", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+
+        mountEditor(container, { width: 128, height: 96, onSave });
+        container.querySelector(".field-text").value = "Hi";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        container.querySelector(".field-transition").value = "fade";
+        container.querySelector(".field-transition-ms").value = "1200";
+
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await new Promise((r) => setTimeout(r, 0));
+
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.transition).toBe("fade");
+        expect(payload.transition_ms).toBe(1200);
+    });
 });
