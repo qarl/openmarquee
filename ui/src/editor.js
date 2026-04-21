@@ -6,6 +6,13 @@
 // `loadForEdit(slide)` pre-fills the form from a stored TextSlide; Save
 // then dispatches to `onSaveExisting(id, payload)` instead of `onSave`.
 // Click "New slide" to exit edit-mode.
+//
+// The horizontal slide-browser at the top is the primary way operators
+// move between slides: click a tile to edit, click "+ New" to create.
+// The Playlists-page pallet's ✎ edit button still works too — either
+// surface feels natural in its own context.
+
+import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 // Signage-friendly color presets. Per SYSTEM_SPEC §5.1: most users just want
 // "white on red" and to be done — not to fiddle with a color picker.
@@ -40,6 +47,8 @@ function presetButtonsHtml() {
 
 const EDITOR_TEMPLATE = `
     <div class="editor">
+        <h2 class="subpage-title">Text Slides</h2>
+        <div class="slide-browser-slot"></div>
         <div class="editor-header">
             <span class="editor-mode-label">New slide</span>
             <button type="button" class="editor-new" hidden>+ New slide</button>
@@ -415,18 +424,18 @@ export function mountEditor(
         }
     });
 
-    function resetToBlank() {
+    async function resetToBlank() {
+        // Sync blank-state setup. Anything here can be safely
+        // overridden by a loadForEdit that interleaves later.
         state.editingId = null;
         state.bgImage = null;
         state.bgSlideId = null;
         modeLabelEl.textContent = "New slide";
         newBtnEl.hidden = true;
         textEl.value = "";
-        nameEl.value = "Untitled";
         autoModeEl.value = "";
         autoModeHintEl.hidden = true;
         populateAutoFormatOptions("");
-        // Reset background source to solid color.
         const colorRadio = container.querySelector(
             '.field-bg-source[value="color"]',
         );
@@ -434,6 +443,29 @@ export function mountEditor(
         bgSlideWrapEl.hidden = true;
         state.bgSource = "color";
         syncAndRender();
+
+        // Async tail: gap-filled default name + browser refresh, both
+        // no-ops if loadForEdit took ownership during the await.
+        const defaultName = await computeDefaultName();
+        if (state.editingId !== null) return;
+        nameEl.value = defaultName;
+        if (browser) {
+            await browser.refresh();
+            browser.highlight(null);
+        }
+    }
+
+    async function computeDefaultName() {
+        if (!fetchItems) return "Text Slide 1";
+        try {
+            const items = await fetchItems();
+            return nextAutoName(
+                items.filter((i) => i.type === "text_slide"),
+                "Text Slide",
+            );
+        } catch {
+            return "Text Slide 1";
+        }
     }
 
     async function loadForEdit(slide) {
@@ -445,6 +477,7 @@ export function mountEditor(
         state.editingId = String(slide.id);
         modeLabelEl.textContent = `Editing: ${slide.name || "Untitled"}`;
         newBtnEl.hidden = false;
+        if (browser) browser.highlight(slide.id);
 
         nameEl.value = slide.name || "Untitled";
         textEl.value = slide.text || "";
@@ -487,9 +520,31 @@ export function mountEditor(
         syncAndRender();
     }
 
+    // Mount the slide browser at the top of the subpage — each tile
+    // click dispatches loadForEdit, "+ New" → resetToBlank. We do this
+    // after all callbacks are defined so they can reference each other.
+    let browser = null;
+    if (fetchItems) {
+        browser = mountSlideBrowser(
+            container.querySelector(".slide-browser-slot"),
+            {
+                type: "text_slide",
+                fetchItems,
+                onSelect: (item) => loadForEdit(item),
+                onCreate: () => resetToBlank(),
+            },
+        );
+    }
+
+    // Initial blank state picks up the first default name.
+    resetToBlank();
     syncAndRender();
 
-    return { loadForEdit };
+    return {
+        loadForEdit,
+        reset: resetToBlank,
+        refreshBrowser: () => browser?.refresh(),
+    };
 }
 
 async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {

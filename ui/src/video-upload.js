@@ -19,8 +19,10 @@
 
 const TEMPLATE = `
     <section class="video-upload">
+        <h2 class="subpage-title">Video Slides</h2>
+        <div class="slide-browser-slot"></div>
         <div class="video-upload-header">
-            <h2 class="video-upload-heading">Upload a video</h2>
+            <h3 class="video-upload-heading">Upload a video</h3>
             <button type="button" class="video-upload-new" hidden>+ New video</button>
         </div>
         <div class="preview-wrap">
@@ -75,6 +77,7 @@ import {
     extractRawFrames,
     transcodeToH264,
 } from "./ffmpeg-pipelines.js";
+import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 const PANEL_OUTPUT_MODES = new Set(["hub75", "ws281x", "composite"]);
 
@@ -105,7 +108,7 @@ const PANEL_FPS = 15;
  */
 export function mountVideoUploader(
     container,
-    { width, height, outputMode = "hdmi", onSave, onSaveExisting },
+    { width, height, outputMode = "hdmi", onSave, onSaveExisting, fetchItems },
 ) {
     container.innerHTML = TEMPLATE;
 
@@ -287,7 +290,9 @@ export function mountVideoUploader(
         }
     });
 
-    function resetToBlank() {
+    async function resetToBlank() {
+        // Sync blank-state setup. Anything here can be safely
+        // overridden by a loadForEdit that interleaves later.
         state.editingId = null;
         state.thumbnailCanvasReady = false;
         state.assetBytesBase64 = null;
@@ -296,10 +301,32 @@ export function mountVideoUploader(
         newBtnEl.hidden = true;
         editHintEl.hidden = true;
         fileEl.value = "";
-        nameEl.value = "Video";
         durationEl.value = "10";
         clearCanvas(canvas);
         updateSaveEnabled();
+
+        // Async tail: gap-filled default name + browser refresh, both
+        // no-ops if loadForEdit took ownership during the await.
+        const defaultName = await computeDefaultName();
+        if (state.editingId !== null) return;
+        nameEl.value = defaultName;
+        if (browser) {
+            await browser.refresh();
+            browser.highlight(null);
+        }
+    }
+
+    async function computeDefaultName() {
+        if (!fetchItems) return "Video Slide 1";
+        try {
+            const items = await fetchItems();
+            return nextAutoName(
+                items.filter((i) => i.type === "video"),
+                "Video Slide",
+            );
+        } catch {
+            return "Video Slide 1";
+        }
     }
 
     async function loadForEdit(slide) {
@@ -315,6 +342,7 @@ export function mountVideoUploader(
         headingEl.textContent = `Editing: ${slide.name || "Untitled"}`;
         newBtnEl.hidden = false;
         editHintEl.hidden = false;
+        if (browser) browser.highlight(slide.id);
         nameEl.value = slide.name || "Video";
         durationEl.value = String(
             Math.max(1, (slide.duration_ms || 10000) / 1000),
@@ -328,7 +356,25 @@ export function mountVideoUploader(
         updateSaveEnabled();
     }
 
-    return { loadForEdit };
+    let browser = null;
+    if (fetchItems) {
+        browser = mountSlideBrowser(
+            container.querySelector(".slide-browser-slot"),
+            {
+                type: "video",
+                fetchItems,
+                onSelect: (item) => loadForEdit(item),
+                onCreate: () => resetToBlank(),
+            },
+        );
+    }
+
+    resetToBlank();
+    return {
+        loadForEdit,
+        reset: resetToBlank,
+        refreshBrowser: () => browser?.refresh(),
+    };
 }
 
 // Duplicated in image-upload.js — deliberately, so neither uploader

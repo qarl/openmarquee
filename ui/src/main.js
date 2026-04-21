@@ -126,6 +126,12 @@ async function boot() {
     const onSaveWithRefresh = (saveFn) => async (payload) => {
         const saved = await saveFn(payload);
         if (playlistTrack) await playlistTrack.refresh();
+        // Each slide subpage carries a horizontal browser at the top;
+        // refresh all three so a just-saved slide shows up regardless
+        // of where the save happened.
+        await editor?.refreshBrowser?.();
+        await imageUploader?.refreshBrowser?.();
+        await videoUploader?.refreshBrowser?.();
         return saved;
     };
 
@@ -186,6 +192,7 @@ async function boot() {
         imageUploader = mountImageUploader(imageSlot, {
             width,
             height,
+            fetchItems: listContent,
             onSave: onSaveWithRefresh(saveImage),
             onSaveExisting: onSaveWithRefresh(updateImage),
         });
@@ -196,6 +203,7 @@ async function boot() {
             width,
             height,
             outputMode,
+            fetchItems: listContent,
             onSave: onSaveWithRefresh(saveVideo),
             onSaveExisting: onSaveWithRefresh(updateVideo),
         });

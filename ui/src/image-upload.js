@@ -2,10 +2,14 @@
 // browser, upload the PNG bytes. The backend only ever sees pre-scaled
 // bitmap data per SYSTEM_SPEC §5.1.
 
+import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
+
 const TEMPLATE = `
     <section class="image-upload">
+        <h2 class="subpage-title">Image Slides</h2>
+        <div class="slide-browser-slot"></div>
         <div class="image-upload-header">
-            <h2 class="image-upload-heading">Upload an image</h2>
+            <h3 class="image-upload-heading">Upload an image</h3>
             <button type="button" class="image-upload-new" hidden>+ New image</button>
         </div>
         <div class="preview-wrap">
@@ -52,7 +56,7 @@ const TEMPLATE = `
  */
 export function mountImageUploader(
     container,
-    { width, height, onSave, onSaveExisting },
+    { width, height, onSave, onSaveExisting, fetchItems },
 ) {
     container.innerHTML = TEMPLATE;
 
@@ -164,17 +168,42 @@ export function mountImageUploader(
         }
     }
 
-    function resetToBlank() {
+    async function resetToBlank() {
+        // Sync blank-state setup. Anything here can be safely
+        // overridden by a loadForEdit that interleaves later.
         state.editingId = null;
         state.hasImage = false;
         headingEl.textContent = "Upload an image";
         newBtnEl.hidden = true;
         editHintEl.hidden = true;
         fileEl.value = "";
-        nameEl.value = "Image";
         durationEl.value = "5";
         clearCanvas();
         updateSaveEnabled();
+
+        // Async tail: gap-filled default name + browser refresh.
+        // Both are no-ops if loadForEdit grabbed editingId while
+        // computeDefaultName was awaiting.
+        const defaultName = await computeDefaultName();
+        if (state.editingId !== null) return;
+        nameEl.value = defaultName;
+        if (browser) {
+            await browser.refresh();
+            browser.highlight(null);
+        }
+    }
+
+    async function computeDefaultName() {
+        if (!fetchItems) return "Image Slide 1";
+        try {
+            const items = await fetchItems();
+            return nextAutoName(
+                items.filter((i) => i.type === "image"),
+                "Image Slide",
+            );
+        } catch {
+            return "Image Slide 1";
+        }
     }
 
     async function loadForEdit(slide) {
@@ -188,6 +217,7 @@ export function mountImageUploader(
         headingEl.textContent = `Editing: ${slide.name || "Untitled"}`;
         newBtnEl.hidden = false;
         editHintEl.hidden = false;
+        if (browser) browser.highlight(slide.id);
         nameEl.value = slide.name || "Image";
         durationEl.value = String(
             Math.max(1, (slide.duration_ms || 5000) / 1000),
@@ -202,7 +232,26 @@ export function mountImageUploader(
     }
 
     clearCanvas();
-    return { loadForEdit };
+
+    let browser = null;
+    if (fetchItems) {
+        browser = mountSlideBrowser(
+            container.querySelector(".slide-browser-slot"),
+            {
+                type: "image",
+                fetchItems,
+                onSelect: (item) => loadForEdit(item),
+                onCreate: () => resetToBlank(),
+            },
+        );
+    }
+
+    resetToBlank();
+    return {
+        loadForEdit,
+        reset: resetToBlank,
+        refreshBrowser: () => browser?.refresh(),
+    };
 }
 
 /**

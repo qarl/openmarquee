@@ -656,23 +656,109 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 
 .preview-wrap {
-    background: #000;
-    border: 1px solid var(--panel-border);
-    border-radius: 0.5rem;
-    padding: 0.75rem;
+    /* No background / padding so the preview outline hugs the sign's
+       actual aspect ratio — avoids black letterbox bars when the
+       device isn't 4:3. */
     display: flex;
     justify-content: center;
     align-items: center;
+    border: 1px solid var(--panel-border);
+    border-radius: 0.5rem;
+    overflow: hidden;
+}
+
+/* Subpage title ("Text Slides" / "Image Slides" / "Video Slides") +
+   horizontal slide browser that sits below it. */
+.subpage-title {
+    margin: 0 0 0.75rem;
+    font-size: 1.05rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    color: var(--text);
+}
+
+.slide-browser {
+    margin-bottom: 1rem;
+}
+.slide-browser-list {
+    list-style: none;
+    margin: 0;
+    padding: 0.35rem 0;
+    display: flex;
+    flex-direction: row;
+    gap: 0.5rem;
+    overflow-x: auto;
+}
+.slide-browser-tile {
+    flex: 0 0 auto;
+    width: 5rem;
+}
+.slide-browser-tile-action {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+    width: 100%;
+    padding: 0.35rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.35rem;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+.slide-browser-tile-action:hover {
+    border-color: var(--accent);
+    background: #111115;
+}
+.slide-browser-tile--selected .slide-browser-tile-action {
+    border-color: var(--accent);
+    background: #161616;
+    box-shadow: 0 0 0 2px rgba(255, 184, 77, 0.35);
+}
+.slide-browser-tile-thumb {
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+    background: #000;
+    border-radius: 0.2rem;
+    image-rendering: pixelated;
+}
+.slide-browser-tile-name {
+    width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: center;
+}
+.slide-browser-tile--new .slide-browser-tile-action {
+    justify-content: center;
+    aspect-ratio: 1 / 1;
+    border-style: dashed;
+    font-weight: 600;
+}
+.slide-browser-tile-plus {
+    font-size: 1.4rem;
+    line-height: 1;
+    color: var(--accent);
+}
+.slide-browser-tile-new-label {
+    font-size: 0.75rem;
+    color: var(--muted);
+    letter-spacing: 0.04em;
 }
 
 .editor-canvas {
-    /* The canvas is at native panel resolution; scale up with pixelation
-       so we preview exactly what the sign would show. */
+    /* Aspect ratio is set inline by the mount fn so it matches the
+       device's configured display dims. Scaled up with pixelation so
+       the preview shows exactly what the sign would render. */
+    display: block;
     width: 100%;
     max-width: 100%;
     height: auto;
     image-rendering: pixelated;
-    aspect-ratio: 4 / 3;
 }
 
 .controls {
