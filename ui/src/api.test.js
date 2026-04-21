@@ -3,9 +3,11 @@ import {
     deleteContent,
     fetchHealth,
     getPlaybackState,
+    getSchedule,
     listContent,
     playContent,
     saveImage,
+    saveSchedule,
     saveTextSlide,
     setPlaylistOrder,
     startPlayback,
@@ -132,6 +134,34 @@ describe("saveImage", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad" });
         await expect(saveImage({})).rejects.toThrow("422");
+    });
+});
+
+describe("schedule API", () => {
+    it("getSchedule GETs /api/schedules", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ rules: [], default_playlist_name: "default" }),
+        });
+        const result = await getSchedule();
+        expect(result.default_playlist_name).toBe("default");
+        expect(fetchMock).toHaveBeenCalledWith("/api/schedules");
+    });
+
+    it("saveSchedule PUTs to /api/schedules", async () => {
+        const schedule = { rules: [], default_playlist_name: "x" };
+        const fetchMock = mockFetch({ ok: true, json: async () => schedule });
+        const result = await saveSchedule(schedule);
+        expect(result).toEqual(schedule);
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/schedules");
+        expect(init.method).toBe("PUT");
+        expect(JSON.parse(init.body)).toEqual(schedule);
+    });
+
+    it("saveSchedule throws on non-ok", async () => {
+        mockFetch({ ok: false, status: 422, text: async () => "bad" });
+        await expect(saveSchedule({})).rejects.toThrow("422");
     });
 });
 

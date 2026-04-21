@@ -110,3 +110,26 @@ export async function setPlaylistOrder(itemIds) {
     }
     return await response.json();
 }
+
+/** Fetch the current schedule (rules + default_playlist_name). */
+export async function getSchedule() {
+    const response = await fetch("/api/schedules");
+    if (!response.ok) {
+        throw new Error(`Schedule fetch failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+/** Replace the schedule with the given object (rules + default_playlist_name). */
+export async function saveSchedule(schedule) {
+    const response = await fetch("/api/schedules", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(schedule),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Save schedule failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
