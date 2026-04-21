@@ -371,6 +371,117 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     min-height: 1.2em;
 }
 
+/* --- named-playlist manager --- */
+
+.playlists {
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--panel-border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.playlists-heading {
+    margin: 0;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+}
+
+.playlists-hint {
+    margin: 0 0 0.25rem;
+    color: var(--muted);
+    font-size: 0.8rem;
+    opacity: 0.8;
+}
+
+.playlists-hint em { font-style: italic; opacity: 0.9; }
+
+.playlists-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.playlist-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.playlist-header {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+.playlist-name {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    flex: 1;
+}
+
+.playlist-count {
+    font-size: 0.8rem;
+    color: var(--muted);
+}
+
+.playlist-items {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 0.25rem 0.75rem;
+    max-height: 10rem;
+    overflow-y: auto;
+}
+
+.playlist-item label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    padding: 0.15rem 0;
+}
+
+.playlist-item label span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.playlist-save {
+    align-self: flex-start;
+}
+
+.playlists-create {
+    display: flex;
+    align-items: end;
+    gap: 0.5rem;
+}
+
+.playlists-create .field { flex: 1; }
+
+.playlists-status {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+    min-height: 1.2em;
+}
+
 /* --- schedule editor --- */
 
 .schedule {

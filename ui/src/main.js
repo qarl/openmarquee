@@ -8,11 +8,14 @@
 // reading device config from the backend is a Phase 3 polish task.
 
 import {
+    deletePlaylistByName,
     deleteContent,
     getPlaybackState,
     getSchedule,
     listContent,
+    listPlaylists,
     playContent,
+    savePlaylistByName,
     saveImage,
     saveSchedule,
     saveTextSlide,
@@ -24,6 +27,7 @@ import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
 import { mountList } from "./list.js";
 import { mountPlaybackControls } from "./playback.js";
+import { mountPlaylistsManager } from "./playlists.js";
 import { mountSchedule } from "./schedule.js";
 
 const PANEL_WIDTH = 128;
@@ -36,6 +40,7 @@ function boot() {
         <div class="image-upload-slot"></div>
         <div class="playback-slot"></div>
         <div class="list-slot"></div>
+        <div class="playlists-slot"></div>
         <div class="schedule-slot"></div>
     `;
 
@@ -68,6 +73,13 @@ function boot() {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
         onSave: onSaveWithRefresh(saveImage),
+    });
+
+    mountPlaylistsManager(root.querySelector(".playlists-slot"), {
+        fetchItems: listContent,
+        fetchPlaylists: listPlaylists,
+        onSave: savePlaylistByName,
+        onDelete: deletePlaylistByName,
     });
 
     mountSchedule(root.querySelector(".schedule-slot"), {

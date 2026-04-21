@@ -111,6 +111,42 @@ export async function setPlaylistOrder(itemIds) {
     return await response.json();
 }
 
+/** Fetch the full named-playlist collection: { schema_version, playlists: {...} }. */
+export async function listPlaylists() {
+    const response = await fetch("/api/playlists");
+    if (!response.ok) {
+        throw new Error(`Playlists fetch failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+/** Create or replace a named playlist with the given item ids. */
+export async function savePlaylistByName(name, itemIds) {
+    const response = await fetch(
+        `/api/playlists/${encodeURIComponent(name)}`,
+        {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ item_ids: itemIds }),
+        },
+    );
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Save playlist failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/** Delete a named playlist. */
+export async function deletePlaylistByName(name) {
+    const response = await fetch(`/api/playlists/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+    });
+    if (!response.ok) {
+        throw new Error(`Delete playlist failed (${response.status})`);
+    }
+}
+
 /** Fetch the current schedule (rules + default_playlist_name). */
 export async function getSchedule() {
     const response = await fetch("/api/schedules");

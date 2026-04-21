@@ -137,6 +137,49 @@ describe("saveImage", () => {
     });
 });
 
+describe("named-playlists API", () => {
+    it("listPlaylists GETs /api/playlists", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ schema_version: 2, playlists: {} }),
+        });
+        const result = await (await import("./api.js")).listPlaylists();
+        expect(result.schema_version).toBe(2);
+        expect(fetchMock).toHaveBeenCalledWith("/api/playlists");
+    });
+
+    it("savePlaylistByName PUTs to /api/playlists/{name} with item_ids body", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ item_ids: ["a", "b"] }),
+        });
+        const { savePlaylistByName } = await import("./api.js");
+        const result = await savePlaylistByName("lunch", ["a", "b"]);
+        expect(result.item_ids).toEqual(["a", "b"]);
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/playlists/lunch");
+        expect(init.method).toBe("PUT");
+        expect(JSON.parse(init.body)).toEqual({ item_ids: ["a", "b"] });
+    });
+
+    it("deletePlaylistByName DELETEs /api/playlists/{name}", async () => {
+        const fetchMock = mockFetch({ ok: true });
+        const { deletePlaylistByName } = await import("./api.js");
+        await deletePlaylistByName("lunch");
+        expect(fetchMock).toHaveBeenCalledWith("/api/playlists/lunch", {
+            method: "DELETE",
+        });
+    });
+
+    it("savePlaylistByName encodes funky names in the URL path", async () => {
+        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
+        const { savePlaylistByName } = await import("./api.js");
+        await savePlaylistByName("spaces in name", []);
+        const [url] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/playlists/spaces%20in%20name");
+    });
+});
+
 describe("schedule API", () => {
     it("getSchedule GETs /api/schedules", async () => {
         const fetchMock = mockFetch({
