@@ -27,6 +27,11 @@ build/
 .cache/
 .parcel-cache/
 
+# Local runtime content / playlist / preview scratch
+# (dev.sh + test runs write these at the cwd defaults)
+openmarquee-content/
+openmarquee-playlist.json
+
 # Playwright
 playwright-report/
 test-results/
