@@ -26,6 +26,7 @@ LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
 class PlaybackState(BaseModel):
     is_running: bool
     current_item_id: UUID | None
+    current_playlist_name: str | None
 
 
 @router.get("/state", response_model=PlaybackState)
@@ -33,6 +34,7 @@ async def get_state(loop: LoopDep) -> PlaybackState:
     return PlaybackState(
         is_running=loop.is_running,
         current_item_id=loop.current_item_id,
+        current_playlist_name=loop.current_playlist_name,
     )
 
 

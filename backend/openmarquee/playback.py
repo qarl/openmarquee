@@ -22,12 +22,19 @@ import contextlib
 import io
 import logging
 from collections.abc import Callable
+from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from PIL import Image, UnidentifiedImageError
 
 from openmarquee.content import ContentItem
 from openmarquee.rendering import Renderer
+
+if TYPE_CHECKING:
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playlist import PlaylistStorage
+    from openmarquee.schedule import ScheduleStorage
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +65,9 @@ class PlaybackLoop:
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         self._current_id: UUID | None = None
+        # Set by fetch_items if it carries playlist context (the
+        # scheduled_fetch_items closure stamps this each fetch).
+        self._current_playlist_name: str | None = None
 
     @property
     def is_running(self) -> bool:
@@ -91,6 +101,7 @@ class PlaybackLoop:
         finally:
             self._stop_event = None
             self._current_id = None
+            self._current_playlist_name = None
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
@@ -180,6 +191,20 @@ class PlaybackLoop:
         except Exception:
             log.exception("playback: renderer raised on render_frame")
 
+    @property
+    def current_playlist_name(self) -> str | None:
+        """The playlist name the loop is currently sourcing items from.
+
+        Set by the schedule-driven fetch fn at the start of each iteration so
+        the UI can show "now playing from <playlist>". None when not running.
+        """
+        return self._current_playlist_name
+
+    def _stamp_playlist_name(self, name: str | None) -> None:
+        """Hook for the scheduled fetch fn to publish which playlist is
+        currently active. Test-only setter is just self._current_playlist_name."""
+        self._current_playlist_name = name
+
     async def _fade(
         self,
         from_image: Image.Image,
@@ -202,3 +227,30 @@ class PlaybackLoop:
             blended = Image.blend(from_image, to_image, alpha)
             self._render_image(blended)
             await self._wait(frame_period)
+
+
+def scheduled_fetch_items(
+    content_storage: "ContentStorage",
+    playlist_storage: "PlaylistStorage",
+    schedule_storage: "ScheduleStorage",
+    now: datetime,
+    loop: PlaybackLoop | None = None,
+) -> list[ContentItem]:
+    """Return items in the order of the playlist active per the schedule at `now`.
+
+    Deferred imports inside the function dodge a content↔playlist↔schedule
+    circular at module load. The composition is small enough to inline; pulling
+    it into a separate "wiring" module would just hide it.
+
+    If `loop` is provided, stamps `_current_playlist_name` so the UI can show
+    which playlist is active. The PlaybackLoop's fetch_items closure passes
+    itself in via `partial`.
+    """
+    from openmarquee.playlist import list_in_playlist_order
+    from openmarquee.schedule import evaluate_schedule
+
+    schedule = schedule_storage.load()
+    active_name = evaluate_schedule(now, schedule)
+    if loop is not None:
+        loop._stamp_playlist_name(active_name)
+    return list_in_playlist_order(content_storage, playlist_storage, active_name)

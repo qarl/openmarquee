@@ -108,21 +108,35 @@ def get_schedule_storage() -> ScheduleStorage:
 
 @lru_cache
 def _playback_loop_singleton() -> PlaybackLoop:
+    from datetime import datetime
+
+    from openmarquee.playback import scheduled_fetch_items
+
     storage = _content_storage_singleton()
     renderer = _mock_renderer_singleton()
     playlist_storage = _playlist_storage_singleton()
+    schedule_storage = _schedule_storage_singleton()
 
-    def fetch_in_playlist_order() -> list:
-        # Imported here to avoid circular import at module load.
-        from openmarquee.playlist import list_in_playlist_order
+    # Closure deferred so we can pass `loop` into the fetch fn for the
+    # current-playlist-name stamp.
+    loop_holder: dict = {}
 
-        return list_in_playlist_order(storage, playlist_storage)
+    def fetch():
+        return scheduled_fetch_items(
+            storage,
+            playlist_storage,
+            schedule_storage,
+            datetime.now(),
+            loop=loop_holder.get("loop"),
+        )
 
-    return PlaybackLoop(
+    loop = PlaybackLoop(
         renderer=renderer,
-        fetch_items=fetch_in_playlist_order,
+        fetch_items=fetch,
         read_asset=storage.read_asset,
     )
+    loop_holder["loop"] = loop
+    return loop
 
 
 def get_playback_loop() -> PlaybackLoop:

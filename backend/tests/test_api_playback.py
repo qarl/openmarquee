@@ -69,7 +69,11 @@ def client(storage: ContentStorage, renderer: MockRenderer, loop: PlaybackLoop) 
 def test_state_returns_not_running_initially(client: TestClient):
     response = client.get("/api/playback/state")
     assert response.status_code == 200
-    assert response.json() == {"is_running": False, "current_item_id": None}
+    assert response.json() == {
+        "is_running": False,
+        "current_item_id": None,
+        "current_playlist_name": None,
+    }
 
 
 def test_start_returns_204_and_state_flips_to_running(client: TestClient):

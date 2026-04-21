@@ -1,5 +1,6 @@
 import asyncio
 import io
+from datetime import datetime
 from uuid import UUID
 
 import pytest
@@ -389,6 +390,168 @@ async def test_image_slide_renders_identically_to_text_slide(renderer):
     assert renderer.last_frame == expected
     assert loop.current_item_id == image.id
     await loop.stop()
+
+
+# --- scheduled_fetch_items (multi-playlist + schedule wiring) ---
+
+
+def test_scheduled_fetch_uses_default_when_schedule_is_empty(tmp_path):
+    """No schedule rules → falls back to default_playlist_name 'default'."""
+    import io as _io
+
+    from PIL import Image as _Image
+
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playback import scheduled_fetch_items
+    from openmarquee.playlist import Playlist, PlaylistStorage
+    from openmarquee.schedule import ScheduleStorage
+
+    storage = ContentStorage(tmp_path / "content")
+    playlist_storage = PlaylistStorage(tmp_path / "playlists.json")
+    schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
+
+    # Save one item to default + a different one to lunch.
+    text_in_default = TextSlide(name="in default", text="x")
+    text_in_lunch = TextSlide(name="in lunch", text="x")
+
+    def _png():
+        img = _Image.new("RGB", (4, 4), (0, 0, 0))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    storage.save_text_slide(text_in_default, _png())
+    storage.save_text_slide(text_in_lunch, _png())
+    playlist_storage.set_playlist("default", Playlist(item_ids=[text_in_default.id]))
+    playlist_storage.set_playlist("lunch", Playlist(item_ids=[text_in_lunch.id]))
+
+    # Empty schedule → default → returns the default-playlist item.
+    items = scheduled_fetch_items(
+        storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0)
+    )
+    assert [item.id for item in items] == [text_in_default.id]
+
+
+def test_scheduled_fetch_picks_active_playlist_per_schedule(tmp_path):
+    """Schedule with a rule that matches `now` → returns that playlist's items."""
+    import io as _io
+
+    from PIL import Image as _Image
+
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playback import scheduled_fetch_items
+    from openmarquee.playlist import Playlist, PlaylistStorage
+    from openmarquee.schedule import (
+        Schedule,
+        ScheduleRule,
+        ScheduleStorage,
+    )
+
+    storage = ContentStorage(tmp_path / "content")
+    playlist_storage = PlaylistStorage(tmp_path / "playlists.json")
+    schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
+
+    text_default = TextSlide(name="default", text="x")
+    text_lunch = TextSlide(name="lunch", text="x")
+
+    def _png():
+        img = _Image.new("RGB", (4, 4), (0, 0, 0))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    storage.save_text_slide(text_default, _png())
+    storage.save_text_slide(text_lunch, _png())
+    playlist_storage.set_playlist("default", Playlist(item_ids=[text_default.id]))
+    playlist_storage.set_playlist("lunch", Playlist(item_ids=[text_lunch.id]))
+
+    schedule_storage.save(
+        Schedule(
+            rules=[
+                ScheduleRule(
+                    name="lunchtime",
+                    days=["mon", "tue", "wed", "thu", "fri"],
+                    start_time="11:00",
+                    end_time="14:00",
+                    playlist_name="lunch",
+                )
+            ],
+            default_playlist_name="default",
+        )
+    )
+
+    # Tuesday 12:00 → lunch rule matches.
+    items = scheduled_fetch_items(
+        storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0)
+    )
+    assert [item.id for item in items] == [text_lunch.id]
+
+    # Tuesday 09:00 → no rule matches, default plays.
+    items = scheduled_fetch_items(
+        storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 9, 0)
+    )
+    assert [item.id for item in items] == [text_default.id]
+
+
+def test_scheduled_fetch_returns_empty_for_unknown_playlist_name(tmp_path):
+    """If schedule selects a playlist that doesn't exist (typo, deleted),
+    return empty so the playback loop polls instead of erroring."""
+    import io as _io
+
+    from PIL import Image as _Image
+
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playback import scheduled_fetch_items
+    from openmarquee.playlist import Playlist, PlaylistStorage
+    from openmarquee.schedule import ScheduleStorage
+
+    storage = ContentStorage(tmp_path / "content")
+    playlist_storage = PlaylistStorage(tmp_path / "playlists.json")
+    schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
+
+    text = TextSlide(name="x", text="x")
+    img = _Image.new("RGB", (4, 4), (0, 0, 0))
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    storage.save_text_slide(text, buf.getvalue())
+    playlist_storage.set_playlist("default", Playlist(item_ids=[text.id]))
+
+    # Schedule has no rules but defaults to "missing_playlist".
+    from openmarquee.schedule import Schedule as _Schedule
+
+    schedule_storage.save(_Schedule(default_playlist_name="missing"))
+
+    items = scheduled_fetch_items(
+        storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0)
+    )
+    assert items == []
+
+
+def test_scheduled_fetch_stamps_loop_with_active_playlist_name(tmp_path):
+    """When passed a PlaybackLoop, scheduled_fetch_items publishes the
+    active playlist name on it for the UI 'now playing' badge."""
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playback import PlaybackLoop, scheduled_fetch_items
+    from openmarquee.playlist import PlaylistStorage
+    from openmarquee.rendering.mock import MockRenderer
+    from openmarquee.schedule import ScheduleStorage
+
+    storage = ContentStorage(tmp_path / "content")
+    playlist_storage = PlaylistStorage(tmp_path / "playlists.json")
+    schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
+    renderer = MockRenderer(8, 8, tmp_path / "out.png")
+
+    loop = PlaybackLoop(renderer, fetch_items=lambda: [], read_asset=lambda _i: b"")
+    assert loop.current_playlist_name is None
+
+    scheduled_fetch_items(
+        storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0), loop=loop
+    )
+    # Default schedule, default fallback name.
+    assert loop.current_playlist_name == "default"
+
+
+# --- back to existing playback tests ---
 
 
 @pytest.mark.asyncio

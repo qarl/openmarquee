@@ -173,19 +173,27 @@ def list_in_playlist_order(
     engine (whichever playlist the schedule selected).
     """
     items_by_id = {item.id: item for item in content_storage.list_all()}
-    playlist = playlist_storage.get_playlist(playlist_name)
+    collection = playlist_storage.load_all()
+    target = collection.playlists.get(playlist_name, Playlist())
 
     ordered: list[ContentItem] = []
     used: set[UUID] = set()
-    for item_id in playlist.item_ids:
+    for item_id in target.item_ids:
         if item_id in items_by_id and item_id not in used:
             ordered.append(items_by_id[item_id])
             used.add(item_id)
 
     if playlist_name == DEFAULT_PLAYLIST_NAME:
-        # Append orphans deterministically (sorted by id string) so newly-
-        # uploaded items are visible even if auto-append hasn't fired yet.
-        orphans = [item for item_id, item in items_by_id.items() if item_id not in used]
+        # Append true orphans — items in storage but referenced by NO
+        # playlist. Items in named playlists belong to those, not to default.
+        all_referenced: set[UUID] = set()
+        for p in collection.playlists.values():
+            all_referenced.update(p.item_ids)
+        orphans = [
+            item
+            for item_id, item in items_by_id.items()
+            if item_id not in used and item_id not in all_referenced
+        ]
         orphans.sort(key=lambda item: str(item.id))
         ordered.extend(orphans)
 
