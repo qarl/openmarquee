@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from openmarquee.content.storage import ContentStorage
+from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
 
 
@@ -64,3 +65,19 @@ def get_mock_renderer() -> MockRenderer:
     (Phases 6/8/10) the playback engine targets a real renderer instead.
     """
     return _mock_renderer_singleton()
+
+
+@lru_cache
+def _playback_loop_singleton() -> PlaybackLoop:
+    storage = _content_storage_singleton()
+    renderer = _mock_renderer_singleton()
+    return PlaybackLoop(
+        renderer=renderer,
+        fetch_items=storage.list_all,
+        read_asset=storage.read_asset,
+    )
+
+
+def get_playback_loop() -> PlaybackLoop:
+    """Dependency provider for the playback engine."""
+    return _playback_loop_singleton()

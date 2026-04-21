@@ -7,9 +7,18 @@
 // Panel dimensions are hardcoded to SYSTEM_SPEC defaults (128×96) for now;
 // reading device config from the backend is a Phase 3 polish task.
 
-import { deleteContent, listContent, playContent, saveTextSlide } from "./api.js";
+import {
+    deleteContent,
+    getPlaybackState,
+    listContent,
+    playContent,
+    saveTextSlide,
+    startPlayback,
+    stopPlayback,
+} from "./api.js";
 import { mountEditor } from "./editor.js";
 import { mountList } from "./list.js";
+import { mountPlaybackControls } from "./playback.js";
 
 const PANEL_WIDTH = 128;
 const PANEL_HEIGHT = 96;
@@ -18,6 +27,7 @@ function boot() {
     const root = document.getElementById("app");
     root.innerHTML = `
         <div class="editor-slot"></div>
+        <div class="playback-slot"></div>
         <div class="list-slot"></div>
     `;
 
@@ -25,6 +35,12 @@ function boot() {
         fetchItems: listContent,
         onPlay: playContent,
         onDelete: deleteContent,
+    });
+
+    mountPlaybackControls(root.querySelector(".playback-slot"), {
+        fetchState: getPlaybackState,
+        onStart: startPlayback,
+        onStop: stopPlayback,
     });
 
     mountEditor(root.querySelector(".editor-slot"), {

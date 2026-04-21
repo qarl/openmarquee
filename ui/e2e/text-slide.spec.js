@@ -83,3 +83,29 @@ test("rejected save (text too long) surfaces the error", async ({ page }) => {
     await page.locator(".field-save").click();
     await expect(page.locator(".editor-status")).toContainText("Save failed");
 });
+
+test("Play all starts the backend loop; Stop stops it", async ({ page }) => {
+    await page.goto("/");
+
+    // Save one slide so the loop has something to render.
+    await page.locator(".field-name").fill("Loop");
+    await page.locator(".field-text").fill("LOOP");
+    await page.locator(".field-save").click();
+    await expect(page.locator(".editor-status")).toHaveText("Saved.");
+
+    // Start playback.
+    const playBtn = page.locator(".playback-btn");
+    await expect(playBtn).toHaveText("Play all");
+    await playBtn.click();
+    await expect(playBtn).toHaveText("Stop");
+
+    // Confirm the backend sees itself as running.
+    const state = await (await page.request.get("/api/playback/state")).json();
+    expect(state.is_running).toBe(true);
+
+    // Stop playback.
+    await playBtn.click();
+    await expect(playBtn).toHaveText("Play all");
+    const stoppedState = await (await page.request.get("/api/playback/state")).json();
+    expect(stoppedState.is_running).toBe(false);
+});

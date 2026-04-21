@@ -41,7 +41,10 @@ def client(storage: ContentStorage, renderer: MockRenderer) -> TestClient:
     app.dependency_overrides[get_content_storage] = lambda: storage
     app.dependency_overrides[get_mock_renderer] = lambda: renderer
     try:
-        yield TestClient(app)
+        # `with TestClient(app)` runs the lifespan context — matters because
+        # the app's shutdown hook stops the playback loop cleanly.
+        with TestClient(app) as test_client:
+            yield test_client
     finally:
         app.dependency_overrides.clear()
         _content_storage_singleton.cache_clear()

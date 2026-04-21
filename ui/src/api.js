@@ -54,3 +54,28 @@ export async function playContent(id) {
         throw new Error(`Play failed (${response.status})`);
     }
 }
+
+/** Get the current playback state: { is_running, current_item_id }. */
+export async function getPlaybackState() {
+    const response = await fetch("/api/playback/state");
+    if (!response.ok) {
+        throw new Error(`Playback state failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+/** Start the playback loop — no-op if already running. */
+export async function startPlayback() {
+    const response = await fetch("/api/playback/start", { method: "POST" });
+    if (!response.ok) {
+        throw new Error(`Start failed (${response.status})`);
+    }
+}
+
+/** Stop the playback loop — no-op if not running. */
+export async function stopPlayback() {
+    const response = await fetch("/api/playback/stop", { method: "POST" });
+    if (!response.ok) {
+        throw new Error(`Stop failed (${response.status})`);
+    }
+}

@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     deleteContent,
     fetchHealth,
+    getPlaybackState,
     listContent,
     playContent,
     saveTextSlide,
+    startPlayback,
+    stopPlayback,
 } from "./api.js";
 
 afterEach(() => {
@@ -108,5 +111,32 @@ describe("playContent", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422 });
         await expect(playContent("bad")).rejects.toThrow("422");
+    });
+});
+
+describe("playback control API", () => {
+    it("getPlaybackState GETs /api/playback/state", async () => {
+        const state = { is_running: true, current_item_id: "abc" };
+        const fetchMock = mockFetch({ ok: true, json: async () => state });
+        const result = await getPlaybackState();
+        expect(result).toEqual(state);
+        expect(fetchMock).toHaveBeenCalledWith("/api/playback/state");
+    });
+
+    it("startPlayback POSTs /api/playback/start", async () => {
+        const fetchMock = mockFetch({ ok: true });
+        await startPlayback();
+        expect(fetchMock).toHaveBeenCalledWith("/api/playback/start", { method: "POST" });
+    });
+
+    it("stopPlayback POSTs /api/playback/stop", async () => {
+        const fetchMock = mockFetch({ ok: true });
+        await stopPlayback();
+        expect(fetchMock).toHaveBeenCalledWith("/api/playback/stop", { method: "POST" });
+    });
+
+    it("throws on non-ok responses", async () => {
+        mockFetch({ ok: false, status: 500 });
+        await expect(startPlayback()).rejects.toThrow("500");
     });
 });

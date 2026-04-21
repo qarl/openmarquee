@@ -1,6 +1,8 @@
 """FastAPI application that runs on the device."""
 
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -8,9 +10,19 @@ from fastapi.staticfiles import StaticFiles
 
 from openmarquee import __version__
 from openmarquee.api import router as content_router
+from openmarquee.api_playback import router as playback_router
+from openmarquee.dependencies import get_playback_loop
 from openmarquee.dev import router as dev_router
 
-app = FastAPI(title="OpenMarquee", version=__version__)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Stop the playback loop on shutdown so the asyncio task doesn't dangle."""
+    yield
+    await get_playback_loop().stop()
+
+
+app = FastAPI(title="OpenMarquee", version=__version__, lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -20,6 +32,7 @@ async def healthz() -> dict[str, str]:
 
 
 app.include_router(content_router)
+app.include_router(playback_router)
 
 # Dev tooling (preview page, manual play endpoint) is mounted by default
 # because the device is its own captive-portal AP with no inbound internet.

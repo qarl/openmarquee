@@ -180,6 +180,27 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 
 /* --- saved-slides list --- */
 
+.playback {
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--panel-border);
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.playback-btn {
+    min-width: 7rem;
+}
+
+.playback-status {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+    min-height: 1.2em;
+    flex: 1;
+}
+
 .list {
     margin-top: 1.5rem;
     padding-top: 1.5rem;

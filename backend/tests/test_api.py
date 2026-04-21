@@ -21,7 +21,10 @@ def storage(tmp_path: Path) -> ContentStorage:
 def client(storage: ContentStorage) -> TestClient:
     app.dependency_overrides[get_content_storage] = lambda: storage
     try:
-        yield TestClient(app)
+        # `with TestClient(app)` runs the lifespan context — matters because
+        # the app's shutdown hook stops the playback loop cleanly.
+        with TestClient(app) as test_client:
+            yield test_client
     finally:
         app.dependency_overrides.clear()
         # Defense in depth: drop the lru_cache'd singleton so a later test
