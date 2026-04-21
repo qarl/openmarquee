@@ -154,6 +154,65 @@ def test_timezone_rejects_garbage():
         SystemSettings(timezone="not a tz; DROP TABLE")
 
 
+# --- WiFi AP / station toggles ---
+
+
+def test_wifi_ap_default_on_station_default_off():
+    s = SystemSettings()
+    assert s.wifi_ap_enabled is True
+    assert s.wifi_station_enabled is False
+
+
+def test_wifi_station_enabled_requires_ssid():
+    with pytest.raises(ValidationError) as exc:
+        SystemSettings(
+            wifi_station_enabled=True,
+            wifi_station_password="correct-horse-battery",
+        )
+    assert "wifi_station_ssid" in str(exc.value)
+
+
+def test_wifi_station_enabled_requires_password():
+    with pytest.raises(ValidationError) as exc:
+        SystemSettings(
+            wifi_station_enabled=True,
+            wifi_station_ssid="home",
+        )
+    assert "wifi_station_password" in str(exc.value)
+
+
+def test_wifi_station_accepts_creds_when_enabled():
+    s = SystemSettings(
+        wifi_station_enabled=True,
+        wifi_station_ssid="home-net",
+        wifi_station_password="correct-horse-battery",
+    )
+    assert s.wifi_station_enabled is True
+    assert s.wifi_station_ssid == "home-net"
+
+
+def test_wifi_station_ssid_empty_coerces_to_none():
+    s = SystemSettings(wifi_station_ssid="")
+    assert s.wifi_station_ssid is None
+
+
+def test_disabling_both_wifi_modes_is_rejected():
+    with pytest.raises(ValidationError) as exc:
+        SystemSettings(wifi_ap_enabled=False, wifi_station_enabled=False)
+    assert "at least one" in str(exc.value).lower()
+
+
+def test_ap_off_station_on_is_fine():
+    s = SystemSettings(
+        wifi_ap_enabled=False,
+        wifi_station_enabled=True,
+        wifi_station_ssid="home",
+        wifi_station_password="correct-horse-battery",
+    )
+    assert s.wifi_ap_enabled is False
+    assert s.wifi_station_enabled is True
+
+
 # --- Tailscale ---
 
 

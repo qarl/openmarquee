@@ -19,8 +19,12 @@ const SAMPLE = {
     display_rotation: 0,
     brightness: 75,
     gamma: 2.4,
+    wifi_ap_enabled: true,
     wifi_ssid: "openMarquee-A3F7",
     wifi_password: "correct-horse-battery",
+    wifi_station_enabled: false,
+    wifi_station_ssid: null,
+    wifi_station_password: null,
     timezone: "America/New_York",
     tailscale_enabled: false,
     tailscale_hostname: null,
@@ -120,6 +124,67 @@ describe("mountSettings", () => {
         await tick();
 
         expect(onSave.mock.calls[0][0].timezone).toBeNull();
+    });
+
+    it("WiFi station fieldset is grayed out when station toggle is off", async () => {
+        const container = document.createElement("div");
+        mountSettings(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+        await tick();
+        const stationFieldset = container.querySelector(".settings-wifi-station");
+        expect(stationFieldset.classList.contains("is-disabled")).toBe(true);
+        expect(container.querySelector(".field-wifi-station-ssid").disabled).toBe(true);
+    });
+
+    it("enabling the station toggle un-grays its fieldset", async () => {
+        const container = document.createElement("div");
+        mountSettings(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+        await tick();
+        const toggle = container.querySelector(".field-wifi-station-enabled");
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+        const stationFieldset = container.querySelector(".settings-wifi-station");
+        expect(stationFieldset.classList.contains("is-disabled")).toBe(false);
+        expect(container.querySelector(".field-wifi-station-ssid").disabled).toBe(false);
+    });
+
+    it("refuses to let the operator disable both WiFi modes", async () => {
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => ({ ...SAMPLE, wifi_station_enabled: false }),
+            onSave: vi.fn(),
+        });
+        await tick();
+        // Only AP is on. Try to turn it off.
+        const apToggle = container.querySelector(".field-wifi-ap-enabled");
+        apToggle.checked = false;
+        apToggle.dispatchEvent(new Event("change"));
+        // Bounced back on.
+        expect(apToggle.checked).toBe(true);
+        expect(container.querySelector(".settings-status").textContent).toMatch(
+            /can't disable both/i,
+        );
+    });
+
+    it("sends all WiFi fields in the save payload", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountSettings(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_station_enabled: true,
+                wifi_station_ssid: "home-net",
+                wifi_station_password: "correct-horse-battery",
+            }),
+            onSave,
+        });
+        await tick();
+        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        await tick();
+        const p = onSave.mock.calls[0][0];
+        expect(p.wifi_ap_enabled).toBe(true);
+        expect(p.wifi_station_enabled).toBe(true);
+        expect(p.wifi_station_ssid).toBe("home-net");
+        expect(p.wifi_station_password).toBe("correct-horse-battery");
     });
 
     it("rotation dropdown exposes the four cardinal angles + hydrates from settings", async () => {

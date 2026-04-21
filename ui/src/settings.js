@@ -93,16 +93,48 @@ const SECTION_TEMPLATE = `
                 </label>
             </div>
 
-            <div class="row">
-                <label class="field">
-                    <span>WiFi SSID (access-point name)</span>
-                    <input type="text" class="field-wifi-ssid" maxlength="32" required>
-                </label>
-                <label class="field">
-                    <span>WiFi password (8-63 chars)</span>
-                    <input type="password" class="field-wifi-password" minlength="8" maxlength="63" required>
-                </label>
-            </div>
+            <fieldset class="settings-wifi-ap">
+                <legend>
+                    <label class="field-inline">
+                        <input type="checkbox" class="field-wifi-ap-enabled" checked>
+                        Access point (captive-portal network phones join during setup)
+                    </label>
+                </legend>
+                <div class="row">
+                    <label class="field">
+                        <span>AP SSID</span>
+                        <input type="text" class="field-wifi-ssid" maxlength="32">
+                    </label>
+                    <label class="field">
+                        <span>AP password (8-63 chars)</span>
+                        <input type="password" class="field-wifi-password" minlength="8" maxlength="63">
+                    </label>
+                </div>
+            </fieldset>
+
+            <fieldset class="settings-wifi-station">
+                <legend>
+                    <label class="field-inline">
+                        <input type="checkbox" class="field-wifi-station-enabled">
+                        Join existing WiFi (for Tailscale + remote management)
+                    </label>
+                </legend>
+                <div class="row">
+                    <label class="field">
+                        <span>Home WiFi SSID</span>
+                        <input type="text" class="field-wifi-station-ssid" maxlength="32">
+                    </label>
+                    <label class="field">
+                        <span>Home WiFi password (8-63 chars)</span>
+                        <input type="password" class="field-wifi-station-password" minlength="8" maxlength="63">
+                    </label>
+                </div>
+                <p class="field-hint">
+                    Runs concurrently with the access point on the Pi's single
+                    radio; both modes share the same channel. Disabling both
+                    modes isn't allowed — the device would be unreachable.
+                </p>
+            </fieldset>
 
             <div class="row">
                 <label class="field">
@@ -165,8 +197,12 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     const rotationEl = container.querySelector(".field-display-rotation");
     const brightnessEl = container.querySelector(".field-brightness");
     const gammaEl = container.querySelector(".field-gamma");
+    const apEnabledEl = container.querySelector(".field-wifi-ap-enabled");
     const ssidEl = container.querySelector(".field-wifi-ssid");
     const passwordEl = container.querySelector(".field-wifi-password");
+    const stationEnabledEl = container.querySelector(".field-wifi-station-enabled");
+    const stationSsidEl = container.querySelector(".field-wifi-station-ssid");
+    const stationPasswordEl = container.querySelector(".field-wifi-station-password");
     const tzEl = container.querySelector(".field-timezone");
     const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
     const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
@@ -186,6 +222,41 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         rotationEl.appendChild(opt);
     }
     populateTimezoneSelect(tzEl);
+
+    // WiFi enable checkboxes: gray out the matching fieldset when off,
+    // and prevent disabling both (the server validator rejects that too,
+    // but catching it client-side avoids a confusing 422 at save time).
+    function syncWifiGrayOut() {
+        const apOn = apEnabledEl.checked;
+        const stationOn = stationEnabledEl.checked;
+        ssidEl.disabled = !apOn;
+        passwordEl.disabled = !apOn;
+        stationSsidEl.disabled = !stationOn;
+        stationPasswordEl.disabled = !stationOn;
+        container
+            .querySelector(".settings-wifi-ap")
+            .classList.toggle("is-disabled", !apOn);
+        container
+            .querySelector(".settings-wifi-station")
+            .classList.toggle("is-disabled", !stationOn);
+    }
+    function guardDisableBoth(toggledEl, otherEl) {
+        // If the user just turned off the LAST enabled mode, bounce the
+        // checkbox back on and flash a status message.
+        if (!apEnabledEl.checked && !stationEnabledEl.checked) {
+            toggledEl.checked = true;
+            statusEl.textContent =
+                "Can't disable both WiFi modes — the device wouldn't be reachable.";
+        }
+    }
+    apEnabledEl.addEventListener("change", () => {
+        guardDisableBoth(apEnabledEl, stationEnabledEl);
+        syncWifiGrayOut();
+    });
+    stationEnabledEl.addEventListener("change", () => {
+        guardDisableBoth(stationEnabledEl, apEnabledEl);
+        syncWifiGrayOut();
+    });
 
     // Output-mode change: if the current dims match *some* mode's default,
     // the operator hasn't customized — snap to the new mode's default. If
@@ -218,11 +289,16 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             rotationEl.value = String(settings.display_rotation ?? 0);
             brightnessEl.value = String(settings.brightness ?? 80);
             gammaEl.value = String(settings.gamma ?? 2.2);
+            apEnabledEl.checked = settings.wifi_ap_enabled !== false; // default on
             ssidEl.value = settings.wifi_ssid ?? "";
             // Round-trip the real password so the operator can resubmit
             // without retyping it. The captive-portal API already returns
             // it in plaintext on GET — this is just hydrating the form.
             passwordEl.value = settings.wifi_password ?? "";
+            stationEnabledEl.checked = Boolean(settings.wifi_station_enabled);
+            stationSsidEl.value = settings.wifi_station_ssid ?? "";
+            stationPasswordEl.value = settings.wifi_station_password ?? "";
+            syncWifiGrayOut();
             setTimezoneValue(tzEl, settings.timezone || "");
             tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
             tsHostnameEl.value = settings.tailscale_hostname ?? "";
@@ -246,8 +322,12 @@ export function mountSettings(container, { fetchSettings, onSave }) {
                 display_rotation: Number(rotationEl.value),
                 brightness: Number(brightnessEl.value),
                 gamma: Number(gammaEl.value),
+                wifi_ap_enabled: apEnabledEl.checked,
                 wifi_ssid: ssidEl.value,
                 wifi_password: passwordEl.value,
+                wifi_station_enabled: stationEnabledEl.checked,
+                wifi_station_ssid: stationSsidEl.value.trim() || null,
+                wifi_station_password: stationPasswordEl.value || null,
                 timezone: tzEl.value || null,
                 tailscale_enabled: tsEnabledEl.checked,
                 tailscale_hostname: tsHostnameEl.value.trim() || null,

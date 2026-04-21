@@ -433,6 +433,30 @@ main {
 .settings-dl dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .settings-status { margin: 0; color: var(--muted); font-size: 0.85rem; min-height: 1.2em; }
 
+.settings-wifi-ap,
+.settings-wifi-station {
+    border: 1px solid var(--panel-border);
+    border-radius: 0.4rem;
+    padding: 0.5rem 0.75rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin-top: 0.5rem;
+    transition: opacity 0.15s ease;
+}
+.settings-wifi-ap legend,
+.settings-wifi-station legend {
+    padding: 0 0.35rem;
+}
+.settings-wifi-ap.is-disabled,
+.settings-wifi-station.is-disabled {
+    opacity: 0.45;
+}
+.settings-wifi-ap.is-disabled input:not([type="checkbox"]),
+.settings-wifi-station.is-disabled input:not([type="checkbox"]) {
+    cursor: not-allowed;
+}
+
 .settings-tailscale {
     border: 1px solid var(--panel-border);
     border-radius: 0.4rem;

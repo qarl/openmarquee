@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Bump when the on-disk format changes in a non-backward-compatible way.
 # Same migration discipline as `openmarquee.schedule` and
@@ -119,6 +119,13 @@ class SystemSettings(BaseModel):
         description="Display gamma correction. 2.2 is the sRGB default.",
     )
 
+    # Captive-portal access point — this is how phones connect during
+    # setup. Default on; disabling requires station mode to be on
+    # instead so the device isn't network-isolated.
+    wifi_ap_enabled: bool = Field(
+        default=True,
+        description="Broadcast the openMarquee captive-portal WiFi network.",
+    )
     wifi_ssid: str = Field(
         default="openMarquee-SETUP",
         description="Access-point SSID (1-32 printable ASCII chars).",
@@ -128,6 +135,23 @@ class SystemSettings(BaseModel):
     wifi_password: str = Field(
         default="openmarquee",
         description="WPA2 passphrase (8-63 printable ASCII chars).",
+    )
+
+    # Station mode — join an existing WiFi. Opt-in. Enables Tailscale +
+    # anything else that needs internet. Runs concurrently with the AP
+    # on the Pi Zero 2 W's single radio (same channel; see SYSTEM_SPEC
+    # §4.1). Empty creds are allowed while the toggle is off.
+    wifi_station_enabled: bool = Field(
+        default=False,
+        description="Join the operator's existing WiFi on wlan0.",
+    )
+    wifi_station_ssid: str | None = Field(
+        default=None,
+        description="SSID of the home WiFi to join.",
+    )
+    wifi_station_password: str | None = Field(
+        default=None,
+        description="Passphrase for the home WiFi (8-63 printable ASCII).",
     )
 
     timezone: str | None = Field(
@@ -181,6 +205,54 @@ class SystemSettings(BaseModel):
                 "wifi_password: expected empty or 8-63 printable ASCII chars"
             )
         return value
+
+    @field_validator("wifi_station_ssid")
+    @classmethod
+    def _check_station_ssid(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not _SSID_PATTERN.match(value):
+            raise ValueError(
+                f"wifi_station_ssid: expected 1-32 printable ASCII chars, got {value!r}"
+            )
+        return value
+
+    @field_validator("wifi_station_password")
+    @classmethod
+    def _check_station_password(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not _WIFI_PASSPHRASE_PATTERN.match(value):
+            raise ValueError(
+                "wifi_station_password: expected 8-63 printable ASCII chars"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_wifi_has_at_least_one_mode_enabled(self) -> "SystemSettings":
+        """Disabling both AP and station leaves the device network-
+        isolated — captive portal dies AND remote management dies. The
+        UI gates against this; this validator is the server-side
+        belt-and-braces so a manual settings.json edit can't brick a
+        deployed device."""
+        if not self.wifi_ap_enabled and not self.wifi_station_enabled:
+            raise ValueError(
+                "at least one of wifi_ap_enabled / wifi_station_enabled "
+                "must be true — disabling both network modes would leave "
+                "the device unreachable"
+            )
+        # If station is enabled, it needs credentials to actually connect.
+        # Empty creds with the toggle on is a user mistake worth catching.
+        if self.wifi_station_enabled:
+            if not self.wifi_station_ssid:
+                raise ValueError(
+                    "wifi_station_enabled=true but wifi_station_ssid is empty"
+                )
+            if not self.wifi_station_password:
+                raise ValueError(
+                    "wifi_station_enabled=true but wifi_station_password is empty"
+                )
+        return self
 
     @field_validator("timezone")
     @classmethod
