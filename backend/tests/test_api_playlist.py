@@ -31,17 +31,19 @@ def client(storage: PlaylistStorage) -> TestClient:
 def test_get_empty_playlist_returns_empty_list(client: TestClient):
     response = client.get("/api/playlist")
     assert response.status_code == 200
-    assert response.json() == {"item_ids": []}
+    body = response.json()
+    assert body["item_ids"] == []
+    assert body["items"] == []
 
 
 def test_put_then_get_round_trips_order(client: TestClient):
     a, b, c = str(uuid4()), str(uuid4()), str(uuid4())
     response = client.put("/api/playlist", json={"item_ids": [c, a, b]})
     assert response.status_code == 200
-    assert response.json() == {"item_ids": [c, a, b]}
+    assert response.json()["item_ids"] == [c, a, b]
 
     response = client.get("/api/playlist")
-    assert response.json() == {"item_ids": [c, a, b]}
+    assert response.json()["item_ids"] == [c, a, b]
 
 
 def test_put_with_empty_list_clears_the_playlist(client: TestClient):
@@ -49,7 +51,7 @@ def test_put_with_empty_list_clears_the_playlist(client: TestClient):
     client.put("/api/playlist", json={"item_ids": [a]})
     response = client.put("/api/playlist", json={"item_ids": []})
     assert response.status_code == 200
-    assert response.json() == {"item_ids": []}
+    assert response.json()["item_ids"] == []
 
 
 def test_put_rejects_non_uuid_strings(client: TestClient):
@@ -89,7 +91,7 @@ def test_put_named_playlist_creates_it(client: TestClient, storage: PlaylistStor
     a, b = str(uuid4()), str(uuid4())
     response = client.put("/api/playlists/lunch", json={"item_ids": [a, b]})
     assert response.status_code == 200
-    assert response.json() == {"item_ids": [a, b]}
+    assert response.json()["item_ids"] == [a, b]
     # And it shows up in the collection.
     coll = client.get("/api/playlists").json()
     assert "lunch" in coll["playlists"]
@@ -98,7 +100,7 @@ def test_put_named_playlist_creates_it(client: TestClient, storage: PlaylistStor
 def test_get_named_playlist_returns_empty_for_unknown_name(client: TestClient):
     response = client.get("/api/playlists/nope")
     assert response.status_code == 200
-    assert response.json() == {"item_ids": []}
+    assert response.json()["item_ids"] == []
 
 
 def test_delete_named_playlist_removes_it(client: TestClient):

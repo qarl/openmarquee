@@ -22,6 +22,7 @@ from openmarquee.playlist import (
     DEFAULT_PLAYLIST_NAME,
     Playlist,
     PlaylistCollection,
+    PlaylistItem,
     PlaylistStorage,
 )
 
@@ -33,12 +34,22 @@ PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
 class PlaylistUpdate(BaseModel):
     """Wire format for PUT requests on either endpoint.
 
-    Structurally identical to `Playlist` today; kept separate so the wire
-    schema can evolve (e.g. adding ETag/version for optimistic concurrency)
-    without touching the domain model.
+    Accepts two shapes:
+      - `{items: [{item_id, transition, transition_ms}, ...]}` — canonical.
+      - `{item_ids: [uuid, ...]}` — legacy. Each id becomes a PlaylistItem
+        with default transitions (cut / 500ms). The UI's reorder path on
+        older bundles still works through this shoulder.
     """
 
-    item_ids: list[UUID] = Field(default_factory=list)
+    items: list[PlaylistItem] | None = None
+    item_ids: list[UUID] | None = None
+
+    def to_playlist(self) -> Playlist:
+        if self.items is not None:
+            return Playlist(items=self.items)
+        if self.item_ids is not None:
+            return Playlist(items=[PlaylistItem(item_id=i) for i in self.item_ids])
+        return Playlist()
 
 
 # --- legacy single-playlist endpoints ---
@@ -51,7 +62,7 @@ async def get_default_playlist(storage: PlaylistDep) -> Playlist:
 
 @router.put("/api/playlist", response_model=Playlist)
 async def set_default_playlist(payload: PlaylistUpdate, storage: PlaylistDep) -> Playlist:
-    playlist = Playlist(item_ids=payload.item_ids)
+    playlist = payload.to_playlist()
     storage.save(playlist)
     return playlist
 
@@ -73,7 +84,7 @@ async def get_playlist_by_name(name: str, storage: PlaylistDep) -> Playlist:
 async def set_playlist_by_name(
     name: str, payload: PlaylistUpdate, storage: PlaylistDep
 ) -> Playlist:
-    playlist = Playlist(item_ids=payload.item_ids)
+    playlist = payload.to_playlist()
     storage.set_playlist(name, playlist)
     return playlist
 

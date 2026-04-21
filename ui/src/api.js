@@ -114,12 +114,24 @@ export async function stopPlayback() {
     }
 }
 
-/** Replace the entire playlist order with the given list of ids. */
-export async function setPlaylistOrder(itemIds) {
+/**
+ * Replace the entire playlist contents. Accepts either:
+ *  - an array of UUID strings (legacy, each entry gets default
+ *    transitions — same wire shape that existed pre-v3), or
+ *  - an array of `{item_id, transition, transition_ms}` objects (v3
+ *    canonical — lets the caller carry transition data).
+ */
+export async function setPlaylistOrder(entriesOrIds) {
+    const body =
+        Array.isArray(entriesOrIds) &&
+        entriesOrIds.length > 0 &&
+        typeof entriesOrIds[0] === "object"
+            ? { items: entriesOrIds }
+            : { item_ids: entriesOrIds };
     const response = await fetch("/api/playlist", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ item_ids: itemIds }),
+        body: JSON.stringify(body),
     });
     if (!response.ok) {
         const detail = await response.text();

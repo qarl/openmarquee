@@ -69,7 +69,7 @@ describe("mountPlaylistTrack", () => {
         expect(durations).toEqual(["5s", "3s", "10s"]);
     });
 
-    it("clicking × removes the block and PUTs the new order", async () => {
+    it("clicking × removes the block and PUTs the new order as canonical entries", async () => {
         const container = document.createElement("div");
         const onReorder = vi.fn().mockResolvedValue(undefined);
         mountPlaylistTrack(container, {
@@ -80,13 +80,86 @@ describe("mountPlaylistTrack", () => {
         await tick();
 
         // Remove the middle one.
-        const middleRemove = container.querySelector(
-            '.track-block[data-id="b"] .track-remove',
-        );
-        middleRemove.click();
+        container
+            .querySelector('.track-block[data-id="b"] .track-remove')
+            .click();
         await tick();
 
-        expect(onReorder).toHaveBeenCalledWith(["a", "c"]);
+        expect(onReorder).toHaveBeenCalledTimes(1);
+        const sent = onReorder.mock.calls[0][0];
+        expect(sent.map((e) => e.item_id)).toEqual(["a", "c"]);
+        // Each entry carries the transition/transition_ms envelope.
+        expect(sent.every((e) => e.transition === "cut")).toBe(true);
+        expect(sent.every((e) => e.transition_ms === 500)).toBe(true);
+    });
+
+    it("clicking the transition chip cycles cut ↔ fade and saves", async () => {
+        const container = document.createElement("div");
+        const onReorder = vi.fn().mockResolvedValue(undefined);
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a"]),
+            onReorder,
+        });
+        await tick();
+
+        const chip = container.querySelector(
+            '.track-block[data-id="a"] .track-block-transition',
+        );
+        expect(chip.textContent).toBe("cut");
+        chip.click();
+        await tick();
+        expect(chip.textContent).toBe("fade");
+        const sent = onReorder.mock.calls[0][0];
+        expect(sent).toEqual([
+            { item_id: "a", transition: "fade", transition_ms: 500 },
+        ]);
+    });
+
+    it("hydrates transition metadata from the v3 `items` shape", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                schema_version: 3,
+                playlists: {
+                    default: {
+                        items: [
+                            { item_id: "a", transition: "fade", transition_ms: 250 },
+                            { item_id: "b", transition: "cut", transition_ms: 0 },
+                        ],
+                    },
+                },
+            }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+
+        const blockA = container.querySelector('.track-block[data-id="a"]');
+        expect(blockA.dataset.transition).toBe("fade");
+        expect(blockA.dataset.transitionMs).toBe("250");
+        expect(
+            blockA.querySelector(".track-block-transition").textContent,
+        ).toBe("fade");
+    });
+
+    it("falls back to legacy `item_ids` shape with default transitions", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            // v2 response shape (UI bundle hitting a backend that hasn't
+            // migrated, or a pre-v3 response).
+            fetchPlaylists: async () => ({
+                schema_version: 2,
+                playlists: { default: { item_ids: ["a", "b"] } },
+            }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+
+        const blockA = container.querySelector('.track-block[data-id="a"]');
+        expect(blockA.dataset.transition).toBe("cut");
+        expect(blockA.dataset.transitionMs).toBe("500");
     });
 
     it("empty-state hint is surfaced on an empty playlist via data-empty-hint", async () => {

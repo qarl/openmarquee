@@ -193,3 +193,102 @@ def test_collection_round_trips_via_load_all_save_all(tmp_path: Path):
     loaded = storage.load_all()
     assert set(loaded.playlists) == {"default", "weekend"}
     assert len(loaded.playlists["weekend"].item_ids) == 2
+
+
+# --- v3: transitions live on the playlist ---
+
+
+def test_playlist_items_round_trip_with_transition_fields(tmp_path: Path):
+    from openmarquee.playlist import PlaylistItem
+
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    a, b = uuid4(), uuid4()
+    pl = Playlist(
+        items=[
+            PlaylistItem(item_id=a, transition="fade", transition_ms=300),
+            PlaylistItem(item_id=b, transition="cut", transition_ms=0),
+        ]
+    )
+    storage.save(pl)
+
+    loaded = storage.load()
+    assert loaded.items[0].item_id == a
+    assert loaded.items[0].transition == "fade"
+    assert loaded.items[0].transition_ms == 300
+    assert loaded.items[1].transition == "cut"
+
+
+def test_playlist_item_ids_is_a_derived_view_over_items():
+    from openmarquee.playlist import PlaylistItem
+
+    a, b = uuid4(), uuid4()
+    pl = Playlist(
+        items=[
+            PlaylistItem(item_id=a, transition="fade"),
+            PlaylistItem(item_id=b),
+        ]
+    )
+    assert pl.item_ids == [a, b]
+
+
+def test_v2_on_disk_migrates_to_v3_with_default_transitions(tmp_path: Path):
+    """Existing SD cards have `item_ids` at each playlist level (schema_version=2)."""
+    path = tmp_path / "playlist.json"
+    a, b = str(uuid4()), str(uuid4())
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "playlists": {
+                    "default": {"item_ids": [a, b]},
+                },
+            }
+        )
+    )
+    storage = PlaylistStorage(path)
+    loaded = storage.load()
+    assert [str(i) for i in loaded.item_ids] == [a, b]
+    # Migrated items get the default transitions.
+    assert all(i.transition == "cut" for i in loaded.items)
+    assert all(i.transition_ms == 500 for i in loaded.items)
+
+
+def test_v1_unnamed_on_disk_migrates_to_v3_default_playlist(tmp_path: Path):
+    """Oldest format: `{item_ids: [...]}` with no envelope at all."""
+    path = tmp_path / "playlist.json"
+    a = str(uuid4())
+    path.write_text(json.dumps({"item_ids": [a]}))
+    storage = PlaylistStorage(path)
+    loaded = storage.load()
+    assert len(loaded.items) == 1
+    assert str(loaded.items[0].item_id) == a
+    assert loaded.items[0].transition == "cut"
+
+
+def test_list_in_playlist_order_patches_transitions_onto_items(tmp_path: Path):
+    """The playlist owns transitions; the content item's own transition
+    fields are legacy-ignored when the item appears via list_in_playlist_order."""
+    from openmarquee.content import TextSlide
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playlist import PlaylistItem, list_in_playlist_order
+
+    storage = ContentStorage(tmp_path / "content")
+    slide = TextSlide(name="x", text="x", transition="cut", transition_ms=500)
+    storage.save_text_slide(slide, b"\x89PNG")
+
+    playlist_storage = PlaylistStorage(tmp_path / "playlist.json")
+    playlist_storage.save(
+        Playlist(
+            items=[
+                PlaylistItem(
+                    item_id=slide.id, transition="fade", transition_ms=250
+                )
+            ]
+        )
+    )
+
+    ordered = list_in_playlist_order(storage, playlist_storage)
+    assert len(ordered) == 1
+    # The playlist's transition wins over the content's.
+    assert ordered[0].transition == "fade"
+    assert ordered[0].transition_ms == 250

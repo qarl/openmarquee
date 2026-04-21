@@ -19,47 +19,106 @@ automatically — users curate them. The schedule evaluator selects which
 playlist plays at any given time; missing / unknown playlist names are
 treated as empty (the playback loop polls instead of erroring).
 
-Storage format: a single JSON file at `path`, containing an envelope:
+Storage format (v3): a single JSON file at `path`, containing an envelope:
 
     {
-        "schema_version": 2,
-        "playlists": { "default": { "item_ids": [...] }, ... }
+        "schema_version": 3,
+        "playlists": {
+            "default": {
+                "items": [
+                    {"item_id": "...", "transition": "cut", "transition_ms": 500},
+                    ...
+                ]
+            },
+            ...
+        }
     }
 
-Backwards compat: `schema_version == 1` (or no envelope at all) is the
-single-playlist format that shipped through Phase 5 (a). Load() migrates
-it transparently to a single "default" playlist on first read.
+Backwards compat: `schema_version == 2` stored items as `item_ids: [uuid]`
+— transitions lived on the slide model at that time. `schema_version == 1`
+(or no envelope at all) was the single-playlist form that shipped through
+Phase 5 (a). Both migrate transparently on load — each legacy id becomes
+a PlaylistItem with default transitions.
 """
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 if TYPE_CHECKING:
     from openmarquee.content import ContentItem
     from openmarquee.content.storage import ContentStorage
 
-PLAYLIST_SCHEMA_VERSION = 2
+PLAYLIST_SCHEMA_VERSION = 3
 DEFAULT_PLAYLIST_NAME = "default"
 
 
+class PlaylistItem(BaseModel):
+    """One entry in a playlist: the content id + the transition OUT of
+    this slide into the NEXT one.
+
+    Transitions live here (on the playlist) rather than on the slide so
+    a single slide can play with different fades in different playlists,
+    and so the same slide appearing twice in a row can have different
+    follow-ons — both were impossible under the slide-side model.
+    """
+
+    item_id: UUID
+    transition: Literal["cut", "fade"] = "cut"
+    transition_ms: int = Field(default=500, ge=0, le=5000)
+
+
 class Playlist(BaseModel):
-    """An ordered list of content item IDs."""
+    """An ordered list of PlaylistItems."""
 
-    item_ids: list[UUID] = Field(default_factory=list)
+    items: list[PlaylistItem] = Field(default_factory=list)
 
-    def append(self, item_id: UUID) -> None:
-        """Add an id to the end if it isn't already present."""
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_item_ids(cls, data):
+        """Back-compat shim: `Playlist(item_ids=[uuid, ...])` still works,
+        wrapping each id in a PlaylistItem with defaults. Keeps both the
+        call-site API and persisted-v2 JSON round-trippable through this
+        constructor without every caller threading PlaylistItem through.
+        """
+        if isinstance(data, dict) and "item_ids" in data and "items" not in data:
+            ids = data.pop("item_ids")
+            data["items"] = [{"item_id": i} for i in ids]
+        return data
+
+    @computed_field
+    @property
+    def item_ids(self) -> list[UUID]:
+        """Read-only list of the item ids in order. Serialized as a
+        convenience field so v2-era clients (UI bundles that haven't
+        migrated to reading `items`) keep working — they see the same
+        shape they've always seen alongside the new `items` field."""
+        return [i.item_id for i in self.items]
+
+    def append(
+        self,
+        item_id: UUID,
+        transition: Literal["cut", "fade"] = "cut",
+        transition_ms: int = 500,
+    ) -> None:
+        """Add an id to the end if it isn't already present. Default
+        transitions match what the v2 → v3 migrator stamps on legacy
+        entries."""
         if item_id not in self.item_ids:
-            self.item_ids.append(item_id)
+            self.items.append(
+                PlaylistItem(
+                    item_id=item_id,
+                    transition=transition,
+                    transition_ms=transition_ms,
+                )
+            )
 
     def remove(self, item_id: UUID) -> None:
         """Remove an id if present; no-op otherwise."""
-        if item_id in self.item_ids:
-            self.item_ids.remove(item_id)
+        self.items = [i for i in self.items if i.item_id != item_id]
 
 
 class PlaylistCollection(BaseModel):
@@ -140,16 +199,47 @@ class PlaylistStorage:
 
 
 def _coerce_to_collection(data: dict) -> PlaylistCollection:
-    """Accept either the new envelope or the legacy single-playlist format.
+    """Accept the v3 envelope or migrate from v2 / v1.
 
-    Legacy: `{"item_ids": [...]}` → `{"playlists": {"default": {...}}}`.
+    - v1 (pre-Phase-5): `{"item_ids": [uuid, ...]}` — one unnamed
+      playlist. Each id gets default transitions.
+    - v2 (Phase 5 through 2026-04-21): `{"playlists": {"default":
+      {"item_ids": [...]}, ...}}` — named collection, transitions
+      lived on the slide model. Each id gets default transitions.
+    - v3 (today): `{"playlists": {"default": {"items": [{"item_id":
+      ..., "transition": ..., "transition_ms": ...}]}, ...}}`.
+
+    Both legacy forms are migrated silently so existing SD cards keep
+    working after an upgrade.
     """
+    # Legacy v1: unnamed single playlist.
     if "item_ids" in data and "playlists" not in data:
-        # Legacy v1 single-playlist format. Migrate to v2 collection.
         return PlaylistCollection(
-            playlists={DEFAULT_PLAYLIST_NAME: Playlist.model_validate(data)},
+            playlists={
+                DEFAULT_PLAYLIST_NAME: _playlist_from_legacy_item_ids(
+                    data.get("item_ids", [])
+                )
+            },
         )
-    return PlaylistCollection.model_validate(data)
+
+    # v2 or v3: named collection. Each playlist may be v2 (`item_ids`) or
+    # v3 (`items`); promote v2 entries.
+    playlists = data.get("playlists", {})
+    migrated: dict[str, Playlist] = {}
+    for name, raw in playlists.items():
+        if isinstance(raw, dict) and "item_ids" in raw and "items" not in raw:
+            migrated[name] = _playlist_from_legacy_item_ids(raw["item_ids"])
+        else:
+            migrated[name] = Playlist.model_validate(raw)
+    return PlaylistCollection(
+        schema_version=data.get("schema_version", PLAYLIST_SCHEMA_VERSION),
+        playlists=migrated,
+    )
+
+
+def _playlist_from_legacy_item_ids(item_ids: list) -> Playlist:
+    """v1/v2 → v3 lift: wrap each raw id in a PlaylistItem with defaults."""
+    return Playlist(items=[PlaylistItem(item_id=UUID(str(i))) for i in item_ids])
 
 
 def list_in_playlist_order(
@@ -178,10 +268,23 @@ def list_in_playlist_order(
 
     ordered: list[ContentItem] = []
     used: set[UUID] = set()
-    for item_id in target.item_ids:
-        if item_id in items_by_id and item_id not in used:
-            ordered.append(items_by_id[item_id])
-            used.add(item_id)
+    for p_item in target.items:
+        if p_item.item_id in items_by_id and p_item.item_id not in used:
+            # Patch the content item's transition fields with the playlist's
+            # values. Since v3 the playlist owns transitions — the content
+            # model's fields are legacy-only. model_copy returns a copy so
+            # the same content reappearing in a different playlist can carry
+            # different transitions.
+            content = items_by_id[p_item.item_id]
+            ordered.append(
+                content.model_copy(
+                    update={
+                        "transition": p_item.transition,
+                        "transition_ms": p_item.transition_ms,
+                    }
+                )
+            )
+            used.add(p_item.item_id)
 
     if playlist_name == DEFAULT_PLAYLIST_NAME:
         # Append true orphans — items in storage but referenced by NO

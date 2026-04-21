@@ -42,8 +42,9 @@ const TEMPLATE = `
  * @param {HTMLElement} container
  * @param {object} options
  * @param {() => Promise<Array>} options.fetchItems — all content items
- * @param {() => Promise<object>} options.fetchPlaylists — { playlists: { default: {item_ids}, ... } }
- * @param {(itemIds: string[]) => Promise<any>} options.onReorder — PUT /api/playlist
+ * @param {() => Promise<object>} options.fetchPlaylists — { playlists: { default: {items, item_ids}, ... } }
+ * @param {(items: Array<{item_id, transition, transition_ms}>) => Promise<any>} options.onReorder
+ *     — PUT /api/playlist with the canonical items shape
  * @param {object} [options.playback] — optional hooks forwarded to
  *     mountPlaybackControls (fetchState, onStart, onStop). When present
  *     the track header renders the shared Play / Stop controls.
@@ -103,15 +104,26 @@ export function mountPlaylistTrack(container, options) {
             ]);
             itemByIdRef = new Map(items.map((it) => [String(it.id), it]));
             const itemById = itemByIdRef;
-            const defaultIds = (
-                collection.playlists?.default?.item_ids || []
-            ).map(String);
+            // v3 API returns `items: [{item_id, transition, transition_ms}]`;
+            // fall back to the legacy `item_ids` shape for defensive reading.
+            const playlistRaw = collection.playlists?.default?.items;
+            const defaultEntries = Array.isArray(playlistRaw)
+                ? playlistRaw.map((e) => ({
+                      item_id: String(e.item_id),
+                      transition: e.transition || "cut",
+                      transition_ms: Number(e.transition_ms) || 500,
+                  }))
+                : (collection.playlists?.default?.item_ids || []).map((id) => ({
+                      item_id: String(id),
+                      transition: "cut",
+                      transition_ms: 500,
+                  }));
 
             trackEl.innerHTML = "";
-            for (const id of defaultIds) {
-                const item = itemById.get(id);
+            for (const entry of defaultEntries) {
+                const item = itemById.get(entry.item_id);
                 if (!item) continue; // stale ref — skip
-                trackEl.appendChild(renderTrackBlock(item));
+                trackEl.appendChild(renderTrackBlock(item, entry));
             }
             // Wire × buttons after the DOM is in place so each handler
             // sees the current trackEl children.
@@ -145,26 +157,31 @@ function bindTrackSortable(trackEl, onReorder, saveAndRefresh, itemByIdRef) {
         group: { name: "playlist-track", pull: true, put: ["playlist-pallet"] },
         animation: 150,
         ghostClass: "track-ghost",
-        filter: ".track-remove",
+        filter: ".track-remove, .track-block-transition",
         preventOnFilter: false,
         onAdd: (evt) => {
             // Cross-list drop from the pallet → Sortable cloned a
             // `.pallet-tile` into the track. Re-skin in place to the
-            // proper `.track-block` shape (with duration label) so the
-            // operator sees correct chrome *immediately*, not after the
-            // save-refresh round-trip. The subsequent onEnd still saves
-            // the authoritative order back to the server.
+            // proper `.track-block` shape (with duration label + default
+            // transition chrome) so the operator sees correct chrome
+            // *immediately*, not after the save-refresh round-trip.
             const dropped = evt.item;
             const id = dropped?.dataset?.id;
             if (!id) return;
             const item = itemByIdRef.get(id);
             if (!item) return;
-            const rebuilt = renderTrackBlock(item);
+            // New entries land with default transitions; operator can
+            // click the transition chip to cycle.
+            const rebuilt = renderTrackBlock(item, {
+                item_id: id,
+                transition: "cut",
+                transition_ms: 500,
+            });
             dropped.replaceWith(rebuilt);
         },
         onEnd: () => {
-            const ids = collectTrackIds(trackEl);
-            saveAndRefresh(() => onReorder(ids));
+            const entries = collectTrackEntries(trackEl);
+            saveAndRefresh(() => onReorder(entries));
         },
     });
 }
@@ -189,22 +206,55 @@ function collectTrackIds(trackEl) {
     );
 }
 
+// The canonical-shape reader for save calls: returns the full
+// `{item_id, transition, transition_ms}` tuple per track block in DOM
+// order, so PUT /api/playlist can round-trip transitions too.
+function collectTrackEntries(trackEl) {
+    return Array.from(trackEl.querySelectorAll(".track-block[data-id]")).map(
+        (li) => ({
+            item_id: li.dataset.id,
+            transition: li.dataset.transition || "cut",
+            transition_ms: Number(li.dataset.transitionMs) || 500,
+        }),
+    );
+}
+
 function bindTrackRemoveButtons(trackEl, onReorder, saveAndRefresh) {
     for (const btn of trackEl.querySelectorAll(".track-remove")) {
         btn.addEventListener("click", () => {
             const block = btn.closest("[data-id]");
             if (!block) return;
             const removingId = block.dataset.id;
-            const next = collectTrackIds(trackEl).filter((id) => id !== removingId);
+            const next = collectTrackEntries(trackEl).filter(
+                (e) => e.item_id !== removingId,
+            );
             saveAndRefresh(() => onReorder(next));
+        });
+    }
+    // Transition chip: cycles cut ↔ fade on click. Uses the block's
+    // dataset as the source of truth so collectTrackEntries picks up
+    // the new value when we save.
+    for (const chip of trackEl.querySelectorAll(".track-block-transition")) {
+        chip.addEventListener("click", () => {
+            const block = chip.closest(".track-block");
+            if (!block) return;
+            const current = block.dataset.transition || "cut";
+            const next = current === "cut" ? "fade" : "cut";
+            block.dataset.transition = next;
+            chip.textContent = next;
+            const entries = collectTrackEntries(trackEl);
+            saveAndRefresh(() => onReorder(entries));
         });
     }
 }
 
-function renderTrackBlock(item) {
+function renderTrackBlock(item, entry = { transition: "cut", transition_ms: 500 }) {
     const li = document.createElement("li");
     li.className = "track-block";
     li.dataset.id = String(item.id);
+    li.dataset.transition = entry.transition;
+    li.dataset.transitionMs = String(entry.transition_ms);
+
     const safeName = escapeHtml(item.name || "Untitled");
     const seconds = (Number(item.duration_ms) || 5000) / 1000;
     const durationLabel = `${
@@ -218,7 +268,11 @@ function renderTrackBlock(item) {
             <button type="button" class="track-remove" aria-label="Remove from playlist" title="Remove from playlist">×</button>
         </div>
         <div class="track-block-name">${safeName}</div>
-        <div class="track-block-duration">${durationLabel}</div>
+        <div class="track-block-meta">
+            <span class="track-block-duration">${durationLabel}</span>
+            <button type="button" class="track-block-transition"
+                    title="Click to cycle transition (cut ↔ fade)">${entry.transition}</button>
+        </div>
     `;
     return li;
 }
