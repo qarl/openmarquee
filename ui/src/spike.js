@@ -155,7 +155,23 @@ function boot() {
             logFn(`done in ${dt}s; ${data.length} bytes`);
             outputEl.appendChild(downloadBytes(data, outName, mime));
         } catch (err) {
-            logFn(`error: ${err.message}`);
+            // ffmpeg.wasm surfaces some failures as plain strings or as
+            // objects with no .message — stringify defensively so the
+            // spike page shows something useful instead of "undefined".
+            let detail;
+            if (err instanceof Error) {
+                detail = err.message;
+            } else if (typeof err === "string") {
+                detail = err;
+            } else {
+                try {
+                    detail = JSON.stringify(err);
+                } catch {
+                    detail = String(err);
+                }
+            }
+            console.error("[spike] pipeline error:", err);
+            logFn(`error: ${detail}`);
         } finally {
             h264Btn.disabled = false;
             rgbBtn.disabled = false;
