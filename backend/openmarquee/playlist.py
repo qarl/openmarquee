@@ -13,9 +13,14 @@ and overwrites).
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from openmarquee.content import ContentItem
+    from openmarquee.content.storage import ContentStorage
 
 
 class Playlist(BaseModel):
@@ -57,3 +62,35 @@ class PlaylistStorage:
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(playlist.model_dump_json(indent=2))
         tmp.replace(self.path)
+
+
+def list_in_playlist_order(
+    content_storage: "ContentStorage",
+    playlist_storage: PlaylistStorage,
+) -> list["ContentItem"]:
+    """Return all stored content items, ordered by the persisted playlist.
+
+    Items present in the playlist appear first, in playlist order. Items in
+    storage but missing from the playlist (orphans — uploaded before this
+    feature, or not yet appended) are appended at the end sorted by id.
+    Items in the playlist that no longer exist in storage are silently
+    skipped.
+
+    This is the single canonical "what items, in what order" function for
+    both the saved-slides list view and the playback engine.
+    """
+    items_by_id = {item.id: item for item in content_storage.list_all()}
+    playlist = playlist_storage.load()
+
+    ordered: list[ContentItem] = []
+    used: set[UUID] = set()
+    for item_id in playlist.item_ids:
+        if item_id in items_by_id and item_id not in used:
+            ordered.append(items_by_id[item_id])
+            used.add(item_id)
+
+    # Append orphans deterministically (sorted by id string).
+    orphans = [item for item_id, item in items_by_id.items() if item_id not in used]
+    orphans.sort(key=lambda item: str(item.id))
+    ordered.extend(orphans)
+    return ordered

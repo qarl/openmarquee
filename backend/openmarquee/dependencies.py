@@ -91,9 +91,17 @@ def get_playlist_storage() -> PlaylistStorage:
 def _playback_loop_singleton() -> PlaybackLoop:
     storage = _content_storage_singleton()
     renderer = _mock_renderer_singleton()
+    playlist_storage = _playlist_storage_singleton()
+
+    def fetch_in_playlist_order() -> list:
+        # Imported here to avoid circular import at module load.
+        from openmarquee.playlist import list_in_playlist_order
+
+        return list_in_playlist_order(storage, playlist_storage)
+
     return PlaybackLoop(
         renderer=renderer,
-        fetch_items=storage.list_all,
+        fetch_items=fetch_in_playlist_order,
         read_asset=storage.read_asset,
     )
 

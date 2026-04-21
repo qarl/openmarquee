@@ -15,11 +15,27 @@ from pydantic import BaseModel, Field, ValidationError
 
 from openmarquee.content import ContentItem, ImageSlide, TextSlide
 from openmarquee.content.storage import ContentStorage
-from openmarquee.dependencies import get_content_storage
+from openmarquee.dependencies import get_content_storage, get_playlist_storage
+from openmarquee.playlist import PlaylistStorage, list_in_playlist_order
 
 router = APIRouter(prefix="/api/content", tags=["content"])
 
 StorageDep = Annotated[ContentStorage, Depends(get_content_storage)]
+PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
+
+
+def _append_to_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
+    """Idempotent append: load → append → save."""
+    playlist = playlist_storage.load()
+    playlist.append(item_id)
+    playlist_storage.save(playlist)
+
+
+def _remove_from_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
+    """Idempotent remove: load → remove → save (no-op if absent)."""
+    playlist = playlist_storage.load()
+    playlist.remove(item_id)
+    playlist_storage.save(playlist)
 
 
 class TextSlideUpload(BaseModel):
@@ -46,7 +62,11 @@ class TextSlideUpload(BaseModel):
 
 
 @router.post("/text-slides", response_model=TextSlide)
-async def upload_text_slide(payload: TextSlideUpload, storage: StorageDep) -> TextSlide:
+async def upload_text_slide(
+    payload: TextSlideUpload,
+    storage: StorageDep,
+    playlist_storage: PlaylistDep,
+) -> TextSlide:
     try:
         png = base64.b64decode(payload.png_base64, validate=True)
     except ValueError as exc:  # binascii.Error is a ValueError subclass
@@ -62,6 +82,7 @@ async def upload_text_slide(payload: TextSlideUpload, storage: StorageDep) -> Te
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
     storage.save_text_slide(slide, png)
+    _append_to_playlist(playlist_storage, slide.id)
     return slide
 
 
@@ -79,7 +100,11 @@ class ImageUpload(BaseModel):
 
 
 @router.post("/images", response_model=ImageSlide)
-async def upload_image(payload: ImageUpload, storage: StorageDep) -> ImageSlide:
+async def upload_image(
+    payload: ImageUpload,
+    storage: StorageDep,
+    playlist_storage: PlaylistDep,
+) -> ImageSlide:
     try:
         png = base64.b64decode(payload.png_base64, validate=True)
     except ValueError as exc:
@@ -93,12 +118,18 @@ async def upload_image(payload: ImageUpload, storage: StorageDep) -> ImageSlide:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
     storage.save_image(image, png)
+    _append_to_playlist(playlist_storage, image.id)
     return image
 
 
 @router.get("", response_model=list[ContentItem])
-async def list_content(storage: StorageDep) -> list[ContentItem]:
-    return storage.list_all()
+async def list_content(storage: StorageDep, playlist_storage: PlaylistDep) -> list[ContentItem]:
+    """All saved content, ordered by the playlist (orphans appended at end).
+
+    Same ordering used by the playback engine — UI list and what plays on the
+    sign stay in sync.
+    """
+    return list_in_playlist_order(storage, playlist_storage)
 
 
 @router.get("/{item_id}", response_model=ContentItem)
@@ -125,8 +156,11 @@ async def get_asset(item_id: UUID, storage: StorageDep) -> FileResponse:
 
 
 @router.delete("/{item_id}", status_code=204)
-async def delete_content_item(item_id: UUID, storage: StorageDep) -> None:
+async def delete_content_item(
+    item_id: UUID, storage: StorageDep, playlist_storage: PlaylistDep
+) -> None:
     try:
         storage.delete(item_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"no content item {item_id}") from exc
+    _remove_from_playlist(playlist_storage, item_id)

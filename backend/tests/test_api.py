@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 
 from openmarquee.app import app
 from openmarquee.content.storage import ContentStorage
-from openmarquee.dependencies import get_content_storage
+from openmarquee.dependencies import get_content_storage, get_playlist_storage
+from openmarquee.playlist import PlaylistStorage
 
 _FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-payload"
 
@@ -18,8 +19,14 @@ def storage(tmp_path: Path) -> ContentStorage:
 
 
 @pytest.fixture
-def client(storage: ContentStorage) -> TestClient:
+def playlist_storage(tmp_path: Path) -> PlaylistStorage:
+    return PlaylistStorage(tmp_path / "playlist.json")
+
+
+@pytest.fixture
+def client(storage: ContentStorage, playlist_storage: PlaylistStorage) -> TestClient:
     app.dependency_overrides[get_content_storage] = lambda: storage
+    app.dependency_overrides[get_playlist_storage] = lambda: playlist_storage
     try:
         # `with TestClient(app)` runs the lifespan context — matters because
         # the app's shutdown hook stops the playback loop cleanly.
@@ -27,11 +34,15 @@ def client(storage: ContentStorage) -> TestClient:
             yield test_client
     finally:
         app.dependency_overrides.clear()
-        # Defense in depth: drop the lru_cache'd singleton so a later test
+        # Defense in depth: drop the lru_cache'd singletons so a later test
         # without an override doesn't pick up a torn-down tmp_path.
-        from openmarquee.dependencies import _content_storage_singleton
+        from openmarquee.dependencies import (
+            _content_storage_singleton,
+            _playlist_storage_singleton,
+        )
 
         _content_storage_singleton.cache_clear()
+        _playlist_storage_singleton.cache_clear()
 
 
 def _upload_payload(**overrides) -> dict:
@@ -235,3 +246,53 @@ def test_list_content_returns_mixed_variants(client: TestClient):
     assert len(items) == 2
     types = {item["type"] for item in items}
     assert types == {"text_slide", "image"}
+
+
+# --- Playlist auto-update on content lifecycle ---
+
+
+def test_uploading_text_slide_appends_to_playlist(
+    client: TestClient, playlist_storage: PlaylistStorage
+):
+    response = client.post("/api/content/text-slides", json=_upload_payload())
+    item_id = UUID(response.json()["id"])
+    assert playlist_storage.load().item_ids == [item_id]
+
+
+def test_uploading_image_appends_to_playlist(client: TestClient, playlist_storage: PlaylistStorage):
+    response = client.post("/api/content/images", json=_image_payload())
+    item_id = UUID(response.json()["id"])
+    assert playlist_storage.load().item_ids == [item_id]
+
+
+def test_uploads_append_in_order(client: TestClient, playlist_storage: PlaylistStorage):
+    a = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="A")).json()["id"])
+    b = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="B")).json()["id"])
+    c = UUID(client.post("/api/content/images", json=_image_payload(name="C")).json()["id"])
+    assert playlist_storage.load().item_ids == [a, b, c]
+
+
+def test_deleting_content_removes_from_playlist(
+    client: TestClient, playlist_storage: PlaylistStorage
+):
+    a = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="A")).json()["id"])
+    b = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="B")).json()["id"])
+    assert playlist_storage.load().item_ids == [a, b]
+
+    client.delete(f"/api/content/{a}")
+    assert playlist_storage.load().item_ids == [b]
+
+
+def test_list_content_returns_items_in_playlist_order(
+    client: TestClient, playlist_storage: PlaylistStorage
+):
+    """GET /api/content reflects playlist order, not id-sort."""
+    a = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="A")).json()["id"])
+    b = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="B")).json()["id"])
+    c = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="C")).json()["id"])
+
+    # Reverse the playlist order.
+    client.put("/api/playlist", json={"item_ids": [str(c), str(b), str(a)]})
+
+    response = client.get("/api/content").json()
+    assert [item["name"] for item in response] == ["C", "B", "A"]
