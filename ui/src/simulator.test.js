@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+    SETTINGS_BROADCAST_CHANNEL,
     applyWindowSizingForMode,
     drawForSkin,
     drawHub75,
     drawPlain,
     drawWs281x,
     pickSkin,
+    resolveSimulatorState,
 } from "./simulator.js";
 
 // jsdom doesn't implement <canvas>.getContext, but drawPlain creates
@@ -188,5 +190,56 @@ describe("drawForSkin dispatch", () => {
         const src = makeImageData([[10, 20, 30]], 1, 1);
         drawForSkin("plain", ctx, 50, 50, src, 1, 1);
         expect(calls[0][2]).toBe("#000"); // plain backdrop
+    });
+});
+
+// --- resolveSimulatorState: maps settings payload → draw-state ---
+
+describe("resolveSimulatorState", () => {
+    it("derives skin + dims from the settings fetch", async () => {
+        const fetchSettings = vi.fn().mockResolvedValue({
+            output_mode: "hub75",
+            display_width: 128,
+            display_height: 96,
+            display_rotation: 0,
+        });
+        const s = await resolveSimulatorState(fetchSettings);
+        expect(s).toEqual({
+            skin: "hub75",
+            signW: 128,
+            signH: 96,
+            outputMode: "hub75",
+        });
+    });
+
+    it("swaps dims for portrait rotations", async () => {
+        const fetchSettings = vi.fn().mockResolvedValue({
+            output_mode: "hdmi",
+            display_width: 1920,
+            display_height: 1080,
+            display_rotation: 90,
+        });
+        const s = await resolveSimulatorState(fetchSettings);
+        expect(s.signW).toBe(1080);
+        expect(s.signH).toBe(1920);
+    });
+
+    it("falls back to sane defaults when the settings fetch throws", async () => {
+        const fetchSettings = vi.fn().mockRejectedValue(new Error("boom"));
+        const s = await resolveSimulatorState(fetchSettings);
+        expect(s.skin).toBe("plain");
+        expect(s.outputMode).toBe("hdmi");
+        expect(s.signW).toBe(128);
+        expect(s.signH).toBe(96);
+    });
+});
+
+// --- broadcast channel constant ---
+
+describe("SETTINGS_BROADCAST_CHANNEL", () => {
+    it("is the same same-origin channel name both windows agree on", () => {
+        // Imported in main.js + simulator.js; test pins it so a rename
+        // on one side can't silently desync them.
+        expect(SETTINGS_BROADCAST_CHANNEL).toBe("openmarquee-settings");
     });
 });

@@ -4,6 +4,12 @@
 // it into the canvas using the skin that matches the configured
 // output_mode.
 //
+// Reacts to live settings changes from the opener window via a
+// same-origin BroadcastChannel("openmarquee-settings"): when the
+// operator saves new settings in the main UI, the simulator
+// re-applies the skin + window sizing + mode label without needing
+// a reload.
+//
 // The simulator is opened via window.open() from the main UI, so it
 // runs as its own top-level page with no admin chrome. That keeps it
 // usable on a second monitor ("walk around with your phone editing
@@ -16,6 +22,10 @@ import { getSettings } from "./api.js";
 // feel live, slow enough that the browser isn't hammering the
 // backend. Matches the /dev/preview page's historical cadence.
 const FRAME_POLL_MS = 250;
+
+// Same-origin channel the opener posts to on settings-save. Shared
+// constant so main.js imports the exact same name.
+export const SETTINGS_BROADCAST_CHANNEL = "openmarquee-settings";
 
 const PANEL_OUTPUT_MODES = new Set(["hub75", "ws281x", "composite"]);
 
@@ -31,17 +41,17 @@ function pickSkin(outputMode) {
     return "plain"; // hdmi, composite, and any unknown mode.
 }
 
-async function boot() {
-    const canvas = document.querySelector(".simulator-canvas");
-    const placeholder = document.querySelector(".simulator-placeholder");
-    const modeLabel = document.querySelector('[data-field="mode"]');
-
-    // 1) Pick up the configured output_mode + dims.
+/**
+ * Fetch + normalize settings into the shape the draw loop uses.
+ * Returns the skin, sign dims (rotation-adjusted), and output_mode
+ * label. Exported so applySettingsToState can be unit-tested against
+ * a fake fetchSettings without booting the whole simulator.
+ */
+export async function resolveSimulatorState(fetchSettings = getSettings) {
     let settings;
     try {
-        settings = await getSettings();
+        settings = await fetchSettings();
     } catch (err) {
-        modeLabel.textContent = "settings unreachable";
         console.error("[simulator] /api/settings failed:", err);
         settings = {
             output_mode: "hdmi",
@@ -50,26 +60,70 @@ async function boot() {
             display_rotation: 0,
         };
     }
-
     const sourceWidth = Number(settings.display_width) || 128;
     const sourceHeight = Number(settings.display_height) || 96;
     const rotation = Number(settings.display_rotation) || 0;
-    // When the sign is rotated 90° / 270° physically, the logical
-    // content is portrait — swap the canvas dims so the simulator's
-    // window aspect ratio matches what the installed sign would show.
+    // 90° / 270° rotate the preview into portrait — swap dims so the
+    // simulator window's aspect matches what the installed sign shows.
     const [signW, signH] =
         rotation === 90 || rotation === 270
             ? [sourceHeight, sourceWidth]
             : [sourceWidth, sourceHeight];
-    const skin = pickSkin(settings.output_mode || "hdmi");
-    modeLabel.textContent = settings.output_mode || "hdmi";
+    return {
+        skin: pickSkin(settings.output_mode || "hdmi"),
+        signW,
+        signH,
+        outputMode: settings.output_mode || "hdmi",
+    };
+}
 
-    // 2) Size the window + canvas so the sign aspect ratio is preserved.
-    applyWindowSizingForMode(skin, signW, signH);
-    sizeCanvasToWindow(canvas, signW, signH);
-    window.addEventListener("resize", () => sizeCanvasToWindow(canvas, signW, signH));
+async function boot() {
+    const canvas = document.querySelector(".simulator-canvas");
+    const placeholder = document.querySelector(".simulator-placeholder");
+    const modeLabel = document.querySelector('[data-field="mode"]');
 
-    // 3) Start the frame poll loop.
+    // Mutable — updated by apply() on boot AND on every broadcast
+    // settings-change message. The draw loop + resize listener read
+    // through to these fields each tick.
+    const state = {
+        skin: "plain",
+        signW: 128,
+        signH: 96,
+    };
+
+    async function apply() {
+        const resolved = await resolveSimulatorState();
+        state.skin = resolved.skin;
+        state.signW = resolved.signW;
+        state.signH = resolved.signH;
+        modeLabel.textContent = resolved.outputMode;
+        applyWindowSizingForMode(state.skin, state.signW, state.signH);
+        sizeCanvasToWindow(canvas, state.signW, state.signH);
+    }
+
+    await apply();
+    window.addEventListener("resize", () =>
+        sizeCanvasToWindow(canvas, state.signW, state.signH),
+    );
+
+    // Wire the BroadcastChannel listener so live settings-changes
+    // from the opener window flow through without a reload. Guarded
+    // against older browsers that don't expose BroadcastChannel —
+    // the simulator still works, just non-reactively.
+    if (typeof BroadcastChannel !== "undefined") {
+        const bc = new BroadcastChannel(SETTINGS_BROADCAST_CHANNEL);
+        bc.addEventListener("message", (ev) => {
+            if (ev && ev.data && ev.data.type === "settings-updated") {
+                // Fire-and-forget — the next frame draws with the new
+                // skin. No need to await here.
+                apply().catch((err) =>
+                    console.error("[simulator] failed to re-apply settings:", err),
+                );
+            }
+        });
+    }
+
+    // Start the frame poll loop.
     const ctx = canvas.getContext("2d");
     const img = new Image();
     let lastSuccessAt = 0;
@@ -77,8 +131,7 @@ async function boot() {
     // Dedicated offscreen canvas for pixel sampling (hub75 + ws281x
     // skins need source-pixel access). Reused across frames but
     // resized if the MockRenderer's PNG dims differ from what
-    // settings advertise (which they frequently do — the dev-mode
-    // MockRenderer is pinned to 128×96 regardless of settings).
+    // settings advertise.
     const sampler = document.createElement("canvas");
     const samplerCtx = sampler.getContext("2d", { willReadFrequently: true });
 
@@ -86,13 +139,13 @@ async function boot() {
         // Use the PNG's actual natural dims for sampling — settings'
         // display_width/height drive the WINDOW aspect ratio, but the
         // content source is whatever the backend renderer wrote.
-        const realW = img.naturalWidth || signW;
-        const realH = img.naturalHeight || signH;
+        const realW = img.naturalWidth || state.signW;
+        const realH = img.naturalHeight || state.signH;
         if (sampler.width !== realW) sampler.width = realW;
         if (sampler.height !== realH) sampler.height = realH;
         samplerCtx.drawImage(img, 0, 0);
         const srcData = samplerCtx.getImageData(0, 0, realW, realH);
-        drawForSkin(skin, ctx, canvas.width, canvas.height, srcData, realW, realH);
+        drawForSkin(state.skin, ctx, canvas.width, canvas.height, srcData, realW, realH);
         lastSuccessAt = Date.now();
         placeholder.classList.add("hidden");
         inFlight = false;

@@ -41,6 +41,7 @@ import { mountPlaybackControls } from "./playback.js";
 import { mountPlaylistTrack } from "./playlist-track.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
+import { SETTINGS_BROADCAST_CHANNEL } from "./simulator.js";
 import { mountVideoUploader } from "./video-upload.js";
 
 // Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
@@ -222,9 +223,17 @@ async function boot() {
     // display config. resolvePanelDims re-reads /api/settings — the
     // event's detail would let us skip that fetch, but re-reading
     // keeps the dim-derivation logic (rotation swap, fallback) in one
-    // place.
+    // place. Broadcasting to the simulator pop-out (if open) lets it
+    // re-apply skin + window sizing in lockstep.
+    const settingsBroadcast =
+        typeof BroadcastChannel !== "undefined"
+            ? new BroadcastChannel(SETTINGS_BROADCAST_CHANNEL)
+            : null;
     document.addEventListener("openmarquee:settings-updated", async () => {
         mountDimensionedPanels(await resolvePanelDims());
+        if (settingsBroadcast) {
+            settingsBroadcast.postMessage({ type: "settings-updated" });
+        }
     });
 
     const nav = mountNav({
