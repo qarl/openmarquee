@@ -85,6 +85,10 @@ function boot() {
     mountSchedule(root.querySelector(".schedule-slot"), {
         fetchSchedule: getSchedule,
         onSave: saveSchedule,
+        fetchPlaylistNames: async () => {
+            const collection = await listPlaylists();
+            return Object.keys(collection.playlists || {}).sort();
+        },
     });
 }
 

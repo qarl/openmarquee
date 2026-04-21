@@ -43,9 +43,13 @@ const SECTION_TEMPLATE = `
  * @param {object} options
  * @param {() => Promise<object>} options.fetchSchedule
  * @param {(schedule: object) => Promise<void>} options.onSave
+ * @param {() => Promise<string[]>} [options.fetchPlaylistNames] — optional;
+ *     when provided, playlist_name fields become <select>s populated from
+ *     this list (plus any existing values that aren't in the list, so
+ *     round-tripping never silently drops a name).
  * @returns {{ refresh: () => Promise<void> }}
  */
-export function mountSchedule(container, { fetchSchedule, onSave }) {
+export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistNames }) {
     container.innerHTML = SECTION_TEMPLATE;
     const defaultEl = container.querySelector(".field-default-playlist");
     const rulesEl = container.querySelector(".schedule-rules");
@@ -53,30 +57,62 @@ export function mountSchedule(container, { fetchSchedule, onSave }) {
     const saveBtn = container.querySelector(".schedule-save");
     const statusEl = container.querySelector(".schedule-status");
 
+    let availableNames = null; // null = no dropdown; array = use <select>
+
     async function refresh() {
         statusEl.textContent = "";
         try {
-            const schedule = await fetchSchedule();
-            defaultEl.value = schedule.default_playlist_name || "default";
+            const [schedule, names] = await Promise.all([
+                fetchSchedule(),
+                fetchPlaylistNames ? fetchPlaylistNames() : Promise.resolve(null),
+            ]);
+            availableNames = names;
+            if (availableNames && defaultEl.tagName !== "SELECT") {
+                replaceDefaultWithSelect(defaultEl.parentElement, schedule.default_playlist_name);
+            }
+            setDefaultValue(container, schedule.default_playlist_name || "default");
             rulesEl.innerHTML = "";
             for (const rule of schedule.rules || []) {
-                rulesEl.appendChild(renderRule(rule));
+                rulesEl.appendChild(renderRule(rule, availableNames));
             }
         } catch (err) {
             statusEl.textContent = `Could not load schedule: ${err.message}`;
         }
     }
 
+    function replaceDefaultWithSelect(labelEl, currentValue) {
+        // Swap the <input class="field-default-playlist"> for a <select>.
+        labelEl.querySelector(".field-default-playlist")?.remove();
+        const select = document.createElement("select");
+        select.className = "field-default-playlist";
+        fillPlaylistOptions(select, availableNames, currentValue);
+        labelEl.appendChild(select);
+    }
+
+    function setDefaultValue(root, value) {
+        const el = root.querySelector(".field-default-playlist");
+        if (!el) return;
+        if (el.tagName === "SELECT") {
+            ensureOption(el, value);
+            el.value = value;
+        } else {
+            el.value = value;
+        }
+    }
+
     addBtn.addEventListener("click", () => {
         rulesEl.appendChild(
-            renderRule({
-                name: "New rule",
-                days: ["mon", "tue", "wed", "thu", "fri"],
-                start_time: "08:00",
-                end_time: "17:00",
-                playlist_name: "default",
-                enabled: true,
-            }),
+            renderRule(
+                {
+                    name: "New rule",
+                    days: ["mon", "tue", "wed", "thu", "fri"],
+                    start_time: "08:00",
+                    end_time: "17:00",
+                    playlist_name: availableNames?.[0] || "default",
+                    enabled: true,
+                },
+                availableNames,
+            ),
         );
     });
 
@@ -98,9 +134,14 @@ export function mountSchedule(container, { fetchSchedule, onSave }) {
     return { refresh };
 }
 
-function renderRule(rule) {
+function renderRule(rule, availableNames) {
     const li = document.createElement("li");
     li.className = "schedule-rule";
+    const playlistValue = rule.playlist_name || "default";
+    const playlistControl = availableNames
+        ? `<select class="rule-playlist"></select>`
+        : `<input type="text" class="rule-playlist" value="${escapeHtml(playlistValue)}"
+                  maxlength="64" pattern="[a-z0-9_-]+">`;
     li.innerHTML = `
         <div class="schedule-rule-row">
             <label class="field schedule-rule-name">
@@ -138,13 +179,42 @@ function renderRule(rule) {
             </label>
             <label class="field">
                 <span>Playlist</span>
-                <input type="text" class="rule-playlist" value="${escapeHtml(rule.playlist_name || "default")}"
-                       maxlength="64" pattern="[a-z0-9_-]+">
+                ${playlistControl}
             </label>
         </div>
     `;
+    if (availableNames) {
+        const select = li.querySelector(".rule-playlist");
+        fillPlaylistOptions(select, availableNames, playlistValue);
+    }
     li.querySelector(".rule-remove").addEventListener("click", () => li.remove());
     return li;
+}
+
+function fillPlaylistOptions(selectEl, names, currentValue) {
+    selectEl.innerHTML = "";
+    const seen = new Set();
+    for (const name of names) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        selectEl.appendChild(opt);
+    }
+    ensureOption(selectEl, currentValue);
+    selectEl.value = currentValue;
+}
+
+function ensureOption(selectEl, value) {
+    if (!value) return;
+    const exists = Array.from(selectEl.options).some((opt) => opt.value === value);
+    if (!exists) {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = `${value} (missing)`;
+        selectEl.appendChild(opt);
+    }
 }
 
 function collectSchedule(defaultEl, rulesEl) {

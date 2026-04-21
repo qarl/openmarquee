@@ -164,6 +164,92 @@ describe("mountSchedule", () => {
         );
     });
 
+    it("when fetchPlaylistNames is provided, playlist fields are <select>s populated from the list", async () => {
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [
+                    {
+                        name: "Lunch",
+                        days: ["mon"],
+                        start_time: "11:00",
+                        end_time: "14:00",
+                        playlist_name: "lunch",
+                        enabled: true,
+                    },
+                ],
+                default_playlist_name: "default",
+            }),
+            onSave: vi.fn(),
+            fetchPlaylistNames: async () => ["default", "lunch", "weekend"],
+        });
+        await tick();
+
+        const ruleSelect = container.querySelector(".rule-playlist");
+        expect(ruleSelect.tagName).toBe("SELECT");
+        const values = Array.from(ruleSelect.options).map((o) => o.value);
+        expect(values).toEqual(["default", "lunch", "weekend"]);
+        expect(ruleSelect.value).toBe("lunch");
+
+        const defaultSelect = container.querySelector(".field-default-playlist");
+        expect(defaultSelect.tagName).toBe("SELECT");
+        expect(defaultSelect.value).toBe("default");
+    });
+
+    it("preserves an unknown playlist_name by adding a '(missing)' option", async () => {
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [
+                    {
+                        name: "Stale",
+                        days: ["mon"],
+                        start_time: "11:00",
+                        end_time: "14:00",
+                        playlist_name: "deleted_playlist",
+                        enabled: true,
+                    },
+                ],
+                default_playlist_name: "default",
+            }),
+            onSave: vi.fn(),
+            fetchPlaylistNames: async () => ["default", "lunch"],
+        });
+        await tick();
+
+        const select = container.querySelector(".rule-playlist");
+        const missing = Array.from(select.options).find(
+            (o) => o.value === "deleted_playlist",
+        );
+        expect(missing).toBeDefined();
+        expect(missing.textContent).toMatch(/missing/);
+        expect(select.value).toBe("deleted_playlist"); // round-trip preserved
+    });
+
+    it("when fetchPlaylistNames is omitted, playlist fields stay as text inputs (back-compat)", async () => {
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [
+                    {
+                        name: "x",
+                        days: ["mon"],
+                        start_time: "11:00",
+                        end_time: "14:00",
+                        playlist_name: "whatever",
+                        enabled: true,
+                    },
+                ],
+                default_playlist_name: "default",
+            }),
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        const el = container.querySelector(".rule-playlist");
+        expect(el.tagName).toBe("INPUT");
+    });
+
     it("escapes html in pre-existing rule names so injected markup can't render", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {
