@@ -60,6 +60,10 @@ const EDITOR_TEMPLATE = `
                 </label>
             </div>
             <button type="submit" class="primary field-save">Save slide</button>
+            <p class="field-hint">
+                <kbd>⌘</kbd> or <kbd>Ctrl</kbd> + <kbd>Enter</kbd> to save.
+                <kbd>Esc</kbd> to clear.
+            </p>
             <p class="editor-status" role="status" aria-live="polite"></p>
         </form>
     </div>
@@ -118,6 +122,24 @@ export function mountEditor(container, { width, height, onSave }) {
     for (const el of [textEl, textColorEl, bgColorEl, nameEl]) {
         el.addEventListener("input", syncAndRender);
     }
+
+    // Keyboard shortcuts: Cmd/Ctrl+Enter to save from anywhere in the form.
+    form.addEventListener("keydown", (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+            event.preventDefault();
+            if (!saveBtn.disabled) form.requestSubmit();
+        }
+    });
+
+    // Escape in the text area clears it (but keeps the styling + name so the
+    // user can iterate quickly on the same slide settings).
+    textEl.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+            event.preventDefault();
+            textEl.value = "";
+            syncAndRender();
+        }
+    });
 
     container.querySelectorAll(".preset").forEach((btn) => {
         btn.addEventListener("click", () => {

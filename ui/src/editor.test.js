@@ -212,4 +212,66 @@ describe("mountEditor — submit flow", () => {
         // Re-render happened.
         expect(fakeCtx.fillRect.mock.calls.length).toBeGreaterThan(renderCallsBefore);
     });
+
+    it("sends the user's duration in milliseconds", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+
+        mountEditor(container, { width: 128, height: 96, onSave });
+        container.querySelector(".field-text").value = "Hi";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        container.querySelector(".field-duration").value = "12";
+
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(onSave.mock.calls[0][0].duration_ms).toBe(12_000);
+    });
+
+    it("Cmd+Enter submits the form when text is non-empty", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+
+        mountEditor(container, { width: 128, height: 96, onSave });
+        const textEl = container.querySelector(".field-text");
+        textEl.value = "Hi";
+        textEl.dispatchEvent(new Event("input"));
+
+        container.querySelector(".controls").dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }),
+        );
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(onSave).toHaveBeenCalledOnce();
+    });
+
+    it("Cmd+Enter does nothing when save is disabled (empty text)", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn();
+
+        mountEditor(container, { width: 128, height: 96, onSave });
+        container.querySelector(".controls").dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }),
+        );
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(onSave).not.toHaveBeenCalled();
+    });
+
+    it("Escape in the text field clears the text", () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
+
+        const textEl = container.querySelector(".field-text");
+        textEl.value = "Hello";
+        textEl.dispatchEvent(new Event("input"));
+        textEl.focus();
+
+        textEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        expect(textEl.value).toBe("");
+    });
 });
