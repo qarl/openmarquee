@@ -131,6 +131,78 @@ main {
     .nav-link.active { border-left: none; border-bottom: 2px solid var(--accent); padding-left: 0.75rem; padding-bottom: calc(0.5rem - 2px); }
 }
 
+/* --- composer --- */
+
+.composer {
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--panel-border);
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.composer-canvas {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    cursor: grab;
+}
+.composer-canvas:active { cursor: grabbing; }
+
+.composer-controls { display: flex; flex-direction: column; gap: 0.75rem; }
+
+.composer-bg, .composer-layers {
+    border: 1px solid var(--panel-border);
+    border-radius: 0.4rem;
+    padding: 0.6rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.composer-bg legend, .composer-layers legend {
+    font-size: 0.8rem;
+    color: var(--muted);
+    padding: 0 0.35rem;
+}
+
+.layers-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+}
+
+.layer-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.35rem;
+    padding: 0.5rem 0.6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.layer-header { display: flex; align-items: center; gap: 0.5rem; }
+.layer-label { flex: 1; font-size: 0.85rem; color: var(--muted); font-weight: 600; }
+.layer-remove { border: none; background: none; font-size: 1.1rem; line-height: 1; padding: 0 0.4rem; cursor: pointer; }
+
+.layer-style-row { align-items: center; }
+.layer-style-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.85rem;
+    color: var(--muted);
+}
+
+.layers-add { align-self: flex-start; }
+
 /* --- settings view --- */
 
 .settings-view {

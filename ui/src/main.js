@@ -26,6 +26,7 @@ import {
     startPlayback,
     stopPlayback,
 } from "./api.js";
+import { mountComposer } from "./composer.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
 import { mountList } from "./list.js";
@@ -45,6 +46,7 @@ function boot() {
     root.innerHTML = `
         <section data-section="slides" class="panel">
             <div class="editor-slot"></div>
+            <div class="composer-slot"></div>
             <div class="image-upload-slot"></div>
             <div class="playback-slot"></div>
             <div class="list-slot"></div>
@@ -88,6 +90,15 @@ function boot() {
     mountImageUploader(root.querySelector(".image-upload-slot"), {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
+        onSave: onSaveWithRefresh(saveImage),
+    });
+
+    mountComposer(root.querySelector(".composer-slot"), {
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
+        fetchItems: listContent,
+        // Composite slides ride the ImageSlide API — a flat PNG is all the
+        // server needs. The layer structure lives only in the browser tab.
         onSave: onSaveWithRefresh(saveImage),
     });
 
