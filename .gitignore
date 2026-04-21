@@ -15,8 +15,13 @@ venv/
 .ruff_cache/
 .mypy_cache/
 
+# Jimmy local artifacts (defensive — code repo shouldn't carry these)
+.Jimmy/
+AGENTS.md
+
 # Node / web
-node_modules/
+# (no trailing slash — matches the dir AND the symlink-to-external-deps form)
+node_modules
 dist/
 build/
 .cache/

@@ -7,4 +7,10 @@ This is where the heavy lifting happens:
 - Text slides rendered directly in the browser to a canvas at the sign's native resolution.
 - Playlist management: drag-and-drop reorder, per-item duration, transitions, loop, schedules.
 
-Talks to the backend via a small REST API. Bundler and framework are TBD; goal is something small, vanilla-ish, and easy to serve from the Pi.
+Talks to the backend via a small REST API. Bundler is **esbuild**, test runner is **vitest**. No framework.
+
+## Local dev
+
+On a normal filesystem: `npm install`, then `npm test` or `npm run dev`.
+
+If your project tree lives on an rclone mount that doesn't preserve POSIX exec bits (qarl's setup), run `bash ../scripts/setup.sh` instead — it installs Node deps to `~/tmp/openmarquee-deps/ui/` and symlinks `node_modules` back into this directory. Re-run after any change to `package.json`.

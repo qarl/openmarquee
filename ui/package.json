@@ -1,0 +1,17 @@
+{
+  "name": "openmarquee-ui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OpenMarquee browser UI",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "dev": "esbuild src/main.js --bundle --outdir=dist --servedir=. --watch",
+    "build": "esbuild src/main.js --bundle --minify --outdir=dist",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "vitest": "^1.6.0"
+  }
+}

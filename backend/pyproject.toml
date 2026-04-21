@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openmarquee"
+version = "0.0.0"
+description = "Self-contained, phone-controlled, no-subscription digital signage platform"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.11"
+authors = [
+    { name = "OpenMarquee contributors" },
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openmarquee*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+markers = [
+    "hardware: requires real Pi hardware to run (skipped by default)",
+]
+addopts = "-m 'not hardware'"
