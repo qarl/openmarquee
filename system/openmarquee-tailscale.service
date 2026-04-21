@@ -1,0 +1,15 @@
+[Unit]
+Description=openMarquee Tailscale bring-up (reads settings.json)
+Documentation=https://github.com/qarl/openmarquee
+# Needs internet; tailscaled also needs its own service running.
+After=network-online.target tailscaled.service openmarquee-backend.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment="OPENMARQUEE_SETTINGS_PATH=/var/openmarquee/settings.json"
+ExecStart=/opt/openmarquee/system/openmarquee-tailscale.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -2,10 +2,13 @@
 Description=openMarquee backend (FastAPI + playback loop)
 Documentation=https://github.com/qarl/openmarquee
 
-# Wait until the network stack is up. hostapd.service brings up the WiFi AP;
-# dnsmasq.service runs DHCP/DNS on it. Both should be settled before we
-# bind to port 80.
-After=network-online.target hostapd.service dnsmasq.service
+# Wait until the network stack is up. openmarquee-ap0.service creates
+# the virtual `ap0` interface; hostapd.service hosts the AP on it;
+# dnsmasq.service runs DHCP/DNS on it. All three should be settled
+# before we bind to port 80 (uvicorn listens on 0.0.0.0 so it catches
+# both ap0 and any station-mode wlan0 association — that's the remote-
+# management surface Tailscale later reaches).
+After=network-online.target openmarquee-ap0.service hostapd.service dnsmasq.service
 Wants=network-online.target
 
 [Service]

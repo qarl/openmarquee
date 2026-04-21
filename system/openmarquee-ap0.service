@@ -1,0 +1,21 @@
+[Unit]
+Description=openMarquee AP virtual interface (ap0) setup
+Documentation=https://github.com/qarl/openmarquee
+# Run before hostapd — hostapd.conf binds to ap0, which this script creates.
+Before=hostapd.service
+# Wait for the physical radio to exist; otherwise the `iw dev wlan0 …`
+# add fails on a just-booted board. `sys-subsystem-net-devices-wlan0.device`
+# is synthesized from udev; it fires when wlan0 is up at link level.
+After=sys-subsystem-net-devices-wlan0.device
+Wants=sys-subsystem-net-devices-wlan0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/openmarquee/system/openmarquee-ap0-setup.sh
+# Clean teardown: remove the ap0 interface on shutdown so the radio is
+# released back to a clean state.
+ExecStop=-/usr/sbin/iw dev ap0 del
+
+[Install]
+WantedBy=multi-user.target
