@@ -5,9 +5,12 @@
 // attribute; panels themselves stay mounted so their state survives
 // navigation.
 //
-// Panel dimensions are hardcoded to SYSTEM_SPEC defaults (128×96) for now;
-// a follow-up reads them from /api/settings once the editor can react to
-// changes on the fly.
+// Panel dimensions come from /api/settings at boot so every preview canvas
+// matches the device's configured display aspect ratio (128×96 is just
+// the SYSTEM_SPEC default; operators with a 1920×1080 HDMI target see a
+// 16:9 preview). Changes made in the Settings form take effect on the
+// next page load — re-mounting the whole app on settings save is a
+// future refinement.
 
 import {
     deletePlaylistByName,
@@ -40,12 +43,31 @@ import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountVideoUploader } from "./video-upload.js";
 
-const PANEL_WIDTH = 128;
-const PANEL_HEIGHT = 96;
+// Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
+// §3.4 defaults so the editor at least renders something usable in an
+// offline / broken-API scenario.
+const FALLBACK_WIDTH = 128;
+const FALLBACK_HEIGHT = 96;
 
 const SECTIONS = ["slides", "playlists", "schedule", "settings"];
 
-function boot() {
+async function resolvePanelDims() {
+    try {
+        const settings = await getSettings();
+        const w = Number(settings.display_width);
+        const h = Number(settings.display_height);
+        if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
+            return { width: w, height: h };
+        }
+    } catch {
+        // Fall through to fallback — editor still mounts even if the
+        // settings endpoint is briefly unavailable on boot.
+    }
+    return { width: FALLBACK_WIDTH, height: FALLBACK_HEIGHT };
+}
+
+async function boot() {
+    const { width: PANEL_WIDTH, height: PANEL_HEIGHT } = await resolvePanelDims();
     const root = document.getElementById("app");
     root.innerHTML = `
         <section data-section="slides" class="panel">

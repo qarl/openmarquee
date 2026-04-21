@@ -72,6 +72,20 @@ describe("pickFontSize", () => {
     });
 });
 
+describe("drawCanvas — explicit fontSize override", () => {
+    it("honors the caller's fontSize over the panel-height heuristic", () => {
+        const canvas = mockCanvas(128, 96);
+        drawCanvas(canvas, { text: "X", fontSize: 17 });
+        expect(canvas._ctx.font).toContain("17px");
+    });
+
+    it("falls back to the heuristic when fontSize is not a positive number", () => {
+        const canvas = mockCanvas(128, 96);
+        drawCanvas(canvas, { text: "X", fontSize: 0 });
+        expect(canvas._ctx.font).toContain(`${pickFontSize(96)}px`);
+    });
+});
+
 describe("drawCanvas — context isolation", () => {
     it("wraps in save/restore so leaked state doesn't escape", () => {
         const canvas = mockCanvas(64, 32);
@@ -148,6 +162,26 @@ describe("mountEditor — submit flow", () => {
         expect(payload.background_color).toBe("#000000");
         expect(payload.duration_ms).toBe(5000); // default 5s
         expect(payload.png_base64).toBe("STUBDATA");
+        // Font-size defaults come from pickFontSize(panelHeight) at 128×96
+        // = floor(0.4 * 96) = 38.
+        expect(payload.font_size_px).toBe(38);
+    });
+
+    it("sends the operator's font-size override when they edit it", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+
+        mountEditor(container, { width: 128, height: 96, onSave });
+        container.querySelector(".field-text").value = "BIG";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        const sizeEl = container.querySelector(".field-font-size");
+        sizeEl.value = "64";
+        sizeEl.dispatchEvent(new Event("input"));
+
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(onSave.mock.calls[0][0].font_size_px).toBe(64);
     });
 
     it("sends the user's duration in milliseconds", async () => {

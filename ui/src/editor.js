@@ -58,6 +58,10 @@ const EDITOR_TEMPLATE = `
                     <span>Duration (s)</span>
                     <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
                 </label>
+                <label class="field field-duration-wrap">
+                    <span>Font size (px)</span>
+                    <input type="number" class="field-font-size" min="4" max="2048" step="1">
+                </label>
             </div>
             <div class="row">
                 <label class="field">
@@ -107,17 +111,23 @@ export function mountEditor(container, { width, height, onSave }) {
     const bgColorEl = container.querySelector(".field-bg-color");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
+    const fontSizeEl = container.querySelector(".field-font-size");
     const transitionEl = container.querySelector(".field-transition");
     const transitionMsEl = container.querySelector(".field-transition-ms");
     const form = container.querySelector(".controls");
     const statusEl = container.querySelector(".editor-status");
     const saveBtn = container.querySelector(".field-save");
 
+    // Seed font-size from the existing heuristic so a first-time user
+    // sees reasonable output without adjusting anything; they can override.
+    fontSizeEl.value = String(pickFontSize(height));
+
     const state = {
         name: nameEl.value,
         text: "",
         textColor: textColorEl.value,
         backgroundColor: bgColorEl.value,
+        fontSize: Number(fontSizeEl.value),
     };
 
     function updateSaveEnabled() {
@@ -130,11 +140,15 @@ export function mountEditor(container, { width, height, onSave }) {
         state.text = textEl.value;
         state.textColor = textColorEl.value;
         state.backgroundColor = bgColorEl.value;
+        const parsedSize = Number(fontSizeEl.value);
+        if (Number.isFinite(parsedSize) && parsedSize > 0) {
+            state.fontSize = parsedSize;
+        }
         drawCanvas(canvas, state);
         updateSaveEnabled();
     }
 
-    for (const el of [textEl, textColorEl, bgColorEl, nameEl]) {
+    for (const el of [textEl, textColorEl, bgColorEl, nameEl, fontSizeEl]) {
         el.addEventListener("input", syncAndRender);
     }
 
@@ -187,6 +201,7 @@ export function mountEditor(container, { width, height, onSave }) {
                 text: state.text,
                 text_color: state.textColor.toUpperCase(),
                 background_color: state.backgroundColor.toUpperCase(),
+                font_size_px: Math.round(state.fontSize),
                 duration_ms: Math.round(durationSeconds * 1000),
                 transition: transitionEl.value,
                 transition_ms: Number.isFinite(transitionMs) ? transitionMs : 500,
@@ -215,7 +230,12 @@ export function mountEditor(container, { width, height, onSave }) {
  */
 export function drawCanvas(canvas, state) {
     const ctx = canvas.getContext("2d");
-    const { text = "", textColor = "#FFFFFF", backgroundColor = "#000000" } = state;
+    const {
+        text = "",
+        textColor = "#FFFFFF",
+        backgroundColor = "#000000",
+        fontSize,
+    } = state;
 
     ctx.save();
     try {
@@ -224,7 +244,13 @@ export function drawCanvas(canvas, state) {
 
         if (!text) return;
 
-        const fontSizePx = pickFontSize(canvas.height);
+        // Operator-chosen font size when present; fall back to the old
+        // ~40% heuristic so render-only callers (list thumbnails) keep
+        // working without threading a size through.
+        const fontSizePx =
+            Number.isFinite(fontSize) && fontSize > 0
+                ? fontSize
+                : pickFontSize(canvas.height);
         ctx.fillStyle = textColor;
         ctx.font = `bold ${fontSizePx}px sans-serif`;
         ctx.textAlign = "center";
