@@ -5,6 +5,9 @@
 # runs the specs in ui/e2e/, then tears down the backend.
 #
 # First run: bash scripts/e2e.sh install   (downloads Chromium)
+#
+# Watching the tests run: set PW_SLOWMO=<ms> to pace every Playwright action.
+# Example: PW_SLOWMO=200 bash scripts/e2e.sh  (slow enough to follow by eye)
 set -euo pipefail
 
 cd "$(dirname "$0")/../ui"

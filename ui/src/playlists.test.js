@@ -57,7 +57,7 @@ describe("mountPlaylistsManager", () => {
         );
     });
 
-    it("renders a checkbox per content item, pre-checked for items already in the playlist", async () => {
+    it("renders each member as a draggable <li> with a × remove button", async () => {
         const container = document.createElement("div");
         mountPlaylistsManager(container, {
             fetchItems: async () => ITEMS,
@@ -73,15 +73,39 @@ describe("mountPlaylistsManager", () => {
         await tick();
 
         const card = container.querySelector('.playlist-card[data-name="lunch"]');
-        const checkboxes = card.querySelectorAll("input[type='checkbox']");
-        expect(checkboxes).toHaveLength(3);
-        const checkedIds = Array.from(checkboxes)
-            .filter((cb) => cb.checked)
-            .map((cb) => cb.value);
-        expect(checkedIds).toEqual(["aaa", "ccc"]);
+        const items = card.querySelectorAll(".playlist-item");
+        expect(items).toHaveLength(2);
+        expect(items[0].dataset.id).toBe("aaa");
+        expect(items[1].dataset.id).toBe("ccc");
+        expect(items[0].querySelector(".playlist-item-remove")).not.toBeNull();
     });
 
-    it("Save sends the currently-checked ids via onSave(name, ids)", async () => {
+    it("Add dropdown lists only items NOT already in the playlist", async () => {
+        const container = document.createElement("div");
+        mountPlaylistsManager(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                playlists: {
+                    default: { item_ids: [] },
+                    lunch: { item_ids: ["aaa"] },
+                },
+            }),
+            onSave: vi.fn(),
+            onDelete: vi.fn(),
+        });
+        await tick();
+
+        const card = container.querySelector('.playlist-card[data-name="lunch"]');
+        const options = Array.from(
+            card.querySelectorAll(".playlist-add-select option"),
+        )
+            .map((o) => o.value)
+            .filter(Boolean);
+        // aaa is already in; bbb and ccc should be the only candidates.
+        expect(options).toEqual(["bbb", "ccc"]);
+    });
+
+    it("selecting from Add dropdown saves the playlist with the item appended", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
         mountPlaylistsManager(container, {
@@ -89,7 +113,7 @@ describe("mountPlaylistsManager", () => {
             fetchPlaylists: async () => ({
                 playlists: {
                     default: { item_ids: [] },
-                    lunch: { item_ids: [] },
+                    lunch: { item_ids: ["aaa"] },
                 },
             }),
             onSave,
@@ -98,31 +122,119 @@ describe("mountPlaylistsManager", () => {
         await tick();
 
         const card = container.querySelector('.playlist-card[data-name="lunch"]');
-        // Check the first and third items.
-        const checkboxes = card.querySelectorAll("input[type='checkbox']");
-        checkboxes[0].checked = true;
-        checkboxes[2].checked = true;
-        card.querySelector(".playlist-save").click();
+        const select = card.querySelector(".playlist-add-select");
+        select.value = "ccc";
+        select.dispatchEvent(new Event("change"));
         await tick();
 
         expect(onSave).toHaveBeenCalledWith("lunch", ["aaa", "ccc"]);
     });
 
+    it("disables the Add dropdown when every item is already in the playlist", async () => {
+        const container = document.createElement("div");
+        mountPlaylistsManager(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                playlists: {
+                    default: { item_ids: [] },
+                    everything: { item_ids: ["aaa", "bbb", "ccc"] },
+                },
+            }),
+            onSave: vi.fn(),
+            onDelete: vi.fn(),
+        });
+        await tick();
+
+        const select = container.querySelector(
+            '.playlist-card[data-name="everything"] .playlist-add-select',
+        );
+        expect(select.disabled).toBe(true);
+    });
+
+    it("× button label names the item and the playlist for screen-readers", async () => {
+        const container = document.createElement("div");
+        mountPlaylistsManager(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                playlists: {
+                    default: { item_ids: [] },
+                    lunch: { item_ids: ["aaa"] },
+                },
+            }),
+            onSave: vi.fn(),
+            onDelete: vi.fn(),
+        });
+        await tick();
+
+        const btn = container.querySelector(
+            '.playlist-card[data-name="lunch"] .playlist-item[data-id="aaa"] .playlist-item-remove',
+        );
+        expect(btn.getAttribute("aria-label")).toBe("Remove Open from lunch");
+    });
+
+    it("clicking × on a member saves the playlist with that item removed", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountPlaylistsManager(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                playlists: {
+                    default: { item_ids: [] },
+                    lunch: { item_ids: ["aaa", "bbb", "ccc"] },
+                },
+            }),
+            onSave,
+            onDelete: vi.fn(),
+        });
+        await tick();
+
+        const card = container.querySelector('.playlist-card[data-name="lunch"]');
+        const bbbRemove = card
+            .querySelector('.playlist-item[data-id="bbb"] .playlist-item-remove');
+        bbbRemove.click();
+        await tick();
+
+        expect(onSave).toHaveBeenCalledWith("lunch", ["aaa", "ccc"]);
+    });
+
+    it("renders an empty <ul> for playlists with no items (so SortableJS has a drop target)", async () => {
+        const container = document.createElement("div");
+        mountPlaylistsManager(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                playlists: {
+                    default: { item_ids: [] },
+                    weekend: { item_ids: [] },
+                },
+            }),
+            onSave: vi.fn(),
+            onDelete: vi.fn(),
+        });
+        await tick();
+
+        const card = container.querySelector('.playlist-card[data-name="weekend"]');
+        const ul = card.querySelector(".playlist-items");
+        expect(ul).not.toBeNull();
+        expect(ul.querySelectorAll(".playlist-item")).toHaveLength(0);
+        // CSS :empty::before uses the attribute, so it must round-trip.
+        expect(ul.getAttribute("data-empty-hint")).toMatch(/drag/i);
+    });
+
     it("Delete calls onDelete(name) after confirm and refreshes the list", async () => {
         const container = document.createElement("div");
         const onDelete = vi.fn().mockResolvedValue(undefined);
-        const playlists = {
-            default: { item_ids: [] },
-            lunch: { item_ids: [] },
-        };
         let callCount = 0;
         mountPlaylistsManager(container, {
             fetchItems: async () => ITEMS,
             fetchPlaylists: async () => {
                 callCount++;
-                // After delete, the second call sees lunch removed.
                 if (callCount >= 2) return { playlists: { default: { item_ids: [] } } };
-                return { playlists };
+                return {
+                    playlists: {
+                        default: { item_ids: [] },
+                        lunch: { item_ids: [] },
+                    },
+                };
             },
             onSave: vi.fn(),
             onDelete,
@@ -188,7 +300,7 @@ describe("mountPlaylistsManager", () => {
             fetchPlaylists: async () => ({
                 playlists: {
                     default: { item_ids: [] },
-                    '<script>alert(1)</script>': { item_ids: [] },
+                    '<script>alert(1)</script>': { item_ids: ["x"] },
                 },
             }),
             onSave: vi.fn(),
@@ -199,5 +311,25 @@ describe("mountPlaylistsManager", () => {
         // No nested scripts / imgs — payloads rendered as text.
         expect(container.querySelector(".playlist-card script")).toBeNull();
         expect(container.querySelector(".playlist-item img")).toBeNull();
+    });
+
+    it("renames a label to '(missing)' when a playlist references a deleted item id", async () => {
+        const container = document.createElement("div");
+        mountPlaylistsManager(container, {
+            fetchItems: async () => ITEMS, // no "zzz" item exists
+            fetchPlaylists: async () => ({
+                playlists: {
+                    default: { item_ids: [] },
+                    lunch: { item_ids: ["zzz"] },
+                },
+            }),
+            onSave: vi.fn(),
+            onDelete: vi.fn(),
+        });
+        await tick();
+
+        const card = container.querySelector('.playlist-card[data-name="lunch"]');
+        const label = card.querySelector('.playlist-item[data-id="zzz"] .playlist-item-label');
+        expect(label.textContent).toBe("(missing)");
     });
 });

@@ -439,32 +439,97 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 
 .playlist-items {
     list-style: none;
-    padding: 0;
+    padding: 0.25rem;
     margin: 0;
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 0.25rem 0.75rem;
-    max-height: 10rem;
-    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-height: 2.75rem;
+    border: 1px dashed var(--panel-border);
+    border-radius: 0.35rem;
+    background: rgba(0, 0, 0, 0.05);
 }
 
-.playlist-item label {
+/* Empty-state hint surfaced via CSS so SortableJS never sees it as a
+   draggable child. The attribute is set on the <ul> in the template. */
+.playlist-items:empty::before {
+    content: attr(data-empty-hint);
+    color: var(--muted);
+    font-size: 0.8rem;
+    font-style: italic;
+    padding: 0.35rem 0.5rem;
+    display: block;
+}
+
+.playlist-item {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: 0.5rem;
     font-size: 0.85rem;
-    cursor: pointer;
-    padding: 0.15rem 0;
+    padding: 0.3rem 0.5rem;
+    background: var(--bg, #fff);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.3rem;
+    cursor: grab;
 }
 
-.playlist-item label span {
+.playlist-item:active { cursor: grabbing; }
+
+.playlist-item-handle {
+    color: var(--muted);
+    font-size: 0.75rem;
+    letter-spacing: -0.1em;
+}
+
+.playlist-item-label {
+    flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.playlist-save {
-    align-self: flex-start;
+.playlist-item-remove {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 1rem;
+    line-height: 1;
+    padding: 0 0.35rem;
+    /* Override .playlist-item's grab cursor so the × reads as clickable, not
+       draggable. */
+    cursor: pointer;
+}
+
+.playlist-item-remove:hover { color: var(--danger, #c33); }
+
+.playlist-item-ghost {
+    opacity: 0.4;
+    background: var(--accent, #def);
+}
+
+.playlist-add {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.playlist-add label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+}
+
+.playlist-add-label {
+    /* Visually redundant with the default <option> text; keep for a11y. */
+    position: absolute;
+    left: -9999px;
+}
+
+.playlist-add-select {
+    font-size: 0.85rem;
+    padding: 0.2rem 0.35rem;
 }
 
 .playlists-create {

@@ -33,6 +33,9 @@ export default defineConfig({
     use: {
         baseURL: "http://localhost:8765",
         trace: "on-first-retry",
+        launchOptions: {
+            slowMo: Number(process.env.PW_SLOWMO || 0),
+        },
     },
     webServer: {
         command: `${uvicornCmd} openmarquee.app:app --port 8765 --host 127.0.0.1`,

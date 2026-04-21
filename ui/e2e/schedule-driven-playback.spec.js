@@ -3,7 +3,7 @@
 //
 // This exercises every integration point introduced over Phase 5:
 //   (a) content upload + default-playlist auto-append
-//   (b) named playlist create + item membership via checkboxes
+//   (b) named playlist create + item membership via the Add-item dropdown
 //   (c) schedule rule editor (playlist dropdown populated from real data)
 //   (d) playback engine reads the schedule + plays from the active playlist
 //   (e) UI "Now playing: <playlist>" badge polling
@@ -37,12 +37,16 @@ test("schedule-driven playback: items → lunch playlist → always-on rule → 
     const lunchCard = page.locator('.playlist-card[data-name="lunch"]');
     await expect(lunchCard).toBeVisible();
 
-    // 3. Check both items into lunch, save.
-    const boxes = lunchCard.locator('input[type="checkbox"]');
-    await expect(boxes).toHaveCount(2);
-    await boxes.nth(0).check();
-    await boxes.nth(1).check();
-    await lunchCard.locator(".playlist-save").click();
+    // 3. Add both items into lunch via the Add-item dropdown. Each selection
+    //    auto-saves + refreshes, so after two picks the select is empty and
+    //    both items appear as draggable members.
+    const select = lunchCard.locator(".playlist-add-select");
+
+    // Pick whatever option is first after the placeholder, twice.
+    await select.selectOption({ index: 1 });
+    await expect(lunchCard.locator(".playlist-item")).toHaveCount(1);
+    await select.selectOption({ index: 1 });
+    await expect(lunchCard.locator(".playlist-item")).toHaveCount(2);
 
     // 4. Verify backend persisted the lunch playlist.
     await expect
