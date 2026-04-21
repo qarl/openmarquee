@@ -72,6 +72,7 @@ def test_state_returns_not_running_initially(client: TestClient):
     assert response.json() == {
         "is_running": False,
         "current_item_id": None,
+        "current_item_type": None,
         "current_playlist_name": None,
     }
 
@@ -114,7 +115,7 @@ def test_stop_when_not_running_is_idempotent(client: TestClient):
 
 def test_state_reports_current_item_id_while_playing(client: TestClient, storage: ContentStorage):
     """With a real item in storage, start the loop and poll state — the
-    backend should surface the currently-rendering slide's id."""
+    backend should surface the currently-rendering slide's id + type."""
     slide = TextSlide(name="x", text="x", duration_ms=1000)
     storage.save_text_slide(slide, _png_bytes(8, 8, (255, 0, 0)))
 
@@ -122,13 +123,15 @@ def test_state_reports_current_item_id_while_playing(client: TestClient, storage
 
     # Poll for up to 2s while the portal's event loop schedules the task.
     deadline = time.time() + 2.0
-    current_id = None
+    state = {}
     while time.time() < deadline:
         state = client.get("/api/playback/state").json()
-        current_id = state["current_item_id"]
-        if current_id is not None:
+        if state.get("current_item_id") is not None:
             break
         time.sleep(0.05)
 
-    assert current_id == str(slide.id)
+    assert state["current_item_id"] == str(slide.id)
+    # The live-preview UI picks <video> vs <img> off this field, so it
+    # must track the item type exactly — "text_slide" here.
+    assert state["current_item_type"] == "text_slide"
     client.post("/api/playback/stop")

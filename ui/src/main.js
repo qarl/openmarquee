@@ -34,6 +34,7 @@ import {
 } from "./api.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
+import { mountLivePreview } from "./live-preview.js";
 import { mountNav } from "./nav.js";
 import { mountPlaybackControls } from "./playback.js";
 import { mountPlaylistTrack } from "./playlist-track.js";
@@ -127,6 +128,16 @@ async function boot() {
                 onStop: stopPlayback,
             },
             mountPlaybackControls,
+            livePreview: {
+                width: PANEL_WIDTH,
+                height: PANEL_HEIGHT,
+                mount: (slot, { width, height }) =>
+                    mountLivePreview(slot, {
+                        width,
+                        height,
+                        fetchState: getPlaybackState,
+                    }),
+            },
         },
     );
 

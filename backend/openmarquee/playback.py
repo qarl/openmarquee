@@ -71,6 +71,10 @@ class PlaybackLoop:
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         self._current_id: UUID | None = None
+        # Exposed alongside _current_id so the UI's live preview knows
+        # whether to render a <video> or a <img> without a second round
+        # trip to /api/content/{id}.
+        self._current_type: str | None = None
         # Set by fetch_items if it carries playlist context (the
         # scheduled_fetch_items closure stamps this each fetch).
         self._current_playlist_name: str | None = None
@@ -82,6 +86,10 @@ class PlaybackLoop:
     @property
     def current_item_id(self) -> UUID | None:
         return self._current_id
+
+    @property
+    def current_item_type(self) -> str | None:
+        return self._current_type
 
     async def start(self) -> None:
         """Start the loop. No-op if already running."""
@@ -107,6 +115,7 @@ class PlaybackLoop:
         finally:
             self._stop_event = None
             self._current_id = None
+            self._current_type = None
             self._current_playlist_name = None
 
     async def _loop(self) -> None:
@@ -120,6 +129,7 @@ class PlaybackLoop:
 
             if not items:
                 self._current_id = None
+                self._current_type = None
                 await self._wait(self._empty_poll)
                 continue
 
@@ -130,6 +140,7 @@ class PlaybackLoop:
                 if self._stop_event.is_set():
                     break
                 self._current_id = item.id
+                self._current_type = item.type
 
                 current_image = self._safe_load_image(item)
                 if current_image is None:

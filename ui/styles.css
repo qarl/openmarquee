@@ -178,6 +178,53 @@ main {
     opacity: 0.85;
 }
 
+/* --- live preview stage ---
+   Mirrors the sign aspect ratio via the inline aspect-ratio set by
+   mountLivePreview. Constrains width so a 16:9 HDMI preview doesn't
+   eat the whole playlists panel. */
+.live-preview {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    align-items: flex-start;
+}
+
+.live-preview-stage {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    max-width: 32rem;
+    background: #000;
+    border-radius: 0.4rem;
+    overflow: hidden;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.live-preview-media {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+    /* Pixel-accurate preview for 128×96 etc. — no smoothing lies about
+       what the panels will actually render. */
+    image-rendering: pixelated;
+}
+
+.live-preview-idle {
+    padding: 1rem;
+    font-size: 0.85rem;
+    color: var(--muted);
+    text-align: center;
+}
+
+.live-preview-caption {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--muted);
+    min-height: 1em;
+}
+
 .playlist-track-scroll {
     overflow-x: auto;
     padding: 0.5rem;

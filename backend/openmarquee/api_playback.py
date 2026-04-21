@@ -2,7 +2,8 @@
 
 POST /api/playback/start — kick off the loop (no-op if already running)
 POST /api/playback/stop  — stop and wait for the loop to exit
-GET  /api/playback/state — { is_running, current_item_id }
+GET  /api/playback/state — { is_running, current_item_id, current_item_type,
+                            current_playlist_name }
 
 The loop drives the device's renderer (MockRenderer in dev, HUB75/HDMI/etc.
 on the device once those land). This obsoletes the manual /dev/play/{id}
@@ -26,6 +27,10 @@ LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
 class PlaybackState(BaseModel):
     is_running: bool
     current_item_id: UUID | None
+    # "text_slide" | "image" | "video" | None — drives the live-preview
+    # UI's choice of <video> vs <img>. Follows the ContentItem type
+    # discriminator so adding a new content type auto-surfaces here.
+    current_item_type: str | None
     current_playlist_name: str | None
 
 
@@ -34,6 +39,7 @@ async def get_state(loop: LoopDep) -> PlaybackState:
     return PlaybackState(
         is_running=loop.is_running,
         current_item_id=loop.current_item_id,
+        current_item_type=loop.current_item_type,
         current_playlist_name=loop.current_playlist_name,
     )
 

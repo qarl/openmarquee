@@ -20,6 +20,7 @@ const TEMPLATE = `
             <h2 class="playlist-track-heading">Default playlist</h2>
             <div class="playlist-track-playback"></div>
         </div>
+        <div class="playlist-track-live-preview"></div>
         <p class="playlist-track-hint">
             Drag blocks to reorder; drag from the pallet below to add;
             × to remove. Duration shown under each block.
@@ -51,6 +52,9 @@ const TEMPLATE = `
  * @param {(container, options) => any} [options.mountPlaybackControls]
  *     — injected playback-controls mount (avoids a direct import so the
  *     module stays leaf-y in the dependency graph for tests).
+ * @param {object} [options.livePreview] — optional hooks: { width, height,
+ *     mount } — calls `mount(slot, { width, height })` under the header
+ *     when present. Injected the same way as playback controls.
  * @returns {{ refresh: () => Promise<void> }}
  */
 export function mountPlaylistTrack(container, options) {
@@ -60,6 +64,7 @@ export function mountPlaylistTrack(container, options) {
         onReorder,
         playback,
         mountPlaybackControls,
+        livePreview,
     } = options;
 
     container.innerHTML = TEMPLATE;
@@ -67,9 +72,17 @@ export function mountPlaylistTrack(container, options) {
     const palletEl = container.querySelector(".playlist-pallet");
     const statusEl = container.querySelector(".playlist-track-status");
     const playbackSlot = container.querySelector(".playlist-track-playback");
+    const livePreviewSlot = container.querySelector(".playlist-track-live-preview");
 
     if (playback && mountPlaybackControls) {
         mountPlaybackControls(playbackSlot, playback);
+    }
+
+    if (livePreview && livePreview.mount) {
+        livePreview.mount(livePreviewSlot, {
+            width: livePreview.width,
+            height: livePreview.height,
+        });
     }
 
     let trackSortable = null;

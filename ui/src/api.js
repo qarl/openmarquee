@@ -151,7 +151,12 @@ export async function playContent(id) {
     }
 }
 
-/** Get the current playback state: { is_running, current_item_id }. */
+/**
+ * Get the current playback state:
+ *   { is_running, current_item_id, current_item_type, current_playlist_name }.
+ * current_item_type is the ContentItem discriminator — "text_slide", "image",
+ * or "video" — so the live-preview UI knows which element to render.
+ */
 export async function getPlaybackState() {
     const response = await fetch("/api/playback/state");
     if (!response.ok) {
