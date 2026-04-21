@@ -5,6 +5,10 @@
 const TEMPLATE = `
     <section class="playback">
         <button type="button" class="playback-btn primary">Play all</button>
+        <button type="button" class="playback-simulator"
+                title="Open a pop-out window that simulates the configured device (HDMI / HUB75 / WS2812B / composite)">
+            Open simulator ↗
+        </button>
         <p class="playback-now-playing" role="status" aria-live="polite"></p>
         <p class="playback-status" role="status" aria-live="polite"></p>
     </section>
@@ -23,8 +27,24 @@ const TEMPLATE = `
 export function mountPlaybackControls(container, { fetchState, onStart, onStop }) {
     container.innerHTML = TEMPLATE;
     const btn = container.querySelector(".playback-btn");
+    const simulatorBtn = container.querySelector(".playback-simulator");
     const statusEl = container.querySelector(".playback-status");
     const nowPlayingEl = container.querySelector(".playback-now-playing");
+
+    simulatorBtn.addEventListener("click", () => {
+        // Named window so repeated clicks focus the existing simulator
+        // instead of stacking popups. Features are a hint — browsers
+        // may ignore them when the call isn't in direct response to a
+        // user gesture, but a click IS a gesture so we usually get the
+        // right size. The simulator's own boot code re-calls
+        // window.resizeTo once it knows the configured aspect ratio.
+        const popup = window.open(
+            "/simulator.html",
+            "openMarquee-simulator",
+            "popup=yes,width=960,height=720",
+        );
+        if (popup) popup.focus();
+    });
 
     let isRunning = false;
     let currentPlaylistName = null;

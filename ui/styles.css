@@ -839,6 +839,22 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     min-width: 7rem;
 }
 
+.playback-simulator {
+    background: var(--field-bg, #0b0b0d);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.85rem;
+    padding: 0.4rem 0.75rem;
+    border-radius: 0.35rem;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+.playback-simulator:hover {
+    border-color: var(--accent);
+    background: #111115;
+}
+
 .playback-status {
     margin: 0;
     color: var(--muted);
