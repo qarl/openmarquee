@@ -22,6 +22,7 @@ describe("mountList", () => {
             fetchItems: async () => items,
             onPlay: vi.fn(),
             onDelete: vi.fn(),
+            onReorder: vi.fn(),
         });
         await waitForTick();
 
@@ -38,6 +39,7 @@ describe("mountList", () => {
             fetchItems: async () => [],
             onPlay: vi.fn(),
             onDelete: vi.fn(),
+            onReorder: vi.fn(),
         });
         await waitForTick();
 
@@ -53,6 +55,7 @@ describe("mountList", () => {
             },
             onPlay: vi.fn(),
             onDelete: vi.fn(),
+            onReorder: vi.fn(),
         });
         await waitForTick();
 
@@ -67,6 +70,7 @@ describe("mountList", () => {
             fetchItems: async () => [{ id: "abc", name: "x", text: "x" }],
             onPlay,
             onDelete: vi.fn(),
+            onReorder: vi.fn(),
         });
         await waitForTick();
 
@@ -91,6 +95,7 @@ describe("mountList", () => {
             fetchItems: async () => [...items],
             onPlay: vi.fn(),
             onDelete,
+            onReorder: vi.fn(),
         });
         await waitForTick();
 
@@ -114,6 +119,7 @@ describe("mountList", () => {
             fetchItems,
             onPlay: vi.fn(),
             onDelete: vi.fn(),
+            onReorder: vi.fn(),
         });
         await waitForTick();
         expect(fetchItems).toHaveBeenCalledTimes(1);

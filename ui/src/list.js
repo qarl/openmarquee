@@ -1,10 +1,15 @@
-// Saved-slides list: thumbnails + per-item Play and Delete. Reads from the
-// /api/content endpoint on mount and on demand via the returned `refresh`
-// function so the editor can ping us after a save.
+// Saved-slides list: thumbnails + per-item Play and Delete + drag-to-reorder.
+// Reads from the /api/content endpoint on mount and on demand via the returned
+// `refresh` function so the editor can ping us after a save. When the user
+// reorders via drag, we extract the new order from the DOM and PUT it to
+// /api/playlist.
+
+import Sortable from "sortablejs";
 
 const LIST_TEMPLATE = `
     <section class="list">
         <h2 class="list-heading">Saved slides</h2>
+        <p class="list-hint">Drag to reorder. Order drives playback.</p>
         <ul class="slides" role="list"></ul>
         <p class="list-status" role="status" aria-live="polite"></p>
     </section>
@@ -20,15 +25,23 @@ const EMPTY_COPY = "No slides yet. Type something above and hit Save.";
  * @param {() => Promise<Array>} options.fetchItems — returns the list.
  * @param {(id: string) => Promise<void>} options.onPlay — invoked when Play is clicked.
  * @param {(id: string) => Promise<void>} options.onDelete — invoked when Delete is clicked.
+ * @param {(itemIds: string[]) => Promise<void>} options.onReorder — invoked with
+ *     the new id order after a drag that actually changed position. Tests that
+ *     don't care can pass `vi.fn()` / `() => Promise.resolve()`.
  * @returns {{ refresh: () => Promise<void> }} — caller can trigger a reload.
  */
-export function mountList(container, { fetchItems, onPlay, onDelete }) {
+export function mountList(container, { fetchItems, onPlay, onDelete, onReorder }) {
     container.innerHTML = LIST_TEMPLATE;
     const listEl = container.querySelector(".slides");
     const statusEl = container.querySelector(".list-status");
+    let sortable = null;
+    // Message to surface after the next refresh completes — lets us show an
+    // error that would otherwise be clobbered by the auto-refresh.
+    let pendingStatus = "";
 
     async function refresh() {
-        statusEl.textContent = "";
+        statusEl.textContent = pendingStatus;
+        pendingStatus = "";
         try {
             const items = await fetchItems();
             renderItems(listEl, items, {
@@ -39,8 +52,15 @@ export function mountList(container, { fetchItems, onPlay, onDelete }) {
                 },
             });
             if (items.length === 0) {
-                statusEl.textContent = EMPTY_COPY;
+                // Don't overwrite a pending error (refresh-on-error case).
+                if (!statusEl.textContent) statusEl.textContent = EMPTY_COPY;
             }
+
+            // Rebind drag-reorder on every render; the <ul> contents just got
+            // replaced wholesale. Destroy the previous binding first so we
+            // don't leak handlers.
+            if (sortable) sortable.destroy();
+            sortable = items.length > 1 ? bindSortable(listEl, onReorder, statusEl, refresh) : null;
         } catch (err) {
             statusEl.textContent = `Could not load slides: ${err.message}`;
         }
@@ -48,6 +68,45 @@ export function mountList(container, { fetchItems, onPlay, onDelete }) {
 
     refresh();
     return { refresh };
+}
+
+function bindSortable(listEl, onReorder, statusEl, refresh) {
+    return Sortable.create(listEl, {
+        animation: 150,
+        // Whole row is draggable, but buttons + interactive controls opt out
+        // via `filter` so taps on Play/Delete don't start a drag.
+        filter: "button, input, textarea",
+        preventOnFilter: false,
+        ghostClass: "slide-drag-ghost",
+        onEnd: async (evt) => {
+            // No-op drops (drag and return to same slot) shouldn't PUT.
+            if (evt.oldIndex === evt.newIndex) return;
+            const ids = Array.from(listEl.querySelectorAll(".slide")).map(
+                (li) => li.dataset.id,
+            );
+            try {
+                await onReorder(ids);
+            } catch (err) {
+                // Stash the message so the refresh() below doesn't clobber it.
+                const msg = `Reorder failed: ${err.message}`;
+                await (async () => {
+                    // Arrow IIFE just to keep this readable — refresh() resets
+                    // statusEl from pendingStatus, which we set here first.
+                })();
+                // eslint-disable-next-line no-param-reassign
+                statusEl.textContent = msg;
+                // Revert to server truth, but preserve the error:
+                await refreshPreservingStatus(refresh, statusEl);
+            }
+        },
+    });
+}
+
+async function refreshPreservingStatus(refresh, statusEl) {
+    const saved = statusEl.textContent;
+    await refresh();
+    // refresh() emptied the status; restore the error if there was one.
+    if (saved) statusEl.textContent = saved;
 }
 
 function wrap(fn, statusEl, label) {

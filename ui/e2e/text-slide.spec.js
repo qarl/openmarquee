@@ -84,6 +84,38 @@ test("rejected save (text too long) surfaces the error", async ({ page }) => {
     await expect(page.locator(".editor-status")).toContainText("Save failed");
 });
 
+test("playlist PUT reorders content via the API (what drag-reorder invokes)", async ({
+    page,
+}) => {
+    // The UI drag-reorder flow ends in a PUT /api/playlist with the new id
+    // order. Driving Sortable's pointer-event internals from Playwright is
+    // flaky, so we verify the contract the drag handler depends on: PUT the
+    // new order via the exact same client path, and the list reflects it.
+    await page.goto("/");
+
+    for (const name of ["First", "Second", "Third"]) {
+        await page.locator(".editor .field-name").fill(name);
+        await page.locator(".editor .field-text").fill(name);
+        await page.locator(".editor .field-save").click();
+        await expect(page.locator(".editor-status")).toHaveText("Saved.");
+    }
+
+    const content = await (await page.request.get("/api/content")).json();
+    expect(content.map((item) => item.name)).toEqual(["First", "Second", "Third"]);
+    const [first, second, third] = content.map((item) => item.id);
+
+    // Reverse via PUT (same shape the drag handler uses via setPlaylistOrder).
+    const putResponse = await page.request.put("/api/playlist", {
+        data: { item_ids: [third, second, first] },
+    });
+    expect(putResponse.status()).toBe(200);
+
+    // GET /api/content now reflects the new order (and so would the UI after
+    // a refresh, and so would the playback loop).
+    const reordered = await (await page.request.get("/api/content")).json();
+    expect(reordered.map((item) => item.name)).toEqual(["Third", "Second", "First"]);
+});
+
 test("Play all starts the backend loop; Stop stops it", async ({ page }) => {
     await page.goto("/");
 

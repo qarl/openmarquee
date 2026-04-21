@@ -96,3 +96,17 @@ export async function stopPlayback() {
         throw new Error(`Stop failed (${response.status})`);
     }
 }
+
+/** Replace the entire playlist order with the given list of ids. */
+export async function setPlaylistOrder(itemIds) {
+    const response = await fetch("/api/playlist", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item_ids: itemIds }),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Reorder failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}

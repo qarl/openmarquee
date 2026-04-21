@@ -14,6 +14,7 @@ import {
     playContent,
     saveImage,
     saveTextSlide,
+    setPlaylistOrder,
     startPlayback,
     stopPlayback,
 } from "./api.js";
@@ -38,6 +39,7 @@ function boot() {
         fetchItems: listContent,
         onPlay: playContent,
         onDelete: deleteContent,
+        onReorder: setPlaylistOrder,
     });
 
     mountPlaybackControls(root.querySelector(".playback-slot"), {

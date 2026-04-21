@@ -7,6 +7,7 @@ import {
     playContent,
     saveImage,
     saveTextSlide,
+    setPlaylistOrder,
     startPlayback,
     stopPlayback,
 } from "./api.js";
@@ -131,6 +132,26 @@ describe("saveImage", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad" });
         await expect(saveImage({})).rejects.toThrow("422");
+    });
+});
+
+describe("setPlaylistOrder", () => {
+    it("PUTs item_ids to /api/playlist", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ item_ids: ["b", "a"] }),
+        });
+        const result = await setPlaylistOrder(["b", "a"]);
+        expect(result).toEqual({ item_ids: ["b", "a"] });
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/playlist");
+        expect(init.method).toBe("PUT");
+        expect(JSON.parse(init.body)).toEqual({ item_ids: ["b", "a"] });
+    });
+
+    it("throws on non-ok response", async () => {
+        mockFetch({ ok: false, status: 422, text: async () => "bad" });
+        await expect(setPlaylistOrder(["not-a-uuid"])).rejects.toThrow("422");
     });
 });
 
