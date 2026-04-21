@@ -4,6 +4,8 @@
 // build the schedule they want and it survives across restarts, ready for
 // the day playback actually honors it.
 
+import { listTimezones } from "./iana-timezones.js";
+
 const DAYS = [
     { value: "mon", label: "Mon" },
     { value: "tue", label: "Tue" },
@@ -30,7 +32,9 @@ const SECTION_TEMPLATE = `
             </label>
             <label class="field">
                 <span>Timezone (IANA, optional — reserved for future zoned eval)</span>
-                <input type="text" class="field-tz" maxlength="64" placeholder="e.g. America/Los_Angeles">
+                <select class="field-tz">
+                    <option value="">Device local (no explicit timezone)</option>
+                </select>
             </label>
         </div>
 
@@ -73,6 +77,8 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
 
     let availableNames = null; // null = no dropdown; array = use <select>
 
+    populateTzSelect(tzEl);
+
     async function refresh() {
         statusEl.textContent = "";
         try {
@@ -85,7 +91,7 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
                 replaceDefaultWithSelect(defaultEl.parentElement, schedule.default_playlist_name);
             }
             setDefaultValue(container, schedule.default_playlist_name || "default");
-            tzEl.value = schedule.tz || "";
+            setTzValue(tzEl, schedule.tz || "");
             rulesEl.innerHTML = "";
             for (const rule of schedule.rules || []) {
                 rulesEl.appendChild(renderRule(rule, availableNames));
@@ -235,6 +241,36 @@ function renderRule(rule, availableNames) {
     }
     li.querySelector(".rule-remove").addEventListener("click", () => li.remove());
     return li;
+}
+
+function populateTzSelect(selectEl) {
+    // Keep the leading "Device local" option already in the template, then
+    // append the IANA zones. An out-of-list stored value is patched in by
+    // setTzValue at load time so round-tripping never drops the user's choice.
+    for (const zone of listTimezones()) {
+        const opt = document.createElement("option");
+        opt.value = zone;
+        opt.textContent = zone;
+        selectEl.appendChild(opt);
+    }
+}
+
+function setTzValue(selectEl, value) {
+    if (!value) {
+        selectEl.value = "";
+        return;
+    }
+    const known = Array.from(selectEl.options).some((opt) => opt.value === value);
+    if (!known) {
+        // Preserve the stored name so we don't silently drop it on save. Mark
+        // it so the operator sees that the stored value isn't one the browser
+        // currently knows about.
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = `${value} (stored)`;
+        selectEl.appendChild(opt);
+    }
+    selectEl.value = value;
 }
 
 function fillPlaylistOptions(selectEl, names, currentValue) {

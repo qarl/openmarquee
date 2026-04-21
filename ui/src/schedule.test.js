@@ -170,6 +170,51 @@ describe("mountSchedule", () => {
         expect(onSave.mock.calls[0][0].tz).toBeNull();
     });
 
+    it("tz field is a <select> populated from the IANA zone list", async () => {
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        const tz = container.querySelector(".field-tz");
+        expect(tz.tagName).toBe("SELECT");
+        // Leading "Device local" option + many IANA zones.
+        const values = Array.from(tz.options).map((o) => o.value);
+        expect(values[0]).toBe(""); // Device local sentinel
+        expect(values).toContain("UTC");
+        expect(values).toContain("America/Los_Angeles");
+    });
+
+    it("tz dropdown preserves an out-of-list stored value with a '(stored)' suffix", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [],
+                default_playlist_name: "default",
+                // Intentionally malformed: not in Intl.supportedValuesOf.
+                tz: "Mars/Olympus_Mons",
+            }),
+            onSave,
+        });
+        await tick();
+
+        const tz = container.querySelector(".field-tz");
+        expect(tz.value).toBe("Mars/Olympus_Mons");
+        const marsOpt = Array.from(tz.options).find(
+            (o) => o.value === "Mars/Olympus_Mons",
+        );
+        expect(marsOpt).toBeTruthy();
+        expect(marsOpt.textContent).toMatch(/stored/);
+
+        // Round-trip preserves the stored value rather than silently dropping.
+        container.querySelector(".schedule-save").click();
+        await tick();
+        expect(onSave.mock.calls[0][0].tz).toBe("Mars/Olympus_Mons");
+    });
+
     it("Save error message surfaces in the status", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {
