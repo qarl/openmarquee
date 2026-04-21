@@ -379,6 +379,31 @@ main {
 }
 .pallet-tile:active { cursor: grabbing; }
 
+/* Mode-locked tiles: video stored for a different output_mode than the
+   device's current mode — renders a warning badge + dims the thumbnail
+   so it's obvious at a glance why this tile won't play. */
+.pallet-tile--locked .pallet-tile-thumb,
+.track-block--locked .track-block-thumb {
+    opacity: 0.45;
+    filter: grayscale(0.4);
+}
+
+.pallet-tile-lock,
+.track-block-lock {
+    position: absolute;
+    top: 0.3rem;
+    left: 0.4rem;
+    font-size: 0.85rem;
+    background: rgba(255, 180, 40, 0.95);
+    color: #1a0f00;
+    border-radius: 999px;
+    padding: 0 0.35rem;
+    line-height: 1.3rem;
+    font-weight: 700;
+    pointer-events: auto;
+    cursor: help;
+}
+
 .pallet-tile-thumb {
     width: 100%;
     aspect-ratio: 4 / 3;

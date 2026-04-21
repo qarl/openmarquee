@@ -46,7 +46,7 @@ describe("mountVideoUploader", () => {
         expect(container.querySelector(".field-pipeline")).toBeNull();
     });
 
-    it("shows the panel-mode fallback banner only when outputMode is a panel driver", async () => {
+    it("shows the correct mode-lock hint for outputMode (panel vs HDMI)", async () => {
         const hdmi = document.createElement("div");
         mountVideoUploader(hdmi, {
             width: 128,
@@ -56,6 +56,7 @@ describe("mountVideoUploader", () => {
         });
         await tick();
         expect(hdmi.querySelector(".video-upload-panel-hint").hidden).toBe(true);
+        expect(hdmi.querySelector(".video-upload-hdmi-hint").hidden).toBe(false);
 
         const hub75 = document.createElement("div");
         mountVideoUploader(hub75, {
@@ -66,6 +67,7 @@ describe("mountVideoUploader", () => {
         });
         await tick();
         expect(hub75.querySelector(".video-upload-panel-hint").hidden).toBe(false);
+        expect(hub75.querySelector(".video-upload-hdmi-hint").hidden).toBe(true);
     });
 
     it("loadForEdit pre-fills + allows metadata-only save (no new file)", async () => {

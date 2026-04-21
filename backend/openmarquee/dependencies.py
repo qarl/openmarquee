@@ -165,11 +165,13 @@ def _playback_loop_singleton() -> PlaybackLoop:
     from datetime import datetime
 
     from openmarquee.playback import scheduled_fetch_items
+    from openmarquee.settings import pipeline_for_output_mode
 
     storage = _content_storage_singleton()
     renderer = _mock_renderer_singleton()
     playlist_storage = _playlist_storage_singleton()
     schedule_storage = _schedule_storage_singleton()
+    settings_storage = _settings_storage_singleton()
 
     # Closure deferred so we can pass `loop` into the fetch fn for the
     # current-playlist-name stamp.
@@ -184,10 +186,17 @@ def _playback_loop_singleton() -> PlaybackLoop:
             loop=loop_holder.get("loop"),
         )
 
+    def expected_pipeline() -> str | None:
+        # Loaded on every iteration so a live-on-device settings change
+        # (operator switches hdmi → hub75 in the UI) takes effect on the
+        # very next slide — no loop restart needed.
+        return pipeline_for_output_mode(settings_storage.load().output_mode)
+
     loop = PlaybackLoop(
         renderer=renderer,
         fetch_items=fetch,
         read_asset=storage.read_asset,
+        get_expected_video_pipeline=expected_pipeline,
     )
     loop_holder["loop"] = loop
     return loop

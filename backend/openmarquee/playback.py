@@ -63,11 +63,19 @@ class PlaybackLoop:
         fetch_items: Callable[[], list[ContentItem]],
         read_asset: Callable[[UUID], bytes],
         empty_playlist_poll_seconds: float = 1.0,
+        get_expected_video_pipeline: Callable[[], str | None] | None = None,
     ):
         self._renderer = renderer
         self._fetch_items = fetch_items
         self._read_asset = read_asset
         self._empty_poll = empty_playlist_poll_seconds
+        # Returns the pipeline that this device's output_mode expects
+        # for VideoSlides ("h264_mp4" or "raw_frames"). A mismatched
+        # slide gets skipped inside _loop with a clear log line — the
+        # thumbnail still renders in the UI pallet so the operator sees
+        # it's there, but it won't play. Returning None means "don't
+        # check" (used in tests + any non-device environment).
+        self._get_expected_pipeline = get_expected_video_pipeline or (lambda: None)
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         self._current_id: UUID | None = None
@@ -169,6 +177,25 @@ class PlaybackLoop:
             for i, item in enumerate(items):
                 if self._stop_event.is_set():
                     break
+
+                # Mode-lock: a VideoSlide stored for h264_mp4 won't play
+                # on a panel renderer (no .rgb asset), and vice versa.
+                # Skip + log so the playlist advances cleanly — the
+                # operator's UI surfaces the same warning at the pallet
+                # + track tile level.
+                if item.type == "video":
+                    expected = self._get_expected_pipeline()
+                    if expected is not None and item.pipeline != expected:
+                        log.warning(
+                            "playback: skipping video %s — stored for %s "
+                            "but device expects %s (re-upload after the "
+                            "output_mode change to play it here)",
+                            item.id,
+                            item.pipeline,
+                            expected,
+                        )
+                        continue
+
                 self._current_id = item.id
                 self._current_type = item.type
                 self._current_pipeline = (

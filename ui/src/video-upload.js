@@ -40,6 +40,15 @@ const TEMPLATE = `
                 (HUB75 / WS2812B / composite), so the upload extracts raw
                 RGB frames at panel resolution. Larger source files take
                 noticeably longer to process than the HDMI H.264 path.
+                Stored videos are locked to this mode — if you switch
+                back to HDMI later, re-upload to play them there.
+            </p>
+            <p class="field-hint video-upload-hdmi-hint" hidden>
+                This device is in <strong>HDMI</strong> output mode, so
+                the upload transcodes to an H.264 MP4 at panel
+                resolution. Stored videos are locked to this mode — if
+                you switch to a panel output (HUB75 / WS2812B /
+                composite) later, re-upload to play them there.
             </p>
             <div class="row">
                 <label class="field">
@@ -119,6 +128,8 @@ export function mountVideoUploader(
 
     const isPanelMode = PANEL_OUTPUT_MODES.has(outputMode);
     panelHintEl.hidden = !isPanelMode;
+    const hdmiHintEl = container.querySelector(".video-upload-hdmi-hint");
+    hdmiHintEl.hidden = isPanelMode;
 
     const logLines = [];
     function logFn(msg) {

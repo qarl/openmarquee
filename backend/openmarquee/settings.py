@@ -36,6 +36,22 @@ SETTINGS_SCHEMA_VERSION = 1
 
 OutputMode = Literal["hdmi", "hub75", "ws281x", "composite"]
 
+# VideoSlide.pipeline must match the renderer's expected pipeline for the
+# slide to play. HDMI wants an MP4 (hardware H.264 decoder); the LED-matrix
+# and composite paths want pre-decoded RGB888 frames. Mode-change without
+# re-upload means the stored asset is in the wrong shape.
+_PIPELINE_FOR_MODE: dict[OutputMode, str] = {
+    "hdmi": "h264_mp4",
+    "hub75": "raw_frames",
+    "ws281x": "raw_frames",
+    "composite": "raw_frames",
+}
+
+
+def pipeline_for_output_mode(output_mode: OutputMode) -> str:
+    """Return the VideoSlide.pipeline that's playable on the given output mode."""
+    return _PIPELINE_FOR_MODE[output_mode]
+
 # IEEE 802.11 SSIDs are up to 32 octets. We accept printable ASCII to sidestep
 # the hostapd escaping dance — operators who want emoji SSIDs are outside the
 # MVP scope.

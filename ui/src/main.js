@@ -138,6 +138,7 @@ async function boot() {
                         fetchState: getPlaybackState,
                     }),
             },
+            outputMode: OUTPUT_MODE,
         },
     );
 

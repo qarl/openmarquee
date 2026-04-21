@@ -16,12 +16,13 @@ _FAST_DURATION_MS = 100
 _FAST_EMPTY_POLL = 0.01  # so loops with no items spin quickly in tests
 
 
-def _new_loop(renderer, *, fetch_items, read_asset):
+def _new_loop(renderer, *, fetch_items, read_asset, get_expected_video_pipeline=None):
     return PlaybackLoop(
         renderer,
         fetch_items=fetch_items,
         read_asset=read_asset,
         empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
+        get_expected_video_pipeline=get_expected_video_pipeline,
     )
 
 
@@ -565,3 +566,97 @@ async def test_resizes_when_asset_dimensions_differ_from_renderer(renderer):
     expected = bytes((200, 100, 50)) * (renderer.width * renderer.height)
     assert renderer.last_frame == expected
     await loop.stop()
+
+
+# --- mode-lock: skip videos whose pipeline doesn't match the device ---
+
+
+@pytest.mark.asyncio
+async def test_mode_mismatched_video_is_skipped(renderer):
+    """A video stored for h264_mp4 must not render on a device whose
+    expected pipeline is raw_frames — skip + advance to the next item."""
+    from openmarquee.content import VideoSlide
+
+    # h264_mp4 video (stored in "hdmi upload" world).
+    mp4_video = VideoSlide(
+        name="hdmi-promo",
+        duration_ms=_FAST_DURATION_MS,
+        pipeline="h264_mp4",
+    )
+    # Compatible image after it — this is what should end up on the
+    # renderer since the video is skipped.
+    img_slide, img_png = _make_slide("keeper", (10, 20, 30))
+
+    assets = {
+        mp4_video.id: _png_bytes(8, 8, (240, 240, 240)),
+        img_slide.id: img_png,
+    }
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [mp4_video, img_slide],
+        read_asset=lambda item_id: assets[item_id],
+        # Device is in a panel mode → expects raw_frames.
+        get_expected_video_pipeline=lambda: "raw_frames",
+    )
+    await loop.start()
+    await asyncio.sleep(0.2)
+    await loop.stop()
+
+    # The image slide landed on the renderer. The video's thumbnail
+    # didn't even make it to the renderer — skip happens before
+    # _safe_load_image.
+    expected = bytes((10, 20, 30)) * (renderer.width * renderer.height)
+    assert renderer.last_frame == expected
+
+
+@pytest.mark.asyncio
+async def test_matching_pipeline_video_is_not_skipped(renderer):
+    """Sanity: the skip path doesn't fire when the stored pipeline
+    matches the device's expected pipeline."""
+    from openmarquee.content import VideoSlide
+
+    video = VideoSlide(
+        name="hdmi-ok",
+        duration_ms=_FAST_DURATION_MS,
+        pipeline="h264_mp4",
+    )
+    asset = _png_bytes(8, 8, (80, 90, 100))
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [video],
+        read_asset=lambda _id: asset,
+        get_expected_video_pipeline=lambda: "h264_mp4",
+    )
+    await loop.start()
+    await asyncio.sleep(0.05)
+    await loop.stop()
+
+    expected = bytes((80, 90, 100)) * (renderer.width * renderer.height)
+    assert renderer.last_frame == expected
+
+
+@pytest.mark.asyncio
+async def test_expected_pipeline_none_disables_mode_lock(renderer):
+    """When the callable returns None (test default), any pipeline
+    renders — the check is opt-in."""
+    from openmarquee.content import VideoSlide
+
+    video = VideoSlide(
+        name="any",
+        duration_ms=_FAST_DURATION_MS,
+        pipeline="raw_frames",
+        frames_fps=15,
+        frames_width=8,
+        frames_height=8,
+    )
+    asset = _png_bytes(8, 8, (123, 45, 67))
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [video],
+        read_asset=lambda _id: asset,
+    )
+    await loop.start()
+    await asyncio.sleep(0.05)
+    await loop.stop()
+
+    assert renderer.last_frame is not None

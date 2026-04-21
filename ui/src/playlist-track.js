@@ -14,6 +14,22 @@
 
 import Sortable from "sortablejs";
 
+const PANEL_OUTPUT_MODES = new Set(["hub75", "ws281x", "composite"]);
+
+/**
+ * Map a device output mode to the VideoSlide.pipeline value that's
+ * playable on it. Mirror of backend openmarquee.settings.pipeline_for_output_mode
+ * so the UI can flag mode-locked slides without a server round-trip.
+ */
+function pipelineForOutputMode(outputMode) {
+    return PANEL_OUTPUT_MODES.has(outputMode) ? "raw_frames" : "h264_mp4";
+}
+
+function isModeLockedVideo(item, outputMode) {
+    if (!item || item.type !== "video" || !outputMode) return false;
+    return item.pipeline !== pipelineForOutputMode(outputMode);
+}
+
 const TEMPLATE = `
     <section class="playlist-track">
         <div class="playlist-track-header">
@@ -55,6 +71,10 @@ const TEMPLATE = `
  * @param {object} [options.livePreview] — optional hooks: { width, height,
  *     mount } — calls `mount(slot, { width, height })` under the header
  *     when present. Injected the same way as playback controls.
+ * @param {string} [options.outputMode] — current device output_mode
+ *     ("hdmi" / "hub75" / "ws281x" / "composite"). Videos whose stored
+ *     pipeline doesn't match the mode get a mode-locked badge on their
+ *     pallet + track tiles and won't play until re-uploaded.
  * @returns {{ refresh: () => Promise<void> }}
  */
 export function mountPlaylistTrack(container, options) {
@@ -65,6 +85,7 @@ export function mountPlaylistTrack(container, options) {
         playback,
         mountPlaybackControls,
         livePreview,
+        outputMode,
     } = options;
 
     container.innerHTML = TEMPLATE;
@@ -133,10 +154,13 @@ export function mountPlaylistTrack(container, options) {
                   }));
 
             trackEl.innerHTML = "";
+            let lockedInTrackCount = 0;
             for (const entry of defaultEntries) {
                 const item = itemById.get(entry.item_id);
                 if (!item) continue; // stale ref — skip
-                trackEl.appendChild(renderTrackBlock(item, entry));
+                const locked = isModeLockedVideo(item, outputMode);
+                if (locked) lockedInTrackCount++;
+                trackEl.appendChild(renderTrackBlock(item, entry, { locked }));
             }
             // Wire × buttons after the DOM is in place so each handler
             // sees the current trackEl children.
@@ -144,7 +168,19 @@ export function mountPlaylistTrack(container, options) {
 
             palletEl.innerHTML = "";
             for (const item of items) {
-                palletEl.appendChild(renderPalletTile(item));
+                palletEl.appendChild(
+                    renderPalletTile(item, {
+                        locked: isModeLockedVideo(item, outputMode),
+                    }),
+                );
+            }
+
+            if (lockedInTrackCount > 0 && outputMode) {
+                const expected = pipelineForOutputMode(outputMode);
+                statusEl.textContent =
+                    `⚠ ${lockedInTrackCount} video${lockedInTrackCount === 1 ? "" : "s"} in this playlist ` +
+                    `won't play on this device (output mode: ${outputMode}, expects ${expected}). ` +
+                    `Re-upload after changing output mode to play them here.`;
             }
 
             if (trackSortable) trackSortable.destroy();
@@ -261,9 +297,13 @@ function bindTrackRemoveButtons(trackEl, onReorder, saveAndRefresh) {
     }
 }
 
-function renderTrackBlock(item, entry = { transition: "cut", transition_ms: 500 }) {
+function renderTrackBlock(
+    item,
+    entry = { transition: "cut", transition_ms: 500 },
+    { locked = false } = {},
+) {
     const li = document.createElement("li");
-    li.className = "track-block";
+    li.className = locked ? "track-block track-block--locked" : "track-block";
     li.dataset.id = String(item.id);
     li.dataset.transition = entry.transition;
     li.dataset.transitionMs = String(entry.transition_ms);
@@ -274,10 +314,14 @@ function renderTrackBlock(item, entry = { transition: "cut", transition_ms: 500 
         Number.isInteger(seconds) ? seconds : seconds.toFixed(1)
     }s`;
     const cacheKey = encodeURIComponent(item.created_at || String(item.id));
+    const lockedBadge = locked
+        ? `<span class="track-block-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
+        : "";
     li.innerHTML = `
         <div class="track-block-thumb-wrap">
             <img class="track-block-thumb" alt=""
                  src="/api/content/${item.id}/asset?v=${cacheKey}">
+            ${lockedBadge}
             <button type="button" class="track-remove" aria-label="Remove from playlist" title="Remove from playlist">×</button>
         </div>
         <div class="track-block-name">${safeName}</div>
@@ -290,9 +334,9 @@ function renderTrackBlock(item, entry = { transition: "cut", transition_ms: 500 
     return li;
 }
 
-function renderPalletTile(item) {
+function renderPalletTile(item, { locked = false } = {}) {
     const li = document.createElement("li");
-    li.className = "pallet-tile";
+    li.className = locked ? "pallet-tile pallet-tile--locked" : "pallet-tile";
     li.dataset.id = String(item.id);
     li.dataset.type = item.type;
     const safeName = escapeHtml(item.name || "Untitled");
@@ -300,6 +344,9 @@ function renderPalletTile(item) {
         item.type === "video" ? "▶" : item.type === "image" ? "🖼" : "Aa",
     );
     const cacheKey = encodeURIComponent(item.created_at || String(item.id));
+    const lockedBadge = locked
+        ? `<span class="pallet-tile-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
+        : "";
     // Every slide type has an "edit" affordance — clicking the ✎ opens
     // the appropriate subpage's editor in edit-existing mode (main.js
     // routes by `item.type`). For image + video, the editor's file
@@ -310,6 +357,7 @@ function renderPalletTile(item) {
              src="/api/content/${item.id}/asset?v=${cacheKey}">
         <div class="pallet-tile-name" title="${safeName}">${safeName}</div>
         <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>
+        ${lockedBadge}
         <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
     `;
     li.querySelector(".pallet-tile-edit").addEventListener("click", (event) => {
