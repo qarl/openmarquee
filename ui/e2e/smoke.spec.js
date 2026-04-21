@@ -11,9 +11,14 @@ test("app loads, editor + list visible, list shows empty state", async ({ page }
     await expect(page).toHaveTitle("OpenMarquee");
     await expect(page.locator("header h1")).toHaveText("OpenMarquee");
 
-    await expect(page.locator(".editor-canvas")).toBeVisible();
-    await expect(page.locator(".field-text")).toBeVisible();
-    await expect(page.locator(".field-save")).toBeVisible();
+    // Scope to `.editor` — `.field-save` also appears inside the image
+    // uploader, and Playwright's strict mode flags the duplicate.
+    await expect(page.locator(".editor .editor-canvas")).toBeVisible();
+    await expect(page.locator(".editor .field-text")).toBeVisible();
+    await expect(page.locator(".editor .field-save")).toBeVisible();
+
+    await expect(page.locator(".image-upload")).toBeVisible();
+    await expect(page.locator(".image-upload .field-file")).toBeVisible();
 
     await expect(page.locator(".list")).toBeVisible();
     await expect(page.locator(".list-status")).toContainText("No slides yet");
@@ -22,12 +27,12 @@ test("app loads, editor + list visible, list shows empty state", async ({ page }
 test("Save button is disabled until text is entered", async ({ page }) => {
     await page.goto("/");
 
-    const saveBtn = page.locator(".field-save");
+    const saveBtn = page.locator(".editor .field-save");
     await expect(saveBtn).toBeDisabled();
 
-    await page.locator(".field-text").fill("Hi");
+    await page.locator(".editor .field-text").fill("Hi");
     await expect(saveBtn).toBeEnabled();
 
-    await page.locator(".field-text").fill("");
+    await page.locator(".editor .field-text").fill("");
     await expect(saveBtn).toBeDisabled();
 });

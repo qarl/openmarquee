@@ -2,9 +2,9 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
-from openmarquee.content import TextSlide
+from openmarquee.content import ContentItem, ImageSlide, TextSlide
 
 
 def test_text_slide_minimal_construction():
@@ -83,6 +83,52 @@ def test_text_length_capped():
 def test_type_literal_rejects_other_strings():
     with pytest.raises(ValidationError):
         TextSlide(type="image", name="x", text="x")
+
+
+# --- ImageSlide ---
+
+
+def test_image_slide_minimal_construction():
+    item = ImageSlide(name="Logo")
+    assert item.type == "image"
+    assert item.name == "Logo"
+    assert item.duration_ms == 5000
+    assert isinstance(item.id, UUID)
+    assert isinstance(item.created_at, datetime)
+    assert item.created_at.tzinfo == UTC
+
+
+def test_image_slide_duration_floor_enforced():
+    with pytest.raises(ValidationError):
+        ImageSlide(name="x", duration_ms=50)
+
+
+def test_image_slide_name_capped():
+    with pytest.raises(ValidationError):
+        ImageSlide(name="x" * 201)
+
+
+# --- Discriminated union dispatch ---
+
+
+def test_content_item_union_routes_text_slide_on_deserialize():
+    adapter = TypeAdapter(ContentItem)
+    payload = {"type": "text_slide", "name": "x", "text": "x"}
+    item = adapter.validate_python(payload)
+    assert isinstance(item, TextSlide)
+
+
+def test_content_item_union_routes_image_on_deserialize():
+    adapter = TypeAdapter(ContentItem)
+    payload = {"type": "image", "name": "Logo"}
+    item = adapter.validate_python(payload)
+    assert isinstance(item, ImageSlide)
+
+
+def test_content_item_union_rejects_unknown_type():
+    adapter = TypeAdapter(ContentItem)
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"type": "video", "name": "x"})
 
 
 def test_background_color_must_be_hex():

@@ -23,7 +23,9 @@ import shutil
 from pathlib import Path
 from uuid import UUID
 
-from openmarquee.content import ContentItem, TextSlide
+from pydantic import TypeAdapter
+
+from openmarquee.content import ContentItem, ImageSlide, TextSlide
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
 # way. load() will refuse to read older versions until a migration is written.
@@ -31,6 +33,10 @@ SCHEMA_VERSION = 1
 
 _ENVELOPE_FILENAME = "item.json"
 _ASSET_FILENAME = "asset.png"
+
+# Pydantic adapter for the discriminated ContentItem union; routes to the
+# right subclass on deserialize based on the `type` literal.
+_CONTENT_ADAPTER: TypeAdapter[ContentItem] = TypeAdapter(ContentItem)
 
 
 class ContentStorage:
@@ -42,22 +48,31 @@ class ContentStorage:
 
     # --- writes ---
 
-    # TODO(image/video): this method is text-slide-specific because the asset
-    # filename is hardcoded to `asset.png`. Video will need `asset.mp4`; HUB75
-    # raw-frame sequences will need a whole `assets/` subdir per SPEC §3.3.
-    # When Image/Video land, refactor to `save(item, asset_bytes, asset_ext)`
-    # and dispatch the filename from the item's type.
-    def save_text_slide(self, slide: TextSlide, png: bytes) -> None:
-        """Persist a text slide and its rendered PNG. Overwrites if the id exists."""
-        item_dir = self.root / str(slide.id)
+    def save(self, item: ContentItem, png: bytes) -> None:
+        """Persist any content item and its PNG asset. Overwrites if the id exists.
+
+        Text slides and image slides both ship PNGs (the browser does the
+        rendering/scaling and uploads bitmap pixel data in both cases). Video
+        content, when it lands, will need a different asset extension —
+        refactor the hardcoded `asset.png` then.
+        """
+        item_dir = self.root / str(item.id)
         item_dir.mkdir(parents=True, exist_ok=True)
 
         envelope = {
             "schema_version": SCHEMA_VERSION,
-            "item": slide.model_dump(mode="json"),
+            "item": item.model_dump(mode="json"),
         }
         self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
         self._atomic_write_bytes(item_dir / _ASSET_FILENAME, png)
+
+    def save_text_slide(self, slide: TextSlide, png: bytes) -> None:
+        """Persist a text slide — convenience wrapper for save()."""
+        self.save(slide, png)
+
+    def save_image(self, image: ImageSlide, png: bytes) -> None:
+        """Persist an image — convenience wrapper for save()."""
+        self.save(image, png)
 
     # --- reads ---
 
@@ -79,10 +94,9 @@ class ContentStorage:
                 f"expected {SCHEMA_VERSION} — migration needed"
             )
 
-        # TODO(image/video): dispatch on data["item"]["type"] — or, once
-        # ContentItem is a proper discriminated union, use
-        # TypeAdapter(ContentItem).validate_python(data["item"]).
-        return TextSlide.model_validate(data["item"])
+        # TypeAdapter dispatches to the right ContentItem variant based on
+        # the `type` literal. Unknown types surface as validation errors.
+        return _CONTENT_ADAPTER.validate_python(data["item"])
 
     def read_asset(self, item_id: UUID) -> bytes:
         """Read the rendered asset bytes for a content item."""

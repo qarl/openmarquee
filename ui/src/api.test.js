@@ -5,6 +5,7 @@ import {
     getPlaybackState,
     listContent,
     playContent,
+    saveImage,
     saveTextSlide,
     startPlayback,
     stopPlayback,
@@ -111,6 +112,25 @@ describe("playContent", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422 });
         await expect(playContent("bad")).rejects.toThrow("422");
+    });
+});
+
+describe("saveImage", () => {
+    it("POSTs JSON to /api/content/images and returns the new item", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ id: "x", type: "image", name: "Logo" }),
+        });
+        const result = await saveImage({ name: "Logo", png_base64: "FAKE" });
+        expect(result).toEqual({ id: "x", type: "image", name: "Logo" });
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/content/images");
+        expect(init.method).toBe("POST");
+    });
+
+    it("throws on non-ok response", async () => {
+        mockFetch({ ok: false, status: 422, text: async () => "bad" });
+        await expect(saveImage({})).rejects.toThrow("422");
     });
 });
 

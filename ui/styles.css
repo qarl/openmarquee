@@ -178,6 +178,49 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     min-height: 1.2em;
 }
 
+/* --- image uploader --- */
+
+.image-upload {
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--panel-border);
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.image-upload-heading {
+    margin: 0;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+}
+
+.image-upload-canvas {
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    image-rendering: pixelated;
+}
+
+.image-upload-status {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+    min-height: 1.2em;
+}
+
+.field-file {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.35rem;
+    padding: 0.4rem;
+    font: inherit;
+    width: 100%;
+}
+
 /* --- saved-slides list --- */
 
 .playback {

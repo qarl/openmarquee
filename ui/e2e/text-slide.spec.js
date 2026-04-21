@@ -9,19 +9,19 @@ test("end-to-end: save → list → play → delete", async ({ page }) => {
     await page.goto("/");
 
     // Type a slide.
-    await page.locator(".field-name").fill("Opening");
-    await page.locator(".field-text").fill("GRAND OPENING");
-    await page.locator(".field-text-color").evaluate((el) => {
+    await page.locator(".editor .field-name").fill("Opening");
+    await page.locator(".editor .field-text").fill("GRAND OPENING");
+    await page.locator(".editor .field-text-color").evaluate((el) => {
         el.value = "#ffffff";
         el.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await page.locator(".field-bg-color").evaluate((el) => {
+    await page.locator(".editor .field-bg-color").evaluate((el) => {
         el.value = "#cc0000";
         el.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
     // Save.
-    await page.locator(".field-save").click();
+    await page.locator(".editor .field-save").click();
     await expect(page.locator(".editor-status")).toHaveText("Saved.");
 
     // The new slide shows in the list.
@@ -65,9 +65,9 @@ test("two slides can coexist, both retrievable", async ({ page }) => {
     await page.goto("/");
 
     for (const name of ["Open", "Closed"]) {
-        await page.locator(".field-name").fill(name);
-        await page.locator(".field-text").fill(name.toUpperCase());
-        await page.locator(".field-save").click();
+        await page.locator(".editor .field-name").fill(name);
+        await page.locator(".editor .field-text").fill(name.toUpperCase());
+        await page.locator(".editor .field-save").click();
         await expect(page.locator(".editor-status")).toHaveText("Saved.");
     }
 
@@ -78,9 +78,9 @@ test("two slides can coexist, both retrievable", async ({ page }) => {
 
 test("rejected save (text too long) surfaces the error", async ({ page }) => {
     await page.goto("/");
-    await page.locator(".field-name").fill("Big");
-    await page.locator(".field-text").fill("X".repeat(10_001));
-    await page.locator(".field-save").click();
+    await page.locator(".editor .field-name").fill("Big");
+    await page.locator(".editor .field-text").fill("X".repeat(10_001));
+    await page.locator(".editor .field-save").click();
     await expect(page.locator(".editor-status")).toContainText("Save failed");
 });
 
@@ -88,9 +88,9 @@ test("Play all starts the backend loop; Stop stops it", async ({ page }) => {
     await page.goto("/");
 
     // Save one slide so the loop has something to render.
-    await page.locator(".field-name").fill("Loop");
-    await page.locator(".field-text").fill("LOOP");
-    await page.locator(".field-save").click();
+    await page.locator(".editor .field-name").fill("Loop");
+    await page.locator(".editor .field-text").fill("LOOP");
+    await page.locator(".editor .field-save").click();
     await expect(page.locator(".editor-status")).toHaveText("Saved.");
 
     // Start playback.

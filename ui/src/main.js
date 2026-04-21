@@ -12,11 +12,13 @@ import {
     getPlaybackState,
     listContent,
     playContent,
+    saveImage,
     saveTextSlide,
     startPlayback,
     stopPlayback,
 } from "./api.js";
 import { mountEditor } from "./editor.js";
+import { mountImageUploader } from "./image-upload.js";
 import { mountList } from "./list.js";
 import { mountPlaybackControls } from "./playback.js";
 
@@ -27,6 +29,7 @@ function boot() {
     const root = document.getElementById("app");
     root.innerHTML = `
         <div class="editor-slot"></div>
+        <div class="image-upload-slot"></div>
         <div class="playback-slot"></div>
         <div class="list-slot"></div>
     `;
@@ -43,14 +46,22 @@ function boot() {
         onStop: stopPlayback,
     });
 
+    const onSaveWithRefresh = (saveFn) => async (payload) => {
+        const saved = await saveFn(payload);
+        await list.refresh();
+        return saved;
+    };
+
     mountEditor(root.querySelector(".editor-slot"), {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
-        onSave: async (payload) => {
-            const saved = await saveTextSlide(payload);
-            await list.refresh();
-            return saved;
-        },
+        onSave: onSaveWithRefresh(saveTextSlide),
+    });
+
+    mountImageUploader(root.querySelector(".image-upload-slot"), {
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
+        onSave: onSaveWithRefresh(saveImage),
     });
 }
 

@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from openmarquee.content import TextSlide
+from openmarquee.content import ContentItem, ImageSlide, TextSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_content_storage
 
@@ -65,13 +65,44 @@ async def upload_text_slide(payload: TextSlideUpload, storage: StorageDep) -> Te
     return slide
 
 
-@router.get("", response_model=list[TextSlide])
-async def list_content(storage: StorageDep) -> list[TextSlide]:
+class ImageUpload(BaseModel):
+    """Wire format for POST /api/content/images.
+
+    The browser scales the source JPG/PNG to the sign's native resolution via
+    Canvas and encodes the result as PNG. We only ever see pre-scaled bitmap
+    data, so the backend doesn't need to know the source format.
+    """
+
+    name: str
+    duration_ms: int = 5000
+    png_base64: str = Field(description="Base64-encoded PNG of the scaled image.")
+
+
+@router.post("/images", response_model=ImageSlide)
+async def upload_image(payload: ImageUpload, storage: StorageDep) -> ImageSlide:
+    try:
+        png = base64.b64decode(payload.png_base64, validate=True)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"png_base64 is not valid base64: {exc}"
+        ) from exc
+
+    try:
+        image = ImageSlide(**payload.model_dump(exclude={"png_base64"}))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    storage.save_image(image, png)
+    return image
+
+
+@router.get("", response_model=list[ContentItem])
+async def list_content(storage: StorageDep) -> list[ContentItem]:
     return storage.list_all()
 
 
-@router.get("/{item_id}", response_model=TextSlide)
-async def get_content_item(item_id: UUID, storage: StorageDep) -> TextSlide:
+@router.get("/{item_id}", response_model=ContentItem)
+async def get_content_item(item_id: UUID, storage: StorageDep) -> ContentItem:
     try:
         return storage.load(item_id)
     except FileNotFoundError as exc:

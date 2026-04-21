@@ -1,17 +1,19 @@
 """Content model — typed descriptions of things that can be played on the sign.
 
-The model is a discriminated union; every variant carries a `type` literal that
-serializes/deserializes the right subclass without ambiguity. Phase 2 ships
-only `TextSlide` because that's the F&F demo path; `Image` and `Video` are
-added as their respective UI features land (post-demo).
+Every variant carries a `type` literal, and `ContentItem` is a discriminated
+union over them. Pydantic picks the right subclass from the `type` field on
+the wire.
 
 What's deliberately *not* in the model: where any rendered asset lives on disk.
-That's the storage layer's job (`openmarquee.content.storage`, lands in the
-next commit). Models are pure metadata; storage maps an item's `id` to bytes.
+That's the storage layer's job (`openmarquee.content.storage`). Models are pure
+metadata; storage maps an item's `id` to bytes.
+
+Variants today: `TextSlide`, `ImageSlide`. `VideoSlide` lands when the
+ffmpeg.wasm pipeline does (post-demo).
 """
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
@@ -56,14 +58,23 @@ class TextSlide(BaseModel):
         return value.upper()
 
 
-# Today this is a type alias for the only content variant we support. Once
-# `Image` and `Video` land, this becomes a proper discriminated union:
-#
-#     ContentItem = Annotated[
-#         TextSlide | Image | Video,
-#         Field(discriminator="type"),
-#     ]
-#
-# The `type` literal on each variant is already in place to make that switch a
-# one-line change.
-ContentItem = TextSlide
+class ImageSlide(BaseModel):
+    """A user-uploaded image.
+
+    Contract: the browser scales the source JPG/PNG to the sign's native
+    resolution via Canvas and uploads the result as PNG — the backend only
+    ever sees pre-scaled pixel data. The model itself is minimal because
+    all the pixels live in the asset file; the envelope just carries
+    housekeeping metadata.
+    """
+
+    type: Literal["image"] = "image"
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(max_length=200)
+    duration_ms: int = Field(default=5000, ge=100)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# Discriminated union of content variants. Pydantic uses the `type` literal to
+# route to the right subclass on deserialize.
+ContentItem = Annotated[TextSlide | ImageSlide, Field(discriminator="type")]

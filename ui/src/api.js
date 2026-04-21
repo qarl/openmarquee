@@ -27,6 +27,23 @@ export async function saveTextSlide(payload) {
     return await response.json();
 }
 
+/**
+ * Upload an image slide. `payload`: name, duration_ms, png_base64 (the
+ * already-scaled PNG — browser does the scaling, backend just stores).
+ */
+export async function saveImage(payload) {
+    const response = await fetch("/api/content/images", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Save failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
 /** Fetch the full list of content items. */
 export async function listContent() {
     const response = await fetch("/api/content");

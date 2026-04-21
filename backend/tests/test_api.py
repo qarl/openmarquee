@@ -183,3 +183,55 @@ def test_delete_content_item_removes_it(client: TestClient, storage: ContentStor
 def test_delete_content_item_404_when_missing(client: TestClient):
     response = client.delete(f"/api/content/{uuid4()}")
     assert response.status_code == 404
+
+
+# --- POST /api/content/images ---
+
+
+def _image_payload(**overrides) -> dict:
+    payload = {
+        "name": "Logo",
+        "png_base64": base64.b64encode(_FAKE_PNG).decode(),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_upload_image_persists_metadata_and_asset(client: TestClient, storage: ContentStorage):
+    response = client.post("/api/content/images", json=_image_payload(name="Promo"))
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["type"] == "image"
+    assert body["name"] == "Promo"
+    assert body["duration_ms"] == 5000
+
+    item_id = UUID(body["id"])
+    assert storage.exists(item_id)
+    assert storage.read_asset(item_id) == _FAKE_PNG
+
+
+def test_upload_image_rejects_bad_base64(client: TestClient):
+    payload = _image_payload()
+    payload["png_base64"] = "not-valid-base64!!!"
+    response = client.post("/api/content/images", json=payload)
+    assert response.status_code == 400
+
+
+def test_upload_image_rejects_name_too_long(client: TestClient):
+    response = client.post("/api/content/images", json=_image_payload(name="x" * 201))
+    assert response.status_code == 422
+
+
+def test_list_content_returns_mixed_variants(client: TestClient):
+    """Uploading a text slide and an image results in both appearing in /api/content
+    with the correct `type` literal on each."""
+    client.post("/api/content/text-slides", json=_upload_payload(name="Text"))
+    client.post("/api/content/images", json=_image_payload(name="Image"))
+
+    response = client.get("/api/content")
+    assert response.status_code == 200
+    items = response.json()
+    assert len(items) == 2
+    types = {item["type"] for item in items}
+    assert types == {"text_slide", "image"}

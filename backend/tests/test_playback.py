@@ -5,7 +5,7 @@ from uuid import UUID
 import pytest
 from PIL import Image
 
-from openmarquee.content import TextSlide
+from openmarquee.content import ImageSlide, TextSlide
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
 
@@ -261,6 +261,23 @@ async def test_renderer_raising_is_swallowed(renderer):
 
     # Slide B rendered successfully despite slide A's renderer crash.
     assert renderer.last_frame == bytes((40, 50, 60)) * (renderer.width * renderer.height)
+
+
+@pytest.mark.asyncio
+async def test_image_slide_renders_identically_to_text_slide(renderer):
+    """The playback engine is type-agnostic — both variants store PNGs and go
+    through the same decode → render path. Pin the behavior so future variants
+    don't accidentally break it."""
+    image = ImageSlide(name="logo", duration_ms=_FAST_DURATION_MS)
+    png = _png_bytes(8, 8, (42, 42, 42))
+
+    loop = _new_loop(renderer, fetch_items=lambda: [image], read_asset=lambda _id: png)
+    await loop.start()
+    await asyncio.sleep(0.05)
+    expected = bytes((42, 42, 42)) * (renderer.width * renderer.height)
+    assert renderer.last_frame == expected
+    assert loop.current_item_id == image.id
+    await loop.stop()
 
 
 @pytest.mark.asyncio

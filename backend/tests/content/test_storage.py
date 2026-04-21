@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from openmarquee.content import TextSlide
+from openmarquee.content import ImageSlide, TextSlide
 from openmarquee.content.storage import SCHEMA_VERSION, ContentStorage
 
 
@@ -198,3 +198,44 @@ def test_atomic_write_leaves_no_tmp_files(tmp_path: Path):
     item_dir = tmp_path / str(slide.id)
     tmp_files = list(item_dir.glob("*.tmp"))
     assert tmp_files == []
+
+
+# --- Image slides: round-trip and union dispatch ---
+
+
+def test_save_and_load_image_round_trip(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    image = ImageSlide(name="Logo", duration_ms=3000)
+    png = b"\x89PNG" + b"image-payload"
+    storage.save_image(image, png)
+
+    loaded = storage.load(image.id)
+    assert isinstance(loaded, ImageSlide)
+    assert loaded == image
+    assert storage.read_asset(image.id) == png
+
+
+def test_list_all_returns_mixed_variants(tmp_path: Path):
+    """Text slides and image slides in the same list, each as the right type."""
+    storage = ContentStorage(tmp_path)
+    text = TextSlide(name="t", text="t")
+    image = ImageSlide(name="i")
+    storage.save_text_slide(text, b"\x89PNG_text")
+    storage.save_image(image, b"\x89PNG_image")
+
+    items = storage.list_all()
+    assert len(items) == 2
+    by_type = {item.type: item for item in items}
+    assert isinstance(by_type["text_slide"], TextSlide)
+    assert isinstance(by_type["image"], ImageSlide)
+
+
+def test_save_generic_dispatches_to_correct_type(tmp_path: Path):
+    """storage.save(item, png) works without knowing the variant up front."""
+    storage = ContentStorage(tmp_path)
+    text = TextSlide(name="t", text="t")
+    image = ImageSlide(name="i")
+    storage.save(text, b"text-png")
+    storage.save(image, b"image-png")
+    assert isinstance(storage.load(text.id), TextSlide)
+    assert isinstance(storage.load(image.id), ImageSlide)

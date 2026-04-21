@@ -108,9 +108,7 @@ def test_stop_when_not_running_is_idempotent(client: TestClient):
     assert state["is_running"] is False
 
 
-def test_state_reports_current_item_id_while_playing(
-    client: TestClient, storage: ContentStorage
-):
+def test_state_reports_current_item_id_while_playing(client: TestClient, storage: ContentStorage):
     """With a real item in storage, start the loop and poll state — the
     backend should surface the currently-rendering slide's id."""
     slide = TextSlide(name="x", text="x", duration_ms=1000)
