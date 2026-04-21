@@ -1,116 +1,133 @@
-"""OpenAI-powered background image generation for the composer.
+"""AI-backed background image generation for the composer.
+
+Provider-pluggable: the default is `pollinations` (Pollinations.ai — free,
+no API key required, Flux/SDXL-backed). Additional providers can be added
+to `PROVIDERS` without changing the API route. Operators pick one via the
+env var `OPENMARQUEE_IMAGEGEN_PROVIDER`, or per-request via the optional
+`provider` field in the POST body.
 
 Contract:
+- Client POSTs a prompt (optionally a provider name) to
+  `/api/backgrounds/generate`.
+- The selected provider's `generate(prompt)` runs; on success we downscale
+  the returned image to the device's display dimensions (letterbox-fit)
+  and persist it via the existing content storage.
+- `generate` can raise `BackgroundGenError`; the route maps it to 502 with
+  the underlying message so operators see the real failure.
+- `BackgroundProviderUnknown` maps to 400 — the request named a provider
+  we don't ship.
 
-- Client POSTs a prompt to /api/backgrounds/generate.
-- If OPENAI_API_KEY is unset, the route returns 503 with a clear message
-  — this keeps the feature *discoverable* without making the captive
-  portal unusable for operators who don't have / don't want an API key.
-- If the key is set, we call the Images API, downscale the returned PNG
-  to the device's display dimensions (same as any other ImageSlide), and
-  persist it via the existing content storage.
-
-The actual HTTP call is isolated in `generate_png_via_openai` so tests
-can monkeypatch it without a network round-trip. Timeout is generous
-(60s) because the model can take a while on first-token and the
-captive-portal operator has no other work to do while they wait.
+What's explicitly NOT here: paid / API-key-gated services. OpenMarquee is
+a free, offline-first captive portal; making the shipped composer depend
+on a paid API would be out of character. Provisioning API keys for users
+who want to bring their own is a separate feature the device doesn't run
+today.
 """
 
 from __future__ import annotations
 
-import base64
 import io
 import logging
+import os
+import urllib.parse
+from dataclasses import dataclass
+from typing import Protocol
 
 import httpx
 from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-OPENAI_IMAGES_URL = "https://api.openai.com/v1/images/generations"
-# gpt-image-1 is the current Images API model. Size 1024x1024 is the
-# smallest square it offers; we scale down to the device's display
-# dimensions on save, so generating at higher resolution just gives us
-# more headroom for crisp results on HDMI while costing roughly the
-# same as smaller requests.
-OPENAI_MODEL = "gpt-image-1"
-OPENAI_SIZE = "1024x1024"
-OPENAI_TIMEOUT_SECONDS = 60.0
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 
 
-class OpenAIError(RuntimeError):
-    """Signals the Images API itself rejected or errored on the request.
+class BackgroundGenError(RuntimeError):
+    """The provider itself rejected / errored. Route → 502."""
 
-    Separate from `OpenAINotConfigured` — this one means we *tried* and
-    the API said no; the route maps it to 502 with the detail from
-    OpenAI so operators see the actual problem (content policy, quota,
-    etc.) rather than a generic 500.
+
+class BackgroundProviderUnknown(LookupError):
+    """Caller asked for a provider we don't ship. Route → 400."""
+
+
+class ImageGenProvider(Protocol):
+    name: str
+
+    def generate(self, prompt: str) -> bytes:
+        """Return raw image bytes (PNG or JPEG — PIL auto-detects)."""
+
+
+@dataclass
+class PollinationsProvider:
+    """Pollinations.ai — free, no API key. Flux-backed.
+
+    The prompt goes in the URL path (URL-encoded); width/height/nologo in
+    query params. Response body is the raw image bytes (JPEG or PNG depending
+    on the upstream model's pipeline). Typical latency is 10-20 seconds.
     """
 
+    name: str = "pollinations"
+    base_url: str = "https://image.pollinations.ai/prompt"
+    generate_width: int = 1024
+    generate_height: int = 1024
+    timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
-class OpenAINotConfigured(RuntimeError):
-    """OPENAI_API_KEY isn't set. The route maps this to 503 — the
-    feature exists, it's just not turned on for this device."""
-
-
-def generate_png_via_openai(prompt: str, api_key: str) -> bytes:
-    """Call OpenAI Images and return the raw PNG bytes.
-
-    Raises `OpenAIError` on any non-2xx or connectivity failure. Isolated
-    here so tests can monkeypatch `backgrounds.generate_png_via_openai`
-    to bypass the real HTTP call.
-    """
-    payload = {
-        "model": OPENAI_MODEL,
-        "prompt": prompt,
-        "size": OPENAI_SIZE,
-        "n": 1,
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    try:
-        response = httpx.post(
-            OPENAI_IMAGES_URL,
-            json=payload,
-            headers=headers,
-            timeout=OPENAI_TIMEOUT_SECONDS,
-        )
-    except httpx.HTTPError as exc:
-        raise OpenAIError(f"network failure talking to OpenAI: {exc}") from exc
-
-    if response.status_code != 200:
-        # Surface the API's own error detail so operators know if it's a
-        # content-policy rejection, quota exhausted, wrong key, etc.
+    def generate(self, prompt: str) -> bytes:
+        encoded = urllib.parse.quote(prompt, safe="")
+        url = f"{self.base_url}/{encoded}"
+        params = {
+            "width": self.generate_width,
+            "height": self.generate_height,
+            # nologo=true suppresses the Pollinations watermark.
+            "nologo": "true",
+        }
         try:
-            body = response.json()
-            detail = body.get("error", {}).get("message") or str(body)
-        except Exception:
-            detail = response.text
-        raise OpenAIError(f"OpenAI {response.status_code}: {detail}")
+            response = httpx.get(url, params=params, timeout=self.timeout_seconds)
+        except httpx.HTTPError as exc:
+            raise BackgroundGenError(
+                f"network failure talking to pollinations.ai: {exc}"
+            ) from exc
+        if response.status_code != 200:
+            raise BackgroundGenError(
+                f"pollinations.ai {response.status_code}: {response.text[:200]}"
+            )
+        body = response.content
+        if not body:
+            raise BackgroundGenError("pollinations.ai returned an empty body")
+        return body
 
+
+# Registry of shipped providers. Add new entries here; the route handler
+# + the UI both read this list so adding a provider is one edit.
+PROVIDERS: dict[str, ImageGenProvider] = {
+    "pollinations": PollinationsProvider(),
+}
+
+
+def default_provider_name() -> str:
+    return os.environ.get("OPENMARQUEE_IMAGEGEN_PROVIDER", "pollinations")
+
+
+def resolve_provider(name: str | None) -> ImageGenProvider:
+    """Look a provider up by name. Raises BackgroundProviderUnknown on miss."""
+    resolved = name or default_provider_name()
     try:
-        body = response.json()
-        b64 = body["data"][0]["b64_json"]
-    except (KeyError, IndexError, ValueError) as exc:
-        raise OpenAIError(f"unexpected OpenAI response shape: {exc}") from exc
-
-    try:
-        return base64.b64decode(b64, validate=True)
-    except ValueError as exc:
-        raise OpenAIError(f"OpenAI returned invalid base64: {exc}") from exc
+        return PROVIDERS[resolved]
+    except KeyError as exc:
+        raise BackgroundProviderUnknown(
+            f"no image-gen provider named {resolved!r}. "
+            f"Known: {sorted(PROVIDERS)}"
+        ) from exc
 
 
-def downscale_to_panel(png: bytes, width: int, height: int) -> bytes:
-    """Letterbox-fit the generated image onto a `width` × `height` canvas.
+def downscale_to_panel(image_bytes: bytes, width: int, height: int) -> bytes:
+    """Letterbox-fit any image bytes onto a `width` × `height` canvas.
 
-    The model returns 1024×1024 (square); panels are rarely square. We
-    preserve aspect ratio with a black-letterboxed fit so the shipped
-    asset matches how any other ImageSlide would be scaled client-side
-    before upload.
+    The provider returns a square (Pollinations defaults to 1024×1024); panels
+    are rarely square. We preserve aspect ratio with a black-letterboxed fit
+    so the shipped asset matches how any other ImageSlide would be scaled
+    client-side before upload.
     """
-    src = Image.open(io.BytesIO(png))
+    src = Image.open(io.BytesIO(image_bytes))
     src.load()
     canvas = Image.new("RGB", (width, height), (0, 0, 0))
     scale = min(width / src.width, height / src.height)

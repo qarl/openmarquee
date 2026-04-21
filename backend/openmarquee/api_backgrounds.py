@@ -2,22 +2,23 @@
 
 POST /api/backgrounds/generate — prompt in, ImageSlide out.
 
-Auth is unchanged (we're on the captive portal; anyone on the WiFi can
-hit this). Cost is the operator's concern — they pay for the OPENAI_API_KEY
-that this reads from the environment.
+Captive-portal auth (i.e. no auth — anyone on the WiFi can hit this).
+The shipped provider set is free-tier services; nothing here depends on
+a paid API key. See `openmarquee.backgrounds` for the provider registry.
 """
 
-import os
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from openmarquee.backgrounds import (
-    OpenAIError,
-    OpenAINotConfigured,
+    PROVIDERS,
+    BackgroundGenError,
+    BackgroundProviderUnknown,
+    default_provider_name,
     downscale_to_panel,
-    generate_png_via_openai,
+    resolve_provider,
 )
 from openmarquee.content import ImageSlide
 from openmarquee.content.storage import ContentStorage
@@ -39,23 +40,31 @@ SettingsDep = Annotated[SettingsStorage, Depends(get_settings_storage)]
 class BackgroundGenerateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     name: str | None = Field(default=None, max_length=200)
+    provider: str | None = Field(
+        default=None,
+        description="One of the shipped provider names, e.g. 'pollinations'. "
+        "Omit to use the device's default.",
+    )
 
 
-def _api_key() -> str:
-    key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise OpenAINotConfigured(
-            "OPENAI_API_KEY is not set on the device. Provision it via the "
-            "systemd unit env or a root-only .env and restart to enable "
-            "AI-generated backgrounds."
-        )
-    return key
+class ProvidersResponse(BaseModel):
+    default: str
+    available: list[str]
 
 
 def _append(playlist_storage: PlaylistStorage, item_id) -> None:
     playlist = playlist_storage.load()
     playlist.append(item_id)
     playlist_storage.save(playlist)
+
+
+@router.get("/providers", response_model=ProvidersResponse)
+async def list_providers() -> ProvidersResponse:
+    """Which image-gen services this device knows about + the default one."""
+    return ProvidersResponse(
+        default=default_provider_name(),
+        available=sorted(PROVIDERS),
+    )
 
 
 @router.post("/generate", response_model=ImageSlide)
@@ -66,23 +75,21 @@ async def generate_background(
     settings_storage: SettingsDep,
 ) -> ImageSlide:
     try:
-        key = _api_key()
-    except OpenAINotConfigured as exc:
-        # 503 "Service Unavailable" signals "this endpoint exists but
-        # isn't turned on for this device" — the browser can render a
-        # friendly message instead of crashing on 500.
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        provider = resolve_provider(payload.provider)
+    except BackgroundProviderUnknown as exc:
+        # 400 = the caller's request was malformed (named provider that
+        # isn't in our registry).
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        png_raw = generate_png_via_openai(payload.prompt, key)
-    except OpenAIError as exc:
-        # 502 = upstream-bad-gateway. The detail surfaces OpenAI's own
-        # message (content policy, quota, auth) so the operator can
-        # actually act on it.
+        raw = provider.generate(payload.prompt)
+    except BackgroundGenError as exc:
+        # 502 = upstream-bad-gateway. The detail surfaces the provider's
+        # own message (rate-limit, timeout, etc.) so the operator can act.
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     settings = settings_storage.load()
-    png = downscale_to_panel(png_raw, settings.display_width, settings.display_height)
+    png = downscale_to_panel(raw, settings.display_width, settings.display_height)
 
     slide = ImageSlide(
         name=payload.name or _name_from_prompt(payload.prompt),

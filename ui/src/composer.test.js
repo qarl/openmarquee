@@ -241,10 +241,10 @@ describe("mountComposer", () => {
         });
     });
 
-    it("Surfaces a 503 from the hook as a friendly 'not set up' status", async () => {
+    it("Surfaces provider errors (rate limit, etc.) in the generate status line", async () => {
         const container = document.createElement("div");
-        const err503 = Object.assign(new Error("nope"), { status: 503 });
-        const onGenerateBackground = vi.fn().mockRejectedValue(err503);
+        const err = new Error("Background generation failed (502): rate limited by upstream");
+        const onGenerateBackground = vi.fn().mockRejectedValue(err);
         mountComposer(container, {
             width: 128,
             height: 96,
@@ -260,7 +260,7 @@ describe("mountComposer", () => {
         await tick();
 
         expect(container.querySelector(".bg-generate-status").textContent).toMatch(
-            /isn't set up/,
+            /rate limited/,
         );
     });
 

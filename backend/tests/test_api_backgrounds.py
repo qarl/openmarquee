@@ -1,4 +1,4 @@
-"""API tests for POST /api/backgrounds/generate."""
+"""API tests for /api/backgrounds/*."""
 
 import io
 from pathlib import Path
@@ -21,13 +21,11 @@ from openmarquee.playlist import PlaylistStorage
 from openmarquee.settings import SettingsStorage, SystemSettings
 
 
-def _real_png_bytes(size: int = 1024) -> bytes:
-    """Square PNG at the size OpenAI's Images API would return. Colored
-    so downscale_to_panel produces a non-trivial final asset we can
-    verify round-trips."""
-    img = Image.new("RGB", (size, size), (120, 200, 30))
+def _real_image_bytes(w: int = 1024, h: int = 1024) -> bytes:
+    img = Image.new("RGB", (w, h), (120, 200, 30))
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    # Pollinations returns JPEG; the downscale path handles either format.
+    img.save(buf, format="JPEG")
     return buf.getvalue()
 
 
@@ -67,13 +65,27 @@ def client(
         _settings_storage_singleton.cache_clear()
 
 
-def test_generate_returns_503_when_no_api_key(client: TestClient, monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    response = client.post(
-        "/api/backgrounds/generate", json={"prompt": "abstract gradient"}
-    )
-    assert response.status_code == 503
-    assert "OPENAI_API_KEY" in response.json()["detail"]
+def _stub_provider_generate(monkeypatch, bytes_: bytes = None):
+    """Patch every registered provider's generate() to return `bytes_`."""
+    image = bytes_ if bytes_ is not None else _real_image_bytes()
+    from openmarquee import backgrounds
+
+    for provider in backgrounds.PROVIDERS.values():
+        monkeypatch.setattr(provider, "generate", lambda prompt, _b=image: _b)
+
+
+# --- GET /providers ---
+
+
+def test_list_providers_returns_default_and_available(client: TestClient):
+    response = client.get("/api/backgrounds/providers")
+    assert response.status_code == 200
+    body = response.json()
+    assert "pollinations" in body["available"]
+    assert body["default"] == "pollinations"
+
+
+# --- POST /generate ---
 
 
 def test_generate_saves_image_and_appends_to_playlist(
@@ -82,47 +94,32 @@ def test_generate_saves_image_and_appends_to_playlist(
     playlist_storage: PlaylistStorage,
     monkeypatch,
 ):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setattr(
-        "openmarquee.api_backgrounds.generate_png_via_openai",
-        lambda prompt, key: _real_png_bytes(),
-    )
-
+    _stub_provider_generate(monkeypatch)
     response = client.post(
         "/api/backgrounds/generate",
-        json={"prompt": "minimal sunrise gradient, signage-friendly"},
+        json={"prompt": "minimal gradient, signage-friendly"},
     )
     assert response.status_code == 200
     body = response.json()
     assert body["type"] == "image"
     assert body["name"].startswith("Background — ")
 
-    # Asset landed on disk at panel dimensions (128×96).
     from uuid import UUID
     item_id = UUID(body["id"])
     asset = storage.read_asset(item_id)
     png = Image.open(io.BytesIO(asset))
     assert png.size == (128, 96)
-
-    # And is appended to the default playlist.
     assert playlist_storage.load().item_ids == [item_id]
 
 
 def test_generate_rejects_empty_prompt(client: TestClient, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    _stub_provider_generate(monkeypatch)
     response = client.post("/api/backgrounds/generate", json={"prompt": ""})
     assert response.status_code == 422
 
 
-def test_generate_accepts_optional_name_override(
-    client: TestClient,
-    monkeypatch,
-):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setattr(
-        "openmarquee.api_backgrounds.generate_png_via_openai",
-        lambda prompt, key: _real_png_bytes(),
-    )
+def test_generate_accepts_optional_name_override(client: TestClient, monkeypatch):
+    _stub_provider_generate(monkeypatch)
     response = client.post(
         "/api/backgrounds/generate",
         json={"prompt": "x", "name": "My Custom Background"},
@@ -131,15 +128,35 @@ def test_generate_accepts_optional_name_override(
     assert response.json()["name"] == "My Custom Background"
 
 
-def test_generate_maps_openai_error_to_502(client: TestClient, monkeypatch):
-    from openmarquee.backgrounds import OpenAIError
+def test_generate_maps_provider_error_to_502(client: TestClient, monkeypatch):
+    from openmarquee import backgrounds
 
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    def boom(prompt):
+        raise backgrounds.BackgroundGenError("rate limited by upstream")
 
-    def boom(prompt, key):
-        raise OpenAIError("content policy violation: 'firearms'")
+    for provider in backgrounds.PROVIDERS.values():
+        monkeypatch.setattr(provider, "generate", boom)
 
-    monkeypatch.setattr("openmarquee.api_backgrounds.generate_png_via_openai", boom)
-    response = client.post("/api/backgrounds/generate", json={"prompt": "gun"})
+    response = client.post("/api/backgrounds/generate", json={"prompt": "x"})
     assert response.status_code == 502
-    assert "content policy" in response.json()["detail"]
+    assert "rate limited" in response.json()["detail"]
+
+
+def test_generate_rejects_unknown_provider(client: TestClient):
+    response = client.post(
+        "/api/backgrounds/generate",
+        json={"prompt": "x", "provider": "dall-e"},
+    )
+    assert response.status_code == 400
+    assert "dall-e" in response.json()["detail"]
+
+
+def test_generate_no_longer_requires_api_key_env(
+    client: TestClient, monkeypatch
+):
+    """Pollinations (the default provider) needs no API key — the 503 path
+    the OpenAI-based prototype used doesn't exist anymore."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _stub_provider_generate(monkeypatch)
+    response = client.post("/api/backgrounds/generate", json={"prompt": "x"})
+    assert response.status_code == 200

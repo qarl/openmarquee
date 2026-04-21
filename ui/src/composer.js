@@ -40,7 +40,7 @@ const TEMPLATE = `
                 </label>
                 <div class="bg-generate">
                     <label class="field">
-                        <span>Generate a new background (requires OPENAI_API_KEY on device)</span>
+                        <span>Generate a new background (free, via pollinations.ai — can take 10-30s)</span>
                         <input type="text" class="bg-generate-prompt"
                                placeholder="abstract gradient, minimal, signage-friendly"
                                maxlength="4000">
@@ -388,7 +388,7 @@ export function mountComposer(container, { width, height, fetchItems, onSave, on
                 return;
             }
             generateBtn.disabled = true;
-            generateStatusEl.textContent = "Generating… (can take 30-60 seconds)";
+            generateStatusEl.textContent = "Generating… (can take 10-30 seconds)";
             try {
                 const slide = await onGenerateBackground({ prompt });
                 // Switch the background to the freshly-generated slide so
@@ -404,15 +404,10 @@ export function mountComposer(container, { width, height, fetchItems, onSave, on
                 generatePromptEl.value = "";
                 generateStatusEl.textContent = `Generated: ${slide.name}`;
             } catch (err) {
-                // 503 = "feature turned off on this device" (no API key);
-                // 502 = OpenAI said no (content policy, quota). Either
-                // way, surface the detail so the operator can act.
-                if (err.status === 503) {
-                    generateStatusEl.textContent =
-                        "AI generation isn't set up on this device — see settings.";
-                } else {
-                    generateStatusEl.textContent = `${err.message}`;
-                }
+                // 502 = upstream provider said no (rate-limit, moderation);
+                // 400 = unknown provider name in request. Either way, the
+                // detail is the actionable part — just show it.
+                generateStatusEl.textContent = `${err.message}`;
             } finally {
                 generateBtn.disabled = false;
             }
