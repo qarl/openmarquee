@@ -6,11 +6,12 @@
 // stay mounted so their state (scroll, in-progress edits, polling
 // loops) survives navigation clicks.
 //
-// Panel dimensions come from /api/settings at boot so every preview
-// canvas matches the device's configured display aspect ratio (128×96
-// is just the SYSTEM_SPEC default; operators with a 1920×1080 HDMI
-// target see 16:9 previews). Settings changes take effect on the
-// next page load — re-mounting on save is a future refinement.
+// Panel dimensions come from /api/settings at boot AND whenever the
+// Settings page emits an `openmarquee:settings-updated` event — the
+// editor + uploader + playlist-track panels get re-mounted at the new
+// dims so the canvas always matches the configured display. Existing
+// stored slides keep their old-dim PNGs until re-saved (the playback
+// loop NEAREST-upscales at runtime); that's expected, not a bug.
 
 import {
     fetchContentItem,
@@ -86,11 +87,6 @@ async function resolvePanelDims() {
 }
 
 async function boot() {
-    const {
-        width: PANEL_WIDTH,
-        height: PANEL_HEIGHT,
-        outputMode: OUTPUT_MODE,
-    } = await resolvePanelDims();
     const root = document.getElementById("app");
     root.innerHTML = `
         <section data-section="slides/text" class="panel">
@@ -113,12 +109,38 @@ async function boot() {
         </section>
     `;
 
-    // Playlist track handles its own refresh — any save returns and the
-    // on-save callbacks below ping its refresh() so newly-created slides
-    // appear in the pallet.
-    const playlistTrack = mountPlaylistTrack(
-        root.querySelector(".playlist-track-slot"),
-        {
+    // Mutable across re-mounts. Keeping them in the outer scope lets
+    // onSaveWithRefresh + the edit-slide route table reach the current
+    // handles even after a settings-driven re-mount tears down the old
+    // ones.
+    let playlistTrack = null;
+    let editor = null;
+    let imageUploader = null;
+    let videoUploader = null;
+    // Live-preview runs a setInterval; we need to stop the old one
+    // before dropping its DOM so we don't leak a poll loop against a
+    // detached stage element.
+    let livePreviewHandle = null;
+
+    const onSaveWithRefresh = (saveFn) => async (payload) => {
+        const saved = await saveFn(payload);
+        if (playlistTrack) await playlistTrack.refresh();
+        return saved;
+    };
+
+    /**
+     * Mount (or re-mount) every panel that depends on display dims.
+     * Called once at boot + again whenever Settings emits a change.
+     */
+    function mountDimensionedPanels({ width, height, outputMode }) {
+        if (livePreviewHandle) {
+            livePreviewHandle.stop();
+            livePreviewHandle = null;
+        }
+
+        const trackSlot = root.querySelector(".playlist-track-slot");
+        trackSlot.innerHTML = "";
+        playlistTrack = mountPlaylistTrack(trackSlot, {
             fetchItems: listContent,
             fetchPlaylists: listPlaylists,
             onReorder: setPlaylistOrder,
@@ -129,59 +151,59 @@ async function boot() {
             },
             mountPlaybackControls,
             livePreview: {
-                width: PANEL_WIDTH,
-                height: PANEL_HEIGHT,
-                mount: (slot, { width, height }) =>
-                    mountLivePreview(slot, {
-                        width,
-                        height,
+                width,
+                height,
+                mount: (slot, dims) => {
+                    livePreviewHandle = mountLivePreview(slot, {
+                        width: dims.width,
+                        height: dims.height,
                         fetchState: getPlaybackState,
-                    }),
+                    });
+                    return livePreviewHandle;
+                },
             },
-            outputMode: OUTPUT_MODE,
-        },
-    );
+            outputMode,
+        });
 
-    const onSaveWithRefresh = (saveFn) => async (payload) => {
-        const saved = await saveFn(payload);
-        await playlistTrack.refresh();
-        return saved;
-    };
+        const editorSlot = root.querySelector(".editor-slot");
+        editorSlot.innerHTML = "";
+        editor = mountEditor(editorSlot, {
+            width,
+            height,
+            fetchItems: listContent,
+            onSave: onSaveWithRefresh(saveTextSlide),
+            onSaveExisting: onSaveWithRefresh(updateTextSlide),
+            // Free AI background generator (Pollinations.ai).
+            // onSaveWithRefresh pings the track refresh so the newly-
+            // generated ImageSlide appears in the pallet + the
+            // editor's bg-slide dropdown on subsequent opens.
+            onGenerateBackground: onSaveWithRefresh(generateBackground),
+        });
 
-    const editor = mountEditor(root.querySelector(".editor-slot"), {
-        width: PANEL_WIDTH,
-        height: PANEL_HEIGHT,
-        fetchItems: listContent,
-        onSave: onSaveWithRefresh(saveTextSlide),
-        onSaveExisting: onSaveWithRefresh(updateTextSlide),
-        // Free AI background generator (Pollinations.ai). onSaveWithRefresh
-        // pings the track refresh so the newly-generated ImageSlide
-        // appears in the pallet + the editor's bg-slide dropdown on
-        // subsequent opens.
-        onGenerateBackground: onSaveWithRefresh(generateBackground),
-    });
-
-    const imageUploader = mountImageUploader(
-        root.querySelector(".image-upload-slot"),
-        {
-            width: PANEL_WIDTH,
-            height: PANEL_HEIGHT,
+        const imageSlot = root.querySelector(".image-upload-slot");
+        imageSlot.innerHTML = "";
+        imageUploader = mountImageUploader(imageSlot, {
+            width,
+            height,
             onSave: onSaveWithRefresh(saveImage),
             onSaveExisting: onSaveWithRefresh(updateImage),
-        },
-    );
+        });
 
-    const videoUploader = mountVideoUploader(
-        root.querySelector(".video-upload-slot"),
-        {
-            width: PANEL_WIDTH,
-            height: PANEL_HEIGHT,
-            outputMode: OUTPUT_MODE,
+        const videoSlot = root.querySelector(".video-upload-slot");
+        videoSlot.innerHTML = "";
+        videoUploader = mountVideoUploader(videoSlot, {
+            width,
+            height,
+            outputMode,
             onSave: onSaveWithRefresh(saveVideo),
             onSaveExisting: onSaveWithRefresh(updateVideo),
-        },
-    );
+        });
+    }
 
+    // Initial mount.
+    mountDimensionedPanels(await resolvePanelDims());
+
+    // Schedule + settings don't depend on dims, so they mount once.
     mountSchedule(root.querySelector(".schedule-slot"), {
         fetchSchedule: getSchedule,
         onSave: saveSchedule,
@@ -196,6 +218,15 @@ async function boot() {
         onSave: saveSettings,
     });
 
+    // Re-mount on settings change so the canvas always matches current
+    // display config. resolvePanelDims re-reads /api/settings — the
+    // event's detail would let us skip that fetch, but re-reading
+    // keeps the dim-derivation logic (rotation swap, fallback) in one
+    // place.
+    document.addEventListener("openmarquee:settings-updated", async () => {
+        mountDimensionedPanels(await resolvePanelDims());
+    });
+
     const nav = mountNav({
         main: root,
         sidebar: document.querySelector(".sidebar"),
@@ -203,9 +234,11 @@ async function boot() {
         defaultSection: DEFAULT_SECTION,
     });
 
-    // Click-to-edit wiring: playlist-track.js dispatches this event when
-    // an operator clicks the ✎ affordance on a pallet tile. We route by
-    // the slide's type to the right subpage + uploader / editor.
+    // Click-to-edit wiring: playlist-track.js dispatches this event
+    // when an operator clicks the ✎ affordance on a pallet tile. We
+    // route by the slide's type to the right subpage + uploader /
+    // editor. The route table closes over the mutable handles above
+    // so it keeps working after a re-mount.
     const EDIT_ROUTES = {
         text_slide: {
             section: "slides/text",

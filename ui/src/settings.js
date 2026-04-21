@@ -335,6 +335,16 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             };
             await onSave(payload);
             statusEl.textContent = "Saved.";
+            // Tell the rest of the app the settings changed. main.js
+            // re-mounts the editor + uploader panels with fresh dims so
+            // the canvas size matches the operator's new display config.
+            // Existing stored slides keep their old-dim PNGs until
+            // re-saved — that's expected, not a bug.
+            document.dispatchEvent(
+                new CustomEvent("openmarquee:settings-updated", {
+                    detail: { settings: payload },
+                }),
+            );
         } catch (err) {
             statusEl.textContent = `Save failed: ${err.message}`;
         } finally {
