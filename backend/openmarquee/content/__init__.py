@@ -54,6 +54,12 @@ class TextSlide(BaseModel):
     font_size_px: int | None = Field(default=None, ge=4, le=2048)
     text_color: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
     background_color: str = Field(default="#000000", pattern=_HEX_COLOR_PATTERN)
+    # Optional: render a bundled / saved ImageSlide's PNG under the text.
+    # The UI flattens both layers to a single PNG at save time, so the
+    # device doesn't re-composite at playback — we keep the reference for
+    # re-editing (operator clicks a saved TextSlide; the editor hydrates
+    # the background picker with the right selection).
+    background_image_slide_id: UUID | None = None
     auto_mode: Literal["time", "date", "day"] | None = None
 
     # Transition INTO the next slide ("cut" = instant; "fade" = alpha-blend

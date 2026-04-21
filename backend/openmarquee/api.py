@@ -90,6 +90,7 @@ class TextSlideUpload(BaseModel):
     font_size_px: int | None = None
     text_color: str = "#FFFFFF"
     background_color: str = "#000000"
+    background_image_slide_id: UUID | None = None
     auto_mode: str | None = None
     transition: str = "cut"
     transition_ms: int = 500
@@ -113,6 +114,47 @@ async def upload_text_slide(
 
     storage.save_text_slide(slide, png)
     _append_to_playlist(playlist_storage, slide.id)
+    return slide
+
+
+@router.put("/text-slides/{item_id}", response_model=TextSlide)
+async def update_text_slide(
+    item_id: UUID,
+    payload: TextSlideUpload,
+    storage: StorageDep,
+) -> TextSlide:
+    """Replace an existing text slide. Used by the editor's edit-existing
+    flow — operator clicks a pallet tile, tweaks, saves. The slide keeps
+    its UUID, so playlist + schedule references remain valid.
+
+    Non-TextSlide variants (ImageSlide / VideoSlide) aren't editable via
+    this route — clients should check item type and either POST a fresh
+    slide or not offer the edit affordance.
+    """
+    # Refuse if the target exists but isn't a TextSlide — the only shape
+    # this endpoint can honor.
+    try:
+        existing = storage.load(item_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"no text slide {item_id}") from exc
+    if existing.type != "text_slide":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item_id} is a {existing.type}, not a text_slide",
+        )
+
+    png = _decode_png_payload(payload.png_base64)
+    try:
+        # Preserve the id + created_at; let everything else come from the payload.
+        slide = TextSlide(
+            id=item_id,
+            created_at=existing.created_at,
+            **payload.model_dump(exclude={"png_base64"}),
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    storage.save_text_slide(slide, png)
     return slide
 
 

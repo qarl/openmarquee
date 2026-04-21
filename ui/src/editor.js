@@ -1,7 +1,11 @@
-// Text-slide editor: form controls on one side, live canvas preview on the
-// other. Canvas is at the sign's native resolution; the browser scales it up
-// for display via CSS (image-rendering: pixelated) so what you see is what
-// the sign will show.
+// Text-slide editor: form controls + live canvas preview. Canvas is at the
+// sign's native resolution; the browser scales it up for display via CSS
+// (image-rendering: pixelated) so what you see is what the sign will show.
+//
+// The editor handles both creating new slides AND editing existing ones.
+// `loadForEdit(slide)` pre-fills the form from a stored TextSlide; Save
+// then dispatches to `onSaveExisting(id, payload)` instead of `onSave`.
+// Click "New slide" to exit edit-mode.
 
 // Signage-friendly color presets. Per SYSTEM_SPEC §5.1: most users just want
 // "white on red" and to be done — not to fiddle with a color picker.
@@ -12,6 +16,15 @@ const PRESETS = [
     { name: "Black on yellow", text: "#000000", bg: "#FFD23A" },
     { name: "White on green", text: "#FFFFFF", bg: "#1F7A3A" },
     { name: "Green on black", text: "#39FF14", bg: "#000000" },
+];
+
+// Generic CSS font families — operator picks the shape ("sans / serif /
+// mono"); the specific face comes from whatever the rendering device has.
+// Kept generic so the canvas render matches the device render.
+const FONT_FAMILIES = [
+    { value: "sans-serif", label: "Sans-serif (default)" },
+    { value: "serif", label: "Serif" },
+    { value: "monospace", label: "Monospace" },
 ];
 
 function presetButtonsHtml() {
@@ -27,6 +40,10 @@ function presetButtonsHtml() {
 
 const EDITOR_TEMPLATE = `
     <div class="editor">
+        <div class="editor-header">
+            <span class="editor-mode-label">New slide</span>
+            <button type="button" class="editor-new" hidden>+ New slide</button>
+        </div>
         <div class="preview-wrap">
             <canvas class="editor-canvas" aria-label="slide preview"></canvas>
         </div>
@@ -45,10 +62,29 @@ const EDITOR_TEMPLATE = `
                     <input type="color" class="field-text-color" value="#FFFFFF">
                 </label>
                 <label class="field field-color">
-                    <span>Background</span>
+                    <span>Solid background</span>
                     <input type="color" class="field-bg-color" value="#000000">
                 </label>
+                <label class="field">
+                    <span>Font</span>
+                    <select class="field-font-family"></select>
+                </label>
             </div>
+            <fieldset class="editor-bg-picker">
+                <legend>Background source</legend>
+                <label class="field-inline">
+                    <input type="radio" name="editor-bg-source" class="field-bg-source" value="color" checked>
+                    Solid color (above)
+                </label>
+                <label class="field-inline">
+                    <input type="radio" name="editor-bg-source" class="field-bg-source" value="slide">
+                    Existing slide
+                </label>
+                <label class="field editor-bg-slide-wrap" hidden>
+                    <span>Saved slide</span>
+                    <select class="field-bg-slide"><option value="">(pick a slide)</option></select>
+                </label>
+            </fieldset>
             <div class="row">
                 <label class="field">
                     <span>Slide name</span>
@@ -61,19 +97,6 @@ const EDITOR_TEMPLATE = `
                 <label class="field field-duration-wrap">
                     <span>Font size (px)</span>
                     <input type="number" class="field-font-size" min="4" max="2048" step="1">
-                </label>
-            </div>
-            <div class="row">
-                <label class="field">
-                    <span>Transition into next</span>
-                    <select class="field-transition">
-                        <option value="cut" selected>Cut (instant)</option>
-                        <option value="fade">Fade</option>
-                    </select>
-                </label>
-                <label class="field field-duration-wrap">
-                    <span>Fade time (ms)</span>
-                    <input type="number" class="field-transition-ms" value="500" min="0" max="5000" step="50">
                 </label>
             </div>
             <label class="field">
@@ -102,41 +125,58 @@ const EDITOR_TEMPLATE = `
 `;
 
 /**
- * Mount the text-slide editor into `container`.
+ * Mount the text-slide editor.
  *
- * @param {HTMLElement} container — parent element (emptied and replaced).
+ * @param {HTMLElement} container — parent (emptied + replaced).
  * @param {object} options
- * @param {number} options.width — target sign width in pixels.
- * @param {number} options.height — target sign height in pixels.
- * @param {(payload: object) => Promise<void>} options.onSave — called with
- *     the serialized slide payload when the user hits Save.
+ * @param {number} options.width  — sign width in pixels.
+ * @param {number} options.height — sign height in pixels.
+ * @param {(payload) => Promise<any>} options.onSave — called for NEW
+ *     slides; payload is the TextSlideUpload shape.
+ * @param {(id, payload) => Promise<any>} [options.onSaveExisting] — called
+ *     for edit-mode saves. When omitted the editor still works but any
+ *     edit attempt falls back to onSave (create-new).
+ * @param {() => Promise<Array>} [options.fetchItems] — populates the
+ *     background-slide dropdown with available content items. Omit to
+ *     disable the "From saved slide" picker.
+ * @returns {{ loadForEdit: (slide) => Promise<void> }}
+ *     caller-facing handle so the playlist-track pallet can wire a
+ *     click-to-edit affordance.
  */
-export function mountEditor(container, { width, height, onSave }) {
+export function mountEditor(
+    container,
+    { width, height, onSave, onSaveExisting, fetchItems },
+) {
     container.innerHTML = EDITOR_TEMPLATE;
 
     const canvas = container.querySelector(".editor-canvas");
     canvas.width = width;
     canvas.height = height;
-    // Pin the visible aspect ratio to the actual canvas dimensions so a
-    // 64x32 panel doesn't get displayed as 4:3.
     canvas.style.aspectRatio = `${width} / ${height}`;
 
+    const modeLabelEl = container.querySelector(".editor-mode-label");
+    const newBtnEl = container.querySelector(".editor-new");
     const textEl = container.querySelector(".field-text");
     const textColorEl = container.querySelector(".field-text-color");
     const bgColorEl = container.querySelector(".field-bg-color");
+    const fontFamilyEl = container.querySelector(".field-font-family");
+    const bgSlideEl = container.querySelector(".field-bg-slide");
+    const bgSlideWrapEl = container.querySelector(".editor-bg-slide-wrap");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const fontSizeEl = container.querySelector(".field-font-size");
     const autoModeEl = container.querySelector(".field-auto-mode");
     const autoModeHintEl = container.querySelector(".field-auto-mode-hint");
-    const transitionEl = container.querySelector(".field-transition");
-    const transitionMsEl = container.querySelector(".field-transition-ms");
     const form = container.querySelector(".controls");
     const statusEl = container.querySelector(".editor-status");
     const saveBtn = container.querySelector(".field-save");
 
-    // Seed font-size from the existing heuristic so a first-time user
-    // sees reasonable output without adjusting anything; they can override.
+    for (const f of FONT_FAMILIES) {
+        const opt = document.createElement("option");
+        opt.value = f.value;
+        opt.textContent = f.label;
+        fontFamilyEl.appendChild(opt);
+    }
     fontSizeEl.value = String(pickFontSize(height));
 
     const state = {
@@ -145,10 +185,16 @@ export function mountEditor(container, { width, height, onSave }) {
         textColor: textColorEl.value,
         backgroundColor: bgColorEl.value,
         fontSize: Number(fontSizeEl.value),
+        fontFamily: fontFamilyEl.value,
+        bgSource: "color",
+        bgSlideId: null,
+        bgImage: null, // decoded <img> for "slide" mode
+        // Edit-mode tracking: when non-null, Save dispatches to
+        // onSaveExisting(editingId, payload) instead of onSave.
+        editingId: null,
     };
 
     function updateSaveEnabled() {
-        // Empty text isn't worth a slide; in-flight saves shouldn't double-fire.
         saveBtn.disabled = !state.text.trim() || saveBtn.dataset.inFlight === "1";
     }
 
@@ -157,6 +203,7 @@ export function mountEditor(container, { width, height, onSave }) {
         state.text = textEl.value;
         state.textColor = textColorEl.value;
         state.backgroundColor = bgColorEl.value;
+        state.fontFamily = fontFamilyEl.value;
         const parsedSize = Number(fontSizeEl.value);
         if (Number.isFinite(parsedSize) && parsedSize > 0) {
             state.fontSize = parsedSize;
@@ -165,19 +212,49 @@ export function mountEditor(container, { width, height, onSave }) {
         updateSaveEnabled();
     }
 
-    for (const el of [textEl, textColorEl, bgColorEl, nameEl, fontSizeEl]) {
+    for (const el of [
+        textEl,
+        textColorEl,
+        bgColorEl,
+        nameEl,
+        fontSizeEl,
+        fontFamilyEl,
+    ]) {
         el.addEventListener("input", syncAndRender);
     }
 
-    // Auto-mode: show/hide the hint and let the user know their typed
-    // text is a fallback when dynamic content is selected. No live render
-    // in the preview — we don't want the canvas to tick with the clock
-    // while the operator is still editing styling.
     autoModeEl.addEventListener("change", () => {
         autoModeHintEl.hidden = !autoModeEl.value;
     });
 
-    // Keyboard shortcuts: Cmd/Ctrl+Enter to save from anywhere in the form.
+    // Background-source radios toggle the slide picker. When "slide" is
+    // selected, populate the dropdown lazily (first time only) via
+    // fetchItems so a first-mount doesn't burn a fetch on an operator
+    // who's going to stick with solid-color anyway.
+    let bgSlidePopulated = false;
+    for (const radio of container.querySelectorAll(".field-bg-source")) {
+        radio.addEventListener("change", async () => {
+            state.bgSource = radio.value;
+            bgSlideWrapEl.hidden = state.bgSource !== "slide";
+            if (state.bgSource === "slide" && fetchItems && !bgSlidePopulated) {
+                await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
+                bgSlidePopulated = true;
+            }
+            if (state.bgSource === "color") {
+                state.bgImage = null;
+                state.bgSlideId = null;
+            }
+            syncAndRender();
+        });
+    }
+    bgSlideEl.addEventListener("change", async () => {
+        state.bgSlideId = bgSlideEl.value || null;
+        state.bgImage = state.bgSlideId
+            ? await loadImageForSlide(state.bgSlideId).catch(() => null)
+            : null;
+        syncAndRender();
+    });
+
     form.addEventListener("keydown", (event) => {
         if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
             event.preventDefault();
@@ -185,8 +262,6 @@ export function mountEditor(container, { width, height, onSave }) {
         }
     });
 
-    // Escape in the text area clears it (but keeps the styling + name so the
-    // user can iterate quickly on the same slide settings).
     textEl.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
             event.preventDefault();
@@ -201,12 +276,13 @@ export function mountEditor(container, { width, height, onSave }) {
             if (!preset) return;
             textColorEl.value = preset.text;
             bgColorEl.value = preset.bg;
-            // Dispatch synthetic input events so any future listener
-            // (validation, dirty-state, undo) sees preset clicks the same as
-            // user edits.
             textColorEl.dispatchEvent(new Event("input", { bubbles: true }));
             bgColorEl.dispatchEvent(new Event("input", { bubbles: true }));
         });
+    });
+
+    newBtnEl.addEventListener("click", () => {
+        resetToBlank();
     });
 
     form.addEventListener("submit", async (event) => {
@@ -218,25 +294,29 @@ export function mountEditor(container, { width, height, onSave }) {
         statusEl.textContent = "Saving…";
         try {
             const png_base64 = canvasToBase64(canvas);
-            // Seconds → ms; clamp lightly so an empty input becomes the default.
             const durationSeconds = Number(durationEl.value) || 5;
-            const transitionMs = Number(transitionMsEl.value);
-            await onSave({
+            const payload = {
                 name: state.name || "Untitled",
                 text: state.text,
                 text_color: state.textColor.toUpperCase(),
                 background_color: state.backgroundColor.toUpperCase(),
+                font_family: state.fontFamily,
                 font_size_px: Math.round(state.fontSize),
+                background_image_slide_id: state.bgSlideId || null,
                 auto_mode: autoModeEl.value || null,
                 duration_ms: Math.round(durationSeconds * 1000),
-                transition: transitionEl.value,
-                transition_ms: Number.isFinite(transitionMs) ? transitionMs : 500,
                 png_base64,
-            });
-            statusEl.textContent = "Saved.";
-            textEl.value = "";
-            state.text = "";
-            syncAndRender();
+            };
+            const result = state.editingId && onSaveExisting
+                ? await onSaveExisting(state.editingId, payload)
+                : await onSave(payload);
+            statusEl.textContent = state.editingId
+                ? "Updated."
+                : "Saved.";
+            // After a save we reset to a blank slate — operator's flow
+            // is save → tweak next one, not re-save → identical twin.
+            resetToBlank();
+            return result;
         } catch (err) {
             statusEl.textContent = `Save failed: ${err.message}`;
         } finally {
@@ -245,14 +325,109 @@ export function mountEditor(container, { width, height, onSave }) {
         }
     });
 
+    function resetToBlank() {
+        state.editingId = null;
+        state.bgImage = null;
+        state.bgSlideId = null;
+        modeLabelEl.textContent = "New slide";
+        newBtnEl.hidden = true;
+        textEl.value = "";
+        nameEl.value = "Untitled";
+        autoModeEl.value = "";
+        autoModeHintEl.hidden = true;
+        // Reset background source to solid color.
+        const colorRadio = container.querySelector(
+            '.field-bg-source[value="color"]',
+        );
+        colorRadio.checked = true;
+        bgSlideWrapEl.hidden = true;
+        state.bgSource = "color";
+        syncAndRender();
+    }
+
+    async function loadForEdit(slide) {
+        if (!slide || slide.type !== "text_slide") {
+            statusEl.textContent =
+                "Only text slides are editable — delete + re-upload for images or videos.";
+            return;
+        }
+        state.editingId = String(slide.id);
+        modeLabelEl.textContent = `Editing: ${slide.name || "Untitled"}`;
+        newBtnEl.hidden = false;
+
+        nameEl.value = slide.name || "Untitled";
+        textEl.value = slide.text || "";
+        textColorEl.value = slide.text_color || "#FFFFFF";
+        bgColorEl.value = slide.background_color || "#000000";
+        fontFamilyEl.value = slide.font_family || "sans-serif";
+        fontSizeEl.value = String(slide.font_size_px || pickFontSize(height));
+        durationEl.value = String(Math.max(1, (slide.duration_ms || 5000) / 1000));
+        autoModeEl.value = slide.auto_mode || "";
+        autoModeHintEl.hidden = !slide.auto_mode;
+
+        if (slide.background_image_slide_id) {
+            // Switch to "slide" background and select the referenced image.
+            const slideRadio = container.querySelector(
+                '.field-bg-source[value="slide"]',
+            );
+            slideRadio.checked = true;
+            if (fetchItems && !bgSlidePopulated) {
+                await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
+                bgSlidePopulated = true;
+            }
+            bgSlideWrapEl.hidden = false;
+            bgSlideEl.value = String(slide.background_image_slide_id);
+            state.bgSource = "slide";
+            state.bgSlideId = String(slide.background_image_slide_id);
+            state.bgImage = await loadImageForSlide(state.bgSlideId).catch(
+                () => null,
+            );
+        } else {
+            const colorRadio = container.querySelector(
+                '.field-bg-source[value="color"]',
+            );
+            colorRadio.checked = true;
+            bgSlideWrapEl.hidden = true;
+            state.bgSource = "color";
+            state.bgSlideId = null;
+            state.bgImage = null;
+        }
+        syncAndRender();
+    }
+
     syncAndRender();
+
+    return { loadForEdit };
+}
+
+async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
+    try {
+        const items = await fetchItems();
+        selectEl.innerHTML = '<option value="">(pick a slide)</option>';
+        for (const item of items) {
+            const opt = document.createElement("option");
+            opt.value = String(item.id);
+            opt.textContent = item.name || item.text || "Untitled";
+            selectEl.appendChild(opt);
+        }
+    } catch (err) {
+        statusEl.textContent = `Could not load slides: ${err.message}`;
+    }
+}
+
+function loadImageForSlide(slideId) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error("could not load slide image"));
+        img.src = `/api/content/${slideId}/asset`;
+    });
 }
 
 /**
  * Draw the slide onto `canvas`. Pure in the sense that it only reads
- * `state` and writes pixels — no DOM wiring, no event handlers. Wraps
- * the body in save()/restore() so callers (e.g. list thumbnails sharing
- * an offscreen canvas) don't see leaked context state.
+ * `state` and writes pixels — no DOM wiring, no event handlers.
  */
 export function drawCanvas(canvas, state) {
     const ctx = canvas.getContext("2d");
@@ -261,33 +436,36 @@ export function drawCanvas(canvas, state) {
         textColor = "#FFFFFF",
         backgroundColor = "#000000",
         fontSize,
+        fontFamily = "sans-serif",
+        bgSource = "color",
+        bgImage = null,
     } = state;
 
     ctx.save();
     try {
-        ctx.fillStyle = backgroundColor;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        // Background layer: image (scaled to cover) or solid color.
+        if (bgSource === "slide" && bgImage) {
+            ctx.drawImage(bgImage, 0, 0, canvas.width, canvas.height);
+        } else {
+            ctx.fillStyle = backgroundColor;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
 
         if (!text) return;
 
-        // Operator-chosen font size when present; fall back to the old
-        // ~40% heuristic so render-only callers (list thumbnails) keep
-        // working without threading a size through.
         const fontSizePx =
             Number.isFinite(fontSize) && fontSize > 0
                 ? fontSize
                 : pickFontSize(canvas.height);
         ctx.fillStyle = textColor;
-        ctx.font = `bold ${fontSizePx}px sans-serif`;
+        ctx.font = `bold ${fontSizePx}px ${fontFamily}`;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
 
-        // Multiline support — handle \r\n from iOS paste too.
         const lines = text.split(/\r?\n/);
         const lineHeight = fontSizePx * 1.1;
         const totalHeight = lineHeight * lines.length;
         const startY = canvas.height / 2 - totalHeight / 2 + lineHeight / 2;
-        // maxWidth shrinks long lines horizontally instead of overflowing.
         const maxWidth = Math.max(1, canvas.width - 4);
         for (let i = 0; i < lines.length; i++) {
             ctx.fillText(lines[i], canvas.width / 2, startY + i * lineHeight, maxWidth);
@@ -297,20 +475,10 @@ export function drawCanvas(canvas, state) {
     }
 }
 
-/**
- * Pick a font size that's roughly readable at the target panel height.
- * Simple heuristic for now; Phase 3 polish can replace this with real
- * auto-fit once we see what real slides need.
- */
 export function pickFontSize(panelHeight) {
-    // ~40% of the panel height per line feels right for a single short line
-    // at small panel sizes, scales up sensibly for HDMI resolutions.
     return Math.max(12, Math.floor(panelHeight * 0.4));
 }
 
-/**
- * Serialize the canvas's current pixels to a base64 PNG body (no data: prefix).
- */
 export function canvasToBase64(canvas) {
     const dataUrl = canvas.toDataURL("image/png");
     return dataUrl.split(",")[1];

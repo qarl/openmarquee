@@ -13,7 +13,7 @@
 // next page load — re-mounting on save is a future refinement.
 
 import {
-    generateBackground,
+    fetchContentItem,
     getPlaybackState,
     getSchedule,
     getSettings,
@@ -27,8 +27,8 @@ import {
     setPlaylistOrder,
     startPlayback,
     stopPlayback,
+    updateTextSlide,
 } from "./api.js";
-import { mountComposer } from "./composer.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
 import { mountNav } from "./nav.js";
@@ -82,7 +82,6 @@ async function boot() {
     root.innerHTML = `
         <section data-section="slides/text" class="panel">
             <div class="editor-slot"></div>
-            <div class="composer-slot"></div>
         </section>
         <section data-section="slides/image" class="panel">
             <div class="image-upload-slot"></div>
@@ -125,22 +124,12 @@ async function boot() {
         return saved;
     };
 
-    mountEditor(root.querySelector(".editor-slot"), {
-        width: PANEL_WIDTH,
-        height: PANEL_HEIGHT,
-        onSave: onSaveWithRefresh(saveTextSlide),
-    });
-
-    mountComposer(root.querySelector(".composer-slot"), {
+    const editor = mountEditor(root.querySelector(".editor-slot"), {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
         fetchItems: listContent,
-        // Composite slides ride the ImageSlide API — a flat PNG is all the
-        // server needs. The layer structure lives only in the browser tab.
-        onSave: onSaveWithRefresh(saveImage),
-        // Server-side generator — returns an ImageSlide and auto-appends to
-        // the default playlist.
-        onGenerateBackground: onSaveWithRefresh(generateBackground),
+        onSave: onSaveWithRefresh(saveTextSlide),
+        onSaveExisting: onSaveWithRefresh(updateTextSlide),
     });
 
     mountImageUploader(root.querySelector(".image-upload-slot"), {
@@ -169,12 +158,32 @@ async function boot() {
         onSave: saveSettings,
     });
 
-    mountNav({
+    const nav = mountNav({
         main: root,
         sidebar: document.querySelector(".sidebar"),
         sections: SECTIONS,
         defaultSection: DEFAULT_SECTION,
     });
+
+    // Click-to-edit wiring: playlist-track.js dispatches this event when
+    // an operator clicks the ✎ affordance on a pallet tile. We navigate
+    // to the Text subpage + hydrate the editor with the slide's data.
+    document.addEventListener("openmarquee:edit-slide", async (event) => {
+        const { id, type } = event.detail || {};
+        if (type !== "text_slide") return;
+        try {
+            const slide = await fetchContentItem(id);
+            window.location.hash = "#/slides/text";
+            await editor.loadForEdit(slide);
+        } catch (err) {
+            // Editor surfaces its own status; console makes the failure
+            // visible during development.
+            console.error("[openmarquee] failed to open slide for edit:", err);
+        }
+    });
+    // Silence unused-var; `nav` is the mount's return value in case a
+    // caller later wants to trigger navigation programmatically.
+    void nav;
 }
 
 if (typeof window !== "undefined") {

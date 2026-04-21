@@ -352,11 +352,13 @@ describe("mountEditor — submit flow", () => {
         await new Promise((r) => setTimeout(r, 0));
 
         const payload = onSave.mock.calls[0][0];
-        expect(payload.transition).toBe("cut");
-        expect(payload.transition_ms).toBe(500);
+        // Transition fields no longer live on text slides — the playlist
+        // carries them as of v3. The editor payload mustn't send them.
+        expect(payload.transition).toBeUndefined();
+        expect(payload.transition_ms).toBeUndefined();
     });
 
-    it("sends transition='fade' and the user's transition_ms", async () => {
+    it("sends font_family + background_image_slide_id in the payload", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
@@ -364,14 +366,79 @@ describe("mountEditor — submit flow", () => {
         mountEditor(container, { width: 128, height: 96, onSave });
         container.querySelector(".field-text").value = "Hi";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
-        container.querySelector(".field-transition").value = "fade";
-        container.querySelector(".field-transition-ms").value = "1200";
+        container.querySelector(".field-font-family").value = "serif";
+        container
+            .querySelector(".field-font-family")
+            .dispatchEvent(new Event("input"));
 
         container.querySelector(".controls").dispatchEvent(new Event("submit"));
         await new Promise((r) => setTimeout(r, 0));
 
         const payload = onSave.mock.calls[0][0];
-        expect(payload.transition).toBe("fade");
-        expect(payload.transition_ms).toBe(1200);
+        expect(payload.font_family).toBe("serif");
+        expect(payload.background_image_slide_id).toBeNull();
+    });
+
+    it("loadForEdit pre-fills the form + Save dispatches to onSaveExisting", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "new" });
+        const onSaveExisting = vi.fn().mockResolvedValue({ id: "abc" });
+
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave,
+            onSaveExisting,
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "abc",
+            name: "Promo",
+            text: "PROMO",
+            text_color: "#ffffff",
+            background_color: "#CC0000",
+            font_family: "monospace",
+            font_size_px: 40,
+            duration_ms: 7000,
+            auto_mode: null,
+        });
+        expect(container.querySelector(".field-text").value).toBe("PROMO");
+        expect(container.querySelector(".field-name").value).toBe("Promo");
+        expect(container.querySelector(".field-font-family").value).toBe(
+            "monospace",
+        );
+        expect(container.querySelector(".field-duration").value).toBe("7");
+        expect(container.querySelector(".editor-mode-label").textContent).toMatch(
+            /Editing: Promo/,
+        );
+
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(onSaveExisting).toHaveBeenCalledTimes(1);
+        expect(onSave).not.toHaveBeenCalled();
+        expect(onSaveExisting.mock.calls[0][0]).toBe("abc");
+    });
+
+    it("New-slide button exits edit mode and clears the form", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting: vi.fn(),
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "abc",
+            name: "X",
+            text: "X",
+        });
+        container.querySelector(".editor-new").click();
+        expect(container.querySelector(".field-text").value).toBe("");
+        expect(container.querySelector(".editor-mode-label").textContent).toBe(
+            "New slide",
+        );
     });
 });

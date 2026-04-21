@@ -70,6 +70,33 @@ export async function listContent() {
     return await response.json();
 }
 
+/** Fetch a single content item by id (for the editor's edit-existing flow). */
+export async function fetchContentItem(id) {
+    const response = await fetch(`/api/content/${id}`);
+    if (!response.ok) {
+        throw new Error(`Fetch item failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+/**
+ * Update an existing text slide. `id` is the slide's UUID; the payload
+ * matches the same shape as saveTextSlide. Preserves the UUID + created_at
+ * so playlist / schedule references keep pointing at the same content.
+ */
+export async function updateTextSlide(id, payload) {
+    const response = await fetch(`/api/content/text-slides/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Update failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
 /** Delete a content item by id. */
 export async function deleteContent(id) {
     const response = await fetch(`/api/content/${id}`, { method: "DELETE" });
