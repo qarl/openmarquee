@@ -52,6 +52,17 @@ _WIFI_PASSPHRASE_PATTERN = re.compile(r"^[\x20-\x7e]{8,63}$")
 # actual use time — but it catches obvious garbage at the API boundary.
 _IANA_TZ_PATTERN = re.compile(r"^[A-Za-z0-9_+/\-]{1,64}$")
 
+# Tailscale pre-auth keys are `tskey-auth-...`; OAuth client keys are
+# `tskey-client-...`. Operators paste one of these; the shape isn't worth
+# hard-enforcing (Tailscale may add variants), but the prefix catches
+# obvious mistakes (random password pasted into the wrong field).
+_TAILSCALE_AUTH_KEY_PATTERN = re.compile(r"^tskey-[a-z]+-[A-Za-z0-9\-]{8,}$")
+
+# RFC 1123 hostname chars, 1-63 per label, no trailing/leading hyphen.
+_TAILSCALE_HOSTNAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$"
+)
+
 
 class SystemSettings(BaseModel):
     """Device-wide configuration. One per device; persisted as a single file."""
@@ -114,6 +125,34 @@ class SystemSettings(BaseModel):
         "naive-local today. Lands fully with the schedule zoned-eval work.",
     )
 
+    # --- Tailscale (optional remote management) ---
+    #
+    # Enabling provisions the device onto the operator's tailnet so they
+    # can reach the captive-portal UI from outside the AP (useful for
+    # managing a sign remotely). Requires the device to have internet at
+    # install time — either via secondary WiFi or Ethernet. All three
+    # fields are stored now; the oneshot systemd unit that reads them +
+    # runs `tailscale up` lands with Phase 7.
+    tailscale_enabled: bool = Field(
+        default=False,
+        description="Bring up the Tailscale daemon on boot.",
+    )
+    tailscale_auth_key: str | None = Field(
+        default=None,
+        description=(
+            "Pre-authorized Tailscale auth key (tskey-auth-… or "
+            "tskey-client-…). Used once at device bring-up; can be cleared "
+            "after the node authenticates."
+        ),
+    )
+    tailscale_hostname: str | None = Field(
+        default=None,
+        description=(
+            "DNS-safe hostname the device registers under on the tailnet. "
+            "Defaults to the operating-system hostname when unset."
+        ),
+    )
+
     @field_validator("wifi_ssid")
     @classmethod
     def _check_ssid(cls, value: str) -> str:
@@ -139,6 +178,30 @@ class SystemSettings(BaseModel):
             return None
         if not _IANA_TZ_PATTERN.match(value):
             raise ValueError(f"timezone: not a well-formed IANA name: {value!r}")
+        return value
+
+    @field_validator("tailscale_auth_key")
+    @classmethod
+    def _check_tailscale_auth_key(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not _TAILSCALE_AUTH_KEY_PATTERN.match(value):
+            raise ValueError(
+                "tailscale_auth_key: expected a tskey-auth-… / tskey-client-… "
+                "string from the Tailscale admin console"
+            )
+        return value
+
+    @field_validator("tailscale_hostname")
+    @classmethod
+    def _check_tailscale_hostname(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not _TAILSCALE_HOSTNAME_PATTERN.match(value):
+            raise ValueError(
+                "tailscale_hostname: expected DNS-safe 1-63 chars "
+                "(letters, digits, hyphens; no leading/trailing hyphen)"
+            )
         return value
 
 

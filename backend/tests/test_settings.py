@@ -139,6 +139,51 @@ def test_timezone_rejects_garbage():
         SystemSettings(timezone="not a tz; DROP TABLE")
 
 
+# --- Tailscale ---
+
+
+def test_tailscale_defaults_off():
+    s = SystemSettings()
+    assert s.tailscale_enabled is False
+    assert s.tailscale_auth_key is None
+    assert s.tailscale_hostname is None
+
+
+def test_tailscale_accepts_pre_authorized_auth_key():
+    s = SystemSettings(tailscale_auth_key="tskey-auth-abc123XYZ-long-enough")
+    assert s.tailscale_auth_key == "tskey-auth-abc123XYZ-long-enough"
+
+
+def test_tailscale_accepts_client_auth_key():
+    s = SystemSettings(tailscale_auth_key="tskey-client-123-456-aaa-bbb")
+    assert s.tailscale_auth_key.startswith("tskey-client")
+
+
+def test_tailscale_rejects_pasted_non_tskey_string():
+    with pytest.raises(ValidationError):
+        SystemSettings(tailscale_auth_key="password123")
+
+
+def test_tailscale_auth_key_empty_string_coerces_to_none():
+    s = SystemSettings(tailscale_auth_key="")
+    assert s.tailscale_auth_key is None
+
+
+def test_tailscale_hostname_accepts_rfc_safe_name():
+    s = SystemSettings(tailscale_hostname="lobby-sign-01")
+    assert s.tailscale_hostname == "lobby-sign-01"
+
+
+def test_tailscale_hostname_rejects_leading_hyphen():
+    with pytest.raises(ValidationError):
+        SystemSettings(tailscale_hostname="-bad")
+
+
+def test_tailscale_hostname_rejects_spaces():
+    with pytest.raises(ValidationError):
+        SystemSettings(tailscale_hostname="lobby sign")
+
+
 # --- SettingsStorage ---
 
 

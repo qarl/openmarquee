@@ -86,6 +86,31 @@ const SECTION_TEMPLATE = `
                 </label>
             </div>
 
+            <fieldset class="settings-tailscale">
+                <legend>Tailscale (optional remote management)</legend>
+                <p class="settings-hint">
+                    Bring the device up on your tailnet so you can reach
+                    this UI from anywhere. Requires internet at
+                    install-time (secondary WiFi or Ethernet). Actual
+                    <code>tailscale up</code> wiring lands with the
+                    network-provisioning work; today the values persist.
+                </p>
+                <label class="field-inline">
+                    <input type="checkbox" class="field-tailscale-enabled">
+                    Enable Tailscale
+                </label>
+                <div class="row">
+                    <label class="field">
+                        <span>Hostname on tailnet (optional)</span>
+                        <input type="text" class="field-tailscale-hostname" maxlength="63" placeholder="e.g. lobby-sign-01">
+                    </label>
+                    <label class="field">
+                        <span>Auth key (tskey-auth-… or tskey-client-…)</span>
+                        <input type="password" class="field-tailscale-auth-key" placeholder="paste from Tailscale admin">
+                    </label>
+                </div>
+            </fieldset>
+
             <button type="submit" class="primary settings-save">Save settings</button>
             <p class="settings-status" role="status" aria-live="polite"></p>
         </form>
@@ -115,6 +140,9 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     const ssidEl = container.querySelector(".field-wifi-ssid");
     const passwordEl = container.querySelector(".field-wifi-password");
     const tzEl = container.querySelector(".field-timezone");
+    const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
+    const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
+    const tsAuthKeyEl = container.querySelector(".field-tailscale-auth-key");
 
     // One-time population of non-data-driven selects.
     for (const mode of OUTPUT_MODES) {
@@ -142,6 +170,9 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             // it in plaintext on GET — this is just hydrating the form.
             passwordEl.value = settings.wifi_password ?? "";
             setTimezoneValue(tzEl, settings.timezone || "");
+            tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
+            tsHostnameEl.value = settings.tailscale_hostname ?? "";
+            tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
         } catch (err) {
             statusEl.textContent = `Could not load settings: ${err.message}`;
         }
@@ -163,6 +194,9 @@ export function mountSettings(container, { fetchSettings, onSave }) {
                 wifi_ssid: ssidEl.value,
                 wifi_password: passwordEl.value,
                 timezone: tzEl.value || null,
+                tailscale_enabled: tsEnabledEl.checked,
+                tailscale_hostname: tsHostnameEl.value.trim() || null,
+                tailscale_auth_key: tsAuthKeyEl.value || null,
             };
             await onSave(payload);
             statusEl.textContent = "Saved.";

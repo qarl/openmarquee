@@ -433,6 +433,30 @@ main {
 .settings-dl dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .settings-status { margin: 0; color: var(--muted); font-size: 0.85rem; min-height: 1.2em; }
 
+.settings-tailscale {
+    border: 1px solid var(--panel-border);
+    border-radius: 0.4rem;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin-top: 0.5rem;
+}
+.settings-tailscale legend {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--muted);
+    padding: 0 0.35rem;
+}
+
+.field-inline {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    color: var(--text);
+}
+
 .status {
     color: var(--muted);
     font-size: 0.9rem;

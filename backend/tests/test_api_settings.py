@@ -53,6 +53,9 @@ def test_put_then_get_round_trip(client: TestClient):
         "wifi_ssid": "CoffeeShop",
         "wifi_password": "bean-bean-bean",
         "timezone": "America/New_York",
+        "tailscale_enabled": False,
+        "tailscale_auth_key": None,
+        "tailscale_hostname": None,
     }
     response = client.put("/api/settings", json=payload)
     assert response.status_code == 200

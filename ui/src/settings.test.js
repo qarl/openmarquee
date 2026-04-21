@@ -21,6 +21,9 @@ const SAMPLE = {
     wifi_ssid: "openMarquee-A3F7",
     wifi_password: "correct-horse-battery",
     timezone: "America/New_York",
+    tailscale_enabled: false,
+    tailscale_hostname: null,
+    tailscale_auth_key: null,
 };
 
 describe("mountSettings", () => {
@@ -116,6 +119,55 @@ describe("mountSettings", () => {
         await tick();
 
         expect(onSave.mock.calls[0][0].timezone).toBeNull();
+    });
+
+    it("hydrates Tailscale fields + round-trips them to onSave", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountSettings(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                tailscale_enabled: true,
+                tailscale_hostname: "lobby-sign-01",
+                tailscale_auth_key: "tskey-auth-existing-12345",
+            }),
+            onSave,
+        });
+        await tick();
+
+        expect(container.querySelector(".field-tailscale-enabled").checked).toBe(true);
+        expect(container.querySelector(".field-tailscale-hostname").value).toBe(
+            "lobby-sign-01",
+        );
+        expect(container.querySelector(".field-tailscale-auth-key").value).toBe(
+            "tskey-auth-existing-12345",
+        );
+
+        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        await tick();
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.tailscale_enabled).toBe(true);
+        expect(payload.tailscale_hostname).toBe("lobby-sign-01");
+        expect(payload.tailscale_auth_key).toBe("tskey-auth-existing-12345");
+    });
+
+    it("sends Tailscale hostname + key as null when cleared", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave,
+        });
+        await tick();
+
+        container.querySelector(".field-tailscale-hostname").value = "  ";
+        container.querySelector(".field-tailscale-auth-key").value = "";
+        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        await tick();
+
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.tailscale_hostname).toBeNull();
+        expect(payload.tailscale_auth_key).toBeNull();
     });
 
     it("surfaces backend failures into the status line without throwing", async () => {
