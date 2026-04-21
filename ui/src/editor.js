@@ -49,10 +49,16 @@ const EDITOR_TEMPLATE = `
                     <input type="color" class="field-bg-color" value="#000000">
                 </label>
             </div>
-            <label class="field">
-                <span>Slide name</span>
-                <input type="text" class="field-name" value="Untitled" maxlength="200">
-            </label>
+            <div class="row">
+                <label class="field">
+                    <span>Slide name</span>
+                    <input type="text" class="field-name" value="Untitled" maxlength="200">
+                </label>
+                <label class="field field-duration-wrap">
+                    <span>Duration (s)</span>
+                    <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
+                </label>
+            </div>
             <button type="submit" class="primary field-save">Save slide</button>
             <p class="editor-status" role="status" aria-live="polite"></p>
         </form>
@@ -83,6 +89,7 @@ export function mountEditor(container, { width, height, onSave }) {
     const textColorEl = container.querySelector(".field-text-color");
     const bgColorEl = container.querySelector(".field-bg-color");
     const nameEl = container.querySelector(".field-name");
+    const durationEl = container.querySelector(".field-duration");
     const form = container.querySelector(".controls");
     const statusEl = container.querySelector(".editor-status");
     const saveBtn = container.querySelector(".field-save");
@@ -135,11 +142,14 @@ export function mountEditor(container, { width, height, onSave }) {
         statusEl.textContent = "Saving…";
         try {
             const png_base64 = canvasToBase64(canvas);
+            // Seconds → ms; clamp lightly so an empty input becomes the default.
+            const durationSeconds = Number(durationEl.value) || 5;
             await onSave({
                 name: state.name || "Untitled",
                 text: state.text,
                 text_color: state.textColor.toUpperCase(),
                 background_color: state.backgroundColor.toUpperCase(),
+                duration_ms: Math.round(durationSeconds * 1000),
                 png_base64,
             });
             statusEl.textContent = "Saved.";

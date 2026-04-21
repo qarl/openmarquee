@@ -13,10 +13,16 @@ const TEMPLATE = `
                 <span>Image file (JPG or PNG)</span>
                 <input type="file" accept="image/jpeg,image/png" class="field-file">
             </label>
-            <label class="field">
-                <span>Slide name</span>
-                <input type="text" class="field-name" value="Image" maxlength="200">
-            </label>
+            <div class="row">
+                <label class="field">
+                    <span>Slide name</span>
+                    <input type="text" class="field-name" value="Image" maxlength="200">
+                </label>
+                <label class="field field-duration-wrap">
+                    <span>Duration (s)</span>
+                    <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
+                </label>
+            </div>
             <button type="submit" class="primary field-save" disabled>Save image</button>
             <p class="image-upload-status" role="status" aria-live="polite"></p>
         </form>
@@ -42,6 +48,7 @@ export function mountImageUploader(container, { width, height, onSave }) {
 
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
+    const durationEl = container.querySelector(".field-duration");
     const form = container.querySelector(".controls");
     const saveBtn = container.querySelector(".field-save");
     const statusEl = container.querySelector(".image-upload-status");
@@ -86,8 +93,10 @@ export function mountImageUploader(container, { width, height, onSave }) {
         statusEl.textContent = "Saving…";
         try {
             const png_base64 = canvasToBase64(canvas);
+            const durationSeconds = Number(durationEl.value) || 5;
             await onSave({
                 name: nameEl.value || "Image",
+                duration_ms: Math.round(durationSeconds * 1000),
                 png_base64,
             });
             statusEl.textContent = "Saved.";

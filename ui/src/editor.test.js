@@ -146,7 +146,25 @@ describe("mountEditor — submit flow", () => {
         expect(payload.text).toBe("Hi");
         expect(payload.text_color).toBe("#FFAA00");
         expect(payload.background_color).toBe("#000000");
+        expect(payload.duration_ms).toBe(5000); // default 5s
         expect(payload.png_base64).toBe("STUBDATA");
+    });
+
+    it("sends the user's duration in milliseconds", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+
+        mountEditor(container, { width: 128, height: 96, onSave });
+
+        container.querySelector(".field-text").value = "Hi";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        container.querySelector(".field-duration").value = "12";
+
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(onSave.mock.calls[0][0].duration_ms).toBe(12_000);
     });
 
     it("disables Save when text is empty", () => {

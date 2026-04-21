@@ -113,6 +113,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 
 .field input[type="text"],
+.field input[type="number"],
 .field textarea {
     background: var(--panel);
     color: var(--text);
@@ -121,6 +122,10 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     padding: 0.55rem 0.7rem;
     font: inherit;
     width: 100%;
+}
+
+.field-duration-wrap {
+    flex: 0 1 7rem;
 }
 
 .field textarea { resize: vertical; min-height: 4em; }
