@@ -16,6 +16,7 @@ const SAMPLE = {
     output_mode: "hdmi",
     display_width: 1920,
     display_height: 1080,
+    display_rotation: 0,
     brightness: 75,
     gamma: 2.4,
     wifi_ssid: "openMarquee-A3F7",
@@ -119,6 +120,78 @@ describe("mountSettings", () => {
         await tick();
 
         expect(onSave.mock.calls[0][0].timezone).toBeNull();
+    });
+
+    it("rotation dropdown exposes the four cardinal angles + hydrates from settings", async () => {
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => ({ ...SAMPLE, display_rotation: 90 }),
+            onSave: vi.fn(),
+        });
+        await tick();
+        const rot = container.querySelector(".field-display-rotation");
+        const values = Array.from(rot.options).map((o) => o.value);
+        expect(values).toEqual(["0", "90", "180", "270"]);
+        expect(rot.value).toBe("90");
+    });
+
+    it("changing output_mode from a default snaps dims to the new mode's default", async () => {
+        const container = document.createElement("div");
+        // Operator is at HUB75 defaults (128x96).
+        mountSettings(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                output_mode: "hub75",
+                display_width: 128,
+                display_height: 96,
+            }),
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        const modeEl = container.querySelector(".field-output-mode");
+        modeEl.value = "hdmi";
+        modeEl.dispatchEvent(new Event("change"));
+
+        expect(container.querySelector(".field-display-width").value).toBe("1920");
+        expect(container.querySelector(".field-display-height").value).toBe("1080");
+    });
+
+    it("leaves customized dims alone on output_mode change", async () => {
+        const container = document.createElement("div");
+        // Operator has non-default dims (say a 256x128 HUB75 cluster).
+        mountSettings(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                output_mode: "hub75",
+                display_width: 256,
+                display_height: 128,
+            }),
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        const modeEl = container.querySelector(".field-output-mode");
+        modeEl.value = "hdmi";
+        modeEl.dispatchEvent(new Event("change"));
+
+        // Dims untouched — we don't know what HDMI panel the operator plans.
+        expect(container.querySelector(".field-display-width").value).toBe("256");
+        expect(container.querySelector(".field-display-height").value).toBe("128");
+    });
+
+    it("saves display_rotation in the payload", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave,
+        });
+        await tick();
+        container.querySelector(".field-display-rotation").value = "270";
+        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        await tick();
+        expect(onSave.mock.calls[0][0].display_rotation).toBe(270);
     });
 
     it("hydrates Tailscale fields + round-trips them to onSave", async () => {

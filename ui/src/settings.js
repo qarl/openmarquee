@@ -21,6 +21,24 @@ const OUTPUT_MODES = [
     { value: "composite", label: "Composite / RF (via modulator)" },
 ];
 
+// Sensible default resolutions per output mode. Native LANDSCAPE dims —
+// `display_rotation` separately handles portrait-mounted installs.
+// HDMI is a placeholder: the real HDMI renderer reads EDID at boot and
+// overrides these; on dev (no monitor attached) the stored value applies.
+const DEFAULT_DIMS = {
+    hdmi: { width: 1920, height: 1080 },
+    hub75: { width: 128, height: 96 },
+    ws281x: { width: 256, height: 1 },
+    composite: { width: 640, height: 480 },
+};
+
+const ROTATION_OPTIONS = [
+    { value: 0, label: "0° (landscape, native)" },
+    { value: 90, label: "90° clockwise" },
+    { value: 180, label: "180°" },
+    { value: 270, label: "270° clockwise" },
+];
+
 const SECTION_TEMPLATE = `
     <section class="settings">
         <h2 class="settings-heading">System settings</h2>
@@ -46,14 +64,23 @@ const SECTION_TEMPLATE = `
 
             <div class="row">
                 <label class="field">
-                    <span>Display width (px)</span>
+                    <span>Display width (px, native landscape)</span>
                     <input type="number" class="field-display-width" min="1" max="4096" step="1" required>
                 </label>
                 <label class="field">
-                    <span>Display height (px)</span>
+                    <span>Display height (px, native landscape)</span>
                     <input type="number" class="field-display-height" min="1" max="4096" step="1" required>
                 </label>
+                <label class="field">
+                    <span>Rotation</span>
+                    <select class="field-display-rotation"></select>
+                </label>
             </div>
+            <p class="field-hint settings-rotation-hint">
+                Native dims = the panel's hardware orientation. Rotation is
+                how you've physically mounted it — the renderer rotates
+                frames on the way to hardware.
+            </p>
 
             <div class="row">
                 <label class="field">
@@ -135,6 +162,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     const outputModeEl = container.querySelector(".field-output-mode");
     const widthEl = container.querySelector(".field-display-width");
     const heightEl = container.querySelector(".field-display-height");
+    const rotationEl = container.querySelector(".field-display-rotation");
     const brightnessEl = container.querySelector(".field-brightness");
     const gammaEl = container.querySelector(".field-gamma");
     const ssidEl = container.querySelector(".field-wifi-ssid");
@@ -151,7 +179,32 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         opt.textContent = mode.label;
         outputModeEl.appendChild(opt);
     }
+    for (const rot of ROTATION_OPTIONS) {
+        const opt = document.createElement("option");
+        opt.value = String(rot.value);
+        opt.textContent = rot.label;
+        rotationEl.appendChild(opt);
+    }
     populateTimezoneSelect(tzEl);
+
+    // Output-mode change: if the current dims match *some* mode's default,
+    // the operator hasn't customized — snap to the new mode's default. If
+    // they've customized, leave the numbers alone (they know what panel
+    // they have).
+    outputModeEl.addEventListener("change", () => {
+        const currentW = Number(widthEl.value);
+        const currentH = Number(heightEl.value);
+        const isDefault = Object.values(DEFAULT_DIMS).some(
+            (d) => d.width === currentW && d.height === currentH,
+        );
+        if (isDefault) {
+            const d = DEFAULT_DIMS[outputModeEl.value];
+            if (d) {
+                widthEl.value = String(d.width);
+                heightEl.value = String(d.height);
+            }
+        }
+    });
 
     async function refresh() {
         statusEl.textContent = "";
@@ -162,6 +215,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             outputModeEl.value = settings.output_mode ?? "hdmi";
             widthEl.value = String(settings.display_width ?? 128);
             heightEl.value = String(settings.display_height ?? 96);
+            rotationEl.value = String(settings.display_rotation ?? 0);
             brightnessEl.value = String(settings.brightness ?? 80);
             gammaEl.value = String(settings.gamma ?? 2.2);
             ssidEl.value = settings.wifi_ssid ?? "";
@@ -189,6 +243,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
                 output_mode: outputModeEl.value,
                 display_width: Number(widthEl.value),
                 display_height: Number(heightEl.value),
+                display_rotation: Number(rotationEl.value),
                 brightness: Number(brightnessEl.value),
                 gamma: Number(gammaEl.value),
                 wifi_ssid: ssidEl.value,

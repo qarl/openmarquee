@@ -48,6 +48,7 @@ def test_put_then_get_round_trip(client: TestClient):
         "output_mode": "hub75",
         "display_width": 192,
         "display_height": 64,
+        "display_rotation": 0,
         "brightness": 40,
         "gamma": 2.4,
         "wifi_ssid": "CoffeeShop",

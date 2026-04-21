@@ -93,6 +93,17 @@ class SystemSettings(BaseModel):
         le=4096,
         description="Display height in pixels. Defaults to SYSTEM_SPEC §3.4 (96).",
     )
+    # Physical panel dims above describe the hardware's native orientation;
+    # `display_rotation` is how the operator has physically mounted it.
+    # The renderer rotates the engine's logical frames before pushing to
+    # hardware, and the editor's preview canvases swap aspect when rotation
+    # is 90° or 270° so operators see what the installed sign actually
+    # shows.
+    display_rotation: Literal[0, 90, 180, 270] = Field(
+        default=0,
+        description="Clockwise rotation applied to rendered frames on the way "
+        "to hardware. 0 = native landscape; 90/270 = portrait mounting.",
+    )
 
     brightness: int = Field(
         default=80,

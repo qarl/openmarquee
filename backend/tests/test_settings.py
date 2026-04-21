@@ -74,6 +74,21 @@ def test_display_dimensions_reject_absurdly_large():
         SystemSettings(display_width=99999)
 
 
+def test_display_rotation_defaults_to_zero():
+    assert SystemSettings().display_rotation == 0
+
+
+def test_display_rotation_accepts_90_180_270():
+    for r in (0, 90, 180, 270):
+        s = SystemSettings(display_rotation=r)
+        assert s.display_rotation == r
+
+
+def test_display_rotation_rejects_non_cardinal_angles():
+    with pytest.raises(ValidationError):
+        SystemSettings(display_rotation=45)  # type: ignore[arg-type]
+
+
 def test_ssid_rejects_empty():
     with pytest.raises(ValidationError):
         SystemSettings(wifi_ssid="")

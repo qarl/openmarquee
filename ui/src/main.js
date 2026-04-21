@@ -61,7 +61,14 @@ async function resolvePanelDims() {
         const settings = await getSettings();
         const w = Number(settings.display_width);
         const h = Number(settings.display_height);
+        const rotation = Number(settings.display_rotation || 0);
         if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
+            // 90° / 270° rotate the preview into portrait — swap dims so
+            // the editor's aspect ratio matches what the installed sign
+            // actually shows.
+            if (rotation === 90 || rotation === 270) {
+                return { width: h, height: w };
+            }
             return { width: w, height: h };
         }
     } catch {
