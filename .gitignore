@@ -31,6 +31,13 @@ build/
 # (dev.sh + test runs write these at the cwd defaults)
 openmarquee-content/
 openmarquee-playlist.json
+openmarquee-schedules.json
+openmarquee-settings.json
+openmarquee-seeded.json
+
+# rclone-fuse mount sometimes leaves these stub files behind — they
+# aren't ours.
+.fuse_hidden*
 
 # Seeded assets:
 # - large operator-supplied binaries (demo.mp4, etc.) are NOT tracked
