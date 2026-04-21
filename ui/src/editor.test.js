@@ -420,6 +420,81 @@ describe("mountEditor — submit flow", () => {
         expect(onSaveExisting.mock.calls[0][0]).toBe("abc");
     });
 
+    it("Generate button is hidden until background source = 'slide' + wired", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            fetchItems: async () => [],
+            onGenerateBackground: vi.fn(),
+        });
+        // Solid-color default: generator hidden.
+        expect(container.querySelector(".editor-bg-generate").hidden).toBe(true);
+        // Switch bg source to "slide" → generator surfaces.
+        const slideRadio = container.querySelector('.field-bg-source[value="slide"]');
+        slideRadio.checked = true;
+        slideRadio.dispatchEvent(new Event("change"));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(container.querySelector(".editor-bg-generate").hidden).toBe(false);
+    });
+
+    it("Generate button calls onGenerateBackground and selects the returned slide", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onGenerateBackground = vi.fn().mockResolvedValue({
+            id: "new-bg",
+            name: "Background — sunset",
+        });
+        mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            fetchItems: async () => [
+                { id: "new-bg", name: "Background — sunset" },
+            ],
+            onGenerateBackground,
+        });
+        // Switch to slide mode.
+        const slideRadio = container.querySelector('.field-bg-source[value="slide"]');
+        slideRadio.checked = true;
+        slideRadio.dispatchEvent(new Event("change"));
+        await new Promise((r) => setTimeout(r, 0));
+
+        container.querySelector(".field-bg-generate-prompt").value = "sunset";
+        container.querySelector(".bg-generate-btn").click();
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(onGenerateBackground).toHaveBeenCalledWith({ prompt: "sunset" });
+        expect(container.querySelector(".field-bg-slide").value).toBe("new-bg");
+    });
+
+    it("Generate button with empty prompt surfaces a status line without calling the hook", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onGenerateBackground = vi.fn();
+        mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            fetchItems: async () => [],
+            onGenerateBackground,
+        });
+        const slideRadio = container.querySelector('.field-bg-source[value="slide"]');
+        slideRadio.checked = true;
+        slideRadio.dispatchEvent(new Event("change"));
+        await new Promise((r) => setTimeout(r, 0));
+
+        container.querySelector(".bg-generate-btn").click();
+        await new Promise((r) => setTimeout(r, 0));
+        expect(onGenerateBackground).not.toHaveBeenCalled();
+        expect(container.querySelector(".bg-generate-status").textContent).toMatch(
+            /prompt first/i,
+        );
+    });
+
     it("New-slide button exits edit mode and clears the form", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");

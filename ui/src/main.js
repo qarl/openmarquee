@@ -14,6 +14,7 @@
 
 import {
     fetchContentItem,
+    generateBackground,
     getPlaybackState,
     getSchedule,
     getSettings,
@@ -130,6 +131,11 @@ async function boot() {
         fetchItems: listContent,
         onSave: onSaveWithRefresh(saveTextSlide),
         onSaveExisting: onSaveWithRefresh(updateTextSlide),
+        // Free AI background generator (Pollinations.ai). onSaveWithRefresh
+        // pings the track refresh so the newly-generated ImageSlide
+        // appears in the pallet + the editor's bg-slide dropdown on
+        // subsequent opens.
+        onGenerateBackground: onSaveWithRefresh(generateBackground),
     });
 
     mountImageUploader(root.querySelector(".image-upload-slot"), {

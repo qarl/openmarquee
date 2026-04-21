@@ -84,6 +84,16 @@ const EDITOR_TEMPLATE = `
                     <span>Saved slide</span>
                     <select class="field-bg-slide"><option value="">(pick a slide)</option></select>
                 </label>
+                <div class="editor-bg-generate" hidden>
+                    <label class="field">
+                        <span>Generate a new background (free, via pollinations.ai — 10-30s)</span>
+                        <input type="text" class="field-bg-generate-prompt"
+                               placeholder="abstract gradient, minimal, signage-friendly"
+                               maxlength="4000">
+                    </label>
+                    <button type="button" class="bg-generate-btn">Generate…</button>
+                    <p class="bg-generate-status field-hint" role="status" aria-live="polite"></p>
+                </div>
             </fieldset>
             <div class="row">
                 <label class="field">
@@ -139,13 +149,17 @@ const EDITOR_TEMPLATE = `
  * @param {() => Promise<Array>} [options.fetchItems] — populates the
  *     background-slide dropdown with available content items. Omit to
  *     disable the "From saved slide" picker.
+ * @param {({prompt}) => Promise<any>} [options.onGenerateBackground] —
+ *     optional hook for the free AI background generator. When provided,
+ *     a Generate… control surfaces in the background fieldset; on
+ *     success the returned ImageSlide becomes the active background.
  * @returns {{ loadForEdit: (slide) => Promise<void> }}
  *     caller-facing handle so the playlist-track pallet can wire a
  *     click-to-edit affordance.
  */
 export function mountEditor(
     container,
-    { width, height, onSave, onSaveExisting, fetchItems },
+    { width, height, onSave, onSaveExisting, fetchItems, onGenerateBackground },
 ) {
     container.innerHTML = EDITOR_TEMPLATE;
 
@@ -231,11 +245,14 @@ export function mountEditor(
     // selected, populate the dropdown lazily (first time only) via
     // fetchItems so a first-mount doesn't burn a fetch on an operator
     // who's going to stick with solid-color anyway.
+    const bgGenerateWrap = container.querySelector(".editor-bg-generate");
     let bgSlidePopulated = false;
     for (const radio of container.querySelectorAll(".field-bg-source")) {
         radio.addEventListener("change", async () => {
             state.bgSource = radio.value;
             bgSlideWrapEl.hidden = state.bgSource !== "slide";
+            bgGenerateWrap.hidden =
+                state.bgSource !== "slide" || !onGenerateBackground;
             if (state.bgSource === "slide" && fetchItems && !bgSlidePopulated) {
                 await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
                 bgSlidePopulated = true;
@@ -245,6 +262,40 @@ export function mountEditor(
                 state.bgSlideId = null;
             }
             syncAndRender();
+        });
+    }
+
+    // Generate-a-background flow. Drops a fresh ImageSlide into the
+    // catalog (the provider-pluggable /api/backgrounds/generate endpoint
+    // handles that), then selects it as this slide's background so the
+    // operator sees the result immediately without a second click.
+    if (onGenerateBackground) {
+        const generateBtn = container.querySelector(".bg-generate-btn");
+        const generatePromptEl = container.querySelector(".field-bg-generate-prompt");
+        const generateStatusEl = container.querySelector(".bg-generate-status");
+        generateBtn.addEventListener("click", async () => {
+            const prompt = generatePromptEl.value.trim();
+            if (!prompt) {
+                generateStatusEl.textContent = "Type a prompt first.";
+                return;
+            }
+            generateBtn.disabled = true;
+            generateStatusEl.textContent = "Generating… (can take 10-30 seconds)";
+            try {
+                const slide = await onGenerateBackground({ prompt });
+                if (fetchItems) {
+                    await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
+                    bgSlidePopulated = true;
+                }
+                bgSlideEl.value = String(slide.id);
+                bgSlideEl.dispatchEvent(new Event("change"));
+                generatePromptEl.value = "";
+                generateStatusEl.textContent = `Generated: ${slide.name}`;
+            } catch (err) {
+                generateStatusEl.textContent = `${err.message}`;
+            } finally {
+                generateBtn.disabled = false;
+            }
         });
     }
     bgSlideEl.addEventListener("change", async () => {
