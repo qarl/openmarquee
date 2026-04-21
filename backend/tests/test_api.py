@@ -1,16 +1,28 @@
 import base64
+import io
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from openmarquee.app import app
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_content_storage, get_playlist_storage
 from openmarquee.playlist import PlaylistStorage
 
-_FAKE_PNG = b"\x89PNG\r\n\x1a\nfake-payload"
+
+def _real_png_bytes() -> bytes:
+    """A genuine 1x1 PNG. The backend now PIL-verifies uploads, so the old
+    "fake PNG = magic-number-plus-junk" sentinel no longer round-trips."""
+    img = Image.new("RGB", (1, 1), (0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_FAKE_PNG = _real_png_bytes()
 
 
 @pytest.fixture
@@ -227,6 +239,43 @@ def test_upload_image_rejects_bad_base64(client: TestClient):
     payload["png_base64"] = "not-valid-base64!!!"
     response = client.post("/api/content/images", json=payload)
     assert response.status_code == 400
+
+
+def test_upload_image_rejects_non_image_bytes(client: TestClient):
+    """Valid base64 but not an image — backend should reject with 400 instead
+    of persisting garbage that the playback engine would later have to skip."""
+    payload = _image_payload()
+    payload["png_base64"] = base64.b64encode(b"this is not an image").decode()
+    response = client.post("/api/content/images", json=payload)
+    assert response.status_code == 400
+    assert "image" in response.json()["detail"].lower()
+
+
+def test_upload_text_slide_rejects_non_image_bytes(client: TestClient):
+    payload = _upload_payload()
+    payload["png_base64"] = base64.b64encode(b"definitely not a png").decode()
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 400
+
+
+def test_upload_image_accepts_real_png(client: TestClient, storage: ContentStorage):
+    """Belt-and-suspenders: confirm a genuinely valid PNG round-trips."""
+    import io as _io
+
+    from PIL import Image as _Image
+
+    img = _Image.new("RGB", (4, 4), (10, 20, 30))
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    payload = _image_payload()
+    payload["png_base64"] = base64.b64encode(buf.getvalue()).decode()
+
+    response = client.post("/api/content/images", json=payload)
+    assert response.status_code == 200, response.text
+    item_id = UUID(response.json()["id"])
+    # Asset on disk decodes cleanly.
+    saved = storage.read_asset(item_id)
+    _Image.open(_io.BytesIO(saved)).verify()
 
 
 def test_upload_image_rejects_name_too_long(client: TestClient):

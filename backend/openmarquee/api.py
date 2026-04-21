@@ -6,11 +6,13 @@ content variants, post-demo.
 """
 
 import base64
+import io
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
 
 from openmarquee.content import ContentItem, ImageSlide, TextSlide
@@ -36,6 +38,36 @@ def _remove_from_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
     playlist = playlist_storage.load()
     playlist.remove(item_id)
     playlist_storage.save(playlist)
+
+
+def _decode_png_payload(b64: str) -> bytes:
+    """Decode a base64 string and confirm it's actually a PNG.
+
+    The browser side restricts file picker types and uses canvas.toBlob, so a
+    well-behaved client always sends a valid PNG. But the captive-portal API
+    is exposed to anything on the AP's WiFi — defense in depth says we don't
+    persist uninterpretable bytes that the playback engine would later have
+    to log+skip.
+
+    Raises HTTPException(400) for either bad base64 or bad image bytes.
+    """
+    try:
+        png = base64.b64decode(b64, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise HTTPException(
+            status_code=400, detail=f"png_base64 is not valid base64: {exc}"
+        ) from exc
+
+    try:
+        with Image.open(io.BytesIO(png)) as img:
+            img.verify()  # confirms PNG/JPEG/etc structure without full decode
+    except (UnidentifiedImageError, Exception) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"png_base64 decoded but isn't a valid image: {exc}",
+        ) from exc
+
+    return png
 
 
 class TextSlideUpload(BaseModel):
@@ -69,12 +101,7 @@ async def upload_text_slide(
     storage: StorageDep,
     playlist_storage: PlaylistDep,
 ) -> TextSlide:
-    try:
-        png = base64.b64decode(payload.png_base64, validate=True)
-    except ValueError as exc:  # binascii.Error is a ValueError subclass
-        raise HTTPException(
-            status_code=400, detail=f"png_base64 is not valid base64: {exc}"
-        ) from exc
+    png = _decode_png_payload(payload.png_base64)
 
     # All field constraints live on TextSlide; the route surfaces violations
     # as 422 instead of letting them become 500s.
@@ -109,12 +136,7 @@ async def upload_image(
     storage: StorageDep,
     playlist_storage: PlaylistDep,
 ) -> ImageSlide:
-    try:
-        png = base64.b64decode(payload.png_base64, validate=True)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"png_base64 is not valid base64: {exc}"
-        ) from exc
+    png = _decode_png_payload(payload.png_base64)
 
     try:
         image = ImageSlide(**payload.model_dump(exclude={"png_base64"}))
