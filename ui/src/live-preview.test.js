@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mountLivePreview } from "./live-preview.js";
+import { formatAutoText, mountLivePreview } from "./live-preview.js";
 
 // Drive state transitions via explicit handle.refresh() calls so the
 // tests don't depend on setInterval timing. Each test stops the
@@ -23,6 +23,35 @@ function mount(container, fetchState) {
 
 afterEach(() => {
     while (openHandles.length) openHandles.pop().stop();
+});
+
+describe("formatAutoText", () => {
+    // 2026-04-21 14:30:45 local → Tuesday
+    const fixed = new Date(2026, 3, 21, 14, 30, 45);
+
+    it("formats time_hm with two-digit zero-padded HH:MM", () => {
+        expect(formatAutoText("time", "time_hm", fixed)).toBe("14:30");
+    });
+
+    it("formats time_hms with HH:MM:SS", () => {
+        expect(formatAutoText("time", "time_hms", fixed)).toBe("14:30:45");
+    });
+
+    it("falls back to the mode's default when format is null", () => {
+        expect(formatAutoText("time", null, fixed)).toBe("14:30");
+        expect(formatAutoText("date", null, fixed)).toBe("2026-04-21");
+        expect(formatAutoText("day", null, fixed)).toBe("Tuesday");
+    });
+
+    it("date_long and date_medium drop the leading zero on the day", () => {
+        const early = new Date(2026, 3, 7, 10, 0, 0);
+        expect(formatAutoText("date", "date_long", early)).toBe("April 7, 2026");
+        expect(formatAutoText("date", "date_medium", early)).toBe("Apr 7");
+    });
+
+    it("day_short returns three-letter weekday", () => {
+        expect(formatAutoText("day", "day_short", fixed)).toBe("Tue");
+    });
 });
 
 describe("mountLivePreview", () => {
@@ -249,6 +278,86 @@ describe("mountLivePreview", () => {
         expect(
             container.querySelectorAll(".live-preview-media").length,
         ).toBe(1);
+    });
+
+    it("overlays auto-mode text on top of the thumbnail and ticks on refresh", async () => {
+        const baseState = {
+            is_running: true,
+            current_item_id: "clk",
+            current_item_type: "text_slide",
+            current_item_pipeline: null,
+            current_item_transition: "cut",
+            current_item_transition_ms: 0,
+            current_item_auto_mode: "time",
+            current_item_auto_format: "time_hms",
+            current_playlist_name: "default",
+        };
+        const fetchState = vi.fn().mockResolvedValue(baseState);
+        const container = document.createElement("div");
+        const handle = mount(container, fetchState);
+
+        // Freeze time via a Date spy that advances by 1s on each call
+        // so we can observe the overlay text change between refreshes.
+        const times = [
+            new Date(2026, 3, 21, 14, 30, 45),
+            new Date(2026, 3, 21, 14, 30, 45), // auto-refresh + first call share
+            new Date(2026, 3, 21, 14, 30, 46),
+        ];
+        let i = 0;
+        const dateSpy = vi.spyOn(global, "Date").mockImplementation(function () {
+            return times[Math.min(i++, times.length - 1)];
+        });
+
+        await handle.refresh();
+        const overlay = container.querySelector(".live-preview-auto-text");
+        expect(overlay).not.toBeNull();
+        expect(overlay.textContent).toBe("14:30:45");
+
+        await handle.refresh();
+        // Next tick — the spy has advanced to :46.
+        expect(
+            container.querySelector(".live-preview-auto-text").textContent,
+        ).toBe("14:30:46");
+
+        dateSpy.mockRestore();
+    });
+
+    it("removes the auto overlay when the slide changes to a non-auto one", async () => {
+        // Auto state twice (covers the mount auto-refresh + first explicit
+        // refresh), then a non-auto state for the transition.
+        const auto = {
+            is_running: true,
+            current_item_id: "clk",
+            current_item_type: "text_slide",
+            current_item_pipeline: null,
+            current_item_transition: "cut",
+            current_item_transition_ms: 0,
+            current_item_auto_mode: "time",
+            current_item_auto_format: "time_hm",
+            current_playlist_name: "default",
+        };
+        const nonAuto = {
+            ...auto,
+            current_item_id: "img",
+            current_item_type: "image",
+            current_item_auto_mode: null,
+            current_item_auto_format: null,
+        };
+        // mount() kicks off auto-refresh (consumes queue[0]) + first explicit
+        // refresh (queue[1]) — both auto. Second explicit refresh consumes
+        // queue[2] — non-auto, triggers overlay removal.
+        const queue = [auto, auto, nonAuto];
+        const fetchState = vi.fn().mockImplementation(async () =>
+            queue.shift() ?? queue[queue.length - 1],
+        );
+        const container = document.createElement("div");
+        const handle = mount(container, fetchState);
+
+        await handle.refresh();
+        expect(container.querySelector(".live-preview-auto-text")).not.toBeNull();
+
+        await handle.refresh();
+        expect(container.querySelector(".live-preview-auto-text")).toBeNull();
     });
 
     it("stop() halts polling so future ticks don't trigger fetches", async () => {

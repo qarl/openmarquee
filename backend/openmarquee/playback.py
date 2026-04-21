@@ -34,6 +34,7 @@ from uuid import UUID
 
 from PIL import Image, UnidentifiedImageError
 
+from openmarquee.auto_render import compose_auto_frame, resolve_timezone
 from openmarquee.content import ContentItem
 from openmarquee.rendering import Renderer
 
@@ -64,6 +65,8 @@ class PlaybackLoop:
         read_asset: Callable[[UUID], bytes],
         empty_playlist_poll_seconds: float = 1.0,
         get_expected_video_pipeline: Callable[[], str | None] | None = None,
+        get_timezone: Callable[[], str | None] | None = None,
+        auto_tick_seconds: float = 1.0,
     ):
         self._renderer = renderer
         self._fetch_items = fetch_items
@@ -76,6 +79,15 @@ class PlaybackLoop:
         # it's there, but it won't play. Returning None means "don't
         # check" (used in tests + any non-device environment).
         self._get_expected_pipeline = get_expected_video_pipeline or (lambda: None)
+        # Returns an IANA timezone name (e.g. "America/Los_Angeles") so
+        # auto-mode text slides render in the operator-configured zone.
+        # Returning None falls back to UTC. Tests inject a fixed value
+        # so assertions don't depend on the environment's tz.
+        self._get_timezone = get_timezone or (lambda: None)
+        # How often an auto-mode slide re-renders. 1Hz is the right
+        # cadence for a ticking-seconds display; tests override to a
+        # much smaller value to keep runtime fast.
+        self._auto_tick = auto_tick_seconds
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         self._current_id: UUID | None = None
@@ -95,6 +107,13 @@ class PlaybackLoop:
         # transition metadata.
         self._current_transition: str | None = None
         self._current_transition_ms: int | None = None
+        # Auto-mode metadata for the currently-rendering TextSlide (None
+        # on image/video/non-auto text). The live preview uses these to
+        # overlay a ticking time/date/day client-side so the browser
+        # preview stays in sync with what the device is actually
+        # rendering, without asking the server for a fresh PNG each tick.
+        self._current_auto_mode: str | None = None
+        self._current_auto_format: str | None = None
         # Set by fetch_items if it carries playlist context (the
         # scheduled_fetch_items closure stamps this each fetch).
         self._current_playlist_name: str | None = None
@@ -122,6 +141,14 @@ class PlaybackLoop:
     @property
     def current_item_transition_ms(self) -> int | None:
         return self._current_transition_ms
+
+    @property
+    def current_item_auto_mode(self) -> str | None:
+        return self._current_auto_mode
+
+    @property
+    def current_item_auto_format(self) -> str | None:
+        return self._current_auto_format
 
     async def start(self) -> None:
         """Start the loop. No-op if already running."""
@@ -151,6 +178,8 @@ class PlaybackLoop:
             self._current_pipeline = None
             self._current_transition = None
             self._current_transition_ms = None
+            self._current_auto_mode = None
+            self._current_auto_format = None
             self._current_playlist_name = None
 
     async def _loop(self) -> None:
@@ -168,6 +197,8 @@ class PlaybackLoop:
                 self._current_pipeline = None
                 self._current_transition = None
                 self._current_transition_ms = None
+                self._current_auto_mode = None
+                self._current_auto_format = None
                 await self._wait(self._empty_poll)
                 continue
 
@@ -203,13 +234,34 @@ class PlaybackLoop:
                 )
                 self._current_transition = item.transition
                 self._current_transition_ms = item.transition_ms
+                self._current_auto_mode = (
+                    getattr(item, "auto_mode", None)
+                    if item.type == "text_slide"
+                    else None
+                )
+                self._current_auto_format = (
+                    getattr(item, "auto_format", None)
+                    if item.type == "text_slide"
+                    else None
+                )
 
-                current_image = self._safe_load_image(item)
-                if current_image is None:
-                    continue
-
-                self._render_image(current_image)
-                await self._wait(item.duration_ms / 1000)
+                is_auto = (
+                    item.type == "text_slide"
+                    and getattr(item, "auto_mode", None) is not None
+                )
+                if is_auto:
+                    # Render-over path: the stored PNG is a placeholder;
+                    # compose a fresh frame with current time/date/day
+                    # each tick for the slide's full duration.
+                    current_image = await self._play_auto_slide(item)
+                    if current_image is None:
+                        continue
+                else:
+                    current_image = self._safe_load_image(item)
+                    if current_image is None:
+                        continue
+                    self._render_image(current_image)
+                    await self._wait(item.duration_ms / 1000)
 
                 if self._stop_event.is_set():
                     break
@@ -230,6 +282,50 @@ class PlaybackLoop:
         assert self._stop_event is not None
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+
+    async def _play_auto_slide(self, item: ContentItem) -> Image.Image | None:
+        """Tick-render an auto-mode text slide for its full duration.
+
+        Re-composites the frame every `self._auto_tick` seconds using
+        the current time in the configured timezone, so a 'time' slide
+        with HH:MM:SS format visibly ticks seconds on the device.
+
+        Returns the last-composed frame so the caller's fade transition
+        into the next slide has something to fade from. Returns None if
+        stop_event fires before the first frame lands.
+        """
+        tz = resolve_timezone(self._get_timezone())
+        total = item.duration_ms / 1000
+        end_at = asyncio.get_event_loop().time() + total
+        last: Image.Image | None = None
+        while True:
+            now = datetime.now(tz)
+            try:
+                frame = compose_auto_frame(
+                    item,
+                    self._renderer.width,
+                    self._renderer.height,
+                    now,
+                    read_asset=self._read_asset,
+                )
+            except Exception:
+                log.exception("playback: compose_auto_frame failed for %s", item.id)
+                return None
+            self._render_image(frame)
+            last = frame
+
+            assert self._stop_event is not None
+            if self._stop_event.is_set():
+                return last
+
+            remaining = end_at - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return last
+            await self._wait(min(self._auto_tick, remaining))
+            if self._stop_event.is_set():
+                return last
+            if asyncio.get_event_loop().time() >= end_at:
+                return last
 
     def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
         """Load + resize an item's PNG to renderer dimensions.

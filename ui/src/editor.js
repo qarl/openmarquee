@@ -118,11 +118,14 @@ const EDITOR_TEMPLATE = `
                     <option value="day">Day of week</option>
                 </select>
             </label>
+            <label class="field field-auto-format-wrap" hidden>
+                <span>Format</span>
+                <select class="field-auto-format"></select>
+            </label>
             <p class="field-hint field-auto-mode-hint" hidden>
                 When dynamic content is set, the typed text is a preview-only
-                fallback — the device re-renders at playback time with the
-                current value. (Playback-time rendering is a follow-up; today
-                only the metadata persists.)
+                fallback — the device re-renders each second at playback time
+                using the configured timezone.
             </p>
             <button type="submit" class="primary field-save">Save slide</button>
             <p class="field-hint">
@@ -181,6 +184,8 @@ export function mountEditor(
     const fontSizeEl = container.querySelector(".field-font-size");
     const autoModeEl = container.querySelector(".field-auto-mode");
     const autoModeHintEl = container.querySelector(".field-auto-mode-hint");
+    const autoFormatEl = container.querySelector(".field-auto-format");
+    const autoFormatWrapEl = container.querySelector(".field-auto-format-wrap");
     const form = container.querySelector(".controls");
     const statusEl = container.querySelector(".editor-status");
     const saveBtn = container.querySelector(".field-save");
@@ -237,8 +242,41 @@ export function mountEditor(
         el.addEventListener("input", syncAndRender);
     }
 
+    // Mode → list of [value, label] pairs for the format dropdown.
+    // Labels include an example so the operator knows exactly what the
+    // saved slide will render at playback time.
+    const AUTO_FORMAT_OPTIONS = {
+        time: [
+            ["time_hm", "HH:MM — 14:30"],
+            ["time_hms", "HH:MM:SS — 14:30:45"],
+        ],
+        date: [
+            ["date_iso", "YYYY-MM-DD — 2026-04-21"],
+            ["date_long", "Long — April 21, 2026"],
+            ["date_medium", "Medium — Apr 21"],
+        ],
+        day: [
+            ["day_long", "Full — Monday"],
+            ["day_short", "Short — Mon"],
+        ],
+    };
+
+    function populateAutoFormatOptions(mode, selected = null) {
+        autoFormatEl.innerHTML = "";
+        const options = AUTO_FORMAT_OPTIONS[mode] || [];
+        for (const [value, label] of options) {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            if (value === selected) opt.selected = true;
+            autoFormatEl.appendChild(opt);
+        }
+        autoFormatWrapEl.hidden = options.length === 0;
+    }
+
     autoModeEl.addEventListener("change", () => {
         autoModeHintEl.hidden = !autoModeEl.value;
+        populateAutoFormatOptions(autoModeEl.value);
     });
 
     // Background-source radios toggle the slide picker. When "slide" is
@@ -355,6 +393,7 @@ export function mountEditor(
                 font_size_px: Math.round(state.fontSize),
                 background_image_slide_id: state.bgSlideId || null,
                 auto_mode: autoModeEl.value || null,
+                auto_format: autoModeEl.value ? autoFormatEl.value || null : null,
                 duration_ms: Math.round(durationSeconds * 1000),
                 png_base64,
             };
@@ -386,6 +425,7 @@ export function mountEditor(
         nameEl.value = "Untitled";
         autoModeEl.value = "";
         autoModeHintEl.hidden = true;
+        populateAutoFormatOptions("");
         // Reset background source to solid color.
         const colorRadio = container.querySelector(
             '.field-bg-source[value="color"]',
@@ -415,6 +455,7 @@ export function mountEditor(
         durationEl.value = String(Math.max(1, (slide.duration_ms || 5000) / 1000));
         autoModeEl.value = slide.auto_mode || "";
         autoModeHintEl.hidden = !slide.auto_mode;
+        populateAutoFormatOptions(slide.auto_mode || "", slide.auto_format || null);
 
         if (slide.background_image_slide_id) {
             // Switch to "slide" background and select the referenced image.

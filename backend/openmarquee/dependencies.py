@@ -192,11 +192,17 @@ def _playback_loop_singleton() -> PlaybackLoop:
         # very next slide — no loop restart needed.
         return pipeline_for_output_mode(settings_storage.load().output_mode)
 
+    def current_timezone() -> str | None:
+        # Auto-mode slides render in this zone. Re-read each call so
+        # changing the tz in Settings is reflected on the next tick.
+        return settings_storage.load().timezone
+
     loop = PlaybackLoop(
         renderer=renderer,
         fetch_items=fetch,
         read_asset=storage.read_asset,
         get_expected_video_pipeline=expected_pipeline,
+        get_timezone=current_timezone,
     )
     loop_holder["loop"] = loop
     return loop

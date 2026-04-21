@@ -179,22 +179,67 @@ describe("mountEditor — submit flow", () => {
         expect(container.querySelector(".field-auto-mode-hint").hidden).toBe(true);
     });
 
-    it("picking an auto_mode reveals the hint + rides through into the save payload", async () => {
+    it("picking an auto_mode reveals the hint + format dropdown + rides through save", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "x" });
         mountEditor(container, { width: 128, height: 96, onSave });
+
+        // Format dropdown starts hidden (no mode selected).
+        expect(container.querySelector(".field-auto-format-wrap").hidden).toBe(true);
 
         const auto = container.querySelector(".field-auto-mode");
         auto.value = "time";
         auto.dispatchEvent(new Event("change"));
         expect(container.querySelector(".field-auto-mode-hint").hidden).toBe(false);
 
+        // Format dropdown revealed with the two time options.
+        expect(container.querySelector(".field-auto-format-wrap").hidden).toBe(false);
+        const formatOptions = Array.from(
+            container.querySelectorAll(".field-auto-format option"),
+        ).map((o) => o.value);
+        expect(formatOptions).toEqual(["time_hm", "time_hms"]);
+
+        // Pick the HH:MM:SS option and save.
+        const fmt = container.querySelector(".field-auto-format");
+        fmt.value = "time_hms";
+
         container.querySelector(".field-text").value = "12:34 (fallback)";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
         container.querySelector(".controls").dispatchEvent(new Event("submit"));
         await new Promise((r) => setTimeout(r, 0));
         expect(onSave.mock.calls[0][0].auto_mode).toBe("time");
+        expect(onSave.mock.calls[0][0].auto_format).toBe("time_hms");
+    });
+
+    it("switching the auto_mode repopulates the format dropdown with the new options", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn().mockResolvedValue({}),
+        });
+        const auto = container.querySelector(".field-auto-mode");
+
+        auto.value = "date";
+        auto.dispatchEvent(new Event("change"));
+        let opts = Array.from(
+            container.querySelectorAll(".field-auto-format option"),
+        ).map((o) => o.value);
+        expect(opts).toEqual(["date_iso", "date_long", "date_medium"]);
+
+        auto.value = "day";
+        auto.dispatchEvent(new Event("change"));
+        opts = Array.from(
+            container.querySelectorAll(".field-auto-format option"),
+        ).map((o) => o.value);
+        expect(opts).toEqual(["day_long", "day_short"]);
+
+        // And switching OFF auto_mode hides the wrap entirely.
+        auto.value = "";
+        auto.dispatchEvent(new Event("change"));
+        expect(container.querySelector(".field-auto-format-wrap").hidden).toBe(true);
     });
 
     it("sends the operator's font-size override when they edit it", async () => {

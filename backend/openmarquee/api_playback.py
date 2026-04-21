@@ -4,7 +4,8 @@ POST /api/playback/start — kick off the loop (no-op if already running)
 POST /api/playback/stop  — stop and wait for the loop to exit
 GET  /api/playback/state — { is_running, current_item_id, current_item_type,
                             current_item_pipeline, current_item_transition,
-                            current_item_transition_ms, current_playlist_name }
+                            current_item_transition_ms, current_item_auto_mode,
+                            current_item_auto_format, current_playlist_name }
 
 The loop drives the device's renderer (MockRenderer in dev, HUB75/HDMI/etc.
 on the device once those land). This obsoletes the manual /dev/play/{id}
@@ -43,6 +44,10 @@ class PlaybackState(BaseModel):
     # what the device's playback loop does frame-by-frame.
     current_item_transition: str | None
     current_item_transition_ms: int | None
+    # Auto-mode metadata for TextSlide items — drives the live preview's
+    # client-side ticking overlay for time/date/day slides.
+    current_item_auto_mode: str | None
+    current_item_auto_format: str | None
     current_playlist_name: str | None
 
 
@@ -55,6 +60,8 @@ async def get_state(loop: LoopDep) -> PlaybackState:
         current_item_pipeline=loop.current_item_pipeline,
         current_item_transition=loop.current_item_transition,
         current_item_transition_ms=loop.current_item_transition_ms,
+        current_item_auto_mode=loop.current_item_auto_mode,
+        current_item_auto_format=loop.current_item_auto_format,
         current_playlist_name=loop.current_playlist_name,
     )
 

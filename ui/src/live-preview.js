@@ -197,6 +197,28 @@ export function mountLivePreview(container, options) {
         caption.textContent = state.current_playlist_name
             ? `Playing: ${state.current_playlist_name}`
             : "";
+
+        // Auto-mode text slides get a client-side ticking overlay on top
+        // of the thumbnail PNG so the preview reflects what the device
+        // is rendering each tick server-side, without polling a
+        // /asset/live endpoint every 500ms.
+        const autoMode = state.current_item_auto_mode || null;
+        const autoFormat = state.current_item_auto_format || null;
+        updateAutoOverlay(autoMode, autoFormat);
+    }
+
+    function updateAutoOverlay(mode, format) {
+        let overlay = stage.querySelector(".live-preview-auto-text");
+        if (!mode) {
+            if (overlay) overlay.remove();
+            return;
+        }
+        if (!overlay) {
+            overlay = document.createElement("div");
+            overlay.className = "live-preview-auto-text";
+            stage.appendChild(overlay);
+        }
+        overlay.textContent = formatAutoText(mode, format, new Date());
     }
 
     refresh();
@@ -221,3 +243,62 @@ function escapeHtml(value) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
 }
+
+/**
+ * Client-side mirror of openmarquee.auto_render.render_auto_text —
+ * formats a JS Date for the live preview's ticking overlay. Uses the
+ * browser's local timezone (the backend uses the device's configured
+ * IANA tz, so preview and device can drift by a zone — acceptable for
+ * a preview, documented in the README if it trips anyone up).
+ *
+ * Kept as a pure exported function so vitest can lock in the format
+ * strings without booting the whole preview widget.
+ */
+export function formatAutoText(mode, format, now) {
+    const fmt = format || defaultFormatFor(mode);
+    if (mode === "time") {
+        if (fmt === "time_hms") {
+            return `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
+        }
+        return `${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
+    }
+    if (mode === "date") {
+        if (fmt === "date_iso") {
+            return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+        }
+        if (fmt === "date_medium") {
+            return `${MONTHS_SHORT[now.getMonth()]} ${now.getDate()}`;
+        }
+        // date_long default
+        return `${MONTHS_LONG[now.getMonth()]} ${now.getDate()}, ${now.getFullYear()}`;
+    }
+    if (mode === "day") {
+        if (fmt === "day_short") return DAYS_SHORT[now.getDay()];
+        return DAYS_LONG[now.getDay()];
+    }
+    return "";
+}
+
+function pad2(n) {
+    return String(n).padStart(2, "0");
+}
+
+function defaultFormatFor(mode) {
+    if (mode === "time") return "time_hm";
+    if (mode === "date") return "date_iso";
+    if (mode === "day") return "day_long";
+    return null;
+}
+
+const MONTHS_LONG = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+];
+const MONTHS_SHORT = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const DAYS_LONG = [
+    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+];
+const DAYS_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

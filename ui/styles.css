@@ -219,6 +219,28 @@ main {
     inset: 0;
 }
 
+/* Auto-mode ticking overlay (time / date / day). Positioned over the
+   thumbnail PNG. Not trying to match the device's typography pixel-for-
+   pixel — this is an "is it ticking?" preview. The real render happens
+   server-side via openmarquee.auto_render. */
+.live-preview-auto-text {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: clamp(1.5rem, 5vw, 3.5rem);
+    font-weight: 700;
+    color: #fff;
+    text-shadow:
+        0 0 6px rgba(0, 0, 0, 0.8),
+        1px 1px 0 rgba(0, 0, 0, 0.9),
+        -1px -1px 0 rgba(0, 0, 0, 0.9);
+    pointer-events: none;
+    letter-spacing: 0.02em;
+}
+
 .live-preview-idle {
     padding: 1rem;
     font-size: 0.85rem;

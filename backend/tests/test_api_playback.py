@@ -76,6 +76,8 @@ def test_state_returns_not_running_initially(client: TestClient):
         "current_item_pipeline": None,
         "current_item_transition": None,
         "current_item_transition_ms": None,
+        "current_item_auto_mode": None,
+        "current_item_auto_format": None,
         "current_playlist_name": None,
     }
 

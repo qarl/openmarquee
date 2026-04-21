@@ -16,13 +16,23 @@ _FAST_DURATION_MS = 100
 _FAST_EMPTY_POLL = 0.01  # so loops with no items spin quickly in tests
 
 
-def _new_loop(renderer, *, fetch_items, read_asset, get_expected_video_pipeline=None):
+def _new_loop(
+    renderer,
+    *,
+    fetch_items,
+    read_asset,
+    get_expected_video_pipeline=None,
+    get_timezone=None,
+    auto_tick_seconds=0.02,
+):
     return PlaybackLoop(
         renderer,
         fetch_items=fetch_items,
         read_asset=read_asset,
         empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
         get_expected_video_pipeline=get_expected_video_pipeline,
+        get_timezone=get_timezone,
+        auto_tick_seconds=auto_tick_seconds,
     )
 
 
@@ -660,3 +670,98 @@ async def test_expected_pipeline_none_disables_mode_lock(renderer):
     await loop.stop()
 
     assert renderer.last_frame is not None
+
+
+# --- auto-mode text slides (render-over at playback time) ---
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_slide_ticks_and_reemits_frames(renderer):
+    """Auto-mode text slides should push multiple frames to the renderer
+    during their duration — one per auto_tick_seconds. Proves the
+    re-composition path is wired and the stored PNG is NOT just
+    forwarded once."""
+    slide = TextSlide(
+        name="clock",
+        text="placeholder",
+        auto_mode="time",
+        auto_format="time_hms",
+        duration_ms=200,
+    )
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [slide],
+        read_asset=lambda _id: b"",  # auto slides don't read asset.png in this path
+        get_timezone=lambda: "UTC",
+        auto_tick_seconds=0.05,
+    )
+    await loop.start()
+    # 200ms duration at 50ms tick → ~4 ticks plus a bit of scheduling slack.
+    await asyncio.sleep(0.3)
+    await loop.stop()
+
+    # Multiple frames emitted for the single slide.
+    assert len(rendered) >= 3
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_slide_skips_asset_read(renderer):
+    """Unlike a static slide, an auto slide doesn't need the stored
+    asset.png — the render-over path composes from slide metadata +
+    current time. A missing / raising read_asset must still let playback
+    run cleanly."""
+    slide = TextSlide(
+        name="clock",
+        text="placeholder",
+        auto_mode="day",
+        auto_format="day_long",
+        duration_ms=100,
+    )
+
+    def hostile_read(_id):
+        raise AssertionError("auto slide should not read stored PNG")
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [slide],
+        read_asset=hostile_read,
+        get_timezone=lambda: "UTC",
+        auto_tick_seconds=0.05,
+    )
+    await loop.start()
+    await asyncio.sleep(0.15)
+    await loop.stop()
+    # Reached a rendered frame → the auto path ran without touching the asset.
+    assert renderer.last_frame is not None
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_exposes_metadata_on_playback_state(renderer):
+    """State endpoint fields current_item_auto_mode / auto_format should
+    reflect the currently-rendering auto slide — the live preview uses
+    them to overlay the ticking text client-side."""
+    slide = TextSlide(
+        name="clock",
+        text="placeholder",
+        auto_mode="time",
+        auto_format="time_hm",
+        duration_ms=500,
+    )
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [slide],
+        read_asset=lambda _id: b"",
+        get_timezone=lambda: "UTC",
+        auto_tick_seconds=0.05,
+    )
+    await loop.start()
+    # Let the loop enter the auto slide before peeking.
+    await asyncio.sleep(0.08)
+    assert loop.current_item_auto_mode == "time"
+    assert loop.current_item_auto_format == "time_hm"
+    await loop.stop()
+    # On stop, fields clear.
+    assert loop.current_item_auto_mode is None
+    assert loop.current_item_auto_format is None

@@ -36,11 +36,16 @@ class TextSlide(BaseModel):
 
     `auto_mode` (optional) marks a slide as *dynamic* — its visible text
     is regenerated at playback time from a device-side data source
-    (current time, today's date, day-of-week, …). When set, the stored
-    `text` field acts as a fallback for previews and list thumbnails; the
-    authoritative content comes from the live render. `None` = static
-    (the stored PNG is what plays). Lands as a metadata-only field here;
-    the playback-time render-over path is follow-up work.
+    (current time, today's date, day-of-week). When set, the playback
+    loop re-composites the slide each tick using the device's timezone
+    via `openmarquee.auto_render`. The stored PNG + `text` field act as
+    fallbacks for pallet thumbnails / previews; the authoritative
+    playback frames come from the live render.
+
+    `auto_format` pairs with `auto_mode` — a mode-specific format
+    choice. Must be None when auto_mode is None, and must be compatible
+    with the chosen auto_mode (cross-field validator below). A None
+    auto_format falls back to the mode's default format.
     """
 
     type: Literal["text_slide"] = "text_slide"
@@ -61,6 +66,15 @@ class TextSlide(BaseModel):
     # the background picker with the right selection).
     background_image_slide_id: UUID | None = None
     auto_mode: Literal["time", "date", "day"] | None = None
+    auto_format: Literal[
+        "time_hm",       # HH:MM (24h, zero-padded)
+        "time_hms",      # HH:MM:SS (24h, zero-padded)
+        "date_iso",      # YYYY-MM-DD
+        "date_long",     # April 21, 2026
+        "date_medium",   # Apr 21
+        "day_long",      # Monday
+        "day_short",     # Mon
+    ] | None = None
 
     # Transition INTO the next slide ("cut" = instant; "fade" = alpha-blend
     # across `transition_ms` after this slide's duration ends).
@@ -75,6 +89,25 @@ class TextSlide(BaseModel):
         """Canonicalize hex colors to uppercase so `#ffaa00` and `#FFAA00`
         compare and dedupe as the same value."""
         return value.upper()
+
+    @model_validator(mode="after")
+    def _auto_format_matches_mode(self) -> "TextSlide":
+        """auto_format is mode-scoped — a "time_hm" format can't live on
+        a date slide. Catch the mismatch here so the editor can't send
+        a nonsensical combo past validation."""
+        if self.auto_mode is None:
+            if self.auto_format is not None:
+                raise ValueError(
+                    "auto_format is only valid when auto_mode is set"
+                )
+            return self
+        prefix = self.auto_mode + "_"
+        if self.auto_format is not None and not self.auto_format.startswith(prefix):
+            raise ValueError(
+                f"auto_format {self.auto_format!r} doesn't match "
+                f"auto_mode={self.auto_mode!r}"
+            )
+        return self
 
 
 class ImageSlide(BaseModel):
