@@ -13,6 +13,7 @@ from openmarquee.content.storage import ContentStorage
 from openmarquee.playback import PlaybackLoop
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.rendering.mock import MockRenderer
+from openmarquee.schedule import ScheduleStorage
 
 
 def _resolve_content_root() -> Path:
@@ -85,6 +86,24 @@ def _playlist_storage_singleton() -> PlaylistStorage:
 def get_playlist_storage() -> PlaylistStorage:
     """Dependency provider for the playlist storage layer."""
     return _playlist_storage_singleton()
+
+
+def _resolve_schedule_path() -> Path:
+    """Where the schedule JSON lives. Sibling of the playlist by default."""
+    override = os.environ.get("OPENMARQUEE_SCHEDULE_PATH")
+    if override:
+        return Path(override)
+    return _resolve_content_root().parent / "openmarquee-schedules.json"
+
+
+@lru_cache
+def _schedule_storage_singleton() -> ScheduleStorage:
+    return ScheduleStorage(_resolve_schedule_path())
+
+
+def get_schedule_storage() -> ScheduleStorage:
+    """Dependency provider for the schedule storage layer."""
+    return _schedule_storage_singleton()
 
 
 @lru_cache
