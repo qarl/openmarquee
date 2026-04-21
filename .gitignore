@@ -27,6 +27,11 @@ build/
 .cache/
 .parcel-cache/
 
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
 # Editor
 .vscode/
 .idea/

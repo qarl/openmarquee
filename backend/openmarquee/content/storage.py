@@ -96,7 +96,13 @@ class ContentStorage:
         return self.root / str(item_id) / _ASSET_FILENAME
 
     def list_all(self) -> list[ContentItem]:
-        """Return all persisted content items, sorted by id string."""
+        """Return all persisted content items, sorted by id string.
+
+        Resilient to the root being deleted at runtime (e.g. SD card swap,
+        manual cleanup) — returns an empty list rather than raising.
+        """
+        if not self.root.exists():
+            return []
         items: list[ContentItem] = []
         for child in sorted(self.root.iterdir()):
             if not child.is_dir():

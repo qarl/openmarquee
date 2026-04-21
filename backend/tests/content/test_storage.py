@@ -106,6 +106,15 @@ def test_list_all_empty_when_no_items(tmp_path: Path):
     assert storage.list_all() == []
 
 
+def test_list_all_empty_when_root_missing_at_runtime(tmp_path: Path):
+    """SD card swap, manual cleanup, e2e reset — root can vanish under us."""
+    import shutil
+
+    storage = ContentStorage(tmp_path)
+    shutil.rmtree(tmp_path)
+    assert storage.list_all() == []
+
+
 def test_list_all_returns_all_saved_items(tmp_path: Path):
     storage = ContentStorage(tmp_path)
     slide_a = _make_slide(name="a", text="a")
