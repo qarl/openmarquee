@@ -12,7 +12,7 @@
 //   - brightness / gamma feed the active renderer at playback time
 // See backend/openmarquee/settings.py for the authoritative scope notes.
 
-import { listTimezones } from "./iana-timezones.js";
+import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
 
 const OUTPUT_MODES = [
     { value: "hdmi", label: "HDMI" },
@@ -178,7 +178,20 @@ export function mountSettings(container, { fetchSettings, onSave }) {
 }
 
 function populateTimezoneSelect(selectEl) {
-    for (const zone of listTimezones()) {
+    // listTimezones() front-loads common U.S. zones; insert a disabled
+    // divider so the visual split between "quick picks" and the full
+    // IANA dump is obvious.
+    const zones = listTimezones();
+    const commonSet = new Set(US_COMMON_TIMEZONES);
+    let dividerPlaced = false;
+    for (const zone of zones) {
+        if (!commonSet.has(zone) && !dividerPlaced) {
+            const divider = document.createElement("option");
+            divider.disabled = true;
+            divider.textContent = "──────── all timezones ────────";
+            selectEl.appendChild(divider);
+            dividerPlaced = true;
+        }
         const opt = document.createElement("option");
         opt.value = zone;
         opt.textContent = zone;

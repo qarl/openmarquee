@@ -1,4 +1,4 @@
-// Thin client over the OpenMarquee REST API. Same-origin, no CORS, no auth.
+// Thin client over the openMarquee REST API. Same-origin, no CORS, no auth.
 
 export async function fetchHealth() {
     const response = await fetch("/healthz");

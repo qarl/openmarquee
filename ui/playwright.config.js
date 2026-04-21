@@ -1,4 +1,4 @@
-// Playwright config for OpenMarquee end-to-end tests.
+// Playwright config for openMarquee end-to-end tests.
 //
 // Auto-starts uvicorn on port 8765 with isolated content/preview paths in
 // /tmp so e2e doesn't pollute dev data. Picks up the venv'd uvicorn via

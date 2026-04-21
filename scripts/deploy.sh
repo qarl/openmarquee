@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/deploy.sh — push local code to a Raspberry Pi running OpenMarquee.
+# scripts/deploy.sh — push local code to a Raspberry Pi running openMarquee.
 #
 # Usage:
 #     bash scripts/deploy.sh <ssh-target>

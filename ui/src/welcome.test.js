@@ -4,8 +4,8 @@ import { buildWifiPayload, renderWelcomeQR } from "./welcome.js";
 
 describe("buildWifiPayload", () => {
     it("formats a WPA WIFI: payload with the SSID and password", () => {
-        expect(buildWifiPayload("OpenMarquee-A3F7", "openmarquee")).toBe(
-            "WIFI:T:WPA;S:OpenMarquee-A3F7;P:openmarquee;;",
+        expect(buildWifiPayload("openMarquee-A3F7", "openmarquee")).toBe(
+            "WIFI:T:WPA;S:openMarquee-A3F7;P:openmarquee;;",
         );
     });
 
@@ -21,7 +21,7 @@ describe("buildWifiPayload", () => {
 describe("renderWelcomeQR", () => {
     it("replaces the placeholder SVG with a real QR and removes the placeholder class", async () => {
         document.body.innerHTML = `
-            <dd data-field="ssid">OpenMarquee-A3F7</dd>
+            <dd data-field="ssid">openMarquee-A3F7</dd>
             <dd data-field="password">openmarquee</dd>
             <div class="qr qr-placeholder">
                 <svg viewBox="0 0 21 21"><rect width="21" height="21"/></svg>

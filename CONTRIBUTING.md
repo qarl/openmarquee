@@ -1,10 +1,10 @@
-# Contributing to OpenMarquee
+# Contributing to openMarquee
 
-OpenMarquee is GPLv3 and welcomes contributions. These rules apply equally to maintainer commits and contributor pull requests.
+openMarquee is GPLv3 and welcomes contributions. These rules apply equally to maintainer commits and contributor pull requests.
 
 ## Project values
 
-OpenMarquee is a self-contained, offline-capable, no-subscription, no-database, phone-first display controller. Contributions that pull against those constraints (cloud sync, account systems, mandatory internet access, heavyweight runtime dependencies) will be rejected on principle. See [`../DESIGN_BRIEF.md`](../DESIGN_BRIEF.md) and [`../SYSTEM_SPEC.md`](../SYSTEM_SPEC.md) for the full picture — they live in the workspace repo, one directory up from the code.
+openMarquee is a self-contained, offline-capable, no-subscription, no-database, phone-first display controller. Contributions that pull against those constraints (cloud sync, account systems, mandatory internet access, heavyweight runtime dependencies) will be rejected on principle. See [`../DESIGN_BRIEF.md`](../DESIGN_BRIEF.md) and [`../SYSTEM_SPEC.md`](../SYSTEM_SPEC.md) for the full picture — they live in the workspace repo, one directory up from the code.
 
 ## Before you start
 

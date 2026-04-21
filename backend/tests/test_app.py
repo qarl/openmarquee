@@ -24,7 +24,7 @@ def test_root_serves_ui_html(client):
     response = client.get("/")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
-    assert "OpenMarquee" in response.text
+    assert "openMarquee" in response.text
 
 
 def test_static_mount_does_not_shadow_api_routes(client):
@@ -39,5 +39,5 @@ def test_openapi_schema_available(client):
     response = client.get("/openapi.json")
     assert response.status_code == 200
     schema = response.json()
-    assert schema["info"]["title"] == "OpenMarquee"
+    assert schema["info"]["title"] == "openMarquee"
     assert schema["info"]["version"] == __version__

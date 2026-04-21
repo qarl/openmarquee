@@ -22,13 +22,28 @@ const FALLBACK = [
     "Australia/Sydney",
 ];
 
+// Common U.S. zones surfaced at the top of the dropdown so US operators
+// (our primary F&F demo audience) find their zone without scrolling
+// through 400+ IANA entries. Order matches the mainland-west-to-east +
+// Alaska / Hawaii / territories the list includes.
+export const US_COMMON_TIMEZONES = Object.freeze([
+    "America/Los_Angeles",
+    "America/Denver",
+    "America/Phoenix",
+    "America/Chicago",
+    "America/New_York",
+    "America/Anchorage",
+    "Pacific/Honolulu",
+    "UTC",
+]);
+
 export function listTimezones() {
     try {
         const supportedValuesOf = Intl?.supportedValuesOf;
         if (typeof supportedValuesOf === "function") {
             const values = supportedValuesOf.call(Intl, "timeZone");
             if (Array.isArray(values) && values.length > 0) {
-                return withUtcFirst(values);
+                return withUsCommonFirst(values);
             }
         }
     } catch {
@@ -38,10 +53,23 @@ export function listTimezones() {
 }
 
 // Browsers' Intl.supportedValuesOf('timeZone') deliberately omits "UTC"
-// (it's an alias, not a zoneinfo entry). For schedulers who don't care
-// about DST, UTC is still the most useful single choice, so we prepend it
-// to the list.
-function withUtcFirst(values) {
-    if (values.includes("UTC")) return values;
-    return ["UTC", ...values];
+// (it's an alias, not a zoneinfo entry). We also front-load the common
+// U.S. zones so the dropdown's first click covers 90% of operators.
+// De-dupe so the remaining IANA list doesn't contain repeats.
+function withUsCommonFirst(values) {
+    const seen = new Set();
+    const out = [];
+    for (const z of US_COMMON_TIMEZONES) {
+        if (!seen.has(z)) {
+            out.push(z);
+            seen.add(z);
+        }
+    }
+    for (const z of values) {
+        if (!seen.has(z)) {
+            out.push(z);
+            seen.add(z);
+        }
+    }
+    return out;
 }

@@ -1,4 +1,4 @@
-// OpenMarquee web UI — entry point.
+// openMarquee web UI — entry point.
 //
 // Four panels (slides, playlists, schedule, settings) mount into a sidebar
 // shell. Sidebar nav (`nav.js`) toggles the active panel's `hidden`

@@ -56,7 +56,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await get_playback_loop().stop()
 
 
-app = FastAPI(title="OpenMarquee", version=__version__, lifespan=lifespan)
+app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
 
 
 @app.get("/healthz")

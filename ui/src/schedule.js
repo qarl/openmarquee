@@ -4,7 +4,7 @@
 // build the schedule they want and it survives across restarts, ready for
 // the day playback actually honors it.
 
-import { listTimezones } from "./iana-timezones.js";
+import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
 
 const DAYS = [
     { value: "mon", label: "Mon" },
@@ -245,9 +245,20 @@ function renderRule(rule, availableNames) {
 
 function populateTzSelect(selectEl) {
     // Keep the leading "Device local" option already in the template, then
-    // append the IANA zones. An out-of-list stored value is patched in by
-    // setTzValue at load time so round-tripping never drops the user's choice.
-    for (const zone of listTimezones()) {
+    // append the IANA zones. listTimezones() front-loads the common U.S.
+    // zones; insert a disabled divider between the top-of-list and the
+    // rest so the visual hierarchy is obvious.
+    const zones = listTimezones();
+    const commonSet = new Set(US_COMMON_TIMEZONES);
+    let dividerPlaced = false;
+    for (const zone of zones) {
+        if (!commonSet.has(zone) && !dividerPlaced) {
+            const divider = document.createElement("option");
+            divider.disabled = true;
+            divider.textContent = "──────── all timezones ────────";
+            selectEl.appendChild(divider);
+            dividerPlaced = true;
+        }
         const opt = document.createElement("option");
         opt.value = zone;
         opt.textContent = zone;

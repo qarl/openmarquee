@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/test.sh — run the full OpenMarquee test suite (backend + UI).
+# scripts/test.sh — run the full openMarquee test suite (backend + UI).
 # Hardware-tagged tests are skipped by default; pass `-m hardware` to pytest
 # directly to run them on a real Pi.
 set -euo pipefail

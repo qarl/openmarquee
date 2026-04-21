@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { listTimezones } from "./iana-timezones.js";
+import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
 
 afterEach(() => {
     vi.restoreAllMocks();
@@ -14,6 +14,22 @@ describe("listTimezones", () => {
         expect(zones).toContain("UTC");
         expect(zones).toContain("America/Los_Angeles");
         expect(zones).toContain("Europe/London");
+    });
+
+    it("front-loads the common U.S. zones at the start of the list", () => {
+        const zones = listTimezones();
+        // The first N entries are US_COMMON_TIMEZONES in the same order.
+        const prefix = zones.slice(0, US_COMMON_TIMEZONES.length);
+        expect(prefix).toEqual([...US_COMMON_TIMEZONES]);
+    });
+
+    it("never duplicates a zone (US commons vs. the IANA list)", () => {
+        const zones = listTimezones();
+        const seen = new Set();
+        for (const z of zones) {
+            expect(seen.has(z)).toBe(false);
+            seen.add(z);
+        }
     });
 
     it("falls back to a small bundled list when Intl.supportedValuesOf is missing", () => {

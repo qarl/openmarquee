@@ -1,5 +1,5 @@
 [Unit]
-Description=OpenMarquee backend (FastAPI + playback loop)
+Description=openMarquee backend (FastAPI + playback loop)
 Documentation=https://github.com/qarl/openmarquee
 
 # Wait until the network stack is up. hostapd.service brings up the WiFi AP;

@@ -36,4 +36,4 @@ GPLv3 — see [`LICENSE`](LICENSE).
 
 ---
 
-> The project was briefly called "OpenSign" early on, before the name was locked in as **OpenMarquee** (domain: openmarquee.com). "OpenSign" collided with the e-signature platform OpenSignLabs and with the digital signage product at opensign.us.
+> The project was briefly called "OpenSign" early on, before the name was locked in as **openMarquee** (domain: openmarquee.com). "OpenSign" collided with the e-signature platform OpenSignLabs and with the digital signage product at opensign.us.

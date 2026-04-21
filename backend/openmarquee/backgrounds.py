@@ -17,7 +17,7 @@ Contract:
 - `BackgroundProviderUnknown` maps to 400 — the request named a provider
   we don't ship.
 
-What's explicitly NOT here: paid / API-key-gated services. OpenMarquee is
+What's explicitly NOT here: paid / API-key-gated services. openMarquee is
 a free, offline-first captive portal; making the shipped composer depend
 on a paid API would be out of character. Provisioning API keys for users
 who want to bring their own is a separate feature the device doesn't run

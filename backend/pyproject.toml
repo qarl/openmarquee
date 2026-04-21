@@ -9,7 +9,7 @@ description = "Self-contained, phone-controlled, no-subscription digital signage
 license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11"
 authors = [
-    { name = "OpenMarquee contributors" },
+    { name = "openMarquee contributors" },
 ]
 dependencies = [
     "fastapi>=0.110",

@@ -32,7 +32,7 @@ _PREVIEW_HTML = """<!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>OpenMarquee — dev preview</title>
+    <title>openMarquee — dev preview</title>
     <style>
         body {
             background: #111;
@@ -59,7 +59,7 @@ _PREVIEW_HTML = """<!doctype html>
     </style>
 </head>
 <body>
-    <h1>OpenMarquee — dev preview</h1>
+    <h1>openMarquee — dev preview</h1>
     <img id="frame" alt="latest rendered frame">
     <div class="meta">polling every 500ms</div>
     <script>

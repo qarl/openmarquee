@@ -18,7 +18,7 @@ const SAMPLE = {
     display_height: 1080,
     brightness: 75,
     gamma: 2.4,
-    wifi_ssid: "OpenMarquee-A3F7",
+    wifi_ssid: "openMarquee-A3F7",
     wifi_password: "correct-horse-battery",
     timezone: "America/New_York",
 };
@@ -39,7 +39,7 @@ describe("mountSettings", () => {
         expect(container.querySelector(".field-brightness").value).toBe("75");
         expect(container.querySelector(".field-gamma").value).toBe("2.4");
         expect(container.querySelector(".field-wifi-ssid").value).toBe(
-            "OpenMarquee-A3F7",
+            "openMarquee-A3F7",
         );
         expect(container.querySelector(".field-wifi-password").value).toBe(
             "correct-horse-battery",

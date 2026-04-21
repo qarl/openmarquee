@@ -22,7 +22,7 @@ without running as root.
 ## First-time install (until Phase 9's image builder lands)
 
 Until pi-gen bakes all of this into a flashable SD card image, these are
-the manual steps to provision a fresh Pi Zero 2 W for OpenMarquee:
+the manual steps to provision a fresh Pi Zero 2 W for openMarquee:
 
 1. **Flash Raspberry Pi OS Lite (64-bit)**, enable SSH in the image
    configurator, give the Pi a recognizable hostname.
@@ -77,7 +77,7 @@ the manual steps to provision a fresh Pi Zero 2 W for OpenMarquee:
 
 7. **Verify:**
 
-   - The Pi should now broadcast `OpenMarquee-SETUP` (2.4 GHz).
+   - The Pi should now broadcast `openMarquee-SETUP` (2.4 GHz).
    - Connect a phone → captive portal should pop with the setup UI.
    - If it doesn't, `sudo journalctl -u openmarquee-backend -f` on the Pi.
 
@@ -87,7 +87,7 @@ The configs here are *setup-mode* defaults. Phase 7 (WiFi AP + captive
 portal) adds:
 
 - **SSID rotation:** a oneshot unit rewrites `hostapd.conf`'s `ssid=` line
-  to `OpenMarquee-XXXX` where `XXXX` is the last four hex chars of the
+  to `openMarquee-XXXX` where `XXXX` is the last four hex chars of the
   board's MAC address, so every device has a unique-looking network.
 - **Password rotation:** same idea, but for `wpa_passphrase=`. The welcome
   screen (`ui/welcome.html`) reads the final SSID + password and encodes

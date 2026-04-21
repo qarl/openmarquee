@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/dev.sh — start the openMarquee backend and UI in dev mode, together.
+# scripts/dev.sh — start the OpenMarquee backend and UI in dev mode, together.
 #
 # Backend: http://localhost:8000 (FastAPI, --reload)
 # UI:      esbuild watch builds to ui/dist/; once the backend serves static

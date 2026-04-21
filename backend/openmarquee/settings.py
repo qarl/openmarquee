@@ -59,7 +59,7 @@ class SystemSettings(BaseModel):
     schema_version: int = Field(default=SETTINGS_SCHEMA_VERSION)
 
     sign_name: str = Field(
-        default="OpenMarquee",
+        default="openMarquee",
         min_length=1,
         max_length=64,
         description="Operator-facing label for this device (shown in UI + welcome screen).",
@@ -98,7 +98,7 @@ class SystemSettings(BaseModel):
     )
 
     wifi_ssid: str = Field(
-        default="OpenMarquee-SETUP",
+        default="openMarquee-SETUP",
         description="Access-point SSID (1-32 printable ASCII chars).",
     )
     # SYSTEM_SPEC §4.1 specifies "openmarquee" as the default passphrase;

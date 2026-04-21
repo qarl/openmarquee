@@ -90,8 +90,8 @@ def test_ssid_rejects_non_ascii():
 
 
 def test_ssid_accepts_hyphens_and_digits():
-    s = SystemSettings(wifi_ssid="OpenMarquee-A3F7")
-    assert s.wifi_ssid == "OpenMarquee-A3F7"
+    s = SystemSettings(wifi_ssid="openMarquee-A3F7")
+    assert s.wifi_ssid == "openMarquee-A3F7"
 
 
 def test_wifi_password_default_matches_system_spec():

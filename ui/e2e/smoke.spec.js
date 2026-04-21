@@ -8,8 +8,8 @@ test.beforeEach(() => {
 test("app loads, editor + list visible, list shows empty state", async ({ page }) => {
     await page.goto("/");
 
-    await expect(page).toHaveTitle("OpenMarquee");
-    await expect(page.locator("header h1")).toHaveText("OpenMarquee");
+    await expect(page).toHaveTitle("openMarquee");
+    await expect(page.locator("header h1")).toHaveText("openMarquee");
 
     // Scope to `.editor` — `.field-save` also appears inside the image
     // uploader, and Playwright's strict mode flags the duplicate.
@@ -87,8 +87,8 @@ test("welcome page renders SSID, password, and a real (not placeholder) QR", asy
     // ensures the page chrome stays wired up AND the welcome.js script
     // generates a real QR (not the no-JS placeholder fallback).
     await page.goto("/welcome.html");
-    await expect(page).toHaveTitle(/OpenMarquee/);
-    await expect(page.locator(".brand")).toHaveText("OpenMarquee");
+    await expect(page).toHaveTitle(/openMarquee/);
+    await expect(page.locator(".brand")).toHaveText("openMarquee");
     await expect(page.locator('[data-field="ssid"]')).toBeVisible();
     await expect(page.locator('[data-field="password"]')).toBeVisible();
 

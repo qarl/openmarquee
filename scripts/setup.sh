@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/setup.sh — set up the local dev environment for OpenMarquee.
+# scripts/setup.sh — set up the local dev environment for openMarquee.
 #
 # Idempotent. Re-run after changes to backend/pyproject.toml or ui/package.json.
 #
