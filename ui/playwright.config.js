@@ -19,6 +19,8 @@ const uvicornCmd = existsSync(venvUvicorn) ? venvUvicorn : "uvicorn";
 
 export const E2E_CONTENT_ROOT = "/tmp/openmarquee-e2e-content";
 export const E2E_PREVIEW_PATH = "/tmp/openmarquee-e2e-preview.png";
+export const E2E_PLAYLIST_PATH = "/tmp/openmarquee-e2e-playlist.json";
+export const E2E_SCHEDULE_PATH = "/tmp/openmarquee-e2e-schedules.json";
 
 export default defineConfig({
     testDir: "./e2e",
@@ -41,6 +43,8 @@ export default defineConfig({
             ...process.env,
             OPENMARQUEE_CONTENT_ROOT: E2E_CONTENT_ROOT,
             OPENMARQUEE_DEV_PREVIEW_PATH: E2E_PREVIEW_PATH,
+            OPENMARQUEE_PLAYLIST_PATH: E2E_PLAYLIST_PATH,
+            OPENMARQUEE_SCHEDULE_PATH: E2E_SCHEDULE_PATH,
             // Resolve the UI dir relative to THIS file, not cwd, so e2e works
             // regardless of where Playwright is launched from.
             OPENMARQUEE_UI_DIR: __dirname,

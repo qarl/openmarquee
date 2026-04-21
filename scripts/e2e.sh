@@ -14,4 +14,8 @@ if [ "${1:-}" = "install" ]; then
     exit 0
 fi
 
+# Rebuild the bundle so Playwright tests against the current source, not a
+# stale `dist/main.js` from an earlier dev session. Cheap (<1s via esbuild).
+npm run build --silent
+
 npm run e2e

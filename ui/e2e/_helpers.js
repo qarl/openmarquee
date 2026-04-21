@@ -5,7 +5,12 @@
 
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
-import { E2E_CONTENT_ROOT, E2E_PREVIEW_PATH } from "../playwright.config.js";
+import {
+    E2E_CONTENT_ROOT,
+    E2E_PLAYLIST_PATH,
+    E2E_PREVIEW_PATH,
+    E2E_SCHEDULE_PATH,
+} from "../playwright.config.js";
 
 export function resetServerState() {
     mkdirSync(E2E_CONTENT_ROOT, { recursive: true });
@@ -13,4 +18,6 @@ export function resetServerState() {
         rmSync(path.join(E2E_CONTENT_ROOT, entry), { recursive: true, force: true });
     }
     rmSync(E2E_PREVIEW_PATH, { force: true });
+    rmSync(E2E_PLAYLIST_PATH, { force: true });
+    rmSync(E2E_SCHEDULE_PATH, { force: true });
 }

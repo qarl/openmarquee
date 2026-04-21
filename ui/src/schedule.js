@@ -100,7 +100,17 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
         }
     }
 
-    addBtn.addEventListener("click", () => {
+    addBtn.addEventListener("click", async () => {
+        // Re-fetch playlist names so a newly-created playlist (via the
+        // manager above) shows up in the dropdown without the user having
+        // to refresh the page.
+        if (fetchPlaylistNames) {
+            try {
+                availableNames = await fetchPlaylistNames();
+            } catch {
+                /* fall back to cached list */
+            }
+        }
         rulesEl.appendChild(
             renderRule(
                 {
