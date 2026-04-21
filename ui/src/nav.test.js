@@ -3,6 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mountNav } from "./nav.js";
 
 const SECTIONS = ["slides", "playlists", "schedule", "settings"];
+const HIERARCHICAL = [
+    "slides/text",
+    "slides/image",
+    "playlists",
+    "settings",
+];
 
 function buildShell() {
     document.body.innerHTML = `
@@ -19,6 +25,29 @@ function buildShell() {
             <section data-section="playlists">playlists panel</section>
             <section data-section="schedule">schedule panel</section>
             <section data-section="settings">settings panel</section>
+        </main>
+    `;
+    return {
+        main: document.getElementById("app"),
+        sidebar: document.querySelector(".sidebar"),
+    };
+}
+
+function buildHierShell() {
+    document.body.innerHTML = `
+        <nav class="sidebar">
+            <ul class="nav-list">
+                <li><a class="nav-link nav-child" href="#/slides/text" data-section="slides/text">Text</a></li>
+                <li><a class="nav-link nav-child" href="#/slides/image" data-section="slides/image">Image</a></li>
+                <li><a class="nav-link" href="#/playlists" data-section="playlists">Playlists</a></li>
+                <li><a class="nav-link" href="#/settings" data-section="settings">Settings</a></li>
+            </ul>
+        </nav>
+        <main id="app">
+            <section data-section="slides/text">text</section>
+            <section data-section="slides/image">image</section>
+            <section data-section="playlists">p</section>
+            <section data-section="settings">s</section>
         </main>
     `;
     return {
@@ -96,5 +125,30 @@ describe("mountNav", () => {
         );
         expect(slidesLink.classList.contains("active")).toBe(false);
         expect(slidesLink.getAttribute("aria-current")).toBeNull();
+    });
+
+    // --- hierarchical section names (slides/text etc.) ---
+
+    it("routes hierarchical sections via the full slash-separated name", () => {
+        history.replaceState(null, "", "#/slides/image");
+        const shell = buildHierShell();
+        mountNav({
+            ...shell,
+            sections: HIERARCHICAL,
+            defaultSection: "slides/text",
+        });
+        const main = document.getElementById("app");
+        expect(main.querySelector('[data-section="slides/image"]').hidden).toBe(false);
+        expect(main.querySelector('[data-section="slides/text"]').hidden).toBe(true);
+    });
+
+    it("canonicalizes a bare URL to the provided defaultSection", () => {
+        const shell = buildHierShell();
+        mountNav({
+            ...shell,
+            sections: HIERARCHICAL,
+            defaultSection: "slides/text",
+        });
+        expect(window.location.hash).toBe("#/slides/text");
     });
 });

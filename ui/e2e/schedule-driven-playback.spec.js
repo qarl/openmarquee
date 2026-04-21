@@ -75,11 +75,11 @@ test("schedule-driven playback: items → lunch playlist → always-on rule → 
     await page.locator(".schedule-save").click();
     await expect(page.locator(".schedule-status")).toHaveText("Saved.");
 
-    // 7. Back to Slides (where the Play all button lives) and start playback.
-    //    The loop should evaluate the schedule, pick lunch, and the state
-    //    endpoint should report that back.
-    await page.locator('.nav-link[data-section="slides"]').click();
-    await expect(page.locator('.panel[data-section="slides"]')).toBeVisible();
+    // 7. Back to the Text subpage (where the Play all button lives) and
+    //    start playback. The loop evaluates the schedule, picks lunch, and
+    //    the state endpoint reports that back.
+    await page.locator('.nav-link[data-section="slides/text"]').click();
+    await expect(page.locator('.panel[data-section="slides/text"]')).toBeVisible();
     await page.locator(".playback-btn").click();
     await expect(page.locator(".playback-btn")).toHaveText("Stop");
 

@@ -1,16 +1,16 @@
 // openMarquee web UI — entry point.
 //
-// Four panels (slides, playlists, schedule, settings) mount into a sidebar
-// shell. Sidebar nav (`nav.js`) toggles the active panel's `hidden`
-// attribute; panels themselves stay mounted so their state survives
-// navigation.
+// Seven panels (slides/text, slides/image, slides/video, slides/auto,
+// playlists, schedule, settings) mount into a sidebar shell. Sidebar
+// nav (`nav.js`) toggles the active panel's `hidden` attribute; panels
+// stay mounted so their state (scroll, in-progress edits, polling
+// loops) survives navigation clicks.
 //
-// Panel dimensions come from /api/settings at boot so every preview canvas
-// matches the device's configured display aspect ratio (128×96 is just
-// the SYSTEM_SPEC default; operators with a 1920×1080 HDMI target see a
-// 16:9 preview). Changes made in the Settings form take effect on the
-// next page load — re-mounting the whole app on settings save is a
-// future refinement.
+// Panel dimensions come from /api/settings at boot so every preview
+// canvas matches the device's configured display aspect ratio (128×96
+// is just the SYSTEM_SPEC default; operators with a 1920×1080 HDMI
+// target see 16:9 previews). Settings changes take effect on the
+// next page load — re-mounting on save is a future refinement.
 
 import {
     deletePlaylistByName,
@@ -32,6 +32,7 @@ import {
     startPlayback,
     stopPlayback,
 } from "./api.js";
+import { mountAutoSlide } from "./auto-slide.js";
 import { mountComposer } from "./composer.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
@@ -49,7 +50,16 @@ import { mountVideoUploader } from "./video-upload.js";
 const FALLBACK_WIDTH = 128;
 const FALLBACK_HEIGHT = 96;
 
-const SECTIONS = ["slides", "playlists", "schedule", "settings"];
+const SECTIONS = [
+    "slides/text",
+    "slides/image",
+    "slides/video",
+    "slides/auto",
+    "playlists",
+    "schedule",
+    "settings",
+];
+const DEFAULT_SECTION = "slides/text";
 
 async function resolvePanelDims() {
     try {
@@ -70,13 +80,20 @@ async function boot() {
     const { width: PANEL_WIDTH, height: PANEL_HEIGHT } = await resolvePanelDims();
     const root = document.getElementById("app");
     root.innerHTML = `
-        <section data-section="slides" class="panel">
+        <section data-section="slides/text" class="panel">
             <div class="editor-slot"></div>
             <div class="composer-slot"></div>
-            <div class="image-upload-slot"></div>
-            <div class="video-upload-slot"></div>
             <div class="playback-slot"></div>
             <div class="list-slot"></div>
+        </section>
+        <section data-section="slides/image" class="panel">
+            <div class="image-upload-slot"></div>
+        </section>
+        <section data-section="slides/video" class="panel">
+            <div class="video-upload-slot"></div>
+        </section>
+        <section data-section="slides/auto" class="panel">
+            <div class="auto-slide-slot"></div>
         </section>
         <section data-section="playlists" class="panel">
             <div class="playlists-slot"></div>
@@ -89,6 +106,9 @@ async function boot() {
         </section>
     `;
 
+    // List + playback live on the Text subpage today (until the Playlists
+    // page redesign moves them there). Mount once; onSaveWithRefresh
+    // triggers a refresh after any creator saves a new slide.
     const list = mountList(root.querySelector(".list-slot"), {
         fetchItems: listContent,
         onPlay: playContent,
@@ -114,12 +134,6 @@ async function boot() {
         onSave: onSaveWithRefresh(saveTextSlide),
     });
 
-    mountImageUploader(root.querySelector(".image-upload-slot"), {
-        width: PANEL_WIDTH,
-        height: PANEL_HEIGHT,
-        onSave: onSaveWithRefresh(saveImage),
-    });
-
     mountComposer(root.querySelector(".composer-slot"), {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
@@ -128,15 +142,25 @@ async function boot() {
         // server needs. The layer structure lives only in the browser tab.
         onSave: onSaveWithRefresh(saveImage),
         // Server-side generator — returns an ImageSlide and auto-appends to
-        // the default playlist. Wrap with onSaveWithRefresh so the
-        // generated slide appears in the Saved slides list immediately.
+        // the default playlist.
         onGenerateBackground: onSaveWithRefresh(generateBackground),
+    });
+
+    mountImageUploader(root.querySelector(".image-upload-slot"), {
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
+        onSave: onSaveWithRefresh(saveImage),
     });
 
     mountVideoUploader(root.querySelector(".video-upload-slot"), {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
         onSave: onSaveWithRefresh(saveVideo),
+    });
+
+    mountAutoSlide(root.querySelector(".auto-slide-slot"), {
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
     });
 
     mountPlaylistsManager(root.querySelector(".playlists-slot"), {
@@ -164,6 +188,7 @@ async function boot() {
         main: root,
         sidebar: document.querySelector(".sidebar"),
         sections: SECTIONS,
+        defaultSection: DEFAULT_SECTION,
     });
 }
 

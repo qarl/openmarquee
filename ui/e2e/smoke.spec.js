@@ -5,20 +5,18 @@ test.beforeEach(() => {
     resetServerState();
 });
 
-test("app loads, editor + list visible, list shows empty state", async ({ page }) => {
+test("app loads on the Text subpage, editor visible, list shows empty state", async ({ page }) => {
     await page.goto("/");
 
     await expect(page).toHaveTitle("openMarquee");
     await expect(page.locator("header h1")).toHaveText("openMarquee");
 
-    // Scope to `.editor` — `.field-save` also appears inside the image
-    // uploader, and Playwright's strict mode flags the duplicate.
     await expect(page.locator(".editor .editor-canvas")).toBeVisible();
     await expect(page.locator(".editor .field-text")).toBeVisible();
     await expect(page.locator(".editor .field-save")).toBeVisible();
 
-    await expect(page.locator(".image-upload")).toBeVisible();
-    await expect(page.locator(".image-upload .field-file")).toBeVisible();
+    // Image uploader lives on its own subpage now — hidden on boot.
+    await expect(page.locator(".image-upload")).toBeHidden();
 
     await expect(page.locator(".list")).toBeVisible();
     await expect(page.locator(".list-status")).toContainText("No slides yet");
@@ -37,16 +35,25 @@ test("Save button is disabled until text is entered", async ({ page }) => {
     await expect(saveBtn).toBeDisabled();
 });
 
-test("sidebar nav shows Slides by default and routes to each section on click", async ({ page }) => {
+test("sidebar nav defaults to Text and routes through every section on click", async ({ page }) => {
     await page.goto("/");
 
-    // Slides is the default section. Sidebar link is marked active.
-    await expect(page.locator('.panel[data-section="slides"]')).toBeVisible();
-    await expect(page.locator('.nav-link[data-section="slides"]')).toHaveClass(/active/);
-    await expect(page.locator('.panel[data-section="playlists"]')).toBeHidden();
+    // Text is the default section.
+    await expect(page.locator('.panel[data-section="slides/text"]')).toBeVisible();
+    await expect(page.locator('.nav-link[data-section="slides/text"]')).toHaveClass(/active/);
+    await expect(page.locator('.panel[data-section="slides/image"]')).toBeHidden();
 
-    // Click through each section; only that panel should be visible.
-    for (const name of ["playlists", "schedule", "settings", "slides"]) {
+    // Click through every section; only that panel should be visible at a time.
+    const routes = [
+        "slides/image",
+        "slides/video",
+        "slides/auto",
+        "playlists",
+        "schedule",
+        "settings",
+        "slides/text",
+    ];
+    for (const name of routes) {
         await page.locator(`.nav-link[data-section="${name}"]`).click();
         await expect(page.locator(`.panel[data-section="${name}"]`)).toBeVisible();
         await expect(page.locator(`.nav-link[data-section="${name}"]`)).toHaveClass(/active/);
@@ -57,6 +64,13 @@ test("sidebar nav shows Slides by default and routes to each section on click", 
     await expect(page.locator(".settings-heading")).toHaveText("System settings");
     await expect(page.locator(".field-output-mode")).toHaveValue("hdmi");
     await expect(page.locator(".field-display-width")).toHaveValue("128");
+});
+
+test("Auto subpage shows the preview canvas + placeholder copy", async ({ page }) => {
+    await page.goto("/#/slides/auto");
+    await expect(page.locator(".auto-slide-heading")).toHaveText("Auto slides");
+    await expect(page.locator(".auto-slide-canvas")).toBeVisible();
+    await expect(page.locator(".auto-slide-todo")).toContainText("Preview only");
 });
 
 test("ffmpeg.wasm spike page renders both pipeline buttons + the file picker", async ({ page }) => {
