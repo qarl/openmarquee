@@ -41,7 +41,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from openmarquee.content import ImageSlide, VideoSlide
+from PIL import ImageDraw, ImageFont
+
+from openmarquee.content import ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playlist import PlaylistStorage
 
@@ -148,34 +150,38 @@ def seed_if_needed(
 
     created: list = []
     try:
+        # 1. Backgrounds become *available content* (saved, but NOT auto-
+        #    appended to the default playlist). Operators drag them onto the
+        #    playlist track themselves. Falls back to Pillow-gradient presets
+        #    when no curated pack is bundled so a stripped image isn't blank.
         bg_dir = (
             bundled_backgrounds_dir
             if bundled_backgrounds_dir is not None
             else _default_bundled_backgrounds_dir()
         )
         bundled = _seed_bundled_backgrounds(storage, bg_dir, width, height)
-        for slide in bundled:
-            playlist.append(slide.id)
-            created.append(slide)
+        created.extend(bundled)
 
-        # Only fall back to the Pillow gradients when no bundled images
-        # were available — operators on a fresh SD image without the
-        # curated pack shouldn't get a blank device.
         if not bundled:
             for preset in _SEED_PRESETS:
                 png = render_gradient_png(preset, width, height)
                 slide = ImageSlide(name=preset.name, duration_ms=5000)
                 storage.save_image(slide, png)
-                playlist.append(slide.id)
                 created.append(slide)
 
-        # Demo video: optional, best-effort. Any failure (missing / bad
-        # bytes / unreadable) falls through silently; the gradients are
-        # still persisted and the seed is considered successful.
+        # 2. Demo video: optional, best-effort, also NOT auto-appended
+        #    (operator drags it into the playlist when they want it).
         demo = _seed_demo_video_if_available(storage, demo_video_path, width, height)
         if demo is not None:
-            playlist.append(demo.id)
             created.append(demo)
+
+        # 3. The ONE thing we auto-append to the default playlist: the
+        #    Welcome text slide. A fresh device boots playing "Welcome" on
+        #    a nice background so the sign isn't a black screen until the
+        #    operator does anything.
+        welcome = _seed_welcome_slide(storage, width, height)
+        created.append(welcome)
+        playlist.append(welcome.id)
 
         playlist_storage.save(playlist)
     except Exception:
@@ -236,6 +242,66 @@ def _seed_bundled_backgrounds(
         storage.save_image(slide, png)
         created.append(slide)
     return created
+
+
+# --- Welcome slide ---
+
+# Chosen for high contrast + a warm, inviting feel at sign sizes. White
+# on deep teal reads well at both LED-matrix and HDMI resolutions.
+WELCOME_TEXT = "Welcome"
+WELCOME_TEXT_COLOR = "#FFFFFF"
+WELCOME_BG_COLOR = "#0A3D4A"
+
+
+def render_welcome_png(width: int, height: int) -> bytes:
+    """Flatten the Welcome slide to a PNG at the panel's native dimensions.
+
+    Mirrors what the UI's text-slide editor does client-side — solid
+    background + centered text — so the device has a ready-to-render
+    PNG the moment the seed finishes.
+    """
+    img = Image.new("RGB", (width, height), WELCOME_BG_COLOR)
+    draw = ImageDraw.Draw(img)
+    font_size_px = max(12, int(height * 0.4))
+    # PIL's default truetype lookup is unreliable across install paths;
+    # fall back to the bitmap default when no scalable face is available.
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size_px)
+    except OSError:
+        try:
+            font = ImageFont.truetype("Arial Bold.ttf", font_size_px)
+        except OSError:
+            font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), WELCOME_TEXT, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(
+        ((width - tw) / 2 - bbox[0], (height - th) / 2 - bbox[1]),
+        WELCOME_TEXT,
+        fill=WELCOME_TEXT_COLOR,
+        font=font,
+    )
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _seed_welcome_slide(
+    storage: ContentStorage, width: int, height: int
+) -> TextSlide:
+    """Create + persist the 'Welcome' TextSlide that a fresh device boots
+    into. Stored as a TextSlide (not ImageSlide) so the operator can open
+    it in the text editor and re-skin it without starting from scratch."""
+    png = render_welcome_png(width, height)
+    slide = TextSlide(
+        name="Welcome",
+        text=WELCOME_TEXT,
+        text_color=WELCOME_TEXT_COLOR,
+        background_color=WELCOME_BG_COLOR,
+        font_size_px=max(12, int(height * 0.4)),
+        duration_ms=5000,
+    )
+    storage.save_text_slide(slide, png)
+    return slide
 
 
 def _seed_demo_video_if_available(
