@@ -75,6 +75,11 @@ class PlaybackLoop:
         # whether to render a <video> or a <img> without a second round
         # trip to /api/content/{id}.
         self._current_type: str | None = None
+        # For VideoSlide items, which pipeline variant they are —
+        # "h264_mp4" vs "raw_frames". The preview uses this to pick
+        # the right asset endpoint (the raw_frames path has no <video>
+        # equivalent, so the preview shows the thumbnail).
+        self._current_pipeline: str | None = None
         # Set by fetch_items if it carries playlist context (the
         # scheduled_fetch_items closure stamps this each fetch).
         self._current_playlist_name: str | None = None
@@ -90,6 +95,10 @@ class PlaybackLoop:
     @property
     def current_item_type(self) -> str | None:
         return self._current_type
+
+    @property
+    def current_item_pipeline(self) -> str | None:
+        return self._current_pipeline
 
     async def start(self) -> None:
         """Start the loop. No-op if already running."""
@@ -116,6 +125,7 @@ class PlaybackLoop:
             self._stop_event = None
             self._current_id = None
             self._current_type = None
+            self._current_pipeline = None
             self._current_playlist_name = None
 
     async def _loop(self) -> None:
@@ -130,6 +140,7 @@ class PlaybackLoop:
             if not items:
                 self._current_id = None
                 self._current_type = None
+                self._current_pipeline = None
                 await self._wait(self._empty_poll)
                 continue
 
@@ -141,6 +152,9 @@ class PlaybackLoop:
                     break
                 self._current_id = item.id
                 self._current_type = item.type
+                self._current_pipeline = (
+                    getattr(item, "pipeline", None) if item.type == "video" else None
+                )
 
                 current_image = self._safe_load_image(item)
                 if current_image is None:

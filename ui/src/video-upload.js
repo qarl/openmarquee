@@ -1,19 +1,21 @@
-// Video upload: pick a video (any FFmpeg-decodable format), transcode
-// client-side via ffmpeg.wasm to an H.264 MP4 at the device's configured
-// dimensions, extract a thumbnail from the transcoded output, upload
-// both to the backend.
+// Video upload: pick a video (any FFmpeg-decodable format), process it
+// client-side via ffmpeg.wasm, upload the appropriate asset to the
+// backend based on the device's output_mode.
 //
-// Transcode happens on file-pick (not on Save) so the operator sees the
-// real thumbnail + the real duration once the wasm pipeline finishes.
-// The produced MP4 is what lands on disk — playback on Pi Zero 2 W's
-// hardware H.264 decoder is reliable because WE chose the profile.
+// HDMI output (pipeline="h264_mp4"):
+//   transcode to H.264 MP4 at panel dims → thumbnail from transcoded
+//   output → upload MP4 bytes.
 //
-// Panel-mode footnote: HUB75 / WS2812B / composite renderers ultimately
-// want raw RGB frames, not H.264. The raw-frames storage path isn't
-// shipped yet, so for now panel modes still upload H.264 (with a visible
-// banner explaining the fallback). The ffmpeg.wasm raw-frames pipeline
-// at /spike.html stays reachable for operators who want to inspect
-// frame bytes while that storage layer lands.
+// Panel output (HUB75 / WS2812B / composite, pipeline="raw_frames"):
+//   extract concatenated RGB888 frames at panel dims + PANEL_FPS →
+//   thumbnail from the first frame's RGB bytes → upload raw frames
+//   bytes with frames_fps/width/height metadata so the renderer can
+//   slice the stream.
+//
+// Processing happens on file-pick (not Save) so the operator sees the
+// real thumbnail + real duration before committing. The resulting
+// bytes are what land on disk — if playback looks wrong, it's the
+// transcode settings below, not whatever source the user picked.
 
 const TEMPLATE = `
     <section class="video-upload">
@@ -35,11 +37,9 @@ const TEMPLATE = `
             </label>
             <p class="field-hint video-upload-panel-hint" hidden>
                 This device is in a <strong>panel</strong> output mode
-                (HUB75 / WS2812B / composite) — the real contract wants
-                raw RGB frames. Raw-frames storage isn't shipped yet, so
-                the video uploads as H.264 for now and the renderer will
-                transcode on the way out. Maintainers watching: raw-frames
-                storage is on the follow-up list.
+                (HUB75 / WS2812B / composite), so the upload extracts raw
+                RGB frames at panel resolution. Larger source files take
+                noticeably longer to process than the HDMI H.264 path.
             </p>
             <div class="row">
                 <label class="field">
@@ -63,10 +63,18 @@ const TEMPLATE = `
 
 import {
     describeFfmpegError,
+    extractRawFrames,
     transcodeToH264,
 } from "./ffmpeg-pipelines.js";
 
 const PANEL_OUTPUT_MODES = new Set(["hub75", "ws281x", "composite"]);
+
+// Fixed playback cadence for panel output modes. Matches the renderer's
+// target refresh rate; higher FPS balloons the stored .rgb stream (3
+// bytes/pixel × width × height × fps per second) without meaningful
+// visual gain at HUB75 / WS2812B densities. A config knob can come
+// later if operators want 30fps at smaller panel sizes.
+const PANEL_FPS = 15;
 
 /**
  * Mount the video-upload UI into `container`.
@@ -109,7 +117,8 @@ export function mountVideoUploader(
     const logEl = container.querySelector(".video-upload-log-body");
     const form = container.querySelector(".controls");
 
-    panelHintEl.hidden = !PANEL_OUTPUT_MODES.has(outputMode);
+    const isPanelMode = PANEL_OUTPUT_MODES.has(outputMode);
+    panelHintEl.hidden = !isPanelMode;
 
     const logLines = [];
     function logFn(msg) {
@@ -120,18 +129,17 @@ export function mountVideoUploader(
     }
 
     const state = {
-        // Populated only when the operator picks a NEW file — the asset
-        // bodies below are null in edit mode when they leave the picker
-        // empty. Save omits the fields so the server retains existing bytes.
-        videoBytesBase64: null,
-        thumbnailCanvasReady: false, // canvas has a fresh first-frame
+        // Populated only when the operator picks a NEW file. In edit
+        // mode these stay null when they leave the picker empty; Save
+        // then omits the fields so the server retains existing bytes.
+        assetBytesBase64: null,     // mp4_base64 OR raw_frames_base64
+        durationSeconds: null,
+        thumbnailCanvasReady: false,
         editingId: null,
     };
 
     function updateSaveEnabled() {
-        // In create mode we need both a thumbnail + MP4 bytes. In edit
-        // mode, metadata-only saves are valid.
-        const hasNewFile = state.thumbnailCanvasReady && state.videoBytesBase64;
+        const hasNewFile = state.thumbnailCanvasReady && state.assetBytesBase64;
         saveBtn.disabled =
             (!state.editingId && !hasNewFile)
             || saveBtn.dataset.inFlight === "1";
@@ -143,47 +151,30 @@ export function mountVideoUploader(
         const file = fileEl.files?.[0];
         if (!file) {
             state.thumbnailCanvasReady = false;
-            state.videoBytesBase64 = null;
+            state.assetBytesBase64 = null;
+            state.durationSeconds = null;
             if (!state.editingId) clearCanvas(canvas);
             updateSaveEnabled();
             return;
         }
 
-        // Pre-populate the slide name from the filename even if transcode
+        // Pre-populate the slide name from the filename even if processing
         // fails — operator can still type over it.
         if (nameEl.value === "Video") {
             nameEl.value = file.name.replace(/\.[^.]+$/, "").slice(0, 200);
         }
 
-        // Disable Save during transcode; the in-flight guard handles the
-        // rest once state flips back.
         saveBtn.dataset.inFlight = "1";
         updateSaveEnabled();
         try {
-            logFn("transcoding via ffmpeg.wasm…");
-            const mp4Bytes = await transcodeToH264(
-                { file, width, height },
-                logFn,
-            );
-            // Wrap the transcoded bytes in a Blob so the thumbnail is
-            // extracted from the *encoded output* — that's what will
-            // actually play on the device, so the preview matches reality.
-            const mp4Blob = new Blob([mp4Bytes], { type: "video/mp4" });
-            const [{ durationSeconds }, bytesB64] = await Promise.all([
-                drawFirstFrameToCanvas(mp4Blob, canvas),
-                fileToBase64(mp4Blob),
-            ]);
-            state.thumbnailCanvasReady = true;
-            state.videoBytesBase64 = bytesB64;
-            if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
-                durationEl.value = String(Math.round(durationSeconds));
+            if (isPanelMode) {
+                await processPanelVideo(file);
+            } else {
+                await processHdmiVideo(file);
             }
-            logFn(
-                `ready. transcoded to ${width}×${height} H.264 MP4 · ${(mp4Bytes.length / 1024).toFixed(1)} KB`,
-            );
         } catch (err) {
             state.thumbnailCanvasReady = false;
-            state.videoBytesBase64 = null;
+            state.assetBytesBase64 = null;
             clearCanvas(canvas);
             logFn(`Could not process video: ${describeFfmpegError(err)}`);
         } finally {
@@ -191,6 +182,52 @@ export function mountVideoUploader(
             updateSaveEnabled();
         }
     });
+
+    async function processHdmiVideo(file) {
+        logFn("transcoding via ffmpeg.wasm…");
+        const mp4Bytes = await transcodeToH264(
+            { file, width, height },
+            logFn,
+        );
+        const mp4Blob = new Blob([mp4Bytes], { type: "video/mp4" });
+        const [{ durationSeconds }, bytesB64] = await Promise.all([
+            drawFirstFrameToCanvas(mp4Blob, canvas),
+            fileToBase64(mp4Blob),
+        ]);
+        state.thumbnailCanvasReady = true;
+        state.assetBytesBase64 = bytesB64;
+        state.durationSeconds = durationSeconds;
+        if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
+            durationEl.value = String(Math.round(durationSeconds));
+        }
+        logFn(
+            `ready. transcoded to ${width}×${height} H.264 MP4 · ${(mp4Bytes.length / 1024).toFixed(1)} KB`,
+        );
+    }
+
+    async function processPanelVideo(file) {
+        logFn("extracting raw frames via ffmpeg.wasm…");
+        const rawBytes = await extractRawFrames(
+            { file, width, height, fps: PANEL_FPS },
+            logFn,
+        );
+        const frameBytes = width * height * 3;
+        const nFrames = Math.floor(rawBytes.length / frameBytes);
+        if (nFrames === 0) {
+            throw new Error(
+                `extracted 0 frames — source too short or ffmpeg failed silently`,
+            );
+        }
+        drawFirstRgbFrameToCanvas(rawBytes, width, height, canvas);
+        state.thumbnailCanvasReady = true;
+        state.assetBytesBase64 = bytesToBase64(rawBytes);
+        const derivedDuration = nFrames / PANEL_FPS;
+        state.durationSeconds = derivedDuration;
+        durationEl.value = String(Math.max(1, Math.round(derivedDuration)));
+        logFn(
+            `ready. ${nFrames} RGB frames @ ${PANEL_FPS}fps · ${(rawBytes.length / 1024).toFixed(1)} KB`,
+        );
+    }
 
     newBtnEl.addEventListener("click", () => resetToBlank());
 
@@ -208,10 +245,21 @@ export function mountVideoUploader(
             const payload = {
                 name: nameEl.value || "Video",
                 duration_ms: Math.round(durationSeconds * 1000),
-                pipeline: "h264_mp4",
+                pipeline: isPanelMode ? "raw_frames" : "h264_mp4",
                 png_base64: includeAssets ? canvasToBase64(canvas) : null,
-                mp4_base64: includeAssets ? state.videoBytesBase64 : null,
             };
+            if (isPanelMode) {
+                payload.raw_frames_base64 = includeAssets
+                    ? state.assetBytesBase64
+                    : null;
+                payload.frames_fps = PANEL_FPS;
+                payload.frames_width = width;
+                payload.frames_height = height;
+            } else {
+                payload.mp4_base64 = includeAssets
+                    ? state.assetBytesBase64
+                    : null;
+            }
             if (state.editingId && onSaveExisting) {
                 await onSaveExisting(state.editingId, payload);
                 statusEl.textContent = "Updated.";
@@ -231,7 +279,8 @@ export function mountVideoUploader(
     function resetToBlank() {
         state.editingId = null;
         state.thumbnailCanvasReady = false;
-        state.videoBytesBase64 = null;
+        state.assetBytesBase64 = null;
+        state.durationSeconds = null;
         headingEl.textContent = "Upload a video";
         newBtnEl.hidden = true;
         editHintEl.hidden = true;
@@ -250,7 +299,8 @@ export function mountVideoUploader(
         }
         state.editingId = String(slide.id);
         state.thumbnailCanvasReady = false;
-        state.videoBytesBase64 = null;
+        state.assetBytesBase64 = null;
+        state.durationSeconds = null;
         headingEl.textContent = `Editing: ${slide.name || "Untitled"}`;
         newBtnEl.hidden = false;
         editHintEl.hidden = false;
@@ -389,6 +439,47 @@ export function fileToBase64(file) {
 function canvasToBase64(canvas) {
     const dataUrl = canvas.toDataURL("image/png");
     return dataUrl.split(",")[1];
+}
+
+/**
+ * Paint the first RGB888 frame in `rawBytes` onto `canvas` as a
+ * preview thumbnail. `rawBytes.length` is expected to be at least
+ * `width*height*3`; extra bytes are ignored (they're additional frames).
+ *
+ * putImageData wants RGBA, so we expand in-place with alpha=255.
+ */
+export function drawFirstRgbFrameToCanvas(rawBytes, width, height, canvas) {
+    const frameSize = width * height * 3;
+    if (rawBytes.length < frameSize) {
+        throw new Error(
+            `raw frame buffer too small: got ${rawBytes.length}, need ${frameSize}`,
+        );
+    }
+    const ctx = canvas.getContext("2d");
+    const imageData = ctx.createImageData(width, height);
+    const dst = imageData.data;
+    for (let i = 0, j = 0; i < frameSize; i += 3, j += 4) {
+        dst[j] = rawBytes[i];
+        dst[j + 1] = rawBytes[i + 1];
+        dst[j + 2] = rawBytes[i + 2];
+        dst[j + 3] = 255;
+    }
+    ctx.putImageData(imageData, 0, 0);
+}
+
+/**
+ * Encode a Uint8Array to a base64 string (no data: prefix). Chunks the
+ * input because btoa trips over very long strings in some browsers and
+ * raw-frame uploads can push tens of MB.
+ */
+export function bytesToBase64(bytes) {
+    const CHUNK = 0x8000; // 32 KB
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        const slice = bytes.subarray(i, i + CHUNK);
+        binary += String.fromCharCode.apply(null, slice);
+    }
+    return btoa(binary);
 }
 
 function clearCanvas(canvas) {

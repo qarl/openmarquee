@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Hex color regex: #RRGGBB. Six lowercase or uppercase hex digits.
 _HEX_COLOR_PATTERN = r"^#[0-9A-Fa-f]{6}$"
@@ -127,16 +127,20 @@ class VideoSlide(BaseModel):
     name: str = Field(max_length=200)
     duration_ms: int = Field(default=5000, ge=100)
 
-    # Re-opened to "raw_frames" now that the ffmpeg.wasm spike page can
-    # actually produce concatenated RGB888 frames (/spike.html exercises
-    # both pipelines client-side). The storage layer still lays down
-    # `asset.mp4` — when a raw_frames VideoSlide lands and the spike is
-    # wired into video-upload.js as the production consumer, storage will
-    # grow a sibling path for frame sequences. Keeping the Literal wide
-    # now lets existing data round-trip even though the production upload
-    # path hasn't shipped yet. Operators saving raw_frames via the /videos
-    # endpoint today should still pass an MP4; this is a stepping stone.
+    # "h264_mp4" stores an `asset.mp4` (H.264 in an MP4 container) — the
+    # HDMI path; relies on the Pi's hardware decoder. "raw_frames" stores
+    # an `asset.rgb` (concatenated RGB888 frames, no header) — the panel
+    # path for HUB75 / WS2812B / composite where the renderer wants pre-
+    # decoded pixel data. Picked at upload time from the device's current
+    # output_mode.
     pipeline: Literal["h264_mp4", "raw_frames"] = "h264_mp4"
+
+    # Only populated when pipeline == "raw_frames". The .rgb stream has
+    # no header, so the frame dims + fps must travel with the metadata
+    # for the renderer to know how to chunk + pace the playback.
+    frames_fps: int | None = Field(default=None, ge=1, le=120)
+    frames_width: int | None = Field(default=None, ge=1, le=4096)
+    frames_height: int | None = Field(default=None, ge=1, le=4096)
 
     # Same transition contract as TextSlide/ImageSlide — applied on the way
     # out, so a cut/fade into the next slide still works across variants.
@@ -144,6 +148,29 @@ class VideoSlide(BaseModel):
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
+
+    @model_validator(mode="after")
+    def _frames_metadata_matches_pipeline(self) -> "VideoSlide":
+        """raw_frames requires all three of fps/width/height; h264_mp4
+        rejects any of them. Keeps on-disk metadata unambiguous about
+        which renderer path is in play."""
+        is_raw = self.pipeline == "raw_frames"
+        has_any = any(
+            v is not None for v in (self.frames_fps, self.frames_width, self.frames_height)
+        )
+        has_all = all(
+            v is not None for v in (self.frames_fps, self.frames_width, self.frames_height)
+        )
+        if is_raw and not has_all:
+            raise ValueError(
+                "raw_frames pipeline requires frames_fps, frames_width, "
+                "and frames_height"
+            )
+        if not is_raw and has_any:
+            raise ValueError(
+                "frames_* metadata is only valid when pipeline='raw_frames'"
+            )
+        return self
 
 
 # Discriminated union of content variants. Pydantic uses the `type` literal to

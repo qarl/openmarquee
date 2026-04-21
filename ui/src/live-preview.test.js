@@ -64,6 +64,7 @@ describe("mountLivePreview", () => {
             is_running: true,
             current_item_id: "vid-42",
             current_item_type: "video",
+            current_item_pipeline: "h264_mp4",
             current_playlist_name: "default",
         });
         const container = document.createElement("div");
@@ -76,6 +77,23 @@ describe("mountLivePreview", () => {
         expect(video.hasAttribute("muted")).toBe(true);
         expect(video.hasAttribute("loop")).toBe(true);
         expect(container.querySelector("img")).toBeNull();
+    });
+
+    it("falls back to the thumbnail <img> for raw_frames videos", async () => {
+        const fetchState = vi.fn().mockResolvedValue({
+            is_running: true,
+            current_item_id: "panel-7",
+            current_item_type: "video",
+            current_item_pipeline: "raw_frames",
+            current_playlist_name: "default",
+        });
+        const container = document.createElement("div");
+        const handle = mount(container, fetchState);
+        await handle.refresh();
+        expect(container.querySelector("video")).toBeNull();
+        const img = container.querySelector("img.live-preview-media");
+        expect(img).not.toBeNull();
+        expect(img.getAttribute("src")).toBe("/api/content/panel-7/asset");
     });
 
     it("only swaps the media element when the current_item_id changes", async () => {

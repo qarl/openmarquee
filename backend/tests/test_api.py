@@ -563,12 +563,152 @@ def test_post_video_rejects_unknown_pipeline(client: TestClient):
     assert response.status_code == 422
 
 
-def test_post_video_rejects_raw_frames_until_storage_supports_it(client: TestClient):
-    """Model accepts raw_frames (for round-tripping existing data), but the
-    upload endpoint won't persist until the frame-sequence storage path
-    lands — otherwise an operator could save an MP4 mis-labeled as
-    raw_frames and break future panel renderers."""
-    payload = _video_payload(pipeline="raw_frames")
+def _raw_frames_payload(width=4, height=3, fps=10, n_frames=5, **overrides):
+    """Build a valid raw_frames upload payload.
+
+    Default is 4×3 @ 10 fps × 5 frames = 180 bytes — tiny but exercises
+    the frame-boundary math (len must be a multiple of width*height*3).
+    """
+    frame_bytes = width * height * 3
+    raw = bytes(range(256))  # deterministic
+    # Tile bytes to fill exactly n_frames * frame_bytes.
+    data = (raw * ((n_frames * frame_bytes) // len(raw) + 1))[: n_frames * frame_bytes]
+    payload = {
+        "name": "PanelPromo",
+        "duration_ms": 2000,
+        "pipeline": "raw_frames",
+        "png_base64": base64.b64encode(_FAKE_PNG).decode("ascii"),
+        "raw_frames_base64": base64.b64encode(data).decode("ascii"),
+        "frames_fps": fps,
+        "frames_width": width,
+        "frames_height": height,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_post_video_raw_frames_creates_variant_and_stores_rgb_bytes(
+    client: TestClient, storage: ContentStorage
+):
+    """raw_frames upload stores asset.png + asset.rgb, and the model
+    carries fps/width/height back on the response."""
+    payload = _raw_frames_payload()
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["pipeline"] == "raw_frames"
+    assert body["frames_fps"] == 10
+    assert body["frames_width"] == 4
+    assert body["frames_height"] == 3
+
+    item_id = UUID(body["id"])
+    assert storage.asset_path(item_id).exists()
+    assert storage.frames_path(item_id).exists()
+    # No MP4 side-file for a raw_frames slide.
+    assert not storage.video_path(item_id).exists()
+
+    stored = storage.read_video_raw_frames(item_id)
+    assert len(stored) == 5 * 4 * 3 * 3  # 5 frames × 4×3 × RGB
+
+
+def test_post_video_raw_frames_rejects_bytes_not_divisible_by_frame_size(
+    client: TestClient,
+):
+    """A 4×3×3=36-byte frame — 35 bytes can't be a whole frame."""
+    short = base64.b64encode(b"\x00" * 35).decode("ascii")
+    payload = _raw_frames_payload(raw_frames_base64=short)
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 400
+    assert "multiple of frame size" in response.json()["detail"]
+
+
+def test_post_video_raw_frames_rejects_when_mp4_also_set(client: TestClient):
+    payload = _raw_frames_payload(
+        mp4_base64=base64.b64encode(_fake_mp4()).decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 422
+    assert "mp4_base64" in response.json()["detail"]
+
+
+def test_post_video_raw_frames_rejects_missing_dims(client: TestClient):
+    payload = _raw_frames_payload(frames_width=None)
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 422
+
+
+def test_post_video_h264_rejects_frames_metadata(client: TestClient):
+    payload = _video_payload(frames_fps=15)
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 422
     assert "raw_frames" in response.json()["detail"]
+
+
+def test_get_frames_serves_the_raw_bytes(client: TestClient):
+    payload = _raw_frames_payload()
+    post = client.post("/api/content/videos", json=payload)
+    item_id = post.json()["id"]
+    response = client.get(f"/api/content/{item_id}/frames")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    # 5 frames × 4×3 × 3 bytes/pixel
+    assert len(response.content) == 5 * 4 * 3 * 3
+
+
+def test_get_frames_404_for_unknown_id(client: TestClient):
+    response = client.get(f"/api/content/{uuid4()}/frames")
+    assert response.status_code == 404
+
+
+def test_get_frames_404_for_h264_video(client: TestClient):
+    """An h264_mp4 slide has asset.mp4 but no asset.rgb — the /frames
+    endpoint must 404, not accidentally serve the wrong asset."""
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = post.json()["id"]
+    response = client.get(f"/api/content/{item_id}/frames")
+    assert response.status_code == 404
+
+
+def test_put_video_raw_frames_metadata_only_keeps_existing_assets(
+    client: TestClient, storage: ContentStorage
+):
+    post = client.post("/api/content/videos", json=_raw_frames_payload())
+    item_id = UUID(post.json()["id"])
+    original_frames = storage.read_video_raw_frames(item_id)
+
+    response = client.put(
+        f"/api/content/videos/{item_id}",
+        json={
+            "name": "Renamed",
+            "duration_ms": 3000,
+            "pipeline": "raw_frames",
+            "png_base64": None,
+            "raw_frames_base64": None,
+            "frames_fps": 10,
+            "frames_width": 4,
+            "frames_height": 3,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Renamed"
+    assert storage.read_video_raw_frames(item_id) == original_frames
+
+
+def test_put_video_pipeline_switch_requires_new_bytes(client: TestClient):
+    """Switching h264 → raw_frames without providing raw_frames_base64
+    would orphan asset.mp4 and leave asset.rgb missing — reject."""
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = post.json()["id"]
+    response = client.put(
+        f"/api/content/videos/{item_id}",
+        json={
+            "name": "switch",
+            "duration_ms": 5000,
+            "pipeline": "raw_frames",
+            "frames_fps": 10,
+            "frames_width": 4,
+            "frames_height": 3,
+        },
+    )
+    assert response.status_code == 422
+    assert "raw_frames_base64" in response.json()["detail"]

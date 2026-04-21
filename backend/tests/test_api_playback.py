@@ -73,6 +73,7 @@ def test_state_returns_not_running_initially(client: TestClient):
         "is_running": False,
         "current_item_id": None,
         "current_item_type": None,
+        "current_item_pipeline": None,
         "current_playlist_name": None,
     }
 

@@ -184,11 +184,38 @@ def test_video_slide_minimal_construction():
 
 
 def test_video_slide_accepts_raw_frames_pipeline():
-    """Reopened in the ffmpeg.wasm spike commit: the browser can now
-    extract concatenated RGB888 frames via /spike.html. Production-grade
-    wiring of raw_frames into the upload path follows."""
-    video = VideoSlide(name="Panel Promo", pipeline="raw_frames")
+    """raw_frames VideoSlides must carry the frame dims + fps so a
+    headerless .rgb stream can be sliced at playback time."""
+    video = VideoSlide(
+        name="Panel Promo",
+        pipeline="raw_frames",
+        frames_fps=15,
+        frames_width=128,
+        frames_height=96,
+    )
     assert video.pipeline == "raw_frames"
+    assert video.frames_fps == 15
+    assert video.frames_width == 128
+    assert video.frames_height == 96
+
+
+def test_video_slide_raw_frames_requires_all_three_frames_fields():
+    with pytest.raises(ValidationError):
+        VideoSlide(name="x", pipeline="raw_frames")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        VideoSlide(
+            name="x",
+            pipeline="raw_frames",
+            frames_fps=15,
+            frames_width=128,
+        )  # type: ignore[arg-type]
+
+
+def test_video_slide_h264_rejects_frames_metadata():
+    """frames_fps/width/height are raw_frames-only — leaking them onto
+    an h264_mp4 slide would misdocument the on-disk layout."""
+    with pytest.raises(ValidationError):
+        VideoSlide(name="x", pipeline="h264_mp4", frames_fps=15)  # type: ignore[arg-type]
 
 
 def test_video_slide_rejects_unknown_pipeline():

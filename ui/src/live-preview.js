@@ -64,20 +64,25 @@ export function mountLivePreview(container, options) {
         currentType = null;
     }
 
-    function renderSlide(id, type) {
+    function renderSlide(id, type, pipeline) {
         // Bust the cache with the id so replayed playlists pick up any
         // mid-loop asset edits; not perfect (the asset URL doesn't
         // include created_at here because we don't fetch the item), but
         // close enough — a stale-for-500ms preview is fine.
         const assetUrl = `/api/content/${id}/asset`;
         const videoUrl = `/api/content/${id}/video`;
-        if (type === "video") {
+        // Raw-frames video has no browser-playable stream (.rgb is
+        // headerless RGB888). Show the stored thumbnail until the
+        // preview grows a client-side rawvideo animator.
+        const isHtmlVideo = type === "video" && pipeline !== "raw_frames";
+        if (isHtmlVideo) {
             stage.innerHTML = `
                 <video class="live-preview-media" autoplay muted playsinline loop
                        src="${videoUrl}" aria-label="live video preview"></video>
             `;
         } else {
-            // text_slide + image both have a rendered PNG at /asset.
+            // text_slide + image + raw_frames video all have a rendered
+            // PNG at /asset.
             stage.innerHTML = `
                 <img class="live-preview-media" alt="live slide preview" src="${assetUrl}">
             `;
@@ -99,6 +104,7 @@ export function mountLivePreview(container, options) {
         const running = Boolean(state.is_running);
         const id = state.current_item_id || null;
         const type = state.current_item_type || null;
+        const pipeline = state.current_item_pipeline || null;
 
         if (!running) {
             renderIdle("Press Play all to preview the playlist.");
@@ -115,7 +121,7 @@ export function mountLivePreview(container, options) {
         }
 
         if (id !== currentId || type !== currentType) {
-            renderSlide(id, type);
+            renderSlide(id, type, pipeline);
         }
         caption.textContent = state.current_playlist_name
             ? `Playing: ${state.current_playlist_name}`
