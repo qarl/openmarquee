@@ -1,0 +1,52 @@
+[Unit]
+Description=OpenMarquee backend (FastAPI + playback loop)
+Documentation=https://github.com/qarl/openmarquee
+
+# Wait until the network stack is up. hostapd.service brings up the WiFi AP;
+# dnsmasq.service runs DHCP/DNS on it. Both should be settled before we
+# bind to port 80.
+After=network-online.target hostapd.service dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openmarquee
+Group=openmarquee
+WorkingDirectory=/opt/openmarquee/backend
+
+# Content + playlist + schedule live under /var per Linux FHS (variable
+# state). The systemd unit sets explicit paths so the app doesn't depend on
+# cwd-relative defaults.
+Environment="OPENMARQUEE_CONTENT_ROOT=/var/openmarquee/content"
+Environment="OPENMARQUEE_UI_DIR=/opt/openmarquee/ui"
+Environment="OPENMARQUEE_PLAYLIST_PATH=/var/openmarquee/playlist.json"
+Environment="OPENMARQUEE_SCHEDULE_PATH=/var/openmarquee/schedules.json"
+Environment="OPENMARQUEE_DEV_PREVIEW_PATH=/var/openmarquee/preview.png"
+
+# Production: strip the /dev tooling (preview page, manual play endpoint)
+# from the HTTP surface. The gate is read by app.py at startup.
+Environment="OPENMARQUEE_DISABLE_DEV=1"
+
+# Bind to all interfaces on port 80 — the device is its own captive-portal
+# WiFi so this is the primary UI.
+ExecStart=/opt/openmarquee/venv/bin/uvicorn openmarquee.app:app \
+    --host 0.0.0.0 --port 80
+
+# Restart on crash; brief backoff to avoid hammering systemd if something
+# is persistently wrong (config error, missing asset, etc).
+Restart=on-failure
+RestartSec=2s
+
+# Let uvicorn bind to port 80 without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Sandbox the service a bit.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/openmarquee
+
+[Install]
+WantedBy=multi-user.target
