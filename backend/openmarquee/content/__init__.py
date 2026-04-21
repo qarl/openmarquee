@@ -8,8 +8,7 @@ What's deliberately *not* in the model: where any rendered asset lives on disk.
 That's the storage layer's job (`openmarquee.content.storage`). Models are pure
 metadata; storage maps an item's `id` to bytes.
 
-Variants today: `TextSlide`, `ImageSlide`. `VideoSlide` lands when the
-ffmpeg.wasm pipeline does (post-demo).
+Variants today: `TextSlide`, `ImageSlide`, `VideoSlide`.
 """
 
 from datetime import UTC, datetime
@@ -85,6 +84,52 @@ class ImageSlide(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class VideoSlide(BaseModel):
+    """A user-uploaded video.
+
+    Today's contract: the browser uploads an MP4 (H.264) directly plus a
+    PNG thumbnail (typically the first frame). The backend stores both:
+
+        <id>/asset.png   — thumbnail (used by the saved-slides list)
+        <id>/asset.mp4   — MP4 payload (HDMI renderer streams from here)
+
+    The ffmpeg.wasm client-side pipeline (decode → scale → re-encode MP4
+    for HDMI, OR extract raw RGB frames for HUB75/WS2812B/composite) is
+    the follow-up. For now the browser passes through whatever MP4 the
+    user picked; if the source is too big for the Pi Zero 2 W's hardware
+    H.264 decoder, playback on HDMI will stutter and the operator will
+    learn to pre-encode. The spec accepts the rough edge — ffmpeg.wasm
+    transcoding lands when the HDMI renderer does.
+
+    `duration_ms` on a video is *informational*: the playback engine reads
+    the actual runtime from the file, and this field is just what the UI
+    renders in the saved-slides list. Keeping it present so the schema
+    looks like TextSlide/ImageSlide and a single ContentItem union works.
+    """
+
+    type: Literal["video"] = "video"
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(max_length=200)
+    duration_ms: int = Field(default=5000, ge=100)
+
+    # Today's uploader is a direct passthrough — the browser sends an MP4
+    # and we store it. The spec's other pipeline ("raw_frames": decoded RGB
+    # frames for HUB75/WS2812B/composite) needs ffmpeg.wasm to produce the
+    # frames, which hasn't landed — accepting it here would let an operator
+    # save an MP4 mis-labeled as raw_frames and break the panel renderers
+    # when they ship. Re-widen this Literal when the producer does.
+    pipeline: Literal["h264_mp4"] = "h264_mp4"
+
+    # Same transition contract as TextSlide/ImageSlide — applied on the way
+    # out, so a cut/fade into the next slide still works across variants.
+    transition: Literal["cut", "fade"] = "cut"
+    transition_ms: int = Field(default=500, ge=0, le=5000)
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 # Discriminated union of content variants. Pydantic uses the `type` literal to
 # route to the right subclass on deserialize.
-ContentItem = Annotated[TextSlide | ImageSlide, Field(discriminator="type")]
+ContentItem = Annotated[
+    TextSlide | ImageSlide | VideoSlide, Field(discriminator="type")
+]

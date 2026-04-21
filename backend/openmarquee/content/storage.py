@@ -25,7 +25,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter
 
-from openmarquee.content import ContentItem, ImageSlide, TextSlide
+from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
 # way. load() will refuse to read older versions until a migration is written.
@@ -33,6 +33,7 @@ SCHEMA_VERSION = 1
 
 _ENVELOPE_FILENAME = "item.json"
 _ASSET_FILENAME = "asset.png"
+_VIDEO_FILENAME = "asset.mp4"
 
 # Pydantic adapter for the discriminated ContentItem union; routes to the
 # right subclass on deserialize based on the `type` literal.
@@ -73,6 +74,41 @@ class ContentStorage:
     def save_image(self, image: ImageSlide, png: bytes) -> None:
         """Persist an image — convenience wrapper for save()."""
         self.save(image, png)
+
+    def save_video(self, video: VideoSlide, thumbnail_png: bytes, video_bytes: bytes) -> None:
+        """Persist a video: thumbnail PNG (for list views) + the MP4 bytes.
+
+        Laid out next to each other under the item's dir so a future playback
+        engine can grab `asset.mp4` directly (e.g. feed its path to ffmpeg)
+        while the UI's list rendering keeps using the existing PNG endpoint.
+
+        Transactional: if any of the three writes (envelope / thumbnail /
+        mp4) fails, the whole item dir is torn down. Without this an
+        envelope-only dir would show up in `list_all()` with a 404 on its
+        video endpoint — the playback loop would cycle on it forever.
+        """
+        item_dir = self.root / str(video.id)
+        preexisting = item_dir.exists()
+        try:
+            self.save(video, thumbnail_png)
+            self._atomic_write_bytes(item_dir / _VIDEO_FILENAME, video_bytes)
+        except Exception:
+            # Only rm if this save created the dir — don't blow away another
+            # item if the id collision were hypothetical.
+            if not preexisting and item_dir.exists():
+                shutil.rmtree(item_dir, ignore_errors=True)
+            raise
+
+    def video_path(self, item_id: UUID) -> Path:
+        """Filesystem path to an item's video payload (no IO)."""
+        return self.root / str(item_id) / _VIDEO_FILENAME
+
+    def read_video(self, item_id: UUID) -> bytes:
+        """Read the MP4 payload. Raises FileNotFoundError if absent."""
+        path = self.video_path(item_id)
+        if not path.exists():
+            raise FileNotFoundError(f"no video at {path}")
+        return path.read_bytes()
 
     # --- reads ---
 

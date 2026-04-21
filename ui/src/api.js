@@ -44,6 +44,23 @@ export async function saveImage(payload) {
     return await response.json();
 }
 
+/**
+ * Upload a video. `payload`: name, duration_ms, pipeline, transition,
+ * png_base64 (thumbnail), mp4_base64 (MP4 H.264 bytes).
+ */
+export async function saveVideo(payload) {
+    const response = await fetch("/api/content/videos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Save video failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
 /** Fetch the full list of content items. */
 export async function listContent() {
     const response = await fetch("/api/content");

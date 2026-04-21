@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
 
-from openmarquee.content import ContentItem, ImageSlide, TextSlide
+from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_content_storage, get_playlist_storage
 from openmarquee.playlist import PlaylistStorage, list_in_playlist_order
@@ -115,6 +115,75 @@ async def upload_text_slide(
     return slide
 
 
+def _decode_mp4_payload(b64: str) -> bytes:
+    """Decode + sanity-check an MP4 upload.
+
+    The real validation of H.264 profile / level / dimensions happens
+    client-side in ffmpeg.wasm (future); here we just confirm the file
+    starts with a well-formed MP4 `ftyp` box so we're not persisting
+    text / images / random bytes under asset.mp4.
+    """
+    try:
+        mp4 = base64.b64decode(b64, validate=True)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"mp4_base64 is not valid base64: {exc}"
+        ) from exc
+
+    # MP4 files start with a box: 4 bytes big-endian size, then 4 bytes type.
+    # The first box is almost always `ftyp`. We tolerate any ftyp brand.
+    if len(mp4) < 12 or mp4[4:8] != b"ftyp":
+        raise HTTPException(
+            status_code=400,
+            detail="mp4_base64 doesn't look like an MP4 (missing ftyp box)",
+        )
+    return mp4
+
+
+class VideoUpload(BaseModel):
+    """Wire format for POST /api/content/videos.
+
+    Client provides:
+      - `png_base64`: thumbnail frame (the UI extracts the first frame
+        from the chosen file via a <video> element + canvas).
+      - `mp4_base64`: the video bytes themselves. Client-side encoding
+        via ffmpeg.wasm is TODO; today the browser uploads whatever MP4
+        the user picked.
+
+    The base64+JSON framing costs ~33% over multipart but keeps the
+    client code a single JSON POST. For the Pi Zero 2 W's 512 MB RAM
+    this caps practical video size to somewhere around ~100 MB encoded
+    — acceptable for short clips at demo resolutions.
+    """
+
+    name: str
+    duration_ms: int = 5000
+    pipeline: str = "h264_mp4"
+    transition: str = "cut"
+    transition_ms: int = 500
+    png_base64: str = Field(description="Thumbnail PNG (first frame).")
+    mp4_base64: str = Field(description="MP4 H.264 video bytes.")
+
+
+@router.post("/videos", response_model=VideoSlide)
+async def upload_video(
+    payload: VideoUpload,
+    storage: StorageDep,
+    playlist_storage: PlaylistDep,
+) -> VideoSlide:
+    thumbnail = _decode_png_payload(payload.png_base64)
+    mp4 = _decode_mp4_payload(payload.mp4_base64)
+
+    try:
+        video = VideoSlide(**payload.model_dump(exclude={"png_base64", "mp4_base64"}))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    storage.save_video(video, thumbnail, mp4)
+    _append_to_playlist(playlist_storage, video.id)
+    return video
+
+
 class ImageUpload(BaseModel):
     """Wire format for POST /api/content/images.
 
@@ -179,6 +248,22 @@ async def get_asset(item_id: UUID, storage: StorageDep) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no asset for {item_id}")
     return FileResponse(path, media_type="image/png")
+
+
+@router.get(
+    "/{item_id}/video",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"video/mp4": {}}},
+        404: {"description": "No video for that id."},
+    },
+)
+async def get_video(item_id: UUID, storage: StorageDep) -> FileResponse:
+    """Serve an MP4 payload. Distinct endpoint from /asset (the thumbnail)."""
+    path = storage.video_path(item_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"no video for {item_id}")
+    return FileResponse(path, media_type="video/mp4")
 
 
 @router.delete("/{item_id}", status_code=204)

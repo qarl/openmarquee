@@ -4,7 +4,7 @@ from uuid import UUID
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from openmarquee.content import ContentItem, ImageSlide, TextSlide
+from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 
 
 def test_text_slide_minimal_construction():
@@ -161,10 +161,36 @@ def test_content_item_union_routes_image_on_deserialize():
     assert isinstance(item, ImageSlide)
 
 
+def test_video_slide_minimal_construction():
+    video = VideoSlide(name="Promo")
+    assert video.type == "video"
+    assert video.name == "Promo"
+    assert video.pipeline == "h264_mp4"
+
+
+def test_video_slide_rejects_raw_frames_until_ffmpeg_wasm_lands():
+    """raw_frames is a Literal option only once the browser can actually
+    produce raw RGB frames (ffmpeg.wasm). Until then saving a VideoSlide
+    with pipeline=raw_frames + an MP4 would mis-label the stored asset."""
+    with pytest.raises(ValidationError):
+        VideoSlide(name="x", pipeline="raw_frames")  # type: ignore[arg-type]
+
+
+def test_video_slide_rejects_unknown_pipeline():
+    with pytest.raises(ValidationError):
+        VideoSlide(name="x", pipeline="vp9")  # type: ignore[arg-type]
+
+
+def test_content_item_union_routes_video_on_deserialize():
+    adapter = TypeAdapter(ContentItem)
+    item = adapter.validate_python({"type": "video", "name": "Promo"})
+    assert isinstance(item, VideoSlide)
+
+
 def test_content_item_union_rejects_unknown_type():
     adapter = TypeAdapter(ContentItem)
     with pytest.raises(ValidationError):
-        adapter.validate_python({"type": "video", "name": "x"})
+        adapter.validate_python({"type": "nope_not_a_real_type", "name": "x"})
 
 
 def test_background_color_must_be_hex():

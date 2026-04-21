@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from openmarquee.content import ImageSlide, TextSlide
+from openmarquee.content import ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import SCHEMA_VERSION, ContentStorage
 
 
@@ -239,3 +239,83 @@ def test_save_generic_dispatches_to_correct_type(tmp_path: Path):
     storage.save(image, b"image-png")
     assert isinstance(storage.load(text.id), TextSlide)
     assert isinstance(storage.load(image.id), ImageSlide)
+
+
+# --- video ---
+
+
+_FAKE_MP4 = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 120
+
+
+def test_save_video_writes_thumbnail_and_mp4_side_by_side(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    video = VideoSlide(name="Promo")
+    storage.save_video(video, thumbnail_png=b"\x89PNG_thumb", video_bytes=_FAKE_MP4)
+
+    # Thumbnail reachable via the existing asset path.
+    assert storage.asset_path(video.id).read_bytes() == b"\x89PNG_thumb"
+    # Video reachable via the new video path.
+    assert storage.video_path(video.id) == tmp_path / str(video.id) / "asset.mp4"
+    assert storage.read_video(video.id) == _FAKE_MP4
+
+
+def test_load_roundtrips_video_slide(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    video = VideoSlide(name="Promo", transition="fade", transition_ms=300)
+    storage.save_video(video, thumbnail_png=b"\x89PNG", video_bytes=_FAKE_MP4)
+    loaded = storage.load(video.id)
+    assert isinstance(loaded, VideoSlide)
+    assert loaded == video
+
+
+def test_save_video_rolls_back_on_partial_failure(tmp_path: Path, monkeypatch):
+    """If the MP4 write blows up mid-save, the whole item dir is removed
+    so list_all() doesn't return an envelope whose /video endpoint 404s."""
+    storage = ContentStorage(tmp_path)
+    video = VideoSlide(name="Promo")
+
+    # First call writes the thumbnail fine; second call (the mp4) raises.
+    original = ContentStorage._atomic_write_bytes
+    call_count = {"n": 0}
+
+    def flaky(path, content):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            raise OSError("disk full")
+        original(path, content)
+
+    monkeypatch.setattr(ContentStorage, "_atomic_write_bytes", staticmethod(flaky))
+
+    with pytest.raises(OSError):
+        storage.save_video(video, b"\x89PNG", _FAKE_MP4)
+
+    # Nothing lingers — list_all() treats this as "no such item."
+    assert not (tmp_path / str(video.id)).exists()
+    assert storage.list_all() == []
+
+
+def test_list_all_surfaces_video_items(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    text = TextSlide(name="t", text="t")
+    video = VideoSlide(name="v")
+    storage.save_text_slide(text, b"\x89PNG_text")
+    storage.save_video(video, b"\x89PNG_thumb", _FAKE_MP4)
+
+    items = storage.list_all()
+    by_type = {item.type: item for item in items}
+    assert isinstance(by_type["text_slide"], TextSlide)
+    assert isinstance(by_type["video"], VideoSlide)
+
+
+def test_read_video_missing_raises(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        storage.read_video(uuid4())
+
+
+def test_delete_removes_video_dir_including_mp4(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    video = VideoSlide(name="Promo")
+    storage.save_video(video, b"\x89PNG", _FAKE_MP4)
+    storage.delete(video.id)
+    assert not storage.video_path(video.id).exists()

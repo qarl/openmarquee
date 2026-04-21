@@ -7,6 +7,12 @@ The loop runs as an asyncio task. On each iteration it:
 - otherwise advances through them in order, decoding each item's PNG
   to RGB and pushing it to the renderer for the item's duration
 
+VideoSlide note: the loop treats videos as still thumbnails today —
+`asset.png` is the first-frame thumbnail saved at upload time, so a
+VideoSlide in the playlist shows the thumbnail for `duration_ms` and
+advances. Real video playback (decoding asset.mp4 to frames on the Pi's
+hardware H.264 decoder) lands with the HDMI renderer (Phase 6).
+
 Items are re-fetched between iterations, so adding/deleting slides while
 playing takes effect on the next cycle without restarting the loop. A
 failed render (missing asset, corrupt PNG) is logged and skipped — one

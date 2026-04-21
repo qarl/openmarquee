@@ -22,6 +22,7 @@ import {
     saveImage,
     saveSchedule,
     saveTextSlide,
+    saveVideo,
     setPlaylistOrder,
     startPlayback,
     stopPlayback,
@@ -35,6 +36,7 @@ import { mountPlaybackControls } from "./playback.js";
 import { mountPlaylistsManager } from "./playlists.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettingsView } from "./settings-view.js";
+import { mountVideoUploader } from "./video-upload.js";
 
 const PANEL_WIDTH = 128;
 const PANEL_HEIGHT = 96;
@@ -48,6 +50,7 @@ function boot() {
             <div class="editor-slot"></div>
             <div class="composer-slot"></div>
             <div class="image-upload-slot"></div>
+            <div class="video-upload-slot"></div>
             <div class="playback-slot"></div>
             <div class="list-slot"></div>
         </section>
@@ -100,6 +103,12 @@ function boot() {
         // Composite slides ride the ImageSlide API — a flat PNG is all the
         // server needs. The layer structure lives only in the browser tab.
         onSave: onSaveWithRefresh(saveImage),
+    });
+
+    mountVideoUploader(root.querySelector(".video-upload-slot"), {
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
+        onSave: onSaveWithRefresh(saveVideo),
     });
 
     mountPlaylistsManager(root.querySelector(".playlists-slot"), {

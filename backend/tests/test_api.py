@@ -345,3 +345,95 @@ def test_list_content_returns_items_in_playlist_order(
 
     response = client.get("/api/content").json()
     assert [item["name"] for item in response] == ["C", "B", "A"]
+
+
+# --- video upload ---
+
+
+def _fake_mp4() -> bytes:
+    """Smallest bytes that pass the ftyp-box sanity check."""
+    return b"\x00\x00\x00\x20ftypisom" + b"\x00" * 120
+
+
+def _video_payload(**overrides) -> dict:
+    payload = {
+        "name": "Promo",
+        "duration_ms": 4000,
+        "pipeline": "h264_mp4",
+        "png_base64": base64.b64encode(_FAKE_PNG).decode("ascii"),
+        "mp4_base64": base64.b64encode(_fake_mp4()).decode("ascii"),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_post_video_creates_variant_and_stores_both_assets(
+    client: TestClient, storage: ContentStorage
+):
+    response = client.post("/api/content/videos", json=_video_payload())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "video"
+    assert body["name"] == "Promo"
+    assert body["pipeline"] == "h264_mp4"
+
+    item_id = UUID(body["id"])
+    # Thumbnail is stored as the standard asset.
+    assert storage.asset_path(item_id).exists()
+    # MP4 is stored at the video path.
+    assert storage.video_path(item_id).exists()
+    assert storage.read_video(item_id) == _fake_mp4()
+
+
+def test_post_video_appends_to_default_playlist(
+    client: TestClient, playlist_storage: PlaylistStorage
+):
+    response = client.post("/api/content/videos", json=_video_payload())
+    item_id = UUID(response.json()["id"])
+    assert playlist_storage.load().item_ids == [item_id]
+
+
+def test_post_video_rejects_non_mp4_bytes(client: TestClient):
+    payload = _video_payload(
+        mp4_base64=base64.b64encode(b"not an mp4 file at all").decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 400
+    assert "ftyp" in response.json()["detail"].lower()
+
+
+def test_post_video_rejects_non_image_thumbnail(client: TestClient):
+    payload = _video_payload(
+        png_base64=base64.b64encode(b"not a png").decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 400
+
+
+def test_get_video_serves_the_mp4_payload(client: TestClient):
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = post.json()["id"]
+    response = client.get(f"/api/content/{item_id}/video")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "video/mp4"
+    assert response.content == _fake_mp4()
+
+
+def test_get_video_404_for_unknown_id(client: TestClient):
+    response = client.get(f"/api/content/{uuid4()}/video")
+    assert response.status_code == 404
+
+
+def test_delete_video_removes_mp4(client: TestClient, storage: ContentStorage):
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = UUID(post.json()["id"])
+    assert storage.video_path(item_id).exists()
+    response = client.delete(f"/api/content/{item_id}")
+    assert response.status_code == 204
+    assert not storage.video_path(item_id).exists()
+
+
+def test_post_video_rejects_unknown_pipeline(client: TestClient):
+    payload = _video_payload(pipeline="vp9")
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 422

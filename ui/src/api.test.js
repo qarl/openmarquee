@@ -11,6 +11,7 @@ import {
     saveSchedule,
     saveSettings,
     saveTextSlide,
+    saveVideo,
     setPlaylistOrder,
     startPlayback,
     stopPlayback,
@@ -136,6 +137,31 @@ describe("saveImage", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad" });
         await expect(saveImage({})).rejects.toThrow("422");
+    });
+});
+
+describe("saveVideo", () => {
+    it("POSTs JSON to /api/content/videos and returns the new item", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ id: "v", type: "video", name: "Promo" }),
+        });
+        const result = await saveVideo({
+            name: "Promo",
+            pipeline: "h264_mp4",
+            png_base64: "THUMB",
+            mp4_base64: "MP4",
+        });
+        expect(result.type).toBe("video");
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/content/videos");
+        expect(init.method).toBe("POST");
+        expect(JSON.parse(init.body).pipeline).toBe("h264_mp4");
+    });
+
+    it("throws on non-ok response with status detail", async () => {
+        mockFetch({ ok: false, status: 400, text: async () => "bad mp4" });
+        await expect(saveVideo({})).rejects.toThrow(/400/);
     });
 });
 
