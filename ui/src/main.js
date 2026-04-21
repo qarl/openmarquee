@@ -63,24 +63,33 @@ async function resolvePanelDims() {
         const w = Number(settings.display_width);
         const h = Number(settings.display_height);
         const rotation = Number(settings.display_rotation || 0);
+        const outputMode = settings.output_mode || "hdmi";
         if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
             // 90° / 270° rotate the preview into portrait — swap dims so
             // the editor's aspect ratio matches what the installed sign
             // actually shows.
             if (rotation === 90 || rotation === 270) {
-                return { width: h, height: w };
+                return { width: h, height: w, outputMode };
             }
-            return { width: w, height: h };
+            return { width: w, height: h, outputMode };
         }
     } catch {
         // Fall through to fallback — editor still mounts even if the
         // settings endpoint is briefly unavailable on boot.
     }
-    return { width: FALLBACK_WIDTH, height: FALLBACK_HEIGHT };
+    return {
+        width: FALLBACK_WIDTH,
+        height: FALLBACK_HEIGHT,
+        outputMode: "hdmi",
+    };
 }
 
 async function boot() {
-    const { width: PANEL_WIDTH, height: PANEL_HEIGHT } = await resolvePanelDims();
+    const {
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
+        outputMode: OUTPUT_MODE,
+    } = await resolvePanelDims();
     const root = document.getElementById("app");
     root.innerHTML = `
         <section data-section="slides/text" class="panel">
@@ -155,6 +164,7 @@ async function boot() {
         {
             width: PANEL_WIDTH,
             height: PANEL_HEIGHT,
+            outputMode: OUTPUT_MODE,
             onSave: onSaveWithRefresh(saveVideo),
             onSaveExisting: onSaveWithRefresh(updateVideo),
         },

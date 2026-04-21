@@ -36,21 +36,31 @@ describe("mountVideoUploader", () => {
         });
         await tick();
         expect(container.querySelector(".field-save").disabled).toBe(true);
-        expect(container.querySelector(".field-pipeline").value).toBe("h264_mp4");
+        // Pipeline dropdown is gone — the uploader always transcodes to
+        // H.264 via ffmpeg.wasm now.
+        expect(container.querySelector(".field-pipeline")).toBeNull();
     });
 
-    it("exposes both pipelines now that the ffmpeg.wasm spike produces raw frames", async () => {
-        const container = document.createElement("div");
-        mountVideoUploader(container, {
+    it("shows the panel-mode fallback banner only when outputMode is a panel driver", async () => {
+        const hdmi = document.createElement("div");
+        mountVideoUploader(hdmi, {
             width: 128,
             height: 96,
+            outputMode: "hdmi",
             onSave: vi.fn(),
         });
         await tick();
-        const options = Array.from(
-            container.querySelectorAll(".field-pipeline option"),
-        ).map((o) => o.value);
-        expect(options).toEqual(["h264_mp4", "raw_frames"]);
+        expect(hdmi.querySelector(".video-upload-panel-hint").hidden).toBe(true);
+
+        const hub75 = document.createElement("div");
+        mountVideoUploader(hub75, {
+            width: 128,
+            height: 96,
+            outputMode: "hub75",
+            onSave: vi.fn(),
+        });
+        await tick();
+        expect(hub75.querySelector(".video-upload-panel-hint").hidden).toBe(false);
     });
 
     it("loadForEdit pre-fills + allows metadata-only save (no new file)", async () => {

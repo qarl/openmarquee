@@ -19,36 +19,11 @@
 // origin — including the captive portal, which doesn't ship
 // Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy.
 
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
-
-const FFMPEG_CORE_BASE = "/dist/vendor/ffmpeg-core";
-
-let ffmpeg = null;
-
-async function loadFfmpeg(logFn) {
-    if (ffmpeg) return ffmpeg;
-    logFn("loading ffmpeg-core…");
-    const instance = new FFmpeg();
-    instance.on("log", ({ message }) => logFn(message));
-    instance.on("progress", ({ progress }) => {
-        logFn(`progress: ${(progress * 100).toFixed(0)}%`);
-    });
-    await instance.load({
-        // toBlobURL fetches the JS/wasm into a blob: URL so the worker
-        // instantiates them without tripping classic CORS rules.
-        coreURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-        // @ffmpeg/ffmpeg's main thread spawns a Web Worker whose source
-        // esbuild does NOT auto-bundle when it sees `new Worker(new
-        // URL("./worker.js", import.meta.url))` — we ship it as a separate
-        // entry (see package.json's build script: `ffmpeg-worker=…`).
-        classWorkerURL: "/dist/ffmpeg-worker.js",
-    });
-    ffmpeg = instance;
-    logFn("ffmpeg-core loaded.");
-    return ffmpeg;
-}
+import {
+    describeFfmpegError,
+    extractRawFrames,
+    transcodeToH264,
+} from "./ffmpeg-pipelines.js";
 
 function makeLogger(statusEl, logEl) {
     const lines = [];
@@ -77,46 +52,6 @@ function downloadBytes(bytes, filename, mime) {
         setTimeout(() => URL.revokeObjectURL(url), 60_000);
     });
     return a;
-}
-
-async function runH264Pipeline({ file, width, height }, logFn) {
-    const ff = await loadFfmpeg(logFn);
-    const inName = "input";
-    const outName = "output.mp4";
-    await ff.writeFile(inName, await fetchFile(file));
-    logFn("transcoding to H.264 MP4…");
-    await ff.exec([
-        "-i", inName,
-        "-vf", `scale=${width}:${height}`,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-an", // drop audio — signs don't speak
-        outName,
-    ]);
-    const data = await ff.readFile(outName);
-    return data;
-}
-
-async function runRawFramesPipeline({ file, width, height, fps }, logFn) {
-    const ff = await loadFfmpeg(logFn);
-    const inName = "input";
-    const outName = "frames.rgb";
-    await ff.writeFile(inName, await fetchFile(file));
-    logFn("extracting raw RGB frames…");
-    // -f rawvideo -pix_fmt rgb24 emits concatenated R,G,B,R,G,B,... bytes,
-    // one frame after another, no header. Matches what the hzeller +
-    // rpi_ws281x renderers want per SYSTEM_SPEC §7.6.
-    await ff.exec([
-        "-i", inName,
-        "-vf", `scale=${width}:${height},fps=${fps}`,
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        outName,
-    ]);
-    const data = await ff.readFile(outName);
-    return data;
 }
 
 function boot() {
@@ -155,23 +90,8 @@ function boot() {
             logFn(`done in ${dt}s; ${data.length} bytes`);
             outputEl.appendChild(downloadBytes(data, outName, mime));
         } catch (err) {
-            // ffmpeg.wasm surfaces some failures as plain strings or as
-            // objects with no .message — stringify defensively so the
-            // spike page shows something useful instead of "undefined".
-            let detail;
-            if (err instanceof Error) {
-                detail = err.message;
-            } else if (typeof err === "string") {
-                detail = err;
-            } else {
-                try {
-                    detail = JSON.stringify(err);
-                } catch {
-                    detail = String(err);
-                }
-            }
             console.error("[spike] pipeline error:", err);
-            logFn(`error: ${detail}`);
+            logFn(`error: ${describeFfmpegError(err)}`);
         } finally {
             h264Btn.disabled = false;
             rgbBtn.disabled = false;
@@ -179,10 +99,10 @@ function boot() {
     }
 
     h264Btn.addEventListener("click", () =>
-        withSpinner(runH264Pipeline, "output.mp4", "video/mp4"),
+        withSpinner(transcodeToH264, "output.mp4", "video/mp4"),
     );
     rgbBtn.addEventListener("click", () =>
-        withSpinner(runRawFramesPipeline, "frames.rgb", "application/octet-stream"),
+        withSpinner(extractRawFrames, "frames.rgb", "application/octet-stream"),
     );
 
     logFn("ready. pick a video, pick a pipeline, click.");
