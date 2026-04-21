@@ -28,7 +28,9 @@ test("schedule-driven playback: items → lunch playlist → always-on rule → 
         await expect(page.locator(".editor-status")).toHaveText("Saved.");
     }
 
-    // 2. Create a "lunch" named playlist.
+    // 2. Switch to the Playlists section and create a "lunch" named playlist.
+    await page.locator('.nav-link[data-section="playlists"]').click();
+    await expect(page.locator('.panel[data-section="playlists"]')).toBeVisible();
     await page.locator(".playlists-create-name").fill("lunch");
     await page
         .locator(".playlists-create")
@@ -56,8 +58,10 @@ test("schedule-driven playback: items → lunch playlist → always-on rule → 
         })
         .toBe(2);
 
-    // 5. Add a schedule rule that always matches (every day, 00:00–24:00) →
-    //    playlist: lunch.
+    // 5. Switch to the Schedule section and add a rule that always matches
+    //    (every day, 00:00–24:00) → playlist: lunch.
+    await page.locator('.nav-link[data-section="schedule"]').click();
+    await expect(page.locator('.panel[data-section="schedule"]')).toBeVisible();
     await page.locator(".schedule-add").click();
     const rule = page.locator(".schedule-rule").first();
     for (let i = 0; i < 7; i++) {
@@ -71,8 +75,11 @@ test("schedule-driven playback: items → lunch playlist → always-on rule → 
     await page.locator(".schedule-save").click();
     await expect(page.locator(".schedule-status")).toHaveText("Saved.");
 
-    // 7. Start playback. The loop should evaluate the schedule, pick lunch,
-    //    and the state endpoint should report that back.
+    // 7. Back to Slides (where the Play all button lives) and start playback.
+    //    The loop should evaluate the schedule, pick lunch, and the state
+    //    endpoint should report that back.
+    await page.locator('.nav-link[data-section="slides"]').click();
+    await expect(page.locator('.panel[data-section="slides"]')).toBeVisible();
     await page.locator(".playback-btn").click();
     await expect(page.locator(".playback-btn")).toHaveText("Stop");
 

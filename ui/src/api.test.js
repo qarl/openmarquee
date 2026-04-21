@@ -4,10 +4,12 @@ import {
     fetchHealth,
     getPlaybackState,
     getSchedule,
+    getSettings,
     listContent,
     playContent,
     saveImage,
     saveSchedule,
+    saveSettings,
     saveTextSlide,
     setPlaylistOrder,
     startPlayback,
@@ -205,6 +207,39 @@ describe("schedule API", () => {
     it("saveSchedule throws on non-ok", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad" });
         await expect(saveSchedule({})).rejects.toThrow("422");
+    });
+});
+
+describe("settings API", () => {
+    it("getSettings GETs /api/settings", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ output_mode: "hdmi", brightness: 80 }),
+        });
+        const result = await getSettings();
+        expect(result.output_mode).toBe("hdmi");
+        expect(fetchMock).toHaveBeenCalledWith("/api/settings");
+    });
+
+    it("getSettings throws on non-ok", async () => {
+        mockFetch({ ok: false, status: 500 });
+        await expect(getSettings()).rejects.toThrow("500");
+    });
+
+    it("saveSettings PUTs the payload to /api/settings", async () => {
+        const payload = { output_mode: "hub75", brightness: 50 };
+        const fetchMock = mockFetch({ ok: true, json: async () => payload });
+        const result = await saveSettings(payload);
+        expect(result).toEqual(payload);
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/settings");
+        expect(init.method).toBe("PUT");
+        expect(JSON.parse(init.body)).toEqual(payload);
+    });
+
+    it("saveSettings surfaces backend detail on non-ok", async () => {
+        mockFetch({ ok: false, status: 422, text: async () => "bad mode" });
+        await expect(saveSettings({})).rejects.toThrow(/422/);
     });
 });
 

@@ -156,6 +156,29 @@ export async function getSchedule() {
     return await response.json();
 }
 
+/** Fetch the device system settings. */
+export async function getSettings() {
+    const response = await fetch("/api/settings");
+    if (!response.ok) {
+        throw new Error(`Settings fetch failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+/** Replace the device system settings. */
+export async function saveSettings(settings) {
+    const response = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Save settings failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
 /** Replace the schedule with the given object (rules + default_playlist_name). */
 export async function saveSchedule(schedule) {
     const response = await fetch("/api/schedules", {

@@ -1,17 +1,20 @@
 // OpenMarquee web UI — entry point.
 //
-// Two modules live side by side in #app: the text-slide editor on top,
-// the saved-slides list below. The editor pings the list to refresh after
-// a successful save so the new slide shows up without a page reload.
+// Four panels (slides, playlists, schedule, settings) mount into a sidebar
+// shell. Sidebar nav (`nav.js`) toggles the active panel's `hidden`
+// attribute; panels themselves stay mounted so their state survives
+// navigation.
 //
 // Panel dimensions are hardcoded to SYSTEM_SPEC defaults (128×96) for now;
-// reading device config from the backend is a Phase 3 polish task.
+// a follow-up reads them from /api/settings once the editor can react to
+// changes on the fly.
 
 import {
     deletePlaylistByName,
     deleteContent,
     getPlaybackState,
     getSchedule,
+    getSettings,
     listContent,
     listPlaylists,
     playContent,
@@ -26,22 +29,35 @@ import {
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
 import { mountList } from "./list.js";
+import { mountNav } from "./nav.js";
 import { mountPlaybackControls } from "./playback.js";
 import { mountPlaylistsManager } from "./playlists.js";
 import { mountSchedule } from "./schedule.js";
+import { mountSettingsView } from "./settings-view.js";
 
 const PANEL_WIDTH = 128;
 const PANEL_HEIGHT = 96;
 
+const SECTIONS = ["slides", "playlists", "schedule", "settings"];
+
 function boot() {
     const root = document.getElementById("app");
     root.innerHTML = `
-        <div class="editor-slot"></div>
-        <div class="image-upload-slot"></div>
-        <div class="playback-slot"></div>
-        <div class="list-slot"></div>
-        <div class="playlists-slot"></div>
-        <div class="schedule-slot"></div>
+        <section data-section="slides" class="panel">
+            <div class="editor-slot"></div>
+            <div class="image-upload-slot"></div>
+            <div class="playback-slot"></div>
+            <div class="list-slot"></div>
+        </section>
+        <section data-section="playlists" class="panel">
+            <div class="playlists-slot"></div>
+        </section>
+        <section data-section="schedule" class="panel">
+            <div class="schedule-slot"></div>
+        </section>
+        <section data-section="settings" class="panel">
+            <div class="settings-slot"></div>
+        </section>
     `;
 
     const list = mountList(root.querySelector(".list-slot"), {
@@ -89,6 +105,16 @@ function boot() {
             const collection = await listPlaylists();
             return Object.keys(collection.playlists || {}).sort();
         },
+    });
+
+    mountSettingsView(root.querySelector(".settings-slot"), {
+        fetchSettings: getSettings,
+    });
+
+    mountNav({
+        main: root,
+        sidebar: document.querySelector(".sidebar"),
+        sections: SECTIONS,
     });
 }
 

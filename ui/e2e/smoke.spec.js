@@ -37,6 +37,27 @@ test("Save button is disabled until text is entered", async ({ page }) => {
     await expect(saveBtn).toBeDisabled();
 });
 
+test("sidebar nav shows Slides by default and routes to each section on click", async ({ page }) => {
+    await page.goto("/");
+
+    // Slides is the default section. Sidebar link is marked active.
+    await expect(page.locator('.panel[data-section="slides"]')).toBeVisible();
+    await expect(page.locator('.nav-link[data-section="slides"]')).toHaveClass(/active/);
+    await expect(page.locator('.panel[data-section="playlists"]')).toBeHidden();
+
+    // Click through each section; only that panel should be visible.
+    for (const name of ["playlists", "schedule", "settings", "slides"]) {
+        await page.locator(`.nav-link[data-section="${name}"]`).click();
+        await expect(page.locator(`.panel[data-section="${name}"]`)).toBeVisible();
+        await expect(page.locator(`.nav-link[data-section="${name}"]`)).toHaveClass(/active/);
+    }
+
+    // Settings section renders the read-only config view.
+    await page.locator('.nav-link[data-section="settings"]').click();
+    await expect(page.locator(".settings-heading")).toHaveText("System settings");
+    await expect(page.locator('dd[data-key="output_mode"]')).toHaveText("hdmi");
+});
+
 test("welcome page renders SSID, password, and a real (not placeholder) QR", async ({ page }) => {
     // Phase 7 swaps in real values from the device side; this smoke test
     // ensures the page chrome stays wired up AND the welcome.js script

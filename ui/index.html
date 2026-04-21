@@ -11,9 +11,20 @@
         <h1>OpenMarquee</h1>
     </header>
 
-    <main id="app">
-        <p class="status">Loading…</p>
-    </main>
+    <div class="shell">
+        <nav class="sidebar" aria-label="Primary">
+            <ul class="nav-list" role="list">
+                <li><a class="nav-link" href="#/slides" data-section="slides">Slides</a></li>
+                <li><a class="nav-link" href="#/playlists" data-section="playlists">Playlists</a></li>
+                <li><a class="nav-link" href="#/schedule" data-section="schedule">Schedule</a></li>
+                <li><a class="nav-link" href="#/settings" data-section="settings">Settings</a></li>
+            </ul>
+        </nav>
+
+        <main id="app">
+            <p class="status">Loading…</p>
+        </main>
+    </div>
 
     <script type="module" src="/dist/main.js"></script>
 </body>
