@@ -1,0 +1,201 @@
+<!doctype html>
+<!--
+    Welcome screen — what the sign displays on first boot before any content
+    has been uploaded (SYSTEM_SPEC §8.6). Intended to be shown via a kiosk
+    browser pointed at this URL in HDMI mode, or rendered to a PNG and piped
+    to the frame buffer on HUB75/WS2812B modes.
+
+    This file is a WIREFRAME. Placeholder SSID, password, and QR code are
+    hardcoded; Phase 7 (WiFi AP + captive portal) replaces them with the
+    real values at boot — likely by having the backend serve a templated
+    version at /welcome.
+
+    Why plain static HTML with no framework? Same reason the app itself
+    uses vanilla JS — this page has to render on the device with no
+    internet, so all assets must be local and small.
+-->
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpenMarquee — welcome</title>
+    <style>
+        :root {
+            --bg: #0e0e10;
+            --text: #f2f2f4;
+            --muted: #9c9ca3;
+            --accent: #ffb84d;
+            --card: #191a1d;
+            --card-border: #2a2a2f;
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+            /* Designed to look right when displayed full-screen on any
+               aspect ratio the sign might run (1080p, 720p, 128x96). */
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            text-align: center;
+            padding: 2rem;
+        }
+
+        .brand {
+            font-size: clamp(1.2rem, 3vw, 2rem);
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            color: var(--accent);
+            margin: 0 0 0.35rem;
+        }
+
+        .headline {
+            font-size: clamp(1.4rem, 4vw, 2.5rem);
+            font-weight: 600;
+            margin: 0 0 0.5rem;
+        }
+
+        .subhead {
+            font-size: clamp(0.9rem, 1.8vw, 1.15rem);
+            color: var(--muted);
+            margin: 0 0 2rem;
+            max-width: 30ch;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 0.75rem;
+            padding: 1.5rem 2rem;
+            display: grid;
+            gap: 1.5rem;
+            grid-template-columns: 1fr auto;
+            align-items: center;
+            max-width: 640px;
+            width: 100%;
+        }
+
+        @media (max-width: 560px) {
+            .card { grid-template-columns: 1fr; }
+            .qr { justify-self: center; }
+        }
+
+        .creds {
+            text-align: left;
+            display: grid;
+            gap: 0.75rem;
+        }
+
+        .creds dt {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--muted);
+            margin: 0 0 0.15rem;
+        }
+
+        .creds dd {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: clamp(1rem, 2.4vw, 1.5rem);
+            margin: 0;
+            color: var(--text);
+        }
+
+        .qr {
+            width: clamp(120px, 22vw, 180px);
+            aspect-ratio: 1 / 1;
+            background: white;
+            border-radius: 0.35rem;
+            display: grid;
+            place-items: center;
+            padding: 0.4rem;
+        }
+
+        .qr svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        footer {
+            margin-top: 2rem;
+            font-size: 0.8rem;
+            color: var(--muted);
+        }
+
+        footer code { font-family: ui-monospace, monospace; color: var(--text); }
+    </style>
+</head>
+<body>
+    <main>
+        <p class="brand">OpenMarquee</p>
+        <h1 class="headline">Connect your phone to set up this sign</h1>
+        <p class="subhead">No app, no account, no internet. Just a browser.</p>
+
+        <section class="card" aria-label="WiFi credentials">
+            <dl class="creds">
+                <div>
+                    <dt>WiFi network</dt>
+                    <dd data-field="ssid">OpenMarquee-A3F7</dd>
+                </div>
+                <div>
+                    <dt>Password</dt>
+                    <dd data-field="password">openmarquee</dd>
+                </div>
+            </dl>
+
+            <!--
+                QR code: a WIFI:-format payload that iOS/Android cameras
+                recognize and offer to join. The SVG below is a placeholder
+                pattern for the wireframe; Phase 7 swaps in an actual
+                backend-rendered QR matching the real SSID/password.
+            -->
+            <div class="qr" aria-label="WiFi QR code (placeholder)">
+                <svg viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
+                    <rect width="21" height="21" fill="white"/>
+                    <!-- Hand-drawn QR-ish pattern. Real QR goes here in Phase 7. -->
+                    <g fill="black">
+                        <rect x="0" y="0" width="7" height="7"/>
+                        <rect x="1" y="1" width="5" height="5" fill="white"/>
+                        <rect x="2" y="2" width="3" height="3"/>
+                        <rect x="14" y="0" width="7" height="7"/>
+                        <rect x="15" y="1" width="5" height="5" fill="white"/>
+                        <rect x="16" y="2" width="3" height="3"/>
+                        <rect x="0" y="14" width="7" height="7"/>
+                        <rect x="1" y="15" width="5" height="5" fill="white"/>
+                        <rect x="2" y="16" width="3" height="3"/>
+                        <rect x="9" y="9" width="3" height="3"/>
+                        <rect x="10" y="3" width="1" height="1"/>
+                        <rect x="12" y="4" width="1" height="1"/>
+                        <rect x="8" y="5" width="1" height="1"/>
+                        <rect x="13" y="8" width="1" height="1"/>
+                        <rect x="10" y="10" width="1" height="1"/>
+                        <rect x="5" y="9" width="1" height="1"/>
+                        <rect x="4" y="11" width="1" height="1"/>
+                        <rect x="3" y="12" width="1" height="1"/>
+                        <rect x="8" y="12" width="1" height="1"/>
+                        <rect x="12" y="13" width="1" height="1"/>
+                        <rect x="10" y="14" width="1" height="1"/>
+                        <rect x="14" y="15" width="1" height="1"/>
+                        <rect x="16" y="14" width="1" height="1"/>
+                        <rect x="18" y="16" width="1" height="1"/>
+                        <rect x="12" y="17" width="1" height="1"/>
+                        <rect x="14" y="19" width="1" height="1"/>
+                        <rect x="17" y="19" width="1" height="1"/>
+                    </g>
+                </svg>
+            </div>
+        </section>
+
+        <footer>
+            Once connected, any browser URL should redirect to the setup UI.
+            If it doesn't, open <code>http://openmarquee.local</code> manually.
+        </footer>
+    </main>
+</body>
+</html>

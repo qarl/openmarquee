@@ -36,3 +36,15 @@ test("Save button is disabled until text is entered", async ({ page }) => {
     await page.locator(".editor .field-text").fill("");
     await expect(saveBtn).toBeDisabled();
 });
+
+test("welcome wireframe page renders with SSID, password, and QR placeholder", async ({ page }) => {
+    // The wireframe ships at /welcome.html. Phase 7 swaps in real values
+    // and a real backend-rendered QR code; this smoke test ensures the
+    // wireframe stays wired up and shows the expected chrome.
+    await page.goto("/welcome.html");
+    await expect(page).toHaveTitle(/OpenMarquee/);
+    await expect(page.locator(".brand")).toHaveText("OpenMarquee");
+    await expect(page.locator('[data-field="ssid"]')).toBeVisible();
+    await expect(page.locator('[data-field="password"]')).toBeVisible();
+    await expect(page.locator(".qr svg")).toBeVisible();
+});
