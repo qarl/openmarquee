@@ -1,18 +1,18 @@
 <!doctype html>
 <!--
-    Welcome screen — what the sign displays on first boot before any content
-    has been uploaded (SYSTEM_SPEC §8.6). Intended to be shown via a kiosk
-    browser pointed at this URL in HDMI mode, or rendered to a PNG and piped
-    to the frame buffer on HUB75/WS2812B modes.
+    Welcome screen — what the sign displays on first boot before any
+    content has been uploaded (SYSTEM_SPEC §8.6). Two display targets:
 
-    This file is a WIREFRAME. Placeholder SSID, password, and QR code are
-    hardcoded; Phase 7 (WiFi AP + captive portal) replaces them with the
-    real values at boot — likely by having the backend serve a templated
-    version at /welcome.
+    1. HDMI output on a 1920×1080 TV / monitor. This is the primary
+       design target — layout is tuned for big-across-the-room
+       readability (QR scannable from ~3m, credentials legible).
+    2. Any operator's phone pointed at /welcome.html. The media queries
+       collapse the two-column layout into a stack below ~900px.
 
-    Why plain static HTML with no framework? Same reason the app itself
-    uses vanilla JS — this page has to render on the device with no
-    internet, so all assets must be local and small.
+    Phase 7 (WiFi AP + captive portal) replaces the placeholder SSID,
+    password, and QR with the real values at boot — the backend
+    templates them into the data-field spans; welcome.js picks them
+    up.
 -->
 <html lang="en">
 <head>
@@ -21,12 +21,16 @@
     <title>openMarquee — welcome</title>
     <style>
         :root {
+            /* Mirrors main UI's /styles.css palette — same accent +
+               panel tones so first-boot and the admin UI feel like the
+               same product. */
             --bg: #0e0e10;
             --text: #f2f2f4;
             --muted: #9c9ca3;
             --accent: #ffb84d;
             --card: #191a1d;
             --card-border: #2a2a2f;
+            --field-bg: #0b0b0d;
         }
 
         * { box-sizing: border-box; }
@@ -37,155 +41,321 @@
             background: var(--bg);
             color: var(--text);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-            /* Designed to look right when displayed full-screen on any
-               aspect ratio the sign might run (1080p, 720p, 128x96). */
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .welcome {
             min-height: 100vh;
             display: grid;
-            place-items: center;
-            text-align: center;
-            padding: 2rem;
+            grid-template-rows: auto 1fr auto;
+            padding: clamp(1.5rem, 3vw, 3.5rem);
+            gap: clamp(1rem, 2vw, 2rem);
         }
 
-        .brand {
-            font-size: clamp(1.2rem, 3vw, 2rem);
-            font-weight: 700;
-            letter-spacing: 0.02em;
-            color: var(--accent);
-            margin: 0 0 0.35rem;
-        }
-
-        .headline {
-            font-size: clamp(1.4rem, 4vw, 2.5rem);
-            font-weight: 600;
-            margin: 0 0 0.5rem;
-        }
-
-        .subhead {
-            font-size: clamp(0.9rem, 1.8vw, 1.15rem);
-            color: var(--muted);
-            margin: 0 0 2rem;
-            max-width: 30ch;
-        }
-
-        .card {
-            background: var(--card);
-            border: 1px solid var(--card-border);
-            border-radius: 0.75rem;
-            padding: 1.5rem 2rem;
-            display: grid;
-            gap: 1.5rem;
-            grid-template-columns: 1fr auto;
+        .welcome-header {
+            display: flex;
             align-items: center;
-            max-width: 640px;
+            gap: 0.9rem;
+        }
+
+        .brand-mark {
+            /* Monogram tile — accent-colored square paired with the
+               wordmark. Flat + square so it reads on both the 1080p
+               kiosk and phone preview. */
+            width: clamp(2.4rem, 3.2vw, 3.4rem);
+            height: clamp(2.4rem, 3.2vw, 3.4rem);
+            border-radius: 0.5rem;
+            background: var(--accent);
+            color: #1a0f00;
+            display: grid;
+            place-items: center;
+            font-weight: 800;
+            font-size: clamp(1.2rem, 1.8vw, 1.7rem);
+            letter-spacing: -0.03em;
+        }
+
+        .brand-word {
+            font-size: clamp(1.8rem, 2.4vw, 2.75rem);
+            font-weight: 700;
+            letter-spacing: 0.01em;
+            color: var(--text);
+            margin: 0;
+        }
+
+        .brand-word span {
+            color: var(--accent);
+        }
+
+        .welcome-body {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: clamp(1.5rem, 4vw, 4rem);
+            align-items: center;
+            max-width: 1680px;
+            margin: 0 auto;
             width: 100%;
         }
 
-        @media (max-width: 560px) {
-            .card { grid-template-columns: 1fr; }
-            .qr { justify-self: center; }
+        @media (max-width: 900px) {
+            .welcome-body {
+                grid-template-columns: 1fr;
+                justify-items: center;
+                text-align: center;
+            }
+        }
+
+        .welcome-copy {
+            display: flex;
+            flex-direction: column;
+            gap: clamp(1.25rem, 2vw, 2rem);
+            min-width: 0; /* so long passwords don't push the grid */
+        }
+
+        .welcome-instruction {
+            font-size: clamp(1.6rem, 3.6vw, 3.2rem);
+            font-weight: 700;
+            line-height: 1.15;
+            margin: 0;
+            max-width: 22ch;
+        }
+
+        .welcome-instruction strong {
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        .welcome-subhead {
+            font-size: clamp(1rem, 1.4vw, 1.4rem);
+            color: var(--muted);
+            margin: 0;
+            max-width: 36ch;
+            line-height: 1.35;
         }
 
         .creds {
-            text-align: left;
             display: grid;
-            gap: 0.75rem;
-        }
-
-        .creds dt {
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: var(--muted);
-            margin: 0 0 0.15rem;
-        }
-
-        .creds dd {
-            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            font-size: clamp(1rem, 2.4vw, 1.5rem);
+            gap: clamp(0.75rem, 1.2vw, 1.25rem);
+            width: min(720px, 100%);
             margin: 0;
-            color: var(--text);
         }
 
-        .qr {
-            width: clamp(120px, 22vw, 180px);
+        .creds-row {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 0.7rem;
+            padding: clamp(0.7rem, 1vw, 1rem) clamp(0.9rem, 1.2vw, 1.2rem);
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            align-items: center;
+            gap: clamp(0.8rem, 1.2vw, 1.25rem);
+            text-align: left;
+        }
+
+        .creds-label {
+            font-size: clamp(0.7rem, 0.9vw, 0.85rem);
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: var(--muted);
+            min-width: 5rem;
+        }
+
+        .creds-value {
+            font-family: ui-monospace, SFMono-Regular, "Menlo", "Consolas", monospace;
+            font-size: clamp(1.1rem, 1.8vw, 1.75rem);
+            font-weight: 600;
+            color: var(--text);
+            /* Break only when the token genuinely doesn't fit — avoids
+               splitting a short SSID like "openMarquee-A3F7" at its
+               dash the way `word-break: break-all` does. */
+            overflow-wrap: anywhere;
+            /* Click on the text → entire field selects, so Cmd+C works
+               even when navigator.clipboard is unavailable (no-HTTPS
+               captive portal case). */
+            user-select: all;
+            -webkit-user-select: all;
+            cursor: text;
+        }
+
+        .copy-btn {
+            /* Tap target sized for both kiosk mouse hover and phone
+               touch — 44px tall is the Apple HIG minimum. */
+            min-width: 3rem;
+            height: 2.4rem;
+            padding: 0 0.9rem;
+            background: var(--field-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 0.4rem;
+            color: var(--text);
+            font-family: inherit;
+            font-size: clamp(0.85rem, 1vw, 1rem);
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background 120ms ease, border-color 120ms ease;
+        }
+
+        .copy-btn:hover {
+            background: #111115;
+            border-color: var(--accent);
+        }
+
+        .copy-btn:active {
+            transform: translateY(1px);
+        }
+
+        .copy-btn[data-state="copied"] {
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .welcome-qr {
+            /* QR at 1080p is ~560px per side — comfortably scannable
+               from ~3m. Shrinks to fit on narrow screens. */
+            width: clamp(220px, 32vw, 560px);
             aspect-ratio: 1 / 1;
             background: white;
-            border-radius: 0.35rem;
-            display: grid;
-            place-items: center;
-            padding: 0.4rem;
+            border-radius: 0.9rem;
+            padding: clamp(0.5rem, 1vw, 1rem);
             position: relative;
+            box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04),
+                        0 24px 60px rgba(0, 0, 0, 0.5);
         }
 
-        .qr svg {
+        .welcome-qr svg {
             width: 100%;
             height: 100%;
             display: block;
+            shape-rendering: crispEdges;
         }
 
-        /* Visible only while .qr-placeholder is still on the element. The
-           welcome.js script removes that class once it has rendered a real
-           QR, so the watermark only shows in the no-JS / failed-load path. */
-        .qr.qr-placeholder::after {
+        .welcome-qr-caption {
+            position: absolute;
+            bottom: -2.2rem;
+            left: 0;
+            right: 0;
+            text-align: center;
+            font-size: clamp(0.8rem, 1vw, 1rem);
+            color: var(--muted);
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            margin: 0;
+        }
+
+        /* PLACEHOLDER watermark — visible until welcome.js swaps in a real QR. */
+        .welcome-qr.qr-placeholder::after {
             content: "PLACEHOLDER";
             position: absolute;
-            inset: 0;
+            inset: clamp(0.5rem, 1vw, 1rem);
             display: grid;
             place-items: center;
-            font-size: clamp(0.6rem, 1.4vw, 0.85rem);
+            font-size: clamp(0.9rem, 1.4vw, 1.4rem);
             font-weight: 700;
-            letter-spacing: 0.15em;
+            letter-spacing: 0.2em;
             color: rgba(255, 0, 0, 0.75);
             background: repeating-linear-gradient(
                 -20deg,
-                rgba(255, 255, 255, 0) 0 6px,
-                rgba(255, 200, 200, 0.55) 6px 10px
+                rgba(255, 255, 255, 0) 0 8px,
+                rgba(255, 200, 200, 0.55) 8px 14px
             );
-            border-radius: 0.35rem;
+            border-radius: 0.6rem;
             pointer-events: none;
         }
 
-        footer {
-            margin-top: 2rem;
-            font-size: 0.8rem;
+        .welcome-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             color: var(--muted);
+            font-size: clamp(0.85rem, 1vw, 1.05rem);
+            max-width: 1680px;
+            margin: 0 auto;
+            width: 100%;
+            gap: 1rem;
         }
 
-        footer code { font-family: ui-monospace, monospace; color: var(--text); }
+        @media (max-width: 900px) {
+            .welcome-footer {
+                flex-direction: column;
+                text-align: center;
+            }
+        }
+
+        .welcome-footer code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: var(--text);
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 0.3rem;
+            padding: 0.15rem 0.45rem;
+        }
+
+        /* Visually-hidden status line for copy-to-clipboard feedback —
+           announced by screen readers without disturbing the visual
+           layout. */
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
     </style>
 </head>
 <body>
-    <main>
-        <p class="brand">openMarquee</p>
-        <h1 class="headline">Connect your phone to set up this sign</h1>
-        <p class="subhead">No app, no account, no internet. Just a browser.</p>
+    <main class="welcome">
+        <header class="welcome-header">
+            <div class="brand-mark" aria-hidden="true">oM</div>
+            <h1 class="brand brand-word">open<span>Marquee</span></h1>
+        </header>
 
-        <section class="card" aria-label="WiFi credentials">
-            <dl class="creds">
-                <div>
-                    <dt>WiFi network</dt>
-                    <dd data-field="ssid">openMarquee-A3F7</dd>
-                </div>
-                <div>
-                    <dt>Password</dt>
-                    <!-- Deliberately fake placeholder. Phase 7 substitutes the
-                         real per-device password at boot. -->
-                    <dd data-field="password">xxxx-xxxx-xxxx</dd>
-                </div>
-            </dl>
+        <section class="welcome-body">
+            <div class="welcome-copy">
+                <h2 class="welcome-instruction">
+                    Connect to this WiFi, then a
+                    <strong>setup page</strong> opens automatically.
+                </h2>
+                <p class="welcome-subhead">
+                    No app, no account, no internet. Scan the code with your
+                    phone camera, or join the network manually using the
+                    credentials below.
+                </p>
+
+                <dl class="creds" aria-label="WiFi credentials">
+                    <div class="creds-row">
+                        <dt class="creds-label">Network</dt>
+                        <dd class="creds-value" data-field="ssid">openMarquee-A3F7</dd>
+                        <button type="button" class="copy-btn"
+                                data-copy-for="ssid"
+                                aria-label="Copy WiFi network name">Copy</button>
+                    </div>
+                    <div class="creds-row">
+                        <dt class="creds-label">Password</dt>
+                        <dd class="creds-value" data-field="password">xxxx-xxxx-xxxx</dd>
+                        <button type="button" class="copy-btn"
+                                data-copy-for="password"
+                                aria-label="Copy WiFi password">Copy</button>
+                    </div>
+                </dl>
+
+                <p class="sr-only" role="status" aria-live="polite"
+                   data-field="copy-status"></p>
+            </div>
 
             <!--
                 WiFi QR: encoded as WIFI:T:WPA;S:...;P:...;; — iOS/Android
                 cameras recognize the format and offer to join. welcome.js
                 generates the real QR at page load by reading the SSID +
-                password fields above; the SVG below is the no-JS / failed-
-                load fallback (the .qr-placeholder class triggers the
-                "PLACEHOLDER" watermark).
+                password fields above; the SVG below is the no-JS /
+                failed-load fallback (the .qr-placeholder class triggers
+                the "PLACEHOLDER" watermark).
             -->
-            <div class="qr qr-placeholder" aria-label="WiFi QR code">
+            <div class="welcome-qr qr qr-placeholder" aria-label="WiFi QR code">
                 <svg viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
                     <rect width="21" height="21" fill="white"/>
-                    <!-- Hand-drawn QR-ish pattern. Real QR goes here in Phase 7. -->
                     <g fill="black">
                         <rect x="0" y="0" width="7" height="7"/>
                         <rect x="1" y="1" width="5" height="5" fill="white"/>
@@ -197,31 +367,21 @@
                         <rect x="1" y="15" width="5" height="5" fill="white"/>
                         <rect x="2" y="16" width="3" height="3"/>
                         <rect x="9" y="9" width="3" height="3"/>
-                        <rect x="10" y="3" width="1" height="1"/>
-                        <rect x="12" y="4" width="1" height="1"/>
-                        <rect x="8" y="5" width="1" height="1"/>
-                        <rect x="13" y="8" width="1" height="1"/>
-                        <rect x="10" y="10" width="1" height="1"/>
-                        <rect x="5" y="9" width="1" height="1"/>
-                        <rect x="4" y="11" width="1" height="1"/>
-                        <rect x="3" y="12" width="1" height="1"/>
-                        <rect x="8" y="12" width="1" height="1"/>
-                        <rect x="12" y="13" width="1" height="1"/>
-                        <rect x="10" y="14" width="1" height="1"/>
-                        <rect x="14" y="15" width="1" height="1"/>
-                        <rect x="16" y="14" width="1" height="1"/>
-                        <rect x="18" y="16" width="1" height="1"/>
-                        <rect x="12" y="17" width="1" height="1"/>
-                        <rect x="14" y="19" width="1" height="1"/>
-                        <rect x="17" y="19" width="1" height="1"/>
                     </g>
                 </svg>
+                <p class="welcome-qr-caption">Scan to join</p>
             </div>
         </section>
 
-        <footer>
-            Once connected, any browser URL should redirect to the setup UI.
-            If it doesn't, open <code>http://openmarquee.local</code> manually.
+        <footer class="welcome-footer">
+            <span>
+                Once connected, any browser URL should redirect to the
+                setup UI.
+            </span>
+            <span>
+                If it doesn't, open <code>http://openmarquee.local</code>
+                manually.
+            </span>
         </footer>
     </main>
     <script type="module" src="/dist/welcome.js"></script>

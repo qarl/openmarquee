@@ -1,6 +1,16 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
-import { buildWifiPayload, renderWelcomeQR } from "./welcome.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+    buildWifiPayload,
+    copyToClipboard,
+    renderWelcomeQR,
+    wireCopyButtons,
+} from "./welcome.js";
+
+afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+});
 
 describe("buildWifiPayload", () => {
     it("formats a WPA WIFI: payload with the SSID and password", () => {
@@ -48,5 +58,111 @@ describe("renderWelcomeQR", () => {
         expect(document.querySelector(".qr").classList.contains("qr-placeholder")).toBe(
             true,
         );
+    });
+
+    it("preserves the QR caption across the placeholder → real-QR swap", async () => {
+        document.body.innerHTML = `
+            <dd data-field="ssid">openMarquee-A3F7</dd>
+            <dd data-field="password">openmarquee</dd>
+            <div class="qr qr-placeholder">
+                <svg viewBox="0 0 21 21"><rect width="21" height="21"/></svg>
+                <p class="welcome-qr-caption">Scan to join</p>
+            </div>
+        `;
+        await renderWelcomeQR();
+        const caption = document.querySelector(".welcome-qr-caption");
+        expect(caption).not.toBeNull();
+        expect(caption.textContent).toBe("Scan to join");
+    });
+});
+
+describe("copyToClipboard", () => {
+    it("uses navigator.clipboard.writeText when available in a secure context", async () => {
+        const writeText = vi.fn().mockResolvedValue(undefined);
+        vi.stubGlobal("navigator", { clipboard: { writeText } });
+        // jsdom's window is secure-context-ish; pretend to be sure.
+        Object.defineProperty(window, "isSecureContext", {
+            configurable: true,
+            value: true,
+        });
+
+        const result = await copyToClipboard("hello");
+        expect(result).toBe("copied");
+        expect(writeText).toHaveBeenCalledWith("hello");
+    });
+
+    it("falls back to execCommand when clipboard API is absent", async () => {
+        vi.stubGlobal("navigator", { /* no clipboard */ });
+        const execCommand = vi.fn().mockReturnValue(true);
+        document.execCommand = execCommand;
+        const result = await copyToClipboard("fallback-text");
+        expect(result).toBe("copied");
+        expect(execCommand).toHaveBeenCalledWith("copy");
+        delete document.execCommand;
+    });
+
+    it("returns 'fallback' when both paths fail", async () => {
+        vi.stubGlobal("navigator", { /* no clipboard */ });
+        document.execCommand = vi.fn().mockReturnValue(false);
+        const result = await copyToClipboard("nope");
+        expect(result).toBe("fallback");
+        delete document.execCommand;
+    });
+});
+
+describe("wireCopyButtons", () => {
+    function mountFixture() {
+        document.body.innerHTML = `
+            <dd data-field="ssid">openMarquee-A3F7</dd>
+            <dd data-field="password">hunter2-network</dd>
+            <button type="button" class="copy-btn"
+                    data-copy-for="ssid">Copy</button>
+            <button type="button" class="copy-btn"
+                    data-copy-for="password">Copy</button>
+            <p data-field="copy-status"></p>
+        `;
+    }
+
+    it("copies the matching field on click and announces success", async () => {
+        mountFixture();
+        const writeText = vi.fn().mockResolvedValue(undefined);
+        vi.stubGlobal("navigator", { clipboard: { writeText } });
+        Object.defineProperty(window, "isSecureContext", {
+            configurable: true,
+            value: true,
+        });
+
+        wireCopyButtons();
+        document
+            .querySelector('[data-copy-for="password"]')
+            .click();
+        // Let the async copy resolve.
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(writeText).toHaveBeenCalledWith("hunter2-network");
+        const btn = document.querySelector('[data-copy-for="password"]');
+        expect(btn.dataset.state).toBe("copied");
+        expect(btn.textContent).toBe("Copied");
+        expect(
+            document.querySelector('[data-field="copy-status"]').textContent,
+        ).toMatch(/Password copied/);
+    });
+
+    it("surfaces a select-fallback state when both copy paths fail", async () => {
+        mountFixture();
+        vi.stubGlobal("navigator", { /* no clipboard */ });
+        document.execCommand = vi.fn().mockReturnValue(false);
+
+        wireCopyButtons();
+        document.querySelector('[data-copy-for="ssid"]').click();
+        await new Promise((r) => setTimeout(r, 0));
+
+        const btn = document.querySelector('[data-copy-for="ssid"]');
+        expect(btn.dataset.state).toBe("fallback");
+        expect(btn.textContent).toMatch(/Select/);
+        expect(
+            document.querySelector('[data-field="copy-status"]').textContent,
+        ).toMatch(/tap the network/i);
+        delete document.execCommand;
     });
 });
