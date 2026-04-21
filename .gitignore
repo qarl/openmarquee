@@ -53,6 +53,9 @@ playwright-report/
 test-results/
 .playwright/
 
+# vitest cache
+.vite/
+
 # Editor
 .vscode/
 .idea/
