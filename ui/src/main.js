@@ -13,16 +13,12 @@
 // next page load — re-mounting on save is a future refinement.
 
 import {
-    deletePlaylistByName,
-    deleteContent,
     generateBackground,
     getPlaybackState,
     getSchedule,
     getSettings,
     listContent,
     listPlaylists,
-    playContent,
-    savePlaylistByName,
     saveImage,
     saveSchedule,
     saveSettings,
@@ -36,10 +32,9 @@ import { mountAutoSlide } from "./auto-slide.js";
 import { mountComposer } from "./composer.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
-import { mountList } from "./list.js";
 import { mountNav } from "./nav.js";
 import { mountPlaybackControls } from "./playback.js";
-import { mountPlaylistsManager } from "./playlists.js";
+import { mountPlaylistTrack } from "./playlist-track.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountVideoUploader } from "./video-upload.js";
@@ -83,8 +78,6 @@ async function boot() {
         <section data-section="slides/text" class="panel">
             <div class="editor-slot"></div>
             <div class="composer-slot"></div>
-            <div class="playback-slot"></div>
-            <div class="list-slot"></div>
         </section>
         <section data-section="slides/image" class="panel">
             <div class="image-upload-slot"></div>
@@ -96,7 +89,7 @@ async function boot() {
             <div class="auto-slide-slot"></div>
         </section>
         <section data-section="playlists" class="panel">
-            <div class="playlists-slot"></div>
+            <div class="playlist-track-slot"></div>
         </section>
         <section data-section="schedule" class="panel">
             <div class="schedule-slot"></div>
@@ -106,25 +99,27 @@ async function boot() {
         </section>
     `;
 
-    // List + playback live on the Text subpage today (until the Playlists
-    // page redesign moves them there). Mount once; onSaveWithRefresh
-    // triggers a refresh after any creator saves a new slide.
-    const list = mountList(root.querySelector(".list-slot"), {
-        fetchItems: listContent,
-        onPlay: playContent,
-        onDelete: deleteContent,
-        onReorder: setPlaylistOrder,
-    });
-
-    mountPlaybackControls(root.querySelector(".playback-slot"), {
-        fetchState: getPlaybackState,
-        onStart: startPlayback,
-        onStop: stopPlayback,
-    });
+    // Playlist track handles its own refresh — any save returns and the
+    // on-save callbacks below ping its refresh() so newly-created slides
+    // appear in the pallet.
+    const playlistTrack = mountPlaylistTrack(
+        root.querySelector(".playlist-track-slot"),
+        {
+            fetchItems: listContent,
+            fetchPlaylists: listPlaylists,
+            onReorder: setPlaylistOrder,
+            playback: {
+                fetchState: getPlaybackState,
+                onStart: startPlayback,
+                onStop: stopPlayback,
+            },
+            mountPlaybackControls,
+        },
+    );
 
     const onSaveWithRefresh = (saveFn) => async (payload) => {
         const saved = await saveFn(payload);
-        await list.refresh();
+        await playlistTrack.refresh();
         return saved;
     };
 
@@ -161,13 +156,6 @@ async function boot() {
     mountAutoSlide(root.querySelector(".auto-slide-slot"), {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
-    });
-
-    mountPlaylistsManager(root.querySelector(".playlists-slot"), {
-        fetchItems: listContent,
-        fetchPlaylists: listPlaylists,
-        onSave: savePlaylistByName,
-        onDelete: deletePlaylistByName,
     });
 
     mountSchedule(root.querySelector(".schedule-slot"), {

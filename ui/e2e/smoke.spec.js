@@ -5,7 +5,7 @@ test.beforeEach(() => {
     resetServerState();
 });
 
-test("app loads on the Text subpage, editor visible, list shows empty state", async ({ page }) => {
+test("app loads on the Text subpage with the text editor visible", async ({ page }) => {
     await page.goto("/");
 
     await expect(page).toHaveTitle("openMarquee");
@@ -15,11 +15,8 @@ test("app loads on the Text subpage, editor visible, list shows empty state", as
     await expect(page.locator(".editor .field-text")).toBeVisible();
     await expect(page.locator(".editor .field-save")).toBeVisible();
 
-    // Image uploader lives on its own subpage now — hidden on boot.
+    // Image uploader lives on its own subpage — hidden on boot.
     await expect(page.locator(".image-upload")).toBeHidden();
-
-    await expect(page.locator(".list")).toBeVisible();
-    await expect(page.locator(".list-status")).toContainText("No slides yet");
 });
 
 test("Save button is disabled until text is entered", async ({ page }) => {

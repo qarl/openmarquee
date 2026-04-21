@@ -148,6 +148,199 @@ main {
     .nav-link.active { border-left: none; border-bottom: 2px solid var(--accent); padding-left: 0.75rem; padding-bottom: calc(0.5rem - 2px); }
 }
 
+/* --- playlist track editor --- */
+
+.playlist-track {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.playlist-track-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.playlist-track-heading {
+    margin: 0;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+    flex: 1;
+}
+
+.playlist-track-hint {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--muted);
+    opacity: 0.85;
+}
+
+.playlist-track-scroll {
+    overflow-x: auto;
+    padding: 0.5rem;
+    background: rgba(0, 0, 0, 0.15);
+    border: 1px dashed var(--panel-border);
+    border-radius: 0.5rem;
+}
+
+.playlist-track-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: row;
+    gap: 0.5rem;
+    min-height: 7rem;
+}
+
+.playlist-track-list:empty::before {
+    content: attr(data-empty-hint);
+    color: var(--muted);
+    font-size: 0.85rem;
+    font-style: italic;
+    padding: 2rem 1rem;
+    display: block;
+    width: 100%;
+    text-align: center;
+}
+
+.track-block {
+    flex: 0 0 auto;
+    width: 6.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.4rem;
+    padding: 0.3rem;
+    cursor: grab;
+}
+.track-block:active { cursor: grabbing; }
+
+.track-block-thumb-wrap {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    border-radius: 0.25rem;
+    overflow: hidden;
+}
+.track-block-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    image-rendering: pixelated;
+}
+.track-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 1.25rem;
+    height: 1.25rem;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.track-remove:hover { background: var(--danger); }
+
+.track-block-name {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.track-block-duration {
+    font-size: 0.7rem;
+    color: var(--muted);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.track-ghost { opacity: 0.4; background: var(--accent); }
+
+.playlist-pallet-heading {
+    margin: 0.5rem 0 0;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+}
+
+.playlist-pallet {
+    list-style: none;
+    padding: 0.5rem;
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
+    gap: 0.5rem;
+    background: rgba(0, 0, 0, 0.08);
+    border-radius: 0.5rem;
+}
+
+.pallet-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.35rem;
+    padding: 0.25rem;
+    cursor: grab;
+    position: relative;
+}
+.pallet-tile:active { cursor: grabbing; }
+
+.pallet-tile-thumb {
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+    background: #000;
+    border-radius: 0.25rem;
+    image-rendering: pixelated;
+}
+
+.pallet-tile-name {
+    font-size: 0.7rem;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pallet-tile-type {
+    position: absolute;
+    top: 0.35rem;
+    right: 0.45rem;
+    font-size: 0.7rem;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    border-radius: 999px;
+    padding: 0 0.35rem;
+}
+
+.pallet-ghost { opacity: 0.4; }
+
+.playlist-track-status {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+    min-height: 1.2em;
+}
+
 /* --- composer --- */
 
 .composer {
