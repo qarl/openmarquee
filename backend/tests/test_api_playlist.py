@@ -73,3 +73,60 @@ def test_put_persists_across_requests(client: TestClient, storage: PlaylistStora
     # Direct read from storage proves the PUT actually wrote to disk.
     persisted = storage.load()
     assert [str(item_id) for item_id in persisted.item_ids] == [a]
+
+
+# --- multi-playlist endpoints ---
+
+
+def test_get_playlists_returns_empty_collection_initially(client: TestClient):
+    response = client.get("/api/playlists")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["playlists"] == {}
+
+
+def test_put_named_playlist_creates_it(client: TestClient, storage: PlaylistStorage):
+    a, b = str(uuid4()), str(uuid4())
+    response = client.put("/api/playlists/lunch", json={"item_ids": [a, b]})
+    assert response.status_code == 200
+    assert response.json() == {"item_ids": [a, b]}
+    # And it shows up in the collection.
+    coll = client.get("/api/playlists").json()
+    assert "lunch" in coll["playlists"]
+
+
+def test_get_named_playlist_returns_empty_for_unknown_name(client: TestClient):
+    response = client.get("/api/playlists/nope")
+    assert response.status_code == 200
+    assert response.json() == {"item_ids": []}
+
+
+def test_delete_named_playlist_removes_it(client: TestClient):
+    a = str(uuid4())
+    client.put("/api/playlists/lunch", json={"item_ids": [a]})
+    response = client.delete("/api/playlists/lunch")
+    assert response.status_code == 204
+    coll = client.get("/api/playlists").json()
+    assert "lunch" not in coll["playlists"]
+
+
+def test_delete_named_playlist_404_when_missing(client: TestClient):
+    response = client.delete("/api/playlists/nope")
+    assert response.status_code == 404
+
+
+def test_legacy_and_multi_endpoints_see_the_same_default_playlist(
+    client: TestClient,
+):
+    """Setting via /api/playlist (legacy) should be readable via
+    /api/playlists/default (new), and vice versa."""
+    a, b = str(uuid4()), str(uuid4())
+    client.put("/api/playlist", json={"item_ids": [a, b]})
+
+    via_new = client.get("/api/playlists/default").json()
+    assert via_new["item_ids"] == [a, b]
+
+    c = str(uuid4())
+    client.put("/api/playlists/default", json={"item_ids": [c]})
+    via_legacy = client.get("/api/playlist").json()
+    assert via_legacy["item_ids"] == [c]
