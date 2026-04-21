@@ -74,6 +74,11 @@ export function mountPlaylistTrack(container, options) {
     let trackSortable = null;
     let palletSortable = null;
     let saving = false;
+    // Closure-scoped lookup so the track Sortable's `onEnd` can re-skin a
+    // cross-list drop (pallet → track) from the Sortable-clone's default
+    // `.pallet-tile` shape into a proper `.track-block` *before* waiting
+    // on the server round-trip. Refreshed on every refresh() call.
+    let itemByIdRef = new Map();
 
     async function saveAndRefresh(work) {
         if (saving) return;
@@ -96,7 +101,8 @@ export function mountPlaylistTrack(container, options) {
                 fetchItems(),
                 fetchPlaylists(),
             ]);
-            const itemById = new Map(items.map((it) => [String(it.id), it]));
+            itemByIdRef = new Map(items.map((it) => [String(it.id), it]));
+            const itemById = itemByIdRef;
             const defaultIds = (
                 collection.playlists?.default?.item_ids || []
             ).map(String);
@@ -118,7 +124,12 @@ export function mountPlaylistTrack(container, options) {
 
             if (trackSortable) trackSortable.destroy();
             if (palletSortable) palletSortable.destroy();
-            trackSortable = bindTrackSortable(trackEl, onReorder, saveAndRefresh);
+            trackSortable = bindTrackSortable(
+                trackEl,
+                onReorder,
+                saveAndRefresh,
+                itemByIdRef,
+            );
             palletSortable = bindPalletSortable(palletEl);
         } catch (err) {
             statusEl.textContent = `Could not load playlist: ${err.message}`;
@@ -129,13 +140,28 @@ export function mountPlaylistTrack(container, options) {
     return { refresh };
 }
 
-function bindTrackSortable(trackEl, onReorder, saveAndRefresh) {
+function bindTrackSortable(trackEl, onReorder, saveAndRefresh, itemByIdRef) {
     return Sortable.create(trackEl, {
         group: { name: "playlist-track", pull: true, put: ["playlist-pallet"] },
         animation: 150,
         ghostClass: "track-ghost",
         filter: ".track-remove",
         preventOnFilter: false,
+        onAdd: (evt) => {
+            // Cross-list drop from the pallet → Sortable cloned a
+            // `.pallet-tile` into the track. Re-skin in place to the
+            // proper `.track-block` shape (with duration label) so the
+            // operator sees correct chrome *immediately*, not after the
+            // save-refresh round-trip. The subsequent onEnd still saves
+            // the authoritative order back to the server.
+            const dropped = evt.item;
+            const id = dropped?.dataset?.id;
+            if (!id) return;
+            const item = itemByIdRef.get(id);
+            if (!item) return;
+            const rebuilt = renderTrackBlock(item);
+            dropped.replaceWith(rebuilt);
+        },
         onEnd: () => {
             const ids = collectTrackIds(trackEl);
             saveAndRefresh(() => onReorder(ids));
