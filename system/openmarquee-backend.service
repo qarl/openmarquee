@@ -21,6 +21,7 @@ Environment="OPENMARQUEE_CONTENT_ROOT=/var/openmarquee/content"
 Environment="OPENMARQUEE_UI_DIR=/opt/openmarquee/ui"
 Environment="OPENMARQUEE_PLAYLIST_PATH=/var/openmarquee/playlist.json"
 Environment="OPENMARQUEE_SCHEDULE_PATH=/var/openmarquee/schedules.json"
+Environment="OPENMARQUEE_SETTINGS_PATH=/var/openmarquee/settings.json"
 Environment="OPENMARQUEE_DEV_PREVIEW_PATH=/var/openmarquee/preview.png"
 
 # Production: strip the /dev tooling (preview page, manual play endpoint)
@@ -46,6 +47,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# /var/openmarquee is not a StateDirectory= target (that would create
+# /var/lib/openmarquee); the install docs + Phase 9 image builder
+# pre-create /var/openmarquee so `ReadWritePaths` has an existing dir
+# to carve out of ProtectSystem=strict.
 ReadWritePaths=/var/openmarquee
 
 [Install]

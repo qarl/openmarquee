@@ -14,6 +14,7 @@ from openmarquee.playback import PlaybackLoop
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.rendering.mock import MockRenderer
 from openmarquee.schedule import ScheduleStorage
+from openmarquee.settings import SettingsStorage
 
 
 def _resolve_content_root() -> Path:
@@ -104,6 +105,27 @@ def _schedule_storage_singleton() -> ScheduleStorage:
 def get_schedule_storage() -> ScheduleStorage:
     """Dependency provider for the schedule storage layer."""
     return _schedule_storage_singleton()
+
+
+def _resolve_settings_path() -> Path:
+    """Where `settings.json` lives. Sibling of the playlist/schedule by default.
+
+    Production (systemd unit) sets OPENMARQUEE_SETTINGS_PATH explicitly.
+    """
+    override = os.environ.get("OPENMARQUEE_SETTINGS_PATH")
+    if override:
+        return Path(override)
+    return _resolve_content_root().parent / "openmarquee-settings.json"
+
+
+@lru_cache
+def _settings_storage_singleton() -> SettingsStorage:
+    return SettingsStorage(_resolve_settings_path())
+
+
+def get_settings_storage() -> SettingsStorage:
+    """Dependency provider for the system-settings storage layer."""
+    return _settings_storage_singleton()
 
 
 @lru_cache

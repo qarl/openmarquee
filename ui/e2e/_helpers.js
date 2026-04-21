@@ -10,6 +10,7 @@ import {
     E2E_PLAYLIST_PATH,
     E2E_PREVIEW_PATH,
     E2E_SCHEDULE_PATH,
+    E2E_SETTINGS_PATH,
 } from "../playwright.config.js";
 
 export function resetServerState() {
@@ -20,4 +21,5 @@ export function resetServerState() {
     rmSync(E2E_PREVIEW_PATH, { force: true });
     rmSync(E2E_PLAYLIST_PATH, { force: true });
     rmSync(E2E_SCHEDULE_PATH, { force: true });
+    rmSync(E2E_SETTINGS_PATH, { force: true });
 }
