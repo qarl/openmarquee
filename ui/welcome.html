@@ -114,12 +114,35 @@
             display: grid;
             place-items: center;
             padding: 0.4rem;
+            position: relative;
         }
 
         .qr svg {
             width: 100%;
             height: 100%;
             display: block;
+        }
+
+        /* Obvious "placeholder" watermark so a wireframe QR can't sneak onto
+           a real device unnoticed. Phase 7 removes this stamp when it swaps
+           in a real, scannable QR. */
+        .qr::after {
+            content: "PLACEHOLDER";
+            position: absolute;
+            inset: 0;
+            display: grid;
+            place-items: center;
+            font-size: clamp(0.6rem, 1.4vw, 0.85rem);
+            font-weight: 700;
+            letter-spacing: 0.15em;
+            color: rgba(255, 0, 0, 0.75);
+            background: repeating-linear-gradient(
+                -20deg,
+                rgba(255, 255, 255, 0) 0 6px,
+                rgba(255, 200, 200, 0.55) 6px 10px
+            );
+            border-radius: 0.35rem;
+            pointer-events: none;
         }
 
         footer {
@@ -145,7 +168,9 @@
                 </div>
                 <div>
                     <dt>Password</dt>
-                    <dd data-field="password">openmarquee</dd>
+                    <!-- Deliberately fake placeholder. Phase 7 substitutes the
+                         real per-device password at boot. -->
+                    <dd data-field="password">xxxx-xxxx-xxxx</dd>
                 </div>
             </dl>
 

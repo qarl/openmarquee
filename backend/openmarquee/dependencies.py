@@ -11,6 +11,7 @@ from pathlib import Path
 
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playback import PlaybackLoop
+from openmarquee.playlist import PlaylistStorage
 from openmarquee.rendering.mock import MockRenderer
 
 
@@ -65,6 +66,25 @@ def get_mock_renderer() -> MockRenderer:
     (Phases 6/8/10) the playback engine targets a real renderer instead.
     """
     return _mock_renderer_singleton()
+
+
+def _resolve_playlist_path() -> Path:
+    """Where the playlist JSON lives. Env override or content-root sibling."""
+    override = os.environ.get("OPENMARQUEE_PLAYLIST_PATH")
+    if override:
+        return Path(override)
+    # Sibling of the content root by default — same parent so backups grab both.
+    return _resolve_content_root().parent / "openmarquee-playlist.json"
+
+
+@lru_cache
+def _playlist_storage_singleton() -> PlaylistStorage:
+    return PlaylistStorage(_resolve_playlist_path())
+
+
+def get_playlist_storage() -> PlaylistStorage:
+    """Dependency provider for the playlist storage layer."""
+    return _playlist_storage_singleton()
 
 
 @lru_cache
