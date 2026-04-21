@@ -8,6 +8,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Pull in the developer's personal secrets file, if present, BEFORE
+# uvicorn starts — gives features like /api/backgrounds/generate access
+# to OPENAI_API_KEY without having to export it in every shell. The
+# file lives outside the project tree (default: ~/Jimmy/.env) so it
+# never gets committed; override via OPENMARQUEE_DEV_ENV_FILE.
+DEV_ENV_FILE="${OPENMARQUEE_DEV_ENV_FILE:-$HOME/Jimmy/.env}"
+if [ -f "$DEV_ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$DEV_ENV_FILE"
+    set +a
+    echo "sourced $DEV_ENV_FILE (OPENAI_API_KEY: ${OPENAI_API_KEY:+set})"
+fi
+
 VENV="${OPENMARQUEE_VENV:-$HOME/tmp/venv/openmarquee}"
 UVICORN="$VENV/bin/uvicorn"
 if [ ! -x "$UVICORN" ]; then
