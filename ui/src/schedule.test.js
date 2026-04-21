@@ -273,6 +273,91 @@ describe("mountSchedule", () => {
         expect(el.tagName).toBe("INPUT");
     });
 
+    it("Disable all flips every rule's enabled checkbox off", async () => {
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [
+                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_name: "a", enabled: true },
+                    { name: "B", days: ["tue"], start_time: "09:00", end_time: "18:00", playlist_name: "b", enabled: true },
+                ],
+                default_playlist_name: "default",
+            }),
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        container.querySelector(".schedule-disable-all").click();
+        const checkboxes = container.querySelectorAll(".rule-enabled");
+        expect(checkboxes).toHaveLength(2);
+        for (const cb of checkboxes) {
+            expect(cb.checked).toBe(false);
+        }
+        expect(container.querySelector(".schedule-status").textContent).toMatch(
+            /Disabled 2 rules.*Save/,
+        );
+    });
+
+    it("Enable all flips every rule's enabled checkbox on", async () => {
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [
+                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_name: "a", enabled: false },
+                    { name: "B", days: ["tue"], start_time: "09:00", end_time: "18:00", playlist_name: "b", enabled: false },
+                ],
+                default_playlist_name: "default",
+            }),
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        container.querySelector(".schedule-enable-all").click();
+        const checkboxes = container.querySelectorAll(".rule-enabled");
+        for (const cb of checkboxes) {
+            expect(cb.checked).toBe(true);
+        }
+    });
+
+    it("Bulk toggle is DOM-only — Save still needed to persist", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [
+                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_name: "a", enabled: true },
+                ],
+                default_playlist_name: "default",
+            }),
+            onSave,
+        });
+        await tick();
+
+        container.querySelector(".schedule-disable-all").click();
+        // No save yet.
+        expect(onSave).not.toHaveBeenCalled();
+
+        // Save picks up the disabled state.
+        container.querySelector(".schedule-save").click();
+        await tick();
+        expect(onSave).toHaveBeenCalledOnce();
+        expect(onSave.mock.calls[0][0].rules[0].enabled).toBe(false);
+    });
+
+    it("Bulk toggle with no rules shows a friendly status message", async () => {
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        container.querySelector(".schedule-disable-all").click();
+        expect(container.querySelector(".schedule-status").textContent).toMatch(
+            /No rules to toggle/,
+        );
+    });
+
     it("escapes html in pre-existing rule names so injected markup can't render", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {

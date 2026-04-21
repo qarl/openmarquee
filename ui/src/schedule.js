@@ -36,6 +36,11 @@ const SECTION_TEMPLATE = `
 
         <ul class="schedule-rules" role="list"></ul>
 
+        <div class="schedule-bulk">
+            <button type="button" class="schedule-enable-all">Enable all</button>
+            <button type="button" class="schedule-disable-all">Disable all</button>
+        </div>
+
         <button type="button" class="schedule-add">+ Add rule</button>
         <button type="button" class="primary schedule-save">Save schedule</button>
         <p class="schedule-status" role="status" aria-live="polite"></p>
@@ -62,6 +67,8 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
     const rulesEl = container.querySelector(".schedule-rules");
     const addBtn = container.querySelector(".schedule-add");
     const saveBtn = container.querySelector(".schedule-save");
+    const enableAllBtn = container.querySelector(".schedule-enable-all");
+    const disableAllBtn = container.querySelector(".schedule-disable-all");
     const statusEl = container.querySelector(".schedule-status");
 
     let availableNames = null; // null = no dropdown; array = use <select>
@@ -107,6 +114,27 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
             el.value = value;
         }
     }
+
+    function setAllEnabled(enabled) {
+        // Mutate DOM only — persistence still flows through the Save button,
+        // consistent with how all the other inline edits work. Save schedule
+        // turns yellow-accent when there are dirty changes (Phase 6+ polish;
+        // deferred for now).
+        const boxes = rulesEl.querySelectorAll(".rule-enabled");
+        if (boxes.length === 0) {
+            statusEl.textContent = "No rules to toggle.";
+            return;
+        }
+        boxes.forEach((cb) => {
+            cb.checked = enabled;
+        });
+        statusEl.textContent = `${enabled ? "Enabled" : "Disabled"} ${boxes.length} rule${
+            boxes.length === 1 ? "" : "s"
+        } — click Save to persist.`;
+    }
+
+    enableAllBtn.addEventListener("click", () => setAllEnabled(true));
+    disableAllBtn.addEventListener("click", () => setAllEnabled(false));
 
     addBtn.addEventListener("click", async () => {
         // Re-fetch playlist names so a newly-created playlist (via the
