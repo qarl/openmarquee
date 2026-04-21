@@ -44,7 +44,6 @@ test("sidebar nav defaults to Text and routes through every section on click", a
     const routes = [
         "slides/image",
         "slides/video",
-        "slides/auto",
         "playlists",
         "schedule",
         "settings",
@@ -61,13 +60,6 @@ test("sidebar nav defaults to Text and routes through every section on click", a
     await expect(page.locator(".settings-heading")).toHaveText("System settings");
     await expect(page.locator(".field-output-mode")).toHaveValue("hdmi");
     await expect(page.locator(".field-display-width")).toHaveValue("128");
-});
-
-test("Auto subpage shows the preview canvas + placeholder copy", async ({ page }) => {
-    await page.goto("/#/slides/auto");
-    await expect(page.locator(".auto-slide-heading")).toHaveText("Auto slides");
-    await expect(page.locator(".auto-slide-canvas")).toBeVisible();
-    await expect(page.locator(".auto-slide-todo")).toContainText("Preview only");
 });
 
 test("ffmpeg.wasm spike page renders both pipeline buttons + the file picker", async ({ page }) => {

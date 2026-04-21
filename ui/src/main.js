@@ -28,7 +28,6 @@ import {
     startPlayback,
     stopPlayback,
 } from "./api.js";
-import { mountAutoSlide } from "./auto-slide.js";
 import { mountComposer } from "./composer.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
@@ -49,7 +48,6 @@ const SECTIONS = [
     "slides/text",
     "slides/image",
     "slides/video",
-    "slides/auto",
     "playlists",
     "schedule",
     "settings",
@@ -91,9 +89,6 @@ async function boot() {
         </section>
         <section data-section="slides/video" class="panel">
             <div class="video-upload-slot"></div>
-        </section>
-        <section data-section="slides/auto" class="panel">
-            <div class="auto-slide-slot"></div>
         </section>
         <section data-section="playlists" class="panel">
             <div class="playlist-track-slot"></div>
@@ -158,11 +153,6 @@ async function boot() {
         width: PANEL_WIDTH,
         height: PANEL_HEIGHT,
         onSave: onSaveWithRefresh(saveVideo),
-    });
-
-    mountAutoSlide(root.querySelector(".auto-slide-slot"), {
-        width: PANEL_WIDTH,
-        height: PANEL_HEIGHT,
     });
 
     mountSchedule(root.querySelector(".schedule-slot"), {

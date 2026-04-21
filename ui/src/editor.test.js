@@ -167,6 +167,36 @@ describe("mountEditor — submit flow", () => {
         expect(payload.font_size_px).toBe(38);
     });
 
+    it("auto_mode defaults to null + the dynamic-content hint is hidden", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn().mockResolvedValue({}),
+        });
+        expect(container.querySelector(".field-auto-mode").value).toBe("");
+        expect(container.querySelector(".field-auto-mode-hint").hidden).toBe(true);
+    });
+
+    it("picking an auto_mode reveals the hint + rides through into the save payload", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "x" });
+        mountEditor(container, { width: 128, height: 96, onSave });
+
+        const auto = container.querySelector(".field-auto-mode");
+        auto.value = "time";
+        auto.dispatchEvent(new Event("change"));
+        expect(container.querySelector(".field-auto-mode-hint").hidden).toBe(false);
+
+        container.querySelector(".field-text").value = "12:34 (fallback)";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        container.querySelector(".controls").dispatchEvent(new Event("submit"));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(onSave.mock.calls[0][0].auto_mode).toBe("time");
+    });
+
     it("sends the operator's font-size override when they edit it", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");

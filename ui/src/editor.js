@@ -76,6 +76,21 @@ const EDITOR_TEMPLATE = `
                     <input type="number" class="field-transition-ms" value="500" min="0" max="5000" step="50">
                 </label>
             </div>
+            <label class="field">
+                <span>Dynamic content (rendered at playback)</span>
+                <select class="field-auto-mode">
+                    <option value="" selected>Off — use the typed text</option>
+                    <option value="time">Current time</option>
+                    <option value="date">Today's date</option>
+                    <option value="day">Day of week</option>
+                </select>
+            </label>
+            <p class="field-hint field-auto-mode-hint" hidden>
+                When dynamic content is set, the typed text is a preview-only
+                fallback — the device re-renders at playback time with the
+                current value. (Playback-time rendering is a follow-up; today
+                only the metadata persists.)
+            </p>
             <button type="submit" class="primary field-save">Save slide</button>
             <p class="field-hint">
                 <kbd>⌘</kbd> or <kbd>Ctrl</kbd> + <kbd>Enter</kbd> to save.
@@ -112,6 +127,8 @@ export function mountEditor(container, { width, height, onSave }) {
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const fontSizeEl = container.querySelector(".field-font-size");
+    const autoModeEl = container.querySelector(".field-auto-mode");
+    const autoModeHintEl = container.querySelector(".field-auto-mode-hint");
     const transitionEl = container.querySelector(".field-transition");
     const transitionMsEl = container.querySelector(".field-transition-ms");
     const form = container.querySelector(".controls");
@@ -151,6 +168,14 @@ export function mountEditor(container, { width, height, onSave }) {
     for (const el of [textEl, textColorEl, bgColorEl, nameEl, fontSizeEl]) {
         el.addEventListener("input", syncAndRender);
     }
+
+    // Auto-mode: show/hide the hint and let the user know their typed
+    // text is a fallback when dynamic content is selected. No live render
+    // in the preview — we don't want the canvas to tick with the clock
+    // while the operator is still editing styling.
+    autoModeEl.addEventListener("change", () => {
+        autoModeHintEl.hidden = !autoModeEl.value;
+    });
 
     // Keyboard shortcuts: Cmd/Ctrl+Enter to save from anywhere in the form.
     form.addEventListener("keydown", (event) => {
@@ -202,6 +227,7 @@ export function mountEditor(container, { width, height, onSave }) {
                 text_color: state.textColor.toUpperCase(),
                 background_color: state.backgroundColor.toUpperCase(),
                 font_size_px: Math.round(state.fontSize),
+                auto_mode: autoModeEl.value || null,
                 duration_ms: Math.round(durationSeconds * 1000),
                 transition: transitionEl.value,
                 transition_ms: Number.isFinite(transitionMs) ? transitionMs : 500,

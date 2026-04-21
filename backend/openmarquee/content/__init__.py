@@ -33,6 +33,14 @@ class TextSlide(BaseModel):
     using Canvas, then uploads the PNG. The editor metadata (text, font,
     colors, etc.) is kept on the device so the slide can be re-opened and
     edited without losing fidelity.
+
+    `auto_mode` (optional) marks a slide as *dynamic* — its visible text
+    is regenerated at playback time from a device-side data source
+    (current time, today's date, day-of-week, …). When set, the stored
+    `text` field acts as a fallback for previews and list thumbnails; the
+    authoritative content comes from the live render. `None` = static
+    (the stored PNG is what plays). Lands as a metadata-only field here;
+    the playback-time render-over path is follow-up work.
     """
 
     type: Literal["text_slide"] = "text_slide"
@@ -46,6 +54,7 @@ class TextSlide(BaseModel):
     font_size_px: int | None = Field(default=None, ge=4, le=2048)
     text_color: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
     background_color: str = Field(default="#000000", pattern=_HEX_COLOR_PATTERN)
+    auto_mode: Literal["time", "date", "day"] | None = None
 
     # Transition INTO the next slide ("cut" = instant; "fade" = alpha-blend
     # across `transition_ms` after this slide's duration ends).

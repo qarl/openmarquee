@@ -7,6 +7,21 @@ from pydantic import TypeAdapter, ValidationError
 from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 
 
+def test_text_slide_auto_mode_defaults_to_none():
+    assert TextSlide(name="x", text="x").auto_mode is None
+
+
+def test_text_slide_accepts_auto_mode_options():
+    for mode in ("time", "date", "day"):
+        slide = TextSlide(name="x", text="x", auto_mode=mode)
+        assert slide.auto_mode == mode
+
+
+def test_text_slide_rejects_unknown_auto_mode():
+    with pytest.raises(ValidationError):
+        TextSlide(name="x", text="x", auto_mode="weather")  # type: ignore[arg-type]
+
+
 def test_text_slide_minimal_construction():
     slide = TextSlide(name="Today's Special", text="Pulled Pork $8.99")
     assert slide.type == "text_slide"
