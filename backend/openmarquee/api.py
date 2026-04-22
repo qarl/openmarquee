@@ -88,6 +88,7 @@ class TextSlideUpload(BaseModel):
     text: str
     font_family: str | None = None
     font_size_px: int | None = None
+    font_size_pct: float | None = None
     text_color: str = "#FFFFFF"
     background_color: str = "#000000"
     background_image_slide_id: UUID | None = None

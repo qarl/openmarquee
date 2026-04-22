@@ -109,8 +109,8 @@ const EDITOR_TEMPLATE = `
                     <select class="field-font-family"></select>
                 </label>
                 <label class="field field-duration-wrap">
-                    <span>Font size (px)</span>
-                    <input type="number" class="field-font-size" min="4" max="2048" step="1">
+                    <span>Font size (% of width)</span>
+                    <input type="number" class="field-font-size" min="1" max="100" step="0.5">
                 </label>
             </div>
             <fieldset class="editor-bg-picker">
@@ -207,14 +207,14 @@ export function mountEditor(
         opt.textContent = f.label;
         fontFamilyEl.appendChild(opt);
     }
-    fontSizeEl.value = String(pickFontSize(height));
+    fontSizeEl.value = String(pickFontSizePct());
 
     const state = {
         name: nameEl.value,
         text: "",
         textColor: textColorEl.value,
         backgroundColor: bgColorEl.value,
-        fontSize: Number(fontSizeEl.value),
+        fontSizePct: Number(fontSizeEl.value),
         fontFamily: fontFamilyEl.value,
         bgSource: "color",
         bgSlideId: null,
@@ -236,7 +236,7 @@ export function mountEditor(
         state.fontFamily = fontFamilyEl.value;
         const parsedSize = Number(fontSizeEl.value);
         if (Number.isFinite(parsedSize) && parsedSize > 0) {
-            state.fontSize = parsedSize;
+            state.fontSizePct = parsedSize;
         }
         drawCanvas(canvas, state);
         updateSaveEnabled();
@@ -401,7 +401,7 @@ export function mountEditor(
                 text_color: state.textColor.toUpperCase(),
                 background_color: state.backgroundColor.toUpperCase(),
                 font_family: state.fontFamily,
-                font_size_px: Math.round(state.fontSize),
+                font_size_pct: state.fontSizePct,
                 background_image_slide_id: state.bgSlideId || null,
                 auto_mode: autoModeEl.value || null,
                 auto_format: autoModeEl.value ? autoFormatEl.value || null : null,
@@ -486,7 +486,14 @@ export function mountEditor(
         textColorEl.value = slide.text_color || "#FFFFFF";
         bgColorEl.value = slide.background_color || "#000000";
         fontFamilyEl.value = slide.font_family || "sans-serif";
-        fontSizeEl.value = String(slide.font_size_px || pickFontSize(height));
+        // Prefer the new pct field. Old slides only carry font_size_px;
+        // back-derive a percent so re-editing migrates them in place.
+        const pct =
+            slide.font_size_pct ??
+            (slide.font_size_px
+                ? (slide.font_size_px / width) * 100
+                : pickFontSizePct());
+        fontSizeEl.value = String(pct);
         durationEl.value = String(Math.max(1, (slide.duration_ms || 5000) / 1000));
         autoModeEl.value = slide.auto_mode || "";
         autoModeHintEl.hidden = !slide.auto_mode;
@@ -585,6 +592,7 @@ export function drawCanvas(canvas, state) {
         textColor = "#FFFFFF",
         backgroundColor = "#000000",
         fontSize,
+        fontSizePct,
         fontFamily = "sans-serif",
         bgSource = "color",
         bgImage = null,
@@ -602,10 +610,14 @@ export function drawCanvas(canvas, state) {
 
         if (!text) return;
 
-        const fontSizePx =
-            Number.isFinite(fontSize) && fontSize > 0
-                ? fontSize
-                : pickFontSize(canvas.height);
+        let fontSizePx;
+        if (Number.isFinite(fontSizePct) && fontSizePct > 0) {
+            fontSizePx = Math.max(4, Math.round((canvas.width * fontSizePct) / 100));
+        } else if (Number.isFinite(fontSize) && fontSize > 0) {
+            fontSizePx = fontSize;
+        } else {
+            fontSizePx = pickFontSize(canvas.height);
+        }
         ctx.fillStyle = textColor;
         ctx.font = `bold ${fontSizePx}px ${fontFamily}`;
         ctx.textAlign = "center";
@@ -626,6 +638,13 @@ export function drawCanvas(canvas, state) {
 
 export function pickFontSize(panelHeight) {
     return Math.max(12, Math.floor(panelHeight * 0.4));
+}
+
+// Default percent-of-width for a brand-new auto-mode-less text slide.
+// 30% reads cleanly as a single-word slogan on common 4:3 / 16:9 panels;
+// the operator can dial in something more specific from the field.
+export function pickFontSizePct() {
+    return 30;
 }
 
 export function canvasToBase64(canvas) {

@@ -162,9 +162,9 @@ describe("mountEditor — submit flow", () => {
         expect(payload.background_color).toBe("#000000");
         expect(payload.duration_ms).toBe(5000); // default 5s
         expect(payload.png_base64).toBe("STUBDATA");
-        // Font-size defaults come from pickFontSize(panelHeight) at 128×96
-        // = floor(0.4 * 96) = 38.
-        expect(payload.font_size_px).toBe(38);
+        // Font-size defaults to the pickFontSizePct() default (% of width)
+        // so the slide reads the same after a panel-resolution change.
+        expect(payload.font_size_pct).toBe(30);
     });
 
     it("auto_mode defaults to null + the dynamic-content hint is hidden", async () => {
@@ -256,7 +256,8 @@ describe("mountEditor — submit flow", () => {
 
         container.querySelector(".controls").dispatchEvent(new Event("submit"));
         await new Promise((r) => setTimeout(r, 0));
-        expect(onSave.mock.calls[0][0].font_size_px).toBe(64);
+        // Field is "% of width" now — operator typed 64, payload sends pct.
+        expect(onSave.mock.calls[0][0].font_size_pct).toBe(64);
     });
 
     it("sends the user's duration in milliseconds", async () => {

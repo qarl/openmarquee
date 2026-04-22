@@ -57,6 +57,13 @@ class TextSlide(BaseModel):
     text: str = Field(max_length=10_000)
     font_family: str | None = None
     font_size_px: int | None = Field(default=None, ge=4, le=2048)
+    # Optional alternative to font_size_px: a fraction of canvas width.
+    # Example: 12.5 = "12.5% of the panel width". When set, takes
+    # precedence over font_size_px so a slide saved at 128×96 reads
+    # the same proportions on a 1920×1080 panel after a settings flip.
+    # Old slides keep font_size_px for backward compat; re-editing
+    # them in the unified editor migrates to the relative metric.
+    font_size_pct: float | None = Field(default=None, ge=0.5, le=100.0)
     text_color: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
     background_color: str = Field(default="#000000", pattern=_HEX_COLOR_PATTERN)
     # Optional: render a bundled / saved ImageSlide's PNG under the text.

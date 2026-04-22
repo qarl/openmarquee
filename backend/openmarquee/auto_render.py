@@ -124,7 +124,14 @@ def compose_auto_frame(
     # fallback so tests + first-boot devices never crash on a missing
     # font — the rendered text might be blockier than the editor preview
     # but that's a visible-quality issue, not a correctness one.
-    font = _load_font(slide.font_family, slide.font_size_px, height)
+    # Prefer the relative metric so the auto-render keeps proportional
+    # sizing across resolution changes. Fall back to absolute px on old
+    # slides that haven't been re-saved with the new field.
+    if slide.font_size_pct is not None:
+        size_px = max(4, int(round(width * slide.font_size_pct / 100)))
+    else:
+        size_px = slide.font_size_px
+    font = _load_font(slide.font_family, size_px, height)
 
     draw = ImageDraw.Draw(base)
     text_w, text_h, text_x, text_y = _measure_centered(
