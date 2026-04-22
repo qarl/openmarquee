@@ -73,7 +73,6 @@ def test_state_returns_not_running_initially(client: TestClient):
         "is_running": False,
         "current_item_id": None,
         "current_item_type": None,
-        "current_item_pipeline": None,
         "current_item_transition": None,
         "current_item_transition_ms": None,
         "current_item_auto_mode": None,

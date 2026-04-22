@@ -12,7 +12,7 @@
 // - Each content item has a [start, end) range computed from its
 //   duration; `position` is seconds-from-start. `findActiveItem(position)`
 //   picks which item to draw.
-// - text_slide / image / raw_frames video → a cached `<img>` loaded
+// - text_slide / image → a cached `<img>` loaded
 //   from /api/content/{id}/asset is drawn onto the canvas through
 //   the skin draw fn.
 // - h264 video → a hidden `<video>` element seeks to
@@ -183,7 +183,7 @@ export function mountInlinePreview(container, options) {
 
     function drawSlot(slot) {
         const item = slot.item;
-        if (item.type === "video" && item.pipeline !== "raw_frames") {
+        if (item.type === "video") {
             syncActiveVideo(item, slot);
             drawVideo(item, slot);
         } else {

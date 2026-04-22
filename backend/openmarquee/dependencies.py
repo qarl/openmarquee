@@ -189,7 +189,6 @@ def _playback_loop_singleton() -> PlaybackLoop:
     from datetime import datetime
 
     from openmarquee.playback import scheduled_fetch_items
-    from openmarquee.settings import pipeline_for_output_mode
 
     storage = _content_storage_singleton()
     renderer = _mock_renderer_singleton()
@@ -210,12 +209,6 @@ def _playback_loop_singleton() -> PlaybackLoop:
             loop=loop_holder.get("loop"),
         )
 
-    def expected_pipeline() -> str | None:
-        # Loaded on every iteration so a live-on-device settings change
-        # (operator switches hdmi → hub75 in the UI) takes effect on the
-        # very next slide — no loop restart needed.
-        return pipeline_for_output_mode(settings_storage.load().output_mode)
-
     def current_timezone() -> str | None:
         # Auto-mode slides render in this zone. Re-read each call so
         # changing the tz in Settings is reflected on the next tick.
@@ -225,7 +218,6 @@ def _playback_loop_singleton() -> PlaybackLoop:
         renderer=renderer,
         fetch_items=fetch,
         read_asset=storage.read_asset,
-        get_expected_video_pipeline=expected_pipeline,
         get_timezone=current_timezone,
     )
     loop_holder["loop"] = loop

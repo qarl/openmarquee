@@ -214,7 +214,7 @@ def test_delete_content_item_404_when_missing(client: TestClient):
 def _image_payload(**overrides) -> dict:
     payload = {
         "name": "Logo",
-        "png_base64": base64.b64encode(_FAKE_PNG).decode(),
+        "image_base64": base64.b64encode(_FAKE_PNG).decode(),
     }
     payload.update(overrides)
     return payload
@@ -236,7 +236,7 @@ def test_upload_image_persists_metadata_and_asset(client: TestClient, storage: C
 
 def test_upload_image_rejects_bad_base64(client: TestClient):
     payload = _image_payload()
-    payload["png_base64"] = "not-valid-base64!!!"
+    payload["image_base64"] = "not-valid-base64!!!"
     response = client.post("/api/content/images", json=payload)
     assert response.status_code == 400
 
@@ -245,7 +245,7 @@ def test_upload_image_rejects_non_image_bytes(client: TestClient):
     """Valid base64 but not an image — backend should reject with 400 instead
     of persisting garbage that the playback engine would later have to skip."""
     payload = _image_payload()
-    payload["png_base64"] = base64.b64encode(b"this is not an image").decode()
+    payload["image_base64"] = base64.b64encode(b"this is not an image").decode()
     response = client.post("/api/content/images", json=payload)
     assert response.status_code == 400
     assert "image" in response.json()["detail"].lower()
@@ -268,7 +268,7 @@ def test_upload_image_accepts_real_png(client: TestClient, storage: ContentStora
     buf = _io.BytesIO()
     img.save(buf, format="PNG")
     payload = _image_payload()
-    payload["png_base64"] = base64.b64encode(buf.getvalue()).decode()
+    payload["image_base64"] = base64.b64encode(buf.getvalue()).decode()
 
     response = client.post("/api/content/images", json=payload)
     assert response.status_code == 200, response.text
@@ -359,7 +359,6 @@ def _video_payload(**overrides) -> dict:
     payload = {
         "name": "Promo",
         "duration_ms": 4000,
-        "pipeline": "h264_mp4",
         "png_base64": base64.b64encode(_FAKE_PNG).decode("ascii"),
         "mp4_base64": base64.b64encode(_fake_mp4()).decode("ascii"),
     }
@@ -375,7 +374,6 @@ def test_post_video_creates_variant_and_stores_both_assets(
     body = response.json()
     assert body["type"] == "video"
     assert body["name"] == "Promo"
-    assert body["pipeline"] == "h264_mp4"
 
     item_id = UUID(body["id"])
     # Thumbnail is stored as the standard asset.
@@ -433,18 +431,18 @@ def test_delete_video_removes_mp4(client: TestClient, storage: ContentStorage):
     assert not storage.video_path(item_id).exists()
 
 
-def test_put_image_metadata_only_keeps_existing_png(
+def test_put_image_metadata_only_keeps_existing_bytes(
     client: TestClient, storage: ContentStorage
 ):
-    """Image PUT with png_base64=null preserves the stored bytes —
+    """Image PUT with image_base64=null preserves the stored bytes —
     operator renaming a slide shouldn't force a re-upload."""
-    post = client.post("/api/content/images", json=_upload_payload(name="Logo"))
+    post = client.post("/api/content/images", json=_image_payload(name="Logo"))
     item_id = UUID(post.json()["id"])
     original_bytes = storage.read_asset(item_id)
 
     response = client.put(
         f"/api/content/images/{item_id}",
-        json={"name": "Renamed", "duration_ms": 7000, "png_base64": None},
+        json={"name": "Renamed", "duration_ms": 7000, "image_base64": None},
     )
     assert response.status_code == 200
     assert response.json()["name"] == "Renamed"
@@ -453,10 +451,10 @@ def test_put_image_metadata_only_keeps_existing_png(
     assert storage.read_asset(item_id) == original_bytes
 
 
-def test_put_image_with_png_replaces_bytes(
+def test_put_image_with_new_bytes_replaces_the_asset(
     client: TestClient, storage: ContentStorage
 ):
-    post = client.post("/api/content/images", json=_upload_payload(name="Old"))
+    post = client.post("/api/content/images", json=_image_payload(name="Old"))
     item_id = UUID(post.json()["id"])
     new_png = _real_png_bytes()
 
@@ -465,7 +463,7 @@ def test_put_image_with_png_replaces_bytes(
         json={
             "name": "Updated",
             "duration_ms": 5000,
-            "png_base64": base64.b64encode(new_png).decode("ascii"),
+            "image_base64": base64.b64encode(new_png).decode("ascii"),
         },
     )
     assert response.status_code == 200
@@ -475,7 +473,7 @@ def test_put_image_with_png_replaces_bytes(
 def test_put_image_404s_on_unknown_id(client: TestClient):
     response = client.put(
         f"/api/content/images/{uuid4()}",
-        json={"name": "ghost", "duration_ms": 5000, "png_base64": None},
+        json={"name": "ghost", "duration_ms": 5000, "image_base64": None},
     )
     assert response.status_code == 404
 
@@ -488,7 +486,7 @@ def test_put_image_409s_when_target_is_not_an_image(
     item_id = UUID(post.json()["id"])
     response = client.put(
         f"/api/content/images/{item_id}",
-        json={"name": "nope", "duration_ms": 5000, "png_base64": None},
+        json={"name": "nope", "duration_ms": 5000, "image_base64": None},
     )
     assert response.status_code == 409
     assert "text_slide" in response.json()["detail"]
@@ -508,7 +506,6 @@ def test_put_video_metadata_only_keeps_existing_assets(
         json={
             "name": "Renamed",
             "duration_ms": 8000,
-            "pipeline": "h264_mp4",
             "png_base64": None,
             "mp4_base64": None,
         },
@@ -533,7 +530,6 @@ def test_put_video_with_new_assets_replaces_them(
         json={
             "name": "v",
             "duration_ms": 5000,
-            "pipeline": "h264_mp4",
             "png_base64": base64.b64encode(new_thumb).decode("ascii"),
             "mp4_base64": base64.b64encode(new_mp4).decode("ascii"),
         },
@@ -549,166 +545,8 @@ def test_put_video_404s_on_unknown_id(client: TestClient):
         json={
             "name": "ghost",
             "duration_ms": 5000,
-            "pipeline": "h264_mp4",
             "png_base64": None,
             "mp4_base64": None,
         },
     )
     assert response.status_code == 404
-
-
-def test_post_video_rejects_unknown_pipeline(client: TestClient):
-    payload = _video_payload(pipeline="vp9")
-    response = client.post("/api/content/videos", json=payload)
-    assert response.status_code == 422
-
-
-def _raw_frames_payload(width=4, height=3, fps=10, n_frames=5, **overrides):
-    """Build a valid raw_frames upload payload.
-
-    Default is 4×3 @ 10 fps × 5 frames = 180 bytes — tiny but exercises
-    the frame-boundary math (len must be a multiple of width*height*3).
-    """
-    frame_bytes = width * height * 3
-    raw = bytes(range(256))  # deterministic
-    # Tile bytes to fill exactly n_frames * frame_bytes.
-    data = (raw * ((n_frames * frame_bytes) // len(raw) + 1))[: n_frames * frame_bytes]
-    payload = {
-        "name": "PanelPromo",
-        "duration_ms": 2000,
-        "pipeline": "raw_frames",
-        "png_base64": base64.b64encode(_FAKE_PNG).decode("ascii"),
-        "raw_frames_base64": base64.b64encode(data).decode("ascii"),
-        "frames_fps": fps,
-        "frames_width": width,
-        "frames_height": height,
-    }
-    payload.update(overrides)
-    return payload
-
-
-def test_post_video_raw_frames_creates_variant_and_stores_rgb_bytes(
-    client: TestClient, storage: ContentStorage
-):
-    """raw_frames upload stores asset.png + asset.rgb, and the model
-    carries fps/width/height back on the response."""
-    payload = _raw_frames_payload()
-    response = client.post("/api/content/videos", json=payload)
-    assert response.status_code == 200, response.json()
-    body = response.json()
-    assert body["pipeline"] == "raw_frames"
-    assert body["frames_fps"] == 10
-    assert body["frames_width"] == 4
-    assert body["frames_height"] == 3
-
-    item_id = UUID(body["id"])
-    assert storage.asset_path(item_id).exists()
-    assert storage.frames_path(item_id).exists()
-    # No MP4 side-file for a raw_frames slide.
-    assert not storage.video_path(item_id).exists()
-
-    stored = storage.read_video_raw_frames(item_id)
-    assert len(stored) == 5 * 4 * 3 * 3  # 5 frames × 4×3 × RGB
-
-
-def test_post_video_raw_frames_rejects_bytes_not_divisible_by_frame_size(
-    client: TestClient,
-):
-    """A 4×3×3=36-byte frame — 35 bytes can't be a whole frame."""
-    short = base64.b64encode(b"\x00" * 35).decode("ascii")
-    payload = _raw_frames_payload(raw_frames_base64=short)
-    response = client.post("/api/content/videos", json=payload)
-    assert response.status_code == 400
-    assert "multiple of frame size" in response.json()["detail"]
-
-
-def test_post_video_raw_frames_rejects_when_mp4_also_set(client: TestClient):
-    payload = _raw_frames_payload(
-        mp4_base64=base64.b64encode(_fake_mp4()).decode("ascii"),
-    )
-    response = client.post("/api/content/videos", json=payload)
-    assert response.status_code == 422
-    assert "mp4_base64" in response.json()["detail"]
-
-
-def test_post_video_raw_frames_rejects_missing_dims(client: TestClient):
-    payload = _raw_frames_payload(frames_width=None)
-    response = client.post("/api/content/videos", json=payload)
-    assert response.status_code == 422
-
-
-def test_post_video_h264_rejects_frames_metadata(client: TestClient):
-    payload = _video_payload(frames_fps=15)
-    response = client.post("/api/content/videos", json=payload)
-    assert response.status_code == 422
-    assert "raw_frames" in response.json()["detail"]
-
-
-def test_get_frames_serves_the_raw_bytes(client: TestClient):
-    payload = _raw_frames_payload()
-    post = client.post("/api/content/videos", json=payload)
-    item_id = post.json()["id"]
-    response = client.get(f"/api/content/{item_id}/frames")
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/octet-stream"
-    # 5 frames × 4×3 × 3 bytes/pixel
-    assert len(response.content) == 5 * 4 * 3 * 3
-
-
-def test_get_frames_404_for_unknown_id(client: TestClient):
-    response = client.get(f"/api/content/{uuid4()}/frames")
-    assert response.status_code == 404
-
-
-def test_get_frames_404_for_h264_video(client: TestClient):
-    """An h264_mp4 slide has asset.mp4 but no asset.rgb — the /frames
-    endpoint must 404, not accidentally serve the wrong asset."""
-    post = client.post("/api/content/videos", json=_video_payload())
-    item_id = post.json()["id"]
-    response = client.get(f"/api/content/{item_id}/frames")
-    assert response.status_code == 404
-
-
-def test_put_video_raw_frames_metadata_only_keeps_existing_assets(
-    client: TestClient, storage: ContentStorage
-):
-    post = client.post("/api/content/videos", json=_raw_frames_payload())
-    item_id = UUID(post.json()["id"])
-    original_frames = storage.read_video_raw_frames(item_id)
-
-    response = client.put(
-        f"/api/content/videos/{item_id}",
-        json={
-            "name": "Renamed",
-            "duration_ms": 3000,
-            "pipeline": "raw_frames",
-            "png_base64": None,
-            "raw_frames_base64": None,
-            "frames_fps": 10,
-            "frames_width": 4,
-            "frames_height": 3,
-        },
-    )
-    assert response.status_code == 200
-    assert response.json()["name"] == "Renamed"
-    assert storage.read_video_raw_frames(item_id) == original_frames
-
-
-def test_put_video_pipeline_switch_requires_new_bytes(client: TestClient):
-    """Switching h264 → raw_frames without providing raw_frames_base64
-    would orphan asset.mp4 and leave asset.rgb missing — reject."""
-    post = client.post("/api/content/videos", json=_video_payload())
-    item_id = post.json()["id"]
-    response = client.put(
-        f"/api/content/videos/{item_id}",
-        json={
-            "name": "switch",
-            "duration_ms": 5000,
-            "pipeline": "raw_frames",
-            "frames_fps": 10,
-            "frames_width": 4,
-            "frames_height": 3,
-        },
-    )
-    assert response.status_code == 422
-    assert "raw_frames_base64" in response.json()["detail"]

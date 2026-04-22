@@ -3,9 +3,9 @@
 POST /api/playback/start — kick off the loop (no-op if already running)
 POST /api/playback/stop  — stop and wait for the loop to exit
 GET  /api/playback/state — { is_running, current_item_id, current_item_type,
-                            current_item_pipeline, current_item_transition,
-                            current_item_transition_ms, current_item_auto_mode,
-                            current_item_auto_format, current_playlist_name }
+                            current_item_transition, current_item_transition_ms,
+                            current_item_auto_mode, current_item_auto_format,
+                            current_playlist_name }
 
 The loop drives the device's renderer (MockRenderer in dev, HUB75/HDMI/etc.
 on the device once those land). This obsoletes the manual /dev/play/{id}
@@ -33,10 +33,6 @@ class PlaybackState(BaseModel):
     # UI's choice of <video> vs <img>. Follows the ContentItem type
     # discriminator so adding a new content type auto-surfaces here.
     current_item_type: str | None
-    # For video items: "h264_mp4" | "raw_frames" | None. The preview
-    # can't embed a raw_frames stream in a <video>, so it falls back
-    # to the thumbnail when this field is "raw_frames".
-    current_item_pipeline: str | None
     # Transition that the *currently-displaying* PlaylistItem is
     # configured to perform on its way out ("cut" or "fade"). The live
     # preview keeps the last-seen pair in memory and replays a CSS
@@ -57,7 +53,6 @@ async def get_state(loop: LoopDep) -> PlaybackState:
         is_running=loop.is_running,
         current_item_id=loop.current_item_id,
         current_item_type=loop.current_item_type,
-        current_item_pipeline=loop.current_item_pipeline,
         current_item_transition=loop.current_item_transition,
         current_item_transition_ms=loop.current_item_transition_ms,
         current_item_auto_mode=loop.current_item_auto_mode,

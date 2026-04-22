@@ -1,18 +1,6 @@
-// ffmpeg.wasm Phase-1 spike page — exercises both content pipelines.
-//
-// H.264 MP4 pipeline  (target: HDMI renderer, pi hardware decoder)
-//   decode input → scale to target resolution → re-encode H.264 in MP4
-//   at a modest bitrate → emit as a downloadable file.
-//
-// Raw RGB frames pipeline  (target: HUB75 / WS2812B / composite)
-//   decode input → scale → emit concatenated RGB888 bytes at the given
-//   FPS → download a .rgb blob the operator can byte-compare against
-//   `ffmpeg -f rawvideo -pix_fmt rgb24`.
-//
-// Byte validation: an operator running `ffmpeg -i source.mp4 -vf
-// scale=128:96,fps=10 -f rawvideo -pix_fmt rgb24 ref.rgb` should get
-// bytes that diff cleanly against the raw-frames output here. The
-// spike's whole point is proving we can.
+// ffmpeg.wasm spike page — exercises the H.264 transcode pipeline end
+// to end so a maintainer can verify the browser-side wasm build is
+// wired up + the Pi can decode the output.
 //
 // COI / SAB note: `@ffmpeg/ffmpeg` v0.12+ supports single-threaded mode
 // without Cross-Origin-Isolation headers, so this page runs on any
@@ -21,7 +9,6 @@
 
 import {
     describeFfmpegError,
-    extractRawFrames,
     transcodeToH264,
 } from "./ffmpeg-pipelines.js";
 
@@ -58,9 +45,7 @@ function boot() {
     const fileEl = document.getElementById("source-file");
     const widthEl = document.getElementById("target-width");
     const heightEl = document.getElementById("target-height");
-    const fpsEl = document.getElementById("target-fps");
     const h264Btn = document.getElementById("run-h264");
-    const rgbBtn = document.getElementById("run-rgb");
     const statusEl = document.getElementById("spike-status");
     const logEl = document.getElementById("spike-log");
     const outputEl = document.getElementById("spike-output");
@@ -77,16 +62,14 @@ function boot() {
             return;
         }
         h264Btn.disabled = true;
-        rgbBtn.disabled = true;
         outputEl.innerHTML = "";
         const t0 = performance.now();
         try {
             const data = await runner(
                 {
                     file,
-                    width: Number(widthEl.value) || 128,
-                    height: Number(heightEl.value) || 96,
-                    fps: Number(fpsEl.value) || 10,
+                    width: Number(widthEl.value) || 1920,
+                    height: Number(heightEl.value) || 1080,
                 },
                 hooks,
             );
@@ -98,18 +81,14 @@ function boot() {
             logFn(`error: ${describeFfmpegError(err)}`);
         } finally {
             h264Btn.disabled = false;
-            rgbBtn.disabled = false;
         }
     }
 
     h264Btn.addEventListener("click", () =>
         withSpinner(transcodeToH264, "output.mp4", "video/mp4"),
     );
-    rgbBtn.addEventListener("click", () =>
-        withSpinner(extractRawFrames, "frames.rgb", "application/octet-stream"),
-    );
 
-    logFn("ready. pick a video, pick a pipeline, click.");
+    logFn("ready. pick a video, click.");
 }
 
 if (typeof window !== "undefined") {

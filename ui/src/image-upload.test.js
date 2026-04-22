@@ -106,8 +106,8 @@ describe("mountImageUploader", () => {
         expect(id).toBe("img-1");
         expect(payload.name).toBe("Logo");
         expect(payload.duration_ms).toBe(8000);
-        // png_base64 is null — operator didn't re-pick a file.
-        expect(payload.png_base64).toBeNull();
+        // image_base64 is null — operator didn't re-pick a file.
+        expect(payload.image_base64).toBeNull();
 
         window.Image = RealImage;
     });

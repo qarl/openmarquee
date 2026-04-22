@@ -64,11 +64,10 @@ test("sidebar nav defaults to Text and routes through every section on click", a
     await expect(page.locator(".field-display-width")).toHaveValue("128");
 });
 
-test("ffmpeg.wasm spike page renders both pipeline buttons + the file picker", async ({ page }) => {
+test("ffmpeg.wasm spike page renders the H.264 button + the file picker", async ({ page }) => {
     await page.goto("/spike.html");
     await expect(page).toHaveTitle(/ffmpeg\.wasm spike/);
     await expect(page.locator("#run-h264")).toBeVisible();
-    await expect(page.locator("#run-rgb")).toBeVisible();
     await expect(page.locator("#source-file")).toBeVisible();
     // Initial status line says "ready." after boot() fires.
     await expect(page.locator("#spike-status")).toContainText("ready");

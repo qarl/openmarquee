@@ -28,8 +28,9 @@ export async function saveTextSlide(payload) {
 }
 
 /**
- * Upload an image slide. `payload`: name, duration_ms, png_base64 (the
- * already-scaled PNG — browser does the scaling, backend just stores).
+ * Upload an image slide. `payload`: name, duration_ms, image_base64
+ * (the operator's source PNG/JPG bytes verbatim — backend keeps full
+ * resolution, playback cover-fits to panel dims at slide entry).
  */
 export async function saveImage(payload) {
     const response = await fetch("/api/content/images", {
@@ -45,8 +46,8 @@ export async function saveImage(payload) {
 }
 
 /**
- * Upload a video. `payload`: name, duration_ms, pipeline, transition,
- * png_base64 (thumbnail), mp4_base64 (MP4 H.264 bytes).
+ * Upload a video. `payload`: name, duration_ms, transition, png_base64
+ * (thumbnail), mp4_base64 (H.264 MP4 bytes, ≤ 1080p).
  */
 export async function saveVideo(payload) {
     const response = await fetch("/api/content/videos", {

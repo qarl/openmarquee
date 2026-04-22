@@ -14,20 +14,11 @@
 
 import Sortable from "sortablejs";
 
-const PANEL_OUTPUT_MODES = new Set(["hub75", "ws281x", "composite"]);
-
-/**
- * Map a device output mode to the VideoSlide.pipeline value that's
- * playable on it. Mirror of backend openmarquee.settings.pipeline_for_output_mode
- * so the UI can flag mode-locked slides without a server round-trip.
- */
-function pipelineForOutputMode(outputMode) {
-    return PANEL_OUTPUT_MODES.has(outputMode) ? "raw_frames" : "h264_mp4";
-}
-
-function isModeLockedVideo(item, outputMode) {
-    if (!item || item.type !== "video" || !outputMode) return false;
-    return item.pipeline !== pipelineForOutputMode(outputMode);
+// Mode-locking went away when videos became resolution-independent H.264
+// MP4s that every renderer can consume. Keep the signature so existing
+// callers don't explode; always return false.
+function isModeLockedVideo() {
+    return false;
 }
 
 const TEMPLATE = `
@@ -208,13 +199,10 @@ export function mountPlaylistTrack(container, options) {
                   }));
 
             trackEl.innerHTML = "";
-            let lockedInTrackCount = 0;
             for (const entry of defaultEntries) {
                 const item = itemById.get(entry.item_id);
                 if (!item) continue; // stale ref — skip
-                const locked = isModeLockedVideo(item, outputMode);
-                if (locked) lockedInTrackCount++;
-                trackEl.appendChild(renderTrackBlock(item, entry, { locked }));
+                trackEl.appendChild(renderTrackBlock(item, entry, { locked: false }));
             }
             // Wire × + transition buttons → mark dirty (no save until
             // the operator clicks Save playlist).
@@ -234,19 +222,7 @@ export function mountPlaylistTrack(container, options) {
 
             palletEl.innerHTML = "";
             for (const item of items) {
-                palletEl.appendChild(
-                    renderPalletTile(item, {
-                        locked: isModeLockedVideo(item, outputMode),
-                    }),
-                );
-            }
-
-            if (lockedInTrackCount > 0 && outputMode) {
-                const expected = pipelineForOutputMode(outputMode);
-                statusEl.textContent =
-                    `⚠ ${lockedInTrackCount} video${lockedInTrackCount === 1 ? "" : "s"} in this playlist ` +
-                    `won't play on this device (output mode: ${outputMode}, expects ${expected}). ` +
-                    `Re-upload after changing output mode to play them here.`;
+                palletEl.appendChild(renderPalletTile(item, { locked: false }));
             }
 
             if (trackSortable) trackSortable.destroy();

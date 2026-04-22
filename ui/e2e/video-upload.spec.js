@@ -62,18 +62,12 @@ test("video uploader transcodes a picked file via ffmpeg.wasm and enables Save",
     // Pick the fixture. The file-change handler kicks off the transcode.
     await page.locator(".video-upload .field-file").setInputFiles(FIXTURE);
 
-    // Transcode completion is signalled by the status line carrying the
-    // "ready." summary + the Save button flipping enabled. The verbose
-    // ffmpeg per-frame log lives in console.debug now, not in the DOM.
+    // Transcode completion: the status line carries "ready. {W}×{H} H.264
+    // MP4 · …" and the Save button flips enabled. The verbose ffmpeg
+    // per-frame log lives in console.debug now, not in the DOM.
     await expect(page.locator(".video-upload-status")).toContainText(
-        "transcoded to",
+        "H.264 MP4",
         { timeout: 90_000 },
     );
     await expect(saveBtn).toBeEnabled({ timeout: 90_000 });
-});
-
-test("panel-mode fallback banner is hidden on the default hdmi output_mode", async ({ page }) => {
-    await page.goto("/");
-    await page.locator('.nav-link[data-section="slides/video"]').click();
-    await expect(page.locator(".video-upload-panel-hint")).toBeHidden();
 });

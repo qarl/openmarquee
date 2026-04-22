@@ -128,7 +128,7 @@ describe("saveImage", () => {
             ok: true,
             json: async () => ({ id: "x", type: "image", name: "Logo" }),
         });
-        const result = await saveImage({ name: "Logo", png_base64: "FAKE" });
+        const result = await saveImage({ name: "Logo", image_base64: "FAKE" });
         expect(result).toEqual({ id: "x", type: "image", name: "Logo" });
         const [url, init] = fetchMock.mock.calls[0];
         expect(url).toBe("/api/content/images");

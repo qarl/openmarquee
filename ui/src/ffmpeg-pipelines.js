@@ -1,11 +1,10 @@
-// Shared ffmpeg.wasm plumbing + the two content-pipeline helpers.
+// Shared ffmpeg.wasm plumbing + the H.264 transcode helper.
 //
 // Consumers:
 //   - /spike.html (ui/src/spike.js) — maintainer-facing page that
-//     exercises both pipelines end-to-end with downloadable outputs.
-//   - Production video uploader (ui/src/video-upload.js) — graduates
-//     the H.264 re-encode path into the upload flow so operators get a
-//     device-sized MP4 every time, not whatever source they picked.
+//     exercises the pipeline end-to-end with a downloadable output.
+//   - Production video uploader (ui/src/video-upload.js) — transcodes
+//     operator uploads to H.264 MP4 at the Pi's 1080p decoder cap.
 //
 // COI / SAB note: `@ffmpeg/ffmpeg` v0.12+ supports single-threaded mode
 // without Cross-Origin-Isolation headers, so this runs on the captive-
@@ -115,44 +114,6 @@ export async function transcodeToH264(
     onProgress?.(100);
     const data = await ff.readFile(outName);
     // Best-effort cleanup — ffmpeg.wasm's virtual FS can accumulate.
-    try {
-        await ff.deleteFile(inName);
-        await ff.deleteFile(outName);
-    } catch {
-        // ignore
-    }
-    return data;
-}
-
-/**
- * Extract concatenated RGB888 frames at the target panel dims + FPS.
- * Format is the rawvideo `rgb24` pixel contract from SYSTEM_SPEC §7.6:
- * row-major, top-left first, three bytes per pixel (R, G, B). No header.
- *
- * @param {object} opts
- * @param {object} [hooks]
- * @param {(msg: string) => void} [hooks.onStatus]
- * @param {(pct: number) => void} [hooks.onProgress] — 0..100.
- * @returns {Uint8Array}
- */
-export async function extractRawFrames(
-    { file, width, height, fps },
-    { onStatus, onProgress } = {},
-) {
-    const ff = await getFfmpeg();
-    const inName = `input-${Date.now()}`;
-    const outName = `frames-${Date.now()}.rgb`;
-    await ff.writeFile(inName, await fetchFile(file));
-    onStatus?.("extracting raw RGB frames…");
-    await withProgressListener(ff, onProgress, () => ff.exec([
-        "-i", inName,
-        "-vf", `scale=${width}:${height},fps=${fps}`,
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        outName,
-    ]));
-    onProgress?.(100);
-    const data = await ff.readFile(outName);
     try {
         await ff.deleteFile(inName);
         await ff.deleteFile(outName);

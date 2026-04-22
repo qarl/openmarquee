@@ -1,6 +1,8 @@
-// Image upload: pick a file, preview-scale it to panel dimensions in the
-// browser, upload the PNG bytes. The backend only ever sees pre-scaled
-// bitmap data per SYSTEM_SPEC §5.1.
+// Image upload: pick a file, preview it in a panel-shaped canvas
+// (cover-fit), upload the SOURCE bytes verbatim. The backend keeps
+// the operator's full-resolution PNG/JPG and the playback engine
+// scales to panel dims at slide entry — so a panel resize never
+// degrades a stored asset.
 
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
@@ -76,39 +78,43 @@ export function mountImageUploader(
     const statusEl = container.querySelector(".image-upload-status");
 
     const state = {
-        // `hasImage` = canvas has a freshly-picked file's pixels drawn.
+        // The picked source file, kept around so submit can FileReader
+        // it as base64 — we no longer round-trip through Canvas, which
+        // would have downsampled to panel dims and re-encoded as PNG.
+        sourceFile: null,
         // `editingId` = non-null when the operator opened an existing slide
-        // for edit; Save goes to onSaveExisting(id, …) and can skip sending
-        // png_base64 when they never repicked a file.
-        hasImage: false,
+        // for edit; Save can skip sending image bytes when they never
+        // repicked a file.
         editingId: null,
     };
 
     function updateSaveEnabled() {
         // In edit mode, metadata-only saves are valid (no new file needed).
-        // In create mode, a freshly-picked image is required.
+        // In create mode, a freshly-picked source file is required.
         saveBtn.disabled =
-            (!state.editingId && !state.hasImage)
+            (!state.editingId && !state.sourceFile)
             || saveBtn.dataset.inFlight === "1";
     }
 
     fileEl.addEventListener("change", async () => {
         const file = fileEl.files?.[0];
         if (!file) {
-            state.hasImage = false;
+            state.sourceFile = null;
             if (!state.editingId) clearCanvas();
             updateSaveEnabled();
             return;
         }
         try {
+            // Preview is just visual feedback; the bytes we upload come
+            // straight from the source file (FileReader on submit).
             await drawFileToCanvas(file, canvas);
-            state.hasImage = true;
+            state.sourceFile = file;
             statusEl.textContent = "";
             if (nameEl.value === "Image") {
                 nameEl.value = file.name.replace(/\.[^.]+$/, "").slice(0, 200);
             }
         } catch (err) {
-            state.hasImage = false;
+            state.sourceFile = null;
             clearCanvas();
             statusEl.textContent = `Could not load image: ${err.message}`;
         } finally {
@@ -127,24 +133,24 @@ export function mountImageUploader(
         statusEl.textContent = "Saving…";
         try {
             const durationSeconds = Number(durationEl.value) || 5;
-            // Send png_base64 only when a new file was picked, or in create
-            // mode where it's always a fresh upload.
-            const png_base64 =
-                state.hasImage || !state.editingId
-                    ? canvasToBase64(canvas)
-                    : null;
+            // Send the source file's bytes verbatim when we have one;
+            // omit on metadata-only edits so the server keeps existing.
+            const image_base64 = state.sourceFile
+                ? await fileToBase64(state.sourceFile)
+                : null;
             const payload = {
                 name: nameEl.value || "Image",
                 duration_ms: Math.round(durationSeconds * 1000),
-                png_base64,
+                image_base64,
             };
             if (state.editingId && onSaveExisting) {
                 await onSaveExisting(state.editingId, payload);
                 statusEl.textContent = "Updated.";
             } else {
-                // Create-mode requires png_base64; strip the null case by
-                // calling with the canvas bytes.
-                payload.png_base64 = canvasToBase64(canvas);
+                // Create-mode requires image bytes; defensive guard.
+                if (!image_base64) {
+                    throw new Error("pick an image file first");
+                }
                 await onSave(payload);
                 statusEl.textContent = "Saved.";
             }
@@ -172,7 +178,7 @@ export function mountImageUploader(
         // Sync blank-state setup. Anything here can be safely
         // overridden by a loadForEdit that interleaves later.
         state.editingId = null;
-        state.hasImage = false;
+        state.sourceFile = null;
         headingEl.textContent = "Upload an image";
         newBtnEl.hidden = true;
         editHintEl.hidden = true;
@@ -213,7 +219,7 @@ export function mountImageUploader(
             return;
         }
         state.editingId = String(slide.id);
-        state.hasImage = false; // canvas has the existing bytes, not a new file
+        state.sourceFile = null; // existing bytes are server-side; no new file picked
         headingEl.textContent = `Editing: ${slide.name || "Untitled"}`;
         newBtnEl.hidden = false;
         editHintEl.hidden = false;
@@ -346,4 +352,25 @@ export function drawUrlToCanvas(url, canvas) {
 export function canvasToBase64(canvas) {
     const dataUrl = canvas.toDataURL("image/png");
     return dataUrl.split(",")[1];
+}
+
+/**
+ * Read `file` as a base64-encoded string (no data: prefix). Streams via
+ * FileReader so a 30MB JPEG doesn't hold an extra ArrayBuffer in memory.
+ */
+export function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = reader.result;
+            if (typeof result !== "string") {
+                reject(new Error("FileReader produced non-string result"));
+                return;
+            }
+            const comma = result.indexOf(",");
+            resolve(comma >= 0 ? result.slice(comma + 1) : result);
+        };
+        reader.onerror = () => reject(new Error("file read failed"));
+        reader.readAsDataURL(file);
+    });
 }

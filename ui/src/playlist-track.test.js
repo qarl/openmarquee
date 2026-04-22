@@ -284,66 +284,6 @@ describe("mountPlaylistTrack", () => {
         expect(Array.from(blocks).map((b) => b.dataset.id)).toEqual(["a", "b"]);
     });
 
-    it("badges mode-locked videos on both the pallet and the track", async () => {
-        const mixedVideos = [
-            { id: "v-mp4", name: "HDMI Promo", type: "video", pipeline: "h264_mp4", duration_ms: 5000 },
-            { id: "v-rgb", name: "Panel Promo", type: "video", pipeline: "raw_frames", duration_ms: 5000 },
-            { id: "still", name: "Logo", type: "image", duration_ms: 3000 },
-        ];
-        const container = document.createElement("div");
-        mountPlaylistTrack(container, {
-            fetchItems: async () => mixedVideos,
-            fetchPlaylists: fetchPlaylistsWith(["v-mp4", "v-rgb", "still"]),
-            onReorder: vi.fn(),
-            outputMode: "hub75",
-        });
-        await tick();
-
-        // Pallet: the h264 video is mode-locked (device expects raw_frames).
-        const palletMp4 = container.querySelector(
-            '.pallet-tile[data-id="v-mp4"]',
-        );
-        expect(palletMp4.classList.contains("pallet-tile--locked")).toBe(true);
-        expect(palletMp4.querySelector(".pallet-tile-lock")).not.toBeNull();
-
-        // The raw_frames video matches — no lock.
-        const palletRgb = container.querySelector(
-            '.pallet-tile[data-id="v-rgb"]',
-        );
-        expect(palletRgb.classList.contains("pallet-tile--locked")).toBe(false);
-
-        // Image slides are always mode-agnostic.
-        const palletStill = container.querySelector(
-            '.pallet-tile[data-id="still"]',
-        );
-        expect(palletStill.classList.contains("pallet-tile--locked")).toBe(
-            false,
-        );
-
-        // Track: the h264 block is locked; status bar warns about 1 video.
-        const blockMp4 = container.querySelector(
-            '.track-block[data-id="v-mp4"]',
-        );
-        expect(blockMp4.classList.contains("track-block--locked")).toBe(true);
-        expect(blockMp4.querySelector(".track-block-lock")).not.toBeNull();
-
-        expect(
-            container.querySelector(".playlist-track-status").textContent,
-        ).toMatch(/1 video.*won't play/);
-    });
-
-    it("omits the mode-lock badge when outputMode is not provided", async () => {
-        const container = document.createElement("div");
-        const items = [
-            { id: "v", name: "vid", type: "video", pipeline: "h264_mp4", duration_ms: 5000 },
-        ];
-        mountPlaylistTrack(container, {
-            fetchItems: async () => items,
-            fetchPlaylists: fetchPlaylistsWith([]),
-            onReorder: vi.fn(),
-        });
-        await tick();
-        const tile = container.querySelector('.pallet-tile[data-id="v"]');
-        expect(tile.classList.contains("pallet-tile--locked")).toBe(false);
-    });
+    // Mode-lock is gone: videos are now resolution-independent H.264 MP4s,
+    // so every renderer can consume them. No per-device pipeline branching.
 });

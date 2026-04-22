@@ -14,6 +14,12 @@
 
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
+// Fixed asset rasterize target. Decoupled from device W×H so a panel
+// resize never degrades a stored text slide — playback cover-fits the
+// 4K bitmap down to whatever the panel is.
+const RASTERIZE_W = 3840;
+const RASTERIZE_H = 2160;
+
 // Signage-friendly color presets. Per SYSTEM_SPEC §5.1: most users just want
 // "white on red" and to be done — not to fiddle with a color picker.
 const PRESETS = [
@@ -393,7 +399,12 @@ export function mountEditor(
         updateSaveEnabled();
         statusEl.textContent = "Saving…";
         try {
-            const png_base64 = canvasToBase64(canvas);
+            // Rasterize the asset at a fixed 4K target so the stored PNG
+            // is resolution-independent — playback cover-fits down to the
+            // current panel dims at slide entry. drawCanvas reads the
+            // canvas's own width/height, so the same scene draws cleanly
+            // at any size (font_size_pct is a fraction of canvas.width).
+            const png_base64 = rasterizeAtTarget(state);
             const durationSeconds = Number(durationEl.value) || 5;
             const payload = {
                 name: state.name || "Untitled",
@@ -664,4 +675,17 @@ export function pickFontSizePct() {
 export function canvasToBase64(canvas) {
     const dataUrl = canvas.toDataURL("image/png");
     return dataUrl.split(",")[1];
+}
+
+/**
+ * Render the editor scene onto a fresh offscreen 4K canvas and return
+ * its base64 PNG body. Decouples the saved asset from the on-screen
+ * preview canvas (which stays at panel dims for visual fidelity).
+ */
+export function rasterizeAtTarget(state) {
+    const off = document.createElement("canvas");
+    off.width = RASTERIZE_W;
+    off.height = RASTERIZE_H;
+    drawCanvas(off, state);
+    return canvasToBase64(off);
 }

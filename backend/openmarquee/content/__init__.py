@@ -142,24 +142,21 @@ class ImageSlide(BaseModel):
 class VideoSlide(BaseModel):
     """A user-uploaded video.
 
-    Today's contract: the browser uploads an MP4 (H.264) directly plus a
-    PNG thumbnail (typically the first frame). The backend stores both:
+    Storage layout:
 
-        <id>/asset.png   — thumbnail (used by the saved-slides list)
-        <id>/asset.mp4   — MP4 payload (HDMI renderer streams from here)
+        <id>/asset.png   — thumbnail (first frame, for saved-slides list)
+        <id>/asset.mp4   — H.264 in MP4 container, capped at 1080p.
 
-    The ffmpeg.wasm client-side pipeline (decode → scale → re-encode MP4
-    for HDMI, OR extract raw RGB frames for HUB75/WS2812B/composite) is
-    the follow-up. For now the browser passes through whatever MP4 the
-    user picked; if the source is too big for the Pi Zero 2 W's hardware
-    H.264 decoder, playback on HDMI will stutter and the operator will
-    learn to pre-encode. The spec accepts the rough edge — ffmpeg.wasm
-    transcoding lands when the HDMI renderer does.
+    The browser-side ffmpeg.wasm pipeline transcodes the operator's source
+    to H.264 at min(source, 1920×1080) — the Pi Zero 2 W's hardware
+    decoder tops out at 1080p30, so anything larger would fall to software
+    decode and stutter. The playback engine scales down further to the
+    current panel dims via ffmpeg's `-vf scale` filter inside the decode
+    pipeline (sws_scale, no Python in the per-frame loop).
 
-    `duration_ms` on a video is *informational*: the playback engine reads
-    the actual runtime from the file, and this field is just what the UI
-    renders in the saved-slides list. Keeping it present so the schema
-    looks like TextSlide/ImageSlide and a single ContentItem union works.
+    `duration_ms` is informational: the playback engine reads the actual
+    runtime from the file. Keeping it present so the schema parallels
+    TextSlide / ImageSlide and a single ContentItem union works.
     """
 
     type: Literal["video"] = "video"
@@ -167,50 +164,12 @@ class VideoSlide(BaseModel):
     name: str = Field(max_length=200)
     duration_ms: int = Field(default=5000, ge=100)
 
-    # "h264_mp4" stores an `asset.mp4` (H.264 in an MP4 container) — the
-    # HDMI path; relies on the Pi's hardware decoder. "raw_frames" stores
-    # an `asset.rgb` (concatenated RGB888 frames, no header) — the panel
-    # path for HUB75 / WS2812B / composite where the renderer wants pre-
-    # decoded pixel data. Picked at upload time from the device's current
-    # output_mode.
-    pipeline: Literal["h264_mp4", "raw_frames"] = "h264_mp4"
-
-    # Only populated when pipeline == "raw_frames". The .rgb stream has
-    # no header, so the frame dims + fps must travel with the metadata
-    # for the renderer to know how to chunk + pace the playback.
-    frames_fps: int | None = Field(default=None, ge=1, le=120)
-    frames_width: int | None = Field(default=None, ge=1, le=4096)
-    frames_height: int | None = Field(default=None, ge=1, le=4096)
-
     # Same transition contract as TextSlide/ImageSlide — applied on the way
     # out, so a cut/fade into the next slide still works across variants.
     transition: Literal["cut", "fade"] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
-
-    @model_validator(mode="after")
-    def _frames_metadata_matches_pipeline(self) -> "VideoSlide":
-        """raw_frames requires all three of fps/width/height; h264_mp4
-        rejects any of them. Keeps on-disk metadata unambiguous about
-        which renderer path is in play."""
-        is_raw = self.pipeline == "raw_frames"
-        has_any = any(
-            v is not None for v in (self.frames_fps, self.frames_width, self.frames_height)
-        )
-        has_all = all(
-            v is not None for v in (self.frames_fps, self.frames_width, self.frames_height)
-        )
-        if is_raw and not has_all:
-            raise ValueError(
-                "raw_frames pipeline requires frames_fps, frames_width, "
-                "and frames_height"
-            )
-        if not is_raw and has_any:
-            raise ValueError(
-                "frames_* metadata is only valid when pipeline='raw_frames'"
-            )
-        return self
 
 
 # Discriminated union of content variants. Pydantic uses the `type` literal to

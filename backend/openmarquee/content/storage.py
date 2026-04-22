@@ -34,7 +34,6 @@ SCHEMA_VERSION = 1
 _ENVELOPE_FILENAME = "item.json"
 _ASSET_FILENAME = "asset.png"
 _VIDEO_FILENAME = "asset.mp4"
-_FRAMES_FILENAME = "asset.rgb"
 
 # Pydantic adapter for the discriminated ContentItem union; routes to the
 # right subclass on deserialize based on the `type` literal.
@@ -109,37 +108,6 @@ class ContentStorage:
         path = self.video_path(item_id)
         if not path.exists():
             raise FileNotFoundError(f"no video at {path}")
-        return path.read_bytes()
-
-    def save_video_raw_frames(
-        self, video: VideoSlide, thumbnail_png: bytes, frames_rgb: bytes
-    ) -> None:
-        """Persist a raw_frames VideoSlide: thumbnail PNG (UI lists) +
-        concatenated RGB888 bytes (`asset.rgb`, no header).
-
-        Same transactional contract as save_video: envelope + thumbnail +
-        frames are torn down together on failure so list_all() never
-        surfaces an item whose asset.rgb is absent.
-        """
-        item_dir = self.root / str(video.id)
-        preexisting = item_dir.exists()
-        try:
-            self.save(video, thumbnail_png)
-            self._atomic_write_bytes(item_dir / _FRAMES_FILENAME, frames_rgb)
-        except Exception:
-            if not preexisting and item_dir.exists():
-                shutil.rmtree(item_dir, ignore_errors=True)
-            raise
-
-    def frames_path(self, item_id: UUID) -> Path:
-        """Filesystem path to an item's raw-frames payload (no IO)."""
-        return self.root / str(item_id) / _FRAMES_FILENAME
-
-    def read_video_raw_frames(self, item_id: UUID) -> bytes:
-        """Read the raw RGB888 frames. Raises FileNotFoundError if absent."""
-        path = self.frames_path(item_id)
-        if not path.exists():
-            raise FileNotFoundError(f"no raw frames at {path}")
         return path.read_bytes()
 
     # --- reads ---

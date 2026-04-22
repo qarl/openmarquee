@@ -40,6 +40,29 @@ def _remove_from_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
     playlist_storage.save(playlist)
 
 
+def _decode_image_payload(b64: str) -> bytes:
+    """Decode a base64 image payload (PNG or JPG) and verify it's
+    structurally an image. Bytes are returned verbatim — the storage
+    layer keeps whichever format the operator uploaded, and the
+    playback renderer's Pillow open handles either.
+    """
+    try:
+        data = base64.b64decode(b64, validate=True)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"image_base64 is not valid base64: {exc}"
+        ) from exc
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+    except (UnidentifiedImageError, Exception) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"image_base64 decoded but isn't a valid image: {exc}",
+        ) from exc
+    return data
+
+
 def _decode_png_payload(b64: str) -> bytes:
     """Decode a base64 string and confirm it's actually a PNG.
 
@@ -188,84 +211,31 @@ def _decode_mp4_payload(b64: str) -> bytes:
 class VideoUpload(BaseModel):
     """Wire format for POST /api/content/videos.
 
-    Two pipeline variants share this shape:
-
-    - `pipeline="h264_mp4"` (HDMI path): set `mp4_base64`. The Pi's
-      hardware H.264 decoder plays it directly.
-    - `pipeline="raw_frames"` (HUB75 / WS2812B / composite): set
-      `raw_frames_base64` plus `frames_fps` / `frames_width` /
-      `frames_height`. The panel renderer slices the stream into
-      fixed-size RGB888 frames and paces playback at frames_fps.
-
-    Exactly one of mp4_base64 / raw_frames_base64 must be set, matching
-    the chosen pipeline. Always also send `png_base64` — the thumbnail
-    is used by the saved-slides list for both variants.
+    Always H.264 in MP4. Browser-side ffmpeg.wasm caps the transcode at
+    min(source, 1920×1080) to stay inside the Pi Zero 2 W's hardware
+    H.264 decoder envelope; playback further scales down to the current
+    panel dims via ffmpeg's filter graph at decode time.
     """
 
     name: str
     duration_ms: int = 5000
-    pipeline: str = "h264_mp4"
     transition: str = "cut"
     transition_ms: int = 500
     png_base64: str = Field(description="Thumbnail PNG (first frame).")
-    mp4_base64: str | None = None
-    raw_frames_base64: str | None = None
-    frames_fps: int | None = None
-    frames_width: int | None = None
-    frames_height: int | None = None
+    mp4_base64: str = Field(description="H.264 MP4 bytes, ≤ 1080p.")
 
 
 class VideoUpdate(BaseModel):
     """Wire format for PUT /api/content/videos/{id}.
 
-    Asset bodies (png_base64 / mp4_base64 / raw_frames_base64) are
-    optional: omit to keep existing bytes. Metadata always updates.
-    Pipeline switch (mp4 ↔ raw_frames) is allowed only if new asset
-    bytes for the target pipeline are provided; otherwise 422.
+    Asset bodies (png_base64 / mp4_base64) are optional: omit to keep
+    existing bytes. Metadata always updates.
     """
 
     name: str
     duration_ms: int = 5000
-    pipeline: str = "h264_mp4"
     png_base64: str | None = None
     mp4_base64: str | None = None
-    raw_frames_base64: str | None = None
-    frames_fps: int | None = None
-    frames_width: int | None = None
-    frames_height: int | None = None
-
-
-def _decode_raw_frames_payload(
-    b64: str, fps: int | None, width: int | None, height: int | None
-) -> bytes:
-    """Decode + size-check a raw_frames upload.
-
-    The stream is headerless concatenated RGB888 (3 bytes per pixel).
-    We require len(bytes) % (width*height*3) == 0 so the renderer can
-    slice it into whole frames without a trailing partial.
-    """
-    if fps is None or width is None or height is None:
-        raise HTTPException(
-            status_code=422,
-            detail="raw_frames pipeline requires frames_fps, frames_width, frames_height",
-        )
-    try:
-        data = base64.b64decode(b64, validate=True)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"raw_frames_base64 is not valid base64: {exc}",
-        ) from exc
-    frame_bytes = width * height * 3
-    if len(data) == 0 or len(data) % frame_bytes != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"raw_frames byte count {len(data)} is not a multiple of "
-                f"frame size {frame_bytes} ({width}×{height}×3)"
-            ),
-        )
-    return data
 
 
 @router.post("/videos", response_model=VideoSlide)
@@ -275,63 +245,14 @@ async def upload_video(
     playlist_storage: PlaylistDep,
 ) -> VideoSlide:
     thumbnail = _decode_png_payload(payload.png_base64)
-
-    if payload.pipeline == "raw_frames":
-        if payload.mp4_base64 is not None:
-            raise HTTPException(
-                status_code=422,
-                detail="pipeline='raw_frames' rejects mp4_base64 — set raw_frames_base64 instead",
-            )
-        if payload.raw_frames_base64 is None:
-            raise HTTPException(
-                status_code=422,
-                detail="pipeline='raw_frames' requires raw_frames_base64",
-            )
-        frames = _decode_raw_frames_payload(
-            payload.raw_frames_base64,
-            payload.frames_fps,
-            payload.frames_width,
-            payload.frames_height,
+    mp4 = _decode_mp4_payload(payload.mp4_base64)
+    try:
+        video = VideoSlide(
+            **payload.model_dump(exclude={"png_base64", "mp4_base64"})
         )
-        try:
-            video = VideoSlide(
-                **payload.model_dump(
-                    exclude={"png_base64", "mp4_base64", "raw_frames_base64"}
-                )
-            )
-        except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=exc.errors()) from exc
-        storage.save_video_raw_frames(video, thumbnail, frames)
-    else:
-        if payload.raw_frames_base64 is not None:
-            raise HTTPException(
-                status_code=422,
-                detail="pipeline='h264_mp4' rejects raw_frames_base64 — set mp4_base64 instead",
-            )
-        if payload.mp4_base64 is None:
-            raise HTTPException(
-                status_code=422,
-                detail="pipeline='h264_mp4' requires mp4_base64",
-            )
-        if any(
-            v is not None
-            for v in (payload.frames_fps, payload.frames_width, payload.frames_height)
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="frames_* metadata is only valid when pipeline='raw_frames'",
-            )
-        mp4 = _decode_mp4_payload(payload.mp4_base64)
-        try:
-            video = VideoSlide(
-                **payload.model_dump(
-                    exclude={"png_base64", "mp4_base64", "raw_frames_base64"}
-                )
-            )
-        except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=exc.errors()) from exc
-        storage.save_video(video, thumbnail, mp4)
-
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    storage.save_video(video, thumbnail, mp4)
     _append_to_playlist(playlist_storage, video.id)
     return video
 
@@ -339,16 +260,19 @@ async def upload_video(
 class ImageUpload(BaseModel):
     """Wire format for POST /api/content/images.
 
-    The browser scales the source JPG/PNG to the sign's native resolution via
-    Canvas and encodes the result as PNG. We only ever see pre-scaled bitmap
-    data, so the backend doesn't need to know the source format.
+    The browser uploads the operator's SOURCE bytes (PNG/JPG/etc) verbatim
+    — no Canvas-scaling round-trip. We keep the file at its full original
+    resolution; the playback engine cover-fits to panel dims on slide entry,
+    so a panel resize never degrades the stored asset.
     """
 
     name: str
     duration_ms: int = 5000
     transition: str = "cut"
     transition_ms: int = 500
-    png_base64: str = Field(description="Base64-encoded PNG of the scaled image.")
+    image_base64: str = Field(
+        description="Base64-encoded source image (PNG or JPG, verbatim)."
+    )
 
 
 @router.post("/images", response_model=ImageSlide)
@@ -357,14 +281,14 @@ async def upload_image(
     storage: StorageDep,
     playlist_storage: PlaylistDep,
 ) -> ImageSlide:
-    png = _decode_png_payload(payload.png_base64)
+    image_bytes = _decode_image_payload(payload.image_base64)
 
     try:
-        image = ImageSlide(**payload.model_dump(exclude={"png_base64"}))
+        image = ImageSlide(**payload.model_dump(exclude={"image_base64"}))
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
-    storage.save_image(image, png)
+    storage.save_image(image, image_bytes)
     _append_to_playlist(playlist_storage, image.id)
     return image
 
@@ -372,15 +296,15 @@ async def upload_image(
 class ImageUpdate(BaseModel):
     """Wire format for PUT /api/content/images/{id}.
 
-    `png_base64` is optional: omit to keep the existing image bytes and
-    update just the metadata (name / duration). Pass a new PNG to replace
-    the stored asset in place — the UUID stays the same so playlist +
+    `image_base64` is optional: omit to keep existing bytes and update
+    only metadata (name / duration). Pass new source bytes to replace
+    the stored asset in place; the UUID stays the same so playlist +
     schedule references are preserved.
     """
 
     name: str
     duration_ms: int = 5000
-    png_base64: str | None = None
+    image_base64: str | None = None
 
 
 @router.put("/images/{item_id}", response_model=ImageSlide)
@@ -409,13 +333,13 @@ async def update_image(
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
-    # If the client didn't re-upload the image, keep the existing bytes.
-    png = (
-        _decode_png_payload(payload.png_base64)
-        if payload.png_base64
+    # No new bytes → keep the existing asset on disk untouched.
+    image_bytes = (
+        _decode_image_payload(payload.image_base64)
+        if payload.image_base64
         else storage.read_asset(item_id)
     )
-    storage.save_image(updated, png)
+    storage.save_image(updated, image_bytes)
     return updated
 
 
@@ -468,38 +392,12 @@ async def update_video(
             detail=f"{item_id} is a {existing.type}, not a video",
         )
 
-    # Pipeline-switch guard: switching h264_mp4 ↔ raw_frames without new
-    # asset bytes for the target pipeline would orphan the old asset
-    # and leave the new one empty. Require the operator to re-upload.
-    pipeline_switching = payload.pipeline != existing.pipeline
-    if pipeline_switching:
-        if payload.pipeline == "raw_frames" and payload.raw_frames_base64 is None:
-            raise HTTPException(
-                status_code=422,
-                detail="switching to raw_frames requires raw_frames_base64",
-            )
-        if payload.pipeline == "h264_mp4" and payload.mp4_base64 is None:
-            raise HTTPException(
-                status_code=422,
-                detail="switching to h264_mp4 requires mp4_base64",
-            )
-
     try:
         updated = VideoSlide(
             id=item_id,
             created_at=existing.created_at,
             name=payload.name,
             duration_ms=payload.duration_ms,
-            pipeline=payload.pipeline,
-            frames_fps=payload.frames_fps
-            if payload.pipeline == "raw_frames"
-            else None,
-            frames_width=payload.frames_width
-            if payload.pipeline == "raw_frames"
-            else None,
-            frames_height=payload.frames_height
-            if payload.pipeline == "raw_frames"
-            else None,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -511,26 +409,12 @@ async def update_video(
         if payload.png_base64
         else storage.read_asset(item_id)
     )
-
-    if updated.pipeline == "raw_frames":
-        frames = (
-            _decode_raw_frames_payload(
-                payload.raw_frames_base64,
-                payload.frames_fps,
-                payload.frames_width,
-                payload.frames_height,
-            )
-            if payload.raw_frames_base64
-            else storage.read_video_raw_frames(item_id)
-        )
-        storage.save_video_raw_frames(updated, thumbnail, frames)
-    else:
-        mp4 = (
-            _decode_mp4_payload(payload.mp4_base64)
-            if payload.mp4_base64
-            else storage.read_video(item_id)
-        )
-        storage.save_video(updated, thumbnail, mp4)
+    mp4 = (
+        _decode_mp4_payload(payload.mp4_base64)
+        if payload.mp4_base64
+        else storage.read_video(item_id)
+    )
+    storage.save_video(updated, thumbnail, mp4)
     return updated
 
 
@@ -548,27 +432,6 @@ async def get_video(item_id: UUID, storage: StorageDep) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no video for {item_id}")
     return FileResponse(path, media_type="video/mp4")
-
-
-@router.get(
-    "/{item_id}/frames",
-    response_class=FileResponse,
-    responses={
-        200: {"content": {"application/octet-stream": {}}},
-        404: {"description": "No raw frames for that id."},
-    },
-)
-async def get_frames(item_id: UUID, storage: StorageDep) -> FileResponse:
-    """Serve a raw_frames VideoSlide's concatenated RGB888 bytes.
-
-    Headerless — dimensions + fps come from the VideoSlide metadata via
-    /api/content/{id}. Panel renderers (HUB75 / WS2812B / composite)
-    stream from this endpoint.
-    """
-    path = storage.frames_path(item_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"no raw frames for {item_id}")
-    return FileResponse(path, media_type="application/octet-stream")
 
 
 @router.delete("/{item_id}", status_code=204)

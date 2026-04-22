@@ -64,7 +64,6 @@ class PlaybackLoop:
         fetch_items: Callable[[], list[ContentItem]],
         read_asset: Callable[[UUID], bytes],
         empty_playlist_poll_seconds: float = 1.0,
-        get_expected_video_pipeline: Callable[[], str | None] | None = None,
         get_timezone: Callable[[], str | None] | None = None,
         auto_tick_seconds: float = 1.0,
     ):
@@ -72,13 +71,6 @@ class PlaybackLoop:
         self._fetch_items = fetch_items
         self._read_asset = read_asset
         self._empty_poll = empty_playlist_poll_seconds
-        # Returns the pipeline that this device's output_mode expects
-        # for VideoSlides ("h264_mp4" or "raw_frames"). A mismatched
-        # slide gets skipped inside _loop with a clear log line — the
-        # thumbnail still renders in the UI pallet so the operator sees
-        # it's there, but it won't play. Returning None means "don't
-        # check" (used in tests + any non-device environment).
-        self._get_expected_pipeline = get_expected_video_pipeline or (lambda: None)
         # Returns an IANA timezone name (e.g. "America/Los_Angeles") so
         # auto-mode text slides render in the operator-configured zone.
         # Returning None falls back to UTC. Tests inject a fixed value
@@ -95,11 +87,6 @@ class PlaybackLoop:
         # whether to render a <video> or a <img> without a second round
         # trip to /api/content/{id}.
         self._current_type: str | None = None
-        # For VideoSlide items, which pipeline variant they are —
-        # "h264_mp4" vs "raw_frames". The preview uses this to pick
-        # the right asset endpoint (the raw_frames path has no <video>
-        # equivalent, so the preview shows the thumbnail).
-        self._current_pipeline: str | None = None
         # The outgoing transition + transition_ms (set by the PlaylistItem
         # the loop is currently rendering). The live preview stashes the
         # most recent non-null values so that when current_item_id changes,
@@ -129,10 +116,6 @@ class PlaybackLoop:
     @property
     def current_item_type(self) -> str | None:
         return self._current_type
-
-    @property
-    def current_item_pipeline(self) -> str | None:
-        return self._current_pipeline
 
     @property
     def current_item_transition(self) -> str | None:
@@ -175,7 +158,6 @@ class PlaybackLoop:
             self._stop_event = None
             self._current_id = None
             self._current_type = None
-            self._current_pipeline = None
             self._current_transition = None
             self._current_transition_ms = None
             self._current_auto_mode = None
@@ -194,7 +176,6 @@ class PlaybackLoop:
             if not items:
                 self._current_id = None
                 self._current_type = None
-                self._current_pipeline = None
                 self._current_transition = None
                 self._current_transition_ms = None
                 self._current_auto_mode = None
@@ -209,29 +190,8 @@ class PlaybackLoop:
                 if self._stop_event.is_set():
                     break
 
-                # Mode-lock: a VideoSlide stored for h264_mp4 won't play
-                # on a panel renderer (no .rgb asset), and vice versa.
-                # Skip + log so the playlist advances cleanly — the
-                # operator's UI surfaces the same warning at the pallet
-                # + track tile level.
-                if item.type == "video":
-                    expected = self._get_expected_pipeline()
-                    if expected is not None and item.pipeline != expected:
-                        log.warning(
-                            "playback: skipping video %s — stored for %s "
-                            "but device expects %s (re-upload after the "
-                            "output_mode change to play it here)",
-                            item.id,
-                            item.pipeline,
-                            expected,
-                        )
-                        continue
-
                 self._current_id = item.id
                 self._current_type = item.type
-                self._current_pipeline = (
-                    getattr(item, "pipeline", None) if item.type == "video" else None
-                )
                 self._current_transition = item.transition
                 self._current_transition_ms = item.transition_ms
                 self._current_auto_mode = (
@@ -348,11 +308,10 @@ class PlaybackLoop:
             log.warning("playback: corrupt asset for %s, skipping", item.id)
             return None
 
-        if image.size != (self._renderer.width, self._renderer.height):
-            image = image.resize(
-                (self._renderer.width, self._renderer.height),
-                resample=Image.Resampling.NEAREST,
-            )
+        target_w = self._renderer.width
+        target_h = self._renderer.height
+        if image.size != (target_w, target_h):
+            image = _cover_fit(image, target_w, target_h)
         return image
 
     def _render_image(self, image: Image.Image) -> None:
@@ -429,3 +388,24 @@ def scheduled_fetch_items(
     if loop is not None:
         loop._stamp_playlist_name(active_name)
     return list_in_playlist_order(content_storage, playlist_storage, active_name)
+
+
+def _cover_fit(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Scale `image` to cover (`target_w`, `target_h`) and center-crop.
+
+    Preserves the source aspect — the larger dimension is resized up or
+    down to exactly match the target, and the overflow on the other axis
+    is cropped evenly on both sides. Mirrors the browser-side editor
+    previews so what the operator sees IS what the device renders.
+    """
+    src_w, src_h = image.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w = max(1, round(src_w * scale))
+    new_h = max(1, round(src_h * scale))
+    # LANCZOS is the slower-but-sharper resample; for a one-shot render
+    # at slide entry the ~10-15ms cost on a Pi Zero 2 W is invisible
+    # behind the transition.
+    resized = image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))

@@ -1,8 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-    bytesToBase64,
-    drawFirstRgbFrameToCanvas,
     fileToBase64,
     mountVideoUploader,
 } from "./video-upload.js";
@@ -44,30 +42,6 @@ describe("mountVideoUploader", () => {
         // Pipeline dropdown is gone — the uploader always transcodes to
         // H.264 via ffmpeg.wasm now.
         expect(container.querySelector(".field-pipeline")).toBeNull();
-    });
-
-    it("shows the correct mode-lock hint for outputMode (panel vs HDMI)", async () => {
-        const hdmi = document.createElement("div");
-        mountVideoUploader(hdmi, {
-            width: 128,
-            height: 96,
-            outputMode: "hdmi",
-            onSave: vi.fn(),
-        });
-        await tick();
-        expect(hdmi.querySelector(".video-upload-panel-hint").hidden).toBe(true);
-        expect(hdmi.querySelector(".video-upload-hdmi-hint").hidden).toBe(false);
-
-        const hub75 = document.createElement("div");
-        mountVideoUploader(hub75, {
-            width: 128,
-            height: 96,
-            outputMode: "hub75",
-            onSave: vi.fn(),
-        });
-        await tick();
-        expect(hub75.querySelector(".video-upload-panel-hint").hidden).toBe(false);
-        expect(hub75.querySelector(".video-upload-hdmi-hint").hidden).toBe(true);
     });
 
     it("loadForEdit pre-fills + allows metadata-only save (no new file)", async () => {
@@ -153,61 +127,3 @@ describe("fileToBase64", () => {
     });
 });
 
-describe("bytesToBase64", () => {
-    it("matches btoa for short inputs", () => {
-        expect(bytesToBase64(new Uint8Array([1, 2, 3, 4]))).toBe("AQIDBA==");
-    });
-
-    it("handles sizes larger than the 32KB chunk boundary", () => {
-        // Two chunks + a tail — exercises the chunk-boundary math.
-        const bytes = new Uint8Array(0x8000 * 2 + 17);
-        for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
-        const encoded = bytesToBase64(bytes);
-        // Round-trip: decode back and compare byte-for-byte.
-        const decoded = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
-        expect(decoded.length).toBe(bytes.length);
-        expect(decoded[0]).toBe(0);
-        expect(decoded[bytes.length - 1]).toBe(bytes[bytes.length - 1]);
-    });
-});
-
-describe("drawFirstRgbFrameToCanvas", () => {
-    it("throws when the buffer is too small for one frame", () => {
-        const canvas = document.createElement("canvas");
-        canvas.width = 2;
-        canvas.height = 2;
-        // Need 2*2*3 = 12 bytes; provide 11.
-        const bytes = new Uint8Array(11);
-        expect(() => drawFirstRgbFrameToCanvas(bytes, 2, 2, canvas)).toThrow(
-            /raw frame buffer too small/,
-        );
-    });
-
-    it("maps RGB triples onto RGBA canvas pixels with full alpha", () => {
-        const putImageDataCalls = [];
-        const fakeImageData = { data: new Uint8ClampedArray(16) };
-        const ctx = {
-            createImageData: (w, h) => {
-                fakeImageData.data = new Uint8ClampedArray(w * h * 4);
-                return fakeImageData;
-            },
-            putImageData: (...args) => putImageDataCalls.push(args),
-        };
-        const canvas = { getContext: () => ctx, width: 2, height: 2 };
-        const bytes = new Uint8Array([
-            10, 20, 30,   // pixel 0: R G B
-            40, 50, 60,   // pixel 1
-            70, 80, 90,   // pixel 2
-            100, 110, 120, // pixel 3
-        ]);
-        drawFirstRgbFrameToCanvas(bytes, 2, 2, canvas);
-        expect(putImageDataCalls).toHaveLength(1);
-        const data = fakeImageData.data;
-        // Pixel 0 → RGBA
-        expect([data[0], data[1], data[2], data[3]]).toEqual([10, 20, 30, 255]);
-        // Pixel 3 (last)
-        expect([data[12], data[13], data[14], data[15]]).toEqual([
-            100, 110, 120, 255,
-        ]);
-    });
-});

@@ -37,23 +37,16 @@
             <div class="row">
                 <label class="field">
                     <span>Target width</span>
-                    <input type="number" id="target-width" value="128" min="1" max="4096">
+                    <input type="number" id="target-width" value="1920" min="1" max="4096">
                 </label>
                 <label class="field">
                     <span>Target height</span>
-                    <input type="number" id="target-height" value="96" min="1" max="4096">
-                </label>
-                <label class="field">
-                    <span>Frames per second (raw-frames only)</span>
-                    <input type="number" id="target-fps" value="10" min="1" max="60">
+                    <input type="number" id="target-height" value="1080" min="1" max="4096">
                 </label>
             </div>
             <div class="row">
                 <button type="button" class="primary" id="run-h264">
-                    Re-encode → H.264 MP4 (HDMI pipeline)
-                </button>
-                <button type="button" class="primary" id="run-rgb">
-                    Extract raw RGB frames (panel pipeline)
+                    Re-encode → H.264 MP4
                 </button>
             </div>
             <p id="spike-status" role="status" aria-live="polite"></p>
