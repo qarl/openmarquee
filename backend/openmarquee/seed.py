@@ -104,10 +104,23 @@ def _default_bundled_backgrounds_dir() -> Path:
     return Path(__file__).resolve().parent / "seed_assets" / "backgrounds"
 
 
+def _default_bundled_videos_dir() -> Path:
+    """Default location of curated demo videos shipped in the Python
+    package. Each .mp4 is paired with a {stem}.png thumbnail — both are
+    copied verbatim into storage (no transcode at boot)."""
+    return Path(__file__).resolve().parent / "seed_assets" / "videos"
+
+
+def _title_from_filename(stem: str) -> str:
+    """'happy-hour' → 'Happy Hour'; 'up-to-70-off' → 'Up To 70 Off'."""
+    words = [w.capitalize() for w in stem.replace("_", "-").split("-") if w]
+    return " ".join(words)
+
+
 def _name_from_filename(stem: str) -> str:
     """'brick-wall' → 'Background — Brick Wall'."""
-    words = [w.capitalize() for w in stem.replace("_", "-").split("-") if w]
-    return "Background — " + " ".join(words) if words else "Background"
+    title = _title_from_filename(stem)
+    return "Background — " + title if title else "Background"
 
 
 def seed_if_needed(
@@ -118,6 +131,7 @@ def seed_if_needed(
     height: int,
     demo_video_path: Path | None = None,
     bundled_backgrounds_dir: Path | None = None,
+    bundled_videos_dir: Path | None = None,
 ) -> list:
     """Run the first-boot seed if appropriate; return the list of items
     that were created (empty if the call was a no-op).
@@ -169,8 +183,18 @@ def seed_if_needed(
                 storage.save_image(slide, png)
                 created.append(slide)
 
-        # 2. Demo video: optional, best-effort, also NOT auto-appended
-        #    (operator drags it into the playlist when they want it).
+        # 2. Bundled videos: scan seed_assets/videos/ for {name}.mp4 paired
+        #    with {name}.png (thumbnail). Each pair becomes a VideoSlide;
+        #    none of them are auto-appended to the playlist.
+        videos_dir = (
+            bundled_videos_dir
+            if bundled_videos_dir is not None
+            else _default_bundled_videos_dir()
+        )
+        created.extend(_seed_bundled_videos(storage, videos_dir))
+
+        # 2b. Legacy single-file demo slot — retained for out-of-band
+        #     drops via OPENMARQUEE_DEMO_VIDEO_PATH. Skipped when absent.
         demo = _seed_demo_video_if_available(storage, demo_video_path, width, height)
         if demo is not None:
             created.append(demo)
@@ -243,6 +267,51 @@ def _seed_bundled_backgrounds(
             continue
         slide = ImageSlide(name=_name_from_filename(path.stem), duration_ms=5000)
         storage.save_image(slide, raw)
+        created.append(slide)
+    return created
+
+
+def _seed_bundled_videos(
+    storage: ContentStorage, directory: Path
+) -> list[VideoSlide]:
+    """Register each {name}.mp4 / {name}.png pair under `directory` as
+    a VideoSlide, bytes copied verbatim.
+
+    Missing thumbnail or missing MP4 = that pair is skipped with a
+    log line — a half-filled bundle shouldn't kill the rest of the
+    seed. Sorted so boot order is deterministic across devices.
+    """
+    if not directory.is_dir():
+        return []
+
+    created: list[VideoSlide] = []
+    mp4s = sorted(p for p in directory.iterdir() if p.suffix.lower() == ".mp4")
+    for mp4_path in mp4s:
+        png_path = mp4_path.with_suffix(".png")
+        if not png_path.exists():
+            logger.warning(
+                "seed: skipping %s — missing paired thumbnail %s",
+                mp4_path.name, png_path.name,
+            )
+            continue
+        try:
+            mp4_bytes = mp4_path.read_bytes()
+            thumbnail = png_path.read_bytes()
+            # Structural check — both must parse cleanly. An MP4 whose
+            # first-byte header is bad would otherwise reach the playback
+            # loop and crash ffmpeg; better to skip + log here.
+            if len(mp4_bytes) < 12 or mp4_bytes[4:8] != b"ftyp":
+                raise ValueError("not a valid MP4 (no ftyp box)")
+            with Image.open(BytesIO(thumbnail)) as probe:
+                probe.verify()
+        except Exception:
+            logger.exception("seed: skipping unreadable video %s", mp4_path)
+            continue
+        slide = VideoSlide(
+            name=_title_from_filename(mp4_path.stem) or "Video",
+            duration_ms=10_000,
+        )
+        storage.save_video(slide, thumbnail, mp4_bytes)
         created.append(slide)
     return created
 

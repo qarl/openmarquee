@@ -47,16 +47,22 @@ def empty_bundled_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def no_bundled_backgrounds_by_default(tmp_path: Path, monkeypatch):
-    """Hide the repo's committed seed_assets/backgrounds/ from every test by
-    default — otherwise test_seed_creates_starter_slides_when_fresh would
-    see 10 curated images rather than the Pillow-generated fallback it's
-    written for. Tests that want to exercise the bundled-backgrounds path
-    pass an explicit `bundled_backgrounds_dir=` to seed_if_needed."""
-    empty = tmp_path / "auto-empty-bundled"
-    empty.mkdir()
+def no_bundled_assets_by_default(tmp_path: Path, monkeypatch):
+    """Hide the repo's committed seed_assets/{backgrounds,videos}/ from
+    every test by default — otherwise the starter-slide tests would see
+    the curated pack rather than the Pillow-generated fallback they're
+    written for. Tests that want to exercise the bundled paths pass an
+    explicit `bundled_backgrounds_dir=` / `bundled_videos_dir=` to
+    seed_if_needed."""
+    empty_bg = tmp_path / "auto-empty-backgrounds"
+    empty_bg.mkdir()
+    empty_vid = tmp_path / "auto-empty-videos"
+    empty_vid.mkdir()
     monkeypatch.setattr(
-        "openmarquee.seed._default_bundled_backgrounds_dir", lambda: empty
+        "openmarquee.seed._default_bundled_backgrounds_dir", lambda: empty_bg
+    )
+    monkeypatch.setattr(
+        "openmarquee.seed._default_bundled_videos_dir", lambda: empty_vid
     )
 
 

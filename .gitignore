@@ -40,13 +40,15 @@ openmarquee-seeded.json
 .fuse_hidden*
 
 # Seeded assets:
-# - large operator-supplied binaries (demo.mp4, etc.) are NOT tracked
-# - curated background images ARE tracked (shipped with the repo)
+# - curated backgrounds + demo videos ARE tracked (shipped with the repo)
+# - any OTHER large operator drop (legacy demo.mp4, etc.) is NOT tracked
 backend/openmarquee/seed_assets/*
 !backend/openmarquee/seed_assets/.gitkeep
 !backend/openmarquee/seed_assets/README.md
 !backend/openmarquee/seed_assets/backgrounds/
 !backend/openmarquee/seed_assets/backgrounds/**
+!backend/openmarquee/seed_assets/videos/
+!backend/openmarquee/seed_assets/videos/**
 
 # Playwright
 playwright-report/
