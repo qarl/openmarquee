@@ -57,7 +57,9 @@ test("sidebar nav defaults to Text and routes through every section on click", a
 
     // Settings section renders an editable form hydrated from /api/settings.
     await page.locator('.nav-link[data-section="settings"]').click();
-    await expect(page.locator(".settings-heading")).toHaveText("System settings");
+    await expect(
+        page.locator('section.settings .subpage-title'),
+    ).toHaveText("System settings");
     await expect(page.locator(".field-output-mode")).toHaveValue("hdmi");
     await expect(page.locator(".field-display-width")).toHaveValue("128");
 });

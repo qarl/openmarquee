@@ -41,14 +41,11 @@ const ROTATION_OPTIONS = [
 
 const SECTION_TEMPLATE = `
     <section class="settings">
-        <h2 class="settings-heading">System settings</h2>
-        <p class="settings-hint">
-            Device-wide configuration. Some fields are stored now but
-            <em>take effect at a later phase</em> — hostapd (WiFi AP)
-            rewrites and the non-HDMI renderers land in subsequent
-            commits; changing those values today persists the value and
-            will be honored when the wiring arrives.
-        </p>
+        <h2 class="subpage-title">System settings</h2>
+        <div class="schedule-now" data-field="now">
+            <span class="schedule-now-label">Device time</span>
+            <span class="schedule-now-value" data-field="now-value">—</span>
+        </div>
 
         <form class="settings-form" autocomplete="off">
             <div class="row">
@@ -64,11 +61,11 @@ const SECTION_TEMPLATE = `
 
             <div class="row">
                 <label class="field">
-                    <span>Display width (px, native landscape)</span>
+                    <span>Display width (px)</span>
                     <input type="number" class="field-display-width" min="1" max="4096" step="1" required>
                 </label>
                 <label class="field">
-                    <span>Display height (px, native landscape)</span>
+                    <span>Display height (px)</span>
                     <input type="number" class="field-display-height" min="1" max="4096" step="1" required>
                 </label>
                 <label class="field">
@@ -76,11 +73,10 @@ const SECTION_TEMPLATE = `
                     <select class="field-display-rotation"></select>
                 </label>
             </div>
-            <p class="field-hint settings-rotation-hint">
-                Native dims = the panel's hardware orientation. Rotation is
-                how you've physically mounted it — the renderer rotates
-                frames on the way to hardware.
-            </p>
+            <button type="button" class="settings-detect-dims field-hint-btn">
+                Detect from device
+            </button>
+            <p class="field-hint settings-detect-status" role="status"></p>
 
             <div class="row">
                 <label class="field">
@@ -92,6 +88,14 @@ const SECTION_TEMPLATE = `
                     <input type="number" class="field-gamma" min="0.1" max="3.0" step="0.1" required>
                 </label>
             </div>
+
+            <label class="field settings-ws281x-pixel-order-wrap" hidden>
+                <span>Addressable strip ordering</span>
+                <select class="field-ws281x-pixel-order">
+                    <option value="row_major">Row-major (wired raster-order)</option>
+                    <option value="serpentine">Serpentine (rows alternate direction)</option>
+                </select>
+            </label>
 
             <fieldset class="settings-wifi-ap">
                 <legend>
@@ -116,19 +120,25 @@ const SECTION_TEMPLATE = `
                 <legend>
                     <label class="field-inline">
                         <input type="checkbox" class="field-wifi-station-enabled">
-                        Join existing WiFi (for Tailscale + remote management)
+                        Join existing WiFi
                     </label>
                 </legend>
                 <div class="row">
                     <label class="field">
-                        <span>Home WiFi SSID</span>
-                        <input type="text" class="field-wifi-station-ssid" maxlength="32">
+                        <span>WiFi SSID</span>
+                        <select class="field-wifi-station-ssid-picker">
+                            <option value="__other__">(type manually)</option>
+                        </select>
+                        <input type="text" class="field-wifi-station-ssid" maxlength="32" placeholder="SSID">
                     </label>
                     <label class="field">
-                        <span>Home WiFi password (8-63 chars)</span>
+                        <span>WiFi password (8-63 chars)</span>
                         <input type="password" class="field-wifi-station-password" minlength="8" maxlength="63">
                     </label>
                 </div>
+                <button type="button" class="settings-wifi-rescan field-hint-btn">
+                    Rescan nearby networks
+                </button>
                 <p class="field-hint">
                     Runs concurrently with the access point on the Pi's single
                     radio; both modes share the same channel. Disabling both
@@ -136,28 +146,18 @@ const SECTION_TEMPLATE = `
                 </p>
             </fieldset>
 
-            <div class="row">
-                <label class="field">
-                    <span>Timezone</span>
-                    <select class="field-timezone">
-                        <option value="">Device local (no explicit timezone)</option>
-                    </select>
-                </label>
-            </div>
-
             <fieldset class="settings-tailscale">
-                <legend>Tailscale (optional remote management)</legend>
+                <legend>
+                    <label class="field-inline">
+                        <input type="checkbox" class="field-tailscale-enabled">
+                        Tailscale
+                    </label>
+                </legend>
                 <p class="settings-hint">
                     Bring the device up on your tailnet so you can reach
                     this UI from anywhere. Requires internet at
-                    install-time (secondary WiFi or Ethernet). Actual
-                    <code>tailscale up</code> wiring lands with the
-                    network-provisioning work; today the values persist.
+                    install-time (secondary WiFi or Ethernet).
                 </p>
-                <label class="field-inline">
-                    <input type="checkbox" class="field-tailscale-enabled">
-                    Enable Tailscale
-                </label>
                 <div class="row">
                     <label class="field">
                         <span>Hostname on tailnet (optional)</span>
@@ -169,6 +169,13 @@ const SECTION_TEMPLATE = `
                     </label>
                 </div>
             </fieldset>
+
+            <label class="field">
+                <span>Timezone</span>
+                <select class="field-timezone">
+                    <option value="">Device local (no explicit timezone)</option>
+                </select>
+            </label>
 
             <button type="submit" class="primary settings-save">Save settings</button>
             <p class="settings-status" role="status" aria-live="polite"></p>
@@ -195,18 +202,29 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     const widthEl = container.querySelector(".field-display-width");
     const heightEl = container.querySelector(".field-display-height");
     const rotationEl = container.querySelector(".field-display-rotation");
+    const detectBtn = container.querySelector(".settings-detect-dims");
+    const detectStatusEl = container.querySelector(".settings-detect-status");
     const brightnessEl = container.querySelector(".field-brightness");
     const gammaEl = container.querySelector(".field-gamma");
+    const ws281xOrderWrap = container.querySelector(
+        ".settings-ws281x-pixel-order-wrap",
+    );
+    const ws281xOrderEl = container.querySelector(".field-ws281x-pixel-order");
     const apEnabledEl = container.querySelector(".field-wifi-ap-enabled");
     const ssidEl = container.querySelector(".field-wifi-ssid");
     const passwordEl = container.querySelector(".field-wifi-password");
     const stationEnabledEl = container.querySelector(".field-wifi-station-enabled");
     const stationSsidEl = container.querySelector(".field-wifi-station-ssid");
+    const stationSsidPickerEl = container.querySelector(
+        ".field-wifi-station-ssid-picker",
+    );
     const stationPasswordEl = container.querySelector(".field-wifi-station-password");
+    const wifiRescanBtn = container.querySelector(".settings-wifi-rescan");
     const tzEl = container.querySelector(".field-timezone");
     const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
     const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
     const tsAuthKeyEl = container.querySelector(".field-tailscale-auth-key");
+    const nowValueEl = container.querySelector('[data-field="now-value"]');
 
     // One-time population of non-data-driven selects.
     for (const mode of OUTPUT_MODES) {
@@ -232,6 +250,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         ssidEl.disabled = !apOn;
         passwordEl.disabled = !apOn;
         stationSsidEl.disabled = !stationOn;
+        stationSsidPickerEl.disabled = !stationOn;
         stationPasswordEl.disabled = !stationOn;
         container
             .querySelector(".settings-wifi-ap")
@@ -240,6 +259,23 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             .querySelector(".settings-wifi-station")
             .classList.toggle("is-disabled", !stationOn);
     }
+    // Tailscale section header toggle gates everything below it the
+    // same way wifi-ap / wifi-station do.
+    function syncTailscaleGrayOut() {
+        const on = tsEnabledEl.checked;
+        tsHostnameEl.disabled = !on;
+        tsAuthKeyEl.disabled = !on;
+        container
+            .querySelector(".settings-tailscale")
+            .classList.toggle("is-disabled", !on);
+    }
+    tsEnabledEl.addEventListener("change", syncTailscaleGrayOut);
+    // Reveal the WS2812B-only ordering control when the operator picks
+    // that output mode; hide otherwise so it doesn't clutter HDMI / HUB75.
+    function syncWs281xOrderVisibility() {
+        ws281xOrderWrap.hidden = outputModeEl.value !== "ws281x";
+    }
+    outputModeEl.addEventListener("change", syncWs281xOrderVisibility);
     function guardDisableBoth(toggledEl, otherEl) {
         // If the user just turned off the LAST enabled mode, bounce the
         // checkbox back on and flash a status message.
@@ -298,11 +334,17 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             stationEnabledEl.checked = Boolean(settings.wifi_station_enabled);
             stationSsidEl.value = settings.wifi_station_ssid ?? "";
             stationPasswordEl.value = settings.wifi_station_password ?? "";
+            ws281xOrderEl.value = settings.ws281x_pixel_order || "row_major";
             syncWifiGrayOut();
+            syncTailscaleGrayOut();
+            syncWs281xOrderVisibility();
             setTimezoneValue(tzEl, settings.timezone || "");
             tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
             tsHostnameEl.value = settings.tailscale_hostname ?? "";
             tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
+            // Trigger a wifi scan in the background so the dropdown is
+            // useful by the time the operator gets to it.
+            populateWifiScan();
         } catch (err) {
             statusEl.textContent = `Could not load settings: ${err.message}`;
         }
@@ -328,6 +370,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
                 wifi_station_enabled: stationEnabledEl.checked,
                 wifi_station_ssid: stationSsidEl.value.trim() || null,
                 wifi_station_password: stationPasswordEl.value || null,
+                ws281x_pixel_order: ws281xOrderEl.value || "row_major",
                 timezone: tzEl.value || null,
                 tailscale_enabled: tsEnabledEl.checked,
                 tailscale_hostname: tsHostnameEl.value.trim() || null,
@@ -351,6 +394,101 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             saveBtn.disabled = false;
         }
     });
+
+    // --- detect dims from device's framebuffer / display probe ---
+
+    detectBtn.addEventListener("click", async () => {
+        detectStatusEl.textContent = "Probing display…";
+        try {
+            const res = await fetch("/api/system/display-dims");
+            const data = await res.json();
+            if (data.width && data.height) {
+                widthEl.value = String(data.width);
+                heightEl.value = String(data.height);
+                detectStatusEl.textContent = `Detected ${data.width}×${data.height} (${data.source}).`;
+            } else {
+                detectStatusEl.textContent =
+                    "Couldn't detect — type the dims manually.";
+            }
+        } catch (err) {
+            detectStatusEl.textContent = `Probe failed: ${err.message}`;
+        }
+    });
+
+    // --- WiFi scan: populate the SSID picker so operator picks from
+    //     nearby networks. "Other" reveals the manual text input. ---
+
+    async function populateWifiScan() {
+        try {
+            const res = await fetch("/api/system/wifi-scan");
+            if (!res.ok) return;
+            const data = await res.json();
+            const networks = Array.isArray(data?.networks) ? data.networks : [];
+            const currentSsid = stationSsidEl.value;
+            stationSsidPickerEl.innerHTML = "";
+            for (const net of networks) {
+                const opt = document.createElement("option");
+                opt.value = net.ssid;
+                const sig = net.signal_dbm != null ? ` (${net.signal_dbm} dBm)` : "";
+                opt.textContent = `${net.ssid}${sig}`;
+                stationSsidPickerEl.appendChild(opt);
+            }
+            const otherOpt = document.createElement("option");
+            otherOpt.value = "__other__";
+            otherOpt.textContent = "(type manually)";
+            stationSsidPickerEl.appendChild(otherOpt);
+
+            // Sync picker selection to the current text value.
+            const known = networks.some((n) => n.ssid === currentSsid);
+            if (known) {
+                stationSsidPickerEl.value = currentSsid;
+            } else {
+                stationSsidPickerEl.value = "__other__";
+            }
+            stationSsidEl.hidden = stationSsidPickerEl.value !== "__other__";
+        } catch (err) {
+            // Silent — picker stays as the "(type manually)" fallback.
+            console.debug("[settings] wifi-scan failed:", err);
+        }
+    }
+    stationSsidPickerEl.addEventListener("change", () => {
+        if (stationSsidPickerEl.value === "__other__") {
+            stationSsidEl.hidden = false;
+            stationSsidEl.focus();
+        } else {
+            stationSsidEl.hidden = true;
+            stationSsidEl.value = stationSsidPickerEl.value;
+        }
+    });
+    wifiRescanBtn.addEventListener("click", populateWifiScan);
+
+    // --- ticking device-time display ---
+
+    function tickNow() {
+        if (!nowValueEl) return;
+        const now = new Date();
+        const options = {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            weekday: "short",
+            hour12: false,
+        };
+        if (tzEl.value) options.timeZone = tzEl.value;
+        try {
+            nowValueEl.textContent = new Intl.DateTimeFormat(
+                undefined,
+                options,
+            ).format(now);
+        } catch {
+            delete options.timeZone;
+            nowValueEl.textContent = new Intl.DateTimeFormat(
+                undefined,
+                options,
+            ).format(now);
+        }
+    }
+    setInterval(tickNow, 1000);
 
     refresh();
     return { refresh };

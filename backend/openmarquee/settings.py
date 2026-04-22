@@ -135,6 +135,18 @@ class SystemSettings(BaseModel):
         description="Display gamma correction. 2.2 is the sRGB default.",
     )
 
+    # WS2812B strip / matrix wiring. Physical order of LEDs in a matrix
+    # built from a strip rarely matches raster order; the operator picks
+    # the wiring style here. Only meaningful when output_mode == "ws281x".
+    # Mirror of the pixel_map arg on WS2812BRenderer.
+    ws281x_pixel_order: Literal["row_major", "serpentine"] = Field(
+        default="row_major",
+        description=(
+            "Physical LED order for the WS2812B strip / matrix. "
+            "row_major = raster order; serpentine = rows alternate direction."
+        ),
+    )
+
     # Captive-portal access point — this is how phones connect during
     # setup. Default on; disabling requires station mode to be on
     # instead so the device isn't network-isolated.

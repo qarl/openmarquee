@@ -51,6 +51,7 @@ def test_put_then_get_round_trip(client: TestClient):
         "display_rotation": 0,
         "brightness": 40,
         "gamma": 2.4,
+        "ws281x_pixel_order": "serpentine",
         "wifi_ap_enabled": True,
         "wifi_ssid": "CoffeeShop",
         "wifi_password": "bean-bean-bean",

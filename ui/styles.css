@@ -1408,6 +1408,24 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     font-variant-numeric: tabular-nums;
 }
 
+/* Small inline action buttons used by Settings (detect dims, rescan WiFi). */
+.field-hint-btn {
+    align-self: flex-start;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.3rem;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+.field-hint-btn:hover {
+    border-color: var(--accent);
+    background: #111115;
+}
+
 .schedule-bulk {
     display: flex;
     gap: 0.4rem;
