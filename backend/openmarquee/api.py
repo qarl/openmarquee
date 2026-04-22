@@ -579,3 +579,34 @@ async def delete_content_item(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"no content item {item_id}") from exc
     _remove_from_playlist(playlist_storage, item_id)
+
+
+class DurationPatch(BaseModel):
+    """Wire format for PATCH /api/content/{id}/duration."""
+
+    duration_ms: int = Field(ge=100, le=24 * 60 * 60 * 1000)
+
+
+@router.patch("/{item_id}/duration", response_model=ContentItem)
+async def patch_duration(
+    item_id: UUID,
+    payload: DurationPatch,
+    storage: StorageDep,
+) -> ContentItem:
+    """Update just the duration of a content item — used by the
+    Playlists-panel duration chip so the operator can change a slide's
+    seconds without re-PUTting the full payload (which would require
+    re-encoding the PNG / MP4 / RGB asset for nothing).
+    """
+    try:
+        item = storage.load(item_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"no content item {item_id}") from exc
+    try:
+        updated = item.model_copy(update={"duration_ms": payload.duration_ms})
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    # save() rewrites the envelope; the on-disk PNG stays untouched.
+    existing_png = storage.read_asset(item_id)
+    storage.save(updated, existing_png)
+    return updated

@@ -132,6 +132,24 @@ export async function updateVideo(id, payload) {
     return await response.json();
 }
 
+/**
+ * Patch just the duration_ms on any content item type. Used by the
+ * Playlists-panel duration chip — saves the operator from re-PUTting
+ * the whole asset for a one-field change.
+ */
+export async function patchSlideDuration(id, durationMs) {
+    const response = await fetch(`/api/content/${id}/duration`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ duration_ms: Math.round(durationMs) }),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Update duration failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
 /** Delete a content item by id. */
 export async function deleteContent(id) {
     const response = await fetch(`/api/content/${id}`, { method: "DELETE" });
@@ -188,14 +206,20 @@ export async function stopPlayback() {
  *  - an array of `{item_id, transition, transition_ms}` objects (v3
  *    canonical — lets the caller carry transition data).
  */
-export async function setPlaylistOrder(entriesOrIds) {
+export async function setPlaylistOrder(entriesOrIds, name = "default") {
     const body =
         Array.isArray(entriesOrIds) &&
         entriesOrIds.length > 0 &&
         typeof entriesOrIds[0] === "object"
             ? { items: entriesOrIds }
             : { item_ids: entriesOrIds };
-    const response = await fetch("/api/playlist", {
+    // /api/playlist is shorthand for the default playlist; named
+    // playlists go through /api/playlists/{name}.
+    const url =
+        name === "default"
+            ? "/api/playlist"
+            : `/api/playlists/${encodeURIComponent(name)}`;
+    const response = await fetch(url, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),

@@ -33,13 +33,14 @@ function isModeLockedVideo(item, outputMode) {
 const TEMPLATE = `
     <section class="playlist-track">
         <h2 class="subpage-title">Playlists</h2>
+        <div class="playlist-browser-slot"></div>
         <div class="playlist-track-header">
-            <h3 class="playlist-track-heading">Default playlist</h3>
+            <h3 class="playlist-track-heading" data-field="heading">Default playlist</h3>
         </div>
         <div class="playlist-track-inline-preview"></div>
         <p class="playlist-track-hint">
             Drag blocks to reorder; drag from the pallet below to add;
-            × to remove. Duration shown under each block.
+            × to remove. Click the duration to change it.
         </p>
 
         <div class="playlist-track-scroll" role="region" aria-label="playlist timeline">
@@ -77,16 +78,26 @@ export function mountPlaylistTrack(container, options) {
         fetchItems,
         fetchPlaylists,
         onReorder,
+        onUpdateDuration,
         inlinePreview,
         outputMode,
+        getCurrentPlaylistName,
+        playlistBrowser,
     } = options;
+    // Fallback when the caller doesn't want multi-playlist — always
+    // operate on "default" like the pre-multi UI did.
+    const resolveName = getCurrentPlaylistName || (() => "default");
 
     container.innerHTML = TEMPLATE;
     const trackEl = container.querySelector(".playlist-track-list");
     const palletEl = container.querySelector(".playlist-pallet");
     const statusEl = container.querySelector(".playlist-track-status");
+    const headingEl = container.querySelector('[data-field="heading"]');
     const inlinePreviewSlot = container.querySelector(
         ".playlist-track-inline-preview",
+    );
+    const playlistBrowserSlot = container.querySelector(
+        ".playlist-browser-slot",
     );
 
     if (inlinePreview && inlinePreview.mount) {
@@ -95,6 +106,10 @@ export function mountPlaylistTrack(container, options) {
             height: inlinePreview.height,
             outputMode: inlinePreview.outputMode,
         });
+    }
+
+    if (playlistBrowser && playlistBrowser.mount) {
+        playlistBrowser.mount(playlistBrowserSlot);
     }
 
     let trackSortable = null;
@@ -129,16 +144,22 @@ export function mountPlaylistTrack(container, options) {
             ]);
             itemByIdRef = new Map(items.map((it) => [String(it.id), it]));
             const itemById = itemByIdRef;
+            const activeName = resolveName();
+            headingEl.textContent =
+                activeName === "default"
+                    ? "Default playlist"
+                    : activeName;
             // v3 API returns `items: [{item_id, transition, transition_ms}]`;
             // fall back to the legacy `item_ids` shape for defensive reading.
-            const playlistRaw = collection.playlists?.default?.items;
+            const active = collection.playlists?.[activeName];
+            const playlistRaw = active?.items;
             const defaultEntries = Array.isArray(playlistRaw)
                 ? playlistRaw.map((e) => ({
                       item_id: String(e.item_id),
                       transition: e.transition || "cut",
                       transition_ms: Number(e.transition_ms) || 500,
                   }))
-                : (collection.playlists?.default?.item_ids || []).map((id) => ({
+                : (active?.item_ids || []).map((id) => ({
                       item_id: String(id),
                       transition: "cut",
                       transition_ms: 500,
@@ -156,6 +177,9 @@ export function mountPlaylistTrack(container, options) {
             // Wire × buttons after the DOM is in place so each handler
             // sees the current trackEl children.
             bindTrackRemoveButtons(trackEl, onReorder, saveAndRefresh);
+            bindTrackDurationButtons(
+                trackEl, onUpdateDuration, saveAndRefresh,
+            );
 
             palletEl.innerHTML = "";
             for (const item of items) {
@@ -288,6 +312,30 @@ function bindTrackRemoveButtons(trackEl, onReorder, saveAndRefresh) {
     }
 }
 
+function bindTrackDurationButtons(trackEl, onUpdateDuration, saveAndRefresh) {
+    if (!onUpdateDuration) return;
+    for (const btn of trackEl.querySelectorAll(".track-block-duration")) {
+        btn.addEventListener("click", () => {
+            const block = btn.closest("[data-id]");
+            if (!block) return;
+            const id = block.dataset.id;
+            const currentMs = Number(btn.dataset.durationMs) || 5000;
+            const currentSec = Math.round((currentMs / 1000) * 10) / 10;
+            // Browser prompt is unglamorous but unambiguous and works
+            // on touch + desktop. Upgrade to a popover if it grates.
+            const next = window.prompt(
+                "Duration in seconds:",
+                String(currentSec),
+            );
+            if (next == null) return;
+            const seconds = Number(next);
+            if (!Number.isFinite(seconds) || seconds <= 0) return;
+            const ms = Math.round(seconds * 1000);
+            saveAndRefresh(() => onUpdateDuration(id, ms));
+        });
+    }
+}
+
 function renderTrackBlock(
     item,
     entry = { transition: "cut", transition_ms: 500 },
@@ -317,7 +365,9 @@ function renderTrackBlock(
         </div>
         <div class="track-block-name">${safeName}</div>
         <div class="track-block-meta">
-            <span class="track-block-duration">${durationLabel}</span>
+            <button type="button" class="track-block-duration"
+                    title="Click to change this slide's duration"
+                    data-duration-ms="${Number(item.duration_ms) || 5000}">${durationLabel}</button>
             <button type="button" class="track-block-transition"
                     title="Click to cycle transition (cut ↔ fade)">${entry.transition}</button>
         </div>

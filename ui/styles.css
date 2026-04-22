@@ -178,6 +178,70 @@ main {
     opacity: 0.85;
 }
 
+/* --- multi-playlist browser at top of the Playlists subpage --- */
+.playlist-browser {
+    margin-bottom: 0.75rem;
+}
+.playlist-browser-list {
+    list-style: none;
+    margin: 0;
+    padding: 0.35rem 0;
+    display: flex;
+    flex-direction: row;
+    gap: 0.5rem;
+    overflow-x: auto;
+}
+.playlist-browser-tile {
+    flex: 0 0 auto;
+    min-width: 6rem;
+}
+.playlist-browser-tile-action {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.15rem;
+    width: 100%;
+    padding: 0.55rem 0.8rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.35rem;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+.playlist-browser-tile-action:hover {
+    border-color: var(--accent);
+    background: #111115;
+}
+.playlist-browser-tile--selected .playlist-browser-tile-action {
+    border-color: var(--accent);
+    background: #161616;
+    box-shadow: 0 0 0 2px rgba(255, 184, 77, 0.35);
+}
+.playlist-browser-tile-name {
+    font-weight: 600;
+}
+.playlist-browser-tile-meta {
+    font-size: 0.7rem;
+    color: var(--muted);
+}
+.playlist-browser-tile--new .playlist-browser-tile-action {
+    border-style: dashed;
+    font-weight: 600;
+}
+.playlist-browser-tile-plus {
+    font-size: 1.3rem;
+    line-height: 1;
+    color: var(--accent);
+}
+.playlist-browser-tile-label {
+    font-size: 0.75rem;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+}
+
 /* --- inline preview (Playlists panel client-side simulator) --- */
 .inline-preview {
     display: flex;
@@ -363,6 +427,17 @@ main {
     font-size: 0.7rem;
     color: var(--muted);
     font-variant-numeric: tabular-nums;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 999px;
+    padding: 0.05rem 0.45rem;
+    cursor: pointer;
+    line-height: 1.3;
+    font-family: inherit;
+}
+.track-block-duration:hover {
+    border-color: var(--accent);
+    color: var(--text);
 }
 .track-block-transition {
     font-size: 0.65rem;

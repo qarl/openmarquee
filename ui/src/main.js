@@ -25,7 +25,9 @@ import {
     getSettings,
     listContent,
     listPlaylists,
+    patchSlideDuration,
     saveImage,
+    savePlaylistByName,
     saveSchedule,
     saveSettings,
     saveTextSlide,
@@ -39,6 +41,10 @@ import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
 import { mountInlinePreview } from "./inline-preview.js";
 import { mountNav } from "./nav.js";
+import {
+    mountPlaylistBrowser,
+    nextPlaylistName,
+} from "./playlist-browser.js";
 import { mountPlaylistTrack } from "./playlist-track.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
@@ -88,17 +94,17 @@ async function resolvePanelDims() {
 }
 
 /**
- * Fetch the default playlist with each item's ContentItem inlined —
- * the inline preview needs full item metadata (duration, type, auto_mode,
+ * Fetch the NAMED playlist with each item's ContentItem inlined — the
+ * inline preview needs full item metadata (duration, type, auto_mode,
  * pipeline) to drive its client-side playback engine.
  */
-async function fetchResolvedDefaultPlaylist() {
+async function fetchResolvedPlaylist(name) {
     const [collection, items] = await Promise.all([
         listPlaylists(),
         listContent(),
     ]);
     const byId = new Map(items.map((it) => [String(it.id), it]));
-    const raw = collection.playlists?.default?.items || [];
+    const raw = collection.playlists?.[name]?.items || [];
     const resolved = raw
         .map((entry) => ({
             item_id: String(entry.item_id),
@@ -144,6 +150,12 @@ async function boot() {
     // Inline preview runs a requestAnimationFrame loop + caches
     // <img>/<video> elements; stop() before dropping its DOM.
     let inlinePreviewHandle = null;
+    // Multi-playlist active-name state. Browser-select + new-create
+    // update this; playlist-track reads it on each refresh via a
+    // closure callable, and reorder / inline-preview fetches target
+    // whatever name this holds at call time.
+    let currentPlaylistName = "default";
+    let playlistBrowserHandle = null;
 
     const onSaveWithRefresh = (saveFn) => async (payload) => {
         const saved = await saveFn(payload);
@@ -175,7 +187,14 @@ async function boot() {
         playlistTrack = mountPlaylistTrack(trackSlot, {
             fetchItems: listContent,
             fetchPlaylists: listPlaylists,
-            onReorder: setPlaylistOrder,
+            // Reorder + duration writes target whichever playlist is
+            // currently active — the closure reads currentPlaylistName
+            // at call time, not at mount time, so switching via the
+            // playlist browser picks up the new target.
+            onReorder: (entries) =>
+                setPlaylistOrder(entries, currentPlaylistName),
+            onUpdateDuration: patchSlideDuration,
+            getCurrentPlaylistName: () => currentPlaylistName,
             inlinePreview: {
                 width,
                 height,
@@ -185,9 +204,38 @@ async function boot() {
                         width: dims.width,
                         height: dims.height,
                         outputMode: dims.outputMode,
-                        fetchPlaylist: fetchResolvedDefaultPlaylist,
+                        fetchPlaylist: () =>
+                            fetchResolvedPlaylist(currentPlaylistName),
                     });
                     return inlinePreviewHandle;
+                },
+            },
+            playlistBrowser: {
+                mount: (slot) => {
+                    playlistBrowserHandle = mountPlaylistBrowser(slot, {
+                        fetchPlaylists: listPlaylists,
+                        onSelect: async (name) => {
+                            currentPlaylistName = name;
+                            playlistBrowserHandle.highlight(name);
+                            await playlistTrack?.refresh();
+                            await inlinePreviewHandle?.refresh();
+                        },
+                        onCreate: async () => {
+                            const collection = await listPlaylists();
+                            const names = Object.keys(
+                                collection.playlists || {},
+                            );
+                            const newName = nextPlaylistName(names);
+                            await savePlaylistByName(newName, []);
+                            currentPlaylistName = newName;
+                            await playlistBrowserHandle.refresh();
+                            playlistBrowserHandle.highlight(newName);
+                            await playlistTrack?.refresh();
+                            await inlinePreviewHandle?.refresh();
+                        },
+                    });
+                    playlistBrowserHandle.highlight(currentPlaylistName);
+                    return playlistBrowserHandle;
                 },
             },
             outputMode,
