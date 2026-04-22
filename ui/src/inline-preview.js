@@ -145,9 +145,12 @@ export function mountInlinePreview(container, options) {
     }
 
     function renderOnce() {
-        sizeCanvasToStage();
+        if (!sizeCanvasToStage()) return;
+        // Always clear with the skin's expected backdrop first so an
+        // unloaded image (drawSlot bails) leaves something coherent
+        // on screen instead of stale or empty pixels.
+        clearCanvas();
         if (timeline.length === 0) {
-            clearCanvas();
             autoText.hidden = true;
             return;
         }
@@ -261,10 +264,20 @@ export function mountInlinePreview(container, options) {
 
     function sizeCanvasToStage() {
         const rect = stage.getBoundingClientRect();
-        const w = Math.max(1, Math.round(rect.width));
-        const h = Math.max(1, Math.round(rect.height));
+        // Stage hasn't been laid out yet — bail and retry on the next
+        // animation frame. Without this guard, the first renderOnce
+        // (which fires synchronously inside refresh) set canvas.width=1
+        // and the cached check below kept it stuck there even after
+        // layout settled.
+        if (rect.width < 2 || rect.height < 2) {
+            requestAnimationFrame(renderOnce);
+            return false;
+        }
+        const w = Math.round(rect.width);
+        const h = Math.round(rect.height);
         if (canvas.width !== w) canvas.width = w;
         if (canvas.height !== h) canvas.height = h;
+        return true;
     }
 
     function clearCanvas() {
