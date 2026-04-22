@@ -366,9 +366,16 @@ function drawPlain(ctx, w, h, srcData, signW, signH) {
     tmp.width = signW;
     tmp.height = signH;
     tmp.getContext("2d").putImageData(srcData, 0, 0);
-    // Fit-preserve aspect; the stage itself already has the right ratio,
-    // so in practice drawImage(w, h) stretches 1:1 to fill.
-    ctx.drawImage(tmp, 0, 0, w, h);
+    // Cover-fit: scale up until both dims meet/exceed the canvas, then
+    // center-crop the overflow. No stretch, no black letterbox bars
+    // when the slide aspect doesn't match the device aspect — the slide
+    // fills the panel and the operator sees what would actually play.
+    const scale = Math.max(w / signW, h / signH);
+    const drawW = signW * scale;
+    const drawH = signH * scale;
+    const offX = (w - drawW) / 2;
+    const offY = (h - drawH) / 2;
+    ctx.drawImage(tmp, offX, offY, drawW, drawH);
 }
 
 function drawHub75(ctx, w, h, srcData, signW, signH) {

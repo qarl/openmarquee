@@ -378,7 +378,7 @@ main {
 
 .track-block-thumb-wrap {
     position: relative;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: var(--device-aspect, 4 / 3);
     background: #000;
     border-radius: 0.25rem;
     overflow: hidden;
@@ -517,7 +517,7 @@ main {
 
 .pallet-tile-thumb {
     width: 100%;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: var(--device-aspect, 4 / 3);
     object-fit: cover;
     background: #000;
     border-radius: 0.25rem;
@@ -591,7 +591,7 @@ main {
     max-width: 100%;
     height: auto;
     image-rendering: pixelated;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: var(--device-aspect, 4 / 3);
     background: #000;
     cursor: grab;
 }
@@ -809,7 +809,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 .slide-browser-tile-thumb {
     width: 100%;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: var(--device-aspect, 4 / 3);
     object-fit: cover;
     background: #000;
     border-radius: 0.2rem;

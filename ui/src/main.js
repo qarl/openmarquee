@@ -177,6 +177,15 @@ async function boot() {
      * Called once at boot + again whenever Settings emits a change.
      */
     function mountDimensionedPanels({ width, height, outputMode }) {
+        // CSS variable picked up by every tile thumbnail + preview
+        // wrapper (.pallet-tile-thumb, .track-block-thumb-wrap,
+        // .slide-browser-tile-thumb) so the thumbs match the device's
+        // aspect ratio without each rule needing to be inline-styled.
+        document.documentElement.style.setProperty(
+            "--device-aspect",
+            `${width} / ${height}`,
+        );
+
         if (inlinePreviewHandle) {
             inlinePreviewHandle.stop();
             inlinePreviewHandle = null;
@@ -190,10 +199,22 @@ async function boot() {
             // Reorder + duration writes target whichever playlist is
             // currently active — the closure reads currentPlaylistName
             // at call time, not at mount time, so switching via the
-            // playlist browser picks up the new target.
-            onReorder: (entries) =>
-                setPlaylistOrder(entries, currentPlaylistName),
-            onUpdateDuration: patchSlideDuration,
+            // playlist browser picks up the new target. After each
+            // save, refresh the inline preview so the operator sees
+            // the new order / duration play out immediately.
+            onReorder: async (entries) => {
+                const result = await setPlaylistOrder(
+                    entries,
+                    currentPlaylistName,
+                );
+                await inlinePreviewHandle?.refresh();
+                return result;
+            },
+            onUpdateDuration: async (id, ms) => {
+                const result = await patchSlideDuration(id, ms);
+                await inlinePreviewHandle?.refresh();
+                return result;
+            },
             getCurrentPlaylistName: () => currentPlaylistName,
             inlinePreview: {
                 width,
