@@ -65,11 +65,6 @@ PRESETS: list[tuple[str, str]] = [
         "signage-friendly background",
     ),
     (
-        "teal-pastel",
-        "soft pastel gradient, mint teal and rose, minimal, "
-        "signage-friendly background",
-    ),
-    (
         "marble",
         "white and gray marble texture, elegant veins, subtle, "
         "signage-friendly background",
