@@ -92,9 +92,15 @@ export function mountInlinePreview(container, options) {
     let stopped = false;
 
     // Asset caches. Image entries are HTMLImageElement; video entries
-    // are HTMLVideoElement. Loaded lazily on first draw.
-    const imageCache = new Map();
-    const videoCache = new Map();
+    // are HTMLVideoElement. Loaded lazily on first draw. Evicted
+    // wholesale at refresh() — an edit-save on any referenced slide
+    // means the bytes may have changed, and keying by id would otherwise
+    // serve stale pixels from a cached <img>.
+    let imageCache = new Map();
+    let videoCache = new Map();
+    // Bumped on every refresh() so `?v=${refreshVersion}` forces the
+    // browser HTTP cache to refetch after a slide edit.
+    let refreshVersion = 0;
     // Tracks which video element is currently the "active" one — i.e.
     // the one driving the slot we're showing. We let it play in real
     // time and just sample drawImage() each raf tick. Seeking is reserved
@@ -116,6 +122,15 @@ export function mountInlinePreview(container, options) {
             console.error("[inline-preview] fetchPlaylist failed:", err);
             return;
         }
+        // Evict in-memory caches so a post-save refresh paints fresh
+        // bytes. Pause + drop any videos too — their .src gets a new
+        // cache-bust on the next getCachedVideo call.
+        for (const v of videoCache.values()) v.pause?.();
+        imageCache = new Map();
+        videoCache = new Map();
+        activeVideoId = null;
+        refreshVersion += 1;
+
         timeline = buildTimeline(playlist?.items || []);
         totalSec = timeline.length > 0 ? timeline[timeline.length - 1].endSec : 0;
         slider.max = String(totalSec.toFixed(2));
@@ -273,7 +288,7 @@ export function mountInlinePreview(container, options) {
         if (cached) return cached;
         const img = new Image();
         img.addEventListener("load", () => renderOnce());
-        img.src = `/api/content/${item.id}/asset`;
+        img.src = `/api/content/${item.id}/asset?v=${refreshVersion}`;
         imageCache.set(item.id, img);
         return img;
     }
@@ -285,7 +300,7 @@ export function mountInlinePreview(container, options) {
         video.muted = true;
         video.playsInline = true;
         video.preload = "auto";
-        video.src = `/api/content/${item.id}/video`;
+        video.src = `/api/content/${item.id}/video?v=${refreshVersion}`;
         video.addEventListener("seeked", () => renderOnce());
         video.addEventListener("loadeddata", () => renderOnce());
         videoCache.set(item.id, video);

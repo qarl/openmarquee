@@ -116,6 +116,10 @@ export function mountPlaylistTrack(container, options) {
     let palletSortable = null;
     let saving = false;
     let isDirty = false;
+    // Bumped on every refresh() so tile thumbnail URLs force a refetch
+    // (edits don't change created_at, so the HTTP cache would otherwise
+    // serve stale bytes after an in-place save).
+    let refreshVersion = 0;
     // Closure-scoped lookup so the track Sortable's `onEnd` can re-skin a
     // cross-list drop (pallet → track) from the Sortable-clone's default
     // `.pallet-tile` shape into a proper `.track-block` *before* waiting
@@ -168,6 +172,7 @@ export function mountPlaylistTrack(container, options) {
 
     async function refresh() {
         statusEl.textContent = "";
+        refreshVersion += 1;
         try {
             const [items, collection] = await Promise.all([
                 fetchItems(),
@@ -202,7 +207,9 @@ export function mountPlaylistTrack(container, options) {
             for (const entry of defaultEntries) {
                 const item = itemById.get(entry.item_id);
                 if (!item) continue; // stale ref — skip
-                trackEl.appendChild(renderTrackBlock(item, entry, { locked: false }));
+                trackEl.appendChild(
+                    renderTrackBlock(item, entry, { locked: false, cacheBust: refreshVersion }),
+                );
             }
             // Wire × + transition buttons → mark dirty (no save until
             // the operator clicks Save playlist).
@@ -222,7 +229,9 @@ export function mountPlaylistTrack(container, options) {
 
             palletEl.innerHTML = "";
             for (const item of items) {
-                palletEl.appendChild(renderPalletTile(item, { locked: false }));
+                palletEl.appendChild(
+                    renderPalletTile(item, { locked: false, cacheBust: refreshVersion }),
+                );
             }
 
             if (trackSortable) trackSortable.destroy();
@@ -232,6 +241,7 @@ export function mountPlaylistTrack(container, options) {
                 markDirty,
                 itemByIdRef,
                 bindAddedBlockButtons,
+                () => refreshVersion,
             );
             palletSortable = bindPalletSortable(palletEl);
         } catch (err) {
@@ -243,7 +253,7 @@ export function mountPlaylistTrack(container, options) {
     return { refresh };
 }
 
-function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons) {
+function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons, getCacheBust) {
     return Sortable.create(trackEl, {
         group: { name: "playlist-track", pull: true, put: ["playlist-pallet"] },
         animation: 150,
@@ -261,11 +271,11 @@ function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons) {
             if (!id) return;
             const item = itemByIdRef.get(id);
             if (!item) return;
-            const rebuilt = renderTrackBlock(item, {
-                item_id: id,
-                transition: "cut",
-                transition_ms: 500,
-            });
+            const rebuilt = renderTrackBlock(
+                item,
+                { item_id: id, transition: "cut", transition_ms: 500 },
+                { cacheBust: getCacheBust ? getCacheBust() : 0 },
+            );
             dropped.replaceWith(rebuilt);
         },
         onEnd: () => {
@@ -379,7 +389,7 @@ function bindTrackDurationButtons(trackEl, onUpdateDuration, refresh) {
 function renderTrackBlock(
     item,
     entry = { transition: "cut", transition_ms: 500 },
-    { locked = false } = {},
+    { locked = false, cacheBust = 0 } = {},
 ) {
     const li = document.createElement("li");
     li.className = locked ? "track-block track-block--locked" : "track-block";
@@ -392,14 +402,13 @@ function renderTrackBlock(
     const durationLabel = `${
         Number.isInteger(seconds) ? seconds : seconds.toFixed(1)
     }s`;
-    const cacheKey = encodeURIComponent(item.created_at || String(item.id));
     const lockedBadge = locked
         ? `<span class="track-block-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
         : "";
     li.innerHTML = `
         <div class="track-block-thumb-wrap">
             <img class="track-block-thumb" alt=""
-                 src="/api/content/${item.id}/asset?v=${cacheKey}">
+                 src="/api/content/${item.id}/asset?v=${cacheBust}">
             ${lockedBadge}
             <button type="button" class="track-remove" aria-label="Remove from playlist" title="Remove from playlist">×</button>
         </div>
@@ -415,7 +424,7 @@ function renderTrackBlock(
     return li;
 }
 
-function renderPalletTile(item, { locked = false } = {}) {
+function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
     const li = document.createElement("li");
     li.className = locked ? "pallet-tile pallet-tile--locked" : "pallet-tile";
     li.dataset.id = String(item.id);
@@ -424,7 +433,6 @@ function renderPalletTile(item, { locked = false } = {}) {
     const typeBadge = escapeHtml(
         item.type === "video" ? "▶" : item.type === "image" ? "🖼" : "Aa",
     );
-    const cacheKey = encodeURIComponent(item.created_at || String(item.id));
     const lockedBadge = locked
         ? `<span class="pallet-tile-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
         : "";
@@ -435,7 +443,7 @@ function renderPalletTile(item, { locked = false } = {}) {
     // re-upload.
     li.innerHTML = `
         <img class="pallet-tile-thumb" alt=""
-             src="/api/content/${item.id}/asset?v=${cacheKey}">
+             src="/api/content/${item.id}/asset?v=${cacheBust}">
         <div class="pallet-tile-name" title="${safeName}">${safeName}</div>
         <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>
         ${lockedBadge}

@@ -32,6 +32,11 @@ export function mountSlideBrowser(container, options) {
     const listEl = container.querySelector(".slide-browser-list");
 
     let highlightedId = null;
+    // Bumped on every refresh() so thumbnail URLs force the browser to
+    // refetch. Without this, editing a slide in place leaves the tile
+    // thumb stale — created_at never changes on an update, so the old
+    // `?v=${created_at}` would keep hitting the HTTP cache.
+    let refreshVersion = 0;
 
     async function refresh() {
         let items = [];
@@ -41,6 +46,7 @@ export function mountSlideBrowser(container, options) {
             console.error("[slide-browser] fetchItems failed:", err);
             items = [];
         }
+        refreshVersion += 1;
         const filtered = items
             .filter((it) => it && it.type === type)
             // Most-recent first so newly-created slides land in view.
@@ -90,11 +96,10 @@ export function mountSlideBrowser(container, options) {
             li.classList.add("slide-browser-tile--selected");
         }
         const safeName = escapeHtml(item.name || "Untitled");
-        const cacheKey = encodeURIComponent(item.created_at || String(item.id));
         li.innerHTML = `
             <button type="button" class="slide-browser-tile-action" title="${safeName}">
                 <img class="slide-browser-tile-thumb" alt=""
-                     src="/api/content/${item.id}/asset?v=${cacheKey}">
+                     src="/api/content/${item.id}/asset?v=${refreshVersion}">
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>
         `;
