@@ -157,8 +157,12 @@ async function boot() {
     let currentPlaylistName = "default";
     let playlistBrowserHandle = null;
 
-    const onSaveWithRefresh = (saveFn) => async (payload) => {
-        const saved = await saveFn(payload);
+    // Forward *all* args so both onSave(payload) and the two-arg
+    // onSaveExisting(id, payload) work through the same wrapper. The
+    // older single-arg signature dropped `payload` on edit calls, which
+    // surfaced as a 422 ("body required") on every PUT.
+    const onSaveWithRefresh = (saveFn) => async (...args) => {
+        const saved = await saveFn(...args);
         if (playlistTrack) await playlistTrack.refresh();
         // Each slide subpage carries a horizontal browser at the top;
         // refresh all three so a just-saved slide shows up regardless
