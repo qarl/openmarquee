@@ -65,6 +65,10 @@ function boot() {
     const logEl = document.getElementById("spike-log");
     const outputEl = document.getElementById("spike-output");
     const logFn = makeLogger(statusEl, logEl);
+    const hooks = {
+        onStatus: logFn,
+        onProgress: (pct) => logFn(`progress: ${pct.toFixed(0)}%`),
+    };
 
     async function withSpinner(runner, outName, mime) {
         const file = fileEl.files?.[0];
@@ -84,7 +88,7 @@ function boot() {
                     height: Number(heightEl.value) || 96,
                     fps: Number(fpsEl.value) || 10,
                 },
-                logFn,
+                hooks,
             );
             const dt = ((performance.now() - t0) / 1000).toFixed(2);
             logFn(`done in ${dt}s; ${data.length} bytes`);

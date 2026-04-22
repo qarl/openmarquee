@@ -94,8 +94,10 @@ test("panel-mode video upload produces a raw-frames asset and the preview uses t
     await expect(page.locator(".video-upload-panel-hint")).toBeVisible();
 
     await page.locator(".video-upload .field-file").setInputFiles(FIXTURE);
-    // Wait for ffmpeg.wasm to finish the raw-frames extraction.
-    await expect(page.locator(".video-upload-log-body")).toContainText(
+    // Wait for ffmpeg.wasm to finish the raw-frames extraction. The
+    // completion summary lands in the status line (the verbose ffmpeg
+    // log is gone; per-frame noise goes to console.debug now).
+    await expect(page.locator(".video-upload-status")).toContainText(
         "RGB frames",
         { timeout: 120_000 },
     );

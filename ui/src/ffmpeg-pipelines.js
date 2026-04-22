@@ -24,20 +24,20 @@ let _loadPromise = null;
  * Safe to call concurrently — concurrent callers share the in-flight
  * load() promise so we never instantiate two cores.
  *
- * @param {(msg: string) => void} [logFn] — receives ffmpeg's per-frame
- *     log + progress lines; defaults to a no-op for silent consumers.
+ * The instance is global and its log/progress handlers are persistent,
+ * so per-call wiring (status / progress bars on the UI) can't live on
+ * the FFmpeg instance — it lives on the per-call helpers below, and
+ * the verbose per-frame ffmpeg log goes to console.debug only.
  */
-export async function getFfmpeg(logFn = () => {}) {
+export async function getFfmpeg() {
     if (_instance) return _instance;
     if (_loadPromise) return _loadPromise;
 
     _loadPromise = (async () => {
-        logFn("loading ffmpeg-core…");
         const instance = new FFmpeg();
-        instance.on("log", ({ message }) => logFn(message));
-        instance.on("progress", ({ progress }) => {
-            logFn(`progress: ${(progress * 100).toFixed(0)}%`);
-        });
+        // Keep verbose log out of the UI — operators don't want a wall
+        // of "frame=  42 fps=12 q=23.0 ..." text. Console only.
+        instance.on("log", ({ message }) => console.debug("[ffmpeg]", message));
         await instance.load({
             coreURL: await toBlobURL(
                 `${FFMPEG_CORE_BASE}/ffmpeg-core.js`,
@@ -54,7 +54,6 @@ export async function getFfmpeg(logFn = () => {}) {
             classWorkerURL: "/dist/ffmpeg-worker.js",
         });
         _instance = instance;
-        logFn("ffmpeg-core loaded.");
         return instance;
     })();
     try {
@@ -64,19 +63,44 @@ export async function getFfmpeg(logFn = () => {}) {
     }
 }
 
+// Per-call progress wiring. The ffmpeg.wasm "progress" event handler
+// is global on the instance, so we attach + detach a one-off forwarder
+// for each pipeline call instead of leaking listeners.
+function withProgressListener(ff, onProgress, fn) {
+    if (!onProgress) return fn();
+    const listener = ({ progress }) => {
+        // ffmpeg.wasm reports progress as a 0..1 fraction that can
+        // briefly overshoot 1.0 (spurious end-of-stream tick). Clamp
+        // so the UI bar doesn't visually rebound.
+        const pct = Math.max(0, Math.min(1, progress)) * 100;
+        try { onProgress(pct); } catch { /* never let UI errors abort the pipeline */ }
+    };
+    ff.on("progress", listener);
+    return Promise.resolve(fn()).finally(() => {
+        try { ff.off?.("progress", listener); } catch { /* older ffmpeg.wasm exposes no off() */ }
+    });
+}
+
 /**
  * Transcode a source video to H.264 MP4 at the target panel dims.
  * Returned bytes are the MP4 ready to upload.
  *
+ * @param {object} opts
+ * @param {object} [hooks]
+ * @param {(msg: string) => void} [hooks.onStatus] — phase change ("transcoding…", "done.")
+ * @param {(pct: number) => void} [hooks.onProgress] — 0..100, fires repeatedly.
  * @returns {Uint8Array}
  */
-export async function transcodeToH264({ file, width, height }, logFn = () => {}) {
-    const ff = await getFfmpeg(logFn);
+export async function transcodeToH264(
+    { file, width, height },
+    { onStatus, onProgress } = {},
+) {
+    const ff = await getFfmpeg();
     const inName = `input-${Date.now()}`;
     const outName = `output-${Date.now()}.mp4`;
     await ff.writeFile(inName, await fetchFile(file));
-    logFn("transcoding to H.264 MP4…");
-    await ff.exec([
+    onStatus?.("transcoding to H.264 MP4…");
+    await withProgressListener(ff, onProgress, () => ff.exec([
         "-i", inName,
         // scale= + force-even-dimensions via the round-down trick; libx264
         // with yuv420p hates odd dimensions.
@@ -87,7 +111,8 @@ export async function transcodeToH264({ file, width, height }, logFn = () => {})
         "-pix_fmt", "yuv420p",
         "-an", // drop audio — signs don't speak
         outName,
-    ]);
+    ]));
+    onProgress?.(100);
     const data = await ff.readFile(outName);
     // Best-effort cleanup — ffmpeg.wasm's virtual FS can accumulate.
     try {
@@ -104,24 +129,29 @@ export async function transcodeToH264({ file, width, height }, logFn = () => {})
  * Format is the rawvideo `rgb24` pixel contract from SYSTEM_SPEC §7.6:
  * row-major, top-left first, three bytes per pixel (R, G, B). No header.
  *
+ * @param {object} opts
+ * @param {object} [hooks]
+ * @param {(msg: string) => void} [hooks.onStatus]
+ * @param {(pct: number) => void} [hooks.onProgress] — 0..100.
  * @returns {Uint8Array}
  */
 export async function extractRawFrames(
     { file, width, height, fps },
-    logFn = () => {},
+    { onStatus, onProgress } = {},
 ) {
-    const ff = await getFfmpeg(logFn);
+    const ff = await getFfmpeg();
     const inName = `input-${Date.now()}`;
     const outName = `frames-${Date.now()}.rgb`;
     await ff.writeFile(inName, await fetchFile(file));
-    logFn("extracting raw RGB frames…");
-    await ff.exec([
+    onStatus?.("extracting raw RGB frames…");
+    await withProgressListener(ff, onProgress, () => ff.exec([
         "-i", inName,
         "-vf", `scale=${width}:${height},fps=${fps}`,
         "-f", "rawvideo",
         "-pix_fmt", "rgb24",
         outName,
-    ]);
+    ]));
+    onProgress?.(100);
     const data = await ff.readFile(outName);
     try {
         await ff.deleteFile(inName);

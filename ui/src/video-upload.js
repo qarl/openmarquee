@@ -64,10 +64,7 @@ const TEMPLATE = `
             </div>
             <button type="submit" class="primary field-save" disabled>Save video</button>
             <p class="video-upload-status" role="status" aria-live="polite"></p>
-            <details class="video-upload-log">
-                <summary>ffmpeg.wasm log</summary>
-                <pre class="video-upload-log-body"></pre>
-            </details>
+            <progress class="video-upload-progress" value="0" max="100" hidden></progress>
         </form>
     </section>
 `;
@@ -126,7 +123,7 @@ export function mountVideoUploader(
     const durationEl = container.querySelector(".field-duration");
     const saveBtn = container.querySelector(".field-save");
     const statusEl = container.querySelector(".video-upload-status");
-    const logEl = container.querySelector(".video-upload-log-body");
+    const progressEl = container.querySelector(".video-upload-progress");
     const form = container.querySelector(".controls");
 
     const isPanelMode = PANEL_OUTPUT_MODES.has(outputMode);
@@ -134,13 +131,18 @@ export function mountVideoUploader(
     const hdmiHintEl = container.querySelector(".video-upload-hdmi-hint");
     hdmiHintEl.hidden = isPanelMode;
 
-    const logLines = [];
-    function logFn(msg) {
+    function setStatus(msg) {
         statusEl.textContent = msg;
-        logLines.push(msg);
-        if (logLines.length > 200) logLines.shift();
-        if (logEl) logEl.textContent = logLines.join("\n");
     }
+    function setProgress(pct) {
+        progressEl.hidden = false;
+        progressEl.value = pct;
+    }
+    function clearProgress() {
+        progressEl.hidden = true;
+        progressEl.value = 0;
+    }
+    const transcodeHooks = { onStatus: setStatus, onProgress: setProgress };
 
     const state = {
         // Populated only when the operator picks a NEW file. In edit
@@ -190,18 +192,20 @@ export function mountVideoUploader(
             state.thumbnailCanvasReady = false;
             state.assetBytesBase64 = null;
             clearCanvas(canvas);
-            logFn(`Could not process video: ${describeFfmpegError(err)}`);
+            setStatus(`Could not process video: ${describeFfmpegError(err)}`);
         } finally {
+            clearProgress();
             delete saveBtn.dataset.inFlight;
             updateSaveEnabled();
         }
     });
 
     async function processHdmiVideo(file) {
-        logFn("transcoding via ffmpeg.wasm…");
+        setStatus("transcoding via ffmpeg.wasm…");
+        setProgress(0);
         const mp4Bytes = await transcodeToH264(
             { file, width, height },
-            logFn,
+            transcodeHooks,
         );
         const mp4Blob = new Blob([mp4Bytes], { type: "video/mp4" });
         const [{ durationSeconds }, bytesB64] = await Promise.all([
@@ -214,16 +218,17 @@ export function mountVideoUploader(
         if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
             durationEl.value = String(Math.round(durationSeconds));
         }
-        logFn(
+        setStatus(
             `ready. transcoded to ${width}×${height} H.264 MP4 · ${(mp4Bytes.length / 1024).toFixed(1)} KB`,
         );
     }
 
     async function processPanelVideo(file) {
-        logFn("extracting raw frames via ffmpeg.wasm…");
+        setStatus("extracting raw frames via ffmpeg.wasm…");
+        setProgress(0);
         const rawBytes = await extractRawFrames(
             { file, width, height, fps: PANEL_FPS },
-            logFn,
+            transcodeHooks,
         );
         const frameBytes = width * height * 3;
         const nFrames = Math.floor(rawBytes.length / frameBytes);
@@ -238,7 +243,7 @@ export function mountVideoUploader(
         const derivedDuration = nFrames / PANEL_FPS;
         state.durationSeconds = derivedDuration;
         durationEl.value = String(Math.max(1, Math.round(derivedDuration)));
-        logFn(
+        setStatus(
             `ready. ${nFrames} RGB frames @ ${PANEL_FPS}fps · ${(rawBytes.length / 1024).toFixed(1)} KB`,
         );
     }
@@ -427,16 +432,21 @@ export function drawFirstFrameToCanvas(file, canvas) {
         const video = document.createElement("video");
         video.muted = true;
         video.playsInline = true;
-        video.preload = "metadata";
+        // `auto` (vs `metadata`) ensures the browser actually buffers
+        // a frame; without it the seek can complete before any pixel
+        // data exists and the canvas reads black.
+        video.preload = "auto";
         video.crossOrigin = "anonymous";
 
         const cleanup = () => URL.revokeObjectURL(url);
+        let drew = false;
 
-        video.addEventListener("loadedmetadata", () => {
-            // Seek a hair past 0 to dodge black-frame intros on some encoders.
-            video.currentTime = Math.min(0.1, video.duration / 10 || 0.1);
-        });
-        video.addEventListener("seeked", () => {
+        function paint() {
+            if (drew) return;
+            // Need at least HAVE_CURRENT_DATA so the video's texture has
+            // a frame for drawImage to read.
+            if (video.readyState < 2 || !video.videoWidth) return;
+            drew = true;
             try {
                 const ctx = canvas.getContext("2d");
                 ctx.save();
@@ -444,11 +454,11 @@ export function drawFirstFrameToCanvas(file, canvas) {
                     ctx.fillStyle = "#000000";
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
                     const scale = Math.min(
-                        canvas.width / (video.videoWidth || 1),
-                        canvas.height / (video.videoHeight || 1),
+                        canvas.width / video.videoWidth,
+                        canvas.height / video.videoHeight,
                     );
-                    const drawW = (video.videoWidth || canvas.width) * scale;
-                    const drawH = (video.videoHeight || canvas.height) * scale;
+                    const drawW = video.videoWidth * scale;
+                    const drawH = video.videoHeight * scale;
                     const drawX = (canvas.width - drawW) / 2;
                     const drawY = (canvas.height - drawH) / 2;
                     ctx.drawImage(video, drawX, drawY, drawW, drawH);
@@ -461,6 +471,21 @@ export function drawFirstFrameToCanvas(file, canvas) {
                 cleanup();
                 reject(err);
             }
+        }
+
+        // Seek only after `loadeddata` — guarantees at least one frame
+        // exists, so the subsequent `seeked` event isn't firing on an
+        // empty video texture.
+        video.addEventListener("loadeddata", () => {
+            video.currentTime = Math.min(0.1, video.duration / 10 || 0.1);
+        });
+        video.addEventListener("seeked", () => {
+            // Some browsers fire `seeked` before the new frame is
+            // composited into the video element's texture. One rAF
+            // is enough breathing room for drawImage to read the
+            // post-seek pixels instead of the prior frame's (often
+            // black) backing store.
+            requestAnimationFrame(paint);
         });
         video.addEventListener("error", () => {
             cleanup();
