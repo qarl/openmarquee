@@ -19,6 +19,7 @@
 // affordance starts / stops the backend loop.
 
 import {
+    deletePlaylistByName,
     fetchContentItem,
     generateBackground,
     getSchedule,
@@ -32,7 +33,6 @@ import {
     saveSettings,
     saveTextSlide,
     saveVideo,
-    setPlaylistOrder,
     updateImage,
     updateTextSlide,
     updateVideo,
@@ -196,19 +196,27 @@ async function boot() {
         playlistTrack = mountPlaylistTrack(trackSlot, {
             fetchItems: listContent,
             fetchPlaylists: listPlaylists,
-            // Reorder + duration writes target whichever playlist is
-            // currently active — the closure reads currentPlaylistName
-            // at call time, not at mount time, so switching via the
-            // playlist browser picks up the new target. After each
-            // save, refresh the inline preview so the operator sees
-            // the new order / duration play out immediately.
-            onReorder: async (entries) => {
-                const result = await setPlaylistOrder(
-                    entries,
-                    currentPlaylistName,
-                );
+            // Explicit Save: drag/drop / transition / × / name-edit
+            // mutate a draft; only the Save button triggers persistence.
+            // Renames pivot via PUT-new + DELETE-old (the default
+            // playlist is rename-locked at the UI level).
+            onSavePlaylist: async ({ originalName, newName, entries }) => {
+                const target = newName || originalName;
+                await savePlaylistByName(target, entries);
+                if (target !== originalName && originalName !== "default") {
+                    try {
+                        await deletePlaylistByName(originalName);
+                    } catch (err) {
+                        console.warn(
+                            "[openmarquee] rename: old playlist delete failed (continuing):",
+                            err,
+                        );
+                    }
+                    currentPlaylistName = target;
+                    await playlistBrowserHandle?.refresh();
+                    playlistBrowserHandle?.highlight(target);
+                }
                 await inlinePreviewHandle?.refresh();
-                return result;
             },
             onUpdateDuration: async (id, ms) => {
                 const result = await patchSlideDuration(id, ms);

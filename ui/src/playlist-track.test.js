@@ -72,34 +72,45 @@ describe("mountPlaylistTrack", () => {
     it("clicking × removes the block and PUTs the new order as canonical entries", async () => {
         const container = document.createElement("div");
         const onReorder = vi.fn().mockResolvedValue(undefined);
+        const onSavePlaylist = vi.fn().mockResolvedValue(undefined);
         mountPlaylistTrack(container, {
             fetchItems: async () => ITEMS,
             fetchPlaylists: fetchPlaylistsWith(["a", "b", "c"]),
-            onReorder,
+            onSavePlaylist,
         });
         await tick();
 
-        // Remove the middle one.
+        // Remove the middle one — it should drop out of the DOM and
+        // dirty the editor (Save button enables) but NOT auto-save.
         container
             .querySelector('.track-block[data-id="b"] .track-remove')
             .click();
         await tick();
 
-        expect(onReorder).toHaveBeenCalledTimes(1);
-        const sent = onReorder.mock.calls[0][0];
-        expect(sent.map((e) => e.item_id)).toEqual(["a", "c"]);
-        // Each entry carries the transition/transition_ms envelope.
-        expect(sent.every((e) => e.transition === "cut")).toBe(true);
-        expect(sent.every((e) => e.transition_ms === 500)).toBe(true);
+        const remainingIds = Array.from(
+            container.querySelectorAll(".track-block"),
+        ).map((b) => b.dataset.id);
+        expect(remainingIds).toEqual(["a", "c"]);
+        expect(onSavePlaylist).not.toHaveBeenCalled();
+        expect(container.querySelector(".playlist-save").disabled).toBe(false);
+
+        // Save click sends the canonical entry envelope for what's
+        // currently in the track.
+        container.querySelector(".playlist-save").click();
+        await tick();
+        expect(onSavePlaylist).toHaveBeenCalledTimes(1);
+        const { entries } = onSavePlaylist.mock.calls[0][0];
+        expect(entries.map((e) => e.item_id)).toEqual(["a", "c"]);
+        expect(entries.every((e) => e.transition === "cut")).toBe(true);
     });
 
-    it("clicking the transition chip cycles cut ↔ fade and saves", async () => {
+    it("clicking the transition chip cycles cut ↔ fade in the draft", async () => {
         const container = document.createElement("div");
-        const onReorder = vi.fn().mockResolvedValue(undefined);
+        const onSavePlaylist = vi.fn().mockResolvedValue(undefined);
         mountPlaylistTrack(container, {
             fetchItems: async () => ITEMS,
             fetchPlaylists: fetchPlaylistsWith(["a"]),
-            onReorder,
+            onSavePlaylist,
         });
         await tick();
 
@@ -110,8 +121,15 @@ describe("mountPlaylistTrack", () => {
         chip.click();
         await tick();
         expect(chip.textContent).toBe("fade");
-        const sent = onReorder.mock.calls[0][0];
-        expect(sent).toEqual([
+        // Cycling marks dirty but doesn't auto-save.
+        expect(onSavePlaylist).not.toHaveBeenCalled();
+        expect(container.querySelector(".playlist-save").disabled).toBe(false);
+
+        // Save sends the new transition value.
+        container.querySelector(".playlist-save").click();
+        await tick();
+        const { entries } = onSavePlaylist.mock.calls[0][0];
+        expect(entries).toEqual([
             { item_id: "a", transition: "fade", transition_ms: 500 },
         ]);
     });

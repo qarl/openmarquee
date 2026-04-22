@@ -34,13 +34,15 @@ const TEMPLATE = `
     <section class="playlist-track">
         <h2 class="subpage-title">Playlists</h2>
         <div class="playlist-browser-slot"></div>
-        <div class="playlist-track-header">
-            <h3 class="playlist-track-heading" data-field="heading">Default playlist</h3>
-        </div>
         <div class="playlist-track-inline-preview"></div>
+        <label class="field">
+            <span>Playlist name</span>
+            <input type="text" class="field-playlist-name" maxlength="64" pattern="[a-z0-9_-]+">
+        </label>
         <p class="playlist-track-hint">
             Drag blocks to reorder; drag from the pallet below to add;
             × to remove. Click the duration to change it.
+            Changes apply when you click <strong>Save playlist</strong>.
         </p>
 
         <div class="playlist-track-scroll" role="region" aria-label="playlist timeline">
@@ -50,6 +52,7 @@ const TEMPLATE = `
         <h3 class="playlist-pallet-heading">All slides</h3>
         <ul class="playlist-pallet" role="list"></ul>
 
+        <button type="button" class="primary playlist-save" disabled>Save playlist</button>
         <p class="playlist-track-status" role="status" aria-live="polite"></p>
     </section>
 `;
@@ -77,7 +80,7 @@ export function mountPlaylistTrack(container, options) {
     const {
         fetchItems,
         fetchPlaylists,
-        onReorder,
+        onSavePlaylist,
         onUpdateDuration,
         inlinePreview,
         outputMode,
@@ -92,6 +95,12 @@ export function mountPlaylistTrack(container, options) {
     const trackEl = container.querySelector(".playlist-track-list");
     const palletEl = container.querySelector(".playlist-pallet");
     const statusEl = container.querySelector(".playlist-track-status");
+    const nameEl = container.querySelector(".field-playlist-name");
+    const saveBtn = container.querySelector(".playlist-save");
+    // Heading element is gone from the template (the name input above
+    // doubles as the playlist label). Keep the lookup for backward
+    // compat: any caller that still injects a `[data-field="heading"]`
+    // gets it updated; otherwise we no-op.
     const headingEl = container.querySelector('[data-field="heading"]');
     const inlinePreviewSlot = container.querySelector(
         ".playlist-track-inline-preview",
@@ -115,25 +124,56 @@ export function mountPlaylistTrack(container, options) {
     let trackSortable = null;
     let palletSortable = null;
     let saving = false;
+    let isDirty = false;
     // Closure-scoped lookup so the track Sortable's `onEnd` can re-skin a
     // cross-list drop (pallet → track) from the Sortable-clone's default
     // `.pallet-tile` shape into a proper `.track-block` *before* waiting
     // on the server round-trip. Refreshed on every refresh() call.
     let itemByIdRef = new Map();
 
-    async function saveAndRefresh(work) {
-        if (saving) return;
+    function markDirty() {
+        isDirty = true;
+        saveBtn.disabled = false;
+        statusEl.textContent = "Unsaved changes.";
+    }
+    function markClean() {
+        isDirty = false;
+        saveBtn.disabled = true;
+    }
+
+    nameEl.addEventListener("input", markDirty);
+
+    function bindAddedBlockButtons() {
+        // After a drag-add or reorder, fresh DOM nodes may not have
+        // their click handlers wired yet. Re-bind everything; the
+        // initial-render path uses these same fns.
+        bindTrackRemoveButtons(trackEl, markDirty);
+        bindTrackDurationButtons(trackEl, onUpdateDuration, refresh);
+    }
+
+    saveBtn.addEventListener("click", async () => {
+        if (saving || !isDirty) return;
         saving = true;
+        saveBtn.disabled = true;
+        statusEl.textContent = "Saving…";
         try {
-            await work();
-            await refresh();
+            const entries = collectTrackEntries(trackEl);
+            const newName = (nameEl.value || "").trim();
+            const originalName = resolveName();
+            await onSavePlaylist({
+                originalName,
+                newName: newName || originalName,
+                entries,
+            });
+            statusEl.textContent = "Saved.";
+            markClean();
         } catch (err) {
             statusEl.textContent = `Save failed: ${err.message}`;
-            await refresh();
+            saveBtn.disabled = false; // let the operator retry
         } finally {
             saving = false;
         }
-    }
+    });
 
     async function refresh() {
         statusEl.textContent = "";
@@ -145,10 +185,12 @@ export function mountPlaylistTrack(container, options) {
             itemByIdRef = new Map(items.map((it) => [String(it.id), it]));
             const itemById = itemByIdRef;
             const activeName = resolveName();
-            headingEl.textContent =
-                activeName === "default"
-                    ? "Default playlist"
-                    : activeName;
+            if (headingEl) {
+                headingEl.textContent =
+                    activeName === "default"
+                        ? "Default playlist"
+                        : activeName;
+            }
             // v3 API returns `items: [{item_id, transition, transition_ms}]`;
             // fall back to the legacy `item_ids` shape for defensive reading.
             const active = collection.playlists?.[activeName];
@@ -174,12 +216,21 @@ export function mountPlaylistTrack(container, options) {
                 if (locked) lockedInTrackCount++;
                 trackEl.appendChild(renderTrackBlock(item, entry, { locked }));
             }
-            // Wire × buttons after the DOM is in place so each handler
-            // sees the current trackEl children.
-            bindTrackRemoveButtons(trackEl, onReorder, saveAndRefresh);
+            // Wire × + transition buttons → mark dirty (no save until
+            // the operator clicks Save playlist).
+            bindTrackRemoveButtons(trackEl, markDirty);
+            // Duration is a SLIDE attribute — auto-saves immediately
+            // outside the playlist's draft flow.
             bindTrackDurationButtons(
-                trackEl, onUpdateDuration, saveAndRefresh,
+                trackEl, onUpdateDuration, refresh,
             );
+
+            // Sync the name input and reset dirty state to match the
+            // freshly-loaded playlist.
+            nameEl.value = activeName;
+            nameEl.disabled = activeName === "default";
+            markClean();
+            statusEl.textContent = "";
 
             palletEl.innerHTML = "";
             for (const item of items) {
@@ -202,9 +253,9 @@ export function mountPlaylistTrack(container, options) {
             if (palletSortable) palletSortable.destroy();
             trackSortable = bindTrackSortable(
                 trackEl,
-                onReorder,
-                saveAndRefresh,
+                markDirty,
                 itemByIdRef,
+                bindAddedBlockButtons,
             );
             palletSortable = bindPalletSortable(palletEl);
         } catch (err) {
@@ -216,26 +267,24 @@ export function mountPlaylistTrack(container, options) {
     return { refresh };
 }
 
-function bindTrackSortable(trackEl, onReorder, saveAndRefresh, itemByIdRef) {
+function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons) {
     return Sortable.create(trackEl, {
         group: { name: "playlist-track", pull: true, put: ["playlist-pallet"] },
         animation: 150,
         ghostClass: "track-ghost",
-        filter: ".track-remove, .track-block-transition",
+        filter: ".track-remove, .track-block-transition, .track-block-duration",
         preventOnFilter: false,
         onAdd: (evt) => {
             // Cross-list drop from the pallet → Sortable cloned a
             // `.pallet-tile` into the track. Re-skin in place to the
             // proper `.track-block` shape (with duration label + default
             // transition chrome) so the operator sees correct chrome
-            // *immediately*, not after the save-refresh round-trip.
+            // *immediately*.
             const dropped = evt.item;
             const id = dropped?.dataset?.id;
             if (!id) return;
             const item = itemByIdRef.get(id);
             if (!item) return;
-            // New entries land with default transitions; operator can
-            // click the transition chip to cycle.
             const rebuilt = renderTrackBlock(item, {
                 item_id: id,
                 transition: "cut",
@@ -244,8 +293,12 @@ function bindTrackSortable(trackEl, onReorder, saveAndRefresh, itemByIdRef) {
             dropped.replaceWith(rebuilt);
         },
         onEnd: () => {
-            const entries = collectTrackEntries(trackEl);
-            saveAndRefresh(() => onReorder(entries));
+            // Drop happened — re-wire button handlers on the (possibly
+            // new) blocks so the operator can interact with the
+            // dropped block immediately, then mark the playlist dirty
+            // so Save lights up.
+            if (rebindButtons) rebindButtons();
+            markDirty();
         },
     });
 }
@@ -283,22 +336,25 @@ function collectTrackEntries(trackEl) {
     );
 }
 
-function bindTrackRemoveButtons(trackEl, onReorder, saveAndRefresh) {
+function bindTrackRemoveButtons(trackEl, markDirty) {
     for (const btn of trackEl.querySelectorAll(".track-remove")) {
+        // Idempotent re-binding: skip if already wired (we may be
+        // called multiple times after drag-adds).
+        if (btn.dataset.bound === "1") continue;
+        btn.dataset.bound = "1";
         btn.addEventListener("click", () => {
             const block = btn.closest("[data-id]");
             if (!block) return;
-            const removingId = block.dataset.id;
-            const next = collectTrackEntries(trackEl).filter(
-                (e) => e.item_id !== removingId,
-            );
-            saveAndRefresh(() => onReorder(next));
+            block.remove();
+            markDirty();
         });
     }
-    // Transition chip: cycles cut ↔ fade on click. Uses the block's
-    // dataset as the source of truth so collectTrackEntries picks up
-    // the new value when we save.
+    // Transition chip: cycles cut ↔ fade on click. Source of truth is
+    // the block's dataset so collectTrackEntries picks up the value at
+    // Save time.
     for (const chip of trackEl.querySelectorAll(".track-block-transition")) {
+        if (chip.dataset.bound === "1") continue;
+        chip.dataset.bound = "1";
         chip.addEventListener("click", () => {
             const block = chip.closest(".track-block");
             if (!block) return;
@@ -306,16 +362,17 @@ function bindTrackRemoveButtons(trackEl, onReorder, saveAndRefresh) {
             const next = current === "cut" ? "fade" : "cut";
             block.dataset.transition = next;
             chip.textContent = next;
-            const entries = collectTrackEntries(trackEl);
-            saveAndRefresh(() => onReorder(entries));
+            markDirty();
         });
     }
 }
 
-function bindTrackDurationButtons(trackEl, onUpdateDuration, saveAndRefresh) {
+function bindTrackDurationButtons(trackEl, onUpdateDuration, refresh) {
     if (!onUpdateDuration) return;
     for (const btn of trackEl.querySelectorAll(".track-block-duration")) {
-        btn.addEventListener("click", () => {
+        if (btn.dataset.bound === "1") continue;
+        btn.dataset.bound = "1";
+        btn.addEventListener("click", async () => {
             const block = btn.closest("[data-id]");
             if (!block) return;
             const id = block.dataset.id;
@@ -331,7 +388,14 @@ function bindTrackDurationButtons(trackEl, onUpdateDuration, saveAndRefresh) {
             const seconds = Number(next);
             if (!Number.isFinite(seconds) || seconds <= 0) return;
             const ms = Math.round(seconds * 1000);
-            saveAndRefresh(() => onUpdateDuration(id, ms));
+            // Duration is a slide-level attribute — auto-save
+            // immediately, outside the playlist's draft flow.
+            try {
+                await onUpdateDuration(id, ms);
+                if (refresh) await refresh();
+            } catch (err) {
+                console.error("[playlist-track] duration save failed:", err);
+            }
         });
     }
 }
