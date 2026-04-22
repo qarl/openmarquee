@@ -29,7 +29,7 @@ from openmarquee.seed import seed_if_needed
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Startup: first-boot seed. Shutdown: stop the playback loop."""
+    """Startup: first-boot seed + auto-start playback. Shutdown: stop."""
     # First-boot seed: if no marker file + storage is empty, create a few
     # starter ImageSlides so the operator has something to hit Play on
     # immediately. seed_if_needed logs + stamps a marker so this is a
@@ -52,6 +52,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             import logging
 
             logging.getLogger(__name__).exception("startup seed failed")
+
+    # "Hardware always running" — the device's real playback loop starts
+    # at boot and runs until shutdown. The UI's inline preview is a
+    # parallel client-side simulator, not a control surface for the loop.
+    # Tests can opt out via OPENMARQUEE_DISABLE_AUTOSTART=1 so fixtures
+    # that spin a backend don't have an extra asyncio task running.
+    if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
+        try:
+            await get_playback_loop().start()
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "startup playback autostart failed"
+            )
     yield
     await get_playback_loop().stop()
 

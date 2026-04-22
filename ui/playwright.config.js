@@ -56,6 +56,9 @@ export default defineConfig({
             // startup seed would pre-populate four slides and break the
             // smoke tests. Seeding is unit-tested in test_seed.py.
             OPENMARQUEE_DISABLE_SEED: "1",
+            // e2e specs that want playback running call start() themselves;
+            // leaving the lifespan auto-start off keeps test runs predictable.
+            OPENMARQUEE_DISABLE_AUTOSTART: "1",
             // Resolve the UI dir relative to THIS file, not cwd, so e2e works
             // regardless of where Playwright is launched from.
             OPENMARQUEE_UI_DIR: __dirname,
