@@ -3,8 +3,11 @@
 // (multi-playlist refactor pending), so this UI is half "dry-run" — users can
 // build the schedule they want and it survives across restarts, ready for
 // the day playback actually honors it.
-
-import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
+//
+// Timezone for rule evaluation comes from System Settings — no panel-local
+// override here, so operators only set the zone in one place. The IANA
+// timezone dropdown helpers are gone from this file with that UI; they
+// still live in iana-timezones.js for the Settings panel's use.
 
 const DAYS = [
     { value: "mon", label: "Mon" },
@@ -18,25 +21,22 @@ const DAYS = [
 
 const SECTION_TEMPLATE = `
     <section class="schedule">
-        <h2 class="schedule-heading">Schedule</h2>
+        <h2 class="subpage-title">Schedule</h2>
+        <div class="schedule-now" data-field="now">
+            <span class="schedule-now-label">Device time</span>
+            <span class="schedule-now-value" data-field="now-value">—</span>
+        </div>
         <p class="schedule-hint">
             Rules pick which playlist plays when. First matching rule wins;
-            otherwise the default below plays.
-            <em>(Backend persists rules; multi-playlist switching lands later.)</em>
+            otherwise the default below plays. Timezone comes from Settings.
         </p>
 
-        <div class="row">
-            <label class="field">
-                <span>Default playlist (when no rule matches)</span>
-                <input type="text" class="field-default-playlist" maxlength="64" pattern="[a-z0-9_-]+">
-            </label>
-            <label class="field">
-                <span>Timezone (IANA, optional — reserved for future zoned eval)</span>
-                <select class="field-tz">
-                    <option value="">Device local (no explicit timezone)</option>
-                </select>
-            </label>
-        </div>
+        <label class="field">
+            <span>Default playlist (when no rule matches)</span>
+            <input type="text" class="field-default-playlist" maxlength="64" pattern="[a-z0-9_-]+">
+        </label>
+
+        <button type="button" class="schedule-add">+ Add Rule</button>
 
         <ul class="schedule-rules" role="list"></ul>
 
@@ -45,7 +45,6 @@ const SECTION_TEMPLATE = `
             <button type="button" class="schedule-disable-all">Disable all</button>
         </div>
 
-        <button type="button" class="schedule-add">+ Add rule</button>
         <button type="button" class="primary schedule-save">Save schedule</button>
         <p class="schedule-status" role="status" aria-live="polite"></p>
     </section>
@@ -64,42 +63,86 @@ const SECTION_TEMPLATE = `
  *     round-tripping never silently drops a name).
  * @returns {{ refresh: () => Promise<void> }}
  */
-export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistNames }) {
+export function mountSchedule(
+    container,
+    { fetchSchedule, onSave, fetchPlaylistNames, fetchSettings },
+) {
     container.innerHTML = SECTION_TEMPLATE;
     const defaultEl = container.querySelector(".field-default-playlist");
-    const tzEl = container.querySelector(".field-tz");
     const rulesEl = container.querySelector(".schedule-rules");
     const addBtn = container.querySelector(".schedule-add");
     const saveBtn = container.querySelector(".schedule-save");
     const enableAllBtn = container.querySelector(".schedule-enable-all");
     const disableAllBtn = container.querySelector(".schedule-disable-all");
     const statusEl = container.querySelector(".schedule-status");
+    const nowValueEl = container.querySelector('[data-field="now-value"]');
 
     let availableNames = null; // null = no dropdown; array = use <select>
-
-    populateTzSelect(tzEl);
+    // TZ carried through saves unchanged — the schedule payload still
+    // round-trips any tz the schedule.json has, even though this UI
+    // doesn't edit it (authoritative tz lives in System Settings).
+    let persistedTz = null;
+    // Device tz, pulled once at mount from /api/settings for the
+    // ticking current-time display. Falls back to browser local if
+    // settings is unreachable.
+    let deviceTz = null;
 
     async function refresh() {
         statusEl.textContent = "";
         try {
-            const [schedule, names] = await Promise.all([
+            const [schedule, names, settings] = await Promise.all([
                 fetchSchedule(),
                 fetchPlaylistNames ? fetchPlaylistNames() : Promise.resolve(null),
+                fetchSettings ? fetchSettings().catch(() => null) : Promise.resolve(null),
             ]);
             availableNames = names;
             if (availableNames && defaultEl.tagName !== "SELECT") {
                 replaceDefaultWithSelect(defaultEl.parentElement, schedule.default_playlist_name);
             }
             setDefaultValue(container, schedule.default_playlist_name || "default");
-            setTzValue(tzEl, schedule.tz || "");
+            persistedTz = schedule.tz || null;
+            deviceTz = settings?.timezone || null;
             rulesEl.innerHTML = "";
             for (const rule of schedule.rules || []) {
                 rulesEl.appendChild(renderRule(rule, availableNames));
             }
+            tickNow();
         } catch (err) {
             statusEl.textContent = `Could not load schedule: ${err.message}`;
         }
     }
+
+    // Current-time display, ticks every second. Uses the device's
+    // configured tz so the operator can eyeball whether their "runs
+    // weekdays 9–5" rule is about to fire.
+    function tickNow() {
+        if (!nowValueEl) return;
+        const now = new Date();
+        const options = {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            weekday: "short",
+            hour12: false,
+        };
+        if (deviceTz) options.timeZone = deviceTz;
+        try {
+            nowValueEl.textContent = new Intl.DateTimeFormat(
+                undefined,
+                options,
+            ).format(now);
+        } catch {
+            // Invalid tz: fall back without a tz option.
+            delete options.timeZone;
+            nowValueEl.textContent = new Intl.DateTimeFormat(
+                undefined,
+                options,
+            ).format(now);
+        }
+    }
+    const nowInterval = setInterval(tickNow, 1000);
+    // Suppress unused-var lint; interval is intentional.
+    void nowInterval;
 
     function replaceDefaultWithSelect(labelEl, currentValue) {
         // Swap the <input class="field-default-playlist"> for a <select>.
@@ -172,7 +215,7 @@ export function mountSchedule(container, { fetchSchedule, onSave, fetchPlaylistN
         saveBtn.disabled = true;
         statusEl.textContent = "Saving…";
         try {
-            const payload = collectSchedule(defaultEl, rulesEl, tzEl);
+            const payload = collectSchedule(defaultEl, rulesEl, persistedTz);
             await onSave(payload);
             statusEl.textContent = "Saved.";
         } catch (err) {
@@ -243,47 +286,6 @@ function renderRule(rule, availableNames) {
     return li;
 }
 
-function populateTzSelect(selectEl) {
-    // Keep the leading "Device local" option already in the template, then
-    // append the IANA zones. listTimezones() front-loads the common U.S.
-    // zones; insert a disabled divider between the top-of-list and the
-    // rest so the visual hierarchy is obvious.
-    const zones = listTimezones();
-    const commonSet = new Set(US_COMMON_TIMEZONES);
-    let dividerPlaced = false;
-    for (const zone of zones) {
-        if (!commonSet.has(zone) && !dividerPlaced) {
-            const divider = document.createElement("option");
-            divider.disabled = true;
-            divider.textContent = "──────── all timezones ────────";
-            selectEl.appendChild(divider);
-            dividerPlaced = true;
-        }
-        const opt = document.createElement("option");
-        opt.value = zone;
-        opt.textContent = zone;
-        selectEl.appendChild(opt);
-    }
-}
-
-function setTzValue(selectEl, value) {
-    if (!value) {
-        selectEl.value = "";
-        return;
-    }
-    const known = Array.from(selectEl.options).some((opt) => opt.value === value);
-    if (!known) {
-        // Preserve the stored name so we don't silently drop it on save. Mark
-        // it so the operator sees that the stored value isn't one the browser
-        // currently knows about.
-        const opt = document.createElement("option");
-        opt.value = value;
-        opt.textContent = `${value} (stored)`;
-        selectEl.appendChild(opt);
-    }
-    selectEl.value = value;
-}
-
 function fillPlaylistOptions(selectEl, names, currentValue) {
     selectEl.innerHTML = "";
     const seen = new Set();
@@ -310,7 +312,7 @@ function ensureOption(selectEl, value) {
     }
 }
 
-function collectSchedule(defaultEl, rulesEl, tzEl) {
+function collectSchedule(defaultEl, rulesEl, persistedTz) {
     const rules = Array.from(rulesEl.querySelectorAll(".schedule-rule")).map((li) => ({
         name: li.querySelector(".rule-name").value,
         days: Array.from(li.querySelectorAll(".rule-day-input"))
@@ -321,11 +323,12 @@ function collectSchedule(defaultEl, rulesEl, tzEl) {
         playlist_name: li.querySelector(".rule-playlist").value,
         enabled: li.querySelector(".rule-enabled").checked,
     }));
-    const tz = tzEl?.value.trim() || null;
     return {
         rules,
         default_playlist_name: defaultEl.value || "default",
-        tz,
+        // Round-trip whatever tz was on disk — the UI doesn't edit it,
+        // but persisting untouched keeps backend-side scheduler happy.
+        tz: persistedTz,
     };
 }
 

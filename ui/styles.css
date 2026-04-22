@@ -1366,6 +1366,46 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 
 .schedule-add {
     align-self: flex-start;
+    background: var(--panel);
+    border: 1px dashed var(--panel-border);
+    border-radius: 0.35rem;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    padding: 0.45rem 0.9rem;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+.schedule-add:hover {
+    border-color: var(--accent);
+    background: #111115;
+}
+
+/* Current-time display at the top of the Schedule subpage. Ticks every
+   second in the device's configured IANA timezone so the operator can
+   eyeball whether a rule is about to fire. */
+.schedule-now {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    margin-bottom: 0.75rem;
+    padding: 0.45rem 0.8rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.35rem;
+}
+.schedule-now-label {
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+.schedule-now-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.95rem;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
 }
 
 .schedule-bulk {

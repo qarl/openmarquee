@@ -285,6 +285,7 @@ async function boot() {
             const collection = await listPlaylists();
             return Object.keys(collection.playlists || {}).sort();
         },
+        fetchSettings: getSettings,
     });
 
     mountSettings(root.querySelector(".settings-slot"), {

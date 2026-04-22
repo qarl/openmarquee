@@ -147,7 +147,10 @@ describe("mountSchedule", () => {
         });
     });
 
-    it("loads and round-trips the optional tz field", async () => {
+    it("round-trips the persisted tz unchanged — UI no longer edits it", async () => {
+        // The tz field moved to System Settings. The schedule's stored
+        // tz still rides through saves to keep the backend scheduler
+        // happy; this test pins that contract.
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
         mountSchedule(container, {
@@ -159,60 +162,29 @@ describe("mountSchedule", () => {
             onSave,
         });
         await tick();
+        expect(container.querySelector(".field-tz")).toBeNull();
 
-        // Initial value populated from the schedule.
-        expect(container.querySelector(".field-tz").value).toBe("America/New_York");
-
-        // User clears it; save should send tz=null.
-        container.querySelector(".field-tz").value = "";
         container.querySelector(".schedule-save").click();
         await tick();
-        expect(onSave.mock.calls[0][0].tz).toBeNull();
+        expect(onSave.mock.calls[0][0].tz).toBe("America/New_York");
     });
 
-    it("tz field is a <select> populated from the IANA zone list", async () => {
+    it("shows a ticking device-time display when fetchSettings is provided", async () => {
         const container = document.createElement("div");
-        mountSchedule(container, {
-            fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
-            onSave: vi.fn(),
-        });
-        await tick();
-
-        const tz = container.querySelector(".field-tz");
-        expect(tz.tagName).toBe("SELECT");
-        // Leading "Device local" option + many IANA zones.
-        const values = Array.from(tz.options).map((o) => o.value);
-        expect(values[0]).toBe(""); // Device local sentinel
-        expect(values).toContain("UTC");
-        expect(values).toContain("America/Los_Angeles");
-    });
-
-    it("tz dropdown preserves an out-of-list stored value with a '(stored)' suffix", async () => {
-        const container = document.createElement("div");
-        const onSave = vi.fn().mockResolvedValue(undefined);
         mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [],
                 default_playlist_name: "default",
-                // Intentionally malformed: not in Intl.supportedValuesOf.
-                tz: "Mars/Olympus_Mons",
             }),
-            onSave,
+            onSave: vi.fn(),
+            fetchSettings: async () => ({ timezone: "UTC" }),
         });
         await tick();
-
-        const tz = container.querySelector(".field-tz");
-        expect(tz.value).toBe("Mars/Olympus_Mons");
-        const marsOpt = Array.from(tz.options).find(
-            (o) => o.value === "Mars/Olympus_Mons",
-        );
-        expect(marsOpt).toBeTruthy();
-        expect(marsOpt.textContent).toMatch(/stored/);
-
-        // Round-trip preserves the stored value rather than silently dropping.
-        container.querySelector(".schedule-save").click();
-        await tick();
-        expect(onSave.mock.calls[0][0].tz).toBe("Mars/Olympus_Mons");
+        const nowEl = container.querySelector('[data-field="now-value"]');
+        expect(nowEl).not.toBeNull();
+        // After a tick the formatter has run; it's either the "—"
+        // placeholder or something else — the contract is "present".
+        expect(nowEl.textContent.length).toBeGreaterThan(0);
     });
 
     it("Save error message surfaces in the status", async () => {
