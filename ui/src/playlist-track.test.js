@@ -176,25 +176,32 @@ describe("mountPlaylistTrack", () => {
         expect(ul.getAttribute("data-empty-hint")).toMatch(/pallet/i);
     });
 
-    it("mounts the injected playback controls when playback hooks are passed", async () => {
+    it("calls the injected inlinePreview.mount with the configured dims + outputMode", async () => {
         const container = document.createElement("div");
-        const mountPlaybackControls = vi.fn();
+        const mount = vi.fn();
         mountPlaylistTrack(container, {
             fetchItems: async () => ITEMS,
             fetchPlaylists: fetchPlaylistsWith([]),
             onReorder: vi.fn(),
-            playback: {
-                fetchState: vi.fn(),
-                onStart: vi.fn(),
-                onStop: vi.fn(),
+            inlinePreview: {
+                width: 128,
+                height: 96,
+                outputMode: "hub75",
+                mount,
             },
-            mountPlaybackControls,
         });
         await tick();
 
-        expect(mountPlaybackControls).toHaveBeenCalledTimes(1);
-        const slot = mountPlaybackControls.mock.calls[0][0];
-        expect(slot.classList.contains("playlist-track-playback")).toBe(true);
+        expect(mount).toHaveBeenCalledTimes(1);
+        const [slot, dims] = mount.mock.calls[0];
+        expect(slot.classList.contains("playlist-track-inline-preview")).toBe(
+            true,
+        );
+        expect(dims).toEqual({
+            width: 128,
+            height: 96,
+            outputMode: "hub75",
+        });
     });
 
     it("re-skins a pallet-cloned drop to .track-block shape immediately (onAdd)", async () => {

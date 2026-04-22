@@ -51,12 +51,10 @@ test("schedule-driven playback: API-built lunch playlist + always-on rule → pl
     await page.locator(".schedule-save").click();
     await expect(page.locator(".schedule-status")).toHaveText("Saved.");
 
-    // 4. Kick playback from the Playlists subpage where Play / Stop lives.
-    await page.locator('.nav-link[data-section="playlists"]').click();
-    const playBtn = page.locator(".playback-btn");
-    await expect(playBtn).toHaveText("Play all");
-    await playBtn.click();
-    await expect(playBtn).toHaveText("Stop");
+    // 4. Hardware playback is autonomous — kick the loop directly.
+    //    (The UI no longer has a Play-all button; e2e config disables
+    //    the lifespan autostart so each spec opts in.)
+    await page.request.post("/api/playback/start");
 
     // 5. The loop should evaluate the schedule, pick "lunch", and the
     //    state endpoint should report that back.
@@ -67,7 +65,5 @@ test("schedule-driven playback: API-built lunch playlist + always-on rule → pl
         })
         .toBe("lunch");
 
-    // 6. Stop so the test doesn't leave a task running.
-    await playBtn.click();
-    await expect(playBtn).toHaveText("Play all");
+    await page.request.post("/api/playback/stop");
 });

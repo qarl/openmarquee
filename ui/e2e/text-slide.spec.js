@@ -94,33 +94,28 @@ test("playlist PUT reorders content via the API (what drag-reorder invokes)", as
     expect(reordered.map((item) => item.name)).toEqual(["Third", "Second", "First"]);
 });
 
-test("Play all on the Playlists subpage starts the backend loop", async ({ page }) => {
+test("inline preview renders the playlist on the Playlists subpage", async ({ page }) => {
     await page.goto("/");
 
-    // Save a slide so the loop has something to render.
+    // Save a slide so the playlist has something to render.
     await page.locator(".editor .field-name").fill("Loop");
     await page.locator(".editor .field-text").fill("LOOP");
     await page.locator(".editor .field-save").click();
     await expect(page.locator(".editor-status")).toHaveText("Saved.");
 
-    // Add it to the default playlist via the drag-handler contract endpoint.
     const content = await (await page.request.get("/api/content")).json();
     await page.request.put("/api/playlist", {
         data: { item_ids: [content[0].id] },
     });
 
-    // Playback controls live on the Playlists subpage now.
+    // The Playlists subpage hosts the inline preview (client-side
+    // simulator). The transport controls render unconditionally; the
+    // idle placeholder hides once a non-empty playlist arrives.
     await page.locator('.nav-link[data-section="playlists"]').click();
-    const playBtn = page.locator(".playback-btn");
-    await expect(playBtn).toHaveText("Play all");
-    await playBtn.click();
-    await expect(playBtn).toHaveText("Stop");
-
-    const state = await (await page.request.get("/api/playback/state")).json();
-    expect(state.is_running).toBe(true);
-
-    await playBtn.click();
-    await expect(playBtn).toHaveText("Play all");
-    const stoppedState = await (await page.request.get("/api/playback/state")).json();
-    expect(stoppedState.is_running).toBe(false);
+    await expect(page.locator(".inline-preview-play")).toBeVisible();
+    await expect(page.locator(".inline-preview-scrub")).toBeVisible();
+    await expect(page.locator(".inline-preview-time")).toBeVisible();
+    await expect(page.locator(".inline-preview-idle")).toBeHidden({
+        timeout: 5_000,
+    });
 });

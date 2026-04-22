@@ -120,22 +120,22 @@ test("panel-mode video upload produces a raw-frames asset and the preview uses t
     expect(buf.length % frameSize).toBe(0);
     expect(buf.length / frameSize).toBeGreaterThan(0);
 
-    // Put the video in the default playlist and play — the preview
-    // should show an <img> (thumbnail), not a broken <video>.
+    // Put the video in the default playlist and play in the inline
+    // preview — the canvas should fill in (raw_frames videos have no
+    // browser-playable stream, so the inline preview falls back to
+    // drawing the asset.png thumbnail through its skin).
     await page.request.put("/api/playlist", {
         data: {
             items: [{ item_id: video.id, transition: "cut", transition_ms: 0 }],
         },
     });
 
-    await page.request.post("/api/playback/stop");
     await page.locator('.nav-link[data-section="playlists"]').click();
-    await page.locator(".playback-btn").click();
+    await page.locator(".inline-preview-play").click();
 
-    await expect(page.locator(".live-preview img")).toBeVisible({ timeout: 20_000 });
-    expect(await page.locator(".live-preview video").count()).toBe(0);
-    const imgSrc = await page.locator(".live-preview img").getAttribute("src");
-    expect(imgSrc).toContain(`/api/content/${video.id}/asset`);
-
-    await page.locator(".playback-btn").click();
+    // Idle placeholder hides as soon as the inline preview registers
+    // a non-empty playlist + active item.
+    await expect(page.locator(".inline-preview-idle")).toBeHidden({
+        timeout: 10_000,
+    });
 });

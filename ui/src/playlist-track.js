@@ -32,11 +32,11 @@ function isModeLockedVideo(item, outputMode) {
 
 const TEMPLATE = `
     <section class="playlist-track">
+        <h2 class="subpage-title">Playlists</h2>
         <div class="playlist-track-header">
-            <h2 class="playlist-track-heading">Default playlist</h2>
-            <div class="playlist-track-playback"></div>
+            <h3 class="playlist-track-heading">Default playlist</h3>
         </div>
-        <div class="playlist-track-live-preview"></div>
+        <div class="playlist-track-inline-preview"></div>
         <p class="playlist-track-hint">
             Drag blocks to reorder; drag from the pallet below to add;
             × to remove. Duration shown under each block.
@@ -62,15 +62,10 @@ const TEMPLATE = `
  * @param {() => Promise<object>} options.fetchPlaylists — { playlists: { default: {items, item_ids}, ... } }
  * @param {(items: Array<{item_id, transition, transition_ms}>) => Promise<any>} options.onReorder
  *     — PUT /api/playlist with the canonical items shape
- * @param {object} [options.playback] — optional hooks forwarded to
- *     mountPlaybackControls (fetchState, onStart, onStop). When present
- *     the track header renders the shared Play / Stop controls.
- * @param {(container, options) => any} [options.mountPlaybackControls]
- *     — injected playback-controls mount (avoids a direct import so the
- *     module stays leaf-y in the dependency graph for tests).
- * @param {object} [options.livePreview] — optional hooks: { width, height,
- *     mount } — calls `mount(slot, { width, height })` under the header
- *     when present. Injected the same way as playback controls.
+ * @param {object} [options.inlinePreview] — optional injection:
+ *     `{ width, height, outputMode, mount(slot, dims) }`. When set, the
+ *     mount is called once right under the header and is expected to
+ *     render its own transport controls (play / scrub / time).
  * @param {string} [options.outputMode] — current device output_mode
  *     ("hdmi" / "hub75" / "ws281x" / "composite"). Videos whose stored
  *     pipeline doesn't match the mode get a mode-locked badge on their
@@ -82,9 +77,7 @@ export function mountPlaylistTrack(container, options) {
         fetchItems,
         fetchPlaylists,
         onReorder,
-        playback,
-        mountPlaybackControls,
-        livePreview,
+        inlinePreview,
         outputMode,
     } = options;
 
@@ -92,17 +85,15 @@ export function mountPlaylistTrack(container, options) {
     const trackEl = container.querySelector(".playlist-track-list");
     const palletEl = container.querySelector(".playlist-pallet");
     const statusEl = container.querySelector(".playlist-track-status");
-    const playbackSlot = container.querySelector(".playlist-track-playback");
-    const livePreviewSlot = container.querySelector(".playlist-track-live-preview");
+    const inlinePreviewSlot = container.querySelector(
+        ".playlist-track-inline-preview",
+    );
 
-    if (playback && mountPlaybackControls) {
-        mountPlaybackControls(playbackSlot, playback);
-    }
-
-    if (livePreview && livePreview.mount) {
-        livePreview.mount(livePreviewSlot, {
-            width: livePreview.width,
-            height: livePreview.height,
+    if (inlinePreview && inlinePreview.mount) {
+        inlinePreview.mount(inlinePreviewSlot, {
+            width: inlinePreview.width,
+            height: inlinePreview.height,
+            outputMode: inlinePreview.outputMode,
         });
     }
 

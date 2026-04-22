@@ -30,7 +30,7 @@ test("auto-mode time slide ticks in the live preview overlay", async ({ page }) 
     await page.locator(".editor .field-save").click();
     await expect(page.locator(".editor-status")).toHaveText("Saved.");
 
-    // 2) Put the slide in the default playlist and start playback.
+    // 2) Put the slide in the default playlist.
     const content = await (await page.request.get("/api/content")).json();
     const clockId = content[0].id;
     await page.request.put("/api/playlist", {
@@ -38,32 +38,32 @@ test("auto-mode time slide ticks in the live preview overlay", async ({ page }) 
             items: [{ item_id: clockId, transition: "cut", transition_ms: 0 }],
         },
     });
-    await page.request.post("/api/playback/stop");
 
-    // 3) Open the Playlists panel (where the live preview mounts).
+    // 3) Playlists panel: the inline preview is the client-side simulator.
+    //    Click the inline play button to start its own playback engine.
     await page.locator('.nav-link[data-section="playlists"]').click();
-    await expect(page.locator(".live-preview")).toBeVisible();
-    await page.locator(".playback-btn").click();
+    await expect(page.locator(".inline-preview")).toBeVisible();
+    await page.locator(".inline-preview-play").click();
 
     // 4) Auto-text overlay appears with HH:MM:SS formatting.
-    const overlay = page.locator(".live-preview-auto-text");
+    const overlay = page.locator(".inline-preview-auto-text");
     await expect(overlay).toBeVisible({ timeout: 10_000 });
     await expect(overlay).toHaveText(/^\d{2}:\d{2}:\d{2}$/);
 
-    // 5) After ~1.5s the overlay text MUST have changed — the preview's
-    //    500ms poll picks up the new seconds value. (Timezone mismatch
-    //    between browser and backend is fine here; both tick.)
+    // 5) After ~1.5s the overlay text MUST have changed — the inline
+    //    preview's rAF loop advances position + re-renders.
     const firstValue = await overlay.textContent();
     await page.waitForTimeout(1500);
     const secondValue = await overlay.textContent();
     expect(secondValue).not.toBe(firstValue);
-    // Sanity: still HH:MM:SS.
     expect(secondValue).toMatch(/^\d{2}:\d{2}:\d{2}$/);
 
-    // 6) State endpoint reflects the auto metadata.
+    // 6) Backend state reflects the auto metadata too (the hardware
+    //    loop runs the same slide in parallel). Explicit start since
+    //    e2e config disables lifespan autostart.
+    await page.request.post("/api/playback/start");
     const state = await (await page.request.get("/api/playback/state")).json();
     expect(state.current_item_auto_mode).toBe("time");
     expect(state.current_item_auto_format).toBe("time_hms");
-
     await page.request.post("/api/playback/stop");
 });

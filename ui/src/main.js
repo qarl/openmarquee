@@ -1,8 +1,8 @@
 // openMarquee web UI — entry point.
 //
-// Seven panels (slides/text, slides/image, slides/video, slides/auto,
-// playlists, schedule, settings) mount into a sidebar shell. Sidebar
-// nav (`nav.js`) toggles the active panel's `hidden` attribute; panels
+// Six panels (slides/text, slides/image, slides/video, playlists,
+// schedule, settings) mount into a sidebar shell. Sidebar nav
+// (`nav.js`) toggles the active panel's `hidden` attribute; panels
 // stay mounted so their state (scroll, in-progress edits, polling
 // loops) survives navigation clicks.
 //
@@ -12,11 +12,15 @@
 // dims so the canvas always matches the configured display. Existing
 // stored slides keep their old-dim PNGs until re-saved (the playback
 // loop NEAREST-upscales at runtime); that's expected, not a bug.
+//
+// Playback model: the backend playback loop is autonomous ("hardware
+// always running"). The UI's inline preview on the Playlists panel is
+// a parallel client-side simulator the operator scrubs — no UI
+// affordance starts / stops the backend loop.
 
 import {
     fetchContentItem,
     generateBackground,
-    getPlaybackState,
     getSchedule,
     getSettings,
     listContent,
@@ -27,21 +31,17 @@ import {
     saveTextSlide,
     saveVideo,
     setPlaylistOrder,
-    startPlayback,
-    stopPlayback,
     updateImage,
     updateTextSlide,
     updateVideo,
 } from "./api.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
-import { mountLivePreview } from "./live-preview.js";
+import { mountInlinePreview } from "./inline-preview.js";
 import { mountNav } from "./nav.js";
-import { mountPlaybackControls } from "./playback.js";
 import { mountPlaylistTrack } from "./playlist-track.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
-import { SETTINGS_BROADCAST_CHANNEL } from "./simulator.js";
 import { mountVideoUploader } from "./video-upload.js";
 
 // Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
@@ -87,6 +87,29 @@ async function resolvePanelDims() {
     };
 }
 
+/**
+ * Fetch the default playlist with each item's ContentItem inlined —
+ * the inline preview needs full item metadata (duration, type, auto_mode,
+ * pipeline) to drive its client-side playback engine.
+ */
+async function fetchResolvedDefaultPlaylist() {
+    const [collection, items] = await Promise.all([
+        listPlaylists(),
+        listContent(),
+    ]);
+    const byId = new Map(items.map((it) => [String(it.id), it]));
+    const raw = collection.playlists?.default?.items || [];
+    const resolved = raw
+        .map((entry) => ({
+            item_id: String(entry.item_id),
+            transition: entry.transition || "cut",
+            transition_ms: Number(entry.transition_ms) || 0,
+            content: byId.get(String(entry.item_id)) || null,
+        }))
+        .filter((entry) => entry.content !== null);
+    return { items: resolved };
+}
+
 async function boot() {
     const root = document.getElementById("app");
     root.innerHTML = `
@@ -118,10 +141,9 @@ async function boot() {
     let editor = null;
     let imageUploader = null;
     let videoUploader = null;
-    // Live-preview runs a setInterval; we need to stop the old one
-    // before dropping its DOM so we don't leak a poll loop against a
-    // detached stage element.
-    let livePreviewHandle = null;
+    // Inline preview runs a requestAnimationFrame loop + caches
+    // <img>/<video> elements; stop() before dropping its DOM.
+    let inlinePreviewHandle = null;
 
     const onSaveWithRefresh = (saveFn) => async (payload) => {
         const saved = await saveFn(payload);
@@ -132,6 +154,9 @@ async function boot() {
         await editor?.refreshBrowser?.();
         await imageUploader?.refreshBrowser?.();
         await videoUploader?.refreshBrowser?.();
+        // The inline preview also caches the playlist; refresh it so
+        // a newly-added slide shows up mid-session.
+        await inlinePreviewHandle?.refresh?.();
         return saved;
     };
 
@@ -140,9 +165,9 @@ async function boot() {
      * Called once at boot + again whenever Settings emits a change.
      */
     function mountDimensionedPanels({ width, height, outputMode }) {
-        if (livePreviewHandle) {
-            livePreviewHandle.stop();
-            livePreviewHandle = null;
+        if (inlinePreviewHandle) {
+            inlinePreviewHandle.stop();
+            inlinePreviewHandle = null;
         }
 
         const trackSlot = root.querySelector(".playlist-track-slot");
@@ -151,22 +176,18 @@ async function boot() {
             fetchItems: listContent,
             fetchPlaylists: listPlaylists,
             onReorder: setPlaylistOrder,
-            playback: {
-                fetchState: getPlaybackState,
-                onStart: startPlayback,
-                onStop: stopPlayback,
-            },
-            mountPlaybackControls,
-            livePreview: {
+            inlinePreview: {
                 width,
                 height,
+                outputMode,
                 mount: (slot, dims) => {
-                    livePreviewHandle = mountLivePreview(slot, {
+                    inlinePreviewHandle = mountInlinePreview(slot, {
                         width: dims.width,
                         height: dims.height,
-                        fetchState: getPlaybackState,
+                        outputMode: dims.outputMode,
+                        fetchPlaylist: fetchResolvedDefaultPlaylist,
                     });
-                    return livePreviewHandle;
+                    return inlinePreviewHandle;
                 },
             },
             outputMode,
@@ -180,10 +201,6 @@ async function boot() {
             fetchItems: listContent,
             onSave: onSaveWithRefresh(saveTextSlide),
             onSaveExisting: onSaveWithRefresh(updateTextSlide),
-            // Free AI background generator (Pollinations.ai).
-            // onSaveWithRefresh pings the track refresh so the newly-
-            // generated ImageSlide appears in the pallet + the
-            // editor's bg-slide dropdown on subsequent opens.
             onGenerateBackground: onSaveWithRefresh(generateBackground),
         });
 
@@ -228,20 +245,9 @@ async function boot() {
     });
 
     // Re-mount on settings change so the canvas always matches current
-    // display config. resolvePanelDims re-reads /api/settings — the
-    // event's detail would let us skip that fetch, but re-reading
-    // keeps the dim-derivation logic (rotation swap, fallback) in one
-    // place. Broadcasting to the simulator pop-out (if open) lets it
-    // re-apply skin + window sizing in lockstep.
-    const settingsBroadcast =
-        typeof BroadcastChannel !== "undefined"
-            ? new BroadcastChannel(SETTINGS_BROADCAST_CHANNEL)
-            : null;
+    // display config.
     document.addEventListener("openmarquee:settings-updated", async () => {
         mountDimensionedPanels(await resolvePanelDims());
-        if (settingsBroadcast) {
-            settingsBroadcast.postMessage({ type: "settings-updated" });
-        }
     });
 
     const nav = mountNav({

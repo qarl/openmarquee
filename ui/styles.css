@@ -178,22 +178,16 @@ main {
     opacity: 0.85;
 }
 
-/* --- live preview stage ---
-   Mirrors the sign aspect ratio via the inline aspect-ratio set by
-   mountLivePreview. Constrains width so a 16:9 HDMI preview doesn't
-   eat the whole playlists panel. */
-.live-preview {
+/* --- inline preview (Playlists panel client-side simulator) --- */
+.inline-preview {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    align-items: flex-start;
+    gap: 0.5rem;
+    align-items: stretch;
+    margin-bottom: 0.75rem;
 }
-
-.live-preview-stage {
+.inline-preview-stage {
     position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     width: 100%;
     max-width: 32rem;
     background: #000;
@@ -201,29 +195,13 @@ main {
     overflow: hidden;
     box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06);
 }
-
-.live-preview-media {
+.inline-preview-canvas {
+    display: block;
     width: 100%;
     height: 100%;
-    object-fit: contain;
-    display: block;
-    /* Pixel-accurate preview for 128×96 etc. — no smoothing lies about
-       what the panels will actually render. */
     image-rendering: pixelated;
 }
-
-/* During a cross-fade, outgoing + incoming elements coexist — stack
-   them so opacity transitions don't push layout around. */
-.live-preview-stage--transitioning .live-preview-media {
-    position: absolute;
-    inset: 0;
-}
-
-/* Auto-mode ticking overlay (time / date / day). Positioned over the
-   thumbnail PNG. Not trying to match the device's typography pixel-for-
-   pixel — this is an "is it ticking?" preview. The real render happens
-   server-side via openmarquee.auto_render. */
-.live-preview-auto-text {
+.inline-preview-auto-text {
     position: absolute;
     inset: 0;
     display: flex;
@@ -233,26 +211,62 @@ main {
     font-size: clamp(1.5rem, 5vw, 3.5rem);
     font-weight: 700;
     color: #fff;
-    text-shadow:
-        0 0 6px rgba(0, 0, 0, 0.8),
+    text-shadow: 0 0 6px rgba(0, 0, 0, 0.8),
         1px 1px 0 rgba(0, 0, 0, 0.9),
         -1px -1px 0 rgba(0, 0, 0, 0.9);
     pointer-events: none;
     letter-spacing: 0.02em;
 }
-
-.live-preview-idle {
-    padding: 1rem;
-    font-size: 0.85rem;
+.inline-preview-idle {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     color: var(--muted);
+    font-size: 0.9rem;
     text-align: center;
+    padding: 1rem;
+    pointer-events: none;
 }
-
-.live-preview-caption {
-    margin: 0;
+/* The display: flex above wins over the UA default for [hidden],
+   so re-state the visibility intent. Same for the auto-text overlay. */
+.inline-preview-idle[hidden],
+.inline-preview-auto-text[hidden] {
+    display: none;
+}
+.inline-preview-transport {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    max-width: 32rem;
+}
+.inline-preview-play {
+    width: 2.4rem;
+    height: 2.4rem;
+    padding: 0;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 999px;
+    color: var(--text);
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+.inline-preview-play:hover {
+    border-color: var(--accent);
+    background: #111115;
+}
+.inline-preview-scrub {
+    flex: 1;
+    accent-color: var(--accent);
+}
+.inline-preview-time {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 0.8rem;
     color: var(--muted);
-    min-height: 1em;
+    min-width: 6rem;
+    text-align: right;
 }
 
 .playlist-track-scroll {
@@ -911,52 +925,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 
 /* --- saved-slides list --- */
-
-.playback {
-    margin-top: 1.5rem;
-    padding-top: 1.5rem;
-    border-top: 1px solid var(--panel-border);
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-}
-
-.playback-btn {
-    min-width: 7rem;
-}
-
-.playback-simulator {
-    background: var(--field-bg, #0b0b0d);
-    border: 1px solid var(--panel-border);
-    color: var(--text);
-    font-family: inherit;
-    font-size: 0.85rem;
-    padding: 0.4rem 0.75rem;
-    border-radius: 0.35rem;
-    cursor: pointer;
-    transition: border-color 120ms ease, background 120ms ease;
-}
-.playback-simulator:hover {
-    border-color: var(--accent);
-    background: #111115;
-}
-
-.playback-status {
-    margin: 0;
-    color: var(--muted);
-    font-size: 0.85rem;
-    min-height: 1.2em;
-    flex: 1;
-}
-
-.playback-now-playing {
-    margin: 0;
-    color: var(--accent);
-    font-size: 0.85rem;
-    font-weight: 500;
-    min-height: 1.2em;
-    flex: 1;
-}
 
 .list {
     margin-top: 1.5rem;
