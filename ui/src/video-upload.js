@@ -15,12 +15,9 @@ const TEMPLATE = `
     <section class="video-upload">
         <h2 class="subpage-title">Video Slides</h2>
         <div class="slide-browser-slot"></div>
-        <div class="video-upload-header">
-            <h3 class="video-upload-heading">Upload a video</h3>
-            <button type="button" class="video-upload-new" hidden>+ New video</button>
-        </div>
         <div class="preview-wrap">
-            <canvas class="video-upload-canvas" aria-label="thumbnail preview"></canvas>
+            <video class="video-upload-video" playsinline controls
+                   aria-label="video preview"></video>
         </div>
         <form class="controls" autocomplete="off">
             <label class="field">
@@ -97,13 +94,17 @@ export function mountVideoUploader(
 ) {
     container.innerHTML = TEMPLATE;
 
-    const canvas = container.querySelector(".video-upload-canvas");
+    const videoEl = container.querySelector(".video-upload-video");
+    videoEl.style.aspectRatio = `${width} / ${height}`;
+
+    // Hidden offscreen canvas used only for thumbnail generation —
+    // painted from the transcoded video's first frame (new file) or
+    // the existing server PNG (edit mode). canvasToBase64 at save time
+    // grabs these bytes as the slide's `asset.png` thumbnail.
+    const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
-    canvas.style.aspectRatio = `${width} / ${height}`;
 
-    const headingEl = container.querySelector(".video-upload-heading");
-    const newBtnEl = container.querySelector(".video-upload-new");
     const editHintEl = container.querySelector(".video-upload-edit-hint");
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
@@ -128,6 +129,27 @@ export function mountVideoUploader(
     function clearProgress() {
         progressEl.hidden = true;
         progressEl.value = 0;
+    }
+
+    // The preview <video>'s current src — tracked so we can revoke a
+    // blob URL when it's replaced. Server URLs are left alone.
+    let currentPreviewObjectUrl = null;
+    function setPreviewSrc(src, revokeOnSwap) {
+        try { videoEl.pause?.(); } catch { /* ignore */ }
+        if (currentPreviewObjectUrl) {
+            URL.revokeObjectURL(currentPreviewObjectUrl);
+            currentPreviewObjectUrl = null;
+        }
+        if (src) {
+            videoEl.src = src;
+            if (revokeOnSwap) currentPreviewObjectUrl = src;
+        } else {
+            videoEl.removeAttribute("src");
+            videoEl.load?.();
+        }
+    }
+    function clearPreview() {
+        setPreviewSrc(null, false);
     }
     const transcodeHooks = { onStatus: setStatus, onProgress: setProgress };
 
@@ -156,7 +178,10 @@ export function mountVideoUploader(
             state.thumbnailCanvasReady = false;
             state.mp4Base64 = null;
             state.durationSeconds = null;
-            if (!state.editingId) clearCanvas(canvas);
+            if (!state.editingId) {
+                clearCanvas(canvas);
+                clearPreview();
+            }
             updateSaveEnabled();
             return;
         }
@@ -175,6 +200,7 @@ export function mountVideoUploader(
             state.thumbnailCanvasReady = false;
             state.mp4Base64 = null;
             clearCanvas(canvas);
+            clearPreview();
             setStatus(`Could not process video: ${describeFfmpegError(err)}`);
         } finally {
             clearProgress();
@@ -201,6 +227,10 @@ export function mountVideoUploader(
             drawFirstFrameToCanvas(mp4Blob, canvas),
             fileToBase64(mp4Blob),
         ]);
+        // Point the preview <video> at the transcoded blob so the
+        // operator can scrub + play the exact bytes the device will
+        // store. Revoke on the next load to avoid blob-URL leakage.
+        setPreviewSrc(URL.createObjectURL(mp4Blob), /* revokeOnSwap */ true);
         state.thumbnailCanvasReady = true;
         state.mp4Base64 = bytesB64;
         state.durationSeconds = durationSeconds;
@@ -211,8 +241,6 @@ export function mountVideoUploader(
             `ready. ${target.width}×${target.height} H.264 MP4 · ${(mp4Bytes.length / 1024).toFixed(1)} KB`,
         );
     }
-
-    newBtnEl.addEventListener("click", () => resetToBlank());
 
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -254,12 +282,11 @@ export function mountVideoUploader(
         state.thumbnailCanvasReady = false;
         state.mp4Base64 = null;
         state.durationSeconds = null;
-        headingEl.textContent = "Upload a video";
-        newBtnEl.hidden = true;
         editHintEl.hidden = true;
         fileEl.value = "";
         durationEl.value = "10";
         clearCanvas(canvas);
+        clearPreview();
         updateSaveEnabled();
 
         // Async tail: gap-filled default name + browser refresh, both
@@ -296,20 +323,22 @@ export function mountVideoUploader(
         state.thumbnailCanvasReady = false;
         state.mp4Base64 = null;
         state.durationSeconds = null;
-        headingEl.textContent = `Editing: ${slide.name || "Untitled"}`;
-        newBtnEl.hidden = false;
         editHintEl.hidden = false;
         if (browser) browser.highlight(slide.id);
         nameEl.value = slide.name || "Video";
         durationEl.value = String(
             Math.max(1, (slide.duration_ms || 10000) / 1000),
         );
-        // Paint the stored thumbnail into the canvas for visual continuity.
+        // Paint the stored thumbnail into the hidden canvas (used as
+        // the save-time `asset.png` if the operator never re-picks a
+        // file) and point the preview <video> at the server's MP4 so
+        // they can play it back inline.
         try {
             await drawUrlToCanvas(`/api/content/${slide.id}/asset`, canvas);
         } catch (err) {
             statusEl.textContent = `Could not load thumbnail: ${err.message}`;
         }
+        setPreviewSrc(`/api/content/${slide.id}/video`, /* revokeOnSwap */ false);
         updateSaveEnabled();
     }
 

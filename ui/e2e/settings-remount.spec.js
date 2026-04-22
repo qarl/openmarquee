@@ -71,7 +71,9 @@ test("image + video uploader canvases also pick up the new dims", async ({ page 
     await expect(imgCanvas).toHaveAttribute("height", "128");
 
     await page.locator('.nav-link[data-section="slides/video"]').click();
-    const vidCanvas = page.locator(".video-upload .video-upload-canvas");
-    await expect(vidCanvas).toHaveAttribute("width", "256");
-    await expect(vidCanvas).toHaveAttribute("height", "128");
+    // Video uploader's preview is a <video> (not a canvas) — its shape
+    // is driven by inline `style.aspectRatio`, set from the panel dims
+    // at mount time. The thumbnail-generation canvas is offscreen.
+    const vidPreview = page.locator(".video-upload .video-upload-video");
+    await expect(vidPreview).toHaveAttribute("style", /aspect-ratio:\s*256\s*\/\s*128/);
 });
