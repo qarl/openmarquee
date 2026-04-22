@@ -857,12 +857,14 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 
 .editor-canvas {
     /* Aspect ratio is set inline by the mount fn so it matches the
-       device's configured display dims. Scaled up with pixelation so
-       the preview shows exactly what the sign would render. */
+       device's configured display dims. The CSS var is a fallback for
+       the first paint before JS runs — without it the canvas takes
+       its intrinsic 300×150 default and looks visibly wrong. */
     display: block;
     width: 100%;
     max-width: 100%;
     height: auto;
+    aspect-ratio: var(--device-aspect, 4 / 3);
     image-rendering: pixelated;
 }
 
@@ -991,10 +993,17 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     letter-spacing: 0.02em;
 }
 
-.image-upload-canvas {
+.image-upload-canvas,
+.video-upload-canvas {
+    /* Canvas bitmap dims are device W×H; the inline style.aspectRatio
+       set by the mount fn drives the rendered shape. The CSS var is a
+       fallback so first-paint (before JS runs) still uses the right
+       proportion instead of the canvas's intrinsic 300×150 default. */
+    display: block;
     width: 100%;
     max-width: 100%;
     height: auto;
+    aspect-ratio: var(--device-aspect, 4 / 3);
     image-rendering: pixelated;
 }
 

@@ -600,9 +600,23 @@ export function drawCanvas(canvas, state) {
 
     ctx.save();
     try {
-        // Background layer: image (scaled to cover) or solid color.
+        // Background layer: image (cover-fit) or solid color. Cover-fit
+        // keeps the saved PNG matching what plays — letterbox bars or a
+        // stretch would both show up on the device.
         if (bgSource === "slide" && bgImage) {
-            ctx.drawImage(bgImage, 0, 0, canvas.width, canvas.height);
+            const scale = Math.max(
+                canvas.width / bgImage.width,
+                canvas.height / bgImage.height,
+            );
+            const drawW = bgImage.width * scale;
+            const drawH = bgImage.height * scale;
+            ctx.drawImage(
+                bgImage,
+                (canvas.width - drawW) / 2,
+                (canvas.height - drawH) / 2,
+                drawW,
+                drawH,
+            );
         } else {
             ctx.fillStyle = backgroundColor;
             ctx.fillRect(0, 0, canvas.width, canvas.height);

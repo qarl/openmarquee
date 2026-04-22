@@ -269,8 +269,12 @@ export function drawFileToCanvas(file, canvas) {
                 try {
                     ctx.fillStyle = "#000000";
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    // Letterbox-fit so we don't distort aspect.
-                    const scale = Math.min(
+                    // Cover-fit — matches the inline preview's behavior so
+                    // what the operator sees in the editor IS what plays.
+                    // The crop is intentional: the device can't render
+                    // black bars and a stretched image looks worse than a
+                    // tasteful center-crop.
+                    const scale = Math.max(
                         canvas.width / img.width,
                         canvas.height / img.height,
                     );
@@ -296,10 +300,10 @@ export function drawFileToCanvas(file, canvas) {
 }
 
 /**
- * Paint an image fetched from a URL onto `canvas`, letterbox-fit. Used
- * when opening an existing ImageSlide for edit — the stored PNG is
- * already at panel resolution so this is mostly a faithful draw, but
- * the letterbox path handles weird historical resize cases too.
+ * Paint an image fetched from a URL onto `canvas`, cover-fit. Used when
+ * opening an existing ImageSlide for edit — the stored PNG is already
+ * at panel resolution so this is mostly a faithful draw, but the
+ * cover-fit path handles weird historical resize cases too.
  */
 export function drawUrlToCanvas(url, canvas) {
     return new Promise((resolve, reject) => {
@@ -312,7 +316,7 @@ export function drawUrlToCanvas(url, canvas) {
                 try {
                     ctx.fillStyle = "#000000";
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    const scale = Math.min(
+                    const scale = Math.max(
                         canvas.width / img.width,
                         canvas.height / img.height,
                     );

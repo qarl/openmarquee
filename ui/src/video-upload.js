@@ -395,7 +395,10 @@ function drawUrlToCanvas(url, canvas) {
                 try {
                     ctx.fillStyle = "#000000";
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    const scale = Math.min(
+                    // Cover-fit so the preview matches what plays — the
+                    // device renders this exact bitmap and a center-crop
+                    // beats letterbox bars on a portrait source.
+                    const scale = Math.max(
                         canvas.width / img.width,
                         canvas.height / img.height,
                     );
@@ -453,7 +456,8 @@ export function drawFirstFrameToCanvas(file, canvas) {
                 try {
                     ctx.fillStyle = "#000000";
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    const scale = Math.min(
+                    // Cover-fit so the thumbnail matches what plays.
+                    const scale = Math.max(
                         canvas.width / video.videoWidth,
                         canvas.height / video.videoHeight,
                     );
