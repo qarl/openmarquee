@@ -61,7 +61,12 @@ PRESETS: list[tuple[str, str]] = [
 
 API_BASE = "https://api.openai.com/v1"
 MODEL = "sora-2-pro"
-SIZE = "1280x720"   # supported sizes: 720x1280, 1280x720
+# sora-2-pro landscape sizes: 1280x720 ($0.30/s), 1792x1024 ($0.50/s),
+# 1920x1080 ($0.50/s). 1080p matches the Pi Zero 2 W's H.264 decoder
+# cap exactly — at the seed-asset spend level the extra $0.20/s is
+# worth the headroom and clarity. (sora-2 base only supports up to
+# 1280x720; pro is required for 1080p.)
+SIZE = "1920x1080"
 SECONDS = "8"        # supported: "4", "8", "12"
 POLL_INTERVAL_SECONDS = 15
 POLL_TIMEOUT_SECONDS = 900   # 15-minute ceiling per generation
