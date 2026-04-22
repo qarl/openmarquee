@@ -455,9 +455,6 @@ describe("mountEditor — submit flow", () => {
             "monospace",
         );
         expect(container.querySelector(".field-duration").value).toBe("7");
-        expect(container.querySelector(".editor-mode-label").textContent).toMatch(
-            /Editing: Promo/,
-        );
 
         container.querySelector(".controls").dispatchEvent(new Event("submit"));
         await new Promise((r) => setTimeout(r, 0));
@@ -541,25 +538,6 @@ describe("mountEditor — submit flow", () => {
         );
     });
 
-    it("New-slide button exits edit mode and clears the form", async () => {
-        patchCanvasPrototype();
-        const container = document.createElement("div");
-        const handle = mountEditor(container, {
-            width: 128,
-            height: 96,
-            onSave: vi.fn(),
-            onSaveExisting: vi.fn(),
-        });
-        await handle.loadForEdit({
-            type: "text_slide",
-            id: "abc",
-            name: "X",
-            text: "X",
-        });
-        container.querySelector(".editor-new").click();
-        expect(container.querySelector(".field-text").value).toBe("");
-        expect(container.querySelector(".editor-mode-label").textContent).toBe(
-            "New slide",
-        );
-    });
+    // New-slide button + Editing-mode label removed — the slide browser
+    // at the top of each subpage has the "+" tile for that flow.
 });

@@ -55,10 +55,6 @@ const EDITOR_TEMPLATE = `
     <div class="editor">
         <h2 class="subpage-title">Text Slides</h2>
         <div class="slide-browser-slot"></div>
-        <div class="editor-header">
-            <span class="editor-mode-label">New slide</span>
-            <button type="button" class="editor-new" hidden>+ New slide</button>
-        </div>
         <div class="preview-wrap">
             <canvas class="editor-canvas" aria-label="slide preview"></canvas>
         </div>
@@ -188,8 +184,6 @@ export function mountEditor(
     canvas.height = height;
     canvas.style.aspectRatio = `${width} / ${height}`;
 
-    const modeLabelEl = container.querySelector(".editor-mode-label");
-    const newBtnEl = container.querySelector(".editor-new");
     const textEl = container.querySelector(".field-text");
     const textColorEl = container.querySelector(".field-text-color");
     const bgColorEl = container.querySelector(".field-bg-color");
@@ -387,10 +381,6 @@ export function mountEditor(
         });
     });
 
-    newBtnEl.addEventListener("click", () => {
-        resetToBlank();
-    });
-
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
         if (saveBtn.disabled) return;
@@ -443,8 +433,6 @@ export function mountEditor(
         state.editingId = null;
         state.bgImage = null;
         state.bgSlideId = null;
-        modeLabelEl.textContent = "New slide";
-        newBtnEl.hidden = true;
         textEl.value = "";
         autoModeEl.value = "";
         autoModeHintEl.hidden = true;
@@ -488,8 +476,6 @@ export function mountEditor(
             return;
         }
         state.editingId = String(slide.id);
-        modeLabelEl.textContent = `Editing: ${slide.name || "Untitled"}`;
-        newBtnEl.hidden = false;
         if (browser) browser.highlight(slide.id);
 
         nameEl.value = slide.name || "Untitled";

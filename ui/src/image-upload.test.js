@@ -92,9 +92,6 @@ describe("mountImageUploader", () => {
 
         expect(container.querySelector(".field-name").value).toBe("Logo");
         expect(container.querySelector(".field-duration").value).toBe("8");
-        expect(container.querySelector(".image-upload-heading").textContent).toMatch(
-            /Editing: Logo/,
-        );
         // Save is enabled even without a new file pick — metadata-only
         // updates are allowed in edit mode.
         expect(container.querySelector(".field-save").disabled).toBe(false);

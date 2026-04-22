@@ -10,10 +10,6 @@ const TEMPLATE = `
     <section class="image-upload">
         <h2 class="subpage-title">Image Slides</h2>
         <div class="slide-browser-slot"></div>
-        <div class="image-upload-header">
-            <h3 class="image-upload-heading">Upload an image</h3>
-            <button type="button" class="image-upload-new" hidden>+ New image</button>
-        </div>
         <div class="preview-wrap">
             <canvas class="image-upload-canvas" aria-label="image preview"></canvas>
         </div>
@@ -67,8 +63,6 @@ export function mountImageUploader(
     canvas.height = height;
     canvas.style.aspectRatio = `${width} / ${height}`;
 
-    const headingEl = container.querySelector(".image-upload-heading");
-    const newBtnEl = container.querySelector(".image-upload-new");
     const editHintEl = container.querySelector(".image-upload-edit-hint");
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
@@ -121,8 +115,6 @@ export function mountImageUploader(
             updateSaveEnabled();
         }
     });
-
-    newBtnEl.addEventListener("click", () => resetToBlank());
 
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -179,8 +171,6 @@ export function mountImageUploader(
         // overridden by a loadForEdit that interleaves later.
         state.editingId = null;
         state.sourceFile = null;
-        headingEl.textContent = "Upload an image";
-        newBtnEl.hidden = true;
         editHintEl.hidden = true;
         fileEl.value = "";
         durationEl.value = "5";
@@ -220,8 +210,6 @@ export function mountImageUploader(
         }
         state.editingId = String(slide.id);
         state.sourceFile = null; // existing bytes are server-side; no new file picked
-        headingEl.textContent = `Editing: ${slide.name || "Untitled"}`;
-        newBtnEl.hidden = false;
         editHintEl.hidden = false;
         if (browser) browser.highlight(slide.id);
         nameEl.value = slide.name || "Image";

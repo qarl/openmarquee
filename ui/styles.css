@@ -985,12 +985,16 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     gap: 1rem;
 }
 
-.image-upload-heading {
-    margin: 0;
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: var(--muted);
-    letter-spacing: 0.02em;
+.video-upload-video {
+    /* Native <video controls> — let the browser draw its play button +
+       scrubber. Sized to the device aspect so the preview matches what
+       plays. */
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    aspect-ratio: var(--device-aspect, 4 / 3);
+    background: #000;
 }
 
 .image-upload-canvas,
