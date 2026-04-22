@@ -107,8 +107,11 @@ def test_generate_saves_image_and_appends_to_playlist(
     from uuid import UUID
     item_id = UUID(body["id"])
     asset = storage.read_asset(item_id)
-    png = Image.open(io.BytesIO(asset))
-    assert png.size == (128, 96)
+    # Provider bytes are stored verbatim now — no device-side resample.
+    # The stub's _real_image_bytes() returns a 1024×1024 JPEG, so that's
+    # what should be on disk; playback cover-fits to panel dims later.
+    img = Image.open(io.BytesIO(asset))
+    assert img.size == (1024, 1024)
     assert playlist_storage.load().item_ids == [item_id]
 
 

@@ -17,7 +17,6 @@ from openmarquee.backgrounds import (
     BackgroundGenError,
     BackgroundProviderUnknown,
     default_provider_name,
-    downscale_to_panel,
     resolve_provider,
 )
 from openmarquee.content import ImageSlide
@@ -88,14 +87,15 @@ async def generate_background(
         # own message (rate-limit, timeout, etc.) so the operator can act.
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    settings = settings_storage.load()
-    png = downscale_to_panel(raw, settings.display_width, settings.display_height)
-
+    # Store the provider's bytes verbatim — no device-side resample.
+    # Playback cover-fits down to panel dims on slide entry, so keeping
+    # the original 1024×1024 (or whatever the provider returned) means
+    # a panel-resolution change doesn't degrade the generated slide.
     slide = ImageSlide(
         name=payload.name or _name_from_prompt(payload.prompt),
         duration_ms=5000,
     )
-    storage.save_image(slide, png)
+    storage.save_image(slide, raw)
     _append(playlist_storage, slide.id)
     return slide
 

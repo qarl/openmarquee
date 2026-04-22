@@ -77,9 +77,13 @@ PRESETS: list[tuple[str, str]] = [
 ]
 
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
-WIDTH = 1024
-HEIGHT = 1024
-TIMEOUT_SECONDS = 120
+# 4K = the cap on what a Pi Zero 2 W can comfortably resize per slide
+# entry, and the same target the text-slide rasterizer uses. Storing
+# at 4K means panel resolution changes are a non-event — playback
+# cover-fits down to whatever the device is.
+WIDTH = 3840
+HEIGHT = 2160
+TIMEOUT_SECONDS = 180
 
 
 def _fetch_with_retry(url: str, attempts: int = 4) -> bytes | None:
@@ -115,7 +119,7 @@ def main() -> int:
 
     print(f"writing to {dest}")
     for stem, prompt in PRESETS:
-        out_path = dest / f"{stem}.jpg"
+        out_path = dest / f"{stem}.png"
         if out_path.exists() and out_path.stat().st_size > 1024:
             # Idempotent: skip what we already have so resumed runs just
             # fill gaps instead of re-paying the generation latency.
@@ -123,7 +127,7 @@ def main() -> int:
             continue
         url = (
             f"{POLLINATIONS_BASE}/{urllib.parse.quote(prompt, safe='')}"
-            f"?width={WIDTH}&height={HEIGHT}&nologo=true"
+            f"?width={WIDTH}&height={HEIGHT}&nologo=true&format=png"
         )
         print(f"  [{stem}] fetching…", flush=True)
         t0 = time.time()

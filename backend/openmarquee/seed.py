@@ -211,20 +211,18 @@ def _seed_bundled_backgrounds(
     width: int,
     height: int,
 ) -> list[ImageSlide]:
-    """Register each image under `directory` as an ImageSlide.
+    """Register each image under `directory` as an ImageSlide, verbatim.
 
     Sorted by filename so the seed order is deterministic across boots.
-    Each file is downscaled + letterboxed onto the panel via the same
-    helper the runtime /api/backgrounds/generate endpoint uses. Unreadable
-    files are logged and skipped — one bad JPEG in the pack shouldn't
-    kill the rest of the seed.
+    Bytes are copied as-is — no device-side resampling — so the bundled
+    assets are the on-disk originals. The playback engine cover-fits down
+    to the panel dims on slide entry, so a resolution change is a no-op
+    for seeded content. `width` / `height` are accepted for API parity
+    with older callers; they're unused here.
     """
+    del width, height  # signature-compat with pre-originals callers
     if not directory.is_dir():
         return []
-
-    # Lazy import so a test that never touches bundled backgrounds
-    # doesn't drag the whole `backgrounds` module into its import graph.
-    from openmarquee.backgrounds import downscale_to_panel
 
     created: list[ImageSlide] = []
     candidates = sorted(
@@ -234,12 +232,17 @@ def _seed_bundled_backgrounds(
     for path in candidates:
         try:
             raw = path.read_bytes()
-            png = downscale_to_panel(raw, width, height)
+            # Structural check — bad bytes in the bundled pack shouldn't
+            # end up on disk where the playback engine would later have
+            # to log + skip them. Pillow.verify() is fast and catches
+            # truncation / magic-number mismatches without a full decode.
+            with Image.open(BytesIO(raw)) as probe:
+                probe.verify()
         except Exception:
             logger.exception("seed: skipping unreadable background %s", path)
             continue
         slide = ImageSlide(name=_name_from_filename(path.stem), duration_ms=5000)
-        storage.save_image(slide, png)
+        storage.save_image(slide, raw)
         created.append(slide)
     return created
 
