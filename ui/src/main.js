@@ -235,6 +235,7 @@ async function boot() {
                 mount: (slot) => {
                     playlistBrowserHandle = mountPlaylistBrowser(slot, {
                         fetchPlaylists: listPlaylists,
+                        fetchItems: listContent,
                         onSelect: async (name) => {
                             currentPlaylistName = name;
                             playlistBrowserHandle.highlight(name);

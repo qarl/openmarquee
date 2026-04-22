@@ -193,7 +193,7 @@ main {
 }
 .playlist-browser-tile {
     flex: 0 0 auto;
-    min-width: 6rem;
+    width: 7rem;
 }
 .playlist-browser-tile-action {
     display: flex;
@@ -219,6 +219,22 @@ main {
     border-color: var(--accent);
     background: #161616;
     box-shadow: 0 0 0 2px rgba(255, 184, 77, 0.35);
+}
+.playlist-browser-tile-thumb {
+    width: 100%;
+    aspect-ratio: var(--device-aspect, 4 / 3);
+    object-fit: cover;
+    background: #000;
+    border-radius: 0.25rem;
+    image-rendering: pixelated;
+    margin-bottom: 0.25rem;
+}
+.playlist-browser-tile-thumb--empty {
+    background: repeating-linear-gradient(
+        135deg,
+        #1c1c20 0 6px,
+        #16161a 6px 12px
+    );
 }
 .playlist-browser-tile-name {
     font-weight: 600;

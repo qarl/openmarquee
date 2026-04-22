@@ -18,6 +18,8 @@ const TEMPLATE = `
  * @param {HTMLElement} container — parent (emptied + replaced).
  * @param {object} options
  * @param {() => Promise<{playlists: object}>} options.fetchPlaylists
+ * @param {() => Promise<Array>} [options.fetchItems] — when provided,
+ *     each tile shows a thumbnail of the playlist's first slide.
  * @param {(name: string) => void} options.onSelect — tile click.
  * @param {() => void} options.onCreate — "+ New" tile click.
  * @returns {{
@@ -26,7 +28,7 @@ const TEMPLATE = `
  * }}
  */
 export function mountPlaylistBrowser(container, options) {
-    const { fetchPlaylists, onSelect, onCreate } = options;
+    const { fetchPlaylists, fetchItems, onSelect, onCreate } = options;
     container.innerHTML = TEMPLATE;
     const listEl = container.querySelector(".playlist-browser-list");
 
@@ -34,12 +36,19 @@ export function mountPlaylistBrowser(container, options) {
 
     async function refresh() {
         let collection;
+        let items = [];
         try {
-            collection = await fetchPlaylists();
+            const [c, i] = await Promise.all([
+                fetchPlaylists(),
+                fetchItems ? fetchItems() : Promise.resolve([]),
+            ]);
+            collection = c;
+            items = i || [];
         } catch (err) {
-            console.error("[playlist-browser] fetchPlaylists failed:", err);
+            console.error("[playlist-browser] fetch failed:", err);
             collection = { playlists: {} };
         }
+        const itemById = new Map(items.map((it) => [String(it.id), it]));
         const names = Object.keys(collection.playlists || {}).sort((a, b) => {
             // "default" first, others alphabetical — matches operator
             // expectation that the always-there playlist is the anchor.
@@ -50,8 +59,13 @@ export function mountPlaylistBrowser(container, options) {
         listEl.innerHTML = "";
         listEl.appendChild(renderNewTile());
         for (const name of names) {
-            const items = collection.playlists[name]?.items || [];
-            listEl.appendChild(renderTile(name, items.length));
+            const playlist = collection.playlists[name];
+            const playlistItems = playlist?.items || [];
+            const firstId = playlistItems[0]?.item_id || null;
+            const firstItem = firstId ? itemById.get(String(firstId)) : null;
+            listEl.appendChild(
+                renderTile(name, playlistItems.length, firstItem),
+            );
         }
     }
 
@@ -84,7 +98,7 @@ export function mountPlaylistBrowser(container, options) {
         return li;
     }
 
-    function renderTile(name, itemCount) {
+    function renderTile(name, itemCount, firstItem) {
         const li = document.createElement("li");
         li.className = "playlist-browser-tile";
         li.dataset.name = name;
@@ -93,9 +107,13 @@ export function mountPlaylistBrowser(container, options) {
         }
         const safeName = escapeHtml(name);
         const itemsLabel = itemCount === 1 ? "1 slide" : `${itemCount} slides`;
+        const thumb = firstItem
+            ? `<img class="playlist-browser-tile-thumb" alt="" src="/api/content/${firstItem.id}/asset?v=${encodeURIComponent(firstItem.created_at || firstItem.id)}">`
+            : `<div class="playlist-browser-tile-thumb playlist-browser-tile-thumb--empty"></div>`;
         li.innerHTML = `
             <button type="button" class="playlist-browser-tile-action"
                     title="${safeName}">
+                ${thumb}
                 <span class="playlist-browser-tile-name">${safeName}</span>
                 <span class="playlist-browser-tile-meta">${itemsLabel}</span>
             </button>
