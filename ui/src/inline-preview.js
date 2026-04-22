@@ -95,6 +95,13 @@ export function mountInlinePreview(container, options) {
     // are HTMLVideoElement. Loaded lazily on first draw.
     const imageCache = new Map();
     const videoCache = new Map();
+    // Tracks which video element is currently the "active" one — i.e.
+    // the one driving the slot we're showing. We let it play in real
+    // time and just sample drawImage() each raf tick. Seeking is reserved
+    // for scrub / wrap-around / slot transitions because exact-seek on
+    // <video> is slow and the per-frame drift threshold from the old
+    // implementation pinned the visible fps at ~5.
+    let activeVideoId = null;
     // Offscreen sampler for reading the image's pixel data (hub75 +
     // ws281x skins need per-pixel access).
     const sampler = document.createElement("canvas");
@@ -177,9 +184,58 @@ export function mountInlinePreview(container, options) {
     function drawSlot(slot) {
         const item = slot.item;
         if (item.type === "video" && item.pipeline !== "raw_frames") {
+            syncActiveVideo(item, slot);
             drawVideo(item, slot);
         } else {
+            // Switched away from a playing video — pause it so audio-less
+            // h264 doesn't keep decoding off-screen.
+            pauseAllVideosExcept(null);
+            activeVideoId = null;
             drawImage(item);
+        }
+    }
+
+    function syncActiveVideo(item, slot) {
+        const video = getCachedVideo(item);
+        const offsetInto = position - slot.startSec;
+        const isNewActive = activeVideoId !== item.id;
+        if (isNewActive) {
+            // Slot just changed. Pause every other video, point this one
+            // at the slot offset, and (if we're playing) let it run.
+            pauseAllVideosExcept(item.id);
+            activeVideoId = item.id;
+            try {
+                video.currentTime = Math.max(0, offsetInto);
+            } catch {
+                // Video isn't ready yet; loadeddata listener will retry.
+            }
+            if (playing) video.play?.().catch(() => {});
+            return;
+        }
+        // Same active video. Only re-seek on a big drift — this catches
+        // the operator scrubbing the slider, or the playlist clock
+        // wrapping back to 0 at totalSec. The threshold is loose
+        // (1 second) so steady playback never seeks at all.
+        if (Math.abs((video.currentTime || 0) - offsetInto) > 1.0) {
+            try {
+                video.currentTime = Math.max(0, offsetInto);
+            } catch {
+                // ignore
+            }
+        }
+        // Mid-slot play/pause toggles can drift the video element out
+        // of sync with the playing flag (e.g. the user pressed play
+        // before this video became active). Reconcile each tick.
+        if (playing && video.paused) {
+            video.play?.().catch(() => {});
+        } else if (!playing && !video.paused) {
+            video.pause?.();
+        }
+    }
+
+    function pauseAllVideosExcept(keepId) {
+        for (const [id, v] of videoCache) {
+            if (id !== keepId) v.pause?.();
         }
     }
 
@@ -199,20 +255,8 @@ export function mountInlinePreview(container, options) {
         drawForSkin(skin, ctx, canvas.width, canvas.height, srcData, srcW, srcH);
     }
 
-    function drawVideo(item, slot) {
+    function drawVideo(item) {
         const video = getCachedVideo(item);
-        const offsetInto = position - slot.startSec;
-        // Keep the video synced to our position. Seeking every frame
-        // on a tight loop is expensive; only re-seek if we've drifted
-        // more than a tick's worth.
-        if (Math.abs((video.currentTime || 0) - offsetInto) > 0.2) {
-            try {
-                video.currentTime = Math.max(0, offsetInto);
-            } catch {
-                // Some browsers throw if the video isn't ready — next
-                // tick will catch up.
-            }
-        }
         if (video.readyState < 2 || !video.videoWidth) return;
         const ctx = canvas.getContext("2d");
         const srcW = video.videoWidth;
@@ -292,14 +336,14 @@ export function mountInlinePreview(container, options) {
         playBtn.textContent = playing ? "❚❚" : "▶";
         playBtn.setAttribute("aria-label", playing ? "pause" : "play");
         if (playing) {
-            // Resume HTMLVideoElement playback for smooth h264.
-            for (const v of videoCache.values()) {
-                v.play?.().catch(() => {});
-            }
+            // syncActiveVideo (called from drawSlot) will start the
+            // currently-active video on the next tick. Don't blanket-
+            // play() the whole cache — non-active videos stay paused
+            // so we don't decode three videos at once.
             lastTick = null;
             rafId = requestAnimationFrame(tick);
         } else {
-            for (const v of videoCache.values()) v.pause?.();
+            pauseAllVideosExcept(null);
             if (rafId) cancelAnimationFrame(rafId);
             rafId = null;
         }
