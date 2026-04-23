@@ -36,7 +36,7 @@ import httpx
 PRESETS: list[tuple[str, str]] = [
     # (filename stem, prompt). The filename (title-cased) becomes the slide
     # name on the device; keep it short — the saved-slides list wraps ugly
-    # long names. Existing bundled clips (up-to-70-off, open-sign, coffee,
+    # long names. Existing bundled clips (sale, open-sign, coffee,
     # happy-hour) were operator-generated via sora.com; new entries here
     # extend the pack without re-generating those.
     (

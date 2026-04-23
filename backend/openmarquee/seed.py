@@ -112,7 +112,7 @@ def _default_bundled_videos_dir() -> Path:
 
 
 def _title_from_filename(stem: str) -> str:
-    """'happy-hour' → 'Happy Hour'; 'up-to-70-off' → 'Up To 70 Off'."""
+    """'happy-hour' → 'Happy Hour'; 'open-sign' → 'Open Sign'."""
     words = [w.capitalize() for w in stem.replace("_", "-").split("-") if w]
     return " ".join(words)
 

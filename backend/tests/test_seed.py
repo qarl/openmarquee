@@ -453,3 +453,36 @@ def test_seed_skips_when_playlist_has_items_even_if_storage_is_empty(
     assert payload["reason"] == "playlist-not-empty"
     # And the pre-existing playlist was untouched.
     assert len(playlist.load().item_ids) == 1
+
+
+# --- bundled videos ---
+
+
+def test_seed_bundled_videos_derives_title_from_filename(
+    storage: ContentStorage,
+    playlist: PlaylistStorage,
+    marker: Path,
+    tmp_path: Path,
+):
+    """Regression for the rename: sale.mp4 should seed as a VideoSlide
+    named 'Sale' (and there must NOT be any 'Up To 70 Off' slide any
+    longer, since the file was renamed from up-to-70-off.mp4)."""
+    bundled = tmp_path / "videos"
+    bundled.mkdir()
+    # Pair: {name}.mp4 + {name}.png thumbnail.
+    (bundled / "sale.mp4").write_bytes(_FAKE_MP4)
+    _write_sample_jpeg(bundled / "sale.png")
+
+    created = seed_if_needed(
+        storage,
+        playlist,
+        marker,
+        width=16,
+        height=16,
+        bundled_videos_dir=bundled,
+    )
+
+    video_slides = [s for s in created if isinstance(s, VideoSlide)]
+    names = sorted(s.name for s in video_slides)
+    assert names == ["Sale"]
+    assert "Up To 70 Off" not in names
