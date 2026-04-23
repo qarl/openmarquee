@@ -6,7 +6,7 @@
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
-    "dev": "esbuild src/main.js src/welcome.js src/spike.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --outdir=dist --servedir=. --watch",
+    "dev": "esbuild src/main.js src/welcome.js src/spike.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --outdir=dist --servedir=. --watch=forever",
     "build": "esbuild src/main.js src/welcome.js src/spike.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --minify --outdir=dist && node scripts/copy-ffmpeg-core.mjs",
     "test": "vitest run",
     "e2e": "playwright test",
