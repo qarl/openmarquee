@@ -44,11 +44,16 @@ test("save a text slide → it shows up in the Playlists pallet + the asset serv
 test("two text slides both land in the pallet", async ({ page }) => {
     await page.goto("/");
 
-    for (const name of ["Open", "Closed"]) {
+    for (const [i, name] of ["Open", "Closed"].entries()) {
+        // Save-flow fix (bug #3): saves stay on the just-saved slide.
+        // Click "+ New" between slides to get a fresh blank editor.
+        if (i > 0) {
+            await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
+        }
         await page.locator(".editor .field-name").fill(name);
         await page.locator(".editor .field-text").fill(name.toUpperCase());
         await page.locator(".editor .field-save").click();
-        await expect(page.locator(".editor-status")).toHaveText("Saved.");
+        await expect(page.locator(".editor-status")).toContainText(/Saved|Updated/);
     }
 
     await page.locator('.nav-link[data-section="playlists"]').click();
@@ -74,11 +79,14 @@ test("playlist PUT reorders content via the API (what drag-reorder invokes)", as
     // the new order via the exact same client path, and GET reflects it.
     await page.goto("/");
 
-    for (const name of ["First", "Second", "Third"]) {
+    for (const [i, name] of ["First", "Second", "Third"].entries()) {
+        if (i > 0) {
+            await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
+        }
         await page.locator(".editor .field-name").fill(name);
         await page.locator(".editor .field-text").fill(name);
         await page.locator(".editor .field-save").click();
-        await expect(page.locator(".editor-status")).toHaveText("Saved.");
+        await expect(page.locator(".editor-status")).toContainText(/Saved|Updated/);
     }
 
     const content = await (await page.request.get("/api/content")).json();

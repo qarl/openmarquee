@@ -18,11 +18,14 @@ test("schedule-driven playback: API-built lunch playlist + always-on rule → pl
     await page.goto("/");
 
     // 1. Save two slides via the Text editor (they auto-append to default).
-    for (const name of ["First", "Second"]) {
+    for (const [i, name] of ["First", "Second"].entries()) {
+        if (i > 0) {
+            await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
+        }
         await page.locator(".editor .field-name").fill(name);
         await page.locator(".editor .field-text").fill(name);
         await page.locator(".editor .field-save").click();
-        await expect(page.locator(".editor-status")).toHaveText("Saved.");
+        await expect(page.locator(".editor-status")).toContainText(/Saved|Updated/);
     }
 
     const content = await (await page.request.get("/api/content")).json();

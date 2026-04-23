@@ -414,6 +414,14 @@ export function mountEditor(
         if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
             event.preventDefault();
             if (!saveBtn.disabled) form.requestSubmit();
+            return;
+        }
+        // Plain Enter inside a single-line <input> would otherwise submit
+        // the form (browser default), which saves and resets editor state
+        // out from under the operator. Suppress unless the focus is in
+        // the <textarea>, where Enter means "newline" and should stay.
+        if (event.key === "Enter" && event.target?.tagName !== "TEXTAREA") {
+            event.preventDefault();
         }
     });
 
@@ -468,15 +476,23 @@ export function mountEditor(
                 duration_ms: Math.round(durationSeconds * 1000),
                 png_base64,
             };
-            const result = state.editingId && onSaveExisting
+            const wasEdit = Boolean(state.editingId);
+            const result = wasEdit && onSaveExisting
                 ? await onSaveExisting(state.editingId, payload)
                 : await onSave(payload);
-            statusEl.textContent = state.editingId
-                ? "Updated."
-                : "Saved.";
-            // After a save we reset to a blank slate — operator's flow
-            // is save → tweak next one, not re-save → identical twin.
-            resetToBlank();
+            statusEl.textContent = wasEdit ? "Updated." : "Saved.";
+            // Stay on the slide the operator just saved — the flow is
+            // "tweak → save → maybe tweak again," not "save → jump to a
+            // blank new slide." For a freshly-created slide, promote the
+            // returned id to editingId so subsequent saves UPDATE that
+            // same slide instead of creating a twin.
+            if (!wasEdit && result?.id) {
+                state.editingId = String(result.id);
+            }
+            if (browser) {
+                await browser.refresh();
+                if (state.editingId) browser.highlight(state.editingId);
+            }
             return result;
         } catch (err) {
             statusEl.textContent = `Save failed: ${err.message}`;
