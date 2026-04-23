@@ -263,18 +263,30 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     // same way wifi-ap / wifi-station do. Tailscale also requires wifi
     // station (internet) to function, so when station is off the whole
     // tailscale subsection is force-disabled + force-unchecked.
+    //
+    // Only add tailscale's own .is-disabled class when station is ON
+    // but tailscale is off. When station is off, the parent station's
+    // dim styling already covers the whole tailscale subsection; adding
+    // tailscale's own dim on top would stack opacity (0.45 × 0.45 ≈ 0.20).
     function syncTailscaleGrayOut() {
-        const on = tsEnabledEl.checked && !tsEnabledEl.disabled;
-        tsHostnameEl.disabled = !on;
-        tsAuthKeyEl.disabled = !on;
+        const stationOn = stationEnabledEl.checked;
+        const tsOn = tsEnabledEl.checked;
+        const bodyEnabled = stationOn && tsOn;
+        tsHostnameEl.disabled = !bodyEnabled;
+        tsAuthKeyEl.disabled = !bodyEnabled;
         container
             .querySelector(".settings-tailscale")
-            .classList.toggle("is-disabled", !on);
+            .classList.toggle("is-disabled", stationOn && !tsOn);
     }
     function syncTailscaleStationGating() {
         const stationOn = stationEnabledEl.checked;
+        // Only disable the checkbox — don't overwrite its checked value.
+        // Preserving the user's tailscale preference across a station
+        // toggle means re-enabling station doesn't silently wipe what
+        // they had set. Persisted state of tailscale=true + station=false
+        // is a valid "tailscale is pre-configured, waiting for wifi" state
+        // — the tailscale unit just won't start until station comes up.
         tsEnabledEl.disabled = !stationOn;
-        if (!stationOn) tsEnabledEl.checked = false;
         syncTailscaleGrayOut();
     }
     tsEnabledEl.addEventListener("change", syncTailscaleGrayOut);
@@ -344,13 +356,16 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             stationSsidEl.value = settings.wifi_station_ssid ?? "";
             stationPasswordEl.value = settings.wifi_station_password ?? "";
             ws281xOrderEl.value = settings.ws281x_pixel_order || "row_major";
+            // Hydrate tailscale state BEFORE the sync calls — syncTailscale*
+            // reads tsEnabledEl.checked to decide dim / disabled state, so
+            // the wrong class would stick on first paint if this came after.
+            tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
+            tsHostnameEl.value = settings.tailscale_hostname ?? "";
+            tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
             syncWifiGrayOut();
             syncTailscaleStationGating();
             syncWs281xOrderVisibility();
             setTimezoneValue(tzEl, settings.timezone || "");
-            tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
-            tsHostnameEl.value = settings.tailscale_hostname ?? "";
-            tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
             // Trigger a wifi scan in the background so the dropdown is
             // useful by the time the operator gets to it.
             populateWifiScan();
