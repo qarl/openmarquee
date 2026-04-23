@@ -880,6 +880,10 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     gap: 0.35rem;
     font-size: 0.85rem;
 }
+/* display: flex above wins over the UA default for [hidden]; re-state. */
+.field[hidden] {
+    display: none;
+}
 
 .field > span {
     color: var(--muted);
