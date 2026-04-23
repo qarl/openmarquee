@@ -34,11 +34,46 @@ const PRESETS = [
 // Generic CSS font families — operator picks the shape ("sans / serif /
 // mono"); the specific face comes from whatever the rendering device has.
 // Kept generic so the canvas render matches the device render.
-const FONT_FAMILIES = [
-    { value: "sans-serif", label: "Sans-serif (default)" },
-    { value: "serif", label: "Serif" },
-    { value: "monospace", label: "Monospace" },
+// `weight` = the numeric CSS font-weight to request in `ctx.font`. Using
+// each face's *native* weight avoids browser-synthesized fake bold on
+// single-weight display fonts (Pacifico, Bebas Neue, etc.), which looks
+// smeary. Variable fonts (Inter, Oswald, Roboto Slab, Cinzel) cover 700
+// natively and look correct at bold. UnifrakturCook ships only as the
+// Bold cut, so 700 matches the file.
+export const FONT_FAMILIES = [
+    // System generics (render with whatever the device has).
+    { value: "sans-serif",            label: "Sans-serif (system default)",             weight: 700 },
+    { value: "serif",                 label: "Serif (system)",                          weight: 700 },
+    { value: "monospace",             label: "Monospace (system)",                      weight: 700 },
+    // Bundled @font-face fonts.
+    { value: "Inter",                 label: "Inter",                                   weight: 700 },
+    { value: "Oswald",                label: "Oswald",                                  weight: 700 },
+    { value: "Bebas Neue",            label: "Bebas Neue",                              weight: 400 },
+    { value: "Roboto Slab",           label: "Roboto Slab",                             weight: 700 },
+    { value: "Caveat Brush",          label: "Caveat Brush — chalk / handwriting",      weight: 400 },
+    { value: "Permanent Marker",      label: "Permanent Marker",                        weight: 400 },
+    { value: "Cinzel",                label: "Cinzel — classical caps",                 weight: 700 },
+    { value: "UnifrakturCook",        label: "UnifrakturCook — blackletter",            weight: 700 },
+    { value: "Rye",                   label: "Rye — western",                           weight: 400 },
+    { value: "Pacifico",              label: "Pacifico — retro script",                 weight: 400 },
+    { value: "Sedgwick Ave Display",  label: "Sedgwick Ave Display — graffiti",         weight: 400 },
 ];
+
+const FONT_WEIGHT_BY_VALUE = new Map(FONT_FAMILIES.map((f) => [f.value, f.weight]));
+
+/**
+ * Return a CSS font-family string safe for use in `ctx.font` / `style.font`.
+ * Generic keywords (sans-serif, serif, monospace) must NOT be quoted; named
+ * families with spaces must be. Canvas will silently drop an unquoted
+ * "Bebas Neue" otherwise.
+ */
+function cssFontFamily(value) {
+    const GENERICS = new Set([
+        "sans-serif", "serif", "monospace", "cursive", "fantasy",
+        "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
+    ]);
+    return GENERICS.has(value) ? value : `"${value}"`;
+}
 
 function presetButtonsHtml() {
     return PRESETS.map(
@@ -253,6 +288,26 @@ export function mountEditor(
         el.addEventListener("input", syncAndRender);
     }
 
+    // When the user picks a bundled @font-face family that hasn't finished
+    // downloading yet, canvas draws with a fallback glyph set (serif) until
+    // the TTF resolves. Kick off an explicit load on selection and redraw
+    // once it's ready — so the preview catches up without the user having
+    // to touch another field.
+    fontFamilyEl.addEventListener("change", async () => {
+        const family = fontFamilyEl.value;
+        const weight = FONT_WEIGHT_BY_VALUE.get(family) ?? 700;
+        if (document.fonts?.load) {
+            try {
+                await document.fonts.load(`${weight} 40px ${cssFontFamily(family)}`);
+            } catch {
+                // Load failures bubble back as the fallback rendering;
+                // no need to surface — the draw-on-input path already ran.
+                return;
+            }
+            if (state.fontFamily === family) syncAndRender();
+        }
+    });
+
     // Mode → list of [value, label] pairs for the format dropdown.
     // Labels include an example so the operator knows exactly what the
     // saved slide will render at playback time.
@@ -389,6 +444,10 @@ export function mountEditor(
         updateSaveEnabled();
         statusEl.textContent = "Saving…";
         try {
+            // Make sure any pending @font-face bytes have loaded before we
+            // rasterize — otherwise the stored PNG might fall back to a
+            // default font while the live preview already has the real one.
+            if (document.fonts?.ready) await document.fonts.ready;
             // Rasterize the asset at a fixed 4K target so the stored PNG
             // is resolution-independent — playback cover-fits down to the
             // current panel dims at slide entry. drawCanvas reads the
@@ -630,7 +689,8 @@ export function drawCanvas(canvas, state) {
             fontSizePx = pickFontSize(canvas.height);
         }
         ctx.fillStyle = textColor;
-        ctx.font = `bold ${fontSizePx}px ${fontFamily}`;
+        const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
+        ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
 

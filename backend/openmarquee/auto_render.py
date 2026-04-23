@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -180,6 +181,30 @@ def _load_background(
     return Image.new("RGB", (width, height), slide.background_color)
 
 
+# Map the UI font-family strings to the bundled TTF filenames under
+# ui/fonts/. The browser editor uses these names via @font-face; server-
+# side auto-render (clock/date/day slides) has to resolve them to actual
+# file paths so Pillow picks the same face the operator picked in the UI.
+_BUNDLED_FONT_FILES = {
+    "Inter": "inter.ttf",
+    "Oswald": "oswald.ttf",
+    "Bebas Neue": "bebas-neue.ttf",
+    "Roboto Slab": "roboto-slab.ttf",
+    "Caveat Brush": "caveat-brush.ttf",
+    "Permanent Marker": "permanent-marker.ttf",
+    "Cinzel": "cinzel.ttf",
+    "UnifrakturCook": "unifrakturcook.ttf",
+    "Rye": "rye.ttf",
+    "Pacifico": "pacifico.ttf",
+    "Sedgwick Ave Display": "sedgwick-ave-display.ttf",
+}
+
+
+def _bundled_fonts_dir() -> Path:
+    """`ui/fonts/` alongside `backend/` in the repo layout."""
+    return Path(__file__).resolve().parent.parent.parent / "ui" / "fonts"
+
+
 def _load_font(
     family: str | None, size_px: int | None, canvas_height: int
 ) -> ImageFont.ImageFont:
@@ -188,10 +213,18 @@ def _load_font(
     having to pick a size explicitly for every auto slide."""
     size = size_px if size_px else max(8, int(canvas_height * 0.4))
     if family:
+        # 1. Bundled @font-face family — load the matching TTF by path.
+        bundled = _BUNDLED_FONT_FILES.get(family)
+        if bundled:
+            path = _bundled_fonts_dir() / bundled
+            try:
+                return ImageFont.truetype(str(path), size=size)
+            except OSError:
+                pass
+        # 2. Raw path or system-registered name — let Pillow try.
         try:
             return ImageFont.truetype(family, size=size)
         except OSError:
-            # Family wasn't a path or installed font — fall through.
             pass
     # Last resort: PIL's bundled bitmap font ignores size but always loads.
     try:

@@ -1,5 +1,24 @@
 /* openMarquee UI — phone-first, no framework, no third-party styles. */
 
+/* Bundled display fonts — shipped in ui/fonts/, served by the device's
+   own origin so captive-portal clients don't need internet. All SIL
+   OFL-1.1 or Apache-2.0 (redistributable). See ui/fonts/LICENSES.md.
+   font-weight tells the browser what weights the file actually provides,
+   so ctx.font in canvas matches a real glyph set instead of triggering
+   synthesized fake-bold. Variable-axis fonts (Inter / Oswald / Cinzel)
+   declare a range; single-weight files declare their exact weight. */
+@font-face { font-family: "Inter";              src: url("fonts/inter.ttf") format("truetype"); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: "Oswald";             src: url("fonts/oswald.ttf") format("truetype"); font-weight: 200 700; font-display: swap; }
+@font-face { font-family: "Bebas Neue";         src: url("fonts/bebas-neue.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Roboto Slab";        src: url("fonts/roboto-slab.ttf") format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Caveat Brush";       src: url("fonts/caveat-brush.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Permanent Marker";   src: url("fonts/permanent-marker.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Cinzel";             src: url("fonts/cinzel.ttf") format("truetype"); font-weight: 400 900; font-display: swap; }
+@font-face { font-family: "UnifrakturCook";     src: url("fonts/unifrakturcook.ttf") format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Rye";                src: url("fonts/rye.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Pacifico";           src: url("fonts/pacifico.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Sedgwick Ave Display"; src: url("fonts/sedgwick-ave-display.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+
 :root {
     --bg: #0e0e10;
     --panel: #19191c;
