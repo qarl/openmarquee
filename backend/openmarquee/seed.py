@@ -199,13 +199,15 @@ def seed_if_needed(
         if demo is not None:
             created.append(demo)
 
-        # 3. The ONE thing we auto-append to the default playlist: the
-        #    Welcome text slide. A fresh device boots playing "Welcome" on
-        #    a nice background so the sign isn't a black screen until the
-        #    operator does anything.
-        welcome = _seed_welcome_slide(storage, width, height)
-        created.append(welcome)
-        playlist.append(welcome.id)
+        # 3. What we auto-append to the default playlist: three text
+        #    slides reading "Welcome" → "to" → "openMarquee". A fresh
+        #    device plays them in order so the sign isn't a black screen
+        #    until the operator does anything. Backgrounds + videos above
+        #    are available as assets but stay out of the playlist.
+        welcome_slides = _seed_welcome_playlist_slides(storage, width, height)
+        created.extend(welcome_slides)
+        for slide in welcome_slides:
+            playlist.append(slide.id)
 
         playlist_storage.save(playlist)
     except Exception:
@@ -316,40 +318,55 @@ def _seed_bundled_videos(
     return created
 
 
-# --- Welcome slide ---
+# --- Welcome playlist ---
 
-# Chosen for high contrast + a warm, inviting feel at sign sizes. White
-# on deep teal reads well at both LED-matrix and HDMI resolutions.
-WELCOME_TEXT = "Welcome"
+# High contrast + warm feel; white on deep teal reads well across panel sizes.
 WELCOME_TEXT_COLOR = "#FFFFFF"
 WELCOME_BG_COLOR = "#0A3D4A"
 
+# Three-slide intro playlist. Each is stored as a TextSlide (not ImageSlide)
+# so the operator can reopen them in the text editor and re-skin without
+# starting from scratch.
+_WELCOME_PLAYLIST_TEXTS: tuple[str, ...] = ("Welcome", "to", "openMarquee")
+
 
 def render_welcome_png(width: int, height: int) -> bytes:
-    """Flatten the Welcome slide to a PNG at the panel's native dimensions.
+    """PNG for the first 'Welcome' slide at the panel's native dims. Kept
+    as a thin shim for tests + historical callers; new code should prefer
+    render_text_slide_png()."""
+    return render_text_slide_png("Welcome", width, height)
+
+
+def render_text_slide_png(
+    text: str,
+    width: int,
+    height: int,
+    fg: str = WELCOME_TEXT_COLOR,
+    bg: str = WELCOME_BG_COLOR,
+) -> bytes:
+    """Flatten one centered-text slide to a PNG.
 
     Mirrors what the UI's text-slide editor does client-side — solid
     background + centered text — so the device has a ready-to-render
-    PNG the moment the seed finishes.
+    PNG the moment the seed finishes. Font auto-shrinks if the text would
+    overflow 90% of the canvas width (e.g. "openMarquee" at small panels).
     """
-    img = Image.new("RGB", (width, height), WELCOME_BG_COLOR)
+    img = Image.new("RGB", (width, height), bg)
     draw = ImageDraw.Draw(img)
     font_size_px = max(12, int(height * 0.4))
-    # PIL's default truetype lookup is unreliable across install paths;
-    # fall back to the bitmap default when no scalable face is available.
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size_px)
-    except OSError:
-        try:
-            font = ImageFont.truetype("Arial Bold.ttf", font_size_px)
-        except OSError:
-            font = ImageFont.load_default()
-    bbox = draw.textbbox((0, 0), WELCOME_TEXT, font=font)
+    font = _load_bold_font(font_size_px)
+    while font_size_px > 12:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] <= width * 0.9:
+            break
+        font_size_px -= 4
+        font = _load_bold_font(font_size_px)
+    bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.text(
         ((width - tw) / 2 - bbox[0], (height - th) / 2 - bbox[1]),
-        WELCOME_TEXT,
-        fill=WELCOME_TEXT_COLOR,
+        text,
+        fill=fg,
         font=font,
     )
     buf = BytesIO()
@@ -357,23 +374,38 @@ def render_welcome_png(width: int, height: int) -> bytes:
     return buf.getvalue()
 
 
-def _seed_welcome_slide(
+def _load_bold_font(size_px: int):
+    # PIL's default truetype lookup is unreliable across install paths;
+    # fall back to the bitmap default when no scalable face is available.
+    try:
+        return ImageFont.truetype("DejaVuSans-Bold.ttf", size_px)
+    except OSError:
+        try:
+            return ImageFont.truetype("Arial Bold.ttf", size_px)
+        except OSError:
+            return ImageFont.load_default()
+
+
+def _seed_welcome_playlist_slides(
     storage: ContentStorage, width: int, height: int
-) -> TextSlide:
-    """Create + persist the 'Welcome' TextSlide that a fresh device boots
-    into. Stored as a TextSlide (not ImageSlide) so the operator can open
-    it in the text editor and re-skin it without starting from scratch."""
-    png = render_welcome_png(width, height)
-    slide = TextSlide(
-        name="Welcome",
-        text=WELCOME_TEXT,
-        text_color=WELCOME_TEXT_COLOR,
-        background_color=WELCOME_BG_COLOR,
-        font_size_px=max(12, int(height * 0.4)),
-        duration_ms=5000,
-    )
-    storage.save_text_slide(slide, png)
-    return slide
+) -> list[TextSlide]:
+    """Create the three 'Welcome' / 'to' / 'openMarquee' text slides that
+    the default playlist plays in order on a fresh device."""
+    slides: list[TextSlide] = []
+    font_size_px = max(12, int(height * 0.4))
+    for text in _WELCOME_PLAYLIST_TEXTS:
+        png = render_text_slide_png(text, width, height)
+        slide = TextSlide(
+            name=text,
+            text=text,
+            text_color=WELCOME_TEXT_COLOR,
+            background_color=WELCOME_BG_COLOR,
+            font_size_px=font_size_px,
+            duration_ms=3000,
+        )
+        storage.save_text_slide(slide, png)
+        slides.append(slide)
+    return slides
 
 
 def _seed_demo_video_if_available(

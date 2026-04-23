@@ -112,34 +112,34 @@ def test_seed_creates_starter_slides_when_fresh(
 ):
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
-    # At least the 4 fallback backgrounds + the Welcome text slide.
-    assert len(created) >= 5
+    # At least the 4 fallback backgrounds + 3 welcome text slides.
+    assert len(created) >= 7
 
     # They round-trip through storage.
     loaded = storage.list_all()
     assert len(loaded) == len(created)
 
-    # Mix of TextSlide (Welcome) + ImageSlide (backgrounds).
+    # Mix of TextSlide (welcome slides) + ImageSlide (backgrounds).
     types = sorted({s.type for s in created})
     assert "image" in types
     assert "text_slide" in types
 
 
-def test_seed_default_playlist_contains_only_the_welcome_slide(
+def test_seed_default_playlist_contains_the_three_welcome_text_slides(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
-    """qarl's requirement: fresh boot → default playlist has ONLY the
-    Welcome slide. Backgrounds are available content but aren't in the
-    playlist — operator drags what they want onto the track themselves."""
+    """qarl's requirement: fresh boot → default playlist holds the three
+    intro text slides ('Welcome' / 'to' / 'openMarquee') in order.
+    Backgrounds + videos are available content but aren't in the playlist
+    — the operator drags what they want onto the track themselves."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
-    welcome = next(s for s in created if s.name == "Welcome")
-    assert welcome.type == "text_slide"
-    assert welcome.text == "Welcome"
+    welcome_slides = [s for s in created if s.type == "text_slide"]
+    assert [s.text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
 
-    # Playlist has exactly the one Welcome slide.
+    # Playlist has exactly those three, in the same order.
     ids = playlist.load().item_ids
-    assert ids == [welcome.id]
+    assert ids == [s.id for s in welcome_slides]
 
 
 def test_seed_writes_marker_file_recording_what_it_did(
@@ -261,16 +261,17 @@ def test_seed_registers_bundled_backgrounds_over_pillow_fallback(
         height=32,
         bundled_backgrounds_dir=bundled,
     )
-    # 2 bundled backgrounds + 1 Welcome slide. No Pillow-gradient fallback
-    # when bundled backgrounds are present.
-    assert len(created) == 3
+    # 2 bundled backgrounds + 3 welcome text slides. No Pillow-gradient
+    # fallback when bundled backgrounds are present.
+    assert len(created) == 5
     bg_names = sorted(
         s.name for s in created if s.name.startswith("Background —")
     )
     assert bg_names == ["Background — Midnight", "Background — Parchment"]
-    # And exactly the Welcome slide is in the default playlist.
-    welcome = next(s for s in created if s.name == "Welcome")
-    assert playlist.load().item_ids == [welcome.id]
+    # Exactly the three welcome slides are in the default playlist.
+    welcome_slides = [s for s in created if s.type == "text_slide"]
+    assert [s.text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
+    assert playlist.load().item_ids == [s.id for s in welcome_slides]
 
 
 def test_seed_falls_back_to_gradients_when_bundled_dir_is_empty(
@@ -287,8 +288,8 @@ def test_seed_falls_back_to_gradients_when_bundled_dir_is_empty(
         height=32,
         bundled_backgrounds_dir=empty_bundled_dir,
     )
-    # 4 Pillow-gradient presets + 1 Welcome slide.
-    assert len(created) == 5
+    # 4 Pillow-gradient presets + 3 welcome slides.
+    assert len(created) == 7
     bg_names = [s.name for s in created if s.name.startswith("Background —")]
     assert len(bg_names) == 4
 
@@ -312,9 +313,9 @@ def test_seed_bundled_skips_unreadable_files_but_still_seeds_good_ones(
         height=32,
         bundled_backgrounds_dir=bundled,
     )
-    # Good bundled + Welcome = 2 items; broken file logged + skipped.
+    # Good bundled + 3 welcome slides = 4 items; broken file logged + skipped.
     names = sorted(s.name for s in created)
-    assert names == ["Background — Good", "Welcome"]
+    assert names == ["Background — Good", "Welcome", "openMarquee", "to"]
 
 
 def test_seed_bundled_is_deterministic_across_runs(
@@ -324,7 +325,8 @@ def test_seed_bundled_is_deterministic_across_runs(
     tmp_path: Path,
 ):
     """Order should be filename-sorted so two fresh devices ship the same
-    set of bundled backgrounds in the same order — Welcome always last."""
+    set of bundled backgrounds in the same order — welcome slides always
+    last, in playlist order."""
     bundled = tmp_path / "backgrounds"
     bundled.mkdir()
     for stem in ["zebra", "alpha", "mango"]:
@@ -343,6 +345,8 @@ def test_seed_bundled_is_deterministic_across_runs(
         "Background — Mango",
         "Background — Zebra",
         "Welcome",
+        "to",
+        "openMarquee",
     ]
 
 
@@ -373,11 +377,11 @@ def test_seed_registers_demo_video_when_mp4_is_present(
     # And it round-trips through storage.read_video() — the bytes match.
     assert storage.read_video(videos[0].id) == _FAKE_MP4
     # Demo video is NOT auto-appended to the default playlist — only the
-    # Welcome slide is. Operator drags the demo into the playlist
-    # themselves when they want to show it.
+    # three welcome text slides are. Operator drags the demo into the
+    # playlist themselves when they want to show it.
     assert videos[0].id not in playlist.load().item_ids
-    welcome = next(s for s in created if s.name == "Welcome")
-    assert playlist.load().item_ids == [welcome.id]
+    welcome_slides = [s for s in created if s.type == "text_slide"]
+    assert playlist.load().item_ids == [s.id for s in welcome_slides]
 
 
 def test_seed_skips_demo_video_when_path_is_missing(
