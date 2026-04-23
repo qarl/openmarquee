@@ -67,13 +67,15 @@ class SeedPreset:
 
 
 _SEED_PRESETS: tuple[SeedPreset, ...] = (
-    # "Background — <name>" so they surface as obvious background candidates
-    # in the composer's "From saved slide" picker. The composer is the
-    # intended consumer — these aren't ready-to-display slides on their own.
-    SeedPreset("Background — Sunset", top=(255, 87, 34), bottom=(255, 204, 0)),
-    SeedPreset("Background — Midnight", top=(15, 28, 74), bottom=(0, 0, 0)),
-    SeedPreset("Background — Forest", top=(34, 99, 70), bottom=(12, 30, 24)),
-    SeedPreset("Background — Ocean", top=(10, 60, 120), bottom=(5, 25, 55)),
+    # "<name> — Background" so they sort lexically grouped by material in
+    # the composer's picker (e.g. "Sunset — Background" next to "Sunset
+    # Gradient — Background") rather than all collapsing under a shared
+    # "Background —" prefix. The composer is the intended consumer —
+    # these aren't ready-to-display slides on their own.
+    SeedPreset("Sunset — Background", top=(255, 87, 34), bottom=(255, 204, 0)),
+    SeedPreset("Midnight — Background", top=(15, 28, 74), bottom=(0, 0, 0)),
+    SeedPreset("Forest — Background", top=(34, 99, 70), bottom=(12, 30, 24)),
+    SeedPreset("Ocean — Background", top=(10, 60, 120), bottom=(5, 25, 55)),
 )
 
 
@@ -118,9 +120,9 @@ def _title_from_filename(stem: str) -> str:
 
 
 def _name_from_filename(stem: str) -> str:
-    """'brick-wall' → 'Background — Brick Wall'."""
+    """'brick-wall' → 'Brick Wall — Background'."""
     title = _title_from_filename(stem)
-    return "Background — " + title if title else "Background"
+    return title + " — Background" if title else "Background"
 
 
 def seed_if_needed(

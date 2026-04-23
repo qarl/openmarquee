@@ -145,7 +145,7 @@ describe("generateBackground", () => {
     it("POSTs the prompt to /api/backgrounds/generate and returns the ImageSlide", async () => {
         const fetchMock = mockFetch({
             ok: true,
-            json: async () => ({ id: "bg1", type: "image", name: "Background — sunset" }),
+            json: async () => ({ id: "bg1", type: "image", name: "sunset — Background" }),
         });
         const result = await generateBackground({ prompt: "sunset gradient" });
         expect(result.id).toBe("bg1");

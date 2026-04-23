@@ -265,9 +265,9 @@ def test_seed_registers_bundled_backgrounds_over_pillow_fallback(
     # fallback when bundled backgrounds are present.
     assert len(created) == 5
     bg_names = sorted(
-        s.name for s in created if s.name.startswith("Background —")
+        s.name for s in created if s.name.endswith("— Background")
     )
-    assert bg_names == ["Background — Midnight", "Background — Parchment"]
+    assert bg_names == ["Midnight — Background", "Parchment — Background"]
     # Exactly the three welcome slides are in the default playlist.
     welcome_slides = [s for s in created if s.type == "text_slide"]
     assert [s.text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
@@ -290,7 +290,7 @@ def test_seed_falls_back_to_gradients_when_bundled_dir_is_empty(
     )
     # 4 Pillow-gradient presets + 3 welcome slides.
     assert len(created) == 7
-    bg_names = [s.name for s in created if s.name.startswith("Background —")]
+    bg_names = [s.name for s in created if s.name.endswith("— Background")]
     assert len(bg_names) == 4
 
 
@@ -315,7 +315,7 @@ def test_seed_bundled_skips_unreadable_files_but_still_seeds_good_ones(
     )
     # Good bundled + 3 welcome slides = 4 items; broken file logged + skipped.
     names = sorted(s.name for s in created)
-    assert names == ["Background — Good", "Welcome", "openMarquee", "to"]
+    assert names == ["Good — Background", "Welcome", "openMarquee", "to"]
 
 
 def test_seed_bundled_is_deterministic_across_runs(
@@ -341,9 +341,9 @@ def test_seed_bundled_is_deterministic_across_runs(
         bundled_backgrounds_dir=bundled,
     )
     assert [s.name for s in created] == [
-        "Background — Alpha",
-        "Background — Mango",
-        "Background — Zebra",
+        "Alpha — Background",
+        "Mango — Background",
+        "Zebra — Background",
         "Welcome",
         "to",
         "openMarquee",

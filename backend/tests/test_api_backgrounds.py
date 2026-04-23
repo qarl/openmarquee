@@ -102,7 +102,7 @@ def test_generate_saves_image_and_appends_to_playlist(
     assert response.status_code == 200
     body = response.json()
     assert body["type"] == "image"
-    assert body["name"].startswith("Background — ")
+    assert body["name"].endswith(" — Background")
 
     from uuid import UUID
     item_id = UUID(body["id"])

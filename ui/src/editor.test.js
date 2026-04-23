@@ -488,7 +488,7 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onGenerateBackground = vi.fn().mockResolvedValue({
             id: "new-bg",
-            name: "Background — sunset",
+            name: "sunset — Background",
         });
         mountEditor(container, {
             width: 128,
@@ -497,7 +497,7 @@ describe("mountEditor — submit flow", () => {
             fetchItems: async () => [
                 // `type: "image"` required after the picker started filtering
                 // to image-only (bug #4 regression).
-                { id: "new-bg", type: "image", name: "Background — sunset" },
+                { id: "new-bg", type: "image", name: "sunset — Background" },
             ],
             onGenerateBackground,
         });

@@ -105,4 +105,4 @@ def _name_from_prompt(prompt: str) -> str:
     the name column in the saved-slides list is narrow; operators rename
     anyway."""
     trimmed = prompt.strip().splitlines()[0][:60].strip()
-    return f"Background — {trimmed}" if trimmed else "Background — Generated"
+    return f"{trimmed} — Background" if trimmed else "Generated — Background"
