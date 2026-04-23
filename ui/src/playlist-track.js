@@ -173,6 +173,12 @@ export function mountPlaylistTrack(container, options) {
     async function refresh() {
         statusEl.textContent = "";
         refreshVersion += 1;
+        // Destroy existing Sortables BEFORE re-rendering tiles. Sortable.js
+        // `destroy()` strips the `draggable` attribute from every child it
+        // managed — doing this AFTER rendering the new tiles would wipe
+        // their draggable="false" and let native <img> drag preempt Sortable.
+        if (trackSortable) { trackSortable.destroy(); trackSortable = null; }
+        if (palletSortable) { palletSortable.destroy(); palletSortable = null; }
         try {
             const [items, collection] = await Promise.all([
                 fetchItems(),
@@ -234,8 +240,6 @@ export function mountPlaylistTrack(container, options) {
                 );
             }
 
-            if (trackSortable) trackSortable.destroy();
-            if (palletSortable) palletSortable.destroy();
             trackSortable = bindTrackSortable(
                 trackEl,
                 markDirty,
@@ -300,6 +304,11 @@ function bindPalletSortable(palletEl) {
         },
         sort: false,
         ghostClass: "pallet-ghost",
+        // Clicks on the edit / delete buttons must not initiate a drag —
+        // otherwise Sortable intercepts the pointerdown and the button's
+        // click handler never fires.
+        filter: ".pallet-tile-edit, .pallet-tile-delete",
+        preventOnFilter: false,
     });
 }
 
@@ -442,7 +451,7 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
     // picker stays optional — metadata-only updates don't force a
     // re-upload.
     li.innerHTML = `
-        <img class="pallet-tile-thumb" alt=""
+        <img class="pallet-tile-thumb" alt="" draggable="false"
              src="/api/content/${item.id}/asset?v=${cacheBust}">
         <div class="pallet-tile-name" title="${safeName}">${safeName}</div>
         <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>

@@ -101,7 +101,7 @@ export function mountSlideBrowser(container, options) {
         );
         li.innerHTML = `
             <button type="button" class="slide-browser-tile-action" title="${safeName}">
-                <img class="slide-browser-tile-thumb" alt=""
+                <img class="slide-browser-tile-thumb" alt="" draggable="false"
                      src="/api/content/${item.id}/asset?v=${refreshVersion}">
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>

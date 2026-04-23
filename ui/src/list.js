@@ -42,6 +42,14 @@ export function mountList(container, { fetchItems, onPlay, onDelete, onReorder }
     async function refresh() {
         statusEl.textContent = pendingStatus;
         pendingStatus = "";
+        // Destroy the previous Sortable BEFORE re-rendering. Sortable.destroy
+        // strips `draggable` off every child it managed; doing this after
+        // renderItems would wipe any draggable="false" intent on fresh DOM.
+        // No problem today (renderItems doesn't set draggable on thumbs)
+        // but re-ordering to match the playlist-track refresh pattern so a
+        // future "add native-drag suppression to thumbs" edit doesn't
+        // silently lose its effect.
+        if (sortable) { sortable.destroy(); sortable = null; }
         try {
             const items = await fetchItems();
             renderItems(listEl, items, {
@@ -57,9 +65,7 @@ export function mountList(container, { fetchItems, onPlay, onDelete, onReorder }
             }
 
             // Rebind drag-reorder on every render; the <ul> contents just got
-            // replaced wholesale. Destroy the previous binding first so we
-            // don't leak handlers.
-            if (sortable) sortable.destroy();
+            // replaced wholesale.
             sortable = items.length > 1 ? bindSortable(listEl, onReorder, statusEl, refresh) : null;
         } catch (err) {
             statusEl.textContent = `Could not load slides: ${err.message}`;
