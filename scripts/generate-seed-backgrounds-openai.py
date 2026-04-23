@@ -46,8 +46,9 @@ PRESETS: list[tuple[str, str]] = [
     ),
     (
         "brick-wall",
-        "weathered red brick wall, warm lighting, subtle texture, "
-        "signage-friendly background, no text",
+        "weathered red brick wall, flat even lighting edge-to-edge, "
+        "no vignette, no spotlight, no shadows, repeating brick pattern, "
+        "signage-friendly background, no text, no focal point",
     ),
     (
         "kraft-paper",
@@ -56,8 +57,9 @@ PRESETS: list[tuple[str, str]] = [
     ),
     (
         "stained-glass",
-        "art nouveau stained glass pattern, jewel tones, elegant "
-        "geometric, signage-friendly background, no text",
+        "stained glass texture, repeating small geometric panes in "
+        "jewel tones, edge-to-edge flat lighting, no frame, no center "
+        "medallion, no focal point, signage-friendly background, no text",
     ),
     (
         "oak-wood",
