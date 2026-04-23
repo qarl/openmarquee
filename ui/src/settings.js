@@ -144,30 +144,30 @@ const SECTION_TEMPLATE = `
                     radio; both modes share the same channel. Disabling both
                     modes isn't allowed — the device would be unreachable.
                 </p>
-            </fieldset>
 
-            <fieldset class="settings-tailscale">
-                <legend>
-                    <label class="field-inline">
-                        <input type="checkbox" class="field-tailscale-enabled">
-                        Tailscale
-                    </label>
-                </legend>
-                <p class="settings-hint">
-                    Bring the device up on your tailnet so you can reach
-                    this UI from anywhere. Requires internet at
-                    install-time (secondary WiFi or Ethernet).
-                </p>
-                <div class="row">
-                    <label class="field">
-                        <span>Hostname on tailnet (optional)</span>
-                        <input type="text" class="field-tailscale-hostname" maxlength="63" placeholder="e.g. lobby-sign-01">
-                    </label>
-                    <label class="field">
-                        <span>Auth key (tskey-auth-… or tskey-client-…)</span>
-                        <input type="password" class="field-tailscale-auth-key" placeholder="paste from Tailscale admin">
-                    </label>
-                </div>
+                <fieldset class="settings-tailscale">
+                    <legend>
+                        <label class="field-inline">
+                            <input type="checkbox" class="field-tailscale-enabled">
+                            Tailscale
+                        </label>
+                    </legend>
+                    <p class="settings-hint">
+                        Bring the device up on your tailnet so you can reach
+                        this UI from anywhere. Requires internet at
+                        install-time (secondary WiFi or Ethernet).
+                    </p>
+                    <div class="row">
+                        <label class="field">
+                            <span>Hostname on tailnet (optional)</span>
+                            <input type="text" class="field-tailscale-hostname" maxlength="63" placeholder="e.g. lobby-sign-01">
+                        </label>
+                        <label class="field">
+                            <span>Auth key (tskey-auth-… or tskey-client-…)</span>
+                            <input type="password" class="field-tailscale-auth-key" placeholder="paste from Tailscale admin">
+                        </label>
+                    </div>
+                </fieldset>
             </fieldset>
 
             <label class="field">
@@ -260,14 +260,22 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             .classList.toggle("is-disabled", !stationOn);
     }
     // Tailscale section header toggle gates everything below it the
-    // same way wifi-ap / wifi-station do.
+    // same way wifi-ap / wifi-station do. Tailscale also requires wifi
+    // station (internet) to function, so when station is off the whole
+    // tailscale subsection is force-disabled + force-unchecked.
     function syncTailscaleGrayOut() {
-        const on = tsEnabledEl.checked;
+        const on = tsEnabledEl.checked && !tsEnabledEl.disabled;
         tsHostnameEl.disabled = !on;
         tsAuthKeyEl.disabled = !on;
         container
             .querySelector(".settings-tailscale")
             .classList.toggle("is-disabled", !on);
+    }
+    function syncTailscaleStationGating() {
+        const stationOn = stationEnabledEl.checked;
+        tsEnabledEl.disabled = !stationOn;
+        if (!stationOn) tsEnabledEl.checked = false;
+        syncTailscaleGrayOut();
     }
     tsEnabledEl.addEventListener("change", syncTailscaleGrayOut);
     // Reveal the WS2812B-only ordering control when the operator picks
@@ -292,6 +300,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     stationEnabledEl.addEventListener("change", () => {
         guardDisableBoth(stationEnabledEl, apEnabledEl);
         syncWifiGrayOut();
+        syncTailscaleStationGating();
     });
 
     // Output-mode change: if the current dims match *some* mode's default,
@@ -336,7 +345,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             stationPasswordEl.value = settings.wifi_station_password ?? "";
             ws281xOrderEl.value = settings.ws281x_pixel_order || "row_major";
             syncWifiGrayOut();
-            syncTailscaleGrayOut();
+            syncTailscaleStationGating();
             syncWs281xOrderVisibility();
             setTimezoneValue(tzEl, settings.timezone || "");
             tsEnabledEl.checked = Boolean(settings.tailscale_enabled);

@@ -730,6 +730,11 @@ main {
     color: var(--muted);
     padding: 0 0.35rem;
 }
+/* Same body-opacity pattern as wifi-ap/station — the legend checkbox
+   (its own enable toggle) stays visible when tailscale body is off. */
+.settings-tailscale.is-disabled > :not(legend) {
+    opacity: 0.45;
+}
 
 .field-inline {
     display: flex;
