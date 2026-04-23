@@ -77,6 +77,11 @@ export function mountPlaylistTrack(container, options) {
         outputMode,
         getCurrentPlaylistName,
         playlistBrowser,
+        // Fires on every drag / transition / name change with the
+        // current in-memory draft. Used by the inline preview to render
+        // unsaved state — otherwise the preview lags the operator's
+        // edits by one Save click.
+        onDraftChange,
     } = options;
     // Fallback when the caller doesn't want multi-playlist — always
     // operate on "default" like the pre-multi UI did.
@@ -131,6 +136,26 @@ export function mountPlaylistTrack(container, options) {
         saveBtn.disabled = false;
         statusEl.textContent = "Unsaved changes.";
     }
+    /**
+     * Like markDirty but ALSO notifies the host (main.js) so the inline
+     * preview re-renders against the in-progress draft. Use this for
+     * changes that affect the rendered sequence (drag, transition,
+     * remove) — NOT the name input, which the preview doesn't care
+     * about and would otherwise trigger a fetch per keystroke.
+     */
+    function markContentDirty() {
+        markDirty();
+        if (onDraftChange) {
+            try {
+                onDraftChange({
+                    name: resolveName(),
+                    entries: collectTrackEntries(trackEl),
+                });
+            } catch (err) {
+                console.error("[playlist-track] onDraftChange failed:", err);
+            }
+        }
+    }
     function markClean() {
         isDirty = false;
         saveBtn.disabled = true;
@@ -141,8 +166,10 @@ export function mountPlaylistTrack(container, options) {
     function bindAddedBlockButtons() {
         // After a drag-add or reorder, fresh DOM nodes may not have
         // their click handlers wired yet. Re-bind everything; the
-        // initial-render path uses these same fns.
-        bindTrackRemoveButtons(trackEl, markDirty);
+        // initial-render path uses these same fns. Content-mutating
+        // actions (remove × + transition chip) use markContentDirty
+        // so the inline preview re-renders against the draft.
+        bindTrackRemoveButtons(trackEl, markContentDirty);
         bindTrackDurationButtons(trackEl, onUpdateDuration, refresh);
     }
 
@@ -217,9 +244,10 @@ export function mountPlaylistTrack(container, options) {
                     renderTrackBlock(item, entry, { locked: false, cacheBust: refreshVersion }),
                 );
             }
-            // Wire × + transition buttons → mark dirty (no save until
-            // the operator clicks Save playlist).
-            bindTrackRemoveButtons(trackEl, markDirty);
+            // Wire × + transition buttons → mark content dirty (no
+            // save until the operator clicks Save playlist; preview
+            // re-renders against the draft via onDraftChange).
+            bindTrackRemoveButtons(trackEl, markContentDirty);
             // Duration is a SLIDE attribute — auto-saves immediately
             // outside the playlist's draft flow.
             bindTrackDurationButtons(
@@ -242,7 +270,7 @@ export function mountPlaylistTrack(container, options) {
 
             trackSortable = bindTrackSortable(
                 trackEl,
-                markDirty,
+                markContentDirty,
                 itemByIdRef,
                 bindAddedBlockButtons,
                 () => refreshVersion,

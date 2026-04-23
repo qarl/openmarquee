@@ -287,3 +287,89 @@ describe("mountPlaylistTrack", () => {
     // Mode-lock is gone: videos are now resolution-independent H.264 MP4s,
     // so every renderer can consume them. No per-device pipeline branching.
 });
+
+
+describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
+    it("fires with draft entries when a transition chip is cycled", async () => {
+        const onDraftChange = vi.fn();
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a", "b"]),
+            onReorder: vi.fn(),
+            onDraftChange,
+        });
+        await tick();
+
+        // Cycle transition on the first block (cut → fade).
+        const chip = container.querySelector(".track-block-transition");
+        expect(chip).not.toBeNull();
+        chip.click();
+
+        expect(onDraftChange).toHaveBeenCalledTimes(1);
+        const [draft] = onDraftChange.mock.calls[0];
+        expect(draft.name).toBe("default");
+        // The first entry's transition should now reflect the flipped state.
+        expect(draft.entries[0].item_id).toBe("a");
+        expect(draft.entries[0].transition).toBe("fade");
+        expect(draft.entries[1].item_id).toBe("b");
+    });
+
+    it("fires with the draft after a track-remove (× button)", async () => {
+        const onDraftChange = vi.fn();
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a", "b", "c"]),
+            onReorder: vi.fn(),
+            onDraftChange,
+        });
+        await tick();
+
+        // Remove the middle item.
+        const removes = container.querySelectorAll(".track-remove");
+        expect(removes).toHaveLength(3);
+        removes[1].click();
+
+        expect(onDraftChange).toHaveBeenCalledTimes(1);
+        const [draft] = onDraftChange.mock.calls[0];
+        expect(draft.entries.map((e) => e.item_id)).toEqual(["a", "c"]);
+    });
+
+    it("does NOT fire when only the playlist name is renamed (preview doesn't care about the name, and firing per-keystroke was a fetch storm)", async () => {
+        const onDraftChange = vi.fn();
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a"]),
+            onReorder: vi.fn(),
+            onDraftChange,
+            getCurrentPlaylistName: () => "lunch",
+        });
+        await tick();
+
+        const nameEl = container.querySelector(".field-playlist-name");
+        nameEl.value = "lunch-2";
+        nameEl.dispatchEvent(new Event("input", { bubbles: true }));
+
+        expect(onDraftChange).not.toHaveBeenCalled();
+        // But isDirty should still be set (save button lit up) — the
+        // rename still needs to be persisted; just the preview wasn't
+        // notified.
+        const saveBtn = container.querySelector(".playlist-save");
+        expect(saveBtn.disabled).toBe(false);
+    });
+
+    it("doesn't throw when onDraftChange isn't provided (back-compat)", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a", "b"]),
+            onReorder: vi.fn(),
+            // no onDraftChange
+        });
+        await tick();
+        const chip = container.querySelector(".track-block-transition");
+        expect(() => chip.click()).not.toThrow();
+    });
+});

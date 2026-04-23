@@ -99,13 +99,23 @@ async function resolvePanelDims() {
  * inline preview needs full item metadata (duration, type, auto_mode,
  * pipeline) to drive its client-side playback engine.
  */
+// Unsaved draft of the currently-edited playlist. Set by the
+// playlist-track's onDraftChange callback on every drag / transition
+// change; cleared on Save. When present and matching `name`,
+// fetchResolvedPlaylist uses it instead of hitting the API so the
+// inline preview reflects the operator's in-progress state.
+let playlistDraft = null;
+
 async function fetchResolvedPlaylist(name) {
-    const [collection, items] = await Promise.all([
-        listPlaylists(),
-        listContent(),
-    ]);
+    const items = await listContent();
     const byId = new Map(items.map((it) => [String(it.id), it]));
-    const raw = collection.playlists?.[name]?.items || [];
+    let raw;
+    if (playlistDraft && playlistDraft.name === name) {
+        raw = playlistDraft.entries;
+    } else {
+        const collection = await listPlaylists();
+        raw = collection.playlists?.[name]?.items || [];
+    }
     const resolved = raw
         .map((entry) => ({
             item_id: String(entry.item_id),
@@ -208,6 +218,8 @@ async function boot() {
             onSavePlaylist: async ({ originalName, newName, entries }) => {
                 const target = newName || originalName;
                 await savePlaylistByName(target, entries);
+                // Clear the draft — the server is now authoritative.
+                playlistDraft = null;
                 if (target !== originalName && originalName !== "default") {
                     try {
                         await deletePlaylistByName(originalName);
@@ -221,6 +233,13 @@ async function boot() {
                     await playlistBrowserHandle?.refresh();
                     playlistBrowserHandle?.highlight(target);
                 }
+                await inlinePreviewHandle?.refresh();
+            },
+            onDraftChange: async (draft) => {
+                // Operator reordered / flipped a transition / renamed —
+                // stash the draft so the preview pulls it instead of
+                // the stale saved copy, then force a preview refresh.
+                playlistDraft = draft;
                 await inlinePreviewHandle?.refresh();
             },
             onUpdateDuration: async (id, ms) => {
@@ -250,12 +269,18 @@ async function boot() {
                         fetchPlaylists: listPlaylists,
                         fetchItems: listContent,
                         onSelect: async (name) => {
+                            // Abandon any draft for the playlist we're
+                            // switching away from — without this, the
+                            // stale draft could resurface if the
+                            // operator navigated back before saving.
+                            playlistDraft = null;
                             currentPlaylistName = name;
                             playlistBrowserHandle.highlight(name);
                             await playlistTrack?.refresh();
                             await inlinePreviewHandle?.refresh();
                         },
                         onCreate: async () => {
+                            playlistDraft = null;
                             const collection = await listPlaylists();
                             const names = Object.keys(
                                 collection.playlists || {},
