@@ -7,16 +7,17 @@
 #     bash scripts/deploy.sh pi@192.168.1.42
 #
 # What it does:
-#   1. Rebuilds the UI bundle locally (esbuild; ~1s) so the Pi runs the
+#   1. Mirrors source → $OPENMARQUEE_BUILD_DIR (fast, incremental).
+#   2. Rebuilds the UI bundle in BUILD_DIR (esbuild; ~1s) so the Pi runs
 #      current JS, not a stale dist/.
-#   2. Rsyncs backend/ (excluding tests, __pycache__, caches) to
+#   3. Rsyncs BUILD_DIR/backend/ (excluding tests, __pycache__, caches) to
 #      /opt/openmarquee/backend/ on the target.
-#   3. Rsyncs the UI static files (index.html, welcome.html, styles.css,
+#   4. Rsyncs the UI static files (index.html, welcome.html, styles.css,
 #      dist/) to /opt/openmarquee/ui/. Source .js, tests, and node_modules
 #      are excluded — the device serves the built bundle only.
-#   4. Installs or updates the backend's Python deps into
+#   5. Installs or updates the backend's Python deps into
 #      /opt/openmarquee/venv/ via pip -e .
-#   5. Restarts the openmarquee-backend systemd unit.
+#   6. Restarts the openmarquee-backend systemd unit.
 #
 # Assumes:
 #   - The target has /opt/openmarquee/ writable by the ssh user.
@@ -30,6 +31,8 @@
 # it into an SD card image.
 set -euo pipefail
 
+source "$(dirname "$0")/_lib.sh"
+
 if [ $# -ne 1 ]; then
     echo "usage: $0 <ssh-target>" >&2
     echo "example: $0 pi@openmarquee.local" >&2
@@ -37,11 +40,12 @@ if [ $# -ne 1 ]; then
 fi
 
 TARGET="$1"
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REMOTE_ROOT="${OPENMARQUEE_REMOTE_ROOT:-/opt/openmarquee}"
 
-echo "==> rebuilding UI bundle"
-(cd "$PROJECT_ROOT/ui" && npm run build --silent)
+sync_to_build_dir
+
+echo "==> rebuilding UI bundle in $OPENMARQUEE_BUILD_DIR/ui"
+(cd "$OPENMARQUEE_BUILD_DIR/ui" && npm run build --silent)
 
 echo "==> rsync backend to $TARGET:$REMOTE_ROOT/backend/"
 rsync -avz --delete \
@@ -50,8 +54,9 @@ rsync -avz --delete \
     --exclude '.ruff_cache' \
     --exclude '.pytest_cache' \
     --exclude '.mypy_cache' \
+    --exclude '*.egg-info' \
     --exclude 'tests/' \
-    "$PROJECT_ROOT/backend/" "$TARGET:$REMOTE_ROOT/backend/"
+    "$OPENMARQUEE_BUILD_DIR/backend/" "$TARGET:$REMOTE_ROOT/backend/"
 
 echo "==> rsync UI to $TARGET:$REMOTE_ROOT/ui/"
 rsync -avz --delete \
@@ -64,7 +69,7 @@ rsync -avz --delete \
     --exclude 'playwright-report/' \
     --exclude 'test-results/' \
     --exclude 'package-lock.json' \
-    "$PROJECT_ROOT/ui/" "$TARGET:$REMOTE_ROOT/ui/"
+    "$OPENMARQUEE_BUILD_DIR/ui/" "$TARGET:$REMOTE_ROOT/ui/"
 
 echo "==> installing / updating backend deps in remote venv"
 # -e install picks up any new pyproject.toml deps without reinstalling the

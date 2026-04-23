@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/e2e.sh — run the Playwright end-to-end suite.
+# scripts/e2e.sh — run the Playwright end-to-end suite out of BUILD_DIR.
 #
 # Auto-starts uvicorn on port 8765 with isolated content paths in /tmp,
 # runs the specs in ui/e2e/, then tears down the backend.
@@ -10,7 +10,10 @@
 # Example: PW_SLOWMO=200 bash scripts/e2e.sh  (slow enough to follow by eye)
 set -euo pipefail
 
-cd "$(dirname "$0")/../ui"
+source "$(dirname "$0")/_lib.sh"
+
+sync_to_build_dir
+cd "$OPENMARQUEE_BUILD_DIR/ui"
 
 if [ "${1:-}" = "install" ]; then
     npm run e2e:install
