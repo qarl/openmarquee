@@ -495,7 +495,9 @@ describe("mountEditor — submit flow", () => {
             height: 96,
             onSave: vi.fn(),
             fetchItems: async () => [
-                { id: "new-bg", name: "Background — sunset" },
+                // `type: "image"` required after the picker started filtering
+                // to image-only (bug #4 regression).
+                { id: "new-bg", type: "image", name: "Background — sunset" },
             ],
             onGenerateBackground,
         });

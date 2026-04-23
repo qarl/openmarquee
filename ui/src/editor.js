@@ -628,11 +628,17 @@ export function mountEditor(
     };
 }
 
-async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
+export async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
     try {
         const items = await fetchItems();
         selectEl.innerHTML = '<option value="">(pick a slide)</option>';
+        // Only image slides can back a text slide — text-on-text or
+        // text-on-video would be either unreadable or would fight the
+        // video asset for decoding bandwidth at playback. Filter here so
+        // the picker dropdown matches what the operator can actually
+        // render against.
         for (const item of items) {
+            if (item.type !== "image") continue;
             const opt = document.createElement("option");
             opt.value = String(item.id);
             opt.textContent = item.name || item.text || "Untitled";
