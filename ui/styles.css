@@ -703,8 +703,11 @@ main {
 .settings-wifi-station legend {
     padding: 0 0.35rem;
 }
-.settings-wifi-ap.is-disabled,
-.settings-wifi-station.is-disabled {
+/* Dim just the body — not the legend — so the enable checkbox in the
+   legend stays at full opacity and is visibly clickable even when the
+   section is off. */
+.settings-wifi-ap.is-disabled > :not(legend),
+.settings-wifi-station.is-disabled > :not(legend) {
     opacity: 0.45;
 }
 .settings-wifi-ap.is-disabled input:not([type="checkbox"]),
