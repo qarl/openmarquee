@@ -102,12 +102,27 @@ export function mountSlideBrowser(container, options) {
                      src="/api/content/${item.id}/asset?v=${refreshVersion}">
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>
+            <button type="button" class="slide-browser-tile-delete"
+                    aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
         `;
         li.querySelector(".slide-browser-tile-action").addEventListener(
             "click",
             () => {
                 highlight(item.id);
                 onSelect(item);
+            },
+        );
+        li.querySelector(".slide-browser-tile-delete").addEventListener(
+            "click",
+            (event) => {
+                // Don't also fire the tile-action click (which would open the
+                // slide we're about to delete).
+                event.stopPropagation();
+                document.dispatchEvent(
+                    new CustomEvent("openmarquee:delete-slide", {
+                        detail: { id: String(item.id), type: item.type, name: item.name },
+                    }),
+                );
             },
         );
         return li;

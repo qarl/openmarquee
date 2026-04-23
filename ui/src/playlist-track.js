@@ -448,6 +448,8 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
         <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>
         ${lockedBadge}
         <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
+        <button type="button" class="pallet-tile-delete"
+                aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
     `;
     li.querySelector(".pallet-tile-edit").addEventListener("click", (event) => {
         // Bubble a custom event so main.js (which owns the editors +
@@ -457,6 +459,14 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
         document.dispatchEvent(
             new CustomEvent("openmarquee:edit-slide", {
                 detail: { id: String(item.id), type: item.type },
+            }),
+        );
+    });
+    li.querySelector(".pallet-tile-delete").addEventListener("click", (event) => {
+        event.stopPropagation();
+        document.dispatchEvent(
+            new CustomEvent("openmarquee:delete-slide", {
+                detail: { id: String(item.id), type: item.type, name: item.name },
             }),
         );
     });

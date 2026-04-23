@@ -19,6 +19,7 @@
 // affordance starts / stops the backend loop.
 
 import {
+    deleteContent,
     deletePlaylistByName,
     fetchContentItem,
     generateBackground,
@@ -372,6 +373,29 @@ async function boot() {
             // makes the failure visible during development.
             console.error("[openmarquee] failed to open slide for edit:", err);
         }
+    });
+
+    document.addEventListener("openmarquee:delete-slide", async (event) => {
+        const { id, name } = event.detail || {};
+        if (!id) return;
+        const label = name || "this slide";
+        if (!window.confirm(`Delete "${label}"? This can't be undone.`)) return;
+        try {
+            await deleteContent(id);
+        } catch (err) {
+            console.error("[openmarquee] delete failed:", err);
+            window.alert(`Could not delete: ${err?.message || err}`);
+            return;
+        }
+        // Refresh every surface that lists slides so the deleted tile
+        // vanishes without a page reload.
+        await Promise.all([
+            playlistTrack?.refresh(),
+            editor?.refreshBrowser?.(),
+            imageUploader?.refreshBrowser?.(),
+            videoUploader?.refreshBrowser?.(),
+            inlinePreviewHandle?.refresh?.(),
+        ]);
     });
     // Silence unused-var; `nav` is the mount's return value in case a
     // caller later wants to trigger navigation programmatically.
