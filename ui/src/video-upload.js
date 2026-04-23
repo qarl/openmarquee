@@ -16,7 +16,8 @@ const TEMPLATE = `
         <h2 class="subpage-title">Video Slides</h2>
         <div class="slide-browser-slot"></div>
         <div class="preview-wrap">
-            <video class="video-upload-video" playsinline controls
+            <video class="video-upload-video" playsinline controls muted
+                   controlslist="novolumeslider nodownload noremoteplayback"
                    aria-label="video preview"></video>
         </div>
         <form class="controls" autocomplete="off">
