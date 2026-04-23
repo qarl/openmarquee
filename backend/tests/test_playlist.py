@@ -292,3 +292,67 @@ def test_list_in_playlist_order_patches_transitions_onto_items(tmp_path: Path):
     # The playlist's transition wins over the content's.
     assert ordered[0].transition == "fade"
     assert ordered[0].transition_ms == 250
+
+
+# --- prune_dangling_refs ---
+
+
+def test_prune_dangling_drops_ids_not_in_valid_set(tmp_path: Path):
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    kept_a, kept_b, stale = uuid4(), uuid4(), uuid4()
+    storage.save(Playlist(item_ids=[kept_a, stale, kept_b]))
+
+    pruned = storage.prune_dangling_refs({kept_a, kept_b})
+
+    assert pruned == 1
+    assert storage.load().item_ids == [kept_a, kept_b]
+
+
+def test_prune_dangling_is_noop_when_everything_resolves(tmp_path: Path):
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    a, b = uuid4(), uuid4()
+    storage.save(Playlist(item_ids=[a, b]))
+
+    pruned = storage.prune_dangling_refs({a, b})
+
+    assert pruned == 0
+    assert storage.load().item_ids == [a, b]
+
+
+def test_prune_dangling_prunes_across_every_playlist_in_collection(tmp_path: Path):
+    """A named playlist AND the default playlist both get cleaned."""
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    a, b, c = uuid4(), uuid4(), uuid4()
+    storage.set_playlist("default", Playlist(item_ids=[a, b]))
+    storage.set_playlist("lobby", Playlist(item_ids=[b, c]))
+
+    pruned = storage.prune_dangling_refs({b})  # only b is "valid"
+
+    assert pruned == 2  # a (default) + c (lobby)
+    assert storage.get_playlist("default").item_ids == [b]
+    assert storage.get_playlist("lobby").item_ids == [b]
+
+
+def test_prune_dangling_empty_valid_set_empties_every_playlist(tmp_path: Path):
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    a, b = uuid4(), uuid4()
+    storage.save(Playlist(item_ids=[a, b]))
+
+    pruned = storage.prune_dangling_refs(set())
+
+    assert pruned == 2
+    assert storage.load().item_ids == []
+
+
+def test_prune_dangling_does_not_write_when_nothing_changes(tmp_path: Path):
+    """File mtime shouldn't bump on a no-op prune — lets integrity-check
+    tooling distinguish 'ran and cleaned' from 'ran and nothing to do'."""
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    a, b = uuid4(), uuid4()
+    storage.save(Playlist(item_ids=[a, b]))
+    mtime_before = (tmp_path / "playlist.json").stat().st_mtime
+
+    pruned = storage.prune_dangling_refs({a, b})
+
+    assert pruned == 0
+    assert (tmp_path / "playlist.json").stat().st_mtime == mtime_before

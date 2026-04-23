@@ -187,6 +187,25 @@ class PlaylistStorage:
         """Return all playlist names sorted alphabetically."""
         return sorted(self.load_all().playlists)
 
+    def prune_dangling_refs(self, valid_ids: set) -> int:
+        """Drop any playlist items whose `item_id` isn't in `valid_ids`.
+
+        Returns the number of entries removed. No-op if nothing is stale.
+        Useful at lifespan startup to recover from a dev-style wipe of
+        content/ that left the playlist JSON intact — the pallet /
+        playback loop would otherwise serve dangling references.
+        """
+        collection = self.load_all()
+        pruned_count = 0
+        for name, playlist in collection.playlists.items():
+            kept = [it for it in playlist.items if it.item_id in valid_ids]
+            if len(kept) != len(playlist.items):
+                pruned_count += len(playlist.items) - len(kept)
+                collection.playlists[name] = Playlist(items=kept)
+        if pruned_count:
+            self.save_all(collection)
+        return pruned_count
+
     # --- legacy single-playlist API (operates on DEFAULT_PLAYLIST_NAME) ---
 
     def load(self) -> Playlist:

@@ -54,6 +54,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             logging.getLogger(__name__).exception("startup seed failed")
 
+    # Prune playlist refs that no longer resolve to stored content. Catches
+    # the "dev-wiped content/ but left playlist.json intact" class of bug
+    # before the pallet renders dangling tiles or the playback loop hits
+    # a FileNotFoundError mid-slide.
+    try:
+        valid_ids = {item.id for item in get_content_storage().list_all()}
+        pruned = get_playlist_storage().prune_dangling_refs(valid_ids)
+        if pruned:
+            import logging
+            logging.getLogger(__name__).warning(
+                "startup: pruned %d dangling playlist item_id(s)", pruned
+            )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("startup playlist prune failed")
+
     # "Hardware always running" — the device's real playback loop starts
     # at boot and runs until shutdown. The UI's inline preview is a
     # parallel client-side simulator, not a control surface for the loop.
