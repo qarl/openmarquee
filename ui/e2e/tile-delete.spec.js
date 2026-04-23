@@ -12,6 +12,9 @@ test.beforeEach(() => {
 
 async function saveTextSlide(page, name) {
     await page.goto("/#/slides/text");
+    // Wait for the editor's async auto-name tail to finish writing
+    // "Text Slide N" before we overwrite with a test-specific name.
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.fill(".editor .field-name", name);
     await page.fill(".editor .field-text", name);
     await page.locator(".editor .field-save").click();

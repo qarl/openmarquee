@@ -49,6 +49,10 @@ test("two text slides both land in the pallet", async ({ page }) => {
         // Click "+ New" between slides to get a fresh blank editor.
         if (i > 0) {
             await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
+            // resetToBlank has an async tail that fills the name field
+            // with the next auto-name ("Text Slide N"). Wait for that to
+            // land so the test's .fill() below isn't overwritten by it.
+            await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
         }
         await page.locator(".editor .field-name").fill(name);
         await page.locator(".editor .field-text").fill(name.toUpperCase());
@@ -82,6 +86,10 @@ test("playlist PUT reorders content via the API (what drag-reorder invokes)", as
     for (const [i, name] of ["First", "Second", "Third"].entries()) {
         if (i > 0) {
             await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
+            // resetToBlank has an async tail that fills the name field
+            // with the next auto-name ("Text Slide N"). Wait for that to
+            // land so the test's .fill() below isn't overwritten by it.
+            await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
         }
         await page.locator(".editor .field-name").fill(name);
         await page.locator(".editor .field-text").fill(name);

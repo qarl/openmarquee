@@ -19,6 +19,10 @@ test.beforeEach(() => {
 
 async function fillAndFocusTextInput(page) {
     await page.goto("/#/slides/text");
+    // Wait for the editor's initial async tail (fetchItems → auto-name)
+    // to land before filling — otherwise it races us and overwrites the
+    // name field with "Text Slide 1" after our fill.
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.fill(".editor .field-name", "OriginalName");
     await page.fill(".editor .field-text", "hello world");
     // Focus a SINGLE-LINE input (the name field) so Enter would

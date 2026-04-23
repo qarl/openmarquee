@@ -21,6 +21,7 @@ test("schedule-driven playback: API-built lunch playlist + always-on rule → pl
     for (const [i, name] of ["First", "Second"].entries()) {
         if (i > 0) {
             await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
+            await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
         }
         await page.locator(".editor .field-name").fill(name);
         await page.locator(".editor .field-text").fill(name);

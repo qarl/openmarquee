@@ -850,14 +850,14 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     list-style: none;
     margin: 0;
     padding: 0.35rem 0;
-    display: flex;
-    flex-direction: row;
+    /* Grid layout (same pattern as .playlist-pallet) so the operator sees
+       every slide in a single scroll-to-fit view instead of a long
+       horizontal strip they'd have to arrow through. */
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
     gap: 0.5rem;
-    overflow-x: auto;
 }
 .slide-browser-tile {
-    flex: 0 0 auto;
-    width: 5rem;
     position: relative;
 }
 /* Delete × in the top-right of a browser tile — same hover-to-reveal

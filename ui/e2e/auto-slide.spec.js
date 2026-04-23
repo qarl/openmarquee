@@ -19,6 +19,7 @@ test("auto-mode time slide ticks in the live preview overlay", async ({ page }) 
 
     // 1) Create a "current time" slide with HH:MM:SS format so seconds
     //    visibly change each refresh.
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.locator(".editor .field-name").fill("Clock");
     await page.locator(".editor .field-text").fill("--:--:--");
     const autoMode = page.locator(".editor .field-auto-mode");

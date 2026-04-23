@@ -12,6 +12,7 @@ test.beforeEach(() => {
 
 test("slide-browser text tile has the Aa type badge", async ({ page }) => {
     await page.goto("/#/slides/text");
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.fill(".editor .field-name", "BadgeTest");
     await page.fill(".editor .field-text", "BadgeTest");
     await page.locator(".editor .field-save").click();
@@ -25,6 +26,7 @@ test("slide-browser text tile has the Aa type badge", async ({ page }) => {
 
 test("pallet tile for the same slide also has the Aa badge (consistency)", async ({ page }) => {
     await page.goto("/#/slides/text");
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.fill(".editor .field-name", "BadgeTest");
     await page.fill(".editor .field-text", "BadgeTest");
     await page.locator(".editor .field-save").click();
