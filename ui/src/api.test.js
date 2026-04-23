@@ -249,6 +249,33 @@ describe("named-playlists API", () => {
         const [url] = fetchMock.mock.calls[0];
         expect(url).toBe("/api/playlists/spaces%20in%20name");
     });
+
+    it("savePlaylistByName routes v3 entry objects to the `items` key, not `item_ids`", async () => {
+        // Regression: sending {item_id, transition, transition_ms} objects
+        // under the `item_ids` key 422s server-side ("UUID input should
+        // be a string"). Same shape detection as setPlaylistOrder.
+        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
+        const { savePlaylistByName } = await import("./api.js");
+        const entries = [
+            { item_id: "a-uuid", transition: "fade", transition_ms: 500 },
+            { item_id: "b-uuid", transition: "cut", transition_ms: 500 },
+        ];
+        await savePlaylistByName("default", entries);
+        const [, init] = fetchMock.mock.calls[0];
+        const body = JSON.parse(init.body);
+        expect(body).toHaveProperty("items");
+        expect(body.items).toEqual(entries);
+        expect(body).not.toHaveProperty("item_ids");
+    });
+
+    it("savePlaylistByName keeps legacy string-array callers on the `item_ids` key", async () => {
+        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
+        const { savePlaylistByName } = await import("./api.js");
+        await savePlaylistByName("default", ["a", "b"]);
+        const [, init] = fetchMock.mock.calls[0];
+        const body = JSON.parse(init.body);
+        expect(body).toEqual({ item_ids: ["a", "b"] });
+    });
 });
 
 describe("schedule API", () => {

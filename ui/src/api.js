@@ -241,14 +241,31 @@ export async function listPlaylists() {
     return await response.json();
 }
 
-/** Create or replace a named playlist with the given item ids. */
-export async function savePlaylistByName(name, itemIds) {
+/**
+ * Create or replace a named playlist. Accepts either:
+ *   - an array of UUID strings (legacy, each entry gets default
+ *     transitions), or
+ *   - an array of `{item_id, transition, transition_ms}` objects (v3
+ *     canonical — lets the caller carry transition data through).
+ *
+ * Same shape-detection as setPlaylistOrder — the server's PlaylistUpdate
+ * validates `item_ids` as `list[UUID]`, so sending v3 objects under that
+ * key 422s with "UUID input should be a string". Route objects to `items`
+ * and strings to `item_ids`.
+ */
+export async function savePlaylistByName(name, entriesOrIds) {
+    const body =
+        Array.isArray(entriesOrIds) &&
+        entriesOrIds.length > 0 &&
+        typeof entriesOrIds[0] === "object"
+            ? { items: entriesOrIds }
+            : { item_ids: entriesOrIds };
     const response = await fetch(
         `/api/playlists/${encodeURIComponent(name)}`,
         {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ item_ids: itemIds }),
+            body: JSON.stringify(body),
         },
     );
     if (!response.ok) {
