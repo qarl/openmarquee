@@ -96,12 +96,16 @@ export function mountSlideBrowser(container, options) {
             li.classList.add("slide-browser-tile--selected");
         }
         const safeName = escapeHtml(item.name || "Untitled");
+        const typeBadge = escapeHtml(
+            item.type === "video" ? "▶" : item.type === "image" ? "🖼" : "Aa",
+        );
         li.innerHTML = `
             <button type="button" class="slide-browser-tile-action" title="${safeName}">
                 <img class="slide-browser-tile-thumb" alt=""
                      src="/api/content/${item.id}/asset?v=${refreshVersion}">
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>
+            <div class="slide-browser-tile-type" aria-hidden="true">${typeBadge}</div>
             <button type="button" class="slide-browser-tile-delete"
                     aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
         `;

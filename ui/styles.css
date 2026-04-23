@@ -884,6 +884,20 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     opacity: 1;
 }
 .slide-browser-tile-delete:hover { background: var(--danger); color: #1a1a1d; }
+/* Type badge — mirrors .pallet-tile-type so a given slide looks the
+   same everywhere (browser strip + playlist pallet). The delete × at
+   top-right stays the focus visually; this sits top-left. */
+.slide-browser-tile-type {
+    position: absolute;
+    top: 0.35rem;
+    left: 0.45rem;
+    font-size: 0.65rem;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    border-radius: 999px;
+    padding: 0 0.3rem;
+    pointer-events: none;
+}
 .slide-browser-tile-action {
     display: flex;
     flex-direction: column;
