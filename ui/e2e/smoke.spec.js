@@ -61,7 +61,7 @@ test("sidebar nav defaults to Text and routes through every section on click", a
         page.locator('section.settings .subpage-title'),
     ).toHaveText("System settings");
     await expect(page.locator(".field-output-mode")).toHaveValue("hdmi");
-    await expect(page.locator(".field-display-width")).toHaveValue("128");
+    await expect(page.locator(".field-display-width")).toHaveValue("1920");
 });
 
 test("ffmpeg.wasm spike page renders the H.264 button + the file picker", async ({ page }) => {

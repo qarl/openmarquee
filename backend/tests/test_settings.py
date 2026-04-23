@@ -16,11 +16,15 @@ from openmarquee.settings import (
 # --- Defaults ---
 
 
-def test_defaults_match_system_spec_display_size():
+def test_defaults_match_default_output_mode():
+    """Default output_mode is HDMI, so default dims must be the HDMI
+    native 1920×1080 — not HUB75's 128×96. Bug report: fresh install
+    showed output_mode=HDMI but dims=128×96, which rendered HDMI
+    playback into a tiny canvas."""
     s = SystemSettings()
-    assert s.display_width == 128
-    assert s.display_height == 96
     assert s.output_mode == "hdmi"
+    assert s.display_width == 1920
+    assert s.display_height == 1080
     assert s.schema_version == SETTINGS_SCHEMA_VERSION
 
 

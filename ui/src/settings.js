@@ -341,8 +341,11 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             signNameEl.value = settings.sign_name ?? "";
             ensureSelectValue(outputModeEl, settings.output_mode);
             outputModeEl.value = settings.output_mode ?? "hdmi";
-            widthEl.value = String(settings.display_width ?? 128);
-            heightEl.value = String(settings.display_height ?? 96);
+            // Defaults match the backend (HDMI output → 1920×1080) so
+            // a response missing dims still paints a consistent mode +
+            // size pair.
+            widthEl.value = String(settings.display_width ?? 1920);
+            heightEl.value = String(settings.display_height ?? 1080);
             rotationEl.value = String(settings.display_rotation ?? 0);
             brightnessEl.value = String(settings.brightness ?? 80);
             gammaEl.value = String(settings.gamma ?? 2.2);

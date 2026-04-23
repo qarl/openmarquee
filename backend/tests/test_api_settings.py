@@ -34,8 +34,8 @@ def test_get_returns_defaults_when_nothing_persisted(client: TestClient):
     assert response.status_code == 200
     body = response.json()
     assert body["output_mode"] == "hdmi"
-    assert body["display_width"] == 128
-    assert body["display_height"] == 96
+    assert body["display_width"] == 1920
+    assert body["display_height"] == 1080
     assert body["brightness"] == 80
     assert body["wifi_password"] == "openmarquee"  # SYSTEM_SPEC §4.1
     assert body["timezone"] is None

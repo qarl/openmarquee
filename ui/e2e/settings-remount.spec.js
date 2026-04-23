@@ -13,14 +13,13 @@ test("saving a new display_width re-mounts the editor with the fresh canvas size
     await page.goto("/");
 
     // The editor canvas at boot is whatever /api/settings reports.
-    // Defaults are 128×96 (SYSTEM_SPEC §3.4). Confirm the initial
-    // canvas attribute before we change anything.
+    // Defaults now match the default output mode (HDMI → 1920×1080).
     const canvas = page.locator(".editor .editor-canvas");
     await expect(canvas).toBeVisible();
     const initialWidth = await canvas.getAttribute("width");
     const initialHeight = await canvas.getAttribute("height");
-    expect(Number(initialWidth)).toBe(128);
-    expect(Number(initialHeight)).toBe(96);
+    expect(Number(initialWidth)).toBe(1920);
+    expect(Number(initialHeight)).toBe(1080);
 
     // Navigate to Settings, flip the display dims.
     await page.locator('.nav-link[data-section="settings"]').click();

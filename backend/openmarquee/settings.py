@@ -81,17 +81,22 @@ class SystemSettings(BaseModel):
         description="Which renderer the playback engine drives.",
     )
 
+    # Defaults match the default `output_mode` (HDMI → 1920×1080). A
+    # fresh install shouldn't render HDMI-mode playback into a HUB75-sized
+    # canvas — the UI has output-mode → default-dims snapping for mode
+    # changes, but the initial paint before any change needs the backend
+    # default to already be mode-consistent.
     display_width: int = Field(
-        default=128,
+        default=1920,
         ge=1,
         le=4096,
-        description="Display width in pixels. Defaults to SYSTEM_SPEC §3.4 (128).",
+        description="Display width in pixels. Default matches HDMI (1920).",
     )
     display_height: int = Field(
-        default=96,
+        default=1080,
         ge=1,
         le=4096,
-        description="Display height in pixels. Defaults to SYSTEM_SPEC §3.4 (96).",
+        description="Display height in pixels. Default matches HDMI (1080).",
     )
     # Physical panel dims above describe the hardware's native orientation;
     # `display_rotation` is how the operator has physically mounted it.
