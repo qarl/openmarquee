@@ -55,9 +55,13 @@ fi
 cat "$UI_DEPS/package-lock.json" > "$PROJECT_ROOT/ui/package-lock.json"
 
 # (Re)link node_modules into the project so vitest/esbuild find it via
-# normal Node module resolution.
+# normal Node module resolution. Use a *relative* target — Mountain Duck
+# silently rewrites symlinks with absolute targets into a broken relative
+# form, but a target you write as relative passes through unchanged
+# (well, with a no-op prefix MD adds, which still resolves).
 rm -rf "$PROJECT_ROOT/ui/node_modules"
-ln -s "$UI_DEPS/node_modules" "$PROJECT_ROOT/ui/node_modules"
+REL_TARGET="$(python3 -c "import os; print(os.path.relpath('$UI_DEPS/node_modules', '$PROJECT_ROOT/ui'))")"
+ln -s "$REL_TARGET" "$PROJECT_ROOT/ui/node_modules"
 
 cat <<EOF
 
