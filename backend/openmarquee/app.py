@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from openmarquee import __version__
 from openmarquee.api import router as content_router
 from openmarquee.api_backgrounds import router as backgrounds_router
+from openmarquee.api_flock import router as flock_router
 from openmarquee.api_playback import router as playback_router
 from openmarquee.api_system import router as system_router
 from openmarquee.api_playlist import router as playlist_router
@@ -104,6 +105,7 @@ app.include_router(settings_router)
 app.include_router(backgrounds_router)
 app.include_router(playback_router)
 app.include_router(system_router)
+app.include_router(flock_router)
 
 # Dev tooling (preview page, manual play endpoint) is mounted by default
 # because the device is its own captive-portal AP with no inbound internet.

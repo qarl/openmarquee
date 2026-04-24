@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from openmarquee.content.storage import ContentStorage
+from openmarquee.flock import FlockStorage
 from openmarquee.playback import PlaybackLoop
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.rendering.mock import MockRenderer
@@ -150,6 +151,25 @@ def _settings_storage_singleton() -> SettingsStorage:
 def get_settings_storage() -> SettingsStorage:
     """Dependency provider for the system-settings storage layer."""
     return _settings_storage_singleton()
+
+
+def _resolve_flock_path() -> Path:
+    """Where `flock.json` lives (peer list + per-peer sync flag). Sibling
+    of the playlist/schedule/settings by default."""
+    override = os.environ.get("OPENMARQUEE_FLOCK_PATH")
+    if override:
+        return Path(override)
+    return _resolve_content_root().parent / "openmarquee-flock.json"
+
+
+@lru_cache
+def _flock_storage_singleton() -> FlockStorage:
+    return FlockStorage(_resolve_flock_path())
+
+
+def get_flock_storage() -> FlockStorage:
+    """Dependency provider for the flock (peer-device list) storage layer."""
+    return _flock_storage_singleton()
 
 
 def _resolve_seed_marker_path() -> Path:
