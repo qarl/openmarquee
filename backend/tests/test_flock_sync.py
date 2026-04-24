@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,7 @@ from PIL import Image
 from openmarquee.content import TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.flock import FlockStorage
-from openmarquee.flock_sync import FlockSync
+from openmarquee.flock_sync import FlockSync, PullWorker
 from openmarquee.tombstone import TombstoneStorage
 
 
@@ -348,3 +349,181 @@ async def test_ingest_update_handles_video_with_separate_mp4_fetch(tmp_path: Pat
     assert content.read_updated_at(peer_cid) == peer_ts
     # The /video endpoint was hit — the video branch ran, not the image one.
     assert any(u.endswith("/video") for u in hits)
+
+
+# --- periodic pull worker ---
+
+
+def _manifest_with(*entries, tombstones=()):
+    return {
+        "schema_version": 1,
+        "entries": [
+            {
+                "content_id": str(cid),
+                "content_type": "text_slide",
+                "updated_at": ts.isoformat(),
+            }
+            for cid, ts in entries
+        ],
+        "tombstones": [
+            {"content_id": str(cid), "deleted_at": ts.isoformat()}
+            for cid, ts in tombstones
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_fetches_missing_content(tmp_path: Path):
+    remote_cid = uuid4()
+    remote_slide = TextSlide(id=remote_cid, name="Remote", text="r")
+    remote_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    png = _make_png_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/api/flock/manifest"):
+            return httpx.Response(200, json=_manifest_with((remote_cid, remote_ts)))
+        if url.endswith(f"/api/content/{remote_cid}"):
+            return httpx.Response(200, json=remote_slide.model_dump(mode="json"))
+        if url.endswith(f"/api/content/{remote_cid}/asset"):
+            return httpx.Response(200, content=png)
+        return httpx.Response(404)
+
+    sync, content, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+    await sync.pull_from_peer("peer.ts.net")
+    assert content.exists(remote_cid)
+    assert content.read_updated_at(remote_cid) == remote_ts
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_applies_tombstones(tmp_path: Path):
+    sync, content, tombstones, _ = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: _pull_tombstone_handler(r))
+    )
+    # Local content that the remote has tombstoned.
+    local_cid = uuid4()
+    local_slide = TextSlide(id=local_cid, name="Gone", text="g")
+    content.save(
+        local_slide,
+        _make_png_bytes(),
+        updated_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
+    )
+    remote_delete_at = datetime(2026, 4, 15, tzinfo=timezone.utc)
+
+    # Rebuild the handler with the actual data bound in.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/api/flock/manifest"):
+            return httpx.Response(
+                200, json=_manifest_with(tombstones=((local_cid, remote_delete_at),))
+            )
+        return httpx.Response(404)
+
+    sync, content, tombstones, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+    content.save(
+        local_slide,
+        _make_png_bytes(),
+        updated_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
+    )
+
+    await sync.pull_from_peer("peer.ts.net")
+    assert not content.exists(local_cid)
+    assert {t.content_id for t in tombstones.list_active()} == {local_cid}
+
+
+def _pull_tombstone_handler(request):
+    return httpx.Response(200, json=_manifest_with())
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
+    cid = uuid4()
+    remote_ts = datetime(2026, 4, 10, tzinfo=timezone.utc)
+    local_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    fetched: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        if str(request.url).endswith("/api/flock/manifest"):
+            return httpx.Response(200, json=_manifest_with((cid, remote_ts)))
+        return httpx.Response(500)
+
+    sync, content, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+    local = TextSlide(id=cid, name="Local wins", text="mine")
+    content.save(local, _make_png_bytes(), updated_at=local_ts)
+
+    await sync.pull_from_peer("peer.ts.net")
+    # Only the manifest — content + asset NOT fetched.
+    assert all(u.endswith("/api/flock/manifest") for u in fetched)
+    assert content.load(cid).name == "Local wins"
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_survives_single_entry_failure(tmp_path: Path):
+    good_cid = uuid4()
+    bad_cid = uuid4()
+    ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    good_slide = TextSlide(id=good_cid, name="Good", text="g")
+    png = _make_png_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/api/flock/manifest"):
+            return httpx.Response(
+                200, json=_manifest_with((good_cid, ts), (bad_cid, ts))
+            )
+        if url.endswith(f"/api/content/{good_cid}"):
+            return httpx.Response(200, json=good_slide.model_dump(mode="json"))
+        if url.endswith(f"/api/content/{good_cid}/asset"):
+            return httpx.Response(200, content=png)
+        # bad_cid fetches return 500 — the good one should still land.
+        return httpx.Response(500)
+
+    sync, content, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+    await sync.pull_from_peer("peer.ts.net")
+    assert content.exists(good_cid)
+    assert not content.exists(bad_cid)
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_handles_manifest_unreachable(tmp_path: Path):
+    # Peer is offline — no exception bubbles.
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unreachable")
+
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+    await sync.pull_from_peer("offline.ts.net")
+
+
+@pytest.mark.asyncio
+async def test_pull_worker_ticks_on_interval_and_stops_cleanly(tmp_path: Path):
+    ticks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ticks.append(str(request.url))
+        return httpx.Response(200, json=_manifest_with())
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    peer = flock.add(address="peer.ts.net")
+    flock.update(peer.id, sync=True)
+
+    worker = PullWorker(sync, interval_seconds=0.05)
+    await worker.start()
+    # One tick fires immediately; wait for a second.
+    await asyncio.sleep(0.15)
+    await worker.stop()
+
+    assert len(ticks) >= 2
+    assert all(u.endswith("/api/flock/manifest") for u in ticks)
+
+
+@pytest.mark.asyncio
+async def test_pull_worker_double_start_is_noop(tmp_path: Path):
+    sync, _, _, _ = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(200, json=_manifest_with()))
+    )
+    worker = PullWorker(sync, interval_seconds=60.0)
+    await worker.start()
+    task1 = worker._task
+    await worker.start()
+    assert worker._task is task1
+    await worker.stop()

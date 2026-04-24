@@ -22,6 +22,7 @@ from openmarquee.dependencies import (
     get_demo_video_path,
     get_playback_loop,
     get_playlist_storage,
+    get_pull_worker,
     get_seed_marker_path,
     get_settings_storage,
 )
@@ -85,8 +86,26 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             logging.getLogger(__name__).exception(
                 "startup playback autostart failed"
             )
+
+    # Flock pull worker — periodic reliability backstop that reconciles
+    # against sync=True peers even when pushes get dropped. Tests can
+    # opt out via OPENMARQUEE_DISABLE_PULL_WORKER=1 so fixtures that
+    # spin a backend don't have an extra asyncio task racing the assertions.
+    if os.environ.get("OPENMARQUEE_DISABLE_PULL_WORKER") != "1":
+        try:
+            await get_pull_worker().start()
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "startup pull worker autostart failed"
+            )
     yield
     await get_playback_loop().stop()
+    try:
+        await get_pull_worker().stop()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)

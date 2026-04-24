@@ -16,3 +16,11 @@ os.environ.setdefault("OPENMARQUEE_DISABLE_SEED", "1")
 # real singleton leaking an asyncio task across the whole suite.
 # Individual tests that need playback running call start() explicitly.
 os.environ.setdefault("OPENMARQUEE_DISABLE_AUTOSTART", "1")
+
+# Same reason as DISABLE_AUTOSTART above: the flock pull worker is a
+# background asyncio task that reconciles against remote peers on a
+# timer. For test fixtures that spin a TestClient it would race
+# dependency_override wiring and (worse) try to reach real peers
+# stamped in the production flock.json. Tests that need it call
+# PullWorker.start() directly on an isolated FlockSync.
+os.environ.setdefault("OPENMARQUEE_DISABLE_PULL_WORKER", "1")

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from openmarquee.content.storage import ContentStorage
 from openmarquee.flock import FlockStorage
-from openmarquee.flock_sync import FlockSync
+from openmarquee.flock_sync import FlockSync, PullWorker
 from openmarquee.playback import PlaybackLoop
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.rendering.mock import MockRenderer
@@ -233,6 +233,28 @@ def _flock_sync_singleton() -> FlockSync:
 def get_flock_sync() -> FlockSync:
     """Dependency provider for the flock sync engine (push/pull orchestrator)."""
     return _flock_sync_singleton()
+
+
+def _resolve_pull_interval_seconds() -> float:
+    """Periodic pull cadence. Env override for tests; 60s default.
+    Short enough that a dropped push is user-invisible within a minute."""
+    override = os.environ.get("OPENMARQUEE_PULL_INTERVAL_SECONDS")
+    if override:
+        return float(override)
+    return 60.0
+
+
+@lru_cache
+def _pull_worker_singleton() -> PullWorker:
+    return PullWorker(
+        sync=_flock_sync_singleton(),
+        interval_seconds=_resolve_pull_interval_seconds(),
+    )
+
+
+def get_pull_worker() -> PullWorker:
+    """Dependency provider for the periodic pull worker (reliability backstop)."""
+    return _pull_worker_singleton()
 
 
 def _resolve_seed_marker_path() -> Path:

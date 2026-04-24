@@ -191,38 +191,150 @@ class FlockSync:
                 )
                 return
             sender_updated_at = datetime.fromisoformat(entry["updated_at"])
-
-            # Last-writer-wins. A stale push from before our edit shouldn't
-            # clobber the local edit.
-            if self.content.exists(content_id):
-                local_ts = self.content.read_updated_at(content_id)
-                if local_ts >= sender_updated_at:
-                    return
-
-            item_r = await client.get(
-                f"http://{sender_address}/api/content/{content_id}"
+            await self._fetch_and_save(
+                client, sender_address, content_id, sender_updated_at
             )
-            item_r.raise_for_status()
-            item = _CONTENT_ADAPTER.validate_python(item_r.json())
 
-            asset_r = await client.get(
-                f"http://{sender_address}/api/content/{content_id}/asset"
+    async def _fetch_and_save(
+        self,
+        client: httpx.AsyncClient,
+        sender_address: str,
+        content_id: UUID,
+        sender_updated_at: datetime,
+    ) -> None:
+        """Pull one content id from a peer and save locally — shared by
+        push-ingest (_ingest_update) and the pull worker (pull_from_peer).
+
+        Skips when local is equal-or-newer (last-writer-wins)."""
+        if self.content.exists(content_id):
+            local_ts = self.content.read_updated_at(content_id)
+            if local_ts >= sender_updated_at:
+                return
+
+        item_r = await client.get(
+            f"http://{sender_address}/api/content/{content_id}"
+        )
+        item_r.raise_for_status()
+        item = _CONTENT_ADAPTER.validate_python(item_r.json())
+
+        asset_r = await client.get(
+            f"http://{sender_address}/api/content/{content_id}/asset"
+        )
+        asset_r.raise_for_status()
+        asset_bytes = asset_r.content
+
+        if isinstance(item, VideoSlide):
+            video_r = await client.get(
+                f"http://{sender_address}/api/content/{content_id}/video"
             )
-            asset_r.raise_for_status()
-            asset_bytes = asset_r.content
+            video_r.raise_for_status()
+            self.content.save_video(
+                item,
+                asset_bytes,
+                video_r.content,
+                updated_at=sender_updated_at,
+            )
+        else:
+            self.content.save(item, asset_bytes, updated_at=sender_updated_at)
 
-            if isinstance(item, VideoSlide):
-                video_r = await client.get(
-                    f"http://{sender_address}/api/content/{content_id}/video"
+    # --- periodic pull (reliability backstop) ---
+
+    async def pull_from_peer(self, peer_address: str) -> None:
+        """One reconcile round against one peer: fetch manifest, pull any
+        missing/newer content, apply any tombstones we missed. Errors are
+        logged, not raised — the loop keeps running."""
+        async with self._client_factory() as client:
+            try:
+                manifest_r = await client.get(
+                    f"http://{peer_address}/api/flock/manifest"
                 )
-                video_r.raise_for_status()
-                self.content.save_video(
-                    item,
-                    asset_bytes,
-                    video_r.content,
-                    updated_at=sender_updated_at,
-                )
-            else:
-                self.content.save(
-                    item, asset_bytes, updated_at=sender_updated_at
-                )
+                manifest_r.raise_for_status()
+            except Exception:
+                logger.exception("pull %s: manifest fetch failed", peer_address)
+                return
+            manifest = manifest_r.json()
+
+            for entry in manifest.get("entries", []):
+                cid = UUID(entry["content_id"])
+                sender_ts = datetime.fromisoformat(entry["updated_at"])
+                try:
+                    await self._fetch_and_save(client, peer_address, cid, sender_ts)
+                except Exception:
+                    logger.exception(
+                        "pull %s: fetch %s failed", peer_address, cid
+                    )
+
+            for stone in manifest.get("tombstones", []):
+                cid = UUID(stone["content_id"])
+                deleted_at = datetime.fromisoformat(stone["deleted_at"])
+                self._apply_pulled_tombstone(cid, deleted_at)
+
+    def _apply_pulled_tombstone(self, content_id: UUID, deleted_at: datetime) -> None:
+        # Same LWW rule as _ingest_delete, but via pull. Skip when a newer
+        # local edit exists; otherwise record tombstone + drop the copy.
+        if self.content.exists(content_id):
+            local_ts = self.content.read_updated_at(content_id)
+            if local_ts > deleted_at:
+                return
+            self.tombstones.add(content_id, now=deleted_at)
+            self.content.delete(content_id)
+        else:
+            # Only record if we don't already have a fresher tombstone —
+            # avoids flapping the on-disk log on every pull round.
+            existing = next(
+                (
+                    t
+                    for t in self.tombstones.load().tombstones
+                    if t.content_id == content_id
+                ),
+                None,
+            )
+            if existing is None or existing.deleted_at < deleted_at:
+                self.tombstones.add(content_id, now=deleted_at)
+
+
+class PullWorker:
+    """Fires FlockSync.pull_from_peer against every sync=True peer on a
+    timer. Provides the reliability backstop for pushes dropped on the
+    floor (peer offline, power cycle, process crash between save+push)."""
+
+    def __init__(
+        self,
+        sync: FlockSync,
+        interval_seconds: float = 60.0,
+    ):
+        self.sync = sync
+        self.interval = interval_seconds
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                peers = [
+                    p for p in self.sync.flock.load().peers if p.sync
+                ]
+                for peer in peers:
+                    await self.sync.pull_from_peer(peer.address)
+                self.sync.tombstones.prune_expired()
+            except Exception:
+                logger.exception("pull worker tick failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def start(self) -> None:
+        if self._task is not None:
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run(), name="flock-pull-worker")
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._stop.set()
+        try:
+            await self._task
+        finally:
+            self._task = None
