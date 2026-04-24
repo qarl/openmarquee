@@ -36,14 +36,16 @@ from pydantic import BaseModel, Field, field_validator
 
 FLOCK_SCHEMA_VERSION = 1
 
-# A peer address must look like a DNS hostname or a bare IPv4 literal —
-# alphanumeric labels separated by dots, no scheme, no port, no path.
-# Phase 2+ feeds this straight into an HTTP client, so anything weirder
-# ("http://foo", "host:8080/x", whitespace) is an SSRF-shaped foot-gun.
-# RFC 1035 caps the total at 253 chars. IPv6 literals aren't supported
-# yet — Tailscale magic-DNS + IPv4 covers the real use cases.
+# A peer address must look like a DNS hostname or a bare IPv4 literal,
+# optionally followed by `:port`. Schemes, paths, and arbitrary port
+# strings are rejected — the sync layer feeds this straight into an
+# HTTP client, so anything weirder is an SSRF-shaped foot-gun.
+# IPv6 literals aren't supported yet — Tailscale magic-DNS + IPv4 is
+# what the real use cases look like.
 FLOCK_ADDRESS_PATTERN = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,251}[A-Za-z0-9])?$"
+    r"^[A-Za-z0-9]"
+    r"(?:[A-Za-z0-9\-\.]{0,251}[A-Za-z0-9])?"
+    r"(?::[0-9]{1,5})?$"
 )
 
 

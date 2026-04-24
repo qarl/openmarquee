@@ -25,9 +25,11 @@ from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_content_storage,
     get_flock_storage,
+    get_flock_sync,
     get_tombstone_storage,
 )
 from openmarquee.flock import FLOCK_ADDRESS_PATTERN, Flock, FlockPeer, FlockStorage
+from openmarquee.flock_sync import FlockSync, NotifyKind
 from openmarquee.tombstone import Tombstone, TombstoneStorage
 
 router = APIRouter(prefix="/api/flock", tags=["flock"])
@@ -35,6 +37,7 @@ router = APIRouter(prefix="/api/flock", tags=["flock"])
 FlockDep = Annotated[FlockStorage, Depends(get_flock_storage)]
 ContentDep = Annotated[ContentStorage, Depends(get_content_storage)]
 TombstoneDep = Annotated[TombstoneStorage, Depends(get_tombstone_storage)]
+FlockSyncDep = Annotated[FlockSync, Depends(get_flock_sync)]
 
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -142,3 +145,47 @@ async def update_peer(
 async def delete_peer(peer_id: UUID, storage: FlockDep) -> None:
     if not storage.remove(peer_id):
         raise HTTPException(status_code=404, detail=f"no peer {str(peer_id)!r}")
+
+
+class NotifyBody(BaseModel):
+    """Wire format for POST /api/flock/notify. A peer is telling us a piece
+    of content changed on their end; we'll pull it back from `sender_address`
+    using the standard /api/content/* surface. `at` stamps the sender's
+    wall-clock moment of the change — used to skip stale deletes that
+    race a local edit."""
+
+    content_id: UUID
+    kind: NotifyKind
+    sender_address: str = Field(
+        min_length=1,
+        max_length=253,
+        pattern=FLOCK_ADDRESS_PATTERN.pattern,
+    )
+    at: datetime
+
+    @field_validator("sender_address", mode="before")
+    @classmethod
+    def _normalize_sender(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+@router.post("/notify", status_code=204)
+async def receive_notify(
+    body: NotifyBody, sync: FlockSyncDep, flock: FlockDep
+) -> None:
+    """Inbound push from a flock peer. For 'updated' we pull the content
+    back from the sender and save it locally (skipping if our copy is
+    newer). For 'deleted' we record a tombstone + drop our copy.
+
+    Only accept pushes from addresses we've explicitly added to our own
+    flock — prevents a tailnet node we don't sync with from seeding
+    arbitrary content into our store via the /api/content/* pull.
+    """
+    if flock.load().find_by_address(body.sender_address) is None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"peer {body.sender_address!r} is not in this device's flock",
+        )
+    await sync.ingest_push(body.content_id, body.kind, body.sender_address, body.at)

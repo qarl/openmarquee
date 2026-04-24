@@ -10,7 +10,7 @@ import io
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
@@ -19,9 +19,11 @@ from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_content_storage,
+    get_flock_sync,
     get_playlist_storage,
     get_tombstone_storage,
 )
+from openmarquee.flock_sync import FlockSync
 from openmarquee.playlist import PlaylistStorage, list_in_playlist_order
 from openmarquee.tombstone import TombstoneStorage
 
@@ -30,6 +32,7 @@ router = APIRouter(prefix="/api/content", tags=["content"])
 StorageDep = Annotated[ContentStorage, Depends(get_content_storage)]
 PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
 TombstoneDep = Annotated[TombstoneStorage, Depends(get_tombstone_storage)]
+FlockSyncDep = Annotated[FlockSync, Depends(get_flock_sync)]
 
 
 def _append_to_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
@@ -133,6 +136,8 @@ async def upload_text_slide(
     payload: TextSlideUpload,
     storage: StorageDep,
     playlist_storage: PlaylistDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> TextSlide:
     png = _decode_png_payload(payload.png_base64)
 
@@ -145,6 +150,7 @@ async def upload_text_slide(
 
     storage.save_text_slide(slide, png)
     _append_to_playlist(playlist_storage, slide.id)
+    background.add_task(flock_sync.notify_peers, slide.id, "updated")
     return slide
 
 
@@ -153,6 +159,8 @@ async def update_text_slide(
     item_id: UUID,
     payload: TextSlideUpload,
     storage: StorageDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> TextSlide:
     """Replace an existing text slide. Used by the editor's edit-existing
     flow — operator clicks a pallet tile, tweaks, saves. The slide keeps
@@ -186,6 +194,7 @@ async def update_text_slide(
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
     storage.save_text_slide(slide, png)
+    background.add_task(flock_sync.notify_peers, slide.id, "updated")
     return slide
 
 
@@ -249,6 +258,8 @@ async def upload_video(
     payload: VideoUpload,
     storage: StorageDep,
     playlist_storage: PlaylistDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> VideoSlide:
     thumbnail = _decode_png_payload(payload.png_base64)
     mp4 = _decode_mp4_payload(payload.mp4_base64)
@@ -260,6 +271,7 @@ async def upload_video(
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
     storage.save_video(video, thumbnail, mp4)
     _append_to_playlist(playlist_storage, video.id)
+    background.add_task(flock_sync.notify_peers, video.id, "updated")
     return video
 
 
@@ -286,6 +298,8 @@ async def upload_image(
     payload: ImageUpload,
     storage: StorageDep,
     playlist_storage: PlaylistDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> ImageSlide:
     image_bytes = _decode_image_payload(payload.image_base64)
 
@@ -296,6 +310,7 @@ async def upload_image(
 
     storage.save_image(image, image_bytes)
     _append_to_playlist(playlist_storage, image.id)
+    background.add_task(flock_sync.notify_peers, image.id, "updated")
     return image
 
 
@@ -318,6 +333,8 @@ async def update_image(
     item_id: UUID,
     payload: ImageUpdate,
     storage: StorageDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> ImageSlide:
     try:
         existing = storage.load(item_id)
@@ -346,6 +363,7 @@ async def update_image(
         else storage.read_asset(item_id)
     )
     storage.save_image(updated, image_bytes)
+    background.add_task(flock_sync.notify_peers, updated.id, "updated")
     return updated
 
 
@@ -387,6 +405,8 @@ async def update_video(
     item_id: UUID,
     payload: VideoUpdate,
     storage: StorageDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> VideoSlide:
     try:
         existing = storage.load(item_id)
@@ -421,6 +441,7 @@ async def update_video(
         else storage.read_video(item_id)
     )
     storage.save_video(updated, thumbnail, mp4)
+    background.add_task(flock_sync.notify_peers, updated.id, "updated")
     return updated
 
 
@@ -446,6 +467,8 @@ async def delete_content_item(
     storage: StorageDep,
     playlist_storage: PlaylistDep,
     tombstones: TombstoneDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> None:
     # 404 first — no tombstone for an id we never had.
     if not storage.exists(item_id):
@@ -457,6 +480,7 @@ async def delete_content_item(
     tombstones.add(item_id)
     storage.delete(item_id)
     _remove_from_playlist(playlist_storage, item_id)
+    background.add_task(flock_sync.notify_peers, item_id, "deleted")
 
 
 class DurationPatch(BaseModel):
@@ -470,6 +494,8 @@ async def patch_duration(
     item_id: UUID,
     payload: DurationPatch,
     storage: StorageDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> ContentItem:
     """Update just the duration of a content item — used by the
     Playlists-panel duration chip so the operator can change a slide's
@@ -487,4 +513,5 @@ async def patch_duration(
     # save() rewrites the envelope; the on-disk PNG stays untouched.
     existing_png = storage.read_asset(item_id)
     storage.save(updated, existing_png)
+    background.add_task(flock_sync.notify_peers, updated.id, "updated")
     return updated

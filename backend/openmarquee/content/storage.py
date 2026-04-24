@@ -94,7 +94,14 @@ class ContentStorage:
         """Persist an image — convenience wrapper for save()."""
         self.save(image, png)
 
-    def save_video(self, video: VideoSlide, thumbnail_png: bytes, video_bytes: bytes) -> None:
+    def save_video(
+        self,
+        video: VideoSlide,
+        thumbnail_png: bytes,
+        video_bytes: bytes,
+        *,
+        updated_at: datetime | None = None,
+    ) -> None:
         """Persist a video: thumbnail PNG (for list views) + the MP4 bytes.
 
         Laid out next to each other under the item's dir so a future playback
@@ -105,11 +112,15 @@ class ContentStorage:
         mp4) fails, the whole item dir is torn down. Without this an
         envelope-only dir would show up in `list_all()` with a 404 on its
         video endpoint — the playback loop would cycle on it forever.
+
+        `updated_at` semantics match save() — defaults to now() for local
+        edits, accepts an explicit value so peer-ingest preserves the
+        originating stamp.
         """
         item_dir = self.root / str(video.id)
         preexisting = item_dir.exists()
         try:
-            self.save(video, thumbnail_png)
+            self.save(video, thumbnail_png, updated_at=updated_at)
             self._atomic_write_bytes(item_dir / _VIDEO_FILENAME, video_bytes)
         except Exception:
             # Only rm if this save created the dir — don't blow away another

@@ -94,3 +94,45 @@ class TestMockRendererFollowsSettings:
         storage.save(SystemSettings(display_width=2, display_height=2))
         renderer.render_frame(bytes([40, 50, 60]) * (2 * 2))
         assert Image.open(renderer.output_path).size == (2, 2)
+
+
+class TestResolveSelfAddress:
+    """The push layer asks _resolve_self_address() for what goes in the
+    notify payload. Peers use that to pull content back, so a value
+    they can't resolve breaks sync silently."""
+
+    def test_env_override_wins(self, monkeypatch):
+        from openmarquee.dependencies import _resolve_self_address
+
+        monkeypatch.setenv("OPENMARQUEE_SELF_ADDRESS", "force.ts.net:1234")
+        assert _resolve_self_address() == "force.ts.net:1234"
+
+    def test_settings_hostname_used_when_no_env(self, monkeypatch, tmp_path: Path):
+        from openmarquee.dependencies import _resolve_self_address
+
+        monkeypatch.delenv("OPENMARQUEE_SELF_ADDRESS", raising=False)
+        storage = SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"]))
+        storage.save(SystemSettings(tailscale_hostname="lobby"))
+        _settings_storage_singleton.cache_clear()
+        assert _resolve_self_address() == "lobby"
+
+    def test_gethostname_fallback_rejects_bare_short_name(
+        self, monkeypatch, tmp_path: Path
+    ):
+        # Stock Pi returns "raspberrypi"; Tailscale peers can't resolve
+        # that. Better to return None so notify_peers skips with a
+        # warning than to send pushes with an unreachable sender_address.
+        from openmarquee.dependencies import _resolve_self_address
+
+        monkeypatch.delenv("OPENMARQUEE_SELF_ADDRESS", raising=False)
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings()
+        )
+        _settings_storage_singleton.cache_clear()
+        with mock.patch("openmarquee.dependencies.socket.gethostname", return_value="raspberrypi"):
+            assert _resolve_self_address() is None
+        with mock.patch(
+            "openmarquee.dependencies.socket.gethostname",
+            return_value="mymachine.local",
+        ):
+            assert _resolve_self_address() == "mymachine.local"

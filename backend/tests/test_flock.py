@@ -42,16 +42,19 @@ def test_peer_rejects_empty_address():
         FlockPeer(address="")
 
 
-def test_peer_rejects_scheme_or_port_or_path():
-    # Guards the Phase 2+ HTTP client from SSRF-shaped inputs.
-    for bad in ("http://foo", "foo:8080", "foo/bar", "a b", "foo@bar"):
+def test_peer_rejects_scheme_path_or_weird_chars():
+    # Guards the sync HTTP client from SSRF-shaped inputs. `host:port` is
+    # explicitly allowed (needed for non-default-port peers).
+    for bad in ("http://foo", "foo/bar", "a b", "foo@bar", "foo:notaport"):
         with pytest.raises(ValueError):
             FlockPeer(address=bad)
 
 
-def test_peer_accepts_dns_name_and_ipv4():
+def test_peer_accepts_dns_name_ipv4_and_host_port():
     assert FlockPeer(address="lobby.ts.net").address == "lobby.ts.net"
     assert FlockPeer(address="100.64.1.5").address == "100.64.1.5"
+    assert FlockPeer(address="127.0.0.1:9877").address == "127.0.0.1:9877"
+    assert FlockPeer(address="lobby.ts.net:8080").address == "lobby.ts.net:8080"
 
 
 def test_peer_address_is_lowercased_and_stripped():

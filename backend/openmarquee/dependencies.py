@@ -5,12 +5,14 @@ via app.dependency_overrides and the production wiring stays in one place.
 """
 
 import os
+import socket
 import tempfile
 from functools import lru_cache
 from pathlib import Path
 
 from openmarquee.content.storage import ContentStorage
 from openmarquee.flock import FlockStorage
+from openmarquee.flock_sync import FlockSync
 from openmarquee.playback import PlaybackLoop
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.rendering.mock import MockRenderer
@@ -190,6 +192,47 @@ def _tombstone_storage_singleton() -> TombstoneStorage:
 def get_tombstone_storage() -> TombstoneStorage:
     """Dependency provider for the tombstone log (deleted-content breadcrumbs)."""
     return _tombstone_storage_singleton()
+
+
+def _resolve_self_address() -> str | None:
+    """Where peers should reach THIS device. Returns None if no reachable
+    form is known — push-notify skips with a warning rather than send
+    pushes stamped with something peers can't reach.
+
+    Priority:
+      1. OPENMARQUEE_SELF_ADDRESS env override (tests, containers).
+      2. SystemSettings.tailscale_hostname (the real production path).
+      3. socket.gethostname() IFF it contains a dot (rejecting bare
+         short names like "raspberrypi" that peers can't resolve).
+    """
+    override = os.environ.get("OPENMARQUEE_SELF_ADDRESS")
+    if override:
+        return override
+    settings = _settings_storage_singleton().load()
+    if settings.tailscale_hostname:
+        return settings.tailscale_hostname
+    try:
+        hostname = socket.gethostname()
+    except Exception:
+        return None
+    if "." in hostname:
+        return hostname
+    return None
+
+
+@lru_cache
+def _flock_sync_singleton() -> FlockSync:
+    return FlockSync(
+        content_storage=_content_storage_singleton(),
+        tombstone_storage=_tombstone_storage_singleton(),
+        flock_storage=_flock_storage_singleton(),
+        get_self_address=_resolve_self_address,
+    )
+
+
+def get_flock_sync() -> FlockSync:
+    """Dependency provider for the flock sync engine (push/pull orchestrator)."""
+    return _flock_sync_singleton()
 
 
 def _resolve_seed_marker_path() -> Path:
