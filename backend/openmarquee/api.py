@@ -17,13 +17,19 @@ from pydantic import BaseModel, Field, ValidationError
 
 from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
-from openmarquee.dependencies import get_content_storage, get_playlist_storage
+from openmarquee.dependencies import (
+    get_content_storage,
+    get_playlist_storage,
+    get_tombstone_storage,
+)
 from openmarquee.playlist import PlaylistStorage, list_in_playlist_order
+from openmarquee.tombstone import TombstoneStorage
 
 router = APIRouter(prefix="/api/content", tags=["content"])
 
 StorageDep = Annotated[ContentStorage, Depends(get_content_storage)]
 PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
+TombstoneDep = Annotated[TombstoneStorage, Depends(get_tombstone_storage)]
 
 
 def _append_to_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
@@ -436,12 +442,20 @@ async def get_video(item_id: UUID, storage: StorageDep) -> FileResponse:
 
 @router.delete("/{item_id}", status_code=204)
 async def delete_content_item(
-    item_id: UUID, storage: StorageDep, playlist_storage: PlaylistDep
+    item_id: UUID,
+    storage: StorageDep,
+    playlist_storage: PlaylistDep,
+    tombstones: TombstoneDep,
 ) -> None:
-    try:
-        storage.delete(item_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=f"no content item {item_id}") from exc
+    # 404 first — no tombstone for an id we never had.
+    if not storage.exists(item_id):
+        raise HTTPException(status_code=404, detail=f"no content item {item_id}")
+    # Tombstone BEFORE delete. If tombstone.add fails we'd rather bail and
+    # leave the content in place than end up with a silent delete that
+    # syncing peers can't learn about (resurrect-on-next-pull). The reverse
+    # order is not self-healing.
+    tombstones.add(item_id)
+    storage.delete(item_id)
     _remove_from_playlist(playlist_storage, item_id)
 
 

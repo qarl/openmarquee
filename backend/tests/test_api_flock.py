@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,11 +10,24 @@ import pytest
 from fastapi.testclient import TestClient
 
 from openmarquee.app import app
+from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
+    _content_storage_singleton,
     _flock_storage_singleton,
+    _tombstone_storage_singleton,
+    get_content_storage,
     get_flock_storage,
+    get_tombstone_storage,
 )
 from openmarquee.flock import FlockStorage
+from openmarquee.tombstone import TombstoneStorage
+
+
+# Minimal valid 1x1 PNG for content upload endpoints (Pillow-generated).
+_TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nG"
+    "P4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
 
 
 @pytest.fixture
@@ -30,6 +44,26 @@ def client(storage: FlockStorage) -> TestClient:
     finally:
         app.dependency_overrides.clear()
         _flock_storage_singleton.cache_clear()
+
+
+@pytest.fixture
+def manifest_client(tmp_path: Path):
+    """Client with flock + content + tombstone overrides — for manifest tests
+    that need to exercise all three together."""
+    flock = FlockStorage(tmp_path / "flock.json")
+    content = ContentStorage(tmp_path / "content")
+    tombstones = TombstoneStorage(tmp_path / "tombstones.json")
+    app.dependency_overrides[get_flock_storage] = lambda: flock
+    app.dependency_overrides[get_content_storage] = lambda: content
+    app.dependency_overrides[get_tombstone_storage] = lambda: tombstones
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+        _flock_storage_singleton.cache_clear()
+        _content_storage_singleton.cache_clear()
+        _tombstone_storage_singleton.cache_clear()
 
 
 def test_get_empty_flock_returns_empty_peer_list(client: TestClient):
@@ -123,6 +157,110 @@ def test_delete_removes_peer(client: TestClient):
 def test_delete_returns_404_for_unknown_peer(client: TestClient):
     response = client.delete(f"/api/flock/{uuid4()}")
     assert response.status_code == 404
+
+
+def test_manifest_empty_when_no_content(manifest_client: TestClient):
+    response = manifest_client.get("/api/flock/manifest")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema_version"] == 1
+    assert body["entries"] == []
+    assert body["tombstones"] == []
+
+
+def _post_text_slide(client: TestClient, name: str) -> str:
+    """Helper: seed one text slide via the real API, return its id."""
+    response = client.post(
+        "/api/content/text-slides",
+        json={
+            "name": name,
+            "duration_ms": 5000,
+            "text": name,
+            "png_base64": _TINY_PNG_B64,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+def test_manifest_lists_held_content_with_type_and_timestamp(
+    manifest_client: TestClient,
+):
+    slide_id = _post_text_slide(manifest_client, "Opening")
+    response = manifest_client.get("/api/flock/manifest")
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["entries"]) == 1
+    entry = body["entries"][0]
+    assert entry["content_id"] == slide_id
+    assert entry["content_type"] == "text_slide"
+    assert entry["updated_at"]  # ISO-8601 string, not empty
+
+
+def test_manifest_surfaces_tombstone_after_delete(manifest_client: TestClient):
+    slide_id = _post_text_slide(manifest_client, "Will-be-deleted")
+    delete_resp = manifest_client.delete(f"/api/content/{slide_id}")
+    assert delete_resp.status_code == 204
+
+    response = manifest_client.get("/api/flock/manifest")
+    body = response.json()
+    assert body["entries"] == []  # item is gone
+    assert len(body["tombstones"]) == 1
+    assert body["tombstones"][0]["content_id"] == slide_id
+
+
+def test_delete_of_unknown_id_leaves_no_tombstone(
+    manifest_client: TestClient, tmp_path: Path
+):
+    # A DELETE on an id we never had must not mint a tombstone — peers
+    # would otherwise learn about a deletion that never happened and drop
+    # content they rightfully hold.
+    response = manifest_client.delete(f"/api/content/{uuid4()}")
+    assert response.status_code == 404
+    manifest = manifest_client.get("/api/flock/manifest").json()
+    assert manifest["tombstones"] == []
+
+
+def test_manifest_filters_expired_tombstones(tmp_path: Path):
+    # Build a manifest client whose tombstone log is seeded directly with
+    # one fresh + one expired entry, and confirm only the fresh one surfaces.
+    from datetime import datetime, timedelta, timezone
+
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.dependencies import (
+        _content_storage_singleton,
+        _flock_storage_singleton,
+        _tombstone_storage_singleton,
+        get_content_storage,
+        get_flock_storage,
+        get_tombstone_storage,
+    )
+    from openmarquee.flock import FlockStorage
+    from openmarquee.tombstone import TOMBSTONE_TTL_DAYS, TombstoneStorage
+
+    flock = FlockStorage(tmp_path / "flock.json")
+    content = ContentStorage(tmp_path / "content")
+    tombstones = TombstoneStorage(tmp_path / "tombstones.json")
+    now = datetime.now(timezone.utc)
+    fresh_id = uuid4()
+    stale_id = uuid4()
+    tombstones.add(fresh_id, now=now - timedelta(days=1))
+    tombstones.add(stale_id, now=now - timedelta(days=TOMBSTONE_TTL_DAYS + 5))
+
+    app.dependency_overrides[get_flock_storage] = lambda: flock
+    app.dependency_overrides[get_content_storage] = lambda: content
+    app.dependency_overrides[get_tombstone_storage] = lambda: tombstones
+    try:
+        with TestClient(app) as test_client:
+            body = test_client.get("/api/flock/manifest").json()
+    finally:
+        app.dependency_overrides.clear()
+        _flock_storage_singleton.cache_clear()
+        _content_storage_singleton.cache_clear()
+        _tombstone_storage_singleton.cache_clear()
+
+    surfaced = {t["content_id"] for t in body["tombstones"]}
+    assert surfaced == {str(fresh_id)}
 
 
 def test_full_lifecycle_through_the_api(client: TestClient):

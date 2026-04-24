@@ -16,6 +16,7 @@ from openmarquee.playlist import PlaylistStorage
 from openmarquee.rendering.mock import MockRenderer
 from openmarquee.schedule import ScheduleStorage
 from openmarquee.settings import SettingsStorage
+from openmarquee.tombstone import TombstoneStorage
 
 
 def _resolve_content_root() -> Path:
@@ -170,6 +171,25 @@ def _flock_storage_singleton() -> FlockStorage:
 def get_flock_storage() -> FlockStorage:
     """Dependency provider for the flock (peer-device list) storage layer."""
     return _flock_storage_singleton()
+
+
+def _resolve_tombstone_path() -> Path:
+    """Where `tombstones.json` lives (recently-deleted content_ids for
+    flock-sync catch-up). Sibling of the other state files."""
+    override = os.environ.get("OPENMARQUEE_TOMBSTONE_PATH")
+    if override:
+        return Path(override)
+    return _resolve_content_root().parent / "openmarquee-tombstones.json"
+
+
+@lru_cache
+def _tombstone_storage_singleton() -> TombstoneStorage:
+    return TombstoneStorage(_resolve_tombstone_path())
+
+
+def get_tombstone_storage() -> TombstoneStorage:
+    """Dependency provider for the tombstone log (deleted-content breadcrumbs)."""
+    return _tombstone_storage_singleton()
 
 
 def _resolve_seed_marker_path() -> Path:

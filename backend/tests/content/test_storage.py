@@ -1,4 +1,7 @@
 import json
+import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -319,3 +322,41 @@ def test_delete_removes_video_dir_including_mp4(tmp_path: Path):
     storage.save_video(video, b"\x89PNG", _FAKE_MP4)
     storage.delete(video.id)
     assert not storage.video_path(video.id).exists()
+
+
+def test_save_stamps_envelope_with_updated_at(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide()
+    storage.save_text_slide(slide, b"\x89PNG")
+    stamp = storage.read_updated_at(slide.id)
+    # Tz-aware and recent (within a few seconds of now).
+    assert stamp.tzinfo is not None
+    assert (datetime.now(timezone.utc) - stamp).total_seconds() < 5
+
+
+def test_save_accepts_explicit_updated_at_for_peer_ingest(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide()
+    fixed = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    storage.save(slide, b"\x89PNG", updated_at=fixed)
+    assert storage.read_updated_at(slide.id) == fixed
+
+
+def test_read_updated_at_falls_back_to_mtime_for_pre_flock_envelopes(tmp_path: Path):
+    # Emulate an envelope persisted before the updated_at field was added.
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide()
+    item_dir = tmp_path / str(slide.id)
+    item_dir.mkdir()
+    envelope_path = item_dir / "item.json"
+    envelope_path.write_text(
+        json.dumps(
+            {"schema_version": SCHEMA_VERSION, "item": slide.model_dump(mode="json")}
+        )
+    )
+    (item_dir / "asset.png").write_bytes(b"\x89PNG")
+    # Force a known mtime so the assertion is deterministic.
+    epoch = 1700000000
+    os.utime(envelope_path, (epoch, epoch))
+    stamp = storage.read_updated_at(slide.id)
+    assert stamp == datetime.fromtimestamp(epoch, tz=timezone.utc)

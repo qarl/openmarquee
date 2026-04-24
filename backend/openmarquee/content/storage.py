@@ -9,6 +9,7 @@ Envelope format:
 
     {
         "schema_version": <int>,
+        "updated_at": "<iso-8601 UTC>",   # added 2026-04: manifest timestamp
         "item": { ...serialized ContentItem... }
     }
 
@@ -16,10 +17,16 @@ The schema version lives on the envelope (not the model) so we can migrate
 the on-disk format without churning the pure-data model. Writes are atomic
 (write-to-temp + rename) so a crashed process can't leave a half-written
 `item.json` that load() would choke on.
+
+`updated_at` is what the flock manifest uses for last-writer-wins sync
+decisions — it's on the envelope (not inside the item) because a peer
+receiving our content preserves this stamp verbatim, while a local
+edit bumps it.
 """
 
 import json
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -49,19 +56,31 @@ class ContentStorage:
 
     # --- writes ---
 
-    def save(self, item: ContentItem, png: bytes) -> None:
+    def save(
+        self,
+        item: ContentItem,
+        png: bytes,
+        *,
+        updated_at: datetime | None = None,
+    ) -> None:
         """Persist any content item and its PNG asset. Overwrites if the id exists.
 
         Text slides and image slides both ship PNGs (the browser does the
         rendering/scaling and uploads bitmap pixel data in both cases). Video
         content, when it lands, will need a different asset extension —
         refactor the hardcoded `asset.png` then.
+
+        `updated_at` defaults to `now()` — bump the local edit stamp.
+        Pass an explicit value when ingesting from a peer so the
+        original stamp travels with the content.
         """
         item_dir = self.root / str(item.id)
         item_dir.mkdir(parents=True, exist_ok=True)
 
+        stamp = updated_at or datetime.now(timezone.utc)
         envelope = {
             "schema_version": SCHEMA_VERSION,
+            "updated_at": stamp.isoformat(),
             "item": item.model_dump(mode="json"),
         }
         self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
@@ -144,6 +163,38 @@ class ContentStorage:
     def asset_path(self, item_id: UUID) -> Path:
         """Return the filesystem path to an item's rendered asset (no IO)."""
         return self.root / str(item_id) / _ASSET_FILENAME
+
+    def read_updated_at(self, item_id: UUID) -> datetime:
+        """When this item was last written locally — used by the flock
+        manifest for last-writer-wins sync decisions.
+
+        Falls back to the envelope file's mtime for items saved before the
+        updated_at field was added (pre-flock items on disk). New saves
+        always write it explicitly.
+
+        Returned datetime is always tz-aware (UTC) — a naive stamp from a
+        hand-edited envelope or mismatched-code peer is coerced to UTC so
+        downstream diff logic doesn't get a naive-vs-aware comparison.
+        """
+        envelope_path = self.root / str(item_id) / _ENVELOPE_FILENAME
+        if not envelope_path.exists():
+            raise FileNotFoundError(f"no content item at {envelope_path}")
+        data = json.loads(envelope_path.read_text())
+        # Mirror load()'s schema check so a future v2 envelope doesn't let
+        # read_updated_at silently return stamps while load() would refuse.
+        version = data.get("schema_version")
+        if version != SCHEMA_VERSION:
+            raise ValueError(
+                f"item {item_id} has schema_version {version}, "
+                f"expected {SCHEMA_VERSION} — migration needed"
+            )
+        stamp = data.get("updated_at")
+        if stamp is None:
+            return datetime.fromtimestamp(envelope_path.stat().st_mtime, tz=timezone.utc)
+        parsed = datetime.fromisoformat(stamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
     def list_all(self) -> list[ContentItem]:
         """Return all persisted content items, sorted by id string.
