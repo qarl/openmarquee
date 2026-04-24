@@ -358,3 +358,65 @@ export async function saveSchedule(schedule) {
     }
     return await response.json();
 }
+
+
+/* --- Flock: peer openMarquee devices for mesh media sync. --- */
+
+export async function listFlock() {
+    const response = await fetch("/api/flock");
+    if (!response.ok) {
+        throw new Error(`List flock failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+export async function addFlockPeer(address) {
+    const response = await fetch("/api/flock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address }),
+    });
+    if (!response.ok) {
+        // 422 bodies are FastAPI validation envelopes ({detail: [...]}); 409
+        // bodies are {detail: "..."}. Pull out a one-line reason so the
+        // modal doesn't dump a regex at the operator.
+        let message = `HTTP ${response.status}`;
+        try {
+            const body = await response.json();
+            if (typeof body.detail === "string") {
+                message = body.detail;
+            } else if (Array.isArray(body.detail) && body.detail[0]?.msg) {
+                message = body.detail[0].msg;
+            }
+        } catch {
+            /* not JSON — keep the status code */
+        }
+        if (response.status === 422) {
+            message = `Invalid address — expected a hostname or IP (optionally host:port).`;
+        }
+        throw new Error(message);
+    }
+    return await response.json();
+}
+
+export async function updateFlockPeer(peerId, { sync, name } = {}) {
+    const body = {};
+    if (sync !== undefined) body.sync = sync;
+    if (name !== undefined) body.name = name;
+    const response = await fetch(`/api/flock/${peerId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+        throw new Error(`Update peer failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+export async function deleteFlockPeer(peerId) {
+    const response = await fetch(`/api/flock/${peerId}`, { method: "DELETE" });
+    if (!response.ok) {
+        throw new Error(`Remove peer failed (${response.status})`);
+    }
+}

@@ -1576,3 +1576,202 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     font-size: 0.85rem;
     min-height: 1.2em;
 }
+
+
+/* --- Flock panel --- */
+
+.flock {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    padding: 1.25rem 1.5rem;
+    max-width: 48rem;
+}
+
+.flock-hint {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.flock-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+    gap: 0.75rem;
+}
+
+.flock-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    transition: border-color 120ms ease;
+}
+
+.flock-tile:hover {
+    border-color: var(--accent);
+}
+
+.flock-tile-synced {
+    border-color: var(--success);
+    box-shadow: 0 0 0 1px var(--success) inset;
+}
+
+.flock-tile-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+}
+
+.flock-tile-name {
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.flock-tile-address {
+    color: var(--muted);
+    font-size: 0.85rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.flock-tile-seen {
+    color: var(--muted);
+    font-size: 0.75rem;
+}
+
+.flock-tile-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    border-top: 1px solid var(--panel-border);
+    padding-top: 0.5rem;
+}
+
+.flock-tile-sync {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.flock-tile-sync-input {
+    accent-color: var(--accent);
+}
+
+.flock-tile-open {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.85rem;
+}
+
+.flock-tile-open:hover {
+    text-decoration: underline;
+}
+
+.flock-tile-delete {
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--muted);
+    border-radius: 0.3rem;
+    width: 1.6rem;
+    height: 1.6rem;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.flock-tile-delete:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.flock-tile-new {
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    min-height: 8rem;
+    cursor: pointer;
+    border-style: dashed;
+    color: var(--muted);
+}
+
+.flock-tile-new:hover {
+    color: var(--accent);
+}
+
+.flock-tile-new-plus {
+    font-size: 2rem;
+    line-height: 1;
+}
+
+.flock-tile-new-label {
+    font-size: 0.85rem;
+}
+
+.flock-status {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+    min-height: 1.2em;
+}
+
+.flock-status.error {
+    color: var(--danger);
+}
+
+.flock-modal {
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 0.5rem;
+    padding: 1rem 1.25rem;
+    max-width: 22rem;
+}
+
+.flock-modal::backdrop {
+    background: rgba(0, 0, 0, 0.6);
+}
+
+.flock-modal-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.flock-modal-form h3 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.flock-modal-hint {
+    margin: -0.25rem 0 0;
+    color: var(--muted);
+    font-size: 0.8rem;
+}
+
+.flock-modal-error {
+    margin: 0;
+    color: var(--danger);
+    font-size: 0.85rem;
+    min-height: 1.2em;
+}
+
+.flock-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+}

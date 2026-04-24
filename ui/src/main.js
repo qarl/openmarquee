@@ -19,13 +19,16 @@
 // affordance starts / stops the backend loop.
 
 import {
+    addFlockPeer,
     deleteContent,
+    deleteFlockPeer,
     deletePlaylistByName,
     fetchContentItem,
     generateBackground,
     getSchedule,
     getSettings,
     listContent,
+    listFlock,
     listPlaylists,
     patchSlideDuration,
     saveImage,
@@ -34,6 +37,7 @@ import {
     saveSettings,
     saveTextSlide,
     saveVideo,
+    updateFlockPeer,
     updateImage,
     updateTextSlide,
     updateVideo,
@@ -47,6 +51,7 @@ import {
     nextPlaylistName,
 } from "./playlist-browser.js";
 import { mountPlaylistTrack } from "./playlist-track.js";
+import { mountFlock } from "./flock.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountVideoUploader } from "./video-upload.js";
@@ -62,6 +67,7 @@ const SECTIONS = [
     "slides/image",
     "slides/video",
     "playlists",
+    "flock",
     "schedule",
     "settings",
 ];
@@ -141,6 +147,9 @@ async function boot() {
         </section>
         <section data-section="playlists" class="panel">
             <div class="playlist-track-slot"></div>
+        </section>
+        <section data-section="flock" class="panel">
+            <div class="flock-slot"></div>
         </section>
         <section data-section="schedule" class="panel">
             <div class="schedule-slot"></div>
@@ -351,6 +360,13 @@ async function boot() {
     mountSettings(root.querySelector(".settings-slot"), {
         fetchSettings: getSettings,
         onSave: saveSettings,
+    });
+
+    mountFlock(root.querySelector(".flock-slot"), {
+        fetchFlock: listFlock,
+        onAdd: addFlockPeer,
+        onUpdate: updateFlockPeer,
+        onDelete: deleteFlockPeer,
     });
 
     // Re-mount on settings change so the canvas always matches current
