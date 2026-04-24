@@ -64,16 +64,39 @@ _TAILSCALE_HOSTNAME_PATTERN = re.compile(
 )
 
 
+def _default_sign_name() -> str:
+    """Mint a `Sign<3-hex>` name (e.g. `SignA7F`) on first device boot.
+
+    The factory fires from SystemSettings()'s default when no value is
+    supplied. SettingsStorage.load() persists the fresh defaults on
+    first access so subsequent reloads return the same name — without
+    that save-on-miss, every boot would be a different name.
+    """
+    import secrets
+
+    return f"Sign{secrets.token_hex(2)[:3].upper()}"
+
+
 class SystemSettings(BaseModel):
     """Device-wide configuration. One per device; persisted as a single file."""
 
     schema_version: int = Field(default=SETTINGS_SCHEMA_VERSION)
 
     sign_name: str = Field(
-        default="openMarquee",
+        default_factory=_default_sign_name,
         min_length=1,
         max_length=64,
         description="Operator-facing label for this device (shown in UI + welcome screen).",
+    )
+
+    flock_sync_enabled: bool = Field(
+        default=True,
+        description=(
+            "Global kill switch for flock participation. When false, this "
+            "device stops pushing local changes, stops pulling from peers, "
+            "and drops inbound /api/flock/notify posts. Peer tiles keep "
+            "their per-peer sync flag but no bytes flow."
+        ),
     )
 
     output_mode: OutputMode = Field(
@@ -318,9 +341,23 @@ class SettingsStorage:
         self.path = Path(path)
 
     def load(self) -> SystemSettings:
-        """Load settings from disk. Returns defaults if the file is missing."""
+        """Load settings from disk. On first access (no file yet) we mint
+        fresh defaults AND persist them — otherwise sign_name's random
+        factory would hand out a different name on every reload and the
+        UI + the flock peer list would flap.
+
+        Derives wifi_ssid from sign_name's XXX suffix so the AP and the
+        device name share an identifier ("SignA7F" + "openMarqueeA7F").
+        """
         if not self.path.exists():
-            return SystemSettings()
+            fresh = SystemSettings()
+            if fresh.sign_name.startswith("Sign") and len(fresh.sign_name) > 4:
+                suffix = fresh.sign_name[4:]
+                fresh = fresh.model_copy(
+                    update={"wifi_ssid": f"openMarquee{suffix}"}
+                )
+            self.save(fresh)
+            return fresh
         data = json.loads(self.path.read_text())
         return SystemSettings.model_validate(data)
 

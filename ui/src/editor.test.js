@@ -463,6 +463,86 @@ describe("mountEditor — submit flow", () => {
         expect(onSaveExisting.mock.calls[0][0]).toBe("abc");
     });
 
+    it("loadForEdit re-renders the canvas after a bundled font finishes loading", async () => {
+        // Regression: loading a slide whose font is a bundled @font-face
+        // family (e.g. Pacifico) used to paint the canvas ONCE with a
+        // fallback before the .ttf was registered, leaving the operator
+        // staring at the wrong glyphs until they clicked the slide a
+        // second time. The fix: loadForEdit awaits document.fonts.load,
+        // gives the browser a paint cycle, then re-renders.
+        const ctx = patchCanvasPrototype();
+        const container = document.createElement("div");
+
+        // Track every time drawCanvas writes to ctx.fillRect (once per
+        // call). With the fix we expect ≥ 2 (initial paint + post-font-
+        // load repaint). Without it, ≤ 1.
+        const fillRectCalls = ctx.fillRect;
+
+        // Stub document.fonts.load so we can resolve it on demand.
+        let loadResolver;
+        const loadCalls = [];
+        const fakeFonts = {
+            load: vi.fn((spec) => {
+                loadCalls.push(spec);
+                return new Promise((r) => {
+                    loadResolver = r;
+                });
+            }),
+            ready: Promise.resolve(),
+        };
+        const origFonts = document.fonts;
+        Object.defineProperty(document, "fonts", {
+            value: fakeFonts,
+            configurable: true,
+        });
+
+        try {
+            const handle = mountEditor(container, {
+                width: 128,
+                height: 96,
+                onSave: vi.fn().mockResolvedValue({}),
+            });
+            // mountEditor's initial syncAndRender bumps fillRect once.
+            const baseline = fillRectCalls.mock.calls.length;
+
+            const editPromise = handle.loadForEdit({
+                type: "text_slide",
+                id: "abc",
+                name: "Promo",
+                text: "PROMO",
+                text_color: "#ffffff",
+                background_color: "#000000",
+                font_family: "Pacifico",
+                font_size_px: 40,
+                duration_ms: 5000,
+                auto_mode: null,
+            });
+
+            // Pump microtasks so the synchronous body of loadForEdit
+            // (including its first syncAndRender) has run, then verify
+            // the font-load was kicked off but the post-load repaint
+            // hasn't fired yet.
+            await new Promise((r) => setTimeout(r, 0));
+            const afterFirstPaint = fillRectCalls.mock.calls.length;
+            expect(afterFirstPaint).toBeGreaterThan(baseline);
+            expect(loadCalls.length).toBe(1);
+            expect(loadCalls[0]).toMatch(/Pacifico/);
+
+            // Resolve the font load. loadForEdit's await cascade should
+            // then issue a second syncAndRender → drawCanvas → fillRect.
+            loadResolver();
+            await editPromise;
+
+            const afterFontLoad = fillRectCalls.mock.calls.length;
+            expect(afterFontLoad).toBeGreaterThan(afterFirstPaint);
+        } finally {
+            Object.defineProperty(document, "fonts", {
+                value: origFonts,
+                configurable: true,
+            });
+        }
+    });
+
     it("Generate button is hidden until background source = 'slide' + wired", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");

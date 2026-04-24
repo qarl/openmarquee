@@ -220,6 +220,13 @@ def _resolve_self_address() -> str | None:
     return None
 
 
+def _resolve_flock_sync_enabled() -> bool:
+    """Global kill switch — reads SystemSettings.flock_sync_enabled on every
+    call so toggling it in the UI propagates to the next notify/pull tick
+    without restarting the process."""
+    return _settings_storage_singleton().load().flock_sync_enabled
+
+
 @lru_cache
 def _flock_sync_singleton() -> FlockSync:
     return FlockSync(
@@ -227,6 +234,7 @@ def _flock_sync_singleton() -> FlockSync:
         tombstone_storage=_tombstone_storage_singleton(),
         flock_storage=_flock_storage_singleton(),
         get_self_address=_resolve_self_address,
+        get_sync_enabled=_resolve_flock_sync_enabled,
     )
 
 

@@ -146,7 +146,7 @@ const EDITOR_TEMPLATE = `
                     <select class="field-font-family"></select>
                 </label>
                 <label class="field field-duration-wrap">
-                    <span>Font size (% of width)</span>
+                    <span>Font size (% of height)</span>
                     <input type="number" class="field-font-size" min="1" max="100" step="0.5">
                 </label>
             </div>
@@ -460,7 +460,7 @@ export function mountEditor(
             // is resolution-independent — playback cover-fits down to the
             // current panel dims at slide entry. drawCanvas reads the
             // canvas's own width/height, so the same scene draws cleanly
-            // at any size (font_size_pct is a fraction of canvas.width).
+            // at any size (font_size_pct is a fraction of canvas.height).
             const png_base64 = rasterizeAtTarget(state);
             const durationSeconds = Number(durationEl.value) || 5;
             const payload = {
@@ -509,6 +509,19 @@ export function mountEditor(
         state.bgImage = null;
         state.bgSlideId = null;
         textEl.value = "";
+        // Safari quirk: after a textarea held content and got cleared,
+        // the placeholder renders inside a stale narrow box and clips
+        // mid-glyph until the user clicks into it. Focus() + blur()
+        // aren't enough; the only reliable nudge is to detach and
+        // re-attach the element so Safari drops the cached layout.
+        // Chromium no-ops either way. Event listeners survive a
+        // detach/re-attach cycle.
+        const parent = textEl.parentNode;
+        if (parent) {
+            const next = textEl.nextSibling;
+            parent.removeChild(textEl);
+            parent.insertBefore(textEl, next);
+        }
         autoModeEl.value = "";
         autoModeHintEl.hidden = true;
         populateAutoFormatOptions("");
@@ -599,6 +612,31 @@ export function mountEditor(
             state.bgImage = null;
         }
         syncAndRender();
+
+        // Bundled @font-face fonts load lazily — on the FIRST loadForEdit
+        // for a slide that uses one (e.g. Pacifico), the canvas paints
+        // with the fallback before the .ttf finishes downloading. Wait
+        // for the font, give the browser a paint cycle (canvas keeps a
+        // separate font cache that lags behind document.fonts.load by
+        // a tick), then re-render. document.fonts.ready settles AFTER
+        // all pending fonts are usable for canvas drawing on every
+        // current browser engine.
+        const family = fontFamilyEl.value;
+        if (family && document.fonts?.load) {
+            const weight = FONT_WEIGHT_BY_VALUE.get(family) ?? 700;
+            try {
+                await document.fonts.load(`${weight} 40px ${cssFontFamily(family)}`);
+                if (document.fonts?.ready) await document.fonts.ready;
+                await new Promise((resolve) =>
+                    requestAnimationFrame(() => resolve()),
+                );
+            } catch {
+                return;
+            }
+            if (state.fontFamily === family && state.editingId === String(slide.id)) {
+                syncAndRender();
+            }
+        }
     }
 
     // Mount the slide browser at the top of the subpage — each tile
@@ -704,7 +742,7 @@ export function drawCanvas(canvas, state) {
 
         let fontSizePx;
         if (Number.isFinite(fontSizePct) && fontSizePct > 0) {
-            fontSizePx = Math.max(4, Math.round((canvas.width * fontSizePct) / 100));
+            fontSizePx = Math.max(4, Math.round((canvas.height * fontSizePct) / 100));
         } else if (Number.isFinite(fontSize) && fontSize > 0) {
             fontSizePx = fontSize;
         } else {

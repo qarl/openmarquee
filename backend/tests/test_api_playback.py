@@ -139,3 +139,114 @@ def test_state_reports_current_item_id_while_playing(client: TestClient, storage
     # must track the item type exactly — "text_slide" here.
     assert state["current_item_type"] == "text_slide"
     client.post("/api/playback/stop")
+
+
+def test_current_thumbnail_returns_204_when_idle(client: TestClient):
+    # Nothing playing → 204, so the Flock tile can cheaply distinguish
+    # "idle" from "offline" without parsing a 5xx.
+    response = client.get("/api/playback/current-thumbnail")
+    assert response.status_code == 204
+
+
+def test_current_thumbnail_serves_current_item_asset(
+    client: TestClient, storage: ContentStorage
+):
+    slide = TextSlide(name="thumb-test", text="t", duration_ms=1000)
+    png = _png_bytes(8, 8, (0, 200, 100))
+    storage.save_text_slide(slide, png)
+
+    client.post("/api/playback/start")
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if client.get("/api/playback/state").json().get("current_item_id"):
+            break
+        time.sleep(0.05)
+
+    response = client.get("/api/playback/current-thumbnail")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    # CORS wildcard so peers' UIs can <img src=...> us cross-origin.
+    assert response.headers.get("access-control-allow-origin") == "*"
+    assert response.headers.get("cache-control") == "no-store"
+    assert response.content == png
+    client.post("/api/playback/stop")
+
+
+def test_current_thumbnail_returns_first_item_of_current_playlist(tmp_path: Path):
+    """The thumbnail is the playlist's cover (first slide), not the
+    currently-rotating slide. Set up a loop that stamps
+    `current_playlist_name` on its items so the endpoint walks the
+    playlist rather than the fallback path."""
+    from openmarquee.dependencies import (
+        _content_storage_singleton,
+        _playback_loop_singleton,
+        _playlist_storage_singleton,
+        get_content_storage,
+        get_playback_loop,
+        get_playlist_storage,
+    )
+    from openmarquee.playlist import Playlist, PlaylistItem, PlaylistStorage
+    from openmarquee.rendering.mock import MockRenderer
+
+    content = ContentStorage(tmp_path / "content")
+    playlists = PlaylistStorage(tmp_path / "playlist.json")
+    renderer = MockRenderer(8, 8, tmp_path / "preview.png")
+
+    # Two distinct slides so "first" vs "current" is observable.
+    first = TextSlide(name="first", text="A", duration_ms=100)
+    second = TextSlide(name="second", text="B", duration_ms=100)
+    first_png = _png_bytes(8, 8, (200, 100, 0))
+    second_png = _png_bytes(8, 8, (0, 100, 200))
+    content.save_text_slide(first, first_png)
+    content.save_text_slide(second, second_png)
+    playlists.set_playlist(
+        "default",
+        Playlist(
+            items=[
+                PlaylistItem(item_id=first.id),
+                PlaylistItem(item_id=second.id),
+            ]
+        ),
+    )
+
+    from openmarquee.playback import PlaybackLoop
+
+    loop_holder: dict = {}
+
+    def fetch():
+        # Mirror scheduled_fetch_items — stamp the playlist name so the
+        # current-thumbnail endpoint can find the playlist's first item.
+        loop_holder["loop"]._stamp_playlist_name("default")
+        return [content.load(iid) for iid in playlists.get_playlist("default").item_ids]
+
+    loop = PlaybackLoop(
+        renderer=renderer,
+        fetch_items=fetch,
+        read_asset=content.read_asset,
+        empty_playlist_poll_seconds=0.01,
+    )
+    loop_holder["loop"] = loop
+
+    app.dependency_overrides[get_content_storage] = lambda: content
+    app.dependency_overrides[get_playback_loop] = lambda: loop
+    app.dependency_overrides[get_playlist_storage] = lambda: playlists
+    try:
+        with TestClient(app) as client:
+            client.post("/api/playback/start")
+            # Wait through at least one slide-advance so the loop is on the
+            # SECOND item — proves the thumbnail still returns the FIRST.
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                cid = client.get("/api/playback/state").json().get("current_item_id")
+                if cid == str(second.id):
+                    break
+                time.sleep(0.05)
+            response = client.get("/api/playback/current-thumbnail")
+            assert response.status_code == 200
+            assert response.content == first_png
+            client.post("/api/playback/stop")
+    finally:
+        app.dependency_overrides.clear()
+        _content_storage_singleton.cache_clear()
+        _playback_loop_singleton.cache_clear()
+        _playlist_storage_singleton.cache_clear()

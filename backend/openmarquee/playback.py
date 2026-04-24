@@ -226,16 +226,28 @@ class PlaybackLoop:
                 if self._stop_event.is_set():
                     break
 
-                # Transition into the next slide (or wrap to first). Skip
-                # for cut (instant), single-item playlists (next == current),
-                # and for the last item if we're about to re-enter the outer
-                # loop and re-fetch (the next iteration's first item handles
-                # its own appearance via cut/fade as configured).
-                if item.transition == "fade" and item.transition_ms > 0 and len(items) > 1:
+                # Transition into the next slide (wraps to first). "cut"
+                # is instant → no-op. single-item playlists also no-op
+                # (next == current). Honors the current item's setting
+                # all the way through the last-to-first wrap so the
+                # inline preview and the device stay consistent.
+                if (
+                    item.transition in ("fade", "wipe", "slide", "iris")
+                    and item.transition_ms > 0
+                    and len(items) > 1
+                ):
                     next_item = items[(i + 1) % len(items)]
                     next_image = self._safe_load_image(next_item)
                     if next_image is not None:
-                        await self._fade(current_image, next_image, item.transition_ms)
+                        kind = item.transition
+                        if kind == "fade":
+                            await self._fade(current_image, next_image, item.transition_ms)
+                        elif kind == "wipe":
+                            await self._wipe(current_image, next_image, item.transition_ms)
+                        elif kind == "slide":
+                            await self._slide(current_image, next_image, item.transition_ms)
+                        elif kind == "iris":
+                            await self._iris(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early if stop is requested."""
@@ -360,6 +372,95 @@ class PlaybackLoop:
             alpha = i / n_frames
             blended = Image.blend(from_image, to_image, alpha)
             self._render_image(blended)
+            await self._wait(frame_period)
+
+    async def _slide(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Push transition: `from_image` slides off to the left while
+        `to_image` slides in from the right at the same rate. Distinct
+        from wipe in that BOTH frames move (rather than to_image
+        revealing under a stationary from_image)."""
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        width, height = from_image.size
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            if self._stop_event.is_set():
+                return
+            offset = max(0, min(width, int(round(width * i / n_frames))))
+            frame = Image.new("RGB", (width, height))
+            # from_image: shifted left by `offset`, so columns [offset, width)
+            # of the source go to columns [0, width - offset) of the frame.
+            if offset < width:
+                frame.paste(from_image.crop((offset, 0, width, height)), (0, 0))
+            # to_image: enters from the right edge — its leftmost
+            # `offset` columns go to columns [width - offset, width).
+            if offset > 0:
+                frame.paste(to_image.crop((0, 0, offset, height)), (width - offset, 0))
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _iris(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Iris transition: `to_image` reveals through a circular mask
+        that grows from a center pinpoint to fully cover the canvas.
+        Reads as a film-projector aperture opening — distinct enough
+        from fade and wipe at small panel sizes that it stays legible."""
+        from PIL import ImageDraw
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        width, height = from_image.size
+        # Final radius covers the whole canvas — corner-to-center distance.
+        max_r = int(((width / 2) ** 2 + (height / 2) ** 2) ** 0.5) + 1
+        cx, cy = width // 2, height // 2
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            if self._stop_event.is_set():
+                return
+            radius = int(round(max_r * i / n_frames))
+            mask = Image.new("L", (width, height), 0)
+            ImageDraw.Draw(mask).ellipse(
+                (cx - radius, cy - radius, cx + radius, cy + radius),
+                fill=255,
+            )
+            frame = Image.composite(to_image, from_image, mask)
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _wipe(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Left-to-right wipe: `to_image` reveals from the left edge,
+        pushing `from_image` out of the way over `transition_ms`.
+
+        Returns early on stop. Same frame cadence as _fade so the two
+        transitions feel like the same smoothness at equal transition_ms.
+        """
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        width, height = from_image.size
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            if self._stop_event.is_set():
+                return
+            split = max(0, min(width, int(round(width * i / n_frames))))
+            # Compose: left `split` columns from to_image, rest from from_image.
+            frame = from_image.copy()
+            if split > 0:
+                frame.paste(to_image.crop((0, 0, split, height)), (0, 0))
+            self._render_image(frame)
             await self._wait(frame_period)
 
 

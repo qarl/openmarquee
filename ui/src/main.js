@@ -364,8 +364,21 @@ async function boot() {
 
     mountFlock(root.querySelector(".flock-slot"), {
         fetchFlock: listFlock,
+        fetchSettings: getSettings,
         onAdd: addFlockPeer,
         onUpdate: updateFlockPeer,
+        onUpdateSelfSync: async (enabled) => {
+            // Global flock_sync_enabled flag lives in SystemSettings.
+            // PUT the whole object so we don't disturb fields we aren't
+            // touching; merge on top of the current state.
+            const current = await getSettings();
+            await saveSettings({ ...current, flock_sync_enabled: enabled });
+            document.dispatchEvent(
+                new CustomEvent("openmarquee:settings-updated", {
+                    detail: { settings: { ...current, flock_sync_enabled: enabled } },
+                }),
+            );
+        },
         onDelete: deleteFlockPeer,
     });
 
@@ -373,7 +386,23 @@ async function boot() {
     // display config.
     document.addEventListener("openmarquee:settings-updated", async () => {
         mountDimensionedPanels(await resolvePanelDims());
+        refreshBrandSignName();
     });
+
+    // Device name shown in the sticky header (next to the "openMarquee"
+    // wordmark). Refreshed on boot + on settings-save so a rename in
+    // the Settings panel is reflected immediately.
+    async function refreshBrandSignName() {
+        const el = document.querySelector("[data-sign-name]");
+        if (!el) return;
+        try {
+            const settings = await getSettings();
+            el.textContent = settings.sign_name || "";
+        } catch {
+            el.textContent = "";
+        }
+    }
+    refreshBrandSignName();
 
     const nav = mountNav({
         main: root,

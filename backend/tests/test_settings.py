@@ -29,9 +29,13 @@ def test_defaults_match_default_output_mode():
 
 
 def test_defaults_roundtrip_through_json():
-    dumped = SystemSettings().model_dump_json()
+    # sign_name uses a random default_factory (minted once per device on
+    # first boot) so two bare SystemSettings() instances aren't equal —
+    # pin it for this round-trip test.
+    original = SystemSettings(sign_name="SignABC")
+    dumped = original.model_dump_json()
     round_tripped = SystemSettings.model_validate_json(dumped)
-    assert round_tripped == SystemSettings()
+    assert round_tripped == original
 
 
 # --- Field validation ---
@@ -141,6 +145,41 @@ def test_wifi_password_accepts_valid_length():
 def test_sign_name_rejects_empty():
     with pytest.raises(ValidationError):
         SystemSettings(sign_name="")
+
+
+def test_default_sign_name_is_random_sign_prefix():
+    import re
+
+    names = {SystemSettings().sign_name for _ in range(8)}
+    # All three chars after "Sign" are uppercase hex.
+    assert all(re.fullmatch(r"Sign[0-9A-F]{3}", n) for n in names)
+    # Non-trivial entropy — 8 draws shouldn't all collapse to one value.
+    assert len(names) > 1
+
+
+def test_storage_persists_minted_default_on_first_load(tmp_path):
+    from openmarquee.settings import SettingsStorage
+
+    path = tmp_path / "settings.json"
+    storage = SettingsStorage(path)
+    minted = storage.load().sign_name
+    # Second load gets the SAME name (not a fresh random) because
+    # load() saved the minted defaults on first access.
+    assert storage.load().sign_name == minted
+    assert path.exists()
+
+
+def test_storage_derives_wifi_ssid_from_sign_name_on_first_load(tmp_path):
+    """AP SSID and sign_name share the same 3-char XXX suffix so the
+    operator's device name matches the WiFi name they broadcast."""
+    from openmarquee.settings import SettingsStorage
+
+    storage = SettingsStorage(tmp_path / "settings.json")
+    loaded = storage.load()
+    # sign_name minted as "Sign<XXX>"; ssid should be "openMarquee<XXX>".
+    assert loaded.sign_name.startswith("Sign")
+    suffix = loaded.sign_name[4:]
+    assert loaded.wifi_ssid == f"openMarquee{suffix}"
 
 
 def test_timezone_accepts_well_formed_iana():
@@ -266,8 +305,14 @@ def test_tailscale_hostname_rejects_spaces():
 
 
 def test_storage_load_returns_defaults_when_file_absent(tmp_path: Path):
+    # sign_name is minted randomly per device and wifi_ssid derives from
+    # it — compare everything else.
     storage = SettingsStorage(tmp_path / "settings.json")
-    assert storage.load() == SystemSettings()
+    loaded = storage.load()
+    skip = {"sign_name", "wifi_ssid"}
+    assert loaded.model_dump(exclude=skip) == SystemSettings(
+        sign_name="ignored"
+    ).model_dump(exclude=skip)
 
 
 def test_storage_save_then_load_roundtrip(tmp_path: Path):

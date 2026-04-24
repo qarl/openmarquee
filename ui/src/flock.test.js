@@ -35,47 +35,54 @@ const PEER = (over = {}) => ({
 });
 
 describe("mountFlock", () => {
-    it("renders one tile per peer + a + New tile", async () => {
-        const container = document.createElement("div");
+    function mount(container, { peers = [], settings = { sign_name: "SignAAA", flock_sync_enabled: true }, ...over } = {}) {
         mountFlock(container, {
-            fetchFlock: async () => ({
-                peers: [PEER(), PEER({ id: "22", address: "b.ts.net" })],
-            }),
+            fetchFlock: async () => ({ peers }),
+            fetchSettings: async () => settings,
             onAdd: vi.fn(),
             onUpdate: vi.fn(),
+            onUpdateSelfSync: vi.fn(),
             onDelete: vi.fn(),
+            ...over,
+        });
+    }
+
+    it("renders self tile first, then one tile per peer + a + New tile", async () => {
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [PEER(), PEER({ id: "22", address: "b.ts.net" })],
         });
         await tick();
-        const peerTiles = container.querySelectorAll(
-            ".flock-tile:not(.flock-tile-new)",
-        );
-        expect(peerTiles).toHaveLength(2);
-        expect(container.querySelector(".flock-tile-new")).toBeTruthy();
+        const tiles = container.querySelectorAll(".flock-tile");
+        // self + 2 peers + new
+        expect(tiles).toHaveLength(4);
+        expect(tiles[0].classList.contains("flock-tile-self")).toBe(true);
+        expect(tiles[tiles.length - 1].classList.contains("flock-tile-new")).toBe(true);
     });
 
-    it("shows an empty-state hint when no peers exist", async () => {
+    it("self tile shows the sign_name from settings", async () => {
         const container = document.createElement("div");
-        mountFlock(container, {
-            fetchFlock: async () => ({ peers: [] }),
-            onAdd: vi.fn(),
-            onUpdate: vi.fn(),
-            onDelete: vi.fn(),
-        });
+        mount(container, { settings: { sign_name: "SignE6B" } });
+        await tick();
+        expect(
+            container.querySelector(".flock-tile-self .flock-tile-name")
+                .textContent,
+        ).toBe("SignE6B");
+    });
+
+    it("shows an empty-state hint when no peer devices exist", async () => {
+        const container = document.createElement("div");
+        mount(container, { peers: [] });
         await tick();
         expect(container.querySelector(".flock-status").textContent).toMatch(
-            /No peers yet/i,
+            /No peer devices yet/i,
         );
     });
 
     it("opens the modal on + New and submits via onAdd", async () => {
         const container = document.createElement("div");
         const onAdd = vi.fn(async () => PEER());
-        mountFlock(container, {
-            fetchFlock: async () => ({ peers: [] }),
-            onAdd,
-            onUpdate: vi.fn(),
-            onDelete: vi.fn(),
-        });
+        mount(container, { peers: [], onAdd });
         await tick();
 
         container.querySelector(".flock-tile-new").click();
@@ -93,14 +100,9 @@ describe("mountFlock", () => {
     it("surfaces add errors inline instead of closing the modal", async () => {
         const container = document.createElement("div");
         const onAdd = vi.fn(async () => {
-            throw new Error("Add peer failed (409): already in flock");
+            throw new Error("already in flock");
         });
-        mountFlock(container, {
-            fetchFlock: async () => ({ peers: [] }),
-            onAdd,
-            onUpdate: vi.fn(),
-            onDelete: vi.fn(),
-        });
+        mount(container, { peers: [], onAdd });
         await tick();
         container.querySelector(".flock-tile-new").click();
         const modal = container.querySelector(".flock-modal");
@@ -118,12 +120,7 @@ describe("mountFlock", () => {
     it("toggling the sync checkbox calls onUpdate", async () => {
         const container = document.createElement("div");
         const onUpdate = vi.fn(async () => PEER({ sync: true }));
-        mountFlock(container, {
-            fetchFlock: async () => ({ peers: [PEER()] }),
-            onAdd: vi.fn(),
-            onUpdate,
-            onDelete: vi.fn(),
-        });
+        mount(container, { peers: [PEER()], onUpdate });
         await tick();
         const checkbox = container.querySelector(".flock-tile-sync-input");
         checkbox.checked = true;
@@ -138,12 +135,7 @@ describe("mountFlock", () => {
     it("clicking × calls onDelete after confirm", async () => {
         const container = document.createElement("div");
         const onDelete = vi.fn(async () => {});
-        mountFlock(container, {
-            fetchFlock: async () => ({ peers: [PEER()] }),
-            onAdd: vi.fn(),
-            onUpdate: vi.fn(),
-            onDelete,
-        });
+        mount(container, { peers: [PEER()], onDelete });
         await tick();
         container.querySelector(".flock-tile-delete").click();
         await tick();
@@ -154,31 +146,100 @@ describe("mountFlock", () => {
 
     it("sync tile gets a synced state class", async () => {
         const container = document.createElement("div");
-        mountFlock(container, {
-            fetchFlock: async () => ({ peers: [PEER({ sync: true })] }),
-            onAdd: vi.fn(),
-            onUpdate: vi.fn(),
-            onDelete: vi.fn(),
+        mount(container, { peers: [PEER({ sync: true })] });
+        await tick();
+        const peerTile = container.querySelector(
+            ".flock-tile:not(.flock-tile-new):not(.flock-tile-self)",
+        );
+        expect(peerTile.classList.contains("flock-tile-synced")).toBe(true);
+    });
+
+    it("Go there link drops into the peer's Flock panel", async () => {
+        const container = document.createElement("div");
+        mount(container, { peers: [PEER({ address: "127.0.0.1:9887" })] });
+        await tick();
+        const link = container.querySelector(".flock-tile-open");
+        expect(link.getAttribute("href")).toBe("http://127.0.0.1:9887/#/flock");
+        expect(link.getAttribute("target")).toBe("_blank");
+        expect(link.textContent.trim()).toMatch(/Go there/);
+    });
+
+    it("self tile reflects flock_sync_enabled and toggling calls onUpdateSelfSync", async () => {
+        const container = document.createElement("div");
+        const onUpdateSelfSync = vi.fn(async () => {});
+        mount(container, {
+            settings: { sign_name: "SignAAA", flock_sync_enabled: false },
+            onUpdateSelfSync,
+        });
+        await tick();
+        const selfTile = container.querySelector(".flock-tile-self");
+        // Disabled state: no "synced" class, checkbox unchecked.
+        expect(selfTile.classList.contains("flock-tile-synced")).toBe(false);
+        const checkbox = selfTile.querySelector(".flock-tile-self-sync-input");
+        expect(checkbox.checked).toBe(false);
+        checkbox.checked = true;
+        checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+        await tick();
+        expect(onUpdateSelfSync).toHaveBeenCalledWith(true);
+    });
+
+    it("self tile is marked synced when flock_sync_enabled is true", async () => {
+        const container = document.createElement("div");
+        mount(container, {
+            settings: { sign_name: "SignAAA", flock_sync_enabled: true },
         });
         await tick();
         expect(
             container
-                .querySelector(".flock-tile:not(.flock-tile-new)")
+                .querySelector(".flock-tile-self")
                 .classList.contains("flock-tile-synced"),
         ).toBe(true);
     });
 
-    it("Open there link points at http://address/", async () => {
-        const container = document.createElement("div");
-        mountFlock(container, {
-            fetchFlock: async () => ({ peers: [PEER({ address: "127.0.0.1:9887" })] }),
-            onAdd: vi.fn(),
-            onUpdate: vi.fn(),
-            onDelete: vi.fn(),
+    it("peer tile thumbnail fetches the peer's current-thumbnail endpoint", async () => {
+        // Refresh switched from <img src=...> to fetch+blob so the demo's
+        // mock-backend can intercept the request — the assertion now
+        // tracks the fetch URL rather than the final blob: src on the img.
+        const seen = [];
+        const fetchSpy = vi.fn(async (url) => {
+            seen.push(String(url));
+            return new Response(new Blob([new Uint8Array(0)], { type: "image/png" }));
         });
-        await tick();
-        const link = container.querySelector(".flock-tile-open");
-        expect(link.getAttribute("href")).toBe("http://127.0.0.1:9887/");
-        expect(link.getAttribute("target")).toBe("_blank");
+        vi.stubGlobal("fetch", fetchSpy);
+        try {
+            const container = document.createElement("div");
+            mount(container, { peers: [PEER({ address: "127.0.0.1:9887" })] });
+            await tick();
+            await tick();
+            expect(
+                seen.some((u) =>
+                    /^http:\/\/127\.0\.0\.1:9887\/api\/playback\/current-thumbnail\?t=\d+/.test(u),
+                ),
+            ).toBe(true);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it("self tile thumbnail fetches same-origin (no http://host prefix)", async () => {
+        const seen = [];
+        const fetchSpy = vi.fn(async (url) => {
+            seen.push(String(url));
+            return new Response(new Blob([new Uint8Array(0)], { type: "image/png" }));
+        });
+        vi.stubGlobal("fetch", fetchSpy);
+        try {
+            const container = document.createElement("div");
+            mount(container);
+            await tick();
+            await tick();
+            // Same-origin path doesn't get a `http://host` prefix —
+            // matches whatever the mock backend / real device serves.
+            expect(
+                seen.some((u) => /^\/api\/playback\/current-thumbnail\?t=\d+/.test(u)),
+            ).toBe(true);
+        } finally {
+            vi.unstubAllGlobals();
+        }
     });
 });

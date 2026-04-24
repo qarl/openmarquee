@@ -55,6 +55,7 @@ class FlockSync:
         tombstone_storage: TombstoneStorage,
         flock_storage: FlockStorage,
         get_self_address: Callable[[], str | None],
+        get_sync_enabled: Callable[[], bool] | None = None,
         timeout_seconds: float = 5.0,
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ):
@@ -62,6 +63,11 @@ class FlockSync:
         self.tombstones = tombstone_storage
         self.flock = flock_storage
         self._get_self_address = get_self_address
+        # Global kill switch (SystemSettings.flock_sync_enabled). When
+        # False: no outbound pushes, no ingest of inbound notifies, no
+        # pull-worker fetches. Defaults to always-on so tests don't
+        # have to wire it explicitly.
+        self._get_sync_enabled = get_sync_enabled or (lambda: True)
         self.timeout = timeout_seconds
         self._client_factory = http_client_factory or (
             lambda: httpx.AsyncClient(timeout=timeout_seconds)
@@ -72,6 +78,8 @@ class FlockSync:
     async def notify_peers(self, content_id: UUID, kind: NotifyKind) -> None:
         """Fire-and-forget push to every sync=True peer. Failures logged,
         never raised — the pull worker recovers dropped pushes."""
+        if not self._get_sync_enabled():
+            return
         peers = [p for p in self.flock.load().peers if p.sync]
         if not peers:
             return
@@ -138,7 +146,10 @@ class FlockSync:
     ) -> None:
         """Apply a push received from a peer. Safe to call concurrently for
         distinct content_ids; behavior under racing pushes of the same id
-        is last-writer-wins by sender-stamped timestamps."""
+        is last-writer-wins by sender-stamped timestamps. Silently drops
+        pushes when the global flock_sync_enabled kill switch is off."""
+        if not self._get_sync_enabled():
+            return
         if kind == "deleted":
             self._ingest_delete(content_id, at)
         elif kind == "updated":
@@ -237,12 +248,81 @@ class FlockSync:
         else:
             self.content.save(item, asset_bytes, updated_at=sender_updated_at)
 
+    # --- sync-flag propagation (symmetric UX) ---
+
+    async def announce_sync_to_peer(self, peer_address: str, sync: bool) -> None:
+        """Tell `peer_address` that THIS device just flipped its sync flag
+        for them. The peer updates its matching entry so the relationship
+        stays visually symmetric across both UIs without waiting for the
+        next pull-worker tick. Best-effort: errors are logged, not raised."""
+        if not self._get_sync_enabled():
+            return
+        sender = self._get_self_address()
+        if sender is None:
+            logger.info(
+                "skipping sync-announce to %s: no reachable self-address yet",
+                peer_address,
+            )
+            return
+        url = f"http://{peer_address}/api/flock/sync-announce"
+        payload = {"sender_address": sender, "sync": bool(sync)}
+        try:
+            async with self._client_factory() as client:
+                r = await client.post(url, json=payload)
+                if r.status_code >= 400:
+                    logger.warning(
+                        "sync-announce → %s returned HTTP %d",
+                        peer_address,
+                        r.status_code,
+                    )
+        except Exception:
+            logger.info("sync-announce to %s failed", peer_address)
+
+    def apply_sync_announcement(self, sender_address: str, sync: bool) -> bool:
+        """Apply an inbound sync-announce: flip our local flock entry for
+        `sender_address` to `sync`. Returns True if a matching peer was
+        found, False otherwise (so the HTTP route can respond 403)."""
+        flock = self.flock.load()
+        peer = flock.find_by_address(sender_address)
+        if peer is None:
+            return False
+        self.flock.update(peer.id, sync=bool(sync))
+        return True
+
+    # --- peer-name probe (fills FlockPeer.name from remote's sign_name) ---
+
+    async def probe_peer_name(self, address: str) -> None:
+        """GET http://address/api/settings and, if it returns a sign_name,
+        write it onto the matching FlockPeer in our flock.json. Best-effort:
+        any exception is logged and swallowed — we'll try again on the
+        next pull round."""
+        flock = self.flock.load()
+        peer = flock.find_by_address(address)
+        if peer is None:
+            return
+        try:
+            async with self._client_factory() as client:
+                r = await client.get(f"http://{address}/api/settings")
+                r.raise_for_status()
+                remote_name = (r.json() or {}).get("sign_name")
+        except Exception:
+            logger.info("probe %s: settings fetch failed", address)
+            return
+        if not remote_name or peer.name == remote_name:
+            return
+        self.flock.update(peer.id, name=remote_name)
+
     # --- periodic pull (reliability backstop) ---
 
     async def pull_from_peer(self, peer_address: str) -> None:
-        """One reconcile round against one peer: fetch manifest, pull any
-        missing/newer content, apply any tombstones we missed. Errors are
-        logged, not raised — the loop keeps running."""
+        """One reconcile round against one peer: refresh the cached
+        sign_name, fetch manifest, pull any missing/newer content, apply
+        any tombstones we missed. Errors are logged, not raised — the
+        loop keeps running. No-op when the global flock_sync_enabled
+        kill switch is off."""
+        if not self._get_sync_enabled():
+            return
+        await self.probe_peer_name(peer_address)
         async with self._client_factory() as client:
             try:
                 manifest_r = await client.get(

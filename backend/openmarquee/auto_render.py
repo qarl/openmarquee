@@ -129,7 +129,7 @@ def compose_auto_frame(
     # sizing across resolution changes. Fall back to absolute px on old
     # slides that haven't been re-saved with the new field.
     if slide.font_size_pct is not None:
-        size_px = max(4, int(round(width * slide.font_size_pct / 100)))
+        size_px = max(4, int(round(height * slide.font_size_pct / 100)))
     else:
         size_px = slide.font_size_px
     font = _load_font(slide.font_family, size_px, height)

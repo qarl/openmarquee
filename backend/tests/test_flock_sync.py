@@ -33,6 +33,7 @@ def _build_sync(
     tmp_path: Path,
     transport: httpx.MockTransport,
     self_address: str = "me.ts.net",
+    enabled: bool = True,
 ) -> tuple[FlockSync, ContentStorage, TombstoneStorage, FlockStorage]:
     content = ContentStorage(tmp_path / "content")
     tombstones = TombstoneStorage(tmp_path / "tombstones.json")
@@ -46,6 +47,7 @@ def _build_sync(
         tombstone_storage=tombstones,
         flock_storage=flock,
         get_self_address=lambda: self_address,
+        get_sync_enabled=lambda: enabled,
         http_client_factory=factory,
     )
     return sync, content, tombstones, flock
@@ -351,6 +353,107 @@ async def test_ingest_update_handles_video_with_separate_mp4_fetch(tmp_path: Pat
     assert any(u.endswith("/video") for u in hits)
 
 
+# --- sync-flag announcement ---
+
+
+@pytest.mark.asyncio
+async def test_announce_sync_to_peer_posts_to_expected_endpoint(tmp_path: Path):
+    calls: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        calls.append((str(request.url), _json.loads(request.content)))
+        return httpx.Response(204)
+
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+    await sync.announce_sync_to_peer("peer.ts.net", True)
+    assert calls == [
+        (
+            "http://peer.ts.net/api/flock/sync-announce",
+            {"sender_address": "me.ts.net", "sync": True},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_announce_sync_skipped_when_sync_disabled(tmp_path: Path):
+    calls: list[httpx.Request] = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(204)
+
+    sync, _, _, _ = _build_sync(
+        tmp_path, httpx.MockTransport(handler), enabled=False
+    )
+    await sync.announce_sync_to_peer("peer.ts.net", True)
+    assert calls == []
+
+
+def test_apply_sync_announcement_flips_matching_peer(tmp_path: Path):
+    sync, _, _, flock = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
+    )
+    peer = flock.add(address="peer.ts.net")
+    assert peer.sync is False
+    ok = sync.apply_sync_announcement("peer.ts.net", True)
+    assert ok is True
+    assert flock.load().find(peer.id).sync is True
+
+
+def test_apply_sync_announcement_rejects_unknown_sender(tmp_path: Path):
+    sync, _, _, _ = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
+    )
+    assert sync.apply_sync_announcement("stranger.ts.net", True) is False
+
+
+# --- peer-name probe ---
+
+
+@pytest.mark.asyncio
+async def test_probe_peer_name_updates_flock_entry(tmp_path: Path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/api/settings"):
+            return httpx.Response(200, json={"sign_name": "Lobby Sign"})
+        return httpx.Response(404)
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    peer = flock.add(address="peer.ts.net")
+    assert peer.name is None
+
+    await sync.probe_peer_name("peer.ts.net")
+    refreshed = flock.load().find(peer.id)
+    assert refreshed.name == "Lobby Sign"
+
+
+@pytest.mark.asyncio
+async def test_probe_peer_name_ignores_unreachable_remote(tmp_path: Path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unreachable")
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    peer = flock.add(address="offline.ts.net")
+    await sync.probe_peer_name("offline.ts.net")  # must not raise
+    assert flock.load().find(peer.id).name is None
+
+
+@pytest.mark.asyncio
+async def test_probe_peer_name_skips_missing_peer(tmp_path: Path):
+    # Nothing should happen (and certainly no HTTP call) if the
+    # address isn't in our flock.
+    hits: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits.append(str(request.url))
+        return httpx.Response(200, json={"sign_name": "X"})
+
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+    await sync.probe_peer_name("stranger.ts.net")
+    assert hits == []
+
+
 # --- periodic pull worker ---
 
 
@@ -452,8 +555,11 @@ async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
     content.save(local, _make_png_bytes(), updated_at=local_ts)
 
     await sync.pull_from_peer("peer.ts.net")
-    # Only the manifest — content + asset NOT fetched.
-    assert all(u.endswith("/api/flock/manifest") for u in fetched)
+    # Only the peer-name probe + the manifest — content + asset NOT fetched.
+    assert all(
+        u.endswith("/api/flock/manifest") or u.endswith("/api/settings")
+        for u in fetched
+    )
     assert content.load(cid).name == "Local wins"
 
 
@@ -512,8 +618,9 @@ async def test_pull_worker_ticks_on_interval_and_stops_cleanly(tmp_path: Path):
     await asyncio.sleep(0.15)
     await worker.stop()
 
-    assert len(ticks) >= 2
-    assert all(u.endswith("/api/flock/manifest") for u in ticks)
+    # Each tick hits /api/settings (name probe) + /api/flock/manifest.
+    manifest_hits = [u for u in ticks if u.endswith("/api/flock/manifest")]
+    assert len(manifest_hits) >= 2
 
 
 @pytest.mark.asyncio
@@ -527,3 +634,48 @@ async def test_pull_worker_double_start_is_noop(tmp_path: Path):
     await worker.start()
     assert worker._task is task1
     await worker.stop()
+
+
+# --- global kill switch (SystemSettings.flock_sync_enabled) ---
+
+
+@pytest.mark.asyncio
+async def test_notify_peers_noops_when_sync_disabled(tmp_path: Path):
+    calls: list[httpx.Request] = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(204)
+
+    sync, _, _, flock = _build_sync(
+        tmp_path, httpx.MockTransport(handler), enabled=False
+    )
+    peer = flock.add(address="peer.ts.net")
+    flock.update(peer.id, sync=True)
+    await sync.notify_peers(uuid4(), "updated")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_push_noops_when_sync_disabled(tmp_path: Path):
+    sync, content, tombstones, _ = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)), enabled=False
+    )
+    await sync.ingest_push(uuid4(), "deleted", "peer.ts.net", _NOW)
+    # No tombstone recorded; ingest should have silently dropped.
+    assert tombstones.list_active() == []
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_noops_when_sync_disabled(tmp_path: Path):
+    hits: list[str] = []
+
+    def handler(request):
+        hits.append(str(request.url))
+        return httpx.Response(200, json={"schema_version": 1, "entries": [], "tombstones": []})
+
+    sync, _, _, _ = _build_sync(
+        tmp_path, httpx.MockTransport(handler), enabled=False
+    )
+    await sync.pull_from_peer("peer.ts.net")
+    assert hits == []

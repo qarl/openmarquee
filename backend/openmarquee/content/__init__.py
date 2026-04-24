@@ -85,7 +85,7 @@ class TextSlide(BaseModel):
 
     # Transition INTO the next slide ("cut" = instant; "fade" = alpha-blend
     # across `transition_ms` after this slide's duration ends).
-    transition: Literal["cut", "fade"] = "cut"
+    transition: Literal["cut", "fade", "wipe", "slide", "iris"] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -133,7 +133,7 @@ class ImageSlide(BaseModel):
     duration_ms: int = Field(default=5000, ge=100)
 
     # Same transition contract as TextSlide.
-    transition: Literal["cut", "fade"] = "cut"
+    transition: Literal["cut", "fade", "wipe", "slide", "iris"] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -166,7 +166,7 @@ class VideoSlide(BaseModel):
 
     # Same transition contract as TextSlide/ImageSlide — applied on the way
     # out, so a cut/fade into the next slide still works across variants.
-    transition: Literal["cut", "fade"] = "cut"
+    transition: Literal["cut", "fade", "wipe", "slide", "iris"] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)

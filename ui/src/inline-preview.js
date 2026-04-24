@@ -180,16 +180,57 @@ export function mountInlinePreview(container, options) {
         if (idx < 0) return;
         const slot = timeline[idx];
         drawSlot(slot);
-        // Cross-fade into the next slot if we're within the fade window.
+        // Transition into the next slot if we're within its window.
+        // The "next slot" wraps modulo timeline length so the last
+        // slide's transition honors its setting when cycling back to
+        // the first — the backend playback loop already wraps, matching
+        // it here keeps preview and device in sync.
         const timeInto = position - slot.startSec;
         const timeLeft = slot.endSec - position;
-        const fadeSec = slot.transition === "fade" ? slot.transition_ms / 1000 : 0;
-        if (fadeSec > 0 && timeLeft < fadeSec && idx < timeline.length - 1) {
-            const alpha = 1 - timeLeft / fadeSec; // 0 → 1 as we near the cut
+        const ANIMATED = new Set(["fade", "wipe", "slide", "iris"]);
+        const fadeSec = ANIMATED.has(slot.transition)
+            ? slot.transition_ms / 1000
+            : 0;
+        if (fadeSec > 0 && timeLeft < fadeSec && timeline.length > 1) {
+            const nextIdx = (idx + 1) % timeline.length;
+            const progress = 1 - timeLeft / fadeSec; // 0 → 1 through window
             const ctx = canvas.getContext("2d");
-            ctx.globalAlpha = alpha;
-            drawSlot(timeline[idx + 1]);
-            ctx.globalAlpha = 1;
+            if (slot.transition === "fade") {
+                ctx.globalAlpha = progress;
+                drawSlot(timeline[nextIdx]);
+                ctx.globalAlpha = 1;
+            } else if (slot.transition === "wipe") {
+                // Wipe left→right — clip to a growing left strip.
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(0, 0, canvas.width * progress, canvas.height);
+                ctx.clip();
+                drawSlot(timeline[nextIdx]);
+                ctx.restore();
+            } else if (slot.transition === "slide") {
+                // Both frames move: from-image shifts left, to-image
+                // enters from the right at the same offset.
+                const ox = canvas.width * progress;
+                ctx.save();
+                ctx.translate(-ox, 0);
+                drawSlot(slot);
+                ctx.restore();
+                ctx.save();
+                ctx.translate(canvas.width - ox, 0);
+                drawSlot(timeline[nextIdx]);
+                ctx.restore();
+            } else if (slot.transition === "iris") {
+                // Circular reveal of next slot from canvas center.
+                const cx = canvas.width / 2;
+                const cy = canvas.height / 2;
+                const maxR = Math.hypot(cx, cy);
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(cx, cy, maxR * progress, 0, Math.PI * 2);
+                ctx.clip();
+                drawSlot(timeline[nextIdx]);
+                ctx.restore();
+            }
         }
         updateAutoOverlay(slot);
         // Silence unused for now.

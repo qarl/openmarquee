@@ -374,7 +374,11 @@ async def list_content(storage: StorageDep, playlist_storage: PlaylistDep) -> li
     Same ordering used by the playback engine — UI list and what plays on the
     sign stay in sync.
     """
-    return list_in_playlist_order(storage, playlist_storage)
+    # UI pallets + bg-picker want the full library — orphans included —
+    # so bundled seed content (backgrounds, demo videos) is visible for
+    # the operator to drag into a playlist. Playback stays strict (see
+    # scheduled_fetch_items) so orphans don't leak onto the sign.
+    return list_in_playlist_order(storage, playlist_storage, include_orphans=True)
 
 
 @router.get("/{item_id}", response_model=ContentItem)

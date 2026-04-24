@@ -62,6 +62,7 @@ def test_put_then_get_round_trip(client: TestClient):
         "tailscale_enabled": False,
         "tailscale_auth_key": None,
         "tailscale_hostname": None,
+        "flock_sync_enabled": True,
     }
     response = client.put("/api/settings", json=payload)
     assert response.status_code == 200

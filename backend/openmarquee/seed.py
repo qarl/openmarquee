@@ -204,12 +204,19 @@ def seed_if_needed(
         # 3. What we auto-append to the default playlist: three text
         #    slides reading "Welcome" → "to" → "openMarquee". A fresh
         #    device plays them in order so the sign isn't a black screen
-        #    until the operator does anything. Backgrounds + videos above
-        #    are available as assets but stay out of the playlist.
-        welcome_slides = _seed_welcome_playlist_slides(storage, width, height)
+        #    until the operator does anything. Each pairs a bundled
+        #    background + a distinct font + transition so the demo
+        #    shows off the editor's range immediately.
+        welcome_slides = _seed_welcome_playlist_slides(
+            storage,
+            width,
+            height,
+            bundled_backgrounds_dir=bg_dir,
+            bundled_bg_slides=bundled,
+        )
         created.extend(welcome_slides)
-        for slide in welcome_slides:
-            playlist.append(slide.id)
+        for slide, spec in zip(welcome_slides, _WELCOME_SPECS):
+            playlist.append(slide.id, transition=spec.transition_out)
 
         playlist_storage.save(playlist)
     except Exception:
@@ -322,14 +329,53 @@ def _seed_bundled_videos(
 
 # --- Welcome playlist ---
 
-# High contrast + warm feel; white on deep teal reads well across panel sizes.
+# Legacy two-color fallback (used when bundled backgrounds aren't present
+# and we can't composite a real image). High contrast + warm feel.
 WELCOME_TEXT_COLOR = "#FFFFFF"
 WELCOME_BG_COLOR = "#0A3D4A"
 
-# Three-slide intro playlist. Each is stored as a TextSlide (not ImageSlide)
-# so the operator can reopen them in the text editor and re-skin without
-# starting from scratch.
-_WELCOME_PLAYLIST_TEXTS: tuple[str, ...] = ("Welcome", "to", "openMarquee")
+
+# Three-slide intro: each slide pairs a bundled background with a
+# distinct font + transition so the demo shows off the editor's range
+# the moment the device boots. Background lookups are by *base name*
+# of the bundled file (chalkboard.png → "Chalkboard"); the seed only
+# wires a slide if the matching background was successfully seeded.
+@dataclass
+class _WelcomeSlideSpec:
+    text: str
+    font_family: str  # matches editor.js FONT_FAMILIES
+    text_color: str
+    background_filename_stem: str  # e.g. "chalkboard"
+    transition_out: str  # transition to play after this slide
+
+
+_WELCOME_SPECS: tuple[_WelcomeSlideSpec, ...] = (
+    _WelcomeSlideSpec(
+        text="Welcome",
+        font_family="Caveat Brush",
+        text_color="#FFFFFF",
+        background_filename_stem="chalkboard",
+        transition_out="fade",
+    ),
+    _WelcomeSlideSpec(
+        text="to",
+        font_family="Sedgwick Ave Display",
+        text_color="#000000",
+        background_filename_stem="brick-wall",
+        transition_out="wipe",
+    ),
+    _WelcomeSlideSpec(
+        text="openMarquee",
+        font_family="Pacifico",
+        # Amber from the marketing site — reads as "neon at night" on midnight bg.
+        text_color="#F5A524",
+        background_filename_stem="midnight",
+        transition_out="iris",
+    ),
+)
+
+
+_WELCOME_PLAYLIST_TEXTS: tuple[str, ...] = tuple(s.text for s in _WELCOME_SPECS)
 
 
 def render_welcome_png(width: int, height: int) -> bytes:
@@ -345,24 +391,38 @@ def render_text_slide_png(
     height: int,
     fg: str = WELCOME_TEXT_COLOR,
     bg: str = WELCOME_BG_COLOR,
+    *,
+    background_image_path: Path | None = None,
+    font_family: str | None = None,
 ) -> bytes:
     """Flatten one centered-text slide to a PNG.
 
-    Mirrors what the UI's text-slide editor does client-side — solid
-    background + centered text — so the device has a ready-to-render
-    PNG the moment the seed finishes. Font auto-shrinks if the text would
-    overflow 90% of the canvas width (e.g. "openMarquee" at small panels).
+    Mirrors what the UI's text-slide editor does client-side — background
+    (solid color OR cover-fit image) + centered text — so the device has
+    a ready-to-render PNG the moment the seed finishes. Font auto-shrinks
+    if the text would overflow 90% of the canvas width (e.g. "openMarquee"
+    at small panels).
+
+    `background_image_path` overrides `bg` when provided. `font_family`
+    looks up a bundled TTF from `_BUNDLED_FONT_FILES` (matches the UI
+    editor's named families); falls back to DejaVu Sans when None or
+    the family isn't bundled.
     """
-    img = Image.new("RGB", (width, height), bg)
+    if background_image_path is not None and background_image_path.exists():
+        with Image.open(background_image_path) as src:
+            img = _cover_fit(src.convert("RGB"), width, height)
+    else:
+        img = Image.new("RGB", (width, height), bg)
+
     draw = ImageDraw.Draw(img)
     font_size_px = max(12, int(height * 0.4))
-    font = _load_bold_font(font_size_px)
+    font = _load_text_font(font_family, font_size_px)
     while font_size_px > 12:
         bbox = draw.textbbox((0, 0), text, font=font)
         if bbox[2] - bbox[0] <= width * 0.9:
             break
         font_size_px -= 4
-        font = _load_bold_font(font_size_px)
+        font = _load_text_font(font_family, font_size_px)
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     draw.text(
@@ -376,9 +436,39 @@ def render_text_slide_png(
     return buf.getvalue()
 
 
-def _load_bold_font(size_px: int):
-    # PIL's default truetype lookup is unreliable across install paths;
-    # fall back to the bitmap default when no scalable face is available.
+def _cover_fit(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Scale + center-crop `image` to exactly (target_w, target_h)."""
+    src_w, src_h = image.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w = max(1, round(src_w * scale))
+    new_h = max(1, round(src_h * scale))
+    resized = image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h))
+
+
+def _load_text_font(family: str | None, size_px: int):
+    """Load a bundled @font-face TTF when `family` matches an entry in
+    `auto_render._BUNDLED_FONT_FILES`; otherwise the historical bold
+    fallback (DejaVuSans-Bold → Arial Bold → bitmap)."""
+    if family:
+        try:
+            from openmarquee.auto_render import (
+                _BUNDLED_FONT_FILES,
+                _bundled_fonts_dir,
+            )
+
+            bundled_name = _BUNDLED_FONT_FILES.get(family)
+            if bundled_name:
+                path = _bundled_fonts_dir() / bundled_name
+                if path.exists():
+                    try:
+                        return ImageFont.truetype(str(path), size_px)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
     try:
         return ImageFont.truetype("DejaVuSans-Bold.ttf", size_px)
     except OSError:
@@ -389,21 +479,54 @@ def _load_bold_font(size_px: int):
 
 
 def _seed_welcome_playlist_slides(
-    storage: ContentStorage, width: int, height: int
+    storage: ContentStorage,
+    width: int,
+    height: int,
+    bundled_backgrounds_dir: Path | None = None,
+    bundled_bg_slides: list[ImageSlide] | None = None,
 ) -> list[TextSlide]:
-    """Create the three 'Welcome' / 'to' / 'openMarquee' text slides that
-    the default playlist plays in order on a fresh device."""
+    """Create the three intro text slides for the default playlist.
+
+    Each spec in `_WELCOME_SPECS` pairs a font, color, and bundled
+    background. When the matching background is present we composite it
+    into the rasterized PNG AND wire the TextSlide's
+    `background_image_slide_id` to the seeded ImageSlide so the operator
+    can re-edit without losing the background. Falls back to a solid
+    color when the bundled asset is missing.
+    """
+    bg_dir = bundled_backgrounds_dir or _default_bundled_backgrounds_dir()
+    # Bundled image slides are named "<Title> — Background" — index by
+    # the same filename stem each spec references for an O(1) lookup.
+    bg_slides_by_stem: dict[str, ImageSlide] = {}
+    for slide in bundled_bg_slides or ():
+        for cand in bg_dir.iterdir() if bg_dir.is_dir() else ():
+            if _name_from_filename(cand.stem) == slide.name:
+                bg_slides_by_stem[cand.stem] = slide
+                break
+
     slides: list[TextSlide] = []
     font_size_px = max(12, int(height * 0.4))
-    for text in _WELCOME_PLAYLIST_TEXTS:
-        png = render_text_slide_png(text, width, height)
+    for spec in _WELCOME_SPECS:
+        bg_path = bg_dir / f"{spec.background_filename_stem}.png"
+        bg_image_slide = bg_slides_by_stem.get(spec.background_filename_stem)
+        png = render_text_slide_png(
+            spec.text,
+            width,
+            height,
+            fg=spec.text_color,
+            bg=WELCOME_BG_COLOR,
+            background_image_path=bg_path if bg_path.exists() else None,
+            font_family=spec.font_family,
+        )
         slide = TextSlide(
-            name=text,
-            text=text,
-            text_color=WELCOME_TEXT_COLOR,
+            name=spec.text,
+            text=spec.text,
+            text_color=spec.text_color,
             background_color=WELCOME_BG_COLOR,
+            font_family=spec.font_family,
             font_size_px=font_size_px,
             duration_ms=3000,
+            background_image_slide_id=bg_image_slide.id if bg_image_slide else None,
         )
         storage.save_text_slide(slide, png)
         slides.append(slide)

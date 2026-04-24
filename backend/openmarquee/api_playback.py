@@ -15,15 +15,24 @@ poke for the normal flow — that endpoint stays around for one-off tests.
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from openmarquee.dependencies import get_playback_loop
+from openmarquee.content.storage import ContentStorage
+from openmarquee.dependencies import (
+    get_content_storage,
+    get_playback_loop,
+    get_playlist_storage,
+)
 from openmarquee.playback import PlaybackLoop
+from openmarquee.playlist import PlaylistStorage
 
 router = APIRouter(prefix="/api/playback", tags=["playback"])
 
 LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
+ContentDep = Annotated[ContentStorage, Depends(get_content_storage)]
+PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
 
 
 class PlaybackState(BaseModel):
@@ -58,6 +67,60 @@ async def get_state(loop: LoopDep) -> PlaybackState:
         current_item_auto_mode=loop.current_item_auto_mode,
         current_item_auto_format=loop.current_item_auto_format,
         current_playlist_name=loop.current_playlist_name,
+    )
+
+
+@router.get(
+    "/current-thumbnail",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"image/png": {}}},
+        204: {"description": "Nothing is currently playing."},
+        404: {"description": "Playlist's first item has no asset on disk."},
+    },
+)
+async def get_current_thumbnail(
+    loop: LoopDep, content: ContentDep, playlists: PlaylistDep
+) -> Response:
+    """Cover art for the playlist this device is currently playing —
+    the first item of that playlist's asset, matching the playlist
+    browser's convention (one stable visual per playlist).
+
+    Drives the Flock panel's tile thumbnails. Using the current
+    PLAYLIST's first slide (not the currently-displaying slide) keeps
+    the tile visually stable as long as the same playlist is on — it
+    only flips when the playlist itself changes (schedule rule kicks
+    in, operator switches). Returns 204 when nothing is playing or
+    the current playlist is empty.
+    """
+    if loop.current_item_id is None:
+        # Nothing on screen → idle.
+        return Response(status_code=204)
+
+    name = loop.current_playlist_name
+    first_id: UUID | None = None
+    if name:
+        playlist = playlists.get_playlist(name)
+        ids = playlist.item_ids
+        if ids:
+            first_id = ids[0]
+    # Fall back to the slide on screen so the tile never goes blank
+    # during a race between a rename/delete and the next playback tick.
+    if first_id is None:
+        first_id = loop.current_item_id
+
+    path = content.asset_path(first_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"no asset for {first_id}")
+    # No-store so the browser's <img> with ?t=<ms> cachebust works; CORS
+    # wildcard so one device's UI can pull this from a peer's backend.
+    return FileResponse(
+        path,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
 

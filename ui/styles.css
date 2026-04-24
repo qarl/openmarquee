@@ -58,6 +58,23 @@ header h1 {
     letter-spacing: 0.02em;
 }
 
+.brand-sign-name {
+    display: inline;
+    margin-left: 0.5rem;
+    color: var(--accent);
+    font-weight: 500;
+}
+
+.brand-sign-name:empty {
+    display: none;
+}
+
+.brand-sign-name::before {
+    content: "— ";
+    color: var(--muted);
+    font-weight: 400;
+}
+
 .shell {
     display: flex;
     align-items: stretch;
@@ -213,6 +230,14 @@ main {
 .playlist-browser-tile {
     flex: 0 0 auto;
     width: 7rem;
+    /* Match heights across the strip — the action <button> stretches to
+       whatever the tallest sibling needs (thumb + name + meta), so the
+       "+ New" tile no longer reads as a stub. */
+    display: flex;
+    flex-direction: column;
+}
+.playlist-browser-tile-action {
+    flex: 1 1 auto;
 }
 .playlist-browser-tile-action {
     display: flex;
@@ -859,6 +884,15 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 .slide-browser-tile {
     position: relative;
+    /* Grid stretches the LI to the row's natural height, but the inner
+       <button> wouldn't fill it on its own — so the "+ New" action
+       reads visibly shorter than its siblings (thumb + name). Become a
+       column flex so the action child can stretch to match. */
+    display: flex;
+    flex-direction: column;
+}
+.slide-browser-tile-action {
+    flex: 1 1 auto;
 }
 /* Delete × in the top-right of a browser tile — same hover-to-reveal
    pattern as the pallet's edit/delete affordances. */
@@ -939,8 +973,10 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     text-align: center;
 }
 .slide-browser-tile--new .slide-browser-tile-action {
+    /* Drop aspect-ratio so the dashed tile takes the same height as its
+       sibling tiles (thumb + name). Center the +/label inside the
+       full-height box. */
     justify-content: center;
-    aspect-ratio: 1 / 1;
     border-style: dashed;
     font-weight: 600;
 }
@@ -1001,13 +1037,31 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     padding: 0.55rem 0.7rem;
     font: inherit;
     width: 100%;
+    /* Safari-specific: in a column flex container, `width: 100%` on a
+       textarea doesn't always resolve against the parent's inner width
+       the way Chromium does — the placeholder render box can end up
+       clipped at the textarea's intrinsic cols-based width. `fill-
+       available` asks the browser to stretch to the computed parent
+       inner width, which Safari honors reliably. */
+    width: -webkit-fill-available;
+    width: stretch;
+    min-width: 0;
 }
 
 .field-duration-wrap {
     flex: 0 1 7rem;
 }
 
-.field textarea { resize: vertical; min-height: 4em; }
+/* `display: block` trumps the UA's inline-block default — Safari was
+   honoring the intrinsic cols-based width for placeholder layout even
+   with `width: 100%` set, causing the placeholder to visibly clip after
+   a switch-then-new flow. Block display forces the textarea to size
+   from its container rather than from its cols attribute. */
+.field textarea {
+    display: block;
+    resize: vertical;
+    min-height: 4em;
+}
 
 .field input[type="text"]:focus,
 .field textarea:focus {
@@ -1596,18 +1650,19 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 
 .flock-tiles {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
-    gap: 0.75rem;
+    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+    gap: 0.85rem;
 }
 
 .flock-tile {
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
     background: var(--panel);
     border: 1px solid var(--panel-border);
     border-radius: 0.5rem;
-    padding: 0.75rem;
+    padding: 0.6rem;
     color: var(--text);
     font: inherit;
     text-align: left;
@@ -1618,9 +1673,58 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     border-color: var(--accent);
 }
 
+/* Synced state is the same visual regardless of self-vs-peer — one
+   "I'm part of the flock" signal the eye can scan across tiles. */
 .flock-tile-synced {
-    border-color: var(--success);
-    box-shadow: 0 0 0 1px var(--success) inset;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.flock-tile-self {
+    /* Self tile always gets the accent border (even when sync is off) so
+       the "you are here" marker stays visible. */
+    border-color: var(--accent);
+}
+
+.flock-tile-thumb-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #05050a;
+    border-radius: 0.3rem;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.flock-tile-thumb {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+    opacity: 0;
+    transition: opacity 180ms ease;
+}
+
+.flock-tile-thumb.is-loaded {
+    opacity: 1;
+}
+
+.flock-tile-thumb-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 0.8rem;
+    pointer-events: none;
+    transition: opacity 180ms ease;
+}
+
+.flock-tile-thumb-empty.is-hidden {
+    opacity: 0;
 }
 
 .flock-tile-body {
@@ -1683,27 +1787,44 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     text-decoration: underline;
 }
 
+/* Match the pallet-tile × for visual consistency: round, top-right,
+   hidden until hover/focus of the tile, red on hover. */
 .flock-tile-delete {
-    background: transparent;
-    border: 1px solid var(--panel-border);
-    color: var(--muted);
-    border-radius: 0.3rem;
-    width: 1.6rem;
-    height: 1.6rem;
+    position: absolute;
+    top: 0.35rem;
+    right: 0.4rem;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 1.4rem;
+    height: 1.4rem;
+    font-size: 0.9rem;
     line-height: 1;
+    padding: 0;
     cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 2;
+}
+
+.flock-tile:hover .flock-tile-delete,
+.flock-tile:focus-within .flock-tile-delete {
+    opacity: 1;
 }
 
 .flock-tile-delete:hover {
-    border-color: var(--danger);
-    color: var(--danger);
+    background: var(--danger);
+    color: #1a1a1d;
 }
 
 .flock-tile-new {
     align-items: center;
     justify-content: center;
     text-align: center;
-    min-height: 8rem;
+    /* No min-height — the grid stretches every tile to the tallest
+       sibling so "+ New" matches the peer tiles' overall footprint
+       (thumbnail + body + controls) instead of looking like a stub. */
     cursor: pointer;
     border-style: dashed;
     color: var(--muted);

@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from openmarquee.content.storage import ContentStorage
@@ -123,21 +123,41 @@ async def get_manifest(
 
 
 @router.post("", response_model=FlockPeer, status_code=201)
-async def add_peer(body: AddPeerBody, storage: FlockDep) -> FlockPeer:
+async def add_peer(
+    body: AddPeerBody,
+    storage: FlockDep,
+    sync: FlockSyncDep,
+    background: BackgroundTasks,
+) -> FlockPeer:
     try:
-        return storage.add(address=body.address)
+        peer = storage.add(address=body.address)
     except ValueError as exc:
         # Duplicate address — 409 Conflict reads better than 400 here.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # Fire-and-forget probe of the new peer's /api/settings so the tile's
+    # display name switches from the raw address to the configured
+    # sign_name within a second or two of the add.
+    background.add_task(sync.probe_peer_name, peer.address)
+    return peer
 
 
 @router.patch("/{peer_id}", response_model=FlockPeer)
 async def update_peer(
-    peer_id: UUID, body: UpdatePeerBody, storage: FlockDep
+    peer_id: UUID,
+    body: UpdatePeerBody,
+    storage: FlockDep,
+    sync: FlockSyncDep,
+    background: BackgroundTasks,
 ) -> FlockPeer:
     peer = storage.update(peer_id, sync=body.sync, name=body.name)
     if peer is None:
         raise HTTPException(status_code=404, detail=f"no peer {str(peer_id)!r}")
+    # Mirror a sync-flag flip back to the peer so their UI reflects the
+    # change without waiting for the next pull-worker tick.
+    if body.sync is not None:
+        background.add_task(
+            sync.announce_sync_to_peer, peer.address, bool(body.sync)
+        )
     return peer
 
 
@@ -169,6 +189,41 @@ class NotifyBody(BaseModel):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+
+class SyncAnnounceBody(BaseModel):
+    """Wire format for POST /api/flock/sync-announce — a peer is telling
+    us they flipped their sync flag for us, and we should mirror it."""
+
+    sender_address: str = Field(
+        min_length=1,
+        max_length=253,
+        pattern=FLOCK_ADDRESS_PATTERN.pattern,
+    )
+    sync: bool
+
+    @field_validator("sender_address", mode="before")
+    @classmethod
+    def _normalize_sender(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+@router.post("/sync-announce", status_code=204)
+async def receive_sync_announce(
+    body: SyncAnnounceBody, sync: FlockSyncDep
+) -> None:
+    """A peer flipped their sync flag for us — mirror it on our side so
+    both UIs agree without waiting for a pull round. Only accepted from
+    addresses that are already in our flock (same allowlist model as
+    /notify)."""
+    ok = sync.apply_sync_announcement(body.sender_address, body.sync)
+    if not ok:
+        raise HTTPException(
+            status_code=403,
+            detail=f"peer {body.sender_address!r} is not in this device's flock",
+        )
 
 
 @router.post("/notify", status_code=204)

@@ -382,7 +382,9 @@ function bindTrackRemoveButtons(trackEl, markDirty) {
             const block = chip.closest(".track-block");
             if (!block) return;
             const current = block.dataset.transition || "cut";
-            const next = current === "cut" ? "fade" : "cut";
+            // cut → fade → wipe → slide → iris → cut ...
+            const order = ["cut", "fade", "wipe", "slide", "iris"];
+            const next = order[(order.indexOf(current) + 1) % order.length];
             block.dataset.transition = next;
             chip.textContent = next;
             markDirty();

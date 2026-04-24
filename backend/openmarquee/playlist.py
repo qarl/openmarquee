@@ -67,7 +67,7 @@ class PlaylistItem(BaseModel):
     """
 
     item_id: UUID
-    transition: Literal["cut", "fade"] = "cut"
+    transition: Literal["cut", "fade", "wipe", "slide", "iris"] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
 
@@ -101,7 +101,7 @@ class Playlist(BaseModel):
     def append(
         self,
         item_id: UUID,
-        transition: Literal["cut", "fade"] = "cut",
+        transition: Literal["cut", "fade", "wipe", "slide", "iris"] = "cut",
         transition_ms: int = 500,
     ) -> None:
         """Add an id to the end if it isn't already present. Default
@@ -265,21 +265,24 @@ def list_in_playlist_order(
     content_storage: "ContentStorage",
     playlist_storage: PlaylistStorage,
     playlist_name: str = DEFAULT_PLAYLIST_NAME,
+    *,
+    include_orphans: bool = False,
 ) -> list["ContentItem"]:
-    """Return content items ordered by the named playlist.
+    """Return content items, playlist order first.
 
-    Items present in the playlist appear first, in playlist order. Items in
-    storage but missing from the playlist (orphans — uploaded before this
-    feature, or not yet appended) are appended at the end sorted by id ONLY
-    if the named playlist is the default. For non-default playlists, only
-    the explicitly-included items appear; users curate those by hand.
+    Default (`include_orphans=False`) returns STRICTLY the items in
+    the named playlist — what the playback loop iterates, so bundled
+    library assets (seed backgrounds, demo videos) don't leak onto
+    the sign unless explicitly added to a playlist.
 
-    Items in the playlist that no longer exist in storage are silently
-    skipped.
+    With `include_orphans=True`, items present in storage but not
+    referenced by ANY playlist are appended at the end (sorted by id).
+    That's what the UI pallets + the text-editor's background picker
+    want — the library view shows everything the device has stored,
+    not just what's currently scheduled to play.
 
-    This is the single canonical "what items, in what order" function for
-    both the saved-slides list view (default playlist) and the playback
-    engine (whichever playlist the schedule selected).
+    Items referenced by the playlist but missing from storage are
+    silently skipped.
     """
     items_by_id = {item.id: item for item in content_storage.list_all()}
     collection = playlist_storage.load_all()
@@ -305,9 +308,7 @@ def list_in_playlist_order(
             )
             used.add(p_item.item_id)
 
-    if playlist_name == DEFAULT_PLAYLIST_NAME:
-        # Append true orphans — items in storage but referenced by NO
-        # playlist. Items in named playlists belong to those, not to default.
+    if include_orphans:
         all_referenced: set[UUID] = set()
         for p in collection.playlists.values():
             all_referenced.update(p.item_ids)

@@ -341,6 +341,57 @@ async def test_fade_transition_emits_blended_frames(renderer):
 
 
 @pytest.mark.asyncio
+async def test_fade_transition_wraps_from_last_to_first(renderer):
+    """Regression: the LAST slide's transition must honor its setting —
+    a fade on the last slide should fade into the first slide on wrap,
+    not cut. qarl saw the wrap always do a cut."""
+    slide_a, png_a = _make_slide("a", (255, 0, 0))
+    slide_b, png_b = _make_slide("b", (0, 0, 255))
+    # Both slides fade so we can observe the B→A wrap as well as A→B.
+    slide_a = slide_a.model_copy(
+        update={"transition": "fade", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(
+        update={"transition": "fade", "transition_ms": 200, "duration_ms": 100}
+    )
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i])
+    await loop.start()
+    # A + fade + B + fade + A + fade + B ≈ 1200ms; give slack to catch
+    # the B→A wrap fade.
+    await asyncio.sleep(1.0)
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (renderer.width * renderer.height)
+    pure_blue = bytes((0, 0, 255)) * (renderer.width * renderer.height)
+
+    # Group consecutive intermediate-frame runs to detect fade-shaped
+    # transitions. Each fade should produce a run of intermediates
+    # sandwiched between pure-A and pure-B (or vice versa). If the
+    # wrap was a hard cut, there'd be one or zero intermediate runs.
+    runs = []
+    cur = []
+    for f in rendered:
+        if f == pure_red or f == pure_blue:
+            if cur:
+                runs.append(cur)
+                cur = []
+        else:
+            cur.append(f)
+    if cur:
+        runs.append(cur)
+
+    # Expect at least TWO distinct fade runs within one cycle (A→B and B→A).
+    assert len(runs) >= 2, (
+        f"expected both A→B and B→A fades to produce intermediate frames; "
+        f"got {len(runs)} run(s)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_single_item_playlist_with_fade_skips_fade(renderer):
     """Fade requires a different next slide. With one item, next == current
     so the fade is a waste — make sure we skip it instead of doing pointless work."""
