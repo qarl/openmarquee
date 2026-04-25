@@ -39,148 +39,164 @@ const ROTATION_OPTIONS = [
     { value: 270, label: "270° clockwise" },
 ];
 
+// Eyebrow row used at the top of each settings card. Mirrors the
+// Claude Design "DISPLAY / NETWORK / TAILSCALE / TIME" pattern —
+// uppercase mono micro-label, ~10px, faded color.
+const CARD_EYEBROW = `style="font-family: var(--om-mono); font-size: 10.5px; letter-spacing: 0.14em; color: var(--om-text-fade); text-transform: uppercase; margin-bottom: 12px; display: block;"`;
+
 const SECTION_TEMPLATE = `
     <section class="settings">
         <div class="om-page-head">
             <div>
-                <span class="om-eyebrow" data-field="now">Device time · <span data-field="now-value">—</span></span>
+                <span class="om-eyebrow" data-field="now">Device · <span data-field="now-value">—</span></span>
                 <h1>Settings</h1>
                 <p>Output mode, network, sync. Changes save to the device's SD card immediately.</p>
             </div>
         </div>
 
-        <form class="settings-form" autocomplete="off">
-            <div class="row">
-                <label class="field">
-                    <span>Sign name</span>
-                    <input type="text" class="field-sign-name" maxlength="64" required>
-                </label>
-                <label class="field">
-                    <span>Output mode</span>
-                    <select class="field-output-mode"></select>
-                </label>
-            </div>
+        <form class="settings-form om-stack" autocomplete="off" style="gap: 14px;">
 
-            <div class="row">
-                <label class="field">
-                    <span>Display width (px)</span>
-                    <input type="number" class="field-display-width" min="1" max="4096" step="1" required>
-                </label>
-                <label class="field">
-                    <span>Display height (px)</span>
-                    <input type="number" class="field-display-height" min="1" max="4096" step="1" required>
-                </label>
-                <label class="field">
-                    <span>Rotation</span>
-                    <select class="field-display-rotation"></select>
-                </label>
-            </div>
-            <button type="button" class="settings-detect-dims field-hint-btn">
-                Detect from device
-            </button>
-            <p class="field-hint settings-detect-status" role="status"></p>
-
-            <div class="row">
-                <label class="field">
-                    <span>Brightness (0-100)</span>
-                    <input type="number" class="field-brightness" min="0" max="100" step="1" required>
-                </label>
-                <label class="field">
-                    <span>Gamma</span>
-                    <input type="number" class="field-gamma" min="0.1" max="3.0" step="0.1" required>
-                </label>
-            </div>
-
-            <label class="field settings-ws281x-pixel-order-wrap" hidden>
-                <span>Addressable strip ordering</span>
-                <select class="field-ws281x-pixel-order">
-                    <option value="row_major">Row-major (wired raster-order)</option>
-                    <option value="serpentine">Serpentine (rows alternate direction)</option>
-                </select>
-            </label>
-
-            <fieldset class="settings-wifi-ap">
-                <legend>
-                    <label class="field-inline">
-                        <input type="checkbox" class="field-wifi-ap-enabled" checked>
-                        Access point (captive-portal network phones join during setup)
+            <div class="om-card">
+                <div ${CARD_EYEBROW}>Display</div>
+                <div class="om-stack" style="gap: 12px;">
+                    <label class="field om-field">
+                        <span>Sign name</span>
+                        <input type="text" class="om-input field-sign-name" maxlength="64" required>
                     </label>
-                </legend>
-                <div class="row">
-                    <label class="field">
-                        <span>AP SSID</span>
-                        <input type="text" class="field-wifi-ssid" maxlength="32">
+                    <label class="field om-field">
+                        <span>Output mode</span>
+                        <select class="om-select field-output-mode"></select>
                     </label>
-                    <label class="field">
-                        <span>AP password (8-63 chars)</span>
-                        <input type="password" class="field-wifi-password" minlength="8" maxlength="63">
-                    </label>
-                </div>
-            </fieldset>
-
-            <fieldset class="settings-wifi-station">
-                <legend>
-                    <label class="field-inline">
-                        <input type="checkbox" class="field-wifi-station-enabled">
-                        Join existing WiFi
-                    </label>
-                </legend>
-                <div class="row">
-                    <label class="field">
-                        <span>WiFi SSID</span>
-                        <select class="field-wifi-station-ssid-picker">
-                            <option value="__other__">(type manually)</option>
-                        </select>
-                        <input type="text" class="field-wifi-station-ssid" maxlength="32" placeholder="SSID">
-                    </label>
-                    <label class="field">
-                        <span>WiFi password (8-63 chars)</span>
-                        <input type="password" class="field-wifi-station-password" minlength="8" maxlength="63">
-                    </label>
-                </div>
-                <button type="button" class="settings-wifi-rescan field-hint-btn">
-                    Rescan nearby networks
-                </button>
-                <p class="field-hint">
-                    Runs concurrently with the access point on the Pi's single
-                    radio; both modes share the same channel. Disabling both
-                    modes isn't allowed — the device would be unreachable.
-                </p>
-
-                <fieldset class="settings-tailscale">
-                    <legend>
-                        <label class="field-inline">
-                            <input type="checkbox" class="field-tailscale-enabled">
-                            Tailscale
+                    <div class="row" style="gap: 10px;">
+                        <label class="field om-field" style="flex: 1;">
+                            <span>Width (px)</span>
+                            <input type="number" class="om-input field-display-width" min="1" max="4096" step="1" required>
                         </label>
-                    </legend>
-                    <p class="settings-hint">
-                        Bring the device up on your tailnet so you can reach
-                        this UI from anywhere. Requires internet at
-                        install-time (secondary WiFi or Ethernet).
-                    </p>
-                    <div class="row">
-                        <label class="field">
-                            <span>Hostname on tailnet (optional)</span>
-                            <input type="text" class="field-tailscale-hostname" maxlength="63" placeholder="e.g. lobby-sign-01">
+                        <label class="field om-field" style="flex: 1;">
+                            <span>Height (px)</span>
+                            <input type="number" class="om-input field-display-height" min="1" max="4096" step="1" required>
                         </label>
-                        <label class="field">
-                            <span>Auth key (tskey-auth-… or tskey-client-…)</span>
-                            <input type="password" class="field-tailscale-auth-key" placeholder="paste from Tailscale admin">
+                        <label class="field om-field" style="flex: 1;">
+                            <span>Rotation</span>
+                            <select class="om-select field-display-rotation"></select>
                         </label>
                     </div>
-                </fieldset>
-            </fieldset>
+                    <div>
+                        <button type="button" class="om-btn ghost sm settings-detect-dims field-hint-btn">
+                            Detect from device
+                        </button>
+                        <p class="field-hint settings-detect-status" role="status" style="margin: 6px 0 0;"></p>
+                    </div>
+                    <div class="row" style="gap: 10px;">
+                        <label class="field om-field" style="flex: 1;">
+                            <span>Brightness (0-100)</span>
+                            <input type="number" class="om-input field-brightness" min="0" max="100" step="1" required>
+                        </label>
+                        <label class="field om-field" style="flex: 1;">
+                            <span>Gamma</span>
+                            <input type="number" class="om-input field-gamma" min="0.1" max="3.0" step="0.1" required>
+                        </label>
+                    </div>
+                    <label class="field om-field settings-ws281x-pixel-order-wrap" hidden>
+                        <span>Addressable strip ordering</span>
+                        <select class="om-select field-ws281x-pixel-order">
+                            <option value="row_major">Row-major (wired raster-order)</option>
+                            <option value="serpentine">Serpentine (rows alternate direction)</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
 
-            <label class="field">
-                <span>Timezone</span>
-                <select class="field-timezone">
-                    <option value="">Device local (no explicit timezone)</option>
-                </select>
-            </label>
+            <div class="om-card">
+                <div ${CARD_EYEBROW}>Network</div>
+                <div class="om-stack" style="gap: 14px;">
+                    <fieldset class="settings-wifi-ap">
+                        <legend>
+                            <label class="field-inline">
+                                <input type="checkbox" class="field-wifi-ap-enabled" checked>
+                                Access point (captive-portal network phones join during setup)
+                            </label>
+                        </legend>
+                        <div class="row" style="gap: 10px;">
+                            <label class="field om-field" style="flex: 1;">
+                                <span>AP SSID</span>
+                                <input type="text" class="om-input field-wifi-ssid" maxlength="32">
+                            </label>
+                            <label class="field om-field" style="flex: 1;">
+                                <span>AP password (8-63 chars)</span>
+                                <input type="password" class="om-input field-wifi-password" minlength="8" maxlength="63">
+                            </label>
+                        </div>
+                    </fieldset>
 
-            <button type="submit" class="primary settings-save">Save settings</button>
-            <p class="settings-status" role="status" aria-live="polite"></p>
+                    <fieldset class="settings-wifi-station">
+                        <legend>
+                            <label class="field-inline">
+                                <input type="checkbox" class="field-wifi-station-enabled">
+                                Join existing WiFi
+                            </label>
+                        </legend>
+                        <div class="row" style="gap: 10px;">
+                            <label class="field om-field" style="flex: 1;">
+                                <span>WiFi SSID</span>
+                                <select class="om-select field-wifi-station-ssid-picker">
+                                    <option value="__other__">(type manually)</option>
+                                </select>
+                                <input type="text" class="om-input field-wifi-station-ssid" maxlength="32" placeholder="SSID">
+                            </label>
+                            <label class="field om-field" style="flex: 1;">
+                                <span>WiFi password (8-63 chars)</span>
+                                <input type="password" class="om-input field-wifi-station-password" minlength="8" maxlength="63">
+                            </label>
+                        </div>
+                        <button type="button" class="om-btn ghost sm settings-wifi-rescan field-hint-btn">
+                            Rescan nearby networks
+                        </button>
+                        <p class="field-hint" style="margin: 6px 0 0;">
+                            Runs concurrently with the access point on the Pi's single
+                            radio; both modes share the same channel. Disabling both
+                            modes isn't allowed — the device would be unreachable.
+                        </p>
+
+                        <fieldset class="settings-tailscale">
+                            <legend>
+                                <label class="field-inline">
+                                    <input type="checkbox" class="field-tailscale-enabled">
+                                    Tailscale
+                                </label>
+                            </legend>
+                            <p class="settings-hint">
+                                Bring the device up on your tailnet so you can reach
+                                this UI from anywhere. Requires internet at
+                                install-time (secondary WiFi or Ethernet).
+                            </p>
+                            <div class="row" style="gap: 10px;">
+                                <label class="field om-field" style="flex: 1;">
+                                    <span>Hostname on tailnet (optional)</span>
+                                    <input type="text" class="om-input field-tailscale-hostname" maxlength="63" placeholder="e.g. lobby-sign-01">
+                                </label>
+                                <label class="field om-field" style="flex: 1;">
+                                    <span>Auth key (tskey-auth-… or tskey-client-…)</span>
+                                    <input type="password" class="om-input field-tailscale-auth-key" placeholder="paste from Tailscale admin">
+                                </label>
+                            </div>
+                        </fieldset>
+                    </fieldset>
+                </div>
+            </div>
+
+            <div class="om-card">
+                <div ${CARD_EYEBROW}>Time</div>
+                <label class="field om-field">
+                    <span>Timezone</span>
+                    <select class="om-select field-timezone">
+                        <option value="">Device local (no explicit timezone)</option>
+                    </select>
+                </label>
+            </div>
+
+            <button type="submit" class="om-btn primary settings-save" style="width: 100%; height: 46px; font-size: 14.5px;">Save settings</button>
+            <p class="settings-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
         </form>
     </section>
 `;

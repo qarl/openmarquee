@@ -142,13 +142,13 @@ header h1 {
     padding-left: calc(1.5rem - 2px);
 }
 
-main {
-    flex: 1 1 auto;
-    padding: 1rem 1.25rem;
-    max-width: 720px;
-    margin: 0 auto;
-    min-width: 0;
-}
+/* Legacy `main` rule retired: it set max-width: 720px + margin: 0 auto,
+   which collided with the new `.om-main` shell from the Claude Design
+   redesign. The om-* shell handles its own sizing via flex: 1 +
+   min-width: 0; this bare-element rule was capping the main column to
+   720px even on wide screens AND (combined with the auto-margins)
+   forcing it to render at the cap width on narrow viewports, cropping
+   the playlist track + Save button on the right. */
 
 .panel { display: block; }
 .panel[hidden] { display: none; }
@@ -393,27 +393,36 @@ main {
     text-align: right;
 }
 
+/* Legacy .playlist-track-scroll wrapper styling — superseded by the
+   .om-card.om-card-tight wrapper the template now uses. The class
+   stays on the element (handlers + tests reference it) but no
+   intrinsic styling here anymore. */
 .playlist-track-scroll {
-    overflow-x: auto;
-    padding: 0.5rem;
-    background: rgba(0, 0, 0, 0.15);
-    border: 1px dashed var(--panel-border);
-    border-radius: 0.5rem;
+    /* min-width: 0 so the card can shrink with its flex parent
+       instead of growing to fit min-content of the widest block. */
+    min-width: 0;
 }
 
+/* Playlist track — vertical stack of horizontal blocks (Claude Design
+   "vertical" variant). Each block is a row: grip · thumb · meta · big
+   duration numeral · remove ×. Replaces the earlier horizontal-tiles
+   layout. Existing JS query selectors (.track-block, .track-remove,
+   .track-block-duration, .track-block-transition) are preserved so
+   handlers + tests don't change. */
 .playlist-track-list {
     list-style: none;
     margin: 0;
     padding: 0;
     display: flex;
-    flex-direction: row;
-    gap: 0.5rem;
+    flex-direction: column;
+    gap: 8px;
     min-height: 7rem;
+    position: relative;
 }
 
 .playlist-track-list:empty::before {
     content: attr(data-empty-hint);
-    color: var(--muted);
+    color: var(--om-text-fade, var(--muted));
     font-size: 0.85rem;
     font-style: italic;
     padding: 2rem 1rem;
@@ -423,24 +432,62 @@ main {
 }
 
 .track-block {
-    flex: 0 0 auto;
-    width: 6.5rem;
     display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 0.4rem;
-    padding: 0.3rem;
+    align-items: stretch;
+    background: var(--om-surface, var(--panel));
+    border: 1px solid var(--om-line, var(--panel-border));
+    border-radius: var(--om-radius, 0.5rem);
+    overflow: hidden;
+    position: relative;
+    user-select: none;
+    -webkit-user-select: none;
     cursor: grab;
+    /* Without min-width:0, the row's min-content width (grip + thumb +
+       dur + meta natural-content) can push past the scroll container,
+       cropping the right edge. min-width:0 lets the meta column shrink
+       and ellipsis the title instead. */
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+    transition: transform .18s cubic-bezier(.2,.7,.3,1),
+                box-shadow .12s, border-color .12s;
 }
 .track-block:active { cursor: grabbing; }
+.track-block:hover { border-color: var(--om-line-2, var(--panel-border)); }
+
+/* Sortable's drag clone gets a glow + accent border so the operator
+   sees clearly which block is moving. */
+.track-block.sortable-chosen {
+    border-color: var(--om-accent);
+    box-shadow: 0 16px 36px rgba(0,0,0,.4),
+                0 0 0 1px var(--om-accent),
+                0 0 24px var(--om-accent-glow, rgba(255,184,77,.4));
+}
+
+.track-grip {
+    width: 28px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--om-text-fade);
+    background: var(--om-surface-2, rgba(255,255,255,0.03));
+    border-right: 1px solid var(--om-line);
+    flex-shrink: 0;
+    cursor: grab;
+}
+.track-grip-dots {
+    font-size: 14px;
+    line-height: 1;
+    letter-spacing: -2px;
+    transform: rotate(0deg);
+}
 
 .track-block-thumb-wrap {
     position: relative;
-    aspect-ratio: var(--device-aspect, 4 / 3);
-    background: #000;
-    border-radius: 0.25rem;
+    width: 70px;
+    aspect-ratio: 2/1;
+    flex-shrink: 0;
+    background: var(--om-led-bg, #000);
+    margin: 8px 0 8px 8px;
+    border-radius: 6px;
     overflow: hidden;
 }
 .track-block-thumb {
@@ -449,71 +496,98 @@ main {
     object-fit: cover;
     image-rendering: pixelated;
 }
+
+.track-block-meta {
+    flex: 1; min-width: 0;
+    padding: 10px 12px;
+    display: flex; flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+}
+.track-block-name {
+    font-size: 13.5px; font-weight: 600;
+    color: var(--om-text, var(--text));
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.track-block-sub {
+    font-family: var(--om-mono);
+    font-size: 11px;
+    color: var(--om-text-fade);
+    letter-spacing: 0.04em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Big duration numeral on the right — accent color, click anywhere to
+   prompt for a new value. The whole cell is the button. */
+.track-block-dur {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 0 14px;
+    border-left: 1px dashed var(--om-line);
+    min-width: 64px;
+    background: transparent;
+    border-top: 0; border-right: 0; border-bottom: 0;
+    cursor: pointer;
+    font-family: var(--om-display);
+    color: inherit;
+}
+.track-block-dur:hover { background: rgba(255,255,255,0.03); }
+.track-block-num {
+    font-size: 20px; font-weight: 700;
+    color: var(--om-accent);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+}
+.track-block-unit {
+    font-size: 9.5px; letter-spacing: 0.14em;
+    color: var(--om-text-fade); text-transform: uppercase;
+    margin-top: 2px;
+}
+
+/* Transition chip lives inside the meta column under the title. */
+.track-block-transition {
+    align-self: flex-start;
+    font-size: 10.5px;
+    font-family: var(--om-mono);
+    background: var(--om-surface-2, rgba(255,255,255,0.04));
+    color: var(--om-text-dim);
+    border: 1px solid var(--om-line);
+    border-radius: 999px;
+    padding: 1px 8px;
+    cursor: pointer;
+    line-height: 1.4;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+}
+.track-block-transition:hover {
+    border-color: var(--om-accent);
+    color: var(--om-text);
+}
+
+/* Remove × — top-right corner, always visible (unlike the old
+   thumb-overlay design, this one's outside the thumb). */
 .track-remove {
     position: absolute;
-    top: 2px;
-    right: 2px;
-    background: rgba(0, 0, 0, 0.6);
+    top: 6px; right: 6px;
+    background: rgba(0,0,0,0.55);
     color: #fff;
     border: none;
     border-radius: 50%;
-    width: 1.25rem;
-    height: 1.25rem;
-    font-size: 0.85rem;
+    width: 22px; height: 22px;
+    font-size: 14px;
     line-height: 1;
     padding: 0;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
+    z-index: 2;
+    opacity: 0;
+    transition: opacity .15s ease;
 }
-.track-remove:hover { background: var(--danger); }
-
-.track-block-name {
-    font-size: 0.75rem;
-    font-weight: 600;
-    color: var(--text);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.track-block-meta {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.35rem;
-}
-.track-block-duration {
-    font-size: 0.7rem;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-    background: var(--bg);
-    border: 1px solid var(--panel-border);
-    border-radius: 999px;
-    padding: 0.05rem 0.45rem;
-    cursor: pointer;
-    line-height: 1.3;
-    font-family: inherit;
-}
-.track-block-duration:hover {
-    border-color: var(--accent);
-    color: var(--text);
-}
-.track-block-transition {
-    font-size: 0.65rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    background: var(--bg);
-    color: var(--muted);
-    border: 1px solid var(--panel-border);
-    border-radius: 999px;
-    padding: 0.05rem 0.45rem;
-    cursor: pointer;
-    line-height: 1.3;
-}
-.track-block-transition:hover {
-    border-color: var(--accent);
-    color: var(--text);
-}
+.track-block:hover .track-remove,
+.track-block:focus-within .track-remove { opacity: 1; }
+.track-remove:hover { background: var(--om-danger, #e85a45); }
 
 .track-ghost { opacity: 0.4; background: var(--accent); }
 
@@ -526,29 +600,60 @@ main {
     text-transform: uppercase;
 }
 
+/* Pallet drawer — Claude Design: horizontally scrolling row with
+   snap-x cards, sits below the track. Each card is 110px wide with
+   a 2:1 thumbnail above a name bar. */
+.om-pallet {
+    border: 1px solid var(--om-line);
+    border-radius: var(--om-radius-lg, 0.6rem);
+    background: var(--om-surface);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+}
+.om-pallet-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px var(--om-pad);
+    border-bottom: 1px solid var(--om-line);
+}
+.om-pallet-head h3 {
+    margin: 0;
+    font-family: var(--om-display);
+    font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--om-text-dim);
+    font-weight: 500;
+}
+
 .playlist-pallet {
     list-style: none;
-    padding: 0.5rem;
     margin: 0;
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
-    gap: 0.5rem;
-    background: rgba(0, 0, 0, 0.08);
-    border-radius: 0.5rem;
+    padding: 10px var(--om-pad);
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
 }
 
 .pallet-tile {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 0.35rem;
-    padding: 0.25rem;
+    flex-shrink: 0;
+    width: 110px;
+    scroll-snap-align: start;
+    background: var(--om-surface-2, var(--panel));
+    border: 1px solid var(--om-line, var(--panel-border));
+    border-radius: 8px;
+    overflow: hidden;
     cursor: grab;
     position: relative;
+    display: flex; flex-direction: column;
 }
 .pallet-tile:active { cursor: grabbing; }
+.pallet-tile:hover { border-color: var(--om-line-2, var(--panel-border)); }
+
+.pallet-tile-thumb-wrap {
+    position: relative;
+    aspect-ratio: 2/1;
+    background: var(--om-led-bg, #000);
+    overflow: hidden;
+}
 
 /* Mode-locked tiles: video stored for a different output_mode than the
    device's current mode — renders a warning badge + dims the thumbnail
@@ -577,16 +682,17 @@ main {
 
 .pallet-tile-thumb {
     width: 100%;
-    aspect-ratio: var(--device-aspect, 4 / 3);
+    height: 100%;
     object-fit: cover;
-    background: #000;
-    border-radius: 0.25rem;
     image-rendering: pixelated;
+    display: block;
 }
 
 .pallet-tile-name {
-    font-size: 0.7rem;
-    color: var(--text);
+    padding: 5px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--om-text, var(--text));
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3063,17 +3169,24 @@ html, body { margin: 0; padding: 0; height: 100%; }
     padding: 8px 8px 24px;
 }
 
-/* ─── Phone-width adjustments ───────────────────────────
-   Below 560px, multi-column form rows stack to one column,
-   topbar drops the breadcrumb + status pills (sign name +
-   hamburger remain — full title is in the page-head h1
-   under the topbar). Compact pallet tiles too. */
-@media (max-width: 560px) {
-    .row { flex-wrap: wrap; }
-    .row > .field { flex: 1 1 100%; min-width: 100%; }
+/* ─── Mobile/tablet adjustments ──────────────────────────
+   Below 760px (matches the sidebar-hide breakpoint), the topbar
+   drops the breadcrumb + status pills (sign name + hamburger
+   remain — full title is in the page-head h1 under the topbar).
+   Otherwise the broadcasting + peer pills push the topbar wider
+   than the narrowed viewport, dragging .om-main with them and
+   cropping the playlist track + form rows on the right edge.
+
+   Below 560px, multi-column form rows also stack to one column. */
+@media (max-width: 760px) {
     .om-topbar .om-divider,
     .om-topbar [data-section-title],
     .om-topbar .om-pill { display: none; }
     .om-topbar [data-peer-pill] { display: inline-flex; flex-shrink: 0; }
-    .playlist-pallet { grid-template-columns: repeat(auto-fill, minmax(4.5rem, 1fr)); }
+    /* Pallet cards shrink so at least 2 are visible without scroll. */
+    .pallet-tile { width: 96px; }
+}
+@media (max-width: 560px) {
+    .row { flex-wrap: wrap; }
+    .row > .field { flex: 1 1 100%; min-width: 100%; }
 }

@@ -63,10 +63,13 @@ describe("mountPlaylistTrack", () => {
         });
         await tick();
 
+        // The duration cell now renders as a big numeral + small "SEC"
+        // unit (Claude Design vertical-track variant). Pull just the
+        // numeral via .track-block-num so the assertion stays readable.
         const durations = Array.from(
-            container.querySelectorAll(".track-block-duration"),
+            container.querySelectorAll(".track-block-dur .track-block-num"),
         ).map((el) => el.textContent);
-        expect(durations).toEqual(["5s", "3s", "10s"]);
+        expect(durations).toEqual(["5", "3", "10"]);
     });
 
     it("clicking × removes the block and PUTs the new order as canonical entries", async () => {
@@ -266,9 +269,9 @@ describe("mountPlaylistTrack", () => {
             '.playlist-track-list .track-block[data-id="b"]',
         );
         expect(blockB).not.toBeNull();
-        expect(blockB.querySelector(".track-block-duration").textContent).toBe(
-            "3s",
-        );
+        expect(
+            blockB.querySelector(".track-block-num").textContent,
+        ).toBe("3");
     });
 
     it("skips stale ids (playlist references an item no longer in storage)", async () => {

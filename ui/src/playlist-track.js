@@ -25,7 +25,7 @@ const TEMPLATE = `
     <section class="playlist-track">
         <div class="om-page-head">
             <div>
-                <span class="om-eyebrow">Loops · drag to reorder</span>
+                <span class="om-eyebrow" data-playlist-stats>Loops · drag to reorder</span>
                 <h1>Playlists</h1>
                 <p>Drag blocks to reorder. Drop slides from the pallet at the bottom. The current loop runs end-to-end on the device.</p>
             </div>
@@ -44,12 +44,16 @@ const TEMPLATE = `
             </p>
         </div>
 
-        <div class="playlist-track-scroll" role="region" aria-label="playlist timeline">
+        <div class="om-card om-card-tight playlist-track-scroll" role="region" aria-label="playlist timeline" style="padding: 12px;">
             <ul class="playlist-track-list" role="list" data-empty-hint="Drag slides from the pallet below to build your playlist."></ul>
         </div>
 
-        <div class="om-eyebrow" style="margin: 18px 0 8px; font-family: var(--om-mono); letter-spacing: 0.14em; font-size: 10.5px; color: var(--om-text-fade); text-transform: uppercase;">Pallet · all slides</div>
-        <ul class="playlist-pallet" role="list"></ul>
+        <div class="om-pallet" style="margin-top: 14px;">
+            <div class="om-pallet-head">
+                <h3>Pallet · saved slides</h3>
+            </div>
+            <ul class="playlist-pallet om-pallet-row" role="list"></ul>
+        </div>
 
         <button type="button" class="om-btn primary playlist-save" disabled style="width: 100%; height: 46px; font-size: 14.5px; margin-top: 14px;">Save playlist</button>
         <p class="playlist-track-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
@@ -284,6 +288,19 @@ export function mountPlaylistTrack(container, options) {
                 () => refreshVersion,
             );
             palletSortable = bindPalletSortable(palletEl);
+
+            // Eyebrow stats: total playlists, then this loop's block count + duration.
+            const statsEl = container.querySelector("[data-playlist-stats]");
+            if (statsEl) {
+                const playlistCount = Object.keys(collection.playlists || {}).length;
+                const blockCount = defaultEntries.length;
+                const loopMs = defaultEntries.reduce((acc, entry) => {
+                    const it = itemById.get(entry.item_id);
+                    return acc + (Number(it?.duration_ms) || 5000);
+                }, 0);
+                const loopSec = Math.round(loopMs / 1000);
+                statsEl.textContent = `${playlistCount} playlist${playlistCount === 1 ? "" : "s"} · this loop ${blockCount} block${blockCount === 1 ? "" : "s"} · ${loopSec}s`;
+            }
         } catch (err) {
             statusEl.textContent = `Could not load playlist: ${err.message}`;
         }
@@ -380,9 +397,9 @@ function bindTrackRemoveButtons(trackEl, markDirty) {
             markDirty();
         });
     }
-    // Transition chip: cycles cut ↔ fade on click. Source of truth is
-    // the block's dataset so collectTrackEntries picks up the value at
-    // Save time.
+    // Transition chip: cycles cut → fade → wipe → slide → iris on click.
+    // Source of truth is the block's dataset so collectTrackEntries picks
+    // up the value at Save time.
     for (const chip of trackEl.querySelectorAll(".track-block-transition")) {
         if (chip.dataset.bound === "1") continue;
         chip.dataset.bound = "1";
@@ -445,28 +462,38 @@ function renderTrackBlock(
     li.dataset.transitionMs = String(entry.transition_ms);
 
     const safeName = escapeHtml(item.name || "Untitled");
+    const safeType = escapeHtml((item.type || "").toUpperCase() || "—");
     const seconds = (Number(item.duration_ms) || 5000) / 1000;
-    const durationLabel = `${
-        Number.isInteger(seconds) ? seconds : seconds.toFixed(1)
-    }s`;
+    // Big numeral on the right, "SEC" small below — split label so we can
+    // typeset them separately. Click anywhere on the dur cell to edit.
+    const durationLabel = Number.isInteger(seconds)
+        ? String(seconds)
+        : seconds.toFixed(1);
     const lockedBadge = locked
         ? `<span class="track-block-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
         : "";
     li.innerHTML = `
+        <div class="track-grip" aria-hidden="true">
+            <span class="track-grip-dots">⋮⋮</span>
+        </div>
         <div class="track-block-thumb-wrap">
             <img class="track-block-thumb" alt=""
                  src="/api/content/${item.id}/asset?v=${cacheBust}">
             ${lockedBadge}
-            <button type="button" class="track-remove" aria-label="Remove from playlist" title="Remove from playlist">×</button>
         </div>
-        <div class="track-block-name">${safeName}</div>
         <div class="track-block-meta">
-            <button type="button" class="track-block-duration"
-                    title="Click to change this slide's duration"
-                    data-duration-ms="${Number(item.duration_ms) || 5000}">${durationLabel}</button>
+            <b class="track-block-name">${safeName}</b>
+            <span class="track-block-sub">${safeType} · #${String(item.id).slice(0, 6)}</span>
             <button type="button" class="track-block-transition"
-                    title="Click to cycle transition (cut ↔ fade)">${entry.transition}</button>
+                    title="Click to cycle transition (cut → fade → wipe → slide → iris)">${entry.transition}</button>
         </div>
+        <button type="button" class="track-block-duration track-block-dur"
+                title="Click to change this slide's duration"
+                data-duration-ms="${Number(item.duration_ms) || 5000}">
+            <span class="track-block-num">${durationLabel}</span>
+            <span class="track-block-unit">SEC</span>
+        </button>
+        <button type="button" class="track-remove" aria-label="Remove from playlist" title="Remove from playlist">×</button>
     `;
     return li;
 }
@@ -483,20 +510,19 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
     const lockedBadge = locked
         ? `<span class="pallet-tile-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
         : "";
-    // Every slide type has an "edit" affordance — clicking the ✎ opens
-    // the appropriate subpage's editor in edit-existing mode (main.js
-    // routes by `item.type`). For image + video, the editor's file
-    // picker stays optional — metadata-only updates don't force a
-    // re-upload.
+    // Pallet cards: thumbnail on top (2:1 aspect, snap target) + name
+    // bar below. Edit/delete buttons stay hover-revealed in the corners.
     li.innerHTML = `
-        <img class="pallet-tile-thumb" alt="" draggable="false"
-             src="/api/content/${item.id}/asset?v=${cacheBust}">
+        <div class="pallet-tile-thumb-wrap">
+            <img class="pallet-tile-thumb" alt="" draggable="false"
+                 src="/api/content/${item.id}/asset?v=${cacheBust}">
+            <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>
+            ${lockedBadge}
+            <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
+            <button type="button" class="pallet-tile-delete"
+                    aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
+        </div>
         <div class="pallet-tile-name" title="${safeName}">${safeName}</div>
-        <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>
-        ${lockedBadge}
-        <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
-        <button type="button" class="pallet-tile-delete"
-                aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
     `;
     li.querySelector(".pallet-tile-edit").addEventListener("click", (event) => {
         // Bubble a custom event so main.js (which owns the editors +
