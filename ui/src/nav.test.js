@@ -3,12 +3,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mountNav } from "./nav.js";
 
 const SECTIONS = ["slides", "playlists", "schedule", "settings"];
-const HIERARCHICAL = [
-    "slides/text",
-    "slides/image",
-    "playlists",
-    "settings",
-];
 
 function buildShell() {
     document.body.innerHTML = `
@@ -33,28 +27,6 @@ function buildShell() {
     };
 }
 
-function buildHierShell() {
-    document.body.innerHTML = `
-        <nav class="sidebar">
-            <ul class="nav-list">
-                <li><a class="nav-link nav-child" href="#/slides/text" data-section="slides/text">Text</a></li>
-                <li><a class="nav-link nav-child" href="#/slides/image" data-section="slides/image">Image</a></li>
-                <li><a class="nav-link" href="#/playlists" data-section="playlists">Playlists</a></li>
-                <li><a class="nav-link" href="#/settings" data-section="settings">Settings</a></li>
-            </ul>
-        </nav>
-        <main id="app">
-            <section data-section="slides/text">text</section>
-            <section data-section="slides/image">image</section>
-            <section data-section="playlists">p</section>
-            <section data-section="settings">s</section>
-        </main>
-    `;
-    return {
-        main: document.getElementById("app"),
-        sidebar: document.querySelector(".sidebar"),
-    };
-}
 
 beforeEach(() => {
     history.replaceState(null, "", "/");
@@ -127,28 +99,29 @@ describe("mountNav", () => {
         expect(slidesLink.getAttribute("aria-current")).toBeNull();
     });
 
-    // --- hierarchical section names (slides/text etc.) ---
+    // --- prefix-walk fallback (deep links like #/slides/text resolve to
+    //     the parent `slides` section so the section can own its own
+    //     internal sub-routing) ---
 
-    it("routes hierarchical sections via the full slash-separated name", () => {
+    it("resolves a deep-link URL to the parent section by walking up slashes", () => {
         history.replaceState(null, "", "#/slides/image");
-        const shell = buildHierShell();
-        mountNav({
-            ...shell,
-            sections: HIERARCHICAL,
-            defaultSection: "slides/text",
-        });
+        const shell = buildShell();
+        mountNav({ ...shell, sections: SECTIONS });
         const main = document.getElementById("app");
-        expect(main.querySelector('[data-section="slides/image"]').hidden).toBe(false);
-        expect(main.querySelector('[data-section="slides/text"]').hidden).toBe(true);
+        expect(main.querySelector('[data-section="slides"]').hidden).toBe(false);
+        expect(main.querySelector('[data-section="playlists"]').hidden).toBe(true);
+        // Sidebar parent link is highlighted, not a (nonexistent) child link.
+        const slidesLink = document.querySelector(
+            '.nav-link[data-section="slides"]',
+        );
+        expect(slidesLink.classList.contains("active")).toBe(true);
     });
 
-    it("canonicalizes a bare URL to the provided defaultSection", () => {
-        const shell = buildHierShell();
-        mountNav({
-            ...shell,
-            sections: HIERARCHICAL,
-            defaultSection: "slides/text",
-        });
-        expect(window.location.hash).toBe("#/slides/text");
+    it("walks multiple slash levels to find a registered ancestor", () => {
+        history.replaceState(null, "", "#/slides/text/font/bitmap");
+        const shell = buildShell();
+        mountNav({ ...shell, sections: SECTIONS });
+        const main = document.getElementById("app");
+        expect(main.querySelector('[data-section="slides"]').hidden).toBe(false);
     });
 });

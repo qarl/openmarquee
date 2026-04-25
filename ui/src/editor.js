@@ -88,13 +88,6 @@ function presetButtonsHtml() {
 
 const EDITOR_TEMPLATE = `
     <div class="editor">
-        <div class="om-page-head">
-            <div>
-                <span class="om-eyebrow">Library · Text</span>
-                <h1>Text Slides</h1>
-                <p>Build a slide. Pick a font, drop in a background, save. Saves write straight to the SD card.</p>
-            </div>
-        </div>
         <div class="slide-browser-slot"></div>
         <div class="preview-wrap">
             <canvas class="editor-canvas" aria-label="slide preview"></canvas>

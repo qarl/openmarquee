@@ -42,7 +42,16 @@ export function mountNav({ main, sidebar, sections, defaultSection }) {
 
     function parseHash() {
         const raw = (window.location.hash || "").replace(/^#\/?/, "");
-        return validSections.has(raw) ? raw : fallback;
+        if (validSections.has(raw)) return raw;
+        // Walk up the slash hierarchy so deep-link URLs like `#/slides/text`
+        // still resolve to the parent section (`slides`) when the section
+        // owns its own internal sub-routing (e.g. the slides shell's tabs).
+        let cursor = raw;
+        while (cursor.includes("/")) {
+            cursor = cursor.slice(0, cursor.lastIndexOf("/"));
+            if (validSections.has(cursor)) return cursor;
+        }
+        return fallback;
     }
 
     function show(name) {

@@ -8,13 +8,6 @@ import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 const TEMPLATE = `
     <section class="image-upload">
-        <div class="om-page-head">
-            <div>
-                <span class="om-eyebrow">Library · Image</span>
-                <h1>Image Slides</h1>
-                <p>Upload a PNG or JPG. The device keeps the original; playback cover-fits to the panel at slide entry.</p>
-            </div>
-        </div>
         <div class="slide-browser-slot"></div>
         <div class="preview-wrap">
             <canvas class="image-upload-canvas" aria-label="image preview"></canvas>

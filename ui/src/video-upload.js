@@ -13,13 +13,6 @@
 
 const TEMPLATE = `
     <section class="video-upload">
-        <div class="om-page-head">
-            <div>
-                <span class="om-eyebrow">Library · Video</span>
-                <h1>Video Slides</h1>
-                <p>Pick a video. Your phone transcodes to H.264 MP4 (capped at 1080p) before upload — the device just plays.</p>
-            </div>
-        </div>
         <div class="slide-browser-slot"></div>
         <div class="preview-wrap">
             <video class="video-upload-video" playsinline controls muted

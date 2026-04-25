@@ -1,10 +1,11 @@
 // openMarquee web UI — entry point.
 //
-// Six panels (slides/text, slides/image, slides/video, playlists,
-// schedule, settings) mount into a sidebar shell. Sidebar nav
-// (`nav.js`) toggles the active panel's `hidden` attribute; panels
-// stay mounted so their state (scroll, in-progress edits, polling
-// loops) survives navigation clicks.
+// Five panels (slides, playlists, flock, schedule, settings) mount into
+// a sidebar shell. Sidebar nav (`nav.js`) toggles the active panel's
+// `hidden` attribute; panels stay mounted so their state (scroll,
+// in-progress edits, polling loops) survives navigation clicks. The
+// `slides` panel is itself a tabbed shell hosting text / image / video
+// child panels — see slides.js.
 //
 // Panel dimensions come from /api/settings at boot AND whenever the
 // Settings page emits an `openmarquee:settings-updated` event — the
@@ -56,6 +57,7 @@ import { mountFlock } from "./flock.js";
 import { Icons } from "./icons.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
+import { mountSlidesShell } from "./slides.js";
 import { mountVideoUploader } from "./video-upload.js";
 
 // Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
@@ -65,15 +67,13 @@ const FALLBACK_WIDTH = 128;
 const FALLBACK_HEIGHT = 96;
 
 const SECTIONS = [
-    "slides/text",
-    "slides/image",
-    "slides/video",
+    "slides",
     "playlists",
     "flock",
     "schedule",
     "settings",
 ];
-const DEFAULT_SECTION = "slides/text";
+const DEFAULT_SECTION = "slides";
 
 async function resolvePanelDims() {
     try {
@@ -166,14 +166,17 @@ async function boot() {
     }
 
     root.innerHTML = `
-        <section data-section="slides/text" class="panel">
-            <div class="editor-slot"></div>
-        </section>
-        <section data-section="slides/image" class="panel">
-            <div class="image-upload-slot"></div>
-        </section>
-        <section data-section="slides/video" class="panel">
-            <div class="video-upload-slot"></div>
+        <section data-section="slides" class="panel">
+            <div class="slides-shell-slot"></div>
+            <div class="tab-pane" data-tab="text">
+                <div class="editor-slot"></div>
+            </div>
+            <div class="tab-pane" data-tab="image" hidden>
+                <div class="image-upload-slot"></div>
+            </div>
+            <div class="tab-pane" data-tab="video" hidden>
+                <div class="video-upload-slot"></div>
+            </div>
         </section>
         <section data-section="playlists" class="panel">
             <div class="playlist-track-slot"></div>
@@ -207,6 +210,11 @@ async function boot() {
     let currentPlaylistName = "default";
     let playlistBrowserHandle = null;
 
+    // Slides shell — sub-tab switcher + +New button. Mounted once; the
+    // child editor / image / video panels mount into the .tab-pane slots
+    // separately (and re-mount on dim change without disturbing the shell).
+    let slidesShell = null;
+
     // Forward *all* args so both onSave(payload) and the two-arg
     // onSaveExisting(id, payload) work through the same wrapper. The
     // older single-arg signature dropped `payload` on edit calls, which
@@ -220,6 +228,8 @@ async function boot() {
         await editor?.refreshBrowser?.();
         await imageUploader?.refreshBrowser?.();
         await videoUploader?.refreshBrowser?.();
+        // Slides shell tab counts.
+        await slidesShell?.refreshCounts?.();
         // The inline preview also caches the playlist; refresh it so
         // a newly-added slide shows up mid-session.
         await inlinePreviewHandle?.refresh?.();
@@ -376,6 +386,23 @@ async function boot() {
     // Initial mount.
     mountDimensionedPanels(await resolvePanelDims());
 
+    // Slides shell — wraps the 3 child panels under one nav entry. Mounts
+    // once: child panels live in stable .tab-pane slots that survive a
+    // dim-change re-mount.
+    const slidesSection = root.querySelector('[data-section="slides"]');
+    slidesShell = mountSlidesShell(
+        root.querySelector(".slides-shell-slot"),
+        {
+            fetchItems: listContent,
+            tabPanesHost: slidesSection,
+            onAddNew: (tabKey) => {
+                if (tabKey === "text") editor?.reset?.();
+                else if (tabKey === "image") imageUploader?.reset?.();
+                else if (tabKey === "video") videoUploader?.reset?.();
+            },
+        },
+    );
+
     // Schedule + settings don't depend on dims, so they mount once.
     mountSchedule(root.querySelector(".schedule-slot"), {
         fetchSchedule: getSchedule,
@@ -469,7 +496,12 @@ async function boot() {
     // Topbar breadcrumb: read the current route and convert to a label.
     // Updates on every hashchange via the existing nav so the title
     // tracks what the operator is looking at.
+    // The `slides/*` keys still live here on purpose: we read the *raw*
+    // hash (not the nav-resolved section), so deep-link URLs like
+    // `#/slides/image` produce a tab-specific breadcrumb even though
+    // they resolve to the parent `slides` section in nav.js.
     const SECTION_TITLES = {
+        slides: "Slides",
         "slides/text": "Text slides",
         "slides/image": "Image slides",
         "slides/video": "Video slides",
@@ -482,7 +514,7 @@ async function boot() {
         const slot = document.querySelector("[data-section-title]");
         if (!slot) return;
         const hash = (window.location.hash || "").replace(/^#\/?/, "");
-        slot.textContent = SECTION_TITLES[hash] || SECTION_TITLES["slides/text"];
+        slot.textContent = SECTION_TITLES[hash] || SECTION_TITLES.slides;
     }
     window.addEventListener("hashchange", refreshSectionTitle);
     refreshSectionTitle();
@@ -619,7 +651,10 @@ async function boot() {
     // when an operator clicks the ✎ affordance on a pallet tile. We
     // route by the slide's type to the right subpage + uploader /
     // editor. The route table closes over the mutable handles above
-    // so it keeps working after a re-mount.
+    // so it keeps working after a re-mount. The `slides/*` URL form
+    // is intentional: nav.js prefix-walks it to the parent `slides`
+    // section, AND the slides shell's hashchange listener picks the
+    // correct tab from the same URL — one mutation, both effects.
     const EDIT_ROUTES = {
         text_slide: {
             section: "slides/text",
