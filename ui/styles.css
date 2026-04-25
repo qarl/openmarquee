@@ -287,21 +287,6 @@ header h1 {
     font-size: 0.7rem;
     color: var(--muted);
 }
-.playlist-browser-tile--new .playlist-browser-tile-action {
-    border-style: dashed;
-    font-weight: 600;
-}
-.playlist-browser-tile-plus {
-    font-size: 1.3rem;
-    line-height: 1;
-    color: var(--accent);
-}
-.playlist-browser-tile-label {
-    font-size: 0.75rem;
-    color: var(--muted);
-    letter-spacing: 0.04em;
-}
-
 /* --- inline preview (Playlists panel client-side simulator) --- */
 .inline-preview {
     display: flex;
@@ -1078,25 +1063,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     text-overflow: ellipsis;
     text-align: center;
 }
-.slide-browser-tile--new .slide-browser-tile-action {
-    /* Drop aspect-ratio so the dashed tile takes the same height as its
-       sibling tiles (thumb + name). Center the +/label inside the
-       full-height box. */
-    justify-content: center;
-    border-style: dashed;
-    font-weight: 600;
-}
-.slide-browser-tile-plus {
-    font-size: 1.4rem;
-    line-height: 1;
-    color: var(--accent);
-}
-.slide-browser-tile-new-label {
-    font-size: 0.75rem;
-    color: var(--muted);
-    letter-spacing: 0.04em;
-}
-
 .editor-canvas {
     /* Aspect ratio is set inline by the mount fn so it matches the
        device's configured display dims. The CSS var is a fallback for

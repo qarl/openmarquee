@@ -31,20 +31,18 @@ const TEMPLATE = `
                 <h1>Playlists</h1>
                 <p>Drag blocks to reorder. Drop slides from the pallet at the bottom. The current loop runs end-to-end on the device.</p>
             </div>
+            <div class="om-page-head-actions">
+                <button type="button" class="om-btn primary playlist-new-btn">+ New playlist</button>
+            </div>
         </div>
         <div class="playlist-browser-slot"></div>
-        <div class="playlist-track-inline-preview"></div>
         <div class="om-card" style="margin-bottom: 12px;">
             <label class="om-field">
                 <span>Playlist name</span>
                 <input type="text" class="om-input field-playlist-name" maxlength="64" pattern="[a-z0-9_-]+">
             </label>
-            <p style="margin: 10px 0 0; color: var(--om-text-dim); font-size: 12.5px;">
-                Drag blocks to reorder; drag from the pallet below to add;
-                × to remove. Click the duration to change it. Changes save
-                automatically.
-            </p>
         </div>
+        <div class="playlist-track-inline-preview"></div>
 
         <div class="om-card om-card-tight playlist-track-scroll" role="region" aria-label="playlist timeline" style="padding: 12px;">
             <ul class="playlist-track-list" role="list" data-empty-hint="Drag slides from the pallet below to build your playlist."></ul>
@@ -95,6 +93,9 @@ export function mountPlaylistTrack(container, options) {
         // unsaved state — otherwise the preview lags the operator's
         // edits by one Save click.
         onDraftChange,
+        // + New playlist button (page-head). Optional — falls back to a
+        // no-op so callers that don't want the affordance can omit.
+        onCreatePlaylist,
     } = options;
     // Fallback when the caller doesn't want multi-playlist — always
     // operate on "default" like the pre-multi UI did.
@@ -105,6 +106,10 @@ export function mountPlaylistTrack(container, options) {
     const palletEl = container.querySelector(".playlist-pallet");
     const statusEl = container.querySelector(".playlist-track-status");
     const nameEl = container.querySelector(".field-playlist-name");
+    const newBtn = container.querySelector(".playlist-new-btn");
+    if (newBtn) {
+        newBtn.addEventListener("click", () => onCreatePlaylist?.());
+    }
     // Heading element is gone from the template (the name input above
     // doubles as the playlist label). Keep the lookup for backward
     // compat: any caller that still injects a `[data-field="heading"]`

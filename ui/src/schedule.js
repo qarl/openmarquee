@@ -1,3 +1,5 @@
+import { attachAutoSave } from "./auto-save.js";
+
 // Schedule editor: a form for the schedule rules backend (Phase 5 (d)).
 // The backend persists time-of-day rules but doesn't yet act on them
 // (multi-playlist refactor pending), so this UI is half "dry-run" — users can
@@ -27,8 +29,8 @@ const SECTION_TEMPLATE = `
                 <h1>Schedule</h1>
                 <p>Rules pick which playlist plays when. First matching rule wins; otherwise the default below plays. Timezone comes from Settings.</p>
             </div>
-            <div class="om-row" style="gap: 8px;">
-                <button type="button" class="om-btn ghost schedule-add">+ Add rule</button>
+            <div class="om-page-head-actions">
+                <button type="button" class="om-btn primary schedule-add">+ New rule</button>
             </div>
         </div>
 
@@ -46,8 +48,7 @@ const SECTION_TEMPLATE = `
             <button type="button" class="om-btn ghost sm schedule-disable-all">Disable all</button>
         </div>
 
-        <button type="button" class="om-btn primary schedule-save" style="width: 100%; height: 46px; font-size: 14.5px; margin-top: 14px;">Save schedule</button>
-        <p class="schedule-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
+        <p class="om-save-status schedule-status" role="status" aria-live="polite" data-state="idle"></p>
     </section>
 `;
 
@@ -69,10 +70,10 @@ export function mountSchedule(
     { fetchSchedule, onSave, fetchPlaylistNames, fetchSettings },
 ) {
     container.innerHTML = SECTION_TEMPLATE;
+    const sectionEl = container.querySelector("section.schedule");
     const defaultEl = container.querySelector(".field-default-playlist");
     const rulesEl = container.querySelector(".schedule-rules");
     const addBtn = container.querySelector(".schedule-add");
-    const saveBtn = container.querySelector(".schedule-save");
     const enableAllBtn = container.querySelector(".schedule-enable-all");
     const disableAllBtn = container.querySelector(".schedule-disable-all");
     const statusEl = container.querySelector(".schedule-status");
@@ -166,10 +167,6 @@ export function mountSchedule(
     }
 
     function setAllEnabled(enabled) {
-        // Mutate DOM only — persistence still flows through the Save button,
-        // consistent with how all the other inline edits work. Save schedule
-        // turns yellow-accent when there are dirty changes (Phase 6+ polish;
-        // deferred for now).
         const boxes = rulesEl.querySelectorAll(".rule-enabled");
         if (boxes.length === 0) {
             statusEl.textContent = "No rules to toggle.";
@@ -178,9 +175,9 @@ export function mountSchedule(
         boxes.forEach((cb) => {
             cb.checked = enabled;
         });
-        statusEl.textContent = `${enabled ? "Enabled" : "Disabled"} ${boxes.length} rule${
-            boxes.length === 1 ? "" : "s"
-        } — click Save to persist.`;
+        // Programmatic mutation doesn't fire input events automatically —
+        // kick auto-save manually so the bulk toggle persists.
+        autoSave.kick();
     }
 
     enableAllBtn.addEventListener("click", () => setAllEnabled(true));
@@ -210,24 +207,29 @@ export function mountSchedule(
                 availableNames,
             ),
         );
+        // Programmatic append doesn't fire input events; persist the
+        // new rule through auto-save explicitly.
+        autoSave.kick();
     });
 
-    saveBtn.addEventListener("click", async () => {
-        saveBtn.disabled = true;
-        statusEl.textContent = "Saving…";
-        try {
-            const payload = collectSchedule(defaultEl, rulesEl, persistedTz);
-            await onSave(payload);
-            statusEl.textContent = "Saved.";
-        } catch (err) {
-            statusEl.textContent = `Save failed: ${err.message}`;
-        } finally {
-            saveBtn.disabled = false;
-        }
+    async function performSave() {
+        const payload = collectSchedule(defaultEl, rulesEl, persistedTz);
+        await onSave(payload);
+    }
+
+    const autoSave = attachAutoSave(sectionEl, {
+        save: performSave,
+        status: statusEl,
+        debounceMs: 500,
     });
+
+    // Removing a rule is wired in renderRule's listener, but it lives at
+    // the row level so we listen at the section level for the synthetic
+    // "schedule-rule-removed" event the row dispatches on remove.
+    sectionEl.addEventListener("schedule-rule-removed", () => autoSave.kick());
 
     refresh();
-    return { refresh };
+    return { refresh, flushAutoSave: () => autoSave.flush() };
 }
 
 function renderRule(rule, availableNames) {
@@ -283,7 +285,15 @@ function renderRule(rule, availableNames) {
         const select = li.querySelector(".rule-playlist");
         fillPlaylistOptions(select, availableNames, playlistValue);
     }
-    li.querySelector(".rule-remove").addEventListener("click", () => li.remove());
+    li.querySelector(".rule-remove").addEventListener("click", () => {
+        const section = li.closest("section.schedule");
+        li.remove();
+        // Notify the section so its autoSave hook fires. closest() walks
+        // up from the row's pre-removal parent to the right section, so
+        // multiple Schedule mounts in the DOM (test harnesses) wouldn't
+        // cross-fire.
+        if (section) section.dispatchEvent(new CustomEvent("schedule-rule-removed"));
+    });
     return li;
 }
 

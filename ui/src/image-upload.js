@@ -10,31 +10,31 @@ import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 const TEMPLATE = `
     <section class="image-upload">
         <div class="slide-browser-slot"></div>
-        <div class="preview-wrap">
-            <canvas class="image-upload-canvas" aria-label="image preview"></canvas>
-        </div>
         <form class="controls" autocomplete="off">
-            <div class="om-card">
-                <div class="om-stack" style="gap: 12px;">
-                    <div class="om-row" style="gap: 10px;">
-                        <label class="om-field" style="flex: 1;">
-                            <span>Slide name</span>
-                            <input type="text" class="om-input field-name" value="Image" maxlength="200">
-                        </label>
-                        <label class="om-field" style="width: 110px;">
-                            <span>Duration (s)</span>
-                            <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
-                        </label>
-                    </div>
-                    <label class="om-field">
-                        <span>Image file (JPG or PNG)</span>
-                        <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
-                        <span class="image-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
-                            Editing an existing image — leave the file picker blank
-                            to just update name / duration.
-                        </span>
+            <div class="om-card" style="margin-bottom: 12px;">
+                <div class="om-row" style="gap: 10px;">
+                    <label class="om-field" style="flex: 1;">
+                        <span>Slide name</span>
+                        <input type="text" class="om-input field-name" value="Image" maxlength="200">
+                    </label>
+                    <label class="om-field" style="width: 110px;">
+                        <span>Duration (s)</span>
+                        <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
                     </label>
                 </div>
+            </div>
+            <div class="preview-wrap">
+                <canvas class="image-upload-canvas" aria-label="image preview"></canvas>
+            </div>
+            <div class="om-card">
+                <label class="om-field">
+                    <span>Image file (JPG or PNG)</span>
+                    <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
+                    <span class="image-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
+                        Editing an existing image — leave the file picker blank
+                        to just update name / duration.
+                    </span>
+                </label>
             </div>
             <p class="om-save-status image-upload-status" role="status" aria-live="polite" data-state="idle"></p>
         </form>
@@ -237,10 +237,69 @@ export function mountImageUploader(
         );
     }
 
-    resetToBlank();
+    // Initial state: open the most-recent saved image for edit. Falls
+    // back to a blank-create form when there are no images yet. +New
+    // resets to blank explicitly.
+    (async () => {
+        let firstItem = null;
+        if (fetchItems) {
+            try {
+                const items = await fetchItems();
+                firstItem = items
+                    .filter((it) => it.type === "image")
+                    .sort((a, b) =>
+                        String(b.created_at || "").localeCompare(
+                            String(a.created_at || ""),
+                        ),
+                    )[0] || null;
+            } catch {
+                // fall through to blank
+            }
+        }
+        if (firstItem) await loadForEdit(firstItem);
+        else await resetToBlank();
+    })();
+    /**
+     * +New flow: render a placeholder thumbnail (black canvas with the
+     * auto-name as a label) and IMMEDIATELY persist it as a new image
+     * slide so the operator sees a fresh tile in the pallet right away.
+     * Then pop the file picker so their next click drops in the real
+     * image — the existing change handler previews + auto-save PATCHes
+     * the slide with the new bytes.
+     */
+    async function createNew() {
+        await resetToBlank();
+        drawPlaceholderToCanvas(canvas, nameEl.value || "New image");
+        // Pre-check: don't auto-pop the file picker. Doing so before the
+        // save creates a race (operator picks a file → file-change handler
+        // fires create-mode save with real bytes → twin slides). Doing
+        // it after breaks Safari's user-gesture chain. Operator clicks
+        // Choose File as the explicit next step.
+        const payload = {
+            name: nameEl.value || "Image",
+            duration_ms: 5000,
+            image_base64: canvasToBase64(canvas),
+        };
+        try {
+            const created = await onSave(payload);
+            if (created?.id) {
+                state.editingId = String(created.id);
+                editHintEl.hidden = false;
+                if (browser) {
+                    await browser.refresh();
+                    browser.highlight(state.editingId);
+                }
+            }
+        } catch (err) {
+            statusEl.textContent = `Could not create slide: ${err?.message || err}`;
+            statusEl.dataset.state = "error";
+        }
+    }
+
     return {
         loadForEdit,
         reset: resetToBlank,
+        createNew,
         refreshBrowser: () => browser?.refresh(),
         flushAutoSave: () => autoSave.flush(),
     };
@@ -338,6 +397,33 @@ export function drawUrlToCanvas(url, canvas) {
 export function canvasToBase64(canvas) {
     const dataUrl = canvas.toDataURL("image/png");
     return dataUrl.split(",")[1];
+}
+
+/**
+ * Render a placeholder thumbnail onto `canvas` — a black background
+ * with the supplied label centered. Used by +New so a freshly-created
+ * image/video slide has visible chrome in the pallet before the
+ * operator drops in real bytes.
+ */
+export function drawPlaceholderToCanvas(canvas, label) {
+    const ctx = canvas.getContext("2d");
+    ctx.save();
+    try {
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#ffffff";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const fontSize = Math.max(8, Math.floor(canvas.height * 0.16));
+        ctx.font = `${fontSize}px sans-serif`;
+        ctx.fillText(
+            String(label || "(empty)"),
+            canvas.width / 2,
+            canvas.height / 2,
+        );
+    } finally {
+        ctx.restore();
+    }
 }
 
 /**

@@ -90,22 +90,24 @@ function presetButtonsHtml() {
 const EDITOR_TEMPLATE = `
     <div class="editor">
         <div class="slide-browser-slot"></div>
-        <div class="preview-wrap">
-            <canvas class="editor-canvas" aria-label="slide preview"></canvas>
-        </div>
         <form class="controls" autocomplete="off">
+            <div class="om-card" style="margin-bottom: 12px;">
+                <div class="om-row" style="gap: 10px;">
+                    <label class="om-field" style="flex: 1;">
+                        <span>Slide name</span>
+                        <input type="text" class="om-input field-name" value="Untitled" maxlength="200">
+                    </label>
+                    <label class="om-field" style="width: 110px;">
+                        <span>Duration (s)</span>
+                        <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
+                    </label>
+                </div>
+            </div>
+            <div class="preview-wrap">
+                <canvas class="editor-canvas" aria-label="slide preview"></canvas>
+            </div>
             <div class="om-card">
                 <div class="om-stack" style="gap: 12px;">
-                    <div class="om-row" style="gap: 10px;">
-                        <label class="om-field" style="flex: 1;">
-                            <span>Slide name</span>
-                            <input type="text" class="om-input field-name" value="Untitled" maxlength="200">
-                        </label>
-                        <label class="om-field" style="width: 110px;">
-                            <span>Duration (s)</span>
-                            <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
-                        </label>
-                    </div>
                     <label class="om-field">
                         <span>Text</span>
                         <textarea class="om-textarea field-text" rows="3" placeholder="(enter text here)"></textarea>
@@ -550,6 +552,34 @@ export function mountEditor(
         }
     }
 
+    /**
+     * +New flow: create a server-side slide IMMEDIATELY (so the operator
+     * sees a fresh tile in the pallet) and drop into edit mode against it.
+     * The slide is seeded with the auto-name as the placeholder text so
+     * the backend's "text non-empty" validation passes — operators
+     * typically replace it with their first keystroke.
+     */
+    async function createNew() {
+        await resetToBlank();
+        // Seed text with a single space so the backend's "non-empty"
+        // create-mode validation passes WITHOUT painting a literal "Text
+        // Slide N" on the device if the operator wanders off mid-create.
+        // First keystroke replaces it.
+        textEl.value = " ";
+        syncAndRender();
+        try {
+            await performSave();
+        } catch (err) {
+            statusEl.textContent = `Could not create slide: ${err?.message || err}`;
+            statusEl.dataset.state = "error";
+            return;
+        }
+        // performSave promotes editingId on success; refresh the browser
+        // so the new tile appears (and stays highlighted via the
+        // browser.highlight call performSave already did).
+        if (browser) await browser.refresh();
+    }
+
     async function loadForEdit(slide) {
         if (!slide || slide.type !== "text_slide") {
             statusEl.textContent =
@@ -651,13 +681,39 @@ export function mountEditor(
         );
     }
 
-    // Initial blank state picks up the first default name.
-    resetToBlank();
-    syncAndRender();
+    // Initial state: prefer editing the most-recent existing slide of
+    // this type. The operator's expectation is "open the editor → see
+    // something to edit," not "see a blank create form." If there are no
+    // saved slides yet (fresh device), fall back to a blank-create form.
+    // +New explicitly resets to blank.
+    (async () => {
+        let firstItem = null;
+        if (fetchItems) {
+            try {
+                const items = await fetchItems();
+                firstItem = items
+                    .filter((it) => it.type === "text_slide")
+                    .sort((a, b) =>
+                        String(b.created_at || "").localeCompare(
+                            String(a.created_at || ""),
+                        ),
+                    )[0] || null;
+            } catch {
+                // fall through to blank
+            }
+        }
+        if (firstItem) {
+            await loadForEdit(firstItem);
+        } else {
+            resetToBlank();
+            syncAndRender();
+        }
+    })();
 
     return {
         loadForEdit,
         reset: resetToBlank,
+        createNew,
         refreshBrowser: () => browser?.refresh(),
         // Test hook: drains any pending debounced auto-save synchronously
         // so assertions don't have to race the timer. Production code

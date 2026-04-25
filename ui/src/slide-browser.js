@@ -55,7 +55,10 @@ export function mountSlideBrowser(container, options) {
             );
 
         listEl.innerHTML = "";
-        listEl.appendChild(renderNewTile());
+        // The +New affordance is now in the slides shell page-head ("+ New
+        // text/image/video"), so we don't render an in-browser tile.
+        // `onCreate` stays in the public API for backward compat in case
+        // the slides shell wants to invoke it programmatically.
         for (const item of filtered) {
             listEl.appendChild(renderTile(item));
         }
@@ -69,25 +72,6 @@ export function mountSlideBrowser(container, options) {
         }
     }
 
-    function renderNewTile() {
-        const li = document.createElement("li");
-        li.className = "slide-browser-tile slide-browser-tile--new";
-        li.innerHTML = `
-            <button type="button" class="slide-browser-tile-action" aria-label="Create a new slide">
-                <span class="slide-browser-tile-plus" aria-hidden="true">+</span>
-                <span class="slide-browser-tile-new-label">New</span>
-            </button>
-        `;
-        li.querySelector(".slide-browser-tile-action").addEventListener(
-            "click",
-            () => {
-                highlight(null);
-                onCreate();
-            },
-        );
-        return li;
-    }
-
     function renderTile(item) {
         const li = document.createElement("li");
         li.className = "slide-browser-tile";
@@ -96,16 +80,15 @@ export function mountSlideBrowser(container, options) {
             li.classList.add("slide-browser-tile--selected");
         }
         const safeName = escapeHtml(item.name || "Untitled");
-        const typeBadge = escapeHtml(
-            item.type === "video" ? "▶" : item.type === "image" ? "🖼" : "Aa",
-        );
+        // Type badge retired: with the slides shell tab subnav (Text /
+        // Image / Video) filtering by type, the per-tile corner badge
+        // was redundant chrome.
         li.innerHTML = `
             <button type="button" class="slide-browser-tile-action" title="${safeName}">
                 <img class="slide-browser-tile-thumb" alt="" draggable="false"
                      src="/api/content/${item.id}/asset?v=${refreshVersion}">
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>
-            <div class="slide-browser-tile-type" aria-hidden="true">${typeBadge}</div>
             <button type="button" class="slide-browser-tile-delete"
                     aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
         `;

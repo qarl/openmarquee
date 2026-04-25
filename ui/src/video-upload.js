@@ -14,33 +14,33 @@
 const TEMPLATE = `
     <section class="video-upload">
         <div class="slide-browser-slot"></div>
-        <div class="preview-wrap">
-            <video class="video-upload-video" playsinline controls muted
-                   controlslist="novolumeslider nodownload noremoteplayback"
-                   aria-label="video preview"></video>
-        </div>
         <form class="controls" autocomplete="off">
-            <div class="om-card">
-                <div class="om-stack" style="gap: 12px;">
-                    <div class="om-row" style="gap: 10px;">
-                        <label class="om-field" style="flex: 1;">
-                            <span>Slide name</span>
-                            <input type="text" class="om-input field-name" value="Video" maxlength="200">
-                        </label>
-                        <label class="om-field" style="width: 110px;">
-                            <span>Duration (s)</span>
-                            <input type="number" class="om-input field-duration" value="10" min="1" max="3600" step="1">
-                        </label>
-                    </div>
-                    <label class="om-field">
-                        <span>Video file (any format ffmpeg can decode)</span>
-                        <input type="file" accept="video/*" class="om-input field-file">
-                        <span class="video-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
-                            Editing an existing video — leave the file picker blank
-                            to just update name / duration.
-                        </span>
+            <div class="om-card" style="margin-bottom: 12px;">
+                <div class="om-row" style="gap: 10px;">
+                    <label class="om-field" style="flex: 1;">
+                        <span>Slide name</span>
+                        <input type="text" class="om-input field-name" value="Video" maxlength="200">
+                    </label>
+                    <label class="om-field" style="width: 110px;">
+                        <span>Duration (s)</span>
+                        <input type="number" class="om-input field-duration" value="10" min="1" max="3600" step="1">
                     </label>
                 </div>
+            </div>
+            <div class="preview-wrap">
+                <video class="video-upload-video" playsinline controls muted
+                       controlslist="novolumeslider nodownload noremoteplayback"
+                       aria-label="video preview"></video>
+            </div>
+            <div class="om-card">
+                <label class="om-field">
+                    <span>Video file (any format ffmpeg can decode)</span>
+                    <input type="file" accept="video/*" class="om-input field-file">
+                    <span class="video-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
+                        Editing an existing video — leave the file picker blank
+                        to just update name / duration.
+                    </span>
+                </label>
             </div>
             <p class="om-save-status video-upload-status" role="status" aria-live="polite" data-state="idle"></p>
             <progress class="video-upload-progress" value="0" max="100" hidden style="width: 100%; margin-top: 6px;"></progress>
@@ -49,11 +49,20 @@ const TEMPLATE = `
 `;
 
 import { attachAutoSave } from "./auto-save.js";
+import { drawPlaceholderToCanvas } from "./image-upload.js";
 import {
     describeFfmpegError,
     transcodeToH264,
 } from "./ffmpeg-pipelines.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
+
+// Tiny pre-encoded H.264 MP4 (128×96, ~0.5s, all-black) used as the
+// placeholder bytes when +New creates a fresh video slide. The backend
+// requires valid MP4 bytes on create; this satisfies the validator
+// without running ffmpeg.wasm just to make a placeholder. The real MP4
+// replaces these bytes via the auto-save PATCH on first file pick.
+const PLACEHOLDER_MP4_B64 =
+    "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAANCbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAAhYAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAm10cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAAhYAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAIAAAABgAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAIWAAAAAAABAAAAAAHlbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAA8AAAAIABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABkG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAVBzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAIAAYABIAAAASAAAAAAAAAABFUxhdmM2MS4xOS4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAK/+EAF2dCwAraCDbARAAAAwAEAAADAHg8SJqAAQAEaM4PyAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAACo/AAAAAAAAABhzdHRzAAAAAAAAAAEAAAAIAAAEAAAAABRzdHNzAAAAAAAAAAEAAAABAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAIAAAAAQAAADRzdHN6AAAAAAAAAAAAAAAIAAACiwAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAUc3RjbwAAAAAAAAABAAADcgAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjEuNy4xMDAAAAAIZnJlZQAAAtltZGF0AAACVAYF//9Q3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9MCBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9MyBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWludD0yNTAga2V5aW50X21pbj0xNSBzY2VuZWN1dD0wIGludHJhX3JlZnJlc2g9MCByYz1jcmYgbWJ0cmVlPTAgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MACAAAAAL2WIhDomKAAJAsnJycnJycnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXgAAAABkGaIDaBjAAAAAZBmkA6gYwAAAAGQZpgOoGMAAAABkGagDqBjAAAAAZBmqA6gYwAAAAGQZrAPoGMAAAABkGa4D6BjA==";
 
 // Hardware cap for the Pi Zero 2 W's H.264 decoder. 1080p30 is the
 // documented maximum; anything larger falls back to software decode.
@@ -364,10 +373,66 @@ export function mountVideoUploader(
         );
     }
 
-    resetToBlank();
+    // Initial state: open the most-recent saved video for edit. Falls
+    // back to blank-create when no videos exist. +New resets to blank.
+    (async () => {
+        let firstItem = null;
+        if (fetchItems) {
+            try {
+                const items = await fetchItems();
+                firstItem = items
+                    .filter((it) => it.type === "video")
+                    .sort((a, b) =>
+                        String(b.created_at || "").localeCompare(
+                            String(a.created_at || ""),
+                        ),
+                    )[0] || null;
+            } catch {
+                // fall through to blank
+            }
+        }
+        if (firstItem) await loadForEdit(firstItem);
+        else await resetToBlank();
+    })();
+    /**
+     * +New flow: render a placeholder thumbnail + submit a tiny
+     * pre-bundled black-frame MP4 so the slide IMMEDIATELY appears in
+     * the pallet. Then pop the file picker so the operator's next click
+     * picks the real video — the change handler transcodes + auto-save
+     * PATCHes both PNG + MP4 with the real bytes.
+     */
+    async function createNew() {
+        await resetToBlank();
+        drawPlaceholderToCanvas(canvas, nameEl.value || "New video");
+        // No auto file-picker pop — would race with the placeholder save
+        // (twin slides) or break the user-gesture chain on Safari if
+        // popped after. Operator clicks Choose File as the next step.
+        const payload = {
+            name: nameEl.value || "Video",
+            duration_ms: 10_000,
+            png_base64: canvasToBase64(canvas),
+            mp4_base64: PLACEHOLDER_MP4_B64,
+        };
+        try {
+            const created = await onSave(payload);
+            if (created?.id) {
+                state.editingId = String(created.id);
+                editHintEl.hidden = false;
+                if (browser) {
+                    await browser.refresh();
+                    browser.highlight(state.editingId);
+                }
+            }
+        } catch (err) {
+            statusEl.textContent = `Could not create slide: ${err?.message || err}`;
+            statusEl.dataset.state = "error";
+        }
+    }
+
     return {
         loadForEdit,
         reset: resetToBlank,
+        createNew,
         refreshBrowser: () => browser?.refresh(),
         flushAutoSave: () => autoSave.flush(),
     };

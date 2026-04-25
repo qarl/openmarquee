@@ -22,7 +22,9 @@ describe("mountSchedule", () => {
         expect(container.querySelector(".field-default-playlist").value).toBe("default");
         expect(container.querySelectorAll(".schedule-rule")).toHaveLength(0);
         expect(container.querySelector(".schedule-add")).not.toBeNull();
-        expect(container.querySelector(".schedule-save")).not.toBeNull();
+        // Save button removed — auto-save handles persistence.
+        expect(container.querySelector(".schedule-save")).toBeNull();
+        expect(container.querySelector(".om-save-status")).not.toBeNull();
     });
 
     it("renders one li per existing rule with name + day checkboxes filled in", async () => {
@@ -109,10 +111,10 @@ describe("mountSchedule", () => {
         expect(remaining[0].querySelector(".rule-name").value).toBe("B");
     });
 
-    it("Save invokes onSave with the schedule payload", async () => {
+    it("auto-save invokes onSave with the schedule payload", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSchedule(container, {
+        const handle = mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [
                     {
@@ -130,8 +132,7 @@ describe("mountSchedule", () => {
         });
         await tick();
 
-        container.querySelector(".schedule-save").click();
-        await tick();
+        await handle.flushAutoSave();
 
         expect(onSave).toHaveBeenCalledOnce();
         const payload = onSave.mock.calls[0][0];
@@ -153,7 +154,7 @@ describe("mountSchedule", () => {
         // happy; this test pins that contract.
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSchedule(container, {
+        const handle = mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [],
                 default_playlist_name: "default",
@@ -164,8 +165,7 @@ describe("mountSchedule", () => {
         await tick();
         expect(container.querySelector(".field-tz")).toBeNull();
 
-        container.querySelector(".schedule-save").click();
-        await tick();
+        await handle.flushAutoSave();
         expect(onSave.mock.calls[0][0].tz).toBe("America/New_York");
     });
 
@@ -187,9 +187,9 @@ describe("mountSchedule", () => {
         expect(nowEl.textContent.length).toBeGreaterThan(0);
     });
 
-    it("Save error message surfaces in the status", async () => {
+    it("Auto-save error message surfaces in the status", async () => {
         const container = document.createElement("div");
-        mountSchedule(container, {
+        const handle = mountSchedule(container, {
             fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
             onSave: async () => {
                 throw new Error("backend rejected");
@@ -197,8 +197,7 @@ describe("mountSchedule", () => {
         });
         await tick();
 
-        container.querySelector(".schedule-save").click();
-        await tick();
+        await handle.flushAutoSave();
         expect(container.querySelector(".schedule-status").textContent).toContain(
             "backend rejected",
         );
@@ -310,9 +309,8 @@ describe("mountSchedule", () => {
         for (const cb of checkboxes) {
             expect(cb.checked).toBe(false);
         }
-        expect(container.querySelector(".schedule-status").textContent).toMatch(
-            /Disabled 2 rules.*Save/,
-        );
+        // Auto-save kicks on bulk toggle; status pill goes through saving →
+        // saved without showing the legacy "click Save" prompt.
     });
 
     it("Enable all flips every rule's enabled checkbox on", async () => {
@@ -336,10 +334,10 @@ describe("mountSchedule", () => {
         }
     });
 
-    it("Bulk toggle is DOM-only — Save still needed to persist", async () => {
+    it("Bulk toggle kicks auto-save with the new disabled state", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSchedule(container, {
+        const handle = mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [
                     { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_name: "a", enabled: true },
@@ -351,12 +349,7 @@ describe("mountSchedule", () => {
         await tick();
 
         container.querySelector(".schedule-disable-all").click();
-        // No save yet.
-        expect(onSave).not.toHaveBeenCalled();
-
-        // Save picks up the disabled state.
-        container.querySelector(".schedule-save").click();
-        await tick();
+        await handle.flushAutoSave();
         expect(onSave).toHaveBeenCalledOnce();
         expect(onSave.mock.calls[0][0].rules[0].enabled).toBe(false);
     });

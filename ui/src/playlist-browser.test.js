@@ -14,19 +14,27 @@ afterEach(() => {
 });
 
 describe("nextPlaylistName", () => {
-    it("returns 'Playlist 1' when none exist (or only default)", () => {
-        expect(nextPlaylistName([])).toBe("Playlist 1");
-        expect(nextPlaylistName(["default"])).toBe("Playlist 1");
+    it("returns 'playlist-1' when none exist (or only default)", () => {
+        expect(nextPlaylistName([])).toBe("playlist-1");
+        expect(nextPlaylistName(["default"])).toBe("playlist-1");
     });
-    it("fills gaps in the Playlist N series", () => {
+    it("fills gaps in the playlist-N series", () => {
         expect(
-            nextPlaylistName(["default", "Playlist 1", "Playlist 3"]),
-        ).toBe("Playlist 2");
+            nextPlaylistName(["default", "playlist-1", "playlist-3"]),
+        ).toBe("playlist-2");
     });
     it("jumps past the max when no gaps", () => {
         expect(
-            nextPlaylistName(["Playlist 1", "Playlist 2", "Playlist 3"]),
-        ).toBe("Playlist 4");
+            nextPlaylistName(["playlist-1", "playlist-2", "playlist-3"]),
+        ).toBe("playlist-4");
+    });
+    it("treats legacy 'Playlist N' names (caps + space) as part of the series", () => {
+        // Pre-fix devices have playlists named "Playlist 1" etc. — the
+        // numbering should continue from those so a new playlist on the
+        // same device gets a non-colliding number.
+        expect(
+            nextPlaylistName(["default", "Playlist 1", "Playlist 2"]),
+        ).toBe("playlist-3");
     });
 });
 
@@ -78,20 +86,9 @@ describe("mountPlaylistBrowser", () => {
         expect(onSelect).toHaveBeenCalledWith("lunch");
     });
 
-    it("fires onCreate on '+ New' click", async () => {
-        const onCreate = vi.fn();
-        const container = document.createElement("div");
-        mountPlaylistBrowser(container, {
-            fetchPlaylists: async () => COLLECTION,
-            onSelect: vi.fn(),
-            onCreate,
-        });
-        await tick();
-        container
-            .querySelector(".playlist-browser-tile--new button")
-            .click();
-        expect(onCreate).toHaveBeenCalledTimes(1);
-    });
+    // The inline +New tile was removed when the playlist page-head gained
+    // "+ New playlist"; onCreate stays in the public API for the page-head
+    // button to invoke.
 
     it("highlight() marks exactly one tile", async () => {
         const container = document.createElement("div");

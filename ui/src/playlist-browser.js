@@ -28,7 +28,7 @@ const TEMPLATE = `
  * }}
  */
 export function mountPlaylistBrowser(container, options) {
-    const { fetchPlaylists, fetchItems, onSelect, onCreate } = options;
+    const { fetchPlaylists, fetchItems, onSelect, onCreate, onDelete } = options;
     container.innerHTML = TEMPLATE;
     const listEl = container.querySelector(".playlist-browser-list");
 
@@ -57,7 +57,9 @@ export function mountPlaylistBrowser(container, options) {
             return a.localeCompare(b);
         });
         listEl.innerHTML = "";
-        listEl.appendChild(renderNewTile());
+        // The +New affordance is now in the playlist page-head ("+ New
+        // playlist"); the in-browser tile is gone. `onCreate` stays in
+        // the public API for the page-head button to invoke.
         for (const name of names) {
             const playlist = collection.playlists[name];
             const playlistItems = playlist?.items || [];
@@ -81,23 +83,6 @@ export function mountPlaylistBrowser(container, options) {
         }
     }
 
-    function renderNewTile() {
-        const li = document.createElement("li");
-        li.className = "playlist-browser-tile playlist-browser-tile--new";
-        li.innerHTML = `
-            <button type="button" class="playlist-browser-tile-action"
-                    aria-label="Create a new playlist">
-                <span class="playlist-browser-tile-plus" aria-hidden="true">+</span>
-                <span class="playlist-browser-tile-label">New</span>
-            </button>
-        `;
-        li.querySelector(".playlist-browser-tile-action").addEventListener(
-            "click",
-            () => onCreate(),
-        );
-        return li;
-    }
-
     function renderTile(name, itemCount, firstItem) {
         const li = document.createElement("li");
         li.className = "playlist-browser-tile";
@@ -117,12 +102,23 @@ export function mountPlaylistBrowser(container, options) {
                 <span class="playlist-browser-tile-name">${safeName}</span>
                 <span class="playlist-browser-tile-meta">${itemsLabel}</span>
             </button>
+            <button type="button" class="slide-browser-tile-delete playlist-browser-tile-delete"
+                    aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
         `;
         li.querySelector(".playlist-browser-tile-action").addEventListener(
             "click",
             () => {
                 highlight(name);
                 onSelect(name);
+            },
+        );
+        li.querySelector(".playlist-browser-tile-delete").addEventListener(
+            "click",
+            (event) => {
+                // Prevent the tile-action click from firing (which would
+                // open the playlist we're about to delete).
+                event.stopPropagation();
+                if (onDelete) onDelete(name);
             },
         );
         return li;
@@ -138,15 +134,22 @@ export function mountPlaylistBrowser(container, options) {
  * so deleting Playlist 2 + creating a new one recycles "2".
  */
 export function nextPlaylistName(existingNames) {
-    const pattern = /^Playlist (\d+)$/;
+    // Names MUST satisfy `^[a-z0-9_-]{1,64}$` because the schedule
+    // model enforces that pattern on `playlist_name` references — a
+    // name with caps or a space (e.g. "Playlist 1") will save into the
+    // playlist collection but will reject when referenced from a rule.
+    // Match the legacy "Playlist N" form too so existing series get
+    // continued without gaps.
+    const compliant = /^playlist-(\d+)$/;
+    const legacy = /^Playlist (\d+)$/;
     const used = new Set();
     for (const name of existingNames || []) {
-        const m = name.match(pattern);
+        const m = name.match(compliant) || name.match(legacy);
         if (m) used.add(Number(m[1]));
     }
     let n = 1;
     while (used.has(n)) n += 1;
-    return `Playlist ${n}`;
+    return `playlist-${n}`;
 }
 
 function escapeHtml(value) {

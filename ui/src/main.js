@@ -254,6 +254,44 @@ async function boot() {
         return saved;
     };
 
+    // Delete a playlist by name. Confirms first, then refreshes every
+    // surface that lists playlists. If the deleted one was active, fall
+    // back to "default".
+    async function deletePlaylist(name) {
+        if (!window.confirm(`Delete "${name}"? This can't be undone.`)) return;
+        try {
+            await deletePlaylistByName(name);
+        } catch (err) {
+            window.alert(`Could not delete: ${err?.message || err}`);
+            return;
+        }
+        if (currentPlaylistName === name) {
+            currentPlaylistName = "default";
+            playlistDraft = null;
+        }
+        await playlistBrowserHandle?.refresh();
+        playlistBrowserHandle?.highlight(currentPlaylistName);
+        await playlistTrack?.refresh();
+        await inlinePreviewHandle?.refresh();
+        await refreshSidebarCounts();
+    }
+
+    // Shared playlist-creation flow — invoked by both the playlist
+    // browser's create row and the playlist page-head's + New button.
+    async function createNewPlaylist() {
+        playlistDraft = null;
+        const collection = await listPlaylists();
+        const names = Object.keys(collection.playlists || {});
+        const newName = nextPlaylistName(names);
+        await savePlaylistByName(newName, []);
+        currentPlaylistName = newName;
+        await playlistBrowserHandle?.refresh();
+        playlistBrowserHandle?.highlight(newName);
+        await playlistTrack?.refresh();
+        await inlinePreviewHandle?.refresh();
+        await refreshSidebarCounts();
+    }
+
     /**
      * Mount (or re-mount) every panel that depends on display dims.
      * Called once at boot + again whenever Settings emits a change.
@@ -347,26 +385,15 @@ async function boot() {
                             await playlistTrack?.refresh();
                             await inlinePreviewHandle?.refresh();
                         },
-                        onCreate: async () => {
-                            playlistDraft = null;
-                            const collection = await listPlaylists();
-                            const names = Object.keys(
-                                collection.playlists || {},
-                            );
-                            const newName = nextPlaylistName(names);
-                            await savePlaylistByName(newName, []);
-                            currentPlaylistName = newName;
-                            await playlistBrowserHandle.refresh();
-                            playlistBrowserHandle.highlight(newName);
-                            await playlistTrack?.refresh();
-                            await inlinePreviewHandle?.refresh();
-                            await refreshSidebarCounts();
-                        },
+                        onCreate: createNewPlaylist,
+                        onDelete: deletePlaylist,
                     });
                     playlistBrowserHandle.highlight(currentPlaylistName);
                     return playlistBrowserHandle;
                 },
             },
+            // Page-head + New playlist button shares the create flow.
+            onCreatePlaylist: createNewPlaylist,
             outputMode,
         });
 
@@ -415,10 +442,14 @@ async function boot() {
         {
             fetchItems: listContent,
             tabPanesHost: slidesSection,
+            // Text +New creates a server-side slide immediately so the
+            // operator sees a fresh tile in the pallet right away.
+            // Image / Video +New pops the file picker — empty
+            // image/video slides need bytes before they exist.
             onAddNew: (tabKey) => {
-                if (tabKey === "text") editor?.reset?.();
-                else if (tabKey === "image") imageUploader?.reset?.();
-                else if (tabKey === "video") videoUploader?.reset?.();
+                if (tabKey === "text") editor?.createNew?.();
+                else if (tabKey === "image") imageUploader?.createNew?.();
+                else if (tabKey === "video") videoUploader?.createNew?.();
             },
         },
     );

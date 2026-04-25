@@ -61,12 +61,12 @@ describe("mountSlideBrowser", () => {
         });
         await tick();
         const tiles = container.querySelectorAll(".slide-browser-tile");
-        // 1 new-tile + 2 text_slide items = 3 total.
-        expect(tiles).toHaveLength(3);
-        expect(tiles[0].classList.contains("slide-browser-tile--new")).toBe(true);
+        // 2 text_slide items — the inline +New tile is gone (the slides
+        // shell page-head now owns the create affordance).
+        expect(tiles).toHaveLength(2);
         // Most-recent first (Charlie 12:00 before Alpha 10:00).
-        expect(tiles[1].dataset.id).toBe("c");
-        expect(tiles[2].dataset.id).toBe("a");
+        expect(tiles[0].dataset.id).toBe("c");
+        expect(tiles[1].dataset.id).toBe("a");
     });
 
     it("filters out items that don't match the requested type", async () => {
@@ -100,19 +100,9 @@ describe("mountSlideBrowser", () => {
         expect(onSelect.mock.calls[0][0].id).toBe("a");
     });
 
-    it("fires onCreate on '+ New' click", async () => {
-        const onCreate = vi.fn();
-        const container = document.createElement("div");
-        mountSlideBrowser(container, {
-            type: "text_slide",
-            fetchItems: async () => ITEMS,
-            onSelect: vi.fn(),
-            onCreate,
-        });
-        await tick();
-        container.querySelector(".slide-browser-tile--new button").click();
-        expect(onCreate).toHaveBeenCalledTimes(1);
-    });
+    // The inline +New tile was removed when the slides shell page-head
+    // gained "+ New text/image/video"; onCreate stays on the public API
+    // for back-compat (the shell calls editor/uploader.reset directly).
 
     it("highlight() marks exactly one tile as selected", async () => {
         const container = document.createElement("div");
@@ -146,9 +136,9 @@ describe("mountSlideBrowser", () => {
             onCreate: vi.fn(),
         });
         await tick();
-        // Only the '+ New' tile remains.
+        // No tiles render (no items, and the +New tile was removed).
         expect(
             container.querySelectorAll(".slide-browser-tile"),
-        ).toHaveLength(1);
+        ).toHaveLength(0);
     });
 });
