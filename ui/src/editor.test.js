@@ -145,15 +145,14 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
 
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
 
         container.querySelector(".field-text").value = "Hi";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
         container.querySelector(".field-text-color").value = "#ffaa00";
         container.querySelector(".field-text-color").dispatchEvent(new Event("input"));
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
 
         expect(onSave).toHaveBeenCalledOnce();
         const payload = onSave.mock.calls[0][0];
@@ -183,7 +182,7 @@ describe("mountEditor — submit flow", () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "x" });
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
 
         // Format dropdown starts hidden (no mode selected).
         expect(container.querySelector(".field-auto-format-wrap").hidden).toBe(true);
@@ -206,8 +205,7 @@ describe("mountEditor — submit flow", () => {
 
         container.querySelector(".field-text").value = "12:34 (fallback)";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
         expect(onSave.mock.calls[0][0].auto_mode).toBe("time");
         expect(onSave.mock.calls[0][0].auto_format).toBe("time_hms");
     });
@@ -247,15 +245,14 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
 
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
         container.querySelector(".field-text").value = "BIG";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
         const sizeEl = container.querySelector(".field-font-size");
         sizeEl.value = "64";
         sizeEl.dispatchEvent(new Event("input"));
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
         // Field is "% of width" now — operator typed 64, payload sends pct.
         expect(onSave.mock.calls[0][0].font_size_pct).toBe(64);
     });
@@ -265,29 +262,37 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
 
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
 
         container.querySelector(".field-text").value = "Hi";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
         container.querySelector(".field-duration").value = "12";
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
 
         expect(onSave.mock.calls[0][0].duration_ms).toBe(12_000);
     });
 
-    it("disables Save when text is empty", () => {
+    it("suppresses auto-save when text is empty (canSave gate)", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
-        mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
-        const saveBtn = container.querySelector(".field-save");
-        expect(saveBtn.disabled).toBe(true);
+        const onSave = vi.fn();
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
 
+        // Touch a field other than text — auto-save schedules but the
+        // gate (state.text.trim() > 0) suppresses on flush.
+        const nameEl = container.querySelector(".field-name");
+        nameEl.value = "Untitled";
+        nameEl.dispatchEvent(new Event("input", { bubbles: true }));
+        await handle.flushAutoSave();
+        expect(onSave).not.toHaveBeenCalled();
+
+        // Filling text in unblocks the gate.
         const textEl = container.querySelector(".field-text");
         textEl.value = "Hi";
-        textEl.dispatchEvent(new Event("input"));
-        expect(saveBtn.disabled).toBe(false);
+        textEl.dispatchEvent(new Event("input", { bubbles: true }));
+        await handle.flushAutoSave();
+        expect(onSave).toHaveBeenCalledOnce();
     });
 
     it("surfaces the error message when onSave rejects", async () => {
@@ -295,13 +300,12 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockRejectedValue(new Error("backend boom"));
 
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
 
         const textEl = container.querySelector(".field-text");
         textEl.value = "Hi";
         textEl.dispatchEvent(new Event("input"));
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
 
         const status = container.querySelector(".editor-status").textContent;
         expect(status).toContain("backend boom");
@@ -328,48 +332,19 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
 
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
         container.querySelector(".field-text").value = "Hi";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
         container.querySelector(".field-duration").value = "12";
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
 
         expect(onSave.mock.calls[0][0].duration_ms).toBe(12_000);
     });
 
-    it("Cmd+Enter submits the form when text is non-empty", async () => {
-        patchCanvasPrototype();
-        const container = document.createElement("div");
-        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
-
-        mountEditor(container, { width: 128, height: 96, onSave });
-        const textEl = container.querySelector(".field-text");
-        textEl.value = "Hi";
-        textEl.dispatchEvent(new Event("input"));
-
-        container.querySelector(".controls").dispatchEvent(
-            new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }),
-        );
-        await new Promise((r) => setTimeout(r, 0));
-
-        expect(onSave).toHaveBeenCalledOnce();
-    });
-
-    it("Cmd+Enter does nothing when save is disabled (empty text)", async () => {
-        patchCanvasPrototype();
-        const container = document.createElement("div");
-        const onSave = vi.fn();
-
-        mountEditor(container, { width: 128, height: 96, onSave });
-        container.querySelector(".controls").dispatchEvent(
-            new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }),
-        );
-        await new Promise((r) => setTimeout(r, 0));
-
-        expect(onSave).not.toHaveBeenCalled();
-    });
+    // Cmd+Enter submit shortcut was removed alongside the Save button —
+    // auto-save replaces it. Typing into the text field schedules a save
+    // automatically; flush forces it through synchronously for the test.
 
     it("Escape in the text field clears the text", () => {
         patchCanvasPrototype();
@@ -390,12 +365,11 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
 
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
         container.querySelector(".field-text").value = "Hi";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
 
         const payload = onSave.mock.calls[0][0];
         // Transition fields no longer live on text slides — the playlist
@@ -409,7 +383,7 @@ describe("mountEditor — submit flow", () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
 
-        mountEditor(container, { width: 128, height: 96, onSave });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
         container.querySelector(".field-text").value = "Hi";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
         container.querySelector(".field-font-family").value = "serif";
@@ -417,8 +391,7 @@ describe("mountEditor — submit flow", () => {
             .querySelector(".field-font-family")
             .dispatchEvent(new Event("input"));
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
 
         const payload = onSave.mock.calls[0][0];
         expect(payload.font_family).toBe("serif");
@@ -456,8 +429,7 @@ describe("mountEditor — submit flow", () => {
         );
         expect(container.querySelector(".field-duration").value).toBe("7");
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await new Promise((r) => setTimeout(r, 0));
+        await handle.flushAutoSave();
         expect(onSaveExisting).toHaveBeenCalledTimes(1);
         expect(onSave).not.toHaveBeenCalled();
         expect(onSaveExisting.mock.calls[0][0]).toBe("abc");

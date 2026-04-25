@@ -20,15 +20,16 @@ function tick() {
 }
 
 describe("mountImageUploader", () => {
-    it("renders file input, name input, save button (disabled), and preview canvas", () => {
+    it("renders file input, name input, status pill, and preview canvas", () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
         mountImageUploader(container, { width: 128, height: 96, onSave: vi.fn() });
 
         expect(container.querySelector(".field-file")).not.toBeNull();
         expect(container.querySelector(".field-name")).not.toBeNull();
-        expect(container.querySelector(".field-save")).not.toBeNull();
-        expect(container.querySelector(".field-save").disabled).toBe(true);
+        // Save button is gone — replaced by debounced auto-save.
+        expect(container.querySelector(".field-save")).toBeNull();
+        expect(container.querySelector(".om-save-status")).not.toBeNull();
         expect(container.querySelector(".image-upload-canvas")).not.toBeNull();
     });
 
@@ -40,18 +41,22 @@ describe("mountImageUploader", () => {
         expect(ctx.fillRect).toHaveBeenCalledWith(0, 0, 64, 32);
     });
 
-    it("submit without a file does nothing", async () => {
+    it("auto-save without a file does nothing (canSave gate suppresses)", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
         const onSave = vi.fn();
-        mountImageUploader(container, { width: 64, height: 32, onSave });
+        const handle = mountImageUploader(container, { width: 64, height: 32, onSave });
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await tick();
+        // Mutate name to schedule a save; then flush — gate should suppress.
+        container.querySelector(".field-name").value = "Untitled";
+        container.querySelector(".field-name").dispatchEvent(
+            new Event("input", { bubbles: true }),
+        );
+        await handle.flushAutoSave();
         expect(onSave).not.toHaveBeenCalled();
     });
 
-    it("loadForEdit pre-fills name + duration and enables Save without re-pick", async () => {
+    it("loadForEdit pre-fills name + duration; auto-save sends metadata-only payload", async () => {
         patchCanvasPrototype();
         // Stub Image so drawUrlToCanvas resolves fast in jsdom.
         const RealImage = window.Image;
@@ -92,16 +97,17 @@ describe("mountImageUploader", () => {
 
         expect(container.querySelector(".field-name").value).toBe("Logo");
         expect(container.querySelector(".field-duration").value).toBe("8");
-        // Save is enabled even without a new file pick — metadata-only
-        // updates are allowed in edit mode.
-        expect(container.querySelector(".field-save").disabled).toBe(false);
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await tick();
+        // Mutate the name to trigger an auto-save attempt.
+        container.querySelector(".field-name").value = "Updated Logo";
+        container.querySelector(".field-name").dispatchEvent(
+            new Event("input", { bubbles: true }),
+        );
+        await handle.flushAutoSave();
         expect(onSaveExisting).toHaveBeenCalledTimes(1);
         const [id, payload] = onSaveExisting.mock.calls[0];
         expect(id).toBe("img-1");
-        expect(payload.name).toBe("Logo");
+        expect(payload.name).toBe("Updated Logo");
         expect(payload.duration_ms).toBe(8000);
         // image_base64 is null — operator didn't re-pick a file.
         expect(payload.image_base64).toBeNull();

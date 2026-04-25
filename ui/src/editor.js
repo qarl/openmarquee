@@ -12,6 +12,7 @@
 // The Playlists-page pallet's ✎ edit button still works too — either
 // surface feels natural in its own context.
 
+import { attachAutoSave } from "./auto-save.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 // Fixed asset rasterize target. Decoupled from device W×H so a panel
@@ -187,12 +188,10 @@ const EDITOR_TEMPLATE = `
                 </div>
             </div>
 
-            <button type="submit" class="om-btn primary field-save" style="width: 100%; height: 46px; font-size: 14.5px;">Save slide</button>
-            <p style="margin: 6px 0 0; font-family: var(--om-mono); font-size: 11px; color: var(--om-text-fade); text-align: center;">
-                <kbd>⌘</kbd> or <kbd>Ctrl</kbd> + <kbd>Enter</kbd> to save.
-                <kbd>Esc</kbd> to clear.
+            <p class="om-save-status editor-status" role="status" aria-live="polite" data-state="idle"></p>
+            <p style="margin: 4px 0 0; font-family: var(--om-mono); font-size: 11px; color: var(--om-text-fade); text-align: center;">
+                <kbd>Esc</kbd> in the text field to clear.
             </p>
-            <p class="editor-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
         </form>
     </div>
 `;
@@ -246,7 +245,6 @@ export function mountEditor(
     const autoFormatWrapEl = container.querySelector(".field-auto-format-wrap");
     const form = container.querySelector(".controls");
     const statusEl = container.querySelector(".editor-status");
-    const saveBtn = container.querySelector(".field-save");
 
     for (const f of FONT_FAMILIES) {
         const opt = document.createElement("option");
@@ -271,10 +269,6 @@ export function mountEditor(
         editingId: null,
     };
 
-    function updateSaveEnabled() {
-        saveBtn.disabled = !state.text.trim() || saveBtn.dataset.inFlight === "1";
-    }
-
     function syncAndRender() {
         state.name = nameEl.value;
         state.text = textEl.value;
@@ -286,7 +280,6 @@ export function mountEditor(
             state.fontSizePct = parsedSize;
         }
         drawCanvas(canvas, state);
-        updateSaveEnabled();
     }
 
     for (const el of [
@@ -423,15 +416,11 @@ export function mountEditor(
     });
 
     form.addEventListener("keydown", (event) => {
-        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-            event.preventDefault();
-            if (!saveBtn.disabled) form.requestSubmit();
-            return;
-        }
         // Plain Enter inside a single-line <input> would otherwise submit
-        // the form (browser default), which saves and resets editor state
-        // out from under the operator. Suppress unless the focus is in
-        // the <textarea>, where Enter means "newline" and should stay.
+        // the form (browser default). Suppress unless focus is in the
+        // <textarea>, where Enter means "newline" and should stay. We no
+        // longer have a submit button, but Enter on a name/duration field
+        // would otherwise trigger an implicit submit attempt.
         if (event.key === "Enter" && event.target?.tagName !== "TEXTAREA") {
             event.preventDefault();
         }
@@ -456,62 +445,50 @@ export function mountEditor(
         });
     });
 
-    form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        if (saveBtn.disabled) return;
-
-        saveBtn.dataset.inFlight = "1";
-        updateSaveEnabled();
-        statusEl.textContent = "Saving…";
-        try {
-            // Make sure any pending @font-face bytes have loaded before we
-            // rasterize — otherwise the stored PNG might fall back to a
-            // default font while the live preview already has the real one.
-            if (document.fonts?.ready) await document.fonts.ready;
-            // Rasterize the asset at a fixed 4K target so the stored PNG
-            // is resolution-independent — playback cover-fits down to the
-            // current panel dims at slide entry. drawCanvas reads the
-            // canvas's own width/height, so the same scene draws cleanly
-            // at any size (font_size_pct is a fraction of canvas.height).
-            const png_base64 = rasterizeAtTarget(state);
-            const durationSeconds = Number(durationEl.value) || 5;
-            const payload = {
-                name: state.name || "Untitled",
-                text: state.text,
-                text_color: state.textColor.toUpperCase(),
-                background_color: state.backgroundColor.toUpperCase(),
-                font_family: state.fontFamily,
-                font_size_pct: state.fontSizePct,
-                background_image_slide_id: state.bgSlideId || null,
-                auto_mode: autoModeEl.value || null,
-                auto_format: autoModeEl.value ? autoFormatEl.value || null : null,
-                duration_ms: Math.round(durationSeconds * 1000),
-                png_base64,
-            };
-            const wasEdit = Boolean(state.editingId);
-            const result = wasEdit && onSaveExisting
-                ? await onSaveExisting(state.editingId, payload)
-                : await onSave(payload);
-            statusEl.textContent = wasEdit ? "Updated." : "Saved.";
-            // Stay on the slide the operator just saved — the flow is
-            // "tweak → save → maybe tweak again," not "save → jump to a
-            // blank new slide." For a freshly-created slide, promote the
-            // returned id to editingId so subsequent saves UPDATE that
-            // same slide instead of creating a twin.
-            if (!wasEdit && result?.id) {
-                state.editingId = String(result.id);
-            }
-            if (browser) {
-                await browser.refresh();
-                if (state.editingId) browser.highlight(state.editingId);
-            }
-            return result;
-        } catch (err) {
-            statusEl.textContent = `Save failed: ${err.message}`;
-        } finally {
-            delete saveBtn.dataset.inFlight;
-            updateSaveEnabled();
+    async function performSave() {
+        // Make sure any pending @font-face bytes have loaded before we
+        // rasterize — otherwise the stored PNG might fall back to a
+        // default font while the live preview already has the real one.
+        if (document.fonts?.ready) await document.fonts.ready;
+        // Rasterize the asset at a fixed 4K target so the stored PNG
+        // is resolution-independent — playback cover-fits down to the
+        // current panel dims at slide entry.
+        const png_base64 = rasterizeAtTarget(state);
+        const durationSeconds = Number(durationEl.value) || 5;
+        const payload = {
+            name: state.name || "Untitled",
+            text: state.text,
+            text_color: state.textColor.toUpperCase(),
+            background_color: state.backgroundColor.toUpperCase(),
+            font_family: state.fontFamily,
+            font_size_pct: state.fontSizePct,
+            background_image_slide_id: state.bgSlideId || null,
+            auto_mode: autoModeEl.value || null,
+            auto_format: autoModeEl.value ? autoFormatEl.value || null : null,
+            duration_ms: Math.round(durationSeconds * 1000),
+            png_base64,
+        };
+        const wasEdit = Boolean(state.editingId);
+        const result = wasEdit && onSaveExisting
+            ? await onSaveExisting(state.editingId, payload)
+            : await onSave(payload);
+        // Promote a freshly-created slide so subsequent auto-saves PATCH
+        // the same id instead of creating a twin on every keystroke.
+        if (!wasEdit && result?.id) {
+            state.editingId = String(result.id);
         }
+        if (browser && state.editingId) browser.highlight(state.editingId);
+    }
+
+    const autoSave = attachAutoSave(form, {
+        save: performSave,
+        status: statusEl,
+        // Create-mode requires non-empty text to bother saving (otherwise
+        // an empty form auto-creates a junk slide on first focus). Edit
+        // mode allows empty text — the operator is intentionally clearing
+        // a saved slide and the PATCH must reach the server.
+        canSave: () => Boolean(state.editingId) || state.text.trim().length > 0,
+        debounceMs: 900,
     });
 
     async function resetToBlank() {
@@ -544,6 +521,10 @@ export function mountEditor(
         bgSlideWrapEl.hidden = true;
         state.bgSource = "color";
         syncAndRender();
+        // Form is being cleared, not edited — drop any pending save.
+        autoSave.cancel();
+        statusEl.textContent = "";
+        statusEl.dataset.state = "idle";
 
         // Async tail: gap-filled default name + browser refresh, both
         // no-ops if loadForEdit took ownership during the await.
@@ -649,6 +630,9 @@ export function mountEditor(
                 syncAndRender();
             }
         }
+        // Loading is not an edit — drop any auto-save scheduled by the
+        // field mutations above.
+        autoSave.cancel();
     }
 
     // Mount the slide browser at the top of the subpage — each tile
@@ -675,6 +659,10 @@ export function mountEditor(
         loadForEdit,
         reset: resetToBlank,
         refreshBrowser: () => browser?.refresh(),
+        // Test hook: drains any pending debounced auto-save synchronously
+        // so assertions don't have to race the timer. Production code
+        // should not rely on this — auto-save is debounced for a reason.
+        flushAutoSave: () => autoSave.flush(),
     };
 }
 

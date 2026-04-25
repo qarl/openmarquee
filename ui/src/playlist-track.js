@@ -14,6 +14,8 @@
 
 import Sortable from "sortablejs";
 
+import { attachAutoSave } from "./auto-save.js";
+
 // Mode-locking went away when videos became resolution-independent H.264
 // MP4s that every renderer can consume. Keep the signature so existing
 // callers don't explode; always return false.
@@ -39,8 +41,8 @@ const TEMPLATE = `
             </label>
             <p style="margin: 10px 0 0; color: var(--om-text-dim); font-size: 12.5px;">
                 Drag blocks to reorder; drag from the pallet below to add;
-                × to remove. Click the duration to change it.
-                Changes apply when you click <strong>Save playlist</strong>.
+                × to remove. Click the duration to change it. Changes save
+                automatically.
             </p>
         </div>
 
@@ -55,8 +57,7 @@ const TEMPLATE = `
             <ul class="playlist-pallet om-pallet-row" role="list"></ul>
         </div>
 
-        <button type="button" class="om-btn primary playlist-save" disabled style="width: 100%; height: 46px; font-size: 14.5px; margin-top: 14px;">Save playlist</button>
-        <p class="playlist-track-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
+        <p class="om-save-status playlist-track-status" role="status" aria-live="polite" data-state="idle"></p>
     </section>
 `;
 
@@ -104,7 +105,6 @@ export function mountPlaylistTrack(container, options) {
     const palletEl = container.querySelector(".playlist-pallet");
     const statusEl = container.querySelector(".playlist-track-status");
     const nameEl = container.querySelector(".field-playlist-name");
-    const saveBtn = container.querySelector(".playlist-save");
     // Heading element is gone from the template (the name input above
     // doubles as the playlist label). Keep the lookup for backward
     // compat: any caller that still injects a `[data-field="heading"]`
@@ -131,8 +131,6 @@ export function mountPlaylistTrack(container, options) {
 
     let trackSortable = null;
     let palletSortable = null;
-    let saving = false;
-    let isDirty = false;
     // Bumped on every refresh() so tile thumbnail URLs force a refetch
     // (edits don't change created_at, so the HTTP cache would otherwise
     // serve stale bytes after an in-place save).
@@ -143,10 +141,28 @@ export function mountPlaylistTrack(container, options) {
     // on the server round-trip. Refreshed on every refresh() call.
     let itemByIdRef = new Map();
 
+    async function performSave() {
+        const entries = collectTrackEntries(trackEl);
+        const newName = (nameEl.value || "").trim();
+        const originalName = resolveName();
+        await onSavePlaylist({
+            originalName,
+            newName: newName || originalName,
+            entries,
+        });
+    }
+
+    // Drag-and-drop fires no `input` / `change` event on the form, so we
+    // attach the helper without an auto-wire form and trigger via kick().
+    // Name typing IS captured by the input listener below.
+    const autoSave = attachAutoSave(null, {
+        save: performSave,
+        status: statusEl,
+        debounceMs: 400,
+    });
+
     function markDirty() {
-        isDirty = true;
-        saveBtn.disabled = false;
-        statusEl.textContent = "Unsaved changes.";
+        autoSave.kick();
     }
     /**
      * Like markDirty but ALSO notifies the host (main.js) so the inline
@@ -168,10 +184,6 @@ export function mountPlaylistTrack(container, options) {
             }
         }
     }
-    function markClean() {
-        isDirty = false;
-        saveBtn.disabled = true;
-    }
 
     nameEl.addEventListener("input", markDirty);
 
@@ -184,30 +196,6 @@ export function mountPlaylistTrack(container, options) {
         bindTrackRemoveButtons(trackEl, markContentDirty);
         bindTrackDurationButtons(trackEl, onUpdateDuration, refresh);
     }
-
-    saveBtn.addEventListener("click", async () => {
-        if (saving || !isDirty) return;
-        saving = true;
-        saveBtn.disabled = true;
-        statusEl.textContent = "Saving…";
-        try {
-            const entries = collectTrackEntries(trackEl);
-            const newName = (nameEl.value || "").trim();
-            const originalName = resolveName();
-            await onSavePlaylist({
-                originalName,
-                newName: newName || originalName,
-                entries,
-            });
-            statusEl.textContent = "Saved.";
-            markClean();
-        } catch (err) {
-            statusEl.textContent = `Save failed: ${err.message}`;
-            saveBtn.disabled = false; // let the operator retry
-        } finally {
-            saving = false;
-        }
-    });
 
     async function refresh() {
         statusEl.textContent = "";
@@ -266,12 +254,14 @@ export function mountPlaylistTrack(container, options) {
                 trackEl, onUpdateDuration, refresh,
             );
 
-            // Sync the name input and reset dirty state to match the
-            // freshly-loaded playlist.
+            // Sync the name input to the freshly-loaded playlist. Refresh
+            // is not an edit, so cancel any pending auto-save and clear
+            // the status pill.
             nameEl.value = activeName;
             nameEl.disabled = activeName === "default";
-            markClean();
+            autoSave.cancel();
             statusEl.textContent = "";
+            statusEl.dataset.state = "idle";
 
             palletEl.innerHTML = "";
             for (const item of items) {
@@ -307,7 +297,10 @@ export function mountPlaylistTrack(container, options) {
     }
 
     refresh();
-    return { refresh };
+    return {
+        refresh,
+        flushAutoSave: () => autoSave.flush(),
+    };
 }
 
 function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons, getCacheBust) {

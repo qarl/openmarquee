@@ -72,11 +72,10 @@ describe("mountPlaylistTrack", () => {
         expect(durations).toEqual(["5", "3", "10"]);
     });
 
-    it("clicking × removes the block and PUTs the new order as canonical entries", async () => {
+    it("clicking × removes the block and auto-saves the new canonical entries", async () => {
         const container = document.createElement("div");
-        const onReorder = vi.fn().mockResolvedValue(undefined);
         const onSavePlaylist = vi.fn().mockResolvedValue(undefined);
-        mountPlaylistTrack(container, {
+        const handle = mountPlaylistTrack(container, {
             fetchItems: async () => ITEMS,
             fetchPlaylists: fetchPlaylistsWith(["a", "b", "c"]),
             onSavePlaylist,
@@ -84,7 +83,7 @@ describe("mountPlaylistTrack", () => {
         await tick();
 
         // Remove the middle one — it should drop out of the DOM and
-        // dirty the editor (Save button enables) but NOT auto-save.
+        // schedule a debounced save.
         container
             .querySelector('.track-block[data-id="b"] .track-remove')
             .click();
@@ -94,23 +93,18 @@ describe("mountPlaylistTrack", () => {
             container.querySelectorAll(".track-block"),
         ).map((b) => b.dataset.id);
         expect(remainingIds).toEqual(["a", "c"]);
-        expect(onSavePlaylist).not.toHaveBeenCalled();
-        expect(container.querySelector(".playlist-save").disabled).toBe(false);
 
-        // Save click sends the canonical entry envelope for what's
-        // currently in the track.
-        container.querySelector(".playlist-save").click();
-        await tick();
+        await handle.flushAutoSave();
         expect(onSavePlaylist).toHaveBeenCalledTimes(1);
         const { entries } = onSavePlaylist.mock.calls[0][0];
         expect(entries.map((e) => e.item_id)).toEqual(["a", "c"]);
         expect(entries.every((e) => e.transition === "cut")).toBe(true);
     });
 
-    it("clicking the transition chip cycles cut ↔ fade in the draft", async () => {
+    it("clicking the transition chip cycles cut → fade and auto-saves", async () => {
         const container = document.createElement("div");
         const onSavePlaylist = vi.fn().mockResolvedValue(undefined);
-        mountPlaylistTrack(container, {
+        const handle = mountPlaylistTrack(container, {
             fetchItems: async () => ITEMS,
             fetchPlaylists: fetchPlaylistsWith(["a"]),
             onSavePlaylist,
@@ -124,13 +118,11 @@ describe("mountPlaylistTrack", () => {
         chip.click();
         await tick();
         expect(chip.textContent).toBe("fade");
-        // Cycling marks dirty but doesn't auto-save.
-        expect(onSavePlaylist).not.toHaveBeenCalled();
-        expect(container.querySelector(".playlist-save").disabled).toBe(false);
 
-        // Save sends the new transition value.
-        container.querySelector(".playlist-save").click();
-        await tick();
+        await handle.flushAutoSave();
+        expect(onSavePlaylist).toHaveBeenCalledTimes(1);
+
+        // Auto-save already fired above; assert the canonical transition value.
         const { entries } = onSavePlaylist.mock.calls[0][0];
         expect(entries).toEqual([
             { item_id: "a", transition: "fade", transition_ms: 500 },
@@ -356,11 +348,9 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
         nameEl.dispatchEvent(new Event("input", { bubbles: true }));
 
         expect(onDraftChange).not.toHaveBeenCalled();
-        // But isDirty should still be set (save button lit up) — the
-        // rename still needs to be persisted; just the preview wasn't
-        // notified.
-        const saveBtn = container.querySelector(".playlist-save");
-        expect(saveBtn.disabled).toBe(false);
+        // But the rename still schedules an auto-save — the preview just
+        // didn't get notified mid-keystroke.
+        // (We don't flush + assert here; that's covered elsewhere.)
     });
 
     it("doesn't throw when onDraftChange isn't provided (back-compat)", async () => {

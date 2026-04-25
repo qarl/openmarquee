@@ -215,6 +215,23 @@ async function boot() {
     // separately (and re-mount on dim change without disturbing the shell).
     let slidesShell = null;
 
+    // Sidebar count badges — totals next to the "Slides" and "Playlists"
+    // nav entries. Decorative; failures are swallowed so a borked API
+    // doesn't blank the chrome.
+    async function refreshSidebarCounts() {
+        try {
+            const items = await listContent();
+            const slot = document.querySelector("[data-slide-count]");
+            if (slot) slot.textContent = String(items.length);
+        } catch { /* leave last-known value */ }
+        try {
+            const collection = await listPlaylists();
+            const count = Object.keys(collection.playlists || {}).length;
+            const slot = document.querySelector("[data-playlist-count]");
+            if (slot) slot.textContent = String(count);
+        } catch { /* leave last-known value */ }
+    }
+
     // Forward *all* args so both onSave(payload) and the two-arg
     // onSaveExisting(id, payload) work through the same wrapper. The
     // older single-arg signature dropped `payload` on edit calls, which
@@ -228,8 +245,9 @@ async function boot() {
         await editor?.refreshBrowser?.();
         await imageUploader?.refreshBrowser?.();
         await videoUploader?.refreshBrowser?.();
-        // Slides shell tab counts.
+        // Slides shell tab counts + sidebar totals.
         await slidesShell?.refreshCounts?.();
+        await refreshSidebarCounts();
         // The inline preview also caches the playlist; refresh it so
         // a newly-added slide shows up mid-session.
         await inlinePreviewHandle?.refresh?.();
@@ -283,6 +301,7 @@ async function boot() {
                     playlistBrowserHandle?.highlight(target);
                 }
                 await inlinePreviewHandle?.refresh();
+                await refreshSidebarCounts();
             },
             onDraftChange: async (draft) => {
                 // Operator reordered / flipped a transition / renamed —
@@ -341,6 +360,7 @@ async function boot() {
                             playlistBrowserHandle.highlight(newName);
                             await playlistTrack?.refresh();
                             await inlinePreviewHandle?.refresh();
+                            await refreshSidebarCounts();
                         },
                     });
                     playlistBrowserHandle.highlight(currentPlaylistName);
@@ -402,6 +422,7 @@ async function boot() {
             },
         },
     );
+    refreshSidebarCounts();
 
     // Schedule + settings don't depend on dims, so they mount once.
     mountSchedule(root.querySelector(".schedule-slot"), {
@@ -703,6 +724,8 @@ async function boot() {
             editor?.refreshBrowser?.(),
             imageUploader?.refreshBrowser?.(),
             videoUploader?.refreshBrowser?.(),
+            slidesShell?.refreshCounts?.(),
+            refreshSidebarCounts(),
             inlinePreviewHandle?.refresh?.(),
         ]);
     });

@@ -30,7 +30,7 @@ afterEach(() => {
 });
 
 describe("mountVideoUploader", () => {
-    it("renders the upload form with Save disabled until a file is picked", async () => {
+    it("renders the upload form with status pill (no Save button — auto-save)", async () => {
         const container = document.createElement("div");
         mountVideoUploader(container, {
             width: 128,
@@ -38,13 +38,14 @@ describe("mountVideoUploader", () => {
             onSave: vi.fn(),
         });
         await tick();
-        expect(container.querySelector(".field-save").disabled).toBe(true);
+        expect(container.querySelector(".field-save")).toBeNull();
+        expect(container.querySelector(".om-save-status")).not.toBeNull();
         // Pipeline dropdown is gone — the uploader always transcodes to
         // H.264 via ffmpeg.wasm now.
         expect(container.querySelector(".field-pipeline")).toBeNull();
     });
 
-    it("loadForEdit pre-fills + allows metadata-only save (no new file)", async () => {
+    it("loadForEdit pre-fills + auto-save sends metadata-only payload (no new file)", async () => {
         // Stub Image so drawUrlToCanvas for the stored thumbnail resolves.
         const RealImage = window.Image;
         window.Image = class {
@@ -83,34 +84,38 @@ describe("mountVideoUploader", () => {
 
         expect(container.querySelector(".field-name").value).toBe("Promo");
         expect(container.querySelector(".field-duration").value).toBe("15");
-        expect(container.querySelector(".field-save").disabled).toBe(false);
 
-        container.querySelector(".controls").dispatchEvent(new Event("submit"));
-        await tick();
+        // Mutate the name to trigger auto-save.
+        container.querySelector(".field-name").value = "Updated Promo";
+        container.querySelector(".field-name").dispatchEvent(
+            new Event("input", { bubbles: true }),
+        );
+        await handle.flushAutoSave();
         expect(onSaveExisting).toHaveBeenCalledTimes(1);
         const [id, payload] = onSaveExisting.mock.calls[0];
         expect(id).toBe("v-1");
-        expect(payload.name).toBe("Promo");
+        expect(payload.name).toBe("Updated Promo");
         expect(payload.png_base64).toBeNull();
         expect(payload.mp4_base64).toBeNull();
 
         window.Image = RealImage;
     });
 
-    it("surfaces a known message when the video can't be read", async () => {
+    it("file pick with no file is a no-op (no save attempted)", async () => {
         const container = document.createElement("div");
-        mountVideoUploader(container, {
+        const onSave = vi.fn();
+        const handle = mountVideoUploader(container, {
             width: 128,
             height: 96,
-            onSave: vi.fn(),
+            onSave,
         });
         await tick();
-        // Simulate a file pick with no actual file — change handler sets
-        // the disabled state without erroring.
+        // Simulate a file pick with no actual file — change handler runs,
+        // canSave gate keeps auto-save suppressed.
         const fileEl = container.querySelector(".field-file");
-        fileEl.dispatchEvent(new Event("change"));
-        await tick();
-        expect(container.querySelector(".field-save").disabled).toBe(true);
+        fileEl.dispatchEvent(new Event("change", { bubbles: true }));
+        await handle.flushAutoSave();
+        expect(onSave).not.toHaveBeenCalled();
     });
 });
 

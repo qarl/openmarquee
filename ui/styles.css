@@ -1222,6 +1222,23 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     min-height: 1.2em;
 }
 
+/* Auto-save indicator. The auto-save helper toggles `data-state`
+   between idle / saving / saved / error; we colorize accordingly. The
+   element is intentionally subtle — operators glance at it to confirm
+   the network heard their change, not a primary call to action. */
+.om-save-status {
+    margin: 6px 0 0;
+    min-height: 1.4em;
+    font-family: var(--om-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    color: var(--om-text-fade);
+    text-align: center;
+}
+.om-save-status[data-state="saving"] { color: var(--om-text-dim); }
+.om-save-status[data-state="saved"]  { color: var(--om-good, #4ec18b); }
+.om-save-status[data-state="error"]  { color: var(--om-warn, #ff7a59); }
+
 .field-hint {
     margin: 0;
     color: var(--muted);
@@ -2386,7 +2403,8 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   color: var(--om-text);
   box-shadow: 0 1px 2px rgba(0,0,0,.25);
 }
-.om-subnav button .om-count {
+/* Count badge — used in subnav buttons and sidebar nav-links. */
+.om-count {
   font-family: var(--om-mono);
   font-size: 10.5px;
   color: var(--om-text-fade);
@@ -2394,7 +2412,8 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   padding: 1px 5px;
   border-radius: 4px;
 }
-.om-subnav button.active .om-count { color: var(--om-accent); background: var(--om-accent-soft); }
+.om-subnav button.active .om-count,
+.om-side-item.active .om-count { color: var(--om-accent); background: var(--om-accent-soft); }
 
 /* ─── Card ────────────────────────── */
 .om-card {

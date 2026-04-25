@@ -22,14 +22,6 @@ const TEMPLATE = `
         <form class="controls" autocomplete="off">
             <div class="om-card">
                 <div class="om-stack" style="gap: 12px;">
-                    <label class="om-field">
-                        <span>Video file (any format ffmpeg can decode)</span>
-                        <input type="file" accept="video/*" class="om-input field-file">
-                        <span class="video-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
-                            Editing an existing video — leave the file picker blank
-                            to just update name / duration.
-                        </span>
-                    </label>
                     <div class="om-row" style="gap: 10px;">
                         <label class="om-field" style="flex: 1;">
                             <span>Slide name</span>
@@ -40,15 +32,23 @@ const TEMPLATE = `
                             <input type="number" class="om-input field-duration" value="10" min="1" max="3600" step="1">
                         </label>
                     </div>
+                    <label class="om-field">
+                        <span>Video file (any format ffmpeg can decode)</span>
+                        <input type="file" accept="video/*" class="om-input field-file">
+                        <span class="video-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
+                            Editing an existing video — leave the file picker blank
+                            to just update name / duration.
+                        </span>
+                    </label>
                 </div>
             </div>
-            <button type="submit" class="om-btn primary field-save" disabled style="width: 100%; height: 46px; font-size: 14.5px;">Save video</button>
-            <p class="video-upload-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
+            <p class="om-save-status video-upload-status" role="status" aria-live="polite" data-state="idle"></p>
             <progress class="video-upload-progress" value="0" max="100" hidden style="width: 100%; margin-top: 6px;"></progress>
         </form>
     </section>
 `;
 
+import { attachAutoSave } from "./auto-save.js";
 import {
     describeFfmpegError,
     transcodeToH264,
@@ -109,7 +109,6 @@ export function mountVideoUploader(
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
-    const saveBtn = container.querySelector(".field-save");
     const statusEl = container.querySelector(".video-upload-status");
     const progressEl = container.querySelector(".video-upload-progress");
     const form = container.querySelector(".controls");
@@ -121,6 +120,9 @@ export function mountVideoUploader(
 
     function setStatus(msg) {
         statusEl.textContent = msg;
+        // Transcode-progress messages are advisory, not save status —
+        // mark them so the auto-save helper's color rules don't apply.
+        statusEl.dataset.state = "idle";
     }
     function setProgress(pct) {
         progressEl.hidden = false;
@@ -163,13 +165,6 @@ export function mountVideoUploader(
         editingId: null,
     };
 
-    function updateSaveEnabled() {
-        const hasNewFile = state.thumbnailCanvasReady && state.mp4Base64;
-        saveBtn.disabled =
-            (!state.editingId && !hasNewFile)
-            || saveBtn.dataset.inFlight === "1";
-    }
-
     clearCanvas(canvas);
 
     fileEl.addEventListener("change", async () => {
@@ -182,7 +177,6 @@ export function mountVideoUploader(
                 clearCanvas(canvas);
                 clearPreview();
             }
-            updateSaveEnabled();
             return;
         }
 
@@ -192,20 +186,26 @@ export function mountVideoUploader(
             nameEl.value = file.name.replace(/\.[^.]+$/, "").slice(0, 200);
         }
 
-        saveBtn.dataset.inFlight = "1";
-        updateSaveEnabled();
+        // Suspend auto-save while ffmpeg.wasm chews on the file — the
+        // status pill shows transcoding progress and we don't want a save
+        // attempt mid-transcode. Field edits (name, duration) made during
+        // transcode aren't lost: they live in the DOM, and the post-
+        // transcode kick() reads current field values via performSave.
+        autoSave.cancel();
         try {
             await processVideo(file);
+            // After transcode completes, kick auto-save so the new bytes
+            // get persisted without an explicit Save button click.
+            autoSave.kick();
         } catch (err) {
             state.thumbnailCanvasReady = false;
             state.mp4Base64 = null;
             clearCanvas(canvas);
             clearPreview();
-            setStatus(`Could not process video: ${describeFfmpegError(err)}`);
+            statusEl.textContent = `Could not process video: ${describeFfmpegError(err)}`;
+            statusEl.dataset.state = "error";
         } finally {
             clearProgress();
-            delete saveBtn.dataset.inFlight;
-            updateSaveEnabled();
         }
     });
 
@@ -242,37 +242,41 @@ export function mountVideoUploader(
         );
     }
 
-    form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        if (saveBtn.disabled) return;
-
-        saveBtn.dataset.inFlight = "1";
-        updateSaveEnabled();
-        statusEl.textContent = "Saving…";
-        try {
-            const durationSeconds = Number(durationEl.value) || 10;
-            const includeAssets =
-                state.thumbnailCanvasReady || !state.editingId;
-            const payload = {
-                name: nameEl.value || "Video",
-                duration_ms: Math.round(durationSeconds * 1000),
-                png_base64: includeAssets ? canvasToBase64(canvas) : null,
-                mp4_base64: includeAssets ? state.mp4Base64 : null,
-            };
-            if (state.editingId && onSaveExisting) {
-                await onSaveExisting(state.editingId, payload);
-                statusEl.textContent = "Updated.";
-            } else {
-                await onSave(payload);
-                statusEl.textContent = "Saved.";
-            }
-            resetToBlank();
-        } catch (err) {
-            statusEl.textContent = `Save failed: ${err.message}`;
-        } finally {
-            delete saveBtn.dataset.inFlight;
-            updateSaveEnabled();
+    async function performSave() {
+        const durationSeconds = Number(durationEl.value) || 10;
+        const includeAssets =
+            state.thumbnailCanvasReady || !state.editingId;
+        const payload = {
+            name: nameEl.value || "Video",
+            duration_ms: Math.round(durationSeconds * 1000),
+            png_base64: includeAssets ? canvasToBase64(canvas) : null,
+            mp4_base64: includeAssets ? state.mp4Base64 : null,
+        };
+        if (state.editingId && onSaveExisting) {
+            await onSaveExisting(state.editingId, payload);
+            // Subsequent metadata-only saves shouldn't re-upload the
+            // (already-stored) MP4 bytes.
+            state.thumbnailCanvasReady = false;
+            state.mp4Base64 = null;
+            return;
         }
+        const created = await onSave(payload);
+        if (created?.id) {
+            state.editingId = String(created.id);
+            state.thumbnailCanvasReady = false;
+            state.mp4Base64 = null;
+            editHintEl.hidden = false;
+            if (browser) browser.highlight(state.editingId);
+        }
+    }
+
+    const autoSave = attachAutoSave(form, {
+        save: performSave,
+        status: statusEl,
+        canSave: () => Boolean(
+            state.editingId
+            || (state.thumbnailCanvasReady && state.mp4Base64),
+        ),
     });
 
     async function resetToBlank() {
@@ -287,7 +291,9 @@ export function mountVideoUploader(
         durationEl.value = "10";
         clearCanvas(canvas);
         clearPreview();
-        updateSaveEnabled();
+        autoSave.cancel();
+        statusEl.textContent = "";
+        statusEl.dataset.state = "idle";
 
         // Async tail: gap-filled default name + browser refresh, both
         // no-ops if loadForEdit took ownership during the await.
@@ -337,9 +343,12 @@ export function mountVideoUploader(
             await drawUrlToCanvas(`/api/content/${slide.id}/asset`, canvas);
         } catch (err) {
             statusEl.textContent = `Could not load thumbnail: ${err.message}`;
+            statusEl.dataset.state = "error";
         }
         setPreviewSrc(`/api/content/${slide.id}/video`, /* revokeOnSwap */ false);
-        updateSaveEnabled();
+        // Loading is not an edit — drop any auto-save scheduled by the
+        // field mutations above.
+        autoSave.cancel();
     }
 
     let browser = null;
@@ -360,6 +369,7 @@ export function mountVideoUploader(
         loadForEdit,
         reset: resetToBlank,
         refreshBrowser: () => browser?.refresh(),
+        flushAutoSave: () => autoSave.flush(),
     };
 }
 

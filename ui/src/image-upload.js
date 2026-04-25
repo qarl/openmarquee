@@ -4,6 +4,7 @@
 // scales to panel dims at slide entry — so a panel resize never
 // degrades a stored asset.
 
+import { attachAutoSave } from "./auto-save.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 const TEMPLATE = `
@@ -15,14 +16,6 @@ const TEMPLATE = `
         <form class="controls" autocomplete="off">
             <div class="om-card">
                 <div class="om-stack" style="gap: 12px;">
-                    <label class="om-field">
-                        <span>Image file (JPG or PNG)</span>
-                        <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
-                        <span class="image-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
-                            Editing an existing image — leave the file picker blank
-                            to just update name / duration.
-                        </span>
-                    </label>
                     <div class="om-row" style="gap: 10px;">
                         <label class="om-field" style="flex: 1;">
                             <span>Slide name</span>
@@ -33,10 +26,17 @@ const TEMPLATE = `
                             <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
                         </label>
                     </div>
+                    <label class="om-field">
+                        <span>Image file (JPG or PNG)</span>
+                        <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
+                        <span class="image-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
+                            Editing an existing image — leave the file picker blank
+                            to just update name / duration.
+                        </span>
+                    </label>
                 </div>
             </div>
-            <button type="submit" class="om-btn primary field-save" disabled style="width: 100%; height: 46px; font-size: 14.5px;">Save image</button>
-            <p class="image-upload-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
+            <p class="om-save-status image-upload-status" role="status" aria-live="polite" data-state="idle"></p>
         </form>
     </section>
 `;
@@ -71,90 +71,77 @@ export function mountImageUploader(
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const form = container.querySelector(".controls");
-    const saveBtn = container.querySelector(".field-save");
     const statusEl = container.querySelector(".image-upload-status");
 
     const state = {
-        // The picked source file, kept around so submit can FileReader
-        // it as base64 — we no longer round-trip through Canvas, which
-        // would have downsampled to panel dims and re-encoded as PNG.
+        // The picked source file, kept around so auto-save can FileReader
+        // it as base64. Cleared after the create-mode save promotes us
+        // to edit mode (the bytes are then server-side).
         sourceFile: null,
-        // `editingId` = non-null when the operator opened an existing slide
-        // for edit; Save can skip sending image bytes when they never
-        // repicked a file.
+        // `editingId` = non-null once an existing slide is loaded OR once
+        // a fresh create-mode save returns an id. Subsequent auto-saves
+        // are metadata-only PATCHes that omit image bytes.
         editingId: null,
     };
 
-    function updateSaveEnabled() {
-        // In edit mode, metadata-only saves are valid (no new file needed).
-        // In create mode, a freshly-picked source file is required.
-        saveBtn.disabled =
-            (!state.editingId && !state.sourceFile)
-            || saveBtn.dataset.inFlight === "1";
+    async function performSave() {
+        const durationSeconds = Number(durationEl.value) || 5;
+        const image_base64 = state.sourceFile
+            ? await fileToBase64(state.sourceFile)
+            : null;
+        const payload = {
+            name: nameEl.value || "Image",
+            duration_ms: Math.round(durationSeconds * 1000),
+            image_base64,
+        };
+        if (state.editingId && onSaveExisting) {
+            await onSaveExisting(state.editingId, payload);
+            return;
+        }
+        if (!image_base64) {
+            throw new Error("pick an image file first");
+        }
+        const created = await onSave(payload);
+        // Promote to edit mode: subsequent auto-saves PATCH the same id
+        // and don't need to re-upload bytes.
+        if (created?.id) {
+            state.editingId = String(created.id);
+            state.sourceFile = null;
+            editHintEl.hidden = false;
+            if (browser) browser.highlight(state.editingId);
+        }
     }
+
+    const autoSave = attachAutoSave(form, {
+        save: performSave,
+        status: statusEl,
+        canSave: () => Boolean(state.editingId || state.sourceFile),
+    });
 
     fileEl.addEventListener("change", async () => {
         const file = fileEl.files?.[0];
         if (!file) {
             state.sourceFile = null;
             if (!state.editingId) clearCanvas();
-            updateSaveEnabled();
             return;
         }
         try {
             // Preview is just visual feedback; the bytes we upload come
-            // straight from the source file (FileReader on submit).
+            // straight from the source file (FileReader at save time).
             await drawFileToCanvas(file, canvas);
             state.sourceFile = file;
-            statusEl.textContent = "";
             if (nameEl.value === "Image") {
                 nameEl.value = file.name.replace(/\.[^.]+$/, "").slice(0, 200);
             }
+            // The form-level `change` listener also schedules — kicking
+            // here ensures we re-arm AFTER state.sourceFile is set so
+            // the canSave gate flips true on the same tick.
+            autoSave.kick();
         } catch (err) {
             state.sourceFile = null;
             clearCanvas();
             statusEl.textContent = `Could not load image: ${err.message}`;
-        } finally {
-            updateSaveEnabled();
-        }
-    });
-
-    form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        if (saveBtn.disabled) return;
-
-        saveBtn.dataset.inFlight = "1";
-        updateSaveEnabled();
-        statusEl.textContent = "Saving…";
-        try {
-            const durationSeconds = Number(durationEl.value) || 5;
-            // Send the source file's bytes verbatim when we have one;
-            // omit on metadata-only edits so the server keeps existing.
-            const image_base64 = state.sourceFile
-                ? await fileToBase64(state.sourceFile)
-                : null;
-            const payload = {
-                name: nameEl.value || "Image",
-                duration_ms: Math.round(durationSeconds * 1000),
-                image_base64,
-            };
-            if (state.editingId && onSaveExisting) {
-                await onSaveExisting(state.editingId, payload);
-                statusEl.textContent = "Updated.";
-            } else {
-                // Create-mode requires image bytes; defensive guard.
-                if (!image_base64) {
-                    throw new Error("pick an image file first");
-                }
-                await onSave(payload);
-                statusEl.textContent = "Saved.";
-            }
-            resetToBlank();
-        } catch (err) {
-            statusEl.textContent = `Save failed: ${err.message}`;
-        } finally {
-            delete saveBtn.dataset.inFlight;
-            updateSaveEnabled();
+            statusEl.dataset.state = "error";
         }
     });
 
@@ -178,7 +165,11 @@ export function mountImageUploader(
         fileEl.value = "";
         durationEl.value = "5";
         clearCanvas();
-        updateSaveEnabled();
+        // Drop any pending auto-save — the form is being cleared,
+        // not edited.
+        autoSave.cancel();
+        statusEl.textContent = "";
+        statusEl.dataset.state = "idle";
 
         // Async tail: gap-filled default name + browser refresh.
         // Both are no-ops if loadForEdit grabbed editingId while
@@ -224,8 +215,11 @@ export function mountImageUploader(
         } catch (err) {
             clearCanvas();
             statusEl.textContent = `Could not load image: ${err.message}`;
+            statusEl.dataset.state = "error";
         }
-        updateSaveEnabled();
+        // Loading an existing slide is not a user edit — drop any pending
+        // auto-save scheduled by the field-value mutations above.
+        autoSave.cancel();
     }
 
     clearCanvas();
@@ -248,6 +242,7 @@ export function mountImageUploader(
         loadForEdit,
         reset: resetToBlank,
         refreshBrowser: () => browser?.refresh(),
+        flushAutoSave: () => autoSave.flush(),
     };
 }
 
