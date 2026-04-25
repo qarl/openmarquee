@@ -77,7 +77,7 @@ def test_state_returns_not_running_initially(client: TestClient):
         "current_item_transition_ms": None,
         "current_item_auto_mode": None,
         "current_item_auto_format": None,
-        "current_playlist_name": None,
+        "current_playlist_id": None,
     }
 
 
@@ -175,7 +175,7 @@ def test_current_thumbnail_serves_current_item_asset(
 def test_current_thumbnail_returns_first_item_of_current_playlist(tmp_path: Path):
     """The thumbnail is the playlist's cover (first slide), not the
     currently-rotating slide. Set up a loop that stamps
-    `current_playlist_name` on its items so the endpoint walks the
+    `current_playlist_id` on its items so the endpoint walks the
     playlist rather than the fallback path."""
     from openmarquee.dependencies import (
         _content_storage_singleton,
@@ -185,7 +185,12 @@ def test_current_thumbnail_returns_first_item_of_current_playlist(tmp_path: Path
         get_playback_loop,
         get_playlist_storage,
     )
-    from openmarquee.playlist import Playlist, PlaylistItem, PlaylistStorage
+    from openmarquee.playlist import (
+        DEFAULT_PLAYLIST_ID,
+        Playlist,
+        PlaylistItem,
+        PlaylistStorage,
+    )
     from openmarquee.rendering.mock import MockRenderer
 
     content = ContentStorage(tmp_path / "content")
@@ -199,14 +204,15 @@ def test_current_thumbnail_returns_first_item_of_current_playlist(tmp_path: Path
     second_png = _png_bytes(8, 8, (0, 100, 200))
     content.save_text_slide(first, first_png)
     content.save_text_slide(second, second_png)
-    playlists.set_playlist(
-        "default",
+    playlists.set_by_id(
         Playlist(
+            id=DEFAULT_PLAYLIST_ID,
+            name="default",
             items=[
                 PlaylistItem(item_id=first.id),
                 PlaylistItem(item_id=second.id),
-            ]
-        ),
+            ],
+        )
     )
 
     from openmarquee.playback import PlaybackLoop
@@ -214,10 +220,11 @@ def test_current_thumbnail_returns_first_item_of_current_playlist(tmp_path: Path
     loop_holder: dict = {}
 
     def fetch():
-        # Mirror scheduled_fetch_items — stamp the playlist name so the
+        # Mirror scheduled_fetch_items — stamp the playlist id so the
         # current-thumbnail endpoint can find the playlist's first item.
-        loop_holder["loop"]._stamp_playlist_name("default")
-        return [content.load(iid) for iid in playlists.get_playlist("default").item_ids]
+        loop_holder["loop"]._stamp_playlist_id(DEFAULT_PLAYLIST_ID)
+        default_pl = playlists.get_by_id(DEFAULT_PLAYLIST_ID)
+        return [content.load(iid) for iid in default_pl.item_ids]
 
     loop = PlaybackLoop(
         renderer=renderer,

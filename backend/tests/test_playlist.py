@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from openmarquee.playlist import (
+    DEFAULT_PLAYLIST_ID,
     DEFAULT_PLAYLIST_NAME,
     PLAYLIST_SCHEMA_VERSION,
     Playlist,
@@ -13,9 +14,15 @@ from openmarquee.playlist import (
 )
 
 
-def test_empty_load_returns_empty_playlist(tmp_path: Path):
+# --- Legacy single-playlist API (operates on the default playlist by id) ---
+
+
+def test_empty_load_returns_empty_default_playlist(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
-    assert storage.load().item_ids == []
+    pl = storage.load()
+    assert pl.item_ids == []
+    assert pl.id == DEFAULT_PLAYLIST_ID
+    assert pl.name == DEFAULT_PLAYLIST_NAME
 
 
 def test_save_then_load_round_trips_order(tmp_path: Path):
@@ -38,7 +45,7 @@ def test_atomic_write_leaves_no_tmp_files(tmp_path: Path):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
-def test_save_overwrites_previous_playlist(tmp_path: Path):
+def test_save_overwrites_previous_default_playlist(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
     storage.save(Playlist(item_ids=[uuid4(), uuid4()]))
     new_ids = [uuid4()]
@@ -47,8 +54,6 @@ def test_save_overwrites_previous_playlist(tmp_path: Path):
 
 
 def test_invalid_json_raises_on_load(tmp_path: Path):
-    import json
-
     path = tmp_path / "playlist.json"
     path.write_text("this is not JSON")
     storage = PlaylistStorage(path)
@@ -86,61 +91,71 @@ def test_remove_drops_only_the_named_id():
     assert playlist.item_ids == [a, c]
 
 
-# --- Multi-playlist API ---
+# --- Multi-playlist (id-keyed) API ---
 
 
-def test_load_all_returns_empty_collection_when_no_file(tmp_path: Path):
+def test_load_all_returns_default_only_when_no_file(tmp_path: Path):
+    """A fresh device bootstraps with just the default playlist present."""
     storage = PlaylistStorage(tmp_path / "playlist.json")
     coll = storage.load_all()
-    assert coll.playlists == {}
+    assert len(coll.playlists) == 1
+    assert coll.playlists[0].id == DEFAULT_PLAYLIST_ID
+    assert coll.playlists[0].name == DEFAULT_PLAYLIST_NAME
     assert coll.schema_version == PLAYLIST_SCHEMA_VERSION
 
 
 def test_set_then_get_playlist_round_trips(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
     a, b = uuid4(), uuid4()
-    storage.set_playlist("lunch", Playlist(item_ids=[a, b]))
+    pl = Playlist(name="lunch", items=[])
+    pl.append(a)
+    pl.append(b)
+    storage.set_by_id(pl)
 
-    loaded = storage.get_playlist("lunch")
+    loaded = storage.get_by_id(pl.id)
+    assert loaded is not None
     assert loaded.item_ids == [a, b]
+    assert loaded.name == "lunch"
 
 
-def test_get_playlist_returns_empty_for_unknown_name(tmp_path: Path):
+def test_get_by_id_returns_none_for_unknown_id(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
-    assert storage.get_playlist("nope").item_ids == []
+    assert storage.get_by_id(uuid4()) is None
 
 
 def test_set_playlist_does_not_affect_other_playlists(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
     a, b = uuid4(), uuid4()
-    storage.set_playlist("default", Playlist(item_ids=[a]))
-    storage.set_playlist("weekend", Playlist(item_ids=[b]))
-    assert storage.get_playlist("default").item_ids == [a]
-    assert storage.get_playlist("weekend").item_ids == [b]
+    pl1 = Playlist(name="weekday", items=[])
+    pl1.append(a)
+    pl2 = Playlist(name="weekend", items=[])
+    pl2.append(b)
+    storage.set_by_id(pl1)
+    storage.set_by_id(pl2)
+    assert storage.get_by_id(pl1.id).item_ids == [a]
+    assert storage.get_by_id(pl2.id).item_ids == [b]
 
 
 def test_delete_playlist_removes_only_that_one(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
-    storage.set_playlist("a", Playlist(item_ids=[uuid4()]))
-    storage.set_playlist("b", Playlist(item_ids=[uuid4()]))
-    assert storage.delete_playlist("a") is True
-    assert storage.all_names() == ["b"]
+    pl1 = Playlist(name="a", items=[])
+    pl1.append(uuid4())
+    pl2 = Playlist(name="b", items=[])
+    pl2.append(uuid4())
+    storage.set_by_id(pl1)
+    storage.set_by_id(pl2)
+    assert storage.delete_by_id(pl1.id) is True
+    remaining_ids = storage.all_ids()
+    assert pl1.id not in remaining_ids
+    assert pl2.id in remaining_ids
 
 
-def test_delete_playlist_returns_false_for_unknown_name(tmp_path: Path):
+def test_delete_playlist_returns_false_for_unknown_id(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
-    assert storage.delete_playlist("nope") is False
+    assert storage.delete_by_id(uuid4()) is False
 
 
-def test_all_names_sorted_alphabetically(tmp_path: Path):
-    storage = PlaylistStorage(tmp_path / "playlist.json")
-    storage.set_playlist("zebra", Playlist())
-    storage.set_playlist("apple", Playlist())
-    storage.set_playlist("mango", Playlist())
-    assert storage.all_names() == ["apple", "mango", "zebra"]
-
-
-# --- Legacy single-playlist API (back-compat) ---
+# --- Legacy single-playlist API ↔ multi-playlist API consistency ---
 
 
 def test_legacy_save_load_operates_on_default_playlist(tmp_path: Path):
@@ -150,52 +165,94 @@ def test_legacy_save_load_operates_on_default_playlist(tmp_path: Path):
 
     # Both APIs see the same data.
     assert storage.load().item_ids == [a, b]
-    assert storage.get_playlist(DEFAULT_PLAYLIST_NAME).item_ids == [a, b]
+    assert storage.get_by_id(DEFAULT_PLAYLIST_ID).item_ids == [a, b]
 
 
-# --- Migration from legacy v1 format ---
+# --- Migration from legacy on-disk formats ---
 
 
-def test_loads_legacy_single_playlist_format_as_default(tmp_path: Path):
-    """A pre-multi-playlist file ({"item_ids": [...]}) should migrate
-    transparently to the default playlist of a v2 collection."""
+def test_loads_legacy_v1_unnamed_format_as_default_playlist(tmp_path: Path):
+    """Pre-Phase-5 file (`{"item_ids": [...]}`) migrates to the default playlist."""
     a, b = uuid4(), uuid4()
     legacy = {"item_ids": [str(a), str(b)]}
     path = tmp_path / "playlist.json"
     path.write_text(json.dumps(legacy))
 
     storage = PlaylistStorage(path)
-    assert storage.get_playlist(DEFAULT_PLAYLIST_NAME).item_ids == [a, b]
+    default_pl = storage.get_by_id(DEFAULT_PLAYLIST_ID)
+    assert default_pl is not None
+    assert default_pl.item_ids == [a, b]
     # And the legacy load() API still works.
     assert storage.load().item_ids == [a, b]
 
 
-def test_save_writes_v2_envelope_with_schema_version(tmp_path: Path):
-    storage = PlaylistStorage(tmp_path / "playlist.json")
-    storage.set_playlist("default", Playlist(item_ids=[uuid4()]))
+def test_v3_dict_keyed_migrates_to_v4_list_with_uuids(tmp_path: Path):
+    """v3: {playlists: {name: {items: [...]}}}. v4: list with {id, name, items}.
+    Default playlist gets the constant DEFAULT_PLAYLIST_ID; others get fresh."""
+    a, b = uuid4(), uuid4()
+    path = tmp_path / "playlist.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "playlists": {
+                    "default": {"items": [{"item_id": str(a)}]},
+                    "lunch": {"items": [{"item_id": str(b)}]},
+                },
+            }
+        )
+    )
+    storage = PlaylistStorage(path)
+    coll = storage.load_all()
+    # Both playlists present.
+    assert len(coll.playlists) == 2
+    default_pl = coll.by_id(DEFAULT_PLAYLIST_ID)
+    assert default_pl is not None
+    assert default_pl.name == "default"
+    assert default_pl.item_ids == [a]
+    # Lunch playlist preserved with its name and a fresh UUID.
+    lunch = coll.by_name("lunch")
+    assert lunch is not None
+    assert lunch.id != DEFAULT_PLAYLIST_ID
+    assert lunch.item_ids == [b]
 
+
+def test_v4_envelope_loads_unchanged(tmp_path: Path):
+    """A file already in v4 form should round-trip without rewriting."""
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    pl = Playlist(name="weekend", items=[])
+    storage.set_by_id(pl)
+
+    # Read raw and confirm format.
     raw = json.loads((tmp_path / "playlist.json").read_text())
     assert raw["schema_version"] == PLAYLIST_SCHEMA_VERSION
-    assert "playlists" in raw
-    assert "default" in raw["playlists"]
+    assert isinstance(raw["playlists"], list)
+    # Each entry has id + name + items.
+    for entry in raw["playlists"]:
+        assert "id" in entry
+        assert "name" in entry
+        assert "items" in entry
 
 
 def test_collection_round_trips_via_load_all_save_all(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
-    coll = PlaylistCollection(
-        playlists={
-            "default": Playlist(item_ids=[uuid4()]),
-            "weekend": Playlist(item_ids=[uuid4(), uuid4()]),
-        }
-    )
+    p1 = Playlist(id=DEFAULT_PLAYLIST_ID, name="default", items=[])
+    p1.append(uuid4())
+    p2 = Playlist(name="weekend", items=[])
+    p2.append(uuid4())
+    p2.append(uuid4())
+    coll = PlaylistCollection(playlists=[p1, p2])
     storage.save_all(coll)
 
     loaded = storage.load_all()
-    assert set(loaded.playlists) == {"default", "weekend"}
-    assert len(loaded.playlists["weekend"].item_ids) == 2
+    names = {p.name for p in loaded.playlists}
+    assert names == {"default", "weekend"}
+    weekend = loaded.by_name("weekend")
+    assert weekend is not None
+    assert len(weekend.item_ids) == 2
 
 
-# --- v3: transitions live on the playlist ---
+# --- v3+ transitions on the playlist ---
 
 
 def test_playlist_items_round_trip_with_transition_fields(tmp_path: Path):
@@ -231,7 +288,7 @@ def test_playlist_item_ids_is_a_derived_view_over_items():
     assert pl.item_ids == [a, b]
 
 
-def test_v2_on_disk_migrates_to_v3_with_default_transitions(tmp_path: Path):
+def test_v2_on_disk_migrates_with_default_transitions(tmp_path: Path):
     """Existing SD cards have `item_ids` at each playlist level (schema_version=2)."""
     path = tmp_path / "playlist.json"
     a, b = str(uuid4()), str(uuid4())
@@ -253,7 +310,7 @@ def test_v2_on_disk_migrates_to_v3_with_default_transitions(tmp_path: Path):
     assert all(i.transition_ms == 500 for i in loaded.items)
 
 
-def test_v1_unnamed_on_disk_migrates_to_v3_default_playlist(tmp_path: Path):
+def test_v1_unnamed_on_disk_migrates_to_default_playlist(tmp_path: Path):
     """Oldest format: `{item_ids: [...]}` with no envelope at all."""
     path = tmp_path / "playlist.json"
     a = str(uuid4())
@@ -323,14 +380,17 @@ def test_prune_dangling_prunes_across_every_playlist_in_collection(tmp_path: Pat
     """A named playlist AND the default playlist both get cleaned."""
     storage = PlaylistStorage(tmp_path / "playlist.json")
     a, b, c = uuid4(), uuid4(), uuid4()
-    storage.set_playlist("default", Playlist(item_ids=[a, b]))
-    storage.set_playlist("lobby", Playlist(item_ids=[b, c]))
+    storage.save(Playlist(item_ids=[a, b]))  # default
+    lobby = Playlist(name="lobby")
+    lobby.append(b)
+    lobby.append(c)
+    storage.set_by_id(lobby)
 
     pruned = storage.prune_dangling_refs({b})  # only b is "valid"
 
     assert pruned == 2  # a (default) + c (lobby)
-    assert storage.get_playlist("default").item_ids == [b]
-    assert storage.get_playlist("lobby").item_ids == [b]
+    assert storage.get_by_id(DEFAULT_PLAYLIST_ID).item_ids == [b]
+    assert storage.get_by_id(lobby.id).item_ids == [b]
 
 
 def test_prune_dangling_empty_valid_set_empties_every_playlist(tmp_path: Path):

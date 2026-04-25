@@ -21,9 +21,10 @@
 
 import {
     addFlockPeer,
+    createPlaylist,
     deleteContent,
     deleteFlockPeer,
-    deletePlaylistByName,
+    deletePlaylistById,
     fetchContentItem,
     generateBackground,
     getSchedule,
@@ -33,7 +34,7 @@ import {
     listPlaylists,
     patchSlideDuration,
     saveImage,
-    savePlaylistByName,
+    savePlaylistById,
     saveSchedule,
     saveSettings,
     saveTextSlide,
@@ -43,6 +44,7 @@ import {
     updateTextSlide,
     updateVideo,
 } from "./api.js";
+import { DEFAULT_PLAYLIST_ID } from "./constants.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
 import { mountInlinePreview } from "./inline-preview.js";
@@ -114,15 +116,18 @@ async function resolvePanelDims() {
 // inline preview reflects the operator's in-progress state.
 let playlistDraft = null;
 
-async function fetchResolvedPlaylist(name) {
+async function fetchResolvedPlaylist(playlistId) {
     const items = await listContent();
     const byId = new Map(items.map((it) => [String(it.id), it]));
     let raw;
-    if (playlistDraft && playlistDraft.name === name) {
+    if (playlistDraft && playlistDraft.playlistId === playlistId) {
         raw = playlistDraft.entries;
     } else {
         const collection = await listPlaylists();
-        raw = collection.playlists?.[name]?.items || [];
+        const target = (collection.playlists || []).find(
+            (p) => String(p.id) === String(playlistId),
+        );
+        raw = target?.items || [];
     }
     const resolved = raw
         .map((entry) => ({
@@ -203,11 +208,11 @@ async function boot() {
     // Inline preview runs a requestAnimationFrame loop + caches
     // <img>/<video> elements; stop() before dropping its DOM.
     let inlinePreviewHandle = null;
-    // Multi-playlist active-name state. Browser-select + new-create
+    // Multi-playlist active-id state. Browser-select + new-create
     // update this; playlist-track reads it on each refresh via a
     // closure callable, and reorder / inline-preview fetches target
-    // whatever name this holds at call time.
-    let currentPlaylistName = "default";
+    // whatever id this holds at call time.
+    let currentPlaylistId = DEFAULT_PLAYLIST_ID;
     let playlistBrowserHandle = null;
 
     // Slides shell — sub-tab switcher + +New button. Mounted once; the
@@ -226,7 +231,7 @@ async function boot() {
         } catch { /* leave last-known value */ }
         try {
             const collection = await listPlaylists();
-            const count = Object.keys(collection.playlists || {}).length;
+            const count = (collection.playlists || []).length;
             const slot = document.querySelector("[data-playlist-count]");
             if (slot) slot.textContent = String(count);
         } catch { /* leave last-known value */ }
@@ -254,23 +259,24 @@ async function boot() {
         return saved;
     };
 
-    // Delete a playlist by name. Confirms first, then refreshes every
+    // Delete a playlist by id. Confirms first, then refreshes every
     // surface that lists playlists. If the deleted one was active, fall
-    // back to "default".
-    async function deletePlaylist(name) {
-        if (!window.confirm(`Delete "${name}"? This can't be undone.`)) return;
+    // back to the default.
+    async function deletePlaylist(playlistId, displayName) {
+        const label = displayName || "this playlist";
+        if (!window.confirm(`Delete "${label}"? This can't be undone.`)) return;
         try {
-            await deletePlaylistByName(name);
+            await deletePlaylistById(playlistId);
         } catch (err) {
             window.alert(`Could not delete: ${err?.message || err}`);
             return;
         }
-        if (currentPlaylistName === name) {
-            currentPlaylistName = "default";
+        if (currentPlaylistId === playlistId) {
+            currentPlaylistId = DEFAULT_PLAYLIST_ID;
             playlistDraft = null;
         }
         await playlistBrowserHandle?.refresh();
-        playlistBrowserHandle?.highlight(currentPlaylistName);
+        playlistBrowserHandle?.highlight(currentPlaylistId);
         await playlistTrack?.refresh();
         await inlinePreviewHandle?.refresh();
         await refreshSidebarCounts();
@@ -281,12 +287,12 @@ async function boot() {
     async function createNewPlaylist() {
         playlistDraft = null;
         const collection = await listPlaylists();
-        const names = Object.keys(collection.playlists || {});
+        const names = (collection.playlists || []).map((p) => p.name);
         const newName = nextPlaylistName(names);
-        await savePlaylistByName(newName, []);
-        currentPlaylistName = newName;
+        const created = await createPlaylist({ name: newName, entries: [] });
+        currentPlaylistId = String(created.id);
         await playlistBrowserHandle?.refresh();
-        playlistBrowserHandle?.highlight(newName);
+        playlistBrowserHandle?.highlight(currentPlaylistId);
         await playlistTrack?.refresh();
         await inlinePreviewHandle?.refresh();
         await refreshSidebarCounts();
@@ -316,28 +322,16 @@ async function boot() {
         playlistTrack = mountPlaylistTrack(trackSlot, {
             fetchItems: listContent,
             fetchPlaylists: listPlaylists,
-            // Explicit Save: drag/drop / transition / × / name-edit
-            // mutate a draft; only the Save button triggers persistence.
-            // Renames pivot via PUT-new + DELETE-old (the default
-            // playlist is rename-locked at the UI level).
-            onSavePlaylist: async ({ originalName, newName, entries }) => {
-                const target = newName || originalName;
-                await savePlaylistByName(target, entries);
-                // Clear the draft — the server is now authoritative.
+            // Auto-save: every drag/drop/transition/×/name-edit fires
+            // through here. The id is stable across renames so a name
+            // change is just a `name` field update — no PUT-new + DELETE-old
+            // pivot needed (the old name-as-id era required that).
+            onSavePlaylist: async ({ playlistId, name, entries }) => {
+                await savePlaylistById(playlistId, { name, entries });
                 playlistDraft = null;
-                if (target !== originalName && originalName !== "default") {
-                    try {
-                        await deletePlaylistByName(originalName);
-                    } catch (err) {
-                        console.warn(
-                            "[openmarquee] rename: old playlist delete failed (continuing):",
-                            err,
-                        );
-                    }
-                    currentPlaylistName = target;
-                    await playlistBrowserHandle?.refresh();
-                    playlistBrowserHandle?.highlight(target);
-                }
+                // Refresh the browser so the new name shows on the tile.
+                await playlistBrowserHandle?.refresh();
+                playlistBrowserHandle?.highlight(currentPlaylistId);
                 await inlinePreviewHandle?.refresh();
                 await refreshSidebarCounts();
             },
@@ -353,7 +347,7 @@ async function boot() {
                 await inlinePreviewHandle?.refresh();
                 return result;
             },
-            getCurrentPlaylistName: () => currentPlaylistName,
+            getCurrentPlaylistId: () => currentPlaylistId,
             inlinePreview: {
                 width,
                 height,
@@ -364,7 +358,7 @@ async function boot() {
                         height: dims.height,
                         outputMode: dims.outputMode,
                         fetchPlaylist: () =>
-                            fetchResolvedPlaylist(currentPlaylistName),
+                            fetchResolvedPlaylist(currentPlaylistId),
                     });
                     return inlinePreviewHandle;
                 },
@@ -374,21 +368,21 @@ async function boot() {
                     playlistBrowserHandle = mountPlaylistBrowser(slot, {
                         fetchPlaylists: listPlaylists,
                         fetchItems: listContent,
-                        onSelect: async (name) => {
+                        onSelect: async (playlistId) => {
                             // Abandon any draft for the playlist we're
                             // switching away from — without this, the
                             // stale draft could resurface if the
                             // operator navigated back before saving.
                             playlistDraft = null;
-                            currentPlaylistName = name;
-                            playlistBrowserHandle.highlight(name);
+                            currentPlaylistId = String(playlistId);
+                            playlistBrowserHandle.highlight(currentPlaylistId);
                             await playlistTrack?.refresh();
                             await inlinePreviewHandle?.refresh();
                         },
                         onCreate: createNewPlaylist,
                         onDelete: deletePlaylist,
                     });
-                    playlistBrowserHandle.highlight(currentPlaylistName);
+                    playlistBrowserHandle.highlight(currentPlaylistId);
                     return playlistBrowserHandle;
                 },
             },
@@ -459,9 +453,14 @@ async function boot() {
     mountSchedule(root.querySelector(".schedule-slot"), {
         fetchSchedule: getSchedule,
         onSave: saveSchedule,
-        fetchPlaylistNames: async () => {
+        // Yields {id, name} pairs so the schedule UI's playlist <select>
+        // shows display names but submits stable UUIDs.
+        fetchPlaylistChoices: async () => {
             const collection = await listPlaylists();
-            return Object.keys(collection.playlists || {}).sort();
+            return (collection.playlists || []).map((p) => ({
+                id: String(p.id),
+                name: p.name,
+            }));
         },
         fetchSettings: getSettings,
     });

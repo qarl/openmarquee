@@ -127,7 +127,13 @@ def _resolve_schedule_path() -> Path:
 
 @lru_cache
 def _schedule_storage_singleton() -> ScheduleStorage:
-    return ScheduleStorage(_resolve_schedule_path())
+    # Pass the playlist storage in so the schedule can transparently
+    # migrate v1 (playlist_name strings) → v2 (playlist_id UUIDs) by
+    # resolving names against the playlist collection on first load.
+    return ScheduleStorage(
+        _resolve_schedule_path(),
+        playlist_storage=_playlist_storage_singleton(),
+    )
 
 
 def get_schedule_storage() -> ScheduleStorage:

@@ -1,10 +1,13 @@
 // Multi-playlist browser — horizontal tile strip at the top of the
-// Playlists subpage. Mirrors the slide-browser pattern but for
-// PlaylistCollection entries: leading "+ New" tile creates a new
-// named playlist, then one tile per existing playlist.
+// Playlists subpage. Renders one tile per existing playlist; selecting
+// a tile switches both the track editor + the inline preview to that
+// playlist via the parent's onSelect callback.
 //
-// Selecting a tile switches both the track editor + the inline
-// preview to that playlist via the parent's onSelect callback.
+// Identity: tiles are keyed by stable UUID (data-id), with the display
+// name shown as the label. Renames don't shift identity, so highlight
+// + selection don't break across an edit.
+
+import { DEFAULT_PLAYLIST_ID } from "./constants.js";
 
 const TEMPLATE = `
     <div class="playlist-browser" role="toolbar" aria-label="playlists">
@@ -16,15 +19,19 @@ const TEMPLATE = `
  * Mount the multi-playlist browser.
  *
  * @param {HTMLElement} container — parent (emptied + replaced).
- * @param {object} options
- * @param {() => Promise<{playlists: object}>} options.fetchPlaylists
+ * @param {() => Promise<{playlists: Array}>} options.fetchPlaylists
+ *   — yields the v4 collection: `playlists` is a list of {id, name, items}.
  * @param {() => Promise<Array>} [options.fetchItems] — when provided,
- *     each tile shows a thumbnail of the playlist's first slide.
- * @param {(name: string) => void} options.onSelect — tile click.
- * @param {() => void} options.onCreate — "+ New" tile click.
+ *   each tile shows a thumbnail of the playlist's first slide.
+ * @param {(playlistId: string) => void} options.onSelect — tile click.
+ * @param {(playlistId: string) => void} options.onCreate — page-head
+ *   "+ New" hook (no in-browser tile uses this anymore).
+ * @param {(playlistId: string, displayName: string) => void} [options.onDelete]
+ *   — × button click. Receives both id (the action key) and display
+ *   name (for the confirm prompt).
  * @returns {{
  *   refresh: () => Promise<void>,
- *   highlight: (name: string | null) => void,
+ *   highlight: (playlistId: string | null) => void,
  * }}
  */
 export function mountPlaylistBrowser(container, options) {
@@ -32,7 +39,7 @@ export function mountPlaylistBrowser(container, options) {
     container.innerHTML = TEMPLATE;
     const listEl = container.querySelector(".playlist-browser-list");
 
-    let highlightedName = null;
+    let highlightedId = null;
 
     async function refresh() {
         let collection;
@@ -46,36 +53,36 @@ export function mountPlaylistBrowser(container, options) {
             items = i || [];
         } catch (err) {
             console.error("[playlist-browser] fetch failed:", err);
-            collection = { playlists: {} };
+            collection = { playlists: [] };
         }
         const itemById = new Map(items.map((it) => [String(it.id), it]));
-        const names = Object.keys(collection.playlists || {}).sort((a, b) => {
-            // "default" first, others alphabetical — matches operator
-            // expectation that the always-there playlist is the anchor.
-            if (a === "default") return -1;
-            if (b === "default") return 1;
-            return a.localeCompare(b);
+        // Sort: default first (by id, not name — rename-safe), then alphabetical
+        // by display name. This mirrors the previous "default first" UX.
+        const playlists = [...(collection.playlists || [])].sort((a, b) => {
+            if (String(a.id) === DEFAULT_PLAYLIST_ID) return -1;
+            if (String(b.id) === DEFAULT_PLAYLIST_ID) return 1;
+            return String(a.name || "").localeCompare(String(b.name || ""));
         });
         listEl.innerHTML = "";
-        // The +New affordance is now in the playlist page-head ("+ New
-        // playlist"); the in-browser tile is gone. `onCreate` stays in
-        // the public API for the page-head button to invoke.
-        for (const name of names) {
-            const playlist = collection.playlists[name];
-            const playlistItems = playlist?.items || [];
+        for (const playlist of playlists) {
+            const playlistItems = playlist.items || [];
             const firstId = playlistItems[0]?.item_id || null;
             const firstItem = firstId ? itemById.get(String(firstId)) : null;
             listEl.appendChild(
-                renderTile(name, playlistItems.length, firstItem),
+                renderTile(
+                    String(playlist.id),
+                    playlist.name || "",
+                    playlistItems.length,
+                    firstItem,
+                ),
             );
         }
     }
 
-    function highlight(name) {
-        highlightedName = name || null;
+    function highlight(playlistId) {
+        highlightedId = playlistId ? String(playlistId) : null;
         for (const tile of listEl.querySelectorAll(".playlist-browser-tile")) {
-            const match =
-                tile.dataset.name && tile.dataset.name === highlightedName;
+            const match = tile.dataset.id && tile.dataset.id === highlightedId;
             tile.classList.toggle(
                 "playlist-browser-tile--selected",
                 Boolean(match),
@@ -83,14 +90,14 @@ export function mountPlaylistBrowser(container, options) {
         }
     }
 
-    function renderTile(name, itemCount, firstItem) {
+    function renderTile(playlistId, displayName, itemCount, firstItem) {
         const li = document.createElement("li");
         li.className = "playlist-browser-tile";
-        li.dataset.name = name;
-        if (highlightedName && name === highlightedName) {
+        li.dataset.id = playlistId;
+        if (highlightedId && playlistId === highlightedId) {
             li.classList.add("playlist-browser-tile--selected");
         }
-        const safeName = escapeHtml(name);
+        const safeName = escapeHtml(displayName || "(unnamed)");
         const itemsLabel = itemCount === 1 ? "1 slide" : `${itemCount} slides`;
         const thumb = firstItem
             ? `<img class="playlist-browser-tile-thumb" alt="" src="/api/content/${firstItem.id}/asset?v=${encodeURIComponent(firstItem.created_at || firstItem.id)}">`
@@ -108,8 +115,8 @@ export function mountPlaylistBrowser(container, options) {
         li.querySelector(".playlist-browser-tile-action").addEventListener(
             "click",
             () => {
-                highlight(name);
-                onSelect(name);
+                highlight(playlistId);
+                onSelect(playlistId);
             },
         );
         li.querySelector(".playlist-browser-tile-delete").addEventListener(
@@ -118,7 +125,7 @@ export function mountPlaylistBrowser(container, options) {
                 // Prevent the tile-action click from firing (which would
                 // open the playlist we're about to delete).
                 event.stopPropagation();
-                if (onDelete) onDelete(name);
+                if (onDelete) onDelete(playlistId, displayName);
             },
         );
         return li;
@@ -129,17 +136,13 @@ export function mountPlaylistBrowser(container, options) {
 }
 
 /**
- * Pick the next default name "Playlist N" that fills gaps in the
- * existing series — matches the slide-browser nextAutoName behavior
- * so deleting Playlist 2 + creating a new one recycles "2".
+ * Pick the next default display name "playlist-N" that fills gaps in
+ * the existing series. Display names are free-form; this helper just
+ * produces a regex-friendly default. Tolerates legacy "Playlist N"
+ * (caps + space) names from before the UUID refactor so the series
+ * stays continuous.
  */
 export function nextPlaylistName(existingNames) {
-    // Names MUST satisfy `^[a-z0-9_-]{1,64}$` because the schedule
-    // model enforces that pattern on `playlist_name` references — a
-    // name with caps or a space (e.g. "Playlist 1") will save into the
-    // playlist collection but will reject when referenced from a rule.
-    // Match the legacy "Playlist N" form too so existing series get
-    // continued without gaps.
     const compliant = /^playlist-(\d+)$/;
     const legacy = /^Playlist (\d+)$/;
     const used = new Set();

@@ -1,24 +1,26 @@
-"""REST API for persistent named playlists.
+"""REST API for playlists — UUID-keyed.
 
 Singular (legacy) endpoints — operate on the default playlist:
-    GET /api/playlist          — { item_ids: [uuid, ...] }
+    GET /api/playlist          — { id, name, items, item_ids }
     PUT /api/playlist          — replace the default playlist's order
 
-Plural (multi-playlist) endpoints — manage any named playlist:
-    GET    /api/playlists           — { name: { item_ids: [...] }, ... }
-    GET    /api/playlists/{name}    — single playlist
-    PUT    /api/playlists/{name}    — create or replace
-    DELETE /api/playlists/{name}    — remove (no-op + 404 if absent)
+Collection endpoints — manage any playlist by id:
+    GET    /api/playlists           — { schema_version, playlists: [...] }
+    POST   /api/playlists           — create a new playlist (server assigns id)
+    GET    /api/playlists/{id}      — single playlist
+    PUT    /api/playlists/{id}      — replace name + items (id immutable)
+    DELETE /api/playlists/{id}      — remove
 """
 
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from openmarquee.dependencies import get_playlist_storage
 from openmarquee.playlist import (
+    DEFAULT_PLAYLIST_ID,
     DEFAULT_PLAYLIST_NAME,
     Playlist,
     PlaylistCollection,
@@ -34,22 +36,36 @@ PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
 class PlaylistUpdate(BaseModel):
     """Wire format for PUT requests on either endpoint.
 
-    Accepts two shapes:
-      - `{items: [{item_id, transition, transition_ms}, ...]}` — canonical.
-      - `{item_ids: [uuid, ...]}` — legacy. Each id becomes a PlaylistItem
-        with default transitions (cut / 500ms). The UI's reorder path on
-        older bundles still works through this shoulder.
+    `name` is the editable display label. `items` is the canonical entry
+    list; `item_ids` is the legacy shape (each id becomes a PlaylistItem
+    with default transitions).
     """
 
+    name: str | None = None
     items: list[PlaylistItem] | None = None
     item_ids: list[UUID] | None = None
 
-    def to_playlist(self) -> Playlist:
+    def to_items(self) -> list[PlaylistItem]:
         if self.items is not None:
-            return Playlist(items=self.items)
+            return self.items
         if self.item_ids is not None:
-            return Playlist(items=[PlaylistItem(item_id=i) for i in self.item_ids])
-        return Playlist()
+            return [PlaylistItem(item_id=i) for i in self.item_ids]
+        return []
+
+
+class PlaylistCreate(BaseModel):
+    """Wire format for POST /api/playlists."""
+
+    name: str = Field(default="", max_length=200)
+    items: list[PlaylistItem] | None = None
+    item_ids: list[UUID] | None = None
+
+    def to_items(self) -> list[PlaylistItem]:
+        if self.items is not None:
+            return self.items
+        if self.item_ids is not None:
+            return [PlaylistItem(item_id=i) for i in self.item_ids]
+        return []
 
 
 # --- legacy single-playlist endpoints ---
@@ -62,8 +78,10 @@ async def get_default_playlist(storage: PlaylistDep) -> Playlist:
 
 @router.put("/api/playlist", response_model=Playlist)
 async def set_default_playlist(payload: PlaylistUpdate, storage: PlaylistDep) -> Playlist:
-    playlist = payload.to_playlist()
-    storage.save(playlist)
+    items = payload.to_items()
+    name = payload.name if payload.name is not None else DEFAULT_PLAYLIST_NAME
+    playlist = Playlist(id=DEFAULT_PLAYLIST_ID, name=name, items=items)
+    storage.set_by_id(playlist)
     return playlist
 
 
@@ -75,26 +93,49 @@ async def list_playlists(storage: PlaylistDep) -> PlaylistCollection:
     return storage.load_all()
 
 
-@router.get("/api/playlists/{name}", response_model=Playlist)
-async def get_playlist_by_name(name: str, storage: PlaylistDep) -> Playlist:
-    return storage.get_playlist(name)
-
-
-@router.put("/api/playlists/{name}", response_model=Playlist)
-async def set_playlist_by_name(
-    name: str, payload: PlaylistUpdate, storage: PlaylistDep
+@router.post("/api/playlists", response_model=Playlist, status_code=201)
+async def create_playlist(
+    payload: PlaylistCreate, storage: PlaylistDep
 ) -> Playlist:
-    playlist = payload.to_playlist()
-    storage.set_playlist(name, playlist)
+    playlist = Playlist(
+        id=uuid4(),
+        name=payload.name,
+        items=payload.to_items(),
+    )
+    storage.set_by_id(playlist)
     return playlist
 
 
-@router.delete("/api/playlists/{name}", status_code=204)
-async def delete_playlist(name: str, storage: PlaylistDep) -> None:
-    if name == DEFAULT_PLAYLIST_NAME:
-        # The default playlist is load-bearing — content uploads auto-append
-        # to it. Allow deletion so users can clear it, but warn via status:
-        # actually, just allow it and let the next upload recreate. No 4xx.
-        pass
-    if not storage.delete_playlist(name):
-        raise HTTPException(status_code=404, detail=f"no playlist named {name!r}")
+@router.get("/api/playlists/{playlist_id}", response_model=Playlist)
+async def get_playlist_by_id(
+    playlist_id: UUID, storage: PlaylistDep
+) -> Playlist:
+    playlist = storage.get_by_id(playlist_id)
+    if playlist is None:
+        raise HTTPException(status_code=404, detail=f"no playlist with id {playlist_id}")
+    return playlist
+
+
+@router.put("/api/playlists/{playlist_id}", response_model=Playlist)
+async def set_playlist_by_id(
+    playlist_id: UUID, payload: PlaylistUpdate, storage: PlaylistDep
+) -> Playlist:
+    existing = storage.get_by_id(playlist_id)
+    # Preserve the existing name if the payload doesn't override it.
+    name = (
+        payload.name
+        if payload.name is not None
+        else (existing.name if existing else "")
+    )
+    playlist = Playlist(id=playlist_id, name=name, items=payload.to_items())
+    storage.set_by_id(playlist)
+    return playlist
+
+
+@router.delete("/api/playlists/{playlist_id}", status_code=204)
+async def delete_playlist(playlist_id: UUID, storage: PlaylistDep) -> None:
+    # The default playlist is load-bearing — content uploads auto-append
+    # to it. Allow deletion so users can clear it; the next upload will
+    # recreate an empty one with the same DEFAULT_PLAYLIST_ID.
+    if not storage.delete_by_id(playlist_id):
+        raise HTTPException(status_code=404, detail=f"no playlist with id {playlist_id}")

@@ -10,6 +10,8 @@ function tick() {
     return new Promise((r) => setTimeout(r, 0));
 }
 
+const DEFAULT_PLAYLIST_ID = "00000000-0000-4000-8000-000000000001";
+
 const ITEMS = [
     { id: "a", name: "Welcome", type: "text_slide", duration_ms: 5000 },
     { id: "b", name: "Logo", type: "image", duration_ms: 3000 },
@@ -18,8 +20,14 @@ const ITEMS = [
 
 function fetchPlaylistsWith(defaultIds) {
     return async () => ({
-        schema_version: 2,
-        playlists: { default: { item_ids: defaultIds } },
+        schema_version: 4,
+        playlists: [
+            {
+                id: DEFAULT_PLAYLIST_ID,
+                name: "default",
+                items: defaultIds.map((id) => ({ item_id: id })),
+            },
+        ],
     });
 }
 
@@ -129,22 +137,23 @@ describe("mountPlaylistTrack", () => {
         ]);
     });
 
-    it("hydrates transition metadata from the v3 `items` shape", async () => {
+    it("hydrates transition metadata from the canonical `items` shape", async () => {
         const container = document.createElement("div");
         mountPlaylistTrack(container, {
             fetchItems: async () => ITEMS,
             fetchPlaylists: async () => ({
-                schema_version: 3,
-                playlists: {
-                    default: {
+                schema_version: 4,
+                playlists: [
+                    {
+                        id: DEFAULT_PLAYLIST_ID,
+                        name: "default",
                         items: [
                             { item_id: "a", transition: "fade", transition_ms: 250 },
                             { item_id: "b", transition: "cut", transition_ms: 0 },
                         ],
                     },
-                },
+                ],
             }),
-            onReorder: vi.fn(),
         });
         await tick();
 
@@ -154,25 +163,6 @@ describe("mountPlaylistTrack", () => {
         expect(
             blockA.querySelector(".track-block-transition").textContent,
         ).toBe("fade");
-    });
-
-    it("falls back to legacy `item_ids` shape with default transitions", async () => {
-        const container = document.createElement("div");
-        mountPlaylistTrack(container, {
-            fetchItems: async () => ITEMS,
-            // v2 response shape (UI bundle hitting a backend that hasn't
-            // migrated, or a pre-v3 response).
-            fetchPlaylists: async () => ({
-                schema_version: 2,
-                playlists: { default: { item_ids: ["a", "b"] } },
-            }),
-            onReorder: vi.fn(),
-        });
-        await tick();
-
-        const blockA = container.querySelector('.track-block[data-id="a"]');
-        expect(blockA.dataset.transition).toBe("cut");
-        expect(blockA.dataset.transitionMs).toBe("500");
     });
 
     it("empty-state hint is surfaced on an empty playlist via data-empty-hint", async () => {
@@ -303,7 +293,7 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
 
         expect(onDraftChange).toHaveBeenCalledTimes(1);
         const [draft] = onDraftChange.mock.calls[0];
-        expect(draft.name).toBe("default");
+        expect(draft.playlistId).toBe(DEFAULT_PLAYLIST_ID);
         // The first entry's transition should now reflect the flipped state.
         expect(draft.entries[0].item_id).toBe("a");
         expect(draft.entries[0].transition).toBe("fade");
@@ -339,7 +329,7 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
             fetchPlaylists: fetchPlaylistsWith(["a"]),
             onReorder: vi.fn(),
             onDraftChange,
-            getCurrentPlaylistName: () => "lunch",
+            getCurrentPlaylistId: () => DEFAULT_PLAYLIST_ID,
         });
         await tick();
 

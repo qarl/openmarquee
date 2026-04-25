@@ -2,6 +2,30 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountSchedule } from "./schedule.js";
 
+const DEFAULT_PLAYLIST_ID = "00000000-0000-4000-8000-000000000001";
+const PL_LUNCH = "00000000-0000-4000-8000-000000000010";
+const PL_WEEKEND = "00000000-0000-4000-8000-000000000011";
+const PL_OPEN = "00000000-0000-4000-8000-000000000012";
+const PL_FALLBACK = "00000000-0000-4000-8000-000000000013";
+const PL_A = "00000000-0000-4000-8000-000000000014";
+const PL_B = "00000000-0000-4000-8000-000000000015";
+const PL_X = "00000000-0000-4000-8000-000000000016";
+
+const DEFAULT_CHOICES = [
+    { id: DEFAULT_PLAYLIST_ID, name: "default" },
+    { id: PL_LUNCH, name: "lunch" },
+    { id: PL_WEEKEND, name: "weekend" },
+    { id: PL_OPEN, name: "open" },
+    { id: PL_FALLBACK, name: "fallback" },
+    { id: PL_A, name: "a-playlist" },
+    { id: PL_B, name: "b-playlist" },
+    { id: PL_X, name: "x-playlist" },
+];
+
+function defaultChoices() {
+    return async () => DEFAULT_CHOICES;
+}
+
 afterEach(() => {
     vi.restoreAllMocks();
 });
@@ -11,15 +35,18 @@ function tick() {
 }
 
 describe("mountSchedule", () => {
-    it("renders default playlist input + add/save buttons + empty rules list on empty schedule", async () => {
+    it("renders default playlist select + add button + empty rules list on empty schedule", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {
-            fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
+            fetchSchedule: async () => ({ rules: [], default_playlist_id: DEFAULT_PLAYLIST_ID }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
-        expect(container.querySelector(".field-default-playlist").value).toBe("default");
+        const defaultSelect = container.querySelector(".field-default-playlist");
+        expect(defaultSelect.tagName).toBe("SELECT");
+        expect(defaultSelect.value).toBe(DEFAULT_PLAYLIST_ID);
         expect(container.querySelectorAll(".schedule-rule")).toHaveLength(0);
         expect(container.querySelector(".schedule-add")).not.toBeNull();
         // Save button removed — auto-save handles persistence.
@@ -37,13 +64,14 @@ describe("mountSchedule", () => {
                         days: ["mon", "tue", "wed", "thu", "fri"],
                         start_time: "11:00",
                         end_time: "14:00",
-                        playlist_name: "lunch",
+                        playlist_id: PL_LUNCH,
                         enabled: true,
                     },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -52,7 +80,7 @@ describe("mountSchedule", () => {
         expect(rules[0].querySelector(".rule-name").value).toBe("Lunch");
         expect(rules[0].querySelector(".rule-start").value).toBe("11:00");
         expect(rules[0].querySelector(".rule-end").value).toBe("14:00");
-        expect(rules[0].querySelector(".rule-playlist").value).toBe("lunch");
+        expect(rules[0].querySelector(".rule-playlist").value).toBe(PL_LUNCH);
 
         const checkedDays = Array.from(
             rules[0].querySelectorAll(".rule-day-input:checked"),
@@ -63,12 +91,14 @@ describe("mountSchedule", () => {
     it("Add rule appends an empty-ish rule to the list", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {
-            fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
+            fetchSchedule: async () => ({ rules: [], default_playlist_id: DEFAULT_PLAYLIST_ID }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
         container.querySelector(".schedule-add").click();
+        await tick();
         const rules = container.querySelectorAll(".schedule-rule");
         expect(rules).toHaveLength(1);
         expect(rules[0].querySelector(".rule-name").value).toBe("New rule");
@@ -84,7 +114,7 @@ describe("mountSchedule", () => {
                         days: ["mon"],
                         start_time: "08:00",
                         end_time: "17:00",
-                        playlist_name: "a",
+                        playlist_id: PL_A,
                         enabled: true,
                     },
                     {
@@ -92,13 +122,14 @@ describe("mountSchedule", () => {
                         days: ["tue"],
                         start_time: "08:00",
                         end_time: "17:00",
-                        playlist_name: "b",
+                        playlist_id: PL_B,
                         enabled: true,
                     },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -111,7 +142,7 @@ describe("mountSchedule", () => {
         expect(remaining[0].querySelector(".rule-name").value).toBe("B");
     });
 
-    it("auto-save invokes onSave with the schedule payload", async () => {
+    it("auto-save invokes onSave with the schedule payload (id-keyed)", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
         const handle = mountSchedule(container, {
@@ -122,13 +153,14 @@ describe("mountSchedule", () => {
                         days: ["mon", "fri"],
                         start_time: "09:00",
                         end_time: "17:00",
-                        playlist_name: "open",
+                        playlist_id: PL_OPEN,
                         enabled: true,
                     },
                 ],
-                default_playlist_name: "fallback",
+                default_playlist_id: PL_FALLBACK,
             }),
             onSave,
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -136,31 +168,29 @@ describe("mountSchedule", () => {
 
         expect(onSave).toHaveBeenCalledOnce();
         const payload = onSave.mock.calls[0][0];
-        expect(payload.default_playlist_name).toBe("fallback");
+        expect(payload.default_playlist_id).toBe(PL_FALLBACK);
         expect(payload.rules).toHaveLength(1);
         expect(payload.rules[0]).toMatchObject({
             name: "Open",
             days: ["mon", "fri"],
             start_time: "09:00",
             end_time: "17:00",
-            playlist_name: "open",
+            playlist_id: PL_OPEN,
             enabled: true,
         });
     });
 
     it("round-trips the persisted tz unchanged — UI no longer edits it", async () => {
-        // The tz field moved to System Settings. The schedule's stored
-        // tz still rides through saves to keep the backend scheduler
-        // happy; this test pins that contract.
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
         const handle = mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
                 tz: "America/New_York",
             }),
             onSave,
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
         expect(container.querySelector(".field-tz")).toBeNull();
@@ -174,26 +204,26 @@ describe("mountSchedule", () => {
         mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
             fetchSettings: async () => ({ timezone: "UTC" }),
         });
         await tick();
         const nowEl = container.querySelector('[data-field="now-value"]');
         expect(nowEl).not.toBeNull();
-        // After a tick the formatter has run; it's either the "—"
-        // placeholder or something else — the contract is "present".
         expect(nowEl.textContent.length).toBeGreaterThan(0);
     });
 
     it("Auto-save error message surfaces in the status", async () => {
         const container = document.createElement("div");
         const handle = mountSchedule(container, {
-            fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
+            fetchSchedule: async () => ({ rules: [], default_playlist_id: DEFAULT_PLAYLIST_ID }),
             onSave: async () => {
                 throw new Error("backend rejected");
             },
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -203,7 +233,7 @@ describe("mountSchedule", () => {
         );
     });
 
-    it("when fetchPlaylistNames is provided, playlist fields are <select>s populated from the list", async () => {
+    it("playlist fields are <select>s populated from fetchPlaylistChoices", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {
             fetchSchedule: async () => ({
@@ -213,29 +243,36 @@ describe("mountSchedule", () => {
                         days: ["mon"],
                         start_time: "11:00",
                         end_time: "14:00",
-                        playlist_name: "lunch",
+                        playlist_id: PL_LUNCH,
                         enabled: true,
                     },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
-            fetchPlaylistNames: async () => ["default", "lunch", "weekend"],
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
         const ruleSelect = container.querySelector(".rule-playlist");
         expect(ruleSelect.tagName).toBe("SELECT");
-        const values = Array.from(ruleSelect.options).map((o) => o.value);
-        expect(values).toEqual(["default", "lunch", "weekend"]);
-        expect(ruleSelect.value).toBe("lunch");
+        const ruleValues = Array.from(ruleSelect.options).map((o) => o.value);
+        expect(ruleValues).toContain(DEFAULT_PLAYLIST_ID);
+        expect(ruleValues).toContain(PL_LUNCH);
+        expect(ruleSelect.value).toBe(PL_LUNCH);
+        // Display name shown in the option label.
+        const lunchOpt = Array.from(ruleSelect.options).find(
+            (o) => o.value === PL_LUNCH,
+        );
+        expect(lunchOpt.textContent).toBe("lunch");
 
         const defaultSelect = container.querySelector(".field-default-playlist");
         expect(defaultSelect.tagName).toBe("SELECT");
-        expect(defaultSelect.value).toBe("default");
+        expect(defaultSelect.value).toBe(DEFAULT_PLAYLIST_ID);
     });
 
-    it("preserves an unknown playlist_name by adding a '(missing)' option", async () => {
+    it("preserves an unknown playlist_id by adding a '(missing)' option", async () => {
+        const stalePlaylistId = "00000000-0000-4000-8000-0000000000ff";
         const container = document.createElement("div");
         mountSchedule(container, {
             fetchSchedule: async () => ({
@@ -245,48 +282,27 @@ describe("mountSchedule", () => {
                         days: ["mon"],
                         start_time: "11:00",
                         end_time: "14:00",
-                        playlist_name: "deleted_playlist",
+                        playlist_id: stalePlaylistId,
                         enabled: true,
                     },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
-            fetchPlaylistNames: async () => ["default", "lunch"],
+            fetchPlaylistChoices: async () => [
+                { id: DEFAULT_PLAYLIST_ID, name: "default" },
+                { id: PL_LUNCH, name: "lunch" },
+            ],
         });
         await tick();
 
         const select = container.querySelector(".rule-playlist");
         const missing = Array.from(select.options).find(
-            (o) => o.value === "deleted_playlist",
+            (o) => o.value === stalePlaylistId,
         );
         expect(missing).toBeDefined();
         expect(missing.textContent).toMatch(/missing/);
-        expect(select.value).toBe("deleted_playlist"); // round-trip preserved
-    });
-
-    it("when fetchPlaylistNames is omitted, playlist fields stay as text inputs (back-compat)", async () => {
-        const container = document.createElement("div");
-        mountSchedule(container, {
-            fetchSchedule: async () => ({
-                rules: [
-                    {
-                        name: "x",
-                        days: ["mon"],
-                        start_time: "11:00",
-                        end_time: "14:00",
-                        playlist_name: "whatever",
-                        enabled: true,
-                    },
-                ],
-                default_playlist_name: "default",
-            }),
-            onSave: vi.fn(),
-        });
-        await tick();
-
-        const el = container.querySelector(".rule-playlist");
-        expect(el.tagName).toBe("INPUT");
+        expect(select.value).toBe(stalePlaylistId); // round-trip preserved
     });
 
     it("Disable all flips every rule's enabled checkbox off", async () => {
@@ -294,12 +310,13 @@ describe("mountSchedule", () => {
         mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [
-                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_name: "a", enabled: true },
-                    { name: "B", days: ["tue"], start_time: "09:00", end_time: "18:00", playlist_name: "b", enabled: true },
+                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_id: PL_A, enabled: true },
+                    { name: "B", days: ["tue"], start_time: "09:00", end_time: "18:00", playlist_id: PL_B, enabled: true },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -309,8 +326,6 @@ describe("mountSchedule", () => {
         for (const cb of checkboxes) {
             expect(cb.checked).toBe(false);
         }
-        // Auto-save kicks on bulk toggle; status pill goes through saving →
-        // saved without showing the legacy "click Save" prompt.
     });
 
     it("Enable all flips every rule's enabled checkbox on", async () => {
@@ -318,12 +333,13 @@ describe("mountSchedule", () => {
         mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [
-                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_name: "a", enabled: false },
-                    { name: "B", days: ["tue"], start_time: "09:00", end_time: "18:00", playlist_name: "b", enabled: false },
+                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_id: PL_A, enabled: false },
+                    { name: "B", days: ["tue"], start_time: "09:00", end_time: "18:00", playlist_id: PL_B, enabled: false },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -340,11 +356,12 @@ describe("mountSchedule", () => {
         const handle = mountSchedule(container, {
             fetchSchedule: async () => ({
                 rules: [
-                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_name: "a", enabled: true },
+                    { name: "A", days: ["mon"], start_time: "08:00", end_time: "17:00", playlist_id: PL_A, enabled: true },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave,
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -357,8 +374,9 @@ describe("mountSchedule", () => {
     it("Bulk toggle with no rules shows a friendly status message", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {
-            fetchSchedule: async () => ({ rules: [], default_playlist_name: "default" }),
+            fetchSchedule: async () => ({ rules: [], default_playlist_id: DEFAULT_PLAYLIST_ID }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
@@ -378,18 +396,17 @@ describe("mountSchedule", () => {
                         days: ["mon"],
                         start_time: "08:00",
                         end_time: "17:00",
-                        playlist_name: "x",
+                        playlist_id: PL_X,
                         enabled: true,
                     },
                 ],
-                default_playlist_name: "default",
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
             }),
             onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
         });
         await tick();
 
-        // No nested <img> should appear inside the rule name input — the
-        // payload is treated as text, not markup.
         const ruleName = container.querySelector(".rule-name");
         expect(ruleName.value).toBe('<img src=x onerror="alert(1)">');
         expect(container.querySelector(".schedule-rule img")).toBeNull();

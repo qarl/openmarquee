@@ -1,11 +1,10 @@
-"""Time-of-day schedules — rules binding (days, HH:MM windows) → playlist name.
+"""Time-of-day schedules — rules binding (days, HH:MM windows) → playlist id.
 
-Per SYSTEM_SPEC §5.3, the device supports multiple named playlists with
-schedule rules selecting which one is active at any given moment. This
-commit ships the data model + persistence + evaluator only; the playback
-engine still drives a single global playlist (Phase 5 (a)/(b)/(c)).
-Wiring schedules into actual playlist switching needs the multi-playlist
-refactor and lands separately.
+Per SYSTEM_SPEC §5.3, the device supports multiple playlists with schedule
+rules selecting which one is active at any given moment.
+
+Identity: rules reference playlists by stable UUID `playlist_id`, so
+renaming a playlist never breaks a schedule reference.
 
 Evaluator semantics:
 
@@ -18,7 +17,7 @@ Evaluator semantics:
   `00:00` to `24:00` for an all-day rule. (`start == end` is an empty
   window and never matches.)
 - First matching rule wins — rule order in the schedule is significant.
-- If no rule matches, `default_playlist_name` is returned.
+- If no rule matches, `default_playlist_id` is returned.
 
 Timezone contract: the evaluator takes a naive `datetime` and assumes the
 device clock is in the operator's local timezone. SYSTEM_SPEC is silent on
@@ -27,18 +26,35 @@ during first-boot. DST transition days are best-effort: spring-forward
 silently skips one window and fall-back plays it twice. A future
 `Schedule.tz: str | None` field can carry an explicit IANA zone for a
 proper-zoned implementation. Reserved as part of the bumpable schema below.
+
+Storage migration: `schema_version == 1` stored playlist references as
+strings (`playlist_name`). On load, those strings get resolved against
+the playlist collection's display names — see `migrate_v1_to_v2`. Once
+migrated, the file is rewritten in v2 form and references stay UUID-based
+across renames.
 """
 
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+log = logging.getLogger(__name__)
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from openmarquee.playlist import (
+    DEFAULT_PLAYLIST_ID,
+    PlaylistStorage,
+)
 
 # Bump when the on-disk format changes in a non-backward-compatible way.
-SCHEDULE_SCHEMA_VERSION = 1
+# v1: playlist_name strings.
+# v2: playlist_id UUIDs.
+SCHEDULE_SCHEMA_VERSION = 2
 
 DayOfWeek = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -47,26 +63,21 @@ _WEEKDAY_NAMES: tuple[DayOfWeek, ...] = ("mon", "tue", "wed", "thu", "fri", "sat
 _HHMM_START_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _HHMM_END_PATTERN = re.compile(r"^(([01]\d|2[0-3]):([0-5]\d)|24:00)$")
 
-# Playlist names act as foreign keys into the (future) named-playlist store.
-# Constrain the format now — every relaxation later is non-breaking; every
-# tightening later is a migration.
-_PLAYLIST_NAME_PATTERN = r"^[a-z0-9_-]{1,64}$"
-
 
 class ScheduleRule(BaseModel):
     """A single (days × time-window) → playlist binding.
 
-    TODO(multi-playlist): when named playlists become real entities,
-    schedule rules will need a rename-cascade hook (renaming a playlist
-    must rewrite schedules) and the evaluator needs a documented
-    "playlist_name not found" fallback path.
+    `playlist_id` references a Playlist's stable UUID. If the referenced
+    playlist no longer exists, the playback loop treats the rule as
+    matching an empty playlist (renderer goes idle until the next rule
+    or the default kicks in).
     """
 
     name: str = Field(max_length=200, description="Human label, e.g. 'Weekday Lunch'.")
     days: list[DayOfWeek] = Field(min_length=1)
     start_time: str  # HH:MM
     end_time: str  # HH:MM (or "24:00" for end-of-day)
-    playlist_name: str = Field(pattern=_PLAYLIST_NAME_PATTERN)
+    playlist_id: UUID
     enabled: bool = True
 
     @field_validator("start_time")
@@ -116,21 +127,19 @@ class ScheduleRule(BaseModel):
 
 
 class Schedule(BaseModel):
-    """A list of rules + a default playlist for when none match.
+    """A list of rules + a default playlist id for when none match.
 
-    `schema_version` bumps on non-backward-compatible format changes — see
-    `openmarquee.content.storage` for the same migration discipline.
-
-    `tz` is a reserved IANA timezone string (e.g. `America/New_York`) for a
-    future zoned evaluator. Today the evaluator uses naive datetime + the
-    device's local clock; persisting a tz now means a sign already in the
-    field can be upgraded to zoned semantics without losing user intent.
+    `tz` is a reserved IANA timezone string for a future zoned evaluator.
     None means "use the device clock as-is" (current behavior).
     """
 
+    # Forward-compat: round-trip unknown fields through the auto-migration
+    # rewrite so a future downgrade scenario doesn't silently drop them.
+    model_config = ConfigDict(extra="allow")
+
     schema_version: int = Field(default=SCHEDULE_SCHEMA_VERSION)
     rules: list[ScheduleRule] = Field(default_factory=list)
-    default_playlist_name: str = Field(default="default", pattern=_PLAYLIST_NAME_PATTERN)
+    default_playlist_id: UUID = Field(default=DEFAULT_PLAYLIST_ID)
     tz: str | None = Field(
         default=None,
         max_length=64,
@@ -138,31 +147,110 @@ class Schedule(BaseModel):
     )
 
 
-def evaluate_schedule(now: datetime, schedule: Schedule) -> str:
-    """Return the playlist name active at `now` per the schedule.
+def evaluate_schedule(now: datetime, schedule: Schedule) -> UUID:
+    """Return the playlist id active at `now` per the schedule.
 
-    First matching rule wins. Falls back to `default_playlist_name`.
+    First matching rule wins. Falls back to `default_playlist_id`.
     """
     for rule in schedule.rules:
         if rule.matches(now):
-            return rule.playlist_name
-    return schedule.default_playlist_name
+            return rule.playlist_id
+    return schedule.default_playlist_id
 
 
 class ScheduleStorage:
-    """Persists the schedule as a single JSON file with atomic writes."""
+    """Persists the schedule as a single JSON file with atomic writes.
 
-    def __init__(self, path: Path):
+    Constructed with an optional `playlist_storage` reference so loads
+    can transparently migrate v1 (name-keyed) schedules to v2 (id-keyed)
+    by resolving the names against the playlist collection.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        playlist_storage: PlaylistStorage | None = None,
+    ):
         self.path = Path(path)
+        self._playlist_storage = playlist_storage
 
     def load(self) -> Schedule:
         if not self.path.exists():
             return Schedule()
         data = json.loads(self.path.read_text())
-        return Schedule.model_validate(data)
+        schedule, was_migrated = _coerce_to_schedule(data, self._playlist_storage)
+        if was_migrated:
+            self.save(schedule)
+        return schedule
 
     def save(self, schedule: Schedule) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(schedule.model_dump_json(indent=2))
         tmp.replace(self.path)
+
+
+def _coerce_to_schedule(
+    data: dict,
+    playlist_storage: PlaylistStorage | None,
+) -> tuple[Schedule, bool]:
+    """Accept the v2 envelope or migrate from v1.
+
+    Returns `(schedule, was_migrated)` so callers can persist the
+    upgraded form back to disk.
+
+    v1: playlist references are name strings (`playlist_name`,
+    `default_playlist_name`). Resolved via `playlist_storage.load_all()`
+    by display name. If a name doesn't resolve, the rule's
+    `playlist_id` falls back to DEFAULT_PLAYLIST_ID — the rule will
+    play the default until the operator fixes it.
+    """
+    schema = data.get("schema_version", 1)
+    if schema >= SCHEDULE_SCHEMA_VERSION:
+        return Schedule.model_validate(data), False
+
+    # v1 → v2 migration. Build a name → id lookup from the playlist
+    # collection. If we don't have one (tests passing raw JSON with no
+    # playlist storage), fall back to DEFAULT_PLAYLIST_ID for everything.
+    name_to_id: dict[str, UUID] = {}
+    if playlist_storage is not None:
+        collection = playlist_storage.load_all()
+        for p in collection.playlists:
+            # First-write-wins on duplicate names — `by_name` semantics.
+            name_to_id.setdefault(p.name, p.id)
+
+    def resolve(name: str | None, *, context: str) -> UUID:
+        if name and name in name_to_id:
+            return name_to_id[name]
+        if name:
+            # Operator visibility: if a v1 rule references a playlist
+            # that no longer exists by name, log it. The migrated
+            # schedule still loads (rule routes to default), but the
+            # log line tells the operator which rules need attention.
+            log.warning(
+                "schedule v1→v2 migration: %s references playlist_name=%r "
+                "which doesn't resolve; falling back to DEFAULT_PLAYLIST_ID",
+                context,
+                name,
+            )
+        return DEFAULT_PLAYLIST_ID
+
+    migrated_rules = []
+    for raw in data.get("rules", []):
+        rule_data = dict(raw)
+        legacy_name = rule_data.pop("playlist_name", None)
+        rule_data["playlist_id"] = resolve(
+            legacy_name, context=f"rule {raw.get('name', '?')!r}"
+        )
+        migrated_rules.append(ScheduleRule.model_validate(rule_data))
+
+    return (
+        Schedule(
+            rules=migrated_rules,
+            default_playlist_id=resolve(
+                data.get("default_playlist_name"), context="default_playlist_name"
+            ),
+            tz=data.get("tz"),
+        ),
+        True,
+    )

@@ -13,7 +13,7 @@ import {
     saveSettings,
     saveTextSlide,
     saveVideo,
-    setPlaylistOrder,
+    setDefaultPlaylistOrder,
     startPlayback,
     stopPlayback,
 } from "./api.js";
@@ -208,59 +208,71 @@ describe("saveVideo", () => {
     });
 });
 
-describe("named-playlists API", () => {
+describe("playlists API (id-based)", () => {
     it("listPlaylists GETs /api/playlists", async () => {
         const fetchMock = mockFetch({
             ok: true,
-            json: async () => ({ schema_version: 2, playlists: {} }),
+            json: async () => ({ schema_version: 4, playlists: [] }),
         });
         const result = await (await import("./api.js")).listPlaylists();
-        expect(result.schema_version).toBe(2);
+        expect(result.schema_version).toBe(4);
         expect(fetchMock).toHaveBeenCalledWith("/api/playlists");
     });
 
-    it("savePlaylistByName PUTs to /api/playlists/{name} with item_ids body", async () => {
+    it("createPlaylist POSTs name + items to /api/playlists", async () => {
         const fetchMock = mockFetch({
             ok: true,
-            json: async () => ({ item_ids: ["a", "b"] }),
+            json: async () => ({ id: "new-uuid", name: "lunch", items: [] }),
         });
-        const { savePlaylistByName } = await import("./api.js");
-        const result = await savePlaylistByName("lunch", ["a", "b"]);
-        expect(result.item_ids).toEqual(["a", "b"]);
+        const { createPlaylist } = await import("./api.js");
+        const result = await createPlaylist({ name: "lunch", entries: [] });
+        expect(result.id).toBe("new-uuid");
         const [url, init] = fetchMock.mock.calls[0];
-        expect(url).toBe("/api/playlists/lunch");
-        expect(init.method).toBe("PUT");
-        expect(JSON.parse(init.body)).toEqual({ item_ids: ["a", "b"] });
+        expect(url).toBe("/api/playlists");
+        expect(init.method).toBe("POST");
+        expect(JSON.parse(init.body)).toEqual({
+            name: "lunch",
+            item_ids: [],
+        });
     });
 
-    it("deletePlaylistByName DELETEs /api/playlists/{name}", async () => {
+    it("savePlaylistById PUTs to /api/playlists/{id} with name + items body", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            json: async () => ({ id: "the-uuid", name: "lunch", item_ids: ["a", "b"] }),
+        });
+        const { savePlaylistById } = await import("./api.js");
+        const result = await savePlaylistById("the-uuid", {
+            name: "lunch",
+            entries: ["a", "b"],
+        });
+        expect(result.item_ids).toEqual(["a", "b"]);
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe("/api/playlists/the-uuid");
+        expect(init.method).toBe("PUT");
+        expect(JSON.parse(init.body)).toEqual({
+            name: "lunch",
+            item_ids: ["a", "b"],
+        });
+    });
+
+    it("deletePlaylistById DELETEs /api/playlists/{id}", async () => {
         const fetchMock = mockFetch({ ok: true });
-        const { deletePlaylistByName } = await import("./api.js");
-        await deletePlaylistByName("lunch");
-        expect(fetchMock).toHaveBeenCalledWith("/api/playlists/lunch", {
+        const { deletePlaylistById } = await import("./api.js");
+        await deletePlaylistById("the-uuid");
+        expect(fetchMock).toHaveBeenCalledWith("/api/playlists/the-uuid", {
             method: "DELETE",
         });
     });
 
-    it("savePlaylistByName encodes funky names in the URL path", async () => {
+    it("savePlaylistById routes v3 entry objects to the `items` key, not `item_ids`", async () => {
         const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
-        const { savePlaylistByName } = await import("./api.js");
-        await savePlaylistByName("spaces in name", []);
-        const [url] = fetchMock.mock.calls[0];
-        expect(url).toBe("/api/playlists/spaces%20in%20name");
-    });
-
-    it("savePlaylistByName routes v3 entry objects to the `items` key, not `item_ids`", async () => {
-        // Regression: sending {item_id, transition, transition_ms} objects
-        // under the `item_ids` key 422s server-side ("UUID input should
-        // be a string"). Same shape detection as setPlaylistOrder.
-        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
-        const { savePlaylistByName } = await import("./api.js");
+        const { savePlaylistById } = await import("./api.js");
         const entries = [
             { item_id: "a-uuid", transition: "fade", transition_ms: 500 },
             { item_id: "b-uuid", transition: "cut", transition_ms: 500 },
         ];
-        await savePlaylistByName("default", entries);
+        await savePlaylistById("the-uuid", { name: "x", entries });
         const [, init] = fetchMock.mock.calls[0];
         const body = JSON.parse(init.body);
         expect(body).toHaveProperty("items");
@@ -268,13 +280,24 @@ describe("named-playlists API", () => {
         expect(body).not.toHaveProperty("item_ids");
     });
 
-    it("savePlaylistByName keeps legacy string-array callers on the `item_ids` key", async () => {
+    it("savePlaylistById keeps legacy string-array callers on the `item_ids` key", async () => {
         const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
-        const { savePlaylistByName } = await import("./api.js");
-        await savePlaylistByName("default", ["a", "b"]);
+        const { savePlaylistById } = await import("./api.js");
+        await savePlaylistById("the-uuid", { name: "x", entries: ["a", "b"] });
         const [, init] = fetchMock.mock.calls[0];
         const body = JSON.parse(init.body);
-        expect(body).toEqual({ item_ids: ["a", "b"] });
+        expect(body).toEqual({ name: "x", item_ids: ["a", "b"] });
+    });
+
+    it("savePlaylistById omits the name when caller passes undefined", async () => {
+        // PUT with name=undefined → server preserves existing name.
+        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
+        const { savePlaylistById } = await import("./api.js");
+        await savePlaylistById("the-uuid", { entries: ["a"] });
+        const [, init] = fetchMock.mock.calls[0];
+        const body = JSON.parse(init.body);
+        expect(body).not.toHaveProperty("name");
+        expect(body).toEqual({ item_ids: ["a"] });
     });
 });
 
@@ -339,13 +362,13 @@ describe("settings API", () => {
     });
 });
 
-describe("setPlaylistOrder", () => {
-    it("PUTs item_ids to /api/playlist", async () => {
+describe("setDefaultPlaylistOrder", () => {
+    it("PUTs item_ids to /api/playlist (the legacy default-only shortcut)", async () => {
         const fetchMock = mockFetch({
             ok: true,
             json: async () => ({ item_ids: ["b", "a"] }),
         });
-        const result = await setPlaylistOrder(["b", "a"]);
+        const result = await setDefaultPlaylistOrder(["b", "a"]);
         expect(result).toEqual({ item_ids: ["b", "a"] });
         const [url, init] = fetchMock.mock.calls[0];
         expect(url).toBe("/api/playlist");
@@ -355,7 +378,7 @@ describe("setPlaylistOrder", () => {
 
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad" });
-        await expect(setPlaylistOrder(["not-a-uuid"])).rejects.toThrow("422");
+        await expect(setDefaultPlaylistOrder(["not-a-uuid"])).rejects.toThrow("422");
     });
 });
 

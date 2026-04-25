@@ -103,7 +103,7 @@ class PlaybackLoop:
         self._current_auto_format: str | None = None
         # Set by fetch_items if it carries playlist context (the
         # scheduled_fetch_items closure stamps this each fetch).
-        self._current_playlist_name: str | None = None
+        self._current_playlist_id: UUID | None = None
 
     @property
     def is_running(self) -> bool:
@@ -162,7 +162,7 @@ class PlaybackLoop:
             self._current_transition_ms = None
             self._current_auto_mode = None
             self._current_auto_format = None
-            self._current_playlist_name = None
+            self._current_playlist_id = None
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
@@ -338,18 +338,18 @@ class PlaybackLoop:
             log.exception("playback: renderer raised on render_frame")
 
     @property
-    def current_playlist_name(self) -> str | None:
-        """The playlist name the loop is currently sourcing items from.
+    def current_playlist_id(self) -> UUID | None:
+        """The playlist id the loop is currently sourcing items from.
 
         Set by the schedule-driven fetch fn at the start of each iteration so
         the UI can show "now playing from <playlist>". None when not running.
         """
-        return self._current_playlist_name
+        return self._current_playlist_id
 
-    def _stamp_playlist_name(self, name: str | None) -> None:
+    def _stamp_playlist_id(self, playlist_id: UUID | None) -> None:
         """Hook for the scheduled fetch fn to publish which playlist is
-        currently active. Test-only setter is just self._current_playlist_name."""
-        self._current_playlist_name = name
+        currently active. Test-only setter is just self._current_playlist_id."""
+        self._current_playlist_id = playlist_id
 
     async def _fade(
         self,
@@ -477,7 +477,7 @@ def scheduled_fetch_items(
     circular at module load. The composition is small enough to inline; pulling
     it into a separate "wiring" module would just hide it.
 
-    If `loop` is provided, stamps `_current_playlist_name` so the UI can show
+    If `loop` is provided, stamps `_current_playlist_id` so the UI can show
     which playlist is active. The PlaybackLoop's fetch_items closure passes
     itself in via `partial`.
     """
@@ -485,10 +485,10 @@ def scheduled_fetch_items(
     from openmarquee.schedule import evaluate_schedule
 
     schedule = schedule_storage.load()
-    active_name = evaluate_schedule(now, schedule)
+    active_id = evaluate_schedule(now, schedule)
     if loop is not None:
-        loop._stamp_playlist_name(active_name)
-    return list_in_playlist_order(content_storage, playlist_storage, active_name)
+        loop._stamp_playlist_id(active_id)
+    return list_in_playlist_order(content_storage, playlist_storage, active_id)
 
 
 def _cover_fit(image: Image.Image, target_w: int, target_h: int) -> Image.Image:

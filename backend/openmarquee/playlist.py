@@ -1,9 +1,12 @@
-"""Persistent playlists — named ordered lists of content item IDs.
+"""Persistent playlists — UUID-keyed ordered lists of content item IDs.
 
 Per SYSTEM_SPEC §3.3, playlists live as JSON on the SD card, not in a
-database. The data model is `dict[str, list[UUID]]` — many named playlists,
-each just an ordered list of ids. Content storage holds the actual items;
-playlists only carry order.
+database.
+
+Identity: each playlist has a stable UUID `id` plus a human-editable
+`name` (display label). Renaming a playlist NEVER changes its id —
+schedule rules, the default-playlist pointer, and any other reference
+key off `id`, so renames are safe.
 
 Items in a playlist that no longer exist in storage are tolerated — the
 playback loop's fetch path skips ids it can't load, so a stale id can't
@@ -12,47 +15,62 @@ actually playable and overwrites).
 
 Default playlist:
 
-`DEFAULT_PLAYLIST_NAME` ("default") is the playlist the content lifecycle
-auto-appends to on upload and auto-removes from on delete. Other named
-playlists can be created via the multi-playlist API but aren't fed
+`DEFAULT_PLAYLIST_ID` is a constant UUID for the playlist the content
+lifecycle auto-appends to on upload and auto-removes from on delete.
+Other playlists can be created via the multi-playlist API but aren't fed
 automatically — users curate them. The schedule evaluator selects which
-playlist plays at any given time; missing / unknown playlist names are
+playlist plays at any given time; missing / unknown playlist ids are
 treated as empty (the playback loop polls instead of erroring).
 
-Storage format (v3): a single JSON file at `path`, containing an envelope:
+Storage format (v4): a single JSON file at `path`, containing an envelope:
 
     {
-        "schema_version": 3,
-        "playlists": {
-            "default": {
+        "schema_version": 4,
+        "playlists": [
+            {
+                "id": "00000000-0000-4000-8000-000000000001",
+                "name": "default",
                 "items": [
                     {"item_id": "...", "transition": "cut", "transition_ms": 500},
                     ...
                 ]
             },
             ...
-        }
+        ]
     }
 
-Backwards compat: `schema_version == 2` stored items as `item_ids: [uuid]`
-— transitions lived on the slide model at that time. `schema_version == 1`
-(or no envelope at all) was the single-playlist form that shipped through
-Phase 5 (a). Both migrate transparently on load — each legacy id becomes
-a PlaylistItem with default transitions.
+Backwards compat: `schema_version <= 3` stored playlists as
+`dict[name, Playlist]`. Each named playlist gets a fresh UUID assigned
+on load (the default playlist gets `DEFAULT_PLAYLIST_ID` so its
+identity is stable across migrations). Schedule rules referring to
+playlists by name will need to be migrated separately — see
+`migrate_schedule_v1_to_v2` in schedule.py.
+
+`schema_version <= 2` stored items as `item_ids: [uuid]` (transitions
+on the slide model). Each id becomes a PlaylistItem with default
+transitions. `schema_version == 1` (or no envelope at all) was the
+single-playlist form — a single unnamed playlist's `item_ids` list.
+All legacy forms migrate transparently on load.
 """
 
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 if TYPE_CHECKING:
     from openmarquee.content import ContentItem
     from openmarquee.content.storage import ContentStorage
 
-PLAYLIST_SCHEMA_VERSION = 3
+PLAYLIST_SCHEMA_VERSION = 4
+
+# Stable UUID for the default playlist. Constant across all devices so
+# the v3→v4 migration produces the same id, and so callers (content
+# upload, tests) can reference the default playlist without a name lookup.
+# This is a UUID4 generated once and frozen here — DO NOT change it.
+DEFAULT_PLAYLIST_ID = UUID("00000000-0000-4000-8000-000000000001")
 DEFAULT_PLAYLIST_NAME = "default"
 
 
@@ -72,8 +90,20 @@ class PlaylistItem(BaseModel):
 
 
 class Playlist(BaseModel):
-    """An ordered list of PlaylistItems."""
+    """A playlist with a stable UUID `id` and an editable display `name`.
 
+    The `id` is the foreign key — schedule rules, the default-playlist
+    pointer, and any other reference uses `id`, so renames don't break
+    references. `name` is purely cosmetic.
+    """
+
+    # Forward-compat: tolerate unknown fields on load + round-trip them
+    # through save_all. Lets a downgrade scenario (or hand-added operator
+    # metadata) survive the auto-migration rewrite without silent loss.
+    model_config = ConfigDict(extra="allow")
+
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(default="", max_length=200)
     items: list[PlaylistItem] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -104,9 +134,7 @@ class Playlist(BaseModel):
         transition: Literal["cut", "fade", "wipe", "slide", "iris"] = "cut",
         transition_ms: int = 500,
     ) -> None:
-        """Add an id to the end if it isn't already present. Default
-        transitions match what the v2 → v3 migrator stamps on legacy
-        entries."""
+        """Add an id to the end if it isn't already present."""
         if item_id not in self.item_ids:
             self.items.append(
                 PlaylistItem(
@@ -122,32 +150,60 @@ class Playlist(BaseModel):
 
 
 class PlaylistCollection(BaseModel):
-    """All playlists, by name. The on-disk envelope."""
+    """All playlists, as an ordered list. The on-disk envelope."""
+
+    model_config = ConfigDict(extra="allow")
 
     schema_version: int = Field(default=PLAYLIST_SCHEMA_VERSION)
-    playlists: dict[str, Playlist] = Field(default_factory=dict)
+    playlists: list[Playlist] = Field(default_factory=list)
+
+    def by_id(self, playlist_id: UUID) -> Playlist | None:
+        """Return the playlist with the given id, or None."""
+        for p in self.playlists:
+            if p.id == playlist_id:
+                return p
+        return None
+
+    def by_name(self, name: str) -> Playlist | None:
+        """Return the FIRST playlist with the given name, or None.
+
+        Names are not unique — two playlists can share a display label.
+        Use `by_id` for guaranteed-unique resolution. This helper exists
+        for the v3→v4 schedule migration (which has only names to work
+        from) and for tests that don't care which one wins.
+        """
+        for p in self.playlists:
+            if p.name == name:
+                return p
+        return None
 
 
 class PlaylistStorage:
-    """Persists the named-playlist collection as a single JSON file with
+    """Persists the playlist collection as a single JSON file with
     atomic writes.
 
-    The legacy single-playlist API (`load`, `save`) still works against the
-    `default` playlist for callers that haven't been refactored yet —
-    typically the content auto-append/remove plumbing.
+    The legacy single-playlist API (`load`, `save`) still works against
+    the default playlist (resolved by `DEFAULT_PLAYLIST_ID`) for callers
+    that haven't been refactored yet — typically the content
+    auto-append/remove plumbing.
     """
 
     def __init__(self, path: Path):
         self.path = Path(path)
 
-    # --- multi-playlist primitives ---
+    # --- collection primitives ---
 
     def load_all(self) -> PlaylistCollection:
-        """Return the full collection of named playlists."""
+        """Return the full collection. Migrates legacy formats on the fly
+        (v1/v2/v3 → v4) AND rewrites the file on a successful migration
+        so subsequent loads skip the conversion."""
         if not self.path.exists():
-            return PlaylistCollection()
+            return _bootstrap_default_collection()
         data = json.loads(self.path.read_text())
-        return _coerce_to_collection(data)
+        collection, was_migrated = _coerce_to_collection(data)
+        if was_migrated:
+            self.save_all(collection)
+        return collection
 
     def save_all(self, collection: PlaylistCollection) -> None:
         """Atomically write the full collection to disk."""
@@ -156,36 +212,39 @@ class PlaylistStorage:
         tmp.write_text(collection.model_dump_json(indent=2))
         tmp.replace(self.path)
 
-    def get_playlist(self, name: str) -> Playlist:
-        """Return the named playlist, or an empty Playlist if it doesn't exist.
+    def get_by_id(self, playlist_id: UUID) -> Playlist | None:
+        """Return the playlist with the given id, or None."""
+        return self.load_all().by_id(playlist_id)
 
-        Tolerant lookup — the playback loop and the schedule evaluator can
-        both reference any name without pre-checking.
-        """
-        return self.load_all().playlists.get(name, Playlist())
-
-    def set_playlist(self, name: str, playlist: Playlist) -> None:
-        """Create or replace a named playlist."""
+    def set_by_id(self, playlist: Playlist) -> None:
+        """Create or replace a playlist by id. The playlist's `id` field
+        is the lookup key; `name` and `items` are the writable fields."""
         collection = self.load_all()
-        collection.playlists[name] = playlist
+        existing = collection.by_id(playlist.id)
+        if existing is not None:
+            idx = collection.playlists.index(existing)
+            collection.playlists[idx] = playlist
+        else:
+            collection.playlists.append(playlist)
         self.save_all(collection)
 
-    def delete_playlist(self, name: str) -> bool:
-        """Remove a named playlist. Returns True if it existed, False otherwise.
+    def delete_by_id(self, playlist_id: UUID) -> bool:
+        """Remove a playlist by id. Returns True if it existed.
 
-        The DEFAULT_PLAYLIST_NAME playlist can be deleted but will be
-        recreated empty on the next content upload.
+        The default playlist can be deleted but will be recreated empty
+        (with the same DEFAULT_PLAYLIST_ID) on the next content upload.
         """
         collection = self.load_all()
-        if name not in collection.playlists:
+        target = collection.by_id(playlist_id)
+        if target is None:
             return False
-        del collection.playlists[name]
+        collection.playlists.remove(target)
         self.save_all(collection)
         return True
 
-    def all_names(self) -> list[str]:
-        """Return all playlist names sorted alphabetically."""
-        return sorted(self.load_all().playlists)
+    def all_ids(self) -> list[UUID]:
+        """Return all playlist ids in collection order."""
+        return [p.id for p in self.load_all().playlists]
 
     def prune_dangling_refs(self, valid_ids: set) -> int:
         """Drop any playlist items whose `item_id` isn't in `valid_ids`.
@@ -197,74 +256,126 @@ class PlaylistStorage:
         """
         collection = self.load_all()
         pruned_count = 0
-        for name, playlist in collection.playlists.items():
+        for playlist in collection.playlists:
             kept = [it for it in playlist.items if it.item_id in valid_ids]
             if len(kept) != len(playlist.items):
                 pruned_count += len(playlist.items) - len(kept)
-                collection.playlists[name] = Playlist(items=kept)
+                playlist.items = kept
         if pruned_count:
             self.save_all(collection)
         return pruned_count
 
-    # --- legacy single-playlist API (operates on DEFAULT_PLAYLIST_NAME) ---
+    # --- legacy single-playlist API (operates on DEFAULT_PLAYLIST_ID) ---
 
     def load(self) -> Playlist:
         """Legacy: return the default playlist, or an empty one."""
-        return self.get_playlist(DEFAULT_PLAYLIST_NAME)
+        existing = self.get_by_id(DEFAULT_PLAYLIST_ID)
+        if existing is not None:
+            return existing
+        return Playlist(id=DEFAULT_PLAYLIST_ID, name=DEFAULT_PLAYLIST_NAME)
 
     def save(self, playlist: Playlist) -> None:
-        """Legacy: replace the default playlist."""
-        self.set_playlist(DEFAULT_PLAYLIST_NAME, playlist)
-
-
-def _coerce_to_collection(data: dict) -> PlaylistCollection:
-    """Accept the v3 envelope or migrate from v2 / v1.
-
-    - v1 (pre-Phase-5): `{"item_ids": [uuid, ...]}` — one unnamed
-      playlist. Each id gets default transitions.
-    - v2 (Phase 5 through 2026-04-21): `{"playlists": {"default":
-      {"item_ids": [...]}, ...}}` — named collection, transitions
-      lived on the slide model. Each id gets default transitions.
-    - v3 (today): `{"playlists": {"default": {"items": [{"item_id":
-      ..., "transition": ..., "transition_ms": ...}]}, ...}}`.
-
-    Both legacy forms are migrated silently so existing SD cards keep
-    working after an upgrade.
-    """
-    # Legacy v1: unnamed single playlist.
-    if "item_ids" in data and "playlists" not in data:
-        return PlaylistCollection(
-            playlists={
-                DEFAULT_PLAYLIST_NAME: _playlist_from_legacy_item_ids(
-                    data.get("item_ids", [])
-                )
-            },
+        """Legacy: replace the default playlist. Coerces the id to
+        DEFAULT_PLAYLIST_ID and the name to "default" so the legacy
+        single-playlist callers don't accidentally lose the default
+        identity."""
+        defaulted = playlist.model_copy(
+            update={"id": DEFAULT_PLAYLIST_ID, "name": DEFAULT_PLAYLIST_NAME}
         )
+        self.set_by_id(defaulted)
 
-    # v2 or v3: named collection. Each playlist may be v2 (`item_ids`) or
-    # v3 (`items`); promote v2 entries.
-    playlists = data.get("playlists", {})
-    migrated: dict[str, Playlist] = {}
-    for name, raw in playlists.items():
-        if isinstance(raw, dict) and "item_ids" in raw and "items" not in raw:
-            migrated[name] = _playlist_from_legacy_item_ids(raw["item_ids"])
-        else:
-            migrated[name] = Playlist.model_validate(raw)
+
+def _bootstrap_default_collection() -> PlaylistCollection:
+    """Return a collection containing just an empty default playlist.
+
+    Used when the storage file doesn't exist yet — gives the system a
+    deterministic starting point with the default playlist's stable id.
+    """
     return PlaylistCollection(
-        schema_version=data.get("schema_version", PLAYLIST_SCHEMA_VERSION),
-        playlists=migrated,
+        playlists=[Playlist(id=DEFAULT_PLAYLIST_ID, name=DEFAULT_PLAYLIST_NAME)]
     )
 
 
-def _playlist_from_legacy_item_ids(item_ids: list) -> Playlist:
-    """v1/v2 → v3 lift: wrap each raw id in a PlaylistItem with defaults."""
-    return Playlist(items=[PlaylistItem(item_id=UUID(str(i))) for i in item_ids])
+def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
+    """Accept the v4 envelope or migrate from v3 / v2 / v1.
+
+    Returns `(collection, was_migrated)` so callers can persist the
+    upgraded form back to disk.
+
+    - v1 (pre-Phase-5): `{"item_ids": [uuid, ...]}` — one unnamed
+      playlist's items. Becomes the default playlist with default
+      transitions on each id.
+    - v2 (Phase 5): `{"playlists": {"default": {"item_ids": [...]},
+      ...}}` — dict-keyed by name, transitions on slides. Each id gets
+      default transitions; each name gets a fresh UUID (default name
+      gets the constant DEFAULT_PLAYLIST_ID).
+    - v3 (2026-04-21 to ~04-25): `{"playlists": {"default": {"items":
+      [...]}, ...}}` — dict-keyed, transitions on items. UUIDs assigned
+      same way as v2.
+    - v4 (today): `{"playlists": [{"id": ..., "name": ..., "items":
+      [...]}, ...]}` — list with explicit id + name on each playlist.
+    """
+    schema = data.get("schema_version", 1)
+
+    # v4: already in target form.
+    if schema >= PLAYLIST_SCHEMA_VERSION and "playlists" in data and isinstance(
+        data["playlists"], list
+    ):
+        return PlaylistCollection.model_validate(data), False
+
+    # v1: unnamed single playlist.
+    if "item_ids" in data and "playlists" not in data:
+        legacy = _playlist_items_from_legacy_item_ids(data.get("item_ids", []))
+        return (
+            PlaylistCollection(
+                playlists=[
+                    Playlist(
+                        id=DEFAULT_PLAYLIST_ID,
+                        name=DEFAULT_PLAYLIST_NAME,
+                        items=legacy,
+                    )
+                ]
+            ),
+            True,
+        )
+
+    # v2 or v3: dict-keyed by name.
+    raw_playlists = data.get("playlists", {})
+    migrated: list[Playlist] = []
+    # Only the FIRST playlist named "default" gets the constant id —
+    # if a hand-edited file or a restored backup somehow contains two
+    # "default" entries, the second gets a fresh UUID rather than
+    # silently overwriting the first.
+    default_id_consumed = False
+    for name, raw in raw_playlists.items():
+        if isinstance(raw, dict) and "item_ids" in raw and "items" not in raw:
+            items = _playlist_items_from_legacy_item_ids(raw["item_ids"])
+        else:
+            items = [PlaylistItem.model_validate(i) for i in raw.get("items", [])]
+        if name == DEFAULT_PLAYLIST_NAME and not default_id_consumed:
+            playlist_id = DEFAULT_PLAYLIST_ID
+            default_id_consumed = True
+        else:
+            playlist_id = uuid4()
+        migrated.append(Playlist(id=playlist_id, name=name, items=items))
+    # Guarantee the default playlist exists so callers can rely on it.
+    if not any(p.id == DEFAULT_PLAYLIST_ID for p in migrated):
+        migrated.insert(
+            0,
+            Playlist(id=DEFAULT_PLAYLIST_ID, name=DEFAULT_PLAYLIST_NAME),
+        )
+    return PlaylistCollection(playlists=migrated), True
+
+
+def _playlist_items_from_legacy_item_ids(item_ids: list) -> list[PlaylistItem]:
+    """v1/v2 → v3+ lift: wrap each raw id in a PlaylistItem with defaults."""
+    return [PlaylistItem(item_id=UUID(str(i))) for i in item_ids]
 
 
 def list_in_playlist_order(
     content_storage: "ContentStorage",
     playlist_storage: PlaylistStorage,
-    playlist_name: str = DEFAULT_PLAYLIST_NAME,
+    playlist_id: UUID = DEFAULT_PLAYLIST_ID,
     *,
     include_orphans: bool = False,
 ) -> list["ContentItem"]:
@@ -286,7 +397,7 @@ def list_in_playlist_order(
     """
     items_by_id = {item.id: item for item in content_storage.list_all()}
     collection = playlist_storage.load_all()
-    target = collection.playlists.get(playlist_name, Playlist())
+    target = collection.by_id(playlist_id) or Playlist()
 
     ordered: list[ContentItem] = []
     used: set[UUID] = set()
@@ -294,9 +405,7 @@ def list_in_playlist_order(
         if p_item.item_id in items_by_id and p_item.item_id not in used:
             # Patch the content item's transition fields with the playlist's
             # values. Since v3 the playlist owns transitions — the content
-            # model's fields are legacy-only. model_copy returns a copy so
-            # the same content reappearing in a different playlist can carry
-            # different transitions.
+            # model's fields are legacy-only.
             content = items_by_id[p_item.item_id]
             ordered.append(
                 content.model_copy(
@@ -310,7 +419,7 @@ def list_in_playlist_order(
 
     if include_orphans:
         all_referenced: set[UUID] = set()
-        for p in collection.playlists.values():
+        for p in collection.playlists:
             all_referenced.update(p.item_ids)
         orphans = [
             item

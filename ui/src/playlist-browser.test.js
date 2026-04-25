@@ -5,6 +5,10 @@ import {
     nextPlaylistName,
 } from "./playlist-browser.js";
 
+const DEFAULT_PLAYLIST_ID = "00000000-0000-4000-8000-000000000001";
+const LUNCH_ID = "00000000-0000-4000-8000-000000000010";
+const EVENING_ID = "00000000-0000-4000-8000-000000000011";
+
 function tick() {
     return new Promise((r) => setTimeout(r, 0));
 }
@@ -29,9 +33,6 @@ describe("nextPlaylistName", () => {
         ).toBe("playlist-4");
     });
     it("treats legacy 'Playlist N' names (caps + space) as part of the series", () => {
-        // Pre-fix devices have playlists named "Playlist 1" etc. — the
-        // numbering should continue from those so a new playlist on the
-        // same device gets a non-colliding number.
         expect(
             nextPlaylistName(["default", "Playlist 1", "Playlist 2"]),
         ).toBe("playlist-3");
@@ -39,15 +40,16 @@ describe("nextPlaylistName", () => {
 });
 
 describe("mountPlaylistBrowser", () => {
+    // v4 collection: list of {id, name, items}.
     const COLLECTION = {
-        playlists: {
-            default: { items: [{ item_id: "a" }] },
-            lunch: { items: [{ item_id: "a" }, { item_id: "b" }] },
-            evening: { items: [] },
-        },
+        playlists: [
+            { id: DEFAULT_PLAYLIST_ID, name: "default", items: [{ item_id: "a" }] },
+            { id: LUNCH_ID, name: "lunch", items: [{ item_id: "a" }, { item_id: "b" }] },
+            { id: EVENING_ID, name: "evening", items: [] },
+        ],
     };
 
-    it("puts 'default' first, then alphabetical, with item counts", async () => {
+    it("puts 'default' first (by id), then alphabetical by name, with item counts", async () => {
         const container = document.createElement("div");
         mountPlaylistBrowser(container, {
             fetchPlaylists: async () => COLLECTION,
@@ -56,22 +58,24 @@ describe("mountPlaylistBrowser", () => {
         });
         await tick();
         const tiles = container.querySelectorAll(
-            ".playlist-browser-tile[data-name]",
+            ".playlist-browser-tile[data-id]",
         );
-        expect(Array.from(tiles).map((t) => t.dataset.name)).toEqual([
-            "default",
-            "evening",
-            "lunch",
+        expect(Array.from(tiles).map((t) => t.dataset.id)).toEqual([
+            DEFAULT_PLAYLIST_ID,
+            EVENING_ID,
+            LUNCH_ID,
         ]);
         const defaultTile = container.querySelector(
-            '[data-name="default"]',
+            `[data-id="${DEFAULT_PLAYLIST_ID}"]`,
         );
         expect(defaultTile.textContent).toMatch(/1 slide/);
-        const lunchTile = container.querySelector('[data-name="lunch"]');
+        const lunchTile = container.querySelector(`[data-id="${LUNCH_ID}"]`);
         expect(lunchTile.textContent).toMatch(/2 slides/);
+        // Display name is shown.
+        expect(lunchTile.textContent).toMatch(/lunch/);
     });
 
-    it("fires onSelect with the playlist name on tile click", async () => {
+    it("fires onSelect with the playlist id on tile click", async () => {
         const onSelect = vi.fn();
         const container = document.createElement("div");
         mountPlaylistBrowser(container, {
@@ -81,16 +85,28 @@ describe("mountPlaylistBrowser", () => {
         });
         await tick();
         container
-            .querySelector('[data-name="lunch"] button')
+            .querySelector(`[data-id="${LUNCH_ID}"] button.playlist-browser-tile-action`)
             .click();
-        expect(onSelect).toHaveBeenCalledWith("lunch");
+        expect(onSelect).toHaveBeenCalledWith(LUNCH_ID);
     });
 
-    // The inline +New tile was removed when the playlist page-head gained
-    // "+ New playlist"; onCreate stays in the public API for the page-head
-    // button to invoke.
+    it("fires onDelete with id + display name on × click", async () => {
+        const onDelete = vi.fn();
+        const container = document.createElement("div");
+        mountPlaylistBrowser(container, {
+            fetchPlaylists: async () => COLLECTION,
+            onSelect: vi.fn(),
+            onCreate: vi.fn(),
+            onDelete,
+        });
+        await tick();
+        container
+            .querySelector(`[data-id="${LUNCH_ID}"] .playlist-browser-tile-delete`)
+            .click();
+        expect(onDelete).toHaveBeenCalledWith(LUNCH_ID, "lunch");
+    });
 
-    it("highlight() marks exactly one tile", async () => {
+    it("highlight() marks exactly one tile by id", async () => {
         const container = document.createElement("div");
         const handle = mountPlaylistBrowser(container, {
             fetchPlaylists: async () => COLLECTION,
@@ -98,11 +114,11 @@ describe("mountPlaylistBrowser", () => {
             onCreate: vi.fn(),
         });
         await tick();
-        handle.highlight("lunch");
+        handle.highlight(LUNCH_ID);
         const selected = container.querySelectorAll(
             ".playlist-browser-tile--selected",
         );
         expect(selected).toHaveLength(1);
-        expect(selected[0].dataset.name).toBe("lunch");
+        expect(selected[0].dataset.id).toBe(LUNCH_ID);
     });
 });

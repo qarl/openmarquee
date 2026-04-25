@@ -201,29 +201,33 @@ export async function stopPlayback() {
 }
 
 /**
- * Replace the entire playlist contents. Accepts either:
- *  - an array of UUID strings (legacy, each entry gets default
- *    transitions — same wire shape that existed pre-v3), or
- *  - an array of `{item_id, transition, transition_ms}` objects (v3
- *    canonical — lets the caller carry transition data).
+ * Encode a playlist's items + (optional) name as the wire body. Accepts
+ * either an array of UUID strings (legacy — each entry gets default
+ * transitions) or an array of `{item_id, transition, transition_ms}`
+ * objects (v3 canonical).
  */
-export async function setPlaylistOrder(entriesOrIds, name = "default") {
+function _encodePlaylistBody(entriesOrIds, name) {
     const body =
         Array.isArray(entriesOrIds) &&
         entriesOrIds.length > 0 &&
         typeof entriesOrIds[0] === "object"
             ? { items: entriesOrIds }
             : { item_ids: entriesOrIds };
-    // /api/playlist is shorthand for the default playlist; named
-    // playlists go through /api/playlists/{name}.
-    const url =
-        name === "default"
-            ? "/api/playlist"
-            : `/api/playlists/${encodeURIComponent(name)}`;
-    const response = await fetch(url, {
+    if (name !== undefined && name !== null) body.name = name;
+    return body;
+}
+
+/**
+ * Replace the default playlist's contents — the legacy single-playlist
+ * shorthand. Operates on `/api/playlist` which always targets the
+ * server's DEFAULT_PLAYLIST_ID. For non-default playlists, use
+ * `savePlaylistById`.
+ */
+export async function setDefaultPlaylistOrder(entriesOrIds) {
+    const response = await fetch("/api/playlist", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(_encodePlaylistBody(entriesOrIds)),
     });
     if (!response.ok) {
         const detail = await response.text();
@@ -232,7 +236,7 @@ export async function setPlaylistOrder(entriesOrIds, name = "default") {
     return await response.json();
 }
 
-/** Fetch the full named-playlist collection: { schema_version, playlists: {...} }. */
+/** Fetch the full playlist collection: { schema_version, playlists: [...] }. */
 export async function listPlaylists() {
     const response = await fetch("/api/playlists");
     if (!response.ok) {
@@ -242,30 +246,36 @@ export async function listPlaylists() {
 }
 
 /**
- * Create or replace a named playlist. Accepts either:
- *   - an array of UUID strings (legacy, each entry gets default
- *     transitions), or
- *   - an array of `{item_id, transition, transition_ms}` objects (v3
- *     canonical — lets the caller carry transition data through).
- *
- * Same shape-detection as setPlaylistOrder — the server's PlaylistUpdate
- * validates `item_ids` as `list[UUID]`, so sending v3 objects under that
- * key 422s with "UUID input should be a string". Route objects to `items`
- * and strings to `item_ids`.
+ * Create a new playlist. Server assigns a fresh UUID and returns the
+ * full Playlist object including its `id`.
  */
-export async function savePlaylistByName(name, entriesOrIds) {
-    const body =
-        Array.isArray(entriesOrIds) &&
-        entriesOrIds.length > 0 &&
-        typeof entriesOrIds[0] === "object"
-            ? { items: entriesOrIds }
-            : { item_ids: entriesOrIds };
+export async function createPlaylist({ name, entries }) {
+    const response = await fetch("/api/playlists", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(_encodePlaylistBody(entries, name)),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Create playlist failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
+ * Replace a playlist's name and/or items. The id is the immutable key —
+ * a rename of `name` here NEVER changes the id, so any schedule rule
+ * referencing this playlist keeps working.
+ *
+ * Pass `name: undefined` to leave the existing name unchanged.
+ */
+export async function savePlaylistById(id, { name, entries }) {
     const response = await fetch(
-        `/api/playlists/${encodeURIComponent(name)}`,
+        `/api/playlists/${encodeURIComponent(id)}`,
         {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
+            body: JSON.stringify(_encodePlaylistBody(entries, name)),
         },
     );
     if (!response.ok) {
@@ -275,9 +285,9 @@ export async function savePlaylistByName(name, entriesOrIds) {
     return await response.json();
 }
 
-/** Delete a named playlist. */
-export async function deletePlaylistByName(name) {
-    const response = await fetch(`/api/playlists/${encodeURIComponent(name)}`, {
+/** Delete a playlist by id. */
+export async function deletePlaylistById(id) {
+    const response = await fetch(`/api/playlists/${encodeURIComponent(id)}`, {
         method: "DELETE",
     });
     if (!response.ok) {

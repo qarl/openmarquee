@@ -15,6 +15,7 @@
 import Sortable from "sortablejs";
 
 import { attachAutoSave } from "./auto-save.js";
+import { DEFAULT_PLAYLIST_ID } from "./constants.js";
 
 // Mode-locking went away when videos became resolution-independent H.264
 // MP4s that every renderer can consume. Keep the signature so existing
@@ -86,7 +87,7 @@ export function mountPlaylistTrack(container, options) {
         onUpdateDuration,
         inlinePreview,
         outputMode,
-        getCurrentPlaylistName,
+        getCurrentPlaylistId,
         playlistBrowser,
         // Fires on every drag / transition / name change with the
         // current in-memory draft. Used by the inline preview to render
@@ -98,8 +99,8 @@ export function mountPlaylistTrack(container, options) {
         onCreatePlaylist,
     } = options;
     // Fallback when the caller doesn't want multi-playlist — always
-    // operate on "default" like the pre-multi UI did.
-    const resolveName = getCurrentPlaylistName || (() => "default");
+    // operate on the well-known DEFAULT_PLAYLIST_ID.
+    const resolveId = getCurrentPlaylistId || (() => DEFAULT_PLAYLIST_ID);
 
     container.innerHTML = TEMPLATE;
     const trackEl = container.querySelector(".playlist-track-list");
@@ -148,11 +149,13 @@ export function mountPlaylistTrack(container, options) {
 
     async function performSave() {
         const entries = collectTrackEntries(trackEl);
-        const newName = (nameEl.value || "").trim();
-        const originalName = resolveName();
+        const name = (nameEl.value || "").trim();
+        const playlistId = resolveId();
+        // Renames are safe — the id is immutable, so any schedule rule
+        // referencing this playlist keeps working across name edits.
         await onSavePlaylist({
-            originalName,
-            newName: newName || originalName,
+            playlistId,
+            name,
             entries,
         });
     }
@@ -181,7 +184,7 @@ export function mountPlaylistTrack(container, options) {
         if (onDraftChange) {
             try {
                 onDraftChange({
-                    name: resolveName(),
+                    playlistId: resolveId(),
                     entries: collectTrackEntries(trackEl),
                 });
             } catch (err) {
@@ -218,16 +221,16 @@ export function mountPlaylistTrack(container, options) {
             ]);
             itemByIdRef = new Map(items.map((it) => [String(it.id), it]));
             const itemById = itemByIdRef;
-            const activeName = resolveName();
+            const activeId = resolveId();
+            // v4 collection: `playlists` is a list of {id, name, items}.
+            const active = (collection.playlists || []).find(
+                (p) => String(p.id) === String(activeId),
+            );
+            const activeName = active?.name || "default";
             if (headingEl) {
                 headingEl.textContent =
-                    activeName === "default"
-                        ? "Default playlist"
-                        : activeName;
+                    activeName === "default" ? "Default playlist" : activeName;
             }
-            // v3 API returns `items: [{item_id, transition, transition_ms}]`;
-            // fall back to the legacy `item_ids` shape for defensive reading.
-            const active = collection.playlists?.[activeName];
             const playlistRaw = active?.items;
             const defaultEntries = Array.isArray(playlistRaw)
                 ? playlistRaw.map((e) => ({
@@ -287,7 +290,7 @@ export function mountPlaylistTrack(container, options) {
             // Eyebrow stats: total playlists, then this loop's block count + duration.
             const statsEl = container.querySelector("[data-playlist-stats]");
             if (statsEl) {
-                const playlistCount = Object.keys(collection.playlists || {}).length;
+                const playlistCount = (collection.playlists || []).length;
                 const blockCount = defaultEntries.length;
                 const loopMs = defaultEntries.reduce((acc, entry) => {
                     const it = itemById.get(entry.item_id);

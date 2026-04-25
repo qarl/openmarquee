@@ -5,7 +5,7 @@ POST /api/playback/stop  — stop and wait for the loop to exit
 GET  /api/playback/state — { is_running, current_item_id, current_item_type,
                             current_item_transition, current_item_transition_ms,
                             current_item_auto_mode, current_item_auto_format,
-                            current_playlist_name }
+                            current_playlist_id }
 
 The loop drives the device's renderer (MockRenderer in dev, HUB75/HDMI/etc.
 on the device once those land). This obsoletes the manual /dev/play/{id}
@@ -53,7 +53,7 @@ class PlaybackState(BaseModel):
     # client-side ticking overlay for time/date/day slides.
     current_item_auto_mode: str | None
     current_item_auto_format: str | None
-    current_playlist_name: str | None
+    current_playlist_id: UUID | None
 
 
 @router.get("/state", response_model=PlaybackState)
@@ -66,7 +66,7 @@ async def get_state(loop: LoopDep) -> PlaybackState:
         current_item_transition_ms=loop.current_item_transition_ms,
         current_item_auto_mode=loop.current_item_auto_mode,
         current_item_auto_format=loop.current_item_auto_format,
-        current_playlist_name=loop.current_playlist_name,
+        current_playlist_id=loop.current_playlist_id,
     )
 
 
@@ -97,13 +97,14 @@ async def get_current_thumbnail(
         # Nothing on screen → idle.
         return Response(status_code=204)
 
-    name = loop.current_playlist_name
+    playlist_id = loop.current_playlist_id
     first_id: UUID | None = None
-    if name:
-        playlist = playlists.get_playlist(name)
-        ids = playlist.item_ids
-        if ids:
-            first_id = ids[0]
+    if playlist_id:
+        playlist = playlists.get_by_id(playlist_id)
+        if playlist is not None:
+            ids = playlist.item_ids
+            if ids:
+                first_id = ids[0]
     # Fall back to the slide on screen so the tile never goes blank
     # during a race between a rename/delete and the next playback tick.
     if first_id is None:
