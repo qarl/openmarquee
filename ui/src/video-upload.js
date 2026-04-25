@@ -30,7 +30,7 @@ const TEMPLATE = `
             <div class="om-card">
                 <div class="om-stack" style="gap: 12px;">
                     <label class="om-field">
-                        <label>Video file (any format ffmpeg can decode)</label>
+                        <span>Video file (any format ffmpeg can decode)</span>
                         <input type="file" accept="video/*" class="om-input field-file">
                         <span class="video-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
                             Editing an existing video — leave the file picker blank
@@ -39,11 +39,11 @@ const TEMPLATE = `
                     </label>
                     <div class="om-row" style="gap: 10px;">
                         <label class="om-field" style="flex: 1;">
-                            <label>Slide name</label>
+                            <span>Slide name</span>
                             <input type="text" class="om-input field-name" value="Video" maxlength="200">
                         </label>
                         <label class="om-field" style="width: 110px;">
-                            <label>Duration (s)</label>
+                            <span>Duration (s)</span>
                             <input type="number" class="om-input field-duration" value="10" min="1" max="3600" step="1">
                         </label>
                     </div>

@@ -104,20 +104,20 @@ const EDITOR_TEMPLATE = `
                 <div class="om-stack" style="gap: 12px;">
                     <div class="om-row" style="gap: 10px;">
                         <label class="om-field" style="flex: 1;">
-                            <label>Slide name</label>
+                            <span>Slide name</span>
                             <input type="text" class="om-input field-name" value="Untitled" maxlength="200">
                         </label>
                         <label class="om-field" style="width: 110px;">
-                            <label>Duration (s)</label>
+                            <span>Duration (s)</span>
                             <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
                         </label>
                     </div>
                     <label class="om-field">
-                        <label>Text</label>
+                        <span>Text</span>
                         <textarea class="om-textarea field-text" rows="3" placeholder="(enter text here)"></textarea>
                     </label>
                     <label class="om-field">
-                        <label>Dynamic Text</label>
+                        <span>Dynamic Text</span>
                         <select class="om-select field-auto-mode">
                             <option value="" selected>Off</option>
                             <option value="time">Current time</option>
@@ -126,7 +126,7 @@ const EDITOR_TEMPLATE = `
                         </select>
                     </label>
                     <label class="om-field field-auto-format-wrap" hidden>
-                        <label>Format</label>
+                        <span>Format</span>
                         <select class="om-select field-auto-format"></select>
                     </label>
                     <p class="field-hint field-auto-mode-hint" hidden style="margin: 0; color: var(--om-text-dim); font-size: 12.5px;">
@@ -140,26 +140,26 @@ const EDITOR_TEMPLATE = `
             <div class="om-card">
                 <div class="om-stack" style="gap: 12px;">
                     <div class="om-field">
-                        <label>Quick colors</label>
+                        <span>Quick colors</span>
                         <div class="presets">${presetButtonsHtml()}</div>
                     </div>
                     <div class="om-row" style="gap: 10px;">
                         <label class="om-field" style="flex: 1;">
-                            <label>Text color</label>
+                            <span>Text color</span>
                             <input type="color" class="field-text-color" value="#FFFFFF" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
                         </label>
                         <label class="om-field" style="flex: 1;">
-                            <label>Solid background</label>
+                            <span>Solid background</span>
                             <input type="color" class="field-bg-color" value="#000000" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
                         </label>
                     </div>
                     <div class="om-row" style="gap: 10px;">
                         <label class="om-field" style="flex: 1;">
-                            <label>Font</label>
+                            <span>Font</span>
                             <select class="om-select field-font-family"></select>
                         </label>
                         <label class="om-field" style="width: 140px;">
-                            <label>Font size (% of height)</label>
+                            <span>Font size (% of height)</span>
                             <input type="number" class="om-input field-font-size" min="1" max="100" step="0.5">
                         </label>
                     </div>
@@ -178,12 +178,12 @@ const EDITOR_TEMPLATE = `
                         <span>Existing slide</span>
                     </label>
                     <label class="om-field editor-bg-slide-wrap" hidden>
-                        <label>Saved slide</label>
+                        <span>Saved slide</span>
                         <select class="om-select field-bg-slide"><option value="">(pick a slide)</option></select>
                     </label>
                     <div class="editor-bg-generate" hidden>
                         <label class="om-field">
-                            <label>Generate a new background (10-30s)</label>
+                            <span>Generate a new background (10-30s)</span>
                             <input type="text" class="om-input field-bg-generate-prompt"
                                    placeholder="abstract gradient, minimal, signage-friendly"
                                    maxlength="4000">

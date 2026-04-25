@@ -34,7 +34,7 @@ const SECTION_TEMPLATE = `
 
         <div class="om-card" style="margin-bottom: 12px;">
             <label class="om-field">
-                <label>Default playlist (when no rule matches)</label>
+                <span>Default playlist (when no rule matches)</span>
                 <input type="text" class="om-input field-default-playlist" maxlength="64" pattern="[a-z0-9_-]+">
             </label>
         </div>

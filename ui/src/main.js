@@ -492,11 +492,28 @@ async function boot() {
     // nav as a bottom-anchored sheet. Tapping any nav link or the
     // backdrop closes it. Re-uses the existing sidebar's DOM by
     // cloning into the sheet body so we don't maintain two nav lists.
+    // The clone captures `.active` at open time; we also re-mirror on
+    // hashchange so back/forward navigation updates the sheet too.
     const hamburger = document.querySelector(".om-sheet-open");
     if (hamburger) {
         let openSheet = null;
+        const mirrorActive = () => {
+            if (!openSheet) return;
+            const orig = document.querySelectorAll(".om-side .nav-link");
+            const cloned = openSheet.sheet.querySelectorAll(".nav-link");
+            for (let i = 0; i < orig.length && i < cloned.length; i++) {
+                const isActive = orig[i].classList.contains("active");
+                cloned[i].classList.toggle("active", isActive);
+                if (isActive) {
+                    cloned[i].setAttribute("aria-current", "page");
+                } else {
+                    cloned[i].removeAttribute("aria-current");
+                }
+            }
+        };
         const closeSheet = () => {
             if (!openSheet) return;
+            window.removeEventListener("hashchange", mirrorActive);
             openSheet.back.remove();
             openSheet.sheet.remove();
             openSheet = null;
@@ -534,6 +551,7 @@ async function boot() {
             document.body.appendChild(back);
             document.body.appendChild(sheet);
             openSheet = { back, sheet };
+            window.addEventListener("hashchange", mirrorActive);
         });
     }
 
@@ -581,7 +599,14 @@ async function boot() {
         }
     }
     refreshFlockChrome();
-    setInterval(refreshFlockChrome, 8000);
+    setInterval(() => {
+        if (document.visibilityState !== "hidden") refreshFlockChrome();
+    }, 8000);
+    // When the tab returns from background, refresh immediately so the
+    // operator doesn't see stale dots while waiting for the next tick.
+    document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") refreshFlockChrome();
+    });
 
     const nav = mountNav({
         main: root,

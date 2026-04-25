@@ -2335,7 +2335,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 
 /* ─── Form fields ────────────────────────── */
 .om-field { display: flex; flex-direction: column; gap: 6px; }
-.om-field label {
+.om-field > span {
   font-family: var(--om-display);
   font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--om-text-fade);

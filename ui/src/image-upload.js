@@ -23,7 +23,7 @@ const TEMPLATE = `
             <div class="om-card">
                 <div class="om-stack" style="gap: 12px;">
                     <label class="om-field">
-                        <label>Image file (JPG or PNG)</label>
+                        <span>Image file (JPG or PNG)</span>
                         <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
                         <span class="image-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
                             Editing an existing image — leave the file picker blank
@@ -32,11 +32,11 @@ const TEMPLATE = `
                     </label>
                     <div class="om-row" style="gap: 10px;">
                         <label class="om-field" style="flex: 1;">
-                            <label>Slide name</label>
+                            <span>Slide name</span>
                             <input type="text" class="om-input field-name" value="Image" maxlength="200">
                         </label>
                         <label class="om-field" style="width: 110px;">
-                            <label>Duration (s)</label>
+                            <span>Duration (s)</span>
                             <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
                         </label>
                     </div>

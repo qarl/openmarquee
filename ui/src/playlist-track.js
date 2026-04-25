@@ -34,7 +34,7 @@ const TEMPLATE = `
         <div class="playlist-track-inline-preview"></div>
         <div class="om-card" style="margin-bottom: 12px;">
             <label class="om-field">
-                <label>Playlist name</label>
+                <span>Playlist name</span>
                 <input type="text" class="om-input field-playlist-name" maxlength="64" pattern="[a-z0-9_-]+">
             </label>
             <p style="margin: 10px 0 0; color: var(--om-text-dim); font-size: 12.5px;">
