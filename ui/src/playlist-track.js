@@ -23,28 +23,36 @@ function isModeLockedVideo() {
 
 const TEMPLATE = `
     <section class="playlist-track">
-        <h2 class="subpage-title">Playlists</h2>
+        <div class="om-page-head">
+            <div>
+                <span class="om-eyebrow">Loops · drag to reorder</span>
+                <h1>Playlists</h1>
+                <p>Drag blocks to reorder. Drop slides from the pallet at the bottom. The current loop runs end-to-end on the device.</p>
+            </div>
+        </div>
         <div class="playlist-browser-slot"></div>
         <div class="playlist-track-inline-preview"></div>
-        <label class="field">
-            <span>Playlist name</span>
-            <input type="text" class="field-playlist-name" maxlength="64" pattern="[a-z0-9_-]+">
-        </label>
-        <p class="playlist-track-hint">
-            Drag blocks to reorder; drag from the pallet below to add;
-            × to remove. Click the duration to change it.
-            Changes apply when you click <strong>Save playlist</strong>.
-        </p>
+        <div class="om-card" style="margin-bottom: 12px;">
+            <label class="om-field">
+                <label>Playlist name</label>
+                <input type="text" class="om-input field-playlist-name" maxlength="64" pattern="[a-z0-9_-]+">
+            </label>
+            <p style="margin: 10px 0 0; color: var(--om-text-dim); font-size: 12.5px;">
+                Drag blocks to reorder; drag from the pallet below to add;
+                × to remove. Click the duration to change it.
+                Changes apply when you click <strong>Save playlist</strong>.
+            </p>
+        </div>
 
         <div class="playlist-track-scroll" role="region" aria-label="playlist timeline">
             <ul class="playlist-track-list" role="list" data-empty-hint="Drag slides from the pallet below to build your playlist."></ul>
         </div>
 
-        <h3 class="playlist-pallet-heading">All slides</h3>
+        <div class="om-eyebrow" style="margin: 18px 0 8px; font-family: var(--om-mono); letter-spacing: 0.14em; font-size: 10.5px; color: var(--om-text-fade); text-transform: uppercase;">Pallet · all slides</div>
         <ul class="playlist-pallet" role="list"></ul>
 
-        <button type="button" class="primary playlist-save" disabled>Save playlist</button>
-        <p class="playlist-track-status" role="status" aria-live="polite"></p>
+        <button type="button" class="om-btn primary playlist-save" disabled style="width: 100%; height: 46px; font-size: 14.5px; margin-top: 14px;">Save playlist</button>
+        <p class="playlist-track-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
     </section>
 `;
 

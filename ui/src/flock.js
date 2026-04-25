@@ -13,16 +13,17 @@ const THUMBNAIL_POLL_MS = 3000;
 
 const SECTION_TEMPLATE = `
     <section class="flock">
-        <h2 class="subpage-title">Flock</h2>
-        <p class="flock-hint">
-            All openMarquee devices in this flock. Each tile shows what
-            that sign is currently playing. Toggle <strong>Sync</strong>
-            on a device to keep media mirrored between here and there.
-        </p>
+        <div class="om-page-head">
+            <div>
+                <span class="om-eyebrow">Mesh · push & sync</span>
+                <h1>Your flock</h1>
+                <p>Every openMarquee device in this flock. Toggle <strong>Sync</strong> on a device to keep media mirrored between here and there.</p>
+            </div>
+        </div>
 
         <div class="flock-tiles" role="list"></div>
 
-        <p class="flock-status" role="status" aria-live="polite"></p>
+        <p class="flock-status" role="status" aria-live="polite" style="margin: 10px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
     </section>
 
     <dialog class="flock-modal">

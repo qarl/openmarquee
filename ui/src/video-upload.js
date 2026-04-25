@@ -13,7 +13,13 @@
 
 const TEMPLATE = `
     <section class="video-upload">
-        <h2 class="subpage-title">Video Slides</h2>
+        <div class="om-page-head">
+            <div>
+                <span class="om-eyebrow">Library · Video</span>
+                <h1>Video Slides</h1>
+                <p>Pick a video. Your phone transcodes to H.264 MP4 (capped at 1080p) before upload — the device just plays.</p>
+            </div>
+        </div>
         <div class="slide-browser-slot"></div>
         <div class="preview-wrap">
             <video class="video-upload-video" playsinline controls muted
@@ -21,31 +27,31 @@ const TEMPLATE = `
                    aria-label="video preview"></video>
         </div>
         <form class="controls" autocomplete="off">
-            <label class="field">
-                <span>Video file (any format ffmpeg can decode)</span>
-                <input type="file" accept="video/*" class="field-file">
-                <span class="field-hint video-upload-edit-hint" hidden>
-                    Editing an existing video — leave the file picker blank
-                    to just update name / duration.
-                </span>
-            </label>
-            <p class="field-hint">
-                Transcoded to H.264 MP4, capped at 1080p. Playback
-                rescales to panel dims on the device.
-            </p>
-            <div class="row">
-                <label class="field">
-                    <span>Slide name</span>
-                    <input type="text" class="field-name" value="Video" maxlength="200">
-                </label>
-                <label class="field field-duration-wrap">
-                    <span>Duration (s)</span>
-                    <input type="number" class="field-duration" value="10" min="1" max="3600" step="1">
-                </label>
+            <div class="om-card">
+                <div class="om-stack" style="gap: 12px;">
+                    <label class="om-field">
+                        <label>Video file (any format ffmpeg can decode)</label>
+                        <input type="file" accept="video/*" class="om-input field-file">
+                        <span class="video-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
+                            Editing an existing video — leave the file picker blank
+                            to just update name / duration.
+                        </span>
+                    </label>
+                    <div class="om-row" style="gap: 10px;">
+                        <label class="om-field" style="flex: 1;">
+                            <label>Slide name</label>
+                            <input type="text" class="om-input field-name" value="Video" maxlength="200">
+                        </label>
+                        <label class="om-field" style="width: 110px;">
+                            <label>Duration (s)</label>
+                            <input type="number" class="om-input field-duration" value="10" min="1" max="3600" step="1">
+                        </label>
+                    </div>
+                </div>
             </div>
-            <button type="submit" class="primary field-save" disabled>Save video</button>
-            <p class="video-upload-status" role="status" aria-live="polite"></p>
-            <progress class="video-upload-progress" value="0" max="100" hidden></progress>
+            <button type="submit" class="om-btn primary field-save" disabled style="width: 100%; height: 46px; font-size: 14.5px;">Save video</button>
+            <p class="video-upload-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
+            <progress class="video-upload-progress" value="0" max="100" hidden style="width: 100%; margin-top: 6px;"></progress>
         </form>
     </section>
 `;

@@ -8,32 +8,42 @@ import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 const TEMPLATE = `
     <section class="image-upload">
-        <h2 class="subpage-title">Image Slides</h2>
+        <div class="om-page-head">
+            <div>
+                <span class="om-eyebrow">Library · Image</span>
+                <h1>Image Slides</h1>
+                <p>Upload a PNG or JPG. The device keeps the original; playback cover-fits to the panel at slide entry.</p>
+            </div>
+        </div>
         <div class="slide-browser-slot"></div>
         <div class="preview-wrap">
             <canvas class="image-upload-canvas" aria-label="image preview"></canvas>
         </div>
         <form class="controls" autocomplete="off">
-            <label class="field">
-                <span>Image file (JPG or PNG)</span>
-                <input type="file" accept="image/jpeg,image/png" class="field-file">
-                <span class="field-hint image-upload-edit-hint" hidden>
-                    Editing an existing image — leave the file picker blank
-                    to just update name / duration.
-                </span>
-            </label>
-            <div class="row">
-                <label class="field">
-                    <span>Slide name</span>
-                    <input type="text" class="field-name" value="Image" maxlength="200">
-                </label>
-                <label class="field field-duration-wrap">
-                    <span>Duration (s)</span>
-                    <input type="number" class="field-duration" value="5" min="1" max="300" step="1">
-                </label>
+            <div class="om-card">
+                <div class="om-stack" style="gap: 12px;">
+                    <label class="om-field">
+                        <label>Image file (JPG or PNG)</label>
+                        <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
+                        <span class="image-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
+                            Editing an existing image — leave the file picker blank
+                            to just update name / duration.
+                        </span>
+                    </label>
+                    <div class="om-row" style="gap: 10px;">
+                        <label class="om-field" style="flex: 1;">
+                            <label>Slide name</label>
+                            <input type="text" class="om-input field-name" value="Image" maxlength="200">
+                        </label>
+                        <label class="om-field" style="width: 110px;">
+                            <label>Duration (s)</label>
+                            <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
+                        </label>
+                    </div>
+                </div>
             </div>
-            <button type="submit" class="primary field-save" disabled>Save image</button>
-            <p class="image-upload-status" role="status" aria-live="polite"></p>
+            <button type="submit" class="om-btn primary field-save" disabled style="width: 100%; height: 46px; font-size: 14.5px;">Save image</button>
+            <p class="image-upload-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
         </form>
     </section>
 `;

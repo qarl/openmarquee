@@ -28,6 +28,17 @@ def test_defaults_match_default_output_mode():
     assert s.schema_version == SETTINGS_SCHEMA_VERSION
 
 
+def test_ui_first_run_seen_defaults_to_false():
+    """A freshly-flashed device has ui_first_run_seen=false so the
+    captive-portal UI shows the welcome screen on first visit. The
+    welcome's "Make it mine" button flips it to true."""
+    s = SystemSettings()
+    assert s.ui_first_run_seen is False
+    # And the field round-trips through PUT-shaped JSON.
+    s2 = SystemSettings.model_validate({**s.model_dump(), "ui_first_run_seen": True})
+    assert s2.ui_first_run_seen is True
+
+
 def test_defaults_roundtrip_through_json():
     # sign_name uses a random default_factory (minted once per device on
     # first boot) so two bare SystemSettings() instances aren't equal —

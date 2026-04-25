@@ -6,29 +6,89 @@
     <title>openMarquee</title>
     <link rel="stylesheet" href="/styles.css">
 </head>
-<body>
-    <header>
-        <h1>openMarquee<span class="brand-sign-name" data-sign-name></span></h1>
-    </header>
+<body class="om-app" data-theme="dark" data-accent="amber" data-density="compact" data-layout="desktop">
 
-    <div class="shell">
-        <nav class="sidebar" aria-label="Primary">
-            <ul class="nav-list" role="list">
-                <li><a class="nav-link" href="#/flock" data-section="flock">Flock</a></li>
-                <li class="nav-group-heading">Slides</li>
-                <li><a class="nav-link nav-child" href="#/slides/text" data-section="slides/text">Text</a></li>
-                <li><a class="nav-link nav-child" href="#/slides/image" data-section="slides/image">Image</a></li>
-                <li><a class="nav-link nav-child" href="#/slides/video" data-section="slides/video">Video</a></li>
-                <li><a class="nav-link" href="#/playlists" data-section="playlists">Playlists</a></li>
-                <li><a class="nav-link" href="#/schedule" data-section="schedule">Schedule</a></li>
-                <li><a class="nav-link" href="#/settings" data-section="settings">Settings</a></li>
-            </ul>
-        </nav>
+    <!-- Sidebar — Wordmark, Flock card, Library section, Device section,
+         version footer. main.js fills the dynamic bits (peer dot row,
+         online count) once it can hit /api/flock + /api/settings. -->
+    <nav class="om-side" aria-label="Primary">
+        <div style="padding: 4px 8px 14px;">
+            <span class="om-wordmark">
+                <span class="om-mark"></span>
+                open<em>M</em>arquee
+            </span>
+        </div>
 
-        <main id="app">
+        <a class="om-side-item om-flock nav-link" href="#/flock" data-section="flock">
+            <div class="om-flock-head">
+                <span class="om-side-icon" data-icon="flock"></span>
+                <span class="om-flock-name">Your flock</span>
+                <span class="om-pill live"><span class="om-pulse"></span>live</span>
+            </div>
+            <div class="om-flock-stats">
+                <span data-flock-count>– / – online</span>
+                <span style="color: var(--om-text-fade);">·</span>
+                <span data-flock-since>just now</span>
+                <div style="margin-left: auto;">
+                    <div class="om-flock-dots" data-flock-dots></div>
+                </div>
+            </div>
+        </a>
+
+        <div class="om-side-section">Library</div>
+        <a class="om-side-item nav-link" href="#/slides/text" data-section="slides/text">
+            <span class="om-side-icon" data-icon="slides"></span>
+            <span style="flex: 1;">Slides</span>
+        </a>
+        <a class="om-side-item om-side-sub nav-link" href="#/slides/text" data-section="slides/text">
+            <span style="flex: 1;">Text</span>
+        </a>
+        <a class="om-side-item om-side-sub nav-link" href="#/slides/image" data-section="slides/image">
+            <span style="flex: 1;">Image</span>
+        </a>
+        <a class="om-side-item om-side-sub nav-link" href="#/slides/video" data-section="slides/video">
+            <span style="flex: 1;">Video</span>
+        </a>
+        <a class="om-side-item nav-link" href="#/playlists" data-section="playlists">
+            <span class="om-side-icon" data-icon="playlist"></span>
+            <span style="flex: 1;">Playlists</span>
+        </a>
+        <a class="om-side-item nav-link" href="#/schedule" data-section="schedule">
+            <span class="om-side-icon" data-icon="schedule"></span>
+            <span style="flex: 1;">Schedule</span>
+        </a>
+
+        <div class="om-side-section">Device</div>
+        <a class="om-side-item nav-link" href="#/settings" data-section="settings">
+            <span class="om-side-icon" data-icon="settings"></span>
+            <span style="flex: 1;">Settings</span>
+        </a>
+
+        <div style="margin-top: auto; padding: 14px 8px 4px; font-family: var(--om-mono); font-size: 10.5px; color: var(--om-text-fade); letter-spacing: 0.04em;">
+            openMarquee 0.9.2 · GPLv3
+        </div>
+    </nav>
+
+    <main class="om-main">
+        <div class="om-topbar">
+            <button class="om-btn ghost icon sm om-sheet-open" type="button"
+                    aria-label="Open menu" data-icon="menu"></button>
+            <div class="om-topbar-title">
+                <b data-sign-name>openMarquee</b>
+                <span class="om-divider"></span>
+                <span data-section-title>Slides</span>
+            </div>
+            <span class="om-pill live"><span class="om-pulse"></span>broadcasting</span>
+            <span class="om-pill" data-peer-pill title="Signs online">
+                <span data-icon="flock-pill"></span>
+                <span data-peer-pill-text>– / –</span>
+            </span>
+        </div>
+
+        <div class="om-scroll" id="app">
             <p class="status">Loading…</p>
-        </main>
-    </div>
+        </div>
+    </main>
 
     <script type="module" src="/dist/main.js"></script>
 </body>

@@ -51,7 +51,9 @@ import {
     nextPlaylistName,
 } from "./playlist-browser.js";
 import { mountPlaylistTrack } from "./playlist-track.js";
+import { mountFirstRunWelcome } from "./first-run.js";
 import { mountFlock } from "./flock.js";
+import { Icons } from "./icons.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountVideoUploader } from "./video-upload.js";
@@ -135,6 +137,34 @@ async function fetchResolvedPlaylist(name) {
 
 async function boot() {
     const root = document.getElementById("app");
+
+    // First-run gate: a freshly-flashed device shows the welcome screen
+    // until the operator dismisses it. The flag lives on
+    // SystemSettings.ui_first_run_seen so it survives a power cycle.
+    // Welcome is rendered INSIDE the new om-* shell (om-side + om-topbar
+    // are still visible) — that's intentional, the operator immediately
+    // sees the chrome they'll be using.
+    try {
+        const settings = await getSettings();
+        if (!settings.ui_first_run_seen) {
+            mountFirstRunWelcome(root, {
+                signName: settings.sign_name || "this device",
+                onContinue: async () => {
+                    await saveSettings({
+                        ...settings,
+                        ui_first_run_seen: true,
+                    });
+                    location.reload();
+                },
+            });
+            return;
+        }
+    } catch (err) {
+        // Settings unreachable — skip the gate so a borked /api/settings
+        // doesn't lock the operator out of the editor entirely.
+        console.warn("[boot] first-run check failed; skipping welcome", err);
+    }
+
     root.innerHTML = `
         <section data-section="slides/text" class="panel">
             <div class="editor-slot"></div>
@@ -389,24 +419,173 @@ async function boot() {
         refreshBrandSignName();
     });
 
-    // Device name shown in the sticky header (next to the "openMarquee"
-    // wordmark). Refreshed on boot + on settings-save so a rename in
-    // the Settings panel is reflected immediately.
+    // Device name shown in the topbar (right of the wordmark). Refreshed
+    // on boot + on settings-save so a rename in the Settings panel
+    // shows up immediately.
     async function refreshBrandSignName() {
         const el = document.querySelector("[data-sign-name]");
         if (!el) return;
         try {
             const settings = await getSettings();
-            el.textContent = settings.sign_name || "";
+            el.textContent = settings.sign_name || "openMarquee";
         } catch {
-            el.textContent = "";
+            el.textContent = "openMarquee";
         }
     }
     refreshBrandSignName();
 
+    // ─── Sidebar/topbar chrome populated dynamically ───────────────
+    // The shell HTML in index.html has placeholder slots for icons,
+    // peer dots, the broadcasting pill, and the section breadcrumb.
+    // Populate each from its data source on boot, then keep the
+    // Flock card + topbar pill in sync via a periodic poll.
+
+    function paintIcon(slot, name, opts = {}) {
+        if (!slot) return;
+        const fn = Icons[name];
+        if (!fn) return;
+        slot.innerHTML = fn(opts);
+    }
+    // Sidebar icons (one per static row). data-icon names map to Icons keys.
+    const ICON_MAP = {
+        flock: "Flock",
+        slides: "Slides",
+        playlist: "Playlist",
+        schedule: "Schedule",
+        settings: "Settings",
+        menu: "Menu",
+    };
+    for (const slot of document.querySelectorAll("[data-icon]")) {
+        const key = slot.getAttribute("data-icon");
+        const name = ICON_MAP[key];
+        if (name) paintIcon(slot, name);
+    }
+    // The peer-count pill in the topbar — render the Flock icon at 11px.
+    const peerPillIconSlot = document.querySelector(
+        "[data-peer-pill] [data-icon]",
+    );
+    if (peerPillIconSlot) paintIcon(peerPillIconSlot, "Flock", { size: 11 });
+
+    // Topbar breadcrumb: read the current route and convert to a label.
+    // Updates on every hashchange via the existing nav so the title
+    // tracks what the operator is looking at.
+    const SECTION_TITLES = {
+        "slides/text": "Text slides",
+        "slides/image": "Image slides",
+        "slides/video": "Video slides",
+        playlists: "Playlists",
+        flock: "Your flock",
+        schedule: "Schedule",
+        settings: "Settings",
+    };
+    function refreshSectionTitle() {
+        const slot = document.querySelector("[data-section-title]");
+        if (!slot) return;
+        const hash = (window.location.hash || "").replace(/^#\/?/, "");
+        slot.textContent = SECTION_TITLES[hash] || SECTION_TITLES["slides/text"];
+    }
+    window.addEventListener("hashchange", refreshSectionTitle);
+    refreshSectionTitle();
+
+    // Mobile sheet nav. The hamburger button (.om-sheet-open) only
+    // shows ≤760px (CSS media query); tapping it overlays the sidebar's
+    // nav as a bottom-anchored sheet. Tapping any nav link or the
+    // backdrop closes it. Re-uses the existing sidebar's DOM by
+    // cloning into the sheet body so we don't maintain two nav lists.
+    const hamburger = document.querySelector(".om-sheet-open");
+    if (hamburger) {
+        let openSheet = null;
+        const closeSheet = () => {
+            if (!openSheet) return;
+            openSheet.back.remove();
+            openSheet.sheet.remove();
+            openSheet = null;
+        };
+        hamburger.addEventListener("click", () => {
+            if (openSheet) {
+                closeSheet();
+                return;
+            }
+            const back = document.createElement("div");
+            back.className = "om-sheet-back";
+            back.addEventListener("click", closeSheet);
+            const sheet = document.createElement("div");
+            sheet.className = "om-sheet";
+            sheet.innerHTML = `
+                <div class="om-sheet-grip"></div>
+                <div class="om-sheet-head">
+                    <h3>Menu</h3>
+                    <button type="button" class="om-btn ghost icon sm" aria-label="Close menu" data-icon="close"></button>
+                </div>
+                <div class="om-sheet-body"></div>
+            `;
+            // Clone the sidebar nav into the sheet so the same items show.
+            const sideClone = document
+                .querySelector(".om-side")
+                .cloneNode(true);
+            sheet.querySelector(".om-sheet-body").appendChild(sideClone);
+            // Wire the close button + auto-close on any nav click.
+            const closeBtn = sheet.querySelector("[aria-label='Close menu']");
+            paintIcon(closeBtn.querySelector("[data-icon]"), "Close");
+            closeBtn.addEventListener("click", closeSheet);
+            sheet
+                .querySelectorAll(".nav-link")
+                .forEach((a) => a.addEventListener("click", closeSheet));
+            document.body.appendChild(back);
+            document.body.appendChild(sheet);
+            openSheet = { back, sheet };
+        });
+    }
+
+    // Flock card (sidebar) + peer pill (topbar). Two pieces of UI driven
+    // by the same data — peers list with online flags. Poll every 8s
+    // so the dots reflect reality even without a hashchange.
+    async function refreshFlockChrome() {
+        let peers = [];
+        try {
+            const data = await listFlock();
+            peers = data?.peers || [];
+        } catch {
+            // On failure, keep last-known UI rather than blanking.
+            return;
+        }
+        // Treat last_seen_at within ~30s as "online" for now.
+        const now = Date.now();
+        const online = peers.filter(
+            (p) =>
+                p.last_seen_at &&
+                now - new Date(p.last_seen_at).getTime() < 30_000,
+        ).length;
+        const dots = document.querySelector("[data-flock-dots]");
+        if (dots) {
+            dots.innerHTML = peers
+                .map((p) => {
+                    const fresh =
+                        p.last_seen_at &&
+                        now - new Date(p.last_seen_at).getTime() < 30_000;
+                    return `<i class="${fresh ? "" : "off"}"></i>`;
+                })
+                .join("");
+        }
+        const count = document.querySelector("[data-flock-count]");
+        if (count) {
+            count.textContent = peers.length
+                ? `${online}/${peers.length} online`
+                : "no peers";
+        }
+        const pill = document.querySelector("[data-peer-pill-text]");
+        if (pill) {
+            pill.textContent = peers.length
+                ? `${online}/${peers.length}`
+                : "no peers";
+        }
+    }
+    refreshFlockChrome();
+    setInterval(refreshFlockChrome, 8000);
+
     const nav = mountNav({
         main: root,
-        sidebar: document.querySelector(".sidebar"),
+        sidebar: document.querySelector(".om-side"),
         sections: SECTIONS,
         defaultSection: DEFAULT_SECTION,
     });

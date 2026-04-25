@@ -1896,3 +1896,1184 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     justify-content: flex-end;
     gap: 0.5rem;
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════
+   NEW DESIGN SYSTEM — om-* prefix
+   ───────────────────────────────────────────────────────────────────
+   From the Claude Design handoff bundle (2026-04-25). Coexists with
+   the legacy classes above; nothing in this section reuses an
+   existing selector. Existing screens keep their old look until each
+   is migrated to om-* in a follow-up commit.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* openMarquee device UI — design system
+ * --------------------------------------
+ * Drives every screen via CSS custom properties so the Tweaks panel can
+ * swap theme / accent / density with a single root mutation. The look is
+ * "marquee scoreboard" — dot-matrix accents, monospace chrome, big block
+ * numerals, with humanist sans for content.
+ *
+ * Type strategy: zero web fonts (the device has no internet). All
+ * families are system stacks — what's already on the phone is the
+ * design.
+ */
+
+:root {
+  /* — Type stacks ——————————————————————————————— */
+  --om-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --om-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+  --om-display: var(--om-mono); /* the "scoreboard" face */
+
+  /* — Density (set by tweaks: comfy | compact) ——— */
+  --om-pad: 14px;
+  --om-gap: 12px;
+  --om-row: 52px;
+  --om-radius: 10px;
+  --om-radius-lg: 14px;
+
+  /* — Theme tokens (filled by [data-theme]) ——————— */
+  --om-bg:        #0b0d10;
+  --om-surface:   #14181d;
+  --om-surface-2: #1c2127;
+  --om-line:      rgba(255,255,255,.08);
+  --om-line-2:    rgba(255,255,255,.14);
+  --om-text:      #e7eaee;
+  --om-text-dim:  rgba(231,234,238,.62);
+  --om-text-fade: rgba(231,234,238,.38);
+  --om-shadow:    0 1px 0 rgba(255,255,255,.04) inset, 0 8px 24px rgba(0,0,0,.4);
+  --om-led-bg:    #050608;
+  --om-led-off:   rgba(255,255,255,.025);
+  --om-glow:      0 0 16px var(--om-accent-glow);
+
+  /* — Accent (filled by [data-accent]) ——————— */
+  --om-accent:       #ffb43c;
+  --om-accent-ink:   #1a0f00;
+  --om-accent-soft:  rgba(255,180,60,.18);
+  --om-accent-glow:  rgba(255,180,60,.35);
+  --om-accent-2:     #ff8a3c; /* secondary marquee color */
+
+  /* — Status — */
+  --om-good:  #5ad28a;
+  --om-warn:  #ffb43c;
+  --om-bad:   #ff5a6b;
+}
+
+/* ─── Theme variants ────────────────────────────────── */
+[data-theme="dark"] {
+  --om-bg:        #0b0d10;
+  --om-surface:   #14181d;
+  --om-surface-2: #1c2127;
+  --om-line:      rgba(255,255,255,.08);
+  --om-line-2:    rgba(255,255,255,.14);
+  --om-text:      #e7eaee;
+  --om-text-dim:  rgba(231,234,238,.62);
+  --om-text-fade: rgba(231,234,238,.38);
+}
+[data-theme="oled"] {
+  --om-bg:        #000000;
+  --om-surface:   #0a0a0a;
+  --om-surface-2: #141414;
+  --om-line:      rgba(255,255,255,.07);
+  --om-line-2:    rgba(255,255,255,.14);
+  --om-text:      #f4f4f4;
+  --om-text-dim:  rgba(244,244,244,.55);
+  --om-text-fade: rgba(244,244,244,.32);
+}
+[data-theme="light"] {
+  --om-bg:        #f4efe6;
+  --om-surface:   #fbf8f1;
+  --om-surface-2: #f0eadc;
+  --om-line:      rgba(20,16,8,.10);
+  --om-line-2:    rgba(20,16,8,.18);
+  --om-text:      #1a1610;
+  --om-text-dim:  rgba(26,22,16,.65);
+  --om-text-fade: rgba(26,22,16,.42);
+  --om-shadow:    0 1px 0 rgba(255,255,255,.7) inset, 0 6px 18px rgba(60,40,10,.10);
+  --om-led-bg:    #0c0a08;
+}
+
+/* ─── Accent variants ────────────────────────────────── */
+[data-accent="amber"] {
+  --om-accent: #ffb43c; --om-accent-ink: #1a0f00;
+  --om-accent-soft: rgba(255,180,60,.18); --om-accent-glow: rgba(255,180,60,.45);
+  --om-accent-2: #ff8a3c;
+}
+[data-accent="green"] {
+  --om-accent: #5af095; --om-accent-ink: #002914;
+  --om-accent-soft: rgba(90,240,149,.16); --om-accent-glow: rgba(90,240,149,.45);
+  --om-accent-2: #b6f05a;
+}
+[data-accent="pink"] {
+  --om-accent: #ff5fa7; --om-accent-ink: #2a0420;
+  --om-accent-soft: rgba(255,95,167,.18); --om-accent-glow: rgba(255,95,167,.45);
+  --om-accent-2: #ff8a3c;
+}
+[data-accent="cyan"] {
+  --om-accent: #5fd5ff; --om-accent-ink: #002028;
+  --om-accent-soft: rgba(95,213,255,.18); --om-accent-glow: rgba(95,213,255,.45);
+  --om-accent-2: #5af095;
+}
+
+/* ─── Density ────────────────────────────────── */
+[data-density="compact"] {
+  --om-pad: 10px;
+  --om-gap: 8px;
+  --om-row: 44px;
+}
+
+/* ─── Core layout ────────────────────────────────── */
+.om-app {
+  display: flex; flex-direction: column;
+  width: 100%; height: 100%;
+  background: var(--om-bg);
+  color: var(--om-text);
+  font-family: var(--om-sans);
+  font-size: 14px;
+  line-height: 1.4;
+  letter-spacing: -0.005em;
+  overflow: hidden;
+  position: relative;
+  isolation: isolate;
+}
+.om-app *::-webkit-scrollbar { width: 6px; height: 6px; }
+.om-app *::-webkit-scrollbar-thumb { background: var(--om-line-2); border-radius: 3px; }
+.om-app *::-webkit-scrollbar-track { background: transparent; }
+.om-app * { scrollbar-width: thin; scrollbar-color: var(--om-line-2) transparent; }
+
+/* ─── Top bar ────────────────────────────────── */
+.om-topbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px var(--om-pad);
+  border-bottom: 1px solid var(--om-line);
+  background: var(--om-bg);
+  position: relative;
+  z-index: 5;
+}
+.om-topbar-title {
+  font-family: var(--om-display);
+  font-size: 13px; letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--om-text-dim);
+  flex: 1;
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0;
+}
+.om-topbar-title b {
+  color: var(--om-text);
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  font-family: var(--om-sans);
+  font-size: 15px;
+}
+.om-topbar-title .om-divider {
+  width: 1px; height: 12px; background: var(--om-line-2);
+}
+
+/* The wordmark — stylized openMarquee with a tiny dot-matrix mark */
+.om-wordmark {
+  font-family: var(--om-sans);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  display: inline-flex; align-items: center; gap: 7px;
+  color: var(--om-text);
+}
+.om-wordmark .om-mark {
+  width: 18px; height: 14px;
+  background: var(--om-led-bg);
+  border-radius: 3px;
+  position: relative;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px var(--om-line-2);
+}
+.om-wordmark .om-mark::before {
+  content: "";
+  position: absolute; inset: 2px;
+  background-image:
+    radial-gradient(circle, var(--om-accent) 38%, transparent 42%),
+    radial-gradient(circle, var(--om-accent) 38%, transparent 42%);
+  background-size: 4px 4px, 4px 4px;
+  background-position: 0 0, 2px 2px;
+  background-repeat: repeat;
+  opacity: 0.95;
+  filter: drop-shadow(0 0 1.5px var(--om-accent-glow));
+}
+.om-wordmark em { color: var(--om-accent); font-style: normal; font-weight: 700; }
+
+/* ─── Sidebar nav (desktop) ────────────────────────── */
+.om-side {
+  width: 220px;
+  flex: 0 0 220px;
+  background: var(--om-surface);
+  border-right: 1px solid var(--om-line);
+  display: flex; flex-direction: column;
+  padding: 16px 10px;
+  gap: 2px;
+}
+.om-side-section {
+  font-family: var(--om-display);
+  font-size: 10px; letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--om-text-fade);
+  padding: 14px 12px 6px;
+}
+.om-side-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  color: var(--om-text-dim);
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 500;
+  position: relative;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.om-side-item:hover { background: var(--om-line); color: var(--om-text); }
+.om-side-item.active {
+  background: var(--om-accent-soft);
+  color: var(--om-accent);
+}
+.om-side-item.active::before {
+  content: ""; position: absolute; left: -10px; top: 8px; bottom: 8px;
+  width: 3px; border-radius: 0 3px 3px 0; background: var(--om-accent);
+  box-shadow: 0 0 8px var(--om-accent-glow);
+}
+.om-side-item .om-side-icon {
+  width: 18px; height: 18px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: inherit;
+}
+.om-side-sub {
+  padding-left: 26px;
+  font-size: 13px;
+  font-weight: 400;
+}
+.om-side-item .om-badge {
+  margin-left: auto;
+  font-family: var(--om-display);
+  font-size: 10px;
+  background: var(--om-line);
+  color: var(--om-text-dim);
+  padding: 2px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.05em;
+}
+.om-side-item.active .om-badge { background: var(--om-accent); color: var(--om-accent-ink); }
+
+/* The flock entry gets extra love — live status dots */
+.om-side-item.om-flock {
+  margin-top: 10px;
+  background: linear-gradient(180deg, var(--om-surface-2), var(--om-surface));
+  border: 1px solid var(--om-line);
+  border-radius: var(--om-radius);
+  padding: 10px 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.om-side-item.om-flock:hover { border-color: var(--om-line-2); }
+.om-side-item.om-flock.active {
+  border-color: var(--om-accent);
+  background: var(--om-accent-soft);
+}
+.om-flock-head { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--om-text); }
+.om-flock-head .om-flock-name { flex: 1; font-size: 13px; }
+.om-flock-dots { display: flex; gap: 4px; }
+.om-flock-dots i {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--om-good);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--om-good) 80%, transparent);
+}
+.om-flock-dots i.off { background: var(--om-line-2); box-shadow: none; }
+.om-flock-stats {
+  display: flex; gap: 10px;
+  font-family: var(--om-mono);
+  font-size: 10.5px;
+  color: var(--om-text-dim);
+  letter-spacing: 0.02em;
+}
+
+/* ─── Bottom tab bar (mobile alt nav) ───────────────────── */
+.om-tabbar {
+  display: flex;
+  background: var(--om-surface);
+  border-top: 1px solid var(--om-line);
+  padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0px));
+  position: relative;
+  z-index: 3;
+}
+.om-tab {
+  flex: 1;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 8px 0 6px;
+  font-family: var(--om-display);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--om-text-fade);
+  border: none; background: transparent;
+  cursor: pointer;
+  border-radius: 8px;
+  position: relative;
+  -webkit-tap-highlight-color: transparent;
+  min-height: 48px;
+}
+.om-tab svg { width: 20px; height: 20px; }
+.om-tab.active { color: var(--om-accent); }
+.om-tab.active::after {
+  content: ""; position: absolute; top: 0; left: 30%; right: 30%; height: 2px;
+  background: var(--om-accent); border-radius: 0 0 2px 2px;
+  box-shadow: 0 0 6px var(--om-accent-glow);
+}
+
+/* ─── Main scroll region ────────────────────────── */
+.om-main { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.om-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--om-pad); }
+.om-scroll-tight { padding: 0; }
+
+.om-page-head {
+  display: flex; align-items: end; justify-content: space-between; gap: 12px;
+  padding: 4px 2px 14px;
+}
+.om-page-head h1 {
+  font-family: var(--om-sans);
+  font-size: 22px; font-weight: 700; letter-spacing: -0.02em;
+  margin: 0;
+  color: var(--om-text);
+}
+.om-page-head .om-eyebrow {
+  font-family: var(--om-display);
+  font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--om-text-fade); margin-bottom: 4px;
+  display: block;
+}
+.om-page-head p { margin: 4px 0 0; color: var(--om-text-dim); font-size: 13px; max-width: 56ch; }
+
+/* ─── Subnav (Slides → Text/Image/Video) ─────────────────── */
+.om-subnav {
+  display: flex; gap: 2px;
+  padding: 4px;
+  background: var(--om-surface-2);
+  border: 1px solid var(--om-line);
+  border-radius: 10px;
+  margin-bottom: var(--om-gap);
+}
+.om-subnav button {
+  flex: 1;
+  appearance: none; border: 0;
+  background: transparent;
+  color: var(--om-text-dim);
+  padding: 8px 10px;
+  font-family: var(--om-sans);
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 7px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+}
+.om-subnav button.active {
+  background: var(--om-bg);
+  color: var(--om-text);
+  box-shadow: 0 1px 2px rgba(0,0,0,.25);
+}
+.om-subnav button .om-count {
+  font-family: var(--om-mono);
+  font-size: 10.5px;
+  color: var(--om-text-fade);
+  background: var(--om-line);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.om-subnav button.active .om-count { color: var(--om-accent); background: var(--om-accent-soft); }
+
+/* ─── Card ────────────────────────── */
+.om-card {
+  background: var(--om-surface);
+  border: 1px solid var(--om-line);
+  border-radius: var(--om-radius-lg);
+  padding: var(--om-pad);
+}
+.om-card-tight { padding: 0; overflow: hidden; }
+
+/* ─── Buttons ────────────────────────── */
+.om-btn {
+  appearance: none; border: 0;
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 10px;
+  background: var(--om-surface-2);
+  color: var(--om-text);
+  font-family: var(--om-sans);
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  border: 1px solid var(--om-line);
+  transition: transform .08s, background .12s, border-color .12s;
+}
+.om-btn:hover { border-color: var(--om-line-2); }
+.om-btn:active { transform: translateY(1px); }
+.om-btn.primary {
+  background: var(--om-accent);
+  color: var(--om-accent-ink);
+  border-color: transparent;
+  font-weight: 600;
+  box-shadow: 0 0 0 0 var(--om-accent-glow), 0 1px 0 rgba(255,255,255,.25) inset;
+}
+.om-btn.primary:hover { box-shadow: 0 0 16px var(--om-accent-glow), 0 1px 0 rgba(255,255,255,.25) inset; }
+.om-btn.ghost { background: transparent; border-color: transparent; color: var(--om-text-dim); }
+.om-btn.ghost:hover { color: var(--om-text); background: var(--om-line); }
+.om-btn.sm { height: 30px; padding: 0 10px; font-size: 12.5px; border-radius: 8px; }
+.om-btn.icon { width: 36px; padding: 0; }
+.om-btn.icon.sm { width: 28px; }
+.om-btn:focus-visible { outline: 2px solid var(--om-accent); outline-offset: 2px; }
+
+/* ─── Form fields ────────────────────────── */
+.om-field { display: flex; flex-direction: column; gap: 6px; }
+.om-field label {
+  font-family: var(--om-display);
+  font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--om-text-fade);
+}
+.om-input, .om-select, .om-textarea {
+  appearance: none;
+  background: var(--om-surface-2);
+  color: var(--om-text);
+  border: 1px solid var(--om-line);
+  border-radius: 9px;
+  padding: 10px 12px;
+  font: inherit;
+  font-family: var(--om-sans);
+  width: 100%;
+  outline: none;
+  transition: border-color .12s, background .12s;
+}
+.om-input:focus, .om-select:focus, .om-textarea:focus {
+  border-color: var(--om-accent);
+  background: var(--om-bg);
+}
+.om-textarea { min-height: 80px; resize: vertical; font-family: var(--om-mono); font-size: 13px; }
+.om-select {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%23999' d='M0 0h10L5 6z'/></svg>");
+  background-repeat: no-repeat; background-position: right 12px center;
+  padding-right: 32px;
+}
+
+/* Switch */
+.om-switch {
+  appearance: none; border: 0;
+  width: 38px; height: 22px; border-radius: 999px;
+  background: var(--om-line-2);
+  position: relative; flex-shrink: 0;
+  transition: background .15s;
+  cursor: pointer;
+}
+.om-switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #fff;
+  transition: transform .15s;
+  box-shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+.om-switch[data-on="1"] { background: var(--om-accent); }
+.om-switch[data-on="1"]::after { transform: translateX(16px); }
+
+/* Range */
+.om-range {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 4px;
+  background: var(--om-line-2);
+  border-radius: 999px;
+  outline: none;
+}
+.om-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--om-accent);
+  box-shadow: 0 0 8px var(--om-accent-glow);
+  cursor: pointer;
+}
+.om-range::-moz-range-thumb {
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--om-accent);
+  box-shadow: 0 0 8px var(--om-accent-glow);
+  cursor: pointer; border: 0;
+}
+
+/* Pill */
+.om-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--om-line);
+  color: var(--om-text-dim);
+  font-family: var(--om-display);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.om-pill.live { background: var(--om-accent-soft); color: var(--om-accent); }
+.om-pill.good { background: rgba(90,210,138,.16); color: var(--om-good); }
+.om-pill.bad { background: rgba(255,90,107,.16); color: var(--om-bad); }
+.om-pill .om-pulse {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor;
+  animation: om-pulse 1.4s infinite;
+}
+@keyframes om-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.7); }
+}
+
+/* ─── LED preview canvas ─────────────────────────────────
+ * The pixel grid that shows what the device will draw. Sits on
+ * --om-led-bg (near-black) with a subtle "off-pixel" pattern so the
+ * panel structure is visible even on dark slides. --aspect-w/h are
+ * set inline by the React component.
+ */
+.om-led-frame {
+  position: relative;
+  background: var(--om-led-bg);
+  border-radius: 12px;
+  border: 1px solid var(--om-line-2);
+  padding: 10px;
+  box-shadow: var(--om-shadow), inset 0 0 0 1px rgba(0,0,0,.5);
+}
+.om-led-stage {
+  width: 100%;
+  aspect-ratio: var(--om-aspect-w, 2) / var(--om-aspect-h, 1);
+  background: var(--om-slide-bg, #0a0a0a);
+  border-radius: 4px;
+  position: relative;
+  overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  isolation: isolate;
+  container-type: size;
+  container-name: ledstage;
+  /* Subtle dot-matrix overlay so panels look like panels */
+}
+.om-led-stage[data-pixel="1"]::after {
+  content: "";
+  position: absolute; inset: 0;
+  background-image:
+    radial-gradient(circle, rgba(0,0,0,.55) 30%, transparent 32%);
+  background-size: var(--om-pixel, 4px) var(--om-pixel, 4px);
+  pointer-events: none;
+  mix-blend-mode: multiply;
+}
+.om-led-stage > * { position: relative; z-index: 1; }
+.om-led-meta {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-top: 8px;
+  font-family: var(--om-mono);
+  font-size: 10.5px;
+  color: var(--om-text-fade);
+  letter-spacing: 0.02em;
+}
+.om-led-meta .om-led-aspect-pick {
+  display: flex; gap: 2px;
+  background: var(--om-surface-2);
+  border-radius: 6px;
+  padding: 2px;
+  border: 1px solid var(--om-line);
+}
+.om-led-meta .om-led-aspect-pick button {
+  appearance: none; border: 0; background: transparent;
+  color: var(--om-text-fade);
+  font: inherit;
+  padding: 4px 7px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.om-led-meta .om-led-aspect-pick button.active {
+  background: var(--om-bg); color: var(--om-accent);
+}
+
+/* Slide-content rendering inside the LED stage */
+.om-slide-text {
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  text-align: center;
+  font-weight: 700;
+  white-space: pre-line;
+  padding: 4%;
+  box-sizing: border-box;
+}
+.om-slide-text.font-block { font-family: "Impact", "Arial Black", var(--om-display); letter-spacing: 0.02em; }
+.om-slide-text.font-mono { font-family: var(--om-mono); }
+.om-slide-text.font-serif { font-family: Georgia, "Times New Roman", serif; }
+.om-slide-text.scroll {
+  justify-content: flex-start;
+  white-space: nowrap;
+  animation: om-scroll 8s linear infinite;
+}
+@keyframes om-scroll {
+  0% { transform: translateX(100%); }
+  100% { transform: translateX(-100%); }
+}
+
+/* Slide background palette — used both inside the LED stage and as
+ * card thumbnails. Kept in sync with the data file's bg keys.  */
+.bg-teal   { background: radial-gradient(120% 90% at 30% 20%, #0d4a52, #06222a 70%); color: #f4ecd8; }
+.bg-amber  { background: linear-gradient(180deg,#ffb43c,#ff7a3c); color: #1a0f00; }
+.bg-cream  { background: linear-gradient(180deg,#fbf3dc,#e9d8a0); color: #1a1610; }
+.bg-ink    { background: linear-gradient(180deg,#0d0e10,#000); color: #ffb43c; }
+.bg-pink   { background: linear-gradient(180deg,#ff5fa7,#7a1d4a); color: #fff; }
+
+/* — Image-slide placeholder treatments — */
+.om-slide-img {
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  position: relative; overflow: hidden;
+  font-family: var(--om-mono);
+  font-size: 10px;
+  color: rgba(255,255,255,.5);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.om-slide-img.placeholder-cup { background: linear-gradient(160deg,#c98a5c,#5a3318); }
+.om-slide-img.placeholder-cup::before {
+  content: "☕ product shot";
+  font-family: var(--om-mono);
+  color: rgba(255,255,255,.6);
+}
+.om-slide-img.placeholder-logo { background: #0e0e10; color: var(--om-accent); }
+.om-slide-img.placeholder-logo::before { content: "LOGO"; font-size: 16px; letter-spacing: 0.4em; font-weight: 700; }
+.om-slide-img.placeholder-video { background: linear-gradient(180deg,#1a1a22,#000); }
+.om-slide-img.placeholder-video::before { content: "▶  video loop"; }
+.om-slide-img.placeholder-gradient-dusk   { background: linear-gradient(180deg,#ff8a5c,#3c1860 80%,#0a0820); }
+.om-slide-img.placeholder-gradient-sunset { background: linear-gradient(180deg,#ffb43c,#ff5a3c 60%,#5e1a1a); }
+
+/* ─── Slide list (cards) ────────────────────────── */
+.om-slide-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+}
+.om-slide-card {
+  background: var(--om-surface);
+  border: 1px solid var(--om-line);
+  border-radius: var(--om-radius);
+  overflow: hidden;
+  cursor: pointer;
+  position: relative;
+  transition: transform .12s, border-color .12s, box-shadow .12s;
+}
+.om-slide-card:hover {
+  border-color: var(--om-line-2);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0,0,0,.25);
+}
+.om-slide-card.selected {
+  border-color: var(--om-accent);
+  box-shadow: 0 0 0 1px var(--om-accent), 0 0 16px var(--om-accent-glow);
+}
+.om-slide-card .om-thumb {
+  aspect-ratio: 2/1;
+  position: relative;
+  background: var(--om-led-bg);
+}
+.om-slide-card .om-thumb > .om-led-stage {
+  border-radius: 0;
+  height: 100%;
+}
+.om-slide-card .om-meta {
+  padding: 8px 10px;
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+}
+.om-slide-card .om-meta b {
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.om-slide-card .om-meta .om-dur {
+  font-family: var(--om-mono);
+  font-size: 10.5px;
+  color: var(--om-text-fade);
+  letter-spacing: 0.05em;
+}
+.om-slide-card .om-kind {
+  position: absolute; top: 6px; left: 6px;
+  font-family: var(--om-display);
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  background: rgba(0,0,0,.5);
+  color: #fff;
+  padding: 2px 5px; border-radius: 3px;
+  backdrop-filter: blur(4px);
+}
+
+/* ─── Playlist track editor — vertical (mobile default) ─── */
+.om-track {
+  display: flex; flex-direction: column;
+  gap: 8px;
+  padding: 4px 0 8px;
+  position: relative;
+}
+.om-track-block {
+  display: flex; align-items: stretch;
+  background: var(--om-surface);
+  border: 1px solid var(--om-line);
+  border-radius: var(--om-radius);
+  overflow: hidden;
+  position: relative;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: transform .18s cubic-bezier(.2,.7,.3,1), box-shadow .12s, border-color .12s, opacity .12s;
+}
+.om-track-block.dragging {
+  transition: none;
+  z-index: 5;
+  border-color: var(--om-accent);
+  box-shadow: 0 16px 36px rgba(0,0,0,.4), 0 0 0 1px var(--om-accent), 0 0 24px var(--om-accent-glow);
+  transform-origin: center;
+}
+.om-track-block .om-grip {
+  width: 28px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--om-text-fade);
+  cursor: grab;
+  background: var(--om-surface-2);
+  border-right: 1px solid var(--om-line);
+  flex-shrink: 0;
+}
+.om-track-block.dragging .om-grip { cursor: grabbing; }
+.om-track-block .om-grip:hover { color: var(--om-text); }
+.om-track-block .om-block-thumb {
+  width: 70px; aspect-ratio: 2/1; flex-shrink: 0;
+  background: var(--om-led-bg);
+  margin: 8px 0 8px 8px;
+  border-radius: 6px;
+  overflow: hidden;
+  position: relative;
+}
+.om-track-block .om-block-meta {
+  flex: 1; min-width: 0;
+  padding: 10px 12px;
+  display: flex; flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+}
+.om-track-block .om-block-meta b {
+  font-size: 13.5px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.om-track-block .om-block-meta .om-block-sub {
+  font-family: var(--om-mono);
+  font-size: 11px;
+  color: var(--om-text-fade);
+  letter-spacing: 0.04em;
+}
+.om-track-block .om-block-dur {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 0 12px;
+  border-left: 1px dashed var(--om-line);
+  min-width: 64px;
+  font-family: var(--om-display);
+}
+.om-track-block .om-block-dur .om-num {
+  font-size: 18px; font-weight: 700;
+  color: var(--om-accent);
+  font-variant-numeric: tabular-nums;
+}
+.om-track-block .om-block-dur .om-unit {
+  font-size: 9.5px; letter-spacing: 0.14em;
+  color: var(--om-text-fade); text-transform: uppercase;
+}
+
+/* drop indicator gap */
+.om-track-gap {
+  height: 2px; border-radius: 2px;
+  background: transparent;
+  transition: background .12s, height .12s, margin .12s;
+  margin: -3px 0;
+}
+.om-track-gap.active {
+  background: var(--om-accent);
+  box-shadow: 0 0 12px var(--om-accent-glow);
+  height: 4px;
+  margin: 4px 0;
+}
+
+/* ─── Playlist editor — horizontal timeline variant ─── */
+.om-timeline {
+  position: relative;
+  background: var(--om-surface);
+  border: 1px solid var(--om-line);
+  border-radius: var(--om-radius);
+  padding: 14px 12px 8px;
+  overflow-x: auto;
+}
+.om-timeline-ruler {
+  display: flex;
+  font-family: var(--om-mono);
+  font-size: 9.5px;
+  color: var(--om-text-fade);
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+  border-bottom: 1px dashed var(--om-line);
+  padding-bottom: 4px;
+}
+.om-timeline-ruler i {
+  flex-shrink: 0;
+  border-left: 1px solid var(--om-line);
+  padding: 0 0 2px 4px;
+  font-style: normal;
+}
+.om-timeline-track {
+  display: flex; gap: 4px;
+  position: relative;
+  user-select: none;
+  touch-action: none;
+}
+.om-timeline-block {
+  height: 64px; flex-shrink: 0;
+  background: var(--om-surface-2);
+  border: 1px solid var(--om-line);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+  display: flex; align-items: stretch;
+  transition: transform .18s cubic-bezier(.2,.7,.3,1), border-color .12s;
+}
+.om-timeline-block.dragging {
+  transition: none; z-index: 5;
+  border-color: var(--om-accent);
+  box-shadow: 0 12px 30px rgba(0,0,0,.4), 0 0 16px var(--om-accent-glow);
+}
+.om-timeline-block .om-tl-thumb {
+  width: 50px; aspect-ratio: 2/1;
+  flex-shrink: 0;
+  background: var(--om-led-bg);
+}
+.om-timeline-block .om-tl-info {
+  padding: 6px 8px;
+  display: flex; flex-direction: column; justify-content: center;
+  min-width: 0;
+}
+.om-timeline-block .om-tl-info b {
+  font-size: 11.5px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 100px;
+}
+.om-timeline-block .om-tl-info .om-tl-dur {
+  font-family: var(--om-display);
+  font-size: 14px; color: var(--om-accent);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.om-timeline-playhead {
+  position: absolute; top: 28px; bottom: 8px;
+  width: 2px;
+  background: var(--om-accent);
+  box-shadow: 0 0 8px var(--om-accent-glow);
+  pointer-events: none;
+  z-index: 6;
+}
+.om-timeline-playhead::before {
+  content: ""; position: absolute; top: -6px; left: -5px;
+  width: 12px; height: 12px;
+  background: var(--om-accent);
+  border-radius: 2px;
+  box-shadow: 0 0 8px var(--om-accent-glow);
+}
+
+/* ─── Pallet (saved slides drawer) ─── */
+.om-pallet {
+  border-top: 1px solid var(--om-line);
+  background: var(--om-surface);
+  display: flex; flex-direction: column;
+  flex-shrink: 0;
+}
+.om-pallet-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px var(--om-pad);
+  border-bottom: 1px solid var(--om-line);
+}
+.om-pallet-head h3 {
+  margin: 0;
+  font-family: var(--om-display);
+  font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--om-text-dim);
+}
+.om-pallet-row {
+  display: flex; gap: 8px;
+  padding: 10px var(--om-pad);
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+}
+.om-pallet-row .om-pallet-card {
+  flex-shrink: 0;
+  width: 110px;
+  scroll-snap-align: start;
+  background: var(--om-surface-2);
+  border: 1px solid var(--om-line);
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: grab;
+}
+.om-pallet-row .om-pallet-card:hover { border-color: var(--om-line-2); }
+.om-pallet-row .om-pallet-card .om-pallet-thumb {
+  aspect-ratio: 2/1; background: var(--om-led-bg);
+}
+.om-pallet-row .om-pallet-card .om-pallet-meta {
+  padding: 5px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ─── Schedule ─── */
+.om-cal {
+  display: grid;
+  grid-template-columns: 56px repeat(7, 1fr);
+  gap: 1px;
+  background: var(--om-line);
+  border: 1px solid var(--om-line);
+  border-radius: var(--om-radius);
+  overflow: hidden;
+}
+.om-cal-cell {
+  background: var(--om-surface);
+  font-family: var(--om-mono);
+  font-size: 10px;
+  color: var(--om-text-fade);
+  padding: 4px 5px;
+  min-height: 18px;
+  position: relative;
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+.om-cal-head { font-weight: 700; color: var(--om-text-dim); padding: 8px 5px; text-align: center; }
+.om-cal-time { color: var(--om-text-fade); padding: 4px 6px; text-align: right; }
+.om-cal-cell.filled { padding: 0; }
+.om-cal-block {
+  position: absolute; left: 1px; right: 1px;
+  border-radius: 3px;
+  background: var(--om-accent-soft);
+  border-left: 2px solid var(--om-accent);
+  font-family: var(--om-sans);
+  font-size: 10.5px; font-weight: 600;
+  color: var(--om-accent);
+  padding: 4px 5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  text-align: left;
+}
+
+/* ─── Flock dashboard ─── */
+.om-flock-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+.om-peer-card {
+  background: var(--om-surface);
+  border: 1px solid var(--om-line);
+  border-radius: var(--om-radius-lg);
+  padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  position: relative;
+  transition: border-color .12s, transform .12s;
+}
+.om-peer-card:hover { border-color: var(--om-line-2); }
+.om-peer-card.this { border-color: var(--om-accent); box-shadow: 0 0 0 1px var(--om-accent-soft); }
+.om-peer-card.offline { opacity: 0.62; }
+
+.om-peer-head { display: flex; align-items: center; gap: 8px; }
+.om-peer-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--om-good);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--om-good) 70%, transparent);
+}
+.om-peer-dot.off { background: var(--om-line-2); box-shadow: none; }
+.om-peer-card .om-peer-name { font-size: 14px; font-weight: 600; flex: 1; }
+.om-peer-card .om-peer-thumb {
+  background: var(--om-led-bg);
+  border-radius: 8px;
+  border: 1px solid var(--om-line);
+  overflow: hidden;
+  position: relative;
+}
+.om-peer-card .om-peer-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  font-family: var(--om-mono);
+  font-size: 11px;
+  color: var(--om-text-dim);
+}
+.om-peer-card .om-peer-stats span b { color: var(--om-text); font-weight: 600; }
+.om-peer-card .om-peer-actions {
+  display: flex; gap: 6px;
+  margin-top: 2px;
+}
+
+/* ─── Welcome — first-run hero ─── */
+.om-welcome {
+  position: relative;
+  height: 100%;
+  display: flex; flex-direction: column;
+  background: var(--om-bg);
+  overflow: hidden;
+}
+.om-welcome-hero {
+  position: relative;
+  flex: 1;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  overflow: hidden;
+}
+.om-welcome-hero::before {
+  content: "";
+  position: absolute; inset: 0;
+  background-image:
+    radial-gradient(circle at 50% 50%, var(--om-accent-glow) 0%, transparent 50%);
+  opacity: 0.5;
+  pointer-events: none;
+}
+.om-marquee-strip {
+  position: absolute; left: 0; right: 0;
+  display: flex; overflow: hidden;
+  font-family: var(--om-display);
+  font-size: 11px; letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--om-accent);
+  padding: 7px 0;
+  border-block: 1px solid var(--om-line);
+  background: var(--om-bg);
+  z-index: 1;
+}
+.om-marquee-strip.top { top: 0; }
+.om-marquee-strip.bot { bottom: 0; }
+.om-marquee-strip > div {
+  flex-shrink: 0;
+  display: flex; gap: 24px;
+  padding-right: 24px;
+  animation: om-scroll-loop 20s linear infinite;
+}
+.om-marquee-strip span { display: inline-flex; align-items: center; gap: 16px; }
+.om-marquee-strip i { font-style: normal; color: var(--om-text-fade); }
+@keyframes om-scroll-loop {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+/* ─── Welcome — preview "card" ─── */
+.om-welcome-card {
+  background: var(--om-led-bg);
+  border-radius: 18px;
+  padding: 14px;
+  border: 1px solid var(--om-line-2);
+  box-shadow: 0 30px 80px rgba(0,0,0,.5), 0 0 60px var(--om-accent-glow);
+  width: min(100%, 360px);
+  position: relative;
+  z-index: 2;
+}
+
+/* ─── Misc helpers ─── */
+.om-row { display: flex; align-items: center; gap: 10px; }
+.om-row.between { justify-content: space-between; }
+.om-stack { display: flex; flex-direction: column; gap: var(--om-gap); }
+.om-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--om-text-dim);
+  border: 1px dashed var(--om-line);
+  border-radius: var(--om-radius);
+  gap: 10px;
+}
+
+/* ─── Sheet (mobile modal) ─── */
+.om-sheet-back {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,.55);
+  backdrop-filter: blur(2px);
+  z-index: 30;
+  animation: om-fade-in .15s ease both;
+}
+.om-sheet {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  background: var(--om-surface);
+  border-radius: var(--om-radius-lg) var(--om-radius-lg) 0 0;
+  border-top: 1px solid var(--om-line-2);
+  z-index: 31;
+  display: flex; flex-direction: column;
+  max-height: 88%;
+  animation: om-sheet-up .25s cubic-bezier(.2,.8,.2,1) both;
+}
+.om-sheet-grip {
+  width: 40px; height: 4px; border-radius: 2px;
+  background: var(--om-line-2);
+  margin: 8px auto 4px;
+}
+.om-sheet-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px var(--om-pad) 10px;
+  border-bottom: 1px solid var(--om-line);
+}
+.om-sheet-head h3 { margin: 0; font-size: 16px; font-weight: 600; flex: 1; }
+.om-sheet-body { padding: var(--om-pad); overflow-y: auto; flex: 1; }
+@keyframes om-sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
+@keyframes om-fade-in  { from { opacity: 0; } to { opacity: 1; } }
+
+/* ─── Reduced motion ─── */
+@media (prefers-reduced-motion: reduce) {
+  .om-marquee-strip > div { animation: none; }
+  .om-slide-text.scroll { animation: none; }
+}
+
+
+/* Desktop layout — sidebar + main side-by-side. Mobile uses
+   flex-direction: column with the topbar on top and the tabbar/
+   sheet below; desktop puts the sidebar on the left. The bundle's
+   MarqueeApp toggles this inline; we use an explicit attribute so
+   media queries can flip back to column on narrow viewports. */
+.om-app[data-layout="desktop"] {
+    flex-direction: row;
+}
+@media (max-width: 760px) {
+    .om-app[data-layout="desktop"] { flex-direction: column; }
+    .om-app[data-layout="desktop"] .om-side { display: none; }
+}
+
+/* Page bg + zero margin so the .om-app shell can fill the viewport. */
+html, body { margin: 0; padding: 0; height: 100%; }
+
+
+/* ─── Mobile sheet nav ─────────────────────────────────
+   On narrow viewports, hide the persistent sidebar and show a
+   hamburger button in the topbar. Clicking opens a sheet anchored
+   to the bottom that mirrors the sidebar's nav. */
+.om-app [hidden] { display: none !important; }
+.om-sheet-open { display: none; }
+@media (max-width: 760px) {
+    .om-sheet-open { display: inline-flex; }
+}
+.om-app .om-sheet .om-side {
+    display: flex;
+    width: 100%;
+    border-right: 0;
+    background: transparent;
+    padding: 8px 8px 24px;
+}
+
+/* ─── Phone-width adjustments ───────────────────────────
+   Below 560px, multi-column form rows stack to one column,
+   topbar drops the breadcrumb + status pills (sign name +
+   hamburger remain — full title is in the page-head h1
+   under the topbar). Compact pallet tiles too. */
+@media (max-width: 560px) {
+    .row { flex-wrap: wrap; }
+    .row > .field { flex: 1 1 100%; min-width: 100%; }
+    .om-topbar .om-divider,
+    .om-topbar [data-section-title],
+    .om-topbar .om-pill { display: none; }
+    .om-topbar [data-peer-pill] { display: inline-flex; flex-shrink: 0; }
+    .playlist-pallet { grid-template-columns: repeat(auto-fill, minmax(4.5rem, 1fr)); }
+}

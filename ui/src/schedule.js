@@ -21,32 +21,33 @@ const DAYS = [
 
 const SECTION_TEMPLATE = `
     <section class="schedule">
-        <h2 class="subpage-title">Schedule</h2>
-        <div class="schedule-now" data-field="now">
-            <span class="schedule-now-label">Device time</span>
-            <span class="schedule-now-value" data-field="now-value">—</span>
-        </div>
-        <p class="schedule-hint">
-            Rules pick which playlist plays when. First matching rule wins;
-            otherwise the default below plays. Timezone comes from Settings.
-        </p>
-
-        <label class="field">
-            <span>Default playlist (when no rule matches)</span>
-            <input type="text" class="field-default-playlist" maxlength="64" pattern="[a-z0-9_-]+">
-        </label>
-
-        <button type="button" class="schedule-add">+ Add Rule</button>
-
-        <ul class="schedule-rules" role="list"></ul>
-
-        <div class="schedule-bulk">
-            <button type="button" class="schedule-enable-all">Enable all</button>
-            <button type="button" class="schedule-disable-all">Disable all</button>
+        <div class="om-page-head">
+            <div>
+                <span class="om-eyebrow" data-field="now"><span data-field="now-value">—</span></span>
+                <h1>Schedule</h1>
+                <p>Rules pick which playlist plays when. First matching rule wins; otherwise the default below plays. Timezone comes from Settings.</p>
+            </div>
+            <div class="om-row" style="gap: 8px;">
+                <button type="button" class="om-btn ghost schedule-add">+ Add rule</button>
+            </div>
         </div>
 
-        <button type="button" class="primary schedule-save">Save schedule</button>
-        <p class="schedule-status" role="status" aria-live="polite"></p>
+        <div class="om-card" style="margin-bottom: 12px;">
+            <label class="om-field">
+                <label>Default playlist (when no rule matches)</label>
+                <input type="text" class="om-input field-default-playlist" maxlength="64" pattern="[a-z0-9_-]+">
+            </label>
+        </div>
+
+        <ul class="schedule-rules" role="list" style="list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px;"></ul>
+
+        <div class="om-row" style="gap: 8px; flex-wrap: wrap; margin-top: 14px;">
+            <button type="button" class="om-btn ghost sm schedule-enable-all">Enable all</button>
+            <button type="button" class="om-btn ghost sm schedule-disable-all">Disable all</button>
+        </div>
+
+        <button type="button" class="om-btn primary schedule-save" style="width: 100%; height: 46px; font-size: 14.5px; margin-top: 14px;">Save schedule</button>
+        <p class="schedule-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
     </section>
 `;
 

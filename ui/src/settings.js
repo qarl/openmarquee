@@ -41,10 +41,12 @@ const ROTATION_OPTIONS = [
 
 const SECTION_TEMPLATE = `
     <section class="settings">
-        <h2 class="subpage-title">System settings</h2>
-        <div class="schedule-now" data-field="now">
-            <span class="schedule-now-label">Device time</span>
-            <span class="schedule-now-value" data-field="now-value">—</span>
+        <div class="om-page-head">
+            <div>
+                <span class="om-eyebrow" data-field="now">Device time · <span data-field="now-value">—</span></span>
+                <h1>Settings</h1>
+                <p>Output mode, network, sync. Changes save to the device's SD card immediately.</p>
+            </div>
         </div>
 
         <form class="settings-form" autocomplete="off">

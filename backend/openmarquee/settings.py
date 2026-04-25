@@ -99,6 +99,17 @@ class SystemSettings(BaseModel):
         ),
     )
 
+    ui_first_run_seen: bool = Field(
+        default=False,
+        description=(
+            "Whether the operator has dismissed the captive-portal "
+            "first-run welcome screen. Flipped to true the first time "
+            "they tap 'Make it mine' so subsequent visits go straight "
+            "to the editor. Independent from the seed marker (which "
+            "tracks content seeding, not UI dismissals)."
+        ),
+    )
+
     output_mode: OutputMode = Field(
         default="hdmi",
         description="Which renderer the playback engine drives.",
