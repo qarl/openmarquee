@@ -2,7 +2,7 @@
 
 import os
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -16,10 +16,10 @@ from openmarquee.api import router as content_router
 from openmarquee.api_backgrounds import router as backgrounds_router
 from openmarquee.api_flock import router as flock_router
 from openmarquee.api_playback import router as playback_router
-from openmarquee.api_system import router as system_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
+from openmarquee.api_system import router as system_router
 from openmarquee.dependencies import (
     get_content_storage,
     get_demo_video_path,
@@ -68,11 +68,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         pruned = get_playlist_storage().prune_dangling_refs(valid_ids)
         if pruned:
             import logging
+
             logging.getLogger(__name__).warning(
                 "startup: pruned %d dangling playlist item_id(s)", pruned
             )
     except Exception:
         import logging
+
         logging.getLogger(__name__).exception("startup playlist prune failed")
 
     # "Hardware always running" — the device's real playback loop starts
@@ -86,9 +88,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             import logging
 
-            logging.getLogger(__name__).exception(
-                "startup playback autostart failed"
-            )
+            logging.getLogger(__name__).exception("startup playback autostart failed")
 
     # Flock pull worker — periodic reliability backstop that reconciles
     # against sync=True peers even when pushes get dropped. Tests can
@@ -100,15 +100,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             import logging
 
-            logging.getLogger(__name__).exception(
-                "startup pull worker autostart failed"
-            )
+            logging.getLogger(__name__).exception("startup pull worker autostart failed")
     yield
     await get_playback_loop().stop()
-    try:
+    with suppress(Exception):
         await get_pull_worker().stop()
-    except Exception:
-        pass
 
 
 app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
@@ -137,9 +133,7 @@ async def _request_validation_handler(
     the default handler gives (UUIDs in `input` paths, exceptions in
     `ctx`).
     """
-    sanitised = [
-        {k: v for k, v in err.items() if k != "input"} for err in exc.errors()
-    ]
+    sanitised = [{k: v for k, v in err.items() if k != "input"} for err in exc.errors()]
     return JSONResponse(
         status_code=422,
         content={"detail": jsonable_encoder(sanitised)},

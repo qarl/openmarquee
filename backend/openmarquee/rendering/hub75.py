@@ -39,7 +39,6 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Literal
 
 log = logging.getLogger(__name__)
 
@@ -50,11 +49,11 @@ log = logging.getLogger(__name__)
 # operator would realistically wire up. Add new entries with a note
 # on what the string means.
 _KNOWN_PIXEL_MAPPERS: set[str] = {
-    "U-mapper",         # 2 parallel chains folded into a "U"
-    "V-mapper",         # same, V-shape
-    "Rotate:90",        # rotate output 90°
-    "Rotate:180",       # rotate output 180°
-    "Rotate:270",       # rotate output 270°
+    "U-mapper",  # 2 parallel chains folded into a "U"
+    "V-mapper",  # same, V-shape
+    "Rotate:90",  # rotate output 90°
+    "Rotate:180",  # rotate output 180°
+    "Rotate:270",  # rotate output 270°
 }
 
 
@@ -110,9 +109,7 @@ class HUB75Renderer:
         if chain_length < 1:
             raise ValueError("chain_length must be >= 1")
         if parallel_chains < 1 or parallel_chains > 3:
-            raise ValueError(
-                "parallel_chains must be in 1..3 (Adafruit Bonnet caps at 3)"
-            )
+            raise ValueError("parallel_chains must be in 1..3 (Adafruit Bonnet caps at 3)")
 
         # Color-response params.
         if not (0 <= brightness <= 100):
@@ -169,7 +166,7 @@ class HUB75Renderer:
 
     # --- lifecycle ---
 
-    def __enter__(self) -> "HUB75Renderer":
+    def __enter__(self) -> HUB75Renderer:
         self._open()
         return self
 
@@ -186,7 +183,9 @@ class HUB75Renderer:
         if self._fd is not None or self.output_path is None:
             return
         self._fd = os.open(
-            self.output_path, os.O_WRONLY | os.O_CREAT, 0o644,
+            self.output_path,
+            os.O_WRONLY | os.O_CREAT,
+            0o644,
         )
 
     def close(self) -> None:
@@ -194,9 +193,7 @@ class HUB75Renderer:
             try:
                 os.close(self._fd)
             except OSError:
-                log.exception(
-                    "HUB75Renderer: close failed for %s", self.output_path
-                )
+                log.exception("HUB75Renderer: close failed for %s", self.output_path)
             finally:
                 self._fd = None
 
@@ -232,9 +229,7 @@ class HUB75Renderer:
             while total < len(view):
                 n = os.write(self._fd, view[total:])
                 if n <= 0:
-                    raise OSError(
-                        f"HUB75Renderer: short write to {self.output_path}"
-                    )
+                    raise OSError(f"HUB75Renderer: short write to {self.output_path}")
                 total += n
         else:
             # Hardware path. Overridden by Phase-8 subclass.

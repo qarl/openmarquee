@@ -22,7 +22,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -96,13 +97,10 @@ class FlockSync:
         # peer that's concurrently editing the same id can skip a stale
         # delete. `updated` pushes carry a hint too, but the authoritative
         # updated_at comes from the sender's manifest during pull.
-        at = datetime.now(timezone.utc)
+        at = datetime.now(UTC)
         async with self._client_factory() as client:
             await asyncio.gather(
-                *(
-                    self._push_one(client, p.address, content_id, kind, sender, at)
-                    for p in peers
-                ),
+                *(self._push_one(client, p.address, content_id, kind, sender, at) for p in peers),
                 return_exceptions=True,
             )
 
@@ -179,16 +177,10 @@ class FlockSync:
 
     async def _ingest_update(self, content_id: UUID, sender_address: str) -> None:
         async with self._client_factory() as client:
-            manifest_r = await client.get(
-                f"http://{sender_address}/api/flock/manifest"
-            )
+            manifest_r = await client.get(f"http://{sender_address}/api/flock/manifest")
             manifest_r.raise_for_status()
             entry = next(
-                (
-                    e
-                    for e in manifest_r.json()["entries"]
-                    if e["content_id"] == str(content_id)
-                ),
+                (e for e in manifest_r.json()["entries"] if e["content_id"] == str(content_id)),
                 None,
             )
             if entry is None:
@@ -202,9 +194,7 @@ class FlockSync:
                 )
                 return
             sender_updated_at = datetime.fromisoformat(entry["updated_at"])
-            await self._fetch_and_save(
-                client, sender_address, content_id, sender_updated_at
-            )
+            await self._fetch_and_save(client, sender_address, content_id, sender_updated_at)
 
     async def _fetch_and_save(
         self,
@@ -222,22 +212,16 @@ class FlockSync:
             if local_ts >= sender_updated_at:
                 return
 
-        item_r = await client.get(
-            f"http://{sender_address}/api/content/{content_id}"
-        )
+        item_r = await client.get(f"http://{sender_address}/api/content/{content_id}")
         item_r.raise_for_status()
         item = _CONTENT_ADAPTER.validate_python(item_r.json())
 
-        asset_r = await client.get(
-            f"http://{sender_address}/api/content/{content_id}/asset"
-        )
+        asset_r = await client.get(f"http://{sender_address}/api/content/{content_id}/asset")
         asset_r.raise_for_status()
         asset_bytes = asset_r.content
 
         if isinstance(item, VideoSlide):
-            video_r = await client.get(
-                f"http://{sender_address}/api/content/{content_id}/video"
-            )
+            video_r = await client.get(f"http://{sender_address}/api/content/{content_id}/video")
             video_r.raise_for_status()
             self.content.save_video(
                 item,
@@ -325,9 +309,7 @@ class FlockSync:
         await self.probe_peer_name(peer_address)
         async with self._client_factory() as client:
             try:
-                manifest_r = await client.get(
-                    f"http://{peer_address}/api/flock/manifest"
-                )
+                manifest_r = await client.get(f"http://{peer_address}/api/flock/manifest")
                 manifest_r.raise_for_status()
             except Exception:
                 logger.exception("pull %s: manifest fetch failed", peer_address)
@@ -340,9 +322,7 @@ class FlockSync:
                 try:
                     await self._fetch_and_save(client, peer_address, cid, sender_ts)
                 except Exception:
-                    logger.exception(
-                        "pull %s: fetch %s failed", peer_address, cid
-                    )
+                    logger.exception("pull %s: fetch %s failed", peer_address, cid)
 
             for stone in manifest.get("tombstones", []):
                 cid = UUID(stone["content_id"])
@@ -362,11 +342,7 @@ class FlockSync:
             # Only record if we don't already have a fresher tombstone —
             # avoids flapping the on-disk log on every pull round.
             existing = next(
-                (
-                    t
-                    for t in self.tombstones.load().tombstones
-                    if t.content_id == content_id
-                ),
+                (t for t in self.tombstones.load().tombstones if t.content_id == content_id),
                 None,
             )
             if existing is None or existing.deleted_at < deleted_at:
@@ -391,18 +367,14 @@ class PullWorker:
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                peers = [
-                    p for p in self.sync.flock.load().peers if p.sync
-                ]
+                peers = [p for p in self.sync.flock.load().peers if p.sync]
                 for peer in peers:
                     await self.sync.pull_from_peer(peer.address)
                 self.sync.tombstones.prune_expired()
             except Exception:
                 logger.exception("pull worker tick failed")
-            try:
+            with suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
-            except asyncio.TimeoutError:
-                pass
 
     async def start(self) -> None:
         if self._task is not None:

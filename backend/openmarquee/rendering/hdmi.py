@@ -97,22 +97,18 @@ class HDMIRenderer:
         self.width = width
         self.height = height
         self.display_width = display_width if display_width is not None else width
-        self.display_height = (
-            display_height if display_height is not None else height
-        )
+        self.display_height = display_height if display_height is not None else height
         if self.display_width <= 0 or self.display_height <= 0:
             raise ValueError("display_width and display_height must be positive")
         self.output_path = Path(output_path)
         self.pixel_format = pixel_format
         self._bytes_per_pixel = _PIXEL_FORMATS[pixel_format]
         self._fd: int | None = None
-        self._frame_bytes = (
-            self.display_width * self.display_height * self._bytes_per_pixel
-        )
+        self._frame_bytes = self.display_width * self.display_height * self._bytes_per_pixel
 
     # --- lifecycle ---
 
-    def __enter__(self) -> "HDMIRenderer":
+    def __enter__(self) -> HDMIRenderer:
         self._open()
         return self
 
@@ -127,7 +123,9 @@ class HDMIRenderer:
         # and a fresh tmp file (creates it empty). On the Pi the fb
         # device node already exists — O_CREAT is a no-op there.
         self._fd = os.open(
-            self.output_path, os.O_WRONLY | os.O_CREAT, 0o644,
+            self.output_path,
+            os.O_WRONLY | os.O_CREAT,
+            0o644,
         )
 
     def close(self) -> None:
@@ -177,9 +175,7 @@ class HDMIRenderer:
         while total < len(view):
             n = os.write(self._fd, view[total:])
             if n <= 0:
-                raise OSError(
-                    f"HDMIRenderer: short write to {self.output_path}"
-                )
+                raise OSError(f"HDMIRenderer: short write to {self.output_path}")
             total += n
 
     # --- internals ---

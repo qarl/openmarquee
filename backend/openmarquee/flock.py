@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -50,7 +50,7 @@ FLOCK_ADDRESS_PATTERN = re.compile(
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _normalize_address(address: str) -> str:
@@ -77,27 +77,27 @@ class FlockPeer(BaseModel):
         normalized = _normalize_address(value)
         if not FLOCK_ADDRESS_PATTERN.match(normalized):
             raise ValueError(
-                f"address {value!r}: expected DNS hostname or IPv4 literal, "
-                "no scheme/port/path"
+                f"address {value!r}: expected DNS hostname or IPv4 literal, no scheme/port/path"
             )
         return normalized
+
     name: str | None = Field(
         default=None,
         max_length=64,
         description="Peer's reported sign_name, filled in once we've probed it. "
-                    "Stays None until the first successful reachability check.",
+        "Stays None until the first successful reachability check.",
     )
     sync: bool = Field(
         default=False,
         description="If true, keep this device's media in sync with the peer "
-                    "(push on local change + periodic pull). If false, the "
-                    "peer is tracked but its media stays independent.",
+        "(push on local change + periodic pull). If false, the "
+        "peer is tracked but its media stays independent.",
     )
     added_at: datetime = Field(default_factory=_now)
     last_seen_at: datetime | None = Field(
         default=None,
         description="UTC of the last successful reachability probe. None means "
-                    "we've never reached this peer (just-added or offline).",
+        "we've never reached this peer (just-added or offline).",
     )
 
 

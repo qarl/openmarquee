@@ -25,7 +25,7 @@ Storage shape (tombstones.json):
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -40,7 +40,7 @@ TOMBSTONE_TTL_DAYS = 30
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Tombstone(BaseModel):

@@ -42,14 +42,14 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
-log = logging.getLogger(__name__)
-
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from openmarquee.playlist import (
     DEFAULT_PLAYLIST_ID,
     PlaylistStorage,
 )
+
+log = logging.getLogger(__name__)
 
 # Bump when the on-disk format changes in a non-backward-compatible way.
 # v1: playlist_name strings.
@@ -239,9 +239,7 @@ def _coerce_to_schedule(
     for raw in data.get("rules", []):
         rule_data = dict(raw)
         legacy_name = rule_data.pop("playlist_name", None)
-        rule_data["playlist_id"] = resolve(
-            legacy_name, context=f"rule {raw.get('name', '?')!r}"
-        )
+        rule_data["playlist_id"] = resolve(legacy_name, context=f"rule {raw.get('name', '?')!r}")
         migrated_rules.append(ScheduleRule.model_validate(rule_data))
 
     return (

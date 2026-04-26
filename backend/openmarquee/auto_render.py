@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import io
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -135,9 +135,7 @@ def compose_auto_frame(
     font = _load_font(slide.font_family, size_px, height)
 
     draw = ImageDraw.Draw(base)
-    text_w, text_h, text_x, text_y = _measure_centered(
-        draw, value, font, width, height
-    )
+    text_w, text_h, text_x, text_y = _measure_centered(draw, value, font, width, height)
     # Drop-shadow-ish: a 1-pixel black outline so the text reads on
     # mid-tone backgrounds without relying on a matched shadow color.
     color = slide.text_color
@@ -205,9 +203,7 @@ def _bundled_fonts_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "ui" / "fonts"
 
 
-def _load_font(
-    family: str | None, size_px: int | None, canvas_height: int
-) -> ImageFont.ImageFont:
+def _load_font(family: str | None, size_px: int | None, canvas_height: int) -> ImageFont.ImageFont:
     """Pick a best-effort font. Size defaults to ~40% of canvas height
     so the auto value reads across a HUB75 panel without the operator
     having to pick a size explicitly for every auto slide."""

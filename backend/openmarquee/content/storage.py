@@ -26,7 +26,7 @@ edit bumps it.
 
 import json
 import shutil
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -77,7 +77,7 @@ class ContentStorage:
         item_dir = self.root / str(item.id)
         item_dir.mkdir(parents=True, exist_ok=True)
 
-        stamp = updated_at or datetime.now(timezone.utc)
+        stamp = updated_at or datetime.now(UTC)
         envelope = {
             "schema_version": SCHEMA_VERSION,
             "updated_at": stamp.isoformat(),
@@ -201,10 +201,10 @@ class ContentStorage:
             )
         stamp = data.get("updated_at")
         if stamp is None:
-            return datetime.fromtimestamp(envelope_path.stat().st_mtime, tz=timezone.utc)
+            return datetime.fromtimestamp(envelope_path.stat().st_mtime, tz=UTC)
         parsed = datetime.fromisoformat(stamp)
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
         return parsed
 
     def list_all(self) -> list[ContentItem]:

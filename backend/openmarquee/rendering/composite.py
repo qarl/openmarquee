@@ -32,7 +32,6 @@ from typing import Literal
 
 from openmarquee.rendering.hdmi import HDMIRenderer
 
-
 # Well-known composite modes → (display_width, display_height). These
 # are the raster sizes the Pi presents to the framebuffer when the
 # sdtv_mode lines in /boot/config.txt are set as documented in the
@@ -69,9 +68,7 @@ class CompositeRenderer(HDMIRenderer):
         pixel_format: str = "bgra32",
     ):
         if tv_mode not in _MODE_DIMS:
-            raise ValueError(
-                f"unknown tv_mode {tv_mode!r}; expected one of {sorted(_MODE_DIMS)}"
-            )
+            raise ValueError(f"unknown tv_mode {tv_mode!r}; expected one of {sorted(_MODE_DIMS)}")
         mode_w, mode_h = _MODE_DIMS[tv_mode]
         super().__init__(
             width=width,

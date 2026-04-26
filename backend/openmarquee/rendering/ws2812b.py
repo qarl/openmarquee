@@ -101,7 +101,7 @@ class WS2812BRenderer:
 
     # --- lifecycle ---
 
-    def __enter__(self) -> "WS2812BRenderer":
+    def __enter__(self) -> WS2812BRenderer:
         self._open()
         return self
 
@@ -113,7 +113,9 @@ class WS2812BRenderer:
         if self._fd is not None:
             return
         self._fd = os.open(
-            self.output_path, os.O_WRONLY | os.O_CREAT, 0o644,
+            self.output_path,
+            os.O_WRONLY | os.O_CREAT,
+            0o644,
         )
 
     def close(self) -> None:
@@ -121,9 +123,7 @@ class WS2812BRenderer:
             try:
                 os.close(self._fd)
             except OSError:
-                log.exception(
-                    "WS2812BRenderer: close failed for %s", self.output_path
-                )
+                log.exception("WS2812BRenderer: close failed for %s", self.output_path)
             finally:
                 self._fd = None
 
@@ -153,9 +153,7 @@ class WS2812BRenderer:
         while total < len(view):
             n = os.write(self._fd, view[total:])
             if n <= 0:
-                raise OSError(
-                    f"WS2812BRenderer: short write to {self.output_path}"
-                )
+                raise OSError(f"WS2812BRenderer: short write to {self.output_path}")
             total += n
 
     # --- internals ---
@@ -203,14 +201,11 @@ class WS2812BRenderer:
                 or len(entry) != 2
                 or not all(isinstance(c, int) for c in entry)
             ):
-                raise TypeError(
-                    f"pixel_map[{i}] must be a (x, y) tuple of ints; got {entry!r}"
-                )
+                raise TypeError(f"pixel_map[{i}] must be a (x, y) tuple of ints; got {entry!r}")
             x, y = entry
             if not (0 <= x < width and 0 <= y < height):
                 raise ValueError(
-                    f"pixel_map[{i}] = ({x}, {y}) is outside "
-                    f"the {width}x{height} frame"
+                    f"pixel_map[{i}] = ({x}, {y}) is outside the {width}x{height} frame"
                 )
             resolved.append((x, y))
         return resolved

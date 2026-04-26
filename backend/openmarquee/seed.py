@@ -39,9 +39,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image
-
-from PIL import ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from openmarquee.content import ImageSlide, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
@@ -189,9 +187,7 @@ def seed_if_needed(
         #    with {name}.png (thumbnail). Each pair becomes a VideoSlide;
         #    none of them are auto-appended to the playlist.
         videos_dir = (
-            bundled_videos_dir
-            if bundled_videos_dir is not None
-            else _default_bundled_videos_dir()
+            bundled_videos_dir if bundled_videos_dir is not None else _default_bundled_videos_dir()
         )
         created.extend(_seed_bundled_videos(storage, videos_dir))
 
@@ -215,7 +211,7 @@ def seed_if_needed(
             bundled_bg_slides=bundled,
         )
         created.extend(welcome_slides)
-        for slide, spec in zip(welcome_slides, _WELCOME_SPECS):
+        for slide, spec in zip(welcome_slides, _WELCOME_SPECS, strict=True):
             playlist.append(slide.id, transition=spec.transition_out)
 
         playlist_storage.save(playlist)
@@ -261,7 +257,8 @@ def _seed_bundled_backgrounds(
 
     created: list[ImageSlide] = []
     candidates = sorted(
-        p for p in directory.iterdir()
+        p
+        for p in directory.iterdir()
         if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
     )
     for path in candidates:
@@ -282,9 +279,7 @@ def _seed_bundled_backgrounds(
     return created
 
 
-def _seed_bundled_videos(
-    storage: ContentStorage, directory: Path
-) -> list[VideoSlide]:
+def _seed_bundled_videos(storage: ContentStorage, directory: Path) -> list[VideoSlide]:
     """Register each {name}.mp4 / {name}.png pair under `directory` as
     a VideoSlide, bytes copied verbatim.
 
@@ -302,7 +297,8 @@ def _seed_bundled_videos(
         if not png_path.exists():
             logger.warning(
                 "seed: skipping %s — missing paired thumbnail %s",
-                mp4_path.name, png_path.name,
+                mp4_path.name,
+                png_path.name,
             )
             continue
         try:
