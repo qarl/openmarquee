@@ -9,10 +9,11 @@ export async function fetchHealth() {
 }
 
 /**
- * Upload a text slide. `payload` matches the backend TextSlideUpload schema:
- * name, text, text_color, background_color, png_base64.
- *
- * Returns the full TextSlide object (server-assigned id, created_at, etc.).
+ * Upload a text slide. `payload` matches the backend `TextSlideUpload`
+ * schema (api.py) — see that class for the full field list (it grew
+ * past anything worth enumerating here when Phase 5b added
+ * `background_video_slide_id`). Returns the full TextSlide object
+ * (server-assigned id, created_at, etc.).
  */
 export async function saveTextSlide(payload) {
     const response = await fetch("/api/content/text-slides", {
@@ -28,9 +29,10 @@ export async function saveTextSlide(payload) {
 }
 
 /**
- * Upload an image slide. `payload`: name, duration_ms, image_base64
- * (the operator's source PNG/JPG bytes verbatim — backend keeps full
- * resolution, playback cover-fits to panel dims at slide entry).
+ * Upload an image slide. `payload` matches the backend `ImageUpload`
+ * schema (api.py). The operator's source PNG/JPG bytes go in verbatim
+ * via `image_base64` — backend keeps full resolution, playback
+ * cover-fits to panel dims at slide entry.
  */
 export async function saveImage(payload) {
     const response = await fetch("/api/content/images", {
@@ -46,8 +48,9 @@ export async function saveImage(payload) {
 }
 
 /**
- * Upload a video. `payload`: name, duration_ms, transition, png_base64
- * (thumbnail), mp4_base64 (H.264 MP4 bytes, ≤ 1080p).
+ * Upload a video. `payload` matches the backend `VideoUpload` schema
+ * (api.py). Carries the thumbnail (`png_base64`) + the H.264 MP4 bytes
+ * (`mp4_base64`, ≤ 1080p — Pi Zero 2 W's hardware decoder ceiling).
  */
 export async function saveVideo(payload) {
     const response = await fetch("/api/content/videos", {
@@ -160,8 +163,11 @@ export async function deleteContent(id) {
 }
 
 /**
- * Push a content item to the dev MockRenderer. Dev-only; replaced by the
- * real playback engine in Phase 5. Backend returns 204 on success.
+ * Push a content item to the dev MockRenderer manually. Dev-only —
+ * the real playback engine (PlaybackLoop, Phase 5) drives the
+ * MockRenderer continuously now, so this endpoint is kept for one-off
+ * "play just this slide" tests in scripts/ + manual debugging. Not
+ * called from the UI runtime. Backend returns 204 on success.
  */
 export async function playContent(id) {
     const response = await fetch(`/dev/play/${id}`, { method: "POST" });
@@ -305,9 +311,13 @@ export async function deletePlaylistById(id) {
 }
 
 /**
- * Generate a new background via the OpenAI-backed endpoint. On 503 the
- * caller should treat this as "feature unavailable" (no API key on the
- * device) rather than a hard failure.
+ * Generate a new background via the provider-pluggable endpoint.
+ * Default provider is Pollinations.ai (free, no API key); the device's
+ * settings can swap in Hugging Face / local Stable Diffusion via a
+ * registry edit (backgrounds.py). On 503 the caller should treat this
+ * as "provider unavailable / not configured" rather than a hard
+ * failure. Prompt is capped at 500 chars (BackgroundGenerateRequest)
+ * — longer payloads 422 with a JSON-safe detail.
  */
 export async function generateBackground({ prompt, name }) {
     const response = await fetch("/api/backgrounds/generate", {
@@ -332,7 +342,7 @@ export async function generateBackground({ prompt, name }) {
     return await response.json();
 }
 
-/** Fetch the current schedule (rules + default_playlist_name). */
+/** Fetch the current schedule (rules + default_playlist_id, post-UUID). */
 export async function getSchedule() {
     const response = await fetch("/api/schedules");
     if (!response.ok) {
@@ -364,7 +374,7 @@ export async function saveSettings(settings) {
     return await response.json();
 }
 
-/** Replace the schedule with the given object (rules + default_playlist_name). */
+/** Replace the schedule with the given object (rules + default_playlist_id). */
 export async function saveSchedule(schedule) {
     const response = await fetch("/api/schedules", {
         method: "PUT",
