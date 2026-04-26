@@ -24,6 +24,7 @@
 //   transition_ms at the boundary. "cut" is instant.
 
 import { formatAutoText } from "./auto-format.js";
+import { drawTextOnly } from "./editor.js";
 
 const TEMPLATE = `
     <section class="inline-preview" aria-label="playlist preview">
@@ -112,6 +113,15 @@ export function mountInlinePreview(container, options) {
     // ws281x skins need per-pixel access).
     const sampler = document.createElement("canvas");
     const samplerCtx = sampler.getContext("2d", { willReadFrequently: true });
+    // Lazily-created scratch canvas for rasterizing the text overlay of a
+    // Text-over-Video slide. Sized to the bg video's native resolution so
+    // the text scales the same way the device will scale it. The raster
+    // is slot-bound: once filled for a slide, it's reused on every rAF
+    // tick (text doesn't change between frames, only the video does).
+    // textOverlayKey fingerprints the cached raster's slide so a slot
+    // change forces re-rasterization; refresh() clears it on edit-save.
+    let textOverlay = null;
+    let textOverlayKey = null;
 
     async function refresh() {
         if (stopped) return;
@@ -129,6 +139,7 @@ export function mountInlinePreview(container, options) {
         imageCache = new Map();
         videoCache = new Map();
         activeVideoId = null;
+        textOverlayKey = null;
         refreshVersion += 1;
 
         timeline = buildTimeline(playlist?.items || []);
@@ -240,8 +251,19 @@ export function mountInlinePreview(container, options) {
     function drawSlot(slot) {
         const item = slot.item;
         if (item.type === "video") {
-            syncActiveVideo(item, slot);
+            syncActiveVideo(item.id, slot);
             drawVideo(item, slot);
+        } else if (item.type === "text_slide" && item.background_video_slide_id) {
+            // Phase 5b — Text over Video. The slide carries a reference to
+            // a saved VideoSlide; the inline preview composites the slide's
+            // text on top of the live video frames in the browser. The
+            // device's playback engine does the same per SYSTEM_SPEC §5.10
+            // (deferred to Phase 5c — VideoSlide playback substrate isn't
+            // implemented yet; live-preview still works because it's just
+            // browser canvas blitting, no Pi pipeline involved).
+            const bgId = String(item.background_video_slide_id);
+            syncActiveVideo(bgId, slot);
+            drawTextOverVideo(item, bgId);
         } else {
             // Switched away from a playing video — pause it so audio-less
             // h264 doesn't keep decoding off-screen.
@@ -251,15 +273,15 @@ export function mountInlinePreview(container, options) {
         }
     }
 
-    function syncActiveVideo(item, slot) {
-        const video = getCachedVideo(item);
+    function syncActiveVideo(videoId, slot) {
+        const video = getCachedVideo(videoId);
         const offsetInto = position - slot.startSec;
-        const isNewActive = activeVideoId !== item.id;
+        const isNewActive = activeVideoId !== videoId;
         if (isNewActive) {
             // Slot just changed. Pause every other video, point this one
             // at the slot offset, and (if we're playing) let it run.
-            pauseAllVideosExcept(item.id);
-            activeVideoId = item.id;
+            pauseAllVideosExcept(videoId);
+            activeVideoId = videoId;
             try {
                 video.currentTime = Math.max(0, offsetInto);
             } catch {
@@ -312,7 +334,7 @@ export function mountInlinePreview(container, options) {
     }
 
     function drawVideo(item) {
-        const video = getCachedVideo(item);
+        const video = getCachedVideo(item.id);
         if (video.readyState < 2 || !video.videoWidth) return;
         const ctx = canvas.getContext("2d");
         const srcW = video.videoWidth;
@@ -320,6 +342,50 @@ export function mountInlinePreview(container, options) {
         if (sampler.width !== srcW) sampler.width = srcW;
         if (sampler.height !== srcH) sampler.height = srcH;
         samplerCtx.drawImage(video, 0, 0);
+        const srcData = samplerCtx.getImageData(0, 0, srcW, srcH);
+        drawForSkin(skin, ctx, canvas.width, canvas.height, srcData, srcW, srcH);
+    }
+
+    /**
+     * Phase 5b — Text-over-Video composite. Sample the bg video frame,
+     * rasterize the slide's text on top with a transparent overlay
+     * canvas, then push both through the skin pipeline as a single
+     * frame. Mirrors what the device-side compositor will do at
+     * playback (per §5.10) — same byte order, same scale logic — so a
+     * future Phase 5c that wires up the Pi pipeline just needs to copy
+     * the math, not the look.
+     */
+    function drawTextOverVideo(item, videoId) {
+        const video = getCachedVideo(videoId);
+        if (video.readyState < 2 || !video.videoWidth) return;
+        const ctx = canvas.getContext("2d");
+        const srcW = video.videoWidth;
+        const srcH = video.videoHeight;
+        if (sampler.width !== srcW) sampler.width = srcW;
+        if (sampler.height !== srcH) sampler.height = srcH;
+        // Layer 1: video frame fills the sampler.
+        samplerCtx.drawImage(video, 0, 0);
+        // Layer 2: text rasterized at the same resolution onto a separate
+        // canvas (transparent bg), then drawn over the video frame. Cache
+        // the raster across rAF ticks within a slot — text is fixed for
+        // the slide's lifetime, only the bg video frame changes per tick.
+        // Slot exit (operator scrubs to a different slide) or edit-save
+        // (refresh() clears the key) triggers a fresh rasterize.
+        if (!textOverlay) {
+            textOverlay = document.createElement("canvas");
+        }
+        const sizeChanged =
+            textOverlay.width !== srcW || textOverlay.height !== srcH;
+        if (sizeChanged) {
+            textOverlay.width = srcW;
+            textOverlay.height = srcH;
+        }
+        const key = `${item.id}|${item.text || ""}|${item.text_color || ""}|${item.font_family || ""}|${item.font_size_px || ""}|${item.font_size_pct || ""}|${srcW}x${srcH}`;
+        if (sizeChanged || textOverlayKey !== key) {
+            drawTextOnly(textOverlay, item);
+            textOverlayKey = key;
+        }
+        samplerCtx.drawImage(textOverlay, 0, 0);
         const srcData = samplerCtx.getImageData(0, 0, srcW, srcH);
         drawForSkin(skin, ctx, canvas.width, canvas.height, srcData, srcW, srcH);
     }
@@ -334,17 +400,17 @@ export function mountInlinePreview(container, options) {
         return img;
     }
 
-    function getCachedVideo(item) {
-        const cached = videoCache.get(item.id);
+    function getCachedVideo(videoId) {
+        const cached = videoCache.get(videoId);
         if (cached) return cached;
         const video = document.createElement("video");
         video.muted = true;
         video.playsInline = true;
         video.preload = "auto";
-        video.src = `/api/content/${item.id}/video?v=${refreshVersion}`;
+        video.src = `/api/content/${videoId}/video?v=${refreshVersion}`;
         video.addEventListener("seeked", () => renderOnce());
         video.addEventListener("loadeddata", () => renderOnce());
-        videoCache.set(item.id, video);
+        videoCache.set(videoId, video);
         return video;
     }
 

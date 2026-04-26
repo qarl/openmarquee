@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
-import { canvasToBase64, drawCanvas, mountEditor, pickFontSize } from "./editor.js";
+import {
+    canvasToBase64,
+    drawCanvas,
+    drawTextOnly,
+    mountEditor,
+    pickFontSize,
+} from "./editor.js";
 
 function mockCanvas(width, height) {
     const ctx = {
@@ -8,6 +14,7 @@ function mockCanvas(width, height) {
         font: "",
         textAlign: "",
         textBaseline: "",
+        clearRect: vi.fn(),
         fillRect: vi.fn(),
         fillText: vi.fn(),
         save: vi.fn(),
@@ -107,6 +114,38 @@ describe("drawCanvas — context isolation", () => {
         expect(canvas._ctx.fillText).toHaveBeenCalledTimes(2);
         expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("A");
         expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("B");
+    });
+});
+
+describe("drawTextOnly (Phase 5b — Text-over-Video overlay)", () => {
+    it("clears to transparent and skips fillText when text is empty", () => {
+        const canvas = mockCanvas(128, 96);
+        drawTextOnly(canvas, { text: "" });
+        expect(canvas._ctx.clearRect).toHaveBeenCalledWith(0, 0, 128, 96);
+        expect(canvas._ctx.fillText).not.toHaveBeenCalled();
+    });
+
+    it("draws each line of multi-line text", () => {
+        const canvas = mockCanvas(128, 96);
+        drawTextOnly(canvas, { text: "TOP\nBOTTOM" });
+        expect(canvas._ctx.fillText).toHaveBeenCalledTimes(2);
+        expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("TOP");
+        expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("BOTTOM");
+    });
+
+    it("uses font_size_pct relative to canvas height when provided", () => {
+        const canvas = mockCanvas(100, 200);
+        drawTextOnly(canvas, { text: "Hi", font_size_pct: 25 });
+        // 25% of 200 = 50px; the wire-shape pct path wins over the
+        // pickFontSize default that drawCanvas falls back to.
+        expect(canvas._ctx.font).toMatch(/\b50px\b/);
+    });
+
+    it("never paints a background — the video frame underneath shows through", () => {
+        const canvas = mockCanvas(128, 96);
+        drawTextOnly(canvas, { text: "OVER VIDEO", text_color: "#ff0" });
+        // drawCanvas paints fillRect for the bg; drawTextOnly must not.
+        expect(canvas._ctx.fillRect).not.toHaveBeenCalled();
     });
 });
 

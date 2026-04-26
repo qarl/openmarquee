@@ -854,6 +854,61 @@ function loadImageForSlide(slideId) {
  * Draw the slide onto `canvas`. Pure in the sense that it only reads
  * `state` and writes pixels — no DOM wiring, no event handlers.
  */
+/**
+ * Render only the text layer of a TextSlide onto `canvas`, leaving the
+ * canvas's background transparent. Used by the inline-preview to overlay
+ * text on top of a live video frame for Text-over-Video slides
+ * (Phase 5b — SYSTEM_SPEC §5.10).
+ *
+ * Accepts the on-the-wire ContentItem shape (text, text_color,
+ * font_family, font_size_pct, font_size_px) — not the editor's
+ * internal `state` — because the inline-preview consumes ContentItem
+ * directly from the playlist.
+ *
+ * @param {HTMLCanvasElement} canvas — sized to the desired output.
+ * @param {object} item — TextSlide ContentItem (wire shape).
+ */
+export function drawTextOnly(canvas, item) {
+    const ctx = canvas.getContext("2d");
+    const text = item.text || "";
+    const textColor = item.text_color || "#FFFFFF";
+    const fontSize = item.font_size_px;
+    const fontSizePct = item.font_size_pct;
+    const fontFamily = item.font_family || "sans-serif";
+
+    ctx.save();
+    try {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (!text) return;
+
+        let fontSizePx;
+        if (Number.isFinite(fontSizePct) && fontSizePct > 0) {
+            fontSizePx = Math.max(4, Math.round((canvas.height * fontSizePct) / 100));
+        } else if (Number.isFinite(fontSize) && fontSize > 0) {
+            fontSizePx = fontSize;
+        } else {
+            fontSizePx = pickFontSize(canvas.height);
+        }
+        ctx.fillStyle = textColor;
+        const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
+        ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+
+        const lines = text.split(/\r?\n/);
+        const lineHeight = fontSizePx * 1.1;
+        const totalHeight = lineHeight * lines.length;
+        const startY = canvas.height / 2 - totalHeight / 2 + lineHeight / 2;
+        const maxWidth = Math.max(1, canvas.width - 4);
+        for (let i = 0; i < lines.length; i++) {
+            ctx.fillText(lines[i], canvas.width / 2, startY + i * lineHeight, maxWidth);
+        }
+    } finally {
+        ctx.restore();
+    }
+}
+
+
 export function drawCanvas(canvas, state) {
     const ctx = canvas.getContext("2d");
     const {

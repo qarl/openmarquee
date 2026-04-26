@@ -155,6 +155,117 @@ describe("mountInlinePreview", () => {
         expect(btn.getAttribute("aria-label")).toBe("play");
     });
 
+    it("text-over-video slot caches the bg video by its referenced id (Phase 5b)", async () => {
+        // Phase 5b — SYSTEM_SPEC §5.10. A TextSlide that references a
+        // saved VideoSlide as its background composes text over the
+        // moving video frames in the inline preview. The bg video is
+        // cached on the same `videoCache` the standalone VideoSlide
+        // path uses, keyed by the bg video's id (NOT the parent text
+        // slide's id) — that lets a single playlist with both a
+        // standalone VideoSlide AND a Text-over-Video referencing it
+        // share one <video> element instead of double-decoding.
+        //
+        // Stub getBoundingClientRect so sizeCanvasToStage doesn't bail
+        // on jsdom's 0×0 layout; without this, renderOnce → drawSlot
+        // → getCachedVideo never fires and the cache stays empty.
+        vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+            { width: 200, height: 150, top: 0, left: 0, bottom: 150, right: 200, x: 0, y: 0 },
+        );
+        const createElementSpy = vi.spyOn(document, "createElement");
+        const container = document.createElement("div");
+        mountInlinePreview(container, {
+            width: 128,
+            height: 96,
+            outputMode: "hdmi",
+            fetchPlaylist: async () => ({
+                items: [
+                    {
+                        item_id: "text-1",
+                        transition: "cut",
+                        transition_ms: 0,
+                        content: {
+                            id: "text-1",
+                            type: "text_slide",
+                            text: "Happy Hour",
+                            text_color: "#FFFFFF",
+                            font_size_pct: 25,
+                            background_video_slide_id: "bgvid-1",
+                            duration_ms: 5000,
+                            auto_mode: null,
+                        },
+                    },
+                ],
+            }),
+        });
+        await tick();
+        await tick();
+        await tick();
+        // The mount path lazily creates a hidden <video> for the bg
+        // video on first frame draw (renderOnce → drawSlot →
+        // drawTextOverVideo → getCachedVideo). Confirm a <video>
+        // element was created with the bg video's id in the src
+        // (NOT the parent text-slide's id — that'd be a 404).
+        // Pull every <video> element the spy minted; map calls→results
+        // by index so we keep the right pairing (mock.results[i] is the
+        // return of mock.calls[i]).
+        const createdVideos = createElementSpy.mock.results
+            .filter(
+                (_, i) =>
+                    String(createElementSpy.mock.calls[i][0]).toLowerCase() === "video",
+            )
+            .map((r) => r.value);
+        expect(createdVideos.length).toBeGreaterThan(0);
+        // The video's src should reference bgvid-1, not text-1.
+        const videoEl = createdVideos[0];
+        expect(videoEl.src).toMatch(/\/api\/content\/bgvid-1\/video/);
+        expect(videoEl.src).not.toMatch(/text-1/);
+    });
+
+    it("standalone video slot still caches the video by content id (regression: getCachedVideo signature took item, now takes id)", async () => {
+        // Phase 5b refactored syncActiveVideo / drawVideo / getCachedVideo
+        // to take a video-id string instead of a content item, so the
+        // text-over-video path can pass the bg slide's id while the
+        // standalone video path passes the item's own id. This pins
+        // that the standalone path still resolves the cache under the
+        // item's id — a regression here would 404 on /video.
+        vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(
+            { width: 200, height: 150, top: 0, left: 0, bottom: 150, right: 200, x: 0, y: 0 },
+        );
+        const createElementSpy = vi.spyOn(document, "createElement");
+        const container = document.createElement("div");
+        mountInlinePreview(container, {
+            width: 128,
+            height: 96,
+            outputMode: "hdmi",
+            fetchPlaylist: async () => ({
+                items: [
+                    {
+                        item_id: "vid-7",
+                        transition: "cut",
+                        transition_ms: 0,
+                        content: {
+                            id: "vid-7",
+                            type: "video",
+                            duration_ms: 5000,
+                            pipeline: "h264_mp4",
+                        },
+                    },
+                ],
+            }),
+        });
+        await tick();
+        await tick();
+        await tick();
+        const createdVideos = createElementSpy.mock.results
+            .filter(
+                (_, i) =>
+                    String(createElementSpy.mock.calls[i][0]).toLowerCase() === "video",
+            )
+            .map((r) => r.value);
+        expect(createdVideos.length).toBeGreaterThan(0);
+        expect(createdVideos[0].src).toMatch(/\/api\/content\/vid-7\/video/);
+    });
+
     it("stop() halts playback and removes the resize listener", async () => {
         const removeSpy = vi.spyOn(window, "removeEventListener");
         const container = document.createElement("div");
