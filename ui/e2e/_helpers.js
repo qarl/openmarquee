@@ -3,7 +3,7 @@
 // itself in place (the backend tolerates a missing root, but keeping it
 // keeps test logs cleaner).
 
-import { mkdirSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
     E2E_CONTENT_ROOT,
@@ -31,4 +31,17 @@ export function resetServerState() {
     // dev-only "reseed" endpoint is future work; for now the seed landing
     // is verified by test_seed.py + the smoke e2e below.
     rmSync(E2E_SEED_MARKER_PATH, { force: true });
+    // Pre-seed the captive-portal first-run gate as already-dismissed so
+    // the SPA boots straight to the editor instead of the welcome CTA.
+    // SystemSettings backfills every other field from its model defaults
+    // when only this key is present. Specs that exercise the welcome
+    // flow itself can call `resetFirstRun()` after this.
+    writeFileSync(E2E_SETTINGS_PATH, JSON.stringify({ ui_first_run_seen: true }));
+}
+
+// Inverse of the seeding done at the bottom of `resetServerState()` — drops
+// the settings file entirely so the next page-load hits the first-run welcome
+// path. Use this in specs that test the welcome gate.
+export function resetFirstRun() {
+    rmSync(E2E_SETTINGS_PATH, { force: true });
 }
