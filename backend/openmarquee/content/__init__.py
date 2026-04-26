@@ -72,16 +72,27 @@ class TextSlide(BaseModel):
     # re-editing (operator clicks a saved TextSlide; the editor hydrates
     # the background picker with the right selection).
     background_image_slide_id: UUID | None = None
+    # Optional: render a saved VideoSlide as the background under the text.
+    # Per SYSTEM_SPEC §5.10, the device composites the cached text PNG over
+    # each video frame at playback time (live-composite, no pre-bake in
+    # v1). The stored thumbnail PNG is a static fallback for pallet tiles
+    # / screenshots; the playback engine replaces it with frame-by-frame
+    # compositing at slide enter (Phase 5b backend bullet — see
+    # IMPLEMENTATION_PLAN). Mutually exclusive with background_image_slide_id.
+    background_video_slide_id: UUID | None = None
     auto_mode: Literal["time", "date", "day"] | None = None
-    auto_format: Literal[
-        "time_hm",       # HH:MM (24h, zero-padded)
-        "time_hms",      # HH:MM:SS (24h, zero-padded)
-        "date_iso",      # YYYY-MM-DD
-        "date_long",     # April 21, 2026
-        "date_medium",   # Apr 21
-        "day_long",      # Monday
-        "day_short",     # Mon
-    ] | None = None
+    auto_format: (
+        Literal[
+            "time_hm",  # HH:MM (24h, zero-padded)
+            "time_hms",  # HH:MM:SS (24h, zero-padded)
+            "date_iso",  # YYYY-MM-DD
+            "date_long",  # April 21, 2026
+            "date_medium",  # Apr 21
+            "day_long",  # Monday
+            "day_short",  # Mon
+        ]
+        | None
+    ) = None
 
     # Transition INTO the next slide ("cut" = instant; "fade" = alpha-blend
     # across `transition_ms` after this slide's duration ends).
@@ -98,21 +109,34 @@ class TextSlide(BaseModel):
         return value.upper()
 
     @model_validator(mode="after")
+    def _bg_layers_are_exclusive(self) -> "TextSlide":
+        """A TextSlide can have one background source: solid color, an
+        ImageSlide, or a VideoSlide — not two layered references at once.
+        The editor's bg-picker is a radio so this combo can't be reached
+        from the UI; the validator catches a malformed payload before it
+        round-trips through storage."""
+        if (
+            self.background_image_slide_id is not None
+            and self.background_video_slide_id is not None
+        ):
+            raise ValueError(
+                "TextSlide cannot reference both an image and a video background; pick one"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _auto_format_matches_mode(self) -> "TextSlide":
         """auto_format is mode-scoped — a "time_hm" format can't live on
         a date slide. Catch the mismatch here so the editor can't send
         a nonsensical combo past validation."""
         if self.auto_mode is None:
             if self.auto_format is not None:
-                raise ValueError(
-                    "auto_format is only valid when auto_mode is set"
-                )
+                raise ValueError("auto_format is only valid when auto_mode is set")
             return self
         prefix = self.auto_mode + "_"
         if self.auto_format is not None and not self.auto_format.startswith(prefix):
             raise ValueError(
-                f"auto_format {self.auto_format!r} doesn't match "
-                f"auto_mode={self.auto_mode!r}"
+                f"auto_format {self.auto_format!r} doesn't match auto_mode={self.auto_mode!r}"
             )
         return self
 
@@ -174,6 +198,4 @@ class VideoSlide(BaseModel):
 
 # Discriminated union of content variants. Pydantic uses the `type` literal to
 # route to the right subclass on deserialize.
-ContentItem = Annotated[
-    TextSlide | ImageSlide | VideoSlide, Field(discriminator="type")
-]
+ContentItem = Annotated[TextSlide | ImageSlide | VideoSlide, Field(discriminator="type")]

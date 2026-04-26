@@ -7,6 +7,7 @@ content variants, post-demo.
 
 import base64
 import io
+import json
 from typing import Annotated
 from uuid import UUID
 
@@ -72,6 +73,24 @@ def _decode_image_payload(b64: str) -> bytes:
     return data
 
 
+def _validation_error_422(exc: ValidationError) -> HTTPException:
+    """Translate a Pydantic ValidationError into a JSON-safe 422.
+
+    `exc.errors()` returns Python objects that include UUIDs (in `input`)
+    and raw Exception instances (in `ctx`), neither of which the FastAPI
+    JSON encoder handles by default — leaving them in flips a 422 into a
+    500. `exc.json()` round-trips through pydantic's own serializer so
+    every field is guaranteed JSON-safe; we parse back to a list so the
+    HTTPException detail is a structured array rather than an opaque
+    string. `include_input=False` also drops echoed payload values, which
+    we don't want to reflect back in the response body anyway.
+    """
+    return HTTPException(
+        status_code=422,
+        detail=json.loads(exc.json(include_input=False)),
+    )
+
+
 def _decode_png_payload(b64: str) -> bytes:
     """Decode a base64 string and confirm it's actually a PNG.
 
@@ -124,6 +143,7 @@ class TextSlideUpload(BaseModel):
     text_color: str = "#FFFFFF"
     background_color: str = "#000000"
     background_image_slide_id: UUID | None = None
+    background_video_slide_id: UUID | None = None
     auto_mode: str | None = None
     auto_format: str | None = None
     transition: str = "cut"
@@ -146,7 +166,7 @@ async def upload_text_slide(
     try:
         slide = TextSlide(**payload.model_dump(exclude={"png_base64"}))
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise _validation_error_422(exc) from exc
 
     storage.save_text_slide(slide, png)
     _append_to_playlist(playlist_storage, slide.id)
@@ -191,7 +211,7 @@ async def update_text_slide(
             **payload.model_dump(exclude={"png_base64"}),
         )
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise _validation_error_422(exc) from exc
 
     storage.save_text_slide(slide, png)
     background.add_task(flock_sync.notify_peers, slide.id, "updated")
@@ -264,11 +284,9 @@ async def upload_video(
     thumbnail = _decode_png_payload(payload.png_base64)
     mp4 = _decode_mp4_payload(payload.mp4_base64)
     try:
-        video = VideoSlide(
-            **payload.model_dump(exclude={"png_base64", "mp4_base64"})
-        )
+        video = VideoSlide(**payload.model_dump(exclude={"png_base64", "mp4_base64"}))
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise _validation_error_422(exc) from exc
     storage.save_video(video, thumbnail, mp4)
     _append_to_playlist(playlist_storage, video.id)
     background.add_task(flock_sync.notify_peers, video.id, "updated")
@@ -288,9 +306,7 @@ class ImageUpload(BaseModel):
     duration_ms: int = 5000
     transition: str = "cut"
     transition_ms: int = 500
-    image_base64: str = Field(
-        description="Base64-encoded source image (PNG or JPG, verbatim)."
-    )
+    image_base64: str = Field(description="Base64-encoded source image (PNG or JPG, verbatim).")
 
 
 @router.post("/images", response_model=ImageSlide)
@@ -306,7 +322,7 @@ async def upload_image(
     try:
         image = ImageSlide(**payload.model_dump(exclude={"image_base64"}))
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise _validation_error_422(exc) from exc
 
     storage.save_image(image, image_bytes)
     _append_to_playlist(playlist_storage, image.id)
@@ -354,7 +370,7 @@ async def update_image(
             duration_ms=payload.duration_ms,
         )
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise _validation_error_422(exc) from exc
 
     # No new bytes → keep the existing asset on disk untouched.
     image_bytes = (
@@ -430,7 +446,7 @@ async def update_video(
             duration_ms=payload.duration_ms,
         )
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise _validation_error_422(exc) from exc
 
     # Thumbnail: reuse existing PNG on metadata-only saves, decode + save
     # a new one when provided.
@@ -513,7 +529,7 @@ async def patch_duration(
     try:
         updated = item.model_copy(update={"duration_ms": payload.duration_ms})
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        raise _validation_error_422(exc) from exc
     # save() rewrites the envelope; the on-disk PNG stays untouched.
     existing_png = storage.read_asset(item_id)
     storage.save(updated, existing_png)

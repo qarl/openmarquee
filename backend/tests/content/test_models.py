@@ -214,3 +214,41 @@ def test_round_trip_through_json():
     restored = TextSlide.model_validate_json(payload)
     assert restored == original
     assert restored.type == "text_slide"
+
+
+def test_text_slide_background_video_id_round_trips(tmp_path):
+    """Phase 5b: TextSlide carries an optional reference to a VideoSlide
+    whose frames the device composites text over at playback time. Field
+    is None on a default slide and round-trips cleanly when set."""
+    from uuid import uuid4
+
+    bg_video_id = uuid4()
+    slide = TextSlide(
+        name="Happy Hour",
+        text="4PM-6PM",
+        background_video_slide_id=bg_video_id,
+    )
+    assert slide.background_video_slide_id == bg_video_id
+    # Default-no-bg-video slide stays None, not missing.
+    plain = TextSlide(name="x", text="x")
+    assert plain.background_video_slide_id is None
+
+    # JSON round-trip preserves the id.
+    restored = TextSlide.model_validate_json(slide.model_dump_json())
+    assert restored.background_video_slide_id == bg_video_id
+
+
+def test_text_slide_rejects_both_image_and_video_backgrounds():
+    """Phase 5b: a slide can have one background source (color, image,
+    or video) — not two layered references at once. The editor's
+    bg-picker is a radio so a malformed payload would have to come
+    from a hand-rolled API client; reject at the model boundary."""
+    from uuid import uuid4
+
+    with pytest.raises(ValidationError, match="image and a video"):
+        TextSlide(
+            name="x",
+            text="x",
+            background_image_slide_id=uuid4(),
+            background_video_slide_id=uuid4(),
+        )

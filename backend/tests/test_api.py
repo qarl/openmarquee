@@ -110,6 +110,28 @@ def test_upload_text_slide_rejects_invalid_color(client: TestClient):
     assert response.status_code == 422  # Pydantic validation error
 
 
+def test_upload_text_slide_rejects_both_image_and_video_bg_with_clean_422(
+    client: TestClient,
+):
+    """Phase 5b: setting both background_image_slide_id and
+    background_video_slide_id is mutually-exclusive at the model. The
+    route must surface the validation as a clean 422 with a JSON-safe
+    detail — pre-fix this returned 500 because the ValidationError's
+    `input` carried UUID values and `ctx` carried a raw ValueError, and
+    FastAPI's default JSON encoder choked on both.
+    """
+    payload = _upload_payload(
+        background_image_slide_id="00000000-0000-4000-8000-000000000088",
+        background_video_slide_id="00000000-0000-4000-8000-000000000099",
+    )
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 422
+    body = response.json()
+    # Detail is a list of error dicts (pydantic-shape, JSON round-tripped).
+    assert isinstance(body["detail"], list)
+    assert any("image and a video" in err.get("msg", "") for err in body["detail"]), body
+
+
 # --- GET /api/content ---
 
 
@@ -431,9 +453,7 @@ def test_delete_video_removes_mp4(client: TestClient, storage: ContentStorage):
     assert not storage.video_path(item_id).exists()
 
 
-def test_put_image_metadata_only_keeps_existing_bytes(
-    client: TestClient, storage: ContentStorage
-):
+def test_put_image_metadata_only_keeps_existing_bytes(client: TestClient, storage: ContentStorage):
     """Image PUT with image_base64=null preserves the stored bytes —
     operator renaming a slide shouldn't force a re-upload."""
     post = client.post("/api/content/images", json=_image_payload(name="Logo"))
@@ -451,9 +471,7 @@ def test_put_image_metadata_only_keeps_existing_bytes(
     assert storage.read_asset(item_id) == original_bytes
 
 
-def test_put_image_with_new_bytes_replaces_the_asset(
-    client: TestClient, storage: ContentStorage
-):
+def test_put_image_with_new_bytes_replaces_the_asset(client: TestClient, storage: ContentStorage):
     post = client.post("/api/content/images", json=_image_payload(name="Old"))
     item_id = UUID(post.json()["id"])
     new_png = _real_png_bytes()
@@ -492,9 +510,7 @@ def test_put_image_409s_when_target_is_not_an_image(
     assert "text_slide" in response.json()["detail"]
 
 
-def test_put_video_metadata_only_keeps_existing_assets(
-    client: TestClient, storage: ContentStorage
-):
+def test_put_video_metadata_only_keeps_existing_assets(client: TestClient, storage: ContentStorage):
     """Renaming a large MP4 shouldn't force re-uploading 50 MB."""
     post = client.post("/api/content/videos", json=_video_payload())
     item_id = UUID(post.json()["id"])
@@ -516,9 +532,7 @@ def test_put_video_metadata_only_keeps_existing_assets(
     assert storage.read_video(item_id) == original_mp4
 
 
-def test_put_video_with_new_assets_replaces_them(
-    client: TestClient, storage: ContentStorage
-):
+def test_put_video_with_new_assets_replaces_them(client: TestClient, storage: ContentStorage):
     post = client.post("/api/content/videos", json=_video_payload())
     item_id = UUID(post.json()["id"])
 
