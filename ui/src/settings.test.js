@@ -1,9 +1,37 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mountSettings } from "./settings.js";
+
+beforeEach(() => {
+    // Stub global fetch so the wifi-scan and display-dims helpers — which
+    // mountSettings kicks off during refresh() — don't crash on jsdom's
+    // missing base URL and dump multi-line stack traces into the test
+    // output (regression: QA 2026-04-26 #06). Returns an empty network
+    // list so the picker degrades to its "(type manually)" fallback.
+    vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url) => {
+            const path = String(url || "");
+            if (path.endsWith("/api/system/wifi-scan")) {
+                return new Response(JSON.stringify({ networks: [] }), {
+                    status: 200,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+            if (path.endsWith("/api/system/display-dims")) {
+                return new Response(JSON.stringify({}), {
+                    status: 200,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+            return new Response("", { status: 404 });
+        }),
+    );
+});
 
 afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
 });
 
 function tick() {
