@@ -335,12 +335,21 @@ function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons, getCa
                 { cacheBust: getCacheBust ? getCacheBust() : 0 },
             );
             dropped.replaceWith(rebuilt);
+            // Sortable's `end` event dispatches against the SOURCE list of
+            // the drag. For a pallet → track drop, that's the pallet
+            // Sortable (which doesn't configure onEnd), so the track's
+            // onEnd never fires and the new block's × / transition chip /
+            // duration controls would stay unbound until a remount. Wire
+            // them here. bindTrackRemoveButtons is data-bound-guarded, so
+            // overlap with onEnd's rebindButtons() on same-list reorders
+            // is a no-op.
+            if (rebindButtons) rebindButtons();
+            markDirty();
         },
         onEnd: () => {
-            // Drop happened — re-wire button handlers on the (possibly
-            // new) blocks so the operator can interact with the
-            // dropped block immediately, then mark the playlist dirty
-            // so Save lights up.
+            // Same-list reorder inside the track. Re-wire any newly-revealed
+            // blocks (idempotent via the data-bound guard) and dirty the
+            // playlist so Save lights up.
             if (rebindButtons) rebindButtons();
             markDirty();
         },

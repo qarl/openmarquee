@@ -256,6 +256,64 @@ describe("mountPlaylistTrack", () => {
         ).toBe("3");
     });
 
+    it("onAdd binds × + transition + duration handlers on the new block (regression: QA 2026-04-26 #09)", async () => {
+        // Sortable's `end` event dispatches against the SOURCE list of the
+        // drag — for a pallet → track drop, that's the pallet Sortable
+        // (which doesn't configure onEnd). The track's onEnd never fires
+        // for a cross-list ADD, so prior behavior left the new block's
+        // .track-remove and .track-block-transition unbound until a
+        // remount: × no-op'd, transition chip didn't cycle. Now onAdd
+        // calls rebindButtons + markDirty itself.
+        //
+        // Capture the track Sortable's options by spying on Sortable.create
+        // (track is the second create call — pallet first per
+        // bindPalletSortable being invoked earlier in mountPlaylistTrack).
+        const { default: Sortable } = await import("sortablejs");
+        const createSpy = vi.spyOn(Sortable, "create");
+
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a"]),
+            onReorder: vi.fn().mockResolvedValue(undefined),
+            onSavePlaylist: vi.fn().mockResolvedValue(undefined),
+        });
+        await tick();
+
+        // The track Sortable is the one whose group includes `playlist-track`
+        // as the name. (Pallet's group name is `playlist-pallet`.)
+        const trackCall = createSpy.mock.calls.find(
+            ([, opts]) => opts?.group?.name === "playlist-track",
+        );
+        expect(trackCall).toBeDefined();
+        const trackOptions = trackCall[1];
+
+        const trackEl = container.querySelector(".playlist-track-list");
+        const palletEl = container.querySelector(".playlist-pallet");
+
+        // Mimic Sortable's cross-list drop: clone the pallet tile for "b"
+        // into the track, then invoke the captured onAdd with the cloned
+        // node as evt.item. (Sortable's real implementation reparents the
+        // clone in place before dispatching `add`.)
+        const bTile = palletEl.querySelector('.pallet-tile[data-id="b"]');
+        const cloned = bTile.cloneNode(true);
+        trackEl.appendChild(cloned);
+        trackOptions.onAdd({ item: cloned });
+
+        // After the handler runs, the clone should have been replaced by a
+        // real .track-block AND that block's children should be bound.
+        const newBlock = trackEl.querySelector('.track-block[data-id="b"]');
+        expect(newBlock).not.toBeNull();
+        const removeBtn = newBlock.querySelector(".track-remove");
+        const chip = newBlock.querySelector(".track-block-transition");
+        expect(removeBtn?.dataset?.bound).toBe("1");
+        expect(chip?.dataset?.bound).toBe("1");
+
+        // Sanity: clicking × removes the new block. Pre-fix it was a brick.
+        removeBtn.click();
+        expect(trackEl.querySelector('.track-block[data-id="b"]')).toBeNull();
+    });
+
     it("skips stale ids (playlist references an item no longer in storage)", async () => {
         const container = document.createElement("div");
         mountPlaylistTrack(container, {
