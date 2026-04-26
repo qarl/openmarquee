@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <meta name="robots" content="noindex">
+    <title>openMarquee demo</title>
+    <link rel="stylesheet" href="./styles.css">
+    <style>
+        /* Demo keeps every affordance visible — "+ New", AI-generate,
+           upload, delete all render. Attempting an upload-shaped action
+           hits a mock-backend 403 ("Uploads are disabled in the demo"),
+           which the UI surfaces in its normal status line. */
+
+        /* Floating reset button. Subtle by default; accent on hover. */
+        .demo-reset {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            z-index: 50;
+            padding: 0.5rem 0.8rem;
+            background: var(--om-surface, #19191c);
+            color: var(--om-text-dim, #8b8b92);
+            border: 1px solid var(--om-line, #2a2a2f);
+            border-radius: 0.35rem;
+            font-size: 0.8rem;
+            cursor: pointer;
+            opacity: 0.55;
+            transition: opacity 120ms ease, border-color 120ms ease, color 120ms ease;
+        }
+        .demo-reset:hover {
+            opacity: 1;
+            border-color: var(--om-accent, #ffb84d);
+            color: var(--om-accent, #ffb84d);
+        }
+
+        /* DEMO badge sits next to the wordmark in the sidebar. */
+        .demo-badge {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 1px 6px;
+            border: 1px solid var(--om-accent, #ffb84d);
+            color: var(--om-accent, #ffb84d);
+            border-radius: 3px;
+            font-family: var(--om-mono, ui-monospace, monospace);
+            font-size: 9px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            font-weight: 500;
+            vertical-align: middle;
+        }
+    </style>
+</head>
+<body class="om-app" data-theme="dark" data-accent="amber" data-density="compact" data-layout="desktop" data-demo-mode>
+
+    <!-- Sidebar — Wordmark, Flock card, Library section, Device section,
+         version footer. main.js fills the dynamic bits (peer dot row,
+         online count) once it can hit /api/flock + /api/settings. -->
+    <nav class="om-side" aria-label="Primary">
+        <div style="padding: 4px 8px 14px;">
+            <span class="om-wordmark">
+                <span class="om-mark"></span>
+                open<em>M</em>arquee
+                <span class="demo-badge">demo</span>
+            </span>
+        </div>
+
+        <a class="om-side-item om-flock nav-link" href="#/flock" data-section="flock">
+            <div class="om-flock-head">
+                <span class="om-side-icon" data-icon="flock"></span>
+                <span class="om-flock-name">Your flock</span>
+                <span class="om-pill live"><span class="om-pulse"></span>live</span>
+            </div>
+            <div class="om-flock-stats">
+                <span data-flock-count>– / – online</span>
+                <span style="color: var(--om-text-fade);">·</span>
+                <span data-flock-since>just now</span>
+                <div style="margin-left: auto;">
+                    <div class="om-flock-dots" data-flock-dots></div>
+                </div>
+            </div>
+        </a>
+
+        <div class="om-side-section">Library</div>
+        <a class="om-side-item nav-link" href="#/slides" data-section="slides">
+            <span class="om-side-icon" data-icon="slides"></span>
+            <span style="flex: 1;">Slides</span>
+            <span class="om-count" data-slide-count>·</span>
+        </a>
+        <a class="om-side-item nav-link" href="#/playlists" data-section="playlists">
+            <span class="om-side-icon" data-icon="playlist"></span>
+            <span style="flex: 1;">Playlists</span>
+            <span class="om-count" data-playlist-count>·</span>
+        </a>
+        <a class="om-side-item nav-link" href="#/schedule" data-section="schedule">
+            <span class="om-side-icon" data-icon="schedule"></span>
+            <span style="flex: 1;">Schedule</span>
+        </a>
+
+        <div class="om-side-section">Device</div>
+        <a class="om-side-item nav-link" href="#/settings" data-section="settings">
+            <span class="om-side-icon" data-icon="settings"></span>
+            <span style="flex: 1;">Settings</span>
+        </a>
+
+        <div style="margin-top: auto; padding: 14px 8px 4px; font-family: var(--om-mono); font-size: 10.5px; color: var(--om-text-fade); letter-spacing: 0.04em;">
+            openMarquee 0.9.2 · GPLv3
+        </div>
+    </nav>
+
+    <main class="om-main">
+        <div class="om-topbar">
+            <button class="om-btn ghost icon sm om-sheet-open" type="button"
+                    aria-label="Open menu" data-icon="menu"></button>
+            <div class="om-topbar-title">
+                <b data-sign-name>openMarquee</b>
+                <span class="om-divider"></span>
+                <span data-section-title>Slides</span>
+            </div>
+            <span class="om-pill live"><span class="om-pulse"></span>broadcasting</span>
+            <span class="om-pill" data-peer-pill title="Signs online">
+                <span data-icon="flock-pill"></span>
+                <span data-peer-pill-text>– / –</span>
+            </span>
+        </div>
+
+        <div class="om-scroll" id="app">
+            <p class="status">Loading…</p>
+        </div>
+    </main>
+
+    <button type="button" class="demo-reset" onclick="window.__openmarquee_demo_reset && window.__openmarquee_demo_reset()">
+        Reset demo
+    </button>
+
+    <!-- mock-backend MUST load and install its fetch wrapper before any
+         UI module imports api.js; using a classic script (not type="module")
+         so it runs synchronously before the deferred module script below.
+         Service worker handles <img> requests that bypass fetch(). -->
+    <script src="./mock-backend.js"></script>
+    <script>
+        // Register the SW so <img> requests route through its rewriter.
+        // First-ever visit: SW isn't controlling this page yet, so some
+        // thumbnails 404 during initial paint. We trigger a single
+        // one-time reload as soon as the SW claims so the rest of the
+        // session is clean.
+        if ("serviceWorker" in navigator) {
+            navigator.serviceWorker.register("./sw.js").catch((err) => {
+                console.warn("[demo] sw register failed:", err);
+            });
+            let reloadedForSW = false;
+            navigator.serviceWorker.addEventListener("controllerchange", () => {
+                if (reloadedForSW) return;
+                reloadedForSW = true;
+                location.reload();
+            });
+        }
+    </script>
+    <script type="module" src="./dist/main.js"></script>
+</body>
+</html>
