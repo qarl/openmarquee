@@ -1,13 +1,5 @@
 // Thin client over the openMarquee REST API. Same-origin, no CORS, no auth.
 
-export async function fetchHealth() {
-    const response = await fetch("/healthz");
-    if (!response.ok) {
-        throw new Error(`/healthz returned ${response.status}`);
-    }
-    return await response.json();
-}
-
 /**
  * Upload a text slide. `payload` matches the backend `TextSlideUpload`
  * schema (api.py) — see that class for the full field list (it grew
@@ -163,20 +155,6 @@ export async function deleteContent(id) {
 }
 
 /**
- * Push a content item to the dev MockRenderer manually. Dev-only —
- * the real playback engine (PlaybackLoop, Phase 5) drives the
- * MockRenderer continuously now, so this endpoint is kept for one-off
- * "play just this slide" tests in scripts/ + manual debugging. Not
- * called from the UI runtime. Backend returns 204 on success.
- */
-export async function playContent(id) {
-    const response = await fetch(`/dev/play/${id}`, { method: "POST" });
-    if (!response.ok) {
-        throw new Error(`Play failed (${response.status})`);
-    }
-}
-
-/**
  * Get the current playback state. Shape mirrors backend `PlaybackState`
  * (api_playback.py): {
  *   is_running, current_item_id, current_item_type,
@@ -230,25 +208,6 @@ function _encodePlaylistBody(entriesOrIds, name) {
             : { item_ids: entriesOrIds };
     if (name !== undefined && name !== null) body.name = name;
     return body;
-}
-
-/**
- * Replace the default playlist's contents — the legacy single-playlist
- * shorthand. Operates on `/api/playlist` which always targets the
- * server's DEFAULT_PLAYLIST_ID. For non-default playlists, use
- * `savePlaylistById`.
- */
-export async function setDefaultPlaylistOrder(entriesOrIds) {
-    const response = await fetch("/api/playlist", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(_encodePlaylistBody(entriesOrIds)),
-    });
-    if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(`Reorder failed (${response.status}): ${detail}`);
-    }
-    return await response.json();
 }
 
 /** Fetch the full playlist collection: { schema_version, playlists: [...] }. */

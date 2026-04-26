@@ -1,19 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     deleteContent,
-    fetchHealth,
     generateBackground,
     getPlaybackState,
     getSchedule,
     getSettings,
     listContent,
-    playContent,
     saveImage,
     saveSchedule,
     saveSettings,
     saveTextSlide,
     saveVideo,
-    setDefaultPlaylistOrder,
     startPlayback,
     stopPlayback,
 } from "./api.js";
@@ -27,29 +24,6 @@ function mockFetch(response) {
     vi.stubGlobal("fetch", fetchMock);
     return fetchMock;
 }
-
-describe("fetchHealth", () => {
-    it("returns the JSON body when the response is ok", async () => {
-        mockFetch({
-            ok: true,
-            json: async () => ({ status: "alive", version: "0.0.0" }),
-        });
-
-        const result = await fetchHealth();
-        expect(result).toEqual({ status: "alive", version: "0.0.0" });
-    });
-
-    it("throws when the response is not ok", async () => {
-        mockFetch({ ok: false, status: 503 });
-        await expect(fetchHealth()).rejects.toThrow("503");
-    });
-
-    it("calls the right endpoint", async () => {
-        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
-        await fetchHealth();
-        expect(fetchMock).toHaveBeenCalledWith("/healthz");
-    });
-});
 
 describe("saveTextSlide", () => {
     it("POSTs JSON to the text-slides endpoint and returns the new item", async () => {
@@ -106,19 +80,6 @@ describe("deleteContent", () => {
     it("throws on non-ok response", async () => {
         mockFetch({ ok: false, status: 404 });
         await expect(deleteContent("missing")).rejects.toThrow("404");
-    });
-});
-
-describe("playContent", () => {
-    it("POSTs /dev/play/{id}", async () => {
-        const fetchMock = mockFetch({ ok: true });
-        await playContent("abc");
-        expect(fetchMock).toHaveBeenCalledWith("/dev/play/abc", { method: "POST" });
-    });
-
-    it("throws on non-ok response", async () => {
-        mockFetch({ ok: false, status: 422 });
-        await expect(playContent("bad")).rejects.toThrow("422");
     });
 });
 
@@ -359,26 +320,6 @@ describe("settings API", () => {
     it("saveSettings surfaces backend detail on non-ok", async () => {
         mockFetch({ ok: false, status: 422, text: async () => "bad mode" });
         await expect(saveSettings({})).rejects.toThrow(/422/);
-    });
-});
-
-describe("setDefaultPlaylistOrder", () => {
-    it("PUTs item_ids to /api/playlist (the legacy default-only shortcut)", async () => {
-        const fetchMock = mockFetch({
-            ok: true,
-            json: async () => ({ item_ids: ["b", "a"] }),
-        });
-        const result = await setDefaultPlaylistOrder(["b", "a"]);
-        expect(result).toEqual({ item_ids: ["b", "a"] });
-        const [url, init] = fetchMock.mock.calls[0];
-        expect(url).toBe("/api/playlist");
-        expect(init.method).toBe("PUT");
-        expect(JSON.parse(init.body)).toEqual({ item_ids: ["b", "a"] });
-    });
-
-    it("throws on non-ok response", async () => {
-        mockFetch({ ok: false, status: 422, text: async () => "bad" });
-        await expect(setDefaultPlaylistOrder(["not-a-uuid"])).rejects.toThrow("422");
     });
 });
 
