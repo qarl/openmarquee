@@ -95,12 +95,27 @@ def enforce_demo_invariants(content: list, playlists: dict, settings: dict) -> N
     if items:
         return
 
-    # Pick up to 3 text_slides from content; fall back to first 3 of any
-    # type if no text slides exist. The order is whatever the backend
-    # returned — typically welcome-slide-first when un-clicked.
-    text_ids = [c["id"] for c in content if c.get("type") == "text_slide"][:3]
+    # Order matters — visitors greet "Welcome → to → openMarquee" in
+    # English reading order, not "openMarquee → to → Welcome" (which
+    # /api/content would yield, since it iterates in alphabetic-by-id
+    # order when the default playlist is empty).
+    welcome_names = ("Welcome", "to", "openMarquee")
+    text_slides = [c for c in content if c.get("type") == "text_slide"]
+    by_name = {c.get("name"): c["id"] for c in text_slides}
+    if all(name in by_name for name in welcome_names):
+        text_ids = [by_name[name] for name in welcome_names]
+    else:
+        # Fallback: created_at ascending. seed.py emits Welcome → to →
+        # openMarquee in that order on a fresh device, so creation
+        # order matches the canonical order whenever named-match fails.
+        sorted_text = sorted(text_slides, key=lambda c: c.get("created_at", ""))
+        text_ids = [c["id"] for c in sorted_text[:3]]
     if not text_ids:
-        text_ids = [c["id"] for c in content[:3]]
+        # No text slides at all — fall back to first 3 of any type,
+        # preserving created_at order so the visitor sees the oldest /
+        # most-canonical content first.
+        sorted_any = sorted(content, key=lambda c: c.get("created_at", ""))
+        text_ids = [c["id"] for c in sorted_any[:3]]
     if not text_ids:
         print(
             "  [hardening] WARNING: source content is empty — demo will be blank",
