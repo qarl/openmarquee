@@ -42,25 +42,135 @@ const PRESETS = [
 // natively and look correct at bold. UnifrakturCook ships only as the
 // Bold cut, so 700 matches the file.
 export const FONT_FAMILIES = [
-    // System generics (render with whatever the device has).
-    { value: "sans-serif",            label: "Sans-serif (system default)",             weight: 700 },
-    { value: "serif",                 label: "Serif (system)",                          weight: 700 },
-    { value: "monospace",             label: "Monospace (system)",                      weight: 700 },
-    // Bundled @font-face fonts.
-    { value: "Inter",                 label: "Inter",                                   weight: 700 },
-    { value: "Oswald",                label: "Oswald",                                  weight: 700 },
-    { value: "Bebas Neue",            label: "Bebas Neue",                              weight: 400 },
-    { value: "Roboto Slab",           label: "Roboto Slab",                             weight: 700 },
-    { value: "Caveat Brush",          label: "Caveat Brush — chalk / handwriting",      weight: 400 },
-    { value: "Permanent Marker",      label: "Permanent Marker",                        weight: 400 },
-    { value: "Cinzel",                label: "Cinzel — classical caps",                 weight: 700 },
-    { value: "UnifrakturCook",        label: "UnifrakturCook — blackletter",            weight: 700 },
-    { value: "Rye",                   label: "Rye — western",                           weight: 400 },
-    { value: "Pacifico",              label: "Pacifico — retro script",                 weight: 400 },
-    { value: "Sedgwick Ave Display",  label: "Sedgwick Ave Display — graffiti",         weight: 400 },
+    // System generics — render with whatever the device has bundled at OS level.
+    { value: "sans-serif",            label: "Sans-serif",            category: "System",     weight: 700 },
+    { value: "serif",                 label: "Serif",                 category: "System",     weight: 700 },
+    { value: "monospace",             label: "Monospace",             category: "System",     weight: 700 },
+    // Block / display — bold, attention-grabbing.
+    { value: "Inter",                 label: "Inter",                 category: "Block",      weight: 700 },
+    { value: "Oswald",                label: "Oswald",                category: "Block",      weight: 700 },
+    { value: "Bebas Neue",            label: "Bebas Neue",            category: "Block",      weight: 400 },
+    { value: "Bowlby One SC",         label: "Bowlby One SC",         category: "Block",      weight: 400 },
+    { value: "Anton",                 label: "Anton",                 category: "Block",      weight: 400 },
+    { value: "Archivo Black",         label: "Archivo Black",         category: "Block",      weight: 400 },
+    { value: "Alfa Slab One",         label: "Alfa Slab One",         category: "Block",      weight: 400 },
+    // Serif — classical / editorial.
+    { value: "Roboto Slab",           label: "Roboto Slab",           category: "Serif",      weight: 700 },
+    { value: "Cinzel",                label: "Cinzel",                category: "Serif",      weight: 700 },
+    { value: "Playfair Display",      label: "Playfair Display",      category: "Serif",      weight: 700 },
+    { value: "DM Serif Display",      label: "DM Serif Display",      category: "Serif",      weight: 400 },
+    { value: "UnifrakturCook",        label: "UnifrakturCook",        category: "Serif",      weight: 700 },
+    // Mono / scoreboard — countdown / retro digital.
+    { value: "VT323",                 label: "VT323",                 category: "Mono",       weight: 400 },
+    { value: "JetBrains Mono",        label: "JetBrains Mono",        category: "Mono",       weight: 700 },
+    { value: "Space Mono",            label: "Space Mono",            category: "Mono",       weight: 700 },
+    // Script / decorative — flowing or themed letterforms.
+    { value: "Pacifico",              label: "Pacifico",              category: "Script",     weight: 400 },
+    { value: "Rye",                   label: "Rye",                   category: "Script",     weight: 400 },
+    { value: "Sedgwick Ave Display",  label: "Sedgwick Ave Display",  category: "Script",     weight: 400 },
+    // Chalk / handwritten — casual, marker, sidewalk-sign vibes.
+    { value: "Caveat Brush",          label: "Caveat Brush",          category: "Chalk",      weight: 400 },
+    { value: "Permanent Marker",      label: "Permanent Marker",      category: "Chalk",      weight: 400 },
+    { value: "Caveat",                label: "Caveat",                category: "Chalk",      weight: 700 },
+    { value: "Reenie Beanie",         label: "Reenie Beanie",         category: "Chalk",      weight: 400 },
+    { value: "Shadows Into Light",    label: "Shadows Into Light",    category: "Chalk",      weight: 400 },
 ];
 
 const FONT_WEIGHT_BY_VALUE = new Map(FONT_FAMILIES.map((f) => [f.value, f.weight]));
+
+/**
+ * Wire up the visual font picker around an existing hidden <select> +
+ * trigger button + popover. The hidden <select> stays the source of
+ * truth (existing read/write code reads `.value`); this layer just
+ * paints tiles in their own faces and syncs both directions.
+ */
+function setupFontPicker(container) {
+    const selectEl = container.querySelector(".field-font-family");
+    const trigger = container.querySelector(".font-picker-trigger");
+    const triggerLabel = container.querySelector(".font-picker-trigger-label");
+    const popover = container.querySelector(".font-picker-popover");
+    if (!selectEl || !trigger || !popover) return;
+
+    const byCategory = new Map();
+    for (const f of FONT_FAMILIES) {
+        if (!byCategory.has(f.category)) byCategory.set(f.category, []);
+        byCategory.get(f.category).push(f);
+    }
+    for (const [cat, fonts] of byCategory) {
+        const section = document.createElement("div");
+        section.className = "font-picker-section";
+        section.innerHTML = `<div class="font-picker-section-head">${cat}</div>`;
+        const grid = document.createElement("div");
+        grid.className = "font-picker-grid";
+        for (const f of fonts) {
+            const tile = document.createElement("button");
+            tile.type = "button";
+            tile.className = "font-picker-tile";
+            tile.dataset.value = f.value;
+            tile.textContent = f.label;
+            tile.style.fontFamily = cssFontFamily(f.value);
+            tile.style.fontWeight = String(f.weight);
+            tile.setAttribute("role", "option");
+            grid.appendChild(tile);
+        }
+        section.appendChild(grid);
+        popover.appendChild(section);
+    }
+
+    function syncTrigger() {
+        const value = selectEl.value || FONT_FAMILIES[0].value;
+        const meta = FONT_FAMILIES.find((f) => f.value === value) || FONT_FAMILIES[0];
+        triggerLabel.textContent = meta.label;
+        triggerLabel.style.fontFamily = cssFontFamily(meta.value);
+        triggerLabel.style.fontWeight = String(meta.weight);
+        for (const tile of popover.querySelectorAll(".font-picker-tile")) {
+            tile.classList.toggle("selected", tile.dataset.value === value);
+            tile.setAttribute("aria-selected", tile.dataset.value === value ? "true" : "false");
+        }
+    }
+
+    function setOpen(open) {
+        popover.hidden = !open;
+        trigger.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) {
+            // Scroll the selected tile into view so the operator sees
+            // their current pick instead of starting at "Sans-serif".
+            const sel = popover.querySelector(".font-picker-tile.selected");
+            sel?.scrollIntoView?.({ block: "nearest" });
+        }
+    }
+
+    trigger.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        setOpen(popover.hidden);
+    });
+
+    popover.addEventListener("click", (ev) => {
+        const tile = ev.target.closest(".font-picker-tile");
+        if (!tile) return;
+        const value = tile.dataset.value;
+        if (selectEl.value === value) {
+            setOpen(false);
+            return;
+        }
+        selectEl.value = value;
+        selectEl.dispatchEvent(new Event("change", { bubbles: true }));
+        syncTrigger();
+        setOpen(false);
+    });
+
+    document.addEventListener("click", (ev) => {
+        if (popover.hidden) return;
+        if (popover.contains(ev.target) || trigger.contains(ev.target)) return;
+        setOpen(false);
+    });
+
+    // External `.value = ...` doesn't fire `change`, so re-sync on each
+    // editor refresh path. The `change` listener still covers user input.
+    selectEl.addEventListener("change", syncTrigger);
+    selectEl.addEventListener("font-picker-sync", syncTrigger);
+    syncTrigger();
+}
 
 /**
  * Return a CSS font-family string safe for use in `ctx.font` / `style.font`.
@@ -150,10 +260,15 @@ const EDITOR_TEMPLATE = `
                         </label>
                     </div>
                     <div class="om-row" style="gap: 10px;">
-                        <label class="om-field" style="flex: 1;">
-                            <span>Font</span>
-                            <select class="om-select field-font-family"></select>
-                        </label>
+                        <div class="om-field font-picker" style="flex: 1;">
+                            <span id="font-picker-label">Font</span>
+                            <select class="om-select field-font-family" aria-labelledby="font-picker-label"></select>
+                            <button type="button" class="font-picker-trigger" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="font-picker-label">
+                                <span class="font-picker-trigger-label">Sans-serif</span>
+                                <span class="font-picker-trigger-caret" aria-hidden="true">▾</span>
+                            </button>
+                            <div class="font-picker-popover" role="listbox" hidden></div>
+                        </div>
                         <label class="om-field" style="width: 140px;">
                             <span>Font size (% of height)</span>
                             <input type="number" class="om-input field-font-size" min="1" max="100" step="0.5">
@@ -264,6 +379,7 @@ export function mountEditor(
         opt.textContent = f.label;
         fontFamilyEl.appendChild(opt);
     }
+    setupFontPicker(container);
     fontSizeEl.value = String(pickFontSizePct());
 
     const state = {
@@ -641,6 +757,7 @@ export function mountEditor(
         textColorEl.value = slide.text_color || "#FFFFFF";
         bgColorEl.value = slide.background_color || "#000000";
         fontFamilyEl.value = slide.font_family || "sans-serif";
+        fontFamilyEl.dispatchEvent(new Event("font-picker-sync"));
         // Prefer the new pct field. Old slides only carry font_size_px;
         // back-derive a percent so re-editing migrates them in place.
         const pct =

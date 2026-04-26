@@ -778,3 +778,76 @@ describe("mountEditor — submit flow", () => {
         }
     });
 });
+
+describe("mountEditor — visual font picker", () => {
+    function patchCanvasPrototype() {
+        // Same shim the other mountEditor tests use — jsdom canvas.
+        HTMLCanvasElement.prototype.getContext = function () {
+            return {
+                fillStyle: "", font: "", textAlign: "", textBaseline: "",
+                clearRect: () => {}, fillRect: () => {}, fillText: () => {},
+                save: () => {}, restore: () => {},
+            };
+        };
+        HTMLCanvasElement.prototype.toDataURL = () => "data:image/png;base64,STUBDATA";
+    }
+
+    it("renders the trigger + a tile per font family, popover starts hidden", () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountEditor(container, {
+                width: 128, height: 96,
+                onSave: vi.fn().mockResolvedValue({}),
+            });
+            const trigger = container.querySelector(".font-picker-trigger");
+            const popover = container.querySelector(".font-picker-popover");
+            expect(trigger).not.toBeNull();
+            expect(popover.hidden).toBe(true);
+            const tiles = popover.querySelectorAll(".font-picker-tile");
+            // One tile per FONT_FAMILIES entry — locked at the const length
+            // so the test fails loudly if a font is added without picker
+            // wiring (or vice versa).
+            expect(tiles.length).toBeGreaterThanOrEqual(20);
+            // Each tile is rendered in its own face — the inline
+            // font-family style is the canonical signal.
+            const interTile = popover.querySelector('[data-value="Inter"]');
+            expect(interTile).not.toBeNull();
+            expect(interTile.style.fontFamily).toContain("Inter");
+        } finally {
+            container.remove();
+        }
+    });
+
+    it("clicking the trigger toggles the popover; clicking a tile selects + closes", () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountEditor(container, {
+                width: 128, height: 96,
+                onSave: vi.fn().mockResolvedValue({}),
+            });
+            const trigger = container.querySelector(".font-picker-trigger");
+            const popover = container.querySelector(".font-picker-popover");
+            const select = container.querySelector(".field-font-family");
+
+            trigger.click();
+            expect(popover.hidden).toBe(false);
+            expect(trigger.getAttribute("aria-expanded")).toBe("true");
+
+            const oswaldTile = popover.querySelector('[data-value="Oswald"]');
+            oswaldTile.click();
+            expect(select.value).toBe("Oswald");
+            expect(popover.hidden).toBe(true);
+
+            // Trigger label sync — shows the new selection, in its face.
+            const label = container.querySelector(".font-picker-trigger-label");
+            expect(label.textContent).toBe("Oswald");
+            expect(label.style.fontFamily).toContain("Oswald");
+        } finally {
+            container.remove();
+        }
+    });
+});

@@ -195,6 +195,18 @@ _BUNDLED_FONT_FILES = {
     "Rye": "rye.ttf",
     "Pacifico": "pacifico.ttf",
     "Sedgwick Ave Display": "sedgwick-ave-display.ttf",
+    "Bowlby One SC": "bowlby-one-sc.ttf",
+    "Anton": "anton.ttf",
+    "Archivo Black": "archivo-black.ttf",
+    "Alfa Slab One": "alfa-slab-one.ttf",
+    "Playfair Display": "playfair-display.ttf",
+    "DM Serif Display": "dm-serif-display.ttf",
+    "VT323": "vt323.ttf",
+    "JetBrains Mono": "jetbrains-mono.ttf",
+    "Space Mono": "space-mono.ttf",
+    "Caveat": "caveat.ttf",
+    "Reenie Beanie": "reenie-beanie.ttf",
+    "Shadows Into Light": "shadows-into-light.ttf",
 }
 
 

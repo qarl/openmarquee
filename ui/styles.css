@@ -18,6 +18,18 @@
 @font-face { font-family: "Rye";                src: url("fonts/rye.ttf") format("truetype"); font-weight: 400; font-display: swap; }
 @font-face { font-family: "Pacifico";           src: url("fonts/pacifico.ttf") format("truetype"); font-weight: 400; font-display: swap; }
 @font-face { font-family: "Sedgwick Ave Display"; src: url("fonts/sedgwick-ave-display.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Bowlby One SC";      src: url("fonts/bowlby-one-sc.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Anton";              src: url("fonts/anton.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Archivo Black";      src: url("fonts/archivo-black.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Alfa Slab One";      src: url("fonts/alfa-slab-one.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Playfair Display";   src: url("fonts/playfair-display.ttf") format("truetype"); font-weight: 400 900; font-display: swap; }
+@font-face { font-family: "DM Serif Display";   src: url("fonts/dm-serif-display.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "VT323";              src: url("fonts/vt323.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "JetBrains Mono";     src: url("fonts/jetbrains-mono.ttf") format("truetype"); font-weight: 100 800; font-display: swap; }
+@font-face { font-family: "Space Mono";         src: url("fonts/space-mono.ttf") format("truetype"); font-weight: 400 700; font-display: swap; }
+@font-face { font-family: "Caveat";             src: url("fonts/caveat.ttf") format("truetype"); font-weight: 400 700; font-display: swap; }
+@font-face { font-family: "Reenie Beanie";      src: url("fonts/reenie-beanie.ttf") format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "Shadows Into Light"; src: url("fonts/shadows-into-light.ttf") format("truetype"); font-weight: 400; font-display: swap; }
 
 :root {
     --bg: #0e0e10;
@@ -3008,4 +3020,103 @@ html, body { margin: 0; padding: 0; height: 100%; }
 @media (max-width: 560px) {
     .row { flex-wrap: wrap; }
     .row > .field { flex: 1 1 100%; min-width: 100%; }
+}
+
+/* Visual font picker — replaces a plain <select> for the text-slide
+   editor's Font field. Underlying <select> stays as state of record
+   so existing tests + form serialization keep working; visually
+   clipped (not display:none) so Playwright still treats it as a real
+   element for `selectOption`. */
+.font-picker { position: relative; }
+.font-picker .field-font-family {
+    position: absolute;
+    width: 1px; height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    pointer-events: none;
+}
+.font-picker-trigger {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    height: 40px;
+    padding: 0 12px;
+    background: var(--om-surface-2);
+    color: var(--om-text);
+    border: 1px solid var(--om-line);
+    border-radius: 9px;
+    font-size: 14px;
+    cursor: pointer;
+    text-align: left;
+}
+.font-picker-trigger:hover { border-color: var(--om-line-strong, var(--om-text-fade)); }
+.font-picker-trigger:focus-visible {
+    outline: 2px solid var(--om-accent);
+    outline-offset: 1px;
+}
+.font-picker-trigger-label {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.font-picker-trigger-caret { color: var(--om-text-fade); flex-shrink: 0; }
+
+.font-picker-popover {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 30;
+    max-height: 360px;
+    overflow-y: auto;
+    padding: 8px;
+    background: var(--om-surface);
+    border: 1px solid var(--om-line);
+    border-radius: 9px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.font-picker-section + .font-picker-section { margin-top: 12px; }
+.font-picker-section-head {
+    padding: 4px 6px;
+    font-family: var(--om-mono, ui-monospace, monospace);
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--om-text-fade);
+}
+.font-picker-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    margin-top: 6px;
+}
+.font-picker-tile {
+    display: block;
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--om-surface-2);
+    color: var(--om-text);
+    border: 1px solid transparent;
+    border-radius: 7px;
+    font-size: 18px;
+    line-height: 1.2;
+    cursor: pointer;
+    text-align: left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: background 80ms ease, border-color 80ms ease;
+}
+.font-picker-tile:hover { background: var(--om-surface-3, var(--om-line)); }
+.font-picker-tile.selected {
+    border-color: var(--om-accent);
+    background: color-mix(in oklab, var(--om-accent) 12%, var(--om-surface-2));
+}
+@media (max-width: 560px) {
+    .font-picker-grid { grid-template-columns: 1fr; }
 }

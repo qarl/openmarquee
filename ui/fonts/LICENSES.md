@@ -17,6 +17,18 @@ set without needing internet at runtime.
 | `rye.ttf` | Rye | SIL OFL-1.1 | https://fonts.google.com/specimen/Rye |
 | `pacifico.ttf` | Pacifico | SIL OFL-1.1 | https://fonts.google.com/specimen/Pacifico |
 | `sedgwick-ave-display.ttf` | Sedgwick Ave Display | SIL OFL-1.1 | https://fonts.google.com/specimen/Sedgwick+Ave+Display |
+| `bowlby-one-sc.ttf` | Bowlby One SC | SIL OFL-1.1 | https://fonts.google.com/specimen/Bowlby+One+SC |
+| `anton.ttf` | Anton | SIL OFL-1.1 | https://fonts.google.com/specimen/Anton |
+| `archivo-black.ttf` | Archivo Black | SIL OFL-1.1 | https://fonts.google.com/specimen/Archivo+Black |
+| `alfa-slab-one.ttf` | Alfa Slab One | SIL OFL-1.1 | https://fonts.google.com/specimen/Alfa+Slab+One |
+| `playfair-display.ttf` | Playfair Display | SIL OFL-1.1 | https://fonts.google.com/specimen/Playfair+Display |
+| `dm-serif-display.ttf` | DM Serif Display | SIL OFL-1.1 | https://fonts.google.com/specimen/DM+Serif+Display |
+| `vt323.ttf` | VT323 | SIL OFL-1.1 | https://fonts.google.com/specimen/VT323 |
+| `jetbrains-mono.ttf` | JetBrains Mono | SIL OFL-1.1 | https://fonts.google.com/specimen/JetBrains+Mono |
+| `space-mono.ttf` | Space Mono | SIL OFL-1.1 | https://fonts.google.com/specimen/Space+Mono |
+| `caveat.ttf` | Caveat | SIL OFL-1.1 | https://fonts.google.com/specimen/Caveat |
+| `reenie-beanie.ttf` | Reenie Beanie | SIL OFL-1.1 | https://fonts.google.com/specimen/Reenie+Beanie |
+| `shadows-into-light.ttf` | Shadows Into Light | SIL OFL-1.1 | https://fonts.google.com/specimen/Shadows+Into+Light |
 
 SIL OFL-1.1: https://openfontlicense.org/
 Apache-2.0: http://www.apache.org/licenses/LICENSE-2.0
