@@ -391,6 +391,31 @@ describe("playback control API", () => {
         expect(fetchMock).toHaveBeenCalledWith("/api/playback/state");
     });
 
+    it("getPlaybackState response uses is_running + current_playlist_id (regression: QA 2026-04-26 #08)", async () => {
+        // Pins the contract pulled from backend api_playback.py::PlaybackState
+        // so a future dev who reads the JSDoc here can rely on those keys.
+        // QA flagged the UI's old `state.running` / `state.current_playlist_name`
+        // usages as undefined-by-design — those names never existed on the
+        // wire, only in stale JSDoc. Don't reintroduce them by accident.
+        const state = {
+            is_running: true,
+            current_item_id: "abc-123",
+            current_item_type: "text_slide",
+            current_item_transition: "fade",
+            current_item_transition_ms: 600,
+            current_item_auto_mode: null,
+            current_item_auto_format: null,
+            current_playlist_id: "pl-456",
+        };
+        mockFetch({ ok: true, json: async () => state });
+        const result = await getPlaybackState();
+        expect(result.is_running).toBe(true);
+        expect(result.current_playlist_id).toBe("pl-456");
+        // Anti-aliases — these never existed; pin so we don't quietly add them.
+        expect(result.running).toBeUndefined();
+        expect(result.current_playlist_name).toBeUndefined();
+    });
+
     it("startPlayback POSTs /api/playback/start", async () => {
         const fetchMock = mockFetch({ ok: true });
         await startPlayback();

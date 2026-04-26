@@ -171,10 +171,19 @@ export async function playContent(id) {
 }
 
 /**
- * Get the current playback state:
- *   { is_running, current_item_id, current_item_type, current_playlist_name }.
- * current_item_type is the ContentItem discriminator — "text_slide", "image",
- * or "video" — so the live-preview UI knows which element to render.
+ * Get the current playback state. Shape mirrors backend `PlaybackState`
+ * (api_playback.py): {
+ *   is_running, current_item_id, current_item_type,
+ *   current_item_transition, current_item_transition_ms,
+ *   current_item_auto_mode, current_item_auto_format,
+ *   current_playlist_id
+ * }. current_item_type is the ContentItem discriminator — "text_slide",
+ * "image", or "video" — so the live-preview UI knows which element to
+ * render.
+ *
+ * Note: the response uses `is_running` (not `running`) and
+ * `current_playlist_id` (not `current_playlist_name`); resolve the id
+ * → display name via fetchPlaylistList() if you need the name.
  */
 export async function getPlaybackState() {
     const response = await fetch("/api/playback/state");
