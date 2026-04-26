@@ -5,7 +5,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from openmarquee import __version__
@@ -109,6 +112,38 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Override FastAPI's default 422 handler to drop the echoed input.
+
+    FastAPI's default emits `detail = jsonable_encoder(exc.errors())`,
+    which includes a verbatim copy of every offending field's value.
+    For an over-cap prompt at /api/backgrounds/generate that's a
+    multi-KB response body for what's morally "input too long" (QA
+    explore-bg-gen 2026-04-26 → verify-d9d6efb-bg-gen-cap.md). Mirrors
+    the api.py::_validation_error_422 helper's `include_input=False`
+    behavior, applied uniformly to every endpoint's request-body
+    validation.
+
+    FastAPI's `RequestValidationError` subclasses pydantic's
+    `ValidationError` but overrides `.errors()` to a Starlette-style
+    list-of-dicts that doesn't accept `include_input=False` (unlike
+    raw pydantic). So we filter the `input` key out manually and pass
+    through `jsonable_encoder` for the same JSON-safety guarantees
+    the default handler gives (UUIDs in `input` paths, exceptions in
+    `ctx`).
+    """
+    sanitised = [
+        {k: v for k, v in err.items() if k != "input"} for err in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(sanitised)},
+    )
 
 
 @app.get("/healthz")

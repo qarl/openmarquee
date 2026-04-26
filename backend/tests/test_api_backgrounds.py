@@ -155,6 +155,11 @@ def test_generate_rejects_prompt_over_500_chars(client: TestClient, monkeypatch)
     # versions may add ctx keys (actual_length, etc.). Don't pin the
     # full dict.
     assert err["ctx"]["max_length"] == 500
+    # The over-cap input itself MUST NOT echo back in `detail[0].input`
+    # — the global RequestValidationError handler in app.py strips it.
+    # Without that, a 5000-char prompt would round-trip back to the
+    # client as a 5KB response body.
+    assert "input" not in err
 
 
 def test_generate_accepts_optional_name_override(client: TestClient, monkeypatch):

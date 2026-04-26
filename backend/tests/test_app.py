@@ -41,3 +41,27 @@ def test_openapi_schema_available(client):
     schema = response.json()
     assert schema["info"]["title"] == "openMarquee"
     assert schema["info"]["version"] == __version__
+
+
+def test_request_validation_422_strips_echoed_input(client):
+    """Global RequestValidationError handler in app.py drops the
+    verbatim input echo from every endpoint's body-validation 422.
+    Pins the cross-cutting behavior at an endpoint OTHER than
+    /api/backgrounds/generate (which has its own boundary test) so a
+    future refactor that scopes the handler too narrowly fails here.
+
+    Routes through /api/content/text-slides which fails at request-
+    validation when png_base64 is missing — distinct from the
+    in-route _validation_error_422 helper that fires after the body
+    parses cleanly but TextSlide() construction raises.
+    """
+    response = client.post(
+        "/api/content/text-slides",
+        json={"name": "x", "text": "x"},  # missing png_base64
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert isinstance(body["detail"], list)
+    # All errors must be JSON-safe AND must NOT echo input bytes.
+    for err in body["detail"]:
+        assert "input" not in err
