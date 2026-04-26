@@ -594,4 +594,148 @@ describe("mountEditor — submit flow", () => {
 
     // New-slide button + Editing-mode label removed — the slide browser
     // at the top of each subpage has the "+" tile for that flow.
+
+    it("picking a video bg sends background_video_slide_id (Phase 5b)", async () => {
+        // §5.10: an operator picks a saved VideoSlide as the background
+        // of a TextSlide; the device composites text over the live video
+        // frames at playback. The editor stores the reference; payload
+        // ships background_video_slide_id and DOESN'T set
+        // background_image_slide_id (mutual-exclusion at the model).
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave,
+            fetchItems: async () => [
+                { id: "vid-1", type: "video", name: "loop reel" },
+                { id: "img-1", type: "image", name: "sunset" },
+            ],
+        });
+        // Settle the editor's initial-mount async tail (resetToBlank
+        // → computeDefaultName → fetchItems again) before flipping
+        // radios — otherwise the tail's resetToBlank overwrites the
+        // radio choice mid-test. Multi-tick await drains the chain.
+        for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 0));
+
+        // Switch to "video" mode → triggers populateBgVideoOptions.
+        const videoRadio = container.querySelector('.field-bg-source[value="video"]');
+        videoRadio.checked = true;
+        videoRadio.dispatchEvent(new Event("change"));
+        await new Promise((r) => setTimeout(r, 0));
+
+        // Dropdown only carries video-type items.
+        const videoSelect = container.querySelector(".field-bg-video");
+        const optionValues = Array.from(videoSelect.options).map((o) => o.value);
+        expect(optionValues).toEqual(["", "vid-1"]);
+        expect(container.querySelector(".editor-bg-video-wrap").hidden).toBe(false);
+        expect(container.querySelector(".editor-bg-slide-wrap").hidden).toBe(true);
+
+        // Pick a video and save.
+        videoSelect.value = "vid-1";
+        videoSelect.dispatchEvent(new Event("change"));
+        container.querySelector(".field-text").value = "Happy Hour";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        await handle.flushAutoSave();
+
+        expect(onSave).toHaveBeenCalledOnce();
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.background_video_slide_id).toBe("vid-1");
+        expect(payload.background_image_slide_id).toBeNull();
+    });
+
+    it("switching from video bg to image bg clears the video ref (mutual exclusion)", async () => {
+        // Operator picks a video bg, changes their mind, picks an image
+        // instead. The save payload must carry only the image id —
+        // shipping both would 422 against the backend's mutual-exclusion
+        // validator (content/__init__.py::_bg_layers_are_exclusive).
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave,
+            fetchItems: async () => [
+                { id: "vid-1", type: "video", name: "loop" },
+                { id: "img-1", type: "image", name: "sunset" },
+            ],
+        });
+        for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 0));
+
+        // First: video bg.
+        const videoRadio = container.querySelector('.field-bg-source[value="video"]');
+        videoRadio.checked = true;
+        videoRadio.dispatchEvent(new Event("change"));
+        await new Promise((r) => setTimeout(r, 0));
+        const videoSelect = container.querySelector(".field-bg-video");
+        videoSelect.value = "vid-1";
+        videoSelect.dispatchEvent(new Event("change"));
+
+        // Then: switch to image bg.
+        const slideRadio = container.querySelector('.field-bg-source[value="slide"]');
+        slideRadio.checked = true;
+        slideRadio.dispatchEvent(new Event("change"));
+        await new Promise((r) => setTimeout(r, 0));
+        const imgSelect = container.querySelector(".field-bg-slide");
+        imgSelect.value = "img-1";
+        imgSelect.dispatchEvent(new Event("change"));
+
+        container.querySelector(".field-text").value = "Sale";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        await handle.flushAutoSave();
+
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.background_image_slide_id).toBe("img-1");
+        expect(payload.background_video_slide_id).toBeNull();
+    });
+
+    it("loadForEdit hydrates the video bg picker from a stored video reference (Phase 5b)", async () => {
+        patchCanvasPrototype();
+        // Stub global Image so loadImageForSlide resolves quickly in jsdom
+        // (the real `new Image()` in jsdom doesn't fire onerror reliably
+        // under microtask awaits, hanging loadForEdit).
+        const RealImage = global.Image;
+        global.Image = class {
+            constructor() {
+                queueMicrotask(() => this.onerror?.(new Event("error")));
+            }
+            set src(_) {}
+        };
+        try {
+            const container = document.createElement("div");
+            const handle = mountEditor(container, {
+                width: 128,
+                height: 96,
+                onSave: vi.fn(),
+                onSaveExisting: vi.fn().mockResolvedValue({}),
+                fetchItems: async () => [
+                    { id: "vid-1", type: "video", name: "loop" },
+                ],
+            });
+            for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 0));
+
+            await handle.loadForEdit({
+                id: "edit-me",
+                type: "text_slide",
+                name: "Existing",
+                text: "Bar Open",
+                text_color: "#FFFFFF",
+                background_color: "#000000",
+                background_video_slide_id: "vid-1",
+                duration_ms: 5000,
+            });
+
+            // The "video" radio is selected and the dropdown points at the
+            // referenced video.
+            const videoRadio = container.querySelector('.field-bg-source[value="video"]');
+            expect(videoRadio.checked).toBe(true);
+            expect(container.querySelector(".field-bg-video").value).toBe("vid-1");
+            expect(container.querySelector(".editor-bg-video-wrap").hidden).toBe(false);
+            expect(container.querySelector(".editor-bg-slide-wrap").hidden).toBe(true);
+        } finally {
+            global.Image = RealImage;
+        }
+    });
 });

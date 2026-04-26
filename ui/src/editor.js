@@ -171,11 +171,19 @@ const EDITOR_TEMPLATE = `
                     </label>
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
                         <input type="radio" name="editor-bg-source" class="field-bg-source" value="slide">
-                        <span>Existing slide</span>
+                        <span>Image slide</span>
                     </label>
                     <label class="om-field editor-bg-slide-wrap" hidden>
-                        <span>Saved slide</span>
+                        <span>Saved image slide</span>
                         <select class="om-select field-bg-slide"><option value="">(pick a slide)</option></select>
+                    </label>
+                    <label class="om-row" style="gap: 8px; cursor: pointer;">
+                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="video">
+                        <span>Video slide</span>
+                    </label>
+                    <label class="om-field editor-bg-video-wrap" hidden>
+                        <span>Saved video slide</span>
+                        <select class="om-select field-bg-video"><option value="">(pick a video)</option></select>
                     </label>
                     <div class="editor-bg-generate" hidden>
                         <label class="om-field">
@@ -238,6 +246,8 @@ export function mountEditor(
     const fontFamilyEl = container.querySelector(".field-font-family");
     const bgSlideEl = container.querySelector(".field-bg-slide");
     const bgSlideWrapEl = container.querySelector(".editor-bg-slide-wrap");
+    const bgVideoEl = container.querySelector(".field-bg-video");
+    const bgVideoWrapEl = container.querySelector(".editor-bg-video-wrap");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const fontSizeEl = container.querySelector(".field-font-size");
@@ -265,7 +275,8 @@ export function mountEditor(
         fontFamily: fontFamilyEl.value,
         bgSource: "color",
         bgSlideId: null,
-        bgImage: null, // decoded <img> for "slide" mode
+        bgVideoId: null,
+        bgImage: null, // decoded <img> for "slide" or "video" preview (video uses its thumbnail)
         // Edit-mode tracking: when non-null, Save dispatches to
         // onSaveExisting(editingId, payload) instead of onSave.
         editingId: null,
@@ -352,24 +363,42 @@ export function mountEditor(
         populateAutoFormatOptions(autoModeEl.value);
     });
 
-    // Background-source radios toggle the slide picker. When "slide" is
-    // selected, populate the dropdown lazily (first time only) via
-    // fetchItems so a first-mount doesn't burn a fetch on an operator
+    // Background-source radios toggle the slide picker. When "slide" or
+    // "video" is selected, populate the dropdown lazily (first time only)
+    // via fetchItems so a first-mount doesn't burn a fetch on an operator
     // who's going to stick with solid-color anyway.
     const bgGenerateWrap = container.querySelector(".editor-bg-generate");
     let bgSlidePopulated = false;
+    let bgVideoPopulated = false;
     for (const radio of container.querySelectorAll(".field-bg-source")) {
         radio.addEventListener("change", async () => {
             state.bgSource = radio.value;
             bgSlideWrapEl.hidden = state.bgSource !== "slide";
+            bgVideoWrapEl.hidden = state.bgSource !== "video";
+            // The AI-generate-background flow only makes sense for the
+            // image-slide path (it produces ImageSlides). Hide for
+            // color + video.
             bgGenerateWrap.hidden =
                 state.bgSource !== "slide" || !onGenerateBackground;
             if (state.bgSource === "slide" && fetchItems && !bgSlidePopulated) {
                 await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
                 bgSlidePopulated = true;
             }
+            if (state.bgSource === "video" && fetchItems && !bgVideoPopulated) {
+                await populateBgVideoOptions(bgVideoEl, fetchItems, statusEl);
+                bgVideoPopulated = true;
+            }
+            // Clear references for the inactive paths so the save payload
+            // never carries both a bg image and a bg video (the backend's
+            // mutual-exclusion validator would reject — see
+            // content/__init__.py::TextSlide::_bg_layers_are_exclusive).
             if (state.bgSource === "color") {
                 state.bgImage = null;
+                state.bgSlideId = null;
+                state.bgVideoId = null;
+            } else if (state.bgSource === "slide") {
+                state.bgVideoId = null;
+            } else if (state.bgSource === "video") {
                 state.bgSlideId = null;
             }
             syncAndRender();
@@ -413,6 +442,21 @@ export function mountEditor(
         state.bgSlideId = bgSlideEl.value || null;
         state.bgImage = state.bgSlideId
             ? await loadImageForSlide(state.bgSlideId).catch(() => null)
+            : null;
+        syncAndRender();
+    });
+
+    bgVideoEl.addEventListener("change", async () => {
+        // For the editor's preview canvas, render the video's THUMBNAIL
+        // (asset.png at /api/content/{id}/asset) as a static bg under the
+        // text. Live moving-video preview lives in the playlist panel's
+        // inline-preview, not here — the editor stays a single static
+        // canvas for predictable rasterize-on-save output. The stored
+        // PNG that ships to the device carries the thumbnail-as-bg too;
+        // playback's compositing path replaces it with live frames.
+        state.bgVideoId = bgVideoEl.value || null;
+        state.bgImage = state.bgVideoId
+            ? await loadImageForSlide(state.bgVideoId).catch(() => null)
             : null;
         syncAndRender();
     });
@@ -465,6 +509,7 @@ export function mountEditor(
             font_family: state.fontFamily,
             font_size_pct: state.fontSizePct,
             background_image_slide_id: state.bgSlideId || null,
+            background_video_slide_id: state.bgVideoId || null,
             auto_mode: autoModeEl.value || null,
             auto_format: autoModeEl.value ? autoFormatEl.value || null : null,
             duration_ms: Math.round(durationSeconds * 1000),
@@ -499,6 +544,7 @@ export function mountEditor(
         state.editingId = null;
         state.bgImage = null;
         state.bgSlideId = null;
+        state.bgVideoId = null;
         textEl.value = "";
         // Safari quirk: after a textarea held content and got cleared,
         // the placeholder renders inside a stale narrow box and clips
@@ -521,6 +567,7 @@ export function mountEditor(
         );
         colorRadio.checked = true;
         bgSlideWrapEl.hidden = true;
+        bgVideoWrapEl.hidden = true;
         state.bgSource = "color";
         syncAndRender();
         // Form is being cleared, not edited — drop any pending save.
@@ -618,10 +665,34 @@ export function mountEditor(
                 bgSlidePopulated = true;
             }
             bgSlideWrapEl.hidden = false;
+            bgVideoWrapEl.hidden = true;
             bgSlideEl.value = String(slide.background_image_slide_id);
             state.bgSource = "slide";
             state.bgSlideId = String(slide.background_image_slide_id);
+            state.bgVideoId = null;
             state.bgImage = await loadImageForSlide(state.bgSlideId).catch(
+                () => null,
+            );
+        } else if (slide.background_video_slide_id) {
+            // Switch to "video" background and select the referenced video.
+            const videoRadio = container.querySelector(
+                '.field-bg-source[value="video"]',
+            );
+            videoRadio.checked = true;
+            if (fetchItems && !bgVideoPopulated) {
+                await populateBgVideoOptions(bgVideoEl, fetchItems, statusEl);
+                bgVideoPopulated = true;
+            }
+            bgSlideWrapEl.hidden = true;
+            bgVideoWrapEl.hidden = false;
+            bgVideoEl.value = String(slide.background_video_slide_id);
+            state.bgSource = "video";
+            state.bgSlideId = null;
+            state.bgVideoId = String(slide.background_video_slide_id);
+            // For the editor's static preview, load the video's thumbnail
+            // (asset.png at /api/content/{id}/asset). Live frame compositing
+            // happens in the playlist panel's inline-preview, not here.
+            state.bgImage = await loadImageForSlide(state.bgVideoId).catch(
                 () => null,
             );
         } else {
@@ -630,8 +701,10 @@ export function mountEditor(
             );
             colorRadio.checked = true;
             bgSlideWrapEl.hidden = true;
+            bgVideoWrapEl.hidden = true;
             state.bgSource = "color";
             state.bgSlideId = null;
+            state.bgVideoId = null;
             state.bgImage = null;
         }
         syncAndRender();
@@ -726,11 +799,11 @@ export async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
     try {
         const items = await fetchItems();
         selectEl.innerHTML = '<option value="">(pick a slide)</option>';
-        // Only image slides can back a text slide — text-on-text or
-        // text-on-video would be either unreadable or would fight the
-        // video asset for decoding bandwidth at playback. Filter here so
-        // the picker dropdown matches what the operator can actually
-        // render against.
+        // The image-slide bg path filters to ImageSlides only — VideoSlides
+        // get their own picker (populateBgVideoOptions) since the
+        // playback-time compositing path is different (§5.10) and the
+        // editor stores them in a separate field for the mutual-exclusion
+        // validator.
         for (const item of items) {
             if (item.type !== "image") continue;
             const opt = document.createElement("option");
@@ -740,6 +813,30 @@ export async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
         }
     } catch (err) {
         statusEl.textContent = `Could not load slides: ${err.message}`;
+    }
+}
+
+/**
+ * Populate the video-bg dropdown with VideoSlide entries. Phase 5b: the
+ * editor's bg-picker can pick a saved VideoSlide as the background; the
+ * device composites text over the live video frames at playback per
+ * SYSTEM_SPEC §5.10. The editor's preview canvas uses the video's
+ * thumbnail (asset.png) as a static stand-in — the playlist panel's
+ * inline-preview is where the operator sees moving frames.
+ */
+export async function populateBgVideoOptions(selectEl, fetchItems, statusEl) {
+    try {
+        const items = await fetchItems();
+        selectEl.innerHTML = '<option value="">(pick a video)</option>';
+        for (const item of items) {
+            if (item.type !== "video") continue;
+            const opt = document.createElement("option");
+            opt.value = String(item.id);
+            opt.textContent = item.name || "Untitled";
+            selectEl.appendChild(opt);
+        }
+    } catch (err) {
+        statusEl.textContent = `Could not load videos: ${err.message}`;
     }
 }
 
