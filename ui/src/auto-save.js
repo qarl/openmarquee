@@ -33,9 +33,15 @@ const DEFAULT_DEBOUNCE_MS = 600;
  * @param {() => boolean} [options.canSave] — gate; auto-save is suppressed
  *   when this returns false. Useful for "no file picked yet" / "draft is
  *   empty" cases where there's nothing meaningful to persist.
+ * @param {() => string | null} [options.validate] — client-side validity
+ *   check; return null when the form is OK to send, or an operator-facing
+ *   error message when it isn't. On a non-null return the helper paints
+ *   the message into `status` (state="error") and skips the network call,
+ *   so a known-invalid form never round-trips through the server. Distinct
+ *   from `canSave` (silent suppression for "nothing to do").
  * @returns {{ kick: () => void, flush: () => Promise<void>, cancel: () => void }}
  */
-export function attachAutoSave(form, { save, status, debounceMs, canSave }) {
+export function attachAutoSave(form, { save, status, debounceMs, canSave, validate }) {
     const wait = Number.isFinite(debounceMs) ? debounceMs : DEFAULT_DEBOUNCE_MS;
     let timer = null;
     let pending = false;
@@ -69,6 +75,17 @@ export function attachAutoSave(form, { save, status, debounceMs, canSave }) {
             // doesn't see a "saved" toast when nothing was saved.
             pending = false;
             return;
+        }
+        if (validate) {
+            const message = validate();
+            if (message) {
+                // Known-invalid form: surface the error message to the
+                // operator and bail before the network call. Don't fire
+                // a doomed PUT just to have the server bounce it back.
+                pending = false;
+                setStatus("error", message);
+                return;
+            }
         }
         if (inFlight) {
             // Coalesce: a save is already running. Mark pending so we

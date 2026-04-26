@@ -48,7 +48,7 @@ const SECTION_TEMPLATE = `
     <section class="settings">
         <div class="om-page-head">
             <div>
-                <span class="om-eyebrow" data-field="now">Device · <span data-field="now-value">—</span></span>
+                <span class="om-eyebrow" data-field="device-now">Device · <span data-field="device-now-value">—</span></span>
                 <h1>Settings</h1>
                 <p>Output mode, network, sync. Changes save to the device's SD card immediately.</p>
             </div>
@@ -242,7 +242,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
     const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
     const tsAuthKeyEl = container.querySelector(".field-tailscale-auth-key");
-    const nowValueEl = container.querySelector('[data-field="now-value"]');
+    const nowValueEl = container.querySelector('[data-field="device-now-value"]');
 
     // One-time population of non-data-driven selects.
     for (const mode of OUTPUT_MODES) {

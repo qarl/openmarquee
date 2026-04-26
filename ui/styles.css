@@ -1599,6 +1599,47 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     gap: 0.5rem;
 }
 
+/* "Add another playlist before scheduling" hint — surfaced when the
+   only available playlist is the seeded default. Without this, the
+   operator can configure rules with no behavioral effect (every rule
+   plays the same playlist the no-rule fallback already plays). */
+.schedule-empty-hint {
+    background: var(--panel);
+    border: 1px dashed var(--panel-border);
+    border-radius: 0.4rem;
+    color: var(--muted);
+    font-size: 0.85rem;
+    line-height: 1.4;
+    margin: 0 0 12px;
+    padding: 0.6rem 0.8rem;
+}
+.schedule-empty-hint a {
+    color: var(--accent, #4ec18b);
+    text-decoration: underline;
+}
+
+/* Per-card outline for rules whose form would 422 the server (e.g. no
+   days checked, malformed HH:MM). Pairs with the field-level highlights
+   below to point the operator at which input is the problem. */
+.schedule-rule.rule-invalid {
+    border-color: var(--om-warn, #ff7a59);
+}
+
+.rule-days-wrap.invalid {
+    border-color: var(--om-warn, #ff7a59);
+}
+
+/* Per-input highlight for HH:MM fields whose value fails the pattern
+   check. Browsers also paint `:invalid` styling for these, but only
+   after the first interaction — this class fires immediately on mount
+   so a stored bad value (rare, but possible if a prior schema accepted
+   it) is visible right away. */
+.schedule-rule .input-error {
+    border-color: var(--om-warn, #ff7a59);
+    outline: 1px solid var(--om-warn, #ff7a59);
+    outline-offset: -1px;
+}
+
 .schedule-rule-row {
     display: flex;
     flex-wrap: wrap;

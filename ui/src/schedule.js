@@ -39,6 +39,13 @@ const SECTION_TEMPLATE = `
             </label>
         </div>
 
+        <p class="schedule-empty-hint" hidden>
+            Schedule needs at least two playlists to switch between — right
+            now only the seeded <strong>default</strong> exists. Create a
+            named playlist on the <a href="#/playlists">Playlists</a> page,
+            then come back to schedule it.
+        </p>
+
         <ul class="schedule-rules" role="list" style="list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px;"></ul>
 
         <div class="om-row" style="gap: 8px; flex-wrap: wrap; margin-top: 14px;">
@@ -75,6 +82,7 @@ export function mountSchedule(
     const disableAllBtn = container.querySelector(".schedule-disable-all");
     const statusEl = container.querySelector(".schedule-status");
     const nowValueEl = container.querySelector('[data-field="now-value"]');
+    const emptyHintEl = container.querySelector(".schedule-empty-hint");
 
     // Available playlists for the dropdowns. Each entry: {id, name}.
     let availableChoices = [];
@@ -90,6 +98,16 @@ export function mountSchedule(
                 fetchSettings ? fetchSettings().catch(() => null) : Promise.resolve(null),
             ]);
             availableChoices = choices || [];
+            // Show the "create another playlist first" hint when only the
+            // seeded default exists — otherwise every rule the operator
+            // adds resolves to the same playlist as the no-rule fallback,
+            // i.e. a no-op. Stays hidden once a second playlist appears.
+            if (emptyHintEl) {
+                const onlyDefault =
+                    availableChoices.length <= 1 &&
+                    (availableChoices[0]?.id || DEFAULT_PLAYLIST_ID) === DEFAULT_PLAYLIST_ID;
+                emptyHintEl.hidden = !onlyDefault;
+            }
             fillPlaylistOptions(
                 defaultEl,
                 availableChoices,
@@ -182,11 +200,67 @@ export function mountSchedule(
         await onSave(payload);
     }
 
+    // Walk every rule and refresh per-card error styling, returning a
+    // human-facing message describing the *first* invalid rule (or null
+    // when the form is fine). The autosave gate uses the message; CSS
+    // uses the .rule-invalid class to outline the offending card so the
+    // operator can see which one needs attention without re-reading the
+    // status pill.
+    function refreshValidation() {
+        let firstError = null;
+        for (const li of rulesEl.querySelectorAll(".schedule-rule")) {
+            const ruleName = () =>
+                li.querySelector(".rule-name").value.trim() || "rule";
+
+            // Days fieldset — at least one checked. The server enforces
+            // min_length=1 on ScheduleRule.days, so an empty array is a
+            // hard 422 we never want to send.
+            const dayCount = li.querySelectorAll(".rule-day-input:checked").length;
+            const daysWrap = li.querySelector(".rule-days-wrap");
+            const noDays = dayCount === 0;
+            if (daysWrap) daysWrap.classList.toggle("invalid", noDays);
+
+            // HH:MM inputs — pattern= already paints :invalid via the
+            // browser's constraint validation, but the autosave path
+            // doesn't go through form-submit, so the bad value would
+            // otherwise round-trip to a 422. We mirror the same check
+            // here and add an explicit class so styling shows up even on
+            // browsers that suppress :invalid for un-touched inputs (they
+            // hide it until first interaction).
+            const startInput = li.querySelector(".rule-start");
+            const endInput = li.querySelector(".rule-end");
+            const startBad = !startInput.checkValidity();
+            const endBad = !endInput.checkValidity();
+            startInput.classList.toggle("input-error", startBad);
+            endInput.classList.toggle("input-error", endBad);
+
+            const ruleInvalid = noDays || startBad || endBad;
+            li.classList.toggle("rule-invalid", ruleInvalid);
+
+            if (firstError) continue;
+            if (noDays) {
+                firstError = `Pick at least one day for "${ruleName()}".`;
+            } else if (startBad) {
+                firstError = `Start time for "${ruleName()}" needs to be HH:MM (e.g. 08:00).`;
+            } else if (endBad) {
+                firstError = `End time for "${ruleName()}" needs to be HH:MM, or 24:00 for end-of-day.`;
+            }
+        }
+        return firstError;
+    }
+
     const autoSave = attachAutoSave(sectionEl, {
         save: performSave,
         status: statusEl,
         debounceMs: 500,
+        validate: refreshValidation,
     });
+
+    // Keep the per-card error styling fresh on every input so the operator
+    // sees the outline clear the moment they re-check a day, not only once
+    // the debounced autosave runs.
+    sectionEl.addEventListener("input", refreshValidation);
+    sectionEl.addEventListener("change", refreshValidation);
 
     sectionEl.addEventListener("schedule-rule-removed", () => autoSave.kick());
 
@@ -227,11 +301,11 @@ function renderRule(rule, availableChoices) {
         <div class="schedule-rule-row">
             <label class="field">
                 <span>Start (HH:MM)</span>
-                <input type="text" class="rule-start" value="${escapeHtml(rule.start_time || "08:00")}" pattern="[0-2][0-9]:[0-5][0-9]">
+                <input type="text" class="rule-start" value="${escapeHtml(rule.start_time || "08:00")}" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="08:00" inputmode="numeric">
             </label>
             <label class="field">
                 <span>End (HH:MM, 24:00 = end-of-day)</span>
-                <input type="text" class="rule-end" value="${escapeHtml(rule.end_time || "17:00")}" pattern="([0-2][0-9]:[0-5][0-9]|24:00)">
+                <input type="text" class="rule-end" value="${escapeHtml(rule.end_time || "17:00")}" pattern="(([01][0-9]|2[0-3]):[0-5][0-9]|24:00)" placeholder="17:00" inputmode="numeric">
             </label>
             <label class="field">
                 <span>Playlist</span>
