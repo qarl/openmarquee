@@ -1,14 +1,15 @@
 import { expect, test } from "@playwright/test";
-import { resetServerState } from "./_helpers.js";
+import { clickNewSlide, resetServerState, saveTextSlide } from "./_helpers.js";
 
 test.beforeEach(() => {
     resetServerState();
 });
 
 test("save a text slide → it shows up in the Playlists pallet + the asset serves", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/#/slides/text");
 
-    // Type a slide on the Text subpage (default route).
+    // Type a slide on the Text subpage and let autosave land.
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.locator(".editor .field-name").fill("Opening");
     await page.locator(".editor .field-text").fill("GRAND OPENING");
     await page.locator(".editor .field-text-color").evaluate((el) => {
@@ -20,8 +21,8 @@ test("save a text slide → it shows up in the Playlists pallet + the asset serv
         el.dispatchEvent(new Event("input", { bubbles: true }));
     });
 
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor-status")).toHaveText("Saved.");
+    await expect(page.locator(".editor-status"))
+        .toContainText(/Saved/, { timeout: 5_000 });
 
     // Over on the Playlists subpage, the new slide is in the pallet.
     await page.locator('.nav-link[data-section="playlists"]').click();
@@ -42,23 +43,9 @@ test("save a text slide → it shows up in the Playlists pallet + the asset serv
 });
 
 test("two text slides both land in the pallet", async ({ page }) => {
-    await page.goto("/");
-
-    for (const [i, name] of ["Open", "Closed"].entries()) {
-        // Save-flow fix (bug #3): saves stay on the just-saved slide.
-        // Click "+ New" between slides to get a fresh blank editor.
-        if (i > 0) {
-            await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
-            // resetToBlank has an async tail that fills the name field
-            // with the next auto-name ("Text Slide N"). Wait for that to
-            // land so the test's .fill() below isn't overwritten by it.
-            await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
-        }
-        await page.locator(".editor .field-name").fill(name);
-        await page.locator(".editor .field-text").fill(name.toUpperCase());
-        await page.locator(".editor .field-save").click();
-        await expect(page.locator(".editor-status")).toContainText(/Saved|Updated/);
-    }
+    await saveTextSlide(page, "Open", { text: "OPEN" });
+    await clickNewSlide(page);
+    await saveTextSlide(page, "Closed", { text: "CLOSED" });
 
     await page.locator('.nav-link[data-section="playlists"]').click();
     await expect(page.locator(".pallet-tile")).toHaveCount(2);
@@ -67,11 +54,14 @@ test("two text slides both land in the pallet", async ({ page }) => {
 });
 
 test("rejected save (text too long) surfaces the error", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/#/slides/text");
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.locator(".editor .field-name").fill("Big");
+    // Server caps text length; autosave PUT/POST will 422 and the auto-save
+    // helper paints the error into the status pill as "Couldn't save · …".
     await page.locator(".editor .field-text").fill("X".repeat(10_001));
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor-status")).toContainText("Save failed");
+    await expect(page.locator(".editor-status"))
+        .toContainText(/Couldn't save/, { timeout: 5_000 });
 });
 
 test("playlist PUT reorders content via the API (what drag-reorder invokes)", async ({
@@ -81,21 +71,11 @@ test("playlist PUT reorders content via the API (what drag-reorder invokes)", as
     // order. Driving Sortable's pointer-event internals from Playwright is
     // flaky, so we verify the contract the drag handler depends on: PUT
     // the new order via the exact same client path, and GET reflects it.
-    await page.goto("/");
-
-    for (const [i, name] of ["First", "Second", "Third"].entries()) {
-        if (i > 0) {
-            await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
-            // resetToBlank has an async tail that fills the name field
-            // with the next auto-name ("Text Slide N"). Wait for that to
-            // land so the test's .fill() below isn't overwritten by it.
-            await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
-        }
-        await page.locator(".editor .field-name").fill(name);
-        await page.locator(".editor .field-text").fill(name);
-        await page.locator(".editor .field-save").click();
-        await expect(page.locator(".editor-status")).toContainText(/Saved|Updated/);
-    }
+    await saveTextSlide(page, "First");
+    await clickNewSlide(page);
+    await saveTextSlide(page, "Second");
+    await clickNewSlide(page);
+    await saveTextSlide(page, "Third");
 
     const content = await (await page.request.get("/api/content")).json();
     expect(content.map((item) => item.name)).toEqual(["First", "Second", "Third"]);
@@ -111,13 +91,7 @@ test("playlist PUT reorders content via the API (what drag-reorder invokes)", as
 });
 
 test("inline preview renders the playlist on the Playlists subpage", async ({ page }) => {
-    await page.goto("/");
-
-    // Save a slide so the playlist has something to render.
-    await page.locator(".editor .field-name").fill("Loop");
-    await page.locator(".editor .field-text").fill("LOOP");
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor-status")).toHaveText("Saved.");
+    await saveTextSlide(page, "Loop", { text: "LOOP" });
 
     const content = await (await page.request.get("/api/content")).json();
     await page.request.put("/api/playlist", {

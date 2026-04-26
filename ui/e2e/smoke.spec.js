@@ -9,57 +9,70 @@ test("app loads on the Text subpage with the text editor visible", async ({ page
     await page.goto("/");
 
     await expect(page).toHaveTitle("openMarquee");
-    await expect(page.locator("header h1")).toHaveText("openMarquee");
+    // Sidebar wordmark is the brand chrome (no <header><h1>); the redesign
+    // moved branding into the .om-side wordmark + topbar.
+    await expect(page.locator(".om-wordmark")).toContainText(/openMarquee/i);
 
     await expect(page.locator(".editor .editor-canvas")).toBeVisible();
     await expect(page.locator(".editor .field-text")).toBeVisible();
-    await expect(page.locator(".editor .field-save")).toBeVisible();
+    // Autosave model: status pill stands in for the old explicit Save button.
+    await expect(page.locator(".editor .editor-status")).toBeAttached();
 
-    // Image uploader lives on its own subpage — hidden on boot.
+    // Image uploader lives on its own slides sub-tab — hidden on boot.
     await expect(page.locator(".image-upload")).toBeHidden();
 });
 
-test("Save button is disabled until text is entered", async ({ page }) => {
-    await page.goto("/");
+test("autosave is suppressed on a fresh editor until text is entered", async ({ page }) => {
+    // Replaces the legacy "Save button disabled until text is entered" test.
+    // Editor's `canSave` gate is `state.editingId || state.text.trim().length > 0`,
+    // so a brand-new editor with no text never POSTs a junk slide on first
+    // focus. Confirms that gate via /api/content (no slides created until
+    // text lands).
+    await page.goto("/#/slides/text");
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
 
-    const saveBtn = page.locator(".editor .field-save");
-    await expect(saveBtn).toBeDisabled();
+    // Wait past the autosave debounce; nothing should have been saved.
+    await page.waitForTimeout(1500);
+    let items = await (await page.request.get("/api/content")).json();
+    expect(items).toHaveLength(0);
 
-    await page.locator(".editor .field-text").fill("Hi");
-    await expect(saveBtn).toBeEnabled();
-
-    await page.locator(".editor .field-text").fill("");
-    await expect(saveBtn).toBeDisabled();
+    // Type text → autosave fires → exactly one slide lands on the server.
+    await page.fill(".editor .field-text", "Hi");
+    await expect(page.locator(".editor .editor-status"))
+        .toContainText(/Saved/, { timeout: 5_000 });
+    items = await (await page.request.get("/api/content")).json();
+    expect(items).toHaveLength(1);
 });
 
-test("sidebar nav defaults to Text and routes through every section on click", async ({ page }) => {
+test("sidebar nav routes through every top-level section on click", async ({ page }) => {
+    // Sidebar collapsed Text/Image/Video into a single Slides entry with an
+    // in-page tab subnav (slides.js). Test the top-level routes here; the
+    // tab subnav is exercised by the slides-shell vitest coverage.
     await page.goto("/");
 
-    // Text is the default section.
-    await expect(page.locator('.panel[data-section="slides/text"]')).toBeVisible();
-    await expect(page.locator('.nav-link[data-section="slides/text"]')).toHaveClass(/active/);
-    await expect(page.locator('.panel[data-section="slides/image"]')).toBeHidden();
+    // Slides is the default landing section.
+    await expect(page.locator('.panel[data-section="slides"]')).toBeVisible();
+    await expect(page.locator('.nav-link[data-section="slides"]')).toHaveClass(/active/);
+    await expect(page.locator('.panel[data-section="playlists"]')).toBeHidden();
 
-    // Click through every section; only that panel should be visible at a time.
-    const routes = [
-        "slides/image",
-        "slides/video",
-        "playlists",
-        "schedule",
-        "settings",
-        "slides/text",
-    ];
+    const routes = ["playlists", "flock", "schedule", "settings", "slides"];
     for (const name of routes) {
         await page.locator(`.nav-link[data-section="${name}"]`).click();
         await expect(page.locator(`.panel[data-section="${name}"]`)).toBeVisible();
         await expect(page.locator(`.nav-link[data-section="${name}"]`)).toHaveClass(/active/);
     }
 
-    // Settings section renders an editable form hydrated from /api/settings.
+    // Slides shell exposes a 3-tab subnav (text / image / video). Default is
+    // text; clicking image / video swaps the active .tab-pane. Hash routing
+    // keeps `#/slides/<tab>` URLs working — covered separately by the
+    // slides-shell vitest.
+    await page.locator('.nav-link[data-section="slides"]').click();
+    await expect(page.locator('.tab-pane[data-tab="text"]')).toBeVisible();
+    await expect(page.locator('.tab-pane[data-tab="image"]')).toBeHidden();
+
+    // Settings still renders the editable form hydrated from /api/settings.
     await page.locator('.nav-link[data-section="settings"]').click();
-    await expect(
-        page.locator('section.settings .subpage-title'),
-    ).toHaveText("System settings");
+    await expect(page.locator("section.settings h1")).toHaveText("Settings");
     await expect(page.locator(".field-output-mode")).toHaveValue("hdmi");
     await expect(page.locator(".field-display-width")).toHaveValue("1920");
 });

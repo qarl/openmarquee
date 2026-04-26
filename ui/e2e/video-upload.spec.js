@@ -48,26 +48,42 @@ test.beforeEach(() => {
     resetServerState();
 });
 
-test("video uploader transcodes a picked file via ffmpeg.wasm and enables Save", async ({ page }) => {
+test("video uploader transcodes a picked file via ffmpeg.wasm and autosaves", async ({ page }) => {
     // ffmpeg-core.wasm is ~30MB; the first load + transcode needs headroom.
     test.setTimeout(120_000);
 
-    await page.goto("/");
-    await page.locator('.nav-link[data-section="slides/video"]').click();
+    // Slides shell collapsed Text/Image/Video sub-entries into a single
+    // sidebar `slides` link + an in-page subnav. Hash-routing lands us
+    // directly on the video sub-tab without depending on the subnav DOM.
+    await page.goto("/#/slides/video");
     await expect(page.locator(".video-upload")).toBeVisible();
 
-    const saveBtn = page.locator(".video-upload .field-save");
-    await expect(saveBtn).toBeDisabled();
+    // Status pill stands in for the old explicit Save button. Idle on mount
+    // — autosave is gated by canSave (mp4Base64 ready), and there's no MP4
+    // until the file picker fires.
+    const status = page.locator(".video-upload .video-upload-status");
+    await expect(status).toBeAttached();
 
     // Pick the fixture. The file-change handler kicks off the transcode.
     await page.locator(".video-upload .field-file").setInputFiles(FIXTURE);
 
     // Transcode completion: the status line carries "ready. {W}×{H} H.264
-    // MP4 · …" and the Save button flips enabled. The verbose ffmpeg
-    // per-frame log lives in console.debug now, not in the DOM.
+    // MP4 · …". The verbose ffmpeg per-frame log lives in console.debug
+    // now, not in the DOM.
     await expect(page.locator(".video-upload-status")).toContainText(
         "H.264 MP4",
         { timeout: 90_000 },
     );
-    await expect(saveBtn).toBeEnabled({ timeout: 90_000 });
+
+    // Once transcode + thumbnail are ready, autosave's canSave gate flips
+    // true, the form-input listener kicks the debounce, and the slide
+    // round-trips to the server. Verify via /api/content (avoids racing
+    // the status pill, which transitions through Saving… → Saved → idle).
+    await expect.poll(
+        async () => {
+            const items = await (await page.request.get("/api/content")).json();
+            return items.filter((it) => it.type === "video").length;
+        },
+        { timeout: 30_000 },
+    ).toBeGreaterThan(0);
 });

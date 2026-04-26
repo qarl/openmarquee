@@ -6,41 +6,38 @@
 // leaning on UI affordances the user doesn't see anymore.
 
 import { expect, test } from "@playwright/test";
-import { resetServerState } from "./_helpers.js";
+import { clickNewSlide, resetServerState, saveTextSlide } from "./_helpers.js";
 
 test.beforeEach(() => {
     resetServerState();
 });
 
-test("schedule-driven playback: API-built lunch playlist + always-on rule → playback shows 'lunch'", async ({
+test("schedule-driven playback: API-built lunch playlist + always-on rule → playback shows lunch", async ({
     page,
 }) => {
-    await page.goto("/");
-
-    // 1. Save two slides via the Text editor (they auto-append to default).
-    for (const [i, name] of ["First", "Second"].entries()) {
-        if (i > 0) {
-            await page.locator(".editor .slide-browser-tile--new .slide-browser-tile-action").click();
-            await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
-        }
-        await page.locator(".editor .field-name").fill(name);
-        await page.locator(".editor .field-text").fill(name);
-        await page.locator(".editor .field-save").click();
-        await expect(page.locator(".editor-status")).toContainText(/Saved|Updated/);
-    }
+    // 1. Save two slides via the Text editor (autosave appends to default).
+    await saveTextSlide(page, "First");
+    await clickNewSlide(page);
+    await saveTextSlide(page, "Second");
 
     const content = await (await page.request.get("/api/content")).json();
     const ids = content.map((item) => String(item.id));
     expect(ids.length).toBe(2);
 
-    // 2. Create a "lunch" named playlist via the API, containing both slides.
-    const put = await page.request.put("/api/playlists/lunch", {
-        data: { item_ids: ids },
+    // 2. Create a "lunch" named playlist via the API. Playlists are
+    //    id-keyed since the UUID refactor (commit 577acc9), so we POST to
+    //    /api/playlists and capture the server-assigned id.
+    const created = await page.request.post("/api/playlists", {
+        data: { name: "lunch", item_ids: ids },
     });
-    expect(put.status()).toBe(200);
+    expect(created.status()).toBe(201);
+    const lunchPlaylist = await created.json();
+    const lunchId = lunchPlaylist.id;
 
     // 3. Add a schedule rule that always matches via the Schedule UI. The
-    //    playlist dropdown pulls from the API so "lunch" surfaces.
+    //    playlist dropdown's option labels are display names; we
+    //    selectOption({label: "lunch"}) so the test reads as
+    //    name-driven even though the wire shape uses ids.
     await page.locator('.nav-link[data-section="schedule"]').click();
     await expect(page.locator('.panel[data-section="schedule"]')).toBeVisible();
     await page.locator(".schedule-add").click();
@@ -50,24 +47,28 @@ test("schedule-driven playback: API-built lunch playlist + always-on rule → pl
     }
     await rule.locator(".rule-start").fill("00:00");
     await rule.locator(".rule-end").fill("24:00");
-    await rule.locator(".rule-playlist").selectOption("lunch");
+    await rule.locator(".rule-playlist").selectOption({ label: "lunch" });
 
-    await page.locator(".schedule-save").click();
-    await expect(page.locator(".schedule-status")).toHaveText("Saved.");
+    // Schedule editor auto-saves (no explicit Save button); wait for the
+    // round-trip via the status pill.
+    await expect(page.locator(".schedule-status"))
+        .toContainText(/Saved/, { timeout: 5_000 });
 
     // 4. Hardware playback is autonomous — kick the loop directly.
     //    (The UI no longer has a Play-all button; e2e config disables
     //    the lifespan autostart so each spec opts in.)
     await page.request.post("/api/playback/start");
 
-    // 5. The loop should evaluate the schedule, pick "lunch", and the
-    //    state endpoint should report that back.
+    // 5. The loop evaluates the schedule, picks "lunch", and the state
+    //    endpoint reports the playlist's id (not name — the wire is
+    //    id-keyed since the UUID refactor; QA #08 nailed down the
+    //    contract).
     await expect
         .poll(async () => {
             const state = await (await page.request.get("/api/playback/state")).json();
-            return state.current_playlist_name;
-        })
-        .toBe("lunch");
+            return state.current_playlist_id;
+        }, { timeout: 10_000 })
+        .toBe(lunchId);
 
     await page.request.post("/api/playback/stop");
 });

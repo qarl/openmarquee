@@ -10,27 +10,19 @@
 // that was failing upstream instead.
 
 import { expect, test } from "@playwright/test";
-import { resetServerState } from "./_helpers.js";
+import { resetServerState, saveTextSlide } from "./_helpers.js";
 
 test.beforeEach(() => {
     resetServerState();
 });
 
-async function saveTextSlide(page, name) {
-    await page.goto("/#/slides/text");
-    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
-    await page.fill(".editor .field-name", name);
-    await page.fill(".editor .field-text", name);
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor .editor-status")).toContainText(/Saved|Updated/);
-}
-
 test("pallet-tile <img> has draggable=false so Sortable wins the drag", async ({ page }) => {
     await saveTextSlide(page, "DragMe");
     await page.goto("/#/playlists");
-    // Wait until the playlist track has rendered tiles (not just the
-    // "+ New" placeholder from the browser).
-    const img = page.locator(".pallet-tile:not(.pallet-tile--new) img").first();
+    // The +New placeholder tile inside the slide-browser was retired in the
+    // redesign; the pallet only renders real slides now. First .pallet-tile
+    // is the saved slide.
+    const img = page.locator(".pallet-tile img").first();
     await expect(img).toBeVisible();
     const draggable = await img.evaluate((el) => el.draggable);
     expect(draggable).toBe(false);

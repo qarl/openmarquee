@@ -5,6 +5,7 @@
 
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { expect } from "@playwright/test";
 import {
     E2E_CONTENT_ROOT,
     E2E_PLAYLIST_PATH,
@@ -44,4 +45,49 @@ export function resetServerState() {
 // path. Use this in specs that test the welcome gate.
 export function resetFirstRun() {
     rmSync(E2E_SETTINGS_PATH, { force: true });
+}
+
+// Save a text slide via the editor and return when autosave has confirmed.
+// Replaces the per-spec inline helper that used to click `.editor .field-save`
+// (the explicit Save button was removed when auto-save shipped — see
+// AGENTS.md "Known stale e2e tests"). The 900ms editor debounce means callers
+// should not race a follow-up assertion before this resolves.
+//
+// **Mount assumption** (load-bearing): the SPA keeps panels mounted across
+// hash navigation (see `main.js`'s "panels stay mounted" comment), so
+// `page.goto("/#/slides/text")` after a prior `clickNewSlide()` does NOT
+// re-mount the editor or reset `editingId`. That's how the
+// `clickNewSlide(); saveTextSlide(...)` sequence threads correctly: the
+// fresh placeholder created by clickNewSlide gets PATCHed by autosave
+// instead of producing a second slide. If a future refactor re-mounts the
+// editor on hash change, callers will quietly start creating extra slides;
+// flag at that point.
+//
+// @param {import('@playwright/test').Page} page
+// @param {string} name — slide name (also used as the body text by default)
+// @param {{text?: string}} [opts]
+export async function saveTextSlide(page, name, opts = {}) {
+    const text = opts.text ?? name;
+    await page.goto("/#/slides/text");
+    // Editor mount has an async tail that sets `field-name` to "Text Slide N";
+    // wait for that before our fill so our value isn't clobbered.
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
+    await page.fill(".editor .field-name", name);
+    await page.fill(".editor .field-text", text);
+    // 900ms debounce + network round-trip + fade window; 5s ceiling is plenty.
+    await expect(page.locator(".editor .editor-status"))
+        .toContainText(/Saved/, { timeout: 5_000 });
+}
+
+// Click the +New affordance in the slides shell page-head to reset the editor
+// to a blank, ready-for-a-new-slide state. Replaces the legacy
+// `.slide-browser-tile--new .slide-browser-tile-action` click — the +New
+// tile inside the slide-browser is gone; the button now lives in the shell
+// header next to the tab subnav.
+export async function clickNewSlide(page) {
+    await page.locator(".slides-shell-new").click();
+    // resetToBlank() runs an async tail that fills `field-name` with the
+    // next "Text Slide N"; wait for it so callers' subsequent fill doesn't
+    // race the auto-name.
+    await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
 }

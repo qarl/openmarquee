@@ -3,15 +3,19 @@
 //   (#2) Pressing <Enter> inside a single-line input must NOT submit
 //        the form. It used to — which triggered a save that reset the
 //        slide state, wiping whatever the operator was mid-typing.
-//        Textarea Enter still means newline.
+//        Textarea Enter still means newline. (Now mostly moot since
+//        autosave replaced the explicit Save button, but the Enter-no-
+//        submit guard still pays for itself any time someone wires a
+//        new submit handler.)
 //
 //   (#3) After a successful save, the editor should remain on the
 //        slide it just saved. It used to clear to a blank "new slide,"
 //        so an operator tweaking + re-saving the same slide would
-//        create a duplicate every time.
+//        create a duplicate every time. Autosave preserves editingId
+//        across the round-trip, so a follow-up edit PATCHes the same id.
 
 import { expect, test } from "@playwright/test";
-import { resetServerState } from "./_helpers.js";
+import { resetServerState, saveTextSlide } from "./_helpers.js";
 
 test.beforeEach(() => {
     resetServerState();
@@ -33,12 +37,10 @@ async function fillAndFocusTextInput(page) {
 test("Enter in the name input does NOT submit / reset editor state", async ({ page }) => {
     await fillAndFocusTextInput(page);
     await page.keyboard.press("Enter");
-    // The text field should keep its value — if the form submitted,
-    // resetToBlank() (the old behavior) would have emptied it.
+    // Even with autosave wired, the form must not submit on Enter — that
+    // path used to call resetToBlank() and wipe the operator's draft.
     await expect(page.locator(".editor .field-text")).toHaveValue("hello world");
     await expect(page.locator(".editor .field-name")).toHaveValue("OriginalName");
-    // Status line should be blank (no "Saved." / "Updated.").
-    await expect(page.locator(".editor .editor-status")).toHaveText("");
 });
 
 test("Enter in the textarea still inserts a newline", async ({ page }) => {
@@ -50,12 +52,8 @@ test("Enter in the textarea still inserts a newline", async ({ page }) => {
     await expect(page.locator(".editor .field-text")).toHaveValue("line1\nline2");
 });
 
-test("Save stays on the just-saved slide (does not clear to a blank)", async ({ page }) => {
-    await page.goto("/#/slides/text");
-    await page.fill(".editor .field-name", "SaveStayTest");
-    await page.fill(".editor .field-text", "first version");
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor .editor-status")).toContainText(/Saved|Updated/i);
+test("Autosave stays on the just-saved slide (does not clear to a blank)", async ({ page }) => {
+    await saveTextSlide(page, "SaveStayTest", { text: "first version" });
     // Editor should still reflect the just-saved slide.
     await expect(page.locator(".editor .field-name")).toHaveValue("SaveStayTest");
     await expect(page.locator(".editor .field-text")).toHaveValue("first version");
@@ -64,17 +62,23 @@ test("Save stays on the just-saved slide (does not clear to a blank)", async ({ 
     await expect(tile).toHaveClass(/slide-browser-tile--selected/);
 });
 
-test("Re-save updates the same slide — no duplicate in the browser", async ({ page }) => {
-    await page.goto("/#/slides/text");
-    await page.fill(".editor .field-name", "NoDup");
-    await page.fill(".editor .field-text", "v1");
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor .editor-status")).toContainText(/Saved/i);
-    // Edit the text and save again.
+test("Re-edit autosaves into the same slide — no duplicate in the browser", async ({ page }) => {
+    await saveTextSlide(page, "NoDup", { text: "v1" });
+    // Edit the text — autosave will PATCH the existing id (editingId is
+    // promoted by performSave on first success), not POST a new slide.
     await page.fill(".editor .field-text", "v2");
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor .editor-status")).toContainText(/Updated/i);
-    // Only one tile named "NoDup" should exist in the browser.
+    // Poll the API directly: the canonical signal that the second save
+    // hit is `text === "v2"` on the existing item. Avoids racing the
+    // status pill, which is sticky for 2.4s after the first save.
+    await expect.poll(
+        async () => {
+            const items = await (await page.request.get("/api/content")).json();
+            const noDup = items.find((it) => it.name === "NoDup");
+            return noDup?.text;
+        },
+        { timeout: 5_000 },
+    ).toBe("v2");
+    // Only one tile named "NoDup" exists in the browser.
     const tiles = page.locator('.slide-browser-tile[data-id]', { hasText: "NoDup" });
     await expect(tiles).toHaveCount(1);
 });

@@ -30,7 +30,8 @@ test("saving a new display_width re-mounts the editor with the fresh canvas size
 
     // Back to the text subpage — the editor should have been
     // re-mounted. Its canvas attribute reflects the new dims.
-    await page.locator('.nav-link[data-section="slides/text"]').click();
+    await page.locator('.nav-link[data-section="slides"]').click();
+    await page.locator('.om-subnav button[data-tab="text"]').click();
     const canvasAfter = page.locator(".editor .editor-canvas");
     await expect(canvasAfter).toHaveAttribute("width", "192");
     await expect(canvasAfter).toHaveAttribute("height", "64");
@@ -51,7 +52,8 @@ test("re-mount wipes the editor's in-progress draft", async ({ page }) => {
     await page.locator(".settings-save").click();
     await expect(page.locator(".settings-status")).toHaveText("Saved.");
 
-    await page.locator('.nav-link[data-section="slides/text"]').click();
+    await page.locator('.nav-link[data-section="slides"]').click();
+    await page.locator('.om-subnav button[data-tab="text"]').click();
     // Draft is gone (empty textarea).
     await expect(page.locator(".editor .field-text")).toHaveValue("");
 });
@@ -64,12 +66,13 @@ test("image + video uploader canvases also pick up the new dims", async ({ page 
     await page.locator(".settings-save").click();
     await expect(page.locator(".settings-status")).toHaveText("Saved.");
 
-    await page.locator('.nav-link[data-section="slides/image"]').click();
+    await page.locator('.nav-link[data-section="slides"]').click();
+    await page.locator('.om-subnav button[data-tab="image"]').click();
     const imgCanvas = page.locator(".image-upload .image-upload-canvas");
     await expect(imgCanvas).toHaveAttribute("width", "256");
     await expect(imgCanvas).toHaveAttribute("height", "128");
 
-    await page.locator('.nav-link[data-section="slides/video"]').click();
+    await page.locator('.om-subnav button[data-tab="video"]').click();
     // Video uploader's preview is a <video> (not a canvas) — its shape
     // is driven by inline `style.aspectRatio`, set from the panel dims
     // at mount time. The thumbnail-generation canvas is offscreen.

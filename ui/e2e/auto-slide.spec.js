@@ -15,10 +15,11 @@ test.beforeEach(() => {
 test("auto-mode time slide ticks in the live preview overlay", async ({ page }) => {
     test.setTimeout(60_000);
 
-    await page.goto("/");
+    await page.goto("/#/slides/text");
 
     // 1) Create a "current time" slide with HH:MM:SS format so seconds
-    //    visibly change each refresh.
+    //    visibly change each refresh. Autosave fires on each field change;
+    //    we wait once at the end for the round-trip.
     await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.locator(".editor .field-name").fill("Clock");
     await page.locator(".editor .field-text").fill("--:--:--");
@@ -28,8 +29,8 @@ test("auto-mode time slide ticks in the live preview overlay", async ({ page }) 
     await page.locator(".editor .field-auto-format").selectOption("time_hms");
     // Keep slide short so the e2e runs fast; 3s is plenty for two ticks.
     await page.locator(".editor .field-duration").fill("3");
-    await page.locator(".editor .field-save").click();
-    await expect(page.locator(".editor-status")).toHaveText("Saved.");
+    await expect(page.locator(".editor .editor-status"))
+        .toContainText(/Saved/, { timeout: 5_000 });
 
     // 2) Put the slide in the default playlist.
     const content = await (await page.request.get("/api/content")).json();
