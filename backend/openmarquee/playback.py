@@ -13,6 +13,17 @@ VideoSlide in the playlist shows the thumbnail for `duration_ms` and
 advances. Real video playback (decoding asset.mp4 to frames on the Pi's
 hardware H.264 decoder) lands with the HDMI renderer (Phase 6).
 
+Phase 5b deferral: TextSlides can reference a VideoSlide via
+`background_video_slide_id` (SYSTEM_SPEC §5.10). The browser-side
+inline preview already composites the slide's text over the live video
+frames at this commit. The device-side composite path — alpha-blend
+text PNG over .rgb panel frames + ffmpeg `overlay` filter for HDMI —
+is the same shape but needs a real video frame stream first, which
+arrives in Phase 6. Tracking as Phase 5c. Until then this loop also
+treats Text-over-Video slides as still thumbnails (the editor saves
+a flattened text-over-thumbnail PNG as a fallback — see
+content/__init__.py::TextSlide::background_video_slide_id docstring).
+
 Items are re-fetched between iterations, so adding/deleting slides while
 playing takes effect on the next cycle without restarting the loop. A
 failed render (missing asset, corrupt PNG) is logged and skipped — one
