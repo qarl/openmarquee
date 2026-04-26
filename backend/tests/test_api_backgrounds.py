@@ -121,6 +121,42 @@ def test_generate_rejects_empty_prompt(client: TestClient, monkeypatch):
     assert response.status_code == 422
 
 
+def test_generate_accepts_prompt_at_500_char_limit(client: TestClient, monkeypatch):
+    """500 is the max_length cap; values up to and including 500 must
+    pass validation. Regression on the off-by-one — admin asked for
+    'sane max ≈ 500 SD-prompt-budget' (QA explore-bg-gen 2026-04-26)."""
+    _stub_provider_generate(monkeypatch)
+    response = client.post(
+        "/api/backgrounds/generate",
+        json={"prompt": "x" * 500},
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_generate_rejects_prompt_over_500_chars(client: TestClient, monkeypatch):
+    """Anything past 500 should 422 with a structured detail instead
+    of round-tripping to Pollinations. Pollinations would fail upstream
+    anyway; defensive validation catches the typo / pasted-novel at
+    the API edge so the operator gets a clean error fast."""
+    _stub_provider_generate(monkeypatch)
+    response = client.post(
+        "/api/backgrounds/generate",
+        json={"prompt": "x" * 501},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert isinstance(body["detail"], list)
+    # Pydantic emits `string_too_long` with `max_length=500` in ctx for
+    # this constraint — pin both so a future cap change is forced to
+    # update the test.
+    err = body["detail"][0]
+    assert err["type"] == "string_too_long"
+    # Subset check: pydantic v2 emits {"max_length": N} today; future
+    # versions may add ctx keys (actual_length, etc.). Don't pin the
+    # full dict.
+    assert err["ctx"]["max_length"] == 500
+
+
 def test_generate_accepts_optional_name_override(client: TestClient, monkeypatch):
     _stub_provider_generate(monkeypatch)
     response = client.post(

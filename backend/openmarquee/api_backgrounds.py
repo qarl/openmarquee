@@ -37,7 +37,13 @@ SettingsDep = Annotated[SettingsStorage, Depends(get_settings_storage)]
 
 
 class BackgroundGenerateRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=4000)
+    # 500 chars matches the typical SD / generic-image-gen prompt budget;
+    # longer prompts hit upstream provider limits before they help. The
+    # earlier 4000-char cap was effectively no cap (a 2 KB prompt sailed
+    # through unnoticed in QA's exploratory probe — explore-bg-gen.md).
+    # Defensive: catches operator typos / pasted novels at the API edge
+    # rather than wasting a Pollinations round-trip to find out.
+    prompt: str = Field(min_length=1, max_length=500)
     name: str | None = Field(default=None, max_length=200)
     provider: str | None = Field(
         default=None,
