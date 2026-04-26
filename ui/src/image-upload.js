@@ -237,27 +237,18 @@ export function mountImageUploader(
         );
     }
 
-    // Initial state: open the most-recent saved image for edit. Falls
-    // back to a blank-create form when there are no images yet. +New
-    // resets to blank explicitly.
+    // Initial state: a blank create form. The editor surface is
+    // dominantly used to upload NEW images, not to re-edit existing
+    // ones (image bytes rarely change after upload — operators replace
+    // a wrong file by deleting and re-uploading, not by editing in
+    // place). Auto-opening the most-recent slide for edit caused a UX
+    // surprise (QA 2026-04-26 explore-image-upload.md): an operator
+    // who landed here to upload a new file picked one and silently
+    // overwrote the auto-loaded slide via PUT. The slide-browser tile
+    // click path (onSelect → loadForEdit) keeps the explicit
+    // edit-existing flow available — it just isn't the default.
     (async () => {
-        let firstItem = null;
-        if (fetchItems) {
-            try {
-                const items = await fetchItems();
-                firstItem = items
-                    .filter((it) => it.type === "image")
-                    .sort((a, b) =>
-                        String(b.created_at || "").localeCompare(
-                            String(a.created_at || ""),
-                        ),
-                    )[0] || null;
-            } catch {
-                // fall through to blank
-            }
-        }
-        if (firstItem) await loadForEdit(firstItem);
-        else await resetToBlank();
+        await resetToBlank();
     })();
     /**
      * +New flow: render a placeholder thumbnail (black canvas with the

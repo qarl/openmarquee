@@ -373,26 +373,14 @@ export function mountVideoUploader(
         );
     }
 
-    // Initial state: open the most-recent saved video for edit. Falls
-    // back to blank-create when no videos exist. +New resets to blank.
+    // Initial state: a blank create form. Same UX argument as the image
+    // uploader (QA 2026-04-26 explore-image-upload.md): operators come
+    // here to upload NEW files; auto-opening the most-recent video for
+    // edit means a fresh file pick PUTs over its bytes silently.
+    // Slide-browser tiles still dispatch loadForEdit on click for the
+    // explicit edit-existing path.
     (async () => {
-        let firstItem = null;
-        if (fetchItems) {
-            try {
-                const items = await fetchItems();
-                firstItem = items
-                    .filter((it) => it.type === "video")
-                    .sort((a, b) =>
-                        String(b.created_at || "").localeCompare(
-                            String(a.created_at || ""),
-                        ),
-                    )[0] || null;
-            } catch {
-                // fall through to blank
-            }
-        }
-        if (firstItem) await loadForEdit(firstItem);
-        else await resetToBlank();
+        await resetToBlank();
     })();
     /**
      * +New flow: render a placeholder thumbnail + submit a tiny

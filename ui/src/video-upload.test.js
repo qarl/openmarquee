@@ -101,6 +101,37 @@ describe("mountVideoUploader", () => {
         window.Image = RealImage;
     });
 
+    it("starts in blank-create mode even when fetchItems has saved videos (regression: QA explore-image-upload 2026-04-26)", async () => {
+        // Same UX argument as image-upload: the uploader stays blank on
+        // mount so an operator who picks a file doesn't silently overwrite
+        // an auto-loaded existing video. Edit-existing still works via
+        // slide-browser tile click → loadForEdit.
+        const container = document.createElement("div");
+        const onSave = vi.fn();
+        const onSaveExisting = vi.fn();
+        mountVideoUploader(container, {
+            width: 128,
+            height: 96,
+            onSave,
+            onSaveExisting,
+            fetchItems: async () => [
+                {
+                    id: "older-vid",
+                    type: "video",
+                    name: "Old Loop",
+                    created_at: "2026-04-20T00:00:00Z",
+                },
+            ],
+        });
+        for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 0));
+        // Auto-name path took over instead of loading "Old Loop".
+        expect(container.querySelector(".field-name").value).toMatch(
+            /Video Slide \d+/,
+        );
+        expect(onSaveExisting).not.toHaveBeenCalled();
+        expect(onSave).not.toHaveBeenCalled();
+    });
+
     it("file pick with no file is a no-op (no save attempted)", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn();

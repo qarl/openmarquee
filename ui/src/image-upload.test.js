@@ -115,6 +115,62 @@ describe("mountImageUploader", () => {
         window.Image = RealImage;
     });
 
+    it("starts in blank-create mode even when fetchItems has saved images (regression: QA explore-image-upload 2026-04-26)", async () => {
+        // The uploader used to auto-load the most-recent saved image
+        // for edit on mount. An operator who landed here to upload a
+        // NEW file then picked one — the file-pick handler PUTs the
+        // bytes against `editingId` (the auto-loaded slide) and silently
+        // overwrote it. Now the uploader stays blank on mount; explicit
+        // edit-existing happens via clicking a slide-browser tile.
+        const RealImage = window.Image;
+        window.Image = class {
+            constructor() {
+                setTimeout(() => this.onload && this.onload(), 0);
+            }
+            set src(_) {}
+            set crossOrigin(_) {}
+            set onload(fn) { this._onload = fn; }
+            get onload() { return this._onload; }
+            onerror = null;
+            width = 128;
+            height = 96;
+        };
+        try {
+            patchCanvasPrototype();
+            const container = document.createElement("div");
+            const onSave = vi.fn();
+            const onSaveExisting = vi.fn();
+            mountImageUploader(container, {
+                width: 128,
+                height: 96,
+                onSave,
+                onSaveExisting,
+                fetchItems: async () => [
+                    {
+                        id: "older-img",
+                        type: "image",
+                        name: "Parchment - Background",
+                        created_at: "2026-04-20T00:00:00Z",
+                    },
+                ],
+            });
+            // Drain a few ticks so any IIFE that WOULD have fired
+            // loadForEdit has had its chance.
+            for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 0));
+
+            // Name field should be the auto-allocated next-name, not the
+            // existing slide's name.
+            expect(container.querySelector(".field-name").value).toMatch(
+                /Image Slide \d+/,
+            );
+            // No PUT/POST should have fired for the auto-loaded slide.
+            expect(onSaveExisting).not.toHaveBeenCalled();
+            expect(onSave).not.toHaveBeenCalled();
+        } finally {
+            window.Image = RealImage;
+        }
+    });
+
     it("rejects loadForEdit on a non-image slide with a friendly status", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
