@@ -64,16 +64,17 @@ export const FONT_FAMILIES = [
     { value: "VT323",                 label: "VT323",                 category: "Mono",       weight: 400 },
     { value: "JetBrains Mono",        label: "JetBrains Mono",        category: "Mono",       weight: 700 },
     { value: "Space Mono",            label: "Space Mono",            category: "Mono",       weight: 700 },
-    // Script / decorative — flowing or themed letterforms.
+    // Script — flowing scripts, themed display, casual handwriting,
+    // and chalk/marker letterforms all share the same use-case bucket
+    // for the operator (decorative + personality vs typographic class).
     { value: "Pacifico",              label: "Pacifico",              category: "Script",     weight: 400 },
     { value: "Rye",                   label: "Rye",                   category: "Script",     weight: 400 },
     { value: "Sedgwick Ave Display",  label: "Sedgwick Ave Display",  category: "Script",     weight: 400 },
-    // Chalk / handwritten — casual, marker, sidewalk-sign vibes.
-    { value: "Caveat Brush",          label: "Caveat Brush",          category: "Chalk",      weight: 400 },
-    { value: "Permanent Marker",      label: "Permanent Marker",      category: "Chalk",      weight: 400 },
-    { value: "Caveat",                label: "Caveat",                category: "Chalk",      weight: 700 },
-    { value: "Reenie Beanie",         label: "Reenie Beanie",         category: "Chalk",      weight: 400 },
-    { value: "Shadows Into Light",    label: "Shadows Into Light",    category: "Chalk",      weight: 400 },
+    { value: "Caveat Brush",          label: "Caveat Brush",          category: "Script",     weight: 400 },
+    { value: "Permanent Marker",      label: "Permanent Marker",      category: "Script",     weight: 400 },
+    { value: "Caveat",                label: "Caveat",                category: "Script",     weight: 700 },
+    { value: "Reenie Beanie",         label: "Reenie Beanie",         category: "Script",     weight: 400 },
+    { value: "Shadows Into Light",    label: "Shadows Into Light",    category: "Script",     weight: 400 },
 ];
 
 const FONT_WEIGHT_BY_VALUE = new Map(FONT_FAMILIES.map((f) => [f.value, f.weight]));
