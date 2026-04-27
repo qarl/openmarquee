@@ -41,5 +41,6 @@ sync_to_build_dir() {
         --exclude='openmarquee-content' \
         --exclude='openmarquee-*.json' \
         --exclude='*.log' \
+        --exclude='demo/' \
         "$OPENMARQUEE_SRC/" "$OPENMARQUEE_BUILD_DIR/"
 }
