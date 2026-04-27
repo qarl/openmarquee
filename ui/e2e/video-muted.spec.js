@@ -1,10 +1,15 @@
-// Regression for bug (#5): videos should play without sound and the
-// browser's volume slider should be absent from the preview element.
-// Captive-portal signage isn't meant to blast audio at whoever walks by.
+// Regression for bug (#5): videos should play without sound. Captive-
+// portal signage isn't meant to blast audio at whoever walks by.
+//
+// Note on the volume slider: an earlier version of this test also
+// asserted controlslist included `novolumeslider`, but Chromium never
+// recognized that token (only nodownload / nofullscreen / noplaybackrate /
+// noremoteplayback are real). The slider stays as Chromium renders it;
+// the muted default is what guarantees silence regardless.
 
 import { expect, test } from "@playwright/test";
 
-test("video preview element is muted and hides the volume slider", async ({ page }) => {
+test("video preview element is muted", async ({ page }) => {
     await page.goto("/#/slides/video");
     const video = page.locator(".video-upload-video");
     await expect(video).toBeVisible();
@@ -13,7 +18,6 @@ test("video preview element is muted and hides the volume slider", async ({ page
     // template. `toHaveJSProperty` reads the DOM property, which is the
     // reliable check for boolean attrs.
     await expect(video).toHaveJSProperty("muted", true);
-    await expect(video).toHaveAttribute("controlslist", /novolumeslider/);
 
     // Double-check the DOM property too — a video element stays muted
     // across src swaps, which matters for the edit-existing flow.

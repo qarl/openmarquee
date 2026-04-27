@@ -29,7 +29,7 @@ const TEMPLATE = `
             </div>
             <div class="preview-wrap">
                 <video class="video-upload-video" playsinline controls muted
-                       controlslist="novolumeslider nofullscreen noplaybackrate nodownload noremoteplayback"
+                       controlslist="nofullscreen noplaybackrate nodownload noremoteplayback"
                        aria-label="video preview"></video>
             </div>
             <div class="om-card">
