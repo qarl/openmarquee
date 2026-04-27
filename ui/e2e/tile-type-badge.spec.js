@@ -1,12 +1,9 @@
-// Pallet tiles carry an "Aa"/"🖼"/"▶" type badge so an operator scanning
-// a mixed-type pallet can spot a slide's medium at a glance. The
-// slide-browser tiles deliberately don't — the slides shell tab subnav
-// (Text / Image / Video) already filters by type, making the per-tile
-// corner badge redundant chrome (see slide-browser.js renderTile).
-//
-// Original bug #6 ("browser tiles look different from pallet tiles")
-// was resolved by retiring the badge on the browser side, not by
-// adding it everywhere.
+// The slide-browser tiles deliberately don't carry a type badge —
+// the slides shell tab subnav (Text / Image / Video) already filters
+// by type, making the per-tile corner badge redundant chrome (see
+// slide-browser.js renderTile). Pallet tiles also dropped their
+// badge in the qarl UX-cleanup batch — the thumbnail conveys medium
+// well enough on its own.
 
 import { expect, test } from "@playwright/test";
 import { resetServerState, saveTextSlide } from "./_helpers.js";
@@ -23,12 +20,11 @@ test("slide-browser tile does NOT carry a type badge (subnav handles type filter
     await expect(tile.locator(".slide-browser-tile-type")).toHaveCount(0);
 });
 
-test("pallet tile for a text slide carries an Aa badge", async ({ page }) => {
+test("pallet tile does NOT carry a type badge (thumbnail conveys medium)", async ({ page }) => {
     await saveTextSlide(page, "BadgeTest");
 
     await page.goto("/#/playlists");
     const tile = page.locator('.pallet-tile[data-id]', { hasText: "BadgeTest" });
-    const badge = tile.locator(".pallet-tile-type");
-    await expect(badge).toHaveCount(1);
-    await expect(badge).toHaveText("Aa");
+    await expect(tile).toBeVisible();
+    await expect(tile.locator(".pallet-tile-type")).toHaveCount(0);
 });

@@ -30,10 +30,6 @@ const TEMPLATE = `
                 <label class="om-field">
                     <span>Image file (JPG or PNG)</span>
                     <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
-                    <span class="image-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
-                        Editing an existing image — leave the file picker blank
-                        to just update name / duration.
-                    </span>
                 </label>
             </div>
             <p class="om-save-status image-upload-status" role="status" aria-live="polite" data-state="idle"></p>
@@ -66,7 +62,6 @@ export function mountImageUploader(
     canvas.height = height;
     canvas.style.aspectRatio = `${width} / ${height}`;
 
-    const editHintEl = container.querySelector(".image-upload-edit-hint");
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
@@ -107,7 +102,6 @@ export function mountImageUploader(
         if (created?.id) {
             state.editingId = String(created.id);
             state.sourceFile = null;
-            editHintEl.hidden = false;
             if (browser) browser.highlight(state.editingId);
         }
     }
@@ -161,7 +155,6 @@ export function mountImageUploader(
         // overridden by a loadForEdit that interleaves later.
         state.editingId = null;
         state.sourceFile = null;
-        editHintEl.hidden = true;
         fileEl.value = "";
         durationEl.value = "5";
         clearCanvas();
@@ -204,7 +197,6 @@ export function mountImageUploader(
         }
         state.editingId = String(slide.id);
         state.sourceFile = null; // existing bytes are server-side; no new file picked
-        editHintEl.hidden = false;
         if (browser) browser.highlight(slide.id);
         nameEl.value = slide.name || "Image";
         durationEl.value = String(
@@ -275,7 +267,6 @@ export function mountImageUploader(
             const created = await onSave(payload);
             if (created?.id) {
                 state.editingId = String(created.id);
-                editHintEl.hidden = false;
                 if (browser) {
                     await browser.refresh();
                     browser.highlight(state.editingId);

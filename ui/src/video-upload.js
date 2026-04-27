@@ -29,17 +29,13 @@ const TEMPLATE = `
             </div>
             <div class="preview-wrap">
                 <video class="video-upload-video" playsinline controls muted
-                       controlslist="novolumeslider nodownload noremoteplayback"
+                       controlslist="novolumeslider nofullscreen noplaybackrate nodownload noremoteplayback"
                        aria-label="video preview"></video>
             </div>
             <div class="om-card">
                 <label class="om-field">
                     <span>Video file (any format ffmpeg can decode)</span>
                     <input type="file" accept="video/*" class="om-input field-file">
-                    <span class="video-upload-edit-hint" hidden style="margin-top: 4px; color: var(--om-text-dim); font-size: 12px;">
-                        Editing an existing video — leave the file picker blank
-                        to just update name / duration.
-                    </span>
                 </label>
             </div>
             <p class="om-save-status video-upload-status" role="status" aria-live="polite" data-state="idle"></p>
@@ -114,7 +110,6 @@ export function mountVideoUploader(
     canvas.width = width;
     canvas.height = height;
 
-    const editHintEl = container.querySelector(".video-upload-edit-hint");
     const fileEl = container.querySelector(".field-file");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
@@ -274,7 +269,6 @@ export function mountVideoUploader(
             state.editingId = String(created.id);
             state.thumbnailCanvasReady = false;
             state.mp4Base64 = null;
-            editHintEl.hidden = false;
             if (browser) browser.highlight(state.editingId);
         }
     }
@@ -295,7 +289,6 @@ export function mountVideoUploader(
         state.thumbnailCanvasReady = false;
         state.mp4Base64 = null;
         state.durationSeconds = null;
-        editHintEl.hidden = true;
         fileEl.value = "";
         durationEl.value = "10";
         clearCanvas(canvas);
@@ -338,7 +331,6 @@ export function mountVideoUploader(
         state.thumbnailCanvasReady = false;
         state.mp4Base64 = null;
         state.durationSeconds = null;
-        editHintEl.hidden = false;
         if (browser) browser.highlight(slide.id);
         nameEl.value = slide.name || "Video";
         durationEl.value = String(
@@ -405,7 +397,6 @@ export function mountVideoUploader(
             const created = await onSave(payload);
             if (created?.id) {
                 state.editingId = String(created.id);
-                editHintEl.hidden = false;
                 if (browser) {
                     await browser.refresh();
                     browser.highlight(state.editingId);

@@ -53,7 +53,7 @@ const TEMPLATE = `
             <div class="om-pallet-head">
                 <h3>Pallet · saved slides</h3>
             </div>
-            <ul class="playlist-pallet om-pallet-row" role="list"></ul>
+            <ul class="playlist-pallet" role="list"></ul>
         </div>
 
         <p class="om-save-status playlist-track-status" role="status" aria-live="polite" data-state="idle"></p>
@@ -514,9 +514,6 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
     li.dataset.id = String(item.id);
     li.dataset.type = item.type;
     const safeName = escapeHtml(item.name || "Untitled");
-    const typeBadge = escapeHtml(
-        item.type === "video" ? "▶" : item.type === "image" ? "🖼" : "Aa",
-    );
     const lockedBadge = locked
         ? `<span class="pallet-tile-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
         : "";
@@ -526,7 +523,6 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
         <div class="pallet-tile-thumb-wrap">
             <img class="pallet-tile-thumb" alt="" draggable="false"
                  src="/api/content/${item.id}/asset?v=${cacheBust}">
-            <div class="pallet-tile-type" aria-hidden="true">${typeBadge}</div>
             ${lockedBadge}
             <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
             <button type="button" class="pallet-tile-delete"

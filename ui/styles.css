@@ -624,16 +624,16 @@ header h1 {
     list-style: none;
     margin: 0;
     padding: 10px var(--om-pad);
-    display: flex;
-    gap: 8px;
-    overflow-x: auto;
-    scroll-snap-type: x mandatory;
+    /* Grid layout — every pallet tile fits in a single scroll-to-fit
+       view instead of a horizontal strip the operator has to arrow
+       through. Same pattern as .slide-browser-list so the two grids
+       look consistent across the editor. */
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
+    gap: 0.5rem;
 }
 
 .pallet-tile {
-    flex-shrink: 0;
-    width: 110px;
-    scroll-snap-align: start;
     background: var(--om-surface-2, var(--panel));
     border: 1px solid var(--om-line, var(--panel-border));
     border-radius: 8px;
@@ -693,17 +693,6 @@ header h1 {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-}
-
-.pallet-tile-type {
-    position: absolute;
-    top: 0.35rem;
-    right: 0.45rem;
-    font-size: 0.7rem;
-    color: #fff;
-    background: rgba(0, 0, 0, 0.5);
-    border-radius: 999px;
-    padding: 0 0.35rem;
 }
 
 .pallet-tile-edit {
@@ -949,9 +938,8 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     opacity: 1;
 }
 .slide-browser-tile-delete:hover { background: var(--danger); color: #1a1a1d; }
-/* Type badge — mirrors .pallet-tile-type so a given slide looks the
-   same everywhere (browser strip + playlist pallet). The delete × at
-   top-right stays the focus visually; this sits top-left. */
+/* Type badge in the browser strip. Delete × at top-right stays the
+   focus visually; this sits top-left. */
 .slide-browser-tile-type {
     position: absolute;
     top: 0.35rem;
@@ -2775,33 +2763,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--om-text-dim);
 }
-.om-pallet-row {
-  display: flex; gap: 8px;
-  padding: 10px var(--om-pad);
-  overflow-x: auto;
-  scroll-snap-type: x mandatory;
-}
-.om-pallet-row .om-pallet-card {
-  flex-shrink: 0;
-  width: 110px;
-  scroll-snap-align: start;
-  background: var(--om-surface-2);
-  border: 1px solid var(--om-line);
-  border-radius: 8px;
-  overflow: hidden;
-  cursor: grab;
-}
-.om-pallet-row .om-pallet-card:hover { border-color: var(--om-line-2); }
-.om-pallet-row .om-pallet-card .om-pallet-thumb {
-  aspect-ratio: 2/1; background: var(--om-led-bg);
-}
-.om-pallet-row .om-pallet-card .om-pallet-meta {
-  padding: 5px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-
 /* ─── Flock dashboard ─── */
 .om-flock-grid {
   display: grid;
@@ -2950,11 +2911,10 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   margin: 8px auto 4px;
 }
 .om-sheet-head {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; justify-content: flex-end;
   padding: 8px var(--om-pad) 10px;
   border-bottom: 1px solid var(--om-line);
 }
-.om-sheet-head h3 { margin: 0; font-size: 16px; font-weight: 600; flex: 1; }
 .om-sheet-body { padding: var(--om-pad); overflow-y: auto; flex: 1; }
 @keyframes om-sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
 @keyframes om-fade-in  { from { opacity: 0; } to { opacity: 1; } }
@@ -3014,8 +2974,6 @@ html, body { margin: 0; padding: 0; height: 100%; }
     .om-topbar [data-section-title],
     .om-topbar .om-pill { display: none; }
     .om-topbar [data-peer-pill] { display: inline-flex; flex-shrink: 0; }
-    /* Pallet cards shrink so at least 2 are visible without scroll. */
-    .pallet-tile { width: 96px; }
 }
 @media (max-width: 560px) {
     .row { flex-wrap: wrap; }

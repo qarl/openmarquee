@@ -614,7 +614,6 @@ async function boot() {
             sheet.innerHTML = `
                 <div class="om-sheet-grip"></div>
                 <div class="om-sheet-head">
-                    <h3>Menu</h3>
                     <button type="button" class="om-btn ghost icon sm" aria-label="Close menu" data-icon="close"></button>
                 </div>
                 <div class="om-sheet-body"></div>
