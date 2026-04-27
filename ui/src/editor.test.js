@@ -820,6 +820,36 @@ describe("mountEditor — visual font picker", () => {
         }
     });
 
+    it("clicking a tile fires BOTH input and change on the select (regression QA #2026-04-26: picker fired only change → canvas preview never updated)", () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountEditor(container, {
+                width: 128, height: 96,
+                onSave: vi.fn().mockResolvedValue({}),
+            });
+            const select = container.querySelector(".field-font-family");
+            const events = [];
+            select.addEventListener("input", () => events.push("input"));
+            select.addEventListener("change", () => events.push("change"));
+
+            container.querySelector(".font-picker-trigger").click();
+            container
+                .querySelector(".font-picker-popover")
+                .querySelector('[data-value="Oswald"]')
+                .click();
+
+            // Input must fire before change to match a native <select>'s
+            // user-pick semantics — syncAndRender is wired to input,
+            // and the font-load handler on change reads state.fontFamily
+            // which input has just updated.
+            expect(events).toEqual(["input", "change"]);
+        } finally {
+            container.remove();
+        }
+    });
+
     it("clicking the trigger toggles the popover; clicking a tile selects + closes", () => {
         patchCanvasPrototype();
         const container = document.createElement("div");

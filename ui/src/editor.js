@@ -154,6 +154,13 @@ function setupFontPicker(container) {
             return;
         }
         selectEl.value = value;
+        // Native <select> fires both `input` and `change` on user pick;
+        // the editor wires `input` to syncAndRender (state + canvas
+        // redraw) and `change` to font-load-then-redraw. Dispatching
+        // only `change` leaves the live preview stale until the next
+        // input on any field. Mimic the native pair to keep both
+        // pathways in sync.
+        selectEl.dispatchEvent(new Event("input", { bubbles: true }));
         selectEl.dispatchEvent(new Event("change", { bubbles: true }));
         syncTrigger();
         setOpen(false);
