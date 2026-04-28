@@ -93,6 +93,21 @@ class PlaybackLoop:
         self._auto_tick = auto_tick_seconds
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
+        # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
+        # stream session is active, it pause()s the loop, takes over
+        # render_frame() calls itself, then resume()s when done. Two
+        # events because asyncio.Event has no "wait for clear": _pause
+        # set means "stop rendering and yield", _resume set means
+        # "start rendering again". They're mutually exclusive — pause()
+        # and resume() flip them as a pair.
+        self._pause_event: asyncio.Event | None = None
+        self._resume_event: asyncio.Event | None = None
+        # Index in the current items[] where the loop was when pause
+        # took effect. None when not paused; set so the loop resumes
+        # at the same slide rather than restarting the playlist from 0.
+        # Sub-second position-within-slide is NOT tracked — the slide
+        # plays for its full duration on resume.
+        self._resume_at_index: int | None = None
         self._current_id: UUID | None = None
         # Exposed alongside _current_id so the UI's live preview knows
         # whether to render a <video> or a <img> without a second round
@@ -119,6 +134,24 @@ class PlaybackLoop:
     @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    @property
+    def is_paused(self) -> bool:
+        """True when a pause has been requested and not yet resumed.
+
+        Stream takeover (SYSTEM_SPEC §5.11) flips this on while a
+        WebRTC session is active so the playback loop yields the
+        renderer to the stream's frame source.
+        """
+        return self._pause_event is not None and self._pause_event.is_set()
+
+    @property
+    def renderer(self) -> Renderer:
+        """The renderer the loop drives. Exposed so a paused loop's
+        external frame source (e.g. the stream session) can push frames
+        through the same wire format the loop normally uses, instead of
+        instantiating a parallel renderer."""
+        return self._renderer
 
     @property
     def current_item_id(self) -> UUID | None:
@@ -148,8 +181,15 @@ class PlaybackLoop:
         """Start the loop. No-op if already running."""
         if self.is_running:
             return
-        # Bind the Event to the running event loop on each start.
+        # Bind the Events to the running event loop on each start.
         self._stop_event = asyncio.Event()
+        self._pause_event = asyncio.Event()
+        self._resume_event = asyncio.Event()
+        # Initial state: not paused, so resume_event is set so any caller
+        # that checks "are we allowed to run?" sees true. _pause_event is
+        # the inverse signal — set means "yield."
+        self._resume_event.set()
+        self._resume_at_index = None
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
@@ -167,6 +207,9 @@ class PlaybackLoop:
             await task
         finally:
             self._stop_event = None
+            self._pause_event = None
+            self._resume_event = None
+            self._resume_at_index = None
             self._current_id = None
             self._current_type = None
             self._current_transition = None
@@ -177,7 +220,15 @@ class PlaybackLoop:
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
+        assert self._pause_event is not None
         while not self._stop_event.is_set():
+            # If pause was requested while we were between iterations,
+            # wait here for resume (or stop) before fetching items.
+            if self._pause_event.is_set():
+                await self._wait_for_resume()
+                if self._stop_event.is_set():
+                    break
+
             try:
                 items = self._fetch_items()
             except Exception:
@@ -194,13 +245,31 @@ class PlaybackLoop:
                 await self._wait(self._empty_poll)
                 continue
 
+            # Resume mid-cycle if a previous iteration was interrupted by
+            # pause. If the items list shrank during pause and the saved
+            # index now points past the end, fall back to 0. Explicit
+            # None-check rather than `or 0` so a legitimate save of
+            # index 0 doesn't degrade through the falsy-coalesce.
+            start_idx = 0 if self._resume_at_index is None else self._resume_at_index
+            self._resume_at_index = None
+            if start_idx >= len(items):
+                start_idx = 0
+
             # Pre-load images lazily inside the per-item iteration so a
             # mid-cycle add/delete is reflected on the next pass without
             # ballooning memory for a hundred-slide playlist.
-            for i, item in enumerate(items):
+            for i in range(start_idx, len(items)):
                 if self._stop_event.is_set():
                     break
 
+                # Pause-check at the top of each iteration: if a stream
+                # takeover requested pause, save where we are so the
+                # outer-while resumes here, and yield the renderer.
+                if self._pause_event.is_set():
+                    self._resume_at_index = i
+                    break
+
+                item = items[i]
                 self._current_id = item.id
                 self._current_type = item.type
                 self._current_transition = item.transition
@@ -237,6 +306,13 @@ class PlaybackLoop:
                 if self._stop_event.is_set():
                     break
 
+                # If the wait was woken by a pause request mid-slide,
+                # skip the transition and resume at the same index so
+                # the user sees the same slide when stream stops.
+                if self._pause_event.is_set():
+                    self._resume_at_index = i
+                    break
+
                 # Transition into the next slide (wraps to first). "cut"
                 # is instant → no-op. single-item playlists also no-op
                 # (next == current). Honors the current item's setting
@@ -261,10 +337,77 @@ class PlaybackLoop:
                             await self._iris(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
-        """Sleep up to `seconds`, returning early if stop is requested."""
+        """Sleep up to `seconds`, returning early on stop or pause request.
+
+        Pause-awareness keeps stream takeover responsive: without it, a
+        5-second slide on screen would mean up to 5s of playlist render
+        before the stream session's pause() actually yields the renderer.
+        """
         assert self._stop_event is not None
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        assert self._pause_event is not None
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        pause_task = asyncio.create_task(self._pause_event.wait())
+        try:
+            await asyncio.wait(
+                [stop_task, pause_task],
+                timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (stop_task, pause_task):
+                t.cancel()
+                # Suppress the swallow-the-cancel exception if a task
+                # already completed before we tried to cancel it.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+
+    async def _wait_for_resume(self) -> None:
+        """Block until resume_event is set OR stop_event is set.
+
+        Used by the outer-while when a stream takeover has paused the
+        loop — we yield indefinitely (no rendering, no advancing) until
+        the stream session ends or the loop is asked to stop entirely.
+        """
+        assert self._resume_event is not None
+        assert self._stop_event is not None
+        resume_task = asyncio.create_task(self._resume_event.wait())
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        try:
+            await asyncio.wait(
+                [resume_task, stop_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (resume_task, stop_task):
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+
+    async def pause(self) -> None:
+        """Request the loop yield rendering. No-op if not running.
+
+        Used by Stream takeover (SYSTEM_SPEC §5.11): when a WebRTC
+        session activates, it pause()s the loop, takes over render_frame
+        calls itself, then resume()s when the session ends. Idempotent —
+        repeated pause() calls don't accumulate state.
+        """
+        if self._pause_event is None or self._resume_event is None:
+            return
+        self._resume_event.clear()
+        self._pause_event.set()
+
+    async def resume(self) -> None:
+        """Resume after pause. No-op if not paused or not running.
+
+        The loop wakes from _wait_for_resume, refetches items, and
+        continues at the saved index — same slide that was on screen
+        before pause (sub-second position-within-slide is not tracked,
+        so that slide plays for its full duration on resume).
+        """
+        if self._pause_event is None or self._resume_event is None:
+            return
+        self._pause_event.clear()
+        self._resume_event.set()
 
     async def _play_auto_slide(self, item: ContentItem) -> Image.Image | None:
         """Tick-render an auto-mode text slide for its full duration.
@@ -275,13 +418,19 @@ class PlaybackLoop:
 
         Returns the last-composed frame so the caller's fade transition
         into the next slide has something to fade from. Returns None if
-        stop_event fires before the first frame lands.
+        stop or pause fires before the first frame lands. Pause exits
+        early so a stream takeover doesn't keep painting auto frames
+        over the live video — same rationale as the transition helpers.
         """
         tz = resolve_timezone(self._get_timezone())
         total = item.duration_ms / 1000
         end_at = asyncio.get_event_loop().time() + total
         last: Image.Image | None = None
         while True:
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return last
             now = datetime.now(tz)
             try:
                 frame = compose_auto_frame(
@@ -297,15 +446,14 @@ class PlaybackLoop:
             self._render_image(frame)
             last = frame
 
-            assert self._stop_event is not None
-            if self._stop_event.is_set():
+            if self._stop_event.is_set() or self._pause_event.is_set():
                 return last
 
             remaining = end_at - asyncio.get_event_loop().time()
             if remaining <= 0:
                 return last
             await self._wait(min(self._auto_tick, remaining))
-            if self._stop_event.is_set():
+            if self._stop_event.is_set() or self._pause_event.is_set():
                 return last
             if asyncio.get_event_loop().time() >= end_at:
                 return last
@@ -370,15 +518,17 @@ class PlaybackLoop:
     ) -> None:
         """Alpha-blend from `from_image` to `to_image` over `transition_ms`.
 
-        Returns early if stop is requested mid-fade. Image.blend is the actual
-        per-pixel math — at alpha=0 we get from_image; at alpha=1 we get
-        to_image.
+        Returns early on stop OR pause request — pause-awareness keeps
+        the transition from painting playlist frames over an in-flight
+        stream takeover. Image.blend is the actual per-pixel math — at
+        alpha=0 we get from_image; at alpha=1 we get to_image.
         """
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         for i in range(1, n_frames + 1):
             assert self._stop_event is not None
-            if self._stop_event.is_set():
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
                 return
             alpha = i / n_frames
             blended = Image.blend(from_image, to_image, alpha)
@@ -400,7 +550,8 @@ class PlaybackLoop:
         width, height = from_image.size
         for i in range(1, n_frames + 1):
             assert self._stop_event is not None
-            if self._stop_event.is_set():
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
                 return
             offset = max(0, min(width, int(round(width * i / n_frames))))
             frame = Image.new("RGB", (width, height))
@@ -435,7 +586,8 @@ class PlaybackLoop:
         cx, cy = width // 2, height // 2
         for i in range(1, n_frames + 1):
             assert self._stop_event is not None
-            if self._stop_event.is_set():
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
                 return
             radius = int(round(max_r * i / n_frames))
             mask = Image.new("L", (width, height), 0)
@@ -464,7 +616,8 @@ class PlaybackLoop:
         width, height = from_image.size
         for i in range(1, n_frames + 1):
             assert self._stop_event is not None
-            if self._stop_event.is_set():
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
                 return
             split = max(0, min(width, int(round(width * i / n_frames))))
             # Compose: left `split` columns from to_image, rest from from_image.

@@ -15,6 +15,7 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "pillow>=10.0",
+    "aiortc>=1.9",
 ]
 
 [project.optional-dependencies]

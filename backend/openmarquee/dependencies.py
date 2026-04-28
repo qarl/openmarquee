@@ -346,3 +346,21 @@ def _playback_loop_singleton() -> PlaybackLoop:
 def get_playback_loop() -> PlaybackLoop:
     """Dependency provider for the playback engine."""
     return _playback_loop_singleton()
+
+
+@lru_cache
+def _stream_manager_singleton():
+    """Process-wide stream takeover manager (SYSTEM_SPEC §5.11).
+
+    Lazy-imported so a backend that never touches /api/stream/* doesn't
+    pay the aiortc import cost (it pulls cryptography, av, libvpx via
+    PyAV — heavy). Holds at most one StreamSession at a time.
+    """
+    from openmarquee.stream import StreamManager
+
+    return StreamManager(_playback_loop_singleton())
+
+
+def get_stream_manager():
+    """Dependency provider for the stream-takeover manager."""
+    return _stream_manager_singleton()

@@ -1,0 +1,392 @@
+"""Phase 12.1 stream takeover coverage (SYSTEM_SPEC §5.11).
+
+Four scenarios called out in IMPLEMENTATION_PLAN Phase 12.1:
+
+1. Frame format — incoming WebRTC frames are downscaled to renderer
+   dims and pushed as RGB888 (matching §7.6 wire format).
+2. Single-publisher — second concurrent /start raises StreamAlreadyActive.
+3. Takeover — /takeover force-stops the existing session and starts new.
+4. Pause-and-resume — PlaybackLoop pauses on stream activate and resumes
+   the same slide it was on when the session ends.
+
+aiortc's RTCPeerConnection is patched out for the orchestration tests
+because the PC's actual SDP/ICE machinery is irrelevant here — the
+StreamManager+StreamSession state and the PlaybackLoop pause/resume
+integration are what we're verifying. Real aiortc gets a live-fire
+exercise in Phase 12.3 (hardware bring-up) instead.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+from typing import Any
+from unittest.mock import patch
+from uuid import UUID
+
+import av
+import numpy as np
+import pytest
+from PIL import Image
+
+from openmarquee.content import TextSlide
+from openmarquee.playback import PlaybackLoop
+from openmarquee.rendering.mock import MockRenderer
+from openmarquee.stream import (
+    StreamAlreadyActive,
+    StreamManager,
+    StreamNotActive,
+    StreamSession,
+)
+
+_FAST_DURATION_MS = 100
+_FAST_EMPTY_POLL = 0.01
+
+
+# --- Fakes -----------------------------------------------------------------
+
+
+class _FakeSdp:
+    """Stand-in for aiortc's RTCSessionDescription. Only `sdp` and `type`
+    are consumed by StreamSession.start, so a thin shim suffices."""
+
+    def __init__(self, sdp: str, type: str):
+        self.sdp = sdp
+        self.type = type
+
+
+class _FakeRTCPeerConnection:
+    """Records calls + serves a canned SDP answer.
+
+    Doesn't try to imitate ICE, codec negotiation, or media flow — the
+    StreamSession's track-consumer side is exercised directly by feeding
+    av.VideoFrames at a real consumer task in test_consume_video.
+    """
+
+    answer_sdp = "v=0\r\nfake-answer\r\n"
+
+    def __init__(self):
+        self.localDescription: _FakeSdp | None = None
+        self.remoteDescription: _FakeSdp | None = None
+        self.handlers: dict[str, Any] = {}
+        self.closed = False
+
+    def on(self, event: str):
+        def decorator(fn):
+            self.handlers[event] = fn
+            return fn
+
+        return decorator
+
+    async def setRemoteDescription(self, desc):
+        self.remoteDescription = desc
+
+    async def createAnswer(self):
+        return _FakeSdp(self.answer_sdp, "answer")
+
+    async def setLocalDescription(self, desc):
+        self.localDescription = desc
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeTrack:
+    """One-shot iterator over canned av.VideoFrames.
+
+    StreamSession._consume_video runs `while not self._closed: await
+    track.recv()`, so once frames are exhausted the recv() raises and
+    the consumer exits its outer try/except. Mirrors how aiortc handles
+    a track ending (MediaStreamError).
+    """
+
+    kind = "video"
+
+    def __init__(self, frames):
+        self._frames = list(frames)
+        self._index = 0
+
+    async def recv(self):
+        if self._index >= len(self._frames):
+            # Yield to other tasks before "ending" so the consumer's
+            # render of the last frame has a chance to run before we
+            # tear down.
+            await asyncio.sleep(0)
+            raise StopAsyncIteration("track ended")
+        frame = self._frames[self._index]
+        self._index += 1
+        return frame
+
+
+# --- Helpers ---------------------------------------------------------------
+
+
+def _video_frame(width: int, height: int, fill: int = 128) -> av.VideoFrame:
+    """Build a single VideoFrame of given dims at a uniform gray fill.
+
+    rgb24 format means PyAV stores the bytes the same way render_frame
+    expects — uniform gray = (fill, fill, fill) for every pixel.
+    """
+    arr = np.full((height, width, 3), fill, dtype=np.uint8)
+    return av.VideoFrame.from_ndarray(arr, format="rgb24")
+
+
+def _png_bytes(width: int, height: int, color: tuple[int, int, int]) -> bytes:
+    img = Image.new("RGB", (width, height), color)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _make_loop_with_three_slides(
+    tmp_path,
+) -> tuple[PlaybackLoop, MockRenderer, list[TextSlide]]:
+    """Standard playlist: A, B, C — each TextSlide rendered at 8×8 px."""
+    renderer = MockRenderer(8, 8, tmp_path / "out.png")
+    slides = [
+        TextSlide(name=name, text=name, duration_ms=_FAST_DURATION_MS) for name in ("A", "B", "C")
+    ]
+    pngs = {
+        slides[0].id: _png_bytes(8, 8, (255, 0, 0)),
+        slides[1].id: _png_bytes(8, 8, (0, 255, 0)),
+        slides[2].id: _png_bytes(8, 8, (0, 0, 255)),
+    }
+
+    def fetch():
+        return list(slides)
+
+    def read_asset(item_id: UUID) -> bytes:
+        return pngs[item_id]
+
+    loop = PlaybackLoop(
+        renderer=renderer,
+        fetch_items=fetch,
+        read_asset=read_asset,
+        empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
+    )
+    return loop, renderer, slides
+
+
+async def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01):
+    """Poll `predicate` until truthy or `timeout` elapses."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+# --- 1. Frame format -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_consume_video_pushes_rgb888_at_renderer_dims(tmp_path):
+    """Stream frames at any size are downscaled to the renderer's
+    native dims and pushed as RGB888 — same wire format §7.6 mandates.
+    Without this guarantee, mixing stream + playlist sources would
+    produce frames the renderer rejects."""
+    renderer = MockRenderer(8, 8, tmp_path / "out.png")
+    # Loop must be running for pause()/resume() to bind events. We
+    # don't actually need it to render anything for this test.
+    loop = PlaybackLoop(
+        renderer=renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
+    )
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = StreamSession(loop)
+            # Bypass start() — it does pause+SDP negotiation we already
+            # have other tests for. Drive the consumer directly.
+            captured: list[bytes] = []
+            original_render = renderer.render_frame
+            renderer.render_frame = lambda data: captured.append(data) or original_render(data)
+
+            # Source frame is 320×240 (different from the 8×8 renderer)
+            # so the cover-fit path is exercised. Consumer's broad
+            # `except Exception` catches the FakeTrack's StopAsyncIteration
+            # cleanly, so this returns rather than re-raises (mirrors
+            # how aiortc's MediaStreamError ends a real session).
+            track = _FakeTrack([_video_frame(320, 240, fill=128)])
+            await session._consume_video(track)
+    finally:
+        await loop.stop()
+
+    assert captured, "consumer didn't push any frame to the renderer"
+    # RGB888 contract: width * height * 3 bytes. Renderer is 8×8 → 192 bytes.
+    assert len(captured[0]) == 8 * 8 * 3
+    # Solid gray input → solid gray output (no swizzle, no channel
+    # reorder); confirms RGB byte order is preserved end-to-end.
+    assert captured[0] == bytes([128] * (8 * 8 * 3))
+
+
+# --- 2. Single-publisher ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_second_start_while_active_raises_stream_already_active(tmp_path):
+    """Second concurrent /start is rejected with the active session id
+    so the phone can switch to the take-over affordance without polling
+    /status separately."""
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = StreamManager(loop)
+            session_id, _answer = await manager.start("v=0\r\noffer-1\r\n")
+            assert manager.is_active
+
+            with pytest.raises(StreamAlreadyActive) as exc_info:
+                await manager.start("v=0\r\noffer-2\r\n")
+            assert exc_info.value.active_session_id == session_id
+
+            # First session is still the active one — refused start
+            # didn't tear it down.
+            assert manager.active_session_id == session_id
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+
+
+# --- 3. Takeover -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_takeover_replaces_active_session_with_new_id(tmp_path):
+    """/takeover force-closes the existing session and starts a fresh
+    one. New session has a different id; old session is closed."""
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = StreamManager(loop)
+            first_id, _ = await manager.start("v=0\r\noffer-1\r\n")
+            first_session = manager._session
+            assert first_session is not None
+
+            second_id, _ = await manager.takeover("v=0\r\noffer-2\r\n")
+
+            assert second_id != first_id
+            assert first_session.closed
+            assert manager.active_session_id == second_id
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_takeover_with_no_active_session_just_starts(tmp_path):
+    """Takeover doesn't require something to be active — phone hits it
+    when the user ack'd the warning, but the previous session may have
+    naturally ended in the interim."""
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = StreamManager(loop)
+            assert not manager.is_active
+            session_id, _ = await manager.takeover("v=0\r\noffer\r\n")
+            assert manager.is_active
+            assert manager.active_session_id == session_id
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_unknown_session_raises(tmp_path):
+    """Stop with a session id that isn't the active one (or no active
+    session at all) is a 404 case — phone caller has stale state."""
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = StreamManager(loop)
+            from uuid import uuid4
+
+            with pytest.raises(StreamNotActive):
+                await manager.stop(uuid4())
+    finally:
+        await loop.stop()
+
+
+# --- 4. Pause-and-resume ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_returns_to_same_slide(tmp_path):
+    """Stream takeover pauses the loop mid-cycle; resume puts the same
+    slide back on screen. Per §5.11: pause+resume, not restart-from-
+    slide-start (sub-second position-within-slide isn't tracked, but
+    the slide identity is)."""
+    loop, _renderer, slides = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        # Wait until the loop is on the SECOND slide (not the first —
+        # we want a non-trivial mid-cycle index).
+        ok = await _wait_until(lambda: loop.current_item_id == slides[1].id, timeout=3.0)
+        assert ok, "loop never reached slide B"
+
+        await loop.pause()
+        # Pause is request-shaped: the loop notices on the next iteration
+        # of _wait or the for-loop's pause-check. Poll until is_paused
+        # AND the loop has actually saved a resume index (proving the
+        # for-loop noticed and broke).
+        await _wait_until(lambda: loop.is_paused and loop._resume_at_index is not None)
+        assert loop.is_paused
+        # _resume_at_index points at the for-loop iteration that was
+        # interrupted — slide B is index 1.
+        assert loop._resume_at_index == 1
+
+        await loop.resume()
+        assert not loop.is_paused
+
+        # After resume, the loop fetches items again and starts the
+        # for-loop at the saved index. Verify it lands back on slide B
+        # before progressing further.
+        ok = await _wait_until(lambda: loop.current_item_id == slides[1].id, timeout=3.0)
+        assert ok, "loop didn't resume on slide B"
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_pause_when_loop_not_running_is_noop(tmp_path):
+    """Pause/resume on a stopped loop quietly does nothing — the public
+    API stays safe to call from anywhere without lifecycle assertions."""
+    renderer = MockRenderer(8, 8, tmp_path / "out.png")
+    loop = PlaybackLoop(
+        renderer=renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
+    )
+    # No start() called — events are None.
+    await loop.pause()
+    assert not loop.is_paused
+    await loop.resume()
+    assert not loop.is_paused
+
+
+@pytest.mark.asyncio
+async def test_streamsession_start_pauses_playback_close_resumes(tmp_path):
+    """Direct integration: StreamSession.start() pauses the loop,
+    StreamSession.close() resumes. This is the contract StreamManager
+    relies on — verified separately from the manager so a manager-side
+    bug doesn't mask a session-side regression."""
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = StreamSession(loop)
+            await session.start("v=0\r\noffer\r\n")
+            await _wait_until(lambda: loop.is_paused)
+            assert loop.is_paused
+
+            await session.close()
+            assert not loop.is_paused
+    finally:
+        await loop.stop()
