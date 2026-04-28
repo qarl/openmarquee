@@ -100,6 +100,43 @@ class FlockPeer(BaseModel):
         "we've never reached this peer (just-added or offline).",
     )
 
+    # Health-probe fields surfaced in the design's flock-grid card stats
+    # row (model / mode / signal / uptime). All optional and default to
+    # None — Phase A leaves the probe wiring as future work, so the UI
+    # has to render gracefully against missing data. Phase B adds the
+    # per-peer /api/system/info probe + populates these. Schema version
+    # stays at 1 because these are new optional fields (per SYSTEM_SPEC
+    # §3.3.2 convention — version bumps only on non-backward-compatible
+    # changes).
+    model: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Peer's hardware identifier (e.g. 'Pi Zero 2 W', 'Pi 4'). "
+        "Populated by Phase B health probes.",
+    )
+    mode: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Peer's output mode + display dims as a slug "
+        "(e.g. 'hub75-128x64', 'hdmi-1080', 'ws2812-strip'). Used "
+        "by the flock UI's stats grid for the aspect-ratio label.",
+    )
+    signal: int | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Peer's WiFi RSSI as a percentage (0-100). "
+        "Populated by Phase B health probes.",
+    )
+    uptime: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Pre-formatted uptime string (e.g. '4d 7h'). "
+        "Computed peer-side and reported via Phase B's health probe; "
+        "stored as a string rather than seconds because the formatting "
+        "is a UI concern and the operator never does math on it.",
+    )
+
 
 class Flock(BaseModel):
     """Envelope wrapping the peer list + schema version for on-disk storage."""

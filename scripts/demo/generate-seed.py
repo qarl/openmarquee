@@ -49,9 +49,39 @@ DEFAULT_BACKEND = "http://127.0.0.1:9886"
 # thumbnail" is a known seeded content id — populated at generation
 # time so the references always resolve.
 FAKE_PEERS = [
-    {"address": "lobby.ts.net", "name": "SignA7F", "sync": True},
-    {"address": "cafeteria.ts.net", "name": "SignC3D", "sync": False},
-    {"address": "lab-corner.ts.net", "name": "SignB82", "sync": True},
+    # The new flock-grid card layout (per 2026-04-28 design handoff)
+    # surfaces a stats row with model / mode / signal / uptime per
+    # peer. We bake plausible variety here so the demo Flock tab
+    # shows the design's intended visual richness rather than four
+    # identical "—" placeholders. Real backends populate these via
+    # Phase B health probes (TBD); for the demo they're cosmetic.
+    {
+        "address": "lobby.ts.net",
+        "name": "SignA7F",
+        "sync": True,
+        "model": "Pi Zero 2 W",
+        "mode": "hub75-128x64",
+        "signal": 92,
+        "uptime": "4d 7h",
+    },
+    {
+        "address": "cafeteria.ts.net",
+        "name": "SignC3D",
+        "sync": False,
+        "model": "Pi 4",
+        "mode": "hdmi-1080",
+        "signal": 76,
+        "uptime": "12d 2h",
+    },
+    {
+        "address": "lab-corner.ts.net",
+        "name": "SignB82",
+        "sync": True,
+        "model": "Pi Zero 2 W",
+        "mode": "hub75-64x32",
+        "signal": 54,
+        "uptime": "2d 18h",
+    },
 ]
 
 

@@ -29,8 +29,12 @@ const PEER = (over = {}) => ({
     address: "lobby.ts.net",
     name: null,
     sync: false,
-    added_at: "2026-04-24T12:00:00+00:00",
+    added_at: "2026-01-01T00:00:00+00:00",
     last_seen_at: null,
+    model: null,
+    mode: null,
+    signal: null,
+    uptime: null,
     ...over,
 });
 
@@ -47,27 +51,50 @@ describe("mountFlock", () => {
         });
     }
 
-    it("renders self tile first, then one tile per peer + a + New tile", async () => {
+    it("renders the self card first, then one card per peer + a + New tile", async () => {
         const container = document.createElement("div");
         mount(container, {
             peers: [PEER(), PEER({ id: "22", address: "b.ts.net" })],
         });
         await tick();
-        const tiles = container.querySelectorAll(".flock-tile");
+        const cards = container.querySelectorAll(".om-flock-grid > .om-peer-card, .om-flock-grid > .flock-new-device");
         // self + 2 peers + new
-        expect(tiles).toHaveLength(4);
-        expect(tiles[0].classList.contains("flock-tile-self")).toBe(true);
-        expect(tiles[tiles.length - 1].classList.contains("flock-tile-new")).toBe(true);
+        expect(cards).toHaveLength(4);
+        expect(cards[0].classList.contains("this")).toBe(true);
+        expect(cards[cards.length - 1].classList.contains("flock-new-device")).toBe(true);
     });
 
-    it("self tile shows the sign_name from settings", async () => {
+    it("self card shows the sign_name from settings", async () => {
         const container = document.createElement("div");
         mount(container, { settings: { sign_name: "SignE6B" } });
         await tick();
         expect(
-            container.querySelector(".flock-tile-self .flock-tile-name")
-                .textContent,
+            container.querySelector(".om-peer-card.this .om-peer-name").textContent,
         ).toBe("SignE6B");
+    });
+
+    it("self card carries a 'this device' pulse pill", async () => {
+        const container = document.createElement("div");
+        mount(container);
+        await tick();
+        const pill = container.querySelector(".om-peer-card.this .om-pill.live");
+        expect(pill).toBeTruthy();
+        expect(pill.textContent).toMatch(/this device/);
+        expect(pill.querySelector(".om-pulse")).toBeTruthy();
+    });
+
+    it("eyebrow reports online count and total signs", async () => {
+        const container = document.createElement("div");
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        mount(container, {
+            peers: [PEER({ last_seen_at: recent }), PEER({ id: "off", address: "x.ts.net" })],
+        });
+        await tick();
+        // Self counts as online by virtue of serving the panel; one of
+        // two peers is fresh, the other has no last_seen → offline.
+        expect(container.querySelector(".flock-eyebrow").textContent).toMatch(
+            /2 of 3 signs online/,
+        );
     });
 
     it("shows an empty-state hint when no peer devices exist", async () => {
@@ -79,13 +106,13 @@ describe("mountFlock", () => {
         );
     });
 
-    it("opens the modal on + New and submits via onAdd", async () => {
+    it("opens the modal on + New device and submits via onAdd", async () => {
         const container = document.createElement("div");
         const onAdd = vi.fn(async () => PEER());
         mount(container, { peers: [], onAdd });
         await tick();
 
-        container.querySelector(".flock-tile-new").click();
+        container.querySelector(".flock-new-device").click();
         const modal = container.querySelector(".flock-modal");
         expect(modal.hasAttribute("open")).toBe(true);
 
@@ -104,7 +131,7 @@ describe("mountFlock", () => {
         });
         mount(container, { peers: [], onAdd });
         await tick();
-        container.querySelector(".flock-tile-new").click();
+        container.querySelector(".flock-new-device").click();
         const modal = container.querySelector(".flock-modal");
         modal.querySelector(".flock-address").value = "lobby.ts.net";
         modal
@@ -117,12 +144,12 @@ describe("mountFlock", () => {
         );
     });
 
-    it("toggling the sync checkbox calls onUpdate", async () => {
+    it("toggling the per-peer sync checkbox calls onUpdate", async () => {
         const container = document.createElement("div");
         const onUpdate = vi.fn(async () => PEER({ sync: true }));
         mount(container, { peers: [PEER()], onUpdate });
         await tick();
-        const checkbox = container.querySelector(".flock-tile-sync-input");
+        const checkbox = container.querySelector(".flock-peer-sync-input");
         checkbox.checked = true;
         checkbox.dispatchEvent(new Event("change", { bubbles: true }));
         await tick();
@@ -132,39 +159,64 @@ describe("mountFlock", () => {
         );
     });
 
-    it("clicking × calls onDelete after confirm", async () => {
+    it("overflow ⋯ menu confirms then calls onDelete (replaces the prior × button)", async () => {
         const container = document.createElement("div");
         const onDelete = vi.fn(async () => {});
         mount(container, { peers: [PEER()], onDelete });
         await tick();
-        container.querySelector(".flock-tile-delete").click();
+        container.querySelector(".flock-peer-overflow").click();
         await tick();
         expect(onDelete).toHaveBeenCalledWith(
             "11111111-1111-1111-1111-111111111111",
         );
     });
 
-    it("sync tile gets a synced state class", async () => {
+    it("Edit button navigates the browser to the peer's tailnet URL", async () => {
+        // Per qarl's locked decision: no in-app context swap. Edit is a
+        // browser-native location.href navigate to the peer's UI.
         const container = document.createElement("div");
-        mount(container, { peers: [PEER({ sync: true })] });
+        // Spy via property descriptor — assigning location.href in
+        // jsdom otherwise just rewrites the property. The peer is
+        // online (recent last_seen) so the Edit button isn't disabled.
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        mount(container, {
+            peers: [PEER({ address: "127.0.0.1:9887", last_seen_at: recent })],
+        });
         await tick();
-        const peerTile = container.querySelector(
-            ".flock-tile:not(.flock-tile-new):not(.flock-tile-self)",
-        );
-        expect(peerTile.classList.contains("flock-tile-synced")).toBe(true);
+        let navigatedTo = null;
+        const orig = window.location;
+        Object.defineProperty(window, "location", {
+            configurable: true,
+            value: {
+                ...orig,
+                set href(v) { navigatedTo = v; },
+                get href() { return orig.href; },
+            },
+        });
+        try {
+            container.querySelector(".flock-peer-edit").click();
+            await tick();
+            expect(navigatedTo).toBe("http://127.0.0.1:9887/");
+        } finally {
+            Object.defineProperty(window, "location", {
+                configurable: true,
+                value: orig,
+            });
+        }
     });
 
-    it("Go there link drops into the peer's Flock panel", async () => {
+    it("offline peer's Edit button is disabled and the card carries an offline pill", async () => {
         const container = document.createElement("div");
-        mount(container, { peers: [PEER({ address: "127.0.0.1:9887" })] });
+        // last_seen_at unset → offline.
+        mount(container, { peers: [PEER()] });
         await tick();
-        const link = container.querySelector(".flock-tile-open");
-        expect(link.getAttribute("href")).toBe("http://127.0.0.1:9887/#/flock");
-        expect(link.getAttribute("target")).toBe("_blank");
-        expect(link.textContent.trim()).toMatch(/Go there/);
+        const card = container.querySelector(".om-peer-card[data-peer-id]");
+        expect(card.classList.contains("offline")).toBe(true);
+        expect(card.querySelector(".om-pill.bad")).toBeTruthy();
+        expect(card.querySelector(".flock-peer-edit").disabled).toBe(true);
     });
 
-    it("self tile reflects flock_sync_enabled and toggling calls onUpdateSelfSync", async () => {
+    it("self card sync toggle reflects flock_sync_enabled and calls onUpdateSelfSync on flip", async () => {
         const container = document.createElement("div");
         const onUpdateSelfSync = vi.fn(async () => {});
         mount(container, {
@@ -172,34 +224,54 @@ describe("mountFlock", () => {
             onUpdateSelfSync,
         });
         await tick();
-        const selfTile = container.querySelector(".flock-tile-self");
-        // Disabled state: no "synced" class, checkbox unchecked.
-        expect(selfTile.classList.contains("flock-tile-synced")).toBe(false);
-        const checkbox = selfTile.querySelector(".flock-tile-self-sync-input");
+        const selfCard = container.querySelector(".om-peer-card.this");
+        const checkbox = selfCard.querySelector(".flock-self-sync-input");
         expect(checkbox.checked).toBe(false);
+        // Pill mirrors intent — "standalone" while disabled.
+        expect(selfCard.querySelector(".om-pill")).toBeTruthy();
         checkbox.checked = true;
         checkbox.dispatchEvent(new Event("change", { bubbles: true }));
         await tick();
         expect(onUpdateSelfSync).toHaveBeenCalledWith(true);
     });
 
-    it("self tile is marked synced when flock_sync_enabled is true", async () => {
+    it("sync-status pill labels: peer.sync && online → syncing", async () => {
         const container = document.createElement("div");
+        const recent = new Date(Date.now() - 5_000).toISOString();
         mount(container, {
-            settings: { sign_name: "SignAAA", flock_sync_enabled: true },
+            peers: [PEER({ sync: true, last_seen_at: recent })],
         });
         await tick();
-        expect(
-            container
-                .querySelector(".flock-tile-self")
-                .classList.contains("flock-tile-synced"),
-        ).toBe(true);
+        const card = container.querySelector(".om-peer-card[data-peer-id]");
+        const pill = card.querySelector(".om-peer-actions .om-pill");
+        expect(pill.textContent).toMatch(/^syncing$/);
     });
 
-    it("peer tile thumbnail fetches the peer's current-thumbnail endpoint", async () => {
-        // Refresh switched from <img src=...> to fetch+blob so the demo's
-        // mock-backend can intercept the request — the assertion now
-        // tracks the fetch URL rather than the final blob: src on the img.
+    it("sync-status pill labels: !peer.sync && online → standalone", async () => {
+        const container = document.createElement("div");
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        mount(container, {
+            peers: [PEER({ sync: false, last_seen_at: recent })],
+        });
+        await tick();
+        const card = container.querySelector(".om-peer-card[data-peer-id]");
+        const pill = card.querySelector(".om-peer-actions .om-pill");
+        expect(pill.textContent).toMatch(/^standalone$/);
+    });
+
+    it("sync-status pill labels: peer.sync && offline → sync paused (intent-vs-reality mismatch)", async () => {
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [PEER({ sync: true, last_seen_at: null })],
+        });
+        await tick();
+        const card = container.querySelector(".om-peer-card[data-peer-id]");
+        // Two pills on this card: header "offline" + actions "sync paused".
+        const actionPill = card.querySelector(".om-peer-actions .om-pill");
+        expect(actionPill.textContent).toMatch(/sync paused/);
+    });
+
+    it("peer card thumbnail fetches the peer's current-thumbnail endpoint cross-origin", async () => {
         const seen = [];
         const fetchSpy = vi.fn(async (url) => {
             seen.push(String(url));
@@ -208,7 +280,8 @@ describe("mountFlock", () => {
         vi.stubGlobal("fetch", fetchSpy);
         try {
             const container = document.createElement("div");
-            mount(container, { peers: [PEER({ address: "127.0.0.1:9887" })] });
+            const recent = new Date(Date.now() - 5_000).toISOString();
+            mount(container, { peers: [PEER({ address: "127.0.0.1:9887", last_seen_at: recent })] });
             await tick();
             await tick();
             expect(
@@ -221,7 +294,7 @@ describe("mountFlock", () => {
         }
     });
 
-    it("self tile thumbnail fetches same-origin (no http://host prefix)", async () => {
+    it("self card thumbnail fetches same-origin (no http://host prefix)", async () => {
         const seen = [];
         const fetchSpy = vi.fn(async (url) => {
             seen.push(String(url));
@@ -233,8 +306,6 @@ describe("mountFlock", () => {
             mount(container);
             await tick();
             await tick();
-            // Same-origin path doesn't get a `http://host` prefix —
-            // matches whatever the mock backend / real device serves.
             expect(
                 seen.some((u) => /^\/api\/playback\/current-thumbnail\?t=\d+/.test(u)),
             ).toBe(true);

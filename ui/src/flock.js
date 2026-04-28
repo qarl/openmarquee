@@ -1,29 +1,59 @@
-// Flock panel: the fleet dashboard. One tile per openMarquee device —
-// this one first (no controls, just a "you are here" marker) and then
-// every device in this device's flock.json. Each tile includes a live
-// thumbnail of what that sign is currently playing (polled against
-// /api/playback/current-thumbnail on the remote).
+// Flock panel: the fleet dashboard. Per the 2026-04-28 design handoff
+// (claude.ai/design): one card per openMarquee device — this one first
+// (with a "this device" pulse pill, no Edit, no overflow), then every
+// peer added to the flock. Each card carries a live LED-preview-style
+// thumbnail polled from the peer's /api/playback/current-thumbnail.
 //
-// "+ New device" at the end opens the address-entry modal. Peer tiles
-// have a sync toggle, an "Open there" link, and a × remove. Listing
-// is passive — the backend's push + pull workers are what actually
-// propagate media.
+// Imperative push is intentionally not a verb in this UI — sync is a
+// declarative checkbox on each card, and the per-peer pill ("syncing"
+// / "standalone" / "offline") is observed state. The combo lets the
+// operator notice intent-vs-reality mismatches without giving them a
+// "force push" button that would lie about what the system can do.
+//
+// Per-peer Edit button just sends the browser to the peer's tailnet
+// URL (`location.href = http://<address>/`) — no in-app context swap,
+// no privileged "home device". All peers are equal; the upper-left
+// sign name re-renders from each device's own /api/settings.
+//
+// "+ New device" stays at the end of the grid for hand-adding peers
+// (Tailscale magic-DNS auto-discovery is Phase B). The × delete from
+// the prior tile UI moved into the per-peer overflow ⋯ menu as
+// "Forget device" — same outcome, less prominent.
 
 const THUMBNAIL_POLL_MS = 3000;
+
+// last_seen freshness window: peers seen within the last 30 seconds
+// are "online". Matches the existing flock-card chrome polling
+// behavior so the two views stay consistent.
+const ONLINE_THRESHOLD_MS = 30_000;
+
+// Pretty labels for the design's mode slugs ("hub75-128x64", etc.).
+// Falls back to the slug verbatim when an unknown mode comes in from
+// a peer running a newer firmware. Phase A peers all report null
+// (mode is Phase-B-populated), so this is mostly forward-looking.
+const MODE_LABELS = {
+    "hub75-64x32": "HUB75 64×32",
+    "hub75-128x64": "HUB75 128×64",
+    "hdmi-720": "HDMI 720p",
+    "hdmi-1080": "HDMI 1080p",
+    "hdmi-4k": "HDMI 4K",
+    "ws2812-strip": "WS2812B strip",
+    "composite": "Composite",
+};
 
 const SECTION_TEMPLATE = `
     <section class="flock">
         <div class="om-page-head">
             <div>
-                <span class="om-eyebrow">Mesh · push & sync</span>
+                <span class="om-eyebrow flock-eyebrow"></span>
                 <h1>Your flock</h1>
-                <p>Every openMarquee device in this flock. Toggle <strong>Sync</strong> on a device to keep media mirrored between here and there.</p>
+                <p>Every openMarquee on your local network. Sync media to one or all — works offline, no cloud.</p>
             </div>
         </div>
 
-        <div class="flock-tiles" role="list"></div>
+        <div class="om-flock-grid" role="list"></div>
 
-        <p class="flock-status" role="status" aria-live="polite" style="margin: 10px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
+        <p class="flock-status" role="status" aria-live="polite"></p>
     </section>
 
     <dialog class="flock-modal">
@@ -52,75 +82,143 @@ function escapeAttr(s) {
     );
 }
 
-function selfTileHTML(signName, syncEnabled) {
-    const name = signName || "This device";
-    const syncedClass = syncEnabled ? " flock-tile-synced" : "";
-    return `
-        <div class="flock-tile flock-tile-self${syncedClass}" role="listitem" data-origin="self">
-            <div class="flock-tile-thumb-wrap">
-                <img class="flock-tile-thumb" alt="Currently playing" data-origin="self">
-                <div class="flock-tile-thumb-empty">Not playing</div>
-            </div>
-            <div class="flock-tile-body">
-                <div class="flock-tile-name">${escapeAttr(name)}</div>
-                <div class="flock-tile-address">this device</div>
-            </div>
-            <div class="flock-tile-controls">
-                <label class="flock-tile-sync">
-                    <input type="checkbox" class="flock-tile-self-sync-input"${syncEnabled ? " checked" : ""}>
-                    <span>Sync</span>
-                </label>
-            </div>
-        </div>
-    `;
+// "X minute ago" → "Xm ago"; "0 minutes" → "just now". Single-source
+// helper for the eyebrow's freshness signal.
+function relativeMinutes(when) {
+    if (!when) return null;
+    const ts = new Date(when).getTime();
+    if (Number.isNaN(ts)) return null;
+    const minutes = Math.max(0, Math.round((Date.now() - ts) / 60_000));
+    if (minutes <= 0) return "just now";
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.round(hours / 24)}d ago`;
 }
 
-function peerTileHTML(peer) {
-    const synced = peer.sync ? " flock-tile-synced" : "";
-    const label = peer.name || peer.address;
-    const address = peer.address;
-    return `
-        <div class="flock-tile${synced}" role="listitem"
-             data-peer-id="${escapeAttr(peer.id)}"
-             data-address="${escapeAttr(address)}">
-            <button type="button" class="flock-tile-delete" aria-label="Forget device">×</button>
-            <div class="flock-tile-thumb-wrap">
-                <img class="flock-tile-thumb" alt="Currently playing on ${escapeAttr(label)}">
-                <div class="flock-tile-thumb-empty">Not playing</div>
-            </div>
-            <div class="flock-tile-body">
-                <div class="flock-tile-name">${escapeAttr(label)}</div>
-                <div class="flock-tile-address">${escapeAttr(address)}</div>
-            </div>
-            <div class="flock-tile-controls">
-                <label class="flock-tile-sync">
-                    <input type="checkbox" class="flock-tile-sync-input"${peer.sync ? " checked" : ""}>
-                    <span>Sync</span>
-                </label>
-                <a class="flock-tile-open" href="http://${escapeAttr(address)}/#/flock" target="_blank" rel="noopener">
-                    Go there ↗
-                </a>
-            </div>
-        </div>
-    `;
+function isPeerOnline(peer) {
+    if (!peer.last_seen_at) return false;
+    const ts = new Date(peer.last_seen_at).getTime();
+    if (Number.isNaN(ts)) return false;
+    return Date.now() - ts < ONLINE_THRESHOLD_MS;
 }
 
-function newTileHTML() {
-    return `
-        <button type="button" class="flock-tile flock-tile-new" aria-label="Add device">
-            <span class="flock-tile-new-plus">+</span>
-            <span class="flock-tile-new-label">New device</span>
-        </button>
-    `;
+// Phase A pill taxonomy:
+//   - "syncing"    sync=true && online
+//   - "sync paused" sync=true && offline (intent on, reality off)
+//   - "standalone" sync=false && online
+//   - "offline"    sync=false && offline
+// Phase B layers on "out-of-sync N items behind" once we have a real
+// content-diff probe.
+function syncStatePillForPeer(peer) {
+    const online = isPeerOnline(peer);
+    if (peer.sync && online) return { label: "syncing", cls: "good" };
+    if (peer.sync && !online) return { label: "sync paused", cls: "bad" };
+    if (!peer.sync && online) return { label: "standalone", cls: "" };
+    return { label: "offline", cls: "bad" };
 }
 
+// Self pill mirrors the global flock_sync_enabled flag: when on, we
+// participate in pushes/pulls; when off, we're islanded by intent.
+function syncStatePillForSelf(syncEnabled) {
+    if (syncEnabled) return { label: "syncing", cls: "good" };
+    return { label: "standalone", cls: "" };
+}
+
+// Cards have a thumb area we render with a real PNG from the peer's
+// /api/playback/current-thumbnail (or the local one for self). The
+// existing flock chrome polled the same endpoint — kept verbatim
+// since the design's LedPreview component is for the editor's
+// what-if simulator, not for live thumbs.
 function thumbnailUrl(address, selfOrigin) {
     const base = selfOrigin ? "" : `http://${address}`;
     return `${base}/api/playback/current-thumbnail?t=${Date.now()}`;
 }
 
+function selfCardHTML({ name, syncEnabled, mode }) {
+    const pill = syncStatePillForSelf(syncEnabled);
+    const modeLabel = MODE_LABELS[mode] || (mode || "—");
+    return `
+        <div class="om-peer-card this" role="listitem" data-origin="self">
+            <div class="om-peer-head">
+                <span class="om-peer-dot"></span>
+                <span class="om-peer-name">${escapeAttr(name)}</span>
+                <span class="om-pill live"><span class="om-pulse"></span>this device</span>
+            </div>
+            <div class="om-peer-thumb">
+                <img class="om-peer-thumb-img" alt="Currently playing" data-origin="self">
+                <div class="om-peer-thumb-empty">— idle —</div>
+            </div>
+            <div class="om-peer-stats">
+                <span>${escapeAttr(modeLabel)}</span>
+                <span style="text-align:right;">—</span>
+                <span>—</span>
+                <span style="text-align:right;">—</span>
+            </div>
+            <div class="om-peer-actions">
+                <span class="om-pill ${pill.cls}">${escapeAttr(pill.label)}</span>
+                <label class="om-peer-sync-toggle">
+                    <input type="checkbox" class="flock-self-sync-input"${syncEnabled ? " checked" : ""}>
+                    <span>Sync</span>
+                </label>
+            </div>
+        </div>
+    `;
+}
+
+function peerCardHTML(peer) {
+    const online = isPeerOnline(peer);
+    const offlineClass = online ? "" : " offline";
+    const pill = syncStatePillForPeer(peer);
+    const label = peer.name || peer.address;
+    const modeLabel = MODE_LABELS[peer.mode] || (peer.mode || "—");
+    const signal = peer.signal != null ? `<b>${peer.signal}%</b> wifi` : "—";
+    const model = peer.model || "—";
+    const uptime = peer.uptime ? `up <b>${escapeAttr(peer.uptime)}</b>` : "—";
+    return `
+        <div class="om-peer-card${offlineClass}" role="listitem"
+             data-peer-id="${escapeAttr(peer.id)}"
+             data-address="${escapeAttr(peer.address)}">
+            <div class="om-peer-head">
+                <span class="om-peer-dot${online ? "" : " off"}"></span>
+                <span class="om-peer-name">${escapeAttr(label)}</span>
+                ${online ? "" : `<span class="om-pill bad">offline</span>`}
+            </div>
+            <div class="om-peer-thumb">
+                <img class="om-peer-thumb-img" alt="Currently playing on ${escapeAttr(label)}">
+                <div class="om-peer-thumb-empty">${online ? "— idle —" : "no signal"}</div>
+            </div>
+            <div class="om-peer-stats">
+                <span>${escapeAttr(modeLabel)}</span>
+                <span style="text-align:right;">${signal}</span>
+                <span>${escapeAttr(model)}</span>
+                <span style="text-align:right;">${uptime}</span>
+            </div>
+            <div class="om-peer-actions">
+                <span class="om-pill ${pill.cls}">${escapeAttr(pill.label)}</span>
+                <label class="om-peer-sync-toggle">
+                    <input type="checkbox" class="flock-peer-sync-input"${peer.sync ? " checked" : ""}>
+                    <span>Sync</span>
+                </label>
+                <button type="button" class="om-btn sm flock-peer-edit"${online ? "" : " disabled"}>Edit</button>
+                <button type="button" class="om-btn ghost icon sm flock-peer-overflow" aria-label="More" title="More">⋯</button>
+            </div>
+        </div>
+    `;
+}
+
+function newDeviceCardHTML() {
+    return `
+        <button type="button" class="om-peer-card flock-new-device" aria-label="Add device">
+            <span class="flock-new-plus">+</span>
+            <span class="flock-new-label">New device</span>
+        </button>
+    `;
+}
+
 /**
- * Mount the flock panel.
+ * Mount the flock panel. Re-rendered idempotently on every external
+ * change (sync toggle, peer add/delete, settings change).
  *
  * @param {HTMLElement} container
  * @param {object} options
@@ -128,6 +226,7 @@ function thumbnailUrl(address, selfOrigin) {
  * @param {() => Promise<object>} options.fetchSettings
  * @param {(address: string) => Promise<object>} options.onAdd
  * @param {(peerId: string, patch: object) => Promise<object>} options.onUpdate
+ * @param {(enabled: boolean) => Promise<void>} options.onUpdateSelfSync
  * @param {(peerId: string) => Promise<void>} options.onDelete
  */
 export function mountFlock(
@@ -135,7 +234,8 @@ export function mountFlock(
     { fetchFlock, fetchSettings, onAdd, onUpdate, onUpdateSelfSync, onDelete },
 ) {
     container.innerHTML = SECTION_TEMPLATE;
-    const tilesEl = container.querySelector(".flock-tiles");
+    const gridEl = container.querySelector(".om-flock-grid");
+    const eyebrowEl = container.querySelector(".flock-eyebrow");
     const statusEl = container.querySelector(".flock-status");
     const modal = container.querySelector(".flock-modal");
     const modalForm = modal.querySelector(".flock-modal-form");
@@ -143,8 +243,6 @@ export function mountFlock(
     const modalError = modal.querySelector(".flock-modal-error");
     const modalCancel = modal.querySelector(".flock-modal-cancel");
 
-    // Interval handle for the tile-thumbnail poller. Cleared + restarted
-    // on every render so torn-down tiles stop firing loads.
     let pollTimer = null;
 
     function setStatus(text, { error = false } = {}) {
@@ -153,13 +251,11 @@ export function mountFlock(
     }
 
     async function loadThumbViaFetch(img, url) {
-        // fetch → blob → createObjectURL, instead of letting the browser
-        // fetch the <img src> itself. Two wins: (a) goes through any
-        // in-page fetch wrappers (the demo's mock backend intercepts
-        // here), and (b) reads 204 / 404 as "not playing" without
-        // triggering the noisy onerror path. The remote thumbnail
-        // endpoint sets Access-Control-Allow-Origin: * so cross-origin
-        // peer fetches still work on a real device.
+        // Same blob-via-fetch pattern as the prior flock chrome — goes
+        // through any in-page fetch wrapper (the demo's mock backend
+        // intercepts here), and reads 204/404 as "not playing" without
+        // an onerror flicker. Cross-origin works because the peer's
+        // /api/playback/current-thumbnail sets ACAO: *.
         try {
             const r = await fetch(url);
             if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
@@ -170,7 +266,6 @@ export function mountFlock(
             img.src = objUrl;
             if (prev) URL.revokeObjectURL(prev);
         } catch {
-            // No content → let the "Not playing" overlay stay up.
             const prev = img.dataset.blobUrl;
             delete img.dataset.blobUrl;
             img.removeAttribute("src");
@@ -180,15 +275,14 @@ export function mountFlock(
     }
 
     function refreshThumbnails() {
-        const imgs = tilesEl.querySelectorAll(".flock-tile-thumb");
+        const imgs = gridEl.querySelectorAll(".om-peer-thumb-img");
         for (const img of imgs) {
-            const tile = img.closest(".flock-tile");
-            if (!tile) continue;
-            const origin = tile.dataset.origin;
-            if (origin === "self") {
+            const card = img.closest(".om-peer-card");
+            if (!card) continue;
+            if (card.dataset.origin === "self") {
                 loadThumbViaFetch(img, thumbnailUrl(null, true));
-            } else if (tile.dataset.address) {
-                loadThumbViaFetch(img, thumbnailUrl(tile.dataset.address, false));
+            } else if (card.dataset.address && !card.classList.contains("offline")) {
+                loadThumbViaFetch(img, thumbnailUrl(card.dataset.address, false));
             }
         }
     }
@@ -200,10 +294,37 @@ export function mountFlock(
         }
     }
 
+    function paintEyebrow(peers) {
+        // Total signs = self + all peers; online count includes self
+        // (assumed always online since it's serving this panel) plus
+        // any peer whose last_seen is within the freshness window.
+        const onlinePeers = peers.filter(isPeerOnline).length;
+        const total = peers.length + 1;
+        const online = onlinePeers + 1;
+        let text = `${online} of ${total} sign${total === 1 ? "" : "s"} online`;
+        // Most-recent peer last_seen drives the "last sync Xm ago"
+        // freshness signal. No peers → omit the second clause; new
+        // devices land with last_seen=null and would otherwise read
+        // "last sync — ago" which is uglier than nothing.
+        let mostRecent = null;
+        for (const p of peers) {
+            if (!p.last_seen_at) continue;
+            const ts = new Date(p.last_seen_at).getTime();
+            if (Number.isNaN(ts)) continue;
+            if (mostRecent === null || ts > mostRecent) mostRecent = ts;
+        }
+        if (mostRecent !== null) {
+            const rel = relativeMinutes(new Date(mostRecent).toISOString());
+            if (rel) text += ` · last sync ${rel}`;
+        }
+        eyebrowEl.textContent = text;
+    }
+
     async function render() {
         stopPolling();
         let selfName = "This device";
         let selfSyncEnabled = true;
+        let selfMode = null;
         let peers = [];
         try {
             const [settings, flock] = await Promise.all([
@@ -212,20 +333,40 @@ export function mountFlock(
             ]);
             selfName = settings.sign_name || "This device";
             selfSyncEnabled = settings.flock_sync_enabled !== false;
+            // Map output_mode + display dims into the design's mode-slug
+            // shape so the self card's stats row picks the right label.
+            // Falls back to null if output_mode is something we haven't
+            // enumerated; the stats label resolves to "—".
+            const w = Number(settings.display_width);
+            const h = Number(settings.display_height);
+            if (settings.output_mode === "hdmi") {
+                selfMode = h >= 1080 ? "hdmi-1080" : "hdmi-720";
+            } else if (settings.output_mode === "hub75") {
+                selfMode = `hub75-${w}x${h}`;
+            } else if (settings.output_mode === "ws281x") {
+                selfMode = "ws2812-strip";
+            } else if (settings.output_mode === "composite") {
+                selfMode = "composite";
+            }
             peers = flock.peers || [];
         } catch (err) {
             setStatus(`Couldn't load flock: ${err.message}`, { error: true });
             return;
         }
-        const peersHTML = peers.map(peerTileHTML).join("");
-        tilesEl.innerHTML =
-            selfTileHTML(selfName, selfSyncEnabled) + peersHTML + newTileHTML();
 
-        // Hide the "Not playing" overlay on successful thumbnail load;
-        // show it on error (204 / 404 / network).
-        for (const img of tilesEl.querySelectorAll(".flock-tile-thumb")) {
+        paintEyebrow(peers);
+        gridEl.innerHTML =
+            selfCardHTML({
+                name: selfName,
+                syncEnabled: selfSyncEnabled,
+                mode: selfMode,
+            }) +
+            peers.map(peerCardHTML).join("") +
+            newDeviceCardHTML();
+
+        for (const img of gridEl.querySelectorAll(".om-peer-thumb-img")) {
             const empty = img.parentElement.querySelector(
-                ".flock-tile-thumb-empty",
+                ".om-peer-thumb-empty",
             );
             img.addEventListener("load", () => {
                 img.classList.add("is-loaded");
@@ -237,12 +378,11 @@ export function mountFlock(
             });
         }
 
-        const count = peers.length;
-        setStatus(
-            count
-                ? `${count} peer device${count === 1 ? "" : "s"}`
-                : "No peer devices yet — add one to start syncing media.",
-        );
+        if (peers.length === 0) {
+            setStatus("No peer devices yet — add one to start syncing media.");
+        } else {
+            setStatus("");
+        }
 
         refreshThumbnails();
         pollTimer = setInterval(refreshThumbnails, THUMBNAIL_POLL_MS);
@@ -266,26 +406,51 @@ export function mountFlock(
             await onAdd(address);
             modal.close();
             await render();
-            // Backend probes the new device's sign_name in the background;
-            // re-render after a beat so the tile flips to the friendlier
-            // name.
+            // The backend probes the new peer for sign_name in the
+            // background; re-render after a beat so the card flips
+            // from "raw address" to the friendly name.
             setTimeout(() => { render().catch(() => {}); }, 1500);
         } catch (err) {
             modalError.textContent = err.message || "Couldn't add device.";
         }
     });
 
-    tilesEl.addEventListener("click", async (event) => {
-        const newBtn = event.target.closest(".flock-tile-new");
+    gridEl.addEventListener("click", async (event) => {
+        const newBtn = event.target.closest(".flock-new-device");
         if (newBtn) {
             openAddModal();
             return;
         }
-        const delBtn = event.target.closest(".flock-tile-delete");
-        if (delBtn) {
-            const tile = delBtn.closest(".flock-tile");
-            const peerId = tile.dataset.peerId;
-            const label = tile.querySelector(".flock-tile-name")?.textContent;
+        const editBtn = event.target.closest(".flock-peer-edit");
+        if (editBtn) {
+            const card = editBtn.closest(".om-peer-card");
+            const address = card.dataset.address;
+            if (address) {
+                // Browser-native navigate to the peer's UI. Back button
+                // returns here. Each device renders itself; no in-app
+                // context swap, no privileged "home device".
+                //
+                // Address is interpolated unescaped — backend's
+                // FLOCK_ADDRESS_PATTERN (flock.py) restricts it to a
+                // hostname / IPv4 + optional :port shape, no schemes
+                // or paths, so the resulting URL is well-formed by
+                // construction. Adding `encodeURIComponent` would
+                // double-encode a value that's already validated.
+                window.location.href = `http://${address}/`;
+            }
+            return;
+        }
+        const overflowBtn = event.target.closest(".flock-peer-overflow");
+        if (overflowBtn) {
+            // v1 overflow "menu" has one entry: Forget device. Skip a
+            // popover chrome and just fire a native confirm() — saves
+            // a dialog component for an action operators take rarely.
+            // The aria-label is "More" to leave room to grow into a
+            // real menu later (Phase B's force-resync would land
+            // here); today it's effectively a one-click button.
+            const card = overflowBtn.closest(".om-peer-card");
+            const peerId = card.dataset.peerId;
+            const label = card.querySelector(".om-peer-name")?.textContent;
             if (!window.confirm(`Forget device "${label}"?`)) return;
             try {
                 await onDelete(peerId);
@@ -293,30 +458,28 @@ export function mountFlock(
             } catch (err) {
                 setStatus(`Delete failed: ${err.message}`, { error: true });
             }
+            return;
         }
     });
 
-    tilesEl.addEventListener("change", async (event) => {
-        const selfSync = event.target.closest(".flock-tile-self-sync-input");
+    gridEl.addEventListener("change", async (event) => {
+        const selfSync = event.target.closest(".flock-self-sync-input");
         if (selfSync) {
             try {
                 await onUpdateSelfSync(selfSync.checked);
                 await render();
             } catch (err) {
-                setStatus(
-                    `Couldn't update sync: ${err.message}`,
-                    { error: true },
-                );
+                setStatus(`Couldn't update sync: ${err.message}`, { error: true });
                 await render();
             }
             return;
         }
-        const syncInput = event.target.closest(".flock-tile-sync-input");
-        if (!syncInput) return;
-        const tile = syncInput.closest(".flock-tile");
-        const peerId = tile.dataset.peerId;
+        const peerSync = event.target.closest(".flock-peer-sync-input");
+        if (!peerSync) return;
+        const card = peerSync.closest(".om-peer-card");
+        const peerId = card.dataset.peerId;
         try {
-            await onUpdate(peerId, { sync: syncInput.checked });
+            await onUpdate(peerId, { sync: peerSync.checked });
             await render();
         } catch (err) {
             setStatus(`Couldn't update sync: ${err.message}`, { error: true });

@@ -2763,53 +2763,12 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--om-text-dim);
 }
-/* ─── Flock dashboard ─── */
-.om-flock-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 10px;
-}
-.om-peer-card {
-  background: var(--om-surface);
-  border: 1px solid var(--om-line);
-  border-radius: var(--om-radius-lg);
-  padding: 14px;
-  display: flex; flex-direction: column; gap: 10px;
-  position: relative;
-  transition: border-color .12s, transform .12s;
-}
-.om-peer-card:hover { border-color: var(--om-line-2); }
-.om-peer-card.this { border-color: var(--om-accent); box-shadow: 0 0 0 1px var(--om-accent-soft); }
-.om-peer-card.offline { opacity: 0.62; }
-
-.om-peer-head { display: flex; align-items: center; gap: 8px; }
-.om-peer-dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--om-good);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--om-good) 70%, transparent);
-}
-.om-peer-dot.off { background: var(--om-line-2); box-shadow: none; }
-.om-peer-card .om-peer-name { font-size: 14px; font-weight: 600; flex: 1; }
-.om-peer-card .om-peer-thumb {
-  background: var(--om-led-bg);
-  border-radius: 8px;
-  border: 1px solid var(--om-line);
-  overflow: hidden;
-  position: relative;
-}
-.om-peer-card .om-peer-stats {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  font-family: var(--om-mono);
-  font-size: 11px;
-  color: var(--om-text-dim);
-}
-.om-peer-card .om-peer-stats span b { color: var(--om-text); font-weight: 600; }
-.om-peer-card .om-peer-actions {
-  display: flex; gap: 6px;
-  margin-top: 2px;
-}
+/* Flock dashboard CSS now lives in the appended om-* block at the
+   bottom of this file — the earlier scaffolding here used to also
+   define .om-flock-grid / .om-peer-card but with incomplete coverage
+   (no .om-peer-thumb-img, no .om-peer-sync-toggle, no
+   .flock-new-device); the duplicate cascade was producing specificity
+   surprises caught in pre-commit review. Removed 2026-04-28. */
 
 /* ─── Welcome — first-run hero ─── */
 .om-welcome {
@@ -3164,3 +3123,166 @@ html, body { margin: 0; padding: 0; height: 100%; }
     opacity: 0.6;
     cursor: progress;
 }
+
+
+/* --- Flock panel — om-flock-grid + om-peer-card (per the 2026-04-28
+   design handoff). The prior flock-tile-* rules above are deprecated
+   but kept dormant to avoid touching this commit's blast radius;
+   followup commit can prune. */
+
+.om-flock-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 10px;
+    margin-top: 4px;
+}
+
+.om-peer-card {
+    background: var(--om-surface, var(--panel));
+    border: 1px solid var(--om-line, var(--panel-border));
+    border-radius: var(--om-radius-lg, 0.5rem);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    position: relative;
+    transition: border-color 120ms ease, transform 120ms ease;
+    color: var(--om-text, var(--text));
+    text-align: left;
+    font: inherit;
+}
+.om-peer-card:hover { border-color: var(--om-line-2, var(--panel-border)); }
+.om-peer-card.this {
+    border-color: var(--om-accent);
+    box-shadow: 0 0 0 1px var(--om-accent-soft, var(--om-accent)) inset;
+}
+.om-peer-card.offline { opacity: 0.62; }
+
+.om-peer-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.om-peer-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--om-good, #4caf50);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--om-good, #4caf50) 70%, transparent);
+}
+.om-peer-dot.off {
+    background: var(--om-line-2, #555);
+    box-shadow: none;
+}
+.om-peer-name {
+    font-size: 14px;
+    font-weight: 600;
+    flex: 1;
+    /* Long Tailscale hostnames truncate cleanly rather than wrapping the
+       whole header into two lines and pushing the pills off the card. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.om-peer-thumb {
+    background: var(--om-led-bg, #000);
+    border-radius: 8px;
+    border: 1px solid var(--om-line, var(--panel-border));
+    overflow: hidden;
+    position: relative;
+    aspect-ratio: 2 / 1;
+}
+.om-peer-thumb-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    opacity: 0;
+    transition: opacity 160ms ease;
+}
+.om-peer-thumb-img.is-loaded { opacity: 1; }
+.om-peer-thumb-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--om-mono, monospace);
+    font-size: 11px;
+    color: var(--om-text-fade, var(--muted));
+    letter-spacing: 0.04em;
+}
+.om-peer-thumb-empty.is-hidden { display: none; }
+
+.om-peer-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    font-family: var(--om-mono, monospace);
+    font-size: 11px;
+    color: var(--om-text-dim, var(--muted));
+}
+.om-peer-stats span b {
+    color: var(--om-text, var(--text));
+    font-weight: 600;
+}
+
+.om-peer-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin-top: 2px;
+    flex-wrap: wrap;
+}
+.om-peer-sync-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--om-text-dim, var(--muted));
+    cursor: pointer;
+    user-select: none;
+}
+.om-peer-sync-toggle input[type="checkbox"] {
+    accent-color: var(--om-accent);
+    cursor: pointer;
+}
+
+/* "+ New device" — same card silhouette as a peer, but sketch-bordered
+   to read as an empty slot operators can fill. */
+.flock-new-device {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 200px;
+    background: transparent;
+    color: var(--om-text-dim, var(--muted));
+    border: 1px dashed var(--om-line-2, var(--panel-border));
+    border-radius: var(--om-radius-lg, 0.5rem);
+    cursor: pointer;
+    font: inherit;
+    transition: border-color 120ms ease, color 120ms ease;
+}
+.flock-new-device:hover {
+    border-color: var(--om-accent);
+    color: var(--om-accent);
+}
+.flock-new-plus {
+    font-size: 32px;
+    line-height: 1;
+}
+.flock-new-label {
+    font-size: 13px;
+    letter-spacing: 0.02em;
+}
+
+.flock-status {
+    margin: 10px 0 0;
+    min-height: 1.2em;
+    color: var(--om-text-dim, var(--muted));
+    font-size: 12.5px;
+}
+.flock-status.error { color: var(--om-bad, #d33); }
