@@ -64,10 +64,24 @@ def http_get_json(url: str):
     return json.loads(http_get(url))
 
 
+# Mirrors backend/openmarquee/playlist.py's DEFAULT_PLAYLIST_ID. Identity,
+# not name — kept in sync manually since this script doesn't import the
+# backend (runs against a remote URL). If this UUID drifts from the
+# backend's, the hardening branch silently warns "no default in source"
+# and the demo seed lacks a populated default playlist.
+_DEFAULT_PLAYLIST_ID = "00000000-0000-4000-8000-000000000001"
+
+
 def find_default_playlist(playlists: dict) -> dict | None:
-    """Return the default playlist dict (or None) from the v4 collection."""
+    """Return the default playlist dict (or None) from the v4 collection.
+
+    Lookup is by stable UUID, not display name — the seed-time display
+    name flipped from "default" → "Welcome" in commit e0a3093, and
+    operator-renamed playlists could drift further. UUID is the only
+    reliable anchor.
+    """
     for pl in playlists.get("playlists", []) or []:
-        if pl.get("name") == "default":
+        if str(pl.get("id")) == _DEFAULT_PLAYLIST_ID:
             return pl
     return None
 

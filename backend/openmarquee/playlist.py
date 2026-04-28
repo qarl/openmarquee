@@ -407,11 +407,14 @@ def list_in_playlist_order(
     library assets (seed backgrounds, demo videos) don't leak onto
     the sign unless explicitly added to a playlist.
 
-    With `include_orphans=True`, items present in storage but not
-    referenced by ANY playlist are appended at the end (sorted by id).
-    That's what the UI pallets + the text-editor's background picker
-    want — the library view shows everything the device has stored,
-    not just what's currently scheduled to play.
+    With `include_orphans=True`, every item in storage that wasn't
+    already returned by the target-playlist loop is appended at the
+    end (sorted by id). This includes both items in other playlists
+    AND items in no playlist at all — the parameter name is legacy
+    from the single-playlist era. The UI pallets + the text-editor's
+    background picker depend on this "full library" view, which has
+    to surface content from every playlist or non-default playlists
+    become invisible once they exist.
 
     Items referenced by the playlist but missing from storage are
     silently skipped.
@@ -439,15 +442,16 @@ def list_in_playlist_order(
             used.add(p_item.item_id)
 
     if include_orphans:
-        all_referenced: set[UUID] = set()
-        for p in collection.playlists:
-            all_referenced.update(p.item_ids)
-        orphans = [
+        # Everything in storage NOT yet in `ordered` — items in other
+        # playlists AND true orphans alike. Pre-2026-04-28 this excluded
+        # items in other playlists, which made non-default playlist
+        # content invisible to the pallets / bg-picker / api/content.
+        extras = [
             item
             for item_id, item in items_by_id.items()
-            if item_id not in used and item_id not in all_referenced
+            if item_id not in used
         ]
-        orphans.sort(key=lambda item: str(item.id))
-        ordered.extend(orphans)
+        extras.sort(key=lambda item: str(item.id))
+        ordered.extend(extras)
 
     return ordered

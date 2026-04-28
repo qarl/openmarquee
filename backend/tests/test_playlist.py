@@ -354,6 +354,55 @@ def test_list_in_playlist_order_patches_transitions_onto_items(tmp_path: Path):
     assert ordered[0].transition_ms == 250
 
 
+def test_list_in_playlist_order_include_orphans_returns_items_from_non_default_playlists(
+    tmp_path: Path,
+):
+    """Pre-2026-04-28 bug: include_orphans=True only added items NOT in
+    any playlist, so items in non-default playlists were invisible to
+    /api/content + the UI pallets. Surfaced when seed.py started
+    seeding the Freedom playlist alongside Welcome — Freedom's slides
+    were missing from /api/content. Fixed by treating "anything not
+    yet in `ordered`" as the extras pool.
+    """
+    from openmarquee.content import TextSlide
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playlist import PlaylistItem, list_in_playlist_order
+
+    storage = ContentStorage(tmp_path / "content")
+    in_default = TextSlide(name="d", text="d")
+    in_other = TextSlide(name="o", text="o")
+    true_orphan = TextSlide(name="z", text="z")
+    for slide in (in_default, in_other, true_orphan):
+        storage.save_text_slide(slide, b"\x89PNG")
+
+    playlist_storage = PlaylistStorage(tmp_path / "playlist.json")
+    playlist_storage.set_by_id(
+        Playlist(
+            id=DEFAULT_PLAYLIST_ID,
+            name="Welcome",
+            items=[PlaylistItem(item_id=in_default.id)],
+        )
+    )
+    playlist_storage.set_by_id(
+        Playlist(
+            name="Freedom",
+            items=[PlaylistItem(item_id=in_other.id)],
+        )
+    )
+    # true_orphan is in storage but in no playlist.
+
+    ordered = list_in_playlist_order(
+        storage, playlist_storage, include_orphans=True
+    )
+    ids = [item.id for item in ordered]
+    # Default playlist's item comes first, in playlist order.
+    assert ids[0] == in_default.id
+    # Both the other-playlist item AND the true orphan show up after.
+    assert in_other.id in ids
+    assert true_orphan.id in ids
+    assert len(ids) == 3
+
+
 # --- prune_dangling_refs ---
 
 
