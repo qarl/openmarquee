@@ -71,7 +71,19 @@ PLAYLIST_SCHEMA_VERSION = 4
 # upload, tests) can reference the default playlist without a name lookup.
 # This is a UUID4 generated once and frozen here — DO NOT change it.
 DEFAULT_PLAYLIST_ID = UUID("00000000-0000-4000-8000-000000000001")
-DEFAULT_PLAYLIST_NAME = "default"
+# Display name applied to the default playlist on fresh-install bootstrap
+# and on legacy-save-path coercion. Was "default" through Phase 5; renamed
+# to "Welcome" 2026-04-28 to match the seeded slide content. The change
+# is name-only — the playlist's identity is its UUID, so schedule rules
+# / API references keep working across the rename.
+DEFAULT_PLAYLIST_NAME = "Welcome"
+# Legacy name used in v2/v3 storage to identify which playlist is the
+# default during migration. Kept as "default" so devices upgrading from
+# pre-v4 schemas still match their existing default playlist by name —
+# without this anchor, the migration would treat the legacy "default"
+# entry as just another named playlist and insert a new (empty) Welcome
+# playlist alongside it.
+LEGACY_DEFAULT_PLAYLIST_NAME = "default"
 
 
 class PlaylistItem(BaseModel):
@@ -276,9 +288,9 @@ class PlaylistStorage:
 
     def save(self, playlist: Playlist) -> None:
         """Legacy: replace the default playlist. Coerces the id to
-        DEFAULT_PLAYLIST_ID and the name to "default" so the legacy
-        single-playlist callers don't accidentally lose the default
-        identity."""
+        DEFAULT_PLAYLIST_ID and the name to DEFAULT_PLAYLIST_NAME
+        ("Welcome") so the legacy single-playlist callers don't
+        accidentally lose the default identity."""
         defaulted = playlist.model_copy(
             update={"id": DEFAULT_PLAYLIST_ID, "name": DEFAULT_PLAYLIST_NAME}
         )
@@ -342,8 +354,10 @@ def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
     # v2 or v3: dict-keyed by name.
     raw_playlists = data.get("playlists", {})
     migrated: list[Playlist] = []
-    # Only the FIRST playlist named "default" gets the constant id —
-    # if a hand-edited file or a restored backup somehow contains two
+    # Only the FIRST playlist named "default" (the LEGACY name used
+    # through v3) gets the constant id — preserves the existing default
+    # playlist's identity across the rename to "Welcome". If a
+    # hand-edited file or a restored backup somehow contains two
     # "default" entries, the second gets a fresh UUID rather than
     # silently overwriting the first.
     default_id_consumed = False
@@ -352,12 +366,19 @@ def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
             items = _playlist_items_from_legacy_item_ids(raw["item_ids"])
         else:
             items = [PlaylistItem.model_validate(i) for i in raw.get("items", [])]
-        if name == DEFAULT_PLAYLIST_NAME and not default_id_consumed:
+        if name == LEGACY_DEFAULT_PLAYLIST_NAME and not default_id_consumed:
             playlist_id = DEFAULT_PLAYLIST_ID
             default_id_consumed = True
+            # Migrate-rename for fleet uniformity: when the dict key is
+            # still the legacy "default" string, the operator hasn't
+            # renamed it themselves (any UI rename in v2/v3 would have
+            # changed the key). Rewrite to "Welcome" so upgraded devices
+            # land on the same name as freshly-seeded devices.
+            display_name = DEFAULT_PLAYLIST_NAME
         else:
             playlist_id = uuid4()
-        migrated.append(Playlist(id=playlist_id, name=name, items=items))
+            display_name = name
+        migrated.append(Playlist(id=playlist_id, name=display_name, items=items))
     # Guarantee the default playlist exists so callers can rely on it.
     if not any(p.id == DEFAULT_PLAYLIST_ID for p in migrated):
         migrated.insert(

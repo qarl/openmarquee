@@ -208,7 +208,10 @@ def test_v3_dict_keyed_migrates_to_v4_list_with_uuids(tmp_path: Path):
     assert len(coll.playlists) == 2
     default_pl = coll.by_id(DEFAULT_PLAYLIST_ID)
     assert default_pl is not None
-    assert default_pl.name == "default"
+    # Migration-rename: a v3 "default" key the operator never touched
+    # gets renamed to "Welcome" on upgrade so the fleet's display
+    # names stay uniform across fresh-installs and upgrades.
+    assert default_pl.name == "Welcome"
     assert default_pl.item_ids == [a]
     # Lunch playlist preserved with its name and a fresh UUID.
     lunch = coll.by_name("lunch")

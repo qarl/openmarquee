@@ -27,6 +27,7 @@ from openmarquee.dependencies import (
     get_playback_loop,
     get_playlist_storage,
     get_pull_worker,
+    get_schedule_storage,
     get_seed_marker_path,
     get_settings_storage,
     get_stream_manager,
@@ -54,6 +55,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 width=settings.display_width,
                 height=settings.display_height,
                 demo_video_path=get_demo_video_path(),
+                schedule_storage=get_schedule_storage(),
             )
         except Exception:
             # Seeding is nice-to-have; never block startup on it.
