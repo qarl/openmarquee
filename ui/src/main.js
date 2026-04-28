@@ -479,7 +479,21 @@ async function boot() {
     // depend on display dims (the device-side renderer cover-fits the
     // remote video to whatever the active renderer's native size is),
     // so it mounts once alongside Settings + Schedule.
-    mountStreamPanel(root.querySelector(".stream-panel-slot"));
+    //
+    // The openmarquee.com/demo bundle has no real backend peer to
+    // negotiate WebRTC against — `data-demo-mode` on <body> flips the
+    // panel into a state-machine-only mode that still opens the local
+    // camera + transitions through live, but skips the real PC creation
+    // and the /api/stream/{start,stop,takeover} round trips. The
+    // pathname check is belt-and-suspenders: if someone ever strips
+    // data-demo-mode from the demo template, the panel still simulates
+    // (instead of silently breaking with a setRemoteDescription throw).
+    const isDemoMode =
+        document.body.hasAttribute("data-demo-mode") ||
+        window.location.pathname.startsWith("/demo/");
+    mountStreamPanel(root.querySelector(".stream-panel-slot"), {
+        simulateOnly: isDemoMode,
+    });
 
     mountFlock(root.querySelector(".flock-slot"), {
         fetchFlock: listFlock,

@@ -365,6 +365,27 @@
         if (pathname === "/api/system/display-dims" && method === "GET") {
             return jsonResponse({ width: 1920, height: 1080, source: "demo" });
         }
+
+        // --- stream (live phone-camera takeover, SYSTEM_SPEC §5.11) ---
+        // simulateOnly mode in the panel skips the /start /stop
+        // /takeover round trips entirely — they're never called from
+        // a demo-mode bundle. /status IS still called as the panel's
+        // pre-flight check, so we answer it here. Always idle so the
+        // operator gets the standard Go Live flow rather than the
+        // take-over branch (which works, but is less interesting as a
+        // first-look demo).
+        if (pathname === "/api/stream/status" && method === "GET") {
+            return jsonResponse({
+                state: "idle",
+                session_id: null,
+                tier: {
+                    name: "basic",
+                    max_width: 854,
+                    max_height: 480,
+                    max_fps: 30,
+                },
+            });
+        }
         if (pathname === "/api/system/wifi-scan" && method === "GET") {
             return jsonResponse({
                 networks: [

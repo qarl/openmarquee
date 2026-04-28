@@ -420,6 +420,49 @@ describe("mountStreamPanel", () => {
         );
     });
 
+    it("simulateOnly: Go Live skips PC creation + /api/stream/start, still flips to live", async () => {
+        // The openmarquee.com/demo bundle has no real peer — the panel
+        // still needs to demo end-to-end (camera open, live state,
+        // Tailscale warning) without actually negotiating WebRTC.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, {
+            ...opts,
+            simulateOnly: true,
+        });
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        // Camera was opened (the local preview is the visible payoff
+        // of the demo) but no PC was created and no /start was called.
+        expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
+        expect(opts.createPeerConnection).not.toHaveBeenCalled();
+        expect(opts.apiStartStream).not.toHaveBeenCalled();
+        // Live state surfaces normally — Stop, flip, warning all visible.
+        expect(container.querySelector(".stream-stop").hidden).toBe(false);
+        expect(container.querySelector(".stream-warning").hidden).toBe(false);
+    });
+
+    it("simulateOnly: Stop returns to idle without calling /api/stream/stop", async () => {
+        // The session_id was minted locally — the backend never knew
+        // about it, so /stop would 404. Skip the call entirely.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, {
+            ...opts,
+            simulateOnly: true,
+        });
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        container.querySelector(".stream-stop").click();
+        await waitFor(() => handle.getState() === "idle");
+
+        expect(opts.apiStopStream).not.toHaveBeenCalled();
+    });
+
     it("connectionstatechange listener ignores our own pc.close() teardown", async () => {
         // Regression: teardownPC nulls state.pc BEFORE close() so the
         // 'closed' connectionstatechange that fires from our own

@@ -107,6 +107,12 @@ const SECTION_TEMPLATE = `
  * @param {(sessionId:string) => Promise} [options.apiStopStream]
  * @param {(constraints) => Promise<MediaStream>} [options.getUserMedia]
  * @param {() => RTCPeerConnection} [options.createPeerConnection]
+ * @param {boolean} [options.simulateOnly] — when true, skip the
+ *   WebRTC negotiation and the /api/stream/{start,stop,takeover}
+ *   round trips entirely. The local-camera preview, state machine,
+ *   and Tailscale-foreground warning still all run as in production.
+ *   Used by the openmarquee.com/demo bundle, where there's no real
+ *   peer to negotiate against.
  * @returns {{ destroy: () => void, getState: () => string }}
  */
 export function mountStreamPanel(container, options = {}) {
@@ -118,6 +124,7 @@ export function mountStreamPanel(container, options = {}) {
         getUserMedia = (constraints) =>
             navigator.mediaDevices.getUserMedia(constraints),
         createPeerConnection = () => new RTCPeerConnection(),
+        simulateOnly = false,
     } = options;
 
     container.innerHTML = SECTION_TEMPLATE;
@@ -273,6 +280,20 @@ export function mountStreamPanel(container, options = {}) {
         state.sessionId = session_id;
     }
 
+    async function simulateNegotiate() {
+        // Demo-mode shortcut: skip the WebRTC negotiation entirely.
+        // No PC, no /api/stream/{start,takeover} round trip — just
+        // mint a local session_id so the rest of the panel's
+        // state machine has something to track.
+        // The local-camera preview is already wired up by the
+        // caller's openLocalCamera() call, so the operator still
+        // sees real frames in the panel.
+        state.sessionId =
+            typeof crypto !== "undefined" && crypto.randomUUID
+                ? crypto.randomUUID()
+                : `demo-${Date.now()}`;
+    }
+
     // --- Phase handlers ---------------------------------------------------
 
     async function goLive() {
@@ -302,7 +323,11 @@ export function mountStreamPanel(container, options = {}) {
             state.phase = "negotiating";
             setMessage("Connecting…");
             render();
-            await negotiate();
+            if (simulateOnly) {
+                await simulateNegotiate();
+            } else {
+                await negotiate();
+            }
 
             state.phase = "live";
             setMessage("Live.");
@@ -329,11 +354,17 @@ export function mountStreamPanel(container, options = {}) {
         const sessionId = state.sessionId;
         teardownPC();
         state.sessionId = null;
-        try {
-            if (sessionId) await apiStopStream(sessionId);
-        } catch {
-            // Stop API failure is non-fatal — the device times out the
-            // session on PC disconnect anyway. Don't block the operator.
+        // simulateOnly minted the session_id locally — the backend
+        // never knew about it, so /api/stream/stop has nothing to
+        // tear down and would just 404.
+        if (!simulateOnly) {
+            try {
+                if (sessionId) await apiStopStream(sessionId);
+            } catch {
+                // Stop API failure is non-fatal — the device times
+                // out the session on PC disconnect anyway. Don't
+                // block the operator.
+            }
         }
         state.phase = "idle";
         setMessage("");
@@ -350,7 +381,11 @@ export function mountStreamPanel(container, options = {}) {
             state.phase = "negotiating";
             setMessage("Taking over…");
             render();
-            await negotiate({ takeover: true });
+            if (simulateOnly) {
+                await simulateNegotiate();
+            } else {
+                await negotiate({ takeover: true });
+            }
 
             state.phase = "live";
             setMessage("Live.");
