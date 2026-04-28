@@ -518,12 +518,13 @@
     }
 
     function orderedContent() {
-        // Mirror list_in_playlist_order(..., include_orphans=True):
-        // default playlist's items first (in playlist order, with
-        // patched transitions), then every storage item not referenced
-        // by ANY playlist (sorted by id). UI pallets + bg-picker expect
-        // the full library; playback stays strict on its own code path.
-        const list = state.playlists.playlists || [];
+        // Mirror list_in_playlist_order(..., include_orphans=True) post
+        // the 9e7d7b7 backend fix: default playlist's items first (in
+        // playlist order, with patched transitions), then every storage
+        // item not yet emitted (sorted by id) — items in OTHER playlists
+        // AND true orphans alike. Pre-2026-04-28 this only added true
+        // orphans, which made non-default playlist content (Freedom's
+        // FREE/YOUR/SCREEN slides) invisible to the pallets / bg-picker.
         const pl = findPlaylistById(DEFAULT_PLAYLIST_ID) || { items: [] };
         const byId = new Map(state.content.map((c) => [c.id, c]));
         const ordered = [];
@@ -538,15 +539,10 @@
                 transition_ms: entry.transition_ms,
             });
         }
-        const allReferenced = new Set();
-        // collection is now a list of playlists (v4 shape).
-        for (const p of list) {
-            for (const e of p.items || []) allReferenced.add(e.item_id);
-        }
-        const orphans = state.content
-            .filter((c) => !used.has(c.id) && !allReferenced.has(c.id))
+        const extras = state.content
+            .filter((c) => !used.has(c.id))
             .sort((a, b) => String(a.id).localeCompare(String(b.id)));
-        ordered.push(...orphans);
+        ordered.push(...extras);
         return ordered;
     }
 
