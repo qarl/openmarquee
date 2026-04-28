@@ -113,7 +113,7 @@ def test_seed_creates_starter_slides_when_fresh(
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
     # At least the 4 fallback backgrounds + 3 welcome text slides + 3
-    # Freedom text slides (FREE / YOUR / SCREEN).
+    # Freedom text slides (FREE / YOUR / SIGN).
     assert len(created) >= 10
 
     # They round-trip through storage.
@@ -136,7 +136,7 @@ def test_seed_default_playlist_contains_the_three_welcome_text_slides(
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
     # Welcome text slides come first in the seed flow; Freedom slides
-    # (FREE / YOUR / SCREEN) come after, on a separate playlist.
+    # (FREE / YOUR / SIGN) come after, on a separate playlist.
     text_slides = [s for s in created if s.type == "text_slide"]
     welcome_slides = text_slides[:3]
     assert [s.text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
@@ -167,12 +167,12 @@ def test_seed_creates_freedom_playlist_with_three_slides(
 ):
     """qarl's 2026-04-28 ask: fresh boot also creates a 'Freedom'
     playlist with three protest-poster slides reading FREE / YOUR /
-    SCREEN. Played by the Friday-night schedule rule."""
+    SIGN. Played by the Friday-night schedule rule."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
     text_slides = [s for s in created if s.type == "text_slide"]
     freedom_slides = text_slides[3:6]
-    assert [s.text for s in freedom_slides] == ["FREE", "YOUR", "SCREEN"]
+    assert [s.text for s in freedom_slides] == ["FREE", "YOUR", "SIGN"]
 
     # Freedom playlist exists alongside the default (Welcome) playlist.
     collection = playlist.load_all()
@@ -415,7 +415,7 @@ def test_seed_bundled_skips_unreadable_files_but_still_seeds_good_ones(
     assert names == [
         "FREE",
         "Good — Background",
-        "SCREEN",
+        "SIGN",
         "Welcome",
         "YOUR",
         "openMarquee",
@@ -454,7 +454,7 @@ def test_seed_bundled_is_deterministic_across_runs(
         "openMarquee",
         "FREE",
         "YOUR",
-        "SCREEN",
+        "SIGN",
     ]
 
 

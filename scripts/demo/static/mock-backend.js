@@ -524,7 +524,7 @@
         // item not yet emitted (sorted by id) — items in OTHER playlists
         // AND true orphans alike. Pre-2026-04-28 this only added true
         // orphans, which made non-default playlist content (Freedom's
-        // FREE/YOUR/SCREEN slides) invisible to the pallets / bg-picker.
+        // FREE/YOUR/SIGN slides) invisible to the pallets / bg-picker.
         const pl = findPlaylistById(DEFAULT_PLAYLIST_ID) || { items: [] };
         const byId = new Map(state.content.map((c) => [c.id, c]));
         const ordered = [];

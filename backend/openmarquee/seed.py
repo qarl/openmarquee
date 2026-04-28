@@ -226,7 +226,7 @@ def seed_if_needed(
         playlist_storage.save(playlist)
 
         # 4. Freedom playlist: three protest-poster-style text slides
-        #    (FREE / YOUR / SCREEN) on a separate playlist. Available
+        #    (FREE / YOUR / SIGN) on a separate playlist. Available
         #    content from the moment seed runs; activated by the Friday
         #    schedule rule below. Operators who want it more often can
         #    edit the schedule, or drag the slides into other playlists.
@@ -423,7 +423,7 @@ _WELCOME_PLAYLIST_TEXTS: tuple[str, ...] = tuple(s.text for s in _WELCOME_SPECS)
 # scheduled rule (see _seed_friday_freedom_rule). Reuse _WelcomeSlideSpec
 # since the shape is identical — text, font, color, bg stem, transition
 # out. Bold display fonts on punchy backgrounds; short duration for a
-# chant-like cadence. "FREE / YOUR / SCREEN" — capital-S Screen, the
+# chant-like cadence. "FREE / YOUR / SIGN" — the openMarquee
 # project's free-your-sign ethos in three hits.
 _FREEDOM_SPECS: tuple[_WelcomeSlideSpec, ...] = (
     _WelcomeSlideSpec(
@@ -441,7 +441,7 @@ _FREEDOM_SPECS: tuple[_WelcomeSlideSpec, ...] = (
         transition_out="wipe",
     ),
     _WelcomeSlideSpec(
-        text="SCREEN",
+        text="SIGN",
         font_family="Alfa Slab One",
         text_color="#F5A524",
         background_filename_stem="midnight",
