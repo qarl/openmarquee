@@ -51,6 +51,7 @@ function makeFakePc({ answerSdp = "v=0\r\nfake-answer\r\n" } = {}) {
     const senders = [];
     const pc = {
         iceGatheringState: "complete",
+        connectionState: "new",
         addTrack(track) {
             const sender = {
                 track,
@@ -76,6 +77,16 @@ function makeFakePc({ answerSdp = "v=0\r\nfake-answer\r\n" } = {}) {
         },
         removeEventListener(event) {
             delete handlers[event];
+        },
+        // Test-only knob: simulate the PC's connection state changing
+        // (Tailscale flap, peer crash, network blip). Sets the new
+        // state and fires whatever connectionstatechange listener the
+        // panel registered.
+        _setConnectionState(next) {
+            pc.connectionState = next;
+            if (handlers.connectionstatechange) {
+                handlers.connectionstatechange();
+            }
         },
         closed: false,
         close() {
@@ -368,5 +379,73 @@ describe("mountStreamPanel", () => {
         handle.destroy();
         expect(opts._fakePc.closed).toBe(true);
         expect(container.innerHTML).toBe("");
+    });
+
+    it("PC connectionState=failed mid-stream resets the panel out of live", async () => {
+        // §5.11 failure modes: phone loses connectivity, PC enters
+        // disconnected/failed. Without this listener, the backend times
+        // out after 10s but the panel keeps showing "Live." indefinitely.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        opts._fakePc._setConnectionState("failed");
+        await waitFor(() => handle.getState() === "error");
+
+        expect(container.querySelector(".stream-status").textContent).toMatch(
+            /Connection failed/,
+        );
+        // Tracks were stopped so the camera light goes off; PC closed
+        // by failTo's teardownPC call.
+        expect(opts._fakePc.closed).toBe(true);
+    });
+
+    it("PC connectionState=disconnected also resets out of live", async () => {
+        // disconnected can be transient in WebRTC, but for v1 we treat
+        // it the same as failed — operator can re-tap Go Live to retry.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        opts._fakePc._setConnectionState("disconnected");
+        await waitFor(() => handle.getState() === "error");
+        expect(container.querySelector(".stream-status").textContent).toMatch(
+            /disconnected/,
+        );
+    });
+
+    it("connectionstatechange listener ignores our own pc.close() teardown", async () => {
+        // Regression: teardownPC nulls state.pc BEFORE close() so the
+        // 'closed' connectionstatechange that fires from our own
+        // teardown doesn't re-enter failTo and double-render. Without
+        // this ordering, Stop would briefly land in 'error' before
+        // settling on 'idle'.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        const pc = opts._fakePc;
+        // Capture original close so we can fire 'closed' after the
+        // panel's stop logic has nulled state.pc.
+        const origClose = pc.close.bind(pc);
+        pc.close = function () {
+            origClose();
+            pc._setConnectionState("closed");
+        };
+
+        container.querySelector(".stream-stop").click();
+        await waitFor(() => handle.getState() === "idle");
+        // Did NOT pass through 'error' — the listener saw state.pc !== pc
+        // (already nulled by teardownPC) and skipped failTo.
+        expect(handle.getState()).toBe("idle");
     });
 });

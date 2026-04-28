@@ -140,9 +140,6 @@ export function mountStreamPanel(container, options = {}) {
         // "take-over-prompt" | "error"
         phase: "idle",
         sessionId: null,
-        // Cached SDP offer from a previous /start — replayed by /takeover
-        // so we don't need to re-create the PC and re-gather ICE.
-        pendingOffer: null,
         // Active local camera stream (preview source + the track we add
         // to the PC). Null when idle/error/take-over-prompt.
         localStream: null,
@@ -211,13 +208,19 @@ export function mountStreamPanel(container, options = {}) {
     }
 
     function teardownPC() {
-        if (state.pc) {
+        // Capture + null state.pc BEFORE close() so the
+        // connectionstatechange listener wired in negotiate() sees a
+        // mismatch (state.pc !== pc) and skips its failure-path
+        // handling — close() fires a 'closed' event that would
+        // otherwise re-enter failTo() and double-render.
+        const pc = state.pc;
+        state.pc = null;
+        if (pc) {
             try {
-                state.pc.close();
+                pc.close();
             } catch {
                 /* close errors aren't actionable */
             }
-            state.pc = null;
         }
         if (state.localStream) {
             for (const track of state.localStream.getTracks()) {
@@ -230,13 +233,32 @@ export function mountStreamPanel(container, options = {}) {
             state.localStream = null;
         }
         previewEl.srcObject = null;
-        state.pendingOffer = null;
     }
 
     async function negotiate({ takeover = false } = {}) {
         // Caller already in "negotiating" phase + has a localStream open.
         const pc = createPeerConnection();
         state.pc = pc;
+
+        // Watch the PC's connection state so the panel reacts to
+        // mid-stream drops — Tailscale flap, peer crash, network blip.
+        // Without this, the backend times out after ~10s (per §5.11
+        // failure modes) but the panel stays in 'live' indefinitely.
+        // The state.pc !== pc check makes the listener safe across
+        // teardown + restart cycles: teardownPC() nulls state.pc before
+        // close(), so the 'closed' event from our own teardown is
+        // silently ignored here and only remote-side failures
+        // (disconnected / failed) trigger the recovery path.
+        pc.addEventListener("connectionstatechange", () => {
+            if (state.pc !== pc) return;
+            if (state.phase !== "live") return;
+            const cs = pc.connectionState;
+            if (cs === "failed" || cs === "disconnected") {
+                state.sessionId = null;
+                failTo(new Error(`Connection ${cs}.`));
+            }
+        });
+
         for (const track of state.localStream.getVideoTracks()) {
             pc.addTrack(track, state.localStream);
         }
@@ -244,7 +266,6 @@ export function mountStreamPanel(container, options = {}) {
         await pc.setLocalDescription(offer);
         await waitForIceGathering(pc);
         const offerSdp = pc.localDescription.sdp;
-        state.pendingOffer = offerSdp;
 
         const apiCall = takeover ? apiTakeoverStream : apiStartStream;
         const { session_id, sdp_answer } = await apiCall(offerSdp);

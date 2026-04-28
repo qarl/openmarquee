@@ -412,6 +412,13 @@ export async function deleteFlockPeer(peerId) {
 
 /* --- Stream: live phone-camera takeover (SYSTEM_SPEC §5.11). --- */
 
+// Negotiation timeout for /start + /takeover. Tailscale on a flat tailnet
+// completes the SDP+ICE round trip in well under a second; 15s is a wide
+// margin that still surfaces a wedged backend or a lossy WAN link before
+// the operator stares at "Connecting…" forever. Without this, an unhealthy
+// fetch hangs the panel indefinitely (QA finding from Phase 12.2 review).
+const STREAM_NEGOTIATE_TIMEOUT_MS = 15_000;
+
 /**
  * Current stream state. Shape:
  *   { state: "idle" | "active",
@@ -441,6 +448,7 @@ export async function startStream(sdpOffer) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sdp_offer: sdpOffer }),
+        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
     });
     if (response.status === 409) {
         const body = await response.json();
@@ -467,6 +475,7 @@ export async function takeoverStream(sdpOffer) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sdp_offer: sdpOffer }),
+        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
     });
     if (!response.ok) {
         const detail = await response.text();

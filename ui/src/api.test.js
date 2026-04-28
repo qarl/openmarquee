@@ -12,7 +12,9 @@ import {
     saveTextSlide,
     saveVideo,
     startPlayback,
+    startStream,
     stopPlayback,
+    takeoverStream,
 } from "./api.js";
 
 afterEach(() => {
@@ -372,5 +374,60 @@ describe("playback control API", () => {
     it("throws on non-ok responses", async () => {
         mockFetch({ ok: false, status: 500 });
         await expect(startPlayback()).rejects.toThrow("500");
+    });
+});
+
+describe("stream API", () => {
+    it("startStream attaches an AbortSignal so a wedged backend can't strand the panel", async () => {
+        // Regression for the QA finding from Phase 12.2 review: without
+        // a timeout, a hung /api/stream/start fetch leaves the panel in
+        // 'Connecting…' indefinitely. AbortSignal.timeout(15s) gives
+        // Tailscale + aiortc plenty of headroom but caps the worst case.
+        const fetchMock = mockFetch({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                session_id: "11111111-1111-1111-1111-111111111111",
+                sdp_answer: "v=0\r\nfake-answer\r\n",
+            }),
+        });
+        await startStream("v=0\r\noffer\r\n");
+        const init = fetchMock.mock.calls[0][1];
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it("takeoverStream also attaches an AbortSignal", async () => {
+        const fetchMock = mockFetch({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                session_id: "22222222-2222-2222-2222-222222222222",
+                sdp_answer: "v=0\r\nfake-answer\r\n",
+            }),
+        });
+        await takeoverStream("v=0\r\noffer\r\n");
+        const init = fetchMock.mock.calls[0][1];
+        expect(init.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it("startStream surfaces a 409 with active_session_id pulled from the body", async () => {
+        // The phone uses err.activeSessionId to switch from "Go Live"
+        // to "Take Over" without a separate /status round trip.
+        mockFetch({
+            ok: false,
+            status: 409,
+            json: async () => ({
+                detail: {
+                    error: "stream_already_active",
+                    active_session_id: "33333333-3333-3333-3333-333333333333",
+                },
+            }),
+        });
+        const err = await startStream("v=0\r\noffer\r\n").catch((e) => e);
+        expect(err.code).toBe("stream_already_active");
+        expect(err.activeSessionId).toBe(
+            "33333333-3333-3333-3333-333333333333",
+        );
+        expect(err.status).toBe(409);
     });
 });
