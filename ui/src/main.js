@@ -60,6 +60,7 @@ import { Icons } from "./icons.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountSlidesShell } from "./slides.js";
+import { mountStreamPanel } from "./stream-panel.js";
 import { mountVideoUploader } from "./video-upload.js";
 
 // Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
@@ -71,6 +72,7 @@ const FALLBACK_HEIGHT = 96;
 const SECTIONS = [
     "slides",
     "playlists",
+    "stream",
     "flock",
     "schedule",
     "settings",
@@ -185,6 +187,9 @@ async function boot() {
         </section>
         <section data-section="playlists" class="panel">
             <div class="playlist-track-slot"></div>
+        </section>
+        <section data-section="stream" class="panel">
+            <div class="stream-panel-slot"></div>
         </section>
         <section data-section="flock" class="panel">
             <div class="flock-slot"></div>
@@ -470,6 +475,12 @@ async function boot() {
         onSave: saveSettings,
     });
 
+    // Stream panel — phone-camera takeover (SYSTEM_SPEC §5.11). Doesn't
+    // depend on display dims (the device-side renderer cover-fits the
+    // remote video to whatever the active renderer's native size is),
+    // so it mounts once alongside Settings + Schedule.
+    mountStreamPanel(root.querySelector(".stream-panel-slot"));
+
     mountFlock(root.querySelector(".flock-slot"), {
         fetchFlock: listFlock,
         fetchSettings: getSettings,
@@ -529,6 +540,7 @@ async function boot() {
         flock: "Flock",
         slides: "Slides",
         playlist: "Playlist",
+        stream: "Stream",
         schedule: "Schedule",
         settings: "Settings",
         menu: "Menu",
@@ -557,6 +569,7 @@ async function boot() {
         "slides/image": "Image slides",
         "slides/video": "Video slides",
         playlists: "Playlists",
+        stream: "Stream",
         flock: "Your flock",
         schedule: "Schedule",
         settings: "Settings",

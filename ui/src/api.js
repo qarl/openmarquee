@@ -408,3 +408,85 @@ export async function deleteFlockPeer(peerId) {
         throw new Error(`Remove peer failed (${response.status})`);
     }
 }
+
+
+/* --- Stream: live phone-camera takeover (SYSTEM_SPEC §5.11). --- */
+
+/**
+ * Current stream state. Shape:
+ *   { state: "idle" | "active",
+ *     session_id: string | null,
+ *     tier: { name, max_width, max_height, max_fps } }
+ *
+ * Polled before Go Live so the panel can switch to a "Take over"
+ * affordance when another phone owns the screen — without a separate
+ * round trip after the 409.
+ */
+export async function getStreamStatus() {
+    const response = await fetch("/api/stream/status");
+    if (!response.ok) {
+        throw new Error(`Stream status failed (${response.status})`);
+    }
+    return await response.json();
+}
+
+/**
+ * Start a stream session. Phone-published SDP offer goes in; SDP answer
+ * + session_id come back. Throws a structured error on 409 carrying
+ * `active_session_id` so the caller can switch to the take-over flow
+ * without re-polling /status.
+ */
+export async function startStream(sdpOffer) {
+    const response = await fetch("/api/stream/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp_offer: sdpOffer }),
+    });
+    if (response.status === 409) {
+        const body = await response.json();
+        const detail = body?.detail || {};
+        const err = new Error("stream_already_active");
+        err.code = detail.error || "stream_already_active";
+        err.activeSessionId = detail.active_session_id || null;
+        err.status = 409;
+        throw err;
+    }
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Stream start failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
+ * Force-stop any active session and start a new one in the same call.
+ * Same response shape as startStream — phone applies the answer.
+ */
+export async function takeoverStream(sdpOffer) {
+    const response = await fetch("/api/stream/takeover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sdp_offer: sdpOffer }),
+    });
+    if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Stream takeover failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
+ * Stop a stream by session id. 404 if it isn't the currently-active
+ * session — caller's local state is stale; usually safe to swallow.
+ */
+export async function stopStream(sessionId) {
+    const response = await fetch("/api/stream/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+    });
+    if (!response.ok && response.status !== 404) {
+        const detail = await response.text();
+        throw new Error(`Stream stop failed (${response.status}): ${detail}`);
+    }
+}
