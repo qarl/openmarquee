@@ -16,6 +16,12 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "pillow>=10.0",
     "aiortc>=1.9",
+    # numpy is a hard dep of stream.py's `frame.to_ndarray(format='rgb24')`.
+    # PyAV declares numpy as optional, so without this entry a fresh
+    # setup.sh fails test collection at tests/test_stream.py with
+    # ModuleNotFoundError: numpy. Caught by Jimmy-openmarquee-qa
+    # post-Phase-12.1 verification.
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
