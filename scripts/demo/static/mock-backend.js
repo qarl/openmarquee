@@ -397,7 +397,21 @@
 
         // --- flock ---
         if (pathname === "/api/flock" && method === "GET") {
-            return jsonResponse({ schema_version: 1, peers: state.flock_peers });
+            // Stamp last_seen_at = now on every peer at GET time so the
+            // demo's flock panel renders peers as ONLINE regardless of
+            // how long the visitor has had the demo open. The 2026-04-28
+            // flock-panel rewrite reads peer freshness from a 30s window
+            // off last_seen_at (real-device semantics: a probe-recently-
+            // succeeded signal). Storing a static timestamp in seed.json
+            // would expire after 30s; storing null would mark every peer
+            // offline forever. Stamping at GET keeps the demo alive
+            // indefinitely without seed-shape gymnastics.
+            const now = new Date().toISOString();
+            const peers = (state.flock_peers || []).map((p) => ({
+                ...p,
+                last_seen_at: now,
+            }));
+            return jsonResponse({ schema_version: 1, peers });
         }
         if (pathname === "/api/flock" && method === "POST") {
             const body = await request.json();
