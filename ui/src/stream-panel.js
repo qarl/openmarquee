@@ -231,8 +231,14 @@ export function mountStreamPanel(container, options = {}) {
     // and toggles which controls are visible, so handlers only need to
     // mutate state + call render().
     const state = {
-        // "idle" | "requesting-camera" | "negotiating" | "live" |
-        // "take-over-prompt" | "error"
+        // "idle" | "requesting-camera" | "preview" | "negotiating" |
+        // "live" | "take-over-prompt" | "error"
+        //
+        // Phase 12.2 followup (qarl 2026-04-29): added 'preview' —
+        // local camera is open + rendering into the viewfinder, but
+        // no PC + no broadcast yet. Mount-init enters this state on
+        // boot when /status is idle; Stop returns here so the next
+        // Go Live skips the camera-permission round trip.
         phase: "idle",
         sessionId: null,
         // Active local camera stream (preview source + the track we add
@@ -374,17 +380,19 @@ export function mountStreamPanel(container, options = {}) {
         // Visibility matrix per phase. The render is idempotent — call
         // it after every state mutation; the DOM converges.
         const phase = state.phase;
-        goLiveBtn.hidden = !(phase === "idle" || phase === "error");
+        const ready = phase === "idle" || phase === "preview" || phase === "error";
+        goLiveBtn.hidden = !ready;
         stopBtn.hidden = phase !== "live";
         takeOverBtn.hidden = phase !== "take-over-prompt";
         cancelTakeoverBtn.hidden = phase !== "take-over-prompt";
 
         // LIVE pill on the viewfinder + metrics grid below it: only
-        // while live. Idle-only paused-playlist hint: only when idle/
-        // error (i.e. not transient + not live).
+        // while live. The paused-playlist hint shows in any "ready"
+        // phase (idle/preview/error) — i.e. anywhere Go live is
+        // available.
         livePillEl.hidden = phase !== "live";
         metricsGridEl.hidden = phase !== "live";
-        pausedRowEl.hidden = !(phase === "idle" || phase === "error");
+        pausedRowEl.hidden = !ready;
 
         // Empty-state cover only when there's no local preview to show.
         previewEmptyEl.hidden = state.localStream !== null;
@@ -464,7 +472,7 @@ export function mountStreamPanel(container, options = {}) {
         return stream;
     }
 
-    function teardownPC() {
+    function teardownPC({ keepCamera = false } = {}) {
         // Capture + null state.pc BEFORE close() so the
         // connectionstatechange listener wired in negotiate() sees a
         // mismatch (state.pc !== pc) and skips its failure-path
@@ -479,7 +487,12 @@ export function mountStreamPanel(container, options = {}) {
                 /* close errors aren't actionable */
             }
         }
-        if (state.localStream) {
+        // Phase 12.2 followup: stop() → preview keeps the camera open
+        // so the operator can re-go-live without another permission
+        // round-trip. Default is full teardown (failTo, cancelTakeover,
+        // pagehide, destroy) — the camera light should be off any time
+        // the panel doesn't intend to show a viewfinder.
+        if (!keepCamera && state.localStream) {
             for (const track of state.localStream.getTracks()) {
                 try {
                     track.stop();
@@ -488,8 +501,8 @@ export function mountStreamPanel(container, options = {}) {
                 }
             }
             state.localStream = null;
+            previewEl.srcObject = null;
         }
-        previewEl.srcObject = null;
     }
 
     async function negotiate({ takeover = false } = {}) {
@@ -557,28 +570,57 @@ export function mountStreamPanel(container, options = {}) {
     // --- Phase handlers ---------------------------------------------------
 
     async function goLive() {
+        // If mount-init is still running, let it finish first. This
+        // serializes the two paths so a synchronous Go-Live click
+        // (before mount-init's /status round-trip resolves) doesn't
+        // race-double-open the camera or fire two pre-flight checks.
+        // Once mount-init settles we'll be in preview / take-over-
+        // prompt / idle / error and can decide accordingly.
+        if (mountInitPromise) {
+            try {
+                await mountInitPromise;
+            } catch {
+                /* mount-init swallows its own errors — nothing to handle here */
+            }
+        }
         // Pre-flight /status check: if another phone owns the screen,
         // skip the camera prompt entirely and surface the take-over UI
         // straight away. Saves the operator a permission dialog they'd
-        // dismiss anyway.
-        try {
-            const status = await apiGetStatus();
-            if (status.state === "active") {
-                state.phase = "take-over-prompt";
-                setMessage("Someone else is streaming to this screen.");
-                render();
-                return;
+        // dismiss anyway. Skipped when starting from preview — mount-
+        // init just ran the same check; the 409-mid-flight handler in
+        // the catch block below covers any race that opens up between
+        // mount and click.
+        if (state.phase === "take-over-prompt") {
+            // Mount-init resolved into take-over-prompt while we were
+            // awaiting it. The button that fired this handler is now
+            // hidden and the UI has already converged — nothing for
+            // goLive to do.
+            return;
+        }
+        if (state.phase !== "preview") {
+            try {
+                const status = await apiGetStatus();
+                if (status.state === "active") {
+                    state.phase = "take-over-prompt";
+                    setMessage("Someone else is streaming to this screen.");
+                    render();
+                    return;
+                }
+            } catch {
+                // /status failure is non-fatal — try to negotiate anyway,
+                // the /start response will tell us the truth.
             }
-        } catch {
-            // /status failure is non-fatal — try to negotiate anyway,
-            // the /start response will tell us the truth.
         }
 
         try {
-            state.phase = "requesting-camera";
-            setMessage("Requesting camera access…");
-            render();
-            await openLocalCamera();
+            // Open camera if mount-init didn't already (idle/error
+            // entry; preview entry already has a live localStream).
+            if (state.localStream === null) {
+                state.phase = "requesting-camera";
+                setMessage("Requesting camera access…");
+                render();
+                await openLocalCamera();
+            }
 
             state.phase = "negotiating";
             setMessage("Connecting…");
@@ -612,7 +654,12 @@ export function mountStreamPanel(container, options = {}) {
 
     async function stopLive() {
         const sessionId = state.sessionId;
-        teardownPC();
+        // Phase 12.2 followup: keep the camera open + return to
+        // preview so the operator can re-go-live without another
+        // permission dialog. The PC is torn down (the session is
+        // over); the local camera stream is preserved as the
+        // viewfinder source.
+        teardownPC({ keepCamera: true });
         state.sessionId = null;
         // simulateOnly minted the session_id locally — the backend
         // never knew about it, so /api/stream/stop has nothing to
@@ -626,7 +673,7 @@ export function mountStreamPanel(container, options = {}) {
                 // block the operator.
             }
         }
-        state.phase = "idle";
+        state.phase = "preview";
         setMessage("");
         render();
     }
@@ -662,6 +709,13 @@ export function mountStreamPanel(container, options = {}) {
         // when there's nothing to tear down.
         teardownPC();
         state.sessionId = null;
+        // TODO(qarl-confirm): Cancel from a mount-time take-over-prompt
+        // currently drops to plain idle — no viewfinder. With preview-
+        // on-mount, the alternative is to re-run mountInit() so /status
+        // is rechecked and the camera opens if the prior publisher has
+        // since stopped. Defaulted to idle for the simplest semantics
+        // (operator chose Cancel = "I want out") — flip to mountInit()
+        // re-trigger if the empty panel feels jarring after Cancel.
         state.phase = "idle";
         setMessage("");
         render();
@@ -673,6 +727,66 @@ export function mountStreamPanel(container, options = {}) {
         state.phase = "error";
         setMessage(`Stream failed: ${err?.message || err}`);
         render();
+    }
+
+    // --- Mount-time pre-flight + camera open ------------------------------
+
+    // Phase 12.2 followup (qarl 2026-04-29): open the camera at mount
+    // so the operator can compose framing/lighting before clicking
+    // Go live. /status pre-flight first — if another phone owns the
+    // screen, surface take-over-prompt without prompting for camera
+    // permission (the operator hasn't yet decided whether to take
+    // over). On mount-init failure (status unreachable, getUserMedia
+    // denied, no camera device) the panel falls back to plain idle;
+    // clicking Go live re-runs the full request flow.
+    let destroyed = false;
+    // Promise tracking the mount-init pass; goLive awaits this so a
+    // synchronous Go-Live click can't race-double-open the camera or
+    // fire two /status pre-flights. Settled (set to null) when mount-
+    // init returns either via success or via a swallowed error.
+    let mountInitPromise = null;
+    async function mountInit() {
+        let status;
+        try {
+            status = await apiGetStatus();
+        } catch {
+            // /status unreachable: stay in idle. goLive() will retry
+            // on first click and handle its own errors from there.
+            return;
+        }
+        if (destroyed || state.phase !== "idle") return;
+        if (status.state === "active") {
+            state.phase = "take-over-prompt";
+            setMessage("Someone else is streaming to this screen.");
+            render();
+            return;
+        }
+        try {
+            state.phase = "requesting-camera";
+            setMessage("Requesting camera access…");
+            render();
+            await openLocalCamera();
+            if (destroyed || state.phase !== "requesting-camera") {
+                // Operator clicked Go live (or destroyed the panel)
+                // before getUserMedia resolved — the click handler
+                // takes over from here. If destroyed, drop the
+                // stream we just opened.
+                if (destroyed) teardownPC();
+                return;
+            }
+            state.phase = "preview";
+            setMessage("");
+            render();
+        } catch {
+            if (destroyed || state.phase !== "requesting-camera") return;
+            // Camera unavailable (permission denied, no device, OS
+            // policy). Drop back to idle silently — the operator
+            // can click Go live to retry; goLive's own error path
+            // will surface the message if it fails again.
+            state.phase = "idle";
+            setMessage("");
+            render();
+        }
     }
 
     // --- Wire up controls -------------------------------------------------
@@ -699,6 +813,13 @@ export function mountStreamPanel(container, options = {}) {
     window.addEventListener("pagehide", onPageHide);
 
     render();
+    mountInitPromise = (async () => {
+        try {
+            await mountInit();
+        } finally {
+            mountInitPromise = null;
+        }
+    })();
 
     return {
         // Test-only window into the panel state. Exposes the phase
@@ -706,6 +827,7 @@ export function mountStreamPanel(container, options = {}) {
         // through the DOM.
         getState: () => state.phase,
         destroy: () => {
+            destroyed = true;
             window.removeEventListener("pagehide", onPageHide);
             document.removeEventListener(
                 "openmarquee:settings-updated",

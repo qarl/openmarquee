@@ -187,9 +187,94 @@ describe("mountStreamPanel", () => {
         // LIVE pill + metrics grid only show in the live phase.
         expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
         expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
-        // Idle-only paused-playlist hint is visible.
+        // Paused-playlist hint is visible in any "ready" phase.
         expect(container.querySelector(".stream-paused-row").hidden).toBe(false);
+        // Phase machine starts in idle synchronously; mount-init's
+        // pre-flight + camera-open are both async and resolve later
+        // (covered by separate tests below).
         expect(handle.getState()).toBe("idle");
+    });
+
+    it("opens the camera at mount + lands in preview when /status is idle", async () => {
+        // Phase 12.2 followup, qarl 2026-04-29: operator should see
+        // their camera framed in the viewfinder before clicking Go
+        // live. Mount-init runs the same /status pre-flight goLive
+        // used to do, then opens the camera if nothing else owns the
+        // screen, leaving the panel in the new "preview" phase.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        await waitFor(() => handle.getState() === "preview");
+
+        expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
+        expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
+        // Go live still visible (preview is a "ready" phase); no LIVE
+        // pill or metrics grid yet (those are live-only).
+        expect(container.querySelector(".stream-go-live").hidden).toBe(false);
+        expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
+        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
+    });
+
+    it("mount-init falls back to idle silently when getUserMedia rejects", async () => {
+        // Permission denied / no camera at mount should not blast an
+        // error — the operator may not intend to go live. Click Go
+        // live then surfaces a real error if the retry also fails.
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            getUserMedia: vi.fn(async () => {
+                throw new Error("Permission denied");
+            }),
+        });
+        const handle = mountStreamPanel(container, opts);
+
+        // Wait for mount-init's getUserMedia attempt to land first
+        // (the panel starts in idle synchronously, so a naive
+        // waitFor(state==="idle") could resolve before mount-init
+        // has run anything at all).
+        await waitFor(() => opts.getUserMedia.mock.calls.length === 1);
+        await waitFor(() => handle.getState() === "idle");
+        expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
+        // No noise in the status line — the panel reads as a clean
+        // idle state.
+        expect(container.querySelector(".stream-status").textContent).toBe("");
+    });
+
+    it("mount-init enters take-over-prompt without opening the camera when /status is active", async () => {
+        // Some other phone owns the screen at mount time. Pre-flight
+        // surfaces take-over-prompt directly, skipping the camera-
+        // permission dialog the operator hasn't earned yet.
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            apiGetStatus: vi.fn(async () => ({
+                state: "active",
+                session_id: "33",
+                tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
+            })),
+        });
+        const handle = mountStreamPanel(container, opts);
+
+        await waitFor(() => handle.getState() === "take-over-prompt");
+        expect(opts.getUserMedia).not.toHaveBeenCalled();
+        expect(container.querySelector(".stream-take-over").hidden).toBe(false);
+    });
+
+    it("Go live from preview skips the second pre-flight + camera-open round trip", async () => {
+        // Mount-init already ran /status + opened the camera; clicking
+        // Go live should reuse them and go straight to negotiating.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        await waitFor(() => handle.getState() === "preview");
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        // Single /status (mount-init) + single getUserMedia (mount-
+        // init): no double round-trip on the click.
+        expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
+        expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
     });
 
     it("Go Live → live: opens camera, negotiates, flips to live phase", async () => {
@@ -216,7 +301,12 @@ describe("mountStreamPanel", () => {
         expect(container.querySelector(".stream-paused-row").hidden).toBe(true);
     });
 
-    it("Stop → idle: posts session_id, returns to idle, stops local tracks", async () => {
+    it("Stop → preview: posts session_id, keeps the camera open for fast re-go-live", async () => {
+        // Phase 12.2 followup, qarl 2026-04-29: Stop returns to the
+        // preview phase (camera stays open + viewfinder still rendering)
+        // so the operator can re-go-live without another permission
+        // round-trip. The PC is torn down (the session is over) but the
+        // local camera stream is preserved.
         const container = document.createElement("div");
         const opts = defaultMounts();
         const handle = mountStreamPanel(container, opts);
@@ -224,21 +314,20 @@ describe("mountStreamPanel", () => {
         container.querySelector(".stream-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
-        // Capture the local stream's tracks so we can verify they got
-        // stopped on teardown — the camera light staying on after Stop
-        // is exactly the kind of bug operators would notice.
         const stream = opts.getUserMedia.mock.results[0].value;
         const track = (await stream).getVideoTracks()[0];
 
         container.querySelector(".stream-stop").click();
-        await waitFor(() => handle.getState() === "idle");
+        await waitFor(() => handle.getState() === "preview");
 
         expect(opts.apiStopStream).toHaveBeenCalledTimes(1);
         expect(opts.apiStopStream.mock.calls[0][0]).toBe(
             "11111111-1111-1111-1111-111111111111",
         );
-        expect(track.stopped).toBe(true);
+        // The PC is closed (session ended) but the camera stream
+        // and its tracks stay alive — they're the preview source.
         expect(opts._fakePc.closed).toBe(true);
+        expect(track.stopped).toBe(false);
     });
 
     it("pre-flight /status returns active → take-over-prompt without opening camera", async () => {
@@ -768,6 +857,27 @@ describe("mountStreamPanel", () => {
         expect(container.innerHTML).toBe("");
     });
 
+    it("pagehide releases the camera even from preview (panel-mount preview should not leak the camera light when the tab closes)", async () => {
+        // The "Stop returns to preview" change keeps the camera open
+        // across Stop, but tab-close / app-background must still
+        // release it — the camera light staying on after the tab
+        // disappears is exactly the kind of bug operators would
+        // notice. pagehide is the browser's last reliable hook.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        await waitFor(() => handle.getState() === "preview");
+        const stream = await opts.getUserMedia.mock.results[0].value;
+        const track = stream.getVideoTracks()[0];
+        expect(track.stopped).toBe(false);
+
+        window.dispatchEvent(new Event("pagehide"));
+        expect(track.stopped).toBe(true);
+
+        handle.destroy();
+    });
+
     it("PC connectionState=failed mid-stream resets the panel out of live", async () => {
         // §5.11 failure modes: phone loses connectivity, PC enters
         // disconnected/failed. Without this listener, the backend times
@@ -831,7 +941,7 @@ describe("mountStreamPanel", () => {
         expect(container.querySelector(".stream-live-pill").hidden).toBe(false);
     });
 
-    it("simulateOnly: Stop returns to idle without calling /api/stream/stop", async () => {
+    it("simulateOnly: Stop returns to preview without calling /api/stream/stop", async () => {
         // The session_id was minted locally — the backend never knew
         // about it, so /stop would 404. Skip the call entirely.
         const container = document.createElement("div");
@@ -845,7 +955,7 @@ describe("mountStreamPanel", () => {
         await waitFor(() => handle.getState() === "live");
 
         container.querySelector(".stream-stop").click();
-        await waitFor(() => handle.getState() === "idle");
+        await waitFor(() => handle.getState() === "preview");
 
         expect(opts.apiStopStream).not.toHaveBeenCalled();
     });
@@ -873,9 +983,10 @@ describe("mountStreamPanel", () => {
         };
 
         container.querySelector(".stream-stop").click();
-        await waitFor(() => handle.getState() === "idle");
+        await waitFor(() => handle.getState() === "preview");
         // Did NOT pass through 'error' — the listener saw state.pc !== pc
-        // (already nulled by teardownPC) and skipped failTo.
-        expect(handle.getState()).toBe("idle");
+        // (already nulled by teardownPC) and skipped failTo. Stop lands
+        // in preview (Phase 12.2 followup: camera stays open).
+        expect(handle.getState()).toBe("preview");
     });
 });
