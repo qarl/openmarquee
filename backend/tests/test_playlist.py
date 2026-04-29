@@ -301,6 +301,7 @@ def test_playlist_item_accepts_palette_transitions(tmp_path: Path):
             PlaylistItem(item_id=uuid4(), transition="glitch", transition_ms=350),
             PlaylistItem(item_id=uuid4(), transition="push", transition_ms=480),
             PlaylistItem(item_id=uuid4(), transition="blinds", transition_ms=520),
+            PlaylistItem(item_id=uuid4(), transition="shutter", transition_ms=460),
         ]
     )
     storage.save(pl)
@@ -326,6 +327,8 @@ def test_playlist_item_accepts_palette_transitions(tmp_path: Path):
     assert loaded.items[8].transition_ms == 480
     assert loaded.items[9].transition == "blinds"
     assert loaded.items[9].transition_ms == 520
+    assert loaded.items[10].transition == "shutter"
+    assert loaded.items[10].transition_ms == 460
 
 
 def test_playlist_item_ids_is_a_derived_view_over_items():

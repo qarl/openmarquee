@@ -40,6 +40,7 @@ const TRANSITION_OPTIONS = [
     { value: "glitch", label: "glitch" },
     { value: "push", label: "push" },
     { value: "blinds", label: "blinds" },
+    { value: "shutter", label: "shutter" },
 ];
 
 function transitionOptionsHTML(selected) {

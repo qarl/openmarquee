@@ -213,6 +213,7 @@ export function mountInlinePreview(container, options) {
             "glitch",
             "push",
             "blinds",
+            "shutter",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -548,6 +549,39 @@ export function mountInlinePreview(container, options) {
                             slatTop + Math.floor((slatHeight - bandHeight) / 2);
                         ctx.rect(0, bandTop, w, bandHeight);
                     }
+                    ctx.clip();
+                    drawSlot(timeline[nextIdx]);
+                    ctx.restore();
+                }
+            } else if (slot.transition === "shutter") {
+                // Hexagonal-aperture shutter: 6-vertex polygon centered
+                // on the canvas grows from 0 to canvas-covering radius.
+                // Distinct from iris (circle) by the polygon's straight
+                // edges. Mirrors playback.py::_shutter.
+                const w = canvas.width;
+                const h = canvas.height;
+                if (w < 4 || h < 4) {
+                    ctx.globalAlpha = progress;
+                    drawSlot(timeline[nextIdx]);
+                    ctx.globalAlpha = 1;
+                } else {
+                    const cx = w / 2;
+                    const cy = h / 2;
+                    // Inflate vertex radius by 1/cos(π/6) so the hexagon's
+                    // narrowest direction (edge midpoint, ~0.866R) still
+                    // reaches the canvas corner at progress=1.
+                    const maxR = (Math.hypot(cx, cy) + 2) / Math.cos(Math.PI / 6);
+                    const radius = progress * maxR;
+                    ctx.save();
+                    ctx.beginPath();
+                    for (let k = 0; k < 6; k++) {
+                        const a = (Math.PI / 3) * k;
+                        const x = cx + radius * Math.cos(a);
+                        const y = cy + radius * Math.sin(a);
+                        if (k === 0) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                    }
+                    ctx.closePath();
                     ctx.clip();
                     drawSlot(timeline[nextIdx]);
                     ctx.restore();

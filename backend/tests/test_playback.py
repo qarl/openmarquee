@@ -1228,6 +1228,88 @@ async def test_blinds_transition_falls_back_to_fade_on_short_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_shutter_transition_emits_polygon_aperture(tmp_path):
+    """Shutter transition: hexagonal aperture grows from canvas center.
+    Distinguishing feature: at mid-progress, the canvas-center pixel
+    is to-color while a corner pixel (which the hexagon hasn't reached
+    yet) is from-color. Distinct from `_iris` (circle, same center-out
+    shape but rotation-symmetric — the polygon vs circle visual
+    difference is operator-visible at small panel sizes)."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    renderer = MockRenderer(32, 32, tmp_path / "out.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "shutter", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(32, 32, (255, 0, 0))
+    png_b = _png_bytes(32, 32, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width = renderer.width
+    pure_red_pixel = bytes((255, 0, 0))
+    pure_blue_pixel = bytes((0, 0, 255))
+
+    def has_centered_aperture(frame: bytes) -> bool:
+        # Center pixel (16, 16) inside the hexagon at any nonzero
+        # progress; corner pixel (0, 0) outside until the hexagon
+        # nearly fills the canvas.
+        center_off = (16 * width + 16) * 3
+        corner_off = (0 * width + 0) * 3
+        center = frame[center_off : center_off + 3]
+        corner = frame[corner_off : corner_off + 3]
+        return center == pure_blue_pixel and corner == pure_red_pixel
+
+    assert any(has_centered_aperture(f) for f in rendered), (
+        "expected at least one frame with center=blue + corner=red (aperture mid-open)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shutter_transition_falls_back_to_fade_on_short_strip(tmp_path):
+    """Strip-graceful: shutter on width<4 or height<4 has no room for a
+    hexagon to read as anything other than a stripe (six vertices
+    overlap at low resolution), so `_shutter` delegates to `_fade`."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    strip_renderer = MockRenderer(2, 8, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "shutter", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (strip_renderer.width * strip_renderer.height)
+    pure_blue = bytes((0, 0, 255)) * (strip_renderer.width * strip_renderer.height)
+    intermediates = [f for f in rendered if f != pure_red and f != pure_blue]
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

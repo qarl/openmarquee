@@ -336,6 +336,7 @@ class PlaybackLoop:
                         "glitch",
                         "push",
                         "blinds",
+                        "shutter",
                     )
                     and item.transition_ms > 0
                     and len(items) > 1
@@ -372,6 +373,8 @@ class PlaybackLoop:
                             await self._push(current_image, next_image, item.transition_ms)
                         elif kind == "blinds":
                             await self._blinds(current_image, next_image, item.transition_ms)
+                        elif kind == "shutter":
+                            await self._shutter(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -1182,6 +1185,74 @@ class PlaybackLoop:
                 draw.rectangle(
                     (0, band_top, width - 1, band_bot - 1), fill=255
                 )
+            frame = Image.composite(to_image, from_image, mask)
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _shutter(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Hexagonal-aperture shutter: a 6-sided regular polygon centered
+        on the canvas grows from a point at progress=0 to fully covering
+        the canvas at progress=1. Inside the polygon = to_image; outside
+        = from_image. Distinct from `_iris` (circle, rotation-symmetric)
+        by the polygon's six straight edges — at mid-transition the
+        hexagon's vertices reach further than its edge-midpoints, giving
+        the aperture-blade silhouette the operator expects from a
+        camera-shutter UI.
+
+        Closes the classic-display family AND the 16-transition palette
+        batch per the 2026-04-28 spec.
+
+        Strip-graceful: width<4 or height<4 leaves no room for the
+        hexagon to read as anything other than a stripe (six vertices
+        overlap at low resolution), so delegate to fade. Same shape as
+        halftone's strip fallback.
+        """
+        from math import cos, pi, sin
+
+        from PIL import ImageDraw
+
+        width, height = from_image.size
+        if width < 4 or height < 4:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        cx, cy = width / 2.0, height / 2.0
+        # Max vertex radius for full canvas coverage at progress=1.
+        # The hexagon's tightest direction (edge midpoint, angle π/6
+        # from a vertex) sits at R·cos(π/6) from center — only ~0.866R
+        # — so a vertex radius equal to the corner distance leaves a
+        # sliver of from_image at every canvas corner that lands
+        # between vertex angles. Dividing by cos(π/6) = √3/2 inflates
+        # the vertex radius enough that the hexagon's narrowest
+        # direction still reaches the canvas corner. +2px safety
+        # margin handles per-frame rounding.
+        corner_dist = (cx * cx + cy * cy) ** 0.5
+        max_r = (corner_dist + 2.0) / cos(pi / 6)
+
+        # Vertex angles (regular hexagon, "pointy-right" orientation —
+        # vertex at angle 0 points along +x).
+        vertex_angles = [pi / 3.0 * k for k in range(6)]
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            radius = progress * max_r
+            vertices = [
+                (cx + radius * cos(a), cy + radius * sin(a))
+                for a in vertex_angles
+            ]
+            mask = Image.new("L", (width, height), 0)
+            ImageDraw.Draw(mask).polygon(vertices, fill=255)
             frame = Image.composite(to_image, from_image, mask)
             self._render_image(frame)
             await self._wait(frame_period)
