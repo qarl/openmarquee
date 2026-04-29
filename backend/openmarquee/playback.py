@@ -29,9 +29,9 @@ playing takes effect on the next cycle without restarting the loop. A
 failed render (missing asset, corrupt PNG) is logged and skipped — one
 bad slide doesn't kill the loop.
 
-This obsoletes the manual `/dev/play/{id}` poke from Phase 2's dev
-tooling. The dev preview now updates continuously while playback is
-running, like a real sign.
+Replaced the Phase 2 manual `/dev/play/{id}` poke (the dev endpoint
+has since been removed). The dev preview now updates continuously
+while playback is running, like a real sign.
 """
 
 import asyncio

@@ -8,8 +8,8 @@ GET  /api/playback/state — { is_running, current_item_id, current_item_type,
                             current_playlist_id }
 
 The loop drives the device's renderer (MockRenderer in dev, HUB75/HDMI/etc.
-on the device once those land). This obsoletes the manual /dev/play/{id}
-poke for the normal flow — that endpoint stays around for one-off tests.
+on the device once those land). Replaced the Phase 2 manual
+/dev/play/{id} poke (the dev endpoint has since been removed).
 """
 
 from typing import Annotated
