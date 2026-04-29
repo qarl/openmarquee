@@ -76,6 +76,11 @@
             schedules: clone(seed.schedules),
             settings: clone(seed.settings),
             flock_peers: clone(seed.flock_peers),
+            // Stream takeover session shape: { id, started_at } when
+            // active, null when idle. Set by POST /api/stream/start
+            // and /takeover, cleared by /stop. Returned through
+            // /api/stream/status (Phase A.2 wire shape).
+            _streamSession: null,
             // Simulated "currently playing" — first item of default playlist.
             playback: {
                 is_running: true,
@@ -374,17 +379,83 @@
         // operator gets the standard Go Live flow rather than the
         // take-over branch (which works, but is less interesting as a
         // first-look demo).
+        // /api/stream/{status,start,stop,takeover} — wire-shape match
+        // with the real backend. The current demo bundle is mounted
+        // with simulateOnly=true (see ui/src/main.js wiring against
+        // isDemoMode), so /start /stop /takeover are bypassed and
+        // only /status is exercised today. The full handler set is
+        // here anyway so a future demo that flips simulateOnly=false
+        // (e.g. to exercise A.2's wire-driven Elapsed semantics)
+        // works against the mock without further changes.
+        //
+        // Session state lives on _streamSession at module scope of
+        // this handler closure — analogous to the per-process state
+        // a real backend's StreamManager owns. Same in-process
+        // stamping pattern as /api/flock's last_seen_at fix.
+        const HARDWARE_TIER = {
+            name: "basic",
+            max_width: 854,
+            max_height: 480,
+            max_fps: 30,
+        };
         if (pathname === "/api/stream/status" && method === "GET") {
+            const session = state._streamSession;
             return jsonResponse({
-                state: "idle",
-                session_id: null,
-                tier: {
-                    name: "basic",
-                    max_width: 854,
-                    max_height: 480,
-                    max_fps: 30,
-                },
+                state: session ? "active" : "idle",
+                session_id: session ? session.id : null,
+                // Phase A.2: started_at is the wall-clock UTC ISO 8601
+                // timestamp at session creation, null when idle.
+                started_at: session ? session.started_at : null,
+                tier: HARDWARE_TIER,
             });
+        }
+        if (pathname === "/api/stream/start" && method === "POST") {
+            if (state._streamSession) {
+                return jsonResponse(
+                    {
+                        detail: {
+                            error: "stream_already_active",
+                            active_session_id: state._streamSession.id,
+                        },
+                    },
+                    { status: 409 },
+                );
+            }
+            state._streamSession = {
+                id: crypto.randomUUID(),
+                started_at: new Date().toISOString(),
+            };
+            return jsonResponse({
+                session_id: state._streamSession.id,
+                sdp_answer: "v=0\r\nfake-mock-answer\r\n",
+                started_at: state._streamSession.started_at,
+            });
+        }
+        if (pathname === "/api/stream/takeover" && method === "POST") {
+            // Force-replace any existing session with a fresh one.
+            state._streamSession = {
+                id: crypto.randomUUID(),
+                started_at: new Date().toISOString(),
+            };
+            return jsonResponse({
+                session_id: state._streamSession.id,
+                sdp_answer: "v=0\r\nfake-mock-answer\r\n",
+                started_at: state._streamSession.started_at,
+            });
+        }
+        if (pathname === "/api/stream/stop" && method === "POST") {
+            const body = await request.json().catch(() => ({}));
+            if (
+                !state._streamSession ||
+                state._streamSession.id !== body.session_id
+            ) {
+                return jsonResponse(
+                    { detail: `no active session ${body.session_id}` },
+                    { status: 404 },
+                );
+            }
+            state._streamSession = null;
+            return new Response(null, { status: 204 });
         }
         if (pathname === "/api/system/wifi-scan" && method === "GET") {
             return jsonResponse({
