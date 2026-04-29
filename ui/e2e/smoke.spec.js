@@ -11,7 +11,12 @@ test("app loads on the Text subpage with the text editor visible", async ({ page
     await expect(page).toHaveTitle("openMarquee");
     // Sidebar wordmark is the brand chrome (no <header><h1>); the redesign
     // moved branding into the .om-side wordmark + topbar.
-    await expect(page.locator(".om-wordmark")).toContainText(/openMarquee/i);
+    // The 2026-04-28 design landed a stacked wordmark — "OPEN" sits
+    // above "Marquee" instead of running them together. Playwright's
+    // toContainText normalizes the inter-element whitespace to a
+    // single space, so the rendered match is "OPEN Marquee" (with a
+    // space). \s* lets either layout pass.
+    await expect(page.locator(".om-wordmark")).toContainText(/open\s*marquee/i);
 
     await expect(page.locator(".editor .editor-canvas")).toBeVisible();
     await expect(page.locator(".editor .field-text")).toBeVisible();

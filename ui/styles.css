@@ -2062,6 +2062,49 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 .om-wordmark em { color: var(--om-accent); font-style: normal; font-weight: 700; }
 
+/* Stacked variant (design variant G, 2026-04-28 design handoff) — OPEN
+   above Marquee, with the M kept in text color (NOT accent). The
+   dot-matrix mark to the left stays orange so brand color still has a
+   home in the lockup. Scoped under .om-wordmark.om-wordmark-stack so
+   the single-line variant is unaffected. */
+/* `align-items: center` keeps the demo-badge pill (and any other sibling
+   chrome) vertically centered alongside the stacked wordmark. The
+   design used `stretch` but that's only safe when the wordmark is the
+   sole content; openmarquee.com/demo's index.html drops a `.demo-badge`
+   pill in alongside, and stretch would balloon it vertically. The
+   inner `.om-wm-stack` has its own `justify-content: center` so the two
+   text lines stay vertically centered regardless of outer alignment. */
+.om-wordmark.om-wordmark-stack { align-items: center; gap: 10px; }
+.om-wordmark .om-wm-stack {
+    display: inline-flex;
+    flex-direction: column;
+    line-height: 1;
+    justify-content: center;
+}
+.om-wordmark .om-wm-pre {
+    font-family: var(--om-mono);
+    font-size: 0.62em;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--om-text-fade);
+    font-weight: 500;
+    margin-bottom: 0.4em;
+}
+.om-wordmark .om-wm-post {
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    color: var(--om-text);
+}
+/* qarl's variant-G call: M matches the rest of the wordmark (white-ish
+   via --om-text), NOT the accent orange the single-line variant uses.
+   Higher specificity than the .om-wordmark em rule above so the stacked
+   form wins inside .om-wm-post. */
+.om-wordmark .om-wm-post em {
+    color: var(--om-text);
+    font-style: normal;
+    font-weight: 700;
+}
+
 /* ─── Sidebar nav (desktop) ────────────────────────── */
 .om-side {
   width: 220px;
