@@ -27,6 +27,7 @@ import {
     deletePlaylistById,
     fetchContentItem,
     generateBackground,
+    getFlockDiscover,
     getSchedule,
     getSettings,
     getSystemInfo,
@@ -500,6 +501,7 @@ async function boot() {
         fetchFlock: listFlock,
         fetchSettings: getSettings,
         fetchSystemInfo: getSystemInfo,
+        fetchDiscover: getFlockDiscover,
         onAdd: addFlockPeer,
         onUpdate: updateFlockPeer,
         onUpdateSelfSync: async (enabled) => {

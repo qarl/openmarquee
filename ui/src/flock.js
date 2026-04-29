@@ -63,6 +63,11 @@ const SECTION_TEMPLATE = `
     <dialog class="flock-modal">
         <form method="dialog" class="flock-modal-form">
             <h3>Add device</h3>
+            <div class="flock-discover-section" hidden>
+                <p class="flock-discover-label">On your Tailnet:</p>
+                <ul class="flock-discover-list"></ul>
+                <p class="flock-discover-divider">— or type one manually —</p>
+            </div>
             <label class="field">
                 <span>Tailscale hostname or IP</span>
                 <input type="text" class="flock-address" maxlength="253"
@@ -264,6 +269,12 @@ function newDeviceCardHTML() {
  *     Optional injection seam for tests; defaults to the api.js
  *     wrapper. A failure here falls back to SELF_PLACEHOLDER_*
  *     constants so the panel still renders.
+ * @param {() => Promise<{candidates: object[], source: string}>} [options.fetchDiscover]
+ *     /api/flock/discover — Phase B.5. Returns Tailnet peers the
+ *     operator could add to the flock. Called on Add Peer modal
+ *     open. Optional; failure or "none" source hides the discover
+ *     list and the modal falls back to manual-typed entry only
+ *     (Phase A behavior).
  * @param {(address: string) => Promise<object>} options.onAdd
  * @param {(peerId: string, patch: object) => Promise<object>} options.onUpdate
  * @param {(enabled: boolean) => Promise<void>} options.onUpdateSelfSync
@@ -275,6 +286,7 @@ export function mountFlock(
         fetchFlock,
         fetchSettings,
         fetchSystemInfo,
+        fetchDiscover,
         onAdd,
         onUpdate,
         onUpdateSelfSync,
@@ -290,6 +302,8 @@ export function mountFlock(
     const addressInput = modal.querySelector(".flock-address");
     const modalError = modal.querySelector(".flock-modal-error");
     const modalCancel = modal.querySelector(".flock-modal-cancel");
+    const discoverSection = modal.querySelector(".flock-discover-section");
+    const discoverList = modal.querySelector(".flock-discover-list");
 
     let pollTimer = null;
 
@@ -461,12 +475,78 @@ export function mountFlock(
         pollTimer = setInterval(refreshThumbnails, THUMBNAIL_POLL_MS);
     }
 
+    async function refreshDiscoverList() {
+        // Phase B.5: populate the discover section with Tailnet
+        // candidates from /api/flock/discover. Hidden + early-bail
+        // when fetchDiscover isn't injected (test-only); also hidden
+        // when the response is empty or source="none" (dev box,
+        // tailscale binary missing). Failure of the fetch is silent
+        // — modal still works for manual-typed entry, matching the
+        // Phase A behavior.
+        if (!fetchDiscover) {
+            discoverSection.hidden = true;
+            return;
+        }
+        let result;
+        try {
+            result = await fetchDiscover();
+        } catch {
+            discoverSection.hidden = true;
+            return;
+        }
+        const candidates = result?.candidates || [];
+        if (candidates.length === 0) {
+            discoverSection.hidden = true;
+            return;
+        }
+        discoverList.innerHTML = candidates
+            .map((c) => {
+                const disabled = c.already_in_flock ? " disabled" : "";
+                const suffix = c.already_in_flock
+                    ? ` <span class="flock-discover-already">(already added)</span>`
+                    : "";
+                return `
+                    <li class="flock-discover-item">
+                        <button type="button"
+                                class="flock-discover-pick${c.already_in_flock ? " is-disabled" : ""}"
+                                data-address="${escapeAttr(c.address)}"${disabled}>
+                            <b>${escapeAttr(c.hostname)}</b>
+                            <span class="flock-discover-addr">${escapeAttr(c.address)}</span>
+                            ${suffix}
+                        </button>
+                    </li>
+                `;
+            })
+            .join("");
+        discoverSection.hidden = false;
+    }
+
     function openAddModal() {
         modalError.textContent = "";
         addressInput.value = "";
+        // Pre-clear the discover section so a slow fetch doesn't
+        // flash the prior open's stale candidates.
+        discoverSection.hidden = true;
+        discoverList.innerHTML = "";
         modal.showModal();
         addressInput.focus();
+        // Fire-and-forget; the modal renders + works manually even
+        // if discover never resolves.
+        refreshDiscoverList().catch(() => {
+            discoverSection.hidden = true;
+        });
     }
+
+    // Click-to-pick: a candidate row populates the address input
+    // (operator can still edit before hitting Add). Disabled rows
+    // (already_in_flock) are non-interactive via the button's
+    // disabled attribute.
+    discoverList.addEventListener("click", (event) => {
+        const btn = event.target.closest(".flock-discover-pick");
+        if (!btn || btn.disabled) return;
+        addressInput.value = btn.dataset.address || "";
+        addressInput.focus();
+    });
 
     modalCancel.addEventListener("click", () => modal.close());
 

@@ -331,6 +331,18 @@ export async function getSystemInfo() {
     return await response.json();
 }
 
+/** Tailnet auto-discovery for the Add Peer modal — Phase B.5.
+ * Returns { candidates: [{address, hostname, already_in_flock}, ...],
+ * source: 'tailscale' | 'none' }. Source 'none' means no Tailscale
+ * binary on this device; UI falls back to manual-typed entry. */
+export async function getFlockDiscover() {
+    const response = await fetch("/api/flock/discover");
+    if (!response.ok) {
+        throw new Error(`Flock discover failed (${response.status})`);
+    }
+    return await response.json();
+}
+
 /** Replace the device system settings. */
 export async function saveSettings(settings) {
     const response = await fetch("/api/settings", {

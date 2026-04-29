@@ -211,6 +211,96 @@ describe("mountFlock", () => {
         ).toBe("standalone");
     });
 
+    it("Add Peer modal renders Tailnet discover candidates (Phase B.5)", async () => {
+        const container = document.createElement("div");
+        const fetchDiscover = vi.fn(async () => ({
+            source: "tailscale",
+            candidates: [
+                { hostname: "lobby", address: "lobby.ts.net", already_in_flock: true },
+                { hostname: "back-room", address: "back-room.ts.net", already_in_flock: false },
+            ],
+        }));
+        mount(container, { fetchDiscover });
+        await tick();
+        // Open the modal — discover fetch fires inside openAddModal.
+        const addBtn = container.querySelector(".flock-new-device");
+        addBtn.click();
+        await tick();
+        await tick(); // refreshDiscoverList awaits the fetch promise.
+        expect(fetchDiscover).toHaveBeenCalledTimes(1);
+        const rows = container.querySelectorAll(".flock-discover-pick");
+        expect(rows).toHaveLength(2);
+        // Already-in-flock peer is disabled; new peer is clickable.
+        expect(rows[0].textContent).toContain("lobby");
+        expect(rows[0].textContent).toContain("(already added)");
+        expect(rows[0].disabled).toBe(true);
+        expect(rows[1].textContent).toContain("back-room");
+        expect(rows[1].disabled).toBe(false);
+    });
+
+    it("clicking a discover candidate populates the address input", async () => {
+        const container = document.createElement("div");
+        mount(container, {
+            fetchDiscover: async () => ({
+                source: "tailscale",
+                candidates: [
+                    { hostname: "back-room", address: "back-room.ts.net", already_in_flock: false },
+                ],
+            }),
+        });
+        await tick();
+        container.querySelector(".flock-new-device").click();
+        await tick();
+        await tick();
+        const pick = container.querySelector(".flock-discover-pick");
+        pick.click();
+        const addrInput = container.querySelector(".flock-address");
+        expect(addrInput.value).toBe("back-room.ts.net");
+    });
+
+    it("Add Peer modal hides discover section when fetchDiscover not injected", async () => {
+        const container = document.createElement("div");
+        // Default mount() helper omits fetchDiscover.
+        mount(container);
+        await tick();
+        container.querySelector(".flock-new-device").click();
+        await tick();
+        const section = container.querySelector(".flock-discover-section");
+        expect(section.hidden).toBe(true);
+    });
+
+    it("Add Peer modal hides discover section when source is 'none'", async () => {
+        // Dev box without tailscale → backend returns empty candidates
+        // + source='none'. Modal should fall back to manual-only.
+        const container = document.createElement("div");
+        mount(container, {
+            fetchDiscover: async () => ({ source: "none", candidates: [] }),
+        });
+        await tick();
+        container.querySelector(".flock-new-device").click();
+        await tick();
+        await tick();
+        const section = container.querySelector(".flock-discover-section");
+        expect(section.hidden).toBe(true);
+    });
+
+    it("Add Peer modal hides discover section when fetchDiscover rejects", async () => {
+        const container = document.createElement("div");
+        mount(container, {
+            fetchDiscover: async () => {
+                throw new Error("boom");
+            },
+        });
+        await tick();
+        container.querySelector(".flock-new-device").click();
+        await tick();
+        await tick();
+        const section = container.querySelector(".flock-discover-section");
+        expect(section.hidden).toBe(true);
+        // Manual address input still works.
+        expect(container.querySelector(".flock-address")).not.toBeNull();
+    });
+
     it("self card maps the backend's ws281x-strip slug to its readable label", async () => {
         // Regression for the B.2 BLOCKER subagent caught: backend's
         // /api/system/info emits "ws281x-strip" (matching the
