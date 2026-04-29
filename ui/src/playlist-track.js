@@ -35,6 +35,7 @@ const TRANSITION_OPTIONS = [
     { value: "marquee", label: "marquee" },
     { value: "dissolve", label: "dissolve" },
     { value: "pixelate", label: "pixelate" },
+    { value: "halftone", label: "halftone" },
 ];
 
 function transitionOptionsHTML(selected) {

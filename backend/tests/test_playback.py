@@ -798,6 +798,94 @@ async def test_pixelate_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_halftone_transition_emits_dot_grid(tmp_path):
+    """Halftone transition: at mid-progress, cell-center pixels should
+    already be to-color (the dots reaching out from each grid cell)
+    while pixels at the edge of each cell — far from any center — are
+    still from-color. That spatial structure (to-color clustered at
+    grid points, from-color in the gaps) is what distinguishes
+    halftone from dissolve (random scatter), pixelate (chunky blend),
+    and fade (uniform blend)."""
+    # 32×32 → pitch = max(2, 32//8) = 4. Cell centers at (2, 2), (6,
+    # 2), (10, 2), …; cell EDGE midpoints at (4, 2), (8, 2), … At
+    # radius=1 the (2, 2) pixel is to-color but (4, 2) — at distance 2
+    # from each adjacent cell center — is still from-color. Cleanest
+    # sample positions for the assertion.
+    from openmarquee.rendering.mock import MockRenderer
+
+    renderer = MockRenderer(32, 32, tmp_path / "out.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "halftone", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(32, 32, (255, 0, 0))
+    png_b = _png_bytes(32, 32, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width = renderer.width
+    pure_red_pixel = bytes((255, 0, 0))
+    pure_blue_pixel = bytes((0, 0, 255))
+
+    def cell_center_blue_with_red_in_gap(frame: bytes) -> bool:
+        # (2, 2) is a cell center; (4, 2) is the midpoint between two
+        # cell centers (still outside any small dot).
+        center_off = (2 * width + 2) * 3
+        gap_off = (2 * width + 4) * 3
+        center = frame[center_off : center_off + 3]
+        gap = frame[gap_off : gap_off + 3]
+        return center == pure_blue_pixel and gap == pure_red_pixel
+
+    assert any(cell_center_blue_with_red_in_gap(f) for f in rendered), (
+        "expected at least one frame with cell-center blue + between-cells red"
+    )
+
+
+@pytest.mark.asyncio
+async def test_halftone_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
+    """Strip-graceful: halftone on width<4 or height<4 has no room for
+    a dot grid (cells would degenerate to a single column or row), so
+    `_halftone` delegates to `_fade`. Same shape as the other strip-
+    fallback regressions."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    strip_renderer = MockRenderer(2, 8, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "halftone", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (strip_renderer.width * strip_renderer.height)
+    pure_blue = bytes((0, 0, 255)) * (strip_renderer.width * strip_renderer.height)
+    intermediates = [f for f in rendered if f != pure_red and f != pure_blue]
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

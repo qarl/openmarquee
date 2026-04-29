@@ -331,6 +331,7 @@ class PlaybackLoop:
                         "marquee",
                         "dissolve",
                         "pixelate",
+                        "halftone",
                     )
                     and item.transition_ms > 0
                     and len(items) > 1
@@ -357,6 +358,8 @@ class PlaybackLoop:
                             await self._dissolve(current_image, next_image, item.transition_ms)
                         elif kind == "pixelate":
                             await self._pixelate(current_image, next_image, item.transition_ms)
+                        elif kind == "halftone":
+                            await self._halftone(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -852,6 +855,71 @@ class PlaybackLoop:
                 (small_w, small_h), Image.NEAREST
             ).resize((width, height), Image.NEAREST)
             frame = Image.blend(pix_from, pix_to, progress)
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _halftone(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Halftone-dot reveal: to_image emerges through a regular grid
+        of growing circular dots, one per cell. Reads as the next slide
+        is "printing in" through a dot-matrix screen — closes the
+        dot-matrix family per the 2026-04-28 palette spec.
+
+        Cell pitch = max(2, min(width, height) // 8) — gives roughly an
+        8-cell row across the smaller dimension. Per-cell dot radius
+        grows linearly 0 → max_r over transition_ms. max_r is the
+        cell's half-diagonal (≈ pitch * 0.71), so by progress=1 every
+        circle covers its cell entirely → fully revealed to_image.
+
+        Strip-graceful: width<4 or height<4 leaves nothing for the dot
+        grid to cohere into (a single column of cells just degenerates
+        to a stripe), so delegate to fade.
+        """
+        from PIL import ImageDraw
+
+        width, height = from_image.size
+        if width < 4 or height < 4:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        pitch = max(2, min(width, height) // 8)
+        # Half-diagonal of a square cell: pitch * sqrt(2)/2 ≈ 0.707 *
+        # pitch. +1 ensures rounding never leaves a hairline gap at
+        # progress=1.
+        max_r = int(round(pitch * 0.71)) + 1
+
+        # Cell centers — staggered grid offset by half-pitch so cells
+        # are inset from canvas edges. Computed once per transition.
+        cell_centers: list[tuple[int, int]] = []
+        cy = pitch // 2
+        while cy < height:
+            cx = pitch // 2
+            while cx < width:
+                cell_centers.append((cx, cy))
+                cx += pitch
+            cy += pitch
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            radius = int(round(progress * max_r))
+            mask = Image.new("L", (width, height), 0)
+            draw = ImageDraw.Draw(mask)
+            for cx, cy in cell_centers:
+                draw.ellipse(
+                    (cx - radius, cy - radius, cx + radius, cy + radius),
+                    fill=255,
+                )
+            frame = Image.composite(to_image, from_image, mask)
             self._render_image(frame)
             await self._wait(frame_period)
 

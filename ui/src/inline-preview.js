@@ -208,6 +208,7 @@ export function mountInlinePreview(container, options) {
             "marquee",
             "dissolve",
             "pixelate",
+            "halftone",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -359,6 +360,38 @@ export function mountInlinePreview(container, options) {
                         }
                     }
                     ctx.putImageData(out, 0, 0);
+                }
+            } else if (slot.transition === "halftone") {
+                // Halftone-dot reveal. Mirrors playback.py::_halftone:
+                // a regular grid of cell centers, each with a circle
+                // whose radius grows 0 → max_r as progress 0 → 1.
+                // Inside any circle = to-slot pixels; outside = the
+                // un-overwritten from-slot the outer renderer left.
+                const w = canvas.width;
+                const h = canvas.height;
+                if (w < 4 || h < 4) {
+                    ctx.globalAlpha = progress;
+                    drawSlot(timeline[nextIdx]);
+                    ctx.globalAlpha = 1;
+                } else {
+                    const pitch = Math.max(2, Math.floor(Math.min(w, h) / 8));
+                    const maxR = Math.round(pitch * 0.71) + 1;
+                    const radius = Math.round(progress * maxR);
+                    ctx.save();
+                    ctx.beginPath();
+                    for (let cy = pitch / 2; cy < h; cy += pitch) {
+                        for (let cx = pitch / 2; cx < w; cx += pitch) {
+                            // moveTo before each arc so adjacent arcs
+                            // don't get connected by an implicit line —
+                            // would silently fill the rectangle between
+                            // them.
+                            ctx.moveTo(cx + radius, cy);
+                            ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+                        }
+                    }
+                    ctx.clip();
+                    drawSlot(timeline[nextIdx]);
+                    ctx.restore();
                 }
             } else if (slot.transition === "marquee") {
                 // Tickertape: from-slot scrolls off to the left, a
