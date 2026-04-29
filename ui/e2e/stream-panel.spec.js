@@ -66,6 +66,21 @@ const STUB_INIT_SCRIPT = `
         addEventListener(e, fn) { this._handlers[e] = fn; }
         removeEventListener() {}
         close() {}
+        // Phase B.1: getStats() returns a minimal RTCStats report so
+        // the panel's pollStats() populates the metrics cells with
+        // non-mock values during the live phase. RTT 0.042s -> 42ms.
+        async getStats() {
+            return new Map([
+                ["outbound", {
+                    type: "outbound-rtp", kind: "video",
+                    bytesSent: 100000, timestamp: 1000000,
+                }],
+                ["inbound", {
+                    type: "remote-inbound-rtp", kind: "video",
+                    roundTripTime: 0.042, packetsLost: 0,
+                }],
+            ]);
+        }
     };
 `;
 
@@ -120,6 +135,10 @@ test("Go Live → Stop cycle flips through live and back to idle", async ({
             body: JSON.stringify({
                 session_id: "11111111-1111-1111-1111-111111111111",
                 sdp_answer: "v=0\r\nfake-answer\r\n",
+                // Phase A.2: backend stamps wall-clock UTC start time.
+                // 5s ago so the Elapsed assertion below has something
+                // to observe before the panel's 1Hz tick fires.
+                started_at: new Date(Date.now() - 5000).toISOString(),
             }),
         });
     });
@@ -140,6 +159,31 @@ test("Go Live → Stop cycle flips through live and back to idle", async ({
     await expect(page.locator(".stream-metrics-grid")).toBeVisible();
     await expect(page.locator(".stream-paused-row")).toBeHidden();
     await expect(page.locator(".stream-status")).toContainText("Live");
+
+    // Phase A.2: Elapsed cell ticks against the wire-served started_at
+    // (mocked 5s ago in the /start route above), NOT phone-local time.
+    // Cell value is MM:SS, total seconds >= 5 by the time this expect
+    // resolves. Playwright's expect.poll retries until the predicate
+    // passes or 5s default timeout, comfortably covering the 1Hz tick.
+    await expect
+        .poll(async () => {
+            const txt = await page
+                .locator('[data-metric="elapsed"]')
+                .textContent();
+            const match = /^(\d\d):(\d\d)$/.exec(txt || "");
+            if (!match) return 0;
+            return Number(match[1]) * 60 + Number(match[2]);
+        })
+        .toBeGreaterThanOrEqual(5);
+
+    // Phase B.1: latency cell rewrites from the template default
+    // ('78 ms') to the polled value derived from the stub's RTT
+    // (0.042s -> 42 ms). Proves pollStats() ran against the stubbed
+    // getStats(). Note: 78 ms is also the template default so this
+    // check is meaningful — without B.1 wired, the cell would stay
+    // at '78 ms' which would still match a /^\d+ ms$/ regex but
+    // wouldn't equal '42 ms'.
+    await expect(page.locator('[data-metric="latency"]')).toHaveText("42 ms");
 
     await page.locator(".stream-stop").click();
     await expect(page.locator(".stream-go-live")).toBeVisible();
