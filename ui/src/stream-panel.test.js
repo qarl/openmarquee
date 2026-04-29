@@ -617,6 +617,58 @@ describe("mountStreamPanel", () => {
         }
     });
 
+    it("latency falls back to candidate-pair RTT when remote-inbound-rtp has no roundTripTime yet", async () => {
+        // Real-stream early-frames path: the candidate pair is up
+        // (transport RTT available immediately) but the receiver
+        // hasn't sent its first RTCP receiver report back, so
+        // remote-inbound-rtp/video.roundTripTime is undefined. The
+        // panel should fall back to candidate-pair.currentRoundTripTime
+        // so the latency cell isn't stuck on the template default
+        // through the first second or two of every stream.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        opts._fakePc._fakeStatsReport = new Map([
+            [
+                "outbound-rtp-video",
+                {
+                    type: "outbound-rtp",
+                    kind: "video",
+                    bytesSent: 50_000,
+                    timestamp: 1_000_000,
+                },
+            ],
+            [
+                "remote-inbound-rtp-video",
+                {
+                    type: "remote-inbound-rtp",
+                    kind: "video",
+                    // roundTripTime intentionally absent — the receiver
+                    // report hasn't arrived yet.
+                    packetsLost: 0,
+                },
+            ],
+            [
+                "candidate-pair-nominated",
+                {
+                    type: "candidate-pair",
+                    nominated: true,
+                    currentRoundTripTime: 0.012, // 12 ms transport
+                },
+            ],
+        ]);
+        const handle = mountStreamPanel(container, opts);
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+        await waitFor(
+            () =>
+                container.querySelector('[data-metric="latency"]').textContent ===
+                "12 ms",
+        );
+        expect(
+            container.querySelector('[data-metric="dropped"]').textContent,
+        ).toBe("0");
+    });
+
     it("simulateOnly Go Live keeps the mocked metric values (no PC to poll)", async () => {
         const container = document.createElement("div");
         const opts = defaultMounts({ simulateOnly: true });
