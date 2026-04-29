@@ -98,7 +98,7 @@ class PlaylistItem(BaseModel):
 
     item_id: UUID
     transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch"
+        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push"
     ] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
@@ -159,6 +159,7 @@ class Playlist(BaseModel):
             "halftone",
             "scanline",
             "glitch",
+            "push",
         ] = "cut",
         transition_ms: int = 500,
     ) -> None:

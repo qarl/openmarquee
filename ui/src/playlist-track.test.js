@@ -142,6 +142,7 @@ describe("mountPlaylistTrack", () => {
             "halftone",
             "scanline",
             "glitch",
+            "push",
         ]);
         expect(chip.value).toBe("cut");
         chip.value = "fade";

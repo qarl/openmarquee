@@ -38,6 +38,7 @@ const TRANSITION_OPTIONS = [
     { value: "halftone", label: "halftone" },
     { value: "scanline", label: "scanline" },
     { value: "glitch", label: "glitch" },
+    { value: "push", label: "push" },
 ];
 
 function transitionOptionsHTML(selected) {

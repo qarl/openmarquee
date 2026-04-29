@@ -211,6 +211,7 @@ export function mountInlinePreview(container, options) {
             "halftone",
             "scanline",
             "glitch",
+            "push",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -487,6 +488,40 @@ export function mountInlinePreview(container, options) {
                     }
                 }
                 ctx.putImageData(out, 0, 0);
+            } else if (slot.transition === "push") {
+                // Classic-display push: to-slot enters from the LEFT,
+                // pushing from-slot off the right edge. Both move
+                // together at the same rate. 1-px bright vertical
+                // separator at the seam = the projector-blade feel
+                // that distinguishes push from slide. Mirrors
+                // playback.py::_push.
+                const w = canvas.width;
+                const h = canvas.height;
+                if (w < 2) {
+                    ctx.globalAlpha = progress;
+                    drawSlot(timeline[nextIdx]);
+                    ctx.globalAlpha = 1;
+                } else {
+                    const offset = Math.round(progress * w);
+                    ctx.clearRect(0, 0, w, h);
+                    // to-slot translated to x = -w + offset (its right
+                    // `offset` columns visible at frame [0, offset)).
+                    ctx.save();
+                    ctx.translate(-w + offset, 0);
+                    drawSlot(timeline[nextIdx]);
+                    ctx.restore();
+                    // from-slot translated to x = +offset (its left
+                    // `w - offset` columns visible at frame [offset, w)).
+                    ctx.save();
+                    ctx.translate(offset, 0);
+                    drawSlot(slot);
+                    ctx.restore();
+                    // Bright projector-blade separator at the seam.
+                    if (offset > 0 && offset < w) {
+                        ctx.fillStyle = "#fff";
+                        ctx.fillRect(offset - 1, 0, 1, h);
+                    }
+                }
             } else if (slot.transition === "marquee") {
                 // Tickertape: from-slot scrolls off to the left, a
                 // gap with a centered dot (the "·" separator) passes

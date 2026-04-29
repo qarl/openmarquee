@@ -1055,6 +1055,87 @@ async def test_glitch_transition_works_on_narrow_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_push_transition_emits_seam_with_full_height_white_column(tmp_path):
+    """Push transition: to_image enters from LEFT, from_image exits
+    RIGHT, with a 1-px bright vertical separator at the seam. Mid-
+    transition we should see at least one frame containing a full-
+    height column of pure-white pixels — that signature is push-
+    specific (scanline paints a full-WIDTH white row, not column;
+    marquee paints isolated white pixels in a black gap, not a
+    spanning column)."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    renderer = MockRenderer(16, 16, tmp_path / "out.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "push", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(16, 16, (255, 0, 0))
+    png_b = _png_bytes(16, 16, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width, height = renderer.width, renderer.height
+    white_pixel = bytes((255, 255, 255))
+
+    def has_full_height_white_column(frame: bytes) -> bool:
+        for x in range(width):
+            if all(
+                frame[(y * width + x) * 3 : (y * width + x) * 3 + 3] == white_pixel
+                for y in range(height)
+            ):
+                return True
+        return False
+
+    assert any(has_full_height_white_column(f) for f in rendered), (
+        "expected at least one frame with a full-height white column (push seam)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_push_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
+    """Strip-graceful: push on width<2 has no horizontal axis to push
+    along, so `_push` delegates to `_fade`. Same shape as flip/marquee/
+    pixelate strip fallbacks."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    strip_renderer = MockRenderer(1, 8, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "push", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (strip_renderer.width * strip_renderer.height)
+    pure_blue = bytes((0, 0, 255)) * (strip_renderer.width * strip_renderer.height)
+    intermediates = [f for f in rendered if f != pure_red and f != pure_blue]
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

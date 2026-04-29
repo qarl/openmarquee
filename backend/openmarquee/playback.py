@@ -334,6 +334,7 @@ class PlaybackLoop:
                         "halftone",
                         "scanline",
                         "glitch",
+                        "push",
                     )
                     and item.transition_ms > 0
                     and len(items) > 1
@@ -366,6 +367,8 @@ class PlaybackLoop:
                             await self._scanline(current_image, next_image, item.transition_ms)
                         elif kind == "glitch":
                             await self._glitch(current_image, next_image, item.transition_ms)
+                        elif kind == "push":
+                            await self._push(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -1049,6 +1052,73 @@ class PlaybackLoop:
             for ty in tear_rows:
                 blended[ty] = (0, 255, 255)
             frame = Image.fromarray(blended, mode="RGB")
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _push(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Classic-display push: to_image enters from the LEFT, pushing
+        from_image off the right edge. Both images move together at the
+        same rate (no gap). A 1-px bright vertical separator paints at
+        the seam between them — gives the mechanical-projector "blade"
+        feel that distinguishes push from `_slide`'s gap-less but
+        bare-edge motion.
+
+        Direction (left-entry) is the mirror of `_slide` (right-entry),
+        so the operator-visible difference between the two pulldown
+        choices is direction PLUS the projector-blade separator. First
+        of the classic-display family per the 2026-04-28 palette spec.
+
+        Strip-graceful: width<2 -> fall back to fade. Same shape as
+        flip/marquee/pixelate strip fallbacks.
+        """
+        from PIL import ImageDraw
+
+        width, height = from_image.size
+        if width < 2:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            offset = max(0, min(width, int(round(width * progress))))
+            frame = Image.new("RGB", (width, height))
+            # to_image enters from left: source columns [width-offset,
+            # width) go to frame columns [0, offset). I.e. to_image is
+            # translated to x = -width + offset, so its rightmost
+            # `offset` columns are visible at the left.
+            if offset > 0:
+                frame.paste(
+                    to_image.crop((width - offset, 0, width, height)), (0, 0)
+                )
+            # from_image exits to right: source columns [0, width-offset)
+            # go to frame columns [offset, width). I.e. from_image is
+            # translated to x = +offset, its leftmost `width-offset`
+            # columns visible.
+            if offset < width:
+                frame.paste(
+                    from_image.crop((0, 0, width - offset, height)),
+                    (offset, 0),
+                )
+            # Bright projector-blade separator at the seam (column
+            # offset). Skipped at offset=0 and offset=width (no seam
+            # visible — full from or full to). 1px wide for legibility
+            # on small panels; reads as a clean cut on bigger ones.
+            if 0 < offset < width:
+                ImageDraw.Draw(frame).rectangle(
+                    (offset - 1, 0, offset - 1, height - 1),
+                    fill=(255, 255, 255),
+                )
             self._render_image(frame)
             await self._wait(frame_period)
 
