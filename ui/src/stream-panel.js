@@ -24,6 +24,7 @@
 // Phase 1 known limitation in §5.11.
 
 import {
+    getSettings,
     getStreamStatus,
     startStream,
     stopStream,
@@ -113,6 +114,10 @@ const SECTION_TEMPLATE = `
  *   and Tailscale-foreground warning still all run as in production.
  *   Used by the openmarquee.com/demo bundle, where there's no real
  *   peer to negotiate against.
+ * @param {() => Promise} [options.fetchSettings] — used to size the
+ *   preview wrap to the device's display aspect ratio so the
+ *   operator sees actual cropping pre-Go-Live (mirrors the device-
+ *   side renderer's cover-fit at playback time).
  * @returns {{ destroy: () => void, getState: () => string }}
  */
 export function mountStreamPanel(container, options = {}) {
@@ -121,6 +126,7 @@ export function mountStreamPanel(container, options = {}) {
         apiStartStream = startStream,
         apiTakeoverStream = takeoverStream,
         apiStopStream = stopStream,
+        fetchSettings = getSettings,
         getUserMedia = (constraints) =>
             navigator.mediaDevices.getUserMedia(constraints),
         createPeerConnection = () => new RTCPeerConnection(),
@@ -129,6 +135,7 @@ export function mountStreamPanel(container, options = {}) {
 
     container.innerHTML = SECTION_TEMPLATE;
 
+    const previewWrapEl = container.querySelector(".stream-preview-wrap");
     const previewEl = container.querySelector(".stream-preview");
     const previewEmptyEl = container.querySelector(".stream-preview-empty");
     const statusEl = container.querySelector(".stream-status");
@@ -138,6 +145,34 @@ export function mountStreamPanel(container, options = {}) {
     const flipBtn = container.querySelector(".stream-flip-camera");
     const takeOverBtn = container.querySelector(".stream-take-over");
     const cancelTakeoverBtn = container.querySelector(".stream-cancel-takeover");
+
+    // Mirror the device's display aspect ratio onto the preview wrap so
+    // the operator sees actual cropping (object-fit: cover on the video
+    // matches the device-side aiortc subscriber's cover-fit at playback
+    // time). Updated on mount and on every openmarquee:settings-updated
+    // event so a settings change while the panel is mounted reflects
+    // immediately. Falls back to the CSS-default 9/16 (phone-portrait)
+    // if /api/settings is unreachable on first load.
+    async function refreshPreviewAspect() {
+        try {
+            const s = await fetchSettings();
+            const w = Number(s?.display_width);
+            const h = Number(s?.display_height);
+            if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+                previewWrapEl.style.setProperty(
+                    "--om-stream-aspect",
+                    `${w} / ${h}`,
+                );
+            }
+        } catch {
+            // Non-fatal — the CSS default 9/16 fallback stays in place.
+        }
+    }
+    refreshPreviewAspect();
+    function onSettingsUpdated() {
+        refreshPreviewAspect();
+    }
+    document.addEventListener("openmarquee:settings-updated", onSettingsUpdated);
 
     // Single source of truth for the panel state. Render() reads off it
     // and toggles which controls are visible, so handlers only need to
@@ -509,6 +544,10 @@ export function mountStreamPanel(container, options = {}) {
         getState: () => state.phase,
         destroy: () => {
             window.removeEventListener("pagehide", onPageHide);
+            document.removeEventListener(
+                "openmarquee:settings-updated",
+                onSettingsUpdated,
+            );
             teardownPC();
             container.innerHTML = "";
         },

@@ -115,6 +115,10 @@ function defaultMounts(overrides = {}) {
             sdp_answer: "v=0\r\nfake-answer\r\n",
         })),
         apiStopStream: vi.fn(async () => undefined),
+        fetchSettings: vi.fn(async () => ({
+            display_width: 1920,
+            display_height: 1080,
+        })),
         getUserMedia: vi.fn(async () => makeFakeStream()),
         createPeerConnection: vi.fn(() => fakePc),
         _fakePc: fakePc,
@@ -366,6 +370,79 @@ describe("mountStreamPanel", () => {
         // Go Live becomes available again on error so the operator can
         // retry after granting permission.
         expect(container.querySelector(".stream-go-live").hidden).toBe(false);
+    });
+
+    it("preview wrap aspect ratio mirrors the device's display dims on mount", async () => {
+        // Phase 12.2 followup, qarl 2026-04-28 ask: operator sees the
+        // actual cropping pre-Go-Live. Wrap aspect ratio = device's
+        // display_width / display_height; CSS object-fit:cover on the
+        // <video> mirrors the device-side aiortc subscriber's
+        // cover-fit at playback time.
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            fetchSettings: vi.fn(async () => ({
+                display_width: 64,
+                display_height: 32,
+            })),
+        });
+        mountStreamPanel(container, opts);
+        await waitFor(
+            () =>
+                container
+                    .querySelector(".stream-preview-wrap")
+                    .style.getPropertyValue("--om-stream-aspect")
+                    .replace(/\s+/g, "") === "64/32",
+        );
+        const wrap = container.querySelector(".stream-preview-wrap");
+        expect(
+            wrap.style.getPropertyValue("--om-stream-aspect").replace(/\s+/g, ""),
+        ).toBe("64/32");
+    });
+
+    it("aspect ratio refreshes on openmarquee:settings-updated", async () => {
+        // Operator changes display dims in Settings while the Stream
+        // panel is mounted: the preview crop should reflect the new
+        // ratio without needing a panel re-mount.
+        const container = document.createElement("div");
+        let dims = { display_width: 1920, display_height: 1080 };
+        const opts = defaultMounts({
+            fetchSettings: vi.fn(async () => dims),
+        });
+        const handle = mountStreamPanel(container, opts);
+        await waitFor(
+            () =>
+                container
+                    .querySelector(".stream-preview-wrap")
+                    .style.getPropertyValue("--om-stream-aspect")
+                    .replace(/\s+/g, "") === "1920/1080",
+        );
+
+        // Simulate a Settings save: operator switched to a HUB75 panel.
+        dims = { display_width: 64, display_height: 32 };
+        document.dispatchEvent(new CustomEvent("openmarquee:settings-updated"));
+        await waitFor(
+            () =>
+                container
+                    .querySelector(".stream-preview-wrap")
+                    .style.getPropertyValue("--om-stream-aspect")
+                    .replace(/\s+/g, "") === "64/32",
+        );
+        expect(opts.fetchSettings).toHaveBeenCalledTimes(2);
+        handle.destroy();
+    });
+
+    it("destroy() removes the settings-updated listener", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+        await waitFor(() => opts.fetchSettings.mock.calls.length >= 1);
+        handle.destroy();
+        // After destroy, dispatching the event should NOT trigger
+        // another fetchSettings — the listener was removed.
+        const before = opts.fetchSettings.mock.calls.length;
+        document.dispatchEvent(new CustomEvent("openmarquee:settings-updated"));
+        await tick();
+        expect(opts.fetchSettings.mock.calls.length).toBe(before);
     });
 
     it("destroy() tears down PC + tracks and clears the DOM", async () => {

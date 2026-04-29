@@ -3120,7 +3120,13 @@ html, body { margin: 0; padding: 0; height: 100%; }
     position: relative;
     width: 100%;
     max-width: 26rem;
-    aspect-ratio: 9 / 16;
+    /* Aspect ratio is the DEVICE'S display ratio (read from /api/settings
+       on mount, refreshed on openmarquee:settings-updated). The video
+       is object-fit: cover'd so the operator sees actual cropping
+       pre-Go-Live, mirroring the device-side aiortc subscriber's
+       cover-fit at playback time. Default 9/16 covers the typical
+       phone-portrait frame when /api/settings hasn't loaded yet. */
+    aspect-ratio: var(--om-stream-aspect, 9 / 16);
     background: var(--om-led-bg, #000);
     border-radius: var(--om-radius, 0.5rem);
     overflow: hidden;
