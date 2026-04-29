@@ -37,6 +37,7 @@ const TRANSITION_OPTIONS = [
     { value: "pixelate", label: "pixelate" },
     { value: "halftone", label: "halftone" },
     { value: "scanline", label: "scanline" },
+    { value: "glitch", label: "glitch" },
 ];
 
 function transitionOptionsHTML(selected) {

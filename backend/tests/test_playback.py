@@ -970,6 +970,91 @@ async def test_scanline_transition_falls_back_to_fade_on_short_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_glitch_transition_emits_cyan_tear_row(tmp_path):
+    """Glitch transition: per-frame random tear rows are filled with
+    cyan (0, 255, 255). Cyan has G=255, which is impossible to produce
+    from any blend or shift of pure-red and pure-blue source slides
+    (every other transition in the palette stays in the R-B plane).
+    Asserting at least one cyan pixel mid-transition confirms the
+    glitch tear-injection actually fired."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    # 32×32 → max_jitter=3, n_tears=max(1, 32//20)=1. One tear row per
+    # frame; with n_frames ~9 over 300ms the chance of zero cyan
+    # pixels in any captured frame is essentially zero.
+    renderer = MockRenderer(32, 32, tmp_path / "out.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "glitch", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(32, 32, (255, 0, 0))
+    png_b = _png_bytes(32, 32, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    cyan_pixel = bytes((0, 255, 255))
+
+    def has_cyan_pixel(frame: bytes) -> bool:
+        for off in range(0, len(frame), 3):
+            if frame[off : off + 3] == cyan_pixel:
+                return True
+        return False
+
+    assert any(has_cyan_pixel(f) for f in rendered), (
+        "expected at least one frame with a pure-cyan pixel from the tear-row injection"
+    )
+
+
+@pytest.mark.asyncio
+async def test_glitch_transition_works_on_narrow_strip(tmp_path):
+    """Strip-friendly: glitch's per-row jitter + cyan tear is shape-
+    agnostic. A 1×N or N×1 strip should still produce cyan tear-row
+    output (no fallback to fade). Per QA's spec: 'glitch works at any
+    geometry — strip naturally fine.'"""
+    from openmarquee.rendering.mock import MockRenderer
+
+    # 1×8 strip: every "row" is a 1-pixel-wide line. n_tears = max(1,
+    # 8//20) = 1, so each frame has 1 tear row out of 8. The cyan
+    # injection still fires.
+    strip_renderer = MockRenderer(1, 8, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "glitch", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    cyan_pixel = bytes((0, 255, 255))
+    has_cyan = any(
+        any(frame[off : off + 3] == cyan_pixel for off in range(0, len(frame), 3))
+        for frame in rendered
+    )
+    assert has_cyan, "expected cyan tear pixel(s) on the 1×8 strip — glitch should not fall back to fade"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

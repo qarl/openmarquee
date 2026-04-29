@@ -210,6 +210,7 @@ export function mountInlinePreview(container, options) {
             "pixelate",
             "halftone",
             "scanline",
+            "glitch",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -427,6 +428,65 @@ export function mountInlinePreview(container, options) {
                         ctx.fillRect(0, bandTop, w, bandBot - bandTop);
                     }
                 }
+            } else if (slot.transition === "glitch") {
+                // Digital-corruption transition: per-row x-jitter +
+                // cross-fade + cyan tear rows. Mirrors playback.py::
+                // _glitch. Per-frame randomness (jitter + tear-row
+                // positions regenerated each frame, NOT cached on the
+                // slot like dissolve's thresholds) is what makes the
+                // breakage read as alive — a static glitch reads as
+                // intentional, an animated glitch reads as broken.
+                const w = canvas.width;
+                const h = canvas.height;
+                const maxJitter = Math.max(1, Math.floor(w / 10));
+                const nTears = Math.max(1, Math.floor(h / 20));
+                // Capture from-slot (outer renderer pre-painted), draw
+                // to-slot, capture, then build the jittered + blended
+                // composite manually. Same shape as the dissolve and
+                // pixelate branches.
+                const fromImg = ctx.getImageData(0, 0, w, h);
+                drawSlot(timeline[nextIdx]);
+                const toImg = ctx.getImageData(0, 0, w, h);
+                const out = ctx.createImageData(w, h);
+                const oneMinusP = 1 - progress;
+                for (let y = 0; y < h; y++) {
+                    const shift =
+                        Math.floor(Math.random() * (2 * maxJitter + 1)) - maxJitter;
+                    for (let x = 0; x < w; x++) {
+                        // np.roll equivalent — wrap around. (x - shift)
+                        // mod w. JS % can return negatives, so the
+                        // explicit w-and-mod chain.
+                        const fromX = ((x - shift) % w + w) % w;
+                        const fromOff = (y * w + fromX) * 4;
+                        const toOff = (y * w + x) * 4;
+                        const dstOff = (y * w + x) * 4;
+                        out.data[dstOff] =
+                            fromImg.data[fromOff] * oneMinusP +
+                            toImg.data[toOff] * progress;
+                        out.data[dstOff + 1] =
+                            fromImg.data[fromOff + 1] * oneMinusP +
+                            toImg.data[toOff + 1] * progress;
+                        out.data[dstOff + 2] =
+                            fromImg.data[fromOff + 2] * oneMinusP +
+                            toImg.data[toOff + 2] * progress;
+                        out.data[dstOff + 3] = 255;
+                    }
+                }
+                // Tear rows — overwrite a few random rows with cyan.
+                const tearYs = new Set();
+                while (tearYs.size < Math.min(nTears, h)) {
+                    tearYs.add(Math.floor(Math.random() * h));
+                }
+                for (const ty of tearYs) {
+                    for (let x = 0; x < w; x++) {
+                        const dstOff = (ty * w + x) * 4;
+                        out.data[dstOff] = 0;
+                        out.data[dstOff + 1] = 255;
+                        out.data[dstOff + 2] = 255;
+                        out.data[dstOff + 3] = 255;
+                    }
+                }
+                ctx.putImageData(out, 0, 0);
             } else if (slot.transition === "marquee") {
                 // Tickertape: from-slot scrolls off to the left, a
                 // gap with a centered dot (the "·" separator) passes

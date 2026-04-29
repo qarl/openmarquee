@@ -333,6 +333,7 @@ class PlaybackLoop:
                         "pixelate",
                         "halftone",
                         "scanline",
+                        "glitch",
                     )
                     and item.transition_ms > 0
                     and len(items) > 1
@@ -363,6 +364,8 @@ class PlaybackLoop:
                             await self._halftone(current_image, next_image, item.transition_ms)
                         elif kind == "scanline":
                             await self._scanline(current_image, next_image, item.transition_ms)
+                        elif kind == "glitch":
+                            await self._glitch(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -977,6 +980,75 @@ class PlaybackLoop:
                     (0, band_top, width - 1, band_bot - 1),
                     fill=(255, 255, 255),
                 )
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _glitch(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Digital-corruption-style transition: per-row horizontal jitter
+        + linear cross-fade + occasional cyan "tear" rows that simulate
+        broken video signal. Closes the CRT family per the 2026-04-28
+        palette spec.
+
+        Per-frame randomization (jitter + tear-row positions are
+        regenerated each frame, not stable across frames like dissolve)
+        is what gives the transition its "glitchy" animated quality —
+        the screen-tearing effect can't read as broken if the breakage
+        sits still.
+
+        Strip-graceful: works at any geometry. Per-row jitter is
+        shape-agnostic; even a 1×N strip just sees its single row jitter
+        each frame. No fallback needed (and none added). Per QA's spec.
+        """
+        width, height = from_image.size
+        rng = np.random.default_rng()
+        # Jitter ceiling ~10% of canvas width, min 1. Bigger jitter
+        # makes the glitch read more "broken"; small enough that the
+        # underlying image stays mostly recognizable.
+        max_jitter = max(1, width // 10)
+        # Tear-row count ~5% of canvas height, min 1. Empirically the
+        # smallest count that reads as "consistent corruption" rather
+        # than "occasional artifact"; tunable later if QA wants more.
+        n_tears = max(1, height // 20)
+
+        from_arr = np.asarray(from_image, dtype=np.uint8)
+        to_arr = np.asarray(to_image, dtype=np.uint8)
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            # Per-row x-shift, regenerated this frame.
+            shifts = rng.integers(-max_jitter, max_jitter + 1, size=height)
+            shifted_from = np.empty_like(from_arr)
+            for y in range(height):
+                shifted_from[y] = np.roll(from_arr[y], shifts[y], axis=0)
+            # Linear cross-fade.
+            blended = (
+                shifted_from.astype(np.float32) * (1.0 - progress)
+                + to_arr.astype(np.float32) * progress
+            ).astype(np.uint8)
+            # Inject cyan tear rows. The exact (0, 255, 255) triplet is
+            # the test-time discriminator — R=0 + G=255 + B=255 all
+            # simultaneously is impossible from a red↔blue cross-fade
+            # (which stays in the R-B plane: G=0 always). Marquee and
+            # scanline DO paint G=255 elsewhere — but as white (255,
+            # 255, 255), not cyan — so the full triplet stays unique
+            # to glitch's tear-row injection.
+            tear_rows = rng.choice(
+                height, size=min(n_tears, height), replace=False
+            )
+            for ty in tear_rows:
+                blended[ty] = (0, 255, 255)
+            frame = Image.fromarray(blended, mode="RGB")
             self._render_image(frame)
             await self._wait(frame_period)
 

@@ -2091,6 +2091,22 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
    inner `.om-wm-stack` has its own `justify-content: center` so the two
    text lines stay vertically centered regardless of outer alignment. */
 .om-wordmark.om-wordmark-stack { align-items: center; gap: 10px; }
+/* Stacked-variant override on the dot-matrix mark — qarl's 2026-04-28
+   tweak via QA-Jimmy: rotate the mark to portrait + scale to span the
+   full stack height (top of OPEN to bottom of Marquee, edge-aligned,
+   NOT center-aligned). Implemented by overriding width/height + using
+   `align-self: stretch` on this item alone — that overrides the
+   outer's `align-items: center` for the mark only, so .demo-badge
+   and any other sibling chrome stay centered (the previous commit's
+   stretch-on-the-outer would have ballooned them).
+   The 4×4 dot tile is symmetric, so portrait orientation needs no
+   transform; the radial-gradient tile just covers more rows than
+   columns now. */
+.om-wordmark.om-wordmark-stack .om-mark {
+    width: 16px;
+    height: auto;
+    align-self: stretch;
+}
 .om-wordmark .om-wm-stack {
     display: inline-flex;
     flex-direction: column;
