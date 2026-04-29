@@ -169,18 +169,39 @@ def test_delete_returns_404_for_unknown_peer(client: TestClient):
 
 
 class _RecordingFlockSync:
-    """Captures notify_peers / ingest_push calls so tests can assert the
-    content API routes actually hook them."""
+    """Captures notify_peers / ingest_push / gossip_add / apply_hello /
+    probe_peer_name / announce_sync_to_peer calls so tests can assert
+    the routes actually hook them. Stub-shaped — none of the methods
+    do anything beyond recording."""
 
     def __init__(self):
         self.pushes: list[tuple[UUID, NotifyKind]] = []
         self.ingests: list[tuple[UUID, NotifyKind, str, datetime]] = []
+        # Phase B gossip-on-add: gossip_add fires from POST /api/flock,
+        # apply_hello fires from POST /api/flock/hello.
+        self.gossips: list[str] = []
+        self.hellos: list[str] = []
+        self.probes: list[str] = []
+        self.sync_announces: list[tuple[str, bool]] = []
 
     async def notify_peers(self, content_id, kind):
         self.pushes.append((content_id, kind))
 
     async def ingest_push(self, content_id, kind, sender_address, at):
         self.ingests.append((content_id, kind, sender_address, at))
+
+    async def gossip_add(self, address):
+        self.gossips.append(address)
+
+    def apply_hello(self, address):
+        self.hellos.append(address)
+        return True
+
+    async def probe_peer_name(self, address):
+        self.probes.append(address)
+
+    async def announce_sync_to_peer(self, address, sync):
+        self.sync_announces.append((address, sync))
 
 
 @pytest.fixture
@@ -210,6 +231,70 @@ def recording_client(tmp_path: Path):
 
 
 _TEST_NOTIFY_AT = "2026-04-24T12:00:00+00:00"
+
+
+def test_post_flock_schedules_gossip_add(recording_client):
+    """SYSTEM_SPEC §13: when an operator adds a peer via POST /api/flock,
+    the route schedules a gossip_add background task carrying the new
+    peer's address. The fan-out itself (hello-ping new peer + forward-
+    notify existing peers) is covered by FlockSync tests; here we just
+    verify the route-level wiring."""
+    client, recorder, _ = recording_client
+    response = client.post("/api/flock", json={"address": "newpeer.ts.net"})
+    assert response.status_code == 201
+    # Background task ran inline under TestClient.
+    assert "newpeer.ts.net" in recorder.gossips
+
+
+def test_hello_endpoint_delegates_to_sync(recording_client):
+    """POST /api/flock/hello calls FlockSync.apply_hello with the
+    introduced peer's address. Returns 204."""
+    client, recorder, _ = recording_client
+    response = client.post(
+        "/api/flock/hello", json={"address": "stranger.ts.net"}
+    )
+    assert response.status_code == 204
+    assert recorder.hellos == ["stranger.ts.net"]
+
+
+def test_hello_endpoint_idempotent_for_known_peer(recording_client):
+    """Duplicate hellos for the same address are 204 — gossip races
+    can land the same introduction twice. apply_hello's idempotent
+    semantics handle the no-op; the route just returns success."""
+    client, recorder, _ = recording_client
+    client.post("/api/flock/hello", json={"address": "stranger.ts.net"})
+    response = client.post(
+        "/api/flock/hello", json={"address": "stranger.ts.net"}
+    )
+    assert response.status_code == 204
+    assert recorder.hellos == ["stranger.ts.net", "stranger.ts.net"]
+
+
+def test_hello_endpoint_rejects_malformed_address(recording_client):
+    """Same SSRF-shape gating as POST /api/flock — schemes, paths,
+    spaces all rejected at the wire layer before apply_hello sees
+    anything."""
+    client, recorder, _ = recording_client
+    for bad in ("http://foo", "foo/bar", "a b", "foo@bar"):
+        response = client.post("/api/flock/hello", json={"address": bad})
+        assert response.status_code == 422, f"expected 422 for {bad!r}"
+    # apply_hello not called for any of them.
+    assert recorder.hellos == []
+
+
+def test_hello_endpoint_does_not_require_known_sender(recording_client):
+    """Unlike /notify and /sync-announce (which 403 senders not in the
+    flock), /hello accepts addresses we don't yet know about — that's
+    the entire point of an introduction protocol. A new peer reaching
+    out for the first time MUST work."""
+    client, recorder, flock = recording_client
+    # The recording_client fixture pre-adds peer.ts.net; stranger.ts.net
+    # is genuinely unknown. Should still 204.
+    response = client.post(
+        "/api/flock/hello", json={"address": "stranger.ts.net"}
+    )
+    assert response.status_code == 204
+    assert recorder.hellos == ["stranger.ts.net"]
 
 
 def test_notify_endpoint_delegates_to_sync(recording_client):

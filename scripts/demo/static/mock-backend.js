@@ -370,6 +370,18 @@
         if (pathname === "/api/system/display-dims" && method === "GET") {
             return jsonResponse({ width: 1920, height: 1080, source: "demo" });
         }
+        if (pathname === "/api/flock/hello" && method === "POST") {
+            // Phase B gossip-on-add (§13): a peer is introducing itself
+            // (or another peer) to us. Demo accepts + 204s without
+            // adding to flock_peers — the demo's flock is operator-
+            // curated by seed.json; an inbound hello in the demo
+            // context isn't actually from another openMarquee device,
+            // it's the panel itself making a self-pinging POST when
+            // the operator adds a peer + simulateOnly is false. The
+            // 204 keeps the gossip fan-out from logging spurious 404
+            // warnings; the demo's flock state stays predictable.
+            return new Response(null, { status: 204 });
+        }
         if (pathname === "/api/system/info" && method === "GET") {
             // Phase B.1 endpoint. Demo doesn't have a real /proc/* to
             // read; report the same SELF_PLACEHOLDER-shaped values the

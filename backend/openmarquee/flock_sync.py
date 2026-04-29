@@ -262,6 +262,105 @@ class FlockSync:
         except Exception:
             logger.info("sync-announce to %s failed", peer_address)
 
+    async def gossip_add(self, new_peer_address: str) -> None:
+        """SYSTEM_SPEC §13 introduction protocol: when peer B is added to
+        this device's (A's) flock, A doesn't store-and-forget — A also:
+          (1) hello-pings B with A's own address so B reciprocally adds
+              A to its own flock,
+          (2) notifies the rest of A's existing flock (C, D, E, …) that
+              B has joined, so each adds B too.
+
+        Loop prevention: hello receivers (POST /api/flock/hello) MUST
+        NOT trigger another gossip_add. Only the operator-driven
+        POST /api/flock entry point fans out. Idempotent inserts at
+        each receiver also break any race-induced duplicates.
+
+        Best-effort: every fan-out POST is a fire-and-forget HTTP. The
+        eventual-consistency model (existing periodic pull worker for
+        content sync; future probe consumer for peer health) handles
+        any drops. The sync_enabled kill switch does NOT gate this —
+        flock-membership gossip is a property-of-the-flock, not a
+        property-of-content-sync.
+        """
+        sender = self._get_self_address()
+        if sender is None:
+            logger.info(
+                "skipping gossip-add for %s: no reachable self-address",
+                new_peer_address,
+            )
+            return
+        # Existing peers EXCLUDING the just-added new peer (to avoid
+        # telling the new peer about itself) AND excluding our own
+        # self-address (defensive: if the operator typo'd their own
+        # tailnet hostname into the add field, we shouldn't gossip
+        # the addition back to ourselves).
+        new_peer_normalized = new_peer_address.strip().lower()
+        existing_peers = [
+            p
+            for p in self.flock.load().peers
+            if p.address != new_peer_normalized and p.address != sender
+        ]
+        async with self._client_factory() as client:
+            tasks = [
+                # (1) hello-ping the new peer with OUR address so they
+                # reciprocally add us.
+                self._post_hello(client, new_peer_address, sender),
+            ]
+            # (2) tell each existing peer that the new peer joined.
+            for p in existing_peers:
+                tasks.append(self._post_hello(client, p.address, new_peer_address))
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _post_hello(
+        self,
+        client: httpx.AsyncClient,
+        peer_address: str,
+        introduced_address: str,
+    ) -> None:
+        """POST {address: introduced_address} to peer_address/api/flock/hello.
+        Errors logged, not raised — gather() above wraps with
+        return_exceptions=True for completeness, but logging here gives
+        the operator a debuggable trail."""
+        url = f"http://{peer_address}/api/flock/hello"
+        payload = {"address": introduced_address}
+        try:
+            r = await client.post(url, json=payload)
+            if r.status_code >= 400:
+                logger.warning(
+                    "hello → %s (introducing %s) returned HTTP %d",
+                    peer_address,
+                    introduced_address,
+                    r.status_code,
+                )
+        except Exception:
+            logger.info(
+                "hello → %s (introducing %s) failed",
+                peer_address,
+                introduced_address,
+            )
+
+    def apply_hello(self, address: str) -> bool:
+        """Apply an inbound hello: add `address` to local flock storage
+        if not already present. Idempotent — duplicate inserts are a
+        no-op rather than a 409, since gossip races can cause the same
+        peer to be introduced twice (once via reciprocal hello, once
+        via forward notification from another peer). Returns True if a
+        new entry was created, False if the peer was already known.
+
+        Critically does NOT trigger gossip_add — the loop-prevention
+        invariant of §13's introduction protocol."""
+        flock = self.flock.load()
+        if flock.find_by_address(address) is not None:
+            return False
+        try:
+            self.flock.add(address=address)
+            return True
+        except ValueError:
+            # Race: another concurrent hello added it between our
+            # find_by_address check and our add() call. Treat as
+            # already-known, same as the idempotent path.
+            return False
+
     def apply_sync_announcement(self, sender_address: str, sync: bool) -> bool:
         """Apply an inbound sync-announce: flip our local flock entry for
         `sender_address` to `sync`. Returns True if a matching peer was

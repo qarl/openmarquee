@@ -138,6 +138,13 @@ async def add_peer(
     # display name switches from the raw address to the configured
     # sign_name within a second or two of the add.
     background.add_task(sync.probe_peer_name, peer.address)
+    # SYSTEM_SPEC §13 introduction protocol: hello-ping the new peer
+    # (so it adds us back) AND notify our existing flock peers (so
+    # they add the new peer too). After settling, full-mesh peer
+    # awareness — operator only has to "Add Peer" on one device.
+    # Loop prevention lives in the receiver: /api/flock/hello does
+    # NOT cascade further. Best-effort fan-out, errors logged.
+    background.add_task(sync.gossip_add, peer.address)
     return peer
 
 
@@ -191,6 +198,29 @@ class NotifyBody(BaseModel):
         return value
 
 
+class HelloBody(BaseModel):
+    """Wire format for POST /api/flock/hello — gossip-on-add (§13).
+
+    `address` is the introduced peer's tailnet hostname / IPv4. The
+    receiver adds it to its own flock if not already present and does
+    NOT cascade further (loop prevention). Used both for the
+    reciprocal-add hello (A→B carries A's address) and the
+    forward-notification hello (A→C carries the new B's address)."""
+
+    address: str = Field(
+        min_length=1,
+        max_length=253,
+        pattern=FLOCK_ADDRESS_PATTERN.pattern,
+    )
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def _normalize_address(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
 class SyncAnnounceBody(BaseModel):
     """Wire format for POST /api/flock/sync-announce — a peer is telling
     us they flipped their sync flag for us, and we should mirror it."""
@@ -208,6 +238,25 @@ class SyncAnnounceBody(BaseModel):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+
+@router.post("/hello", status_code=204)
+async def receive_hello(body: HelloBody, sync: FlockSyncDep) -> None:
+    """SYSTEM_SPEC §13 introduction protocol: a peer is telling us
+    about a flock member (either themselves, in the reciprocal-add
+    case, or another peer in the forward-notification case). We add
+    the address to our flock if not already present and DO NOT
+    cascade further — gossip_add fans out only on operator-driven
+    POST /api/flock, never on inbound hellos. Idempotent: duplicate
+    hellos for the same address are 204 no-ops, since gossip races
+    can introduce the same peer twice (once via reciprocal, once via
+    forward).
+
+    Unlike /notify and /sync-announce, /hello accepts addresses we
+    don't yet know about — that's the entire point of an
+    introduction protocol. The address-format validator on HelloBody
+    blocks the SSRF-shape concerns."""
+    sync.apply_hello(body.address)
 
 
 @router.post("/sync-announce", status_code=204)

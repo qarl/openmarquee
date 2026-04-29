@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -678,3 +679,194 @@ async def test_pull_from_peer_noops_when_sync_disabled(tmp_path: Path):
     )
     await sync.pull_from_peer("peer.ts.net")
     assert hits == []
+
+
+# --- §13 introduction protocol (gossip-on-add) ---
+
+
+@pytest.mark.asyncio
+async def test_gossip_add_pings_new_peer_and_existing_peers(tmp_path: Path):
+    """When a new peer B is added, A hello-pings B (with A's own
+    address) AND each existing peer C/D/E (with B's address). After
+    settling, every peer knows about every other peer."""
+    calls: list[tuple[str, dict]] = []
+
+    def handler(request):
+        calls.append((str(request.url), json.loads(request.content)))
+        return httpx.Response(204)
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    # Existing peers C and D, plus the just-added new peer B.
+    flock.add(address="c.ts.net")
+    flock.add(address="d.ts.net")
+    flock.add(address="b.ts.net")  # new
+
+    await sync.gossip_add("b.ts.net")
+
+    # Three POSTs total — one to B (with self), two to existing
+    # peers (with B's address). The reciprocal-add hello carries
+    # OUR self-address so B adds us back; the forward-notification
+    # hellos carry B's address so the existing peers add B.
+    by_url = sorted(calls, key=lambda x: x[0])
+    assert [u for u, _ in by_url] == [
+        "http://b.ts.net/api/flock/hello",
+        "http://c.ts.net/api/flock/hello",
+        "http://d.ts.net/api/flock/hello",
+    ]
+    payloads = {u: p for u, p in by_url}
+    assert payloads["http://b.ts.net/api/flock/hello"] == {"address": "me.ts.net"}
+    assert payloads["http://c.ts.net/api/flock/hello"] == {"address": "b.ts.net"}
+    assert payloads["http://d.ts.net/api/flock/hello"] == {"address": "b.ts.net"}
+
+
+@pytest.mark.asyncio
+async def test_gossip_add_excludes_new_peer_from_forward_set(tmp_path: Path):
+    """The new peer is in our flock at gossip_add time (the POST
+    /api/flock handler added it before scheduling the gossip
+    background task), but we shouldn't tell B about itself — only
+    OTHER existing peers get the forward notification."""
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(204)
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    flock.add(address="b.ts.net")  # new + only peer
+
+    await sync.gossip_add("b.ts.net")
+
+    # Just the reciprocal-add to B with our address. No forward to
+    # B about itself, since the existing-peers loop skips
+    # new_peer_address.
+    assert calls == ["http://b.ts.net/api/flock/hello"]
+
+
+@pytest.mark.asyncio
+async def test_gossip_add_excludes_self_from_forward_set(tmp_path: Path):
+    """Defensive: if the operator typo'd OUR own address into another
+    peer's flock entry (or this device added itself somehow), don't
+    gossip the addition back to ourselves."""
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(204)
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    # Our self-address is "me.ts.net" per _build_sync default. If it
+    # somehow ends up in our flock list, the gossip should skip it.
+    flock.add(address="me.ts.net")
+    flock.add(address="b.ts.net")  # new
+
+    await sync.gossip_add("b.ts.net")
+
+    # Just the reciprocal-add to B. The me.ts.net entry is excluded
+    # from the forward fan-out.
+    assert calls == ["http://b.ts.net/api/flock/hello"]
+
+
+@pytest.mark.asyncio
+async def test_gossip_add_skips_when_no_self_address(tmp_path: Path):
+    """A device without a configured tailnet hostname can't tell
+    peers how to reach it. Skip gossip silently rather than send
+    nonsense."""
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(204)
+
+    content = ContentStorage(tmp_path / "content")
+    tombstones = TombstoneStorage(tmp_path / "tombstones.json")
+    flock = FlockStorage(tmp_path / "flock.json")
+    flock.add(address="b.ts.net")
+    sync = FlockSync(
+        content_storage=content,
+        tombstone_storage=tombstones,
+        flock_storage=flock,
+        get_self_address=lambda: None,
+        http_client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), timeout=5.0
+        ),
+    )
+
+    await sync.gossip_add("b.ts.net")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_gossip_add_swallows_peer_errors(tmp_path: Path):
+    """A peer being unreachable shouldn't fail the gossip — the
+    other peers in the fan-out should still get hellos. Eventual
+    consistency model."""
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if "broken.ts.net" in str(request.url):
+            raise httpx.ConnectError("boom")
+        return httpx.Response(204)
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    flock.add(address="broken.ts.net")
+    flock.add(address="ok.ts.net")
+    flock.add(address="b.ts.net")  # new
+
+    # Doesn't raise.
+    await sync.gossip_add("b.ts.net")
+
+    # All three were attempted (the broken one + the ok one + the
+    # reciprocal to B). gather() with return_exceptions=True wraps
+    # the failure cleanly.
+    urls = sorted(calls)
+    assert urls == [
+        "http://b.ts.net/api/flock/hello",
+        "http://broken.ts.net/api/flock/hello",
+        "http://ok.ts.net/api/flock/hello",
+    ]
+
+
+def test_apply_hello_adds_new_peer(tmp_path: Path):
+    """Inbound hello for an unknown address adds it to local flock."""
+    sync, _, _, flock = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
+    )
+    assert flock.load().peers == []
+    added = sync.apply_hello("new.ts.net")
+    assert added is True
+    peers = flock.load().peers
+    assert len(peers) == 1
+    assert peers[0].address == "new.ts.net"
+
+
+def test_apply_hello_idempotent_for_known_peer(tmp_path: Path):
+    """Duplicate hello (race between reciprocal-add + forward-
+    notification) is a no-op rather than a 409 — gossip introductions
+    can land twice for the same peer in a 3+-device flock."""
+    sync, _, _, flock = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
+    )
+    flock.add(address="known.ts.net")
+    added = sync.apply_hello("known.ts.net")
+    assert added is False
+    # Still one peer, no duplicate.
+    assert len(flock.load().peers) == 1
+
+
+def test_apply_hello_does_not_cascade(tmp_path: Path):
+    """Critical loop-prevention invariant: receiving a hello does
+    NOT trigger another gossip_add. Without this, A→B→A→B would
+    ping-pong forever."""
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(204)
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    flock.add(address="existing.ts.net")
+    sync.apply_hello("new.ts.net")
+    # apply_hello should not have fired any HTTP — only gossip_add
+    # does fan-out, and apply_hello explicitly doesn't call it.
+    assert calls == []
