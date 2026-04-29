@@ -653,6 +653,56 @@ async def test_marquee_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dissolve_transition_emits_marbled_frames(renderer):
+    """Dissolve transition: per-pixel random reveal. Mid-transition we
+    should see frames where pure-red AND pure-blue pixels coexist with
+    no blended (intermediate) pixels — that's the random-pixel-switch
+    signature. Distinguishes dissolve from fade (per-pixel blend, no
+    pure pixels mid-way), wipe/scroll (geometrically-grouped pure
+    rows/columns, not scattered)."""
+    slide_a, png_a = _make_slide("a", (255, 0, 0))
+    slide_b, png_b = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "dissolve", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i])
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width, height = renderer.width, renderer.height
+    pure_red_pixel = bytes((255, 0, 0))
+    pure_blue_pixel = bytes((0, 0, 255))
+
+    def is_marbled(frame: bytes) -> bool:
+        # Scan every 3-byte pixel. Frame is "marbled" when it contains
+        # BOTH pure-red and pure-blue pixels AND every pixel is one or
+        # the other (no blend). Fade emits per-pixel blends; wipe/
+        # scroll emit pure pixels but in contiguous blocks not random
+        # interleaving.
+        has_red = False
+        has_blue = False
+        for off in range(0, len(frame), 3):
+            px = frame[off : off + 3]
+            if px == pure_red_pixel:
+                has_red = True
+            elif px == pure_blue_pixel:
+                has_blue = True
+            else:
+                return False  # any blend disqualifies
+        return has_red and has_blue
+
+    assert any(is_marbled(f) for f in rendered), (
+        "expected at least one marbled frame with mixed pure-red and pure-blue pixels"
+    )
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

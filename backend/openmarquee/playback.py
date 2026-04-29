@@ -43,6 +43,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 from openmarquee.auto_render import compose_auto_frame, resolve_timezone
@@ -320,7 +321,16 @@ class PlaybackLoop:
                 # inline preview and the device stay consistent.
                 if (
                     item.transition
-                    in ("fade", "wipe", "slide", "iris", "scroll", "flip", "marquee")
+                    in (
+                        "fade",
+                        "wipe",
+                        "slide",
+                        "iris",
+                        "scroll",
+                        "flip",
+                        "marquee",
+                        "dissolve",
+                    )
                     and item.transition_ms > 0
                     and len(items) > 1
                 ):
@@ -342,6 +352,8 @@ class PlaybackLoop:
                             await self._flip(current_image, next_image, item.transition_ms)
                         elif kind == "marquee":
                             await self._marquee(current_image, next_image, item.transition_ms)
+                        elif kind == "dissolve":
+                            await self._dissolve(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -741,6 +753,47 @@ class PlaybackLoop:
                 return
             offset = max(0, min(scroll_total, int(round(scroll_total * i / n_frames))))
             frame = compound.crop((offset, 0, offset + width, height))
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _dissolve(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Random per-pixel reveal: each pixel of `to_image` is gated by
+        a per-pixel threshold sampled uniformly from [0, 1). As progress
+        crosses each pixel's threshold, that pixel switches from
+        `from_image` to `to_image`. Reads as a noise-driven crossfade
+        — the first of the dot-matrix-family transitions per the
+        2026-04-28 palette spec.
+
+        Strip-graceful: works at any width or height — the per-pixel
+        randomization doesn't depend on geometry, so a 1×N strip just
+        sees its individual pixels reveal independently. No fallback.
+        """
+        width, height = from_image.size
+        # Per-pixel reveal thresholds. Generated once per transition so
+        # pixels reveal in a stable random order across frames; using a
+        # fresh rng each call means no two transitions share a pattern.
+        thresholds = np.random.default_rng().random((height, width))
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            # Binary L-mode mask: 255 wherever a pixel has been
+            # revealed (threshold < progress), 0 elsewhere.
+            # Image.composite picks to_image where mask==255, from_image
+            # where mask==0 — exactly the per-pixel switch we want.
+            mask_arr = (thresholds < progress).astype(np.uint8) * 255
+            mask = Image.fromarray(mask_arr, mode="L")
+            frame = Image.composite(to_image, from_image, mask)
             self._render_image(frame)
             await self._wait(frame_period)
 

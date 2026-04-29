@@ -97,7 +97,9 @@ class PlaylistItem(BaseModel):
     """
 
     item_id: UUID
-    transition: Literal["cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee"] = "cut"
+    transition: Literal[
+        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve"
+    ] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
 
@@ -143,7 +145,17 @@ class Playlist(BaseModel):
     def append(
         self,
         item_id: UUID,
-        transition: Literal["cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee"] = "cut",
+        transition: Literal[
+            "cut",
+            "fade",
+            "wipe",
+            "slide",
+            "iris",
+            "scroll",
+            "flip",
+            "marquee",
+            "dissolve",
+        ] = "cut",
         transition_ms: int = 500,
     ) -> None:
         """Add an id to the end if it isn't already present."""

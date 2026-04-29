@@ -206,6 +206,7 @@ export function mountInlinePreview(container, options) {
             "scroll",
             "flip",
             "marquee",
+            "dissolve",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -262,6 +263,51 @@ export function mountInlinePreview(container, options) {
                 ctx.translate(0, canvas.height - oy);
                 drawSlot(timeline[nextIdx]);
                 ctx.restore();
+            } else if (slot.transition === "dissolve") {
+                // Per-pixel random reveal. Threshold matrix generated
+                // once per transition (cached on the slot) so the
+                // dissolve pattern is stable across frames — same
+                // contract as playback.py::_dissolve, which seeds its
+                // numpy thresholds once per call.
+                const total = canvas.width * canvas.height;
+                if (
+                    !slot._dissolveThresholds ||
+                    slot._dissolveThresholds.length !== total
+                ) {
+                    const thr = new Uint8Array(total);
+                    for (let i = 0; i < total; i++) {
+                        thr[i] = Math.floor(Math.random() * 256);
+                    }
+                    slot._dissolveThresholds = thr;
+                }
+                // drawSlot(slot) was painted above — capture from-slot
+                // pixels before we overwrite, then redraw to-slot, then
+                // restore from-slot pixels for cells whose threshold
+                // hasn't yet been crossed.
+                const fromImg = ctx.getImageData(
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height,
+                );
+                drawSlot(timeline[nextIdx]);
+                const composed = ctx.getImageData(
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height,
+                );
+                const thr = slot._dissolveThresholds;
+                const progressByte = Math.floor(progress * 256);
+                for (let i = 0; i < total; i++) {
+                    if (thr[i] >= progressByte) {
+                        const off = i * 4;
+                        composed.data[off] = fromImg.data[off];
+                        composed.data[off + 1] = fromImg.data[off + 1];
+                        composed.data[off + 2] = fromImg.data[off + 2];
+                    }
+                }
+                ctx.putImageData(composed, 0, 0);
             } else if (slot.transition === "marquee") {
                 // Tickertape: from-slot scrolls off to the left, a
                 // gap with a centered dot (the "·" separator) passes
