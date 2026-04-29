@@ -368,7 +368,9 @@ def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
 
 
 @router.post("/hello", status_code=204)
-async def receive_hello(body: HelloBody, sync: FlockSyncDep) -> None:
+async def receive_hello(
+    body: HelloBody, sync: FlockSyncDep, background: BackgroundTasks
+) -> None:
     """SYSTEM_SPEC §13 introduction protocol: a peer is telling us
     about a flock member (either themselves, in the reciprocal-add
     case, or another peer in the forward-notification case). We add
@@ -382,8 +384,19 @@ async def receive_hello(body: HelloBody, sync: FlockSyncDep) -> None:
     Unlike /notify and /sync-announce, /hello accepts addresses we
     don't yet know about — that's the entire point of an
     introduction protocol. The address-format validator on HelloBody
-    blocks the SSRF-shape concerns."""
-    sync.apply_hello(body.address)
+    blocks the SSRF-shape concerns.
+
+    When the hello is the first time we've seen this peer (apply_
+    hello returns True), schedule the same probe_peer_name backfill
+    that POST /api/flock does — without it, the new peer would
+    appear in our flock UI as address-only with no sign_name until
+    the next pull-worker tick (potentially never, if operator
+    leaves sync=False on the new peer). Loop-safety: probe_peer_name
+    only reads /api/settings, doesn't gossip; no cascade risk.
+    """
+    newly_added = sync.apply_hello(body.address)
+    if newly_added:
+        background.add_task(sync.probe_peer_name, body.address)
 
 
 @router.post("/sync-announce", status_code=204)

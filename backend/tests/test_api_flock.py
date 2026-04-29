@@ -410,6 +410,43 @@ def test_hello_endpoint_rejects_malformed_address(recording_client):
     assert recorder.hellos == []
 
 
+def test_hello_endpoint_schedules_name_probe_on_first_hello(recording_client):
+    """Phase B.4: when an inbound hello adds a never-seen peer
+    (apply_hello returns True), schedule the same probe_peer_name
+    backfill that POST /api/flock does. Without it, the peer would
+    appear address-only with no sign_name until the next pull-worker
+    tick (potentially never if sync=False stays the default).
+
+    Loop-safety: probe_peer_name only reads /api/settings, doesn't
+    gossip — no cascade risk."""
+    client, recorder, _ = recording_client
+    response = client.post(
+        "/api/flock/hello", json={"address": "stranger.ts.net"}
+    )
+    assert response.status_code == 204
+    # apply_hello returned True (recorder default), so the route
+    # scheduled probe_peer_name as a background task.
+    assert "stranger.ts.net" in recorder.probes
+
+
+def test_hello_endpoint_skips_name_probe_for_known_peer(recording_client):
+    """Idempotent hello (peer already in flock) -> apply_hello returns
+    False -> no probe scheduled. Avoids re-probing every time a peer
+    gossips us about an existing peer in a 3+-device flock."""
+    client, recorder, _ = recording_client
+    # Override apply_hello to return False (already-known case).
+    recorder.apply_hello = lambda address: (
+        recorder.hellos.append(address) or False
+    )
+    response = client.post(
+        "/api/flock/hello", json={"address": "known.ts.net"}
+    )
+    assert response.status_code == 204
+    assert recorder.hellos == ["known.ts.net"]
+    # No probe — apply_hello returned False so nothing was newly added.
+    assert recorder.probes == []
+
+
 def test_hello_endpoint_does_not_require_known_sender(recording_client):
     """Unlike /notify and /sync-announce (which 403 senders not in the
     flock), /hello accepts addresses we don't yet know about — that's

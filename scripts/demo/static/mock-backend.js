@@ -394,15 +394,41 @@
             });
         }
         if (pathname === "/api/flock/hello" && method === "POST") {
-            // Phase B gossip-on-add (§13): a peer is introducing itself
-            // (or another peer) to us. Demo accepts + 204s without
-            // adding to flock_peers — the demo's flock is operator-
-            // curated by seed.json; an inbound hello in the demo
-            // context isn't actually from another openMarquee device,
-            // it's the panel itself making a self-pinging POST when
-            // the operator adds a peer + simulateOnly is false. The
-            // 204 keeps the gossip fan-out from logging spurious 404
-            // warnings; the demo's flock state stays predictable.
+            // Phase B gossip-on-add (§13) — receiver-side parity with
+            // the production /api/flock/hello. A peer is introducing
+            // itself (or another peer) to us; we add the address to
+            // local flock state if not already present and DO NOT
+            // cascade further (loop-prevention invariant — gossip
+            // fan-out only fires from the operator-driven POST
+            // /api/flock entry point, never on inbound hellos).
+            //
+            // Idempotent: duplicate hellos for the same address are
+            // 204 no-ops, since gossip races can introduce the same
+            // peer twice (once via reciprocal, once via forward).
+            const helloBody = await request.json().catch(() => ({}));
+            const helloAddr = String(helloBody.address || "").trim().toLowerCase();
+            if (!helloAddr) {
+                return jsonResponse(
+                    { detail: "address required" },
+                    { status: 422 },
+                );
+            }
+            if (!state.flock_peers.some((p) => p.address === helloAddr)) {
+                // Mirror the FlockPeer shape the demo uses elsewhere.
+                state.flock_peers.push({
+                    id: crypto.randomUUID(),
+                    address: helloAddr,
+                    name: null,
+                    sync: false,
+                    added_at: new Date().toISOString(),
+                    last_seen_at: null,
+                    model: null,
+                    mode: null,
+                    signal: null,
+                    uptime: null,
+                    items_behind: null,
+                });
+            }
             return new Response(null, { status: 204 });
         }
         if (pathname === "/api/system/info" && method === "GET") {
