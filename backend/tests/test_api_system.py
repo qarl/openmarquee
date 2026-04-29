@@ -160,6 +160,51 @@ def test_info_mode_reflects_ws281x_strip_settings(client: TestClient):
     assert info["mode"] == "ws281x-strip"
 
 
+def test_info_exposes_rotation_applied_display_dims(client: TestClient):
+    """B1 follow-up (qarl 2026-04-29): flock peers query each other's
+    /api/system/info for display_rotation when rendering thumbs. The
+    response carries the rotation-applied effective width/height plus
+    the raw rotation int — landscape 1920×1080 rotated 90° → 1080×1920,
+    rotation=90."""
+    payload = SystemSettings(
+        output_mode="hdmi",
+        display_width=1920,
+        display_height=1080,
+        display_rotation=90,
+    ).model_dump(mode="json")
+    client.put("/api/settings", json=payload)
+
+    info = client.get("/api/system/info").json()
+    assert info["display_width"] == 1080
+    assert info["display_height"] == 1920
+    assert info["display_rotation"] == 90
+
+
+def test_info_sets_cors_header_so_peers_can_read_it(client: TestClient):
+    """Peer flock UIs fetch each other's /api/system/info to render
+    per-peer thumbs at the correct rotation. That's a cross-origin GET,
+    so the response must carry Access-Control-Allow-Origin: * (matching
+    the thumbnail endpoint's pattern)."""
+    response = client.get("/api/system/info")
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == "*"
+
+
+def test_info_passes_unrotated_dims_through_when_rotation_is_zero(client: TestClient):
+    payload = SystemSettings(
+        output_mode="hub75",
+        display_width=128,
+        display_height=64,
+        display_rotation=0,
+    ).model_dump(mode="json")
+    client.put("/api/settings", json=payload)
+
+    info = client.get("/api/system/info").json()
+    assert info["display_width"] == 128
+    assert info["display_height"] == 64
+    assert info["display_rotation"] == 0
+
+
 def test_info_signal_in_range_when_present(client: TestClient):
     """Whatever /proc/net/wireless reports (or the fallback), signal
     must be in [0, 100]. The Pydantic model doesn't enforce a range

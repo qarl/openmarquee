@@ -156,6 +156,29 @@ function thumbnailUrl(address, selfOrigin) {
     return `${base}/api/playback/current-thumbnail?t=${Date.now()}`;
 }
 
+// Default impl for fetchPeerSystemInfo. Tests inject their own. The
+// peer's /api/system/info is the source of truth for that peer's
+// rotation-applied display dims; the flock card reads it once on
+// panel render and pushes the resulting aspect onto the thumb.
+//
+// 3s AbortController bound — a black-holed peer (TCP timeout) would
+// otherwise leave the promise hanging until the page closes, and each
+// re-render piles on more.
+const PEER_INFO_TIMEOUT_MS = 3_000;
+async function defaultFetchPeerSystemInfo(address) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), PEER_INFO_TIMEOUT_MS);
+    try {
+        const r = await fetch(`http://${address}/api/system/info`, {
+            signal: ctl.signal,
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.json();
+    } finally {
+        clearTimeout(t);
+    }
+}
+
 // Self-card telemetry fallbacks. Used when /api/system/info hasn't
 // loaded yet (mount-time gap before the fetch lands) or when it
 // fails (older backend, network blip). Phase B.1 endpoint provides
@@ -287,6 +310,7 @@ export function mountFlock(
         fetchSettings,
         fetchSystemInfo,
         fetchDiscover,
+        fetchPeerSystemInfo = defaultFetchPeerSystemInfo,
         onAdd,
         onUpdate,
         onUpdateSelfSync,
@@ -472,7 +496,38 @@ export function mountFlock(
         }
 
         refreshThumbnails();
+        applyPeerAspects(peers);
         pollTimer = setInterval(refreshThumbnails, THUMBNAIL_POLL_MS);
+    }
+
+    // Each peer's display_rotation is fetched live (not persisted on
+    // FlockPeer) — qarl's call: "just query the peers when the panel
+    // opens. everyone here is online and well connected." Per-peer
+    // failure falls back to the local --device-aspect already applied
+    // by the .om-peer-thumb CSS rule, so an offline / blocked peer
+    // just looks like the local sign instead of crashing the panel.
+    function applyPeerAspects(peers) {
+        for (const peer of peers) {
+            if (!isPeerOnline(peer)) continue;
+            const peerIdSel = `.om-peer-card[data-peer-id="${escapeAttr(peer.id)}"]`;
+            if (!gridEl.querySelector(peerIdSel)) continue;
+            fetchPeerSystemInfo(peer.address)
+                .then((info) => {
+                    if (!info || !info.display_width || !info.display_height) {
+                        return;
+                    }
+                    // Re-resolve the thumb element rather than capture it —
+                    // a re-render between fetch start + resolve replaces
+                    // the DOM under us, so write to whatever is current.
+                    const live = gridEl.querySelector(`${peerIdSel} .om-peer-thumb`);
+                    if (live) {
+                        live.style.aspectRatio = `${info.display_width} / ${info.display_height}`;
+                    }
+                })
+                .catch(() => {
+                    // Fall back to --device-aspect.
+                });
+        }
     }
 
     async function refreshDiscoverList() {

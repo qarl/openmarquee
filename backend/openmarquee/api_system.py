@@ -22,7 +22,7 @@ import subprocess
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 
 from openmarquee.dependencies import get_settings_storage
@@ -221,14 +221,31 @@ class SystemInfo(BaseModel):
     signal: int
     uptime: str
     source: str  # "proc" | "fallback" | "mixed"
+    # Rotation-applied display dims so flock peers can render each
+    # other's thumbnails at the correct aspect (B1 follow-up, qarl
+    # 2026-04-29). Width/height are AFTER rotation — a 1920×1080 panel
+    # rotated 90° reports 1080×1920. Rotation is the raw value (0/90/
+    # 180/270) so debugging tools can still see what's set on the device.
+    display_width: int
+    display_height: int
+    display_rotation: int
 
 
 @router.get("/info", response_model=SystemInfo)
-async def system_info(settings_storage: SettingsDep) -> SystemInfo:
+async def system_info(
+    response: Response,
+    settings_storage: SettingsDep,
+) -> SystemInfo:
     """Read /proc/* + the configured display mode and return a flock
     self-card payload. Each /proc reader is best-effort; failure
     falls back to the matching SELF_PLACEHOLDER constant.
     """
+    # Permit cross-origin GETs so a peer's flock UI can read this device's
+    # rotation when rendering its thumb. Mirrors the thumbnail endpoint's
+    # wildcard ACAO; the payload is non-sensitive (model / mode / signal /
+    # uptime / display dims).
+    response.headers["Access-Control-Allow-Origin"] = "*"
+
     settings = settings_storage.load()
 
     model = _read_model()
@@ -265,12 +282,21 @@ async def system_info(settings_storage: SettingsDep) -> SystemInfo:
 
     mode = _format_mode(settings.output_mode, settings.display_width, settings.display_height)
 
+    rotation = int(settings.display_rotation)
+    if rotation in (90, 270):
+        eff_w, eff_h = settings.display_height, settings.display_width
+    else:
+        eff_w, eff_h = settings.display_width, settings.display_height
+
     return SystemInfo(
         model=model,
         mode=mode,
         signal=signal,
         uptime=uptime,
         source=source,
+        display_width=eff_w,
+        display_height=eff_h,
+        display_rotation=rotation,
     )
 
 

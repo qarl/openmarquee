@@ -443,6 +443,11 @@
                 signal: 100,
                 uptime: "up since boot",
                 source: "demo",
+                // Demo defaults to landscape 1920×1080, no rotation.
+                // Real seed snapshots can override (regen seed.json).
+                display_width: 1920,
+                display_height: 1080,
+                display_rotation: 0,
             });
         }
 
@@ -656,13 +661,32 @@
             (p) => p.address && `http://${p.address}` === u.origin,
         );
         if (!peer) return null;
-        if (u.pathname !== "/api/playback/current-thumbnail") return null;
-        if (peer.current_thumbnail_content_id) {
-            return assetResponse(peer.current_thumbnail_content_id, "png", {
-                "Cache-Control": "no-store",
+        if (u.pathname === "/api/playback/current-thumbnail") {
+            if (peer.current_thumbnail_content_id) {
+                return assetResponse(peer.current_thumbnail_content_id, "png", {
+                    "Cache-Control": "no-store",
+                });
+            }
+            return noContent(204);
+        }
+        if (u.pathname === "/api/system/info") {
+            // Demo peers are uniformly landscape 1920×1080 unless the
+            // seed snapshot explicitly carries display_* fields per
+            // peer. Falls back to the local-mock defaults so the flock
+            // panel's per-peer rotation fetch resolves cleanly instead
+            // of hitting an unreachable origin.
+            return jsonResponse({
+                model: peer.model || "Pi Zero 2 W",
+                mode: peer.mode || "hdmi-1080",
+                signal: peer.signal != null ? peer.signal : 100,
+                uptime: peer.uptime || "up since boot",
+                source: "demo",
+                display_width: peer.display_width || 1920,
+                display_height: peer.display_height || 1080,
+                display_rotation: peer.display_rotation || 0,
             });
         }
-        return noContent(204);
+        return null;
     }
 
     function normalizePlaylistItems(body) {

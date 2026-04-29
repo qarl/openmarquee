@@ -63,6 +63,91 @@ describe("mountFlock", () => {
         });
     }
 
+    it("applies each peer's display_rotation to its thumb aspect (B1 followup)", async () => {
+        // qarl 2026-04-29: "just query the peers when the panel opens.
+        // everyone here is online and well connected." Each peer's
+        // /api/system/info reports rotation-applied display_width/height;
+        // the flock UI sets that as the thumb's aspect-ratio.
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        const portraitPeer = PEER({
+            id: "22222222-2222-2222-2222-222222222222",
+            address: "tall.ts.net",
+            last_seen_at: recent,
+        });
+        const landscapePeer = PEER({
+            id: "33333333-3333-3333-3333-333333333333",
+            address: "wide.ts.net",
+            last_seen_at: recent,
+        });
+        const fetchPeerSystemInfo = vi.fn(async (address) => {
+            if (address === "tall.ts.net") {
+                return {
+                    model: "Pi Zero 2 W",
+                    mode: "hub75-32x64",
+                    signal: 100,
+                    uptime: "1h",
+                    source: "proc",
+                    display_width: 32,
+                    display_height: 64,
+                    display_rotation: 90,
+                };
+            }
+            return {
+                model: "Pi Zero 2 W",
+                mode: "hdmi-1080",
+                signal: 100,
+                uptime: "1h",
+                source: "proc",
+                display_width: 1920,
+                display_height: 1080,
+                display_rotation: 0,
+            };
+        });
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [portraitPeer, landscapePeer],
+            fetchPeerSystemInfo,
+        });
+        // render() awaits Promise.allSettled before rendering cards;
+        // need a few ticks to get past the allSettled + per-peer fetch
+        // resolution + .then() write.
+        await tick();
+        await tick();
+        await tick();
+        // Per-peer fetch fires once per online peer.
+        expect(fetchPeerSystemInfo).toHaveBeenCalledWith("tall.ts.net");
+        expect(fetchPeerSystemInfo).toHaveBeenCalledWith("wide.ts.net");
+        const tall = container.querySelector(
+            `.om-peer-card[data-peer-id="${portraitPeer.id}"] .om-peer-thumb`,
+        );
+        const wide = container.querySelector(
+            `.om-peer-card[data-peer-id="${landscapePeer.id}"] .om-peer-thumb`,
+        );
+        expect(tall.style.aspectRatio.replace(/\s+/g, "")).toBe("32/64");
+        expect(wide.style.aspectRatio.replace(/\s+/g, "")).toBe("1920/1080");
+    });
+
+    it("falls back gracefully when a peer's /api/system/info fails (B1 followup)", async () => {
+        // Per-peer fetch failure is non-fatal — peer's thumb stays at
+        // the local --device-aspect default. No status banner, no panel
+        // crash; just no per-peer override.
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        const fetchPeerSystemInfo = vi.fn(async () => {
+            throw new Error("network unreachable");
+        });
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [PEER({ last_seen_at: recent })],
+            fetchPeerSystemInfo,
+        });
+        await tick();
+        await tick();
+        const thumb = container.querySelector(".om-peer-thumb");
+        expect(thumb.style.aspectRatio).toBe("");
+        // Panel still rendered.
+        expect(container.querySelector(".flock-status").classList.contains("error")).toBe(false);
+    });
+
     it("renders the self card first, then one card per peer + a + New tile", async () => {
         const container = document.createElement("div");
         mount(container, {
