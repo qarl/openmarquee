@@ -2090,7 +2090,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
    pill in alongside, and stretch would balloon it vertically. The
    inner `.om-wm-stack` has its own `justify-content: center` so the two
    text lines stay vertically centered regardless of outer alignment. */
-.om-wordmark.om-wordmark-stack { align-items: center; gap: 10px; }
+.om-wordmark.om-wordmark-stack { align-items: center; gap: 5px; }
 /* Stacked-variant override on the dot-matrix mark — qarl's 2026-04-28
    tweak via QA-Jimmy: rotate the mark to portrait + scale to span the
    full stack height (top of OPEN to bottom of Marquee, edge-aligned,
