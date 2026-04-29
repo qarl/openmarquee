@@ -813,13 +813,50 @@ export function mountStreamPanel(container, options = {}) {
     window.addEventListener("pagehide", onPageHide);
 
     render();
-    mountInitPromise = (async () => {
-        try {
-            await mountInit();
-        } finally {
-            mountInitPromise = null;
+
+    // Defer mount-init (which probes /status + opens the camera) until
+    // the panel is actually visible. The whole device UI mounts every
+    // panel at boot regardless of route — eager init here would prompt
+    // for camera permission before the operator ever navigates to the
+    // Stream tab. We watch the closest data-section ancestor's `hidden`
+    // attribute and only init when it goes (or starts) visible.
+    function startMountInit() {
+        if (mountInitPromise || destroyed) return;
+        mountInitPromise = (async () => {
+            try {
+                await mountInit();
+            } finally {
+                mountInitPromise = null;
+            }
+        })();
+    }
+
+    function isHiddenChain(el) {
+        for (let cur = el; cur; cur = cur.parentElement) {
+            if (cur.hidden) return true;
         }
-    })();
+        return false;
+    }
+
+    let visibilityObserver = null;
+    const section = container.closest?.("[data-section]") ?? null;
+    if (section && isHiddenChain(section)) {
+        visibilityObserver = new MutationObserver(() => {
+            if (!isHiddenChain(section)) {
+                visibilityObserver.disconnect();
+                visibilityObserver = null;
+                startMountInit();
+            }
+        });
+        visibilityObserver.observe(section, {
+            attributes: true,
+            attributeFilter: ["hidden"],
+        });
+    } else {
+        // Visible (or no section ancestor — covers test fixtures that
+        // mount into a bare div). Init right away.
+        startMountInit();
+    }
 
     return {
         // Test-only window into the panel state. Exposes the phase
@@ -828,6 +865,10 @@ export function mountStreamPanel(container, options = {}) {
         getState: () => state.phase,
         destroy: () => {
             destroyed = true;
+            if (visibilityObserver !== null) {
+                visibilityObserver.disconnect();
+                visibilityObserver = null;
+            }
             window.removeEventListener("pagehide", onPageHide);
             document.removeEventListener(
                 "openmarquee:settings-updated",

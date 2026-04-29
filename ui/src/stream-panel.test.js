@@ -240,6 +240,45 @@ describe("mountStreamPanel", () => {
         expect(container.querySelector(".stream-status").textContent).toBe("");
     });
 
+    it("defers camera + /status until the section becomes visible", async () => {
+        // Bug B4 (qarl batch 2026-04-29): mount-init was firing at app
+        // boot regardless of route, so the camera permission prompt
+        // appeared before the operator ever clicked the Stream tab.
+        // The panel should now wait for its closest [data-section]
+        // ancestor's `hidden` attribute to clear before probing /status
+        // or opening the camera.
+        const section = document.createElement("section");
+        section.setAttribute("data-section", "stream");
+        section.hidden = true;
+        const container = document.createElement("div");
+        section.appendChild(container);
+        document.body.appendChild(section);
+        try {
+            const opts = defaultMounts();
+            const handle = mountStreamPanel(container, opts);
+
+            // Flush microtasks so any (errant) eager init has a chance
+            // to land — asserting on a negative needs determinism, not
+            // a wall-clock sleep.
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(opts.apiGetStatus).not.toHaveBeenCalled();
+            expect(opts.getUserMedia).not.toHaveBeenCalled();
+            expect(handle.getState()).toBe("idle");
+
+            // Operator navigates to Stream → nav clears the hidden attr.
+            section.hidden = false;
+
+            await waitFor(() => handle.getState() === "preview");
+            expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
+            expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
+
+            handle.destroy();
+        } finally {
+            section.remove();
+        }
+    });
+
     it("mount-init enters take-over-prompt without opening the camera when /status is active", async () => {
         // Some other phone owns the screen at mount time. Pre-flight
         // surfaces take-over-prompt directly, skipping the camera-
