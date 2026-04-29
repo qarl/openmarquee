@@ -37,6 +37,10 @@ const MODE_LABELS = {
     "hdmi-720": "HDMI 720p",
     "hdmi-1080": "HDMI 1080p",
     "hdmi-4k": "HDMI 4K",
+    // Backend's /api/system/info emits "ws281x-strip" (matching the
+    // OutputMode literal "ws281x"); legacy "ws2812-strip" key kept
+    // alive for any peer-supplied slugs that pre-date the rename.
+    "ws281x-strip": "WS2812B strip",
     "ws2812-strip": "WS2812B strip",
     "composite": "Composite",
 };
@@ -135,20 +139,25 @@ function thumbnailUrl(address, selfOrigin) {
     return `${base}/api/playback/current-thumbnail?t=${Date.now()}`;
 }
 
-// Phase A self-card telemetry placeholders. These keep the home-
-// device card from reading as a row of em-dashes — qarl's call:
-// "the home device doesn't have all his stats displayed." Named
-// PLACEHOLDER (not DEFAULT) so the next reader sees them as
-// stubs-pending-removal, not as fallbacks meant to survive forever.
-// TODO(phase-b): replace with real reads via the per-peer health
-// endpoint — model from /proc/cpuinfo, signal % from
-// /proc/net/wireless, uptime from /proc/uptime — wired alongside
-// the §13 gossip-on-add work.
+// Self-card telemetry fallbacks. Used when /api/system/info hasn't
+// loaded yet (mount-time gap before the fetch lands) or when it
+// fails (older backend, network blip). Phase B.1 endpoint provides
+// the production values; B.2 wired the consumer call. Sentinels are
+// kept in sync with backend's _FALLBACK_{MODEL,SIGNAL,UPTIME} in
+// api_system.py — the wire shape is the contract; both sides need
+// the same fallback so a partial-failure render reads consistent.
 const SELF_PLACEHOLDER_MODEL = "Pi Zero 2 W";
 const SELF_PLACEHOLDER_SIGNAL = 100;
 const SELF_PLACEHOLDER_UPTIME = "up since boot";
 
-function selfCardHTML({ name, syncEnabled, mode }) {
+function selfCardHTML({
+    name,
+    syncEnabled,
+    mode,
+    model = SELF_PLACEHOLDER_MODEL,
+    signal = SELF_PLACEHOLDER_SIGNAL,
+    uptime = SELF_PLACEHOLDER_UPTIME,
+}) {
     const pill = syncStatePillForSelf(syncEnabled);
     const modeLabel = MODE_LABELS[mode] || (mode || "—");
     return `
@@ -164,9 +173,9 @@ function selfCardHTML({ name, syncEnabled, mode }) {
             </div>
             <div class="om-peer-stats">
                 <span>${escapeAttr(modeLabel)}</span>
-                <span style="text-align:right;"><b>${SELF_PLACEHOLDER_SIGNAL}%</b> wifi</span>
-                <span>${escapeAttr(SELF_PLACEHOLDER_MODEL)}</span>
-                <span style="text-align:right;">${escapeAttr(SELF_PLACEHOLDER_UPTIME)}</span>
+                <span style="text-align:right;"><b>${signal}%</b> wifi</span>
+                <span>${escapeAttr(model)}</span>
+                <span style="text-align:right;">${escapeAttr(uptime)}</span>
             </div>
             <div class="om-peer-actions">
                 <span class="om-pill ${pill.cls}">${escapeAttr(pill.label)}</span>
@@ -237,6 +246,12 @@ function newDeviceCardHTML() {
  * @param {object} options
  * @param {() => Promise<{peers: object[]}>} options.fetchFlock
  * @param {() => Promise<object>} options.fetchSettings
+ * @param {() => Promise<object>} [options.fetchSystemInfo]
+ *     /api/system/info — Phase B.1. Returns the local device's
+ *     {model, mode, signal, uptime, source} for the self-card.
+ *     Optional injection seam for tests; defaults to the api.js
+ *     wrapper. A failure here falls back to SELF_PLACEHOLDER_*
+ *     constants so the panel still renders.
  * @param {(address: string) => Promise<object>} options.onAdd
  * @param {(peerId: string, patch: object) => Promise<object>} options.onUpdate
  * @param {(enabled: boolean) => Promise<void>} options.onUpdateSelfSync
@@ -244,7 +259,15 @@ function newDeviceCardHTML() {
  */
 export function mountFlock(
     container,
-    { fetchFlock, fetchSettings, onAdd, onUpdate, onUpdateSelfSync, onDelete },
+    {
+        fetchFlock,
+        fetchSettings,
+        fetchSystemInfo,
+        onAdd,
+        onUpdate,
+        onUpdateSelfSync,
+        onDelete,
+    },
 ) {
     container.innerHTML = SECTION_TEMPLATE;
     const gridEl = container.querySelector(".om-flock-grid");
@@ -338,30 +361,52 @@ export function mountFlock(
         let selfName = "This device";
         let selfSyncEnabled = true;
         let selfMode = null;
+        let selfModel;
+        let selfSignal;
+        let selfUptime;
         let peers = [];
         try {
-            const [settings, flock] = await Promise.all([
+            // Phase B.2: fetch settings + flock + system-info concurrently.
+            // System-info failure is non-fatal (older backend, network
+            // blip) — selfCardHTML's parameter defaults fall back to
+            // SELF_PLACEHOLDER_* constants, mirroring the production
+            // backend's _FALLBACK_{MODEL,SIGNAL,UPTIME} sentinels in
+            // api_system.py. allSettled lets the panel render even if
+            // /api/system/info 404s on a server that pre-dates this
+            // commit.
+            const fetchInfo = fetchSystemInfo || (() => Promise.reject());
+            const [settingsResult, flockResult, infoResult] = await Promise.allSettled([
                 fetchSettings(),
                 fetchFlock(),
+                fetchInfo(),
             ]);
+            if (settingsResult.status !== "fulfilled") {
+                throw new Error(
+                    settingsResult.reason?.message || "settings fetch failed",
+                );
+            }
+            if (flockResult.status !== "fulfilled") {
+                throw new Error(
+                    flockResult.reason?.message || "flock fetch failed",
+                );
+            }
+            const settings = settingsResult.value;
+            const flock = flockResult.value;
             selfName = settings.sign_name || "This device";
             selfSyncEnabled = settings.flock_sync_enabled !== false;
-            // Map output_mode + display dims into the design's mode-slug
-            // shape so the self card's stats row picks the right label.
-            // Falls back to null if output_mode is something we haven't
-            // enumerated; the stats label resolves to "—".
-            const w = Number(settings.display_width);
-            const h = Number(settings.display_height);
-            if (settings.output_mode === "hdmi") {
-                selfMode = h >= 1080 ? "hdmi-1080" : "hdmi-720";
-            } else if (settings.output_mode === "hub75") {
-                selfMode = `hub75-${w}x${h}`;
-            } else if (settings.output_mode === "ws281x") {
-                selfMode = "ws2812-strip";
-            } else if (settings.output_mode === "composite") {
-                selfMode = "composite";
-            }
             peers = flock.peers || [];
+            // System info populates the self-card's mode + telemetry. The
+            // server's /api/system/info already formats mode as a slug
+            // matching MODE_LABELS keys (hdmi-1080 / hub75-128x64 /
+            // ws281x-strip / etc.), so the prior manual output_mode →
+            // slug derivation in this function is gone.
+            if (infoResult.status === "fulfilled") {
+                const info = infoResult.value;
+                selfMode = info.mode || null;
+                selfModel = info.model;
+                selfSignal = info.signal;
+                selfUptime = info.uptime;
+            }
         } catch (err) {
             setStatus(`Couldn't load flock: ${err.message}`, { error: true });
             return;
@@ -373,6 +418,9 @@ export function mountFlock(
                 name: selfName,
                 syncEnabled: selfSyncEnabled,
                 mode: selfMode,
+                model: selfModel,
+                signal: selfSignal,
+                uptime: selfUptime,
             }) +
             peers.map(peerCardHTML).join("") +
             newDeviceCardHTML();

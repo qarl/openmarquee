@@ -39,10 +39,22 @@ const PEER = (over = {}) => ({
 });
 
 describe("mountFlock", () => {
-    function mount(container, { peers = [], settings = { sign_name: "SignAAA", flock_sync_enabled: true }, ...over } = {}) {
+    function mount(container, {
+        peers = [],
+        settings = { sign_name: "SignAAA", flock_sync_enabled: true },
+        systemInfo = {
+            model: "Pi Zero 2 W",
+            mode: "hdmi-1080",
+            signal: 100,
+            uptime: "up since boot",
+            source: "fallback",
+        },
+        ...over
+    } = {}) {
         mountFlock(container, {
             fetchFlock: async () => ({ peers }),
             fetchSettings: async () => settings,
+            fetchSystemInfo: async () => systemInfo,
             onAdd: vi.fn(),
             onUpdate: vi.fn(),
             onUpdateSelfSync: vi.fn(),
@@ -71,6 +83,74 @@ describe("mountFlock", () => {
         expect(
             container.querySelector(".om-peer-card.this .om-peer-name").textContent,
         ).toBe("SignE6B");
+    });
+
+    it("self card stats row reflects /api/system/info (Phase B.2)", async () => {
+        const container = document.createElement("div");
+        mount(container, {
+            systemInfo: {
+                model: "Raspberry Pi 4B",
+                mode: "hub75-128x64",
+                signal: 73,
+                uptime: "4d 7h",
+                source: "proc",
+            },
+        });
+        await tick();
+        const stats = container.querySelector(".om-peer-card.this .om-peer-stats");
+        // Stats row order: mode (label), signal+wifi, model, uptime.
+        expect(stats.textContent).toContain("Pi 4B");
+        expect(stats.textContent).toContain("73%");
+        expect(stats.textContent).toContain("4d 7h");
+        // The mode-slug → label mapping comes from MODE_LABELS;
+        // hub75-128x64 → its display string. Just verify the slug
+        // landed in the rendered label path (substring check
+        // tolerates whatever MODE_LABELS produces).
+        expect(stats.textContent.toLowerCase()).toContain("hub75");
+    });
+
+    it("self card maps the backend's ws281x-strip slug to its readable label", async () => {
+        // Regression for the B.2 BLOCKER subagent caught: backend's
+        // /api/system/info emits "ws281x-strip" (matching the
+        // OutputMode literal), but MODE_LABELS originally only knew
+        // about the legacy "ws2812-strip" key. Without the alias, a
+        // ws281x device's self-card would render the raw slug instead
+        // of "WS2812B strip".
+        const container = document.createElement("div");
+        mount(container, {
+            systemInfo: {
+                model: "Pi Zero 2 W",
+                mode: "ws281x-strip",
+                signal: 100,
+                uptime: "1h 0m",
+                source: "proc",
+            },
+        });
+        await tick();
+        const stats = container.querySelector(".om-peer-card.this .om-peer-stats");
+        expect(stats.textContent).toContain("WS2812B strip");
+        // The raw slug should NOT appear — that would mean the label
+        // mapping fell through to the slug-as-fallback branch.
+        expect(stats.textContent).not.toContain("ws281x-strip");
+    });
+
+    it("self card falls back to placeholders when /api/system/info rejects", async () => {
+        // Older backend / network blip → fetchSystemInfo throws.
+        // Panel should still render with the SELF_PLACEHOLDER_*
+        // sentinel values rather than failing to mount.
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSystemInfo: async () => {
+                throw new Error("boom");
+            },
+        });
+        await tick();
+        const stats = container.querySelector(".om-peer-card.this .om-peer-stats");
+        // SELF_PLACEHOLDER_* values from flock.js: 'Pi Zero 2 W',
+        // 100, 'up since boot'.
+        expect(stats.textContent).toContain("Pi Zero 2 W");
+        expect(stats.textContent).toContain("100%");
+        expect(stats.textContent).toContain("up since boot");
     });
 
     it("self card carries a 'this device' pulse pill", async () => {

@@ -29,6 +29,7 @@ import {
     generateBackground,
     getSchedule,
     getSettings,
+    getSystemInfo,
     listContent,
     listFlock,
     listPlaylists,
@@ -498,6 +499,7 @@ async function boot() {
     mountFlock(root.querySelector(".flock-slot"), {
         fetchFlock: listFlock,
         fetchSettings: getSettings,
+        fetchSystemInfo: getSystemInfo,
         onAdd: addFlockPeer,
         onUpdate: updateFlockPeer,
         onUpdateSelfSync: async (enabled) => {

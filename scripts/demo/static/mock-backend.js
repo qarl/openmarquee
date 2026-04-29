@@ -370,6 +370,20 @@
         if (pathname === "/api/system/display-dims" && method === "GET") {
             return jsonResponse({ width: 1920, height: 1080, source: "demo" });
         }
+        if (pathname === "/api/system/info" && method === "GET") {
+            // Phase B.1 endpoint. Demo doesn't have a real /proc/* to
+            // read; report the same SELF_PLACEHOLDER-shaped values the
+            // backend's _FALLBACK_* sentinels emit on a Mac dev box.
+            // 'source: "demo"' tags this distinctly from production's
+            // 'fallback' so a verifier probe can tell them apart.
+            return jsonResponse({
+                model: "Pi Zero 2 W",
+                mode: "hdmi-1080",
+                signal: 100,
+                uptime: "up since boot",
+                source: "demo",
+            });
+        }
 
         // --- stream (live phone-camera takeover, SYSTEM_SPEC §5.11) ---
         // simulateOnly mode in the panel skips the /start /stop

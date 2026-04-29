@@ -319,6 +319,18 @@ export async function getSettings() {
     return await response.json();
 }
 
+/** Read the local device's flock-self-card payload — model / mode /
+ * signal / uptime + a source field. Phase B.1 endpoint; the flock
+ * panel's self-card consumes this on mount to replace its hardcoded
+ * SELF_PLACEHOLDER_* values with real /proc/* reads. */
+export async function getSystemInfo() {
+    const response = await fetch("/api/system/info");
+    if (!response.ok) {
+        throw new Error(`System info fetch failed (${response.status})`);
+    }
+    return await response.json();
+}
+
 /** Replace the device system settings. */
 export async function saveSettings(settings) {
     const response = await fetch("/api/settings", {
