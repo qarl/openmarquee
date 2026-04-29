@@ -886,6 +886,90 @@ async def test_halftone_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scanline_transition_emits_bright_band(tmp_path):
+    """Scanline transition: bright white band sweeps top-to-bottom.
+    At mid-progress we should see frames where:
+      - top rows are pure-blue (to-color, already revealed)
+      - bottom rows are pure-red (from-color, not yet revealed)
+      - somewhere between, a pure-white row spans the full width
+    Only scanline produces all three at once."""
+    # 16-tall panel so band_height = max(1, 16//32) = 1 — single bright
+    # row. 16 wide so each row is a 16×1×3 = 48-byte block.
+    from openmarquee.rendering.mock import MockRenderer
+
+    renderer = MockRenderer(16, 16, tmp_path / "out.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "scanline", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(16, 16, (255, 0, 0))
+    png_b = _png_bytes(16, 16, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width, height = renderer.width, renderer.height
+    pure_red_row = bytes((255, 0, 0)) * width
+    pure_blue_row = bytes((0, 0, 255)) * width
+    pure_white_row = bytes((255, 255, 255)) * width
+
+    def has_three_zones(frame: bytes) -> bool:
+        rows = [frame[y * width * 3 : (y + 1) * width * 3] for y in range(height)]
+        return (
+            pure_blue_row in rows
+            and pure_red_row in rows
+            and pure_white_row in rows
+        )
+
+    assert any(has_three_zones(f) for f in rendered), (
+        "expected at least one frame with blue/white/red zones (scanline sweep)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scanline_transition_falls_back_to_fade_on_short_strip(tmp_path):
+    """Strip-graceful: scanline on height<2 has no room for the sweep,
+    so `_scanline` delegates to `_fade`. Per QA's spec ("scanline on a
+    1×N strip is just a fade")."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    # 1-row horizontal strip — the WS281x case.
+    strip_renderer = MockRenderer(8, 1, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "scanline", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (strip_renderer.width * strip_renderer.height)
+    pure_blue = bytes((0, 0, 255)) * (strip_renderer.width * strip_renderer.height)
+    intermediates = [f for f in rendered if f != pure_red and f != pure_blue]
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

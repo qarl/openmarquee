@@ -209,6 +209,7 @@ export function mountInlinePreview(container, options) {
             "dissolve",
             "pixelate",
             "halftone",
+            "scanline",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -392,6 +393,39 @@ export function mountInlinePreview(container, options) {
                     ctx.clip();
                     drawSlot(timeline[nextIdx]);
                     ctx.restore();
+                }
+            } else if (slot.transition === "scanline") {
+                // CRT scanline sweep. Bright band top-to-bottom over
+                // the transition; above the band is to-slot, below
+                // stays from-slot (already pre-painted by the outer
+                // renderer). Mirrors playback.py::_scanline.
+                const w = canvas.width;
+                const h = canvas.height;
+                if (h < 2) {
+                    // Strip fallback — same shape the server uses.
+                    ctx.globalAlpha = progress;
+                    drawSlot(timeline[nextIdx]);
+                    ctx.globalAlpha = 1;
+                } else {
+                    const bandHeight = Math.max(1, Math.floor(h / 32));
+                    const sweepY = Math.round(progress * h);
+                    // Reveal to-slot above the sweep via clip rect.
+                    if (sweepY > 0) {
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.rect(0, 0, w, sweepY);
+                        ctx.clip();
+                        drawSlot(timeline[nextIdx]);
+                        ctx.restore();
+                    }
+                    // Bright glow band centered on the sweep, clamped
+                    // so it doesn't extend past the canvas edges.
+                    const bandTop = Math.max(0, sweepY - Math.floor(bandHeight / 2));
+                    const bandBot = Math.min(h, bandTop + bandHeight);
+                    if (bandBot > bandTop) {
+                        ctx.fillStyle = "#fff";
+                        ctx.fillRect(0, bandTop, w, bandBot - bandTop);
+                    }
                 }
             } else if (slot.transition === "marquee") {
                 // Tickertape: from-slot scrolls off to the left, a

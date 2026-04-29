@@ -332,6 +332,7 @@ class PlaybackLoop:
                         "dissolve",
                         "pixelate",
                         "halftone",
+                        "scanline",
                     )
                     and item.transition_ms > 0
                     and len(items) > 1
@@ -360,6 +361,8 @@ class PlaybackLoop:
                             await self._pixelate(current_image, next_image, item.transition_ms)
                         elif kind == "halftone":
                             await self._halftone(current_image, next_image, item.transition_ms)
+                        elif kind == "scanline":
+                            await self._scanline(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -920,6 +923,60 @@ class PlaybackLoop:
                     fill=255,
                 )
             frame = Image.composite(to_image, from_image, mask)
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _scanline(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """CRT scanline sweep: a bright horizontal band sweeps top-to-
+        bottom over transition_ms. Above the line is to_image; below
+        stays from_image. Reads as a vintage tube reveal where the
+        electron beam is "scanning in" the new frame. First of the CRT-
+        family transitions per the 2026-04-28 palette spec.
+
+        Strip-graceful: scanline on a 1-row strip (height<2) has no
+        room to sweep — the line would cover the entire panel for the
+        duration. Fall back to fade. Per QA's spec ("scanline on a 1×N
+        strip is just a fade"); we make it explicit here so the
+        operator's pulldown choice doesn't silently degrade.
+        """
+        from PIL import ImageDraw
+
+        width, height = from_image.size
+        if height < 2:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        # Sweep band thickness: ~3% of panel height, min 1px. Gives a
+        # visible CRT-glow trail without dominating short canvases.
+        band_height = max(1, height // 32)
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            sweep_y = int(round(progress * height))
+            frame = from_image.copy()
+            # Above the sweep: paint to_image rows.
+            if sweep_y > 0:
+                frame.paste(to_image.crop((0, 0, width, sweep_y)), (0, 0))
+            # Bright glow band centered on the sweep line — clamped so
+            # it doesn't extend past the canvas at progress=0 or 1.
+            band_top = max(0, sweep_y - band_height // 2)
+            band_bot = min(height, band_top + band_height)
+            if band_bot > band_top:
+                ImageDraw.Draw(frame).rectangle(
+                    (0, band_top, width - 1, band_bot - 1),
+                    fill=(255, 255, 255),
+                )
             self._render_image(frame)
             await self._wait(frame_period)
 
