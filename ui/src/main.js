@@ -25,6 +25,7 @@ import {
     deleteContent,
     deleteFlockPeer,
     deletePlaylistById,
+    effectiveDisplayDims,
     fetchContentItem,
     generateBackground,
     getFlockDiscover,
@@ -84,18 +85,10 @@ const DEFAULT_SECTION = "slides";
 async function resolvePanelDims() {
     try {
         const settings = await getSettings();
-        const w = Number(settings.display_width);
-        const h = Number(settings.display_height);
-        const rotation = Number(settings.display_rotation || 0);
+        const dims = effectiveDisplayDims(settings);
         const outputMode = settings.output_mode || "hdmi";
-        if (Number.isFinite(w) && w > 0 && Number.isFinite(h) && h > 0) {
-            // 90° / 270° rotate the preview into portrait — swap dims so
-            // the editor's aspect ratio matches what the installed sign
-            // actually shows.
-            if (rotation === 90 || rotation === 270) {
-                return { width: h, height: w, outputMode };
-            }
-            return { width: w, height: h, outputMode };
+        if (dims !== null) {
+            return { width: dims.width, height: dims.height, outputMode };
         }
     } catch {
         // Fall through to fallback — editor still mounts even if the

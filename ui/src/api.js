@@ -319,6 +319,34 @@ export async function getSettings() {
     return await response.json();
 }
 
+/** Compute the effective display dims after applying display_rotation.
+ *
+ * Rotation 0 / 180 → physical orientation matches the panel; dims pass
+ * through. Rotation 90 / 270 → the panel is mounted portrait, so the
+ * sign actually outputs height-by-width — swap so previews match the
+ * installed orientation. Per §5.9 ('Live Preview') every preview canvas
+ * pins its aspect ratio to display_width × display_height; this helper
+ * is the single source of truth for "what dims should I render at?"
+ * across stream preview, slide editor previews, inline preview canvas,
+ * and the panel-level resolvePanelDims dispatch.
+ *
+ * Returns { width, height } as numbers. Returns null when the input
+ * settings shape doesn't have parseable positive width/height — caller
+ * decides what to fall back to (resolvePanelDims uses 128×96; the
+ * stream preview lets CSS default 9/16 stick).
+ */
+export function effectiveDisplayDims(settings) {
+    const w = Number(settings?.display_width);
+    const h = Number(settings?.display_height);
+    const rotation = Number(settings?.display_rotation || 0);
+    if (!Number.isFinite(w) || w <= 0) return null;
+    if (!Number.isFinite(h) || h <= 0) return null;
+    if (rotation === 90 || rotation === 270) {
+        return { width: h, height: w };
+    }
+    return { width: w, height: h };
+}
+
 /** Read the local device's flock-self-card payload — model / mode /
  * signal / uptime + a source field. Phase B.1 endpoint; the flock
  * panel's self-card consumes this on mount to replace its hardcoded

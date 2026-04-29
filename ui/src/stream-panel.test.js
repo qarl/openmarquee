@@ -472,6 +472,48 @@ describe("mountStreamPanel", () => {
         handle.destroy();
     });
 
+    it("preview aspect swaps width/height when display_rotation is 90 or 270", async () => {
+        // Phase 12.2 followup, qarl 2026-04-28: portrait-mounted signs
+        // (rotation in {90, 270}) actually output height-by-width, so
+        // the preview must swap dims or the operator's framing won't
+        // match the installed orientation.
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            fetchSettings: vi.fn(async () => ({
+                display_width: 1920,
+                display_height: 1080,
+                display_rotation: 90,
+            })),
+        });
+        mountStreamPanel(container, opts);
+        await waitFor(
+            () =>
+                container
+                    .querySelector(".stream-preview-wrap")
+                    .style.getPropertyValue("--om-stream-aspect")
+                    .replace(/\s+/g, "") === "1080/1920",
+        );
+    });
+
+    it("preview aspect passes through unchanged at display_rotation 0 / 180", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            fetchSettings: vi.fn(async () => ({
+                display_width: 1920,
+                display_height: 1080,
+                display_rotation: 180,
+            })),
+        });
+        mountStreamPanel(container, opts);
+        await waitFor(
+            () =>
+                container
+                    .querySelector(".stream-preview-wrap")
+                    .style.getPropertyValue("--om-stream-aspect")
+                    .replace(/\s+/g, "") === "1920/1080",
+        );
+    });
+
     it("Elapsed cell ticks against the server's started_at, not local Date.now", async () => {
         // Phase A.2: the backend stamps the session-start timestamp
         // and returns it in /start (and /status). The phone's Elapsed

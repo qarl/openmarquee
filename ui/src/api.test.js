@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     deleteContent,
+    effectiveDisplayDims,
     generateBackground,
     getPlaybackState,
     getSchedule,
@@ -429,5 +430,73 @@ describe("stream API", () => {
             "33333333-3333-3333-3333-333333333333",
         );
         expect(err.status).toBe(409);
+    });
+});
+
+describe("effectiveDisplayDims", () => {
+    it("passes width/height through at rotation 0", () => {
+        expect(
+            effectiveDisplayDims({
+                display_width: 1920,
+                display_height: 1080,
+                display_rotation: 0,
+            }),
+        ).toEqual({ width: 1920, height: 1080 });
+    });
+
+    it("passes width/height through at rotation 180", () => {
+        expect(
+            effectiveDisplayDims({
+                display_width: 1920,
+                display_height: 1080,
+                display_rotation: 180,
+            }),
+        ).toEqual({ width: 1920, height: 1080 });
+    });
+
+    it("swaps dims at rotation 90 (portrait-mounted sign)", () => {
+        expect(
+            effectiveDisplayDims({
+                display_width: 1920,
+                display_height: 1080,
+                display_rotation: 90,
+            }),
+        ).toEqual({ width: 1080, height: 1920 });
+    });
+
+    it("swaps dims at rotation 270", () => {
+        expect(
+            effectiveDisplayDims({
+                display_width: 64,
+                display_height: 32,
+                display_rotation: 270,
+            }),
+        ).toEqual({ width: 32, height: 64 });
+    });
+
+    it("treats missing display_rotation as 0 (no swap)", () => {
+        expect(
+            effectiveDisplayDims({
+                display_width: 64,
+                display_height: 32,
+            }),
+        ).toEqual({ width: 64, height: 32 });
+    });
+
+    it("returns null for invalid / missing dims so callers fall back", () => {
+        expect(effectiveDisplayDims(null)).toBe(null);
+        expect(effectiveDisplayDims({})).toBe(null);
+        expect(
+            effectiveDisplayDims({ display_width: 0, display_height: 32 }),
+        ).toBe(null);
+        expect(
+            effectiveDisplayDims({ display_width: 64, display_height: -1 }),
+        ).toBe(null);
+        expect(
+            effectiveDisplayDims({
+                display_width: "huh",
+                display_height: 32,
+            }),
+        ).toBe(null);
     });
 });

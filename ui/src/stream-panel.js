@@ -24,6 +24,7 @@
 // Phase 1 known limitation in §5.11.
 
 import {
+    effectiveDisplayDims,
     getSettings,
     getStreamStatus,
     startStream,
@@ -200,15 +201,20 @@ export function mountStreamPanel(container, options = {}) {
     // event so a settings change while the panel is mounted reflects
     // immediately. Falls back to the CSS-default 9/16 (phone-portrait)
     // if /api/settings is unreachable on first load.
+    //
+    // Rotation: portrait-mounted signs (display_rotation in {90, 270})
+    // output height-by-width. effectiveDisplayDims swaps so the
+    // preview matches the installed orientation; without it a 1080p
+    // panel rotated 90° would still preview 16:9 landscape and the
+    // operator's framing wouldn't match what actually displays.
     async function refreshPreviewAspect() {
         try {
             const s = await fetchSettings();
-            const w = Number(s?.display_width);
-            const h = Number(s?.display_height);
-            if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+            const dims = effectiveDisplayDims(s);
+            if (dims !== null) {
                 previewWrapEl.style.setProperty(
                     "--om-stream-aspect",
-                    `${w} / ${h}`,
+                    `${dims.width} / ${dims.height}`,
                 );
             }
         } catch {
