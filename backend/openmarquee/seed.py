@@ -393,21 +393,24 @@ class _WelcomeSlideSpec:
 _WELCOME_SPECS: tuple[_WelcomeSlideSpec, ...] = (
     _WelcomeSlideSpec(
         text="Welcome",
-        font_family="Caveat Brush",
+        # qarl 2026-04-29 (B8): hand-lettered, schoolyard-chalk vibe.
+        font_family="Reenie Beanie",
         text_color="#FFFFFF",
         background_filename_stem="chalkboard",
         transition_out="fade",
     ),
     _WelcomeSlideSpec(
         text="to",
-        font_family="Sedgwick Ave Display",
+        # qarl 2026-04-29 (B9): heavy marker stroke that reads against brick.
+        font_family="Permanent Marker",
         text_color="#000000",
         background_filename_stem="brick-wall",
         transition_out="wipe",
     ),
     _WelcomeSlideSpec(
         text="openMarquee",
-        font_family="Pacifico",
+        # qarl 2026-04-29 (B10): wispy hand-drawn glow against midnight.
+        font_family="Shadows Into Light",
         # Amber from the marketing site — reads as "neon at night" on midnight bg.
         text_color="#F5A524",
         background_filename_stem="midnight",

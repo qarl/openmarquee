@@ -146,6 +146,21 @@ def test_seed_default_playlist_contains_the_three_welcome_text_slides(
     assert ids == [s.id for s in welcome_slides]
 
 
+def test_welcome_slides_render_with_qarl_specified_fonts(
+    storage: ContentStorage, playlist: PlaylistStorage, marker: Path
+):
+    """qarl batch 2026-04-29 (B8/B9/B10): Welcome → Reenie Beanie,
+    to → Permanent Marker, openMarquee → Shadows Into Light. Locks the
+    pairing so a refactor of the spec list doesn't silently revert the
+    chosen pairings."""
+    created = seed_if_needed(storage, playlist, marker, width=32, height=32)
+    text_slides = [s for s in created if s.type == "text_slide"]
+    welcome = {s.text: s for s in text_slides[:3]}
+    assert welcome["Welcome"].font_family == "Reenie Beanie"
+    assert welcome["to"].font_family == "Permanent Marker"
+    assert welcome["openMarquee"].font_family == "Shadows Into Light"
+
+
 def test_seed_default_playlist_is_named_welcome(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
