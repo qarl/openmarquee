@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -23,7 +22,7 @@ from openmarquee.dependencies import (
     get_tombstone_storage,
 )
 from openmarquee.flock import FlockStorage
-from openmarquee.flock_sync import FlockSync, NotifyKind
+from openmarquee.flock_sync import NotifyKind
 from openmarquee.tombstone import TombstoneStorage
 
 

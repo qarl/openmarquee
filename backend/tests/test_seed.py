@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image  # noqa: F401  (used via fixture _write_sample_jpeg)
 
-from openmarquee.content import ImageSlide, TextSlide, VideoSlide
+from openmarquee.content import TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.seed import (
