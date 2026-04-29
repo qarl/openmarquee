@@ -480,7 +480,7 @@ header h1 {
 .track-block-thumb-wrap {
     position: relative;
     width: 70px;
-    aspect-ratio: 2/1;
+    aspect-ratio: var(--device-aspect, 2/1);
     flex-shrink: 0;
     background: var(--om-led-bg, #000);
     margin: 8px 0 8px 8px;
@@ -663,7 +663,7 @@ header h1 {
 
 .pallet-tile-thumb-wrap {
     position: relative;
-    aspect-ratio: 2/1;
+    aspect-ratio: var(--device-aspect, 2/1);
     background: var(--om-led-bg, #000);
     overflow: hidden;
 }
@@ -3419,7 +3419,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
     border: 1px solid var(--om-line, var(--panel-border));
     overflow: hidden;
     position: relative;
-    aspect-ratio: 2 / 1;
+    aspect-ratio: var(--device-aspect, 2 / 1);
 }
 .om-peer-thumb-img {
     width: 100%;
