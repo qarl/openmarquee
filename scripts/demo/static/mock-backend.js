@@ -503,11 +503,36 @@
             // would expire after 30s; storing null would mark every peer
             // offline forever. Stamping at GET keeps the demo alive
             // indefinitely without seed-shape gymnastics.
+            //
+            // Phase B.3: synthesize items_behind too. The new
+            // FAKE_PEERS in generate-seed.py carry items_behind
+            // directly, but seed.json predates the regeneration on
+            // many demo deploys; fall back to an address-keyed map
+            // so the demo Flock tab exercises the new affordance
+            // even on stale seeds. Three cases at a glance: lobby
+            // mid-backlog (3), lab-corner caught up (0), cafeteria
+            // sync=False (null — UI ignores).
+            const ITEMS_BEHIND_FALLBACK = {
+                "lobby.ts.net": 3,
+                "lab-corner.ts.net": 0,
+            };
             const now = new Date().toISOString();
-            const peers = (state.flock_peers || []).map((p) => ({
-                ...p,
-                last_seen_at: now,
-            }));
+            const peers = (state.flock_peers || []).map((p) => {
+                let itemsBehind;
+                if (p.items_behind !== undefined) {
+                    // Post-regen seed already carries the value.
+                    itemsBehind = p.items_behind;
+                } else if (p.sync === false) {
+                    // sync=False → meaningless; UI hides the
+                    // "K behind" affordance and shows "standalone".
+                    itemsBehind = null;
+                } else {
+                    // Fall back to the address-keyed demo map.
+                    // Unknown address → null (looks unprobed).
+                    itemsBehind = ITEMS_BEHIND_FALLBACK[p.address] ?? null;
+                }
+                return { ...p, last_seen_at: now, items_behind: itemsBehind };
+            });
             return jsonResponse({ schema_version: 1, peers });
         }
         if (pathname === "/api/flock" && method === "POST") {
