@@ -402,7 +402,15 @@ class FlockSync:
         sign_name, fetch manifest, pull any missing/newer content, apply
         any tombstones we missed. Errors are logged, not raised — the
         loop keeps running. No-op when the global flock_sync_enabled
-        kill switch is off."""
+        kill switch is off.
+
+        Phase B.3 side-effect: count manifest entries we don't have
+        before applying them, and stamp that count onto the peer's
+        items_behind field. UI surfaces it as the "K items behind"
+        affordance. Computed pre-apply because applying immediately
+        zeroes the diff — operator's read is "what was the gap at
+        the moment we last reconciled".
+        """
         if not self._get_sync_enabled():
             return
         await self.probe_peer_name(peer_address)
@@ -414,8 +422,28 @@ class FlockSync:
                 logger.exception("pull %s: manifest fetch failed", peer_address)
                 return
             manifest = manifest_r.json()
+            entries = manifest.get("entries", [])
 
-            for entry in manifest.get("entries", []):
+            # Phase B.3: count items the peer has that we don't, BEFORE
+            # applying. The number we display as "K items behind" is
+            # the moment-of-pull gap — applying immediately would zero
+            # it (the eventual consistency model assumes a successful
+            # pull catches us up).
+            #
+            # TODO(qarl-confirm): items_behind ignores tombstones-we-
+            # need (ones in their manifest we haven't yet recorded).
+            # Default counts only positive entries. Operator's mental
+            # model is "K items I need to pull"; tombstones are
+            # invisible cleanup, not "behind" in the user-facing
+            # sense. Flip if you want the count to include them.
+            missing = sum(
+                1
+                for entry in entries
+                if not self.content.exists(UUID(entry["content_id"]))
+            )
+            self._record_items_behind(peer_address, missing)
+
+            for entry in entries:
                 cid = UUID(entry["content_id"])
                 sender_ts = datetime.fromisoformat(entry["updated_at"])
                 try:
@@ -427,6 +455,17 @@ class FlockSync:
                 cid = UUID(stone["content_id"])
                 deleted_at = datetime.fromisoformat(stone["deleted_at"])
                 self._apply_pulled_tombstone(cid, deleted_at)
+
+    def _record_items_behind(self, peer_address: str, count: int) -> None:
+        """Stamp items_behind on the peer record matching peer_address.
+        Silent no-op if the peer somehow isn't in our flock — pull_
+        from_peer's caller (PullWorker) already resolved them, but a
+        race between resolve and stamp shouldn't crash the pull."""
+        flock = self.flock.load()
+        peer = flock.find_by_address(peer_address)
+        if peer is None:
+            return
+        self.flock.update(peer.id, items_behind=count)
 
     def _apply_pulled_tombstone(self, content_id: UUID, deleted_at: datetime) -> None:
         # Same LWW rule as _ingest_delete, but via pull. Skip when a newer

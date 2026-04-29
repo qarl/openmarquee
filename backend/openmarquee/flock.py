@@ -137,6 +137,42 @@ class FlockPeer(BaseModel):
         "is a UI concern and the operator never does math on it.",
     )
 
+    # Phase B.3 — out-of-sync diff. Count of content items the peer
+    # has that we don't (so we're "behind by N" relative to them).
+    # Computed during pull_from_peer pre-apply + stored back on the
+    # peer record; UI reads it at render time without a cross-device
+    # probe. None means "never pulled" or "pull-on-this-peer is off
+    # (sync=False)" — UI surfaces both as "—" rather than 0.
+    #
+    # TODO(qarl-confirm): the "we're behind them" semantic is the
+    # default; an alternative ("they're behind us") would require a
+    # second field. Operator's read of "this peer is N items
+    # behind" is more naturally "we're missing N of their items"
+    # since the operator sees the peer card from THIS device's
+    # perspective. Flip if operator-mental-model says otherwise.
+    #
+    # TODO(qarl-confirm): for sync=False peers we leave items_behind
+    # at None. An alternative ("compute it anyway as a what-if-I-
+    # synced preview") would require running the manifest fetch
+    # outside the pull worker — wasteful when the operator hasn't
+    # opted into sync. Flip if the preview is wanted.
+    #
+    # TODO(qarl-confirm): when an operator flips sync=True -> False
+    # mid-flock, the previously-stored items_behind value persists
+    # until the next pull (which won't happen since sync is off).
+    # Default leaves it stale — the UI can gate display on the
+    # current sync flag and read items_behind only when sync==True.
+    # Alternative: clear items_behind to None on sync=True->False
+    # transitions in PATCH /api/flock/{peer}. Flip if you'd rather
+    # the data stay strictly fresh-or-absent.
+    items_behind: int | None = Field(
+        default=None,
+        ge=0,
+        description="Count of items the peer has that we don't, as of "
+        "the most recent successful pull. None when never pulled or "
+        "when sync=False on this peer.",
+    )
+
 
 class Flock(BaseModel):
     """Envelope wrapping the peer list + schema version for on-disk storage."""
@@ -209,9 +245,15 @@ class FlockStorage:
         sync: bool | None = None,
         name: str | None = None,
         mark_seen: bool = False,
+        items_behind: int | None = -1,
     ) -> FlockPeer | None:
         """Mutate a peer's non-id fields. Returns the updated peer, or None
-        if no peer matched `peer_id`. `mark_seen=True` stamps last_seen_at."""
+        if no peer matched `peer_id`. `mark_seen=True` stamps last_seen_at.
+
+        `items_behind` uses sentinel -1 to mean "leave unchanged" (since
+        None is a meaningful value — "never pulled / sync off"). Pass an
+        int to set, None to explicitly clear.
+        """
         flock = self.load()
         peer = flock.find(peer_id)
         if peer is None:
@@ -222,5 +264,7 @@ class FlockStorage:
             peer.name = name
         if mark_seen:
             peer.last_seen_at = _now()
+        if items_behind != -1:
+            peer.items_behind = items_behind
         self.save(flock)
         return peer

@@ -870,3 +870,100 @@ def test_apply_hello_does_not_cascade(tmp_path: Path):
     # apply_hello should not have fired any HTTP — only gossip_add
     # does fan-out, and apply_hello explicitly doesn't call it.
     assert calls == []
+
+
+# --- Phase B.3: out-of-sync diff (items_behind tracking) ---
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_records_items_behind_pre_apply(tmp_path: Path):
+    """Phase B.3: pull_from_peer counts manifest entries we don't have
+    BEFORE applying them, stamps the count onto the peer record.
+    Operator's read of 'K items behind' is the moment-of-pull gap."""
+    cid_a = uuid4()
+    cid_b = uuid4()
+    cid_c = uuid4()
+    remote_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    png = _make_png_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/api/flock/manifest"):
+            return httpx.Response(
+                200,
+                json=_manifest_with(
+                    (cid_a, remote_ts), (cid_b, remote_ts), (cid_c, remote_ts)
+                ),
+            )
+        if "/api/content/" in url and url.endswith("/asset"):
+            return httpx.Response(200, content=png)
+        if "/api/content/" in url:
+            slide = TextSlide(
+                id=UUID(url.rsplit("/", 1)[-1]), name="r", text="r"
+            )
+            return httpx.Response(200, json=slide.model_dump(mode="json"))
+        return httpx.Response(404)
+
+    sync, content, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    peer = flock.add(address="peer.ts.net")
+    # Pre-seed one of the three so the count comes out to 2-not-3.
+    content.save(
+        TextSlide(id=cid_a, name="had", text="had"),
+        _make_png_bytes(),
+        updated_at=datetime(2026, 4, 19, tzinfo=timezone.utc),
+    )
+
+    await sync.pull_from_peer("peer.ts.net")
+
+    refreshed = flock.load().find(peer.id)
+    assert refreshed is not None
+    # Two missing at moment-of-pull (cid_b + cid_c). cid_a was
+    # already local. Computed pre-apply per the spec comment.
+    assert refreshed.items_behind == 2
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_records_zero_when_in_sync(tmp_path: Path):
+    """If we already have everything in the peer's manifest at pull
+    time, items_behind = 0. UI surfaces this as 'in sync'."""
+    cid = uuid4()
+    remote_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/api/flock/manifest"):
+            return httpx.Response(200, json=_manifest_with((cid, remote_ts)))
+        return httpx.Response(404)
+
+    sync, content, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    peer = flock.add(address="peer.ts.net")
+    content.save(
+        TextSlide(id=cid, name="had", text="had"),
+        _make_png_bytes(),
+        updated_at=datetime(2026, 4, 19, tzinfo=timezone.utc),
+    )
+
+    await sync.pull_from_peer("peer.ts.net")
+
+    assert flock.load().find(peer.id).items_behind == 0
+
+
+@pytest.mark.asyncio
+async def test_pull_from_peer_leaves_items_behind_unchanged_on_manifest_failure(
+    tmp_path: Path,
+):
+    """Manifest fetch failure → pull aborts before recording. The
+    previously-stored items_behind is NOT zeroed out — operator's
+    'last known' value stays visible until the next successful pull
+    actually computes a fresh number."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler))
+    peer = flock.add(address="peer.ts.net")
+    # Pre-stamp a known value to verify it survives the failed pull.
+    flock.update(peer.id, items_behind=7)
+
+    await sync.pull_from_peer("peer.ts.net")
+
+    assert flock.load().find(peer.id).items_behind == 7
