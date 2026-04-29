@@ -678,14 +678,27 @@ async function boot() {
         }
         // Treat last_seen_at within ~30s as "online" for now.
         const now = Date.now();
-        const online = peers.filter(
+        const onlinePeers = peers.filter(
             (p) =>
                 p.last_seen_at &&
                 now - new Date(p.last_seen_at).getTime() < 30_000,
         ).length;
+        // Both tallies include self — the device serving this UI is
+        // assumed online (it's right here, responding) and counts in
+        // the flock's headcount. Aligns the sidebar's "X/Y online"
+        // with the flock-page eyebrow's "X of Y signs online" — both
+        // now treat self as a flock member, matching the "all peers
+        // equal, no privileged home device" framing from the 2026-04-28
+        // design adoption. Assumes this UI is rendered ON the device
+        // it's counting; a future admin-console scenario where the UI
+        // runs on something OTHER than a flock peer would need to
+        // demote self from the +1.
+        const onlineTotal = onlinePeers + 1;
+        const peersTotal = peers.length + 1;
         const dots = document.querySelector("[data-flock-dots]");
         if (dots) {
-            dots.innerHTML = peers
+            // Self dot first (always fresh); peers after.
+            const peerDots = peers
                 .map((p) => {
                     const fresh =
                         p.last_seen_at &&
@@ -693,18 +706,15 @@ async function boot() {
                     return `<i class="${fresh ? "" : "off"}"></i>`;
                 })
                 .join("");
+            dots.innerHTML = `<i></i>${peerDots}`;
         }
         const count = document.querySelector("[data-flock-count]");
         if (count) {
-            count.textContent = peers.length
-                ? `${online}/${peers.length} online`
-                : "no peers";
+            count.textContent = `${onlineTotal}/${peersTotal} online`;
         }
         const pill = document.querySelector("[data-peer-pill-text]");
         if (pill) {
-            pill.textContent = peers.length
-                ? `${online}/${peers.length}`
-                : "no peers";
+            pill.textContent = `${onlineTotal}/${peersTotal}`;
         }
     }
     refreshFlockChrome();

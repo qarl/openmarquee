@@ -159,16 +159,36 @@ describe("mountFlock", () => {
         );
     });
 
-    it("overflow ⋯ menu confirms then calls onDelete (replaces the prior × button)", async () => {
+    it("Deflock button confirms then calls onDelete", async () => {
         const container = document.createElement("div");
         const onDelete = vi.fn(async () => {});
         mount(container, { peers: [PEER()], onDelete });
         await tick();
-        container.querySelector(".flock-peer-overflow").click();
+        container.querySelector(".flock-peer-deflock").click();
         await tick();
         expect(onDelete).toHaveBeenCalledWith(
             "11111111-1111-1111-1111-111111111111",
         );
+    });
+
+    it("Deflock confirm prompt names the peer ('Remove X from your flock?')", async () => {
+        const container = document.createElement("div");
+        const onDelete = vi.fn(async () => {});
+        const confirmSpy = vi.fn(() => false);
+        vi.stubGlobal("confirm", confirmSpy);
+        mount(container, {
+            peers: [PEER({ name: "SignA7F" })],
+            onDelete,
+        });
+        await tick();
+        container.querySelector(".flock-peer-deflock").click();
+        await tick();
+        expect(confirmSpy).toHaveBeenCalledTimes(1);
+        expect(confirmSpy).toHaveBeenCalledWith(
+            "Remove SignA7F from your flock?",
+        );
+        // Cancelled — onDelete NOT called.
+        expect(onDelete).not.toHaveBeenCalled();
     });
 
     it("Edit button navigates the browser to the peer's tailnet URL", async () => {

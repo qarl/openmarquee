@@ -135,6 +135,19 @@ function thumbnailUrl(address, selfOrigin) {
     return `${base}/api/playback/current-thumbnail?t=${Date.now()}`;
 }
 
+// Phase A self-card telemetry placeholders. These keep the home-
+// device card from reading as a row of em-dashes — qarl's call:
+// "the home device doesn't have all his stats displayed." Named
+// PLACEHOLDER (not DEFAULT) so the next reader sees them as
+// stubs-pending-removal, not as fallbacks meant to survive forever.
+// TODO(phase-b): replace with real reads via the per-peer health
+// endpoint — model from /proc/cpuinfo, signal % from
+// /proc/net/wireless, uptime from /proc/uptime — wired alongside
+// the §13 gossip-on-add work.
+const SELF_PLACEHOLDER_MODEL = "Pi Zero 2 W";
+const SELF_PLACEHOLDER_SIGNAL = 100;
+const SELF_PLACEHOLDER_UPTIME = "up since boot";
+
 function selfCardHTML({ name, syncEnabled, mode }) {
     const pill = syncStatePillForSelf(syncEnabled);
     const modeLabel = MODE_LABELS[mode] || (mode || "—");
@@ -151,9 +164,9 @@ function selfCardHTML({ name, syncEnabled, mode }) {
             </div>
             <div class="om-peer-stats">
                 <span>${escapeAttr(modeLabel)}</span>
-                <span style="text-align:right;">—</span>
-                <span>—</span>
-                <span style="text-align:right;">—</span>
+                <span style="text-align:right;"><b>${SELF_PLACEHOLDER_SIGNAL}%</b> wifi</span>
+                <span>${escapeAttr(SELF_PLACEHOLDER_MODEL)}</span>
+                <span style="text-align:right;">${escapeAttr(SELF_PLACEHOLDER_UPTIME)}</span>
             </div>
             <div class="om-peer-actions">
                 <span class="om-pill ${pill.cls}">${escapeAttr(pill.label)}</span>
@@ -201,7 +214,7 @@ function peerCardHTML(peer) {
                     <span>Sync</span>
                 </label>
                 <button type="button" class="om-btn sm flock-peer-edit"${online ? "" : " disabled"}>Edit</button>
-                <button type="button" class="om-btn ghost icon sm flock-peer-overflow" aria-label="More" title="More">⋯</button>
+                <button type="button" class="om-btn ghost sm flock-peer-deflock">Deflock</button>
             </div>
         </div>
     `;
@@ -440,23 +453,25 @@ export function mountFlock(
             }
             return;
         }
-        const overflowBtn = event.target.closest(".flock-peer-overflow");
-        if (overflowBtn) {
-            // v1 overflow "menu" has one entry: Forget device. Skip a
-            // popover chrome and just fire a native confirm() — saves
-            // a dialog component for an action operators take rarely.
-            // The aria-label is "More" to leave room to grow into a
-            // real menu later (Phase B's force-resync would land
-            // here); today it's effectively a one-click button.
-            const card = overflowBtn.closest(".om-peer-card");
+        const deflockBtn = event.target.closest(".flock-peer-deflock");
+        if (deflockBtn) {
+            // qarl's domain verb: add-to-flock → "deflock" the inverse.
+            // Confirm step is mandatory (re-adding requires re-typing
+            // the peer's address, so an accidental tap has real cost).
+            // Native confirm() over a custom modal — conventional and
+            // hard to mis-tap on mobile.
+            const card = deflockBtn.closest(".om-peer-card");
             const peerId = card.dataset.peerId;
             const label = card.querySelector(".om-peer-name")?.textContent;
-            if (!window.confirm(`Forget device "${label}"?`)) return;
+            // i18n: phase-deferred. Operator-visible strings here +
+            // setStatus below will need the eventual i18n pass; for
+            // now embed the peer label directly.
+            if (!window.confirm(`Remove ${label} from your flock?`)) return;
             try {
                 await onDelete(peerId);
                 await render();
             } catch (err) {
-                setStatus(`Delete failed: ${err.message}`, { error: true });
+                setStatus(`Deflock failed: ${err.message}`, { error: true });
             }
             return;
         }
