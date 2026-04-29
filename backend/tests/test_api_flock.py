@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -75,6 +76,133 @@ def test_get_empty_flock_returns_empty_peer_list(client: TestClient):
     body = response.json()
     assert body["peers"] == []
     assert body["schema_version"] == 1
+
+
+def test_discover_returns_empty_when_no_tailscale(client: TestClient, monkeypatch):
+    """Phase B.5: dev box / macOS without `tailscale` in PATH gets
+    an empty candidates list + source='none'. UI falls back to the
+    manual-typed address path that Phase A already supports."""
+    import openmarquee.api_flock as mod
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: None)
+    response = client.get("/api/flock/discover")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"candidates": [], "source": "none"}
+
+
+def test_discover_parses_tailscale_status_json(client: TestClient, monkeypatch):
+    """Happy path: tailscale binary exists, returns the documented
+    JSON shape; we parse + filter Peer table to (hostname, address)
+    tuples. DNSName trailing-dot stripped + lowercased to match
+    FlockPeer.address normalization."""
+    import openmarquee.api_flock as mod
+
+    payload = {
+        "Self": {"HostName": "this", "DNSName": "this.tn.ts.net."},
+        "Peer": {
+            "key1": {
+                "HostName": "lobby",
+                "DNSName": "Lobby.tn.ts.net.",
+                "Online": True,
+            },
+            "key2": {
+                # Offline peer: filtered out per default.
+                "HostName": "store",
+                "DNSName": "store.tn.ts.net.",
+                "Online": False,
+            },
+            "key3": {
+                "HostName": "cafeteria",
+                "DNSName": "cafeteria.tn.ts.net.",
+                "Online": True,
+            },
+        },
+    }
+
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps(payload)
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
+
+    response = client.get("/api/flock/discover")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "tailscale"
+    # Two online peers, sorted alphabetically by hostname.
+    addrs = [c["address"] for c in body["candidates"]]
+    assert addrs == ["cafeteria.tn.ts.net", "lobby.tn.ts.net"]
+    hostnames = [c["hostname"] for c in body["candidates"]]
+    assert hostnames == ["cafeteria", "lobby"]
+    # None already in flock (this client fixture has empty storage).
+    assert all(c["already_in_flock"] is False for c in body["candidates"])
+
+
+def test_discover_marks_already_added_peers(client: TestClient, monkeypatch):
+    """Already-flocked peers come back with already_in_flock=True
+    so the UI can disable them rather than offer a re-add (which
+    would 409 anyway)."""
+    import openmarquee.api_flock as mod
+
+    # Pre-populate the flock with one of the candidates.
+    client.post("/api/flock", json={"address": "lobby.tn.ts.net"})
+
+    payload = {
+        "Peer": {
+            "key1": {
+                "HostName": "lobby",
+                "DNSName": "lobby.tn.ts.net.",
+                "Online": True,
+            },
+        },
+    }
+
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps(payload)
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
+
+    body = client.get("/api/flock/discover").json()
+    assert len(body["candidates"]) == 1
+    assert body["candidates"][0]["already_in_flock"] is True
+
+
+def test_discover_handles_tailscale_failure_gracefully(
+    client: TestClient, monkeypatch
+):
+    """tailscale binary present but returns non-zero (network blip,
+    daemon down) — fallback to empty + source='none'. No 500."""
+    import openmarquee.api_flock as mod
+
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
+
+    body = client.get("/api/flock/discover").json()
+    assert body == {"candidates": [], "source": "none"}
+
+
+def test_discover_handles_malformed_json(client: TestClient, monkeypatch):
+    """tailscale binary returns 0 but stdout isn't valid JSON
+    (transient garbage, version mismatch) — fallback gracefully."""
+    import openmarquee.api_flock as mod
+
+    class FakeProc:
+        returncode = 0
+        stdout = "not json at all"
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
+
+    body = client.get("/api/flock/discover").json()
+    assert body == {"candidates": [], "source": "none"}
 
 
 def test_post_adds_a_peer(client: TestClient):

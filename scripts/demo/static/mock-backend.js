@@ -370,6 +370,29 @@
         if (pathname === "/api/system/display-dims" && method === "GET") {
             return jsonResponse({ width: 1920, height: 1080, source: "demo" });
         }
+        if (pathname === "/api/flock/discover" && method === "GET") {
+            // Phase B.5: magicDNS auto-discovery. Demo doesn't have
+            // a Tailnet to enumerate; return a small handcrafted set
+            // of plausible Tailnet hostnames so the Add Peer modal
+            // shows the affordance live. One is already in the
+            // operator's flock (already_in_flock=true), letting the
+            // verifier see the disable-already-added behavior; one
+            // is fresh.
+            const known = new Set(
+                (state.flock_peers || []).map((p) => p.address),
+            );
+            const synthetic = [
+                { hostname: "lobby", address: "lobby.ts.net" },
+                { hostname: "back-room", address: "back-room.ts.net" },
+            ];
+            return jsonResponse({
+                source: "tailscale",
+                candidates: synthetic.map((c) => ({
+                    ...c,
+                    already_in_flock: known.has(c.address),
+                })),
+            });
+        }
         if (pathname === "/api/flock/hello" && method === "POST") {
             // Phase B gossip-on-add (§13): a peer is introducing itself
             // (or another peer) to us. Demo accepts + 204s without

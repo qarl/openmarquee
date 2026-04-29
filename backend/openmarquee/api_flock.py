@@ -14,12 +14,18 @@ I need to fetch / delete?". Push notifications + periodic pull arrive
 in follow-up modules on top of this data.
 """
 
+import json
+import logging
+import shutil
+import subprocess
 from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
+
+log = logging.getLogger(__name__)
 
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
@@ -238,6 +244,127 @@ class SyncAnnounceBody(BaseModel):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+
+class DiscoverCandidate(BaseModel):
+    """One Tailnet peer the operator could add to this device's flock.
+
+    `address` is the magicDNS hostname (e.g. "lobby.tailnet-xyz.ts.net")
+    suitable for direct passing into POST /api/flock. `hostname` is the
+    short name (e.g. "lobby") for UI display. `already_in_flock` is
+    True when this peer is already added — UI uses it to disable the
+    suggestion."""
+
+    address: str
+    hostname: str
+    already_in_flock: bool
+
+
+class DiscoverResult(BaseModel):
+    candidates: list[DiscoverCandidate]
+    source: str  # "tailscale" | "none"
+
+
+@router.get("/discover", response_model=DiscoverResult)
+async def discover_tailnet_peers(storage: FlockDep) -> DiscoverResult:
+    """Phase B.5 (§13's third Phase B item) — magicDNS auto-discovery.
+    Shell out to `tailscale status --json`, parse the peers list,
+    return candidates the operator can one-click-add to their flock.
+
+    Best-effort: dev boxes / macOS without Tailscale return an empty
+    candidates list + source="none". UI falls back to the manual-typed
+    address path that Phase A already supports.
+
+    TODO(qarl-confirm): default skips peers we can't reach the
+    `Online: true` flag for. Alternative: include offline peers,
+    let the operator add them anyway (the eventual-consistency model
+    handles the "peer comes back" case via the existing pull worker).
+    Flip if operators want to pre-stage offline-peer connections.
+
+    TODO(qarl-confirm): default does NOT probe each candidate's
+    /api/system/info to verify they're actually openMarquee devices
+    (every Tailnet peer is suggested regardless of what software they
+    run). The probe would be more user-friendly but adds N HTTP
+    round-trips per discover call. Flip if false-positives in the
+    suggestions list become noisy.
+
+    TODO(qarl-confirm): output uses `tailscale status --json` shell-
+    out. Alternative: speak directly to the local Tailscale daemon
+    via /var/run/tailscale/tailscaled.sock + the LocalAPI. The
+    LocalAPI is more robust (no PATH dependency, no $PATH-poisoning
+    risk) but needs Unix-socket plumbing through httpx. Flip if the
+    shell-out's reliability ever bites us in production.
+    """
+    candidates, source = _discover_tailnet_candidates()
+    # Cross-reference with the operator's existing flock so the UI
+    # can disable already-added entries rather than offering the
+    # operator the chance to "add" a peer who's already there.
+    known = {p.address for p in storage.load().peers}
+    out: list[DiscoverCandidate] = []
+    for hostname, address in candidates:
+        out.append(
+            DiscoverCandidate(
+                address=address,
+                hostname=hostname,
+                already_in_flock=address in known,
+            )
+        )
+    return DiscoverResult(candidates=out, source=source)
+
+
+def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
+    """Shell out to `tailscale status --json` and parse the Peer
+    table. Returns (list_of_(hostname, address), source). Source is
+    "tailscale" on a successful parse, "none" otherwise.
+
+    Filtering:
+    - Skip peers with Online == False (the operator will see them
+      as offline-pill in the existing Phase A address-typed flow if
+      they want to pre-stage).
+    - Don't filter by openMarquee-software detection — see the route's
+      TODO(qarl-confirm) about the trade-off.
+
+    Output shape from tailscale (publicly documented):
+        {"Peer": {"<nodekey>": {"HostName": "lobby", "DNSName":
+            "lobby.tailnet-xyz.ts.net.", "Online": true, ...}, ...}}
+    DNSName is FQDN-style with trailing dot; we strip it for the
+    address field so it matches FlockPeer.address normalization
+    (lowercase, no scheme, no trailing dot).
+    """
+    if not shutil.which("tailscale"):
+        return ([], "none")
+    try:
+        out = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        log.warning("tailscale status probe timed out / failed to spawn")
+        return ([], "none")
+    if out.returncode != 0:
+        return ([], "none")
+    try:
+        payload = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        log.warning("tailscale status returned non-JSON stdout")
+        return ([], "none")
+
+    candidates: list[tuple[str, str]] = []
+    for _key, peer in (payload.get("Peer") or {}).items():
+        if not isinstance(peer, dict):
+            continue
+        if not peer.get("Online"):
+            continue
+        hostname = (peer.get("HostName") or "").strip()
+        dns_name = (peer.get("DNSName") or "").strip().rstrip(".")
+        if not hostname or not dns_name:
+            continue
+        candidates.append((hostname, dns_name.lower()))
+    candidates.sort(key=lambda hd: hd[0])
+    return (candidates, "tailscale")
 
 
 @router.post("/hello", status_code=204)
