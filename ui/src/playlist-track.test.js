@@ -122,10 +122,24 @@ describe("mountPlaylistTrack", () => {
         const chip = container.querySelector(
             '.track-block[data-id="a"] .track-block-transition',
         );
-        expect(chip.textContent).toBe("cut");
-        chip.click();
+        // 2026-04-28: chip became a <select> pulldown. Selected option
+        // is the source of visible truth; setting .value + dispatching
+        // change matches operator behavior. Lock in the option set so
+        // accidental palette regressions surface here when the new
+        // 11 transitions start landing in subsequent commits.
+        expect(chip.tagName).toBe("SELECT");
+        expect(Array.from(chip.options).map((o) => o.value)).toEqual([
+            "cut",
+            "fade",
+            "wipe",
+            "slide",
+            "iris",
+        ]);
+        expect(chip.value).toBe("cut");
+        chip.value = "fade";
+        chip.dispatchEvent(new Event("change", { bubbles: true }));
         await tick();
-        expect(chip.textContent).toBe("fade");
+        expect(chip.value).toBe("fade");
 
         await handle.flushAutoSave();
         expect(onSavePlaylist).toHaveBeenCalledTimes(1);
@@ -160,9 +174,10 @@ describe("mountPlaylistTrack", () => {
         const blockA = container.querySelector('.track-block[data-id="a"]');
         expect(blockA.dataset.transition).toBe("fade");
         expect(blockA.dataset.transitionMs).toBe("250");
-        expect(
-            blockA.querySelector(".track-block-transition").textContent,
-        ).toBe("fade");
+        // Pulldown's selected option mirrors the dataset hydration.
+        expect(blockA.querySelector(".track-block-transition").value).toBe(
+            "fade",
+        );
     });
 
     it("empty-state hint is surfaced on an empty playlist via data-empty-hint", async () => {
@@ -333,7 +348,7 @@ describe("mountPlaylistTrack", () => {
 
 
 describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
-    it("fires with draft entries when a transition chip is cycled", async () => {
+    it("fires with draft entries when a transition is changed", async () => {
         const onDraftChange = vi.fn();
         const container = document.createElement("div");
         mountPlaylistTrack(container, {
@@ -344,10 +359,11 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
         });
         await tick();
 
-        // Cycle transition on the first block (cut → fade).
+        // Pulldown swap on the first block (cut → fade).
         const chip = container.querySelector(".track-block-transition");
         expect(chip).not.toBeNull();
-        chip.click();
+        chip.value = "fade";
+        chip.dispatchEvent(new Event("change", { bubbles: true }));
 
         expect(onDraftChange).toHaveBeenCalledTimes(1);
         const [draft] = onDraftChange.mock.calls[0];
@@ -411,6 +427,9 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
         });
         await tick();
         const chip = container.querySelector(".track-block-transition");
-        expect(() => chip.click()).not.toThrow();
+        expect(() => {
+            chip.value = "fade";
+            chip.dispatchEvent(new Event("change", { bubbles: true }));
+        }).not.toThrow();
     });
 });

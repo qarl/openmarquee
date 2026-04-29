@@ -542,6 +542,10 @@ header h1 {
 }
 
 /* Transition chip lives inside the meta column under the title. */
+/* Per-block transition selector. Was a cycle-button until 2026-04-28;
+   now a <select> pulldown so the new 16-transition palette can grow
+   without scaling problems. Browser default <select> chrome is killed
+   via appearance:none so the existing pill look survives the swap. */
 .track-block-transition {
     align-self: flex-start;
     font-size: 10.5px;
@@ -550,15 +554,27 @@ header h1 {
     color: var(--om-text-dim);
     border: 1px solid var(--om-line);
     border-radius: 999px;
-    padding: 1px 8px;
+    padding: 1px 18px 1px 8px;
     cursor: pointer;
     line-height: 1.4;
     text-transform: lowercase;
     letter-spacing: 0.04em;
+    appearance: none;
+    -webkit-appearance: none;
+    /* Custom chevron anchored to the right padding slot. SVG inline so
+       no extra HTTP fetch; fixed grey fill matches --om-text-dim
+       closely enough at the size operators see it. */
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'><path fill='%23999' d='M0 0l4 5 4-5z'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 6px center;
 }
 .track-block-transition:hover {
     border-color: var(--om-accent);
     color: var(--om-text);
+}
+.track-block-transition:focus-visible {
+    outline: 2px solid var(--om-accent);
+    outline-offset: 1px;
 }
 
 /* Remove × — top-right corner, always visible (unlike the old

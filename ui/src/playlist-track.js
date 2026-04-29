@@ -17,6 +17,31 @@ import Sortable from "sortablejs";
 import { attachAutoSave } from "./auto-save.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
 
+// Per-block transition selector options. The pulldown UX replaced the
+// prior cycle-button per the 2026-04-28 design batch; this list is the
+// single source of truth for both the renderer (renders <option>s in
+// order) and downstream additions (new transitions land here as their
+// renderers ship — server-side in playback.py + browser-side in
+// inline-preview.js — atomically with their tokens, so we never list
+// a transition that secretly falls back to fade).
+const TRANSITION_OPTIONS = [
+    { value: "cut", label: "cut" },
+    { value: "fade", label: "fade" },
+    { value: "wipe", label: "wipe" },
+    { value: "slide", label: "slide" },
+    { value: "iris", label: "iris" },
+];
+
+function transitionOptionsHTML(selected) {
+    // escapeHtml is defined further down (function decl, hoisted) and
+    // attribute-safe — handles `&`, `<`, `>`, `"` identically to what a
+    // separate attr-escaper would.
+    return TRANSITION_OPTIONS.map(
+        (opt) =>
+            `<option value="${escapeHtml(opt.value)}"${opt.value === selected ? " selected" : ""}>${escapeHtml(opt.label)}</option>`,
+    ).join("");
+}
+
 // Mode-locking went away when videos became resolution-independent H.264
 // MP4s that every renderer can consume. Keep the signature so existing
 // callers don't explode; always return false.
@@ -407,21 +432,20 @@ function bindTrackRemoveButtons(trackEl, markDirty) {
             markDirty();
         });
     }
-    // Transition chip: cycles cut → fade → wipe → slide → iris on click.
-    // Source of truth is the block's dataset so collectTrackEntries picks
-    // up the value at Save time.
+    // Transition selector: <select> pulldown listing the available
+    // transitions. Replaced the prior cycle-button (cut → fade →
+    // wipe → slide → iris on each click) per the 2026-04-28 design
+    // batch — the new transition palette is growing past the 5
+    // currently shipped, and a click-to-cycle UX won't scale to 16.
+    // Source of truth is the block's dataset so collectTrackEntries
+    // picks up the value at Save time.
     for (const chip of trackEl.querySelectorAll(".track-block-transition")) {
         if (chip.dataset.bound === "1") continue;
         chip.dataset.bound = "1";
-        chip.addEventListener("click", () => {
+        chip.addEventListener("change", () => {
             const block = chip.closest(".track-block");
             if (!block) return;
-            const current = block.dataset.transition || "cut";
-            // cut → fade → wipe → slide → iris → cut ...
-            const order = ["cut", "fade", "wipe", "slide", "iris"];
-            const next = order[(order.indexOf(current) + 1) % order.length];
-            block.dataset.transition = next;
-            chip.textContent = next;
+            block.dataset.transition = chip.value;
             markDirty();
         });
     }
@@ -494,8 +518,8 @@ function renderTrackBlock(
         <div class="track-block-meta">
             <b class="track-block-name">${safeName}</b>
             <span class="track-block-sub">${safeType} · #${String(item.id).slice(0, 6)}</span>
-            <button type="button" class="track-block-transition"
-                    title="Click to cycle transition (cut → fade → wipe → slide → iris)">${entry.transition}</button>
+            <select class="track-block-transition"
+                    title="Transition out of this slide">${transitionOptionsHTML(entry.transition)}</select>
         </div>
         <button type="button" class="track-block-duration track-block-dur"
                 title="Click to change this slide's duration"
