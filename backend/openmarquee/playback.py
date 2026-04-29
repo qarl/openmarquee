@@ -330,6 +330,7 @@ class PlaybackLoop:
                         "flip",
                         "marquee",
                         "dissolve",
+                        "pixelate",
                     )
                     and item.transition_ms > 0
                     and len(items) > 1
@@ -354,6 +355,8 @@ class PlaybackLoop:
                             await self._marquee(current_image, next_image, item.transition_ms)
                         elif kind == "dissolve":
                             await self._dissolve(current_image, next_image, item.transition_ms)
+                        elif kind == "pixelate":
+                            await self._pixelate(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -794,6 +797,61 @@ class PlaybackLoop:
             mask_arr = (thresholds < progress).astype(np.uint8) * 255
             mask = Image.fromarray(mask_arr, mode="L")
             frame = Image.composite(to_image, from_image, mask)
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _pixelate(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Chunky-pixel cross-fade: both images pixelate to a peak block
+        size at the midpoint then sharpen back to native resolution as
+        the alpha-blend progresses from-image to to-image. Reads as the
+        slide is "rendering" into the next at progressively coarser
+        then finer dot-matrix resolution — second of the dot-matrix-
+        family transitions per the 2026-04-28 palette spec.
+
+        Strip-graceful: with width<2 or height<2 there's no room to
+        pixelate (block_size collapses to 1 → identity), so delegate
+        to fade. Cleaner than emitting frames identical to fade under
+        a different name.
+        """
+        width, height = from_image.size
+        if width < 2 or height < 2:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        # Peak block size: ~quarter of the smaller dimension. Bounded
+        # so even tall-skinny strips (e.g. 4×64) don't try to pixelate
+        # into a single super-pixel that erases all content.
+        max_block = max(2, min(width, height) // 4)
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            # Triangular: 0 → 1 → 0 over [0, 0.5, 1]. Block size grows
+            # then shrinks. Linear cross-fade over the same window.
+            triangular = 1.0 - abs(2.0 * progress - 1.0)
+            block_size = max(1, int(round(1 + triangular * (max_block - 1))))
+            small_w = max(1, width // block_size)
+            small_h = max(1, height // block_size)
+            # NEAREST resample twice = pixelation. Down-sample first to
+            # reduce detail, then up-sample to reproduce as blocky
+            # squares.
+            pix_from = from_image.resize(
+                (small_w, small_h), Image.NEAREST
+            ).resize((width, height), Image.NEAREST)
+            pix_to = to_image.resize(
+                (small_w, small_h), Image.NEAREST
+            ).resize((width, height), Image.NEAREST)
+            frame = Image.blend(pix_from, pix_to, progress)
             self._render_image(frame)
             await self._wait(frame_period)
 

@@ -34,6 +34,7 @@ const TRANSITION_OPTIONS = [
     { value: "flip", label: "flip" },
     { value: "marquee", label: "marquee" },
     { value: "dissolve", label: "dissolve" },
+    { value: "pixelate", label: "pixelate" },
 ];
 
 function transitionOptionsHTML(selected) {

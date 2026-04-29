@@ -207,6 +207,7 @@ export function mountInlinePreview(container, options) {
             "flip",
             "marquee",
             "dissolve",
+            "pixelate",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -308,6 +309,57 @@ export function mountInlinePreview(container, options) {
                     }
                 }
                 ctx.putImageData(composed, 0, 0);
+            } else if (slot.transition === "pixelate") {
+                // Chunky-pixel cross-fade. Both slots pixelate to a
+                // peak block size at progress=0.5 then sharpen back to
+                // native resolution as the alpha-blend lands. Mirrors
+                // playback.py::_pixelate: triangular block-size,
+                // linear cross-fade.
+                const w = canvas.width;
+                const h = canvas.height;
+                if (w < 2 || h < 2) {
+                    // Strip fallback — same shape the server uses.
+                    ctx.globalAlpha = progress;
+                    drawSlot(timeline[nextIdx]);
+                    ctx.globalAlpha = 1;
+                } else {
+                    const maxBlock = Math.max(2, Math.floor(Math.min(w, h) / 4));
+                    const triangular = 1 - Math.abs(2 * progress - 1);
+                    const blockSize = Math.max(
+                        1,
+                        Math.round(1 + triangular * (maxBlock - 1)),
+                    );
+                    // Capture from-slot (drawSlot(slot) above pre-painted),
+                    // draw to-slot, capture, then build the pixelated +
+                    // blended composite manually. Manual is cheaper than
+                    // an offscreen <canvas> per frame and keeps the
+                    // smoothing-flag dance off the main ctx.
+                    const fromImg = ctx.getImageData(0, 0, w, h);
+                    drawSlot(timeline[nextIdx]);
+                    const toImg = ctx.getImageData(0, 0, w, h);
+                    const out = ctx.createImageData(w, h);
+                    const oneMinusP = 1 - progress;
+                    for (let y = 0; y < h; y++) {
+                        const by = Math.floor(y / blockSize) * blockSize;
+                        for (let x = 0; x < w; x++) {
+                            const bx = Math.floor(x / blockSize) * blockSize;
+                            const srcOff = (by * w + bx) * 4;
+                            const dstOff = (y * w + x) * 4;
+                            // Pixel-block sample from each side, then blend.
+                            out.data[dstOff] =
+                                fromImg.data[srcOff] * oneMinusP +
+                                toImg.data[srcOff] * progress;
+                            out.data[dstOff + 1] =
+                                fromImg.data[srcOff + 1] * oneMinusP +
+                                toImg.data[srcOff + 1] * progress;
+                            out.data[dstOff + 2] =
+                                fromImg.data[srcOff + 2] * oneMinusP +
+                                toImg.data[srcOff + 2] * progress;
+                            out.data[dstOff + 3] = 255;
+                        }
+                    }
+                    ctx.putImageData(out, 0, 0);
+                }
             } else if (slot.transition === "marquee") {
                 // Tickertape: from-slot scrolls off to the left, a
                 // gap with a centered dot (the "·" separator) passes

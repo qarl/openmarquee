@@ -295,6 +295,7 @@ def test_playlist_item_accepts_palette_transitions(tmp_path: Path):
             PlaylistItem(item_id=uuid4(), transition="flip", transition_ms=350),
             PlaylistItem(item_id=uuid4(), transition="marquee", transition_ms=600),
             PlaylistItem(item_id=uuid4(), transition="dissolve", transition_ms=450),
+            PlaylistItem(item_id=uuid4(), transition="pixelate", transition_ms=550),
         ]
     )
     storage.save(pl)
@@ -308,6 +309,8 @@ def test_playlist_item_accepts_palette_transitions(tmp_path: Path):
     assert loaded.items[2].transition_ms == 600
     assert loaded.items[3].transition == "dissolve"
     assert loaded.items[3].transition_ms == 450
+    assert loaded.items[4].transition == "pixelate"
+    assert loaded.items[4].transition_ms == 550
 
 
 def test_playlist_item_ids_is_a_derived_view_over_items():

@@ -703,6 +703,101 @@ async def test_dissolve_transition_emits_marbled_frames(renderer):
 
 
 @pytest.mark.asyncio
+async def test_pixelate_transition_emits_blended_chunks(tmp_path):
+    """Pixelate transition: at peak block_size we should see frames
+    where pixels group into identical blocks (chunkiness) AND those
+    block colors are blended intermediates (neither pure-from nor
+    pure-to). dissolve/wipe/scroll emit pure-color blocks only —
+    finding a 2×2 of identical non-pure pixels confirms the pixelate
+    pipeline (NEAREST-resample shrink + grow + alpha-blend) actually
+    fired. (fade also paints a uniform non-pure frame which would
+    trivially match this 2×2 assertion, but only pixelate frames are
+    rendered in this test, so it doesn't bleed in.)"""
+    # Use a 16×16 panel so max_block = max(2, 16//4) = 4. At peak
+    # pixelation each 4×4 block has the same blended color.
+    from openmarquee.rendering.mock import MockRenderer
+
+    renderer = MockRenderer(16, 16, tmp_path / "out.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "pixelate", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(16, 16, (255, 0, 0))
+    png_b = _png_bytes(16, 16, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width, height = renderer.width, renderer.height
+    pure_red_pixel = bytes((255, 0, 0))
+    pure_blue_pixel = bytes((0, 0, 255))
+
+    def has_blended_chunk(frame: bytes) -> bool:
+        # Look for any 2×2 region where all four pixels match AND the
+        # pixel is blended (not pure from/to).
+        for y in range(height - 1):
+            for x in range(width - 1):
+                p00 = frame[(y * width + x) * 3 : (y * width + x) * 3 + 3]
+                p01 = frame[(y * width + x + 1) * 3 : (y * width + x + 1) * 3 + 3]
+                p10 = frame[
+                    ((y + 1) * width + x) * 3 : ((y + 1) * width + x) * 3 + 3
+                ]
+                p11 = frame[
+                    ((y + 1) * width + x + 1) * 3 : ((y + 1) * width + x + 1) * 3 + 3
+                ]
+                if p00 == p01 == p10 == p11:
+                    if p00 not in (pure_red_pixel, pure_blue_pixel):
+                        return True
+        return False
+
+    assert any(has_blended_chunk(f) for f in rendered), (
+        "expected at least one frame with a 2×2 blended-color chunk"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pixelate_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
+    """Strip-graceful: pixelate on width<2 or height<2 has no room to
+    chunk pixels (block_size collapses to 1 = identity), so `_pixelate`
+    delegates to `_fade`. Same regression shape as flip/marquee."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    strip_renderer = MockRenderer(1, 8, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "pixelate", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red_strip = bytes((255, 0, 0)) * 8
+    pure_blue_strip = bytes((0, 0, 255)) * 8
+    intermediates = [f for f in rendered if f != pure_red_strip and f != pure_blue_strip]
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants
