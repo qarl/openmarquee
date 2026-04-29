@@ -301,6 +301,45 @@ describe("mountStreamPanel", () => {
         expect(container.querySelector(".stream-paused-row").hidden).toBe(true);
     });
 
+    it("Stop → preview hides LIVE pill + metrics grid (QA regression — inconsistent state where Go live and LIVE pill were simultaneously visible)", async () => {
+        // QA verifier 02649a6 caught: post-Stop, Go live re-visible
+        // (preview phase) but LIVE pill still rendered. JS-level fix:
+        // render() correctly sets .hidden=true on each live-only
+        // element. The visual fix lived in styles.css — see
+        // .stream-live-pill[hidden] etc. block — because the
+        // .om-app [hidden] !important global rule wasn't winning the
+        // cascade against display: inline-flex / flex / grid in QA's
+        // verifier-build environment.
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        await waitFor(() => handle.getState() === "preview");
+        // Preview-empty cover hides as soon as the camera stream
+        // is wired to the <video> — defends the .stream-preview-
+        // empty[hidden] rule too, since it's the same shape.
+        expect(container.querySelector(".stream-preview-empty").hidden).toBe(true);
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+        // Live phase: LIVE pill + metrics grid visible, paused row hidden.
+        expect(container.querySelector(".stream-live-pill").hidden).toBe(false);
+        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(false);
+        expect(container.querySelector(".stream-paused-row").hidden).toBe(true);
+
+        container.querySelector(".stream-stop").click();
+        await waitFor(() => handle.getState() === "preview");
+        // Preview phase: LIVE pill + metrics grid hidden, paused row visible,
+        // Go live re-visible (none of those should be in a "live"-only state).
+        expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
+        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
+        expect(container.querySelector(".stream-paused-row").hidden).toBe(false);
+        expect(container.querySelector(".stream-go-live").hidden).toBe(false);
+        expect(container.querySelector(".stream-stop").hidden).toBe(true);
+        // Camera kept open across Stop → the empty-cover stays hidden.
+        expect(container.querySelector(".stream-preview-empty").hidden).toBe(true);
+    });
+
     it("Stop → preview: posts session_id, keeps the camera open for fast re-go-live", async () => {
         // Phase 12.2 followup, qarl 2026-04-29: Stop returns to the
         // preview phase (camera stays open + viewfinder still rendering)

@@ -3272,6 +3272,20 @@ html, body { margin: 0; padding: 0; height: 100%; }
     text-transform: uppercase;
     color: #ffd690;
 }
+/* The `display: ...` rules on the three live-only / preview-only
+   stream elements above + below win over the UA default for
+   [hidden] in the cascade — re-state the visibility intent
+   explicitly (same defensive pattern used at line 355 for
+   .inline-preview-idle[hidden]). Caught by QA after 02649a6:
+   post-Stop, render() set `livePillEl.hidden = true` correctly
+   but the pill stayed visually rendered because `display:
+   inline-flex` was overriding the UA `[hidden]` default. */
+.stream-live-pill[hidden],
+.stream-paused-row[hidden],
+.stream-metrics-grid[hidden],
+.stream-preview-empty[hidden] {
+    display: none !important;
+}
 .stream-live-pill-dot {
     width: 6px;
     height: 6px;
