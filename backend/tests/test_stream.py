@@ -372,6 +372,66 @@ async def test_pause_when_loop_not_running_is_noop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_phantom_session_watchdog_closes_on_no_track(tmp_path, monkeypatch):
+    """Phase 12.1 Finding #2: a bogus SDP that parses + answers cleanly
+    but never delivers a real track produces a "phantom" session — the
+    PC is open, StreamManager.is_active=True, but no media flows. The
+    phantom-session watchdog should auto-close after _PHANTOM_TIMEOUT_
+    SECONDS, flipping closed=True so is_active turns False on the next
+    /status query.
+
+    The fake PC's on() decorator captures the on_track handler but
+    never invokes it (no real ICE / DTLS / SRTP), simulating exactly
+    the "answered but no track" failure mode."""
+    # Compress the watchdog timeout so the test runs in <0.5s.
+    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
+
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = StreamSession(loop)
+            await session.start("v=0\r\nbogus-no-media\r\n")
+            assert not session.closed
+            # Wait past the watchdog timeout. on_track never fires
+            # (the fake PC doesn't actually negotiate media), so the
+            # watchdog should hit its TimeoutError path and call
+            # close().
+            await _wait_until(lambda: session.closed, timeout=1.0)
+            assert session.closed
+            # Playback resumed as part of close(); no phantom paused-
+            # forever side effect.
+            assert not loop.is_paused
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_phantom_watchdog_canceled_on_normal_close(tmp_path, monkeypatch):
+    """Normal close() path (operator stops the stream before the
+    watchdog timer fires) cancels the watchdog so it doesn't dangle
+    + race with the explicit close. Without this, the watchdog could
+    fire its own log.warning ('phantom') even on a clean close."""
+    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 5.0)
+
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = StreamSession(loop)
+            await session.start("v=0\r\noffer\r\n")
+            # Close before the 5s timeout would fire.
+            await session.close()
+            assert session.closed
+            # Watchdog should be done (cancelled) — not running, not
+            # pending. Ensures close() awaited the cancellation.
+            assert session._watchdog_task is not None
+            assert session._watchdog_task.done()
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_streamsession_start_pauses_playback_close_resumes(tmp_path):
     """Direct integration: StreamSession.start() pauses the loop,
     StreamSession.close() resumes. This is the contract StreamManager

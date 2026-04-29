@@ -69,6 +69,31 @@ class StreamSession:
     (§7.6 renderer wire format).
     """
 
+    # Phase 12.1 Finding #2 mitigation — phantom-session watchdog
+    # timeout. If no on_track event fires within this window after
+    # session.start() returns, the session is auto-closed. Catches
+    # bogus SDPs that parse + answer cleanly but never deliver a
+    # real media track, plus phones that crash mid-handshake. Set
+    # comfortably above the worst-case real-network handshake time
+    # (~1-2s on local Tailnet, ~5s on slow/relay paths); 10s is the
+    # same threshold §5.11 uses for the PC-disconnect timeout, so
+    # the two paths converge on the same UX.
+    #
+    # TODO(qarl-confirm): default mitigation is timeout-based.
+    # Alternative #1: pre-validate SDP at the API boundary (parse
+    # the m= sections, require a video media line). Pro: rejects
+    # at /api/stream/start before any session exists. Con: needs
+    # an SDP parser, can miss subtle malformed cases that aiortc
+    # would still accept-but-not-negotiate.
+    # Alternative #2: poll RTCPeerConnection.connectionState every
+    # second; close on "failed" / "disconnected". Pro: catches
+    # mid-stream drops too. Con: aiortc's connectionState semantics
+    # vary across versions.
+    # Combination of all three is also possible. Flip if QA finds
+    # the timeout-only approach lets a class of bogus-SDP phantoms
+    # through.
+    _PHANTOM_TIMEOUT_SECONDS = 10.0
+
     def __init__(self, playback: PlaybackLoop):
         self._playback = playback
         self.id: UUID = uuid4()
@@ -82,6 +107,12 @@ class StreamSession:
         self._pc = RTCPeerConnection()
         self._consume_task: asyncio.Task | None = None
         self._closed = False
+        # Phase 12.1 Finding #2: signaled when the first on_track
+        # event fires. The phantom-session watchdog awaits this with
+        # a timeout; if it never resolves, the session was never
+        # backed by real media and the watchdog auto-closes.
+        self._first_track_event = asyncio.Event()
+        self._watchdog_task: asyncio.Task | None = None
 
     @property
     def closed(self) -> bool:
@@ -100,6 +131,7 @@ class StreamSession:
         def on_track(track):  # noqa: ANN001 — aiortc's MediaStreamTrack
             # Only video for v1 — audio is muted at capture per §5.11.
             if track.kind == "video":
+                self._first_track_event.set()
                 self._consume_task = asyncio.create_task(self._consume_video(track))
 
         await self._pc.setRemoteDescription(offer)
@@ -108,9 +140,42 @@ class StreamSession:
         # Pause playback now that the negotiation is complete; the first
         # video frame may arrive any moment via the on_track callback.
         await self._playback.pause()
+        # Phase 12.1 Finding #2 phantom-session watchdog. Schedule a
+        # background task that waits up to _PHANTOM_TIMEOUT_SECONDS
+        # for the first track event; if no track materializes (bogus
+        # SDP that answered cleanly but had no real media, phone
+        # crashed mid-handshake, etc.) the session is auto-closed.
+        # Closing flips _closed=True, which makes StreamManager.
+        # is_active return False on the next /status query — the
+        # phone will see the session has gone away.
+        self._watchdog_task = asyncio.create_task(self._watch_for_first_track())
         # setLocalDescription may rewrite the SDP with gathered ICE
         # candidates; read the canonical form back from the PC.
         return self._pc.localDescription.sdp
+
+    async def _watch_for_first_track(self) -> None:
+        """Phase 12.1 Finding #2: auto-close if no track materializes
+        within _PHANTOM_TIMEOUT_SECONDS. Cancellation-safe: close()
+        cancels this task, which surfaces as CancelledError here and
+        is silently re-raised so the cancel completes."""
+        try:
+            await asyncio.wait_for(
+                self._first_track_event.wait(),
+                timeout=self._PHANTOM_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            if self._closed:
+                # Session was closed via the normal path during the
+                # wait — nothing to do.
+                return
+            log.warning(
+                "stream: session %s saw no track within %.1fs; closing as phantom",
+                self.id,
+                self._PHANTOM_TIMEOUT_SECONDS,
+            )
+            await self.close()
+        except asyncio.CancelledError:
+            raise
 
     async def _consume_video(self, track) -> None:  # noqa: ANN001
         """Pull frames off the track, scale, push to the renderer.
@@ -146,6 +211,21 @@ class StreamSession:
         if self._closed:
             return
         self._closed = True
+        # Cancel the phantom-session watchdog if it's still pending —
+        # the session is closing via the normal path, so the watchdog's
+        # timeout-fire path doesn't need to do its own close. Skipped
+        # when the watchdog is the caller (TimeoutError path → close()
+        # → here), since that task is itself currently running and
+        # cancelling it would self-cancel awkwardly. Self-cancel is
+        # detected via `asyncio.current_task()`.
+        if (
+            self._watchdog_task is not None
+            and not self._watchdog_task.done()
+            and asyncio.current_task() is not self._watchdog_task
+        ):
+            self._watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._watchdog_task
         if self._consume_task is not None and not self._consume_task.done():
             self._consume_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
