@@ -212,6 +212,7 @@ export function mountInlinePreview(container, options) {
             "scanline",
             "glitch",
             "push",
+            "blinds",
         ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
@@ -521,6 +522,35 @@ export function mountInlinePreview(container, options) {
                         ctx.fillStyle = "#fff";
                         ctx.fillRect(offset - 1, 0, 1, h);
                     }
+                }
+            } else if (slot.transition === "blinds") {
+                // Venetian-blind reveal. Multi-slat clip path —
+                // one rect per slat, growing from each slat's
+                // midline outward. Mirrors playback.py::_blinds.
+                const w = canvas.width;
+                const h = canvas.height;
+                if (h < 4) {
+                    ctx.globalAlpha = progress;
+                    drawSlot(timeline[nextIdx]);
+                    ctx.globalAlpha = 1;
+                } else {
+                    const nSlats = Math.max(2, Math.floor(h / 8));
+                    const slatH = h / nSlats;
+                    ctx.save();
+                    ctx.beginPath();
+                    for (let s = 0; s < nSlats; s++) {
+                        const slatTop = Math.round(s * slatH);
+                        const slatBot = Math.round((s + 1) * slatH);
+                        const slatHeight = slatBot - slatTop;
+                        const bandHeight = Math.round(slatHeight * progress);
+                        if (bandHeight <= 0) continue;
+                        const bandTop =
+                            slatTop + Math.floor((slatHeight - bandHeight) / 2);
+                        ctx.rect(0, bandTop, w, bandHeight);
+                    }
+                    ctx.clip();
+                    drawSlot(timeline[nextIdx]);
+                    ctx.restore();
                 }
             } else if (slot.transition === "marquee") {
                 // Tickertape: from-slot scrolls off to the left, a

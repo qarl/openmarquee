@@ -39,6 +39,7 @@ const TRANSITION_OPTIONS = [
     { value: "scanline", label: "scanline" },
     { value: "glitch", label: "glitch" },
     { value: "push", label: "push" },
+    { value: "blinds", label: "blinds" },
 ];
 
 function transitionOptionsHTML(selected) {

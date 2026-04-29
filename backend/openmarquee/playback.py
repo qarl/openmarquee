@@ -335,6 +335,7 @@ class PlaybackLoop:
                         "scanline",
                         "glitch",
                         "push",
+                        "blinds",
                     )
                     and item.transition_ms > 0
                     and len(items) > 1
@@ -369,6 +370,8 @@ class PlaybackLoop:
                             await self._glitch(current_image, next_image, item.transition_ms)
                         elif kind == "push":
                             await self._push(current_image, next_image, item.transition_ms)
+                        elif kind == "blinds":
+                            await self._blinds(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -1119,6 +1122,67 @@ class PlaybackLoop:
                     (offset - 1, 0, offset - 1, height - 1),
                     fill=(255, 255, 255),
                 )
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _blinds(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Venetian-blind reveal: horizontal slats open to expose
+        to_image. Each slat has its own midline; the visible band
+        within each slat grows from a horizontal hairline at the
+        midline outward, until at progress=1 every slat is fully open
+        and the entire to_image is revealed.
+
+        n_slats = max(2, height // 8) — slats are roughly 8px tall,
+        clamped to at least two so the blind effect reads as a blind
+        even on small panels. Same Image.composite-mask pattern that
+        _halftone uses, just with rectangles instead of ellipses.
+
+        Strip-graceful: height<4 leaves no room for two slats with
+        meaningful midline-spread bands, so delegate to fade.
+        """
+        from PIL import ImageDraw
+
+        width, height = from_image.size
+        if height < 4:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        n_slats = max(2, height // 8)
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            mask = Image.new("L", (width, height), 0)
+            draw = ImageDraw.Draw(mask)
+            # Per-slat midline-out reveal. Use float arithmetic for the
+            # slat boundaries so non-integer division (e.g. 32 / 5 =
+            # 6.4 px slats) doesn't accumulate rounding error across
+            # slats — each pair of integer top/bot rounds back from
+            # the floating boundary.
+            slat_h = height / n_slats
+            for s in range(n_slats):
+                slat_top = int(round(s * slat_h))
+                slat_bot = int(round((s + 1) * slat_h))
+                slat_height = slat_bot - slat_top
+                band_height = int(round(slat_height * progress))
+                if band_height <= 0:
+                    continue
+                band_top = slat_top + (slat_height - band_height) // 2
+                band_bot = band_top + band_height
+                draw.rectangle(
+                    (0, band_top, width - 1, band_bot - 1), fill=255
+                )
+            frame = Image.composite(to_image, from_image, mask)
             self._render_image(frame)
             await self._wait(frame_period)
 

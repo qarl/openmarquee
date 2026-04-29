@@ -1136,6 +1136,98 @@ async def test_push_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_blinds_transition_emits_alternating_slat_pattern(tmp_path):
+    """Blinds transition: horizontal slats open from each slat's midline.
+    At mid-progress we should see frames containing an alternating
+    pattern: from-color rows, then to-color rows, then from again, etc.
+    The "multiple alternating bands" signature distinguishes blinds
+    from scanline (one bright row), wipe/scroll (single block split),
+    and dissolve (random scatter, not stripes)."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    # 32-tall panel -> n_slats = max(2, 32//8) = 4 slats of 8px each.
+    # Mid-progress -> ~4px-tall to-color band centered in each slat.
+    renderer = MockRenderer(8, 32, tmp_path / "out.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "blinds", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 32, (255, 0, 0))
+    png_b = _png_bytes(8, 32, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(
+        renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width, height = renderer.width, renderer.height
+    pure_red_row = bytes((255, 0, 0)) * width
+    pure_blue_row = bytes((0, 0, 255)) * width
+
+    def has_alternating_pattern(frame: bytes) -> bool:
+        # Walk row-by-row, build a sequence of "regions" (red/blue/other).
+        # The blinds-distinctive frame has at least 4 region transitions
+        # (e.g. red→blue→red→blue→red across the slat midlines).
+        rows = [frame[y * width * 3 : (y + 1) * width * 3] for y in range(height)]
+        prev = None
+        transitions = 0
+        for row in rows:
+            if row == pure_red_row:
+                cur = "r"
+            elif row == pure_blue_row:
+                cur = "b"
+            else:
+                cur = "x"
+            if prev is not None and cur != prev and "x" not in (cur, prev):
+                transitions += 1
+            prev = cur
+        return transitions >= 4
+
+    assert any(has_alternating_pattern(f) for f in rendered), (
+        "expected at least one frame with an alternating slat pattern (>=4 transitions)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_blinds_transition_falls_back_to_fade_on_short_strip(tmp_path):
+    """Strip-graceful: blinds on height<4 has no room for two slats
+    with meaningful bands, so `_blinds` delegates to `_fade`."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    strip_renderer = MockRenderer(8, 2, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "blinds", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red = bytes((255, 0, 0)) * (strip_renderer.width * strip_renderer.height)
+    pure_blue = bytes((0, 0, 255)) * (strip_renderer.width * strip_renderer.height)
+    intermediates = [f for f in rendered if f != pure_red and f != pure_blue]
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants
