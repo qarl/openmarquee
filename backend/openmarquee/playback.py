@@ -319,7 +319,8 @@ class PlaybackLoop:
                 # all the way through the last-to-first wrap so the
                 # inline preview and the device stay consistent.
                 if (
-                    item.transition in ("fade", "wipe", "slide", "iris", "scroll", "flip")
+                    item.transition
+                    in ("fade", "wipe", "slide", "iris", "scroll", "flip", "marquee")
                     and item.transition_ms > 0
                     and len(items) > 1
                 ):
@@ -339,6 +340,8 @@ class PlaybackLoop:
                             await self._scroll(current_image, next_image, item.transition_ms)
                         elif kind == "flip":
                             await self._flip(current_image, next_image, item.transition_ms)
+                        elif kind == "marquee":
+                            await self._marquee(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -679,6 +682,65 @@ class PlaybackLoop:
             resized = source.resize((new_w, height))
             frame = Image.new("RGB", (width, height))
             frame.paste(resized, ((width - new_w) // 2, 0))
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _marquee(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Tickertape wraparound: from_image scrolls off to the left, a
+        gap with a centered dot separator passes through, and to_image
+        arrives from the right. Native to the openMarquee brand identity
+        — the same "ticker" reading that the wordmark evokes.
+
+        Implemented by composing a wide [from | gap | to] strip and
+        sliding a width-sized window across it. Cleaner than tracking
+        three independent paste offsets per frame.
+
+        Strip-graceful: width<2 → no horizontal motion is meaningful,
+        fall back to fade. Per QA's spec for strip rendering.
+        """
+        from PIL import ImageDraw
+
+        width, height = from_image.size
+        if width < 2:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        # Gap is ~1/8 of canvas width, min 4px so the dot stays visible
+        # on small panels. The compound is [from | gap | to] = total
+        # 2*width + gap_w wide; the visible window is `width` wide so
+        # the scroll distance over transition_ms is width + gap_w (after
+        # which to_image is fully revealed).
+        gap_w = max(4, width // 8)
+        gap_panel = Image.new("RGB", (gap_w, height))
+        # Centered dot — small filled circle. dot_radius bounded by both
+        # gap width and panel height so it never bleeds the gap or
+        # crowds a thin row. Falls to 1px on a 1-row strip.
+        dot_radius = max(1, min(gap_w // 3, height // 3))
+        cx, cy = gap_w // 2, height // 2
+        ImageDraw.Draw(gap_panel).ellipse(
+            (cx - dot_radius, cy - dot_radius, cx + dot_radius, cy + dot_radius),
+            fill=(255, 255, 255),
+        )
+        compound = Image.new("RGB", (2 * width + gap_w, height))
+        compound.paste(from_image, (0, 0))
+        compound.paste(gap_panel, (width, 0))
+        compound.paste(to_image, (width + gap_w, 0))
+
+        scroll_total = width + gap_w
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            offset = max(0, min(scroll_total, int(round(scroll_total * i / n_frames))))
+            frame = compound.crop((offset, 0, offset + width, height))
             self._render_image(frame)
             await self._wait(frame_period)
 

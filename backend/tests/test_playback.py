@@ -573,6 +573,86 @@ async def test_flip_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_marquee_transition_emits_dot_separator(tmp_path):
+    """Marquee transition: tickertape with a centered white dot in the
+    gap between from and to. Mid-transition we should see at least one
+    pure-white pixel — distinguishing marquee from every other current
+    transition (slides A/B are pure red and pure blue here, fade blends
+    to magenta-ish, scroll/slide preserve only red/blue rows or columns,
+    none paint white)."""
+    # Use a wider renderer so the gap_w (=max(4, w//8)) and dot_radius
+    # have room to render visibly. 32×8 → gap_w=4, dot_radius=1, a small
+    # white blob centered in the gap.
+    from openmarquee.rendering.mock import MockRenderer
+
+    wide_renderer = MockRenderer(32, 8, tmp_path / "wide.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "marquee", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(32, 8, (255, 0, 0))
+    png_b = _png_bytes(32, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(wide_renderer)
+
+    loop = _new_loop(
+        wide_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    white_pixel = bytes((255, 255, 255))
+
+    def has_white_pixel(frame: bytes) -> bool:
+        # Each pixel is 3 bytes; scan all of them.
+        for off in range(0, len(frame), 3):
+            if frame[off : off + 3] == white_pixel:
+                return True
+        return False
+
+    assert any(has_white_pixel(f) for f in rendered), (
+        "expected at least one frame with a pure-white pixel from the dot separator"
+    )
+
+
+@pytest.mark.asyncio
+async def test_marquee_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
+    """Strip-graceful: marquee on a width=1 column has no horizontal
+    motion, so `_marquee` delegates to `_fade`. Same shape as the
+    flip-strip-fallback regression."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    strip_renderer = MockRenderer(1, 8, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "marquee", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red_strip = bytes((255, 0, 0)) * 8
+    pure_blue_strip = bytes((0, 0, 255)) * 8
+    intermediates = [f for f in rendered if f != pure_red_strip and f != pure_blue_strip]
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

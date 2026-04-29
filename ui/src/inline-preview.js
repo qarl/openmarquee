@@ -198,7 +198,15 @@ export function mountInlinePreview(container, options) {
         // it here keeps preview and device in sync.
         const timeInto = position - slot.startSec;
         const timeLeft = slot.endSec - position;
-        const ANIMATED = new Set(["fade", "wipe", "slide", "iris", "scroll", "flip"]);
+        const ANIMATED = new Set([
+            "fade",
+            "wipe",
+            "slide",
+            "iris",
+            "scroll",
+            "flip",
+            "marquee",
+        ]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
             : 0;
@@ -252,6 +260,43 @@ export function mountInlinePreview(container, options) {
                 ctx.restore();
                 ctx.save();
                 ctx.translate(0, canvas.height - oy);
+                drawSlot(timeline[nextIdx]);
+                ctx.restore();
+            } else if (slot.transition === "marquee") {
+                // Tickertape: from-slot scrolls off to the left, a
+                // gap with a centered dot (the "·" separator) passes
+                // through, then to-slot arrives from the right. Same
+                // [from | gap | to] compound idea as playback.py::_marquee
+                // — built here as three consecutive draws under a
+                // shared -offset translate.
+                const gapW = Math.max(4, Math.floor(canvas.width / 8));
+                const scrollTotal = canvas.width + gapW;
+                const offset = scrollTotal * progress;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.save();
+                ctx.translate(-offset, 0);
+                drawSlot(slot);
+                // Gap panel: black field with a centered white dot.
+                ctx.fillStyle = "#000";
+                ctx.fillRect(canvas.width, 0, gapW, canvas.height);
+                ctx.fillStyle = "#fff";
+                const dotR = Math.max(
+                    1,
+                    Math.min(Math.floor(gapW / 3), Math.floor(canvas.height / 3)),
+                );
+                ctx.beginPath();
+                ctx.arc(
+                    canvas.width + gapW / 2,
+                    canvas.height / 2,
+                    dotR,
+                    0,
+                    Math.PI * 2,
+                );
+                ctx.fill();
+                // To-slot at canvas.width + gapW (in pre-translate
+                // coords). drawSlot paints at (0, 0) → (w, h), so
+                // translate first, then draw, then we're done.
+                ctx.translate(canvas.width + gapW, 0);
                 drawSlot(timeline[nextIdx]);
                 ctx.restore();
             } else if (slot.transition === "flip") {

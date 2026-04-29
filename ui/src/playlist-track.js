@@ -32,6 +32,7 @@ const TRANSITION_OPTIONS = [
     { value: "iris", label: "iris" },
     { value: "scroll", label: "scroll" },
     { value: "flip", label: "flip" },
+    { value: "marquee", label: "marquee" },
 ];
 
 function transitionOptionsHTML(selected) {
