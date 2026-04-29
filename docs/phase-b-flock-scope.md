@@ -76,7 +76,32 @@ Implementation:
   `flock_sync_enabled` — flock membership is a property of the
   flock, not of content sync.
 
-### B.3 — Out-of-sync diff (PENDING qarl input)
+### B.3 — Out-of-sync diff ✅ SHIPPED (draft, four TODO(qarl-confirm) blocks for review)
+
+Backend `5e8023f`, frontend `7a8eda9`, demo wire fix `1a5ec00`.
+QA verifier 5/5 PASS, regression clean across 6 prior suites.
+
+`FlockPeer.items_behind: int | None` is computed during the
+existing `pull_from_peer` reconcile pre-apply and stamped onto the
+peer record. Frontend folds the count into the existing sync-state
+pill: when sync=True + online + items_behind > 0 the pill reads
+"K items behind" instead of "syncing"; caught-up (0) and never-
+pulled (null) stay at "syncing". Mock-backend synthesizes per
+peer at /api/flock GET-time so the demo Flock tab exercises the
+new affordance even on stale seed.json.
+
+Four decision points shipped as defaults with TODO(qarl-confirm)
+blocks for him to flip:
+
+  1. Semantic direction (we're behind them vs they're behind us).
+  2. sync=False handling (None vs what-if-preview).
+  3. Tombstone inclusion in the count.
+  4. Stale items_behind on sync=True→False flip.
+
+Below text preserved for historical context — was the original
+"PENDING" framing before the draft shipped:
+
+
 
 QA's framing: surface "N items behind" on each peer card so the
 operator sees content drift at a glance. The flock.js comment at
@@ -160,13 +185,17 @@ Add Peer modal calls it on open and renders the list inline.
 
 ## Suggested ordering (remaining)
 
-- **B.3 out-of-sync diff** — QA explicitly named this; design
-  intent visible in flock.js comments. Likely the next ship if
-  qarl resolves the cached-vs-probe-on-demand question.
+- **B.4 gossip-on-add live-fire verification** — the protocol is
+  fully shipped per §13 (a05184b); a single-backend demo can't
+  exercise multi-peer round-trips. Real verification waits for
+  Phase 6 hardware so two+ devices on a Tailnet can be observed
+  reciprocally adding each other.
 - **B.5 magicDNS auto-discovery** — bigger scope, Tailscale-binary-
-  dependent, hardware-bringup-blocking. Defer until after Phase 6
-  hardware comes up so it can be exercised end-to-end against a
-  real Tailnet.
+  dependent. Could ship as a draft via the same TODO(qarl-confirm)
+  pattern B.3 used: shell-out to `tailscale status --json`, return
+  candidates with an `is_openmarquee` filter probe, dev-fallback
+  to empty list. Implementation possible without Phase 6; live-
+  fire verification waits for it.
 
 ## Where this doc lives
 
