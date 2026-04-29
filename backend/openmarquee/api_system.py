@@ -1,12 +1,16 @@
-"""System-probe endpoints used by the Settings UI to offer sensible
-defaults: display-dim detection (so first-boot picks up the real
-framebuffer res) and WiFi-scan (so the station-mode dropdown lists
-what's actually reachable).
+"""System-probe endpoints used by the Settings UI + the flock health
+view to offer sensible defaults: display-dim detection (so first-boot
+picks up the real framebuffer res), WiFi-scan (so the station-mode
+dropdown lists what's actually reachable), and a /info endpoint that
+reports the device's own model / mode / signal / uptime for the flock
+self-card (Phase B.1 per docs/phase-b-flock-scope.md).
 
-Both endpoints best-effort — they shell out to tools that exist on
-real hardware (fbset / iw / airport) and return empty-but-well-formed
-payloads on dev boxes without those tools. The UI falls back to
-letting the operator type values manually.
+All endpoints best-effort — they shell out to tools that exist on
+real hardware (fbset / iw / airport / /proc/*) and return empty-but-
+well-formed payloads on dev boxes without those tools. The UI falls
+back to letting the operator type values manually OR to placeholder
+constants matching the Phase A SELF_PLACEHOLDER_* fallbacks in
+flock.js.
 """
 
 from __future__ import annotations
@@ -16,13 +20,19 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+
+from openmarquee.dependencies import get_settings_storage
+from openmarquee.settings import SettingsStorage
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+SettingsDep = Annotated[SettingsStorage, Depends(get_settings_storage)]
 
 
 class DisplayDims(BaseModel):
@@ -175,6 +185,204 @@ def _parse_iw_scan(output: str) -> list[WifiNetwork]:
         networks.values(),
         key=lambda n: (-(n.signal_dbm or -999), n.ssid),
     )
+
+
+# --- /api/system/info — flock health probe payload (Phase B.1) ---
+
+
+# Sentinel values that match flock.js's Phase A SELF_PLACEHOLDER_*
+# constants. When the relevant /proc source isn't available (dev
+# laptop, missing wireless interface, etc.) we report these so the
+# UI's self-card stays meaningful instead of rendering blanks. The
+# duplication with the JS-side constants is deliberate — the wire
+# shape of /api/system/info is the contract; the JS-side fallbacks
+# remain so the UI can render before the fetch lands.
+_FALLBACK_MODEL = "Pi Zero 2 W"
+_FALLBACK_SIGNAL = 100
+_FALLBACK_UPTIME = "up since boot"
+
+
+class SystemInfo(BaseModel):
+    """Per-device health summary for the flock self-card.
+
+    Wire shape mirrors FlockPeer.{model, mode, signal, uptime}. The
+    flock UI's self-card consumes /api/system/info from the local
+    device; the flock probe consumer (Phase B.3) will fetch the
+    same endpoint from each peer.
+
+    Source field documents which path produced the values so a
+    mixed result (model from /proc/device-tree but signal falling
+    back to sentinel because no wireless adapter) is debuggable
+    without re-probing.
+    """
+
+    model: str
+    mode: str
+    signal: int
+    uptime: str
+    source: str  # "proc" | "fallback" | "mixed"
+
+
+@router.get("/info", response_model=SystemInfo)
+async def system_info(settings_storage: SettingsDep) -> SystemInfo:
+    """Read /proc/* + the configured display mode and return a flock
+    self-card payload. Each /proc reader is best-effort; failure
+    falls back to the matching SELF_PLACEHOLDER constant.
+    """
+    settings = settings_storage.load()
+
+    model = _read_model()
+    signal = _read_signal()
+    uptime_s = _read_uptime_seconds()
+    sources_used: list[str] = []
+    sources_fallback: list[str] = []
+
+    if model is None:
+        model = _FALLBACK_MODEL
+        sources_fallback.append("model")
+    else:
+        sources_used.append("model")
+
+    if signal is None:
+        signal = _FALLBACK_SIGNAL
+        sources_fallback.append("signal")
+    else:
+        sources_used.append("signal")
+
+    if uptime_s is None:
+        uptime = _FALLBACK_UPTIME
+        sources_fallback.append("uptime")
+    else:
+        uptime = _format_uptime(uptime_s)
+        sources_used.append("uptime")
+
+    if sources_used and sources_fallback:
+        source = "mixed"
+    elif sources_used:
+        source = "proc"
+    else:
+        source = "fallback"
+
+    mode = _format_mode(settings.output_mode, settings.display_width, settings.display_height)
+
+    return SystemInfo(
+        model=model,
+        mode=mode,
+        signal=signal,
+        uptime=uptime,
+        source=source,
+    )
+
+
+def _read_model() -> str | None:
+    """Read the device model from /proc/device-tree/model (Pi-native)
+    or /proc/cpuinfo's `Model:` line (older Pi OS, generic ARM).
+    Returns None on macOS / dev boxes / unknown hardware."""
+    # /proc/device-tree/model is null-terminated on Pi OS — strip nulls
+    # before returning. Path-based open avoids the platform-shell
+    # dependency that fbset / iw rely on.
+    dt = Path("/proc/device-tree/model")
+    if dt.exists():
+        try:
+            text = dt.read_text(errors="replace").strip("\x00").strip()
+            if text:
+                return text
+        except Exception:
+            log.exception("/proc/device-tree/model read failed")
+
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        try:
+            for line in cpuinfo.read_text().splitlines():
+                m = re.match(r"^\s*Model\s*:\s*(.+?)\s*$", line)
+                if m:
+                    return m.group(1)
+        except Exception:
+            log.exception("/proc/cpuinfo Model parse failed")
+
+    return None
+
+
+def _read_signal() -> int | None:
+    """Read WiFi signal quality as a 0-100 percentage from
+    /proc/net/wireless. Returns None if no wireless interface is
+    configured or the file isn't readable.
+
+    /proc/net/wireless format (truncated):
+
+        Inter-| sta-|   Quality        |   Discarded packets ...
+         face | tus | link level noise |  nwid crypt frag retry misc | beacon
+         wlan0: 0000   54.  -55.  -256        0     0    0     0    0       0
+
+    The `link` column (first numeric after status) is a quality
+    score scaled to a per-driver maximum — typically 70 on Pi's
+    brcmfmac. Return as percentage of 70 since most callers want a
+    portable 0-100. Drivers that go higher will clamp.
+    """
+    wireless = Path("/proc/net/wireless")
+    if not wireless.exists():
+        return None
+    try:
+        for line in wireless.read_text().splitlines():
+            # Skip header lines (no colon-followed-by-numbers).
+            m = re.match(r"^\s*(\S+):\s+\S+\s+([\d.]+)", line)
+            if m and m.group(1) != "face":
+                quality = float(m.group(2))
+                pct = round(quality / 70 * 100)
+                return max(0, min(100, pct))
+    except Exception:
+        log.exception("/proc/net/wireless parse failed")
+    return None
+
+
+def _read_uptime_seconds() -> float | None:
+    """Read uptime in seconds from /proc/uptime. Returns None on
+    macOS / non-Linux."""
+    uptime = Path("/proc/uptime")
+    if not uptime.exists():
+        return None
+    try:
+        first = uptime.read_text().split()[0]
+        return float(first)
+    except Exception:
+        log.exception("/proc/uptime parse failed")
+        return None
+
+
+def _format_uptime(seconds: float) -> str:
+    """Format uptime as a two-unit truncated string matching the
+    FlockPeer.uptime convention ("4d 7h", "3h 15m", "12m 5s").
+    Boot-recent values (<60s) read as "Ns" only — saying "0m Ns" is
+    silly."""
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def _format_mode(output_mode: str, width: int, height: int) -> str:
+    """Format the device's output mode + display dims as the slug
+    convention FlockPeer.mode expects.
+
+    - hub75 / composite: f"{mode}-{w}x{h}" (e.g. "hub75-128x64")
+    - ws281x: "ws281x-strip" when min(w, h) == 1, else "ws281x-{w}x{h}"
+    - hdmi: "hdmi-{h}" — operators talk about HDMI in resolution-
+      class terms (720p/1080p) rather than literal dimensions.
+    """
+    if output_mode == "ws281x":
+        if min(width, height) <= 1:
+            return "ws281x-strip"
+        return f"ws281x-{width}x{height}"
+    if output_mode == "hdmi":
+        return f"hdmi-{height}"
+    return f"{output_mode}-{width}x{height}"
 
 
 def _parse_airport_scan(output: str) -> list[WifiNetwork]:
