@@ -310,11 +310,14 @@ header h1 {
 .inline-preview-stage {
     position: relative;
     width: 100%;
-    max-width: 32rem;
-    background: #000;
-    border-radius: 0.4rem;
+    /* Matches stream-preview-wrap (B3 normalization, qarl 2026-04-29).
+       Was 32rem; tightened to 26rem so the playlist preview reads at the
+       same scale as the slide editor + stream viewfinder. */
+    max-width: 26rem;
+    background: var(--om-led-bg, #000);
+    border-radius: var(--om-radius, 0.5rem);
     overflow: hidden;
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--om-line, var(--panel-border));
 }
 .inline-preview-canvas {
     display: block;
@@ -883,14 +886,18 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 
 .preview-wrap {
-    /* No background / padding so the preview outline hugs the sign's
-       actual aspect ratio — avoids black letterbox bars when the
-       device isn't 4:3. */
+    /* The wrap owns the chrome (border / radius / LED background); the
+       inner .editor-canvas just paints. Width capped at 26rem to match
+       stream-preview-wrap and inline-preview-stage so all three preview
+       windows read at the same scale (B3 normalization, qarl 2026-04-29). */
     display: flex;
     justify-content: center;
     align-items: center;
-    border: 1px solid var(--panel-border);
-    border-radius: 0.5rem;
+    width: 100%;
+    max-width: 26rem;
+    background: var(--om-led-bg, #000);
+    border: 1px solid var(--om-line, var(--panel-border));
+    border-radius: var(--om-radius, 0.5rem);
     overflow: hidden;
 }
 
@@ -1011,10 +1018,10 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     /* Aspect ratio is set inline by the mount fn so it matches the
        device's configured display dims. The CSS var is a fallback for
        the first paint before JS runs — without it the canvas takes
-       its intrinsic 300×150 default and looks visibly wrong. */
+       its intrinsic 300×150 default and looks visibly wrong. Chrome
+       (border / radius / bg) lives on .preview-wrap. */
     display: block;
     width: 100%;
-    max-width: 100%;
     height: auto;
     aspect-ratio: var(--device-aspect, 4 / 3);
     image-rendering: pixelated;
