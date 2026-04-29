@@ -92,6 +92,43 @@ function makeFakePc({ answerSdp = "v=0\r\nfake-answer\r\n" } = {}) {
         close() {
             pc.closed = true;
         },
+        // Phase B.1: getStats() returns a Map<string, RTCStats> per
+        // the WebRTC spec. Default fakePc returns a minimal report
+        // shape (one outbound-rtp/video, one remote-inbound-rtp/video,
+        // one nominated candidate-pair) that the panel's pollStats
+        // happy-path consumes; tests that need to observe a delta
+        // override _fakeStatsReport between polls.
+        _fakeStatsReport: new Map([
+            [
+                "outbound-rtp-video",
+                {
+                    type: "outbound-rtp",
+                    kind: "video",
+                    bytesSent: 100_000,
+                    timestamp: 1_000_000,
+                },
+            ],
+            [
+                "remote-inbound-rtp-video",
+                {
+                    type: "remote-inbound-rtp",
+                    kind: "video",
+                    roundTripTime: 0.078, // 78 ms
+                    packetsLost: 3,
+                },
+            ],
+            [
+                "candidate-pair",
+                {
+                    type: "candidate-pair",
+                    nominated: true,
+                    currentRoundTripTime: 0.080,
+                },
+            ],
+        ]),
+        async getStats() {
+            return pc._fakeStatsReport;
+        },
     };
     pc.localDescription = { sdp: "v=0\r\nfake-offer\r\n", type: "offer" };
     pc._answerSdp = answerSdp;
@@ -475,6 +512,139 @@ describe("mountStreamPanel", () => {
         // between serverStartedAt capture and the render assertion.
         expect(totalSec).toBeGreaterThanOrEqual(60);
         expect(totalSec).toBeLessThanOrEqual(75);
+    });
+
+    it("metrics cells populate from RTCPeerConnection.getStats() on the live transition (Phase B.1)", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountStreamPanel(container, opts);
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+        // First poll fires synchronously inside render() on the live
+        // transition (so cells populate before the user sees them).
+        // Wait for the latency cell to swap from the template's mock
+        // '78 ms' to the polled value derived from the fake report's
+        // roundTripTime of 0.078s — same number, but the path through
+        // pollStats() proves the wiring.
+        await waitFor(
+            () =>
+                container.querySelector('[data-metric="latency"]').textContent ===
+                "78 ms",
+        );
+        // Dropped: pulled directly from remote-inbound-rtp.packetsLost.
+        expect(
+            container.querySelector('[data-metric="dropped"]').textContent,
+        ).toBe("3");
+    });
+
+    it("bitrate cell renders Mbps once a delta is computable (poll #2)", async () => {
+        // First poll caches; second-and-onward computes (bytesSent_now
+        // - bytesSent_prev) * 8 / dMs. Use vitest fake timers to
+        // advance the 1Hz setInterval deterministically — wall-clock
+        // waits would race the test runner's tick scheduling.
+        vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+        try {
+            const container = document.createElement("div");
+            const opts = defaultMounts();
+            // Sample 1: 1MB at t=1_000_000ms.
+            opts._fakePc._fakeStatsReport = new Map([
+                [
+                    "outbound-rtp-video",
+                    {
+                        type: "outbound-rtp",
+                        kind: "video",
+                        bytesSent: 1_000_000,
+                        timestamp: 1_000_000,
+                    },
+                ],
+                [
+                    "remote-inbound-rtp-video",
+                    {
+                        type: "remote-inbound-rtp",
+                        kind: "video",
+                        roundTripTime: 0.05,
+                        packetsLost: 0,
+                    },
+                ],
+            ]);
+            const handle = mountStreamPanel(container, opts);
+            container.querySelector(".stream-go-live").click();
+            // The Go Live click chain awaits multiple promises before
+            // landing in live. Pump microtasks until the panel is in
+            // live phase + the synchronous first pollStats() resolved
+            // (latency cell rewritten to '50 ms' from the template's
+            // '78 ms' default).
+            for (let i = 0; i < 200 && handle.getState() !== "live"; i++) {
+                await Promise.resolve();
+            }
+            for (
+                let i = 0;
+                i < 200 &&
+                container.querySelector('[data-metric="latency"]').textContent !==
+                    "50 ms";
+                i++
+            ) {
+                await Promise.resolve();
+            }
+            // Sample 2: +1MB at t=+1000ms. With dBytes=1_000_000,
+            // dMs=1000, expected bps = 1_000_000 * 8 * 1000 / 1000 =
+            // 8_000_000 bps = 8.0 Mbps.
+            opts._fakePc._fakeStatsReport.set("outbound-rtp-video", {
+                type: "outbound-rtp",
+                kind: "video",
+                bytesSent: 2_000_000,
+                timestamp: 1_001_000,
+            });
+            // Advance the fake clock to fire the next interval tick;
+            // pollStats then returns a Promise that resolves on
+            // microtask drain.
+            vi.advanceTimersByTime(1000);
+            for (
+                let i = 0;
+                i < 200 &&
+                container.querySelector('[data-metric="bitrate"]').textContent ===
+                    "2.8 Mbps";
+                i++
+            ) {
+                await Promise.resolve();
+            }
+            expect(
+                container.querySelector('[data-metric="bitrate"]').textContent,
+            ).toBe("8.0 Mbps");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("simulateOnly Go Live keeps the mocked metric values (no PC to poll)", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts({ simulateOnly: true });
+        // simulateOnly bypasses createPeerConnection; assert + signal
+        // intent. (And reaching into _fakePc.getStats would be a
+        // misleading test under simulateOnly anyway.)
+        opts.createPeerConnection = vi.fn(() => {
+            throw new Error("simulateOnly should not create a PC");
+        });
+        // simulateOnly also skips /start, so this test would fail if
+        // pollStats fired against a non-existent PC.
+        opts.apiStartStream = vi.fn(async () => {
+            throw new Error("simulateOnly should not call /start");
+        });
+        const handle = mountStreamPanel(container, opts);
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+        // Cells stay at the template's mock literals (the demo's
+        // visible payoff). No PC, no real polling, no cell rewrites.
+        expect(
+            container.querySelector('[data-metric="latency"]').textContent,
+        ).toBe("78 ms");
+        expect(
+            container.querySelector('[data-metric="bitrate"]').textContent,
+        ).toBe("2.8 Mbps");
+        expect(
+            container.querySelector('[data-metric="dropped"]').textContent,
+        ).toBe("0");
     });
 
     it("destroy() removes the settings-updated listener", async () => {

@@ -189,6 +189,9 @@ export function mountStreamPanel(container, options = {}) {
     const pausedRowEl = container.querySelector(".stream-paused-row");
     const metricsGridEl = container.querySelector(".stream-metrics-grid");
     const elapsedEl = container.querySelector('[data-metric="elapsed"]');
+    const latencyEl = container.querySelector('[data-metric="latency"]');
+    const bitrateEl = container.querySelector('[data-metric="bitrate"]');
+    const droppedEl = container.querySelector('[data-metric="dropped"]');
 
     // Mirror the device's display aspect ratio onto the preview wrap so
     // the operator sees actual cropping (object-fit: cover on the video
@@ -236,16 +239,27 @@ export function mountStreamPanel(container, options = {}) {
         message: "",
         // Timestamp of the last 'live' transition (Date.now()). Cleared
         // on stop/error. The metrics-grid Elapsed cell ticks against
-        // this once per second while phase === 'live'. Phase B will
-        // augment with real RTCPeerConnection.getStats() polling for
-        // latency/bitrate/dropped; for A.1 those stay mocked.
+        // this once per second while phase === 'live'. Phase A.2: set
+        // from the server's wall-clock UTC started_at when /start
+        // returns it; falls back to Date.now() under deploy stagger
+        // or simulateOnly.
         startedAt: null,
+        // Last RTCPeerConnection.getStats() sample, used for bitrate
+        // delta calculation (bitrate = bytesSent delta over poll
+        // interval). { bytesSent, timestamp } when populated, null
+        // before the first poll lands. Reset on every non-live phase.
+        // Phase B.1 only polls in non-simulateOnly mode (the simulate
+        // path has no real PC + no real frames; mocks stay).
+        lastStats: null,
     };
 
-    // 1Hz interval handle that drives the Elapsed cell while live.
-    // Lives at module scope so render() can clear/start it from any
-    // phase transition without leaking.
+    // 1Hz interval handles. Lives at module scope so render() can
+    // clear/start them from any phase transition without leaking.
+    // Both timers share the live↔non-live edge: elapsed paints MM:SS
+    // off state.startedAt, stats polls pc.getStats() and rewrites the
+    // latency/bitrate/dropped cells.
     let elapsedTimer = null;
+    let statsTimer = null;
     function formatElapsed(ms) {
         const total = Math.max(0, Math.floor(ms / 1000));
         const m = Math.floor(total / 60);
@@ -255,6 +269,94 @@ export function mountStreamPanel(container, options = {}) {
     function tickElapsed() {
         if (!state.startedAt || !elapsedEl) return;
         elapsedEl.textContent = formatElapsed(Date.now() - state.startedAt);
+    }
+
+    // Phase B.1: extract publisher-side metrics from the live PC's
+    // RTCStats report. The phone is the WebRTC publisher (sending
+    // video to the device's aiortc subscriber), so we read send-side
+    // stats: outbound-rtp for bytesSent, remote-inbound-rtp for
+    // round-trip-time + packetsLost (those come back in receiver
+    // reports), candidate-pair as a RTT fallback when the remote-
+    // inbound-rtp report hasn't arrived yet.
+    //
+    // Polling cadence is 1Hz to match Elapsed and to keep the bitrate
+    // delta meaningful (sub-second deltas amplify jitter). Phase B.2
+    // will augment with /api/stream/status subscriber-side metrics
+    // (frames received, decode latency on the device).
+    //
+    // Single-track assumption: §5.11 v1 publishes one video track + no
+    // audio + no simulcast. The loop's last-write-wins behavior on
+    // multiple outbound-rtp/video entries is safe under that
+    // assumption. If simulcast ever lands, this needs to aggregate
+    // bytesSent across layers.
+    function formatBitrateMbps(bps) {
+        if (!Number.isFinite(bps) || bps < 0) return null;
+        return `${(bps / 1_000_000).toFixed(1)} Mbps`;
+    }
+    async function pollStats() {
+        // simulateOnly + non-live phases bail out before this fires
+        // (statsTimer cleared in render()), so state.pc null here is
+        // a remount race or a teardown mid-tick — silent return is
+        // correct.
+        if (!state.pc || state.phase !== "live") return;
+        let report;
+        try {
+            report = await state.pc.getStats();
+        } catch {
+            // PC closed mid-poll, getStats unsupported, etc. Don't
+            // touch the cells — they keep their last value, which
+            // is fine for a single skipped tick.
+            return;
+        }
+        let bytesSent;
+        let timestamp;
+        let packetsLost;
+        let rttSec;
+        let candidateRttSec;
+        for (const stat of report.values()) {
+            if (stat.type === "outbound-rtp" && stat.kind === "video") {
+                bytesSent = stat.bytesSent;
+                timestamp = stat.timestamp;
+            } else if (stat.type === "remote-inbound-rtp" && stat.kind === "video") {
+                packetsLost = stat.packetsLost;
+                rttSec = stat.roundTripTime;
+            } else if (
+                stat.type === "candidate-pair" &&
+                (stat.nominated === true || stat.selected === true)
+            ) {
+                candidateRttSec = stat.currentRoundTripTime;
+            }
+        }
+        // Latency: prefer the remote-inbound-rtp RTT (end-to-end at
+        // the receiver), fall back to candidate-pair RTT (transport
+        // only, available immediately) when the receiver report
+        // hasn't arrived yet.
+        const rtt = Number.isFinite(rttSec) ? rttSec : candidateRttSec;
+        if (Number.isFinite(rtt) && latencyEl) {
+            latencyEl.textContent = `${Math.round(rtt * 1000)} ms`;
+        }
+        // Dropped: cumulative packetsLost from the receiver. A non-
+        // monotonic value would be a stats glitch; show what we got.
+        if (Number.isFinite(packetsLost) && droppedEl) {
+            droppedEl.textContent = String(packetsLost);
+        }
+        // Bitrate: needs two samples for a delta. First poll caches;
+        // second-and-onward computes (bytesSent_now - bytesSent_prev)
+        // * 8 / (timestamp_now - timestamp_prev) in bps. Stats
+        // timestamps are ms (DOMHighResTimeStamp / Performance.now-
+        // anchored).
+        if (Number.isFinite(bytesSent) && Number.isFinite(timestamp)) {
+            if (state.lastStats) {
+                const dBytes = bytesSent - state.lastStats.bytesSent;
+                const dMs = timestamp - state.lastStats.timestamp;
+                if (dMs > 0 && dBytes >= 0) {
+                    const bps = (dBytes * 8 * 1000) / dMs;
+                    const formatted = formatBitrateMbps(bps);
+                    if (formatted && bitrateEl) bitrateEl.textContent = formatted;
+                }
+            }
+            state.lastStats = { bytesSent, timestamp };
+        }
     }
 
     function setMessage(text) {
@@ -286,21 +388,33 @@ export function mountStreamPanel(container, options = {}) {
         goLiveBtn.disabled =
             phase === "requesting-camera" || phase === "negotiating";
 
-        // Elapsed-timer lifecycle. Starts on the live transition,
-        // stops on any non-live phase. setInterval is 1Hz to match
-        // the seconds-precision the metric cell displays.
+        // Elapsed + stats timer lifecycle. Both 1Hz, both started on
+        // the live transition + cleared on every non-live phase.
+        // simulateOnly's stats timer skips the polling work (no real
+        // PC) but keeps the mock cell values intact as the demo
+        // payoff — render() doesn't reset them on phase=live so they
+        // persist as long as the panel mounts.
         if (phase === "live") {
             if (state.startedAt === null) state.startedAt = Date.now();
             tickElapsed();
             if (elapsedTimer === null) {
                 elapsedTimer = setInterval(tickElapsed, 1000);
             }
+            if (statsTimer === null && !simulateOnly) {
+                pollStats();
+                statsTimer = setInterval(pollStats, 1000);
+            }
         } else {
             if (elapsedTimer !== null) {
                 clearInterval(elapsedTimer);
                 elapsedTimer = null;
             }
+            if (statsTimer !== null) {
+                clearInterval(statsTimer);
+                statsTimer = null;
+            }
             state.startedAt = null;
+            state.lastStats = null;
             if (elapsedEl) elapsedEl.textContent = "00:00";
         }
     }
@@ -594,6 +708,10 @@ export function mountStreamPanel(container, options = {}) {
             if (elapsedTimer !== null) {
                 clearInterval(elapsedTimer);
                 elapsedTimer = null;
+            }
+            if (statsTimer !== null) {
+                clearInterval(statsTimer);
+                statsTimer = null;
             }
             teardownPC();
             container.innerHTML = "";
