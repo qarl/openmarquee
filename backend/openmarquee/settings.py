@@ -362,11 +362,18 @@ class SettingsStorage:
         """
         if not self.path.exists():
             fresh = SystemSettings()
+            updates: dict[str, str] = {}
             if fresh.sign_name.startswith("Sign") and len(fresh.sign_name) > 4:
                 suffix = fresh.sign_name[4:]
-                fresh = fresh.model_copy(
-                    update={"wifi_ssid": f"openMarquee{suffix}"}
-                )
+                updates["wifi_ssid"] = f"openMarquee{suffix}"
+            # Bug B15 (qarl batch 2026-04-29): Tailscale hostname starts
+            # empty, so the first-run UI surfaces a blank field. Pre-fill
+            # with the lowercased sign_name (DNS-safe by construction —
+            # `Sign<3-hex>` matches _TAILSCALE_HOSTNAME_PATTERN). Operator
+            # can still override before enabling the daemon.
+            updates["tailscale_hostname"] = fresh.sign_name.lower()
+            if updates:
+                fresh = fresh.model_copy(update=updates)
             self.save(fresh)
             return fresh
         data = json.loads(self.path.read_text())

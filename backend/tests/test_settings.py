@@ -193,6 +193,19 @@ def test_storage_derives_wifi_ssid_from_sign_name_on_first_load(tmp_path):
     assert loaded.wifi_ssid == f"openMarquee{suffix}"
 
 
+def test_storage_seeds_tailscale_hostname_from_sign_name_on_first_load(tmp_path):
+    """Bug B15 (qarl batch 2026-04-29): the Tailscale hostname field
+    started empty on a fresh device, so the first-run UI surfaced a
+    blank input. SettingsStorage.load() now pre-fills it with the
+    lowercased sign_name (DNS-safe by construction)."""
+    from openmarquee.settings import SettingsStorage
+
+    storage = SettingsStorage(tmp_path / "settings.json")
+    loaded = storage.load()
+    assert loaded.sign_name.startswith("Sign")
+    assert loaded.tailscale_hostname == loaded.sign_name.lower()
+
+
 def test_timezone_accepts_well_formed_iana():
     s = SystemSettings(timezone="America/Los_Angeles")
     assert s.timezone == "America/Los_Angeles"
@@ -316,11 +329,11 @@ def test_tailscale_hostname_rejects_spaces():
 
 
 def test_storage_load_returns_defaults_when_file_absent(tmp_path: Path):
-    # sign_name is minted randomly per device and wifi_ssid derives from
-    # it — compare everything else.
+    # sign_name is minted randomly per device; wifi_ssid + tailscale_hostname
+    # both derive from it (different format each) — compare everything else.
     storage = SettingsStorage(tmp_path / "settings.json")
     loaded = storage.load()
-    skip = {"sign_name", "wifi_ssid"}
+    skip = {"sign_name", "wifi_ssid", "tailscale_hostname"}
     assert loaded.model_dump(exclude=skip) == SystemSettings(
         sign_name="ignored"
     ).model_dump(exclude=skip)
