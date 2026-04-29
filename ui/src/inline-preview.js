@@ -198,7 +198,7 @@ export function mountInlinePreview(container, options) {
         // it here keeps preview and device in sync.
         const timeInto = position - slot.startSec;
         const timeLeft = slot.endSec - position;
-        const ANIMATED = new Set(["fade", "wipe", "slide", "iris", "scroll"]);
+        const ANIMATED = new Set(["fade", "wipe", "slide", "iris", "scroll", "flip"]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
             : 0;
@@ -253,6 +253,36 @@ export function mountInlinePreview(container, options) {
                 ctx.save();
                 ctx.translate(0, canvas.height - oy);
                 drawSlot(timeline[nextIdx]);
+                ctx.restore();
+            } else if (slot.transition === "flip") {
+                // Card-flip: from squishes to center column over [0,
+                // 0.5], then to grows from center column over [0.5,
+                // 1]. 2D approximation of a 3D card-flip; mirrors
+                // playback.py::_flip. Strip-fallback (width<2 = fade)
+                // lives on the server; the preview canvas is always
+                // wider than 1px so the live flip path works here
+                // directly.
+                //
+                // Clear the canvas first because the drawSlot(slot)
+                // call above this transition block painted the full
+                // from-image at (0,0). Without the clear, the squished
+                // card sits on top of the un-squished original instead
+                // of carving silhouette space around it.
+                let scale;
+                let drawTarget;
+                if (progress < 0.5) {
+                    scale = 1 - 2 * progress;
+                    drawTarget = slot;
+                } else {
+                    scale = 2 * progress - 1;
+                    drawTarget = timeline[nextIdx];
+                }
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.save();
+                ctx.translate(canvas.width / 2, 0);
+                ctx.scale(scale, 1);
+                ctx.translate(-canvas.width / 2, 0);
+                drawSlot(drawTarget);
                 ctx.restore();
             }
         }

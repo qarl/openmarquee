@@ -479,6 +479,100 @@ async def test_scroll_transition_emits_split_frames(renderer):
 
 
 @pytest.mark.asyncio
+async def test_flip_transition_emits_squished_frames(renderer):
+    """Flip transition: from-image scaleX-shrinks to a center column,
+    then to-image scaleX-grows from a center column. Mid-transition
+    we should see frames where most of the canvas is BLACK (the cleared
+    PIL Image.new background) with only a center band of color — that's
+    the distinguishing card-flip silhouette no other transition emits."""
+    slide_a, png_a = _make_slide("a", (255, 0, 0))
+    slide_b, png_b = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "flip", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i])
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    width, height = renderer.width, renderer.height
+    pure_red = bytes((255, 0, 0)) * (width * height)
+    pure_blue = bytes((0, 0, 255)) * (width * height)
+    black_pixel = bytes((0, 0, 0))
+
+    def has_black_edges_with_center_color(frame: bytes) -> bool:
+        # Mid-flip: leftmost and rightmost columns should be black
+        # (the un-pasted PIL canvas), with at least one center-column
+        # pixel still red or blue.
+        # Pixel at (x, y) lives at offset (y * width + x) * 3.
+        left_col_black = all(
+            frame[(y * width) * 3 : (y * width) * 3 + 3] == black_pixel
+            for y in range(height)
+        )
+        right_col_black = all(
+            frame[(y * width + width - 1) * 3 : (y * width + width - 1) * 3 + 3]
+            == black_pixel
+            for y in range(height)
+        )
+        center_x = width // 2
+        center_pixel = frame[
+            (0 * width + center_x) * 3 : (0 * width + center_x) * 3 + 3
+        ]
+        return left_col_black and right_col_black and center_pixel != black_pixel
+
+    assert any(f == pure_red for f in rendered), "expected pure-red frames from A"
+    assert any(f == pure_blue for f in rendered), "expected pure-blue frames from B"
+    assert any(has_black_edges_with_center_color(f) for f in rendered), (
+        "expected at least one mid-flip frame with black edges + center color"
+    )
+
+
+@pytest.mark.asyncio
+async def test_flip_transition_falls_back_to_fade_on_narrow_strip(tmp_path):
+    """Strip-graceful: a horizontal scaleX flip on a width=1 panel has
+    no visible motion, so _flip delegates to _fade. Verify by rendering
+    on a 1×8 mock renderer and asserting we see blended (intermediate)
+    frames — fade emits those, raw flip on width=1 would not."""
+    from openmarquee.rendering.mock import MockRenderer
+
+    # 1-wide strip — the WS281x columnar case the spec calls out.
+    strip_renderer = MockRenderer(1, 8, tmp_path / "strip.png")
+    slide_a, _ = _make_slide("a", (255, 0, 0))
+    slide_b, _ = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "flip", "transition_ms": 200, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    # PNGs are sized to the 8x8 helper default — _safe_load_image will
+    # _cover_fit them to 1x8.
+    png_a = _png_bytes(8, 8, (255, 0, 0))
+    png_b = _png_bytes(8, 8, (0, 0, 255))
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(strip_renderer)
+
+    loop = _new_loop(
+        strip_renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i]
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    pure_red_strip = bytes((255, 0, 0)) * 8  # 1×8 = 8 pixels
+    pure_blue_strip = bytes((0, 0, 255)) * 8
+    intermediates = [f for f in rendered if f != pure_red_strip and f != pure_blue_strip]
+    # Fade emits per-pixel-blended frames; raw flip on width=1 emits
+    # only the source columns (no blending), so any intermediate
+    # confirms the fallback happened.
+    assert intermediates, "expected fade-shaped blended frames on the strip fallback"
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

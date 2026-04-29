@@ -319,7 +319,7 @@ class PlaybackLoop:
                 # all the way through the last-to-first wrap so the
                 # inline preview and the device stay consistent.
                 if (
-                    item.transition in ("fade", "wipe", "slide", "iris", "scroll")
+                    item.transition in ("fade", "wipe", "slide", "iris", "scroll", "flip")
                     and item.transition_ms > 0
                     and len(items) > 1
                 ):
@@ -337,6 +337,8 @@ class PlaybackLoop:
                             await self._iris(current_image, next_image, item.transition_ms)
                         elif kind == "scroll":
                             await self._scroll(current_image, next_image, item.transition_ms)
+                        elif kind == "flip":
+                            await self._flip(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -630,6 +632,53 @@ class PlaybackLoop:
             # `offset` rows go to rows [height - offset, height).
             if offset > 0:
                 frame.paste(to_image.crop((0, 0, width, offset)), (0, height - offset))
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _flip(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Card-flip: from_image scaleX-shrinks to a center column over the
+        first half, then to_image scaleX-grows from a center column over
+        the second half. 2D approximation of a 3D card-flip — at small
+        panel sizes the suggestion of "flipping" carries even without
+        perspective.
+
+        Strip-graceful: a horizontal scaleX flip on a width<2 panel has
+        no visible motion (the only column collapses to itself), so we
+        fall back to fade. Per QA's 2026-04-28 transition-palette spec:
+        "flip on a strip is meaningless — fall back to fade."
+        """
+        width, height = from_image.size
+        if width < 2:
+            await self._fade(from_image, to_image, transition_ms)
+            return
+
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            progress = i / n_frames
+            # First half: from_image shrinks 1.0 → 0.0 width.
+            # Second half: to_image grows 0.0 → 1.0 width.
+            if progress < 0.5:
+                scale = 1.0 - 2.0 * progress
+                source = from_image
+            else:
+                scale = 2.0 * progress - 1.0
+                source = to_image
+            new_w = max(1, int(round(width * scale)))
+            # Horizontal squish only — height is preserved so the card
+            # reads as flipping around a vertical axis, not collapsing.
+            resized = source.resize((new_w, height))
+            frame = Image.new("RGB", (width, height))
+            frame.paste(resized, ((width - new_w) // 2, 0))
             self._render_image(frame)
             await self._wait(frame_period)
 
