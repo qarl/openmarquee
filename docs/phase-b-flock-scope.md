@@ -1,173 +1,176 @@
 # Phase B Flock — Scope Notes
 
-Status: **draft, awaiting qarl review**. Written 2026-04-29 by
-jimmy:openmarquee-code from a code archaeology pass on `flock.py`,
-`api_flock.py`, `flock_sync.py`, and `flock.js`. The Phase A
-landmarks below are factual; the Phase B sub-phase decomposition is
-proposed and likely needs adjustment before any commit.
+Status: **partially shipped**. First written 2026-04-29 by
+jimmy:openmarquee-code from a code archaeology pass; updated
+2026-04-29 after the first three sub-phases shipped + QA's framing
+clarified the remaining items against SYSTEM_SPEC §13's canonical
+list. Items below match §13 / QA's framing rather than the original
+draft's speculation.
+
+§13 calls out three Phase B items: **peer health endpoint** +
+**introduction protocol (gossip-on-add)** + **magicDNS auto-
+discovery**. The original draft of this doc proposed a "periodic
+probe consumer" that wasn't in §13; that idea is dropped (peers
+discover each other on-demand via /api/system/info reads at render
+time, not via a periodic backend worker).
 
 ---
 
-## Phase A: where we are
+## Phase A: where we are (factual)
 
 The flock data model and CRUD surface shipped in earlier phases.
 What's live today:
 
 - `FlockPeer` model (`backend/openmarquee/flock.py`) carries
   `id`, `address`, `name`, `sync`, `added_at`, `last_seen_at`. Plus
-  four health fields — `model`, `mode`, `signal`, `uptime` — that
-  are all `None`-default and explicitly flagged as "Populated by
-  Phase B health probes" in the field docstrings.
+  four health fields — `model`, `mode`, `signal`, `uptime`.
 - `api_flock.py` exposes the CRUD surface (`GET / POST / PATCH /
   DELETE /api/flock`), the manifest pull route
   (`/api/flock/manifest`), and the sync ingress endpoints
   (`/api/flock/notify`, `/api/flock/sync-announce`).
 - `flock_sync.py` implements the push-on-change notify path. Pull-
-  on-notify is the receiver semantics. Loop prevention is at the
-  HTTP-layer hook, not in storage.
-- The flock UI (`ui/src/flock.js`) renders the peer grid. For the
-  current device's own card it falls back to module-scoped
-  `SELF_PLACEHOLDER_MODEL = "Pi Zero 2 W"`,
-  `SELF_PLACEHOLDER_SIGNAL = 100`,
-  `SELF_PLACEHOLDER_UPTIME = "up since boot"`. The TODO comment at
-  `ui/src/flock.js:143` reads:
-  > `TODO(phase-b): replace with real reads via the per-peer health
-  > endpoint that'll replace these with /proc/cpuinfo,
-  > /proc/net/wireless, /proc/uptime reads`.
+  on-notify is the receiver semantics.
+- The flock UI (`ui/src/flock.js`) renders the peer grid.
 
-So the data shape exists end-to-end; Phase B is about populating
-it from real sources and propagating between peers.
+## Phase B sub-phases
 
-## What Phase B needs to deliver
+### B.1 — Backend: per-device `/api/system/info` endpoint ✅ SHIPPED
 
-The minimum-viable Phase B is "the flock UI shows real model /
-mode / signal / uptime for every peer, including the current
-device". Decomposing into shippable commits:
+Commit `8e1923e`. Reads `/proc/device-tree/model` (with /proc/cpuinfo
+fallback), `/proc/net/wireless` link-quality column scaled to 0-100,
+`/proc/uptime` two-unit-truncated, and the configured display mode.
+macOS/dev-box fallback returns sentinel values matching the old
+`SELF_PLACEHOLDER_*` constants in flock.js. Source field reports
+`proc` / `fallback` / `mixed` so a partial-success read is
+debuggable from the wire alone.
 
-### B.1 — Backend: per-device `/api/system/info` endpoint
+### B.2 — Frontend: self-card reads `/api/system/info` ✅ SHIPPED
 
-A new local endpoint that reads `/proc/cpuinfo` (model),
-`/proc/net/wireless` (signal), `/proc/uptime` (uptime), and the
-configured display mode (mode = `output_mode-WxH` slug). Returns
-the four values as a Pydantic model. Pure-local read, no flock
-involvement yet.
+Commit `92acb09`. Replaces the `SELF_PLACEHOLDER_*` constants in
+`flock.js` with reads from `/api/system/info`. The self-card stats
+row now ticks against /proc-driven values on real hardware. The
+bespoke `output_mode → slug` derivation in render() is gone — the
+backend's `_format_mode` now owns the slug shape, fixing a pre-
+existing inconsistency where the UI emitted "ws2812-strip" while
+the backend used "ws281x-strip". Mount-time-gap and failure-path
+fallbacks preserved via parameter defaults on `selfCardHTML`.
 
-This is the data SOURCE — once it exists, the local UI can use it
-for the self-card (replacing `SELF_PLACEHOLDER_*` in `flock.js`),
-and the flock probe consumer (B.3) has something to fetch from
-each peer.
+### gossip-on-add — Introduction protocol per §13 ✅ SHIPPED
 
-Decision points needing qarl input:
-- Does `mode` belong on `/api/system/info` or on `/api/settings`
-  (where `display_width` / `display_height` already live)? Probably
-  the former — the flock card cares about the device-as-peer view,
-  not the operator-edit view.
-- macOS / dev-laptop fallback: `/proc/*` files don't exist outside
-  Linux. What does `/api/system/info` return when `Path('/proc')`
-  is missing? Probably hardcoded sentinel values matching the
-  current `SELF_PLACEHOLDER_*`, gated on `os.uname().sysname`.
+Commit `a05184b`. Closes §13's "Peer introduction (gossip on add)"
+verbatim: when peer B is added to A's flock, A reciprocally hello-
+pings B (so B adds A) AND notifies existing peers C/D/E (so each
+adds B). Full-mesh after settling — operator only has to "Add
+Peer" on one device.
 
-### B.2 — Frontend: self-card reads `/api/system/info`
+Implementation:
+- `POST /api/flock/hello` accepts `{address: string}`. Idempotent;
+  does NOT 403 unknown senders (the entire point of an introduction
+  protocol is bootstrap). Does NOT cascade — the loop-prevention
+  invariant.
+- `FlockSync.gossip_add(new_peer_address)` fans out via httpx, one
+  POST per existing peer + one to the new peer. Per-peer failures
+  swallowed via `asyncio.gather(return_exceptions=True)` — eventual-
+  consistency model handles dropouts.
+- Membership gossip is intentionally NOT gated by
+  `flock_sync_enabled` — flock membership is a property of the
+  flock, not of content sync.
 
-Replace the three `SELF_PLACEHOLDER_*` constants in `flock.js` with
-a `fetchSystemInfo()` call on mount. Same pattern as
-`refreshPreviewAspect` in `stream-panel.js`: fetch on mount, cache
-the result, render against it. No periodic refresh needed for the
-self-card — uptime ticks slowly enough that a once-per-mount read
-is fine.
+### B.3 — Out-of-sync diff (PENDING qarl input)
 
-Decision points needing qarl input:
-- Mount-time fetch is fire-and-forget; shows the placeholder values
-  until the fetch lands. Acceptable, or should the cells render
-  em-dashes until the fetch completes? (The earlier flock self-card
-  conversation explicitly chose placeholders over em-dashes for
-  Phase A — same choice probably applies here.)
-
-### B.3 — Backend: flock probe consumer
-
-A periodic worker that hits each peer's `/api/system/info` (using
-the existing `address` field as the host part of the URL) and
-writes the result back into the local flock storage's per-peer
-`model` / `mode` / `signal` / `uptime` fields. Plus stamps
-`last_seen_at` on success.
-
-Cadence: probably 30 seconds (matches the current `last_seen_at`
-freshness window the UI uses for online/offline rendering).
-Concurrency: aiohttp fan-out across peers, bounded by a small
-semaphore so a flock of 50+ doesn't thundering-herd Tailscale.
+QA's framing: surface "N items behind" on each peer card so the
+operator sees content drift at a glance. The flock.js comment at
+line 111 anchors this:
+> Phase B layers on "out-of-sync N items behind" once we have a
+> real comparison.
 
 Decision points needing qarl input:
-- Probe failure: stamp `last_seen_at = None` on N consecutive
-  failures? Leave the last-known values in place when the peer
-  goes offline, or null them out on first failure?
-- Backoff: linear, exponential, or just-keep-trying-at-30s?
-- Where does the worker live? `flock_sync.py` already has the push
-  worker shape; could co-locate. Or new `flock_health.py` module.
-- Is the probe also the `last_seen_at` source, or is that still
-  driven by `flock_sync.py`'s notify ingress? (Today nothing
-  populates `last_seen_at` automatically — the demo mock-backend
-  stamps it at GET-time per the `/api/flock` handler.)
 
-### B.4 — Frontend: out-of-sync indicator
+- **Source of truth for the diff**: cached manifest (populated by
+  the existing pull worker in flock_sync.py:299) vs probe-on-demand
+  during render. The pull-worker path is faster but stale-bound by
+  the pull cadence; the probe-on-demand path is fresh but adds
+  latency to the flock UI's render. (Cached is the right answer
+  for §13's "no central coordinator, no distributed-state
+  machinery" framing — a render-time probe IS distributed state.)
+- **Display granularity**: integer items-behind count vs
+  minutes-since-last-sync vs a binary in-sync/out-of-sync pill.
+  Design probably has an opinion (chat2.md may have framed it; QA's
+  earlier reports may reference it).
+- **Hash shape on the manifest endpoint**: the existing
+  `/api/flock/manifest` returns full content lists. For diff
+  computation the local device hashes both sides (its own + the
+  peer's cached manifest) and compares. Roll out depends on whether
+  the manifest endpoint needs to grow a `content_set_hash` field
+  for cheap-comparison or whether full-list-hash-on-the-fly is
+  acceptable for flocks of <50 items.
 
-The earlier flock UI conversation referenced a "sync paused" state
-and an out-of-sync count. The flock.js comment at line 111 reads:
-> `Phase B layers on "out-of-sync N items behind" once we have a
-> real comparison`.
+Could ship as: a `/api/flock/{peer_id}/diff` endpoint that returns
+`{items_behind: int}` computed against the cached manifest +
+local content storage. UI consumes it on render. Renders "N items
+behind" badge on peer cards when nonzero.
 
-Likely shape: peer's manifest carries a content-set hash + count;
-local device compares against its own; the UI surfaces the delta
-on the peer card. Touches `flock_sync.py` (manifest shape extension),
-`api_flock.py` (manifest endpoint augmentation), and `flock.js`
-(rendering).
+### B.5 — Tailscale magicDNS auto-discovery (PENDING qarl input) {#b5}
 
-Decision points needing qarl input:
-- Manifest hash shape: rolling content-set hash, per-item ETag
-  list, or last-modified timestamp? Existing manifest endpoint
-  shape would need to grow.
-- Where does the indicator render? Subtitle on the peer card, or a
-  badge alongside the sync-state pill?
-
-### B.5 — Live updates (optional)
-
-The flock UI today re-fetches `/api/flock` on mount + on user
-actions (add / remove). Phase A behavior. Phase B could push
-updates from the backend (server-sent events or polling) so a
-peer's signal / uptime / out-of-sync count refreshes in place
-without an operator action.
+§13's third Phase B item. Today's UX: operator manually types the
+peer's tailnet address into the "Add Peer" modal. Phase B can
+auto-suggest peers from the local Tailscale node's `peers` list
+(via `tailscale status --json`).
 
 Decision points needing qarl input:
-- Is this scope-creep for Phase B, or in-scope? The current UI
-  surface is acceptable without it — the self-card + per-peer
-  probe results that are 30s-stale match the operator's mental
-  model of "this is the flock state right now".
+
+- **Shell-out vs Tailscale Local API**: `tailscale status --json`
+  is the easy path but requires the binary to be in $PATH and
+  privileges to query. The Local API at `/var/run/tailscale/
+  tailscaled.sock` is more robust but needs Unix-socket plumbing
+  through aiohttp (or httpx-uds).
+- **Filtering**: not every tailnet peer is an openMarquee device.
+  Probe each candidate's `/api/system/info` (or a marker endpoint
+  like `/api/system/_is_openmarquee`) before adding to the
+  suggestions list?
+- **UX**: list suggestions inline in the Add Peer modal, or a
+  separate "Discover" affordance? Real-time refresh, or one-shot
+  on modal open?
+- **Dev-box fallback**: same shape as `/api/system/info` —
+  return empty suggestions on macOS / dev where Tailscale isn't
+  installed, fall through to the manual-typed path that exists
+  today.
+
+Could ship as: a `GET /api/flock/discover` endpoint that returns
+`{candidates: [{address, hostname, is_openmarquee}, ...]}`. The
+Add Peer modal calls it on open and renders the list inline.
 
 ---
 
-## Suggested ordering
+## What's been dropped
 
-1. B.1 (backend `/api/system/info`) — small, no dependencies,
-   shippable solo. Doesn't change the flock UI.
-2. B.2 (frontend self-card) — depends on B.1, demo-visible win.
-3. B.3 (probe consumer) — depends on B.1. Bigger scope; needs the
-   most qarl input on the failure/backoff/cadence questions.
-4. B.4 (out-of-sync indicator) — depends on B.3 conceptually but
-   can be its own commit.
-5. B.5 (live updates) — defer until after B.4 if at all.
+- **Periodic probe consumer (original B.3 in this doc's first
+  draft)**. Not in §13. The flock self-card discovers /api/system/
+  info on-demand at render; cross-peer health is via the existing
+  `pull_from_peer` worker for content sync + the operator's manual
+  "view this peer's flock card" UX. A separate periodic /info
+  probe worker would duplicate effort — dropped.
+- **Live updates (original B.5 in this doc's first draft)**. SSE
+  / polling on the flock panel for live signal/uptime updates.
+  Out of scope; the flock panel re-renders on operator action and
+  on the existing 30s refresh cycle, which is fast enough for the
+  operator's mental model of "this is the flock state right now".
 
-B.1 + B.2 together would close the SELF_PLACEHOLDER TODO in
-flock.js without needing any of the harder decisions in B.3+.
-That's the smallest visible improvement, and a clean stopping
-point if qarl wants to gate the rest of Phase B on real hardware
-(B.3 only meaningfully exercises against multiple peers on a
-Tailnet — Phase 6 hardware bring-up).
+---
+
+## Suggested ordering (remaining)
+
+- **B.3 out-of-sync diff** — QA explicitly named this; design
+  intent visible in flock.js comments. Likely the next ship if
+  qarl resolves the cached-vs-probe-on-demand question.
+- **B.5 magicDNS auto-discovery** — bigger scope, Tailscale-binary-
+  dependent, hardware-bringup-blocking. Defer until after Phase 6
+  hardware comes up so it can be exercised end-to-end against a
+  real Tailnet.
 
 ## Where this doc lives
 
-`docs/phase-b-flock-scope.md`. The directory README lists planned
-docs (hardware, dev-setup, architecture, building-the-image) but
-explicitly says "as we write them"; a phase-scope sketch fits.
-
-If qarl's preference is to keep planning docs in a separate
-location (or out of the repo entirely), feel free to relocate or
-delete — this is a decision-point dump, not a contract.
+`docs/phase-b-flock-scope.md`. Updated alongside major Phase B
+commits. If qarl prefers planning docs out of the repo entirely,
+feel free to relocate or delete — this is a working artifact, not
+a contract.
