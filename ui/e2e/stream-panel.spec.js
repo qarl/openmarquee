@@ -78,10 +78,18 @@ test("Stream nav route shows the panel with Go Live button", async ({ page }) =>
         /active/,
     );
 
-    await expect(page.locator(".stream h1")).toHaveText("Stream");
+    await expect(page.locator(".stream-header-title")).toHaveText("Stream");
     await expect(page.locator(".stream-go-live")).toBeVisible();
     await expect(page.locator(".stream-stop")).toBeHidden();
-    await expect(page.locator(".stream-warning")).toBeHidden();
+    // 2026-04-29 redesign: tailscale-foreground warning + camera-flip
+    // button removed from the panel template. LIVE pill + metrics grid
+    // only surface in the live phase. Idle-only paused-playlist row is
+    // visible.
+    await expect(page.locator(".stream-warning")).toHaveCount(0);
+    await expect(page.locator(".stream-flip-camera")).toHaveCount(0);
+    await expect(page.locator(".stream-live-pill")).toBeHidden();
+    await expect(page.locator(".stream-metrics-grid")).toBeHidden();
+    await expect(page.locator(".stream-paused-row")).toBeVisible();
 });
 
 test("Go Live → Stop cycle flips through live and back to idle", async ({
@@ -123,18 +131,22 @@ test("Go Live → Stop cycle flips through live and back to idle", async ({
     await expect(page.locator('.panel[data-section="stream"]')).toBeVisible();
 
     await page.locator(".stream-go-live").click();
-    // Live state surfaces three things at once: Stop button visible,
-    // Go Live hidden, warning banner visible. Verify all three.
+    // Live state surfaces: Stop button visible, Go live hidden,
+    // LIVE pill on the viewfinder visible, 4-cell metrics grid below
+    // the viewfinder visible, idle-only paused-playlist row hidden.
     await expect(page.locator(".stream-stop")).toBeVisible();
     await expect(page.locator(".stream-go-live")).toBeHidden();
-    await expect(page.locator(".stream-warning")).toBeVisible();
-    await expect(page.locator(".stream-flip-camera")).toBeVisible();
+    await expect(page.locator(".stream-live-pill")).toBeVisible();
+    await expect(page.locator(".stream-metrics-grid")).toBeVisible();
+    await expect(page.locator(".stream-paused-row")).toBeHidden();
     await expect(page.locator(".stream-status")).toContainText("Live");
 
     await page.locator(".stream-stop").click();
     await expect(page.locator(".stream-go-live")).toBeVisible();
     await expect(page.locator(".stream-stop")).toBeHidden();
-    await expect(page.locator(".stream-warning")).toBeHidden();
+    await expect(page.locator(".stream-live-pill")).toBeHidden();
+    await expect(page.locator(".stream-metrics-grid")).toBeHidden();
+    await expect(page.locator(".stream-paused-row")).toBeVisible();
 });
 
 test("active session at /status surfaces Take over UI without opening camera", async ({

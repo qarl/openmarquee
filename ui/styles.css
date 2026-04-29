@@ -3171,38 +3171,171 @@ html, body { margin: 0; padding: 0; height: 100%; }
     font-size: 0.9rem;
 }
 
-/* Tailscale-foreground warning — visible only while live. iOS / Android
-   kill background VPNs aggressively, so a phone whose Tailscale drops
-   while the user app-switches will silently lose the connection. */
-.stream-warning {
-    background: color-mix(in oklab, var(--om-accent, gold) 10%, transparent);
-    border: 1px solid var(--om-accent, gold);
-    border-radius: var(--om-radius, 0.5rem);
-    padding: 0.6rem 0.85rem;
-    font-size: 0.85rem;
-    color: var(--om-text, var(--text));
-    line-height: 1.45;
-}
-.stream-warning strong {
-    display: block;
-    margin-bottom: 0.15rem;
-}
-
-.stream-controls {
+/* Unified StreamHeader: eyebrow + title + variable action button. The
+   action slot stays put across modes (Go live -> Stop -> Take over) so
+   the operator's eye doesn't have to chase. Per the 2026-04-29 design
+   handoff (variant A + E + chat2.md unification). */
+.stream-header {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.6rem;
-    align-items: center;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 1rem;
+    margin-bottom: 14px;
 }
-.stream-go-live,
+.stream-header-text {
+    min-width: 0;
+}
+.stream-header-eyebrow {
+    display: block;
+    font-family: var(--om-mono, monospace);
+    font-size: 10.5px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--om-text-fade, var(--muted));
+    margin-bottom: 4px;
+}
+.stream-header-title {
+    margin: 0;
+    font-family: var(--om-sans, inherit);
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--om-text, var(--text));
+}
+.stream-header-blurb {
+    margin: 4px 0 0;
+    color: var(--om-text-dim, var(--muted));
+    font-size: 13px;
+    max-width: 56ch;
+}
+.stream-header-action {
+    flex-shrink: 0;
+}
+.stream-header-action .om-btn {
+    height: 44px;
+    padding: 0 22px;
+    gap: 8px;
+}
+/* Go live primary action: small dark dot left of label (8x8, against
+   the orange button bg the dot reads as a recessed indicator). */
+.stream-go-live-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: #1a0f00;
+}
+/* Stop button: red-tinted destructive variant. Square indicator
+   instead of a dot, matching the 'stop' shape the operator sees on
+   any standard transport control. */
+.stream-stop {
+    background: rgba(255, 90, 107, 0.16);
+    color: var(--om-bad, #ff5a6b);
+    border: 1px solid rgba(255, 90, 107, 0.35);
+}
+.stream-stop-square {
+    width: 10px;
+    height: 10px;
+    background: var(--om-bad, #ff5a6b);
+}
+/* Take over button: same red-destructive styling as Stop — taking over
+   another publisher's session is destructive-to-them. (Reversible
+   default: if QA wants this in a darker orange instead, it's a one-
+   line color swap.) */
 .stream-take-over {
-    /* Make the primary live-action button visually weighty — it's the
-       one the operator hits the most. */
-    min-width: 8rem;
+    background: rgba(255, 90, 107, 0.16);
+    color: var(--om-bad, #ff5a6b);
+    border: 1px solid rgba(255, 90, 107, 0.35);
 }
 .stream-go-live[disabled] {
     opacity: 0.6;
     cursor: progress;
+}
+
+/* LIVE pill — top-left of the viewfinder while broadcasting. Orange
+   (var(--om-accent)) per qarl's iteration ('no REC - instead make that
+   an orange LIVE'). The pulsing dot reuses the existing @keyframes
+   om-pulse defined near the flock indicator block. */
+.stream-live-pill {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: rgba(255, 180, 60, 0.2);
+    border: 1px solid rgba(255, 180, 60, 0.55);
+    border-radius: 4px;
+    font-family: var(--om-mono, monospace);
+    font-size: 11px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: #ffd690;
+}
+.stream-live-pill-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--om-accent, gold);
+    box-shadow: 0 0 6px var(--om-accent-glow, rgba(255, 180, 60, 0.5));
+    /* Reuses the existing @keyframes om-pulse (declared near the
+       flock indicator block ~line 2465) — opacity 1->0.35->1, scale
+       1->0.7->1. Timing-function override (ease-in-out vs the flock's
+       implicit default) is local to this animation property. */
+    animation: om-pulse 1.4s ease-in-out infinite;
+}
+
+/* Idle-only paused-playlist row. Sits under the viewfinder so the
+   operator sees what's currently playing on the sign before they
+   take over the screen. */
+.stream-paused-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: var(--om-surface-2, var(--panel));
+    border: 1px solid var(--om-line, var(--panel-border));
+    border-radius: 10px;
+    font-size: 12.5px;
+    color: var(--om-text-dim, var(--muted));
+}
+.stream-paused-row-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--om-text-fade, var(--muted));
+}
+.stream-paused-row-name {
+    color: var(--om-text, var(--text));
+}
+
+/* Live-only metrics grid — 4 cells across (Elapsed / Latency / Bitrate
+   / Dropped). Phase A.1 mocks Latency/Bitrate/Dropped; Elapsed ticks
+   real against state.startedAt at 1Hz. Phase B will wire all four. */
+.stream-metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-top: 14px;
+}
+.stream-metric-cell {
+    padding: 12px 14px;
+    background: var(--om-surface-2, var(--panel));
+    border: 1px solid var(--om-line, var(--panel-border));
+    border-radius: 10px;
+}
+.stream-metric-label {
+    font-size: 10.5px;
+    font-family: var(--om-mono, monospace);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--om-text-fade, var(--muted));
+}
+.stream-metric-value {
+    font-size: 16px;
+    font-family: var(--om-mono, monospace);
+    margin-top: 4px;
+    color: var(--om-text, var(--text));
 }
 
 

@@ -129,14 +129,24 @@ function defaultMounts(overrides = {}) {
 // --- Tests --------------------------------------------------------------
 
 describe("mountStreamPanel", () => {
-    it("renders Go Live in idle, Stop hidden, warning hidden", () => {
+    it("renders Go live in idle: action button visible, LIVE pill + metrics + Stop hidden", () => {
         const container = document.createElement("div");
         const opts = defaultMounts();
         const handle = mountStreamPanel(container, opts);
 
         expect(container.querySelector(".stream-go-live").hidden).toBe(false);
         expect(container.querySelector(".stream-stop").hidden).toBe(true);
-        expect(container.querySelector(".stream-warning").hidden).toBe(true);
+        // 2026-04-29 redesign: tailscale-foreground warning + camera-flip
+        // button removed from the panel template (defaulted decisions —
+        // see SECTION_TEMPLATE comment block). Lock the absence in so
+        // an accidental re-add surfaces here.
+        expect(container.querySelector(".stream-warning")).toBeNull();
+        expect(container.querySelector(".stream-flip-camera")).toBeNull();
+        // LIVE pill + metrics grid only show in the live phase.
+        expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
+        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
+        // Idle-only paused-playlist hint is visible.
+        expect(container.querySelector(".stream-paused-row").hidden).toBe(false);
         expect(handle.getState()).toBe("idle");
     });
 
@@ -155,10 +165,13 @@ describe("mountStreamPanel", () => {
         expect(constraints.video.facingMode).toBe("environment");
         expect(constraints.audio).toBe(false);
         expect(opts.apiStartStream).toHaveBeenCalledTimes(1);
-        // Live state: warning + stop visible, go-live hidden.
+        // Live state: Stop visible, Go live hidden, LIVE pill +
+        // metrics grid visible, idle-only paused-playlist row hidden.
         expect(container.querySelector(".stream-stop").hidden).toBe(false);
         expect(container.querySelector(".stream-go-live").hidden).toBe(true);
-        expect(container.querySelector(".stream-warning").hidden).toBe(false);
+        expect(container.querySelector(".stream-live-pill").hidden).toBe(false);
+        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(false);
+        expect(container.querySelector(".stream-paused-row").hidden).toBe(true);
     });
 
     it("Stop → idle: posts session_id, returns to idle, stops local tracks", async () => {
@@ -320,36 +333,22 @@ describe("mountStreamPanel", () => {
         expect(opts.apiTakeoverStream).not.toHaveBeenCalled();
     });
 
-    it("Flip Camera replaces the track without renegotiating SDP", async () => {
+    it("camera-flip affordance is removed from the panel template (2026-04-29 redesign)", async () => {
+        // The redesign defers source-switching until after Stop —
+        // qarl's iteration in chat2.md dropped the camera picker and
+        // settings buttons, leaving the live HUD uncluttered. Anyone
+        // re-adding mid-stream camera switching needs to pair it with
+        // a design conversation; this test surfaces the regression.
         const container = document.createElement("div");
-        // Two distinct fake streams so we can watch the track swap.
-        const firstStream = makeFakeStream();
-        const secondStream = makeFakeStream();
-        const opts = defaultMounts({
-            getUserMedia: vi
-                .fn()
-                .mockResolvedValueOnce(firstStream)
-                .mockResolvedValueOnce(secondStream),
-        });
+        const opts = defaultMounts();
         const handle = mountStreamPanel(container, opts);
 
         container.querySelector(".stream-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
-        const senderBefore = opts._fakePc.getSenders()[0];
-        const trackBefore = senderBefore.track;
-
-        container.querySelector(".stream-flip-camera").click();
-        await waitFor(() => senderBefore.track !== trackBefore);
-
-        // facingMode flipped to "user" on the second getUserMedia call.
-        expect(opts.getUserMedia.mock.calls[1][0].video.facingMode).toBe("user");
-        // PC was NOT torn down — the same instance, same sender.
-        expect(opts._fakePc.closed).toBe(false);
-        expect(opts.apiStartStream).toHaveBeenCalledTimes(1);
-        // First stream's tracks were stopped so the camera light goes
-        // out on the previous lens.
-        expect(firstStream.getVideoTracks()[0].stopped).toBe(true);
+        // No flip button anywhere in the panel — neither hidden nor
+        // visible — at any phase.
+        expect(container.querySelector(".stream-flip-camera")).toBeNull();
     });
 
     it("getUserMedia rejection lands in error phase with a message", async () => {
@@ -516,9 +515,9 @@ describe("mountStreamPanel", () => {
         expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
         expect(opts.createPeerConnection).not.toHaveBeenCalled();
         expect(opts.apiStartStream).not.toHaveBeenCalled();
-        // Live state surfaces normally — Stop, flip, warning all visible.
+        // Live state surfaces normally — Stop visible, LIVE pill on the viewfinder.
         expect(container.querySelector(".stream-stop").hidden).toBe(false);
-        expect(container.querySelector(".stream-warning").hidden).toBe(false);
+        expect(container.querySelector(".stream-live-pill").hidden).toBe(false);
     });
 
     it("simulateOnly: Stop returns to idle without calling /api/stream/stop", async () => {

@@ -45,55 +45,97 @@ const DEFAULT_CAPTURE_CONSTRAINTS = {
     audio: false,
 };
 
+// Unified StreamHeader (eyebrow + title + variable action button) +
+// viewfinder + idle-only paused-playlist row + live-only metrics grid.
+// Design reference: design/stream-redesigns-2026-04-29 variants A
+// (idle) + E (live). Per qarl's iteration in chat2.md (2026-04-28),
+// the action button is the only thing that swaps between modes —
+// everything else stays put so the eye doesn't have to chase.
+//
+// Divergences from the prior Phase 12.2 panel (defaulted, not
+// confirmed with qarl yet):
+// 1. Camera flip button dropped — the redesign defers source-
+//    switching until after Stop. Matches qarl's "drop settings for
+//    now" intent and keeps the live HUD uncluttered. Reversible if
+//    the flow turns out to need it.
+// 2. Tailscale-foreground warning dropped — operator-known by now,
+//    and the redesign doesn't depict it. The §5.11 known-limitation
+//    still applies; if QA wants it back, it lands as an inline pill
+//    under the live HUD.
+// 3. Take-over button restyled to red (matches the Stop button's
+//    semantics — it's a destructive-to-the-other-publisher action,
+//    not a primary path).
+// 4. Mocked metrics for latency/bitrate/dropped (Phase A.1 per QA's
+//    handoff). Real-elapsed ticks against state.startedAt. Phase B
+//    will wire RTCPeerConnection.getStats() polling for the rest.
 const SECTION_TEMPLATE = `
     <section class="stream">
-        <div class="om-page-head">
-            <div>
-                <span class="om-eyebrow">Live · phone camera takeover</span>
-                <h1>Stream</h1>
-                <p>
-                    Broadcast your phone's camera live to this device's
-                    screen. The active playlist pauses while you stream
-                    and resumes when you stop.
+        <header class="stream-header">
+            <div class="stream-header-text">
+                <span class="stream-header-eyebrow">Live · this device's camera</span>
+                <h1 class="stream-header-title">Stream</h1>
+                <p class="stream-header-blurb">
+                    Push the camera on this device straight to your sign.
+                    The active playlist pauses while you broadcast and
+                    picks up where it left off.
                 </p>
             </div>
-        </div>
+            <div class="stream-header-action">
+                <button type="button" class="om-btn primary stream-go-live">
+                    <span class="stream-go-live-dot" aria-hidden="true"></span>
+                    Go live
+                </button>
+                <button type="button" class="om-btn stream-stop" hidden>
+                    <span class="stream-stop-square" aria-hidden="true"></span>
+                    Stop
+                </button>
+                <button type="button" class="om-btn stream-take-over" hidden>
+                    Take over
+                </button>
+                <button type="button" class="om-btn ghost stream-cancel-takeover" hidden>
+                    Cancel
+                </button>
+            </div>
+        </header>
 
         <div class="stream-stage">
             <div class="stream-preview-wrap">
                 <video class="stream-preview" autoplay muted playsinline></video>
                 <div class="stream-preview-empty">
-                    Tap <strong>Go Live</strong> to open your camera.
+                    Tap <strong>Go live</strong> to open your camera.
+                </div>
+                <div class="stream-live-pill" hidden>
+                    <span class="stream-live-pill-dot" aria-hidden="true"></span>
+                    LIVE
                 </div>
             </div>
         </div>
 
+        <div class="stream-paused-row" hidden>
+            <span class="stream-paused-row-dot" aria-hidden="true"></span>
+            <span>paused while live · resumes <b class="stream-paused-row-name">the active playlist</b> when you stop</span>
+        </div>
+
+        <div class="stream-metrics-grid" hidden>
+            <div class="stream-metric-cell">
+                <div class="stream-metric-label">Elapsed</div>
+                <div class="stream-metric-value" data-metric="elapsed">00:00</div>
+            </div>
+            <div class="stream-metric-cell">
+                <div class="stream-metric-label">Latency</div>
+                <div class="stream-metric-value" data-metric="latency">78 ms</div>
+            </div>
+            <div class="stream-metric-cell">
+                <div class="stream-metric-label">Bitrate</div>
+                <div class="stream-metric-value" data-metric="bitrate">2.8 Mbps</div>
+            </div>
+            <div class="stream-metric-cell">
+                <div class="stream-metric-label">Dropped</div>
+                <div class="stream-metric-value" data-metric="dropped">0</div>
+            </div>
+        </div>
+
         <div class="stream-status" role="status" aria-live="polite"></div>
-
-        <div class="stream-warning" hidden>
-            <strong>Keep openMarquee in the foreground while streaming.</strong>
-            iOS and Android kill background VPNs aggressively — if
-            Tailscale drops while your phone is locked or app-switched,
-            the stream disconnects and won't reconnect on its own.
-        </div>
-
-        <div class="stream-controls">
-            <button type="button" class="om-btn primary stream-go-live">
-                Go Live
-            </button>
-            <button type="button" class="om-btn stream-stop" hidden>
-                Stop
-            </button>
-            <button type="button" class="om-btn ghost stream-flip-camera" hidden>
-                Flip camera
-            </button>
-            <button type="button" class="om-btn primary stream-take-over" hidden>
-                Take over
-            </button>
-            <button type="button" class="om-btn ghost stream-cancel-takeover" hidden>
-                Cancel
-            </button>
-        </div>
     </section>
 `;
 
@@ -139,12 +181,14 @@ export function mountStreamPanel(container, options = {}) {
     const previewEl = container.querySelector(".stream-preview");
     const previewEmptyEl = container.querySelector(".stream-preview-empty");
     const statusEl = container.querySelector(".stream-status");
-    const warningEl = container.querySelector(".stream-warning");
     const goLiveBtn = container.querySelector(".stream-go-live");
     const stopBtn = container.querySelector(".stream-stop");
-    const flipBtn = container.querySelector(".stream-flip-camera");
     const takeOverBtn = container.querySelector(".stream-take-over");
     const cancelTakeoverBtn = container.querySelector(".stream-cancel-takeover");
+    const livePillEl = container.querySelector(".stream-live-pill");
+    const pausedRowEl = container.querySelector(".stream-paused-row");
+    const metricsGridEl = container.querySelector(".stream-metrics-grid");
+    const elapsedEl = container.querySelector('[data-metric="elapsed"]');
 
     // Mirror the device's display aspect ratio onto the preview wrap so
     // the operator sees actual cropping (object-fit: cover on the video
@@ -187,12 +231,31 @@ export function mountStreamPanel(container, options = {}) {
         localStream: null,
         // Active RTCPeerConnection. Null between sessions.
         pc: null,
-        // "user" | "environment" — toggle target for the camera flip.
-        facing: "environment",
         // User-facing message rendered into .stream-status. Reset when
         // a transition clears it.
         message: "",
+        // Timestamp of the last 'live' transition (Date.now()). Cleared
+        // on stop/error. The metrics-grid Elapsed cell ticks against
+        // this once per second while phase === 'live'. Phase B will
+        // augment with real RTCPeerConnection.getStats() polling for
+        // latency/bitrate/dropped; for A.1 those stay mocked.
+        startedAt: null,
     };
+
+    // 1Hz interval handle that drives the Elapsed cell while live.
+    // Lives at module scope so render() can clear/start it from any
+    // phase transition without leaking.
+    let elapsedTimer = null;
+    function formatElapsed(ms) {
+        const total = Math.max(0, Math.floor(ms / 1000));
+        const m = Math.floor(total / 60);
+        const s = total % 60;
+        return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
+    function tickElapsed() {
+        if (!state.startedAt || !elapsedEl) return;
+        elapsedEl.textContent = formatElapsed(Date.now() - state.startedAt);
+    }
 
     function setMessage(text) {
         state.message = text;
@@ -205,18 +268,41 @@ export function mountStreamPanel(container, options = {}) {
         const phase = state.phase;
         goLiveBtn.hidden = !(phase === "idle" || phase === "error");
         stopBtn.hidden = phase !== "live";
-        flipBtn.hidden = phase !== "live";
         takeOverBtn.hidden = phase !== "take-over-prompt";
         cancelTakeoverBtn.hidden = phase !== "take-over-prompt";
-        warningEl.hidden = phase !== "live";
+
+        // LIVE pill on the viewfinder + metrics grid below it: only
+        // while live. Idle-only paused-playlist hint: only when idle/
+        // error (i.e. not transient + not live).
+        livePillEl.hidden = phase !== "live";
+        metricsGridEl.hidden = phase !== "live";
+        pausedRowEl.hidden = !(phase === "idle" || phase === "error");
 
         // Empty-state cover only when there's no local preview to show.
         previewEmptyEl.hidden = state.localStream !== null;
 
-        // Disable Go Live during transient phases so a double-tap can't
+        // Disable Go live during transient phases so a double-tap can't
         // start two negotiations.
         goLiveBtn.disabled =
             phase === "requesting-camera" || phase === "negotiating";
+
+        // Elapsed-timer lifecycle. Starts on the live transition,
+        // stops on any non-live phase. setInterval is 1Hz to match
+        // the seconds-precision the metric cell displays.
+        if (phase === "live") {
+            if (state.startedAt === null) state.startedAt = Date.now();
+            tickElapsed();
+            if (elapsedTimer === null) {
+                elapsedTimer = setInterval(tickElapsed, 1000);
+            }
+        } else {
+            if (elapsedTimer !== null) {
+                clearInterval(elapsedTimer);
+                elapsedTimer = null;
+            }
+            state.startedAt = null;
+            if (elapsedEl) elapsedEl.textContent = "00:00";
+        }
     }
 
     // --- WebRTC plumbing ---------------------------------------------------
@@ -237,15 +323,24 @@ export function mountStreamPanel(container, options = {}) {
         });
     }
 
-    async function openLocalCamera(facing) {
+    async function openLocalCamera() {
+        // Always opens the back-facing ('environment') camera on
+        // mobile. The redesign drops the in-stream camera-flip
+        // affordance — source-switching is deferred until after Stop
+        // (start a fresh session against a different camera). The
+        // `facingMode: 'environment'` constraint is a soft hint; on
+        // desktops + phones-with-only-one-camera, getUserMedia falls
+        // back to whatever's available.
         const constraints = {
             ...DEFAULT_CAPTURE_CONSTRAINTS,
-            video: { ...DEFAULT_CAPTURE_CONSTRAINTS.video, facingMode: facing },
+            video: {
+                ...DEFAULT_CAPTURE_CONSTRAINTS.video,
+                facingMode: "environment",
+            },
         };
         const stream = await getUserMedia(constraints);
         previewEl.srcObject = stream;
         state.localStream = stream;
-        state.facing = facing;
         return stream;
     }
 
@@ -353,7 +448,7 @@ export function mountStreamPanel(container, options = {}) {
             state.phase = "requesting-camera";
             setMessage("Requesting camera access…");
             render();
-            await openLocalCamera("environment");
+            await openLocalCamera();
 
             state.phase = "negotiating";
             setMessage("Connecting…");
@@ -411,7 +506,7 @@ export function mountStreamPanel(container, options = {}) {
             state.phase = "requesting-camera";
             setMessage("Requesting camera access…");
             render();
-            await openLocalCamera("environment");
+            await openLocalCamera();
 
             state.phase = "negotiating";
             setMessage("Taking over…");
@@ -442,65 +537,6 @@ export function mountStreamPanel(container, options = {}) {
         render();
     }
 
-    async function flipCamera() {
-        // Disable the flip button across the await — without this guard
-        // a rapid double-tap fires two getUserMedia calls and at least
-        // one of the resulting MediaStreams ends up unstopped (camera
-        // light stays on). Re-enable in finally so error paths don't
-        // strand the button.
-        flipBtn.disabled = true;
-        try {
-            const next = state.facing === "environment" ? "user" : "environment";
-            let newStream;
-            try {
-                const constraints = {
-                    ...DEFAULT_CAPTURE_CONSTRAINTS,
-                    video: {
-                        ...DEFAULT_CAPTURE_CONSTRAINTS.video,
-                        facingMode: next,
-                    },
-                };
-                newStream = await getUserMedia(constraints);
-            } catch (err) {
-                // Phones with only one camera throw OverconstrainedError.
-                // Surface it but keep streaming on the existing camera.
-                setMessage(`Couldn't switch cameras: ${err?.message || err}`);
-                return;
-            }
-            const newTrack = newStream.getVideoTracks()[0];
-            if (!newTrack) {
-                setMessage("Couldn't switch cameras: no video track.");
-                return;
-            }
-
-            // replaceTrack swaps the encoded source without renegotiating
-            // — no SDP exchange, no PC teardown. Per §5.11 v1 spec.
-            const sender = state.pc
-                ?.getSenders()
-                .find((s) => s.track && s.track.kind === "video");
-            if (sender) {
-                try {
-                    await sender.replaceTrack(newTrack);
-                } catch (err) {
-                    // Some Safari versions throw on replaceTrack mid-stream.
-                    // Roll back.
-                    for (const t of newStream.getTracks()) t.stop();
-                    setMessage(`Couldn't switch cameras: ${err?.message || err}`);
-                    return;
-                }
-            }
-
-            // Stop the OLD tracks before we drop the reference, otherwise
-            // the camera light stays on.
-            for (const t of state.localStream.getTracks()) t.stop();
-            previewEl.srcObject = newStream;
-            state.localStream = newStream;
-            state.facing = next;
-        } finally {
-            flipBtn.disabled = false;
-        }
-    }
-
     function failTo(err) {
         teardownPC();
         state.sessionId = null;
@@ -516,9 +552,6 @@ export function mountStreamPanel(container, options = {}) {
     });
     stopBtn.addEventListener("click", () => {
         stopLive();
-    });
-    flipBtn.addEventListener("click", () => {
-        flipCamera();
     });
     takeOverBtn.addEventListener("click", () => {
         takeOver();
@@ -548,6 +581,10 @@ export function mountStreamPanel(container, options = {}) {
                 "openmarquee:settings-updated",
                 onSettingsUpdated,
             );
+            if (elapsedTimer !== null) {
+                clearInterval(elapsedTimer);
+                elapsedTimer = null;
+            }
             teardownPC();
             container.innerHTML = "";
         },
