@@ -112,11 +112,23 @@ function isPeerOnline(peer) {
 //   - "sync paused" sync=true && offline (intent on, reality off)
 //   - "standalone" sync=false && online
 //   - "offline"    sync=false && offline
-// Phase B layers on "out-of-sync N items behind" once we have a real
-// content-diff probe.
+// Sync-state pill on the peer card. When sync=True and the peer is
+// reachable, surface the items_behind count in place of the generic
+// 'syncing' label whenever there's a backlog (Phase B.3 — items_behind
+// is populated by the backend's pull_from_peer pre-apply count). When
+// the operator is caught up (items_behind = 0), the pill stays at
+// 'syncing'. items_behind = null means "never pulled" or "sync just
+// flipped on" — display as plain 'syncing' until the first pull
+// lands a real number.
 function syncStatePillForPeer(peer) {
     const online = isPeerOnline(peer);
-    if (peer.sync && online) return { label: "syncing", cls: "good" };
+    if (peer.sync && online) {
+        if (peer.items_behind != null && peer.items_behind > 0) {
+            const noun = peer.items_behind === 1 ? "item" : "items";
+            return { label: `${peer.items_behind} ${noun} behind`, cls: "good" };
+        }
+        return { label: "syncing", cls: "good" };
+    }
     if (peer.sync && !online) return { label: "sync paused", cls: "bad" };
     if (!peer.sync && online) return { label: "standalone", cls: "" };
     return { label: "offline", cls: "bad" };

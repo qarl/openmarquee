@@ -63,6 +63,13 @@ FAKE_PEERS = [
         "mode": "hub75-128x64",
         "signal": 92,
         "uptime": "4d 7h",
+        # Phase B.3: items_behind surfaces in the sync pill as
+        # "K items behind". Lobby is mid-backlog so the demo Flock
+        # tab shows the affordance live; cafeteria is off-sync so
+        # items_behind is meaningless (UI ignores it for sync=False
+        # peers); lab-corner is caught up so the pill stays at
+        # "syncing". Three demo cases at a glance.
+        "items_behind": 3,
     },
     {
         "address": "cafeteria.ts.net",
@@ -72,6 +79,7 @@ FAKE_PEERS = [
         "mode": "hdmi-1080",
         "signal": 76,
         "uptime": "12d 2h",
+        "items_behind": None,  # sync=False → meaningless, UI hides
     },
     {
         "address": "lab-corner.ts.net",
@@ -81,6 +89,7 @@ FAKE_PEERS = [
         "mode": "hub75-64x32",
         "signal": 54,
         "uptime": "2d 18h",
+        "items_behind": 0,  # caught up — pill stays at "syncing"
     },
 ]
 

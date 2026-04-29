@@ -109,6 +109,108 @@ describe("mountFlock", () => {
         expect(stats.textContent.toLowerCase()).toContain("hub75");
     });
 
+    it("peer card surfaces items_behind in the sync pill when backlog > 0 (Phase B.3)", async () => {
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [
+                PEER({
+                    last_seen_at: recent,
+                    sync: true,
+                    items_behind: 3,
+                }),
+            ],
+        });
+        await tick();
+        const pill = container.querySelector(
+            '.om-peer-card[data-peer-id] .om-pill.good',
+        );
+        expect(pill).toBeTruthy();
+        expect(pill.textContent).toBe("3 items behind");
+    });
+
+    it("peer card uses singular noun when items_behind == 1", async () => {
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [PEER({ last_seen_at: recent, sync: true, items_behind: 1 })],
+        });
+        await tick();
+        const pill = container.querySelector(
+            '.om-peer-card[data-peer-id] .om-pill.good',
+        );
+        expect(pill.textContent).toBe("1 item behind");
+    });
+
+    it("peer card pill stays at 'syncing' when caught up (items_behind === 0)", async () => {
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [PEER({ last_seen_at: recent, sync: true, items_behind: 0 })],
+        });
+        await tick();
+        const pill = container.querySelector(
+            '.om-peer-card[data-peer-id] .om-pill.good',
+        );
+        expect(pill.textContent).toBe("syncing");
+    });
+
+    it("peer card pill stays at 'syncing' when items_behind is null (never pulled)", async () => {
+        // First mount + brand-new peer: backend hasn't pulled yet,
+        // so items_behind is null. UI shouldn't claim 'in sync'
+        // (we don't actually know that) — falls back to plain
+        // 'syncing' label.
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [PEER({ last_seen_at: recent, sync: true, items_behind: null })],
+        });
+        await tick();
+        const pill = container.querySelector(
+            '.om-peer-card[data-peer-id] .om-pill.good',
+        );
+        expect(pill.textContent).toBe("syncing");
+    });
+
+    it("sync-paused / offline / standalone pills ignore items_behind", async () => {
+        // items_behind is meaningless when the peer isn't actively
+        // syncing — the operator's read of those states shouldn't
+        // get cluttered by a stale-by-definition number.
+        const recent = new Date(Date.now() - 5_000).toISOString();
+        const container = document.createElement("div");
+        mount(container, {
+            peers: [
+                // sync=True but offline → 'sync paused', items_behind ignored.
+                PEER({
+                    id: "paused",
+                    address: "p.ts.net",
+                    sync: true,
+                    last_seen_at: null,
+                    items_behind: 5,
+                }),
+                // sync=False + online → 'standalone'.
+                PEER({
+                    id: "standalone",
+                    address: "s.ts.net",
+                    sync: false,
+                    last_seen_at: recent,
+                    items_behind: 5,
+                }),
+            ],
+        });
+        await tick();
+        // Scope to .om-peer-actions because .om-peer-head also has
+        // an "offline" pill on un-reachable peers — the sync-state
+        // pill we're testing here is the one in the actions row.
+        const cards = container.querySelectorAll(".om-peer-card[data-peer-id]");
+        expect(
+            cards[0].querySelector(".om-peer-actions .om-pill").textContent,
+        ).toBe("sync paused");
+        expect(
+            cards[1].querySelector(".om-peer-actions .om-pill").textContent,
+        ).toBe("standalone");
+    });
+
     it("self card maps the backend's ws281x-strip slug to its readable label", async () => {
         // Regression for the B.2 BLOCKER subagent caught: backend's
         // /api/system/info emits "ws281x-strip" (matching the
