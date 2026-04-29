@@ -109,10 +109,15 @@ function defaultMounts(overrides = {}) {
         apiStartStream: vi.fn(async () => ({
             session_id: "11111111-1111-1111-1111-111111111111",
             sdp_answer: "v=0\r\nfake-answer\r\n",
+            // Phase A.2: backend stamps wall-clock UTC start time so
+            // the phone's Elapsed counter ticks against the device's
+            // authoritative reference instead of phone-local Date.now.
+            started_at: "2026-04-29T00:00:00+00:00",
         })),
         apiTakeoverStream: vi.fn(async () => ({
             session_id: "22222222-2222-2222-2222-222222222222",
             sdp_answer: "v=0\r\nfake-answer\r\n",
+            started_at: "2026-04-29T00:00:00+00:00",
         })),
         apiStopStream: vi.fn(async () => undefined),
         fetchSettings: vi.fn(async () => ({
@@ -428,6 +433,48 @@ describe("mountStreamPanel", () => {
         );
         expect(opts.fetchSettings).toHaveBeenCalledTimes(2);
         handle.destroy();
+    });
+
+    it("Elapsed cell ticks against the server's started_at, not local Date.now", async () => {
+        // Phase A.2: the backend stamps the session-start timestamp
+        // and returns it in /start (and /status). The phone's Elapsed
+        // counter subtracts that from wall-clock-now, so it's correct
+        // even if the phone's clock is skewed and survives a panel
+        // re-mount mid-stream. Local Date.now() is the deploy-stagger
+        // fallback (server older than client); not exercised here.
+        const container = document.createElement("div");
+        // Server says the session started 65 seconds ago.
+        const serverStartedAt = new Date(Date.now() - 65000).toISOString();
+        const opts = defaultMounts({
+            apiStartStream: vi.fn(async () => ({
+                session_id: "11111111-1111-1111-1111-111111111111",
+                sdp_answer: "v=0\r\nfake-answer\r\n",
+                started_at: serverStartedAt,
+            })),
+        });
+        const handle = mountStreamPanel(container, opts);
+
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        // First render reads state.startedAt and writes the cell.
+        // 65s ago -> the Elapsed cell should read MM:SS where MM>=1
+        // (1:05 +/- a tick of jitter from clock skew between the
+        // mock-time fixture and Date.now). MM:SS=00:00 would mean
+        // the server's started_at was ignored and the local Date.now
+        // path fired — which is exactly the regression this test
+        // pins against.
+        const elapsedEl = container.querySelector('[data-metric="elapsed"]');
+        const text = elapsedEl.textContent;
+        expect(text).toMatch(/^\d\d:\d\d$/);
+        const [mm, ss] = text.split(":").map(Number);
+        const totalSec = mm * 60 + ss;
+        // Tolerance for jitter: 60-75 inclusive. Lower bound catches
+        // the regression (Date.now-fallback path renders 00:00); upper
+        // bound is wide enough to absorb a heavily-loaded CI run
+        // between serverStartedAt capture and the render assertion.
+        expect(totalSec).toBeGreaterThanOrEqual(60);
+        expect(totalSec).toBeLessThanOrEqual(75);
     });
 
     it("destroy() removes the settings-updated listener", async () => {

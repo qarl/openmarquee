@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
@@ -71,6 +72,13 @@ class StreamSession:
     def __init__(self, playback: PlaybackLoop):
         self._playback = playback
         self.id: UUID = uuid4()
+        # Wall-clock timestamp at session creation. The Stream UI's
+        # Elapsed metric ticks against (now - started_at) read off
+        # /api/stream/status, so the value survives a panel re-mount
+        # mid-stream (Phase A.2 — closes the loop on QA's A.2 callout).
+        # UTC explicit so the JSON response is unambiguous; the phone
+        # subtracts wall-clock-now in the same UTC frame.
+        self.started_at: datetime = datetime.now(UTC)
         self._pc = RTCPeerConnection()
         self._consume_task: asyncio.Task | None = None
         self._closed = False
@@ -172,6 +180,18 @@ class StreamManager:
     @property
     def active_session_id(self) -> UUID | None:
         return self._session.id if self.is_active else None
+
+    @property
+    def active_session_started_at(self) -> datetime | None:
+        """Wall-clock timestamp the active session was created.
+
+        Surfaced through /api/stream/status so the publishing phone's
+        Elapsed counter ticks against the device's authoritative start
+        time — survives a panel re-mount and is correct even if the
+        phone's clock is skewed from the device's. None when no
+        session is active.
+        """
+        return self._session.started_at if self.is_active else None
 
     async def start(self, sdp_offer: str) -> tuple[UUID, str]:
         """Negotiate a new session. Returns (session_id, sdp_answer).

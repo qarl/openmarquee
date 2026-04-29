@@ -405,9 +405,19 @@ export function mountStreamPanel(container, options = {}) {
         const offerSdp = pc.localDescription.sdp;
 
         const apiCall = takeover ? apiTakeoverStream : apiStartStream;
-        const { session_id, sdp_answer } = await apiCall(offerSdp);
+        const { session_id, sdp_answer, started_at } = await apiCall(offerSdp);
         await pc.setRemoteDescription({ sdp: sdp_answer, type: "answer" });
         state.sessionId = session_id;
+        // Phase A.2: Elapsed counter ticks against the device's
+        // authoritative session-start timestamp instead of a phone-
+        // local Date.now() — survives a panel re-mount and is correct
+        // even if the phone's clock is skewed from the device's. The
+        // server's started_at lands as an ISO 8601 string; Date.parse
+        // returns epoch ms. Falls through silently to render()'s
+        // local-Date.now() fallback if the server is older than the
+        // client (deploy-staggered).
+        const startedMs = started_at ? Date.parse(started_at) : NaN;
+        if (Number.isFinite(startedMs)) state.startedAt = startedMs;
     }
 
     async function simulateNegotiate() {

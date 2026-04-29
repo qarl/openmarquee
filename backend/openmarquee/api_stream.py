@@ -14,6 +14,7 @@ so /start does the full SDP round trip in a single response. The phone
 hands the answer to its RTCPeerConnection and frames flow.
 """
 
+from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -38,10 +39,17 @@ class StreamStartRequest(BaseModel):
 
 class StreamStartResponse(BaseModel):
     """SDP answer + session id. Phone applies the answer to its
-    RTCPeerConnection and the WebRTC handshake completes."""
+    RTCPeerConnection and the WebRTC handshake completes.
+
+    `started_at` is the wall-clock UTC timestamp the device assigned
+    when the session was created — the phone's Elapsed counter ticks
+    against (now - started_at) so it's correct even if the phone's
+    clock is skewed from the device's, and survives a panel re-mount
+    mid-stream (Phase A.2)."""
 
     session_id: UUID
     sdp_answer: str
+    started_at: datetime
 
 
 class StreamStopRequest(BaseModel):
@@ -69,10 +77,16 @@ class StreamStatus(BaseModel):
     `state == "active"` with a session_id different from the caller's
     means another phone owns the screen — the phone shows the
     "Take over" affordance instead of "Go Live".
+
+    `started_at` is the wall-clock UTC timestamp of the active
+    session's creation, or None when idle. Lets a panel that mounts
+    mid-stream pick up the Elapsed counter from /status without
+    needing to have observed the original /start response (Phase A.2).
     """
 
     state: Literal["idle", "active"]
     session_id: UUID | None
+    started_at: datetime | None
     tier: HardwareTier
 
 
@@ -106,7 +120,11 @@ async def start_stream(
             status_code=400,
             detail=f"stream negotiation failed: {exc}",
         ) from exc
-    return StreamStartResponse(session_id=session_id, sdp_answer=answer)
+    started_at = streams.active_session_started_at
+    assert started_at is not None  # session was just created above
+    return StreamStartResponse(
+        session_id=session_id, sdp_answer=answer, started_at=started_at
+    )
 
 
 @router.post("/stop", status_code=204)
@@ -138,7 +156,11 @@ async def takeover_stream(
             status_code=400,
             detail=f"stream takeover failed: {exc}",
         ) from exc
-    return StreamStartResponse(session_id=session_id, sdp_answer=answer)
+    started_at = streams.active_session_started_at
+    assert started_at is not None  # session was just created above
+    return StreamStartResponse(
+        session_id=session_id, sdp_answer=answer, started_at=started_at
+    )
 
 
 @router.get("/status", response_model=StreamStatus)
@@ -146,5 +168,6 @@ async def stream_status(streams: StreamDep) -> StreamStatus:
     return StreamStatus(
         state="active" if streams.is_active else "idle",
         session_id=streams.active_session_id,
+        started_at=streams.active_session_started_at,
         tier=_BASIC_TIER,
     )

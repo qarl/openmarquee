@@ -93,6 +93,28 @@ def test_status_reports_active_after_start(client: TestClient):
     status = client.get("/api/stream/status").json()
     assert status["state"] == "active"
     assert status["session_id"] == start["session_id"]
+    # Phase A.2: started_at flows through both /start and /status so
+    # the phone's Elapsed counter ticks against the device's
+    # authoritative start time. Both responses report the SAME wall-
+    # clock UTC ISO 8601 timestamp for the same session — a panel
+    # mounting mid-stream off /status sees the original /start time.
+    assert "started_at" in start
+    assert "started_at" in status
+    assert status["started_at"] == start["started_at"]
+    # ISO 8601 UTC: parseable + has timezone marker.
+    from datetime import datetime
+
+    parsed = datetime.fromisoformat(status["started_at"])
+    assert parsed.tzinfo is not None
+
+
+def test_status_started_at_is_none_when_idle(client: TestClient):
+    """Phase A.2: /status returns started_at=null when no session is
+    active, so the phone can distinguish 'no live session' from
+    'live session, just no Elapsed yet'."""
+    body = client.get("/api/stream/status").json()
+    assert body["state"] == "idle"
+    assert body["started_at"] is None
 
 
 def test_second_start_returns_409_with_active_session_id(client: TestClient):
