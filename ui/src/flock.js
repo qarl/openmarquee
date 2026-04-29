@@ -240,7 +240,7 @@ function peerCardHTML(peer) {
                     <span>Sync</span>
                 </label>
                 <button type="button" class="om-btn sm flock-peer-edit"${online ? "" : " disabled"}>Edit</button>
-                <button type="button" class="om-btn ghost sm flock-peer-deflock">Deflock</button>
+                <button type="button" class="om-btn sm flock-peer-deflock">Deflock</button>
             </div>
         </div>
     `;

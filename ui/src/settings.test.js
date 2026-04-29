@@ -57,6 +57,21 @@ describe("mountSettings", () => {
         );
     });
 
+    it("Rescan nearby networks button renders with a visible border", async () => {
+        // Bug B14 (qarl batch 2026-04-29): the button used `om-btn ghost`
+        // which strips the border, making it read as a hint string
+        // rather than a tappable control next to the SSID field.
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const rescanBtn = container.querySelector(".settings-wifi-rescan");
+        expect(rescanBtn).not.toBeNull();
+        expect(rescanBtn.classList.contains("ghost")).toBe(false);
+    });
+
     it("output mode select covers every SYSTEM_SPEC output variant", async () => {
         const container = document.createElement("div");
         mountSettings(container, {

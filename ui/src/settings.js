@@ -149,7 +149,7 @@ const SECTION_TEMPLATE = `
                                 <input type="password" class="om-input field-wifi-station-password" minlength="8" maxlength="63">
                             </label>
                         </div>
-                        <button type="button" class="om-btn ghost sm settings-wifi-rescan field-hint-btn">
+                        <button type="button" class="om-btn sm settings-wifi-rescan field-hint-btn">
                             Rescan nearby networks
                         </button>
                         <p class="field-hint" style="margin: 6px 0 0;">

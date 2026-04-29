@@ -431,6 +431,20 @@ describe("mountFlock", () => {
         );
     });
 
+    it("Deflock button reads as a same-class control as Edit (visible border)", async () => {
+        // Bug B12 (qarl batch 2026-04-29): Deflock used `om-btn ghost`,
+        // which strips the border + background, so it read as a text
+        // label next to Edit's bordered button. Both are om-btn sm
+        // controls now.
+        const container = document.createElement("div");
+        mount(container, { peers: [PEER()] });
+        await tick();
+        const editBtn = container.querySelector(".flock-peer-edit");
+        const deflockBtn = container.querySelector(".flock-peer-deflock");
+        expect(editBtn.classList.contains("ghost")).toBe(false);
+        expect(deflockBtn.classList.contains("ghost")).toBe(false);
+    });
+
     it("Deflock button confirms then calls onDelete", async () => {
         const container = document.createElement("div");
         const onDelete = vi.fn(async () => {});

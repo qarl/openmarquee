@@ -49,8 +49,8 @@ const SECTION_TEMPLATE = `
         <ul class="schedule-rules" role="list" style="list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px;"></ul>
 
         <div class="om-row" style="gap: 8px; flex-wrap: wrap; margin-top: 14px;">
-            <button type="button" class="om-btn ghost sm schedule-enable-all">Enable all</button>
-            <button type="button" class="om-btn ghost sm schedule-disable-all">Disable all</button>
+            <button type="button" class="om-btn sm schedule-enable-all">Enable all</button>
+            <button type="button" class="om-btn sm schedule-disable-all">Disable all</button>
         </div>
 
         <p class="om-save-status schedule-status" role="status" aria-live="polite" data-state="idle"></p>

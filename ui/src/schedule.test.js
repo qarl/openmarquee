@@ -306,6 +306,26 @@ describe("mountSchedule", () => {
         expect(select.value).toBe(stalePlaylistId); // round-trip preserved
     });
 
+    it("Enable/Disable all bulk buttons render with a visible border", async () => {
+        // Bug B13 (qarl batch 2026-04-29): both buttons used
+        // `om-btn ghost`, which strips the border and made them read as
+        // text labels rather than tappable controls.
+        const container = document.createElement("div");
+        mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [],
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
+            }),
+            onSave: vi.fn(),
+            fetchPlaylistChoices: defaultChoices(),
+        });
+        await tick();
+        const enableBtn = container.querySelector(".schedule-enable-all");
+        const disableBtn = container.querySelector(".schedule-disable-all");
+        expect(enableBtn.classList.contains("ghost")).toBe(false);
+        expect(disableBtn.classList.contains("ghost")).toBe(false);
+    });
+
     it("Disable all flips every rule's enabled checkbox off", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {
