@@ -198,7 +198,7 @@ export function mountInlinePreview(container, options) {
         // it here keeps preview and device in sync.
         const timeInto = position - slot.startSec;
         const timeLeft = slot.endSec - position;
-        const ANIMATED = new Set(["fade", "wipe", "slide", "iris"]);
+        const ANIMATED = new Set(["fade", "wipe", "slide", "iris", "scroll"]);
         const fadeSec = ANIMATED.has(slot.transition)
             ? slot.transition_ms / 1000
             : 0;
@@ -239,6 +239,19 @@ export function mountInlinePreview(container, options) {
                 ctx.beginPath();
                 ctx.arc(cx, cy, maxR * progress, 0, Math.PI * 2);
                 ctx.clip();
+                drawSlot(timeline[nextIdx]);
+                ctx.restore();
+            } else if (slot.transition === "scroll") {
+                // Vertical scroll: from-image rolls up off the top,
+                // to-image rolls in from below at the same rate.
+                // Mirrors playback.py::_scroll on the device.
+                const oy = canvas.height * progress;
+                ctx.save();
+                ctx.translate(0, -oy);
+                drawSlot(slot);
+                ctx.restore();
+                ctx.save();
+                ctx.translate(0, canvas.height - oy);
                 drawSlot(timeline[nextIdx]);
                 ctx.restore();
             }

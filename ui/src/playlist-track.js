@@ -30,6 +30,7 @@ const TRANSITION_OPTIONS = [
     { value: "wipe", label: "wipe" },
     { value: "slide", label: "slide" },
     { value: "iris", label: "iris" },
+    { value: "scroll", label: "scroll" },
 ];
 
 function transitionOptionsHTML(selected) {

@@ -436,6 +436,49 @@ async def test_stop_during_fade_returns_promptly(renderer):
 
 
 @pytest.mark.asyncio
+async def test_scroll_transition_emits_split_frames(renderer):
+    """Scroll transition: vertical roll — at progress p, the top
+    (h - p*h) rows of the frame are from_image and the bottom p*h rows
+    are to_image. So a mid-transition frame has BOTH source colors
+    visible at distinct rows, distinguishing scroll from fade (which
+    blends per-pixel and never preserves either pure color mid-way)."""
+    slide_a, png_a = _make_slide("a", (255, 0, 0))
+    slide_b, png_b = _make_slide("b", (0, 0, 255))
+    slide_a = slide_a.model_copy(
+        update={"transition": "scroll", "transition_ms": 300, "duration_ms": 100}
+    )
+    slide_b = slide_b.model_copy(update={"duration_ms": 100})
+    items = [slide_a, slide_b]
+    assets = {slide_a.id: png_a, slide_b.id: png_b}
+    rendered = _track_frames(renderer)
+
+    loop = _new_loop(renderer, fetch_items=lambda: items, read_asset=lambda i: assets[i])
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    # An 8×8 RGB frame is 192 bytes; pixel i lives at offset i*3.
+    width, height = renderer.width, renderer.height
+    pure_red = bytes((255, 0, 0)) * (width * height)
+    pure_blue = bytes((0, 0, 255)) * (width * height)
+
+    def has_split(frame: bytes) -> bool:
+        # Look for at least one fully-red row AND at least one fully-blue
+        # row in the same frame. That's what scroll produces and what
+        # fade/cut never can.
+        red_row = bytes((255, 0, 0)) * width
+        blue_row = bytes((0, 0, 255)) * width
+        rows = [frame[y * width * 3 : (y + 1) * width * 3] for y in range(height)]
+        return red_row in rows and blue_row in rows
+
+    assert any(f == pure_red for f in rendered), "expected pure-red frames from A"
+    assert any(f == pure_blue for f in rendered), "expected pure-blue frames from B"
+    assert any(has_split(f) for f in rendered), (
+        "expected at least one split frame with both pure-red and pure-blue rows"
+    )
+
+
+@pytest.mark.asyncio
 async def test_image_slide_renders_identically_to_text_slide(renderer):
     """The playback engine is type-agnostic — both variants store PNGs and go
     through the same decode → render path. Pin the behavior so future variants

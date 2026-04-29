@@ -278,6 +278,23 @@ def test_playlist_items_round_trip_with_transition_fields(tmp_path: Path):
     assert loaded.items[1].transition == "cut"
 
 
+def test_playlist_item_accepts_scroll_transition(tmp_path: Path):
+    """Regression: a 6th transition added to TextSlide/ImageSlide/VideoSlide
+    Literals must also be accepted by PlaylistItem — the runtime dispatch
+    in playback.py reads the transition off PlaylistItem, not the content
+    slide. Pre-2026-04-28 the two Literals could drift; this locks them."""
+    from openmarquee.playlist import PlaylistItem
+
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    a = uuid4()
+    pl = Playlist(items=[PlaylistItem(item_id=a, transition="scroll", transition_ms=400)])
+    storage.save(pl)
+
+    loaded = storage.load()
+    assert loaded.items[0].transition == "scroll"
+    assert loaded.items[0].transition_ms == 400
+
+
 def test_playlist_item_ids_is_a_derived_view_over_items():
     from openmarquee.playlist import PlaylistItem
 

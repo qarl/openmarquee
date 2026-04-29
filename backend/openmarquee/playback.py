@@ -319,7 +319,7 @@ class PlaybackLoop:
                 # all the way through the last-to-first wrap so the
                 # inline preview and the device stay consistent.
                 if (
-                    item.transition in ("fade", "wipe", "slide", "iris")
+                    item.transition in ("fade", "wipe", "slide", "iris", "scroll")
                     and item.transition_ms > 0
                     and len(items) > 1
                 ):
@@ -335,6 +335,8 @@ class PlaybackLoop:
                             await self._slide(current_image, next_image, item.transition_ms)
                         elif kind == "iris":
                             await self._iris(current_image, next_image, item.transition_ms)
+                        elif kind == "scroll":
+                            await self._scroll(current_image, next_image, item.transition_ms)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -596,6 +598,38 @@ class PlaybackLoop:
                 fill=255,
             )
             frame = Image.composite(to_image, from_image, mask)
+            self._render_image(frame)
+            await self._wait(frame_period)
+
+    async def _scroll(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """Vertical scroll: `from_image` rolls up off the top while
+        `to_image` rolls in from the bottom at the same rate. Reads as
+        a stadium scoreboard advancing rows. Distinct from slide in
+        that the motion is vertical — natural on tall WS281x columns
+        and ticker-style HUB75 strips."""
+        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+        frame_period = (transition_ms / 1000) / n_frames
+        width, height = from_image.size
+        for i in range(1, n_frames + 1):
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return
+            offset = max(0, min(height, int(round(height * i / n_frames))))
+            frame = Image.new("RGB", (width, height))
+            # from_image: shifted up by `offset`, so rows [offset, height)
+            # of the source go to rows [0, height - offset) of the frame.
+            if offset < height:
+                frame.paste(from_image.crop((0, offset, width, height)), (0, 0))
+            # to_image: enters from the bottom edge — its topmost
+            # `offset` rows go to rows [height - offset, height).
+            if offset > 0:
+                frame.paste(to_image.crop((0, 0, width, offset)), (0, height - offset))
             self._render_image(frame)
             await self._wait(frame_period)
 
