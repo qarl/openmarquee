@@ -94,6 +94,44 @@ def test_welcome_png_is_valid_and_at_requested_dimensions():
     assert img.mode == "RGB"
 
 
+def test_text_slide_renders_inside_box(tmp_path):
+    """qarl 2026-04-30 §5.10a: text renders inside the box, not centered
+    on the slide. With a half-width box on the right, the text-bearing
+    pixels should sit on the right half of the canvas — the left half
+    is just background."""
+    from openmarquee.content import TextBox
+    from openmarquee.seed import render_text_slide_png
+
+    box = TextBox(x=0.5, y=0.1, w=0.4, h=0.4)  # top-right quadrant
+    png = render_text_slide_png(
+        "X",
+        100,
+        100,
+        fg="#FFFFFF",
+        bg="#000000",
+        box=box,
+    )
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    pixels = img.load()
+    top_right = top_left = bottom_left = bottom_right = 0
+    for y in range(100):
+        for x in range(100):
+            if pixels[x, y] == (0, 0, 0):
+                continue
+            if x >= 50 and y < 50:
+                top_right += 1
+            elif x < 50 and y < 50:
+                top_left += 1
+            elif x < 50 and y >= 50:
+                bottom_left += 1
+            else:
+                bottom_right += 1
+    assert top_right > top_left + bottom_left + bottom_right, (
+        f"text bled out of box: tr={top_right} tl={top_left} "
+        f"bl={bottom_left} br={bottom_right}"
+    )
+
+
 def test_text_slide_squishes_long_text_horizontally(tmp_path):
     """B7 (qarl batch 2026-04-29): long text should squish horizontally
     to fit, mirroring the UI editor's `fillText(maxWidth)` treatment.

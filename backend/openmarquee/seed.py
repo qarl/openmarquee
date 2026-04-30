@@ -478,14 +478,26 @@ def render_text_slide_png(
     *,
     background_image_path: Path | None = None,
     font_family: str | None = None,
+    box: object | None = None,
 ) -> bytes:
-    """Flatten one centered-text slide to a PNG.
+    """Flatten one text slide to a PNG.
 
     Mirrors what the UI's text-slide editor does client-side — background
-    (solid color OR cover-fit image) + centered text. Long text squishes
-    horizontally to fit (B7, qarl 2026-04-29: "squish-everywhere as the
-    canonical behavior") rather than font-shrinking; matches the canvas
+    (solid color OR cover-fit image) + text rendered inside the slide's
+    `box` region (SYSTEM_SPEC §5.10a). Long text squishes horizontally to
+    fit the box (B7, qarl 2026-04-29: "squish-everywhere as the canonical
+    behavior") rather than font-shrinking; matches the canvas
     `fillText(maxWidth)` treatment in the UI editor's drawTextOnly.
+
+    Font size is anchored to the BOX height (not the slide height) — a
+    half-height box gets half-height text, regardless of the panel's
+    actual pixel dims. Squish target is the box width edge-to-edge (no
+    extra margin — the box itself is the explicit container).
+
+    `box` accepts a TextBox-shaped object (anything with x/y/w/h
+    attributes in [0,1] fractions) or None to default to the full slide
+    {x:0, y:0, w:1, h:1}. Passing the slide's TextBox keeps
+    re-renders consistent with the editor's WYSIWYG view.
 
     `background_image_path` overrides `bg` when provided. `font_family`
     looks up a bundled TTF from `_BUNDLED_FONT_FILES` (matches the UI
@@ -498,29 +510,50 @@ def render_text_slide_png(
     else:
         img = Image.new("RGB", (width, height), bg)
 
+    # Resolve box → pixel rect within the canvas. Defaults to full slide
+    # so legacy callers (tests, internal helpers) don't need to construct
+    # a TextBox to render the same output as before.
+    if box is None:
+        bx, by, bw, bh = 0.0, 0.0, 1.0, 1.0
+    else:
+        bx = float(getattr(box, "x", 0.0))
+        by = float(getattr(box, "y", 0.0))
+        bw = float(getattr(box, "w", 1.0))
+        bh = float(getattr(box, "h", 1.0))
+    px_box_x = int(bx * width)
+    px_box_y = int(by * height)
+    px_box_w = max(1, int(bw * width))
+    px_box_h = max(1, int(bh * height))
+
     draw = ImageDraw.Draw(img)
-    font_size_px = max(12, int(height * 0.4))
+    # Font size anchored to BOX height per §5.10a. Min 12 keeps text
+    # legible even on tiny WS281x strips with a tiny box.
+    font_size_px = max(12, int(px_box_h * 0.4))
     font = _load_text_font(font_family, font_size_px)
     bbox = draw.textbbox((0, 0), text, font=font)
     natural_w = bbox[2] - bbox[0]
     natural_h = bbox[3] - bbox[1]
-    target_w = max(1, int(width * 0.9))
+    # Squish target is box width edge-to-edge (no margin — the box is
+    # the explicit container per §5.10a).
+    target_w = px_box_w
+    box_center_x = px_box_x + px_box_w / 2
+    box_center_y = px_box_y + px_box_h / 2
     if natural_w <= target_w or natural_w <= 0 or natural_h <= 0:
-        # Fits at native scale — draw straight onto the main canvas.
+        # Fits at native scale — draw centered in the box.
         draw.text(
-            ((width - natural_w) / 2 - bbox[0], (height - natural_h) / 2 - bbox[1]),
+            (box_center_x - natural_w / 2 - bbox[0], box_center_y - natural_h / 2 - bbox[1]),
             text,
             fill=fg,
             font=font,
         )
     else:
         # Squish: render at native width on a transparent surface, then
-        # resize horizontally to target_w and composite.
+        # resize horizontally to target_w and composite into the box.
         #
         # The pad keeps antialiased glyph edges from clipping at the
         # bbox boundary. Because the temp surface gets resized BY a
-        # ratio (target_w + pad_post_horiz) / (natural_w + pad_pre_horiz),
-        # a fixed 4px pre-resize pad would shrink to sub-pixel at extreme
+        # ratio (target_w + pad_post*2) / (natural_w + pad_pre*2), a
+        # fixed 4px pre-resize pad would shrink to sub-pixel at extreme
         # compression and reintroduce the very clipping it was meant to
         # prevent. Scale the horizontal pad up pre-resize so it survives
         # to ~4px post-resize.
@@ -537,8 +570,8 @@ def render_text_slide_png(
         squished = temp.resize(
             (target_w + pad_post * 2, natural_h + pad_post * 2), Image.LANCZOS
         )
-        paste_x = (width - squished.width) // 2
-        paste_y = (height - squished.height) // 2
+        paste_x = int(box_center_x - squished.width / 2)
+        paste_y = int(box_center_y - squished.height / 2)
         img.paste(squished, (paste_x, paste_y), squished)
     buf = BytesIO()
     img.save(buf, format="PNG")

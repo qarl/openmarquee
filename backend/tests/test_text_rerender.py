@@ -133,6 +133,55 @@ def test_rerender_returns_zero_on_empty_store(storage: ContentStorage):
     assert rerender_text_slides_for_dims(storage, rotation=0, width=64, height=32) == 0
 
 
+def test_rerender_threads_box_through(storage: ContentStorage):
+    """qarl 2026-04-30 §5.10a: the rerender side-effect must use each
+    slide's box when re-rendering. With a half-width box, the resulting
+    PNG has text-bearing pixels concentrated in the half the box covers,
+    not spread across the slide."""
+    from openmarquee.content import TextBox
+    from openmarquee.content import TextSlide
+
+    slide = TextSlide(
+        name="X",
+        text="X",
+        text_color="#FFFFFF",
+        background_color="#000000",
+        font_size_px=200,
+        duration_ms=3000,
+        box=TextBox(x=0.5, y=0.1, w=0.4, h=0.4),
+    )
+    initial_png = render_text_slide_png(
+        slide.text,
+        100,
+        100,
+        fg=slide.text_color,
+        bg=slide.background_color,
+        box=slide.box,
+    )
+    storage.save_text_slide(slide, initial_png)
+
+    count = rerender_text_slides_for_dims(
+        storage, rotation=0, width=200, height=200
+    )
+    assert count == 1
+    rendered = Image.open(BytesIO(storage.read_asset(slide.id))).convert("RGB")
+    assert rendered.size == (200, 200)
+    pixels = rendered.load()
+    top_right = 0
+    rest = 0
+    for y in range(200):
+        for x in range(200):
+            if pixels[x, y] == (0, 0, 0):
+                continue
+            if x >= 100 and y < 100:
+                top_right += 1
+            else:
+                rest += 1
+    assert top_right > rest, (
+        f"rerender ignored box: top_right={top_right} rest={rest}"
+    )
+
+
 def test_rerender_triggers_horizontal_squish_when_text_overflows_new_width(
     storage: ContentStorage,
 ):

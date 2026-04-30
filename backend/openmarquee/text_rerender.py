@@ -85,6 +85,7 @@ def rerender_text_slides_for_dims(
                 bg=it.background_color,
                 background_image_path=bg_path,
                 font_family=it.font_family,
+                box=it.box,
             )
             storage.save_text_slide(it, png)
             rerendered += 1
