@@ -102,6 +102,13 @@ class TextSlide(BaseModel):
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
+    # Mirror of the storage envelope's `updated_at`. Output-only — populated
+    # by ContentStorage.load() so frontends can cachebust asset URLs against
+    # this stamp (e.g. `?v=${updated_at}`) and pick up the new bytes when
+    # the backend re-renders (settings dim flip, peer-sync, edit-save). The
+    # envelope is the authoritative source; save() ignores any value passed
+    # here and stamps the envelope itself.
+    updated_at: datetime | None = None
 
     @field_validator("text_color", "background_color")
     @classmethod
@@ -165,6 +172,8 @@ class ImageSlide(BaseModel):
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
+    # See TextSlide.updated_at — output-only mirror of the storage envelope.
+    updated_at: datetime | None = None
 
 
 class VideoSlide(BaseModel):
@@ -200,6 +209,8 @@ class VideoSlide(BaseModel):
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
+    # See TextSlide.updated_at — output-only mirror of the storage envelope.
+    updated_at: datetime | None = None
 
 
 # Discriminated union of content variants. Pydantic uses the `type` literal to

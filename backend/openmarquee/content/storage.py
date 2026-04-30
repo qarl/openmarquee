@@ -81,7 +81,10 @@ class ContentStorage:
         envelope = {
             "schema_version": SCHEMA_VERSION,
             "updated_at": stamp.isoformat(),
-            "item": item.model_dump(mode="json"),
+            # Exclude the model's updated_at mirror — the envelope is the
+            # authoritative source. Two stamps for the same fact would
+            # drift the moment someone hand-edits item.json.
+            "item": item.model_dump(mode="json", exclude={"updated_at"}),
         }
         self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
         self._atomic_write_bytes(item_dir / _ASSET_FILENAME, png)
@@ -162,7 +165,23 @@ class ContentStorage:
 
         # TypeAdapter dispatches to the right ContentItem variant based on
         # the `type` literal. Unknown types surface as validation errors.
-        return _CONTENT_ADAPTER.validate_python(data["item"])
+        item = _CONTENT_ADAPTER.validate_python(data["item"])
+        # Populate the output-only updated_at mirror so API consumers can
+        # cachebust asset URLs (`?v=${updated_at}`) and pick up new bytes
+        # after a re-render. Envelope is the authoritative source; falling
+        # back to the file mtime mirrors read_updated_at's pre-flock path.
+        stamp = data.get("updated_at")
+        if stamp is not None:
+            try:
+                parsed = datetime.fromisoformat(stamp)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                item.updated_at = parsed
+            except ValueError:
+                # Malformed envelope stamp — leave the mirror null rather
+                # than crash the load; the next save() rewrites the field.
+                pass
+        return item
 
     def read_asset(self, item_id: UUID) -> bytes:
         """Read the rendered asset bytes for a content item."""

@@ -686,7 +686,7 @@ export function mountInlinePreview(container, options) {
     }
 
     function syncActiveVideo(videoId, slot) {
-        const video = getCachedVideo(videoId);
+        const video = getCachedVideo(videoId, slot && slot.item);
         const offsetInto = position - slot.startSec;
         const isNewActive = activeVideoId !== videoId;
         if (isNewActive) {
@@ -746,7 +746,7 @@ export function mountInlinePreview(container, options) {
     }
 
     function drawVideo(item) {
-        const video = getCachedVideo(item.id);
+        const video = getCachedVideo(item.id, item);
         if (video.readyState < 2 || !video.videoWidth) return;
         const ctx = canvas.getContext("2d");
         const srcW = video.videoWidth;
@@ -768,7 +768,7 @@ export function mountInlinePreview(container, options) {
      * the math, not the look.
      */
     function drawTextOverVideo(item, videoId) {
-        const video = getCachedVideo(videoId);
+        const video = getCachedVideo(videoId, item);
         if (video.readyState < 2 || !video.videoWidth) return;
         const ctx = canvas.getContext("2d");
         const srcW = video.videoWidth;
@@ -807,22 +807,39 @@ export function mountInlinePreview(container, options) {
         if (cached) return cached;
         const img = new Image();
         img.addEventListener("load", () => renderOnce());
-        img.src = `/api/content/${item.id}/asset?v=${refreshVersion}`;
+        // Cachebust uses item.updated_at when present (storage envelope
+        // stamp from the backend) so a re-render bump (settings dim flip
+        // → text_rerender) invalidates the browser cache cleanly. Falls
+        // back to created_at then refreshVersion for older payloads.
+        const v = encodeURIComponent(
+            item.updated_at || item.created_at || refreshVersion,
+        );
+        img.src = `/api/content/${item.id}/asset?v=${v}`;
         imageCache.set(item.id, img);
         return img;
     }
 
-    function getCachedVideo(videoId) {
-        const cached = videoCache.get(videoId);
+    function getCachedVideo(videoId, item) {
+        // Key on videoId + the referencing slide's stamp so two text
+        // slides pointing at the same video bg with differing updated_at
+        // each get their own cache entry — without this, the second
+        // slide would inherit the first slide's pre-bump bytes after a
+        // dim flip rerender. Falls back to refreshVersion when only the
+        // bare videoId is known.
+        const stamp =
+            (item && (item.updated_at || item.created_at)) || refreshVersion;
+        const key = `${videoId}|${stamp}`;
+        const cached = videoCache.get(key);
         if (cached) return cached;
         const video = document.createElement("video");
         video.muted = true;
         video.playsInline = true;
         video.preload = "auto";
-        video.src = `/api/content/${videoId}/video?v=${refreshVersion}`;
+        const v = encodeURIComponent(stamp);
+        video.src = `/api/content/${videoId}/video?v=${v}`;
         video.addEventListener("seeked", () => renderOnce());
         video.addEventListener("loadeddata", () => renderOnce());
-        videoCache.set(videoId, video);
+        videoCache.set(key, video);
         return video;
     }
 

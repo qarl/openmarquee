@@ -89,7 +89,7 @@ export function mountSlideBrowser(container, options) {
             <button type="button" class="slide-browser-tile-action" title="${safeName}">
                 <span class="slide-browser-tile-thumb-wrap">
                     <img class="slide-browser-tile-thumb" alt="" draggable="false"
-                         src="/api/content/${item.id}/asset?v=${refreshVersion}">
+                         src="/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || refreshVersion)}">
                 </span>
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>

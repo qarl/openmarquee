@@ -29,7 +29,10 @@ def test_save_then_load_round_trips_text_slide(tmp_path: Path):
     storage.save_text_slide(slide, png=b"\x89PNG\r\nfake")
 
     loaded = storage.load(slide.id)
-    assert loaded == slide
+    # load() populates updated_at from the envelope (output-only mirror,
+    # added 2026-04-30 for frontend cachebust). Compare ignoring it.
+    assert loaded.model_copy(update={"updated_at": None}) == slide
+    assert loaded.updated_at is not None
 
 
 def test_read_asset_returns_exact_bytes(tmp_path: Path):
@@ -213,7 +216,8 @@ def test_save_and_load_image_round_trip(tmp_path: Path):
 
     loaded = storage.load(image.id)
     assert isinstance(loaded, ImageSlide)
-    assert loaded == image
+    assert loaded.model_copy(update={"updated_at": None}) == image
+    assert loaded.updated_at is not None
     assert storage.read_asset(image.id) == png
 
 
@@ -267,7 +271,8 @@ def test_load_roundtrips_video_slide(tmp_path: Path):
     storage.save_video(video, thumbnail_png=b"\x89PNG", video_bytes=_FAKE_MP4)
     loaded = storage.load(video.id)
     assert isinstance(loaded, VideoSlide)
-    assert loaded == video
+    assert loaded.model_copy(update={"updated_at": None}) == video
+    assert loaded.updated_at is not None
 
 
 def test_save_video_rolls_back_on_partial_failure(tmp_path: Path, monkeypatch):

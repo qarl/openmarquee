@@ -150,6 +150,23 @@ def test_list_content_returns_uploaded_items(client: TestClient):
     assert names == {"A", "B"}
 
 
+def test_list_content_exposes_updated_at_for_cachebust(client: TestClient):
+    """Frontend cachebust path: /api/content/{id}/asset?v={updated_at}.
+    GET /api/content must return each item's storage envelope updated_at
+    so a re-render bump (settings dim flip → text_rerender side-effect)
+    invalidates the browser HTTP cache."""
+    upload = client.post(
+        "/api/content/text-slides", json=_upload_payload(name="A", text="A")
+    )
+    assert upload.status_code == 200
+    response = client.get("/api/content")
+    items = response.json()
+    assert items
+    for item in items:
+        assert "updated_at" in item
+        assert item["updated_at"] is not None
+
+
 # --- GET /api/content/{id} ---
 
 

@@ -524,7 +524,7 @@ function renderTrackBlock(
         </div>
         <div class="track-block-thumb-wrap">
             <img class="track-block-thumb" alt=""
-                 src="/api/content/${item.id}/asset?v=${cacheBust}">
+                 src="/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || cacheBust)}">
             ${lockedBadge}
         </div>
         <div class="track-block-meta">
@@ -559,7 +559,7 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
     li.innerHTML = `
         <div class="pallet-tile-thumb-wrap">
             <img class="pallet-tile-thumb" alt="" draggable="false"
-                 src="/api/content/${item.id}/asset?v=${cacheBust}">
+                 src="/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || cacheBust)}">
             ${lockedBadge}
             <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
             <button type="button" class="pallet-tile-delete"

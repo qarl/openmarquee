@@ -125,6 +125,59 @@ describe("mountSlideBrowser", () => {
         ).toHaveLength(0);
     });
 
+    it("uses the slide's updated_at as the asset cachebust query param (qarl ask 1 followup)", async () => {
+        // Backend re-renders text slides on a settings dim flip and bumps
+        // each slide's envelope updated_at. The tile thumb URL must
+        // include that stamp so the browser HTTP cache invalidates and
+        // refetches new bytes — without it, refreshVersion=0 on the
+        // freshly-remounted browser collides with the pre-flip cache key
+        // and the operator sees stale PNGs.
+        const items = [
+            {
+                id: "tx",
+                name: "Time",
+                type: "text_slide",
+                created_at: "2026-04-30T01:00:00Z",
+                updated_at: "2026-04-30T05:30:00Z",
+            },
+        ];
+        const container = document.createElement("div");
+        mountSlideBrowser(container, {
+            type: "text_slide",
+            fetchItems: async () => items,
+            onSelect: vi.fn(),
+            onCreate: vi.fn(),
+        });
+        await tick();
+        const img = container.querySelector(".slide-browser-tile-thumb");
+        expect(img.getAttribute("src")).toContain(
+            encodeURIComponent("2026-04-30T05:30:00Z"),
+        );
+    });
+
+    it("falls back to created_at when updated_at is missing", async () => {
+        const items = [
+            {
+                id: "tx",
+                name: "Time",
+                type: "text_slide",
+                created_at: "2026-04-21T10:00:00Z",
+            },
+        ];
+        const container = document.createElement("div");
+        mountSlideBrowser(container, {
+            type: "text_slide",
+            fetchItems: async () => items,
+            onSelect: vi.fn(),
+            onCreate: vi.fn(),
+        });
+        await tick();
+        const img = container.querySelector(".slide-browser-tile-thumb");
+        expect(img.getAttribute("src")).toContain(
+            encodeURIComponent("2026-04-21T10:00:00Z"),
+        );
+    });
+
     it("renders gracefully when fetchItems throws", async () => {
         const container = document.createElement("div");
         mountSlideBrowser(container, {
