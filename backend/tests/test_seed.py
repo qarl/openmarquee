@@ -94,6 +94,27 @@ def test_welcome_png_is_valid_and_at_requested_dimensions():
     assert img.mode == "RGB"
 
 
+def test_text_slide_squishes_long_text_horizontally(tmp_path):
+    """B7 (qarl batch 2026-04-29): long text should squish horizontally
+    to fit, mirroring the UI editor's `fillText(maxWidth)` treatment.
+    Previously the renderer would shrink the font until the text fit;
+    now the font stays at the height-anchored size and the rendered
+    glyphs scale horizontally onto the canvas."""
+    from openmarquee.seed import render_text_slide_png
+
+    # 32-wide canvas; "openMarquee" is well over the natural width at
+    # the height-derived font size, so the squish path is exercised.
+    png = render_text_slide_png("openMarquee", 32, 32)
+    img = Image.open(io.BytesIO(png))
+    img.verify()
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    assert img.size == (32, 32)
+    # Smoke check: not entirely the background — text actually rendered.
+    pixels = img.getdata()
+    distinct = set(pixels)
+    assert len(distinct) > 1
+
+
 def test_gradient_interpolates_from_top_to_bottom():
     preset = SeedPreset(name="x", top=(255, 0, 0), bottom=(0, 0, 255))
     png = render_gradient_png(preset, 4, 8)

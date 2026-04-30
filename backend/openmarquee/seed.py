@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -481,10 +482,10 @@ def render_text_slide_png(
     """Flatten one centered-text slide to a PNG.
 
     Mirrors what the UI's text-slide editor does client-side — background
-    (solid color OR cover-fit image) + centered text — so the device has
-    a ready-to-render PNG the moment the seed finishes. Font auto-shrinks
-    if the text would overflow 90% of the canvas width (e.g. "openMarquee"
-    at small panels).
+    (solid color OR cover-fit image) + centered text. Long text squishes
+    horizontally to fit (B7, qarl 2026-04-29: "squish-everywhere as the
+    canonical behavior") rather than font-shrinking; matches the canvas
+    `fillText(maxWidth)` treatment in the UI editor's drawTextOnly.
 
     `background_image_path` overrides `bg` when provided. `font_family`
     looks up a bundled TTF from `_BUNDLED_FONT_FILES` (matches the UI
@@ -500,20 +501,45 @@ def render_text_slide_png(
     draw = ImageDraw.Draw(img)
     font_size_px = max(12, int(height * 0.4))
     font = _load_text_font(font_family, font_size_px)
-    while font_size_px > 12:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        if bbox[2] - bbox[0] <= width * 0.9:
-            break
-        font_size_px -= 4
-        font = _load_text_font(font_family, font_size_px)
     bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(
-        ((width - tw) / 2 - bbox[0], (height - th) / 2 - bbox[1]),
-        text,
-        fill=fg,
-        font=font,
-    )
+    natural_w = bbox[2] - bbox[0]
+    natural_h = bbox[3] - bbox[1]
+    target_w = max(1, int(width * 0.9))
+    if natural_w <= target_w or natural_w <= 0 or natural_h <= 0:
+        # Fits at native scale — draw straight onto the main canvas.
+        draw.text(
+            ((width - natural_w) / 2 - bbox[0], (height - natural_h) / 2 - bbox[1]),
+            text,
+            fill=fg,
+            font=font,
+        )
+    else:
+        # Squish: render at native width on a transparent surface, then
+        # resize horizontally to target_w and composite.
+        #
+        # The pad keeps antialiased glyph edges from clipping at the
+        # bbox boundary. Because the temp surface gets resized BY a
+        # ratio (target_w + pad_post_horiz) / (natural_w + pad_pre_horiz),
+        # a fixed 4px pre-resize pad would shrink to sub-pixel at extreme
+        # compression and reintroduce the very clipping it was meant to
+        # prevent. Scale the horizontal pad up pre-resize so it survives
+        # to ~4px post-resize.
+        pad_post = 4
+        ratio = target_w / max(1, natural_w)
+        pad_pre = max(pad_post, math.ceil(pad_post / max(ratio, 0.001)))
+        temp = Image.new(
+            "RGBA",
+            (natural_w + pad_pre * 2, natural_h + pad_post * 2),
+            (0, 0, 0, 0),
+        )
+        td = ImageDraw.Draw(temp)
+        td.text((pad_pre - bbox[0], pad_post - bbox[1]), text, fill=fg, font=font)
+        squished = temp.resize(
+            (target_w + pad_post * 2, natural_h + pad_post * 2), Image.LANCZOS
+        )
+        paste_x = (width - squished.width) // 2
+        paste_y = (height - squished.height) // 2
+        img.paste(squished, (paste_x, paste_y), squished)
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
