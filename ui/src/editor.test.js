@@ -515,6 +515,87 @@ describe("mountEditor — submit flow", () => {
         expect(onSaveExisting.mock.calls[0][0]).toBe("abc");
     });
 
+    it("dragging the SE handle commits new box dims into the autosave payload (qarl §5.10a fu)", async () => {
+        // QA 2026-04-30: the live trace showed overlay style updating
+        // mid-drag (state.box mutating correctly) but the autoSave
+        // payload sent the DEFAULT box. Reproduce here: simulate a
+        // pointerdown on the SE handle, pointermove that crosses the
+        // 5px threshold, pointerup, then flush autoSave and assert the
+        // captured payload.box reflects the new size.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSaveExisting = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting,
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "abc",
+            name: "X",
+            text: "X",
+            box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+        });
+
+        const overlay = container.querySelector(".editor-box-overlay");
+        const seHandle = overlay.querySelector('[data-handle="se"]');
+        const canvas = container.querySelector(".editor-canvas");
+
+        // Stub the canvas's bounding rect so the drag math has known
+        // pixel dims to work against. jsdom defaults to 0×0.
+        canvas.getBoundingClientRect = () => ({
+            width: 1000,
+            height: 1000,
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 1000,
+            x: 0,
+            y: 0,
+        });
+
+        // Drag SE handle by -200px in both dims → -0.2 in slide-relative.
+        // Starting box w=h=0.8 → new w=h should clamp to 0.6.
+        seHandle.dispatchEvent(
+            new PointerEvent("pointerdown", {
+                pointerId: 1,
+                clientX: 900,
+                clientY: 900,
+                button: 0,
+                bubbles: true,
+            }),
+        );
+        overlay.dispatchEvent(
+            new PointerEvent("pointermove", {
+                pointerId: 1,
+                clientX: 700,
+                clientY: 700,
+                bubbles: true,
+            }),
+        );
+        overlay.dispatchEvent(
+            new PointerEvent("pointerup", {
+                pointerId: 1,
+                clientX: 700,
+                clientY: 700,
+                bubbles: true,
+            }),
+        );
+
+        await handle.flushAutoSave();
+        expect(onSaveExisting).toHaveBeenCalled();
+        const lastCall =
+            onSaveExisting.mock.calls[onSaveExisting.mock.calls.length - 1];
+        const payload = lastCall[1];
+        expect(payload.box.w).toBeCloseTo(0.6, 5);
+        expect(payload.box.h).toBeCloseTo(0.6, 5);
+        // x and y are unchanged by an SE drag (origin stays put).
+        expect(payload.box.x).toBeCloseTo(0.1, 5);
+        expect(payload.box.y).toBeCloseTo(0.1, 5);
+    });
+
     it("loadForEdit hydrates state.box from slide payload + Save round-trips it", async () => {
         // §5.10a phase 3: the editor restores the operator's box on
         // re-edit, the overlay positions itself off it, and Save sends

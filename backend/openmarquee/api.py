@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
 
-from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
+from openmarquee.content import ContentItem, ImageSlide, TextBox, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_content_storage,
@@ -148,6 +148,13 @@ class TextSlideUpload(BaseModel):
     auto_format: str | None = None
     transition: str = "cut"
     transition_ms: int = 500
+    # SYSTEM_SPEC §5.10a — bounding box, fractions of slide dims. None
+    # means "operator didn't supply one" → TextSlide's default takes
+    # over (centered with 10% margin all sides). The QA-flagged bug
+    # 2026-04-30: this field was MISSING, so Pydantic silently dropped
+    # the editor's `box` from the payload and every save reverted to
+    # default no matter what the operator dragged.
+    box: TextBox | None = None
     png_base64: str = Field(description="Base64-encoded PNG of the rendered slide.")
 
 
@@ -162,9 +169,13 @@ async def upload_text_slide(
     png = _decode_png_payload(payload.png_base64)
 
     # All field constraints live on TextSlide; the route surfaces violations
-    # as 422 instead of letting them become 500s.
+    # as 422 instead of letting them become 500s. exclude_none so a
+    # not-supplied `box` falls back to TextSlide's default_factory rather
+    # than failing on `box=None` (TextBox isn't optional on the model).
     try:
-        slide = TextSlide(**payload.model_dump(exclude={"png_base64"}))
+        slide = TextSlide(
+            **payload.model_dump(exclude={"png_base64"}, exclude_none=True)
+        )
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc
 
@@ -204,11 +215,13 @@ async def update_text_slide(
 
     png = _decode_png_payload(payload.png_base64)
     try:
-        # Preserve the id + created_at; let everything else come from the payload.
+        # Preserve the id + created_at; let everything else come from the
+        # payload. exclude_none so a not-supplied `box` falls back to
+        # TextSlide's default_factory rather than failing on `box=None`.
         slide = TextSlide(
             id=item_id,
             created_at=existing.created_at,
-            **payload.model_dump(exclude={"png_base64"}),
+            **payload.model_dump(exclude={"png_base64"}, exclude_none=True),
         )
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc

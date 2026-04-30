@@ -150,6 +150,48 @@ def test_list_content_returns_uploaded_items(client: TestClient):
     assert names == {"A", "B"}
 
 
+def test_text_slide_post_persists_box_from_payload(client: TestClient):
+    """qarl §5.10a fu 2026-04-30: TextSlideUpload was missing the `box`
+    field, so Pydantic silently dropped it from the editor's payload
+    and every save reverted to TextSlide's default. This test pins the
+    POST route's box-roundtrip contract."""
+    payload = _upload_payload(name="A", text="A")
+    payload["box"] = {"x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4}
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["box"] == {"x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4}
+
+
+def test_text_slide_put_persists_box_from_payload(client: TestClient):
+    """Same contract on the PUT (edit-existing) route."""
+    posted = client.post(
+        "/api/content/text-slides", json=_upload_payload(name="A", text="A")
+    ).json()
+    item_id = posted["id"]
+    # Default box on POST without explicit field.
+    assert posted["box"] == {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}
+
+    payload = _upload_payload(name="A", text="A")
+    payload["box"] = {"x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7}
+    response = client.put(f"/api/content/text-slides/{item_id}", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["box"] == {"x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7}
+
+
+def test_text_slide_post_without_box_uses_model_default(client: TestClient):
+    """Operator's editor that doesn't send `box` (older client, or a
+    code path that legitimately omits it) gets the centered default
+    rather than a 422 — exclude_none on the dump is what makes this
+    work."""
+    payload = _upload_payload(name="A", text="A")
+    assert "box" not in payload  # confidence check on the fixture
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 200
+    assert response.json()["box"] == {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}
+
+
 def test_list_content_exposes_updated_at_for_cachebust(client: TestClient):
     """Frontend cachebust path: /api/content/{id}/asset?v={updated_at}.
     GET /api/content must return each item's storage envelope updated_at
