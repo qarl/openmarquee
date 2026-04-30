@@ -26,6 +26,41 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+class TextBox(BaseModel):
+    """Where text renders inside a TextSlide — a rectangle in slide-relative
+    fractions (0..1). Storing as fractions instead of pixels keeps the same
+    slide visually consistent across rotation flips and resolution changes:
+    a `{x: 0.1, y: 0.1, w: 0.9, h: 0.9}` box looks the same on a 1920×1080
+    HDMI panel as on a 64×32 HUB75 grid (per SYSTEM_SPEC §5.10a).
+
+    Validators enforce that w,h stay in [0.1, 0.9] (min so the box can't
+    shrink to invisible; max so there's always a margin to grab and
+    resize from) and that x+w / y+h stay inside the slide.
+    """
+
+    x: float = Field(default=0.1, ge=0.0, le=1.0)
+    y: float = Field(default=0.1, ge=0.0, le=1.0)
+    w: float = Field(default=0.9, ge=0.1, le=0.9)
+    h: float = Field(default=0.9, ge=0.1, le=0.9)
+
+    @model_validator(mode="after")
+    def _stays_inside_slide(self) -> "TextBox":
+        # Use a small epsilon so float-math drift on operator drag doesn't
+        # spuriously trip validation when the box snaps to the slide edge.
+        eps = 1e-6
+        if self.x + self.w > 1.0 + eps:
+            raise ValueError(
+                f"box.x ({self.x}) + box.w ({self.w}) > 1.0 — "
+                f"box extends past the right edge of the slide"
+            )
+        if self.y + self.h > 1.0 + eps:
+            raise ValueError(
+                f"box.y ({self.y}) + box.h ({self.h}) > 1.0 — "
+                f"box extends past the bottom edge of the slide"
+            )
+        return self
+
+
 class TextSlide(BaseModel):
     """A user-typed text slide.
 
@@ -100,6 +135,11 @@ class TextSlide(BaseModel):
         "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
     ] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
+
+    # Where the text renders inside the slide — see TextBox docstring +
+    # SYSTEM_SPEC §5.10a. Defaults to a centered, 10%-margin-all-around
+    # box. Resolution- and rotation-safe (fractions, not pixels).
+    box: TextBox = Field(default_factory=TextBox)
 
     created_at: datetime = Field(default_factory=_utcnow)
     # Mirror of the storage envelope's `updated_at`. Output-only — populated

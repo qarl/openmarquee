@@ -4,7 +4,7 @@ from uuid import UUID
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
+from openmarquee.content import ContentItem, ImageSlide, TextBox, TextSlide, VideoSlide
 
 
 def test_text_slide_auto_mode_defaults_to_none():
@@ -252,3 +252,93 @@ def test_text_slide_rejects_both_image_and_video_backgrounds():
             background_image_slide_id=uuid4(),
             background_video_slide_id=uuid4(),
         )
+
+
+# --- TextBox (SYSTEM_SPEC §5.10a) -------------------------------------
+
+
+def test_text_box_default_is_centered_with_10pct_margin():
+    """qarl 2026-04-30: default {0.1, 0.1, 0.9, 0.9} so the top-left
+    margin matches the max-side limit for visual symmetry."""
+    box = TextBox()
+    assert (box.x, box.y, box.w, box.h) == (0.1, 0.1, 0.9, 0.9)
+
+
+def test_text_slide_default_box_matches():
+    """A freshly-created TextSlide carries the default box without the
+    operator having to construct one explicitly."""
+    slide = TextSlide(name="x", text="x")
+    assert (slide.box.x, slide.box.y, slide.box.w, slide.box.h) == (
+        0.1,
+        0.1,
+        0.9,
+        0.9,
+    )
+
+
+def test_text_box_rejects_w_below_min():
+    with pytest.raises(ValidationError):
+        TextBox(w=0.05)
+
+
+def test_text_box_rejects_h_above_max():
+    with pytest.raises(ValidationError):
+        TextBox(h=0.95)
+
+
+def test_text_box_rejects_x_negative():
+    with pytest.raises(ValidationError):
+        TextBox(x=-0.1)
+
+
+def test_text_box_rejects_extending_past_right_edge():
+    """w=0.9 + x=0.5 → 1.4, off the slide on the right."""
+    with pytest.raises(ValidationError, match="right edge"):
+        TextBox(x=0.5, w=0.9)
+
+
+def test_text_box_rejects_extending_past_bottom_edge():
+    with pytest.raises(ValidationError, match="bottom edge"):
+        TextBox(y=0.5, h=0.9)
+
+
+def test_text_box_accepts_edge_aligned_box():
+    """x=0.1, w=0.9 sums to exactly 1.0 — should NOT trip the
+    'past the right edge' check."""
+    box = TextBox(x=0.1, y=0.1, w=0.9, h=0.9)
+    assert box.x == 0.1
+
+
+def test_text_box_round_trips_through_json():
+    box = TextBox(x=0.2, y=0.3, w=0.5, h=0.4)
+    raw = box.model_dump_json()
+    restored = TextBox.model_validate_json(raw)
+    assert restored == box
+
+
+def test_text_slide_with_custom_box_round_trips():
+    slide = TextSlide(
+        name="x",
+        text="x",
+        box=TextBox(x=0.2, y=0.2, w=0.5, h=0.5),
+    )
+    raw = slide.model_dump_json()
+    restored = TextSlide.model_validate_json(raw)
+    assert restored.box == slide.box
+
+
+def test_text_slide_envelope_without_box_field_back_compat():
+    """An old-shape TextSlide JSON (no `box` field) deserializes with
+    the default box. No SCHEMA_VERSION bump needed for this addition."""
+    raw = {
+        "type": "text_slide",
+        "name": "legacy",
+        "text": "no box on disk",
+    }
+    slide = TextSlide.model_validate(raw)
+    assert (slide.box.x, slide.box.y, slide.box.w, slide.box.h) == (
+        0.1,
+        0.1,
+        0.9,
+        0.9,
+    )
