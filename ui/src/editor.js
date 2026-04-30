@@ -223,7 +223,19 @@ const EDITOR_TEMPLATE = `
                 </div>
             </div>
             <div class="preview-wrap">
-                <canvas class="editor-canvas" aria-label="slide preview"></canvas>
+                <div class="editor-canvas-stack">
+                    <canvas class="editor-canvas" aria-label="slide preview"></canvas>
+                    <div class="editor-box-overlay" aria-hidden="true">
+                        <div class="editor-box-handle" data-handle="nw"></div>
+                        <div class="editor-box-handle" data-handle="n"></div>
+                        <div class="editor-box-handle" data-handle="ne"></div>
+                        <div class="editor-box-handle" data-handle="e"></div>
+                        <div class="editor-box-handle" data-handle="se"></div>
+                        <div class="editor-box-handle" data-handle="s"></div>
+                        <div class="editor-box-handle" data-handle="sw"></div>
+                        <div class="editor-box-handle" data-handle="w"></div>
+                    </div>
+                </div>
             </div>
             <div class="om-card">
                 <div class="om-stack" style="gap: 12px;">
@@ -402,10 +414,160 @@ export function mountEditor(
         bgSlideId: null,
         bgVideoId: null,
         bgImage: null, // decoded <img> for "slide" or "video" preview (video uses its thumbnail)
+        // Bounding box (SYSTEM_SPEC §5.10a). Fractions of slide w/h.
+        // Default {0.1, 0.1, 0.9, 0.9} matches the backend default.
+        // Edits via the canvas overlay drag handlers update this in-place.
+        box: { x: 0.1, y: 0.1, w: 0.9, h: 0.9 },
         // Edit-mode tracking: when non-null, Save dispatches to
         // onSaveExisting(editingId, payload) instead of onSave.
         editingId: null,
     };
+
+    // Bounding-box overlay (§5.10a). Positioned via inline % so it
+    // tracks the canvas's bounding rect across resizes / device-aspect
+    // changes — the overlay is a sibling of the canvas inside the
+    // editor-canvas-stack, both inheriting the same width.
+    const boxOverlay = container.querySelector(".editor-box-overlay");
+    const BOX_MIN = 0.1;
+    const BOX_MAX = 0.9;
+    const DRAG_THRESHOLD_PX = 5;
+
+    function positionBoxOverlay() {
+        if (!boxOverlay) return;
+        boxOverlay.style.left = `${state.box.x * 100}%`;
+        boxOverlay.style.top = `${state.box.y * 100}%`;
+        boxOverlay.style.width = `${state.box.w * 100}%`;
+        boxOverlay.style.height = `${state.box.h * 100}%`;
+    }
+
+    function applyHandleDrag(start, mode, dx, dy) {
+        // Compute new size from the handle's edge motion, then clamp w/h,
+        // then recompute the MOVING corner from the clamped size so that
+        // a "min-side" handle dragged past the minimum doesn't drift the
+        // fixed edge. Without this, dragging the nw handle past min-width
+        // makes the box snap forward as the pointer keeps moving — the
+        // visual jitter reviewers caught.
+        let x = start.x;
+        let y = start.y;
+        let w = start.w;
+        let h = start.h;
+        switch (mode) {
+            case "move":
+                x = start.x + dx; y = start.y + dy;
+                break;
+            case "n":
+                h = start.h - dy;
+                break;
+            case "s":
+                h = start.h + dy;
+                break;
+            case "e":
+                w = start.w + dx;
+                break;
+            case "w":
+                w = start.w - dx;
+                break;
+            case "nw":
+                w = start.w - dx; h = start.h - dy;
+                break;
+            case "ne":
+                w = start.w + dx; h = start.h - dy;
+                break;
+            case "sw":
+                w = start.w - dx; h = start.h + dy;
+                break;
+            case "se":
+                w = start.w + dx; h = start.h + dy;
+                break;
+        }
+        w = Math.min(BOX_MAX, Math.max(BOX_MIN, w));
+        h = Math.min(BOX_MAX, Math.max(BOX_MIN, h));
+        // Recompute the moving corner so that the fixed edge stays put.
+        // North-side handles (n/nw/ne) keep the bottom edge fixed; west-
+        // side handles (w/nw/sw) keep the right edge fixed.
+        if (mode === "n" || mode === "nw" || mode === "ne") {
+            y = start.y + start.h - h;
+        }
+        if (mode === "w" || mode === "nw" || mode === "sw") {
+            x = start.x + start.w - w;
+        }
+        // Final clamp: stay inside the slide.
+        x = Math.min(1 - w, Math.max(0, x));
+        y = Math.min(1 - h, Math.max(0, y));
+        return { x, y, w, h };
+    }
+
+    let activeDrag = null;
+
+    function onBoxPointerDown(event) {
+        if (event.button !== undefined && event.button !== 0) return;
+        const handle = event.target?.dataset?.handle ?? null;
+        const isMove = !handle && event.currentTarget === boxOverlay;
+        if (!handle && !isMove) return;
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        activeDrag = {
+            mode: handle || "move",
+            startX: event.clientX,
+            startY: event.clientY,
+            canvasW: rect.width,
+            canvasH: rect.height,
+            startBox: { ...state.box },
+            crossedThreshold: false,
+        };
+        boxOverlay.setPointerCapture?.(event.pointerId);
+        event.preventDefault();
+    }
+
+    function onBoxPointerMove(event) {
+        if (!activeDrag) return;
+        const dxPx = event.clientX - activeDrag.startX;
+        const dyPx = event.clientY - activeDrag.startY;
+        if (
+            !activeDrag.crossedThreshold &&
+            Math.abs(dxPx) < DRAG_THRESHOLD_PX &&
+            Math.abs(dyPx) < DRAG_THRESHOLD_PX
+        ) {
+            return;
+        }
+        if (!activeDrag.crossedThreshold) {
+            activeDrag.crossedThreshold = true;
+            // Forward-compat hook for v2's selection model — currently
+            // unstyled, but lets later CSS distinguish the active drag.
+            boxOverlay.dataset.state = "dragging";
+        }
+        const dx = dxPx / activeDrag.canvasW;
+        const dy = dyPx / activeDrag.canvasH;
+        state.box = applyHandleDrag(activeDrag.startBox, activeDrag.mode, dx, dy);
+        positionBoxOverlay();
+        drawCanvas(canvas, state);
+    }
+
+    function onBoxPointerUp(event) {
+        if (!activeDrag) return;
+        const crossed = activeDrag.crossedThreshold;
+        activeDrag = null;
+        delete boxOverlay.dataset.state;
+        try {
+            boxOverlay.releasePointerCapture?.(event.pointerId);
+        } catch {
+            // Capture may not have been granted; ignore.
+        }
+        if (crossed) {
+            // Trigger the shared autoSave debounce on the form — same
+            // path as any other input event. attachAutoSave listens for
+            // 'input' bubbling up.
+            form?.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+    }
+
+    if (boxOverlay) {
+        boxOverlay.addEventListener("pointerdown", onBoxPointerDown);
+        boxOverlay.addEventListener("pointermove", onBoxPointerMove);
+        boxOverlay.addEventListener("pointerup", onBoxPointerUp);
+        boxOverlay.addEventListener("pointercancel", onBoxPointerUp);
+        positionBoxOverlay();
+    }
 
     function syncAndRender() {
         state.name = nameEl.value;
@@ -653,6 +815,7 @@ export function mountEditor(
             auto_mode: autoModeEl.value || null,
             auto_format: autoModeEl.value ? autoFormatEl.value || null : null,
             duration_ms: Math.round(durationSeconds * 1000),
+            box: { ...state.box },
             png_base64,
         };
         const wasEdit = Boolean(state.editingId);
@@ -794,6 +957,21 @@ export function mountEditor(
         autoModeEl.value = slide.auto_mode || "";
         autoModeHintEl.hidden = !slide.auto_mode;
         populateAutoFormatOptions(slide.auto_mode || "", slide.auto_format || null);
+        // Box (§5.10a) — hydrate from server, defaulting to the centered
+        // {0.1, 0.1, 0.9, 0.9} when an older slide on disk has no box
+        // field. Drag handlers in the canvas overlay update state.box
+        // in place; loadForEdit replaces it wholesale.
+        if (slide.box && typeof slide.box === "object") {
+            state.box = {
+                x: Number(slide.box.x ?? 0.1),
+                y: Number(slide.box.y ?? 0.1),
+                w: Number(slide.box.w ?? 0.9),
+                h: Number(slide.box.h ?? 0.9),
+            };
+        } else {
+            state.box = { x: 0.1, y: 0.1, w: 0.9, h: 0.9 };
+        }
+        positionBoxOverlay();
 
         if (slide.background_image_slide_id) {
             // Switch to "slide" background and select the referenced image.
@@ -1063,6 +1241,7 @@ export function drawCanvas(canvas, state) {
         bgImage = null,
         autoMode = null,
         autoFormat = null,
+        box = { x: 0.1, y: 0.1, w: 0.9, h: 0.9 },
     } = state;
     // Auto-mode slides surface the current formatted value (time / date /
     // day token) so the preview matches what the device renders at
@@ -1071,6 +1250,12 @@ export function drawCanvas(canvas, state) {
     const text = autoMode
         ? formatAutoText(autoMode, autoFormat, new Date()) || rawText
         : rawText;
+
+    // Box → canvas-pixel rect. Mirrors render_text_slide_png in seed.py.
+    const boxX = box.x * canvas.width;
+    const boxY = box.y * canvas.height;
+    const boxW = Math.max(1, box.w * canvas.width);
+    const boxH = Math.max(1, box.h * canvas.height);
 
     ctx.save();
     try {
@@ -1098,13 +1283,15 @@ export function drawCanvas(canvas, state) {
 
         if (!text) return;
 
+        // Font size anchored to BOX height (§5.10a) — matches the backend
+        // renderer so the saved PNG looks like the editor preview.
         let fontSizePx;
         if (Number.isFinite(fontSizePct) && fontSizePct > 0) {
-            fontSizePx = Math.max(4, Math.round((canvas.height * fontSizePct) / 100));
+            fontSizePx = Math.max(4, Math.round((boxH * fontSizePct) / 100));
         } else if (Number.isFinite(fontSize) && fontSize > 0) {
             fontSizePx = fontSize;
         } else {
-            fontSizePx = pickFontSize(canvas.height);
+            fontSizePx = pickFontSize(boxH);
         }
         ctx.fillStyle = textColor;
         const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
@@ -1115,10 +1302,14 @@ export function drawCanvas(canvas, state) {
         const lines = text.split(/\r?\n/);
         const lineHeight = fontSizePx * 1.1;
         const totalHeight = lineHeight * lines.length;
-        const startY = canvas.height / 2 - totalHeight / 2 + lineHeight / 2;
-        const maxWidth = Math.max(1, canvas.width - 4);
+        const boxCenterX = boxX + boxW / 2;
+        const boxCenterY = boxY + boxH / 2;
+        const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
+        // Squish target is box width edge-to-edge per §5.10a (no margin —
+        // the box is the explicit container).
+        const maxWidth = Math.max(1, boxW);
         for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], canvas.width / 2, startY + i * lineHeight, maxWidth);
+            ctx.fillText(lines[i], boxCenterX, startY + i * lineHeight, maxWidth);
         }
     } finally {
         ctx.restore();

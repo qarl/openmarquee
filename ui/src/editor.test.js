@@ -42,7 +42,7 @@ describe("drawCanvas", () => {
         expect(canvas._ctx.fillText).not.toHaveBeenCalled();
     });
 
-    it("renders the text centered when there is text", () => {
+    it("renders the text centered in the box (default {0.1, 0.1, 0.9, 0.9})", () => {
         const canvas = mockCanvas(128, 96);
         drawCanvas(canvas, { text: "HI", textColor: "#fff", backgroundColor: "#000" });
         expect(canvas._ctx.textAlign).toBe("center");
@@ -50,7 +50,23 @@ describe("drawCanvas", () => {
         expect(canvas._ctx.fillText).toHaveBeenCalledTimes(1);
         const [line, x] = canvas._ctx.fillText.mock.calls[0];
         expect(line).toBe("HI");
-        expect(x).toBe(64); // canvas.width / 2
+        // Default box centers at (0.1 + 0.9/2) = 0.55 → 0.55 * 128 = 70.4
+        expect(x).toBeCloseTo(0.55 * 128, 5);
+    });
+
+    it("centers in an explicit box rather than the slide (§5.10a)", () => {
+        const canvas = mockCanvas(100, 100);
+        drawCanvas(canvas, {
+            text: "X",
+            box: { x: 0.5, y: 0.1, w: 0.4, h: 0.4 },
+        });
+        const [, x, y] = canvas._ctx.fillText.mock.calls[0];
+        // box center: x = 0.5 + 0.4/2 = 0.7; y = 0.1 + 0.4/2 = 0.3
+        expect(x).toBeCloseTo(0.7 * 100, 5);
+        // y is the line baseline, derived from box-center + half lineHeight
+        // adjustments — just check it sits inside the box's vertical span.
+        expect(y).toBeGreaterThan(0.1 * 100);
+        expect(y).toBeLessThan(0.5 * 100);
     });
 
     it("renders multiline text as separate fillText calls", () => {
@@ -111,7 +127,9 @@ describe("drawCanvas — explicit fontSize override", () => {
     it("falls back to the heuristic when fontSize is not a positive number", () => {
         const canvas = mockCanvas(128, 96);
         drawCanvas(canvas, { text: "X", fontSize: 0 });
-        expect(canvas._ctx.font).toContain(`${pickFontSize(96)}px`);
+        // Heuristic anchors to BOX height per §5.10a — default box.h = 0.9
+        // so the heuristic fires against 96 * 0.9 = 86.4.
+        expect(canvas._ctx.font).toContain(`${pickFontSize(86.4)}px`);
     });
 });
 
@@ -123,11 +141,12 @@ describe("drawCanvas — context isolation", () => {
         expect(canvas._ctx.restore).toHaveBeenCalledTimes(1);
     });
 
-    it("constrains text width via maxWidth (avoids horizontal overflow)", () => {
+    it("constrains text width to box width edge-to-edge (§5.10a)", () => {
         const canvas = mockCanvas(64, 32);
         drawCanvas(canvas, { text: "VERY LONG LINE OF TEXT" });
         const [, , , maxWidth] = canvas._ctx.fillText.mock.calls[0];
-        expect(maxWidth).toBe(60); // canvas.width - 4
+        // Default box.w = 0.9 → 0.9 * 64 = 57.6
+        expect(maxWidth).toBeCloseTo(0.9 * 64, 5);
     });
 
     it("splits text on \\r\\n as well as \\n (iOS paste)", () => {
@@ -494,6 +513,68 @@ describe("mountEditor — submit flow", () => {
         expect(onSaveExisting).toHaveBeenCalledTimes(1);
         expect(onSave).not.toHaveBeenCalled();
         expect(onSaveExisting.mock.calls[0][0]).toBe("abc");
+    });
+
+    it("loadForEdit hydrates state.box from slide payload + Save round-trips it", async () => {
+        // §5.10a phase 3: the editor restores the operator's box on
+        // re-edit, the overlay positions itself off it, and Save sends
+        // the box back to the backend in the payload.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSaveExisting = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting,
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "abc",
+            name: "Promo",
+            text: "PROMO",
+            text_color: "#ffffff",
+            background_color: "#CC0000",
+            font_family: "monospace",
+            font_size_px: 40,
+            duration_ms: 7000,
+            box: { x: 0.2, y: 0.3, w: 0.5, h: 0.4 },
+        });
+        const overlay = container.querySelector(".editor-box-overlay");
+        // Inline style reflects the loaded box as percentages.
+        expect(overlay.style.left).toBe("20%");
+        expect(overlay.style.top).toBe("30%");
+        expect(overlay.style.width).toBe("50%");
+        expect(overlay.style.height).toBe("40%");
+
+        await handle.flushAutoSave();
+        expect(onSaveExisting).toHaveBeenCalledTimes(1);
+        const payload = onSaveExisting.mock.calls[0][1];
+        expect(payload.box).toEqual({ x: 0.2, y: 0.3, w: 0.5, h: 0.4 });
+    });
+
+    it("loadForEdit defaults the box to {0.1, 0.1, 0.9, 0.9} when slide.box is missing", async () => {
+        // Old slides on disk carry no `box` field — editor synthesizes
+        // the default centered box.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting: vi.fn().mockResolvedValue({ id: "old" }),
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "old",
+            name: "Legacy",
+            text: "OLD",
+        });
+        const overlay = container.querySelector(".editor-box-overlay");
+        expect(overlay.style.left).toBe("10%");
+        expect(overlay.style.top).toBe("10%");
+        expect(overlay.style.width).toBe("90%");
+        expect(overlay.style.height).toBe("90%");
     });
 
     it("loadForEdit re-renders the canvas after a bundled font finishes loading", async () => {

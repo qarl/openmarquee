@@ -1050,13 +1050,58 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
        device's configured display dims. The CSS var is a fallback for
        the first paint before JS runs — without it the canvas takes
        its intrinsic 300×150 default and looks visibly wrong. Chrome
-       (border / radius / bg) lives on .preview-wrap. */
+       (border / radius / bg) lives on .preview-wrap.
+       touch-action: none keeps a touch pointerdown that lands on the
+       canvas (rather than the overlay) from triggering the browser's
+       default pan-zoom — the canvas is otherwise a non-interactive
+       paint surface so we lose nothing by suppressing scroll on it. */
     display: block;
     width: 100%;
     height: auto;
     aspect-ratio: var(--device-aspect, 4 / 3);
     image-rendering: pixelated;
+    touch-action: none;
 }
+
+/* Stack the canvas + the bounding-box overlay so they share the same
+   layout box. position: relative anchors the overlay's absolute children
+   to this wrapper. Sits inside .preview-wrap (which centers + applies
+   chrome). SYSTEM_SPEC §5.10a. */
+.editor-canvas-stack {
+    position: relative;
+    width: 100%;
+    line-height: 0;
+}
+.editor-box-overlay {
+    position: absolute;
+    /* left/top/width/height set inline by positionBoxOverlay() — drives
+       off state.box (% of slide). */
+    box-sizing: border-box;
+    border: 1px dashed rgba(255, 255, 255, 0.7);
+    background: transparent;
+    cursor: move;
+    touch-action: none;
+}
+.editor-box-handle {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    background: var(--om-accent, var(--accent, #ffb84d));
+    border: 1px solid rgba(0, 0, 0, 0.6);
+    border-radius: 2px;
+    box-sizing: border-box;
+    touch-action: none;
+}
+/* Pin each handle to its corner / edge midpoint of the overlay,
+   centered on the boundary so the visual grab area straddles the line. */
+.editor-box-handle[data-handle="nw"] { top: -6px; left: -6px; cursor: nwse-resize; }
+.editor-box-handle[data-handle="n"]  { top: -6px; left: 50%; margin-left: -6px; cursor: ns-resize; }
+.editor-box-handle[data-handle="ne"] { top: -6px; right: -6px; cursor: nesw-resize; }
+.editor-box-handle[data-handle="e"]  { top: 50%; right: -6px; margin-top: -6px; cursor: ew-resize; }
+.editor-box-handle[data-handle="se"] { bottom: -6px; right: -6px; cursor: nwse-resize; }
+.editor-box-handle[data-handle="s"]  { bottom: -6px; left: 50%; margin-left: -6px; cursor: ns-resize; }
+.editor-box-handle[data-handle="sw"] { bottom: -6px; left: -6px; cursor: nesw-resize; }
+.editor-box-handle[data-handle="w"]  { top: 50%; left: -6px; margin-top: -6px; cursor: ew-resize; }
 
 .controls {
     display: flex;
