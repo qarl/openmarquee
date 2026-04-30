@@ -100,7 +100,7 @@ export function mountPlaylistBrowser(container, options) {
         const safeName = escapeHtml(displayName || "(unnamed)");
         const itemsLabel = itemCount === 1 ? "1 slide" : `${itemCount} slides`;
         const thumb = firstItem
-            ? `<img class="playlist-browser-tile-thumb" alt="" src="/api/content/${firstItem.id}/asset?v=${encodeURIComponent(firstItem.created_at || firstItem.id)}">`
+            ? `<img class="playlist-browser-tile-thumb" alt="" src="/api/content/${firstItem.id}/asset?v=${encodeURIComponent(firstItem.updated_at || firstItem.created_at || firstItem.id)}">`
             : `<div class="playlist-browser-tile-thumb playlist-browser-tile-thumb--empty"></div>`;
         li.innerHTML = `
             <button type="button" class="playlist-browser-tile-action"
