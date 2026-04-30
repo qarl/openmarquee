@@ -13,6 +13,7 @@
 // surface feels natural in its own context.
 
 import { attachAutoSave } from "./auto-save.js";
+import { formatAutoText } from "./auto-format.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 // Fixed asset rasterize target. Decoupled from device W×H so a panel
@@ -412,6 +413,14 @@ export function mountEditor(
         state.textColor = textColorEl.value;
         state.backgroundColor = bgColorEl.value;
         state.fontFamily = fontFamilyEl.value;
+        // Auto-mode tokens (time / date / day / weather …): the canvas
+        // shows the current formatted value so the preview matches what
+        // the device renders at playout (B6, qarl 2026-04-29). Saved
+        // asset gets the same value frozen at save-moment; auto_render
+        // overlays a live composite at playback time so the on-disk
+        // freeze is invisible.
+        state.autoMode = autoModeEl.value || null;
+        state.autoFormat = state.autoMode ? autoFormatEl.value || null : null;
         const parsedSize = Number(fontSizeEl.value);
         if (Number.isFinite(parsedSize) && parsedSize > 0) {
             state.fontSizePct = parsedSize;
@@ -485,6 +494,13 @@ export function mountEditor(
     autoModeEl.addEventListener("change", () => {
         autoModeHintEl.hidden = !autoModeEl.value;
         populateAutoFormatOptions(autoModeEl.value);
+        // B6: flip the canvas immediately so the preview shows the
+        // current formatted token (or the operator's text when auto_mode
+        // is cleared) without waiting for the next input event.
+        syncAndRender();
+    });
+    autoFormatEl.addEventListener("change", () => {
+        syncAndRender();
     });
 
     // Background-source radios toggle the slide picker. When "slide" or
@@ -1037,7 +1053,7 @@ export function drawTextOnly(canvas, item) {
 export function drawCanvas(canvas, state) {
     const ctx = canvas.getContext("2d");
     const {
-        text = "",
+        text: rawText = "",
         textColor = "#FFFFFF",
         backgroundColor = "#000000",
         fontSize,
@@ -1045,7 +1061,16 @@ export function drawCanvas(canvas, state) {
         fontFamily = "sans-serif",
         bgSource = "color",
         bgImage = null,
+        autoMode = null,
+        autoFormat = null,
     } = state;
+    // Auto-mode slides surface the current formatted value (time / date /
+    // day token) so the preview matches what the device renders at
+    // playout. Operator's typed text becomes a fallback shown only when
+    // auto_mode is unset (B6, qarl 2026-04-29).
+    const text = autoMode
+        ? formatAutoText(autoMode, autoFormat, new Date()) || rawText
+        : rawText;
 
     ctx.save();
     try {

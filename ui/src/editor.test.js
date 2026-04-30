@@ -69,6 +69,28 @@ describe("drawCanvas", () => {
     });
 });
 
+describe("drawCanvas — auto_mode dynamic text", () => {
+    // Bug B6 (qarl batch 2026-04-29): the editor preview should show
+    // the current formatted token (HH:MM, weekday, etc.) when auto_mode
+    // is set, instead of the operator's typed placeholder text.
+    it("substitutes the formatted time when autoMode is 'time'", () => {
+        const canvas = mockCanvas(64, 32);
+        drawCanvas(canvas, {
+            text: "ignored",
+            autoMode: "time",
+            autoFormat: "time_hm",
+        });
+        const drawnText = canvas._ctx.fillText.mock.calls[0][0];
+        expect(drawnText).toMatch(/^\d\d:\d\d$/);
+    });
+
+    it("falls back to the operator's text when autoMode is null", () => {
+        const canvas = mockCanvas(64, 32);
+        drawCanvas(canvas, { text: "Hello", autoMode: null });
+        expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("Hello");
+    });
+});
+
 describe("pickFontSize", () => {
     it("scales with panel height", () => {
         expect(pickFontSize(96)).toBeGreaterThan(pickFontSize(32));
