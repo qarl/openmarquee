@@ -6,6 +6,8 @@
 // subpage browser click-to-edit) since each is natural in its
 // location.
 
+import { attachAutoTextOverlay } from "./auto-text-overlay.js";
+
 const TEMPLATE = `
     <div class="slide-browser" role="toolbar" aria-label="slide list">
         <ul class="slide-browser-list" role="list"></ul>
@@ -85,13 +87,23 @@ export function mountSlideBrowser(container, options) {
         // was redundant chrome.
         li.innerHTML = `
             <button type="button" class="slide-browser-tile-action" title="${safeName}">
-                <img class="slide-browser-tile-thumb" alt="" draggable="false"
-                     src="/api/content/${item.id}/asset?v=${refreshVersion}">
+                <span class="slide-browser-tile-thumb-wrap">
+                    <img class="slide-browser-tile-thumb" alt="" draggable="false"
+                         src="/api/content/${item.id}/asset?v=${refreshVersion}">
+                </span>
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>
             <button type="button" class="slide-browser-tile-delete"
                     aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
         `;
+        // Auto-mode text slides get a live-ticking overlay on top of the
+        // static asset.png — same pattern as inline-preview's auto-text
+        // div. Shared ticker prunes the overlay automatically when this
+        // tile is replaced on the next refresh().
+        attachAutoTextOverlay(
+            li.querySelector(".slide-browser-tile-thumb-wrap"),
+            item,
+        );
         li.querySelector(".slide-browser-tile-action").addEventListener(
             "click",
             () => {

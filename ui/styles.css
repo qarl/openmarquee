@@ -704,6 +704,32 @@ header h1 {
     display: block;
 }
 
+/* Auto-mode text overlay — shared across slide-browser, playlist-track
+   block, and pallet-tile thumbnails. The static asset.png renders
+   underneath and this div paints the live formatted token (HH:MM,
+   weekday, etc.) on top, mirroring the inline-preview overlay pattern.
+   Drop-shadowed white text reads against any seed background. */
+.om-auto-text-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-weight: 700;
+    font-size: clamp(10px, 24%, 28px);
+    letter-spacing: 0.02em;
+    text-shadow:
+        0 0 4px rgba(0, 0, 0, 0.85),
+        1px 1px 0 rgba(0, 0, 0, 0.9),
+        -1px -1px 0 rgba(0, 0, 0, 0.9);
+    pointer-events: none;
+    text-align: center;
+    padding: 0 4px;
+    line-height: 1.05;
+}
+
 .pallet-tile-name {
     padding: 5px 8px;
     font-size: 11px;
@@ -998,6 +1024,11 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     border-color: var(--accent);
     background: #161616;
     box-shadow: 0 0 0 2px rgba(255, 184, 77, 0.35);
+}
+.slide-browser-tile-thumb-wrap {
+    position: relative;
+    display: block;
+    width: 100%;
 }
 .slide-browser-tile-thumb {
     width: 100%;

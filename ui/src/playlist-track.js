@@ -15,6 +15,7 @@
 import Sortable from "sortablejs";
 
 import { attachAutoSave } from "./auto-save.js";
+import { attachAutoTextOverlay } from "./auto-text-overlay.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
 
 // Per-block transition selector options. The pulldown UX replaced the
@@ -540,6 +541,7 @@ function renderTrackBlock(
         </button>
         <button type="button" class="track-remove" aria-label="Remove from playlist" title="Remove from playlist">×</button>
     `;
+    attachAutoTextOverlay(li.querySelector(".track-block-thumb-wrap"), item);
     return li;
 }
 
@@ -565,6 +567,7 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
         </div>
         <div class="pallet-tile-name" title="${safeName}">${safeName}</div>
     `;
+    attachAutoTextOverlay(li.querySelector(".pallet-tile-thumb-wrap"), item);
     li.querySelector(".pallet-tile-edit").addEventListener("click", (event) => {
         // Bubble a custom event so main.js (which owns the editors +
         // router) can navigate + pre-fill without playlist-track having
