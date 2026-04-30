@@ -279,6 +279,53 @@ describe("mountStreamPanel", () => {
         }
     });
 
+    it("doesn't race nav setup: section.hidden=undefined at mount still defers init when nav applies hidden synchronously after", async () => {
+        // QA caught this regression on 2026-04-29: my first B4 fix
+        // (097d89c) checked section.hidden synchronously at mount, but
+        // mountStreamPanel runs BEFORE nav.js's initial show() call in
+        // main.js's boot order. So `hidden` was still undefined at
+        // mount time and the panel eager-inited anyway, even when the
+        // operator was on a non-Stream route after the welcome-dismiss
+        // reload.
+        //
+        // The fix defers the visibility decision to the next animation
+        // frame, by which time nav has applied initial hidden states.
+        const section = document.createElement("section");
+        section.setAttribute("data-section", "stream");
+        // hidden NOT set — simulating mount-before-nav at boot.
+        const container = document.createElement("div");
+        section.appendChild(container);
+        document.body.appendChild(section);
+        try {
+            const opts = defaultMounts();
+            const handle = mountStreamPanel(container, opts);
+
+            // Boot sequence: nav's show() lands synchronously after mount.
+            // Simulate that by setting hidden synchronously here.
+            section.hidden = true;
+
+            // Wait two animation frames so the deferred init has fired
+            // and (correctly) decided to install the observer rather
+            // than init.
+            await new Promise((r) => requestAnimationFrame(() => r()));
+            await new Promise((r) => requestAnimationFrame(() => r()));
+
+            expect(opts.apiGetStatus).not.toHaveBeenCalled();
+            expect(opts.getUserMedia).not.toHaveBeenCalled();
+            expect(handle.getState()).toBe("idle");
+
+            // Operator clicks the Stream tab → nav clears the hidden attr.
+            section.hidden = false;
+            await waitFor(() => handle.getState() === "preview");
+            expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
+            expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
+
+            handle.destroy();
+        } finally {
+            section.remove();
+        }
+    });
+
     it("mount-init enters take-over-prompt without opening the camera when /status is active", async () => {
         // Some other phone owns the screen at mount time. Pre-flight
         // surfaces take-over-prompt directly, skipping the camera-

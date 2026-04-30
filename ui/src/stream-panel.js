@@ -840,7 +840,16 @@ export function mountStreamPanel(container, options = {}) {
 
     let visibilityObserver = null;
     const section = container.closest?.("[data-section]") ?? null;
-    if (section && isHiddenChain(section)) {
+
+    function decideInitTiming() {
+        if (destroyed) return;
+        if (!section || !isHiddenChain(section)) {
+            // No section ancestor (test fixture / standalone) or section
+            // is currently visible (deep-link to /stream, or section.hidden
+            // was never set). Init immediately.
+            startMountInit();
+            return;
+        }
         visibilityObserver = new MutationObserver(() => {
             if (!isHiddenChain(section)) {
                 visibilityObserver.disconnect();
@@ -852,10 +861,21 @@ export function mountStreamPanel(container, options = {}) {
             attributes: true,
             attributeFilter: ["hidden"],
         });
+    }
+
+    // Defer one animation frame before deciding. nav.js's initial show()
+    // call applies `hidden` attrs to non-active sections SYNCHRONOUSLY at
+    // boot, but mountStreamPanel can run earlier in the boot order — so
+    // a synchronous isHiddenChain() reads `undefined` and we'd eager-init
+    // even when the operator is on a non-Stream route. By the time rAF
+    // fires, all sync boot mounts have completed, including nav setup.
+    // QA caught this regression on 2026-04-29 after 097d89c shipped: the
+    // welcome-dismiss reload landed on a non-Stream route but the camera
+    // permission prompt fired anyway.
+    if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(decideInitTiming);
     } else {
-        // Visible (or no section ancestor — covers test fixtures that
-        // mount into a bare div). Init right away.
-        startMountInit();
+        queueMicrotask(decideInitTiming);
     }
 
     return {
