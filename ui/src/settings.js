@@ -82,7 +82,7 @@ const SECTION_TEMPLATE = `
                         </label>
                     </div>
                     <div>
-                        <button type="button" class="om-btn ghost sm settings-detect-dims field-hint-btn">
+                        <button type="button" class="om-btn sm settings-detect-dims field-hint-btn">
                             Detect from device
                         </button>
                         <p class="field-hint settings-detect-status" role="status" style="margin: 6px 0 0;"></p>

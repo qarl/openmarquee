@@ -72,6 +72,21 @@ describe("mountSettings", () => {
         expect(rescanBtn.classList.contains("ghost")).toBe(false);
     });
 
+    it("Detect from device button renders with a visible border", async () => {
+        // qarl 2026-04-30 follow-up to B12-B14: same `om-btn ghost
+        // field-hint-btn` combo as Rescan — flagged in 67e50a1's review
+        // as out-of-scope, now greenlit.
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const detectBtn = container.querySelector(".settings-detect-dims");
+        expect(detectBtn).not.toBeNull();
+        expect(detectBtn.classList.contains("ghost")).toBe(false);
+    });
+
     it("output mode select covers every SYSTEM_SPEC output variant", async () => {
         const container = document.createElement("div");
         mountSettings(container, {
