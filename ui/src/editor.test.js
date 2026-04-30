@@ -42,7 +42,7 @@ describe("drawCanvas", () => {
         expect(canvas._ctx.fillText).not.toHaveBeenCalled();
     });
 
-    it("renders the text centered in the box (default {0.1, 0.1, 0.9, 0.9})", () => {
+    it("renders the text centered in the box (default {0.1, 0.1, 0.8, 0.8})", () => {
         const canvas = mockCanvas(128, 96);
         drawCanvas(canvas, { text: "HI", textColor: "#fff", backgroundColor: "#000" });
         expect(canvas._ctx.textAlign).toBe("center");
@@ -50,8 +50,8 @@ describe("drawCanvas", () => {
         expect(canvas._ctx.fillText).toHaveBeenCalledTimes(1);
         const [line, x] = canvas._ctx.fillText.mock.calls[0];
         expect(line).toBe("HI");
-        // Default box centers at (0.1 + 0.9/2) = 0.55 → 0.55 * 128 = 70.4
-        expect(x).toBeCloseTo(0.55 * 128, 5);
+        // Default box {0.1, 0.1, 0.8, 0.8} centers at 0.5 → 0.5 * 128 = 64
+        expect(x).toBeCloseTo(0.5 * 128, 5);
     });
 
     it("centers in an explicit box rather than the slide (§5.10a)", () => {
@@ -127,9 +127,9 @@ describe("drawCanvas — explicit fontSize override", () => {
     it("falls back to the heuristic when fontSize is not a positive number", () => {
         const canvas = mockCanvas(128, 96);
         drawCanvas(canvas, { text: "X", fontSize: 0 });
-        // Heuristic anchors to BOX height per §5.10a — default box.h = 0.9
-        // so the heuristic fires against 96 * 0.9 = 86.4.
-        expect(canvas._ctx.font).toContain(`${pickFontSize(86.4)}px`);
+        // §5.10a (qarl 2026-04-30 revision): font sizing is slide-relative,
+        // not box-relative. Heuristic fires against canvas.height = 96.
+        expect(canvas._ctx.font).toContain(`${pickFontSize(96)}px`);
     });
 });
 
@@ -145,8 +145,8 @@ describe("drawCanvas — context isolation", () => {
         const canvas = mockCanvas(64, 32);
         drawCanvas(canvas, { text: "VERY LONG LINE OF TEXT" });
         const [, , , maxWidth] = canvas._ctx.fillText.mock.calls[0];
-        // Default box.w = 0.9 → 0.9 * 64 = 57.6
-        expect(maxWidth).toBeCloseTo(0.9 * 64, 5);
+        // Default box.w = 0.8 → 0.8 * 64 = 51.2
+        expect(maxWidth).toBeCloseTo(0.8 * 64, 5);
     });
 
     it("splits text on \\r\\n as well as \\n (iOS paste)", () => {
@@ -553,9 +553,9 @@ describe("mountEditor — submit flow", () => {
         expect(payload.box).toEqual({ x: 0.2, y: 0.3, w: 0.5, h: 0.4 });
     });
 
-    it("loadForEdit defaults the box to {0.1, 0.1, 0.9, 0.9} when slide.box is missing", async () => {
+    it("loadForEdit defaults the box to {0.1, 0.1, 0.8, 0.8} when slide.box is missing", async () => {
         // Old slides on disk carry no `box` field — editor synthesizes
-        // the default centered box.
+        // the centered-with-10%-margin default.
         patchCanvasPrototype();
         const container = document.createElement("div");
         const handle = mountEditor(container, {
@@ -573,8 +573,8 @@ describe("mountEditor — submit flow", () => {
         const overlay = container.querySelector(".editor-box-overlay");
         expect(overlay.style.left).toBe("10%");
         expect(overlay.style.top).toBe("10%");
-        expect(overlay.style.width).toBe("90%");
-        expect(overlay.style.height).toBe("90%");
+        expect(overlay.style.width).toBe("80%");
+        expect(overlay.style.height).toBe("80%");
     });
 
     it("loadForEdit re-renders the canvas after a bundled font finishes loading", async () => {

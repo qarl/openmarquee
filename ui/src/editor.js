@@ -417,7 +417,7 @@ export function mountEditor(
         // Bounding box (SYSTEM_SPEC §5.10a). Fractions of slide w/h.
         // Default {0.1, 0.1, 0.9, 0.9} matches the backend default.
         // Edits via the canvas overlay drag handlers update this in-place.
-        box: { x: 0.1, y: 0.1, w: 0.9, h: 0.9 },
+        box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
         // Edit-mode tracking: when non-null, Save dispatches to
         // onSaveExisting(editingId, payload) instead of onSave.
         editingId: null,
@@ -497,6 +497,13 @@ export function mountEditor(
         return { x, y, w, h };
     }
 
+    // Forward-declared so onBoxPointerUp can call autoSave.kick() — the
+    // attachAutoSave call lower down assigns into this. Synthetic 'input'
+    // events on the form would race attachAutoSave's listener registration
+    // and (per QA 2026-04-30 thumb-not-updating bug) sometimes fail to
+    // trigger the debounce; calling kick() directly is unambiguous.
+    let autoSave = null;
+
     let activeDrag = null;
 
     function onBoxPointerDown(event) {
@@ -554,10 +561,12 @@ export function mountEditor(
             // Capture may not have been granted; ignore.
         }
         if (crossed) {
-            // Trigger the shared autoSave debounce on the form — same
-            // path as any other input event. attachAutoSave listens for
-            // 'input' bubbling up.
-            form?.dispatchEvent(new Event("input", { bubbles: true }));
+            // Drive the shared autoSave debounce directly. The save call
+            // captures state.box (already updated by the drag), and
+            // performSave's rasterizeAtTarget snapshots the current
+            // canvas state so the new asset.png reflects the operator's
+            // resize/move.
+            autoSave?.kick();
         }
     }
 
@@ -830,7 +839,7 @@ export function mountEditor(
         if (browser && state.editingId) browser.highlight(state.editingId);
     }
 
-    const autoSave = attachAutoSave(form, {
+    autoSave = attachAutoSave(form, {
         save: performSave,
         status: statusEl,
         // Create-mode requires non-empty text to bother saving (otherwise
@@ -965,11 +974,11 @@ export function mountEditor(
             state.box = {
                 x: Number(slide.box.x ?? 0.1),
                 y: Number(slide.box.y ?? 0.1),
-                w: Number(slide.box.w ?? 0.9),
-                h: Number(slide.box.h ?? 0.9),
+                w: Number(slide.box.w ?? 0.8),
+                h: Number(slide.box.h ?? 0.8),
             };
         } else {
-            state.box = { x: 0.1, y: 0.1, w: 0.9, h: 0.9 };
+            state.box = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
         }
         positionBoxOverlay();
 
@@ -1241,7 +1250,7 @@ export function drawCanvas(canvas, state) {
         bgImage = null,
         autoMode = null,
         autoFormat = null,
-        box = { x: 0.1, y: 0.1, w: 0.9, h: 0.9 },
+        box = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
     } = state;
     // Auto-mode slides surface the current formatted value (time / date /
     // day token) so the preview matches what the device renders at
@@ -1283,15 +1292,16 @@ export function drawCanvas(canvas, state) {
 
         if (!text) return;
 
-        // Font size anchored to BOX height (§5.10a) — matches the backend
-        // renderer so the saved PNG looks like the editor preview.
+        // Font size anchored to SLIDE height per §5.10a (qarl 2026-04-30
+        // revision: box positions/clips text but doesn't scale it).
+        // Matches render_text_slide_png on the backend.
         let fontSizePx;
         if (Number.isFinite(fontSizePct) && fontSizePct > 0) {
-            fontSizePx = Math.max(4, Math.round((boxH * fontSizePct) / 100));
+            fontSizePx = Math.max(4, Math.round((canvas.height * fontSizePct) / 100));
         } else if (Number.isFinite(fontSize) && fontSize > 0) {
             fontSizePx = fontSize;
         } else {
-            fontSizePx = pickFontSize(boxH);
+            fontSizePx = pickFontSize(canvas.height);
         }
         ctx.fillStyle = textColor;
         const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;

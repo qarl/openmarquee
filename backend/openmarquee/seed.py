@@ -489,9 +489,9 @@ def render_text_slide_png(
     behavior") rather than font-shrinking; matches the canvas
     `fillText(maxWidth)` treatment in the UI editor's drawTextOnly.
 
-    Font size is anchored to the BOX height (not the slide height) — a
-    half-height box gets half-height text, regardless of the panel's
-    actual pixel dims. Squish target is the box width edge-to-edge (no
+    Font size is anchored to the SLIDE height (per §5.10a, qarl
+    2026-04-30 revision): the box positions and clips the text, but
+    doesn't scale it. Squish target is the box width edge-to-edge (no
     extra margin — the box itself is the explicit container).
 
     `box` accepts a TextBox-shaped object (anything with x/y/w/h
@@ -526,9 +526,11 @@ def render_text_slide_png(
     px_box_h = max(1, int(bh * height))
 
     draw = ImageDraw.Draw(img)
-    # Font size anchored to BOX height per §5.10a. Min 12 keeps text
-    # legible even on tiny WS281x strips with a tiny box.
-    font_size_px = max(12, int(px_box_h * 0.4))
+    # Font size anchored to SLIDE height per §5.10a (qarl 2026-04-30:
+    # box positions/clips text but doesn't scale it — operator-set
+    # font sizes mean the same thing across boxes of any size on the
+    # same slide). Min 12 keeps tiny WS281x panels legible.
+    font_size_px = max(12, int(height * 0.4))
     font = _load_text_font(font_family, font_size_px)
     bbox = draw.textbbox((0, 0), text, font=font)
     natural_w = bbox[2] - bbox[0]

@@ -40,8 +40,11 @@ class TextBox(BaseModel):
 
     x: float = Field(default=0.1, ge=0.0, le=1.0)
     y: float = Field(default=0.1, ge=0.0, le=1.0)
-    w: float = Field(default=0.9, ge=0.1, le=0.9)
-    h: float = Field(default=0.9, ge=0.1, le=0.9)
+    # Default 0.8 (was 0.9) so the centered box has 10% margin on ALL
+    # four sides — qarl 2026-04-30. The clamp range still allows up to
+    # 0.9 so the operator can drag wider; just the default is symmetric.
+    w: float = Field(default=0.8, ge=0.1, le=0.9)
+    h: float = Field(default=0.8, ge=0.1, le=0.9)
 
     @model_validator(mode="after")
     def _stays_inside_slide(self) -> "TextBox":

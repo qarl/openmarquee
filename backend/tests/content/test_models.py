@@ -257,11 +257,12 @@ def test_text_slide_rejects_both_image_and_video_backgrounds():
 # --- TextBox (SYSTEM_SPEC §5.10a) -------------------------------------
 
 
-def test_text_box_default_is_centered_with_10pct_margin():
-    """qarl 2026-04-30: default {0.1, 0.1, 0.9, 0.9} so the top-left
-    margin matches the max-side limit for visual symmetry."""
+def test_text_box_default_is_centered_with_10pct_margin_all_sides():
+    """qarl 2026-04-30 revision: default {0.1, 0.1, 0.8, 0.8} so the
+    centered box has 10% margin on ALL four sides (was {0.1, 0.1, 0.9,
+    0.9} which had x+w=1 and y+h=1, no right/bottom margin)."""
     box = TextBox()
-    assert (box.x, box.y, box.w, box.h) == (0.1, 0.1, 0.9, 0.9)
+    assert (box.x, box.y, box.w, box.h) == (0.1, 0.1, 0.8, 0.8)
 
 
 def test_text_slide_default_box_matches():
@@ -271,8 +272,8 @@ def test_text_slide_default_box_matches():
     assert (slide.box.x, slide.box.y, slide.box.w, slide.box.h) == (
         0.1,
         0.1,
-        0.9,
-        0.9,
+        0.8,
+        0.8,
     )
 
 
@@ -339,6 +340,6 @@ def test_text_slide_envelope_without_box_field_back_compat():
     assert (slide.box.x, slide.box.y, slide.box.w, slide.box.h) == (
         0.1,
         0.1,
-        0.9,
-        0.9,
+        0.8,
+        0.8,
     )
