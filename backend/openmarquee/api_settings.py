@@ -12,13 +12,18 @@ PUT also fires a side-effect when display dims change (rotation OR
 width OR height): every saved text slide gets re-rendered at the new
 effective dims so its asset.png matches what the device will display
 instead of being letterboxed / cover-fitted from stale dims. The
-re-render runs as a BackgroundTask so the operator's PUT response
-isn't gated by potentially many slide renders.
+re-render runs SYNCHRONOUSLY before PUT returns 200 — operators expect
+a rotation flip to "do something" and the UI re-mounts every panel
+immediately on the openmarquee:settings-updated event, so an async
+BackgroundTask raced the re-mount and the new slide-browser fetched
+GET /api/content before the rerender bumped updated_at on disk
+(QA-flagged race 2026-04-30). Synchronous trades a ~1s rotation save
+for a guaranteed-coherent post-save state.
 """
 
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, Depends
 
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_content_storage, get_settings_storage
@@ -41,12 +46,11 @@ async def set_settings(
     payload: SystemSettings,
     storage: SettingsDep,
     content_storage: ContentDep,
-    background: BackgroundTasks,
 ) -> SystemSettings:
-    # Compare the dim-affecting fields BEFORE the save so we can decide
-    # whether to schedule a text-slide rerender. None of these are
-    # remotely mutable independently — the UI does GET → mutate → PUT
-    # so the whole payload is what arrives.
+    # Compare the dim-affecting fields BEFORE the save so we know whether
+    # to fire the text-slide rerender. None of these are remotely mutable
+    # independently — the UI does GET → mutate → PUT so the whole payload
+    # is what arrives.
     previous = storage.load()
     dims_changed = (
         int(previous.display_rotation) != int(payload.display_rotation)
@@ -55,8 +59,13 @@ async def set_settings(
     )
     storage.save(payload)
     if dims_changed:
-        background.add_task(
-            rerender_text_slides_for_dims,
+        # Synchronous: operator's UI re-mounts panels on the
+        # settings-updated event; if rerender ran in the background
+        # the re-mount would race ahead and fetch stale updated_at
+        # from /api/content. Cost is ~1s on a rotation flip — rare,
+        # and the operator already expects "something happens" on
+        # this knob.
+        rerender_text_slides_for_dims(
             content_storage,
             int(payload.display_rotation),
             int(payload.display_width),
