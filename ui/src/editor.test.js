@@ -975,10 +975,11 @@ describe("mountEditor — submit flow", () => {
         const onSave = vi.fn().mockResolvedValue({ id: "abc" });
         const handle = mountEditor(container, { width: 128, height: 96, onSave });
 
-        // Start: one layer, labeled "Layer".
+        // Start: one layer, auto-named "Layer 1" (qarl 2026-05-01:
+        // new layers pre-populate name with the next-unused "Layer N").
         const list = container.querySelector(".editor-layers-list");
         expect(list.children.length).toBe(1);
-        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer");
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
 
         // Type into layer 1 (the only one) so it's distinguishable.
         const layer0Text = list.children[0].querySelector(".field-text");
@@ -987,11 +988,14 @@ describe("mountEditor — submit flow", () => {
 
         // Click +New. New layer lands at array tail (drawn last) and
         // appears at DOM[0] (top of UI). Old layer slides to DOM[1].
+        // Auto-naming: new layer takes the next-unused N → "Layer 2";
+        // original keeps its "Layer 1" (names are sticky to the layer,
+        // not the visual position — same as slide-name nextAutoName).
         container.querySelector(".editor-add-layer").click();
         expect(list.children.length).toBe(2);
-        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
-        expect(list.children[1].querySelector(".editor-layer-name-display").textContent).toBe("Layer 2");
-        // Old "BOTTOM" text is now in DOM[1] (Layer 2 / array index 0).
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 2");
+        expect(list.children[1].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
+        // Old "BOTTOM" text is now in DOM[1] (Layer 1 / array index 0).
         expect(list.children[1].querySelector(".field-text").value).toBe("BOTTOM");
         // New layer is empty + selected.
         expect(list.children[0].querySelector(".field-text").value).toBe("");
@@ -1028,11 +1032,11 @@ describe("mountEditor — submit flow", () => {
         // Both layers' delete buttons are visible.
         expect(list.children[0].querySelector(".editor-layer-delete").hidden).toBe(false);
 
-        // Delete the top layer (DOM[0] = array tail).
+        // Delete the top layer (DOM[0] = array tail = "Layer 2").
         list.children[0].querySelector(".editor-layer-delete").click();
         expect(list.children.length).toBe(1);
-        // Sole layer is now labeled "Layer" (no number) and shows BOTTOM.
-        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer");
+        // Sole layer keeps its sticky auto-name "Layer 1" and shows BOTTOM.
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
         expect(list.children[0].querySelector(".field-text").value).toBe("BOTTOM");
         // Delete button is hidden when only one layer remains (backend
         // min_length=1).
@@ -1076,6 +1080,50 @@ describe("mountEditor — submit flow", () => {
         const payload = onSaveExisting.mock.calls[0][1];
         expect(payload.text_layers[0].text).toBe("BOTTOM");
         expect(payload.text_layers[1].text).toBe("TOP");
+    });
+
+    it("auto-named layers: new layers fill the smallest unused 'Layer N' slot", async () => {
+        // §5.10a v3.1 (qarl 2026-05-01): on +New layer, default name
+        // is the smallest unused "Layer N". Custom-named layers (e.g.
+        // "Headline") don't reserve a slot — deleting "Layer 2" then
+        // adding fills back as "Layer 2".
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn().mockResolvedValue({ id: "abc" }),
+        });
+        const list = container.querySelector(".editor-layers-list");
+
+        // Start: Layer 1.
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
+
+        // +New → Layer 2 at top.
+        container.querySelector(".editor-add-layer").click();
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 2");
+
+        // +New → Layer 3 at top.
+        container.querySelector(".editor-add-layer").click();
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 3");
+
+        // Delete Layer 2 (now at DOM[1] — DOM[0]=Layer 3, DOM[1]=Layer 2,
+        // DOM[2]=Layer 1).
+        list.children[1].querySelector(".editor-layer-delete").click();
+        expect(list.children.length).toBe(2);
+
+        // +New → fills the gap with "Layer 2".
+        container.querySelector(".editor-add-layer").click();
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 2");
+
+        // Custom-named layer doesn't reserve a slot.
+        list.children[0].querySelector(".field-layer-name").value = "Headline";
+        list.children[0].querySelector(".field-layer-name").dispatchEvent(new Event("input", { bubbles: true }));
+        // +New → since no Layer 2 left, "Layer 2" again.
+        container.querySelector(".editor-add-layer").click();
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 2");
+
+        await handle.flushAutoSave();
     });
 
     it("accordion: only one layer is expanded at a time; clicking another header swaps", async () => {

@@ -404,6 +404,36 @@ function defaultLayer() {
 }
 
 /**
+ * Smallest unused "Layer N" given the slide's current layer names.
+ * Custom-named layers ("Headline", "Hours") don't reserve a slot —
+ * deleting "Layer 2" and adding fills back as "Layer 2". Mirrors
+ * slide-browser's nextAutoName for the slide-title field. qarl
+ * 2026-05-01.
+ */
+function nextLayerName(layers) {
+    const pattern = /^Layer (\d+)$/;
+    const used = new Set();
+    for (const layer of layers || []) {
+        const m = (layer?.name || "").match(pattern);
+        if (m) used.add(Number(m[1]));
+    }
+    let n = 1;
+    while (used.has(n)) n += 1;
+    return `Layer ${n}`;
+}
+
+/**
+ * defaultLayer() pre-populated with the next-unused "Layer N" name —
+ * used at editor mount, resetToBlank, and the +New affordance so a
+ * fresh layer always has a real label.
+ */
+function makeAutoNamedLayer(existingLayers) {
+    const layer = defaultLayer();
+    layer.name = nextLayerName(existingLayers);
+    return layer;
+}
+
+/**
  * Mount the text-slide editor.
  *
  * @param {HTMLElement} container — parent (emptied + replaced).
@@ -451,7 +481,7 @@ export function mountEditor(
         bgSlideId: null,
         bgVideoId: null,
         bgImage: null,
-        layers: [defaultLayer()],
+        layers: [makeAutoNamedLayer([])],
         // Selection drives the box overlay's binding. Expansion drives
         // which accordion card has its body visible. They stay coupled
         // by default (clicking a header sets BOTH to that index) but
@@ -1035,7 +1065,7 @@ export function mountEditor(
         // adds at the top of the list (drawn last → composited on top)".
         // The new layer becomes the active + expanded one (selection
         // and expansion are coupled in the accordion).
-        state.layers.push(defaultLayer());
+        state.layers.push(makeAutoNamedLayer(state.layers));
         state.activeLayerIndex = state.layers.length - 1;
         state.expandedLayerIndex = state.layers.length - 1;
         renderLayers();
@@ -1218,7 +1248,7 @@ export function mountEditor(
         state.bgImage = null;
         state.bgSlideId = null;
         state.bgVideoId = null;
-        state.layers = [defaultLayer()];
+        state.layers = [makeAutoNamedLayer([])];
         state.activeLayerIndex = 0;
         state.expandedLayerIndex = 0;
         renderLayers();
