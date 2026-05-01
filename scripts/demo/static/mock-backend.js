@@ -35,13 +35,12 @@
         return seed;
     }
 
-    /**
-     * §5.10a v3 (qarl 2026-05-01): TextSlide carries a `text_layers` list
-     * instead of flat text/text_color/font_*/auto_* fields. Old seed
-     * snapshots predate the migration; rewrite text_slide entries to the
-     * layered shape on load so the demo doesn't ship a broken editor
-     * until generate-seed.py is re-run against a v3 backend.
-     */
+    // §5.10a v3 (qarl 2026-05-01): TextSlide carries a `text_layers`
+    // list instead of flat text / text_color / font_* / auto_* fields.
+    // Old seed snapshots predate the migration; rewrite text_slide
+    // entries to the layered shape on load so the demo doesn't ship a
+    // broken editor until generate-seed.py is re-run against a v3
+    // backend.
     function migrateSeedToV3(seedData) {
         for (const item of seedData.content || []) {
             if (item.type !== "text_slide") continue;
