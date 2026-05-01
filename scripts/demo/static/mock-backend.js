@@ -258,6 +258,54 @@
             }
         }
 
+        // PUT /api/content/text-slides/{id} — in-memory update so the
+        // demo's autosave round-trips cleanly. Without this every layer
+        // edit (text/color/font/motion/dynamic-source/box-drag) 403s,
+        // updated_at never advances, and tile-thumb cachebust freezes
+        // (qarl 2026-05-01 review #4 caught this — local uvicorn worked
+        // fine, demo was broken). Asset.png CAN'T re-rasterize here
+        // (no Python in the browser), so the stored thumbnail shows
+        // whatever it showed at seed time — but the wire shape matches
+        // what a real backend serves, the cachebust bumps, and the
+        // operator's edit persists in-session.
+        const textSlidePutMatch = pathname.match(
+            /^\/api\/content\/text-slides\/([^/]+)$/,
+        );
+        if (textSlidePutMatch && method === "PUT") {
+            const id = textSlidePutMatch[1];
+            const item = state.content.find((c) => c.id === id);
+            if (!item || item.type !== "text_slide") {
+                return notFound("no text slide");
+            }
+            let body;
+            try {
+                body = await request.json();
+            } catch {
+                return forbidden("invalid JSON body");
+            }
+            // Merge slide-level fields + replace text_layers wholesale.
+            // png_base64 + the wire-side validators are skipped — the
+            // mock trusts whatever the editor sends, which is fine
+            // because the editor IS the only writer.
+            for (const key of [
+                "name",
+                "duration_ms",
+                "background_color",
+                "background_image_slide_id",
+                "background_video_slide_id",
+                "transition",
+                "transition_ms",
+            ]) {
+                if (key in body) item[key] = body[key];
+            }
+            if (Array.isArray(body.text_layers)) {
+                item.text_layers = body.text_layers;
+            }
+            item.updated_at = new Date().toISOString();
+            saveState();
+            return jsonResponse(item);
+        }
+
         // --- content write path: blocked ---
         if (
             (pathname === "/api/content/text-slides" && method === "POST") ||
