@@ -129,10 +129,11 @@ describe("drawCanvas — explicit fontSize override", () => {
     it("falls back to the heuristic when fontSize is not a positive number", () => {
         const canvas = mockCanvas(128, 96);
         drawCanvas(canvas, { text: "X", fontSize: 0 });
-        // §5.10a v3.1.1 (qarl 2026-05-01 ask #1): font sizing is
-        // SLIDE-WIDTH-relative now (was height-relative). Heuristic
-        // fires against canvas.width = 128.
-        expect(canvas._ctx.font).toContain(`${pickFontSize(128)}px`);
+        // §5.10a v3.1.2 (qarl 2026-05-01 review #3): font sizing is
+        // BOX-WIDTH-relative. Default box.w = 0.8 → boxW = 0.8 * 128
+        // = 102.4 → floor → 102. Heuristic = pickFontSize(boxW).
+        const boxW = Math.max(1, Math.round(0.8 * 128));
+        expect(canvas._ctx.font).toContain(`${pickFontSize(boxW)}px`);
     });
 });
 
@@ -202,14 +203,37 @@ describe("drawTextOnly (Phase 5b — Text-over-Video overlay)", () => {
         expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("BOTTOM");
     });
 
-    it("uses font_size_pct relative to canvas WIDTH when provided", () => {
+    it("uses font_size_pct relative to BOX width when provided", () => {
+        // §5.10a v3.1.2 (qarl 2026-05-01 review #3): pct is of box
+        // width. Default box {x:0.1, y:0.1, w:0.8, h:0.8} on a 200×100
+        // canvas → boxW = 0.8 * 200 = 160. 25% of 160 = 40px.
         const canvas = mockCanvas(200, 100);
         drawTextOnly(canvas, {
             text_layers: [{ text: "Hi", font_size_pct: 25 }],
         });
-        // §5.10a v3.1.1 (qarl 2026-05-01 ask #1): pct is of WIDTH now.
-        // 25% of 200 = 50px.
-        expect(canvas._ctx.font).toMatch(/\b50px\b/);
+        expect(canvas._ctx.font).toMatch(/\b40px\b/);
+    });
+
+    it("font scales with the layer's box.w (qarl 2026-05-01 review #3)", () => {
+        // Half-width box → half-size font for the same font_size_pct.
+        // Confirms 'resizing the box visibly resizes the text.'
+        const canvasWide = mockCanvas(200, 100);
+        drawTextOnly(canvasWide, {
+            text_layers: [
+                { text: "X", font_size_pct: 25, box: { x: 0, y: 0, w: 0.8, h: 1 } },
+            ],
+        });
+        const wideFont = canvasWide._ctx.font;
+        const canvasNarrow = mockCanvas(200, 100);
+        drawTextOnly(canvasNarrow, {
+            text_layers: [
+                { text: "X", font_size_pct: 25, box: { x: 0, y: 0, w: 0.4, h: 1 } },
+            ],
+        });
+        const narrowFont = canvasNarrow._ctx.font;
+        // Wide box (boxW=160) → 40px; narrow box (boxW=80) → 20px.
+        expect(wideFont).toMatch(/\b40px\b/);
+        expect(narrowFont).toMatch(/\b20px\b/);
     });
 
     it("never paints a background — the video frame underneath shows through", () => {
@@ -1100,8 +1124,12 @@ describe("mountEditor — submit flow", () => {
         });
         const list = container.querySelector(".editor-layers-list");
         expect(list.children.length).toBe(2);
-        // DOM[0] (top of UI) = "Layer 1" = array tail = "TOP".
-        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
+        // §5.10a v3.1 review #1 (qarl 2026-05-01): empty-name layers
+        // backfill on load with the smallest-unused "Layer N", same
+        // convention as +New. Array-order backfill: layer[0] → Layer 1,
+        // layer[1] → Layer 2. Visual top = array tail = "Layer 2"="TOP".
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 2");
+        expect(list.children[1].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
         expect(list.children[0].querySelector(".field-text").value).toBe("TOP");
         expect(list.children[1].querySelector(".field-text").value).toBe("BOTTOM");
 
@@ -1165,6 +1193,72 @@ describe("mountEditor — submit flow", () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it("loadForEdit backfills empty-name layers with auto Layer-N (qarl 2026-05-01 review #1)", async () => {
+        // Pre-76934f2 saves left layer.name="" — without backfill the
+        // saved name stays blank forever, the input shows the
+        // 'Headline' placeholder, and the chip falls through to a
+        // visual fallback. Backfill on load surfaces "Layer N" in the
+        // input AND saves it on next edit. Custom-named layers DON'T
+        // get renamed; they keep reserving their slot via nextLayerName.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSaveExisting = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting,
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "abc",
+            name: "Stacked",
+            background_color: "#000000",
+            duration_ms: 5000,
+            text_layers: [
+                { text: "BOTTOM" },              // unnamed → Layer 1 (smallest unused)
+                { text: "MID", name: "Headline" }, // custom → keeps name
+                { text: "TOP" },                 // unnamed → Layer 2 (next unused)
+            ],
+        });
+        const list = container.querySelector(".editor-layers-list");
+        // Per-layer name input is hydrated with the backfilled name —
+        // operator sees a real label, not a placeholder.
+        expect(list.children[0].querySelector(".field-layer-name").value).toBe("Layer 2");
+        expect(list.children[1].querySelector(".field-layer-name").value).toBe("Headline");
+        expect(list.children[2].querySelector(".field-layer-name").value).toBe("Layer 1");
+
+        await handle.flushAutoSave();
+        const payload = onSaveExisting.mock.calls[0][1];
+        // Backfilled names ride through to the wire shape — next save
+        // catches up the slide model. Custom name preserved.
+        expect(payload.text_layers[0].name).toBe("Layer 1");
+        expect(payload.text_layers[1].name).toBe("Headline");
+        expect(payload.text_layers[2].name).toBe("Layer 2");
+    });
+
+    it("single-layer slide always shows 'Layer 1' (no bare 'Layer' fallback)", async () => {
+        // Review #1: "qarl wants to see 'Layer 1' / 'Layer 2' / etc
+        // visibly in the header chip even when name is blank." A sole
+        // layer used to fall through to "Layer" (no number).
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting: vi.fn().mockResolvedValue({}),
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "x",
+            name: "X",
+            text_layers: [{ text: "X" }],   // unnamed
+        });
+        const list = container.querySelector(".editor-layers-list");
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
     });
 
     it("auto-named layers: new layers fill the smallest unused 'Layer N' slot", async () => {

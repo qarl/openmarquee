@@ -367,7 +367,7 @@ const LAYER_GROUP_TEMPLATE = `
                 <div class="font-picker-popover" role="listbox" hidden></div>
             </div>
             <label class="om-field" style="width: 160px;">
-                <span>Font size (% of height) <span class="field-font-size-display"></span></span>
+                <span>Font size (% of box width) <span class="field-font-size-display"></span></span>
                 <input type="range" class="om-range field-font-size" min="8" max="100" step="0.5">
             </label>
         </div>
@@ -868,7 +868,11 @@ export function mountEditor(
         const total = state.layers.length;
         // Visual position: array tail = TOP of UI = "Layer 1".
         const visualPosition = total - 1 - arrayIdx;
-        const fallbackName = total === 1 ? "Layer" : `Layer ${visualPosition + 1}`;
+        // Visual fallback ALWAYS shows "Layer N" (qarl 2026-05-01 review #1) —
+        // no special-case for single-layer slides. Numbers track visual
+        // position (DOM[0] = Layer 1) so the fallback reads naturally
+        // even when the saved name field is empty.
+        const fallbackName = `Layer ${visualPosition + 1}`;
         groupEl.querySelector(".editor-layer-name-display").textContent =
             layer.name?.trim() || fallbackName;
 
@@ -1372,6 +1376,21 @@ export function mountEditor(
             ? slide.text_layers
             : [{ text: "" }];
         state.layers = wireLayers.map(layerFromWire);
+        // Backfill empty-name layers with "Layer N" (qarl 2026-05-01
+        // review #1). Pre-76934f2 saves left layer.name="" — without
+        // this the saved name stays blank forever and the chip falls
+        // through to the visual fallback. Backfilling here surfaces
+        // the auto-name in the input AND saves it on next edit, so
+        // the slide shape catches up over time.
+        const seenNames = state.layers
+            .filter((l) => (l.name || "").trim() !== "")
+            .map((l) => ({ name: l.name }));
+        for (const layer of state.layers) {
+            if ((layer.name || "").trim() === "") {
+                layer.name = nextLayerName(seenNames);
+                seenNames.push({ name: layer.name });
+            }
+        }
         // Default selection + expansion: top of UI = array tail = the
         // layer drawn last. Operators expect "the topmost layer is open
         // when I click into a slide."
@@ -1605,16 +1624,16 @@ function paintLayer(ctx, canvas, layer) {
     const pct = layer.font_size_pct ?? layer.fontSizePct;
     const px = layer.font_size_px ?? layer.fontSize;
     if (Number.isFinite(pct) && pct > 0) {
-        // §5.10a v3.1.1 (qarl 2026-05-01 ask #1): font_size_pct is a
-        // percentage of slide WIDTH (not height). Wide signs at
-        // 1920×128 made height-relative font yield tiny letters;
-        // width-relative matches operator intuition for sign-sized
-        // type. Backend's _draw_text_into uses the same formula.
-        fontSizePx = Math.max(4, Math.round((canvas.width * pct) / 100));
+        // §5.10a v3.1.2 (qarl 2026-05-01 review #3): font_size_pct is
+        // a percentage of BOX WIDTH (not slide width). Resizing the
+        // box visibly resizes the text — operators expected that math
+        // and asked for it explicitly. Math: pct% × box.w × canvas.width
+        // = pct% × boxW (already in pixels).
+        fontSizePx = Math.max(4, Math.round((boxW * pct) / 100));
     } else if (Number.isFinite(px) && px > 0) {
         fontSizePx = px;
     } else {
-        fontSizePx = pickFontSize(canvas.width);
+        fontSizePx = pickFontSize(boxW);
     }
     ctx.fillStyle = textColor;
     const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;

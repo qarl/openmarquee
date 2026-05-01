@@ -487,15 +487,16 @@ def _draw_text_into(
     callers + text editor seed path) and render_layered_text_slide_png
     (the v3 multi-layer compositor). Centers the text inside `box`.
 
-    Font sizing (qarl 2026-05-01 ask #1): font_size_pct is a percentage
-    of slide WIDTH (not height — wide HDMI signs at 1920×128 made
-    height-relative font yield tiny letters; width-relative matches
-    how operators think about sign-sized type). Squish (qarl 2026-05-01
-    ask #1): if the rendered text overflows the box on EITHER axis,
-    squish on that axis via Lanczos resize. Vertical squish handles
-    multi-line text that exceeds box height; horizontal squish stays
-    as a fallback for verbose single-line text. Both axes squish
-    independently when both overflow.
+    Font sizing (qarl 2026-05-01 review #3, refining ask #1):
+    font_size_pct is a percentage of BOX WIDTH — resizing the box
+    visibly resizes the text. (Earlier same day went % of slide width;
+    qarl's review correction pinned it to box width because operators
+    expected box-resize → text-resize.) Squish (ask #1): if the
+    rendered text overflows the box on EITHER axis, Lanczos-resize
+    that axis to fit. Vertical squish handles multi-line text that
+    exceeds box height; horizontal squish stays as a fallback for
+    verbose single-line text. Both axes squish independently when
+    both overflow.
     """
     if not text:
         return
@@ -515,10 +516,11 @@ def _draw_text_into(
     if font_size_px is not None and font_size_px > 0:
         size_px = int(font_size_px)
     elif font_size_pct is not None and font_size_pct > 0:
-        # §5.10a v3.1.1 (qarl 2026-05-01 ask #1): pct is of slide WIDTH.
-        size_px = max(4, int(slide_width * font_size_pct / 100.0))
+        # §5.10a v3.1.2 (qarl 2026-05-01 review #3): pct is of BOX
+        # width. Resizing the box visibly resizes the text.
+        size_px = max(4, int(px_box_w * font_size_pct / 100.0))
     else:
-        size_px = max(12, int(slide_width * 0.3))
+        size_px = max(12, int(px_box_w * 0.3))
     font = _load_text_font(font_family, size_px)
     bbox = draw.textbbox((0, 0), text, font=font)
     natural_w = bbox[2] - bbox[0]
