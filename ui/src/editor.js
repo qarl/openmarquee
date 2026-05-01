@@ -725,6 +725,13 @@ export function mountEditor(
         // pill-group). Per QA 2026-05-01: bind to existing auto_mode
         // values (off/time/date/day) — the temp + next-event modes from
         // the design handoff are queued for qarl's call.
+        //
+        // Setting `.value =` on a hidden input doesn't dispatch any
+        // event, so attachAutoSave's form-level input/change listener
+        // wouldn't see the change → debounce never schedules → save
+        // never fires (qarl 2026-05-01 ask #3 root cause for "motion
+        // edits don't update tile thumbnails"). Explicitly kick the
+        // debounce here, same shape as the box-drag's onBoxPointerUp.
         autoModeSegEl.querySelectorAll("button").forEach((btn) => {
             btn.addEventListener("click", () => {
                 const value = btn.dataset.value;
@@ -734,11 +741,13 @@ export function mountEditor(
                 populateAutoFormatOptions(groupEl, value);
                 refreshSegmentedPressed(autoModeSegEl, value);
                 syncLayerFromForm(groupEl);
+                autoSave?.kick();
             });
         });
         autoFormatEl.addEventListener("change", () => syncLayerFromForm(groupEl));
 
-        // Motion segmented control. Same hidden-input pattern.
+        // Motion segmented control. Same hidden-input pattern; same
+        // explicit autoSave kick (see autoModeSeg comment above).
         motionSegEl.querySelectorAll("button").forEach((btn) => {
             btn.addEventListener("click", () => {
                 const value = btn.dataset.value;
@@ -746,6 +755,7 @@ export function mountEditor(
                 motionEl.value = value;
                 refreshSegmentedPressed(motionSegEl, value);
                 syncLayerFromForm(groupEl);
+                autoSave?.kick();
             });
         });
 

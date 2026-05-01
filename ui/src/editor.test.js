@@ -1082,6 +1082,62 @@ describe("mountEditor — submit flow", () => {
         expect(payload.text_layers[1].text).toBe("TOP");
     });
 
+    it("segmented controls (motion / dynamic-source) explicitly kick autosave (qarl ask #3 root cause)", async () => {
+        // Bug QA flagged 2026-05-01: thumbnails don't update on layer-
+        // motion edits. Root cause: segmented controls drive a HIDDEN
+        // input via `.value = …`, which dispatches no event — so
+        // attachAutoSave's form-level input/change listener never sees
+        // the change and the debounce never schedules. Real-world: tile
+        // thumb keeps the pre-edit updated_at in `?v=` indefinitely. Fix:
+        // explicitly autoSave.kick() in the segmented click handlers,
+        // same shape as box-drag's onBoxPointerUp.
+        //
+        // Test guards against regression by using fake timers to advance
+        // past the debounce WITHOUT calling flushAutoSave (which would
+        // mask the bug — flush attempts a save regardless of the timer
+        // state). Real usage relies on the debounce-schedule path.
+        vi.useFakeTimers();
+        try {
+            patchCanvasPrototype();
+            const container = document.createElement("div");
+            const onSaveExisting = vi.fn().mockResolvedValue({ id: "abc" });
+            const handle = mountEditor(container, {
+                width: 128,
+                height: 96,
+                onSave: vi.fn().mockResolvedValue({ id: "abc" }),
+                onSaveExisting,
+            });
+            // Pre-load an existing slide so canSave passes without
+            // typing into the text field (typing would route through
+            // the form's input listener, masking the segmented bug).
+            await handle.loadForEdit({
+                type: "text_slide",
+                id: "abc",
+                name: "X",
+                text_layers: [{ text: "X" }],
+            });
+
+            // Click motion-segmented "Scroll" button.
+            container
+                .querySelector('.field-motion-segmented button[data-value="scroll"]')
+                .click();
+
+            // Advance past the 900ms autosave debounce.
+            await vi.advanceTimersByTimeAsync(950);
+            // attempt() resolves an awaitable promise inside the
+            // debounced fn; the in-flight save's microtasks need a turn
+            // before the assertion sees the call.
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(onSaveExisting).toHaveBeenCalled();
+            const payload =
+                onSaveExisting.mock.calls[onSaveExisting.mock.calls.length - 1][1];
+            expect(payload.text_layers[0].motion).toBe("scroll");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("auto-named layers: new layers fill the smallest unused 'Layer N' slot", async () => {
         // §5.10a v3.1 (qarl 2026-05-01): on +New layer, default name
         // is the smallest unused "Layer N". Custom-named layers (e.g.
