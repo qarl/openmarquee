@@ -31,7 +31,46 @@
         const r = await nativeFetch(SEED_URL);
         if (!r.ok) throw new Error(`seed.json fetch failed: ${r.status}`);
         seed = await r.json();
+        migrateSeedToV3(seed);
         return seed;
+    }
+
+    /**
+     * §5.10a v3 (qarl 2026-05-01): TextSlide carries a `text_layers` list
+     * instead of flat text/text_color/font_*/auto_* fields. Old seed
+     * snapshots predate the migration; rewrite text_slide entries to the
+     * layered shape on load so the demo doesn't ship a broken editor
+     * until generate-seed.py is re-run against a v3 backend.
+     */
+    function migrateSeedToV3(seedData) {
+        for (const item of seedData.content || []) {
+            if (item.type !== "text_slide") continue;
+            if (Array.isArray(item.text_layers) && item.text_layers.length > 0) {
+                continue; // already v3
+            }
+            item.text_layers = [
+                {
+                    text: item.text || "",
+                    font_family: item.font_family || null,
+                    font_size_px: item.font_size_px || null,
+                    font_size_pct: item.font_size_pct || null,
+                    text_color: item.text_color || "#FFFFFF",
+                    auto_mode: item.auto_mode || null,
+                    auto_format: item.auto_format || null,
+                    box: item.box || { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+                },
+            ];
+            // Drop the legacy flat fields so the wire shape matches what
+            // a real v3 backend serves; bg + slide-level fields stay.
+            delete item.text;
+            delete item.font_family;
+            delete item.font_size_px;
+            delete item.font_size_pct;
+            delete item.text_color;
+            delete item.auto_mode;
+            delete item.auto_format;
+            delete item.box;
+        }
     }
 
     function loadStoredState() {
@@ -58,7 +97,10 @@
         // Versioned by seed.generated_at — a new seed roll-out invalidates
         // every visitor's stale state automatically. Falls back to
         // schema_version for older seeds that pre-date the stamp.
-        const seedKey = seed.generated_at || `v${seed.schema_version}`;
+        // §5.10a v3 (2026-05-01): bump version key so visitors stuck on
+        // pre-layered stored state get a fresh seed → next page load
+        // shows them a working editor.
+        const seedKey = `v3-${seed.generated_at || `v${seed.schema_version}`}`;
         if (stored && stored.__demo_version === seedKey) {
             state = stored;
         } else {
@@ -244,8 +286,14 @@
                 current_item_type: cur?.type || null,
                 current_item_transition: cur?.transition || null,
                 current_item_transition_ms: cur?.transition_ms || null,
-                current_item_auto_mode: cur?.auto_mode ?? null,
-                current_item_auto_format: cur?.auto_format ?? null,
+                // §5.10a v3: auto_mode/auto_format moved onto text_layers.
+                // Read off layer[0] for the playback-state surface; falls
+                // back to the legacy root-level fields for any image/video
+                // slide stub the mock might serve.
+                current_item_auto_mode:
+                    cur?.text_layers?.[0]?.auto_mode ?? cur?.auto_mode ?? null,
+                current_item_auto_format:
+                    cur?.text_layers?.[0]?.auto_format ?? cur?.auto_format ?? null,
                 current_playlist_id: DEFAULT_PLAYLIST_ID,
             });
         }
