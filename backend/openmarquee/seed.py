@@ -469,6 +469,113 @@ def render_welcome_png(width: int, height: int) -> bytes:
     return render_text_slide_png("Welcome", width, height)
 
 
+def _draw_text_into(
+    img: "Image.Image",
+    *,
+    text: str,
+    fg: str,
+    font_family: str | None,
+    box: object | None,
+    slide_width: int,
+    slide_height: int,
+) -> None:
+    """Compose one text layer onto `img` in place.
+
+    Shared by render_text_slide_png (single-layer rendering, legacy
+    callers + text editor seed path) and render_layered_text_slide_png
+    (the v3 multi-layer compositor). Centers the text inside `box`,
+    squishes horizontally if it overflows. Font size anchored to the
+    SLIDE height per §5.10a.
+    """
+    if not text:
+        return
+    if box is None:
+        bx, by, bw, bh = 0.0, 0.0, 1.0, 1.0
+    else:
+        bx = float(getattr(box, "x", 0.0))
+        by = float(getattr(box, "y", 0.0))
+        bw = float(getattr(box, "w", 1.0))
+        bh = float(getattr(box, "h", 1.0))
+    px_box_x = int(bx * slide_width)
+    px_box_y = int(by * slide_height)
+    px_box_w = max(1, int(bw * slide_width))
+    px_box_h = max(1, int(bh * slide_height))
+
+    draw = ImageDraw.Draw(img)
+    font_size_px = max(12, int(slide_height * 0.4))
+    font = _load_text_font(font_family, font_size_px)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    natural_w = bbox[2] - bbox[0]
+    natural_h = bbox[3] - bbox[1]
+    target_w = px_box_w
+    box_center_x = px_box_x + px_box_w / 2
+    box_center_y = px_box_y + px_box_h / 2
+    if natural_w <= target_w or natural_w <= 0 or natural_h <= 0:
+        draw.text(
+            (box_center_x - natural_w / 2 - bbox[0],
+             box_center_y - natural_h / 2 - bbox[1]),
+            text,
+            fill=fg,
+            font=font,
+        )
+        return
+    # Squish: render at native width on a transparent surface, then
+    # resize horizontally to target_w and composite back onto img. The
+    # pad-survives-resize trick is the same as before — just lifted
+    # into the helper.
+    pad_post = 4
+    ratio = target_w / max(1, natural_w)
+    pad_pre = max(pad_post, math.ceil(pad_post / max(ratio, 0.001)))
+    temp = Image.new(
+        "RGBA",
+        (natural_w + pad_pre * 2, natural_h + pad_post * 2),
+        (0, 0, 0, 0),
+    )
+    td = ImageDraw.Draw(temp)
+    td.text((pad_pre - bbox[0], pad_post - bbox[1]), text, fill=fg, font=font)
+    squished = temp.resize(
+        (target_w + pad_post * 2, natural_h + pad_post * 2), Image.LANCZOS
+    )
+    paste_x = int(box_center_x - squished.width / 2)
+    paste_y = int(box_center_y - squished.height / 2)
+    img.paste(squished, (paste_x, paste_y), squished)
+
+
+def render_layered_text_slide_png(
+    layers: list,
+    width: int,
+    height: int,
+    bg: str = WELCOME_BG_COLOR,
+    *,
+    background_image_path: Path | None = None,
+) -> bytes:
+    """Composite a list of TextLayers onto a single PNG (§5.10a v3).
+
+    Layers render in array order: index 0 first, later entries paint
+    on top. Each layer's `box` positions+clips its text; font_family
+    + text_color come per-layer. Background (solid fill or cover-fit
+    image) is shared across all layers — slide-level per the spec.
+    """
+    if background_image_path is not None and background_image_path.exists():
+        with Image.open(background_image_path) as src:
+            img = _cover_fit(src.convert("RGB"), width, height)
+    else:
+        img = Image.new("RGB", (width, height), bg)
+    for layer in layers:
+        _draw_text_into(
+            img,
+            text=getattr(layer, "text", ""),
+            fg=getattr(layer, "text_color", WELCOME_TEXT_COLOR),
+            font_family=getattr(layer, "font_family", None),
+            box=getattr(layer, "box", None),
+            slide_width=width,
+            slide_height=height,
+        )
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def render_text_slide_png(
     text: str,
     width: int,
@@ -480,29 +587,12 @@ def render_text_slide_png(
     font_family: str | None = None,
     box: object | None = None,
 ) -> bytes:
-    """Flatten one text slide to a PNG.
+    """Flatten a single text+box onto a PNG.
 
-    Mirrors what the UI's text-slide editor does client-side — background
-    (solid color OR cover-fit image) + text rendered inside the slide's
-    `box` region (SYSTEM_SPEC §5.10a). Long text squishes horizontally to
-    fit the box (B7, qarl 2026-04-29: "squish-everywhere as the canonical
-    behavior") rather than font-shrinking; matches the canvas
-    `fillText(maxWidth)` treatment in the UI editor's drawTextOnly.
-
-    Font size is anchored to the SLIDE height (per §5.10a, qarl
-    2026-04-30 revision): the box positions and clips the text, but
-    doesn't scale it. Squish target is the box width edge-to-edge (no
-    extra margin — the box itself is the explicit container).
-
-    `box` accepts a TextBox-shaped object (anything with x/y/w/h
-    attributes in [0,1] fractions) or None to default to the full slide
-    {x:0, y:0, w:1, h:1}. Passing the slide's TextBox keeps
-    re-renders consistent with the editor's WYSIWYG view.
-
-    `background_image_path` overrides `bg` when provided. `font_family`
-    looks up a bundled TTF from `_BUNDLED_FONT_FILES` (matches the UI
-    editor's named families); falls back to DejaVu Sans when None or
-    the family isn't bundled.
+    Single-layer rendering — used by the seed path's _seed_text_slide_set
+    + the test_rerender single-text fixtures. The new layered compositor
+    is `render_layered_text_slide_png` (§5.10a v3); both share the
+    `_draw_text_into` helper so squish + box-centering stay consistent.
     """
     if background_image_path is not None and background_image_path.exists():
         with Image.open(background_image_path) as src:
@@ -510,71 +600,15 @@ def render_text_slide_png(
     else:
         img = Image.new("RGB", (width, height), bg)
 
-    # Resolve box → pixel rect within the canvas. Defaults to full slide
-    # so legacy callers (tests, internal helpers) don't need to construct
-    # a TextBox to render the same output as before.
-    if box is None:
-        bx, by, bw, bh = 0.0, 0.0, 1.0, 1.0
-    else:
-        bx = float(getattr(box, "x", 0.0))
-        by = float(getattr(box, "y", 0.0))
-        bw = float(getattr(box, "w", 1.0))
-        bh = float(getattr(box, "h", 1.0))
-    px_box_x = int(bx * width)
-    px_box_y = int(by * height)
-    px_box_w = max(1, int(bw * width))
-    px_box_h = max(1, int(bh * height))
-
-    draw = ImageDraw.Draw(img)
-    # Font size anchored to SLIDE height per §5.10a (qarl 2026-04-30:
-    # box positions/clips text but doesn't scale it — operator-set
-    # font sizes mean the same thing across boxes of any size on the
-    # same slide). Min 12 keeps tiny WS281x panels legible.
-    font_size_px = max(12, int(height * 0.4))
-    font = _load_text_font(font_family, font_size_px)
-    bbox = draw.textbbox((0, 0), text, font=font)
-    natural_w = bbox[2] - bbox[0]
-    natural_h = bbox[3] - bbox[1]
-    # Squish target is box width edge-to-edge (no margin — the box is
-    # the explicit container per §5.10a).
-    target_w = px_box_w
-    box_center_x = px_box_x + px_box_w / 2
-    box_center_y = px_box_y + px_box_h / 2
-    if natural_w <= target_w or natural_w <= 0 or natural_h <= 0:
-        # Fits at native scale — draw centered in the box.
-        draw.text(
-            (box_center_x - natural_w / 2 - bbox[0], box_center_y - natural_h / 2 - bbox[1]),
-            text,
-            fill=fg,
-            font=font,
-        )
-    else:
-        # Squish: render at native width on a transparent surface, then
-        # resize horizontally to target_w and composite into the box.
-        #
-        # The pad keeps antialiased glyph edges from clipping at the
-        # bbox boundary. Because the temp surface gets resized BY a
-        # ratio (target_w + pad_post*2) / (natural_w + pad_pre*2), a
-        # fixed 4px pre-resize pad would shrink to sub-pixel at extreme
-        # compression and reintroduce the very clipping it was meant to
-        # prevent. Scale the horizontal pad up pre-resize so it survives
-        # to ~4px post-resize.
-        pad_post = 4
-        ratio = target_w / max(1, natural_w)
-        pad_pre = max(pad_post, math.ceil(pad_post / max(ratio, 0.001)))
-        temp = Image.new(
-            "RGBA",
-            (natural_w + pad_pre * 2, natural_h + pad_post * 2),
-            (0, 0, 0, 0),
-        )
-        td = ImageDraw.Draw(temp)
-        td.text((pad_pre - bbox[0], pad_post - bbox[1]), text, fill=fg, font=font)
-        squished = temp.resize(
-            (target_w + pad_post * 2, natural_h + pad_post * 2), Image.LANCZOS
-        )
-        paste_x = int(box_center_x - squished.width / 2)
-        paste_y = int(box_center_y - squished.height / 2)
-        img.paste(squished, (paste_x, paste_y), squished)
+    _draw_text_into(
+        img,
+        text=text,
+        fg=fg,
+        font_family=font_family,
+        box=box,
+        slide_width=width,
+        slide_height=height,
+    )
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()

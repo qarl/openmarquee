@@ -149,6 +149,46 @@ def test_rerender_returns_zero_on_empty_store(storage: ContentStorage):
     assert rerender_text_slides_for_dims(storage, rotation=0, width=64, height=32) == 0
 
 
+def test_rerender_composites_multiple_layers_in_order(storage: ContentStorage):
+    """qarl §5.10a v3 (2026-05-01): layered text renders in array order;
+    later layers paint over earlier ones. Stack a red bottom layer with
+    a non-overlapping white top layer; rerender; assert both colors
+    appear in the final PNG (proves both layers ran)."""
+    from openmarquee.content import TextBox
+
+    slide = TextSlide(
+        name="stacked",
+        background_color="#000000",
+        duration_ms=3000,
+        text_layers=[
+            TextLayer(
+                text="A",
+                text_color="#FF0000",
+                font_size_px=80,
+                box=TextBox(x=0.1, y=0.1, w=0.4, h=0.8),
+            ),
+            TextLayer(
+                text="B",
+                text_color="#FFFFFF",
+                font_size_px=80,
+                box=TextBox(x=0.5, y=0.1, w=0.4, h=0.8),
+            ),
+        ],
+    )
+    initial_png = render_text_slide_png("seed", 200, 200, fg="#FFFFFF", bg="#000000")
+    storage.save_text_slide(slide, initial_png)
+    count = rerender_text_slides_for_dims(
+        storage, rotation=0, width=200, height=200
+    )
+    assert count == 1
+    img = Image.open(BytesIO(storage.read_asset(slide.id))).convert("RGB")
+    pixels = set(img.getdata())
+    has_red = any(r > 200 and g < 80 and b < 80 for r, g, b in pixels)
+    has_white = any(r > 200 and g > 200 and b > 200 for r, g, b in pixels)
+    assert has_red, "layer 0 (red) didn't render"
+    assert has_white, "layer 1 (white) didn't render"
+
+
 def test_rerender_threads_box_through(storage: ContentStorage):
     """qarl 2026-04-30 §5.10a: the rerender side-effect must use each
     slide's box when re-rendering. With a half-width box, the resulting

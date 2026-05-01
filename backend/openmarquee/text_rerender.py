@@ -27,7 +27,7 @@ import logging
 
 from openmarquee.content import TextSlide
 from openmarquee.content.storage import ContentStorage
-from openmarquee.seed import render_text_slide_png
+from openmarquee.seed import render_layered_text_slide_png
 
 log = logging.getLogger(__name__)
 
@@ -76,21 +76,16 @@ def rerender_text_slides_for_dims(
             if it.background_image_slide_id is not None
             else None
         )
-        # Schema v3 (qarl 2026-05-01): per-text fields moved off the
-        # slide root into text_layers. Phase 1 reads layer[0]; phase 2
-        # of the layered rollout extends render_text_slide_png to
-        # composite the full layer list, and this loop iterates them.
-        layer = it.text_layers[0]
+        # Schema v3 (qarl 2026-05-01): every layer renders in array
+        # order, later entries compositing over earlier ones. The bg
+        # (solid fill or image) is shared across all layers.
         try:
-            png = render_text_slide_png(
-                layer.text,
+            png = render_layered_text_slide_png(
+                it.text_layers,
                 eff_w,
                 eff_h,
-                fg=layer.text_color,
                 bg=it.background_color,
                 background_image_path=bg_path,
-                font_family=layer.font_family,
-                box=layer.box,
             )
             storage.save_text_slide(it, png)
             rerendered += 1
