@@ -1208,6 +1208,178 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     outline-offset: 1px;
 }
 
+/* Accordion layer card (§5.10a v3.1, layer-editor handoff 2026-05-01).
+   Each layer is a card with an always-visible header row and a body
+   that's only visible when the card is expanded. One open at a time —
+   clicking another header collapses the previously open one. */
+.editor-layer-card {
+    background: var(--om-surface);
+    border: 1px solid var(--om-line);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: border-color 0.15s ease;
+}
+.editor-layer-card.editor-layer-expanded {
+    border-color: var(--om-accent);
+}
+.editor-layer-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px;
+    cursor: pointer;
+    user-select: none;
+}
+.editor-layer-handle {
+    color: var(--om-text-fade);
+    cursor: grab;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px;
+    font-size: 14px;
+    line-height: 1;
+}
+.editor-layer-handle:active { cursor: grabbing; }
+.editor-layer-thumb {
+    width: 36px;
+    height: 18px;
+    flex-shrink: 0;
+    background: var(--om-led-bg, #050608);
+    border-radius: 3px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--om-mono);
+    font-size: 7px;
+    font-weight: 700;
+    white-space: nowrap;
+    padding: 2px;
+}
+.editor-layer-card.editor-layer-hidden .editor-layer-thumb { opacity: 0.3; }
+.editor-layer-titleblock {
+    flex: 1;
+    min-width: 0;
+}
+.editor-layer-name-display {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--om-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.editor-layer-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 2px;
+    font-family: var(--om-mono);
+    font-size: 10px;
+    color: var(--om-text-fade);
+}
+.editor-layer-meta-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    border: 1px solid var(--om-line-2);
+    flex-shrink: 0;
+}
+.editor-layer-meta-motion {
+    color: var(--om-accent);
+}
+.editor-layer-eye {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--om-text-dim);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+}
+.editor-layer-eye:hover { background: var(--om-line); color: var(--om-text); }
+.editor-layer-chevron {
+    color: var(--om-text-fade);
+    display: inline-flex;
+    transition: transform 0.15s ease;
+    font-size: 14px;
+    line-height: 1;
+}
+.editor-layer-card.editor-layer-expanded .editor-layer-chevron {
+    transform: rotate(180deg);
+}
+.editor-layer-body {
+    padding: 4px 10px 10px;
+    border-top: 1px solid var(--om-line);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.editor-layer-card:not(.editor-layer-expanded) .editor-layer-body {
+    display: none;
+}
+
+/* Color row — 9 hex swatches + native picker. Per-layer text color only. */
+.editor-color-row {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.editor-color-swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 6px;
+    border: 1px solid var(--om-line-2);
+    padding: 0;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+.editor-color-swatch.editor-color-swatch--selected {
+    border: 2px solid var(--om-accent);
+}
+.editor-color-row .field-text-color {
+    width: 22px;
+    height: 18px;
+    padding: 0;
+    border: 1px solid var(--om-line-2);
+    border-radius: 6px;
+    background: transparent;
+    cursor: pointer;
+}
+
+/* Compact pill-group segmented control. Used for Dynamic-source +
+   Motion. Uses radio inputs under the hood for keyboard a11y; visual
+   chrome is the labels with [aria-pressed] styling. */
+.editor-segmented {
+    display: inline-flex;
+    padding: 2px;
+    gap: 2px;
+    background: var(--om-surface-2);
+    border: 1px solid var(--om-line);
+    border-radius: 7px;
+}
+.editor-segmented button {
+    padding: 3px 7px;
+    font-size: 11px;
+    font-family: var(--om-mono);
+    letter-spacing: 0.04em;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--om-text-dim);
+    cursor: pointer;
+}
+.editor-segmented button[aria-pressed="true"] {
+    background: var(--om-bg);
+    color: var(--om-accent);
+}
+
 .editor-status {
     margin: 0;
     color: var(--muted);

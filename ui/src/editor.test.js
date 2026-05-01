@@ -276,6 +276,9 @@ describe("mountEditor — submit flow", () => {
     });
 
     it("picking an auto_mode reveals the hint + format dropdown + rides through save", async () => {
+        // §5.10a v3.1 (accordion editor): the dynamic-source picker is a
+        // segmented button group whose clicks drive a hidden
+        // .field-auto-mode input. Drive it via the segmented buttons.
         patchCanvasPrototype();
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "x" });
@@ -284,9 +287,10 @@ describe("mountEditor — submit flow", () => {
         // Format dropdown starts hidden (no mode selected).
         expect(container.querySelector(".field-auto-format-wrap").hidden).toBe(true);
 
-        const auto = container.querySelector(".field-auto-mode");
-        auto.value = "time";
-        auto.dispatchEvent(new Event("change"));
+        container
+            .querySelector('.field-auto-mode-segmented button[data-value="time"]')
+            .click();
+        expect(container.querySelector(".field-auto-mode").value).toBe("time");
         expect(container.querySelector(".field-auto-mode-hint").hidden).toBe(false);
 
         // Format dropdown revealed with the two time options.
@@ -299,6 +303,7 @@ describe("mountEditor — submit flow", () => {
         // Pick the HH:MM:SS option and save.
         const fmt = container.querySelector(".field-auto-format");
         fmt.value = "time_hms";
+        fmt.dispatchEvent(new Event("change", { bubbles: true }));
 
         container.querySelector(".field-text").value = "12:34 (fallback)";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
@@ -315,25 +320,25 @@ describe("mountEditor — submit flow", () => {
             height: 96,
             onSave: vi.fn().mockResolvedValue({}),
         });
-        const auto = container.querySelector(".field-auto-mode");
+        const segPick = (val) =>
+            container
+                .querySelector(`.field-auto-mode-segmented button[data-value="${val}"]`)
+                .click();
 
-        auto.value = "date";
-        auto.dispatchEvent(new Event("change"));
+        segPick("date");
         let opts = Array.from(
             container.querySelectorAll(".field-auto-format option"),
         ).map((o) => o.value);
         expect(opts).toEqual(["date_iso", "date_long", "date_medium"]);
 
-        auto.value = "day";
-        auto.dispatchEvent(new Event("change"));
+        segPick("day");
         opts = Array.from(
             container.querySelectorAll(".field-auto-format option"),
         ).map((o) => o.value);
         expect(opts).toEqual(["day_long", "day_short"]);
 
         // And switching OFF auto_mode hides the wrap entirely.
-        auto.value = "";
-        auto.dispatchEvent(new Event("change"));
+        segPick("");
         expect(container.querySelector(".field-auto-format-wrap").hidden).toBe(true);
     });
 
@@ -408,18 +413,28 @@ describe("mountEditor — submit flow", () => {
         expect(status).toContain("backend boom");
     });
 
-    it("clicking a preset updates the color inputs and re-renders", () => {
+    it("clicking a quick-color swatch updates the layer's text color and re-renders", () => {
+        // §5.10a v3.1 (accordion editor): the per-layer "Quick colors"
+        // pairs (text + bg "Aa" buttons) are gone; replaced by 9 hex
+        // swatches that set the LAYER'S text color only. Bg color stays
+        // slide-level in the Background-source card.
         const fakeCtx = patchCanvasPrototype();
         const container = document.createElement("div");
         mountEditor(container, { width: 64, height: 32, onSave: vi.fn() });
 
         const renderCallsBefore = fakeCtx.fillRect.mock.calls.length;
-        // Pick the second preset (white on red).
-        const preset = container.querySelectorAll(".preset")[1];
-        preset.click();
+        // Pick the amber accent swatch (#FFB43C — second in the row).
+        const swatch = container.querySelectorAll(".editor-color-swatch")[1];
+        expect(swatch.dataset.color).toBe("#FFB43C");
+        swatch.click();
 
-        expect(container.querySelector(".field-text-color").value).toBe("#ffffff");
-        expect(container.querySelector(".field-bg-color").value).toBe("#cc0000");
+        // Native browsers lowercase color-input values; the editor
+        // uppercases on save, so just check case-insensitively.
+        expect(
+            container.querySelector(".field-text-color").value.toUpperCase(),
+        ).toBe("#FFB43C");
+        // Bg color was NOT touched — that's slide-level now.
+        expect(container.querySelector(".field-bg-color").value).toBe("#000000");
         // Re-render happened.
         expect(fakeCtx.fillRect.mock.calls.length).toBeGreaterThan(renderCallsBefore);
     });
@@ -963,7 +978,7 @@ describe("mountEditor — submit flow", () => {
         // Start: one layer, labeled "Layer".
         const list = container.querySelector(".editor-layers-list");
         expect(list.children.length).toBe(1);
-        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer");
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer");
 
         // Type into layer 1 (the only one) so it's distinguishable.
         const layer0Text = list.children[0].querySelector(".field-text");
@@ -974,8 +989,8 @@ describe("mountEditor — submit flow", () => {
         // appears at DOM[0] (top of UI). Old layer slides to DOM[1].
         container.querySelector(".editor-add-layer").click();
         expect(list.children.length).toBe(2);
-        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer 1");
-        expect(list.children[1].querySelector(".editor-layer-title").textContent).toBe("Layer 2");
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
+        expect(list.children[1].querySelector(".editor-layer-name-display").textContent).toBe("Layer 2");
         // Old "BOTTOM" text is now in DOM[1] (Layer 2 / array index 0).
         expect(list.children[1].querySelector(".field-text").value).toBe("BOTTOM");
         // New layer is empty + selected.
@@ -1017,7 +1032,7 @@ describe("mountEditor — submit flow", () => {
         list.children[0].querySelector(".editor-layer-delete").click();
         expect(list.children.length).toBe(1);
         // Sole layer is now labeled "Layer" (no number) and shows BOTTOM.
-        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer");
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer");
         expect(list.children[0].querySelector(".field-text").value).toBe("BOTTOM");
         // Delete button is hidden when only one layer remains (backend
         // min_length=1).
@@ -1053,7 +1068,7 @@ describe("mountEditor — submit flow", () => {
         const list = container.querySelector(".editor-layers-list");
         expect(list.children.length).toBe(2);
         // DOM[0] (top of UI) = "Layer 1" = array tail = "TOP".
-        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer 1");
+        expect(list.children[0].querySelector(".editor-layer-name-display").textContent).toBe("Layer 1");
         expect(list.children[0].querySelector(".field-text").value).toBe("TOP");
         expect(list.children[1].querySelector(".field-text").value).toBe("BOTTOM");
 
@@ -1061,6 +1076,102 @@ describe("mountEditor — submit flow", () => {
         const payload = onSaveExisting.mock.calls[0][1];
         expect(payload.text_layers[0].text).toBe("BOTTOM");
         expect(payload.text_layers[1].text).toBe("TOP");
+    });
+
+    it("accordion: only one layer is expanded at a time; clicking another header swaps", async () => {
+        // §5.10a v3.1 (accordion editor): one-open-at-a-time. On mount
+        // the sole layer is expanded. Adding a second layer expands the
+        // new (TOP / array-tail) one and collapses the previous. Clicking
+        // the OTHER card's header opens it and collapses the first.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn().mockResolvedValue({}),
+        });
+        const list = container.querySelector(".editor-layers-list");
+        // Initial: 1 layer, expanded.
+        expect(list.children[0].classList.contains("editor-layer-expanded")).toBe(true);
+
+        // + New layer: new card lands at DOM[0] expanded; old card collapses.
+        container.querySelector(".editor-add-layer").click();
+        expect(list.children.length).toBe(2);
+        expect(list.children[0].classList.contains("editor-layer-expanded")).toBe(true);
+        expect(list.children[1].classList.contains("editor-layer-expanded")).toBe(false);
+
+        // Click DOM[1]'s header → it expands, DOM[0] collapses.
+        list.children[1].querySelector(".editor-layer-head").click();
+        expect(list.children[0].classList.contains("editor-layer-expanded")).toBe(false);
+        expect(list.children[1].classList.contains("editor-layer-expanded")).toBe(true);
+
+        // Cleanup the autosave that the +New layer kicked.
+        await handle.flushAutoSave();
+    });
+
+    it("eye toggle hides a layer from save-time rasterization", async () => {
+        // §5.10a v3.1: clicking the eye icon on a layer's header sets
+        // visible=false. The save payload reflects that, AND the layer
+        // is excluded from drawCanvas / rasterizeAtTarget so the stored
+        // PNG matches the editor preview.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "x" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+        const list = container.querySelector(".editor-layers-list");
+
+        container.querySelector(".field-text").value = "VISIBLE";
+        container.querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
+
+        // Toggle eye → layer goes hidden.
+        list.children[0].querySelector(".editor-layer-eye").click();
+        expect(list.children[0].classList.contains("editor-layer-hidden")).toBe(true);
+
+        await handle.flushAutoSave();
+        expect(onSave.mock.calls[0][0].text_layers[0].visible).toBe(false);
+    });
+
+    it("motion segmented control rides through to the save payload", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "x" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+
+        container.querySelector(".field-text").value = "RUN";
+        container.querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
+
+        // Default motion: static. Pick Scroll.
+        container
+            .querySelector('.field-motion-segmented button[data-value="scroll"]')
+            .click();
+        expect(container.querySelector(".field-motion").value).toBe("scroll");
+
+        await handle.flushAutoSave();
+        expect(onSave.mock.calls[0][0].text_layers[0].motion).toBe("scroll");
+    });
+
+    it("layer name input drives the header name display + saves on the wire", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "x" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+        const list = container.querySelector(".editor-layers-list");
+
+        // Editor's per-layer name field is .field-layer-name (slide-level
+        // .field-name lives at the top of the editor unchanged).
+        const nameInput = list.children[0].querySelector(".field-layer-name");
+        nameInput.value = "Headline";
+        nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+
+        // Header's name display (always visible) reflects the value.
+        expect(
+            list.children[0].querySelector(".editor-layer-name-display").textContent,
+        ).toBe("Headline");
+
+        container.querySelector(".field-text").value = "OPEN";
+        container.querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
+        await handle.flushAutoSave();
+        expect(onSave.mock.calls[0][0].text_layers[0].name).toBe("Headline");
     });
 
     it("loadForEdit hydrates the video bg picker from a stored video reference (Phase 5b)", async () => {

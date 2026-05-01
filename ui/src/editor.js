@@ -27,14 +27,6 @@ import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 const RASTERIZE_W = 3840;
 const RASTERIZE_H = 2160;
 
-const PRESETS = [
-    { name: "White on black", text: "#FFFFFF", bg: "#000000" },
-    { name: "White on red", text: "#FFFFFF", bg: "#CC0000" },
-    { name: "Yellow on blue", text: "#FFD23A", bg: "#1538A8" },
-    { name: "Black on yellow", text: "#000000", bg: "#FFD23A" },
-    { name: "White on green", text: "#FFFFFF", bg: "#1F7A3A" },
-    { name: "Green on black", text: "#39FF14", bg: "#000000" },
-];
 
 // `weight` = numeric CSS font-weight to request in `ctx.font`. Using
 // each face's *native* weight avoids browser-synthesized fake bold on
@@ -194,17 +186,6 @@ function cssFontFamily(value) {
     return GENERICS.has(value) ? value : `"${value}"`;
 }
 
-function presetButtonsHtml() {
-    return PRESETS.map(
-        (p, i) => `
-        <button type="button" class="preset" data-preset-index="${i}"
-                aria-label="${p.name}"
-                title="${p.name}"
-                style="background:${p.bg};color:${p.text};">Aa</button>
-    `,
-    ).join("");
-}
-
 const EDITOR_TEMPLATE = `
     <div class="editor">
         <div class="slide-browser-slot"></div>
@@ -293,30 +274,72 @@ const EDITOR_TEMPLATE = `
     </div>
 `;
 
-// Per-layer field group. Inserted dynamically into .editor-layers-list,
-// one element per layer in state.layers. Field selectors stay class-based
-// (.field-text, .field-text-color, etc.) so per-layer querySelector under
-// the group root finds the right control.
+// Quick text-color swatches for the per-layer color row (§5.10a v3.1
+// accordion-editor handoff). Per-layer COLOR ONLY — bg color stayed
+// slide-level and lives in the Background-source card. Pulls the same
+// nine values the design ref uses (handoff/reference/app/layer-variants.jsx).
+const LAYER_QUICK_COLORS = [
+    "#FFFFFF", "#FFB43C", "#FF5FA7", "#5AF095", "#5FD5FF",
+    "#FF5A3C", "#A06CFF", "#1A1610", "#F4ECD8",
+];
+
+function quickColorSwatchesHtml() {
+    return LAYER_QUICK_COLORS.map(
+        (c) => `<button type="button" class="editor-color-swatch" data-color="${c}"
+                  aria-label="${c}" title="${c}"
+                  style="background:${c};"></button>`,
+    ).join("");
+}
+
+// Per-layer accordion card. Inserted dynamically into .editor-layers-list,
+// one element per layer in state.layers. The header row is always visible;
+// the body is only rendered open for the *expanded* layer (one-open-at-
+// a-time accordion).
+//
+// Field selectors stay class-based (.field-text, .field-text-color,
+// .field-font-family, etc.) so per-layer querySelector under the group
+// root finds the right control. The slide-level slide-name field uses
+// .field-name (TOP of the editor) — the per-layer name field below is
+// .field-layer-name to avoid the collision.
 const LAYER_GROUP_TEMPLATE = `
     <header class="editor-layer-head">
         <span class="editor-layer-handle" aria-label="drag to reorder" title="drag to reorder">⋮⋮</span>
-        <span class="editor-layer-title">Layer</span>
-        <button type="button" class="om-btn ghost editor-layer-delete" aria-label="delete layer" title="delete layer">×</button>
+        <div class="editor-layer-thumb" aria-hidden="true"></div>
+        <div class="editor-layer-titleblock">
+            <div class="editor-layer-name-display"></div>
+            <div class="editor-layer-meta">
+                <span class="editor-layer-meta-swatch" aria-hidden="true"></span>
+                <span class="editor-layer-meta-font"></span>
+                <span aria-hidden="true">·</span>
+                <span class="editor-layer-meta-size"></span>
+                <span class="editor-layer-meta-motion-sep" aria-hidden="true" hidden>·</span>
+                <span class="editor-layer-meta-motion editor-layer-meta-motion" hidden></span>
+            </div>
+        </div>
+        <button type="button" class="editor-layer-eye" aria-label="toggle visibility" title="toggle visibility">
+            <span class="editor-layer-eye-glyph">●</span>
+        </button>
+        <span class="editor-layer-chevron" aria-hidden="true">▾</span>
     </header>
-    <div class="editor-layer-body om-stack" style="gap: 12px;">
+    <div class="editor-layer-body">
+        <label class="om-field">
+            <span>Layer name</span>
+            <input type="text" class="om-input field-layer-name" placeholder="Headline" maxlength="200">
+        </label>
         <label class="om-field">
             <span>Text</span>
-            <textarea class="om-textarea field-text" rows="3" placeholder="(enter text here)"></textarea>
+            <textarea class="om-textarea field-text" rows="2" placeholder="(enter text here)"></textarea>
         </label>
-        <label class="om-field">
+        <div class="om-field">
             <span>Dynamic Text</span>
-            <select class="om-select field-auto-mode">
-                <option value="" selected>Off</option>
-                <option value="time">Current time</option>
-                <option value="date">Today's date</option>
-                <option value="day">Day of week</option>
-            </select>
-        </label>
+            <div class="editor-segmented field-auto-mode-segmented" role="group" aria-label="dynamic source">
+                <button type="button" data-value="" aria-pressed="true">Off</button>
+                <button type="button" data-value="time" aria-pressed="false">Time</button>
+                <button type="button" data-value="date" aria-pressed="false">Date</button>
+                <button type="button" data-value="day" aria-pressed="false">Day</button>
+            </div>
+            <input type="hidden" class="field-auto-mode" value="">
+        </div>
         <label class="om-field field-auto-format-wrap" hidden>
             <span>Format</span>
             <select class="om-select field-auto-format"></select>
@@ -327,20 +350,13 @@ const LAYER_GROUP_TEMPLATE = `
             time using the configured timezone.
         </p>
         <div class="om-field">
-            <span>Quick colors</span>
-            <div class="presets">${presetButtonsHtml()}</div>
+            <span>Text color</span>
+            <div class="editor-color-row">
+                ${quickColorSwatchesHtml()}
+                <input type="color" class="field-text-color" value="#FFFFFF">
+            </div>
         </div>
-        <div class="om-row" style="gap: 10px;">
-            <label class="om-field" style="flex: 1;">
-                <span>Text color</span>
-                <input type="color" class="field-text-color" value="#FFFFFF" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-            </label>
-            <label class="om-field" style="width: 140px;">
-                <span>Font size (% of height)</span>
-                <input type="number" class="om-input field-font-size" min="1" max="100" step="0.5">
-            </label>
-        </div>
-        <div class="om-row" style="gap: 10px;">
+        <div class="om-row" style="gap: 10px; align-items: end;">
             <div class="om-field font-picker" style="flex: 1;">
                 <span class="font-picker-label">Font</span>
                 <select class="om-select field-font-family"></select>
@@ -350,21 +366,39 @@ const LAYER_GROUP_TEMPLATE = `
                 </button>
                 <div class="font-picker-popover" role="listbox" hidden></div>
             </div>
+            <label class="om-field" style="width: 160px;">
+                <span>Font size (% of height) <span class="field-font-size-display"></span></span>
+                <input type="range" class="om-range field-font-size" min="8" max="100" step="0.5">
+            </label>
+        </div>
+        <div class="om-row" style="justify-content: space-between; align-items: center; gap: 8px;">
+            <div class="editor-segmented field-motion-segmented" role="group" aria-label="motion">
+                <button type="button" data-value="static" aria-pressed="true">Static</button>
+                <button type="button" data-value="scroll" aria-pressed="false">Scroll</button>
+                <button type="button" data-value="pulse" aria-pressed="false">Pulse</button>
+            </div>
+            <input type="hidden" class="field-motion" value="static">
+            <button type="button" class="om-btn ghost editor-layer-delete" aria-label="delete layer" title="delete layer" style="color: var(--om-bad);">🗑</button>
         </div>
     </div>
 `;
 
 /**
  * Construct an empty layer (default values matching backend TextLayer).
+ * §5.10a v3.1: includes the new editor-driven fields (name / motion /
+ * visible / etc.) that landed in commit 20cb506.
  */
 function defaultLayer() {
     return {
         text: "",
+        name: "",
         textColor: "#FFFFFF",
         fontFamily: FONT_FAMILIES[0].value,
         fontSizePct: pickFontSizePct(),
         autoMode: null,
         autoFormat: null,
+        motion: "static",
+        visible: true,
         box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
     };
 }
@@ -418,7 +452,14 @@ export function mountEditor(
         bgVideoId: null,
         bgImage: null,
         layers: [defaultLayer()],
+        // Selection drives the box overlay's binding. Expansion drives
+        // which accordion card has its body visible. They stay coupled
+        // by default (clicking a header sets BOTH to that index) but
+        // are tracked separately because the focus-driven selection
+        // path (typing in a field) updates the active index without
+        // collapsing other cards.
         activeLayerIndex: 0,
+        expandedLayerIndex: 0,
         editingId: null,
     };
 
@@ -574,6 +615,7 @@ export function mountEditor(
         const layer = state.layers[arrayIdx];
         if (!layer) return;
         layer.text = groupEl.querySelector(".field-text").value;
+        layer.name = groupEl.querySelector(".field-layer-name").value;
         layer.textColor = groupEl.querySelector(".field-text-color").value;
         layer.fontFamily = groupEl.querySelector(".field-font-family").value;
         const sizeEl = groupEl.querySelector(".field-font-size");
@@ -581,9 +623,21 @@ export function mountEditor(
         if (Number.isFinite(parsedSize) && parsedSize > 0) {
             layer.fontSizePct = parsedSize;
         }
+        // Live numeric readout next to the range slider's label, so the
+        // operator sees the current % without having to inspect the
+        // slider thumb.
+        const sizeDisplayEl = groupEl.querySelector(".field-font-size-display");
+        if (sizeDisplayEl) {
+            sizeDisplayEl.textContent = `(${Math.round(layer.fontSizePct ?? pickFontSizePct())}%)`;
+        }
         layer.autoMode = groupEl.querySelector(".field-auto-mode").value || null;
         const fmtEl = groupEl.querySelector(".field-auto-format");
         layer.autoFormat = layer.autoMode ? fmtEl.value || null : null;
+        const motionEl = groupEl.querySelector(".field-motion");
+        layer.motion = motionEl ? motionEl.value || "static" : "static";
+        // The header chrome (name/meta/thumbnail) drives off layer state;
+        // refresh it so an in-card edit immediately mirrors up to the row.
+        refreshLayerHeader(groupEl, layer, arrayIdx);
         drawCanvas(canvas, state);
     }
 
@@ -615,13 +669,17 @@ export function mountEditor(
         setupFontPicker(groupEl);
 
         const textEl = groupEl.querySelector(".field-text");
+        const layerNameEl = groupEl.querySelector(".field-layer-name");
         const textColorEl = groupEl.querySelector(".field-text-color");
         const fontSizeEl = groupEl.querySelector(".field-font-size");
         const autoModeEl = groupEl.querySelector(".field-auto-mode");
+        const autoModeSegEl = groupEl.querySelector(".field-auto-mode-segmented");
         const autoFormatEl = groupEl.querySelector(".field-auto-format");
         const autoModeHintEl = groupEl.querySelector(".field-auto-mode-hint");
+        const motionEl = groupEl.querySelector(".field-motion");
+        const motionSegEl = groupEl.querySelector(".field-motion-segmented");
 
-        for (const el of [textEl, textColorEl, fontSizeEl, fontFamilyEl]) {
+        for (const el of [textEl, layerNameEl, textColorEl, fontSizeEl, fontFamilyEl]) {
             el.addEventListener("input", () => syncLayerFromForm(groupEl));
             // Selecting any field in this layer makes this the active
             // layer (drives the box overlay).
@@ -631,13 +689,47 @@ export function mountEditor(
             });
         }
 
-        autoModeEl.addEventListener("change", () => {
-            autoModeHintEl.hidden = !autoModeEl.value;
-            populateAutoFormatOptions(groupEl, autoModeEl.value);
-            syncLayerFromForm(groupEl);
+        // Dynamic-source segmented control. Buttons drive a hidden
+        // `.field-auto-mode` input (so the existing read-from-form code
+        // path doesn't care that the chrome moved from <select> to
+        // pill-group). Per QA 2026-05-01: bind to existing auto_mode
+        // values (off/time/date/day) — the temp + next-event modes from
+        // the design handoff are queued for qarl's call.
+        autoModeSegEl.querySelectorAll("button").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const value = btn.dataset.value;
+                if (autoModeEl.value === value) return;
+                autoModeEl.value = value;
+                autoModeHintEl.hidden = !value;
+                populateAutoFormatOptions(groupEl, value);
+                refreshSegmentedPressed(autoModeSegEl, value);
+                syncLayerFromForm(groupEl);
+            });
         });
-        autoFormatEl.addEventListener("change", () => {
-            syncLayerFromForm(groupEl);
+        autoFormatEl.addEventListener("change", () => syncLayerFromForm(groupEl));
+
+        // Motion segmented control. Same hidden-input pattern.
+        motionSegEl.querySelectorAll("button").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const value = btn.dataset.value;
+                if (motionEl.value === value) return;
+                motionEl.value = value;
+                refreshSegmentedPressed(motionSegEl, value);
+                syncLayerFromForm(groupEl);
+            });
+        });
+
+        // Quick-color swatches set this layer's text color (the BG color
+        // is slide-level and lives in the Background-source card —
+        // per-layer presets that paired text+bg colors are gone in v3.1).
+        groupEl.querySelectorAll(".editor-color-swatch").forEach((btn) => {
+            btn.addEventListener("click", (ev) => {
+                ev.preventDefault();
+                const color = btn.dataset.color;
+                if (!color) return;
+                textColorEl.value = color;
+                textColorEl.dispatchEvent(new Event("input", { bubbles: true }));
+            });
         });
 
         // Bundled @font-face fonts load lazily — kick an explicit load on
@@ -667,29 +759,107 @@ export function mountEditor(
             }
         });
 
-        groupEl.querySelectorAll(".preset").forEach((btn) => {
-            btn.addEventListener("click", () => {
-                const preset = PRESETS[Number(btn.dataset.presetIndex)];
-                if (!preset) return;
-                textColorEl.value = preset.text;
-                bgColorEl.value = preset.bg;
-                textColorEl.dispatchEvent(new Event("input", { bubbles: true }));
-                bgColorEl.dispatchEvent(new Event("input", { bubbles: true }));
-            });
-        });
-
-        // Click on the layer header (or anywhere outside an input) selects
-        // this layer for box editing without stealing focus from the form.
-        groupEl.addEventListener("pointerdown", (ev) => {
-            if (ev.target.closest("input, textarea, select, button")) return;
+        // Click on the layer head (anywhere except a button/input/handle)
+        // expands+selects this layer; collapses the previously expanded
+        // one (one-open-at-a-time accordion, per design handoff).
+        const headEl = groupEl.querySelector(".editor-layer-head");
+        headEl.addEventListener("click", (ev) => {
+            if (ev.target.closest(".editor-layer-handle, .editor-layer-eye, button, input, textarea, select")) {
+                return;
+            }
             const idx = layerIndexOfGroup(groupEl);
-            if (idx >= 0) selectLayer(idx);
+            if (idx < 0) return;
+            // Toggle: clicking the already-expanded layer's header
+            // collapses it (matches the reference behavior).
+            if (state.expandedLayerIndex === idx) {
+                state.expandedLayerIndex = null;
+            } else {
+                state.expandedLayerIndex = idx;
+                state.activeLayerIndex = idx;
+            }
+            updateActiveLayerStyling();
+            positionBoxOverlay();
         });
 
-        groupEl.querySelector(".editor-layer-delete").addEventListener("click", () => {
+        // Eye toggle — stop-prop so the head's click handler doesn't fire.
+        // Toggles layer.visible. Hidden layers are excluded from save-time
+        // rasterization (drawCanvas + rasterizeAtTarget skip them), and
+        // the thumbnail fades to 30%.
+        groupEl.querySelector(".editor-layer-eye").addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            const idx = layerIndexOfGroup(groupEl);
+            if (idx < 0) return;
+            const layer = state.layers[idx];
+            layer.visible = !layer.visible;
+            refreshLayerHeader(groupEl, layer, idx);
+            drawCanvas(canvas, state);
+            autoSave?.kick();
+        });
+
+        groupEl.querySelector(".editor-layer-delete").addEventListener("click", (ev) => {
+            ev.stopPropagation();
             const idx = layerIndexOfGroup(groupEl);
             if (idx >= 0) deleteLayerAt(idx);
         });
+    }
+
+    /**
+     * Repaint a segmented control's [aria-pressed] state to reflect the
+     * picked value. Called after every set-from-state and every user-
+     * initiated change.
+     */
+    function refreshSegmentedPressed(segEl, value) {
+        segEl.querySelectorAll("button").forEach((btn) => {
+            btn.setAttribute(
+                "aria-pressed",
+                btn.dataset.value === value ? "true" : "false",
+            );
+        });
+    }
+
+    /**
+     * Repaint the always-visible header row (name display, meta chips,
+     * thumbnail, eye glyph, expand/visible/active class flags) off the
+     * layer model. Called whenever the layer state mutates — drag-end,
+     * delete, eye toggle, in-card field edit. Body inputs aren't touched
+     * here (they're driven directly by the operator's typing).
+     */
+    function refreshLayerHeader(groupEl, layer, arrayIdx) {
+        const total = state.layers.length;
+        // Visual position: array tail = TOP of UI = "Layer 1".
+        const visualPosition = total - 1 - arrayIdx;
+        const fallbackName = total === 1 ? "Layer" : `Layer ${visualPosition + 1}`;
+        groupEl.querySelector(".editor-layer-name-display").textContent =
+            layer.name?.trim() || fallbackName;
+
+        const fontMeta =
+            FONT_FAMILIES.find((f) => f.value === layer.fontFamily) ||
+            FONT_FAMILIES[0];
+        const sizePct = Math.round(layer.fontSizePct ?? pickFontSizePct());
+        groupEl.querySelector(".editor-layer-meta-swatch").style.background =
+            layer.textColor || "#FFFFFF";
+        groupEl.querySelector(".editor-layer-meta-font").textContent = fontMeta.label;
+        groupEl.querySelector(".editor-layer-meta-size").textContent = `${sizePct}%`;
+        const motionEl = groupEl.querySelector(".editor-layer-meta-motion");
+        const motionSepEl = groupEl.querySelector(".editor-layer-meta-motion-sep");
+        const motion = layer.motion || "static";
+        if (motion === "static") {
+            motionEl.hidden = true;
+            motionSepEl.hidden = true;
+        } else {
+            motionEl.hidden = false;
+            motionSepEl.hidden = false;
+            motionEl.textContent = motion;
+        }
+
+        const thumbEl = groupEl.querySelector(".editor-layer-thumb");
+        const preview = (layer.text || "").slice(0, 8) || "—";
+        thumbEl.textContent = preview;
+        thumbEl.style.color = layer.textColor || "#FFFFFF";
+
+        const visible = layer.visible !== false;
+        groupEl.classList.toggle("editor-layer-hidden", !visible);
+        groupEl.querySelector(".editor-layer-eye-glyph").textContent = visible ? "●" : "○";
     }
 
     function layerIndexOfGroup(groupEl) {
@@ -704,17 +874,22 @@ export function mountEditor(
 
     function buildLayerGroupEl(layer, idx) {
         const groupEl = document.createElement("div");
-        groupEl.className = "om-card editor-layer-group";
+        // .editor-layer-group kept on the wrapping element for back-compat
+        // with tests that select via `.editor-layer-group`. .editor-layer-
+        // card is the v3.1 accordion-chrome class; both apply at once.
+        groupEl.className = "editor-layer-card editor-layer-group";
         groupEl.innerHTML = LAYER_GROUP_TEMPLATE;
         groupEl.dataset.layerIndex = String(idx);
 
         // Hydrate fields from the layer model.
         groupEl.querySelector(".field-text").value = layer.text || "";
+        groupEl.querySelector(".field-layer-name").value = layer.name || "";
         groupEl.querySelector(".field-text-color").value = layer.textColor || "#FFFFFF";
         const fontFamilyEl = groupEl.querySelector(".field-font-family");
         const fontSizeEl = groupEl.querySelector(".field-font-size");
         const autoModeEl = groupEl.querySelector(".field-auto-mode");
         const autoModeHintEl = groupEl.querySelector(".field-auto-mode-hint");
+        const motionEl = groupEl.querySelector(".field-motion");
 
         // bindLayerGroupListeners populates the <select> options before
         // we set its value below — so insert listeners-first, then write
@@ -724,9 +899,23 @@ export function mountEditor(
         fontFamilyEl.value = layer.fontFamily || FONT_FAMILIES[0].value;
         fontFamilyEl.dispatchEvent(new Event("font-picker-sync"));
         fontSizeEl.value = String(layer.fontSizePct ?? pickFontSizePct());
+        const sizeDisplayEl = groupEl.querySelector(".field-font-size-display");
+        if (sizeDisplayEl) {
+            sizeDisplayEl.textContent = `(${Math.round(layer.fontSizePct ?? pickFontSizePct())}%)`;
+        }
         autoModeEl.value = layer.autoMode || "";
         autoModeHintEl.hidden = !layer.autoMode;
         populateAutoFormatOptions(groupEl, layer.autoMode || "", layer.autoFormat || null);
+        refreshSegmentedPressed(
+            groupEl.querySelector(".field-auto-mode-segmented"),
+            layer.autoMode || "",
+        );
+        motionEl.value = layer.motion || "static";
+        refreshSegmentedPressed(
+            groupEl.querySelector(".field-motion-segmented"),
+            layer.motion || "static",
+        );
+        refreshLayerHeader(groupEl, layer, idx);
 
         return groupEl;
     }
@@ -751,22 +940,19 @@ export function mountEditor(
             const groupEl = buildLayerGroupEl(state.layers[i], i);
             layersListEl.appendChild(groupEl);
         }
-        updateLayerLabels();
         updateActiveLayerStyling();
         updateDeleteButtonAvailability();
+        updateLayersCountEyebrow();
         positionBoxOverlay();
         bindLayerSortable();
     }
 
-    function updateLayerLabels() {
-        // Visual top of UI = "Layer 1" (= last array entry = drawn last).
-        // DOM children appear in reverse-array order so child[0] is the
-        // top of the UI.
-        const total = state.layers.length;
-        for (let domIdx = 0; domIdx < total; domIdx++) {
-            const groupEl = layersListEl.children[domIdx];
-            const titleEl = groupEl.querySelector(".editor-layer-title");
-            titleEl.textContent = total === 1 ? "Layer" : `Layer ${domIdx + 1}`;
+    function updateLayersCountEyebrow() {
+        // The eyebrow above the layer list reads "LAYERS · N" per the
+        // accordion-editor handoff.
+        const eyebrowEl = container.querySelector(".editor-layers .om-eyebrow");
+        if (eyebrowEl) {
+            eyebrowEl.textContent = `Layers · ${state.layers.length}`;
         }
     }
 
@@ -775,10 +961,10 @@ export function mountEditor(
         for (let domIdx = 0; domIdx < layersListEl.children.length; domIdx++) {
             const arrayIdx = total - 1 - domIdx;
             const groupEl = layersListEl.children[domIdx];
-            groupEl.classList.toggle(
-                "editor-layer-active",
-                arrayIdx === state.activeLayerIndex,
-            );
+            const isActive = arrayIdx === state.activeLayerIndex;
+            const isExpanded = arrayIdx === state.expandedLayerIndex;
+            groupEl.classList.toggle("editor-layer-active", isActive);
+            groupEl.classList.toggle("editor-layer-expanded", isExpanded);
         }
     }
 
@@ -806,24 +992,33 @@ export function mountEditor(
                 const newArrayIdx = total - 1 - ev.newIndex;
                 const moved = state.layers.splice(oldArrayIdx, 1)[0];
                 state.layers.splice(newArrayIdx, 0, moved);
-                if (state.activeLayerIndex === oldArrayIdx) {
-                    state.activeLayerIndex = newArrayIdx;
-                } else if (
-                    oldArrayIdx < state.activeLayerIndex &&
-                    newArrayIdx >= state.activeLayerIndex
-                ) {
-                    state.activeLayerIndex -= 1;
-                } else if (
-                    oldArrayIdx > state.activeLayerIndex &&
-                    newArrayIdx <= state.activeLayerIndex
-                ) {
-                    state.activeLayerIndex += 1;
-                }
+                state.activeLayerIndex = shiftIndexForReorder(
+                    state.activeLayerIndex, oldArrayIdx, newArrayIdx,
+                );
+                state.expandedLayerIndex = shiftIndexForReorder(
+                    state.expandedLayerIndex, oldArrayIdx, newArrayIdx,
+                );
                 renderLayers();
                 drawCanvas(canvas, state);
                 autoSave?.kick();
             },
         });
+    }
+
+    /**
+     * After a Sortable reorder, return where a tracked array index
+     * (e.g. activeLayerIndex) ends up. Handles all four cases:
+     *   - the tracked index IS the moved layer → follows it to newIdx
+     *   - moved across forward (oldIdx < tracked, newIdx ≥ tracked) → tracked - 1
+     *   - moved across backward (oldIdx > tracked, newIdx ≤ tracked) → tracked + 1
+     *   - moved entirely on the other side → unchanged
+     */
+    function shiftIndexForReorder(tracked, oldIdx, newIdx) {
+        if (tracked === null || tracked === undefined) return tracked;
+        if (tracked === oldIdx) return newIdx;
+        if (oldIdx < tracked && newIdx >= tracked) return tracked - 1;
+        if (oldIdx > tracked && newIdx <= tracked) return tracked + 1;
+        return tracked;
     }
 
     function selectLayer(idx) {
@@ -838,9 +1033,11 @@ export function mountEditor(
         // New layer inserts at the END of the array (drawn last →
         // composited on top), matching qarl's spec note: "+ New layer
         // adds at the top of the list (drawn last → composited on top)".
-        // The new layer becomes the active one.
+        // The new layer becomes the active + expanded one (selection
+        // and expansion are coupled in the accordion).
         state.layers.push(defaultLayer());
         state.activeLayerIndex = state.layers.length - 1;
+        state.expandedLayerIndex = state.layers.length - 1;
         renderLayers();
         drawCanvas(canvas, state);
         autoSave?.kick();
@@ -853,6 +1050,14 @@ export function mountEditor(
             state.activeLayerIndex = state.layers.length - 1;
         } else if (state.activeLayerIndex > idx) {
             state.activeLayerIndex -= 1;
+        }
+        if (
+            state.expandedLayerIndex === null ||
+            state.expandedLayerIndex >= state.layers.length
+        ) {
+            state.expandedLayerIndex = state.layers.length - 1;
+        } else if (state.expandedLayerIndex > idx) {
+            state.expandedLayerIndex -= 1;
         }
         renderLayers();
         drawCanvas(canvas, state);
@@ -966,11 +1171,14 @@ export function mountEditor(
         const durationSeconds = Number(durationEl.value) || 5;
         const text_layers = state.layers.map((layer) => ({
             text: layer.text,
+            name: layer.name || "",
             text_color: (layer.textColor || "#FFFFFF").toUpperCase(),
             font_family: layer.fontFamily,
             font_size_pct: layer.fontSizePct,
             auto_mode: layer.autoMode || null,
             auto_format: layer.autoMode ? layer.autoFormat || null : null,
+            motion: layer.motion || "static",
+            visible: layer.visible !== false,
             box: { ...layer.box },
         }));
         const payload = {
@@ -1012,6 +1220,7 @@ export function mountEditor(
         state.bgVideoId = null;
         state.layers = [defaultLayer()];
         state.activeLayerIndex = 0;
+        state.expandedLayerIndex = 0;
         renderLayers();
         const colorRadio = container.querySelector(
             '.field-bg-source[value="color"]',
@@ -1080,6 +1289,7 @@ export function mountEditor(
     function layerFromWire(wire) {
         return {
             text: wire?.text || "",
+            name: wire?.name || "",
             textColor: wire?.text_color || "#FFFFFF",
             fontFamily: wire?.font_family || FONT_FAMILIES[0].value,
             fontSizePct:
@@ -1089,6 +1299,8 @@ export function mountEditor(
                     : pickFontSizePct()),
             autoMode: wire?.auto_mode || null,
             autoFormat: wire?.auto_format || null,
+            motion: wire?.motion || "static",
+            visible: wire?.visible !== false,
             box:
                 wire?.box && typeof wire.box === "object"
                     ? {
@@ -1120,7 +1332,11 @@ export function mountEditor(
             ? slide.text_layers
             : [{ text: "" }];
         state.layers = wireLayers.map(layerFromWire);
-        state.activeLayerIndex = 0;
+        // Default selection + expansion: top of UI = array tail = the
+        // layer drawn last. Operators expect "the topmost layer is open
+        // when I click into a slide."
+        state.activeLayerIndex = state.layers.length - 1;
+        state.expandedLayerIndex = state.layers.length - 1;
         renderLayers();
 
         if (slide.background_image_slide_id) {
@@ -1413,6 +1629,10 @@ export function drawCanvas(canvas, state) {
 
         const layers = layersForDraw(state);
         for (const layer of layers) {
+            // §5.10a v3.1: editor's eye toggle sets visible=false; skip
+            // hidden layers entirely so the rasterized PNG matches what
+            // the operator sees in preview.
+            if (layer?.visible === false) continue;
             const resolved = resolveLayerForDraw(layer);
             paintLayer(ctx, canvas, resolved);
         }
