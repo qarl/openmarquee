@@ -792,7 +792,16 @@ export function mountInlinePreview(container, options) {
             textOverlay.width = srcW;
             textOverlay.height = srcH;
         }
-        const key = `${item.id}|${item.text || ""}|${item.text_color || ""}|${item.font_family || ""}|${item.font_size_px || ""}|${item.font_size_pct || ""}|${srcW}x${srcH}`;
+        // §5.10a v3: text fields moved onto text_layers — fingerprint
+        // each layer (text/color/font/size/box) so a layered slide
+        // re-rasterizes on any per-layer change.
+        const layerSig = (item.text_layers || [])
+            .map(
+                (l) =>
+                    `${l.text || ""}~${l.text_color || ""}~${l.font_family || ""}~${l.font_size_px || ""}~${l.font_size_pct || ""}~${l.box ? `${l.box.x},${l.box.y},${l.box.w},${l.box.h}` : ""}`,
+            )
+            .join("|");
+        const key = `${item.id}|${layerSig}|${srcW}x${srcH}`;
         if (sizeChanged || textOverlayKey !== key) {
             drawTextOnly(textOverlay, item);
             textOverlayKey = key;
@@ -845,11 +854,17 @@ export function mountInlinePreview(container, options) {
 
     function updateAutoOverlay(slot) {
         const item = slot.item;
-        if (item.type === "text_slide" && item.auto_mode) {
+        // §5.10a v3: auto_mode/auto_format live on text_layers, not the
+        // slide root. The inline-preview overlay shows a single token at
+        // the canvas center, so read off layer[0] (the bottom-most text
+        // layer). Multi-layer auto-text would need its own overlay
+        // composition — out of scope here.
+        const layer = item.type === "text_slide" ? item.text_layers?.[0] : null;
+        if (layer?.auto_mode) {
             autoText.hidden = false;
             autoText.textContent = formatAutoText(
-                item.auto_mode,
-                item.auto_format,
+                layer.auto_mode,
+                layer.auto_format,
                 new Date(),
             );
         } else {

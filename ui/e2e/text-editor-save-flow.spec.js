@@ -74,7 +74,8 @@ test("Re-edit autosaves into the same slide — no duplicate in the browser", as
         async () => {
             const items = await (await page.request.get("/api/content")).json();
             const noDup = items.find((it) => it.name === "NoDup");
-            return noDup?.text;
+            // §5.10a v3: text lives on text_layers[0], not the slide root.
+            return noDup?.text_layers?.[0]?.text;
         },
         { timeout: 5_000 },
     ).toBe("v2");

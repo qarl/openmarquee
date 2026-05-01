@@ -59,14 +59,21 @@ function ensureTicker() {
  * @param {object} item — content item ({type, auto_mode, auto_format, ...}).
  */
 export function attachAutoTextOverlay(parent, item) {
-    if (!item || !item.auto_mode) return null;
+    // §5.10a v3: auto_mode + auto_format moved from the slide root onto
+    // each TextLayer. Read off layer[0] for the thumbnail token — multi-
+    // layer auto-text would need a layered overlay, but that's out of
+    // scope for the tile preview. Tests that pass auto_mode at the slide
+    // root keep working via the second-arg fallback.
+    const layer = item?.text_layers?.[0];
+    const autoMode = layer?.auto_mode ?? item?.auto_mode ?? null;
+    const autoFormat = layer?.auto_format ?? item?.auto_format ?? null;
+    if (!autoMode) return null;
     const overlay = document.createElement("div");
     overlay.className = "om-auto-text-overlay";
-    overlay.dataset.autoMode = item.auto_mode;
-    if (item.auto_format) overlay.dataset.autoFormat = item.auto_format;
+    overlay.dataset.autoMode = autoMode;
+    if (autoFormat) overlay.dataset.autoFormat = autoFormat;
     overlay.textContent =
-        formatAutoText(item.auto_mode, item.auto_format || null, new Date()) ||
-        "";
+        formatAutoText(autoMode, autoFormat, new Date()) || "";
     parent.appendChild(overlay);
     OVERLAYS.add(overlay);
     // Tile re-renders leave orphaned overlays in the registry until the

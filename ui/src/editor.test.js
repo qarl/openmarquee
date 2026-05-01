@@ -159,16 +159,18 @@ describe("drawCanvas — context isolation", () => {
 });
 
 describe("drawTextOnly (Phase 5b — Text-over-Video overlay)", () => {
-    it("clears to transparent and skips fillText when text is empty", () => {
+    // §5.10a v3: drawTextOnly takes a wire-shape ContentItem with
+    // text_layers; iterates layers in array order.
+    it("clears to transparent and skips fillText when text_layers is empty", () => {
         const canvas = mockCanvas(128, 96);
-        drawTextOnly(canvas, { text: "" });
+        drawTextOnly(canvas, { text_layers: [] });
         expect(canvas._ctx.clearRect).toHaveBeenCalledWith(0, 0, 128, 96);
         expect(canvas._ctx.fillText).not.toHaveBeenCalled();
     });
 
     it("draws each line of multi-line text", () => {
         const canvas = mockCanvas(128, 96);
-        drawTextOnly(canvas, { text: "TOP\nBOTTOM" });
+        drawTextOnly(canvas, { text_layers: [{ text: "TOP\nBOTTOM" }] });
         expect(canvas._ctx.fillText).toHaveBeenCalledTimes(2);
         expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("TOP");
         expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("BOTTOM");
@@ -176,17 +178,31 @@ describe("drawTextOnly (Phase 5b — Text-over-Video overlay)", () => {
 
     it("uses font_size_pct relative to canvas height when provided", () => {
         const canvas = mockCanvas(100, 200);
-        drawTextOnly(canvas, { text: "Hi", font_size_pct: 25 });
-        // 25% of 200 = 50px; the wire-shape pct path wins over the
-        // pickFontSize default that drawCanvas falls back to.
+        drawTextOnly(canvas, {
+            text_layers: [{ text: "Hi", font_size_pct: 25 }],
+        });
+        // 25% of 200 = 50px.
         expect(canvas._ctx.font).toMatch(/\b50px\b/);
     });
 
     it("never paints a background — the video frame underneath shows through", () => {
         const canvas = mockCanvas(128, 96);
-        drawTextOnly(canvas, { text: "OVER VIDEO", text_color: "#ff0" });
+        drawTextOnly(canvas, {
+            text_layers: [{ text: "OVER VIDEO", text_color: "#ff0" }],
+        });
         // drawCanvas paints fillRect for the bg; drawTextOnly must not.
         expect(canvas._ctx.fillRect).not.toHaveBeenCalled();
+    });
+
+    it("composites multiple text_layers in array order (later draws over earlier)", () => {
+        const canvas = mockCanvas(200, 200);
+        drawTextOnly(canvas, {
+            text_layers: [{ text: "BOTTOM" }, { text: "TOP" }],
+        });
+        // Two layers → two fillText calls in order.
+        expect(canvas._ctx.fillText).toHaveBeenCalledTimes(2);
+        expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("BOTTOM");
+        expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("TOP");
     });
 });
 
@@ -236,14 +252,15 @@ describe("mountEditor — submit flow", () => {
 
         expect(onSave).toHaveBeenCalledOnce();
         const payload = onSave.mock.calls[0][0];
-        expect(payload.text).toBe("Hi");
-        expect(payload.text_color).toBe("#FFAA00");
+        // §5.10a v3: per-layer fields live in text_layers[0], slide-level
+        // fields stay at the root (background_color, duration_ms, etc.).
+        expect(payload.text_layers[0].text).toBe("Hi");
+        expect(payload.text_layers[0].text_color).toBe("#FFAA00");
         expect(payload.background_color).toBe("#000000");
         expect(payload.duration_ms).toBe(5000); // default 5s
         expect(payload.png_base64).toBe("STUBDATA");
-        // Font-size defaults to the pickFontSizePct() default (% of width)
-        // so the slide reads the same after a panel-resolution change.
-        expect(payload.font_size_pct).toBe(30);
+        // Font-size defaults to the pickFontSizePct() default (% of height).
+        expect(payload.text_layers[0].font_size_pct).toBe(30);
     });
 
     it("auto_mode defaults to null + the dynamic-content hint is hidden", async () => {
@@ -286,8 +303,8 @@ describe("mountEditor — submit flow", () => {
         container.querySelector(".field-text").value = "12:34 (fallback)";
         container.querySelector(".field-text").dispatchEvent(new Event("input"));
         await handle.flushAutoSave();
-        expect(onSave.mock.calls[0][0].auto_mode).toBe("time");
-        expect(onSave.mock.calls[0][0].auto_format).toBe("time_hms");
+        expect(onSave.mock.calls[0][0].text_layers[0].auto_mode).toBe("time");
+        expect(onSave.mock.calls[0][0].text_layers[0].auto_format).toBe("time_hms");
     });
 
     it("switching the auto_mode repopulates the format dropdown with the new options", async () => {
@@ -333,8 +350,8 @@ describe("mountEditor — submit flow", () => {
         sizeEl.dispatchEvent(new Event("input"));
 
         await handle.flushAutoSave();
-        // Field is "% of width" now — operator typed 64, payload sends pct.
-        expect(onSave.mock.calls[0][0].font_size_pct).toBe(64);
+        // Field is "% of height" — operator typed 64, payload sends pct on layer[0].
+        expect(onSave.mock.calls[0][0].text_layers[0].font_size_pct).toBe(64);
     });
 
     it("sends the user's duration in milliseconds", async () => {
@@ -474,7 +491,7 @@ describe("mountEditor — submit flow", () => {
         await handle.flushAutoSave();
 
         const payload = onSave.mock.calls[0][0];
-        expect(payload.font_family).toBe("serif");
+        expect(payload.text_layers[0].font_family).toBe("serif");
         expect(payload.background_image_slide_id).toBeNull();
     });
 
@@ -494,13 +511,17 @@ describe("mountEditor — submit flow", () => {
             type: "text_slide",
             id: "abc",
             name: "Promo",
-            text: "PROMO",
-            text_color: "#ffffff",
             background_color: "#CC0000",
-            font_family: "monospace",
-            font_size_px: 40,
             duration_ms: 7000,
-            auto_mode: null,
+            text_layers: [
+                {
+                    text: "PROMO",
+                    text_color: "#ffffff",
+                    font_family: "monospace",
+                    font_size_px: 40,
+                    auto_mode: null,
+                },
+            ],
         });
         expect(container.querySelector(".field-text").value).toBe("PROMO");
         expect(container.querySelector(".field-name").value).toBe("Promo");
@@ -535,8 +556,12 @@ describe("mountEditor — submit flow", () => {
             type: "text_slide",
             id: "abc",
             name: "X",
-            text: "X",
-            box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+            text_layers: [
+                {
+                    text: "X",
+                    box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+                },
+            ],
         });
 
         const overlay = container.querySelector(".editor-box-overlay");
@@ -589,11 +614,13 @@ describe("mountEditor — submit flow", () => {
         const lastCall =
             onSaveExisting.mock.calls[onSaveExisting.mock.calls.length - 1];
         const payload = lastCall[1];
-        expect(payload.box.w).toBeCloseTo(0.6, 5);
-        expect(payload.box.h).toBeCloseTo(0.6, 5);
+        // §5.10a v3: box lives on the per-layer entry now.
+        const layer0 = payload.text_layers[0];
+        expect(layer0.box.w).toBeCloseTo(0.6, 5);
+        expect(layer0.box.h).toBeCloseTo(0.6, 5);
         // x and y are unchanged by an SE drag (origin stays put).
-        expect(payload.box.x).toBeCloseTo(0.1, 5);
-        expect(payload.box.y).toBeCloseTo(0.1, 5);
+        expect(layer0.box.x).toBeCloseTo(0.1, 5);
+        expect(layer0.box.y).toBeCloseTo(0.1, 5);
     });
 
     it("loadForEdit hydrates state.box from slide payload + Save round-trips it", async () => {
@@ -613,13 +640,17 @@ describe("mountEditor — submit flow", () => {
             type: "text_slide",
             id: "abc",
             name: "Promo",
-            text: "PROMO",
-            text_color: "#ffffff",
             background_color: "#CC0000",
-            font_family: "monospace",
-            font_size_px: 40,
             duration_ms: 7000,
-            box: { x: 0.2, y: 0.3, w: 0.5, h: 0.4 },
+            text_layers: [
+                {
+                    text: "PROMO",
+                    text_color: "#ffffff",
+                    font_family: "monospace",
+                    font_size_px: 40,
+                    box: { x: 0.2, y: 0.3, w: 0.5, h: 0.4 },
+                },
+            ],
         });
         const overlay = container.querySelector(".editor-box-overlay");
         // Inline style reflects the loaded box as percentages.
@@ -631,7 +662,7 @@ describe("mountEditor — submit flow", () => {
         await handle.flushAutoSave();
         expect(onSaveExisting).toHaveBeenCalledTimes(1);
         const payload = onSaveExisting.mock.calls[0][1];
-        expect(payload.box).toEqual({ x: 0.2, y: 0.3, w: 0.5, h: 0.4 });
+        expect(payload.text_layers[0].box).toEqual({ x: 0.2, y: 0.3, w: 0.5, h: 0.4 });
     });
 
     it("loadForEdit defaults the box to {0.1, 0.1, 0.8, 0.8} when slide.box is missing", async () => {
@@ -649,7 +680,7 @@ describe("mountEditor — submit flow", () => {
             type: "text_slide",
             id: "old",
             name: "Legacy",
-            text: "OLD",
+            text_layers: [{ text: "OLD" }],
         });
         const overlay = container.querySelector(".editor-box-overlay");
         expect(overlay.style.left).toBe("10%");
@@ -704,13 +735,17 @@ describe("mountEditor — submit flow", () => {
                 type: "text_slide",
                 id: "abc",
                 name: "Promo",
-                text: "PROMO",
-                text_color: "#ffffff",
                 background_color: "#000000",
-                font_family: "Pacifico",
-                font_size_px: 40,
                 duration_ms: 5000,
-                auto_mode: null,
+                text_layers: [
+                    {
+                        text: "PROMO",
+                        text_color: "#ffffff",
+                        font_family: "Pacifico",
+                        font_size_px: 40,
+                        auto_mode: null,
+                    },
+                ],
             });
 
             // Pump microtasks so the synchronous body of loadForEdit
@@ -914,6 +949,120 @@ describe("mountEditor — submit flow", () => {
         expect(payload.background_video_slide_id).toBeNull();
     });
 
+    it("clicking + New layer adds a layer at the TOP of the UI list (drawn last → on top)", async () => {
+        // §5.10a v3: "+ New layer adds at the top of the list (drawn
+        // last → composited on top)". The UI list renders in REVERSE of
+        // array order, so the new layer (which addLayer pushes to the
+        // array tail) must appear at DOM child[0] and become the active
+        // layer.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+
+        // Start: one layer, labeled "Layer".
+        const list = container.querySelector(".editor-layers-list");
+        expect(list.children.length).toBe(1);
+        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer");
+
+        // Type into layer 1 (the only one) so it's distinguishable.
+        const layer0Text = list.children[0].querySelector(".field-text");
+        layer0Text.value = "BOTTOM";
+        layer0Text.dispatchEvent(new Event("input", { bubbles: true }));
+
+        // Click +New. New layer lands at array tail (drawn last) and
+        // appears at DOM[0] (top of UI). Old layer slides to DOM[1].
+        container.querySelector(".editor-add-layer").click();
+        expect(list.children.length).toBe(2);
+        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer 1");
+        expect(list.children[1].querySelector(".editor-layer-title").textContent).toBe("Layer 2");
+        // Old "BOTTOM" text is now in DOM[1] (Layer 2 / array index 0).
+        expect(list.children[1].querySelector(".field-text").value).toBe("BOTTOM");
+        // New layer is empty + selected.
+        expect(list.children[0].querySelector(".field-text").value).toBe("");
+        expect(list.children[0].classList.contains("editor-layer-active")).toBe(true);
+
+        // Type into the new top layer + save.
+        const layer1Text = list.children[0].querySelector(".field-text");
+        layer1Text.value = "TOP";
+        layer1Text.dispatchEvent(new Event("input", { bubbles: true }));
+        await handle.flushAutoSave();
+
+        const payload = onSave.mock.calls[0][0];
+        // Array order: index 0 is drawn first (BOTTOM), index 1 is
+        // drawn last (TOP). UI top = array tail.
+        expect(payload.text_layers.length).toBe(2);
+        expect(payload.text_layers[0].text).toBe("BOTTOM");
+        expect(payload.text_layers[1].text).toBe("TOP");
+    });
+
+    it("delete-layer affordance removes the targeted layer + collapses to single-layer when 2→1", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+        const list = container.querySelector(".editor-layers-list");
+
+        // Seed two layers.
+        list.children[0].querySelector(".field-text").value = "BOTTOM";
+        list.children[0].querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
+        container.querySelector(".editor-add-layer").click();
+        list.children[0].querySelector(".field-text").value = "TOP";
+        list.children[0].querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
+        expect(list.children.length).toBe(2);
+        // Both layers' delete buttons are visible.
+        expect(list.children[0].querySelector(".editor-layer-delete").hidden).toBe(false);
+
+        // Delete the top layer (DOM[0] = array tail).
+        list.children[0].querySelector(".editor-layer-delete").click();
+        expect(list.children.length).toBe(1);
+        // Sole layer is now labeled "Layer" (no number) and shows BOTTOM.
+        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer");
+        expect(list.children[0].querySelector(".field-text").value).toBe("BOTTOM");
+        // Delete button is hidden when only one layer remains (backend
+        // min_length=1).
+        expect(list.children[0].querySelector(".editor-layer-delete").hidden).toBe(true);
+
+        await handle.flushAutoSave();
+        const payload = onSave.mock.calls[onSave.mock.calls.length - 1][0];
+        expect(payload.text_layers.length).toBe(1);
+        expect(payload.text_layers[0].text).toBe("BOTTOM");
+    });
+
+    it("loadForEdit hydrates a multi-layer slide; UI shows layer 1 at top + saves the same shape", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSaveExisting = vi.fn().mockResolvedValue({ id: "abc" });
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting,
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "abc",
+            name: "Stacked",
+            background_color: "#000000",
+            duration_ms: 5000,
+            text_layers: [
+                { text: "BOTTOM", text_color: "#FF0000" },
+                { text: "TOP", text_color: "#FFFFFF" },
+            ],
+        });
+        const list = container.querySelector(".editor-layers-list");
+        expect(list.children.length).toBe(2);
+        // DOM[0] (top of UI) = "Layer 1" = array tail = "TOP".
+        expect(list.children[0].querySelector(".editor-layer-title").textContent).toBe("Layer 1");
+        expect(list.children[0].querySelector(".field-text").value).toBe("TOP");
+        expect(list.children[1].querySelector(".field-text").value).toBe("BOTTOM");
+
+        await handle.flushAutoSave();
+        const payload = onSaveExisting.mock.calls[0][1];
+        expect(payload.text_layers[0].text).toBe("BOTTOM");
+        expect(payload.text_layers[1].text).toBe("TOP");
+    });
+
     it("loadForEdit hydrates the video bg picker from a stored video reference (Phase 5b)", async () => {
         patchCanvasPrototype();
         // Stub global Image so loadImageForSlide resolves quickly in jsdom
@@ -943,11 +1092,15 @@ describe("mountEditor — submit flow", () => {
                 id: "edit-me",
                 type: "text_slide",
                 name: "Existing",
-                text: "Bar Open",
-                text_color: "#FFFFFF",
                 background_color: "#000000",
                 background_video_slide_id: "vid-1",
                 duration_ms: 5000,
+                text_layers: [
+                    {
+                        text: "Bar Open",
+                        text_color: "#FFFFFF",
+                    },
+                ],
             });
 
             // The "video" radio is selected and the dropdown points at the

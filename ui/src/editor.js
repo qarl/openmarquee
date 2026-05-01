@@ -11,19 +11,22 @@
 // move between slides: click a tile to edit, click "+ New" to create.
 // The Playlists-page pallet's ✎ edit button still works too — either
 // surface feels natural in its own context.
+//
+// §5.10a v3 (qarl 2026-05-01): TextSlide carries a `text_layers` list.
+// Each layer has its own text / font / color / dynamic-text / box. The
+// editor surfaces one **layer group** per layer (with its own field
+// panel), drag-reorderable; the box overlay attaches to the focused
+// (selected) layer.
+
+import Sortable from "sortablejs";
 
 import { attachAutoSave } from "./auto-save.js";
 import { formatAutoText } from "./auto-format.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
-// Fixed asset rasterize target. Decoupled from device W×H so a panel
-// resize never degrades a stored text slide — playback cover-fits the
-// 4K bitmap down to whatever the panel is.
 const RASTERIZE_W = 3840;
 const RASTERIZE_H = 2160;
 
-// Signage-friendly color presets. Per SYSTEM_SPEC §5.1: most users just want
-// "white on red" and to be done — not to fiddle with a color picker.
 const PRESETS = [
     { name: "White on black", text: "#FFFFFF", bg: "#000000" },
     { name: "White on red", text: "#FFFFFF", bg: "#CC0000" },
@@ -33,21 +36,13 @@ const PRESETS = [
     { name: "Green on black", text: "#39FF14", bg: "#000000" },
 ];
 
-// Generic CSS font families — operator picks the shape ("sans / serif /
-// mono"); the specific face comes from whatever the rendering device has.
-// Kept generic so the canvas render matches the device render.
-// `weight` = the numeric CSS font-weight to request in `ctx.font`. Using
+// `weight` = numeric CSS font-weight to request in `ctx.font`. Using
 // each face's *native* weight avoids browser-synthesized fake bold on
-// single-weight display fonts (Pacifico, Bebas Neue, etc.), which looks
-// smeary. Variable fonts (Inter, Oswald, Roboto Slab, Cinzel) cover 700
-// natively and look correct at bold. UnifrakturCook ships only as the
-// Bold cut, so 700 matches the file.
+// single-weight display fonts (Pacifico, Bebas Neue, etc.).
 export const FONT_FAMILIES = [
-    // System generics — render with whatever the device has bundled at OS level.
     { value: "sans-serif",            label: "Sans-serif",            category: "System",     weight: 700 },
     { value: "serif",                 label: "Serif",                 category: "System",     weight: 700 },
     { value: "monospace",             label: "Monospace",             category: "System",     weight: 700 },
-    // Block / display — bold, attention-grabbing.
     { value: "Inter",                 label: "Inter",                 category: "Block",      weight: 700 },
     { value: "Oswald",                label: "Oswald",                category: "Block",      weight: 700 },
     { value: "Bebas Neue",            label: "Bebas Neue",            category: "Block",      weight: 400 },
@@ -55,19 +50,14 @@ export const FONT_FAMILIES = [
     { value: "Anton",                 label: "Anton",                 category: "Block",      weight: 400 },
     { value: "Archivo Black",         label: "Archivo Black",         category: "Block",      weight: 400 },
     { value: "Alfa Slab One",         label: "Alfa Slab One",         category: "Block",      weight: 400 },
-    // Serif — classical / editorial.
     { value: "Roboto Slab",           label: "Roboto Slab",           category: "Serif",      weight: 700 },
     { value: "Cinzel",                label: "Cinzel",                category: "Serif",      weight: 700 },
     { value: "Playfair Display",      label: "Playfair Display",      category: "Serif",      weight: 700 },
     { value: "DM Serif Display",      label: "DM Serif Display",      category: "Serif",      weight: 400 },
     { value: "UnifrakturCook",        label: "UnifrakturCook",        category: "Serif",      weight: 700 },
-    // Mono / scoreboard — countdown / retro digital.
     { value: "VT323",                 label: "VT323",                 category: "Mono",       weight: 400 },
     { value: "JetBrains Mono",        label: "JetBrains Mono",        category: "Mono",       weight: 700 },
     { value: "Space Mono",            label: "Space Mono",            category: "Mono",       weight: 700 },
-    // Script — flowing scripts, themed display, casual handwriting,
-    // and chalk/marker letterforms all share the same use-case bucket
-    // for the operator (decorative + personality vs typographic class).
     { value: "Pacifico",              label: "Pacifico",              category: "Script",     weight: 400 },
     { value: "Rye",                   label: "Rye",                   category: "Script",     weight: 400 },
     { value: "Sedgwick Ave Display",  label: "Sedgwick Ave Display",  category: "Script",     weight: 400 },
@@ -80,17 +70,32 @@ export const FONT_FAMILIES = [
 
 const FONT_WEIGHT_BY_VALUE = new Map(FONT_FAMILIES.map((f) => [f.value, f.weight]));
 
+const AUTO_FORMAT_OPTIONS = {
+    time: [
+        ["time_hm", "HH:MM — 14:30"],
+        ["time_hms", "HH:MM:SS — 14:30:45"],
+    ],
+    date: [
+        ["date_iso", "YYYY-MM-DD — 2026-04-21"],
+        ["date_long", "Long — April 21, 2026"],
+        ["date_medium", "Medium — Apr 21"],
+    ],
+    day: [
+        ["day_long", "Full — Monday"],
+        ["day_short", "Short — Mon"],
+    ],
+};
+
 /**
- * Wire up the visual font picker around an existing hidden <select> +
- * trigger button + popover. The hidden <select> stays the source of
- * truth (existing read/write code reads `.value`); this layer just
- * paints tiles in their own faces and syncs both directions.
+ * Wire up the visual font picker around a layer's hidden <select> +
+ * trigger button + popover. Idempotent per `layerEl`: each layer gets
+ * its own popover wired once at insert time.
  */
-function setupFontPicker(container) {
-    const selectEl = container.querySelector(".field-font-family");
-    const trigger = container.querySelector(".font-picker-trigger");
-    const triggerLabel = container.querySelector(".font-picker-trigger-label");
-    const popover = container.querySelector(".font-picker-popover");
+function setupFontPicker(layerEl) {
+    const selectEl = layerEl.querySelector(".field-font-family");
+    const trigger = layerEl.querySelector(".font-picker-trigger");
+    const triggerLabel = layerEl.querySelector(".font-picker-trigger-label");
+    const popover = layerEl.querySelector(".font-picker-popover");
     if (!selectEl || !trigger || !popover) return;
 
     const byCategory = new Map();
@@ -135,8 +140,6 @@ function setupFontPicker(container) {
         popover.hidden = !open;
         trigger.setAttribute("aria-expanded", open ? "true" : "false");
         if (open) {
-            // Scroll the selected tile into view so the operator sees
-            // their current pick instead of starting at "Sans-serif".
             const sel = popover.querySelector(".font-picker-tile.selected");
             sel?.scrollIntoView?.({ block: "nearest" });
         }
@@ -157,11 +160,9 @@ function setupFontPicker(container) {
         }
         selectEl.value = value;
         // Native <select> fires both `input` and `change` on user pick;
-        // the editor wires `input` to syncAndRender (state + canvas
-        // redraw) and `change` to font-load-then-redraw. Dispatching
-        // only `change` leaves the live preview stale until the next
-        // input on any field. Mimic the native pair to keep both
-        // pathways in sync.
+        // syncAndRender wires `input`, font-load-then-redraw wires
+        // `change`. Dispatching only `change` leaves the live preview
+        // stale until the next input on any field.
         selectEl.dispatchEvent(new Event("input", { bubbles: true }));
         selectEl.dispatchEvent(new Event("change", { bubbles: true }));
         syncTrigger();
@@ -174,8 +175,6 @@ function setupFontPicker(container) {
         setOpen(false);
     });
 
-    // External `.value = ...` doesn't fire `change`, so re-sync on each
-    // editor refresh path. The `change` listener still covers user input.
     selectEl.addEventListener("change", syncTrigger);
     selectEl.addEventListener("font-picker-sync", syncTrigger);
     syncTrigger();
@@ -237,65 +236,13 @@ const EDITOR_TEMPLATE = `
                     </div>
                 </div>
             </div>
-            <div class="om-card">
-                <div class="om-stack" style="gap: 12px;">
-                    <label class="om-field">
-                        <span>Text</span>
-                        <textarea class="om-textarea field-text" rows="3" placeholder="(enter text here)"></textarea>
-                    </label>
-                    <label class="om-field">
-                        <span>Dynamic Text</span>
-                        <select class="om-select field-auto-mode">
-                            <option value="" selected>Off</option>
-                            <option value="time">Current time</option>
-                            <option value="date">Today's date</option>
-                            <option value="day">Day of week</option>
-                        </select>
-                    </label>
-                    <label class="om-field field-auto-format-wrap" hidden>
-                        <span>Format</span>
-                        <select class="om-select field-auto-format"></select>
-                    </label>
-                    <p class="field-hint field-auto-mode-hint" hidden style="margin: 0; color: var(--om-text-dim); font-size: 12.5px;">
-                        When Dynamic Text is set, the typed text is a preview-only
-                        fallback — the device re-renders each second at playback
-                        time using the configured timezone.
-                    </p>
-                </div>
-            </div>
 
-            <div class="om-card">
-                <div class="om-stack" style="gap: 12px;">
-                    <div class="om-field">
-                        <span>Quick colors</span>
-                        <div class="presets">${presetButtonsHtml()}</div>
-                    </div>
-                    <div class="om-row" style="gap: 10px;">
-                        <label class="om-field" style="flex: 1;">
-                            <span>Text color</span>
-                            <input type="color" class="field-text-color" value="#FFFFFF" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-                        </label>
-                        <label class="om-field" style="flex: 1;">
-                            <span>Solid background</span>
-                            <input type="color" class="field-bg-color" value="#000000" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-                        </label>
-                    </div>
-                    <div class="om-row" style="gap: 10px;">
-                        <div class="om-field font-picker" style="flex: 1;">
-                            <span id="font-picker-label">Font</span>
-                            <select class="om-select field-font-family" aria-labelledby="font-picker-label"></select>
-                            <button type="button" class="font-picker-trigger" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="font-picker-label">
-                                <span class="font-picker-trigger-label">Sans-serif</span>
-                                <span class="font-picker-trigger-caret" aria-hidden="true">▾</span>
-                            </button>
-                            <div class="font-picker-popover" role="listbox" hidden></div>
-                        </div>
-                        <label class="om-field" style="width: 140px;">
-                            <span>Font size (% of height)</span>
-                            <input type="number" class="om-input field-font-size" min="1" max="100" step="0.5">
-                        </label>
-                    </div>
+            <div class="om-card editor-layers">
+                <div class="om-row" style="align-items: center; justify-content: space-between; margin-bottom: 10px;">
+                    <div class="om-eyebrow" style="font-family: var(--om-mono); letter-spacing: 0.14em; font-size: 10.5px; color: var(--om-text-fade); text-transform: uppercase;">Layers</div>
+                    <button type="button" class="om-btn ghost editor-add-layer">+ New layer</button>
                 </div>
+                <div class="editor-layers-list"></div>
             </div>
 
             <div class="om-card editor-bg-picker">
@@ -303,7 +250,11 @@ const EDITOR_TEMPLATE = `
                 <div class="om-stack" style="gap: 10px;">
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
                         <input type="radio" name="editor-bg-source" class="field-bg-source" value="color" checked>
-                        <span>Solid color (above)</span>
+                        <span>Solid color</span>
+                    </label>
+                    <label class="om-field editor-bg-color-wrap">
+                        <span>Background color</span>
+                        <input type="color" class="field-bg-color" value="#000000" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
                     </label>
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
                         <input type="radio" name="editor-bg-source" class="field-bg-source" value="slide">
@@ -336,11 +287,87 @@ const EDITOR_TEMPLATE = `
 
             <p class="om-save-status editor-status" role="status" aria-live="polite" data-state="idle"></p>
             <p style="margin: 4px 0 0; font-family: var(--om-mono); font-size: 11px; color: var(--om-text-fade); text-align: center;">
-                <kbd>Esc</kbd> in the text field to clear.
+                <kbd>Esc</kbd> in a text field to clear.
             </p>
         </form>
     </div>
 `;
+
+// Per-layer field group. Inserted dynamically into .editor-layers-list,
+// one element per layer in state.layers. Field selectors stay class-based
+// (.field-text, .field-text-color, etc.) so per-layer querySelector under
+// the group root finds the right control.
+const LAYER_GROUP_TEMPLATE = `
+    <header class="editor-layer-head">
+        <span class="editor-layer-handle" aria-label="drag to reorder" title="drag to reorder">⋮⋮</span>
+        <span class="editor-layer-title">Layer</span>
+        <button type="button" class="om-btn ghost editor-layer-delete" aria-label="delete layer" title="delete layer">×</button>
+    </header>
+    <div class="editor-layer-body om-stack" style="gap: 12px;">
+        <label class="om-field">
+            <span>Text</span>
+            <textarea class="om-textarea field-text" rows="3" placeholder="(enter text here)"></textarea>
+        </label>
+        <label class="om-field">
+            <span>Dynamic Text</span>
+            <select class="om-select field-auto-mode">
+                <option value="" selected>Off</option>
+                <option value="time">Current time</option>
+                <option value="date">Today's date</option>
+                <option value="day">Day of week</option>
+            </select>
+        </label>
+        <label class="om-field field-auto-format-wrap" hidden>
+            <span>Format</span>
+            <select class="om-select field-auto-format"></select>
+        </label>
+        <p class="field-hint field-auto-mode-hint" hidden style="margin: 0; color: var(--om-text-dim); font-size: 12.5px;">
+            When Dynamic Text is set, the typed text is a preview-only
+            fallback — the device re-renders each second at playback
+            time using the configured timezone.
+        </p>
+        <div class="om-field">
+            <span>Quick colors</span>
+            <div class="presets">${presetButtonsHtml()}</div>
+        </div>
+        <div class="om-row" style="gap: 10px;">
+            <label class="om-field" style="flex: 1;">
+                <span>Text color</span>
+                <input type="color" class="field-text-color" value="#FFFFFF" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
+            </label>
+            <label class="om-field" style="width: 140px;">
+                <span>Font size (% of height)</span>
+                <input type="number" class="om-input field-font-size" min="1" max="100" step="0.5">
+            </label>
+        </div>
+        <div class="om-row" style="gap: 10px;">
+            <div class="om-field font-picker" style="flex: 1;">
+                <span class="font-picker-label">Font</span>
+                <select class="om-select field-font-family"></select>
+                <button type="button" class="font-picker-trigger" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="font-picker-trigger-label">Sans-serif</span>
+                    <span class="font-picker-trigger-caret" aria-hidden="true">▾</span>
+                </button>
+                <div class="font-picker-popover" role="listbox" hidden></div>
+            </div>
+        </div>
+    </div>
+`;
+
+/**
+ * Construct an empty layer (default values matching backend TextLayer).
+ */
+function defaultLayer() {
+    return {
+        text: "",
+        textColor: "#FFFFFF",
+        fontFamily: FONT_FAMILIES[0].value,
+        fontSizePct: pickFontSizePct(),
+        autoMode: null,
+        autoFormat: null,
+        box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+    };
+}
 
 /**
  * Mount the text-slide editor.
@@ -350,20 +377,14 @@ const EDITOR_TEMPLATE = `
  * @param {number} options.width  — sign width in pixels.
  * @param {number} options.height — sign height in pixels.
  * @param {(payload) => Promise<any>} options.onSave — called for NEW
- *     slides; payload is the TextSlideUpload shape.
+ *     slides; payload is the TextSlideUpload shape with text_layers list.
  * @param {(id, payload) => Promise<any>} [options.onSaveExisting] — called
- *     for edit-mode saves. When omitted the editor still works but any
- *     edit attempt falls back to onSave (create-new).
+ *     for edit-mode saves.
  * @param {() => Promise<Array>} [options.fetchItems] — populates the
- *     background-slide dropdown with available content items. Omit to
- *     disable the "From saved slide" picker.
+ *     background-slide dropdown with available content items.
  * @param {({prompt}) => Promise<any>} [options.onGenerateBackground] —
- *     optional hook for the free AI background generator. When provided,
- *     a Generate… control surfaces in the background fieldset; on
- *     success the returned ImageSlide becomes the active background.
+ *     optional hook for the AI background generator.
  * @returns {{ loadForEdit: (slide) => Promise<void> }}
- *     caller-facing handle so the playlist-track pallet can wire a
- *     click-to-edit affordance.
  */
 export function mountEditor(
     container,
@@ -376,77 +397,51 @@ export function mountEditor(
     canvas.height = height;
     canvas.style.aspectRatio = `${width} / ${height}`;
 
-    const textEl = container.querySelector(".field-text");
-    const textColorEl = container.querySelector(".field-text-color");
     const bgColorEl = container.querySelector(".field-bg-color");
-    const fontFamilyEl = container.querySelector(".field-font-family");
     const bgSlideEl = container.querySelector(".field-bg-slide");
     const bgSlideWrapEl = container.querySelector(".editor-bg-slide-wrap");
     const bgVideoEl = container.querySelector(".field-bg-video");
     const bgVideoWrapEl = container.querySelector(".editor-bg-video-wrap");
+    const bgColorWrapEl = container.querySelector(".editor-bg-color-wrap");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
-    const fontSizeEl = container.querySelector(".field-font-size");
-    const autoModeEl = container.querySelector(".field-auto-mode");
-    const autoModeHintEl = container.querySelector(".field-auto-mode-hint");
-    const autoFormatEl = container.querySelector(".field-auto-format");
-    const autoFormatWrapEl = container.querySelector(".field-auto-format-wrap");
     const form = container.querySelector(".controls");
     const statusEl = container.querySelector(".editor-status");
-
-    for (const f of FONT_FAMILIES) {
-        const opt = document.createElement("option");
-        opt.value = f.value;
-        opt.textContent = f.label;
-        fontFamilyEl.appendChild(opt);
-    }
-    setupFontPicker(container);
-    fontSizeEl.value = String(pickFontSizePct());
+    const layersListEl = container.querySelector(".editor-layers-list");
+    const addLayerBtn = container.querySelector(".editor-add-layer");
 
     const state = {
         name: nameEl.value,
-        text: "",
-        textColor: textColorEl.value,
         backgroundColor: bgColorEl.value,
-        fontSizePct: Number(fontSizeEl.value),
-        fontFamily: fontFamilyEl.value,
         bgSource: "color",
         bgSlideId: null,
         bgVideoId: null,
-        bgImage: null, // decoded <img> for "slide" or "video" preview (video uses its thumbnail)
-        // Bounding box (SYSTEM_SPEC §5.10a). Fractions of slide w/h.
-        // Default {0.1, 0.1, 0.9, 0.9} matches the backend default.
-        // Edits via the canvas overlay drag handlers update this in-place.
-        box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
-        // Edit-mode tracking: when non-null, Save dispatches to
-        // onSaveExisting(editingId, payload) instead of onSave.
+        bgImage: null,
+        layers: [defaultLayer()],
+        activeLayerIndex: 0,
         editingId: null,
     };
 
-    // Bounding-box overlay (§5.10a). Positioned via inline % so it
-    // tracks the canvas's bounding rect across resizes / device-aspect
-    // changes — the overlay is a sibling of the canvas inside the
-    // editor-canvas-stack, both inheriting the same width.
     const boxOverlay = container.querySelector(".editor-box-overlay");
     const BOX_MIN = 0.1;
     const BOX_MAX = 0.9;
     const DRAG_THRESHOLD_PX = 5;
 
+    function activeLayer() {
+        return state.layers[state.activeLayerIndex] || state.layers[0];
+    }
+
     function positionBoxOverlay() {
         if (!boxOverlay) return;
-        boxOverlay.style.left = `${state.box.x * 100}%`;
-        boxOverlay.style.top = `${state.box.y * 100}%`;
-        boxOverlay.style.width = `${state.box.w * 100}%`;
-        boxOverlay.style.height = `${state.box.h * 100}%`;
+        const layer = activeLayer();
+        if (!layer) return;
+        boxOverlay.style.left = `${layer.box.x * 100}%`;
+        boxOverlay.style.top = `${layer.box.y * 100}%`;
+        boxOverlay.style.width = `${layer.box.w * 100}%`;
+        boxOverlay.style.height = `${layer.box.h * 100}%`;
     }
 
     function applyHandleDrag(start, mode, dx, dy) {
-        // Compute new size from the handle's edge motion, then clamp w/h,
-        // then recompute the MOVING corner from the clamped size so that
-        // a "min-side" handle dragged past the minimum doesn't drift the
-        // fixed edge. Without this, dragging the nw handle past min-width
-        // makes the box snap forward as the pointer keeps moving — the
-        // visual jitter reviewers caught.
         let x = start.x;
         let y = start.y;
         let w = start.w;
@@ -482,28 +477,19 @@ export function mountEditor(
         }
         w = Math.min(BOX_MAX, Math.max(BOX_MIN, w));
         h = Math.min(BOX_MAX, Math.max(BOX_MIN, h));
-        // Recompute the moving corner so that the fixed edge stays put.
-        // North-side handles (n/nw/ne) keep the bottom edge fixed; west-
-        // side handles (w/nw/sw) keep the right edge fixed.
+        // Recompute the moving corner so the fixed edge stays put.
         if (mode === "n" || mode === "nw" || mode === "ne") {
             y = start.y + start.h - h;
         }
         if (mode === "w" || mode === "nw" || mode === "sw") {
             x = start.x + start.w - w;
         }
-        // Final clamp: stay inside the slide.
         x = Math.min(1 - w, Math.max(0, x));
         y = Math.min(1 - h, Math.max(0, y));
         return { x, y, w, h };
     }
 
-    // Forward-declared so onBoxPointerUp can call autoSave.kick() — the
-    // attachAutoSave call lower down assigns into this. Synthetic 'input'
-    // events on the form would race attachAutoSave's listener registration
-    // and (per QA 2026-04-30 thumb-not-updating bug) sometimes fail to
-    // trigger the debounce; calling kick() directly is unambiguous.
     let autoSave = null;
-
     let activeDrag = null;
 
     function onBoxPointerDown(event) {
@@ -513,13 +499,15 @@ export function mountEditor(
         if (!handle && !isMove) return;
         const rect = canvas.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
+        const layer = activeLayer();
+        if (!layer) return;
         activeDrag = {
             mode: handle || "move",
             startX: event.clientX,
             startY: event.clientY,
             canvasW: rect.width,
             canvasH: rect.height,
-            startBox: { ...state.box },
+            startBox: { ...layer.box },
             crossedThreshold: false,
         };
         boxOverlay.setPointerCapture?.(event.pointerId);
@@ -539,13 +527,12 @@ export function mountEditor(
         }
         if (!activeDrag.crossedThreshold) {
             activeDrag.crossedThreshold = true;
-            // Forward-compat hook for v2's selection model — currently
-            // unstyled, but lets later CSS distinguish the active drag.
             boxOverlay.dataset.state = "dragging";
         }
         const dx = dxPx / activeDrag.canvasW;
         const dy = dyPx / activeDrag.canvasH;
-        state.box = applyHandleDrag(activeDrag.startBox, activeDrag.mode, dx, dy);
+        const layer = activeLayer();
+        layer.box = applyHandleDrag(activeDrag.startBox, activeDrag.mode, dx, dy);
         positionBoxOverlay();
         drawCanvas(canvas, state);
     }
@@ -561,11 +548,6 @@ export function mountEditor(
             // Capture may not have been granted; ignore.
         }
         if (crossed) {
-            // Drive the shared autoSave debounce directly. The save call
-            // captures state.box (already updated by the drag), and
-            // performSave's rasterizeAtTarget snapshots the current
-            // canvas state so the new asset.png reflects the operator's
-            // resize/move.
             autoSave?.kick();
         }
     }
@@ -575,104 +557,312 @@ export function mountEditor(
         boxOverlay.addEventListener("pointermove", onBoxPointerMove);
         boxOverlay.addEventListener("pointerup", onBoxPointerUp);
         boxOverlay.addEventListener("pointercancel", onBoxPointerUp);
-        positionBoxOverlay();
     }
 
-    function syncAndRender() {
+    function syncSlideFromForm() {
         state.name = nameEl.value;
-        state.text = textEl.value;
-        state.textColor = textColorEl.value;
         state.backgroundColor = bgColorEl.value;
-        state.fontFamily = fontFamilyEl.value;
-        // Auto-mode tokens (time / date / day / weather …): the canvas
-        // shows the current formatted value so the preview matches what
-        // the device renders at playout (B6, qarl 2026-04-29). Saved
-        // asset gets the same value frozen at save-moment; auto_render
-        // overlays a live composite at playback time so the on-disk
-        // freeze is invisible.
-        state.autoMode = autoModeEl.value || null;
-        state.autoFormat = state.autoMode ? autoFormatEl.value || null : null;
-        const parsedSize = Number(fontSizeEl.value);
-        if (Number.isFinite(parsedSize) && parsedSize > 0) {
-            state.fontSizePct = parsedSize;
-        }
         drawCanvas(canvas, state);
     }
 
-    for (const el of [
-        textEl,
-        textColorEl,
-        bgColorEl,
-        nameEl,
-        fontSizeEl,
-        fontFamilyEl,
-    ]) {
-        el.addEventListener("input", syncAndRender);
+    function syncLayerFromForm(groupEl) {
+        // The UI renders layers in reverse-array order, so DOM-child
+        // position ≠ array index. Read both off the group element to
+        // avoid the mix-up.
+        const arrayIdx = layerIndexOfGroup(groupEl);
+        if (arrayIdx < 0) return;
+        const layer = state.layers[arrayIdx];
+        if (!layer) return;
+        layer.text = groupEl.querySelector(".field-text").value;
+        layer.textColor = groupEl.querySelector(".field-text-color").value;
+        layer.fontFamily = groupEl.querySelector(".field-font-family").value;
+        const sizeEl = groupEl.querySelector(".field-font-size");
+        const parsedSize = Number(sizeEl.value);
+        if (Number.isFinite(parsedSize) && parsedSize > 0) {
+            layer.fontSizePct = parsedSize;
+        }
+        layer.autoMode = groupEl.querySelector(".field-auto-mode").value || null;
+        const fmtEl = groupEl.querySelector(".field-auto-format");
+        layer.autoFormat = layer.autoMode ? fmtEl.value || null : null;
+        drawCanvas(canvas, state);
     }
 
-    // When the user picks a bundled @font-face family that hasn't finished
-    // downloading yet, canvas draws with a fallback glyph set (serif) until
-    // the TTF resolves. Kick off an explicit load on selection and redraw
-    // once it's ready — so the preview catches up without the user having
-    // to touch another field.
-    fontFamilyEl.addEventListener("change", async () => {
-        const family = fontFamilyEl.value;
-        const weight = FONT_WEIGHT_BY_VALUE.get(family) ?? 700;
-        if (document.fonts?.load) {
-            try {
-                await document.fonts.load(`${weight} 40px ${cssFontFamily(family)}`);
-            } catch {
-                // Load failures bubble back as the fallback rendering;
-                // no need to surface — the draw-on-input path already ran.
-                return;
-            }
-            if (state.fontFamily === family) syncAndRender();
-        }
-    });
-
-    // Mode → list of [value, label] pairs for the format dropdown.
-    // Labels include an example so the operator knows exactly what the
-    // saved slide will render at playback time.
-    const AUTO_FORMAT_OPTIONS = {
-        time: [
-            ["time_hm", "HH:MM — 14:30"],
-            ["time_hms", "HH:MM:SS — 14:30:45"],
-        ],
-        date: [
-            ["date_iso", "YYYY-MM-DD — 2026-04-21"],
-            ["date_long", "Long — April 21, 2026"],
-            ["date_medium", "Medium — Apr 21"],
-        ],
-        day: [
-            ["day_long", "Full — Monday"],
-            ["day_short", "Short — Mon"],
-        ],
-    };
-
-    function populateAutoFormatOptions(mode, selected = null) {
-        autoFormatEl.innerHTML = "";
+    function populateAutoFormatOptions(groupEl, mode, selected = null) {
+        const fmtEl = groupEl.querySelector(".field-auto-format");
+        const wrapEl = groupEl.querySelector(".field-auto-format-wrap");
+        fmtEl.innerHTML = "";
         const options = AUTO_FORMAT_OPTIONS[mode] || [];
         for (const [value, label] of options) {
             const opt = document.createElement("option");
             opt.value = value;
             opt.textContent = label;
             if (value === selected) opt.selected = true;
-            autoFormatEl.appendChild(opt);
+            fmtEl.appendChild(opt);
         }
-        autoFormatWrapEl.hidden = options.length === 0;
+        wrapEl.hidden = options.length === 0;
     }
 
-    autoModeEl.addEventListener("change", () => {
-        autoModeHintEl.hidden = !autoModeEl.value;
-        populateAutoFormatOptions(autoModeEl.value);
-        // B6: flip the canvas immediately so the preview shows the
-        // current formatted token (or the operator's text when auto_mode
-        // is cleared) without waiting for the next input event.
-        syncAndRender();
-    });
-    autoFormatEl.addEventListener("change", () => {
-        syncAndRender();
-    });
+    let layerSortable = null;
+
+    function bindLayerGroupListeners(groupEl) {
+        const fontFamilyEl = groupEl.querySelector(".field-font-family");
+        for (const f of FONT_FAMILIES) {
+            const opt = document.createElement("option");
+            opt.value = f.value;
+            opt.textContent = f.label;
+            fontFamilyEl.appendChild(opt);
+        }
+        setupFontPicker(groupEl);
+
+        const textEl = groupEl.querySelector(".field-text");
+        const textColorEl = groupEl.querySelector(".field-text-color");
+        const fontSizeEl = groupEl.querySelector(".field-font-size");
+        const autoModeEl = groupEl.querySelector(".field-auto-mode");
+        const autoFormatEl = groupEl.querySelector(".field-auto-format");
+        const autoModeHintEl = groupEl.querySelector(".field-auto-mode-hint");
+
+        for (const el of [textEl, textColorEl, fontSizeEl, fontFamilyEl]) {
+            el.addEventListener("input", () => syncLayerFromForm(groupEl));
+            // Selecting any field in this layer makes this the active
+            // layer (drives the box overlay).
+            el.addEventListener("focus", () => {
+                const idx = layerIndexOfGroup(groupEl);
+                if (idx >= 0) selectLayer(idx);
+            });
+        }
+
+        autoModeEl.addEventListener("change", () => {
+            autoModeHintEl.hidden = !autoModeEl.value;
+            populateAutoFormatOptions(groupEl, autoModeEl.value);
+            syncLayerFromForm(groupEl);
+        });
+        autoFormatEl.addEventListener("change", () => {
+            syncLayerFromForm(groupEl);
+        });
+
+        // Bundled @font-face fonts load lazily — kick an explicit load on
+        // selection and redraw once it's ready, so the preview catches up
+        // without the user having to touch another field.
+        fontFamilyEl.addEventListener("change", async () => {
+            const family = fontFamilyEl.value;
+            const weight = FONT_WEIGHT_BY_VALUE.get(family) ?? 700;
+            if (document.fonts?.load) {
+                try {
+                    await document.fonts.load(`${weight} 40px ${cssFontFamily(family)}`);
+                } catch {
+                    return;
+                }
+                const idx = layerIndexOfGroup(groupEl);
+                if (idx >= 0 && state.layers[idx]?.fontFamily === family) {
+                    drawCanvas(canvas, state);
+                }
+            }
+        });
+
+        textEl.addEventListener("keydown", (event) => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                textEl.value = "";
+                syncLayerFromForm(groupEl);
+            }
+        });
+
+        groupEl.querySelectorAll(".preset").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const preset = PRESETS[Number(btn.dataset.presetIndex)];
+                if (!preset) return;
+                textColorEl.value = preset.text;
+                bgColorEl.value = preset.bg;
+                textColorEl.dispatchEvent(new Event("input", { bubbles: true }));
+                bgColorEl.dispatchEvent(new Event("input", { bubbles: true }));
+            });
+        });
+
+        // Click on the layer header (or anywhere outside an input) selects
+        // this layer for box editing without stealing focus from the form.
+        groupEl.addEventListener("pointerdown", (ev) => {
+            if (ev.target.closest("input, textarea, select, button")) return;
+            const idx = layerIndexOfGroup(groupEl);
+            if (idx >= 0) selectLayer(idx);
+        });
+
+        groupEl.querySelector(".editor-layer-delete").addEventListener("click", () => {
+            const idx = layerIndexOfGroup(groupEl);
+            if (idx >= 0) deleteLayerAt(idx);
+        });
+    }
+
+    function layerIndexOfGroup(groupEl) {
+        // The UI renders layers in REVERSE of array order — the visual
+        // top is `text_layers[N-1]` (drawn last, composited on top), per
+        // qarl's §5.10a v3 spec. Convert DOM-child position back to
+        // array index here.
+        const domIdx = Array.prototype.indexOf.call(layersListEl.children, groupEl);
+        if (domIdx < 0) return -1;
+        return state.layers.length - 1 - domIdx;
+    }
+
+    function buildLayerGroupEl(layer, idx) {
+        const groupEl = document.createElement("div");
+        groupEl.className = "om-card editor-layer-group";
+        groupEl.innerHTML = LAYER_GROUP_TEMPLATE;
+        groupEl.dataset.layerIndex = String(idx);
+
+        // Hydrate fields from the layer model.
+        groupEl.querySelector(".field-text").value = layer.text || "";
+        groupEl.querySelector(".field-text-color").value = layer.textColor || "#FFFFFF";
+        const fontFamilyEl = groupEl.querySelector(".field-font-family");
+        const fontSizeEl = groupEl.querySelector(".field-font-size");
+        const autoModeEl = groupEl.querySelector(".field-auto-mode");
+        const autoModeHintEl = groupEl.querySelector(".field-auto-mode-hint");
+
+        // bindLayerGroupListeners populates the <select> options before
+        // we set its value below — so insert listeners-first, then write
+        // values, then notify the picker.
+        bindLayerGroupListeners(groupEl);
+
+        fontFamilyEl.value = layer.fontFamily || FONT_FAMILIES[0].value;
+        fontFamilyEl.dispatchEvent(new Event("font-picker-sync"));
+        fontSizeEl.value = String(layer.fontSizePct ?? pickFontSizePct());
+        autoModeEl.value = layer.autoMode || "";
+        autoModeHintEl.hidden = !layer.autoMode;
+        populateAutoFormatOptions(groupEl, layer.autoMode || "", layer.autoFormat || null);
+
+        return groupEl;
+    }
+
+    function renderLayers() {
+        // Wholesale rebuild keeps the array → DOM mapping trivial. Layer
+        // groups are cheap (a few dozen nodes); a per-input edit doesn't
+        // re-enter renderLayers, so we don't lose focus on each keystroke.
+        //
+        // Render in REVERSE of array order so the visual TOP of the UI
+        // list is the layer drawn LAST (top z-order). This matches the
+        // Photoshop convention operators expect AND qarl's §5.10a v3
+        // contract: "+ New layer adds at the top of the list (drawn last
+        // → composited on top)" — addLayer pushes to the array tail,
+        // which appears at DOM child[0] under this iteration order.
+        if (layerSortable) {
+            layerSortable.destroy();
+            layerSortable = null;
+        }
+        layersListEl.innerHTML = "";
+        for (let i = state.layers.length - 1; i >= 0; i--) {
+            const groupEl = buildLayerGroupEl(state.layers[i], i);
+            layersListEl.appendChild(groupEl);
+        }
+        updateLayerLabels();
+        updateActiveLayerStyling();
+        updateDeleteButtonAvailability();
+        positionBoxOverlay();
+        bindLayerSortable();
+    }
+
+    function updateLayerLabels() {
+        // Visual top of UI = "Layer 1" (= last array entry = drawn last).
+        // DOM children appear in reverse-array order so child[0] is the
+        // top of the UI.
+        const total = state.layers.length;
+        for (let domIdx = 0; domIdx < total; domIdx++) {
+            const groupEl = layersListEl.children[domIdx];
+            const titleEl = groupEl.querySelector(".editor-layer-title");
+            titleEl.textContent = total === 1 ? "Layer" : `Layer ${domIdx + 1}`;
+        }
+    }
+
+    function updateActiveLayerStyling() {
+        const total = state.layers.length;
+        for (let domIdx = 0; domIdx < layersListEl.children.length; domIdx++) {
+            const arrayIdx = total - 1 - domIdx;
+            const groupEl = layersListEl.children[domIdx];
+            groupEl.classList.toggle(
+                "editor-layer-active",
+                arrayIdx === state.activeLayerIndex,
+            );
+        }
+    }
+
+    function updateDeleteButtonAvailability() {
+        // Backend min_length=1 — never let the operator delete the last
+        // layer through the UI. Hide rather than disable so the chrome is
+        // crisp.
+        const single = state.layers.length === 1;
+        for (const groupEl of layersListEl.children) {
+            const btn = groupEl.querySelector(".editor-layer-delete");
+            btn.hidden = single;
+        }
+    }
+
+    function bindLayerSortable() {
+        layerSortable = Sortable.create(layersListEl, {
+            handle: ".editor-layer-handle",
+            animation: 150,
+            onEnd: (ev) => {
+                if (ev.oldIndex === ev.newIndex) return;
+                // Sortable reports DOM-child positions; convert to array
+                // indices (UI is rendered in reverse of array order).
+                const total = state.layers.length;
+                const oldArrayIdx = total - 1 - ev.oldIndex;
+                const newArrayIdx = total - 1 - ev.newIndex;
+                const moved = state.layers.splice(oldArrayIdx, 1)[0];
+                state.layers.splice(newArrayIdx, 0, moved);
+                if (state.activeLayerIndex === oldArrayIdx) {
+                    state.activeLayerIndex = newArrayIdx;
+                } else if (
+                    oldArrayIdx < state.activeLayerIndex &&
+                    newArrayIdx >= state.activeLayerIndex
+                ) {
+                    state.activeLayerIndex -= 1;
+                } else if (
+                    oldArrayIdx > state.activeLayerIndex &&
+                    newArrayIdx <= state.activeLayerIndex
+                ) {
+                    state.activeLayerIndex += 1;
+                }
+                renderLayers();
+                drawCanvas(canvas, state);
+                autoSave?.kick();
+            },
+        });
+    }
+
+    function selectLayer(idx) {
+        if (idx < 0 || idx >= state.layers.length) return;
+        if (state.activeLayerIndex === idx) return;
+        state.activeLayerIndex = idx;
+        updateActiveLayerStyling();
+        positionBoxOverlay();
+    }
+
+    function addLayer() {
+        // New layer inserts at the END of the array (drawn last →
+        // composited on top), matching qarl's spec note: "+ New layer
+        // adds at the top of the list (drawn last → composited on top)".
+        // The new layer becomes the active one.
+        state.layers.push(defaultLayer());
+        state.activeLayerIndex = state.layers.length - 1;
+        renderLayers();
+        drawCanvas(canvas, state);
+        autoSave?.kick();
+    }
+
+    function deleteLayerAt(idx) {
+        if (state.layers.length <= 1) return;
+        state.layers.splice(idx, 1);
+        if (state.activeLayerIndex >= state.layers.length) {
+            state.activeLayerIndex = state.layers.length - 1;
+        } else if (state.activeLayerIndex > idx) {
+            state.activeLayerIndex -= 1;
+        }
+        renderLayers();
+        drawCanvas(canvas, state);
+        autoSave?.kick();
+    }
+
+    addLayerBtn.addEventListener("click", addLayer);
+
+    nameEl.addEventListener("input", syncSlideFromForm);
+    bgColorEl.addEventListener("input", syncSlideFromForm);
 
     // Background-source radios toggle the slide picker. When "slide" or
     // "video" is selected, populate the dropdown lazily (first time only)
@@ -684,11 +874,9 @@ export function mountEditor(
     for (const radio of container.querySelectorAll(".field-bg-source")) {
         radio.addEventListener("change", async () => {
             state.bgSource = radio.value;
+            bgColorWrapEl.hidden = state.bgSource !== "color";
             bgSlideWrapEl.hidden = state.bgSource !== "slide";
             bgVideoWrapEl.hidden = state.bgSource !== "video";
-            // The AI-generate-background flow only makes sense for the
-            // image-slide path (it produces ImageSlides). Hide for
-            // color + video.
             bgGenerateWrap.hidden =
                 state.bgSource !== "slide" || !onGenerateBackground;
             if (state.bgSource === "slide" && fetchItems && !bgSlidePopulated) {
@@ -700,9 +888,7 @@ export function mountEditor(
                 bgVideoPopulated = true;
             }
             // Clear references for the inactive paths so the save payload
-            // never carries both a bg image and a bg video (the backend's
-            // mutual-exclusion validator would reject — see
-            // content/__init__.py::TextSlide::_bg_layers_are_exclusive).
+            // never carries both a bg image and a bg video.
             if (state.bgSource === "color") {
                 state.bgImage = null;
                 state.bgSlideId = null;
@@ -712,14 +898,10 @@ export function mountEditor(
             } else if (state.bgSource === "video") {
                 state.bgSlideId = null;
             }
-            syncAndRender();
+            drawCanvas(canvas, state);
         });
     }
 
-    // Generate-a-background flow. Drops a fresh ImageSlide into the
-    // catalog (the provider-pluggable /api/backgrounds/generate endpoint
-    // handles that), then selects it as this slide's background so the
-    // operator sees the result immediately without a second click.
     if (onGenerateBackground) {
         const generateBtn = container.querySelector(".bg-generate-btn");
         const generatePromptEl = container.querySelector(".field-bg-generate-prompt");
@@ -749,90 +931,61 @@ export function mountEditor(
             }
         });
     }
+
     bgSlideEl.addEventListener("change", async () => {
         state.bgSlideId = bgSlideEl.value || null;
         state.bgImage = state.bgSlideId
             ? await loadImageForSlide(state.bgSlideId).catch(() => null)
             : null;
-        syncAndRender();
+        drawCanvas(canvas, state);
     });
 
     bgVideoEl.addEventListener("change", async () => {
-        // For the editor's preview canvas, render the video's THUMBNAIL
-        // (asset.png at /api/content/{id}/asset) as a static bg under the
-        // text. Live moving-video preview lives in the playlist panel's
-        // inline-preview, not here — the editor stays a single static
-        // canvas for predictable rasterize-on-save output. The stored
-        // PNG that ships to the device carries the thumbnail-as-bg too;
-        // playback's compositing path replaces it with live frames.
+        // The editor's preview canvas renders the video's THUMBNAIL as a
+        // static bg under the text. Live moving-video preview lives in
+        // the playlist panel's inline-preview, not here.
         state.bgVideoId = bgVideoEl.value || null;
         state.bgImage = state.bgVideoId
             ? await loadImageForSlide(state.bgVideoId).catch(() => null)
             : null;
-        syncAndRender();
+        drawCanvas(canvas, state);
     });
 
     form.addEventListener("keydown", (event) => {
         // Plain Enter inside a single-line <input> would otherwise submit
-        // the form (browser default). Suppress unless focus is in the
-        // <textarea>, where Enter means "newline" and should stay. We no
-        // longer have a submit button, but Enter on a name/duration field
-        // would otherwise trigger an implicit submit attempt.
+        // the form (browser default). Suppress unless focus is in a
+        // <textarea>, where Enter means "newline".
         if (event.key === "Enter" && event.target?.tagName !== "TEXTAREA") {
             event.preventDefault();
         }
     });
 
-    textEl.addEventListener("keydown", (event) => {
-        if (event.key === "Escape") {
-            event.preventDefault();
-            textEl.value = "";
-            syncAndRender();
-        }
-    });
-
-    container.querySelectorAll(".preset").forEach((btn) => {
-        btn.addEventListener("click", () => {
-            const preset = PRESETS[Number(btn.dataset.presetIndex)];
-            if (!preset) return;
-            textColorEl.value = preset.text;
-            bgColorEl.value = preset.bg;
-            textColorEl.dispatchEvent(new Event("input", { bubbles: true }));
-            bgColorEl.dispatchEvent(new Event("input", { bubbles: true }));
-        });
-    });
-
     async function performSave() {
-        // Make sure any pending @font-face bytes have loaded before we
-        // rasterize — otherwise the stored PNG might fall back to a
-        // default font while the live preview already has the real one.
         if (document.fonts?.ready) await document.fonts.ready;
-        // Rasterize the asset at a fixed 4K target so the stored PNG
-        // is resolution-independent — playback cover-fits down to the
-        // current panel dims at slide entry.
         const png_base64 = rasterizeAtTarget(state);
         const durationSeconds = Number(durationEl.value) || 5;
+        const text_layers = state.layers.map((layer) => ({
+            text: layer.text,
+            text_color: (layer.textColor || "#FFFFFF").toUpperCase(),
+            font_family: layer.fontFamily,
+            font_size_pct: layer.fontSizePct,
+            auto_mode: layer.autoMode || null,
+            auto_format: layer.autoMode ? layer.autoFormat || null : null,
+            box: { ...layer.box },
+        }));
         const payload = {
             name: state.name || "Untitled",
-            text: state.text,
-            text_color: state.textColor.toUpperCase(),
             background_color: state.backgroundColor.toUpperCase(),
-            font_family: state.fontFamily,
-            font_size_pct: state.fontSizePct,
             background_image_slide_id: state.bgSlideId || null,
             background_video_slide_id: state.bgVideoId || null,
-            auto_mode: autoModeEl.value || null,
-            auto_format: autoModeEl.value ? autoFormatEl.value || null : null,
             duration_ms: Math.round(durationSeconds * 1000),
-            box: { ...state.box },
+            text_layers,
             png_base64,
         };
         const wasEdit = Boolean(state.editingId);
         const result = wasEdit && onSaveExisting
             ? await onSaveExisting(state.editingId, payload)
             : await onSave(payload);
-        // Promote a freshly-created slide so subsequent auto-saves PATCH
-        // the same id instead of creating a twin on every keystroke.
         if (!wasEdit && result?.id) {
             state.editingId = String(result.id);
         }
@@ -842,47 +995,33 @@ export function mountEditor(
     autoSave = attachAutoSave(form, {
         save: performSave,
         status: statusEl,
-        // Create-mode requires non-empty text to bother saving (otherwise
-        // an empty form auto-creates a junk slide on first focus). Edit
-        // mode allows empty text — the operator is intentionally clearing
-        // a saved slide and the PATCH must reach the server.
-        canSave: () => Boolean(state.editingId) || state.text.trim().length > 0,
+        // Create-mode requires non-empty text on at least one layer to
+        // bother saving (otherwise an empty form auto-creates a junk slide
+        // on first focus). Edit mode allows empty text — the operator may
+        // be intentionally clearing layers.
+        canSave: () =>
+            Boolean(state.editingId) ||
+            state.layers.some((l) => (l.text || "").trim().length > 0),
         debounceMs: 900,
     });
 
     async function resetToBlank() {
-        // Sync blank-state setup. Anything here can be safely
-        // overridden by a loadForEdit that interleaves later.
         state.editingId = null;
         state.bgImage = null;
         state.bgSlideId = null;
         state.bgVideoId = null;
-        textEl.value = "";
-        // Safari quirk: after a textarea held content and got cleared,
-        // the placeholder renders inside a stale narrow box and clips
-        // mid-glyph until the user clicks into it. Focus() + blur()
-        // aren't enough; the only reliable nudge is to detach and
-        // re-attach the element so Safari drops the cached layout.
-        // Chromium no-ops either way. Event listeners survive a
-        // detach/re-attach cycle.
-        const parent = textEl.parentNode;
-        if (parent) {
-            const next = textEl.nextSibling;
-            parent.removeChild(textEl);
-            parent.insertBefore(textEl, next);
-        }
-        autoModeEl.value = "";
-        autoModeHintEl.hidden = true;
-        populateAutoFormatOptions("");
+        state.layers = [defaultLayer()];
+        state.activeLayerIndex = 0;
+        renderLayers();
         const colorRadio = container.querySelector(
             '.field-bg-source[value="color"]',
         );
         colorRadio.checked = true;
+        bgColorWrapEl.hidden = false;
         bgSlideWrapEl.hidden = true;
         bgVideoWrapEl.hidden = true;
         state.bgSource = "color";
-        syncAndRender();
-        // Form is being cleared, not edited — drop any pending save.
+        drawCanvas(canvas, state);
         autoSave.cancel();
         statusEl.textContent = "";
         statusEl.dataset.state = "idle";
@@ -892,6 +1031,7 @@ export function mountEditor(
         const defaultName = await computeDefaultName();
         if (state.editingId !== null) return;
         nameEl.value = defaultName;
+        state.name = defaultName;
         if (browser) {
             await browser.refresh();
             browser.highlight(null);
@@ -914,18 +1054,16 @@ export function mountEditor(
     /**
      * +New flow: create a server-side slide IMMEDIATELY (so the operator
      * sees a fresh tile in the pallet) and drop into edit mode against it.
-     * The slide is seeded with the auto-name as the placeholder text so
-     * the backend's "text non-empty" validation passes — operators
-     * typically replace it with their first keystroke.
+     * Seeded with a single space as placeholder text so backend's
+     * non-empty validation passes — operators replace it with their first
+     * keystroke.
      */
     async function createNew() {
         await resetToBlank();
-        // Seed text with a single space so the backend's "non-empty"
-        // create-mode validation passes WITHOUT painting a literal "Text
-        // Slide N" on the device if the operator wanders off mid-create.
-        // First keystroke replaces it.
-        textEl.value = " ";
-        syncAndRender();
+        state.layers[0].text = " ";
+        const groupEl = layersListEl.children[0];
+        if (groupEl) groupEl.querySelector(".field-text").value = " ";
+        drawCanvas(canvas, state);
         try {
             await performSave();
         } catch (err) {
@@ -933,10 +1071,34 @@ export function mountEditor(
             statusEl.dataset.state = "error";
             return;
         }
-        // performSave promotes editingId on success; refresh the browser
-        // so the new tile appears (and stays highlighted via the
-        // browser.highlight call performSave already did).
         if (browser) await browser.refresh();
+    }
+
+    /**
+     * Coerce a wire-shape TextLayer into editor-state shape.
+     */
+    function layerFromWire(wire) {
+        return {
+            text: wire?.text || "",
+            textColor: wire?.text_color || "#FFFFFF",
+            fontFamily: wire?.font_family || FONT_FAMILIES[0].value,
+            fontSizePct:
+                wire?.font_size_pct ??
+                (wire?.font_size_px
+                    ? (wire.font_size_px / width) * 100
+                    : pickFontSizePct()),
+            autoMode: wire?.auto_mode || null,
+            autoFormat: wire?.auto_format || null,
+            box:
+                wire?.box && typeof wire.box === "object"
+                    ? {
+                          x: Number(wire.box.x ?? 0.1),
+                          y: Number(wire.box.y ?? 0.1),
+                          w: Number(wire.box.w ?? 0.8),
+                          h: Number(wire.box.h ?? 0.8),
+                      }
+                    : { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+        };
     }
 
     async function loadForEdit(slide) {
@@ -949,41 +1111,19 @@ export function mountEditor(
         if (browser) browser.highlight(slide.id);
 
         nameEl.value = slide.name || "Untitled";
-        textEl.value = slide.text || "";
-        textColorEl.value = slide.text_color || "#FFFFFF";
+        state.name = nameEl.value;
         bgColorEl.value = slide.background_color || "#000000";
-        fontFamilyEl.value = slide.font_family || "sans-serif";
-        fontFamilyEl.dispatchEvent(new Event("font-picker-sync"));
-        // Prefer the new pct field. Old slides only carry font_size_px;
-        // back-derive a percent so re-editing migrates them in place.
-        const pct =
-            slide.font_size_pct ??
-            (slide.font_size_px
-                ? (slide.font_size_px / width) * 100
-                : pickFontSizePct());
-        fontSizeEl.value = String(pct);
+        state.backgroundColor = bgColorEl.value;
         durationEl.value = String(Math.max(1, (slide.duration_ms || 5000) / 1000));
-        autoModeEl.value = slide.auto_mode || "";
-        autoModeHintEl.hidden = !slide.auto_mode;
-        populateAutoFormatOptions(slide.auto_mode || "", slide.auto_format || null);
-        // Box (§5.10a) — hydrate from server, defaulting to the centered
-        // {0.1, 0.1, 0.9, 0.9} when an older slide on disk has no box
-        // field. Drag handlers in the canvas overlay update state.box
-        // in place; loadForEdit replaces it wholesale.
-        if (slide.box && typeof slide.box === "object") {
-            state.box = {
-                x: Number(slide.box.x ?? 0.1),
-                y: Number(slide.box.y ?? 0.1),
-                w: Number(slide.box.w ?? 0.8),
-                h: Number(slide.box.h ?? 0.8),
-            };
-        } else {
-            state.box = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
-        }
-        positionBoxOverlay();
+
+        const wireLayers = Array.isArray(slide.text_layers) && slide.text_layers.length
+            ? slide.text_layers
+            : [{ text: "" }];
+        state.layers = wireLayers.map(layerFromWire);
+        state.activeLayerIndex = 0;
+        renderLayers();
 
         if (slide.background_image_slide_id) {
-            // Switch to "slide" background and select the referenced image.
             const slideRadio = container.querySelector(
                 '.field-bg-source[value="slide"]',
             );
@@ -992,6 +1132,7 @@ export function mountEditor(
                 await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
                 bgSlidePopulated = true;
             }
+            bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = false;
             bgVideoWrapEl.hidden = true;
             bgSlideEl.value = String(slide.background_image_slide_id);
@@ -1002,7 +1143,6 @@ export function mountEditor(
                 () => null,
             );
         } else if (slide.background_video_slide_id) {
-            // Switch to "video" background and select the referenced video.
             const videoRadio = container.querySelector(
                 '.field-bg-source[value="video"]',
             );
@@ -1011,15 +1151,13 @@ export function mountEditor(
                 await populateBgVideoOptions(bgVideoEl, fetchItems, statusEl);
                 bgVideoPopulated = true;
             }
+            bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = false;
             bgVideoEl.value = String(slide.background_video_slide_id);
             state.bgSource = "video";
             state.bgSlideId = null;
             state.bgVideoId = String(slide.background_video_slide_id);
-            // For the editor's static preview, load the video's thumbnail
-            // (asset.png at /api/content/{id}/asset). Live frame compositing
-            // happens in the playlist panel's inline-preview, not here.
             state.bgImage = await loadImageForSlide(state.bgVideoId).catch(
                 () => null,
             );
@@ -1028,6 +1166,7 @@ export function mountEditor(
                 '.field-bg-source[value="color"]',
             );
             colorRadio.checked = true;
+            bgColorWrapEl.hidden = false;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = true;
             state.bgSource = "color";
@@ -1035,30 +1174,36 @@ export function mountEditor(
             state.bgVideoId = null;
             state.bgImage = null;
         }
-        syncAndRender();
+        drawCanvas(canvas, state);
 
-        // Bundled @font-face fonts load lazily — on the FIRST loadForEdit
-        // for a slide that uses one (e.g. Pacifico), the canvas paints
-        // with the fallback before the .ttf finishes downloading. Wait
-        // for the font, give the browser a paint cycle (canvas keeps a
-        // separate font cache that lags behind document.fonts.load by
-        // a tick), then re-render. document.fonts.ready settles AFTER
-        // all pending fonts are usable for canvas drawing on every
-        // current browser engine.
-        const family = fontFamilyEl.value;
-        if (family && document.fonts?.load) {
-            const weight = FONT_WEIGHT_BY_VALUE.get(family) ?? 700;
+        // Bundled @font-face fonts load lazily — wait for any used by
+        // any layer to be ready, then re-render so the canvas catches up
+        // without the operator having to touch a field.
+        const families = new Set(
+            state.layers.map((l) => l.fontFamily).filter(Boolean),
+        );
+        if (families.size > 0 && document.fonts?.load) {
+            const loadedAt = state.editingId;
             try {
-                await document.fonts.load(`${weight} 40px ${cssFontFamily(family)}`);
+                await Promise.all(
+                    [...families].map((family) => {
+                        const weight = FONT_WEIGHT_BY_VALUE.get(family) ?? 700;
+                        return document.fonts.load(
+                            `${weight} 40px ${cssFontFamily(family)}`,
+                        );
+                    }),
+                );
                 if (document.fonts?.ready) await document.fonts.ready;
                 await new Promise((resolve) =>
                     requestAnimationFrame(() => resolve()),
                 );
             } catch {
+                // A failed font-face load shouldn't break the editor —
+                // canvas already painted with the fallback face.
                 return;
             }
-            if (state.fontFamily === family && state.editingId === String(slide.id)) {
-                syncAndRender();
+            if (state.editingId === loadedAt) {
+                drawCanvas(canvas, state);
             }
         }
         // Loading is not an edit — drop any auto-save scheduled by the
@@ -1066,9 +1211,11 @@ export function mountEditor(
         autoSave.cancel();
     }
 
-    // Mount the slide browser at the top of the subpage — each tile
-    // click dispatches loadForEdit, "+ New" → resetToBlank. We do this
-    // after all callbacks are defined so they can reference each other.
+    // Initial layer-group render. Mount listeners + box overlay before
+    // the slide-browser kicks loadForEdit so a synchronous edit-load
+    // doesn't race against the unmounted layers list.
+    renderLayers();
+
     let browser = null;
     if (fetchItems) {
         browser = mountSlideBrowser(
@@ -1082,11 +1229,6 @@ export function mountEditor(
         );
     }
 
-    // Initial state: prefer editing the most-recent existing slide of
-    // this type. The operator's expectation is "open the editor → see
-    // something to edit," not "see a blank create form." If there are no
-    // saved slides yet (fresh device), fall back to a blank-create form.
-    // +New explicitly resets to blank.
     (async () => {
         let firstItem = null;
         if (fetchItems) {
@@ -1107,7 +1249,7 @@ export function mountEditor(
             await loadForEdit(firstItem);
         } else {
             resetToBlank();
-            syncAndRender();
+            drawCanvas(canvas, state);
         }
     })();
 
@@ -1116,9 +1258,6 @@ export function mountEditor(
         reset: resetToBlank,
         createNew,
         refreshBrowser: () => browser?.refresh(),
-        // Test hook: drains any pending debounced auto-save synchronously
-        // so assertions don't have to race the timer. Production code
-        // should not rely on this — auto-save is debounced for a reason.
         flushAutoSave: () => autoSave.flush(),
     };
 }
@@ -1127,11 +1266,6 @@ export async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
     try {
         const items = await fetchItems();
         selectEl.innerHTML = '<option value="">(pick a slide)</option>';
-        // The image-slide bg path filters to ImageSlides only — VideoSlides
-        // get their own picker (populateBgVideoOptions) since the
-        // playback-time compositing path is different (§5.10) and the
-        // editor stores them in a separate field for the mutual-exclusion
-        // validator.
         for (const item of items) {
             if (item.type !== "image") continue;
             const opt = document.createElement("option");
@@ -1144,14 +1278,6 @@ export async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
     }
 }
 
-/**
- * Populate the video-bg dropdown with VideoSlide entries. Phase 5b: the
- * editor's bg-picker can pick a saved VideoSlide as the background; the
- * device composites text over the live video frames at playback per
- * SYSTEM_SPEC §5.10. The editor's preview canvas uses the video's
- * thumbnail (asset.png) as a static stand-in — the playlist panel's
- * inline-preview is where the operator sees moving frames.
- */
 export async function populateBgVideoOptions(selectEl, fetchItems, statusEl) {
     try {
         const items = await fetchItems();
@@ -1179,98 +1305,93 @@ function loadImageForSlide(slideId) {
 }
 
 /**
- * Draw the slide onto `canvas`. Pure in the sense that it only reads
- * `state` and writes pixels — no DOM wiring, no event handlers.
- */
-/**
- * Render only the text layer of a TextSlide onto `canvas`, leaving the
+ * Render only the text layers of a TextSlide onto `canvas`, leaving the
  * canvas's background transparent. Used by the inline-preview to overlay
  * text on top of a live video frame for Text-over-Video slides
- * (Phase 5b — SYSTEM_SPEC §5.10).
+ * (Phase 5b — SYSTEM_SPEC §5.10). Iterates `text_layers` in array order
+ * (later entries composite over earlier).
  *
- * Accepts the on-the-wire ContentItem shape (text, text_color,
- * font_family, font_size_pct, font_size_px) — not the editor's
- * internal `state` — because the inline-preview consumes ContentItem
- * directly from the playlist.
- *
- * @param {HTMLCanvasElement} canvas — sized to the desired output.
- * @param {object} item — TextSlide ContentItem (wire shape).
+ * Accepts the on-the-wire ContentItem shape — not the editor's internal
+ * `state` — because the inline-preview consumes ContentItem directly.
  */
 export function drawTextOnly(canvas, item) {
     const ctx = canvas.getContext("2d");
-    const text = item.text || "";
-    const textColor = item.text_color || "#FFFFFF";
-    const fontSize = item.font_size_px;
-    const fontSizePct = item.font_size_pct;
-    const fontFamily = item.font_family || "sans-serif";
-
     ctx.save();
     try {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        if (!text) return;
-
-        let fontSizePx;
-        if (Number.isFinite(fontSizePct) && fontSizePct > 0) {
-            fontSizePx = Math.max(4, Math.round((canvas.height * fontSizePct) / 100));
-        } else if (Number.isFinite(fontSize) && fontSize > 0) {
-            fontSizePx = fontSize;
-        } else {
-            fontSizePx = pickFontSize(canvas.height);
-        }
-        ctx.fillStyle = textColor;
-        const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
-        ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-
-        const lines = text.split(/\r?\n/);
-        const lineHeight = fontSizePx * 1.1;
-        const totalHeight = lineHeight * lines.length;
-        const startY = canvas.height / 2 - totalHeight / 2 + lineHeight / 2;
-        const maxWidth = Math.max(1, canvas.width - 4);
-        for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], canvas.width / 2, startY + i * lineHeight, maxWidth);
+        const layers = Array.isArray(item.text_layers) ? item.text_layers : [];
+        for (const layer of layers) {
+            paintLayer(ctx, canvas, layer, /* fillBox */ null);
         }
     } finally {
         ctx.restore();
     }
 }
 
+/**
+ * Paint a single layer's text onto an already-cleared / pre-filled
+ * context. `box` defaults to {0.1, 0.1, 0.8, 0.8} when absent. Mirrors
+ * `_draw_text_into` on the backend (seed.py).
+ */
+function paintLayer(ctx, canvas, layer) {
+    const text = layer?.text || "";
+    if (!text) return;
+    const textColor = layer.text_color || layer.textColor || "#FFFFFF";
+    const fontFamily = layer.font_family || layer.fontFamily || "sans-serif";
+    const box = layer.box || { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
 
-export function drawCanvas(canvas, state) {
-    const ctx = canvas.getContext("2d");
-    const {
-        text: rawText = "",
-        textColor = "#FFFFFF",
-        backgroundColor = "#000000",
-        fontSize,
-        fontSizePct,
-        fontFamily = "sans-serif",
-        bgSource = "color",
-        bgImage = null,
-        autoMode = null,
-        autoFormat = null,
-        box = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
-    } = state;
-    // Auto-mode slides surface the current formatted value (time / date /
-    // day token) so the preview matches what the device renders at
-    // playout. Operator's typed text becomes a fallback shown only when
-    // auto_mode is unset (B6, qarl 2026-04-29).
-    const text = autoMode
-        ? formatAutoText(autoMode, autoFormat, new Date()) || rawText
-        : rawText;
-
-    // Box → canvas-pixel rect. Mirrors render_text_slide_png in seed.py.
     const boxX = box.x * canvas.width;
     const boxY = box.y * canvas.height;
     const boxW = Math.max(1, box.w * canvas.width);
     const boxH = Math.max(1, box.h * canvas.height);
 
+    let fontSizePx;
+    const pct = layer.font_size_pct ?? layer.fontSizePct;
+    const px = layer.font_size_px ?? layer.fontSize;
+    if (Number.isFinite(pct) && pct > 0) {
+        fontSizePx = Math.max(4, Math.round((canvas.height * pct) / 100));
+    } else if (Number.isFinite(px) && px > 0) {
+        fontSizePx = px;
+    } else {
+        fontSizePx = pickFontSize(canvas.height);
+    }
+    ctx.fillStyle = textColor;
+    const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
+    ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    const lines = text.split(/\r?\n/);
+    const lineHeight = fontSizePx * 1.1;
+    const totalHeight = lineHeight * lines.length;
+    const boxCenterX = boxX + boxW / 2;
+    const boxCenterY = boxY + boxH / 2;
+    const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
+    const maxWidth = Math.max(1, boxW);
+    for (let i = 0; i < lines.length; i++) {
+        ctx.fillText(lines[i], boxCenterX, startY + i * lineHeight, maxWidth);
+    }
+}
+
+/**
+ * Draw the slide onto `canvas`. Pure: only reads `state` and writes
+ * pixels — no DOM wiring, no event handlers.
+ *
+ * Accepts BOTH editor-state shape (`state.layers` with internal field
+ * names) AND a flat single-layer back-compat shape (`state.text`,
+ * `state.textColor`, …) for callers that haven't migrated. The two
+ * shapes are distinguished by presence of `.layers`.
+ */
+export function drawCanvas(canvas, state) {
+    const ctx = canvas.getContext("2d");
+    const {
+        backgroundColor = "#000000",
+        bgSource = "color",
+        bgImage = null,
+    } = state;
+
     ctx.save();
     try {
-        // Background layer: image (cover-fit) or solid color. Cover-fit
-        // keeps the saved PNG matching what plays — letterbox bars or a
-        // stretch would both show up on the device.
         if (bgSource === "slide" && bgImage) {
             const scale = Math.max(
                 canvas.width / bgImage.width,
@@ -1290,47 +1411,55 @@ export function drawCanvas(canvas, state) {
             ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
 
-        if (!text) return;
-
-        // Font size anchored to SLIDE height per §5.10a (qarl 2026-04-30
-        // revision: box positions/clips text but doesn't scale it).
-        // Matches render_text_slide_png on the backend.
-        let fontSizePx;
-        if (Number.isFinite(fontSizePct) && fontSizePct > 0) {
-            fontSizePx = Math.max(4, Math.round((canvas.height * fontSizePct) / 100));
-        } else if (Number.isFinite(fontSize) && fontSize > 0) {
-            fontSizePx = fontSize;
-        } else {
-            fontSizePx = pickFontSize(canvas.height);
-        }
-        ctx.fillStyle = textColor;
-        const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
-        ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-
-        const lines = text.split(/\r?\n/);
-        const lineHeight = fontSizePx * 1.1;
-        const totalHeight = lineHeight * lines.length;
-        const boxCenterX = boxX + boxW / 2;
-        const boxCenterY = boxY + boxH / 2;
-        const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
-        // Squish target is box width edge-to-edge per §5.10a (no margin —
-        // the box is the explicit container).
-        const maxWidth = Math.max(1, boxW);
-        for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], boxCenterX, startY + i * lineHeight, maxWidth);
+        const layers = layersForDraw(state);
+        for (const layer of layers) {
+            const resolved = resolveLayerForDraw(layer);
+            paintLayer(ctx, canvas, resolved);
         }
     } finally {
         ctx.restore();
     }
 }
 
+function layersForDraw(state) {
+    if (Array.isArray(state.layers) && state.layers.length > 0) {
+        return state.layers;
+    }
+    // Back-compat single-layer shape: pull a synthetic layer off the
+    // top-level state fields. This keeps drawCanvas usable from older
+    // unit tests that pass `{text, textColor, …}` directly.
+    return [
+        {
+            text: state.text || "",
+            textColor: state.textColor,
+            fontFamily: state.fontFamily,
+            fontSizePct: state.fontSizePct,
+            fontSize: state.fontSize,
+            autoMode: state.autoMode,
+            autoFormat: state.autoFormat,
+            box: state.box,
+        },
+    ];
+}
+
+function resolveLayerForDraw(layer) {
+    // Auto-mode tokens (time / date / day): the canvas shows the current
+    // formatted value so the preview matches what the device renders at
+    // playout. Operator's typed text is the fallback.
+    const rawText = layer.text || "";
+    const mode = layer.auto_mode ?? layer.autoMode ?? null;
+    const fmt = layer.auto_format ?? layer.autoFormat ?? null;
+    const text = mode
+        ? formatAutoText(mode, fmt, new Date()) || rawText
+        : rawText;
+    return { ...layer, text };
+}
+
 export function pickFontSize(panelHeight) {
     return Math.max(12, Math.floor(panelHeight * 0.4));
 }
 
-// Default percent-of-width for a brand-new auto-mode-less text slide.
+// Default percent-of-height for a brand-new auto-mode-less text slide.
 // 30% reads cleanly as a single-word slogan on common 4:3 / 16:9 panels;
 // the operator can dial in something more specific from the field.
 export function pickFontSizePct() {
@@ -1344,8 +1473,7 @@ export function canvasToBase64(canvas) {
 
 /**
  * Render the editor scene onto a fresh offscreen 4K canvas and return
- * its base64 PNG body. Decouples the saved asset from the on-screen
- * preview canvas (which stays at panel dims for visual fidelity).
+ * its base64 PNG body.
  */
 export function rasterizeAtTarget(state) {
     const off = document.createElement("canvas");
