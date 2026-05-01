@@ -178,12 +178,12 @@ describe("mountStreamPanel", () => {
 
         expect(container.querySelector(".stream-go-live").hidden).toBe(false);
         expect(container.querySelector(".stream-stop").hidden).toBe(true);
-        // 2026-04-29 redesign: tailscale-foreground warning + camera-flip
-        // button removed from the panel template (defaulted decisions —
-        // see SECTION_TEMPLATE comment block). Lock the absence in so
-        // an accidental re-add surfaces here.
+        // 2026-04-29 redesign dropped the tailscale-foreground warning;
+        // still gone. Camera flip was dropped in that pass too but
+        // restored 2026-05-01 per qarl — it's hidden in idle (no
+        // localStream), surfaces in preview/live.
         expect(container.querySelector(".stream-warning")).toBeNull();
-        expect(container.querySelector(".stream-flip-camera")).toBeNull();
+        expect(container.querySelector(".stream-flip-camera").hidden).toBe(true);
         // LIVE pill + metrics grid only show in the live phase.
         expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
         expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
@@ -589,22 +589,141 @@ describe("mountStreamPanel", () => {
         expect(opts.apiTakeoverStream).not.toHaveBeenCalled();
     });
 
-    it("camera-flip affordance is removed from the panel template (2026-04-29 redesign)", async () => {
-        // The redesign defers source-switching until after Stop —
-        // qarl's iteration in chat2.md dropped the camera picker and
-        // settings buttons, leaving the live HUD uncluttered. Anyone
-        // re-adding mid-stream camera switching needs to pair it with
-        // a design conversation; this test surfaces the regression.
-        const container = document.createElement("div");
-        const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+    it("flip-camera button surfaces in preview, swaps facingMode, and persists choice", async () => {
+        // Re-§5.11 (qarl 2026-05-01): flip is back. Idle has no stream
+        // open so the button is hidden; preview lights it up; click
+        // re-getUserMedias with the opposite facingMode and persists
+        // to localStorage so the next mount resumes there.
+        //
+        // jsdom in this vitest setup ships a stripped Storage (the
+        // `--localstorage-file` warning at run time + spyOn-on-getItem
+        // failing because the methods don't exist) — so swap in a real
+        // backing Map via Object.defineProperty for the duration of
+        // the test, then restore.
+        const backing = new Map();
+        const stub = {
+            getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+            setItem: (k, v) => backing.set(k, String(v)),
+            removeItem: (k) => backing.delete(k),
+        };
+        const orig = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+        Object.defineProperty(globalThis, "localStorage", {
+            configurable: true,
+            value: stub,
+        });
+        try {
+            const container = document.createElement("div");
+            const opts = defaultMounts();
+            const handle = mountStreamPanel(container, opts);
+            await waitFor(() => handle.getState() === "preview");
 
+            const flipBtn = container.querySelector(".stream-flip-camera");
+            expect(flipBtn).not.toBeNull();
+            expect(flipBtn.hidden).toBe(false);
+
+            // Initial open used the default 'environment' facingMode.
+            expect(
+                opts.getUserMedia.mock.calls[0][0].video.facingMode,
+            ).toBe("environment");
+
+            flipBtn.click();
+            // Wait on the LAST side-effect of flipCamera (the write)
+            // rather than getUserMedia's call count — the latter
+            // increments synchronously when the mock fn is invoked but
+            // before its returned promise resolves, which races the
+            // post-await code (state mutation + writeFacingModePref).
+            await waitFor(
+                () => backing.get("openmarquee:stream:facing-mode") === "user",
+            );
+            expect(
+                opts.getUserMedia.mock.calls[1][0].video.facingMode,
+            ).toBe("user");
+        } finally {
+            if (orig) {
+                Object.defineProperty(globalThis, "localStorage", orig);
+            } else {
+                delete globalThis.localStorage;
+            }
+        }
+    });
+
+    it("flip-camera while live calls replaceTrack on the active video sender (no PC teardown)", async () => {
+        // §5.11: mid-stream flip is hot-swappable via track.replaceTrack.
+        // The publisher stays connected, no SDP renegotiation, no
+        // closeup of the existing PC.
+        const container = document.createElement("div");
+        const fakePc = makeFakePc();
+        const initialVideoTrack = { kind: "video", stop: vi.fn() };
+        // Mock localStream for the FIRST getUserMedia → tracks include
+        // the initial video track; subsequent calls return a fresh
+        // stream with a fresh track.
+        let mediaCallCount = 0;
+        const opts = defaultMounts({
+            createPeerConnection: vi.fn(() => fakePc),
+            _fakePc: fakePc,
+            getUserMedia: vi.fn(async () => {
+                mediaCallCount += 1;
+                const track = {
+                    kind: "video",
+                    stop: vi.fn(),
+                    _id: `track-${mediaCallCount}`,
+                };
+                return {
+                    getTracks: () => [track],
+                    getVideoTracks: () => [track],
+                };
+            }),
+        });
+        // Wire a sender on the fake PC that the panel can replaceTrack on.
+        const replaceTrack = vi.fn(async () => {});
+        fakePc.getSenders = () => [
+            { track: { kind: "video", _id: "track-1" }, replaceTrack },
+        ];
+        const handle = mountStreamPanel(container, opts);
         container.querySelector(".stream-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
-        // No flip button anywhere in the panel — neither hidden nor
-        // visible — at any phase.
-        expect(container.querySelector(".stream-flip-camera")).toBeNull();
+        const flipBtn = container.querySelector(".stream-flip-camera");
+        flipBtn.click();
+        await waitFor(() => replaceTrack.mock.calls.length === 1);
+
+        // Sender's replaceTrack received the freshly-opened video track.
+        const passed = replaceTrack.mock.calls[0][0];
+        expect(passed?.kind).toBe("video");
+        // PC was NOT torn down — fakePc.closed flag stays false (the
+        // helper sets it to true on close()).
+        expect(fakePc.closed).toBe(false);
+        // Phase still 'live'.
+        expect(handle.getState()).toBe("live");
+    });
+
+    it("mount-init reads localStorage and opens the operator's last facingMode", async () => {
+        const backing = new Map([["openmarquee:stream:facing-mode", "user"]]);
+        const stub = {
+            getItem: (k) => (backing.has(k) ? backing.get(k) : null),
+            setItem: (k, v) => backing.set(k, String(v)),
+            removeItem: (k) => backing.delete(k),
+        };
+        const orig = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+        Object.defineProperty(globalThis, "localStorage", {
+            configurable: true,
+            value: stub,
+        });
+        try {
+            const container = document.createElement("div");
+            const opts = defaultMounts();
+            const handle = mountStreamPanel(container, opts);
+            await waitFor(() => handle.getState() === "preview");
+            expect(
+                opts.getUserMedia.mock.calls[0][0].video.facingMode,
+            ).toBe("user");
+        } finally {
+            if (orig) {
+                Object.defineProperty(globalThis, "localStorage", orig);
+            } else {
+                delete globalThis.localStorage;
+            }
+        }
     });
 
     it("getUserMedia rejection lands in error phase with a message", async () => {

@@ -46,6 +46,31 @@ const DEFAULT_CAPTURE_CONSTRAINTS = {
     audio: false,
 };
 
+// Per-session persistence for the operator's last camera choice. Reads
+// at mount-init so a re-mounted panel resumes with the camera the
+// operator picked last time, not the spec'd 'environment' default.
+// localStorage key namespaced under openmarquee:stream:* (consistent
+// with the demo bundle's LS_KEY pattern). Best-effort — a private-
+// browsing failure or a quota-exceeded write is silently swallowed,
+// the panel just runs against the in-memory default for the session.
+const FACING_MODE_LS_KEY = "openmarquee:stream:facing-mode";
+function readFacingModePref() {
+    try {
+        const v = globalThis.localStorage?.getItem(FACING_MODE_LS_KEY);
+        if (v === "user" || v === "environment") return v;
+    } catch {
+        /* no localStorage available (private browsing, sandbox) */
+    }
+    return "environment";
+}
+function writeFacingModePref(value) {
+    try {
+        globalThis.localStorage?.setItem(FACING_MODE_LS_KEY, value);
+    } catch {
+        /* quota / disabled — skip */
+    }
+}
+
 // Unified StreamHeader (eyebrow + title + variable action button) +
 // viewfinder + idle-only paused-playlist row + live-only metrics grid.
 // Design reference: design/stream-redesigns-2026-04-29 variants A
@@ -55,10 +80,15 @@ const DEFAULT_CAPTURE_CONSTRAINTS = {
 //
 // Divergences from the prior Phase 12.2 panel (defaulted, not
 // confirmed with qarl yet):
-// 1. Camera flip button dropped — the redesign defers source-
-//    switching until after Stop. Matches qarl's "drop settings for
-//    now" intent and keeps the live HUD uncluttered. Reversible if
-//    the flow turns out to need it.
+// 1. Camera flip button RESTORED 2026-05-01 per qarl. Was dropped in
+//    the 2026-04-29 redesign iteration ("defer source-switching until
+//    after Stop"); operator wanted the mid-stream hot-swap path back.
+//    Surfaces as a circular icon button overlaid on the viewfinder's
+//    top-right corner whenever a local stream is open. Idle/preview:
+//    re-getUserMedia, swap srcObject. Live: track.replaceTrack on the
+//    active video sender — no PC teardown, no SDP renegotiation, per
+//    §5.11. Choice persists in localStorage so the next mount resumes
+//    on the same camera.
 // 2. Tailscale-foreground warning dropped — operator-known by now,
 //    and the redesign doesn't depict it. The §5.11 known-limitation
 //    still applies; if QA wants it back, it lands as an inline pill
@@ -105,6 +135,19 @@ const SECTION_TEMPLATE = `
                 <div class="stream-preview-empty">
                     Tap <strong>Go live</strong> to open your camera.
                 </div>
+                <button type="button" class="stream-flip-camera"
+                        aria-label="Switch camera (front / back)"
+                        title="Switch camera"
+                        hidden>
+                    <svg viewBox="0 0 24 24" width="20" height="20"
+                         fill="none" stroke="currentColor" stroke-width="1.8"
+                         stroke-linecap="round" stroke-linejoin="round"
+                         aria-hidden="true">
+                        <path d="M4 7h3l2-2h6l2 2h3v12H4z"/>
+                        <circle cx="12" cy="13" r="3"/>
+                        <path d="M9.5 13l-1.5-1.5M14.5 13l1.5 1.5"/>
+                    </svg>
+                </button>
                 <div class="stream-live-pill" hidden>
                     <span class="stream-live-pill-dot" aria-hidden="true"></span>
                     LIVE
@@ -186,6 +229,7 @@ export function mountStreamPanel(container, options = {}) {
     const stopBtn = container.querySelector(".stream-stop");
     const takeOverBtn = container.querySelector(".stream-take-over");
     const cancelTakeoverBtn = container.querySelector(".stream-cancel-takeover");
+    const flipCameraBtn = container.querySelector(".stream-flip-camera");
     const livePillEl = container.querySelector(".stream-live-pill");
     const pausedRowEl = container.querySelector(".stream-paused-row");
     const metricsGridEl = container.querySelector(".stream-metrics-grid");
@@ -244,6 +288,11 @@ export function mountStreamPanel(container, options = {}) {
         // Active local camera stream (preview source + the track we add
         // to the PC). Null when idle/error/take-over-prompt.
         localStream: null,
+        // 'environment' (back) or 'user' (front). Hydrated from
+        // localStorage so the operator's last choice survives mount
+        // cycles. Re-§5.11: flip is hot-swappable mid-stream via
+        // track.replaceTrack — no PC teardown.
+        facingMode: readFacingModePref(),
         // Active RTCPeerConnection. Null between sessions.
         pc: null,
         // User-facing message rendered into .stream-status. Reset when
@@ -386,6 +435,14 @@ export function mountStreamPanel(container, options = {}) {
         takeOverBtn.hidden = phase !== "take-over-prompt";
         cancelTakeoverBtn.hidden = phase !== "take-over-prompt";
 
+        // Flip-camera button rides on the viewfinder whenever the
+        // camera is open — preview + live phases. Hidden in idle (no
+        // stream open), take-over-prompt (someone else owns the
+        // screen), error (no usable stream), and during the brief
+        // requesting-camera + negotiating windows.
+        flipCameraBtn.hidden =
+            !state.localStream || (phase !== "preview" && phase !== "live");
+
         // LIVE pill on the viewfinder + metrics grid below it: only
         // while live. The paused-playlist hint shows in any "ready"
         // phase (idle/preview/error) — i.e. anywhere Go live is
@@ -452,24 +509,72 @@ export function mountStreamPanel(container, options = {}) {
     }
 
     async function openLocalCamera() {
-        // Always opens the back-facing ('environment') camera on
-        // mobile. The redesign drops the in-stream camera-flip
-        // affordance — source-switching is deferred until after Stop
-        // (start a fresh session against a different camera). The
-        // `facingMode: 'environment'` constraint is a soft hint; on
-        // desktops + phones-with-only-one-camera, getUserMedia falls
-        // back to whatever's available.
+        // Defaults to back-facing on mobile ('environment'), but reads
+        // state.facingMode so the operator's last flip choice survives
+        // mount cycles. The constraint is a soft hint — on desktops +
+        // phones-with-only-one-camera, getUserMedia falls back to
+        // whatever's available.
         const constraints = {
             ...DEFAULT_CAPTURE_CONSTRAINTS,
             video: {
                 ...DEFAULT_CAPTURE_CONSTRAINTS.video,
-                facingMode: "environment",
+                facingMode: state.facingMode,
             },
         };
         const stream = await getUserMedia(constraints);
         previewEl.srcObject = stream;
         state.localStream = stream;
         return stream;
+    }
+
+    async function flipCamera() {
+        // Idle/preview: re-open getUserMedia with the flipped facingMode,
+        //   stop the old tracks, swap srcObject.
+        // Live: same getUserMedia, but instead of teardownPC we find the
+        //   active video sender and replaceTrack — the publisher stays
+        //   connected, no SDP renegotiation, no PC teardown (§5.11).
+        // Either way, persist the new choice to localStorage.
+        const next = state.facingMode === "environment" ? "user" : "environment";
+        const constraints = {
+            ...DEFAULT_CAPTURE_CONSTRAINTS,
+            video: {
+                ...DEFAULT_CAPTURE_CONSTRAINTS.video,
+                facingMode: next,
+            },
+        };
+        const newStream = await getUserMedia(constraints);
+        const oldStream = state.localStream;
+        state.facingMode = next;
+        writeFacingModePref(next);
+        state.localStream = newStream;
+        previewEl.srcObject = newStream;
+        // Mid-stream hot-swap: if a PC has active senders, swap the
+        // video track in place. Per-§5.11 this is the documented path
+        // for camera flips during a live broadcast.
+        if (state.pc) {
+            const newVideoTrack = newStream.getVideoTracks()[0] ?? null;
+            for (const sender of state.pc.getSenders?.() ?? []) {
+                if (sender.track && sender.track.kind === "video") {
+                    try {
+                        await sender.replaceTrack(newVideoTrack);
+                    } catch {
+                        /* sender shut down between getSenders + replaceTrack */
+                    }
+                }
+            }
+        }
+        // Stop the old tracks AFTER replaceTrack so the publisher never
+        // sees a frame gap. Order matters: stop-then-replace blanks the
+        // remote until the new track flows.
+        if (oldStream) {
+            for (const track of oldStream.getTracks()) {
+                try {
+                    track.stop();
+                } catch {
+                    /* track already ended — harmless */
+                }
+            }
+        }
     }
 
     function teardownPC({ keepCamera = false } = {}) {
@@ -800,6 +905,29 @@ export function mountStreamPanel(container, options = {}) {
     takeOverBtn.addEventListener("click", () => {
         takeOver();
     });
+    let flipInFlight = false;
+    flipCameraBtn.addEventListener("click", async () => {
+        if (flipInFlight) return;
+        if (!state.localStream) return;
+        flipInFlight = true;
+        flipCameraBtn.disabled = true;
+        try {
+            await flipCamera();
+        } catch (err) {
+            // getUserMedia rejected the new facingMode (single-camera
+            // device, OS denied, etc.). Leave the existing stream alone
+            // and surface a status note; the panel stays in its current
+            // phase since localStream is still healthy.
+            setMessage(
+                `Couldn't switch camera · ${err?.message || err}`,
+            );
+            render();
+        } finally {
+            flipInFlight = false;
+            flipCameraBtn.disabled = false;
+        }
+    });
+
     cancelTakeoverBtn.addEventListener("click", () => {
         cancelTakeover();
     });

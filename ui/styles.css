@@ -3236,6 +3236,36 @@ html, body { margin: 0; padding: 0; height: 100%; }
     height: 100%;
     object-fit: cover;
 }
+
+/* Flip-camera button — overlay on the viewfinder's top-right corner.
+   Only surfaces while a local camera stream is open (preview + live);
+   stream-panel.js sets `hidden` per-phase. Touch target is comfortably
+   larger than the 12px icon so a phone tap doesn't miss. Re-§5.11. */
+.stream-flip-camera {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    width: 2.25rem;
+    height: 2.25rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 999px;
+    cursor: pointer;
+    padding: 0;
+    line-height: 0;
+    transition: background-color 120ms ease;
+}
+.stream-flip-camera:hover { background: rgba(0, 0, 0, 0.75); }
+.stream-flip-camera:focus-visible {
+    outline: 2px solid var(--om-accent, var(--accent, #ffb84d));
+    outline-offset: 2px;
+}
+.stream-flip-camera[disabled] { opacity: 0.5; cursor: progress; }
+.stream-flip-camera[hidden] { display: none !important; }
 .stream-preview-empty {
     position: absolute;
     inset: 0;
