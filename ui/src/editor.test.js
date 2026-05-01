@@ -19,6 +19,8 @@ function mockCanvas(width, height) {
         fillText: vi.fn(),
         save: vi.fn(),
         restore: vi.fn(),
+        translate: vi.fn(),
+        scale: vi.fn(),
     };
     return {
         width,
@@ -127,9 +129,10 @@ describe("drawCanvas — explicit fontSize override", () => {
     it("falls back to the heuristic when fontSize is not a positive number", () => {
         const canvas = mockCanvas(128, 96);
         drawCanvas(canvas, { text: "X", fontSize: 0 });
-        // §5.10a (qarl 2026-04-30 revision): font sizing is slide-relative,
-        // not box-relative. Heuristic fires against canvas.height = 96.
-        expect(canvas._ctx.font).toContain(`${pickFontSize(96)}px`);
+        // §5.10a v3.1.1 (qarl 2026-05-01 ask #1): font sizing is
+        // SLIDE-WIDTH-relative now (was height-relative). Heuristic
+        // fires against canvas.width = 128.
+        expect(canvas._ctx.font).toContain(`${pickFontSize(128)}px`);
     });
 });
 
@@ -147,6 +150,29 @@ describe("drawCanvas — context isolation", () => {
         const [, , , maxWidth] = canvas._ctx.fillText.mock.calls[0];
         // Default box.w = 0.8 → 0.8 * 64 = 51.2
         expect(maxWidth).toBeCloseTo(0.8 * 64, 5);
+    });
+
+    it("squishes vertically when total text height overflows the box (qarl 2026-05-01 ask #1)", () => {
+        // Many lines + a tall font_size_pct → totalHeight > box.h
+        // (default box.h = 0.8 → 0.8 * 100 = 80px on a 100×100 canvas).
+        // 5 lines × fontSize 30 (30% of 100 width) × 1.1 line-height
+        // = 165px total. 165 > 80 → vertical squish via ctx.scale(1, ratio).
+        const canvas = mockCanvas(100, 100);
+        drawCanvas(canvas, { text: "A\nB\nC\nD\nE", fontSizePct: 30 });
+        // ctx.translate + ctx.scale fired once each (for the squish).
+        expect(canvas._ctx.translate).toHaveBeenCalledTimes(1);
+        expect(canvas._ctx.scale).toHaveBeenCalledTimes(1);
+        // The y-scale ratio should be box.h / totalHeight ≈ 80/165 ≈ 0.485.
+        const [, yScale] = canvas._ctx.scale.mock.calls[0];
+        expect(yScale).toBeGreaterThan(0);
+        expect(yScale).toBeLessThan(1);
+    });
+
+    it("does NOT squish vertically when text fits in the box", () => {
+        const canvas = mockCanvas(100, 100);
+        drawCanvas(canvas, { text: "OK", fontSizePct: 20 });
+        // Single line fits → no scale call.
+        expect(canvas._ctx.scale).not.toHaveBeenCalled();
     });
 
     it("splits text on \\r\\n as well as \\n (iOS paste)", () => {
@@ -176,11 +202,12 @@ describe("drawTextOnly (Phase 5b — Text-over-Video overlay)", () => {
         expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("BOTTOM");
     });
 
-    it("uses font_size_pct relative to canvas height when provided", () => {
-        const canvas = mockCanvas(100, 200);
+    it("uses font_size_pct relative to canvas WIDTH when provided", () => {
+        const canvas = mockCanvas(200, 100);
         drawTextOnly(canvas, {
             text_layers: [{ text: "Hi", font_size_pct: 25 }],
         });
+        // §5.10a v3.1.1 (qarl 2026-05-01 ask #1): pct is of WIDTH now.
         // 25% of 200 = 50px.
         expect(canvas._ctx.font).toMatch(/\b50px\b/);
     });
@@ -228,6 +255,8 @@ function patchCanvasPrototype() {
         fillText: vi.fn(),
         save: vi.fn(),
         restore: vi.fn(),
+        translate: vi.fn(),
+        scale: vi.fn(),
     };
     const proto = HTMLCanvasElement.prototype;
     proto.getContext = vi.fn(() => fakeCtx);
@@ -1339,6 +1368,7 @@ describe("mountEditor — visual font picker", () => {
                 fillStyle: "", font: "", textAlign: "", textBaseline: "",
                 clearRect: () => {}, fillRect: () => {}, fillText: () => {},
                 save: () => {}, restore: () => {},
+                translate: () => {}, scale: () => {},
             };
         };
         HTMLCanvasElement.prototype.toDataURL = () => "data:image/png;base64,STUBDATA";

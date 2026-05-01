@@ -1605,11 +1605,16 @@ function paintLayer(ctx, canvas, layer) {
     const pct = layer.font_size_pct ?? layer.fontSizePct;
     const px = layer.font_size_px ?? layer.fontSize;
     if (Number.isFinite(pct) && pct > 0) {
-        fontSizePx = Math.max(4, Math.round((canvas.height * pct) / 100));
+        // §5.10a v3.1.1 (qarl 2026-05-01 ask #1): font_size_pct is a
+        // percentage of slide WIDTH (not height). Wide signs at
+        // 1920×128 made height-relative font yield tiny letters;
+        // width-relative matches operator intuition for sign-sized
+        // type. Backend's _draw_text_into uses the same formula.
+        fontSizePx = Math.max(4, Math.round((canvas.width * pct) / 100));
     } else if (Number.isFinite(px) && px > 0) {
         fontSizePx = px;
     } else {
-        fontSizePx = pickFontSize(canvas.height);
+        fontSizePx = pickFontSize(canvas.width);
     }
     ctx.fillStyle = textColor;
     const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
@@ -1622,10 +1627,30 @@ function paintLayer(ctx, canvas, layer) {
     const totalHeight = lineHeight * lines.length;
     const boxCenterX = boxX + boxW / 2;
     const boxCenterY = boxY + boxH / 2;
-    const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
     const maxWidth = Math.max(1, boxW);
-    for (let i = 0; i < lines.length; i++) {
-        ctx.fillText(lines[i], boxCenterX, startY + i * lineHeight, maxWidth);
+    // Vertical squish (qarl 2026-05-01 ask #1): when total rendered
+    // text height exceeds box height, scale-y around the box center
+    // so lines stay inside. fillText's maxWidth handles horizontal
+    // overflow as before — both axes squish independently.
+    const yScale = totalHeight > boxH ? boxH / totalHeight : 1;
+    if (yScale === 1) {
+        const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
+        for (let i = 0; i < lines.length; i++) {
+            ctx.fillText(lines[i], boxCenterX, startY + i * lineHeight, maxWidth);
+        }
+    } else {
+        ctx.save();
+        ctx.translate(boxCenterX, boxCenterY);
+        ctx.scale(1, yScale);
+        // Draw centered around (0,0) under the local transform; each
+        // line's y-offset is from the centered origin. fillText's
+        // maxWidth is in untransformed coords, so it still clamps
+        // horizontal width correctly.
+        const lineY0 = -totalHeight / 2 + lineHeight / 2;
+        for (let i = 0; i < lines.length; i++) {
+            ctx.fillText(lines[i], 0, lineY0 + i * lineHeight, maxWidth);
+        }
+        ctx.restore();
     }
 }
 
@@ -1715,11 +1740,18 @@ function resolveLayerForDraw(layer) {
     return { ...layer, text };
 }
 
-export function pickFontSize(panelHeight) {
-    return Math.max(12, Math.floor(panelHeight * 0.4));
+/**
+ * Heuristic fallback when neither `font_size_pct` nor `font_size_px`
+ * is set on a layer. Width-relative per §5.10a v3.1.1 (qarl
+ * 2026-05-01 ask #1) — matches the new pct semantic so a slide
+ * without explicit sizing reads the same way the editor's "% of
+ * width" field would suggest.
+ */
+export function pickFontSize(panelWidth) {
+    return Math.max(12, Math.floor(panelWidth * 0.3));
 }
 
-// Default percent-of-height for a brand-new auto-mode-less text slide.
+// Default percent-of-width for a brand-new auto-mode-less text slide.
 // 30% reads cleanly as a single-word slogan on common 4:3 / 16:9 panels;
 // the operator can dial in something more specific from the field.
 export function pickFontSizePct() {

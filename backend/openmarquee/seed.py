@@ -478,14 +478,24 @@ def _draw_text_into(
     box: object | None,
     slide_width: int,
     slide_height: int,
+    font_size_pct: float | None = None,
+    font_size_px: int | None = None,
 ) -> None:
     """Compose one text layer onto `img` in place.
 
     Shared by render_text_slide_png (single-layer rendering, legacy
     callers + text editor seed path) and render_layered_text_slide_png
-    (the v3 multi-layer compositor). Centers the text inside `box`,
-    squishes horizontally if it overflows. Font size anchored to the
-    SLIDE height per §5.10a.
+    (the v3 multi-layer compositor). Centers the text inside `box`.
+
+    Font sizing (qarl 2026-05-01 ask #1): font_size_pct is a percentage
+    of slide WIDTH (not height — wide HDMI signs at 1920×128 made
+    height-relative font yield tiny letters; width-relative matches
+    how operators think about sign-sized type). Squish (qarl 2026-05-01
+    ask #1): if the rendered text overflows the box on EITHER axis,
+    squish on that axis via Lanczos resize. Vertical squish handles
+    multi-line text that exceeds box height; horizontal squish stays
+    as a fallback for verbose single-line text. Both axes squish
+    independently when both overflow.
     """
     if not text:
         return
@@ -502,15 +512,23 @@ def _draw_text_into(
     px_box_h = max(1, int(bh * slide_height))
 
     draw = ImageDraw.Draw(img)
-    font_size_px = max(12, int(slide_height * 0.4))
-    font = _load_text_font(font_family, font_size_px)
+    if font_size_px is not None and font_size_px > 0:
+        size_px = int(font_size_px)
+    elif font_size_pct is not None and font_size_pct > 0:
+        # §5.10a v3.1.1 (qarl 2026-05-01 ask #1): pct is of slide WIDTH.
+        size_px = max(4, int(slide_width * font_size_pct / 100.0))
+    else:
+        size_px = max(12, int(slide_width * 0.3))
+    font = _load_text_font(font_family, size_px)
     bbox = draw.textbbox((0, 0), text, font=font)
     natural_w = bbox[2] - bbox[0]
     natural_h = bbox[3] - bbox[1]
-    target_w = px_box_w
     box_center_x = px_box_x + px_box_w / 2
     box_center_y = px_box_y + px_box_h / 2
-    if natural_w <= target_w or natural_w <= 0 or natural_h <= 0:
+    if natural_w <= 0 or natural_h <= 0:
+        return
+    # Fits inside the box on both axes — paint directly, no squish.
+    if natural_w <= px_box_w and natural_h <= px_box_h:
         draw.text(
             (box_center_x - natural_w / 2 - bbox[0],
              box_center_y - natural_h / 2 - bbox[1]),
@@ -519,22 +537,27 @@ def _draw_text_into(
             font=font,
         )
         return
-    # Squish: render at native width on a transparent surface, then
-    # resize horizontally to target_w and composite back onto img. The
-    # pad-survives-resize trick is the same as before — just lifted
-    # into the helper.
+    # Squish: render at natural size on a transparent surface, then
+    # resize whichever axes overflow the box. Lanczos preserves glyph
+    # legibility at small scale factors. The pad trick survives the
+    # resize because pad-pre is scaled inversely to keep pad-post a
+    # constant pixel count after the squeeze.
     pad_post = 4
-    ratio = target_w / max(1, natural_w)
-    pad_pre = max(pad_post, math.ceil(pad_post / max(ratio, 0.001)))
+    target_w = min(natural_w, px_box_w)
+    target_h = min(natural_h, px_box_h)
+    ratio_w = target_w / max(1, natural_w)
+    ratio_h = target_h / max(1, natural_h)
+    pad_pre_w = max(pad_post, math.ceil(pad_post / max(ratio_w, 0.001)))
+    pad_pre_h = max(pad_post, math.ceil(pad_post / max(ratio_h, 0.001)))
     temp = Image.new(
         "RGBA",
-        (natural_w + pad_pre * 2, natural_h + pad_post * 2),
+        (natural_w + pad_pre_w * 2, natural_h + pad_pre_h * 2),
         (0, 0, 0, 0),
     )
     td = ImageDraw.Draw(temp)
-    td.text((pad_pre - bbox[0], pad_post - bbox[1]), text, fill=fg, font=font)
+    td.text((pad_pre_w - bbox[0], pad_pre_h - bbox[1]), text, fill=fg, font=font)
     squished = temp.resize(
-        (target_w + pad_post * 2, natural_h + pad_post * 2), Image.LANCZOS
+        (target_w + pad_post * 2, target_h + pad_post * 2), Image.LANCZOS
     )
     paste_x = int(box_center_x - squished.width / 2)
     paste_y = int(box_center_y - squished.height / 2)
@@ -570,6 +593,8 @@ def render_layered_text_slide_png(
             box=getattr(layer, "box", None),
             slide_width=width,
             slide_height=height,
+            font_size_pct=getattr(layer, "font_size_pct", None),
+            font_size_px=getattr(layer, "font_size_px", None),
         )
     buf = BytesIO()
     img.save(buf, format="PNG")
@@ -586,6 +611,8 @@ def render_text_slide_png(
     background_image_path: Path | None = None,
     font_family: str | None = None,
     box: object | None = None,
+    font_size_pct: float | None = None,
+    font_size_px: int | None = None,
 ) -> bytes:
     """Flatten a single text+box onto a PNG.
 
@@ -608,6 +635,8 @@ def render_text_slide_png(
         box=box,
         slide_width=width,
         slide_height=height,
+        font_size_pct=font_size_pct,
+        font_size_px=font_size_px,
     )
     buf = BytesIO()
     img.save(buf, format="PNG")
