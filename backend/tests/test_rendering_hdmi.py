@@ -148,6 +148,72 @@ class TestBgra32Output:
         ])
 
 
+class TestRGB565PixelFormat:
+    """The dev Pi (Bookworm + vc4-kms-v3d) exposes /dev/fb0 as
+    16-bit RGB565 little-endian — verified 2026-05-01 via
+    /sys/class/graphics/fb0/bits_per_pixel = 16. Frame size = w*h*2
+    bytes; 5 bits R + 6 bits G + 5 bits B; low byte first."""
+
+    def test_rgb565_pure_red_packs_correctly(self, tmp_path: Path):
+        # R=255, G=0, B=0:
+        #   r5 = 0b11111, g6 = 0b000000, b5 = 0b00000
+        #   packed: 0b11111_000000_00000 = 0xF800
+        # Little-endian: 0x00, 0xF8
+        path = tmp_path / "fb"
+        r = HDMIRenderer(
+            width=1, height=1, output_path=path, pixel_format="rgb565"
+        )
+        r.render_frame(bytes([255, 0, 0]))
+        r.close()
+        assert path.read_bytes() == bytes([0x00, 0xF8])
+
+    def test_rgb565_pure_green_packs_correctly(self, tmp_path: Path):
+        # R=0, G=255, B=0:
+        #   r5 = 0b00000, g6 = 0b111111, b5 = 0b00000
+        #   packed: 0b00000_111111_00000 = 0x07E0
+        # Little-endian: 0xE0, 0x07
+        path = tmp_path / "fb"
+        r = HDMIRenderer(
+            width=1, height=1, output_path=path, pixel_format="rgb565"
+        )
+        r.render_frame(bytes([0, 255, 0]))
+        r.close()
+        assert path.read_bytes() == bytes([0xE0, 0x07])
+
+    def test_rgb565_pure_blue_packs_correctly(self, tmp_path: Path):
+        # R=0, G=0, B=255:
+        #   r5 = 0, g6 = 0, b5 = 0b11111
+        #   packed: 0x001F
+        # Little-endian: 0x1F, 0x00
+        path = tmp_path / "fb"
+        r = HDMIRenderer(
+            width=1, height=1, output_path=path, pixel_format="rgb565"
+        )
+        r.render_frame(bytes([0, 0, 255]))
+        r.close()
+        assert path.read_bytes() == bytes([0x1F, 0x00])
+
+    def test_rgb565_white_sums_all_channels(self, tmp_path: Path):
+        # R=G=B=255 → all bits set → 0xFFFF
+        path = tmp_path / "fb"
+        r = HDMIRenderer(
+            width=1, height=1, output_path=path, pixel_format="rgb565"
+        )
+        r.render_frame(bytes([255, 255, 255]))
+        r.close()
+        assert path.read_bytes() == bytes([0xFF, 0xFF])
+
+    def test_rgb565_frame_byte_size_matches_2bpp(self, tmp_path: Path):
+        # 4×3 sign at rgb565 → 4*3*2 = 24 bytes on the fb.
+        path = tmp_path / "fb"
+        r = HDMIRenderer(
+            width=4, height=3, output_path=path, pixel_format="rgb565"
+        )
+        r.render_frame(bytes([128, 64, 32] * 12))
+        r.close()
+        assert len(path.read_bytes()) == 24
+
+
 # --- display-size upscale + letterbox ---
 
 

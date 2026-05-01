@@ -49,15 +49,26 @@ import logging
 import os
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 log = logging.getLogger(__name__)
 
-# Pixel formats we know how to serialize RGB888 into. `bgra32` is the
-# Pi HDMI default; `rgb24` is a convenience for tests where 3-bytes-
-# per-pixel bytes are easier to eyeball.
+# Pixel formats we know how to serialize RGB888 into.
+#
+# - `bgra32` (4 bytes/pixel): the historical "Pi HDMI default" the
+#   renderer was built against. Some Pi configurations land in this
+#   format (especially after a `framebuffer_depth=32` config.txt
+#   knob or with vc4-fkms-v3d).
+# - `rgb565` (2 bytes/pixel): what the dev Pi (Bookworm + vc4-kms-v3d
+#   compat shim) actually exposes — verified 2026-05-01:
+#   `cat /sys/class/graphics/fb0/bits_per_pixel` → `16`. 5 bits R + 6
+#   bits G + 5 bits B packed little-endian per pixel.
+# - `rgb24` (3 bytes/pixel): convenience for tests where 3-bytes-per-
+#   pixel layouts are easier to eyeball than the swizzled paths.
 _PIXEL_FORMATS: dict[str, int] = {
     "bgra32": 4,
+    "rgb565": 2,
     "rgb24": 3,
 }
 
@@ -191,6 +202,23 @@ class HDMIRenderer:
 
         if self.pixel_format == "rgb24":
             return image.tobytes()
+
+        if self.pixel_format == "rgb565":
+            # RGB565 little-endian: pack each RGB888 pixel into 2 bytes
+            # as `RRRRRGGG GGGBBBBB` viewed MSB-first (5/6/5), stored
+            # low-byte-first per the Linux fb little-endian convention.
+            # numpy keeps the per-pixel work at C speed — Pi Zero 2 W
+            # @ 1920×1080 ≈ 2M pixels per frame, transitions fire at
+            # _FADE_FPS=30 in the playback loop, so a pure-Python loop
+            # would miss the frame budget by ~3 orders of magnitude.
+            arr = np.frombuffer(image.tobytes(), dtype=np.uint8).reshape(
+                image.height, image.width, 3
+            )
+            r5 = (arr[..., 0] >> 3).astype(np.uint16)
+            g6 = (arr[..., 1] >> 2).astype(np.uint16)
+            b5 = (arr[..., 2] >> 3).astype(np.uint16)
+            packed = (r5 << 11) | (g6 << 5) | b5
+            return packed.astype("<u2").tobytes()
 
         # bgra32: swap R and B channels via Pillow's split/merge — the
         # C-implemented inner loop keeps this fast enough for 1080p at
