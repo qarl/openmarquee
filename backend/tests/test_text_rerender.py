@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from openmarquee.content import ImageSlide, TextSlide, VideoSlide
+from openmarquee.content import ImageSlide, TextLayer, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.seed import render_text_slide_png
 from openmarquee.text_rerender import (
@@ -26,11 +26,15 @@ def _make_text_slide(
     png = render_text_slide_png(text, width, height, fg="#FFFFFF", bg="#000000")
     slide = TextSlide(
         name=text,
-        text=text,
-        text_color="#FFFFFF",
         background_color="#000000",
-        font_size_px=int(height * 0.4),
         duration_ms=3000,
+        text_layers=[
+            TextLayer(
+                text=text,
+                text_color="#FFFFFF",
+                font_size_px=int(height * 0.4),
+            ),
+        ],
     )
     storage.save_text_slide(slide, png)
     return slide
@@ -72,15 +76,23 @@ def test_rerender_skips_text_with_video_bg(storage: ContentStorage):
 
     text_with_video_bg = TextSlide(
         name="over-video",
-        text="Over video",
-        text_color="#FFFFFF",
         background_color="#000000",
         background_video_slide_id=video.id,
-        font_size_px=400,
         duration_ms=3000,
+        text_layers=[
+            TextLayer(
+                text="Over video",
+                text_color="#FFFFFF",
+                font_size_px=400,
+            ),
+        ],
     )
     original_png = render_text_slide_png(
-        text_with_video_bg.text, 1920, 1080, fg="#FFFFFF", bg="#000000"
+        text_with_video_bg.text_layers[0].text,
+        1920,
+        1080,
+        fg="#FFFFFF",
+        bg="#000000",
     )
     storage.save_text_slide(text_with_video_bg, original_png)
 
@@ -104,15 +116,19 @@ def test_rerender_preserves_image_bg_composite(storage: ContentStorage):
 
     text_over_bg = TextSlide(
         name="over-image",
-        text="OVER",
-        text_color="#FFFFFF",
         background_color="#000000",
         background_image_slide_id=bg.id,
-        font_size_px=int(1080 * 0.4),
         duration_ms=3000,
+        text_layers=[
+            TextLayer(
+                text="OVER",
+                text_color="#FFFFFF",
+                font_size_px=int(1080 * 0.4),
+            ),
+        ],
     )
     composed = render_text_slide_png(
-        text_over_bg.text,
+        text_over_bg.text_layers[0].text,
         1920,
         1080,
         fg="#FFFFFF",
@@ -143,20 +159,25 @@ def test_rerender_threads_box_through(storage: ContentStorage):
 
     slide = TextSlide(
         name="X",
-        text="X",
-        text_color="#FFFFFF",
         background_color="#000000",
-        font_size_px=200,
         duration_ms=3000,
-        box=TextBox(x=0.5, y=0.1, w=0.4, h=0.4),
+        text_layers=[
+            TextLayer(
+                text="X",
+                text_color="#FFFFFF",
+                font_size_px=200,
+                box=TextBox(x=0.5, y=0.1, w=0.4, h=0.4),
+            ),
+        ],
     )
+    layer = slide.text_layers[0]
     initial_png = render_text_slide_png(
-        slide.text,
+        layer.text,
         100,
         100,
-        fg=slide.text_color,
+        fg=layer.text_color,
         bg=slide.background_color,
-        box=slide.box,
+        box=layer.box,
     )
     storage.save_text_slide(slide, initial_png)
 

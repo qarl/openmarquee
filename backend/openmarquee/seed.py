@@ -42,7 +42,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from openmarquee.content import ImageSlide, TextSlide, VideoSlide
+from openmarquee.content import ImageSlide, TextLayer, TextSlide, VideoSlide
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playlist import PlaylistStorage
 
@@ -669,13 +669,17 @@ def _seed_text_slide_set(
         )
         slide = TextSlide(
             name=spec.text,
-            text=spec.text,
-            text_color=spec.text_color,
             background_color=WELCOME_BG_COLOR,
-            font_family=spec.font_family,
-            font_size_px=font_size_px,
             duration_ms=duration_ms,
             background_image_slide_id=bg_image_slide.id if bg_image_slide else None,
+            text_layers=[
+                TextLayer(
+                    text=spec.text,
+                    text_color=spec.text_color,
+                    font_family=spec.font_family,
+                    font_size_px=font_size_px,
+                ),
+            ],
         )
         storage.save_text_slide(slide, png)
         slides.append(slide)

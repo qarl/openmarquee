@@ -64,60 +64,31 @@ class TextBox(BaseModel):
         return self
 
 
-class TextSlide(BaseModel):
-    """A user-typed text slide.
+class TextLayer(BaseModel):
+    """One independently-positioned text element on a TextSlide.
 
-    The browser renders the text to a PNG at the sign's native resolution
-    using Canvas, then uploads the PNG. The editor metadata (text, font,
-    colors, etc.) is kept on the device so the slide can be re-opened and
-    edited without losing fidelity.
+    A TextSlide carries an ordered list of these (`text_layers`); v3 of
+    the on-disk schema makes layered text canonical. Layers render in
+    array order — later entries draw on top of earlier ones — letting
+    operators stack a headline + ticker + dynamic-time stamp on the
+    same slide. Per SYSTEM_SPEC §5.10a.
 
-    `auto_mode` (optional) marks a slide as *dynamic* — its visible text
-    is regenerated at playback time from a device-side data source
-    (current time, today's date, day-of-week). When set, the playback
-    loop re-composites the slide each tick using the device's timezone
-    via `openmarquee.auto_render`. The stored PNG + `text` field act as
-    fallbacks for pallet thumbnails / previews; the authoritative
-    playback frames come from the live render.
-
-    `auto_format` pairs with `auto_mode` — a mode-specific format
-    choice. Must be None when auto_mode is None, and must be compatible
-    with the chosen auto_mode (cross-field validator below). A None
-    auto_format falls back to the mode's default format.
+    `auto_mode` marks a layer as *dynamic*: visible text is regenerated
+    at playback from a device-side data source (current time, today's
+    date, day-of-week). Each layer carries its own `auto_mode`/
+    `auto_format` independently. The stored asset.png shows the value
+    at save time; the playback engine recomposites live per-tick.
     """
 
-    type: Literal["text_slide"] = "text_slide"
-    id: UUID = Field(default_factory=uuid4)
-    name: str = Field(max_length=200)
-    duration_ms: int = Field(default=5000, ge=100)
-
-    # Editor metadata — what the user typed and how they styled it.
     text: str = Field(max_length=10_000)
     font_family: str | None = None
     font_size_px: int | None = Field(default=None, ge=4, le=2048)
-    # Optional alternative to font_size_px: a fraction of canvas width.
-    # Example: 12.5 = "12.5% of the panel width". When set, takes
-    # precedence over font_size_px so a slide saved at 128×96 reads
-    # the same proportions on a 1920×1080 panel after a settings flip.
-    # Old slides keep font_size_px for backward compat; re-editing
-    # them in the unified editor migrates to the relative metric.
+    # Per §5.10a fu (qarl 2026-04-30): font_size_pct is a percentage of
+    # the SLIDE height, not the box height. The box positions and clips
+    # text but doesn't scale font sizing — operator-set sizes mean the
+    # same thing across boxes of any size on the same slide.
     font_size_pct: float | None = Field(default=None, ge=0.5, le=100.0)
     text_color: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
-    background_color: str = Field(default="#000000", pattern=_HEX_COLOR_PATTERN)
-    # Optional: render a bundled / saved ImageSlide's PNG under the text.
-    # The UI flattens both layers to a single PNG at save time, so the
-    # device doesn't re-composite at playback — we keep the reference for
-    # re-editing (operator clicks a saved TextSlide; the editor hydrates
-    # the background picker with the right selection).
-    background_image_slide_id: UUID | None = None
-    # Optional: render a saved VideoSlide as the background under the text.
-    # Per SYSTEM_SPEC §5.10, the device composites the cached text PNG over
-    # each video frame at playback time (live-composite, no pre-bake in
-    # v1). The stored thumbnail PNG is a static fallback for pallet tiles
-    # / screenshots; the playback engine replaces it with frame-by-frame
-    # compositing at slide enter (Phase 5b backend bullet — see
-    # IMPLEMENTATION_PLAN). Mutually exclusive with background_image_slide_id.
-    background_video_slide_id: UUID | None = None
     auto_mode: Literal["time", "date", "day"] | None = None
     auto_format: (
         Literal[
@@ -131,29 +102,11 @@ class TextSlide(BaseModel):
         ]
         | None
     ) = None
-
-    # Transition INTO the next slide ("cut" = instant; "fade" = alpha-blend
-    # across `transition_ms` after this slide's duration ends).
-    transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
-    ] = "cut"
-    transition_ms: int = Field(default=500, ge=0, le=5000)
-
-    # Where the text renders inside the slide — see TextBox docstring +
-    # SYSTEM_SPEC §5.10a. Defaults to a centered, 10%-margin-all-around
-    # box. Resolution- and rotation-safe (fractions, not pixels).
+    # Where the layer renders — see TextBox + §5.10a. Defaults to a
+    # centered, 10%-margin-all-around box. Resolution- and rotation-safe.
     box: TextBox = Field(default_factory=TextBox)
 
-    created_at: datetime = Field(default_factory=_utcnow)
-    # Mirror of the storage envelope's `updated_at`. Output-only — populated
-    # by ContentStorage.load() so frontends can cachebust asset URLs against
-    # this stamp (e.g. `?v=${updated_at}`) and pick up the new bytes when
-    # the backend re-renders (settings dim flip, peer-sync, edit-save). The
-    # envelope is the authoritative source; save() ignores any value passed
-    # here and stamps the envelope itself.
-    updated_at: datetime | None = None
-
-    @field_validator("text_color", "background_color")
+    @field_validator("text_color")
     @classmethod
     def _uppercase_hex(cls, value: str) -> str:
         """Canonicalize hex colors to uppercase so `#ffaa00` and `#FFAA00`
@@ -161,25 +114,9 @@ class TextSlide(BaseModel):
         return value.upper()
 
     @model_validator(mode="after")
-    def _bg_layers_are_exclusive(self) -> "TextSlide":
-        """A TextSlide can have one background source: solid color, an
-        ImageSlide, or a VideoSlide — not two layered references at once.
-        The editor's bg-picker is a radio so this combo can't be reached
-        from the UI; the validator catches a malformed payload before it
-        round-trips through storage."""
-        if (
-            self.background_image_slide_id is not None
-            and self.background_video_slide_id is not None
-        ):
-            raise ValueError(
-                "TextSlide cannot reference both an image and a video background; pick one"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _auto_format_matches_mode(self) -> "TextSlide":
+    def _auto_format_matches_mode(self) -> "TextLayer":
         """auto_format is mode-scoped — a "time_hm" format can't live on
-        a date slide. Catch the mismatch here so the editor can't send
+        a date layer. Catch the mismatch here so the editor can't send
         a nonsensical combo past validation."""
         if self.auto_mode is None:
             if self.auto_format is not None:
@@ -189,6 +126,89 @@ class TextSlide(BaseModel):
         if self.auto_format is not None and not self.auto_format.startswith(prefix):
             raise ValueError(
                 f"auto_format {self.auto_format!r} doesn't match auto_mode={self.auto_mode!r}"
+            )
+        return self
+
+
+class TextSlide(BaseModel):
+    """A user-typed text slide composed of one or more TextLayers.
+
+    The browser renders the layered scene to a PNG at the sign's native
+    resolution using Canvas, then uploads the PNG. Layer metadata is
+    kept on the device so the slide can be re-opened and edited without
+    losing fidelity.
+
+    Schema v3 (qarl 2026-05-01): per-text fields (text / font_family /
+    text_color / auto_mode / auto_format / box) moved off the slide
+    root into `text_layers`. Slide-level fields stay at the root:
+    background fill / image / video, transition, transition_ms,
+    duration_ms, name. The on-disk envelope's SCHEMA_VERSION bumps to
+    3 since v2 envelopes (single-box flat layout) won't deserialize
+    against this shape — operators wipe their dev content directory
+    once on rollout (clean cutover; no production installations to
+    migrate per qarl).
+    """
+
+    type: Literal["text_slide"] = "text_slide"
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(max_length=200)
+    duration_ms: int = Field(default=5000, ge=100)
+
+    # Ordered list of text layers; index 0 draws first, later entries
+    # composite over earlier ones. min_length=1 — a slide with no
+    # layers is meaningless and would render blank.
+    text_layers: list[TextLayer] = Field(
+        default_factory=lambda: [TextLayer(text="")],
+        min_length=1,
+    )
+
+    background_color: str = Field(default="#000000", pattern=_HEX_COLOR_PATTERN)
+    # Optional: render a bundled / saved ImageSlide's PNG under the text.
+    # The UI flattens layers + bg to a single PNG at save time, so the
+    # device doesn't re-composite at playback — we keep the reference
+    # for re-editing (operator clicks a saved TextSlide; the editor
+    # hydrates the background picker with the right selection).
+    background_image_slide_id: UUID | None = None
+    # Optional: render a saved VideoSlide as the background under the
+    # text. Per SYSTEM_SPEC §5.10, the device composites the cached
+    # text PNG over each video frame at playback time. Mutually
+    # exclusive with background_image_slide_id.
+    background_video_slide_id: UUID | None = None
+
+    # Transition INTO the next slide ("cut" = instant; "fade" =
+    # alpha-blend across `transition_ms` after this slide's duration
+    # ends).
+    transition: Literal[
+        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
+    ] = "cut"
+    transition_ms: int = Field(default=500, ge=0, le=5000)
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    # Mirror of the storage envelope's `updated_at`. Output-only —
+    # populated by ContentStorage.load() so frontends can cachebust
+    # asset URLs against this stamp.
+    updated_at: datetime | None = None
+
+    @field_validator("background_color")
+    @classmethod
+    def _uppercase_hex(cls, value: str) -> str:
+        """Canonicalize hex colors to uppercase so `#ffaa00` and `#FFAA00`
+        compare and dedupe as the same value."""
+        return value.upper()
+
+    @model_validator(mode="after")
+    def _bg_layers_are_exclusive(self) -> "TextSlide":
+        """A TextSlide can have one background source: solid color, an
+        ImageSlide, or a VideoSlide — not two layered references at
+        once. The editor's bg-picker is a radio so this combo can't
+        be reached from the UI; the validator catches a malformed
+        payload before it round-trips through storage."""
+        if (
+            self.background_image_slide_id is not None
+            and self.background_video_slide_id is not None
+        ):
+            raise ValueError(
+                "TextSlide cannot reference both an image and a video background; pick one"
             )
         return self
 

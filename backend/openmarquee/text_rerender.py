@@ -76,16 +76,21 @@ def rerender_text_slides_for_dims(
             if it.background_image_slide_id is not None
             else None
         )
+        # Schema v3 (qarl 2026-05-01): per-text fields moved off the
+        # slide root into text_layers. Phase 1 reads layer[0]; phase 2
+        # of the layered rollout extends render_text_slide_png to
+        # composite the full layer list, and this loop iterates them.
+        layer = it.text_layers[0]
         try:
             png = render_text_slide_png(
-                it.text,
+                layer.text,
                 eff_w,
                 eff_h,
-                fg=it.text_color,
+                fg=layer.text_color,
                 bg=it.background_color,
                 background_image_path=bg_path,
-                font_family=it.font_family,
-                box=it.box,
+                font_family=layer.font_family,
+                box=layer.box,
             )
             storage.save_text_slide(it, png)
             rerendered += 1

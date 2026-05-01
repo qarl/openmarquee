@@ -6,7 +6,27 @@ from uuid import UUID
 import pytest
 from PIL import Image
 
-from openmarquee.content import ImageSlide, TextSlide
+from openmarquee.content import ImageSlide, TextLayer, TextSlide
+
+
+def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
+    """Build a single-layer TextSlide for tests. Schema v3 routed
+    text fields off the slide root into text_layers — accept the flat
+    kwargs the existing tests use and shuttle them into the canonical
+    layer."""
+    layer_keys = {
+        "text_color", "font_family", "font_size_px",
+        "font_size_pct", "auto_mode", "auto_format", "box",
+    }
+    layer = {"text": text}
+    for k in list(kwargs.keys()):
+        if k in layer_keys:
+            layer[k] = kwargs.pop(k)
+    return TextSlide(
+        name=name,
+        text_layers=[TextLayer(**layer)],
+        **kwargs,
+    )
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
 
@@ -42,7 +62,7 @@ def _png_bytes(width: int, height: int, color: tuple[int, int, int]) -> bytes:
 
 
 def _make_slide(name: str, color: tuple[int, int, int]) -> tuple[TextSlide, bytes]:
-    slide = TextSlide(name=name, text=name, duration_ms=_FAST_DURATION_MS)
+    slide = _text_slide(name=name, text=name, duration_ms=_FAST_DURATION_MS)
     return slide, _png_bytes(8, 8, color)
 
 
@@ -131,7 +151,7 @@ async def test_cycles_through_multiple_items_in_order(renderer):
 @pytest.mark.asyncio
 async def test_missing_asset_is_logged_and_skipped(renderer):
     slide_ok, png_ok = _make_slide("ok", (0, 255, 0))
-    slide_missing = TextSlide(name="missing", text="x", duration_ms=_FAST_DURATION_MS)
+    slide_missing = _text_slide(name="missing", duration_ms=_FAST_DURATION_MS)
 
     def read_asset(item_id: UUID) -> bytes:
         if item_id == slide_missing.id:
@@ -153,7 +173,7 @@ async def test_missing_asset_is_logged_and_skipped(renderer):
 
 @pytest.mark.asyncio
 async def test_corrupt_asset_is_logged_and_skipped(renderer):
-    slide_corrupt = TextSlide(name="corrupt", text="x", duration_ms=_FAST_DURATION_MS)
+    slide_corrupt = _text_slide(name="corrupt", duration_ms=_FAST_DURATION_MS)
     slide_ok, png_ok = _make_slide("ok", (0, 0, 255))
     assets = {slide_corrupt.id: b"not a PNG", slide_ok.id: png_ok}
 
@@ -171,7 +191,7 @@ async def test_corrupt_asset_is_logged_and_skipped(renderer):
 
 @pytest.mark.asyncio
 async def test_stop_returns_promptly_during_long_duration(renderer):
-    long_slide = TextSlide(name="long", text="x", duration_ms=10_000)
+    long_slide = _text_slide(name="long", duration_ms=10_000)
     _, png = _make_slide("dummy", (255, 255, 255))
 
     loop = _new_loop(
@@ -1349,8 +1369,8 @@ def test_scheduled_fetch_uses_default_when_schedule_is_empty(tmp_path):
     schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
 
     # Save one item to default + a different one to a separate playlist.
-    text_in_default = TextSlide(name="in default", text="x")
-    text_in_lunch = TextSlide(name="in lunch", text="x")
+    text_in_default = _text_slide(name="in default")
+    text_in_lunch = _text_slide(name="in lunch")
 
     def _png():
         img = _Image.new("RGB", (4, 4), (0, 0, 0))
@@ -1399,8 +1419,8 @@ def test_scheduled_fetch_picks_active_playlist_per_schedule(tmp_path):
     playlist_storage = PlaylistStorage(tmp_path / "playlists.json")
     schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
 
-    text_default = TextSlide(name="default", text="x")
-    text_lunch = TextSlide(name="lunch", text="x")
+    text_default = _text_slide(name="default")
+    text_lunch = _text_slide(name="lunch")
 
     def _png():
         img = _Image.new("RGB", (4, 4), (0, 0, 0))
@@ -1466,7 +1486,7 @@ def test_scheduled_fetch_returns_empty_for_unknown_playlist_id(tmp_path):
     playlist_storage = PlaylistStorage(tmp_path / "playlists.json")
     schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
 
-    text = TextSlide(name="x", text="x")
+    text = _text_slide(name="x")
     img = _Image.new("RGB", (4, 4), (0, 0, 0))
     buf = _io.BytesIO()
     img.save(buf, format="PNG")
@@ -1517,7 +1537,7 @@ def test_scheduled_fetch_stamps_loop_with_active_playlist_id(tmp_path):
 async def test_resizes_when_asset_dimensions_differ_from_renderer(renderer):
     """Renderer is 8x8; asset is 16x16 — should be resized via NEAREST."""
     big_png = _png_bytes(16, 16, (200, 100, 50))
-    slide = TextSlide(name="big", text="x", duration_ms=_FAST_DURATION_MS)
+    slide = _text_slide(name="big", duration_ms=_FAST_DURATION_MS)
     loop = _new_loop(renderer, fetch_items=lambda: [slide], read_asset=lambda _id: big_png)
     await loop.start()
     await asyncio.sleep(0.05)
@@ -1535,7 +1555,7 @@ async def test_auto_mode_slide_ticks_and_reemits_frames(renderer):
     during their duration — one per auto_tick_seconds. Proves the
     re-composition path is wired and the stored PNG is NOT just
     forwarded once."""
-    slide = TextSlide(
+    slide = _text_slide(
         name="clock",
         text="placeholder",
         auto_mode="time",
@@ -1566,7 +1586,7 @@ async def test_auto_mode_slide_skips_asset_read(renderer):
     asset.png — the render-over path composes from slide metadata +
     current time. A missing / raising read_asset must still let playback
     run cleanly."""
-    slide = TextSlide(
+    slide = _text_slide(
         name="clock",
         text="placeholder",
         auto_mode="day",
@@ -1596,7 +1616,7 @@ async def test_auto_mode_exposes_metadata_on_playback_state(renderer):
     """State endpoint fields current_item_auto_mode / auto_format should
     reflect the currently-rendering auto slide — the live preview uses
     them to overlay the ticking text client-side."""
-    slide = TextSlide(
+    slide = _text_slide(
         name="clock",
         text="placeholder",
         auto_mode="time",

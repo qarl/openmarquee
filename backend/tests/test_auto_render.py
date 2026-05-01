@@ -15,13 +15,26 @@ from openmarquee.auto_render import (
     render_auto_text,
     resolve_timezone,
 )
-from openmarquee.content import TextSlide
+from openmarquee.content import TextLayer, TextSlide
 
 
 def _auto_slide(**kwargs) -> TextSlide:
-    defaults = {"name": "auto", "text": "placeholder"}
-    defaults.update(kwargs)
-    return TextSlide(**defaults)
+    """Helper: builds a single-layer TextSlide for the auto-render tests.
+    Schema v3 routed text fields off the slide root; accept the flat
+    kwargs the tests already use and route them into text_layers[0]."""
+    layer_keys = {
+        "text", "text_color", "font_family", "font_size_px",
+        "font_size_pct", "auto_mode", "auto_format", "box",
+    }
+    layer = {"text": kwargs.pop("text", "placeholder")}
+    for k in list(kwargs.keys()):
+        if k in layer_keys:
+            layer[k] = kwargs.pop(k)
+    return TextSlide(
+        name=kwargs.pop("name", "auto"),
+        text_layers=[TextLayer(**layer)],
+        **kwargs,
+    )
 
 
 # --- render_auto_text: string formatting per mode + format ---
@@ -29,7 +42,7 @@ def _auto_slide(**kwargs) -> TextSlide:
 
 class TestRenderAutoText:
     def test_non_auto_slide_returns_typed_text(self):
-        slide = TextSlide(name="x", text="hello")
+        slide = _auto_slide(text="hello")
         now = datetime(2026, 4, 21, 14, 30, 45, tzinfo=ZoneInfo("UTC"))
         assert render_auto_text(slide, now) == "hello"
 
@@ -79,24 +92,19 @@ class TestRenderAutoText:
 class TestAutoFormatValidator:
     def test_accepts_matching_mode_and_format(self):
         s = _auto_slide(auto_mode="time", auto_format="time_hms")
-        assert s.auto_format == "time_hms"
+        assert s.text_layers[0].auto_format == "time_hms"
 
     def test_rejects_format_without_mode(self):
         with pytest.raises(Exception):  # ValidationError — let pydantic match
-            TextSlide(name="x", text="y", auto_format="time_hm")
+            _auto_slide(auto_format="time_hm")
 
     def test_rejects_mode_mismatch(self):
         with pytest.raises(Exception):
-            TextSlide(
-                name="x",
-                text="y",
-                auto_mode="time",
-                auto_format="day_long",
-            )
+            _auto_slide(auto_mode="time", auto_format="day_long")
 
     def test_mode_without_format_is_allowed(self):
         s = _auto_slide(auto_mode="time")
-        assert s.auto_format is None
+        assert s.text_layers[0].auto_format is None
 
 
 # --- timezone resolution ---

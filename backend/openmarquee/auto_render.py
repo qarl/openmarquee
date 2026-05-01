@@ -48,18 +48,24 @@ def render_auto_text(slide: TextSlide, now: datetime) -> str:
 
     Non-auto slides get their `text` field back unchanged so the same
     entry point works for the whole rendering path.
+
+    Schema v3 (qarl 2026-05-01): per-text fields live on text_layers[0].
+    Multi-layer auto-mode composition lands in phase 2 of the layered
+    rollout — for now this reads layer[0] and matches single-layer
+    behavior. (compose_auto_frame likewise.)
     """
-    if not slide.auto_mode:
-        return slide.text
+    layer = slide.text_layers[0]
+    if not layer.auto_mode:
+        return layer.text
 
-    fmt = slide.auto_format or _DEFAULT_FORMAT.get(slide.auto_mode)
+    fmt = layer.auto_format or _DEFAULT_FORMAT.get(layer.auto_mode)
 
-    if slide.auto_mode == "time":
+    if layer.auto_mode == "time":
         if fmt == "time_hms":
             return now.strftime("%H:%M:%S")
         return now.strftime("%H:%M")
 
-    if slide.auto_mode == "date":
+    if layer.auto_mode == "date":
         if fmt == "date_iso":
             return now.strftime("%Y-%m-%d")
         if fmt == "date_medium":
@@ -70,14 +76,14 @@ def render_auto_text(slide: TextSlide, now: datetime) -> str:
         # date_long default: "April 21, 2026"
         return now.strftime("%B ") + f"{now.day}, {now.year}"
 
-    if slide.auto_mode == "day":
+    if layer.auto_mode == "day":
         if fmt == "day_short":
             return now.strftime("%a")
         return now.strftime("%A")
 
     # Unknown mode — fall through to typed text so playback doesn't crash
     # if a future mode ships ahead of this helper.
-    return slide.text
+    return layer.text
 
 
 def resolve_timezone(tz_name: str | None) -> ZoneInfo:
@@ -128,17 +134,18 @@ def compose_auto_frame(
     # Prefer the relative metric so the auto-render keeps proportional
     # sizing across resolution changes. Fall back to absolute px on old
     # slides that haven't been re-saved with the new field.
-    if slide.font_size_pct is not None:
-        size_px = max(4, int(round(height * slide.font_size_pct / 100)))
+    layer = slide.text_layers[0]
+    if layer.font_size_pct is not None:
+        size_px = max(4, int(round(height * layer.font_size_pct / 100)))
     else:
-        size_px = slide.font_size_px
-    font = _load_font(slide.font_family, size_px, height)
+        size_px = layer.font_size_px
+    font = _load_font(layer.font_family, size_px, height)
 
     draw = ImageDraw.Draw(base)
     text_w, text_h, text_x, text_y = _measure_centered(draw, value, font, width, height)
     # Drop-shadow-ish: a 1-pixel black outline so the text reads on
     # mid-tone backgrounds without relying on a matched shadow color.
-    color = slide.text_color
+    color = layer.text_color
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         draw.text((text_x + dx, text_y + dy), value, fill="#000000", font=font)
     draw.text((text_x, text_y), value, fill=color, font=font)

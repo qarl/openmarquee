@@ -4,31 +4,49 @@ from uuid import UUID
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from openmarquee.content import ContentItem, ImageSlide, TextBox, TextSlide, VideoSlide
+from openmarquee.content import ContentItem, ImageSlide, TextBox, TextLayer, TextSlide, VideoSlide
+
+
+def _make_slide(*, name="x", text="x", **layer_kwargs):
+    """Helper: construct a single-layer TextSlide for tests that read/write
+    one layer's fields. Accepts the old flat kwargs (text=, font_family=,
+    auto_mode= …) and routes them into text_layers[0]; slide-level kwargs
+    (name=, duration_ms=, transition=, …) stay at the root."""
+    slide_kwargs = {}
+    for k in ("duration_ms", "transition", "transition_ms",
+              "background_color", "background_image_slide_id",
+              "background_video_slide_id"):
+        if k in layer_kwargs:
+            slide_kwargs[k] = layer_kwargs.pop(k)
+    return TextSlide(
+        name=name,
+        text_layers=[TextLayer(text=text, **layer_kwargs)],
+        **slide_kwargs,
+    )
 
 
 def test_text_slide_auto_mode_defaults_to_none():
-    assert TextSlide(name="x", text="x").auto_mode is None
+    assert _make_slide().text_layers[0].auto_mode is None
 
 
 def test_text_slide_accepts_auto_mode_options():
     for mode in ("time", "date", "day"):
-        slide = TextSlide(name="x", text="x", auto_mode=mode)
-        assert slide.auto_mode == mode
+        slide = _make_slide(auto_mode=mode)
+        assert slide.text_layers[0].auto_mode == mode
 
 
 def test_text_slide_rejects_unknown_auto_mode():
     with pytest.raises(ValidationError):
-        TextSlide(name="x", text="x", auto_mode="weather")  # type: ignore[arg-type]
+        TextLayer(text="x", auto_mode="weather")  # type: ignore[arg-type]
 
 
 def test_text_slide_minimal_construction():
-    slide = TextSlide(name="Today's Special", text="Pulled Pork $8.99")
+    slide = _make_slide(name="Today's Special", text="Pulled Pork $8.99")
     assert slide.type == "text_slide"
     assert slide.name == "Today's Special"
-    assert slide.text == "Pulled Pork $8.99"
+    assert slide.text_layers[0].text == "Pulled Pork $8.99"
     assert slide.duration_ms == 5000
-    assert slide.text_color == "#FFFFFF"
+    assert slide.text_layers[0].text_color == "#FFFFFF"
     assert slide.background_color == "#000000"
 
 
@@ -58,21 +76,21 @@ def test_duration_accepts_minimum():
 
 def test_font_size_minimum_enforced():
     with pytest.raises(ValidationError):
-        TextSlide(name="x", text="x", font_size_px=2)  # below 4
+        TextLayer(text="x", font_size_px=2)  # below 4
 
 
 def test_text_color_must_be_hex():
     with pytest.raises(ValidationError):
-        TextSlide(name="x", text="x", text_color="red")
+        TextLayer(text="x", text_color="red")
 
 
 def test_text_color_normalizes_to_uppercase():
     """Hex colors should canonicalize to uppercase regardless of input case,
     so `#ffaa00` and `#FFAA00` dedupe as the same value."""
-    slide_lower = TextSlide(name="x", text="x", text_color="#ffaa00")
-    slide_mixed = TextSlide(name="x", text="x", text_color="#FfAa00")
-    assert slide_lower.text_color == "#FFAA00"
-    assert slide_mixed.text_color == "#FFAA00"
+    layer_lower = TextLayer(text="x", text_color="#ffaa00")
+    layer_mixed = TextLayer(text="x", text_color="#FfAa00")
+    assert layer_lower.text_color == "#FFAA00"
+    assert layer_mixed.text_color == "#FFAA00"
 
 
 def test_background_color_normalizes_to_uppercase():
@@ -82,7 +100,7 @@ def test_background_color_normalizes_to_uppercase():
 
 def test_font_size_upper_bound_enforced():
     with pytest.raises(ValidationError):
-        TextSlide(name="x", text="x", font_size_px=4096)
+        TextLayer(text="x", font_size_px=4096)
 
 
 def test_name_length_capped():
@@ -92,7 +110,7 @@ def test_name_length_capped():
 
 def test_text_length_capped():
     with pytest.raises(ValidationError):
-        TextSlide(name="x", text="x" * 10_001)
+        TextLayer(text="x" * 10_001)
 
 
 def test_type_literal_rejects_other_strings():
@@ -265,16 +283,13 @@ def test_text_box_default_is_centered_with_10pct_margin_all_sides():
     assert (box.x, box.y, box.w, box.h) == (0.1, 0.1, 0.8, 0.8)
 
 
-def test_text_slide_default_box_matches():
-    """A freshly-created TextSlide carries the default box without the
-    operator having to construct one explicitly."""
-    slide = TextSlide(name="x", text="x")
-    assert (slide.box.x, slide.box.y, slide.box.w, slide.box.h) == (
-        0.1,
-        0.1,
-        0.8,
-        0.8,
-    )
+def test_text_slide_default_layer_box_matches():
+    """A freshly-created TextSlide carries one default-box layer without
+    the operator having to construct one explicitly."""
+    slide = TextSlide(name="x")
+    assert len(slide.text_layers) == 1
+    box = slide.text_layers[0].box
+    assert (box.x, box.y, box.w, box.h) == (0.1, 0.1, 0.8, 0.8)
 
 
 def test_text_box_rejects_w_below_min():
@@ -317,29 +332,38 @@ def test_text_box_round_trips_through_json():
     assert restored == box
 
 
-def test_text_slide_with_custom_box_round_trips():
+def test_text_slide_with_custom_layer_box_round_trips():
     slide = TextSlide(
         name="x",
-        text="x",
-        box=TextBox(x=0.2, y=0.2, w=0.5, h=0.5),
+        text_layers=[
+            TextLayer(text="x", box=TextBox(x=0.2, y=0.2, w=0.5, h=0.5)),
+        ],
     )
     raw = slide.model_dump_json()
     restored = TextSlide.model_validate_json(raw)
-    assert restored.box == slide.box
+    assert restored.text_layers[0].box == slide.text_layers[0].box
 
 
-def test_text_slide_envelope_without_box_field_back_compat():
-    """An old-shape TextSlide JSON (no `box` field) deserializes with
-    the default box. No SCHEMA_VERSION bump needed for this addition."""
-    raw = {
-        "type": "text_slide",
-        "name": "legacy",
-        "text": "no box on disk",
-    }
-    slide = TextSlide.model_validate(raw)
-    assert (slide.box.x, slide.box.y, slide.box.w, slide.box.h) == (
-        0.1,
-        0.1,
-        0.8,
-        0.8,
+def test_text_slide_multi_layer_round_trips_in_order():
+    """Layers preserve array order through the JSON round-trip — index 0
+    is the bottom layer at render time."""
+    slide = TextSlide(
+        name="stacked",
+        text_layers=[
+            TextLayer(text="bottom", text_color="#FF0000"),
+            TextLayer(text="middle", text_color="#00FF00"),
+            TextLayer(text="top", text_color="#0000FF"),
+        ],
     )
+    raw = slide.model_dump_json()
+    restored = TextSlide.model_validate_json(raw)
+    assert [layer.text for layer in restored.text_layers] == [
+        "bottom",
+        "middle",
+        "top",
+    ]
+    assert [layer.text_color for layer in restored.text_layers] == [
+        "#FF0000",
+        "#00FF00",
+        "#0000FF",
+    ]

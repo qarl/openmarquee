@@ -198,7 +198,7 @@ def test_seed_default_playlist_contains_the_three_welcome_text_slides(
     # (FREE / YOUR / SIGN) come after, on a separate playlist.
     text_slides = [s for s in created if s.type == "text_slide"]
     welcome_slides = text_slides[:3]
-    assert [s.text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
+    assert [s.text_layers[0].text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
 
     # Default playlist holds exactly those three, in the same order.
     ids = playlist.load().item_ids
@@ -214,10 +214,10 @@ def test_welcome_slides_render_with_qarl_specified_fonts(
     chosen pairings."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
     text_slides = [s for s in created if s.type == "text_slide"]
-    welcome = {s.text: s for s in text_slides[:3]}
-    assert welcome["Welcome"].font_family == "Reenie Beanie"
-    assert welcome["to"].font_family == "Permanent Marker"
-    assert welcome["openMarquee"].font_family == "Shadows Into Light"
+    welcome = {s.text_layers[0].text: s for s in text_slides[:3]}
+    assert welcome["Welcome"].text_layers[0].font_family == "Reenie Beanie"
+    assert welcome["to"].text_layers[0].font_family == "Permanent Marker"
+    assert welcome["openMarquee"].text_layers[0].font_family == "Shadows Into Light"
 
 
 def test_seed_default_playlist_is_named_welcome(
@@ -246,7 +246,7 @@ def test_seed_creates_freedom_playlist_with_three_slides(
 
     text_slides = [s for s in created if s.type == "text_slide"]
     freedom_slides = text_slides[3:6]
-    assert [s.text for s in freedom_slides] == ["FREE", "YOUR", "SIGN"]
+    assert [s.text_layers[0].text for s in freedom_slides] == ["FREE", "YOUR", "SIGN"]
 
     # Freedom playlist exists alongside the default (Welcome) playlist.
     collection = playlist.load_all()
@@ -440,7 +440,7 @@ def test_seed_registers_bundled_backgrounds_over_pillow_fallback(
     # Freedom slides land on a separate playlist (covered elsewhere).
     text_slides = [s for s in created if s.type == "text_slide"]
     welcome_slides = text_slides[:3]
-    assert [s.text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
+    assert [s.text_layers[0].text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
     assert playlist.load().item_ids == [s.id for s in welcome_slides]
 
 

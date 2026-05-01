@@ -275,20 +275,21 @@ class PlaybackLoop:
                 self._current_type = item.type
                 self._current_transition = item.transition
                 self._current_transition_ms = item.transition_ms
-                self._current_auto_mode = (
-                    getattr(item, "auto_mode", None)
-                    if item.type == "text_slide"
-                    else None
-                )
-                self._current_auto_format = (
-                    getattr(item, "auto_format", None)
-                    if item.type == "text_slide"
-                    else None
-                )
+                # Schema v3 (qarl 2026-05-01): per-text fields live on
+                # text_layers[0]. Phase 1 reads layer[0]; phase 2 of the
+                # layered rollout will composite all layers and the
+                # state-endpoint fields will reflect the active layer.
+                if item.type == "text_slide" and item.text_layers:
+                    primary_layer = item.text_layers[0]
+                    self._current_auto_mode = primary_layer.auto_mode
+                    self._current_auto_format = primary_layer.auto_format
+                else:
+                    self._current_auto_mode = None
+                    self._current_auto_format = None
 
                 is_auto = (
                     item.type == "text_slide"
-                    and getattr(item, "auto_mode", None) is not None
+                    and self._current_auto_mode is not None
                 )
                 if is_auto:
                     # Render-over path: the stored PNG is a placeholder;

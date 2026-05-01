@@ -36,7 +36,15 @@ from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
 # way. load() will refuse to read older versions until a migration is written.
-SCHEMA_VERSION = 1
+#
+# v3 (2026-05-01): TextSlide gained `text_layers: list[TextLayer]` and the
+#                  per-text fields (text / font_family / text_color /
+#                  auto_mode / auto_format / box) moved off the slide root
+#                  into the layer model. Clean cutover per qarl — dev
+#                  envelopes need a one-time wipe.
+# v2 (skipped): planned with the v1 single-box layout; never landed.
+# v1: legacy (text fields at slide root, no box).
+SCHEMA_VERSION = 3
 
 _ENVELOPE_FILENAME = "item.json"
 _ASSET_FILENAME = "asset.png"

@@ -6,14 +6,28 @@ from uuid import uuid4
 
 import pytest
 
-from openmarquee.content import ImageSlide, TextSlide, VideoSlide
+from openmarquee.content import ImageSlide, TextLayer, TextSlide, VideoSlide
 from openmarquee.content.storage import SCHEMA_VERSION, ContentStorage
 
 
 def _make_slide(**overrides) -> TextSlide:
-    kwargs = {"name": "Test Slide", "text": "Hello, world"}
-    kwargs.update(overrides)
-    return TextSlide(**kwargs)
+    """Helper: builds a single-layer TextSlide for storage tests. Schema v3
+    routed text fields off the slide root into text_layers — accept the
+    flat kwargs the tests were already using and shuttle them into the
+    canonical layer."""
+    layer_keys = {
+        "text", "text_color", "font_family", "font_size_px",
+        "font_size_pct", "auto_mode", "auto_format", "box",
+    }
+    layer = {"text": overrides.pop("text", "Hello, world")}
+    for k in list(overrides.keys()):
+        if k in layer_keys:
+            layer[k] = overrides.pop(k)
+    return TextSlide(
+        name=overrides.pop("name", "Test Slide"),
+        text_layers=[TextLayer(**layer)],
+        **overrides,
+    )
 
 
 def test_storage_creates_root_directory(tmp_path: Path):
@@ -57,12 +71,16 @@ def test_save_overwrites_existing_item(tmp_path: Path):
     slide_v1 = _make_slide(name="v1", text="first")
     storage.save_text_slide(slide_v1, b"\x89PNG\r\nv1")
 
-    slide_v2 = TextSlide(id=slide_v1.id, name="v2", text="second")
+    slide_v2 = TextSlide(
+        id=slide_v1.id,
+        name="v2",
+        text_layers=[TextLayer(text="second")],
+    )
     storage.save_text_slide(slide_v2, b"\x89PNG\r\nv2")
 
     loaded = storage.load(slide_v1.id)
     assert loaded.name == "v2"
-    assert loaded.text == "second"
+    assert loaded.text_layers[0].text == "second"
     assert storage.read_asset(slide_v1.id) == b"\x89PNG\r\nv2"
 
 

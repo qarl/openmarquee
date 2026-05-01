@@ -58,9 +58,22 @@ def client(storage: ContentStorage, playlist_storage: PlaylistStorage) -> TestCl
 
 
 def _upload_payload(**overrides) -> dict:
+    """Build a TextSlideUpload payload. Accepts the old flat `text=`,
+    `text_color=`, `font_family=`, `auto_mode=`, `auto_format=`, `box=`
+    kwargs and routes them into text_layers[0]; slide-level kwargs
+    (name=, duration_ms=, background_color=, transition=, …) stay at
+    the root. Schema v3 contract — see SYSTEM_SPEC §5.10a."""
+    layer_keys = {
+        "text", "text_color", "font_family", "font_size_px",
+        "font_size_pct", "auto_mode", "auto_format", "box",
+    }
+    layer = {"text": overrides.pop("text", "Hello, world")}
+    for k in list(overrides.keys()):
+        if k in layer_keys:
+            layer[k] = overrides.pop(k)
     payload = {
-        "name": "Test Slide",
-        "text": "Hello, world",
+        "name": overrides.pop("name", "Test Slide"),
+        "text_layers": [layer],
         "png_base64": base64.b64encode(_FAKE_PNG).decode(),
     }
     payload.update(overrides)
@@ -77,7 +90,7 @@ def test_upload_text_slide_persists_metadata_and_asset(client: TestClient, stora
 
     assert body["type"] == "text_slide"
     assert body["name"] == "Specials"
-    assert body["text"] == "Hello, world"
+    assert body["text_layers"][0]["text"] == "Hello, world"
     assert body["duration_ms"] == 5000  # default
 
     item_id = UUID(body["id"])
@@ -91,7 +104,7 @@ def test_upload_text_slide_normalizes_color(client: TestClient):
         json=_upload_payload(text_color="#ffaa00"),
     )
     assert response.status_code == 200
-    assert response.json()["text_color"] == "#FFAA00"
+    assert response.json()["text_layers"][0]["text_color"] == "#FFAA00"
 
 
 def test_upload_text_slide_rejects_bad_base64(client: TestClient):
@@ -155,12 +168,15 @@ def test_text_slide_post_persists_box_from_payload(client: TestClient):
     field, so Pydantic silently dropped it from the editor's payload
     and every save reverted to TextSlide's default. This test pins the
     POST route's box-roundtrip contract."""
-    payload = _upload_payload(name="A", text="A")
-    payload["box"] = {"x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4}
+    payload = _upload_payload(
+        name="A", text="A", box={"x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4}
+    )
     response = client.post("/api/content/text-slides", json=payload)
     assert response.status_code == 200
     body = response.json()
-    assert body["box"] == {"x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4}
+    assert body["text_layers"][0]["box"] == {
+        "x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4,
+    }
 
 
 def test_text_slide_put_persists_box_from_payload(client: TestClient):
@@ -170,14 +186,19 @@ def test_text_slide_put_persists_box_from_payload(client: TestClient):
     ).json()
     item_id = posted["id"]
     # Default box on POST without explicit field.
-    assert posted["box"] == {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}
+    assert posted["text_layers"][0]["box"] == {
+        "x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8,
+    }
 
-    payload = _upload_payload(name="A", text="A")
-    payload["box"] = {"x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7}
+    payload = _upload_payload(
+        name="A", text="A", box={"x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7}
+    )
     response = client.put(f"/api/content/text-slides/{item_id}", json=payload)
     assert response.status_code == 200
     body = response.json()
-    assert body["box"] == {"x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7}
+    assert body["text_layers"][0]["box"] == {
+        "x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7,
+    }
 
 
 def test_text_slide_post_without_box_uses_model_default(client: TestClient):
@@ -186,10 +207,13 @@ def test_text_slide_post_without_box_uses_model_default(client: TestClient):
     rather than a 422 — exclude_none on the dump is what makes this
     work."""
     payload = _upload_payload(name="A", text="A")
-    assert "box" not in payload  # confidence check on the fixture
+    # Confidence check: helper didn't auto-inject a box on the layer.
+    assert "box" not in payload["text_layers"][0]
     response = client.post("/api/content/text-slides", json=payload)
     assert response.status_code == 200
-    assert response.json()["box"] == {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}
+    assert response.json()["text_layers"][0]["box"] == {
+        "x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8,
+    }
 
 
 def test_list_content_exposes_updated_at_for_cachebust(client: TestClient):

@@ -121,6 +121,21 @@ def _decode_png_payload(b64: str) -> bytes:
     return png
 
 
+class TextLayerUpload(BaseModel):
+    """Per-layer wire format inside a TextSlideUpload. Mirrors TextLayer's
+    fields without the validators (those fire when the route reconstructs
+    the canonical model and the route catches their ValidationError → 422)."""
+
+    text: str
+    font_family: str | None = None
+    font_size_px: int | None = None
+    font_size_pct: float | None = None
+    text_color: str = "#FFFFFF"
+    auto_mode: str | None = None
+    auto_format: str | None = None
+    box: TextBox | None = None
+
+
 class TextSlideUpload(BaseModel):
     """Wire format for POST /api/content/text-slides.
 
@@ -129,32 +144,24 @@ class TextSlideUpload(BaseModel):
     PNGs are KB-sized and the simpler all-JSON contract beats multipart for
     client code.
 
-    Field constraints (length caps, hex color pattern, etc.) live on TextSlide
-    so there's a single source of truth — the route catches the resulting
+    Schema v3 (qarl 2026-05-01): text fields live in `text_layers`, a list
+    of TextLayerUpload (one entry per layer; index 0 draws first, later
+    entries composite over earlier ones).
+
+    Field constraints (length caps, hex color pattern, auto_format/auto_mode
+    cross-validation, box bounds) live on TextSlide / TextLayer so there's
+    a single source of truth — the route catches the resulting
     ValidationError and returns 422.
     """
 
     name: str
     duration_ms: int = 5000
-    text: str
-    font_family: str | None = None
-    font_size_px: int | None = None
-    font_size_pct: float | None = None
-    text_color: str = "#FFFFFF"
     background_color: str = "#000000"
     background_image_slide_id: UUID | None = None
     background_video_slide_id: UUID | None = None
-    auto_mode: str | None = None
-    auto_format: str | None = None
     transition: str = "cut"
     transition_ms: int = 500
-    # SYSTEM_SPEC §5.10a — bounding box, fractions of slide dims. None
-    # means "operator didn't supply one" → TextSlide's default takes
-    # over (centered with 10% margin all sides). The QA-flagged bug
-    # 2026-04-30: this field was MISSING, so Pydantic silently dropped
-    # the editor's `box` from the payload and every save reverted to
-    # default no matter what the operator dragged.
-    box: TextBox | None = None
+    text_layers: list[TextLayerUpload]
     png_base64: str = Field(description="Base64-encoded PNG of the rendered slide.")
 
 

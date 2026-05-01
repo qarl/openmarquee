@@ -549,8 +549,8 @@ def test_text_slide_post_enqueues_updated_push(recording_client):
         "/api/content/text-slides",
         json={
             "name": "Hook test",
-            "text": "Hook",
             "duration_ms": 3000,
+            "text_layers": [{"text": "Hook"}],
             "png_base64": _TINY_PNG_B64,
         },
     )
@@ -565,8 +565,8 @@ def test_content_delete_enqueues_deleted_push(recording_client):
         "/api/content/text-slides",
         json={
             "name": "Goner",
-            "text": "Goner",
             "duration_ms": 3000,
+            "text_layers": [{"text": "Goner"}],
             "png_base64": _TINY_PNG_B64,
         },
     ).json()
@@ -589,10 +589,10 @@ def test_peer_ingested_content_does_not_trigger_outbound_push(
     client, recorder, _ = recording_client
     # Call ContentStorage.save() the same way flock_sync._ingest_update
     # does — bypassing /api/content/text-slides.
-    from openmarquee.content import TextSlide
+    from openmarquee.content import TextLayer, TextSlide
 
     overridden_content = app.dependency_overrides[get_content_storage]()
-    slide = TextSlide(name="Ingested", text="from peer")
+    slide = TextSlide(name="Ingested", text_layers=[TextLayer(text="from peer")])
     overridden_content.save(slide, b"", updated_at=datetime.now(timezone.utc))
 
     # A follow-up API roundtrip is needed to flush any pending backgrounds
@@ -617,7 +617,7 @@ def _post_text_slide(client: TestClient, name: str) -> str:
         json={
             "name": name,
             "duration_ms": 5000,
-            "text": name,
+            "text_layers": [{"text": name}],
             "png_base64": _TINY_PNG_B64,
         },
     )
