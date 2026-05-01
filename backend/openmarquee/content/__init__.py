@@ -78,17 +78,55 @@ class TextLayer(BaseModel):
     date, day-of-week). Each layer carries its own `auto_mode`/
     `auto_format` independently. The stored asset.png shows the value
     at save time; the playback engine recomposites live per-tick.
+
+    §5.10a v3.1 (qarl 2026-05-01, accordion-editor handoff) adds a
+    handful of editor-driven fields: `name` (layer label distinct from
+    `text`), `motion`, `opacity`, `anchor`, `visible`, `locked`,
+    `outline`, `weight`, `blend`. All are optional with sensible
+    defaults — old envelopes load cleanly without a SCHEMA_VERSION
+    bump (Pydantic backfills missing fields). Render-side support for
+    motion / opacity / anchor / blend lands in a later wave; until
+    then the renderer treats them as static / 1.0 / center / normal.
     """
 
     text: str = Field(max_length=10_000)
+    # Operator-set short label — "Headline", "Hours", "Marquee" — that
+    # the accordion editor surfaces in each layer card's header.
+    # Distinct from `text`, which is the visible string. Empty string
+    # → editor falls back to a generated "Layer N" placeholder.
+    name: str = Field(default="", max_length=200)
     font_family: str | None = None
     font_size_px: int | None = Field(default=None, ge=4, le=2048)
     # Per §5.10a fu (qarl 2026-04-30): font_size_pct is a percentage of
-    # the SLIDE height, not the box height. The box positions and clips
-    # text but doesn't scale font sizing — operator-set sizes mean the
-    # same thing across boxes of any size on the same slide.
+    # the SLIDE height, not the box height.
     font_size_pct: float | None = Field(default=None, ge=0.5, le=100.0)
+    # Optional CSS-style font weight (300–900, multiples of 100). Most
+    # bundled @font-face families are single-weight; this is for the
+    # variable-weight ones (Inter, Oswald, Roboto Slab, …).
+    weight: int | None = Field(default=None, ge=100, le=900)
     text_color: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
+    # Stroke outline around the glyphs. Editor-set; render support TBD.
+    outline: bool = False
+    # Layer opacity, 0–1. Composited by the renderer when < 1.
+    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Vertical anchor INSIDE the box. The current renderer always
+    # center-anchors; editor stores this for forward-compat with
+    # top/bottom layout (next render-side commit).
+    anchor: Literal["top", "center", "bottom"] = "center"
+    # Editor-driven hide toggle (the eye icon on each layer card).
+    # Hidden layers are excluded from save-time rasterization so the
+    # stored asset.png matches what the operator sees in preview.
+    visible: bool = True
+    # Editor-driven lock toggle. Locked layers reject text/box edits
+    # in the editor; the model just carries the bit.
+    locked: bool = False
+    # Per-layer animation. Today's renderer treats everything as
+    # "static"; "scroll" + "pulse" land in the render-side wave.
+    motion: Literal["static", "scroll", "pulse"] = "static"
+    # Compositing mode against the layers below. "normal" = source-over
+    # (today's behavior); the rest are reserved for the render-side
+    # wave.
+    blend: Literal["normal", "screen", "multiply", "overlay"] = "normal"
     auto_mode: Literal["time", "date", "day"] | None = None
     auto_format: (
         Literal[

@@ -127,10 +127,19 @@ class TextLayerUpload(BaseModel):
     the canonical model and the route catches their ValidationError → 422)."""
 
     text: str
+    name: str | None = None
     font_family: str | None = None
     font_size_px: int | None = None
     font_size_pct: float | None = None
+    weight: int | None = None
     text_color: str = "#FFFFFF"
+    outline: bool | None = None
+    opacity: float | None = None
+    anchor: str | None = None
+    visible: bool | None = None
+    locked: bool | None = None
+    motion: str | None = None
+    blend: str | None = None
     auto_mode: str | None = None
     auto_format: str | None = None
     box: TextBox | None = None

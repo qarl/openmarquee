@@ -29,6 +29,24 @@ def test_text_slide_auto_mode_defaults_to_none():
     assert _make_slide().text_layers[0].auto_mode is None
 
 
+def test_v3_1_per_layer_extensions_default_when_omitted():
+    """§5.10a v3.1 (qarl 2026-05-01, accordion-editor handoff): the
+    new per-layer fields (name/weight/outline/opacity/anchor/visible/
+    locked/motion/blend) must populate to defaults on a TextLayer
+    constructed without them — old envelopes load cleanly, no
+    SCHEMA_VERSION bump needed."""
+    layer = TextLayer(text="x")
+    assert layer.name == ""
+    assert layer.weight is None
+    assert layer.outline is False
+    assert layer.opacity == 1.0
+    assert layer.anchor == "center"
+    assert layer.visible is True
+    assert layer.locked is False
+    assert layer.motion == "static"
+    assert layer.blend == "normal"
+
+
 def test_text_slide_accepts_auto_mode_options():
     for mode in ("time", "date", "day"):
         slide = _make_slide(auto_mode=mode)
