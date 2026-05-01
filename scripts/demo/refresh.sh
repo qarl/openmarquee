@@ -49,6 +49,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Parse-check the demo's hand-maintained JS shims BEFORE any rebuild.
+# vitest doesn't import mock-backend.js (it's loaded by index.html in the
+# browser), so a syntax error there sails past `npm run test` and bricks
+# the live demo on first /api/* call (qarl + QA caught one on 2026-05-01:
+# `font_*/auto_*` inside a /** */ docblock closed the comment early).
+echo "==> parse-check demo static JS"
+for f in static/mock-backend.js static/sw.js; do
+    if [ -f "$f" ]; then
+        node --check "$f"
+    fi
+done
+
 echo "==> mirror UI source to BUILD_DIR ($BUILD_DIR/ui)"
 mkdir -p "$BUILD_DIR/ui"
 rsync -a --delete \
