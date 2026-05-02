@@ -44,7 +44,63 @@ def test_v3_1_per_layer_extensions_default_when_omitted():
     assert layer.visible is True
     assert layer.locked is False
     assert layer.motion == "static"
+    assert layer.motion_intensity == 50
+    assert layer.motion_phase == 0.0
     assert layer.blend == "normal"
+
+
+def test_motion_accepts_all_seven_values():
+    """Spec docs/text-layer-motion-spec.md (2026-05-02): the operator-
+    facing motion menu is static + six effects. Round-trip each."""
+    for kind in ("static", "ticker", "breathe", "pulse",
+                 "bounce", "shake", "blink"):
+        layer = TextLayer(text="x", motion=kind)
+        assert layer.motion == kind
+
+
+def test_motion_rejects_unknown_value():
+    """Effects rejected during scoping (wave, color-cycle, marquee,
+    scroll-as-anything-but-legacy) must fail validation, not silently
+    map to static."""
+    for kind in ("wave", "color-cycle", "marquee", "glow", "throb"):
+        with pytest.raises(ValidationError):
+            TextLayer(text="x", motion=kind)  # type: ignore[arg-type]
+
+
+def test_motion_legacy_scroll_migrates_to_ticker():
+    """Old envelopes saved with the pre-2026-05-02 motion="scroll"
+    value must load as motion="ticker" — the rename ships without a
+    schema_version bump (storage.py's loader rejects mismatched
+    versions, which would orphan every v3 item). The field_validator
+    handles the rename in-place; next save() writes the new value
+    back."""
+    layer = TextLayer(text="x", motion="scroll")  # type: ignore[arg-type]
+    assert layer.motion == "ticker"
+    # Round-trip via dict to confirm the migrated value persists
+    # through Pydantic's serialize/deserialize cycle.
+    rehydrated = TextLayer.model_validate(layer.model_dump())
+    assert rehydrated.motion == "ticker"
+
+
+def test_motion_intensity_range_enforced():
+    """0-100 inclusive. Editor slider snaps to ints in this range."""
+    TextLayer(text="x", motion_intensity=0)
+    TextLayer(text="x", motion_intensity=100)
+    with pytest.raises(ValidationError):
+        TextLayer(text="x", motion_intensity=-1)
+    with pytest.raises(ValidationError):
+        TextLayer(text="x", motion_intensity=101)
+
+
+def test_motion_phase_range_enforced():
+    """0.0-1.0 inclusive — fractional cycle offset on the shared tick."""
+    TextLayer(text="x", motion_phase=0.0)
+    TextLayer(text="x", motion_phase=1.0)
+    TextLayer(text="x", motion_phase=0.5)
+    with pytest.raises(ValidationError):
+        TextLayer(text="x", motion_phase=-0.1)
+    with pytest.raises(ValidationError):
+        TextLayer(text="x", motion_phase=1.1)
 
 
 def test_text_slide_accepts_auto_mode_options():

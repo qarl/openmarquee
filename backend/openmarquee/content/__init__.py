@@ -120,9 +120,27 @@ class TextLayer(BaseModel):
     # Editor-driven lock toggle. Locked layers reject text/box edits
     # in the editor; the model just carries the bit.
     locked: bool = False
-    # Per-layer animation. Today's renderer treats everything as
-    # "static"; "scroll" + "pulse" land in the render-side wave.
-    motion: Literal["static", "scroll", "pulse"] = "static"
+    # Per-layer animation. The renderer currently honors only "static"
+    # — every other value loads cleanly and survives saves but draws as
+    # static until the render-side wave (see docs/text-layer-motion-
+    # spec.md, step 3) lands.
+    motion: Literal[
+        "static",
+        "ticker",   # horizontal travel, linear, LTR
+        "breathe",  # scale around box center, sine
+        "pulse",    # alpha modulation, sine
+        "bounce",   # vertical bob, sine
+        "shake",    # deterministic Gaussian micro-jitter
+        "blink",    # square-wave on/off opacity
+    ] = "static"
+    # Operator-facing single-knob motion control (0=mild, 100=intense).
+    # Each effect maps this to a sensible per-effect range — see
+    # docs/text-layer-motion-spec.md for the table.
+    motion_intensity: int = Field(default=50, ge=0, le=100)
+    # Per-layer phase offset on the shared global tick (0.0=in-phase,
+    # 0.5=opposition, 1.0=full cycle = in-phase). Lets two layers with
+    # the same effect run out-of-sync without per-layer tick clocks.
+    motion_phase: float = Field(default=0.0, ge=0.0, le=1.0)
     # Compositing mode against the layers below. "normal" = source-over
     # (today's behavior); the rest are reserved for the render-side
     # wave.
@@ -150,6 +168,20 @@ class TextLayer(BaseModel):
         """Canonicalize hex colors to uppercase so `#ffaa00` and `#FFAA00`
         compare and dedupe as the same value."""
         return value.upper()
+
+    @field_validator("motion", mode="before")
+    @classmethod
+    def _migrate_legacy_motion(cls, value):
+        """Lazy in-validator migration: rename the legacy `"scroll"`
+        value to its new name `"ticker"`. Old envelopes load cleanly
+        without a SCHEMA_VERSION bump (which would orphan every
+        existing v3 item under storage.py's strict-equality loader);
+        the new value writes back on the next save() so the rename
+        drains as content gets edited. See docs/text-layer-motion-
+        spec.md."""
+        if value == "scroll":
+            return "ticker"
+        return value
 
     @model_validator(mode="after")
     def _auto_format_matches_mode(self) -> "TextLayer":

@@ -213,6 +213,41 @@ def test_load_rejects_wrong_schema_version(tmp_path: Path):
         storage.load(slide.id)
 
 
+def test_load_migrates_legacy_motion_scroll_to_ticker(tmp_path: Path):
+    """Cross-module contract for the additive motion migration
+    (docs/text-layer-motion-spec.md, step 1): a v3 envelope on disk
+    with the legacy `motion="scroll"` value loads as a TextLayer with
+    `motion="ticker"`. No SCHEMA_VERSION bump — the field_validator
+    on TextLayer.motion handles the rename in-place. The next save()
+    on the loaded item drains the disk value to "ticker" too."""
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide()
+    storage.save_text_slide(slide, b"\x89PNG")
+
+    # Hand-tamper the envelope to simulate an old item written before
+    # the rename — set the layer's motion to the legacy "scroll" value
+    # and strip the two new fields so the test also confirms defaults
+    # populate on load (the additive part of the migration).
+    envelope_path = tmp_path / str(slide.id) / "item.json"
+    envelope = json.loads(envelope_path.read_text())
+    layer = envelope["item"]["text_layers"][0]
+    layer["motion"] = "scroll"
+    layer.pop("motion_intensity", None)
+    layer.pop("motion_phase", None)
+    envelope_path.write_text(json.dumps(envelope))
+
+    loaded = storage.load(slide.id)
+    assert loaded.text_layers[0].motion == "ticker"
+    assert loaded.text_layers[0].motion_intensity == 50
+    assert loaded.text_layers[0].motion_phase == 0.0
+
+    # Saving the loaded item drains the rename to disk: the on-disk
+    # envelope's layer.motion becomes "ticker".
+    storage.save_text_slide(loaded, b"\x89PNG")
+    after = json.loads(envelope_path.read_text())
+    assert after["item"]["text_layers"][0]["motion"] == "ticker"
+
+
 def test_atomic_write_leaves_no_tmp_files(tmp_path: Path):
     storage = ContentStorage(tmp_path)
     slide = _make_slide()
