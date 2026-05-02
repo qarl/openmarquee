@@ -275,12 +275,21 @@ function patchCanvasPrototype() {
         font: "",
         textAlign: "",
         textBaseline: "",
+        globalAlpha: 1,
         fillRect: vi.fn(),
         fillText: vi.fn(),
         save: vi.fn(),
         restore: vi.fn(),
         translate: vi.fn(),
         scale: vi.fn(),
+        // canvas-motion's box clip + ticker double-paint use these —
+        // without them the editor's motion rAF loop throws when a
+        // layer animates.
+        beginPath: vi.fn(),
+        rect: vi.fn(),
+        clip: vi.fn(),
+        clearRect: vi.fn(),
+        drawImage: vi.fn(),
     };
     const proto = HTMLCanvasElement.prototype;
     proto.getContext = vi.fn(() => fakeCtx);
@@ -1472,6 +1481,35 @@ describe("mountEditor — submit flow", () => {
         expect([...thumbEl.classList].some((c) => c.startsWith("motion-"))).toBe(false);
     });
 
+    it("motion editor canvas preview kicks an rAF loop when a layer animates", async () => {
+        // qarl 2026-05-02 demo eyeball: motion needs to show up in
+        // the BIG preview, not just the layer-thumb chip. The editor
+        // wires a rAF loop in mountEditor's scope that runs only when
+        // at least one visible layer has motion != static AND the
+        // canvas is attached to document. The spy here doesn't call
+        // through, so the tick never actually fires — just the call-
+        // site is observable.
+        patchCanvasPrototype();
+        const rafSpy = vi.spyOn(window, "requestAnimationFrame");
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
+            const baseline = rafSpy.mock.calls.length;
+            const motionSelect = container.querySelector(".field-motion");
+            motionSelect.value = "ticker";
+            motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+            expect(rafSpy.mock.calls.length).toBeGreaterThan(baseline);
+            // Toggle back to static so the loop's tick (if it ever
+            // fires) self-stops and other tests aren't affected.
+            motionSelect.value = "static";
+            motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        } finally {
+            rafSpy.mockRestore();
+            container.remove();
+        }
+    });
+
     it("ticker thumb wraps text in a doubled track for seamless repeat", async () => {
         // qarl 2026-05-02 demo eyeball: the prior single-text-translate
         // ticker showed "text exits, gap, text returns." Fix: two text
@@ -1639,9 +1677,12 @@ describe("mountEditor — visual font picker", () => {
         HTMLCanvasElement.prototype.getContext = function () {
             return {
                 fillStyle: "", font: "", textAlign: "", textBaseline: "",
+                globalAlpha: 1,
                 clearRect: () => {}, fillRect: () => {}, fillText: () => {},
                 save: () => {}, restore: () => {},
                 translate: () => {}, scale: () => {},
+                beginPath: () => {}, rect: () => {}, clip: () => {},
+                drawImage: () => {},
             };
         };
         HTMLCanvasElement.prototype.toDataURL = () => "data:image/png;base64,STUBDATA";

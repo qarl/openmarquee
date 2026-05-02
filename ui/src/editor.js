@@ -22,6 +22,10 @@ import Sortable from "sortablejs";
 
 import { attachAutoSave } from "./auto-save.js";
 import { formatAutoText } from "./auto-format.js";
+import {
+    anyLayerAnimated,
+    paintLayerWithMotion,
+} from "./canvas-motion.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 const RASTERIZE_W = 3840;
@@ -581,6 +585,56 @@ export function mountEditor(
     let autoSave = null;
     let activeDrag = null;
 
+    // Motion preview rAF loop. Runs only when at least one visible
+    // layer in state.layers has motion != "static" (qarl 2026-05-02
+    // demo eyeball: ops want to see motion in the BIG preview, not
+    // just the layer-thumb chip). Each tick re-renders the canvas
+    // with `elapsed_s` since the loop started; static-input drawCanvas
+    // calls (focus / typing / dragging the box) still fire and may
+    // briefly render a static frame, but the next tick (~16 ms later)
+    // overwrites with motion-aware pixels — imperceptible flicker.
+    // Loop self-stops when motion goes back to all-static so static
+    // slides don't burn idle CPU.
+    let motionRafId = null;
+    let motionT0 = 0;
+    function maybeStartMotionLoop() {
+        if (motionRafId !== null) return;
+        if (!anyLayerAnimated(state.layers)) return;
+        // Don't even enqueue a rAF for a canvas that isn't in the
+        // document — covers test-runner cases where mountEditor's
+        // container isn't appended to document.body. jsdom's rAF is
+        // backed by setTimeout, which would keep the test process
+        // event loop alive forever otherwise (each tick reschedules
+        // the next).
+        const doc = canvas.ownerDocument;
+        if (!doc || !doc.contains(canvas)) return;
+        motionT0 = performance.now();
+        const tick = (now) => {
+            // Same guard at tick time — covers the case where the
+            // editor was unmounted (DOM detached) between scheduling
+            // and the rAF firing.
+            if (!doc.contains(canvas)) {
+                motionRafId = null;
+                return;
+            }
+            if (!anyLayerAnimated(state.layers)) {
+                motionRafId = null;
+                drawCanvas(canvas, state); // settle on a static final frame
+                return;
+            }
+            const elapsed = (now - motionT0) / 1000;
+            drawCanvas(canvas, state, { elapsed_s: elapsed });
+            motionRafId = requestAnimationFrame(tick);
+        };
+        motionRafId = requestAnimationFrame(tick);
+    }
+    function stopMotionLoop() {
+        if (motionRafId !== null) {
+            cancelAnimationFrame(motionRafId);
+            motionRafId = null;
+        }
+    }
+
     function onBoxPointerDown(event) {
         if (event.button !== undefined && event.button !== 0) return;
         const handle = event.target?.dataset?.handle ?? null;
@@ -712,6 +766,10 @@ export function mountEditor(
         // refresh it so an in-card edit immediately mirrors up to the row.
         refreshLayerHeader(groupEl, layer, arrayIdx);
         drawCanvas(canvas, state);
+        // Motion may have just been toggled on/off — kick the rAF loop
+        // (no-op if already running, stops itself if no layers are
+        // animated anymore).
+        maybeStartMotionLoop();
     }
 
     function populateAutoFormatOptions(groupEl, mode, selected = null) {
@@ -1075,6 +1133,10 @@ export function mountEditor(
         updateLayersCountEyebrow();
         positionBoxOverlay();
         bindLayerSortable();
+        // After a wholesale rebuild (loadForEdit / addLayer / delete /
+        // reorder), the layer set may have changed — re-evaluate
+        // whether the motion rAF loop should be running.
+        maybeStartMotionLoop();
     }
 
     function updateLayersCountEyebrow() {
@@ -1679,14 +1741,26 @@ function loadImageForSlide(slideId) {
  * Accepts the on-the-wire ContentItem shape — not the editor's internal
  * `state` — because the inline-preview consumes ContentItem directly.
  */
-export function drawTextOnly(canvas, item) {
+export function drawTextOnly(canvas, item, opts) {
     const ctx = canvas.getContext("2d");
     ctx.save();
     try {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         const layers = Array.isArray(item.text_layers) ? item.text_layers : [];
-        for (const layer of layers) {
-            paintLayer(ctx, canvas, layer, /* fillBox */ null);
+        const elapsed = opts && opts.elapsed_s;
+        const slideKey = (item && (item.id || "?")) + "";
+        for (let i = 0; i < layers.length; i++) {
+            const layer = layers[i];
+            const paint = () => paintLayer(ctx, canvas, layer, /* fillBox */ null);
+            if (elapsed === undefined || elapsed === null) {
+                // Static path — current behavior, no motion.
+                paint();
+            } else {
+                paintLayerWithMotion(ctx, canvas, layer, paint, {
+                    elapsed_s: elapsed,
+                    layerKey: `${slideKey}:${i}`,
+                });
+            }
         }
     } finally {
         ctx.restore();
@@ -1772,7 +1846,7 @@ function paintLayer(ctx, canvas, layer) {
  * `state.textColor`, …) for callers that haven't migrated. The two
  * shapes are distinguished by presence of `.layers`.
  */
-export function drawCanvas(canvas, state) {
+export function drawCanvas(canvas, state, opts) {
     const ctx = canvas.getContext("2d");
     const {
         backgroundColor = "#000000",
@@ -1802,13 +1876,27 @@ export function drawCanvas(canvas, state) {
         }
 
         const layers = layersForDraw(state);
-        for (const layer of layers) {
+        const elapsed = opts && opts.elapsed_s;
+        for (let i = 0; i < layers.length; i++) {
+            const layer = layers[i];
             // §5.10a v3.1: editor's eye toggle sets visible=false; skip
             // hidden layers entirely so the rasterized PNG matches what
             // the operator sees in preview.
             if (layer?.visible === false) continue;
             const resolved = resolveLayerForDraw(layer);
-            paintLayer(ctx, canvas, resolved);
+            const paint = () => paintLayer(ctx, canvas, resolved);
+            if (elapsed === undefined || elapsed === null) {
+                paint();
+            } else {
+                // The motion wrapper takes the unresolved layer so it
+                // reads .motion / .motion_intensity / .motion_phase
+                // off the editor-state shape; paintLayer is called via
+                // the closure with the auto-resolved layer.
+                paintLayerWithMotion(ctx, canvas, layer, paint, {
+                    elapsed_s: elapsed,
+                    layerKey: `editor:${i}`,
+                });
+            }
         }
     } finally {
         ctx.restore();
