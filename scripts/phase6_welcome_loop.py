@@ -1,8 +1,8 @@
-"""Phase 6 follow-up — drive the seeded Welcome playlist through HDMIRenderer.
+"""Phase 6 follow-up — drive the seeded Welcome playlist through DRMRenderer.
 
-Scope-creep beyond the original Phase 6 exit (one frame on screen,
-which 704e1b3 + scripts/phase6_hdmi_smoke.py landed): bring up the
-real PlaybackLoop on the Pi against the seeded "Welcome" playlist.
+Bring up the real PlaybackLoop on the Pi against the seeded "Welcome"
+playlist via the DRM/KMS path (the fb0 path was the original target;
+DRM/KMS is what makes 30 fps fades land on a Pi Zero 2 W).
 
 What this script does:
 
@@ -12,16 +12,17 @@ What this script does:
 2. Runs `seed_if_needed` to create the Welcome → to → openMarquee
    slides + Friday-night Freedom schedule rule + bundled backgrounds /
    videos. Idempotent — re-runs are no-ops once the marker is written.
-3. Detects fb geometry from /sys/class/graphics/fb0 (bpp → pixel_format,
-   virtual_size → display dims) — same probe as phase6_hdmi_smoke.py.
-4. Wires PlaybackLoop with HDMIRenderer + content.read_asset +
+3. Opens DRMRenderer on /dev/dri/card0 — auto-detects the connector's
+   preferred mode (no /sys/class/graphics fb probe needed since DRM
+   tells us the active HDMI mode directly).
+4. Wires PlaybackLoop with DRMRenderer + content.read_asset +
    scheduled_fetch_items (so the schedule's default fallback to Welcome
    is honored, and any Friday-night Freedom rule fires when the clock
    crosses 20:00).
 5. Starts the loop and waits forever. Ctrl-C cleanly stops the loop +
-   closes the renderer's fb fd.
+   releases DRM master.
 
-Run on the Pi (sudo for /dev/fb0 write access):
+Run on the Pi (sudo for /dev/dri/card0 + DRM master):
 
     cd /home/openmarquee/openmarquee
     sudo PYTHONPATH=backend python3 scripts/phase6_welcome_loop.py
@@ -41,14 +42,13 @@ sys.path.insert(0, str(ROOT))
 from openmarquee.content.storage import ContentStorage  # noqa: E402
 from openmarquee.playback import PlaybackLoop, scheduled_fetch_items  # noqa: E402
 from openmarquee.playlist import PlaylistStorage  # noqa: E402
-from openmarquee.rendering.hdmi import HDMIRenderer  # noqa: E402
+from openmarquee.rendering.drm_kms import DRMRenderer  # noqa: E402
 from openmarquee.schedule import ScheduleStorage  # noqa: E402
 from openmarquee.seed import seed_if_needed  # noqa: E402
 
 # Sign-side rasterize dims. The asset PNGs are written at this
-# resolution; HDMIRenderer's NEAREST upscale + letterbox stretches
-# 128×96 to whatever the HDMI display is. Matches phase6_hdmi_smoke
-# so the cycle visually inherits the smoke test's framing.
+# resolution; the vc4 HVS scales each plane to the letterboxed display
+# region at scanout — no software upscale, no canvas/paste.
 SIGN_W = 128
 SIGN_H = 96
 
@@ -59,21 +59,6 @@ SCHEDULE_PATH = DATA_ROOT / "schedule.json"
 SEED_MARKER = DATA_ROOT / "seed-marker.json"
 
 
-def detect_fb() -> tuple[int, int, str]:
-    sys_root = Path("/sys/class/graphics/fb0")
-    virtual = (sys_root / "virtual_size").read_text().strip()
-    bpp = int((sys_root / "bits_per_pixel").read_text().strip())
-    w_s, h_s = virtual.split(",")
-    width, height = int(w_s), int(h_s)
-    if bpp == 16:
-        fmt = "rgb565"
-    elif bpp == 32:
-        fmt = "bgra32"
-    else:
-        raise ValueError(f"unsupported fb bpp {bpp}")
-    return width, height, fmt
-
-
 async def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -81,9 +66,9 @@ async def main() -> int:
     )
     log = logging.getLogger("phase6")
 
-    fb = Path("/dev/fb0")
-    if not fb.exists():
-        print(f"ERR: {fb} missing — is the HDMI monitor connected?", file=sys.stderr)
+    card = Path("/dev/dri/card0")
+    if not card.exists():
+        print(f"ERR: {card} missing — DRM not available", file=sys.stderr)
         return 1
 
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -110,23 +95,7 @@ async def main() -> int:
     pl = playlist_storage.load()
     log.info("default playlist: %d items", len(pl.item_ids))
 
-    display_w, display_h, fmt = detect_fb()
-    log.info("fb: %dx%d @ %s", display_w, display_h, fmt)
-
-    renderer = HDMIRenderer(
-        width=SIGN_W,
-        height=SIGN_H,
-        display_width=display_w,
-        display_height=display_h,
-        output_path=fb,
-        pixel_format=fmt,
-    )
-
     def fetch_items():
-        # `scheduled_fetch_items` honors the Friday-night Freedom rule
-        # if the schedule has one, otherwise falls through to Welcome.
-        # Passing the loop in lets it stamp current_playlist_id, but
-        # there's no UI consuming that here — None is fine.
         return scheduled_fetch_items(
             content,
             playlist_storage,
@@ -134,25 +103,29 @@ async def main() -> int:
             datetime.now(UTC),
         )
 
-    loop = PlaybackLoop(
-        renderer=renderer,
-        fetch_items=fetch_items,
-        read_asset=content.read_asset,
-    )
-
-    await loop.start()
-    log.info("playback loop started — Ctrl-C to stop")
-    try:
-        # Block until the loop's task finishes (it won't on its own —
-        # only Ctrl-C / SIGTERM ends the wait).
-        await loop._task  # type: ignore[union-attr]
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    finally:
-        log.info("stopping playback loop…")
-        await loop.stop()
-        renderer.close()
-        log.info("done.")
+    with DRMRenderer(
+        width=SIGN_W, height=SIGN_H, device_path=card,
+    ) as renderer:
+        log.info(
+            "DRM: %dx%d display @ %s — primary plane HVS-scaled from %dx%d",
+            renderer.display_width, renderer.display_height,
+            renderer.pixel_format, SIGN_W, SIGN_H,
+        )
+        loop = PlaybackLoop(
+            renderer=renderer,
+            fetch_items=fetch_items,
+            read_asset=content.read_asset,
+        )
+        await loop.start()
+        log.info("playback loop started — Ctrl-C to stop")
+        try:
+            await loop._task  # type: ignore[union-attr]
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            log.info("stopping playback loop…")
+            await loop.stop()
+            log.info("done.")
     return 0
 
 
