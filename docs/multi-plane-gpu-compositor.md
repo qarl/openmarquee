@@ -334,3 +334,23 @@ Two non-obvious behaviors burned a couple of debugging cycles:
   premultiplied input + plane.alpha multiplier, transparent bbox
   pixels stay (0,0,0,0) at any plane.alpha and ink pixels fade
   cleanly toward 0 — pulse / blink work as designed.
+
+### Behavioral divergences vs. the software path
+
+Step 2's `GPUSlideCompositor` mirrors `motion.compose_motion_frame`'s
+intent but produces visibly different pixels in two places:
+
+- **Ticker — sweep instead of in-box wrap.** Software uses
+  `np.roll` on the box-cropped region, so text leaving the left
+  edge re-enters from the right (continuous marquee, no snap). The
+  GPU path sweeps the cropped glyph horizontally across the box's
+  on-screen extent and snaps back at phase wrap. A future iteration
+  could pre-render text twice into a 2*box_w-wide source bitmap
+  and slide SRC_X for a true wrap, but that needs a buffer-vs-src
+  dim split in `attach_animated_layer`. Deferred until operators
+  flag the snap as a problem.
+- **Breathe — HVS bilinear instead of PIL NEAREST.** Software
+  scales the glyph via `Image.Resampling.NEAREST` (motion.py:151).
+  GPU delegates scale to vc4 HVS, which is bilinear. The GPU
+  breathe will look smoother than the editor's preview at the same
+  intensity. Operator-visible but not wrong.
