@@ -139,6 +139,8 @@ class TextLayerUpload(BaseModel):
     visible: bool | None = None
     locked: bool | None = None
     motion: str | None = None
+    motion_intensity: int | None = None
+    motion_phase: float | None = None
     blend: str | None = None
     auto_mode: str | None = None
     auto_format: str | None = None

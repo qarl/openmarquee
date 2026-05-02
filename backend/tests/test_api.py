@@ -66,6 +66,7 @@ def _upload_payload(**overrides) -> dict:
     layer_keys = {
         "text", "text_color", "font_family", "font_size_px",
         "font_size_pct", "auto_mode", "auto_format", "box",
+        "motion", "motion_intensity", "motion_phase",
     }
     layer = {"text": overrides.pop("text", "Hello, world")}
     for k in list(overrides.keys()):
@@ -199,6 +200,58 @@ def test_text_slide_put_persists_box_from_payload(client: TestClient):
     assert body["text_layers"][0]["box"] == {
         "x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7,
     }
+
+
+def test_text_slide_post_persists_motion_fields(client: TestClient):
+    """Motion spec step 1+2 (commits 10e60d8 + 79df7e4): the editor
+    sends motion / motion_intensity / motion_phase per text layer.
+    TextLayerUpload (api.py wire model) must mirror those — without
+    that mirror, Pydantic silently drops the extra fields, the route
+    reconstructs the slide using TextLayer's defaults (50/0), and the
+    operator's intensity/phase changes vanish on save. This is the
+    regression test for that bug (qarl QA report 2026-05-02)."""
+    payload = _upload_payload(
+        name="P", text="P",
+        motion="breathe", motion_intensity=75, motion_phase=0.4,
+    )
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 200
+    layer = response.json()["text_layers"][0]
+    assert layer["motion"] == "breathe"
+    assert layer["motion_intensity"] == 75
+    assert layer["motion_phase"] == 0.4
+
+
+def test_text_slide_put_persists_motion_fields(client: TestClient):
+    """Same contract on the PUT (edit-existing) route — the editor's
+    autoSave path goes through PUT, so this is the route that
+    actually shipped broken in 79df7e4 before the api.py fix."""
+    posted = client.post(
+        "/api/content/text-slides", json=_upload_payload(name="P", text="P")
+    ).json()
+    item_id = posted["id"]
+    assert posted["text_layers"][0]["motion"] == "static"
+    assert posted["text_layers"][0]["motion_intensity"] == 50
+    assert posted["text_layers"][0]["motion_phase"] == 0.0
+
+    payload = _upload_payload(
+        name="P", text="P",
+        motion="ticker", motion_intensity=75, motion_phase=0.4,
+    )
+    response = client.put(f"/api/content/text-slides/{item_id}", json=payload)
+    assert response.status_code == 200
+    layer = response.json()["text_layers"][0]
+    assert layer["motion"] == "ticker"
+    assert layer["motion_intensity"] == 75
+    assert layer["motion_phase"] == 0.4
+
+    # Also confirm a subsequent GET (the path QA's verifier exercises)
+    # returns the round-tripped values, not stale defaults.
+    fetched = client.get(f"/api/content/{item_id}").json()
+    fetched_layer = fetched["text_layers"][0]
+    assert fetched_layer["motion"] == "ticker"
+    assert fetched_layer["motion_intensity"] == 75
+    assert fetched_layer["motion_phase"] == 0.4
 
 
 def test_text_slide_post_without_box_uses_model_default(client: TestClient):
