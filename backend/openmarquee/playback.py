@@ -48,6 +48,11 @@ from PIL import Image, UnidentifiedImageError
 
 from openmarquee.auto_render import compose_auto_frame, resolve_timezone
 from openmarquee.content import ContentItem
+from openmarquee.motion import (
+    compose_motion_frame,
+    load_motion_background,
+    slide_has_motion,
+)
 from openmarquee.rendering import Renderer
 
 if TYPE_CHECKING:
@@ -291,11 +296,27 @@ class PlaybackLoop:
                     item.type == "text_slide"
                     and self._current_auto_mode is not None
                 )
+                is_motion = (
+                    item.type == "text_slide"
+                    and not is_auto
+                    and slide_has_motion(item)
+                )
                 if is_auto:
                     # Render-over path: the stored PNG is a placeholder;
                     # compose a fresh frame with current time/date/day
                     # each tick for the slide's full duration.
                     current_image = await self._play_auto_slide(item)
+                    if current_image is None:
+                        continue
+                elif is_motion:
+                    # Step 3a (docs/text-layer-motion-spec.md): any
+                    # visible layer with motion!=static drives a per-
+                    # tick re-composition at _FADE_FPS (30 Hz). Auto
+                    # and motion are mutex for now — auto wins because
+                    # its tick rate (1 Hz) is too slow for motion's
+                    # 30 Hz target. A unified per-tick composer that
+                    # handles both is a step 3a follow-up.
+                    current_image = await self._play_motion_slide(item)
                     if current_image is None:
                         continue
                 else:
@@ -497,6 +518,68 @@ class PlaybackLoop:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 return last
             if asyncio.get_event_loop().time() >= end_at:
+                return last
+
+    async def _play_motion_slide(self, item: ContentItem) -> Image.Image | None:
+        """Tick-render a motion-animated text slide for its full duration.
+
+        Re-composes the frame every 1/_FADE_FPS seconds so each layer's
+        motion (ticker / breathe / pulse / bounce / shake / blink) walks
+        forward on the shared global clock. Background is loaded once
+        and cached across ticks of this slide so we're not re-reading
+        the PNG (or re-allocating the solid-color canvas) 30× a second.
+
+        Returns the last-composed frame so the caller's transition has
+        something to fade from. Mirrors `_play_auto_slide`'s stop /
+        pause behavior — both exit early so a stream takeover doesn't
+        keep painting motion frames over live video.
+        """
+        total = item.duration_ms / 1000
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        end_at = t0 + total
+        tick_period = 1.0 / max(1, _FADE_FPS)
+        last: Image.Image | None = None
+        # Pre-load the background once so the per-tick composer doesn't
+        # re-read the background PNG (or re-allocate the solid-color
+        # canvas) 30× per second.
+        try:
+            background_cache: Image.Image | None = load_motion_background(
+                item, self._renderer.width, self._renderer.height, self._read_asset,
+            )
+        except Exception:
+            background_cache = None
+        while True:
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return last
+            elapsed = loop.time() - t0
+            try:
+                frame = compose_motion_frame(
+                    item,
+                    elapsed,
+                    self._renderer.width,
+                    self._renderer.height,
+                    read_asset=self._read_asset,
+                    background_cache=background_cache,
+                )
+            except Exception:
+                log.exception("playback: compose_motion_frame failed for %s", item.id)
+                return None
+            self._render_image(frame)
+            last = frame
+
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return last
+
+            remaining = end_at - loop.time()
+            if remaining <= 0:
+                return last
+            await self._wait(min(tick_period, remaining))
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                return last
+            if loop.time() >= end_at:
                 return last
 
     def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
