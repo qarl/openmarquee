@@ -138,6 +138,108 @@ describe("mountInlinePreview", () => {
         expect(Number(slider.max)).toBeCloseTo(8, 1);
     });
 
+    it("text-slide WITH motion routes through canvas-render path (not cached PNG)", async () => {
+        // Bug 1b (qarl 2026-05-02): motion in the playlist's inline-
+        // preview during playback. A text_slide whose layers include
+        // motion != static must NOT freeze on the cached PNG —
+        // drawSlot sends it through drawTextSlideAnimated which calls
+        // drawTextOnly+motion-aware paint via canvas-motion.
+        //
+        // Distinguishing signal: canvas-motion's paintLayerWithMotion
+        // calls ctx.beginPath/rect/clip for every animated layer (the
+        // box-bounded clip), which the cached-PNG drawImage path
+        // never does. Spy on the shared fakeCtx's beginPath calls to
+        // detect routing.
+        const beginPathCalls = [];
+        // Wide ctx mock — covers paintLayerWithMotion, drawTextOnly,
+        // drawForSkin (and any future LED-skin paths that add stroke /
+        // shadow / measureText / composite ops). Drift between this
+        // and canvas-motion.test.js's fakeCtx is the load-bearing risk
+        // — keep the surfaces aligned.
+        const fakeCtx = {
+            putImageData: vi.fn(),
+            drawImage: vi.fn(),
+            fillRect: vi.fn(),
+            getImageData: vi.fn(() => ({ data: new Uint8ClampedArray(0) })),
+            createRadialGradient: vi.fn(() => ({ addColorStop: vi.fn() })),
+            beginPath: vi.fn(() => beginPathCalls.push("beginPath")),
+            rect: vi.fn(),
+            clip: vi.fn(),
+            arc: vi.fn(),
+            fill: vi.fn(),
+            stroke: vi.fn(),
+            save: vi.fn(),
+            restore: vi.fn(),
+            translate: vi.fn(),
+            scale: vi.fn(),
+            clearRect: vi.fn(),
+            fillText: vi.fn(),
+            measureText: vi.fn(() => ({ width: 10 })),
+            set globalAlpha(_v) {},
+            set fillStyle(_v) {},
+            set strokeStyle(_v) {},
+            set lineWidth(_v) {},
+            set imageSmoothingEnabled(_v) {},
+            set globalCompositeOperation(_v) {},
+            set shadowColor(_v) {},
+            set shadowBlur(_v) {},
+            set font(_v) {},
+            set textAlign(_v) {},
+            set textBaseline(_v) {},
+        };
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+            fakeCtx,
+        );
+
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountInlinePreview(container, {
+                width: 128,
+                height: 96,
+                outputMode: "hdmi",
+                fetchPlaylist: async () => ({
+                    items: [
+                        {
+                            item_id: "a",
+                            transition: "cut",
+                            transition_ms: 0,
+                            content: {
+                                id: "a",
+                                type: "text_slide",
+                                duration_ms: 5000,
+                                background_color: "#000",
+                                text_layers: [
+                                    {
+                                        text: "GO",
+                                        motion: "ticker",
+                                        motion_intensity: 50,
+                                        motion_phase: 0,
+                                        text_color: "#FFF",
+                                        box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                }),
+            });
+            await tick();
+            await tick();
+            // Press play — first tick fires renderOnce → drawSlot →
+            // drawTextSlideAnimated → drawTextOnly → paintLayerWithMotion
+            // → ctx.beginPath (the box-clip setup).
+            container.querySelector(".inline-preview-play").click();
+            await tick();
+            await new Promise((r) => requestAnimationFrame(r));
+            await tick();
+            // beginPath was called by the motion-aware paint path.
+            expect(beginPathCalls.length).toBeGreaterThan(0);
+        } finally {
+            container.remove();
+        }
+    });
+
     it("play button toggles aria-label between play/pause", async () => {
         const container = document.createElement("div");
         mountInlinePreview(container, {

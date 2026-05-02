@@ -24,6 +24,7 @@
 //   transition_ms at the boundary. "cut" is instant.
 
 import { formatAutoText } from "./auto-format.js";
+import { anyLayerAnimated } from "./canvas-motion.js";
 import { drawTextOnly } from "./editor.js";
 
 const TEMPLATE = `
@@ -676,6 +677,21 @@ export function mountInlinePreview(container, options) {
             const bgId = String(item.background_video_slide_id);
             syncActiveVideo(bgId, slot);
             drawTextOverVideo(item, bgId);
+        } else if (
+            item.type === "text_slide"
+            && anyLayerAnimated(item.text_layers)
+        ) {
+            // Bug 1b (qarl 2026-05-02 demo): plain text slides with
+            // motion need to animate during playback, not just freeze
+            // on the cached PNG asset. Re-render the slide each tick
+            // via canvas-motion's drawTextOnly + a bg fill rather than
+            // blitting the static asset. Same pixel pipeline (sampler
+            // → drawForSkin) as drawImage so LED-skin chrome still
+            // applies. Static-text slides keep using drawImage — the
+            // PNG cache is fine when nothing's moving.
+            pauseAllVideosExcept(null);
+            activeVideoId = null;
+            drawTextSlideAnimated(item, slot);
         } else {
             // Switched away from a playing video — pause it so audio-less
             // h264 doesn't keep decoding off-screen.
@@ -741,6 +757,87 @@ export function mountInlinePreview(container, options) {
         if (sampler.width !== srcW) sampler.width = srcW;
         if (sampler.height !== srcH) sampler.height = srcH;
         samplerCtx.drawImage(img, 0, 0);
+        const srcData = samplerCtx.getImageData(0, 0, srcW, srcH);
+        drawForSkin(skin, ctx, canvas.width, canvas.height, srcData, srcW, srcH);
+    }
+
+    // Reused offscreen canvas for the text-with-motion overlay so we
+    // don't allocate a fresh one every rAF tick.
+    let motionTextOverlay = null;
+
+    function drawTextSlideAnimated(item, slot) {
+        // elapsed_s = position-within-this-slot. 0 at slot entry,
+        // monotonically advancing through the slot's duration. Same
+        // shared-clock semantics as the editor preview's rAF loop —
+        // motion_phase still offsets the cycle per layer.
+        const elapsed_s = position - slot.startSec;
+        const ctx = canvas.getContext("2d");
+        const srcW = width;
+        const srcH = height;
+        if (sampler.width !== srcW) sampler.width = srcW;
+        if (sampler.height !== srcH) sampler.height = srcH;
+
+        // Background — solid fill or referenced bg slide's PNG. Mirrors
+        // the editor's drawCanvas bg-source resolution. The bg slide
+        // may not yet be in imageCache (the cache fills lazily as
+        // slides are drawn); on miss we fetch it via getCachedImage,
+        // which kicks an async load + a renderOnce on completion. The
+        // first frame after a motion slide enters with a bg slide
+        // reference falls back to the solid color until the bg PNG
+        // finishes loading — same shape as the existing drawImage
+        // path's "leave whatever was drawn last" early-return.
+        if (item.background_image_slide_id) {
+            // Cachebust limitation (v1, qarl 2026-05-02): we use the
+            // CURRENT slide's updated_at on the synthesized bg-item
+            // rather than the bg slide's own. If the bg slide is
+            // re-rendered server-side (text edit on the bg, dim flip,
+            // etc.) DURING a playback session, the inline-preview
+            // would keep showing the stale bg PNG. Acceptable for
+            // v1 — bg slides rarely change mid-playback — but worth a
+            // proper lookup of the bg slide's own updated_at if this
+            // bites. Same shape as drawTextOverVideo's bg-video
+            // sync_active_video, which has the same v1 cachebust gap.
+            const bgItem = {
+                id: String(item.background_image_slide_id),
+                updated_at: item.updated_at,
+                created_at: item.created_at,
+            };
+            const bgImg = getCachedImage(bgItem);
+            if (bgImg && bgImg.complete && bgImg.naturalWidth > 0) {
+                const scale = Math.max(
+                    srcW / bgImg.naturalWidth,
+                    srcH / bgImg.naturalHeight,
+                );
+                const drawW = bgImg.naturalWidth * scale;
+                const drawH = bgImg.naturalHeight * scale;
+                samplerCtx.drawImage(
+                    bgImg,
+                    (srcW - drawW) / 2,
+                    (srcH - drawH) / 2,
+                    drawW,
+                    drawH,
+                );
+            } else {
+                samplerCtx.fillStyle = item.background_color || "#000";
+                samplerCtx.fillRect(0, 0, srcW, srcH);
+            }
+        } else {
+            samplerCtx.fillStyle = item.background_color || "#000";
+            samplerCtx.fillRect(0, 0, srcW, srcH);
+        }
+
+        // Text layers (with motion transforms) onto a transparent
+        // overlay canvas, then composite onto the bg in sampler.
+        // drawTextOnly clearRects its target so we can't draw bg into
+        // the same canvas — separate overlay is cheap and reusable.
+        if (!motionTextOverlay) {
+            motionTextOverlay = document.createElement("canvas");
+        }
+        if (motionTextOverlay.width !== srcW) motionTextOverlay.width = srcW;
+        if (motionTextOverlay.height !== srcH) motionTextOverlay.height = srcH;
+        drawTextOnly(motionTextOverlay, item, { elapsed_s });
+        samplerCtx.drawImage(motionTextOverlay, 0, 0);
+
         const srcData = samplerCtx.getImageData(0, 0, srcW, srcH);
         drawForSkin(skin, ctx, canvas.width, canvas.height, srcData, srcW, srcH);
     }
