@@ -1472,6 +1472,90 @@ describe("mountEditor — submit flow", () => {
         expect([...thumbEl.classList].some((c) => c.startsWith("motion-"))).toBe(false);
     });
 
+    it("ticker thumb wraps text in a doubled track for seamless repeat", async () => {
+        // qarl 2026-05-02 demo eyeball: the prior single-text-translate
+        // ticker showed "text exits, gap, text returns." Fix: two text
+        // copies inside an inline-flex track, animated translateX 0 →
+        // -50% (= one copy width), so the second copy slides into where
+        // the first started. Test the DOM structure that enables the
+        // seamless loop; CSS is exercised in browser, not jsdom.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
+        // Type text first so the thumb has a value other than the
+        // empty-state em-dash.
+        const text = container.querySelector(".field-text");
+        text.value = "MARQUEE";
+        text.dispatchEvent(new Event("input", { bubbles: true }));
+
+        const motionSelect = container.querySelector(".field-motion");
+        motionSelect.value = "ticker";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+
+        const thumbEl = container.querySelector(".editor-layer-thumb");
+        const track = thumbEl.querySelector(".editor-layer-thumb-ticker-track");
+        expect(track).not.toBeNull();
+        const copies = track.querySelectorAll(":scope > span");
+        expect(copies.length).toBe(2);
+        expect(copies[0].textContent).toBe("MARQUEE");
+        expect(copies[1].textContent).toBe("MARQUEE");
+    });
+
+    it("non-ticker thumb wraps text in a single inner span", async () => {
+        // breathe / pulse / bounce / shake / blink all animate the
+        // same inner span (.editor-layer-thumb-text) so the thumb's
+        // overflow:hidden clips them — animating the thumb itself
+        // would move its clipping box too. Static thumbs use the
+        // same wrapper for layout consistency.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
+        const text = container.querySelector(".field-text");
+        text.value = "PULSE";
+        text.dispatchEvent(new Event("input", { bubbles: true }));
+
+        const motionSelect = container.querySelector(".field-motion");
+        for (const kind of ["static", "breathe", "pulse", "bounce", "shake", "blink"]) {
+            motionSelect.value = kind;
+            motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+            const thumbEl = container.querySelector(".editor-layer-thumb");
+            const span = thumbEl.querySelector(".editor-layer-thumb-text");
+            expect(span).not.toBeNull();
+            expect(span.textContent).toBe("PULSE");
+            // Ticker structure should NOT exist for non-ticker effects.
+            expect(thumbEl.querySelector(".editor-layer-thumb-ticker-track")).toBeNull();
+        }
+    });
+
+    it("switching from ticker to non-ticker swaps thumb DOM cleanly", async () => {
+        // Both ends of the structure swap: ticker → text-span erases
+        // the track; text-span → ticker erases the span. No accumulated
+        // children that could overlap visually.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
+        const text = container.querySelector(".field-text");
+        text.value = "X";
+        text.dispatchEvent(new Event("input", { bubbles: true }));
+
+        const motionSelect = container.querySelector(".field-motion");
+        motionSelect.value = "ticker";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        const thumbEl = container.querySelector(".editor-layer-thumb");
+        expect(thumbEl.querySelector(".editor-layer-thumb-ticker-track")).not.toBeNull();
+        expect(thumbEl.querySelector(".editor-layer-thumb-text")).toBeNull();
+
+        motionSelect.value = "breathe";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(thumbEl.querySelector(".editor-layer-thumb-ticker-track")).toBeNull();
+        expect(thumbEl.querySelector(".editor-layer-thumb-text")).not.toBeNull();
+
+        motionSelect.value = "ticker";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(thumbEl.querySelector(".editor-layer-thumb-ticker-track")).not.toBeNull();
+        expect(thumbEl.querySelector(".editor-layer-thumb-text")).toBeNull();
+    });
+
     it("layer name input drives the header name display + saves on the wire", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");

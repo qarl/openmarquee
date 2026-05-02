@@ -1260,40 +1260,63 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 .editor-layer-card.editor-layer-hidden .editor-layer-thumb { opacity: 0.3; }
 
 /* Motion preview on the layer thumb — CSS-keyframes approximation of
-   each effect (see docs/text-layer-motion-spec.md). The animations
-   target the thumb's text via ::after-style transforms on the inner
-   text node, BUT since the thumb's flex centering already wraps the
-   text, animating the whole element is the simplest path that doesn't
-   require a child element. overflow:hidden (already set) clips ticker
-   travel to the thumb's bounding box. */
-.editor-layer-thumb.motion-ticker {
-    /* Horizontal travel — text drifts right-to-left and loops. */
-    animation: omthumb-ticker 3s linear infinite;
+   each effect (see docs/text-layer-motion-spec.md). Keyframes target
+   an INNER span (.editor-layer-thumb-text or .editor-layer-thumb-
+   ticker-track), NOT the thumb element itself. Animating the thumb
+   directly moved its clipping box too — ticker text would spill
+   outside the thumb's 36×18 footprint (qarl 2026-05-02 demo eyeball).
+   Inner-span animation lets the thumb's overflow:hidden actually
+   clip the motion. */
+.editor-layer-thumb-text {
+    display: inline-block;
+    white-space: nowrap;
+    will-change: transform, opacity;
 }
-.editor-layer-thumb.motion-breathe {
-    /* Scale around center, sine-feeling via ease-in-out alternate. */
+.editor-layer-thumb.motion-breathe .editor-layer-thumb-text {
     animation: omthumb-breathe 1s ease-in-out infinite alternate;
 }
-.editor-layer-thumb.motion-pulse {
-    /* Alpha modulation, sine via ease-in-out alternate. */
+.editor-layer-thumb.motion-pulse .editor-layer-thumb-text {
     animation: omthumb-pulse 1s ease-in-out infinite alternate;
 }
-.editor-layer-thumb.motion-bounce {
-    /* Vertical bob. */
+.editor-layer-thumb.motion-bounce .editor-layer-thumb-text {
     animation: omthumb-bounce 1s ease-in-out infinite;
 }
-.editor-layer-thumb.motion-shake {
-    /* Step-function jitter — CSS can't do random, so a fixed
-       multi-keyframe wiggle suffices for "yes this layer shakes." */
+.editor-layer-thumb.motion-shake .editor-layer-thumb-text {
     animation: omthumb-shake 0.6s steps(8) infinite;
 }
-.editor-layer-thumb.motion-blink {
-    /* Hard square-wave on/off — no easing, sharp transitions. */
+.editor-layer-thumb.motion-blink .editor-layer-thumb-text {
     animation: omthumb-blink 1s steps(2) infinite;
 }
+/* Ticker uses a different inner structure: two copies of the text in
+   a track, animated translateX 0 → -50% so the second copy slides
+   into where the first started. Loops seamlessly without the "text
+   exits, gap, text returns" feel the prior single-copy translate had. */
+.editor-layer-thumb-ticker-track {
+    display: inline-flex;
+    flex-shrink: 0;
+    white-space: nowrap;
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    align-items: center;
+    will-change: transform;
+}
+.editor-layer-thumb-ticker-track > span {
+    padding-right: 4px;
+}
+.editor-layer-thumb.motion-ticker {
+    /* Override flex centering so the absolutely-positioned track sits
+       at the left edge and animates rightward → out the left side. */
+    justify-content: flex-start;
+    position: relative;
+}
+.editor-layer-thumb.motion-ticker .editor-layer-thumb-ticker-track {
+    animation: omthumb-ticker 3s linear infinite;
+}
 @keyframes omthumb-ticker {
-    0%   { transform: translateX(60%); }
-    100% { transform: translateX(-60%); }
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
 }
 @keyframes omthumb-breathe {
     0%   { transform: scale(0.85); }
@@ -1324,8 +1347,9 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 @media (prefers-reduced-motion: reduce) {
     /* Operators with motion-sensitivity preferences: still tag the
        thumb visually (the meta strip's text label is unchanged) but
-       skip the animation. */
-    .editor-layer-thumb[class*="motion-"] { animation: none; }
+       skip the animation on every inner-span variant. */
+    .editor-layer-thumb-text,
+    .editor-layer-thumb-ticker-track { animation: none; }
 }
 .editor-layer-titleblock {
     flex: 1;

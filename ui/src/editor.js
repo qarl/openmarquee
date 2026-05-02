@@ -941,7 +941,6 @@ export function mountEditor(
 
         const thumbEl = groupEl.querySelector(".editor-layer-thumb");
         const preview = (layer.text || "").slice(0, 8) || "—";
-        thumbEl.textContent = preview;
         thumbEl.style.color = layer.textColor || "#FFFFFF";
         // CSS-keyframes preview of the picked motion effect — visually
         // approximate, not pixel-identical to the device renderer (per
@@ -954,6 +953,30 @@ export function mountEditor(
         const motionForThumb = layer.motion || "static";
         if (motionForThumb !== "static") {
             thumbEl.classList.add(`motion-${motionForThumb}`);
+        }
+        // Thumb content: keyframes target an INNER span so the thumb's
+        // overflow:hidden clips the animation. Animating the thumb
+        // itself moves its clipping box too — ticker text would spill
+        // outside the 36×18 footprint (qarl 2026-05-02 demo eyeball).
+        // Ticker also needs visible repeat so the animation reads as
+        // a continuous strip rather than "text exits, gap, text returns";
+        // the trick is two text copies inside a track that animates
+        // translateX 0 → -50% (= one copy width), loops seamlessly.
+        thumbEl.replaceChildren();
+        if (motionForThumb === "ticker") {
+            const track = document.createElement("span");
+            track.className = "editor-layer-thumb-ticker-track";
+            const a = document.createElement("span");
+            a.textContent = preview;
+            const b = document.createElement("span");
+            b.textContent = preview;
+            track.append(a, b);
+            thumbEl.append(track);
+        } else {
+            const span = document.createElement("span");
+            span.className = "editor-layer-thumb-text";
+            span.textContent = preview;
+            thumbEl.append(span);
         }
 
         const visible = layer.visible !== false;
