@@ -34,6 +34,7 @@ ioctls. The Pi-side live-fire is the canonical correctness check.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import fcntl
 import logging
 import mmap
@@ -42,9 +43,33 @@ import struct
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageChops
 
 log = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class _PlaneSlot:
+    """One DRM plane + its dumb-buffer fb. Allocated once at __enter__,
+    held for the renderer's lifetime; the static-text plane keeps the
+    same slot for every slide (its bitmap is overwritten at slide
+    entry), animated planes' source bitmaps get rewritten on
+    attach_animated_layer for each new slide.
+
+    `attached`: True when the plane is currently bound to the CRTC
+    (visible). False = plane disabled (CRTC_ID=0). update_animated_
+    layer flips this via the `visible` arg.
+    """
+    plane_id: int = 0
+    props: dict[str, int] = dataclasses.field(default_factory=dict)
+    fb_id: int = 0
+    dumb_handle: int = 0
+    dumb_size: int = 0
+    dumb_pitch: int = 0
+    mmap: "mmap.mmap | None" = None
+    width: int = 0
+    height: int = 0
+    attached: bool = False
 
 
 # --- ioctl encoding ---
@@ -339,6 +364,18 @@ DRM_MODE_OBJECT_PLANE = 0xEEEEEEEE
 # mode-set commit; per-frame commits leave it off.
 DRM_MODE_ATOMIC_ALLOW_MODESET = 0x0400
 
+# pixel blend mode enum values — stable kernel-defined constants from
+# include/drm/drm_blend.h, exposed by drm_plane_create_blend_mode_property().
+# We pin PREMULTI on every animated plane attach (the vc4 default, but
+# the property persists across DRM master sessions so we can't trust
+# inheritance). PREMULTI requires premultiplied RGB input, which
+# `_write_plane_buffer_subregion` produces. COVERAGE is documented but
+# vc4-broken — see "vc4 alpha-handling gotchas" in
+# docs/multi-plane-gpu-compositor.md. PIXEL_NONE is unused.
+DRM_MODE_BLEND_PIXEL_NONE = 0
+DRM_MODE_BLEND_PREMULTI = 1
+DRM_MODE_BLEND_COVERAGE = 2
+
 
 def _ioctl(fd: int, request: int, arg) -> None:
     """Run an ioctl with a ctypes struct, raising OSError on failure.
@@ -383,11 +420,19 @@ class DRMRenderer:
         device_path: Path = Path("/dev/dri/card0"),
         pixel_format: str = "rgb565",
         enable_overlay: bool = False,
+        max_animated_planes: int = 0,
     ):
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive")
         if pixel_format not in ("rgb565", "xrgb8888"):
             raise ValueError(f"unsupported pixel_format {pixel_format!r}")
+        if max_animated_planes < 0:
+            raise ValueError("max_animated_planes must be >= 0")
+        if enable_overlay and max_animated_planes > 0:
+            raise ValueError(
+                "enable_overlay is the legacy single-overlay API; "
+                "use max_animated_planes>0 for the GPU compositor instead"
+            )
         self.width = width
         self.height = height
         self.pixel_format = pixel_format
@@ -438,6 +483,32 @@ class DRMRenderer:
         self._scaled_h: int = 0
         self._letterbox_x: int = 0
         self._letterbox_y: int = 0
+        # GPU-compositor state (max_animated_planes > 0). N animated
+        # overlay planes (zpos=2..N+1), each one motion-animated
+        # layer's pre-rasterized RGBA bitmap. Per-frame motion =
+        # atomic-commit changing each plane's CRTC_X/Y/W/H / alpha —
+        # zero per-pixel CPU.
+        #
+        # No dedicated static-text plane: vc4 LBM ceiling at 1080p is
+        # ~3 simultaneously bound planes (primary + 2 overlays). The
+        # bg + all motion=static text layers software-composite into
+        # the primary plane ONCE at slide entry via the existing
+        # render_frame() path; that frees both overlay slots for
+        # animated layers (qarl 2026-05-02 architectural choice
+        # combining options 2+3 from the LBM-finding follow-up).
+        #
+        # Per-plane LBM consumption on vc4 scales with SRC_W (the
+        # source rect width the HVS reads per scanline), NOT fb
+        # width. So animated planes' fbs stay allocated at max sign
+        # dims, but attach_animated_layer takes a glyph-bbox subset
+        # — SRC_W/H = bbox dims, CRTC_W/H = display-pixel dest rect.
+        # Smaller bbox = less LBM = more simultaneous animated layers.
+        self.max_animated_planes = max(0, int(max_animated_planes))
+        self._animated_planes: list["_PlaneSlot"] = []
+        # Pending atomic-property changes staged between commits. Maps
+        # (plane_id, prop_id) → value. commit() drains it into one
+        # DRM_IOCTL_MODE_ATOMIC and clears.
+        self._pending_props: dict[tuple[int, int], int] = {}
         # Override display dims if caller specified — otherwise we'll
         # detect from the connector's preferred mode at __enter__.
         self._explicit_display_w = display_width
@@ -467,6 +538,8 @@ class DRMRenderer:
             if self.enable_overlay:
                 self._discover_overlay_plane()
                 self._allocate_overlay_framebuffer()
+            if self.max_animated_planes > 0:
+                self._discover_compositor_planes()
             self._atomic_modeset()
         except Exception:
             self.close()
@@ -846,6 +919,144 @@ class DRMRenderer:
                     f"{label} is missing required atomic properties: {missing}"
                 )
 
+    def _discover_compositor_planes(self) -> None:
+        """Find max_animated_planes ARGB8888 overlay planes bound to
+        our CRTC and allocate a dumb buffer + DRM fb for each. Each
+        plane is a slot for one motion-animated layer in the active
+        slide; bg + static layers go on the primary plane via
+        render_frame() (software composite once at slide entry).
+
+        Each plane's fb is allocated at max sign-native dims, but
+        attach_animated_layer's SRC_W/H is set to the layer's glyph-
+        bbox subset — vc4 LBM consumption scales with SRC_W not fb
+        width, so smaller glyph bboxes mean more simultaneous animated
+        layers within the LBM ceiling (~3 planes total at 1080p
+        full-frame source; more at smaller source widths).
+
+        Planes are NOT bound to the CRTC at this point — FB_ID and
+        CRTC_ID stay 0 until attach_animated_layer + commit() activate
+        them. This lets us pre-allocate the whole plane stack once at
+        __enter__ without affecting what's on screen.
+        """
+        n_needed = self.max_animated_planes
+        if n_needed == 0:
+            return
+        res = _DrmModeGetPlaneRes()
+        _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANERESOURCES, res)
+        plane_ids_arr = (ctypes.c_uint32 * res.count_planes)()
+        res.plane_id_ptr = ctypes.cast(plane_ids_arr, ctypes.c_void_p).value or 0
+        _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANERESOURCES, res)
+
+        skip = {self._primary_plane_id}
+        if self._overlay_plane_id:
+            skip.add(self._overlay_plane_id)
+        chosen: list[int] = []
+        for pid in plane_ids_arr:
+            if len(chosen) >= n_needed:
+                break
+            if pid in skip:
+                continue
+            plane = _DrmModeGetPlane()
+            plane.plane_id = pid
+            _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANE, plane)
+            if not (plane.possible_crtcs & self._crtc_bit):
+                continue
+            if self._get_plane_type(pid) != DRM_PLANE_TYPE_OVERLAY:
+                continue
+            if plane.count_format_types == 0:
+                continue
+            formats = (ctypes.c_uint32 * plane.count_format_types)()
+            plane.format_type_ptr = ctypes.cast(formats, ctypes.c_void_p).value or 0
+            _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANE, plane)
+            if DRM_FORMAT_ARGB8888 not in tuple(formats):
+                continue
+            chosen.append(pid)
+        if len(chosen) < n_needed:
+            raise RuntimeError(
+                f"GPU compositor needs {n_needed} ARGB8888 overlay "
+                f"planes on CRTC {self._crtc_id}, found {len(chosen)}. "
+                f"Lower max_animated_planes or pick a CRTC with more "
+                f"overlays."
+            )
+
+        self._animated_planes = [
+            self._allocate_compositor_plane_slot(pid) for pid in chosen
+        ]
+        log.info(
+            "DRM: GPU compositor allocated %d animated planes (ids=%s)",
+            len(self._animated_planes),
+            [s.plane_id for s in self._animated_planes],
+        )
+
+    def _allocate_compositor_plane_slot(self, plane_id: int) -> _PlaneSlot:
+        """Allocate dumb buffer + DRM fb in ARGB8888 at sign-native
+        dims, mmap, fetch atomic property ids. Returns a _PlaneSlot
+        ready for attach via update_animated_layer / set_static_text_
+        bitmap. Plane stays disabled (CRTC_ID=0) until the caller
+        commits an activation."""
+        assert self._fd is not None
+        create = _DrmModeCreateDumb()
+        create.width = self.width
+        create.height = self.height
+        create.bpp = 32  # ARGB8888
+        _ioctl(self._fd, DRM_IOCTL_MODE_CREATE_DUMB, create)
+
+        fb = _DrmModeFbCmd2()
+        fb.width = self.width
+        fb.height = self.height
+        fb.pixel_format = DRM_FORMAT_ARGB8888
+        fb.handles[0] = create.handle
+        fb.pitches[0] = create.pitch
+        _ioctl(self._fd, DRM_IOCTL_MODE_ADDFB2, fb)
+
+        map_dumb = _DrmModeMapDumb()
+        map_dumb.handle = create.handle
+        _ioctl(self._fd, DRM_IOCTL_MODE_MAP_DUMB, map_dumb)
+        mm = mmap.mmap(
+            self._fd,
+            int(create.size),
+            mmap.MAP_SHARED,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=int(map_dumb.offset),
+        )
+        # Zero-init so the first scanout (when the plane gets bound)
+        # doesn't show driver garbage.
+        mm[: int(create.size)] = b"\x00" * int(create.size)
+
+        props = self._get_object_properties(plane_id, DRM_MODE_OBJECT_PLANE)
+        required = (
+            "FB_ID", "CRTC_ID",
+            "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
+            "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H",
+        )
+        missing = [n for n in required if n not in props]
+        if missing:
+            raise RuntimeError(
+                f"compositor plane {plane_id} missing required props: {missing}"
+            )
+        # alpha + zpos + pixel-blend-mode are optional but expected on
+        # vc4 (probe confirmed 2026-05-02). Log if they're absent so a
+        # future kernel regression surfaces loudly.
+        for opt in ("alpha", "zpos", "pixel blend mode"):
+            if opt not in props:
+                log.warning(
+                    "DRM: compositor plane %d missing optional %r prop",
+                    plane_id, opt,
+                )
+
+        return _PlaneSlot(
+            plane_id=plane_id,
+            props=props,
+            fb_id=fb.fb_id,
+            dumb_handle=create.handle,
+            dumb_size=int(create.size),
+            dumb_pitch=int(create.pitch),
+            mmap=mm,
+            width=self.width,
+            height=self.height,
+            attached=False,
+        )
+
     def _create_mode_blob(self, mode: _DrmModeInfo) -> int:
         """Stash a struct drm_mode_modeinfo in a kernel-side property
         blob and return its id. The atomic CRTC.MODE_ID property takes
@@ -1084,6 +1295,42 @@ class DRMRenderer:
                 self._overlay_dumb_handle = 0
         except OSError:
             log.exception("DRMRenderer: overlay destroy dumb failed")
+        # GPU-compositor planes (max_animated_planes > 0): tear down
+        # every animated plane in the same mmap → RMFB → DESTROY_DUMB
+        # order the legacy single-overlay path uses.
+        for slot in self._animated_planes:
+            try:
+                if slot.mmap is not None:
+                    slot.mmap.close()
+                    slot.mmap = None
+            except Exception:
+                log.exception(
+                    "DRMRenderer: compositor plane %d mmap close failed",
+                    slot.plane_id,
+                )
+            try:
+                if slot.fb_id:
+                    fb_id = ctypes.c_uint32(slot.fb_id)
+                    _ioctl(self._fd, DRM_IOCTL_MODE_RMFB, fb_id)
+                    slot.fb_id = 0
+            except OSError:
+                log.exception(
+                    "DRMRenderer: compositor plane %d rmfb failed",
+                    slot.plane_id,
+                )
+            try:
+                if slot.dumb_handle:
+                    d = _DrmModeDestroyDumb()
+                    d.handle = slot.dumb_handle
+                    _ioctl(self._fd, DRM_IOCTL_MODE_DESTROY_DUMB, d)
+                    slot.dumb_handle = 0
+            except OSError:
+                log.exception(
+                    "DRMRenderer: compositor plane %d destroy dumb failed",
+                    slot.plane_id,
+                )
+        self._animated_planes = []
+        self._pending_props.clear()
         try:
             if self._mode_blob_id:
                 blob = _DrmModeDestroyBlob()
@@ -1161,7 +1408,257 @@ class DRMRenderer:
                     y * self._dumb_pitch : y * self._dumb_pitch + row_bytes
                 ] = payload[start : start + row_bytes]
 
-    # --- multi-plane composite path ---
+    # --- GPU-compositor public API ---
+
+    def attach_animated_layer(
+        self,
+        slot_idx: int,
+        rgba_bytes: bytes,
+        *,
+        src_w: int,
+        src_h: int,
+        crtc_x: int,
+        crtc_y: int,
+        crtc_w: int,
+        crtc_h: int,
+        zpos: int | None = None,
+    ) -> None:
+        """Bind animated overlay plane `slot_idx` to our CRTC.
+
+        rgba_bytes: src_w * src_h * 4 bytes — the layer's content
+            cropped to its glyph bounding box. Caller is responsible
+            for the crop; smaller bbox = less vc4 LBM consumed = more
+            animated layers fit simultaneously.
+        src_w / src_h: pixel dims of the rgba buffer.
+        crtc_x / crtc_y / crtc_w / crtc_h: where this layer sits on
+            the display, in display pixels. crtc_w / crtc_h can equal
+            src_w / src_h (1:1 paint) or differ (HVS scales). For
+            breathe and per-frame scale, just keep updating these
+            via update_animated_layer.
+
+        zpos defaults to 2 + slot_idx (animated layers stack above
+        primary in slot order). Caller must `commit()`.
+        """
+        slot = self._require_animated_slot(slot_idx)
+        if src_w <= 0 or src_h <= 0:
+            raise ValueError(f"src_w/src_h must be positive, got {src_w}x{src_h}")
+        if src_w > slot.width or src_h > slot.height:
+            raise ValueError(
+                f"src dims {src_w}x{src_h} exceed plane fb {slot.width}x{slot.height}"
+            )
+        self._write_plane_buffer_subregion(slot, rgba_bytes, src_w, src_h)
+        if zpos is None:
+            zpos = 2 + slot_idx
+        # Force PREMULTI blend mode explicitly. vc4's default IS
+        # PREMULTI but the property persists across DRM master
+        # sessions — if a previous run staged COVERAGE on this plane,
+        # not setting it here leaves the leftover COVERAGE active. Set
+        # it every attach to make state deterministic. PREMULTI under
+        # premultiplied RGB input (handled by _write_plane_buffer_
+        # subregion) honors per-pixel alpha correctly, so transparent
+        # bbox pixels stay transparent and plane.alpha cleanly fades
+        # the layer.
+        self._stage_plane_props(
+            slot,
+            fb_id=slot.fb_id,
+            crtc_id=self._crtc_id,
+            src_x=0, src_y=0,
+            src_w=src_w << 16, src_h=src_h << 16,
+            crtc_x=crtc_x, crtc_y=crtc_y,
+            crtc_w=crtc_w, crtc_h=crtc_h,
+            alpha=65535,
+            zpos=zpos,
+            pixel_blend_mode=DRM_MODE_BLEND_PREMULTI,
+        )
+        slot.attached = True
+
+    def detach_animated_layer(self, slot_idx: int) -> None:
+        """Disable the animated plane at `slot_idx` (CRTC_ID=0,
+        FB_ID=0). The dumb buffer stays allocated for the next attach.
+        Caller must `commit()`."""
+        slot = self._require_animated_slot(slot_idx)
+        self._stage_plane_detach(slot)
+        slot.attached = False
+
+    def update_animated_layer(
+        self,
+        slot_idx: int,
+        *,
+        crtc_x: int | None = None,
+        crtc_y: int | None = None,
+        crtc_w: int | None = None,
+        crtc_h: int | None = None,
+        src_x: int | None = None,
+        src_y: int | None = None,
+        src_w: int | None = None,
+        src_h: int | None = None,
+        alpha: int | None = None,
+        zpos: int | None = None,
+    ) -> None:
+        """Stage per-property changes for the animated plane at `slot_
+        idx`. Each kwarg is the new value or None to leave unchanged.
+        All geometry kwargs (crtc_*, src_*) are in INTEGER PIXELS;
+        src_x/y/w/h get the 16.16 fp shift applied internally for
+        consistency with attach_animated_layer. alpha is 0-65535.
+        Caller must `commit()`.
+
+        Per-frame motion is one of:
+            ticker / shake → crtc_x (and crtc_y for shake)
+            bounce         → crtc_y
+            breathe        → crtc_w + crtc_h + crtc_x + crtc_y
+                             (orbit-around-box-center; orchestrator
+                             handles the math)
+            pulse          → alpha
+            blink          → alpha (0 or 65535) or detach via
+                             detach_animated_layer + commit
+        """
+        slot = self._require_animated_slot(slot_idx)
+        # Consistent units: SRC_* are passed in pixels and shifted to
+        # 16.16 fp here, matching attach_animated_layer's pixel-in
+        # contract. Without this, a caller animating SRC_X for a
+        # ticker wrap would get a 65536× off result.
+        self._stage_plane_props(
+            slot,
+            crtc_x=crtc_x, crtc_y=crtc_y,
+            crtc_w=crtc_w, crtc_h=crtc_h,
+            src_x=(src_x << 16) if src_x is not None else None,
+            src_y=(src_y << 16) if src_y is not None else None,
+            src_w=(src_w << 16) if src_w is not None else None,
+            src_h=(src_h << 16) if src_h is not None else None,
+            alpha=alpha, zpos=zpos,
+        )
+
+    def commit(self) -> None:
+        """Flush all staged property changes via one DRM_IOCTL_MODE_
+        ATOMIC. Per-frame hot path: this is the only kernel call. No
+        ALLOW_MODESET — only flips plane state, not CRTC mode.
+
+        After commit, the staging buffer clears and the changes take
+        effect at the next vblank."""
+        if not self._pending_props:
+            return
+        # Build (plane_id, [(prop_id, value), ...]) groups from the
+        # flat staging dict.
+        by_plane: dict[int, list[tuple[int, int]]] = {}
+        for (plane_id, prop_id), value in self._pending_props.items():
+            by_plane.setdefault(plane_id, []).append((prop_id, value))
+        object_props = list(by_plane.items())
+        self._atomic_commit(flags=0, object_props=object_props)
+        self._pending_props.clear()
+
+    # ---- internal staging helpers ----
+
+    def _require_animated_slot(self, slot_idx: int) -> _PlaneSlot:
+        if not 0 <= slot_idx < len(self._animated_planes):
+            raise IndexError(
+                f"animated slot {slot_idx} out of range "
+                f"[0..{len(self._animated_planes) - 1}]"
+            )
+        return self._animated_planes[slot_idx]
+
+    def _write_plane_buffer_subregion(
+        self, slot: _PlaneSlot, rgba_bytes: bytes, src_w: int, src_h: int
+    ) -> None:
+        """Write src_w*src_h*4 RGBA bytes into the top-left subregion
+        of the plane's mmap'd buffer. The remainder of the buffer is
+        zeroed (so a previous attach's tail bytes don't leak). BGRA
+        channel swizzle (LE arm64 ARGB8888 byte order = B,G,R,A) via
+        Pillow split/merge. RGB is pre-multiplied by alpha because
+        vc4 plane composition runs in PREMULTI mode by default and
+        the smoke (2026-05-02) confirmed that PREMULTI is the only
+        mode where vc4 honors per-pixel alpha correctly under a
+        plane.alpha multiplier (COVERAGE on vc4 ignores per-pixel
+        alpha, leaving an opaque-black bbox under partial plane.alpha).
+
+        SRC_W/H on the plane (set by attach_animated_layer) tells HVS
+        to only read this top-left subregion; vc4 LBM consumption
+        scales with SRC_W, not the fb's full width."""
+        if slot.mmap is None:
+            raise RuntimeError(f"plane {slot.plane_id} mmap is None")
+        expected = src_w * src_h * 4
+        if len(rgba_bytes) != expected:
+            raise ValueError(
+                f"plane {slot.plane_id}: rgba_bytes length {len(rgba_bytes)} "
+                f"!= {src_w}x{src_h} ARGB8888 ({expected})"
+            )
+        image = Image.frombytes("RGBA", (src_w, src_h), rgba_bytes)
+        r, g, b, a = image.split()
+        # Pre-multiply RGB by alpha (ImageChops.multiply = floor(x*y/255)).
+        r_pm = ImageChops.multiply(r, a)
+        g_pm = ImageChops.multiply(g, a)
+        b_pm = ImageChops.multiply(b, a)
+        payload = Image.merge("RGBA", (b_pm, g_pm, r_pm, a)).tobytes()
+        # Zero whole buffer first so old subregion data doesn't leak
+        # into the next attach (e.g. previous slide's bigger glyph
+        # bbox bleeding around the current smaller one).
+        slot.mmap[: slot.dumb_size] = b"\x00" * slot.dumb_size
+        # Write the subregion's rows at the buffer's row pitch.
+        src_row_bytes = src_w * 4
+        for y in range(src_h):
+            dst_offset = y * slot.dumb_pitch
+            src_offset = y * src_row_bytes
+            slot.mmap[dst_offset : dst_offset + src_row_bytes] = (
+                payload[src_offset : src_offset + src_row_bytes]
+            )
+
+    def _stage_plane_detach(self, slot: _PlaneSlot) -> None:
+        """Stage CRTC_ID=0, FB_ID=0 to disable the plane. Other
+        properties are irrelevant when detached but harmless to leave
+        at last-known values."""
+        self._stage_plane_props(slot, fb_id=0, crtc_id=0)
+
+    def _stage_plane_props(
+        self,
+        slot: _PlaneSlot,
+        *,
+        fb_id: int | None = None,
+        crtc_id: int | None = None,
+        crtc_x: int | None = None,
+        crtc_y: int | None = None,
+        crtc_w: int | None = None,
+        crtc_h: int | None = None,
+        src_x: int | None = None,
+        src_y: int | None = None,
+        src_w: int | None = None,
+        src_h: int | None = None,
+        alpha: int | None = None,
+        zpos: int | None = None,
+        pixel_blend_mode: int | None = None,
+    ) -> None:
+        """Generic property-staging helper. Each kwarg maps to a DRM
+        plane property id (looked up in slot.props at allocation
+        time). None = leave unchanged."""
+        mapping = (
+            ("FB_ID", fb_id),
+            ("CRTC_ID", crtc_id),
+            ("CRTC_X", crtc_x),
+            ("CRTC_Y", crtc_y),
+            ("CRTC_W", crtc_w),
+            ("CRTC_H", crtc_h),
+            ("SRC_X", src_x),
+            ("SRC_Y", src_y),
+            ("SRC_W", src_w),
+            ("SRC_H", src_h),
+            ("alpha", alpha),
+            ("zpos", zpos),
+            ("pixel blend mode", pixel_blend_mode),
+        )
+        for name, value in mapping:
+            if value is None:
+                continue
+            prop_id = slot.props.get(name)
+            if prop_id is None:
+                # Optional props (alpha, zpos) — log once if requested
+                # but missing; required props would have failed at
+                # allocation.
+                log.debug(
+                    "DRM: plane %d has no property %r; skipping stage",
+                    slot.plane_id, name,
+                )
+                continue
+            self._pending_props[(slot.plane_id, prop_id)] = int(value)
+
+    # --- legacy single-overlay composite path ---
 
     def render_composite(
         self,
