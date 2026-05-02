@@ -28,6 +28,7 @@ from openmarquee.motion import (
     compose_motion_frame,
     compute_phase,
     load_motion_background,
+    prerender_layer_bitmaps,
     slide_has_motion,
 )
 
@@ -432,6 +433,104 @@ def test_compose_motion_frame_uses_background_cache_when_provided():
     # Sample a point with no text (default box has 10 % margin, so
     # corners are background-only): green wins.
     assert frame.getpixel((1, 1)) == (0, 255, 0)
+
+
+def test_prerender_layer_bitmaps_returns_list_parallel_to_text_layers():
+    slide = TextSlide(
+        name="s",
+        text_layers=[
+            TextLayer(text="A"),
+            TextLayer(text="B"),
+            TextLayer(text="C"),
+        ],
+    )
+    bitmaps = prerender_layer_bitmaps(slide, 64, 32)
+    assert len(bitmaps) == 3
+    for bm in bitmaps:
+        assert bm is not None
+        assert bm.mode == "RGBA"
+        assert bm.size == (64, 32)
+
+
+def test_prerender_layer_bitmaps_skips_hidden_layers():
+    """Hidden layers cost ~8 MB / layer at 1080 p RGBA — wasted memory
+    if we pre-rasterize them just for the composer's hidden-layer
+    skip path to discard the result. Skip them at prerender time and
+    leave a None placeholder; the composer's hidden check fires
+    first, so the placeholder is never accessed."""
+    slide = TextSlide(
+        name="s",
+        text_layers=[
+            TextLayer(text="A", visible=True),
+            TextLayer(text="B", visible=False),
+            TextLayer(text="C", visible=True),
+        ],
+    )
+    bitmaps = prerender_layer_bitmaps(slide, 64, 32)
+    assert len(bitmaps) == 3
+    assert bitmaps[0] is not None
+    assert bitmaps[1] is None
+    assert bitmaps[2] is not None
+
+
+def test_compose_motion_frame_uses_layer_bitmap_cache_when_provided():
+    """If a cache parallel to text_layers is supplied, the composer
+    pulls layer bitmaps from it instead of re-rasterizing each tick.
+    Verify by handing in a fully-magenta cache entry — if the cache
+    is honored, the composed frame is magenta everywhere (a fresh
+    rasterize from "X" text would produce mostly-transparent + a
+    few glyph pixels, which alpha-composites to mostly-black on
+    the configured black background)."""
+    slide = TextSlide(
+        name="s",
+        background_color="#000000",
+        text_layers=[TextLayer(text="X", motion="static")],
+    )
+    # Fill the entire cache entry with opaque magenta so the test
+    # doesn't couple to TextLayer's default-box dims (if the box
+    # default ever changes, a partial-fill cache could miss the
+    # sampled pixel — full-fill stays robust).
+    cache_entry = Image.new("RGBA", (64, 32), (255, 0, 255, 255))
+    frame = compose_motion_frame(
+        slide, 0.0, 64, 32, layer_bitmap_cache=[cache_entry],
+    )
+    # Center pixel should be magenta — proves the cache fed the composer.
+    assert frame.getpixel((32, 16)) == (255, 0, 255)
+
+
+def test_compose_motion_frame_falls_through_when_cache_size_mismatch():
+    """Defensive: if the cache entry's size doesn't match the requested
+    width/height (e.g. cache built for a different renderer), fall
+    through to a fresh rasterize rather than rendering at the wrong
+    dims. Out-of-band callers + future re-renderer surfaces benefit
+    from this guard."""
+    slide = TextSlide(
+        name="s",
+        background_color="#000000",
+        text_layers=[TextLayer(text="HELLO", motion="static")],
+    )
+    # Cache built for 100x50 — but composing for 64×32. Should be ignored.
+    wrong_cache = [Image.new("RGBA", (100, 50), (0, 255, 0, 255))]
+    frame = compose_motion_frame(
+        slide, 0.0, 64, 32, layer_bitmap_cache=wrong_cache,
+    )
+    # The bright-green cache should NOT show through. Center pixel is
+    # whatever a fresh rasterize produces — not green.
+    assert frame.getpixel((32, 16)) != (0, 255, 0)
+
+
+def test_compose_motion_frame_cache_cold_call_still_works():
+    """No cache → composer falls through to render_layer_to_rgba. The
+    cold-call path is what tests + ad-hoc callers exercise; it must
+    keep working unchanged from the pre-cache shape."""
+    slide = TextSlide(
+        name="s",
+        background_color="#001122",
+        text_layers=[TextLayer(text="X", motion="ticker")],
+    )
+    frame = compose_motion_frame(slide, 0.0, 64, 32)  # no caches
+    assert frame.mode == "RGB"
+    assert frame.size == (64, 32)
 
 
 def test_load_motion_background_returns_solid_when_no_image():

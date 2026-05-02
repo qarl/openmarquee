@@ -338,6 +338,35 @@ def _box_px(layer: "TextLayer", width: int, height: int) -> tuple[int, int, int,
     return (bx, by, bw, bh)
 
 
+def prerender_layer_bitmaps(
+    slide: "TextSlide", width: int, height: int
+) -> list[Image.Image | None]:
+    """Rasterize each visible layer's text once into a slide-sized RGBA
+    bitmap, parallel to `slide.text_layers`. Hidden layers get `None`
+    in their slot so the composer's hidden-layer skip path doesn't
+    consult the cache at all. Used by `_play_motion_slide` at slide
+    entry so the per-tick path skips PIL's text rasterization
+    entirely — animated layers just transform + alpha-composite the
+    cached bitmap, static layers paste it as-is.
+
+    The text doesn't change during a slide's playback (auto-mode
+    slides go through a separate path; motion's job is to MOVE the
+    pixels, not redraw them), so the cache stays valid for the
+    slide's full duration. Cost shifts from per-tick to per-slide,
+    which is the difference between 30 N rasterizations / sec and 1
+    rasterization / slide-entry. At 1080 p with multiple animated
+    layers, that's the difference between blowing the 33 ms tick
+    budget and trivially fitting it.
+    """
+    out: list[Image.Image | None] = []
+    for layer in getattr(slide, "text_layers", []):
+        if not getattr(layer, "visible", True):
+            out.append(None)
+            continue
+        out.append(render_layer_to_rgba(layer, width, height))
+    return out
+
+
 def load_motion_background(
     slide: "TextSlide",
     width: int,
@@ -372,18 +401,23 @@ def compose_motion_frame(
     height: int,
     read_asset: Callable[["UUID"], bytes] | None = None,
     background_cache: Image.Image | None = None,
+    layer_bitmap_cache: list[Image.Image] | None = None,
 ) -> Image.Image:
     """Render an RGB frame for `slide` at `elapsed_s` on the shared
     global clock. Caches background across ticks of the same slide via
-    `background_cache` (pass the prior frame's `.background_cache`
-    attribute back in — see `_play_motion_slide` in playback.py).
+    `background_cache` AND per-layer text rasterizations via
+    `layer_bitmap_cache` — pass both in from `_play_motion_slide`'s
+    slide-entry hooks so the per-tick path is just composite + motion.
 
-    Per-frame work, sign-native (128×96), one animated layer:
-    layer rasterize ~1 ms + motion transform ~0.5 ms + composite ~0.5 ms
-    ≈ 2 ms on Pi Zero 2 W. 30 fps target = 33 ms budget; comfortable.
+    Per-frame work with both caches warm, sign-native (128×96), one
+    animated layer:
+        ~0.3 ms motion transform + ~0.5 ms alpha composite ≈ <1 ms
+        on Pi Zero 2 W. 30 fps target = 33 ms budget; trivial.
 
-    1080 p sign-native is the bench-deferred path (step 3b, pending Pi
-    access from home).
+    Without `layer_bitmap_cache` (cold-call), each visible layer
+    re-rasterizes via PIL each frame (~1 ms at 128×96, ~5-10 ms at
+    1080 p). That cold-call shape is fine for tests + ad-hoc renders;
+    the playback loop's hot path always passes the cache.
     """
     if background_cache is not None and background_cache.size == (width, height):
         base = background_cache.copy()
@@ -393,10 +427,23 @@ def compose_motion_frame(
         base = base.convert("RGBA")
 
     slide_id = str(getattr(slide, "id", "?"))
-    for idx, layer in enumerate(getattr(slide, "text_layers", [])):
+    layers = getattr(slide, "text_layers", [])
+    for idx, layer in enumerate(layers):
         if not getattr(layer, "visible", True):
             continue
-        layer_rgba = render_layer_to_rgba(layer, width, height)
+        # Cache hit: reuse the pre-rasterized RGBA. Defensive
+        # `idx < len(...)` and `is not None` so a cache built before a
+        # hot-edit (which PlaybackLoop currently never does, but tests
+        # + future callers might) falls through to a fresh rasterize
+        # rather than IndexError- or AttributeError-ing.
+        cached: Image.Image | None = None
+        if layer_bitmap_cache is not None and idx < len(layer_bitmap_cache):
+            entry = layer_bitmap_cache[idx]
+            if entry is not None and entry.size == (width, height):
+                cached = entry
+        layer_rgba = cached if cached is not None else render_layer_to_rgba(
+            layer, width, height
+        )
         motion = getattr(layer, "motion", "static") or "static"
         if motion != "static":
             box_px = _box_px(layer, width, height)

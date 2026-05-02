@@ -51,6 +51,7 @@ from openmarquee.content import ContentItem
 from openmarquee.motion import (
     compose_motion_frame,
     load_motion_background,
+    prerender_layer_bitmaps,
     slide_has_motion,
 )
 from openmarquee.rendering import Renderer
@@ -549,6 +550,18 @@ class PlaybackLoop:
             )
         except Exception:
             background_cache = None
+        # Pre-rasterize each layer's text once at slide entry. Motion
+        # transforms (translate / scale / alpha-modulate) are pixel
+        # operations on this bitmap — no per-tick PIL text rendering.
+        # That keeps the 30 Hz tick under the 33 ms budget at 1080 p
+        # sign-native, where re-rasterizing N layers per frame would
+        # otherwise blow the budget on its own.
+        try:
+            layer_bitmap_cache: list[Image.Image] | None = prerender_layer_bitmaps(
+                item, self._renderer.width, self._renderer.height,
+            )
+        except Exception:
+            layer_bitmap_cache = None
         while True:
             assert self._stop_event is not None
             assert self._pause_event is not None
@@ -563,6 +576,7 @@ class PlaybackLoop:
                     self._renderer.height,
                     read_asset=self._read_asset,
                     background_cache=background_cache,
+                    layer_bitmap_cache=layer_bitmap_cache,
                 )
             except Exception:
                 log.exception("playback: compose_motion_frame failed for %s", item.id)
