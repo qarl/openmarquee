@@ -371,14 +371,30 @@ const LAYER_GROUP_TEMPLATE = `
                 <input type="range" class="om-range field-font-size" min="8" max="100" step="0.5">
             </label>
         </div>
-        <div class="om-row" style="justify-content: space-between; align-items: center; gap: 8px;">
-            <div class="editor-segmented field-motion-segmented" role="group" aria-label="motion">
-                <button type="button" data-value="static" aria-pressed="true">Static</button>
-                <button type="button" data-value="scroll" aria-pressed="false">Scroll</button>
-                <button type="button" data-value="pulse" aria-pressed="false">Pulse</button>
-            </div>
-            <input type="hidden" class="field-motion" value="static">
-            <button type="button" class="om-btn ghost editor-layer-delete" aria-label="delete layer" title="delete layer" style="color: var(--om-bad);">🗑</button>
+        <div class="om-row" style="gap: 10px; align-items: end;">
+            <label class="om-field" style="flex: 1;">
+                <span>Motion</span>
+                <select class="om-select field-motion" aria-label="layer motion">
+                    <option value="static">Static</option>
+                    <option value="ticker">Ticker (horizontal travel)</option>
+                    <option value="breathe">Breathe (scale)</option>
+                    <option value="pulse">Pulse (alpha)</option>
+                    <option value="bounce">Bounce (vertical bob)</option>
+                    <option value="shake">Shake (jitter)</option>
+                    <option value="blink">Blink (on/off)</option>
+                </select>
+            </label>
+            <button type="button" class="om-btn ghost editor-layer-delete" aria-label="delete layer" title="delete layer" style="color: var(--om-bad); align-self: end; margin-bottom: 1px;">🗑</button>
+        </div>
+        <div class="om-row field-motion-controls" style="gap: 10px; align-items: end;" hidden>
+            <label class="om-field" style="flex: 1;">
+                <span>Intensity <span class="field-motion-intensity-display"></span></span>
+                <input type="range" class="om-range field-motion-intensity" min="0" max="100" step="1" value="50">
+            </label>
+            <label class="om-field" style="flex: 1;">
+                <span>Phase <span class="field-motion-phase-display"></span></span>
+                <input type="range" class="om-range field-motion-phase" min="0" max="1" step="0.01" value="0">
+            </label>
         </div>
     </div>
 `;
@@ -398,6 +414,8 @@ function defaultLayer() {
         autoMode: null,
         autoFormat: null,
         motion: "static",
+        motionIntensity: 50,
+        motionPhase: 0,
         visible: true,
         box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
     };
@@ -665,6 +683,31 @@ export function mountEditor(
         layer.autoFormat = layer.autoMode ? fmtEl.value || null : null;
         const motionEl = groupEl.querySelector(".field-motion");
         layer.motion = motionEl ? motionEl.value || "static" : "static";
+        const intensityEl = groupEl.querySelector(".field-motion-intensity");
+        const parsedIntensity = Number(intensityEl?.value);
+        if (Number.isFinite(parsedIntensity)) {
+            layer.motionIntensity = Math.max(0, Math.min(100, Math.round(parsedIntensity)));
+        }
+        const phaseEl = groupEl.querySelector(".field-motion-phase");
+        const parsedPhase = Number(phaseEl?.value);
+        if (Number.isFinite(parsedPhase)) {
+            layer.motionPhase = Math.max(0, Math.min(1, parsedPhase));
+        }
+        // Update the inline numeric readouts next to the slider labels.
+        const intensityDisplayEl = groupEl.querySelector(".field-motion-intensity-display");
+        if (intensityDisplayEl) {
+            intensityDisplayEl.textContent = `(${layer.motionIntensity ?? 50})`;
+        }
+        const phaseDisplayEl = groupEl.querySelector(".field-motion-phase-display");
+        if (phaseDisplayEl) {
+            phaseDisplayEl.textContent = `(${(layer.motionPhase ?? 0).toFixed(2)})`;
+        }
+        // Hide the intensity+phase row when motion=static — those knobs
+        // have no meaning without a non-static effect picked.
+        const motionControlsEl = groupEl.querySelector(".field-motion-controls");
+        if (motionControlsEl) {
+            motionControlsEl.hidden = (layer.motion ?? "static") === "static";
+        }
         // The header chrome (name/meta/thumbnail) drives off layer state;
         // refresh it so an in-card edit immediately mirrors up to the row.
         refreshLayerHeader(groupEl, layer, arrayIdx);
@@ -707,10 +750,22 @@ export function mountEditor(
         const autoFormatEl = groupEl.querySelector(".field-auto-format");
         const autoModeHintEl = groupEl.querySelector(".field-auto-mode-hint");
         const motionEl = groupEl.querySelector(".field-motion");
-        const motionSegEl = groupEl.querySelector(".field-motion-segmented");
+        const motionIntensityEl = groupEl.querySelector(".field-motion-intensity");
+        const motionPhaseEl = groupEl.querySelector(".field-motion-phase");
 
-        for (const el of [textEl, layerNameEl, textColorEl, fontSizeEl, fontFamilyEl]) {
+        for (const el of [
+            textEl, layerNameEl, textColorEl, fontSizeEl, fontFamilyEl,
+            motionEl, motionIntensityEl, motionPhaseEl,
+        ]) {
+            if (!el) continue;
+            // <select> fires "change" on commit; <input> fires "input"
+            // continuously while the operator drags or types. Bind both
+            // so each control flushes the layer state on its native
+            // event without needing an explicit autoSave?.kick() (the
+            // hidden-input pattern that needed kicks doesn't apply
+            // here — these are real form controls).
             el.addEventListener("input", () => syncLayerFromForm(groupEl));
+            el.addEventListener("change", () => syncLayerFromForm(groupEl));
             // Selecting any field in this layer makes this the active
             // layer (drives the box overlay).
             el.addEventListener("focus", () => {
@@ -746,18 +801,6 @@ export function mountEditor(
         });
         autoFormatEl.addEventListener("change", () => syncLayerFromForm(groupEl));
 
-        // Motion segmented control. Same hidden-input pattern; same
-        // explicit autoSave kick (see autoModeSeg comment above).
-        motionSegEl.querySelectorAll("button").forEach((btn) => {
-            btn.addEventListener("click", () => {
-                const value = btn.dataset.value;
-                if (motionEl.value === value) return;
-                motionEl.value = value;
-                refreshSegmentedPressed(motionSegEl, value);
-                syncLayerFromForm(groupEl);
-                autoSave?.kick();
-            });
-        });
 
         // Quick-color swatches set this layer's text color (the BG color
         // is slide-level and lives in the Background-source card —
@@ -900,6 +943,18 @@ export function mountEditor(
         const preview = (layer.text || "").slice(0, 8) || "—";
         thumbEl.textContent = preview;
         thumbEl.style.color = layer.textColor || "#FFFFFF";
+        // CSS-keyframes preview of the picked motion effect — visually
+        // approximate, not pixel-identical to the device renderer (per
+        // docs/text-layer-motion-spec.md Q3 lock). The thumb is small
+        // (36×18) so the animation reads as "yes, this layer animates"
+        // rather than as a faithful simulation.
+        for (const cls of [...thumbEl.classList]) {
+            if (cls.startsWith("motion-")) thumbEl.classList.remove(cls);
+        }
+        const motionForThumb = layer.motion || "static";
+        if (motionForThumb !== "static") {
+            thumbEl.classList.add(`motion-${motionForThumb}`);
+        }
 
         const visible = layer.visible !== false;
         groupEl.classList.toggle("editor-layer-hidden", !visible);
@@ -955,10 +1010,18 @@ export function mountEditor(
             layer.autoMode || "",
         );
         motionEl.value = layer.motion || "static";
-        refreshSegmentedPressed(
-            groupEl.querySelector(".field-motion-segmented"),
-            layer.motion || "static",
-        );
+        const intensityEl = groupEl.querySelector(".field-motion-intensity");
+        const phaseEl = groupEl.querySelector(".field-motion-phase");
+        const intensityVal = layer.motionIntensity ?? 50;
+        const phaseVal = layer.motionPhase ?? 0;
+        intensityEl.value = String(intensityVal);
+        phaseEl.value = String(phaseVal);
+        groupEl.querySelector(".field-motion-intensity-display").textContent =
+            `(${intensityVal})`;
+        groupEl.querySelector(".field-motion-phase-display").textContent =
+            `(${Number(phaseVal).toFixed(2)})`;
+        groupEl.querySelector(".field-motion-controls").hidden =
+            (layer.motion || "static") === "static";
         refreshLayerHeader(groupEl, layer, idx);
 
         return groupEl;
@@ -1222,6 +1285,8 @@ export function mountEditor(
             auto_mode: layer.autoMode || null,
             auto_format: layer.autoMode ? layer.autoFormat || null : null,
             motion: layer.motion || "static",
+            motion_intensity: layer.motionIntensity ?? 50,
+            motion_phase: layer.motionPhase ?? 0,
             visible: layer.visible !== false,
             box: { ...layer.box },
         }));
@@ -1344,6 +1409,8 @@ export function mountEditor(
             autoMode: wire?.auto_mode || null,
             autoFormat: wire?.auto_format || null,
             motion: wire?.motion || "static",
+            motionIntensity: wire?.motion_intensity ?? 50,
+            motionPhase: wire?.motion_phase ?? 0,
             visible: wire?.visible !== false,
             box:
                 wire?.box && typeof wire.box === "object"

@@ -1139,9 +1139,9 @@ describe("mountEditor — submit flow", () => {
         expect(payload.text_layers[1].text).toBe("TOP");
     });
 
-    it("segmented controls (motion / dynamic-source) explicitly kick autosave (qarl ask #3 root cause)", async () => {
-        // Bug QA flagged 2026-05-01: thumbnails don't update on layer-
-        // motion edits. Root cause: segmented controls drive a HIDDEN
+    it("auto-mode segmented control explicitly kicks autosave (qarl ask #3 root cause)", async () => {
+        // Bug QA flagged 2026-05-01: thumbnails don't update on layer
+        // edits. Root cause: segmented controls drive a HIDDEN
         // input via `.value = …`, which dispatches no event — so
         // attachAutoSave's form-level input/change listener never sees
         // the change and the debounce never schedules. Real-world: tile
@@ -1174,9 +1174,13 @@ describe("mountEditor — submit flow", () => {
                 text_layers: [{ text: "X" }],
             });
 
-            // Click motion-segmented "Scroll" button.
+            // Click auto-mode-segmented "time" button (still uses the
+            // hidden-input pattern that needs the explicit kick — motion
+            // moved to a <select> in step 2 of the motion spec, so it
+            // dispatches change events natively and no longer needs this
+            // regression coverage).
             container
-                .querySelector('.field-motion-segmented button[data-value="scroll"]')
+                .querySelector('.field-auto-mode-segmented button[data-value="time"]')
                 .click();
 
             // Advance past the 900ms autosave debounce.
@@ -1189,7 +1193,7 @@ describe("mountEditor — submit flow", () => {
             expect(onSaveExisting).toHaveBeenCalled();
             const payload =
                 onSaveExisting.mock.calls[onSaveExisting.mock.calls.length - 1][1];
-            expect(payload.text_layers[0].motion).toBe("scroll");
+            expect(payload.text_layers[0].auto_mode).toBe("time");
         } finally {
             vi.useRealTimers();
         }
@@ -1358,7 +1362,7 @@ describe("mountEditor — submit flow", () => {
         expect(onSave.mock.calls[0][0].text_layers[0].visible).toBe(false);
     });
 
-    it("motion segmented control rides through to the save payload", async () => {
+    it("motion select rides through to the save payload", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue({ id: "x" });
@@ -1367,14 +1371,105 @@ describe("mountEditor — submit flow", () => {
         container.querySelector(".field-text").value = "RUN";
         container.querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
 
-        // Default motion: static. Pick Scroll.
-        container
-            .querySelector('.field-motion-segmented button[data-value="scroll"]')
-            .click();
-        expect(container.querySelector(".field-motion").value).toBe("scroll");
+        // Default motion: static. Pick the new "ticker" value (post-
+        // 2026-05-02 motion-spec rename of "scroll" → "ticker") via the
+        // <select> that replaced the 3-button segmented control.
+        const motionSelect = container.querySelector(".field-motion");
+        motionSelect.value = "ticker";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(motionSelect.value).toBe("ticker");
 
         await handle.flushAutoSave();
-        expect(onSave.mock.calls[0][0].text_layers[0].motion).toBe("scroll");
+        expect(onSave.mock.calls[0][0].text_layers[0].motion).toBe("ticker");
+    });
+
+    it("motion intensity + phase ride through to the save payload", async () => {
+        // Step 2 of the motion spec adds two operator-facing knobs
+        // (intensity 0-100 default 50, phase 0.0-1.0 default 0.0). They
+        // ride to the wire as `motion_intensity` / `motion_phase`.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "x" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+
+        container.querySelector(".field-text").value = "RUN";
+        container.querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
+
+        // Switch to a non-static effect so the intensity+phase row
+        // shows. Intensity default is 50 — bump to 80. Phase default
+        // is 0 — bump to 0.25.
+        const motionSelect = container.querySelector(".field-motion");
+        motionSelect.value = "breathe";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+
+        const intensityEl = container.querySelector(".field-motion-intensity");
+        intensityEl.value = "80";
+        intensityEl.dispatchEvent(new Event("input", { bubbles: true }));
+
+        const phaseEl = container.querySelector(".field-motion-phase");
+        phaseEl.value = "0.25";
+        phaseEl.dispatchEvent(new Event("input", { bubbles: true }));
+
+        await handle.flushAutoSave();
+        const layer = onSave.mock.calls[0][0].text_layers[0];
+        expect(layer.motion).toBe("breathe");
+        expect(layer.motion_intensity).toBe(80);
+        expect(layer.motion_phase).toBe(0.25);
+    });
+
+    it("motion intensity + phase row hides when motion=static", async () => {
+        // intensity/phase have no meaning without a non-static effect
+        // picked. Test that toggling motion=static hides the row.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
+
+        const motionSelect = container.querySelector(".field-motion");
+        const controlsRow = container.querySelector(".field-motion-controls");
+        // Default state: motion=static, controls hidden.
+        expect(motionSelect.value).toBe("static");
+        expect(controlsRow.hidden).toBe(true);
+
+        // Pick a non-static effect → controls row becomes visible.
+        motionSelect.value = "ticker";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(controlsRow.hidden).toBe(false);
+
+        // Back to static → controls row hides again.
+        motionSelect.value = "static";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(controlsRow.hidden).toBe(true);
+    });
+
+    it("motion thumb gets a motion-{kind} class for CSS keyframes preview", async () => {
+        // Spec docs/text-layer-motion-spec.md (Q3 lock): editor preview
+        // uses CSS keyframes. The implementation tags the layer thumb
+        // with a `motion-{kind}` class; styles.css has the @keyframes.
+        // Test the class hookup, not the CSS itself (jsdom can't render
+        // animation; the class+keyframe contract is what matters).
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        mountEditor(container, { width: 128, height: 96, onSave: vi.fn() });
+        const thumbEl = container.querySelector(".editor-layer-thumb");
+
+        // Default motion=static → no motion-* class.
+        expect([...thumbEl.classList].some((c) => c.startsWith("motion-"))).toBe(false);
+
+        const motionSelect = container.querySelector(".field-motion");
+        motionSelect.value = "breathe";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(thumbEl.classList.contains("motion-breathe")).toBe(true);
+
+        // Switching effects swaps the class, doesn't accumulate.
+        motionSelect.value = "ticker";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(thumbEl.classList.contains("motion-breathe")).toBe(false);
+        expect(thumbEl.classList.contains("motion-ticker")).toBe(true);
+
+        // Back to static → all motion-* classes drop.
+        motionSelect.value = "static";
+        motionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+        expect([...thumbEl.classList].some((c) => c.startsWith("motion-"))).toBe(false);
     });
 
     it("layer name input drives the header name display + saves on the wire", async () => {
