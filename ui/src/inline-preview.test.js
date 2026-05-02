@@ -190,6 +190,17 @@ describe("mountInlinePreview", () => {
         vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
             fakeCtx,
         );
+        // JSDOM doesn't run layout, so getBoundingClientRect returns
+        // 0×0 by default — sizeCanvasToStage (inline-preview.js)
+        // would bail and recurse via rAF forever, drawSlot never
+        // fires, and ctx.beginPath never gets called. Stub the rect
+        // to a non-zero size so the render path actually runs in
+        // jsdom (QA caught this gap on the verifier — 71e513f works
+        // in real Chromium but the unit test needs the stub).
+        vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+            x: 0, y: 0, top: 0, left: 0, right: 416, bottom: 234,
+            width: 416, height: 234, toJSON: () => ({}),
+        });
 
         const container = document.createElement("div");
         document.body.appendChild(container);
