@@ -15,11 +15,11 @@ The DRM/KMS path side-steps both:
   bytes go straight into the display buffer (no syscall copy
   beyond what mmap already established at __enter__).
 - Multi-plane composition: text on one plane, video on another,
-  GPU composites at scanout. Phase 1 of this file implements the
-  single-primary-plane path (legacy SETCRTC) — feature-parity
-  with HDMIRenderer's fb0 path. Phase 2 (atomic commit + overlay
-  plane) ships next; the ctypes layer here is set up to reach
-  it.
+  GPU composites at scanout. Phase 2a-1 of this file lands the
+  atomic commit infrastructure on a single primary plane —
+  feature-parity with HDMIRenderer's fb0 path, but the path is
+  now property-driven so the next commit can add an overlay
+  plane (text-with-alpha) without reshaping anything.
 
 This is a Linux-only module; tests on the Mac side mock the
 ioctls. The Pi-side live-fire is the canonical correctness check.
@@ -57,6 +57,10 @@ def _IOC(dir_: int, type_: int, nr: int, size: int) -> int:
 
 def _IOWR(type_: int, nr: int, size: int) -> int:
     return _IOC(_IOC_READ | _IOC_WRITE, type_, nr, size)
+
+
+def _IOW(type_: int, nr: int, size: int) -> int:
+    return _IOC(_IOC_WRITE, type_, nr, size)
 
 
 _DRM_TYPE = ord("d")
@@ -188,18 +192,105 @@ class _DrmModeCrtc(ctypes.Structure):
     ]
 
 
+# Atomic / universal-planes structs — used by phase 2a (atomic mode-set,
+# multi-plane composition). The atomic API is property-driven: every
+# CRTC/connector/plane has named properties addressed by id, and an
+# atomic commit is a flat list of (object_id, prop_id, value) tuples
+# that the kernel applies (or rejects) as a single transaction.
+
+class _DrmSetClientCap(ctypes.Structure):
+    _fields_ = [
+        ("capability", ctypes.c_uint64),
+        ("value", ctypes.c_uint64),
+    ]
+
+
+class _DrmModeGetPlaneRes(ctypes.Structure):
+    _fields_ = [
+        ("plane_id_ptr", ctypes.c_uint64),
+        ("count_planes", ctypes.c_uint32),
+    ]
+
+
+class _DrmModeGetPlane(ctypes.Structure):
+    _fields_ = [
+        ("plane_id", ctypes.c_uint32),
+        ("crtc_id", ctypes.c_uint32),
+        ("fb_id", ctypes.c_uint32),
+        ("possible_crtcs", ctypes.c_uint32),
+        ("gamma_size", ctypes.c_uint32),
+        ("count_format_types", ctypes.c_uint32),
+        ("format_type_ptr", ctypes.c_uint64),
+    ]
+
+
+class _DrmModeObjGetProperties(ctypes.Structure):
+    _fields_ = [
+        ("props_ptr", ctypes.c_uint64),
+        ("prop_values_ptr", ctypes.c_uint64),
+        ("count_props", ctypes.c_uint32),
+        ("obj_id", ctypes.c_uint32),
+        ("obj_type", ctypes.c_uint32),
+    ]
+
+
+class _DrmModeGetProperty(ctypes.Structure):
+    _fields_ = [
+        ("values_ptr", ctypes.c_uint64),
+        ("enum_blob_ptr", ctypes.c_uint64),
+        ("prop_id", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("name", ctypes.c_char * 32),
+        ("count_values", ctypes.c_uint32),
+        ("count_enum_blobs", ctypes.c_uint32),
+    ]
+
+
+class _DrmModeAtomic(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("count_objs", ctypes.c_uint32),
+        ("objs_ptr", ctypes.c_uint64),
+        ("count_props_ptr", ctypes.c_uint64),
+        ("props_ptr", ctypes.c_uint64),
+        ("prop_values_ptr", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64),
+        ("user_data", ctypes.c_uint64),
+    ]
+
+
+class _DrmModeCreateBlob(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_uint64),
+        ("length", ctypes.c_uint32),
+        ("blob_id", ctypes.c_uint32),
+    ]
+
+
+class _DrmModeDestroyBlob(ctypes.Structure):
+    _fields_ = [("blob_id", ctypes.c_uint32)]
+
+
 # --- ioctl numbers ---
 
-DRM_IOCTL_MODE_GETRESOURCES = _IOWR(_DRM_TYPE, 0xA0, ctypes.sizeof(_DrmModeRes))
-DRM_IOCTL_MODE_GETCRTC      = _IOWR(_DRM_TYPE, 0xA1, ctypes.sizeof(_DrmModeCrtc))
-DRM_IOCTL_MODE_SETCRTC      = _IOWR(_DRM_TYPE, 0xA2, ctypes.sizeof(_DrmModeCrtc))
-DRM_IOCTL_MODE_GETENCODER   = _IOWR(_DRM_TYPE, 0xA6, ctypes.sizeof(_DrmModeGetEncoder))
-DRM_IOCTL_MODE_GETCONNECTOR = _IOWR(_DRM_TYPE, 0xA7, ctypes.sizeof(_DrmModeGetConnector))
-DRM_IOCTL_MODE_RMFB         = _IOWR(_DRM_TYPE, 0xAF, ctypes.sizeof(ctypes.c_uint32))
-DRM_IOCTL_MODE_CREATE_DUMB  = _IOWR(_DRM_TYPE, 0xB2, ctypes.sizeof(_DrmModeCreateDumb))
-DRM_IOCTL_MODE_MAP_DUMB     = _IOWR(_DRM_TYPE, 0xB3, ctypes.sizeof(_DrmModeMapDumb))
-DRM_IOCTL_MODE_DESTROY_DUMB = _IOWR(_DRM_TYPE, 0xB4, ctypes.sizeof(_DrmModeDestroyDumb))
-DRM_IOCTL_MODE_ADDFB2       = _IOWR(_DRM_TYPE, 0xB8, ctypes.sizeof(_DrmModeFbCmd2))
+DRM_IOCTL_SET_CLIENT_CAP        = _IOW (_DRM_TYPE, 0x0D, ctypes.sizeof(_DrmSetClientCap))
+DRM_IOCTL_MODE_GETRESOURCES     = _IOWR(_DRM_TYPE, 0xA0, ctypes.sizeof(_DrmModeRes))
+DRM_IOCTL_MODE_GETCRTC          = _IOWR(_DRM_TYPE, 0xA1, ctypes.sizeof(_DrmModeCrtc))
+DRM_IOCTL_MODE_SETCRTC          = _IOWR(_DRM_TYPE, 0xA2, ctypes.sizeof(_DrmModeCrtc))
+DRM_IOCTL_MODE_GETENCODER       = _IOWR(_DRM_TYPE, 0xA6, ctypes.sizeof(_DrmModeGetEncoder))
+DRM_IOCTL_MODE_GETCONNECTOR     = _IOWR(_DRM_TYPE, 0xA7, ctypes.sizeof(_DrmModeGetConnector))
+DRM_IOCTL_MODE_GETPROPERTY      = _IOWR(_DRM_TYPE, 0xAA, ctypes.sizeof(_DrmModeGetProperty))
+DRM_IOCTL_MODE_RMFB             = _IOWR(_DRM_TYPE, 0xAF, ctypes.sizeof(ctypes.c_uint32))
+DRM_IOCTL_MODE_CREATE_DUMB      = _IOWR(_DRM_TYPE, 0xB2, ctypes.sizeof(_DrmModeCreateDumb))
+DRM_IOCTL_MODE_MAP_DUMB         = _IOWR(_DRM_TYPE, 0xB3, ctypes.sizeof(_DrmModeMapDumb))
+DRM_IOCTL_MODE_DESTROY_DUMB     = _IOWR(_DRM_TYPE, 0xB4, ctypes.sizeof(_DrmModeDestroyDumb))
+DRM_IOCTL_MODE_GETPLANERESOURCES= _IOWR(_DRM_TYPE, 0xB5, ctypes.sizeof(_DrmModeGetPlaneRes))
+DRM_IOCTL_MODE_GETPLANE         = _IOWR(_DRM_TYPE, 0xB6, ctypes.sizeof(_DrmModeGetPlane))
+DRM_IOCTL_MODE_ADDFB2           = _IOWR(_DRM_TYPE, 0xB8, ctypes.sizeof(_DrmModeFbCmd2))
+DRM_IOCTL_MODE_OBJ_GETPROPERTIES= _IOWR(_DRM_TYPE, 0xB9, ctypes.sizeof(_DrmModeObjGetProperties))
+DRM_IOCTL_MODE_ATOMIC           = _IOWR(_DRM_TYPE, 0xBC, ctypes.sizeof(_DrmModeAtomic))
+DRM_IOCTL_MODE_CREATEPROPBLOB   = _IOWR(_DRM_TYPE, 0xBD, ctypes.sizeof(_DrmModeCreateBlob))
+DRM_IOCTL_MODE_DESTROYPROPBLOB  = _IOWR(_DRM_TYPE, 0xBE, ctypes.sizeof(_DrmModeDestroyBlob))
 
 
 # --- DRM constants ---
@@ -215,7 +306,32 @@ def _fourcc(a: str, b: str, c: str, d: str) -> int:
 
 
 DRM_FORMAT_XRGB8888 = _fourcc("X", "R", "2", "4")
+DRM_FORMAT_ARGB8888 = _fourcc("A", "R", "2", "4")
 DRM_FORMAT_RGB565   = _fourcc("R", "G", "1", "6")
+
+
+# Client capability flags — opt into universal-planes (so non-primary
+# planes show up in GETPLANERESOURCES) and atomic (so DRM_IOCTL_MODE_ATOMIC
+# is permitted for our DRM master). Both must be set BEFORE any plane
+# enumeration or atomic commit is attempted.
+DRM_CLIENT_CAP_UNIVERSAL_PLANES = 2
+DRM_CLIENT_CAP_ATOMIC = 3
+
+# Plane types — value of the plane object's "type" property. Discovered
+# via OBJ_GETPROPERTIES on each plane id.
+DRM_PLANE_TYPE_OVERLAY = 0
+DRM_PLANE_TYPE_PRIMARY = 1
+DRM_PLANE_TYPE_CURSOR = 2
+
+# Object types for OBJ_GETPROPERTIES — distinct sentinel values per
+# object class, defined in drm_mode.h.
+DRM_MODE_OBJECT_CRTC = 0xCCCCCCCC
+DRM_MODE_OBJECT_CONNECTOR = 0xC0C0C0C0
+DRM_MODE_OBJECT_PLANE = 0xEEEEEEEE
+
+# Atomic commit flags. ALLOW_MODESET is required for the initial
+# mode-set commit; per-frame commits leave it off.
+DRM_MODE_ATOMIC_ALLOW_MODESET = 0x0400
 
 
 def _ioctl(fd: int, request: int, arg) -> None:
@@ -232,10 +348,11 @@ class DRMRenderer:
 
     Mirrors HDMIRenderer's protocol (`width`, `height`, `render_frame(bytes)`)
     so PlaybackLoop can swap one for the other without changes. This phase
-    ships the legacy SETCRTC path — single primary plane, mmap'd dumb
-    buffer, full-frame write per render_frame call. Multi-plane atomic
-    commit (text-over-video composition without per-frame CPU work) is
-    the next commit.
+    (2a-1) ships the atomic mode-set on a single primary plane — same
+    behavior as the prior legacy SETCRTC implementation, but the path
+    is now property-driven (universal-planes + atomic client caps,
+    plane and property discovery, atomic commit). The overlay plane
+    for text-with-alpha composition lands in the follow-up commit.
 
     Args:
         width, height: Sign-side dims (what the playback engine emits).
@@ -280,7 +397,16 @@ class DRMRenderer:
         self._connector_id: int = 0
         self._encoder_id: int = 0
         self._crtc_id: int = 0
+        # Bit position of self._crtc_id in the resources' crtcs[] order —
+        # used to filter planes by their possible_crtcs bitmask.
+        self._crtc_bit: int = 0
         self._original_crtc: _DrmModeCrtc | None = None
+        # Atomic / multi-plane state. Empty until _open() runs.
+        self._primary_plane_id: int = 0
+        self._mode_blob_id: int = 0
+        self._crtc_props: dict[str, int] = {}
+        self._connector_props: dict[str, int] = {}
+        self._primary_plane_props: dict[str, int] = {}
         # Override display dims if caller specified — otherwise we'll
         # detect from the connector's preferred mode at __enter__.
         self._explicit_display_w = display_width
@@ -301,9 +427,12 @@ class DRMRenderer:
             return
         self._fd = os.open(self.device_path, os.O_RDWR | os.O_CLOEXEC)
         try:
+            self._set_client_caps()
             self._discover()
+            self._discover_planes()
+            self._discover_properties()
             self._allocate_framebuffer()
-            self._mode_set()
+            self._atomic_modeset()
         except Exception:
             self.close()
             raise
@@ -387,9 +516,12 @@ class DRMRenderer:
         enc.encoder_id = self._encoder_id
         _ioctl(self._fd, DRM_IOCTL_MODE_GETENCODER, enc)
         # possible_crtcs is a bitmask over the resources' crtcs[] order.
+        # Track BOTH the chosen id and its bit so plane discovery can
+        # filter planes via their own possible_crtcs bitmask later.
         for i, cid in enumerate(crtcs):
             if enc.possible_crtcs & (1 << i):
                 self._crtc_id = cid
+                self._crtc_bit = 1 << i
                 break
         if self._crtc_id == 0:
             raise RuntimeError("encoder has no usable CRTC")
@@ -411,6 +543,244 @@ class DRMRenderer:
             chosen_mode.name.decode(errors="ignore"),
             chosen_mode.hdisplay, chosen_mode.vdisplay,
         )
+
+    # --- atomic / universal-planes plumbing ---
+
+    def _set_client_caps(self) -> None:
+        """Opt this DRM master into universal planes + atomic. Must run
+        BEFORE GETPLANERESOURCES (else only primary planes show up) and
+        BEFORE any DRM_IOCTL_MODE_ATOMIC (else EOPNOTSUPP)."""
+        assert self._fd is not None
+        for cap in (DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_CLIENT_CAP_ATOMIC):
+            c = _DrmSetClientCap(capability=cap, value=1)
+            _ioctl(self._fd, DRM_IOCTL_SET_CLIENT_CAP, c)
+
+    def _get_object_properties(
+        self, obj_id: int, obj_type: int
+    ) -> dict[str, int]:
+        """Map property name → property id for the given DRM object.
+
+        Two-call dance: first OBJ_GETPROPERTIES returns count, second
+        fills the prop-id and prop-value arrays. We then GETPROPERTY on
+        each id to pull the human-readable name (the kernel does not
+        expose a single ioctl that gives names + ids in one shot).
+
+        We only need name→id here; the live values are read separately
+        when needed (e.g. plane "type" classification).
+        """
+        assert self._fd is not None
+        obj = _DrmModeObjGetProperties()
+        obj.obj_id = obj_id
+        obj.obj_type = obj_type
+        _ioctl(self._fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, obj)
+        if obj.count_props == 0:
+            return {}
+        prop_ids = (ctypes.c_uint32 * obj.count_props)()
+        prop_vals = (ctypes.c_uint64 * obj.count_props)()
+        obj.props_ptr = ctypes.cast(prop_ids, ctypes.c_void_p).value or 0
+        obj.prop_values_ptr = ctypes.cast(prop_vals, ctypes.c_void_p).value or 0
+        _ioctl(self._fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, obj)
+        # Re-read count_props from the second ioctl: kernel is allowed
+        # to return a smaller count (rare, but legal). Iterating past
+        # that would hit zeroed slots → GETPROPERTY with prop_id=0 → EINVAL.
+        out: dict[str, int] = {}
+        for i in range(obj.count_props):
+            prop = _DrmModeGetProperty()
+            prop.prop_id = prop_ids[i]
+            _ioctl(self._fd, DRM_IOCTL_MODE_GETPROPERTY, prop)
+            name = prop.name.decode("ascii", errors="ignore").rstrip("\x00")
+            out[name] = prop_ids[i]
+        return out
+
+    def _get_plane_type(self, plane_id: int) -> int:
+        """Read the plane's "type" property value (PRIMARY/OVERLAY/CURSOR)."""
+        assert self._fd is not None
+        obj = _DrmModeObjGetProperties()
+        obj.obj_id = plane_id
+        obj.obj_type = DRM_MODE_OBJECT_PLANE
+        _ioctl(self._fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, obj)
+        if obj.count_props == 0:
+            return -1
+        prop_ids = (ctypes.c_uint32 * obj.count_props)()
+        prop_vals = (ctypes.c_uint64 * obj.count_props)()
+        obj.props_ptr = ctypes.cast(prop_ids, ctypes.c_void_p).value or 0
+        obj.prop_values_ptr = ctypes.cast(prop_vals, ctypes.c_void_p).value or 0
+        _ioctl(self._fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, obj)
+        for i in range(obj.count_props):
+            prop = _DrmModeGetProperty()
+            prop.prop_id = prop_ids[i]
+            _ioctl(self._fd, DRM_IOCTL_MODE_GETPROPERTY, prop)
+            name = prop.name.decode("ascii", errors="ignore").rstrip("\x00")
+            if name == "type":
+                return int(prop_vals[i])
+        return -1
+
+    def _discover_planes(self) -> None:
+        """Find a primary plane bound to our chosen CRTC.
+
+        With universal-planes enabled, GETPLANERESOURCES lists ALL planes
+        (primary, overlay, cursor). We filter by possible_crtcs & our
+        crtc bit, then by the plane's "type" property == PRIMARY.
+        """
+        assert self._fd is not None and self._crtc_bit != 0
+        res = _DrmModeGetPlaneRes()
+        _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANERESOURCES, res)
+        if res.count_planes == 0:
+            raise RuntimeError("no DRM planes available")
+        plane_ids = (ctypes.c_uint32 * res.count_planes)()
+        res.plane_id_ptr = ctypes.cast(plane_ids, ctypes.c_void_p).value or 0
+        _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANERESOURCES, res)
+
+        for pid in plane_ids:
+            plane = _DrmModeGetPlane()
+            plane.plane_id = pid
+            _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANE, plane)
+            if not (plane.possible_crtcs & self._crtc_bit):
+                continue
+            if self._get_plane_type(pid) == DRM_PLANE_TYPE_PRIMARY:
+                self._primary_plane_id = pid
+                break
+        if self._primary_plane_id == 0:
+            raise RuntimeError(
+                f"no primary plane bound to CRTC {self._crtc_id} "
+                f"(crtc_bit=0x{self._crtc_bit:x})"
+            )
+        log.info("DRM: primary plane=%d", self._primary_plane_id)
+
+    def _discover_properties(self) -> None:
+        """Cache property name→id for our CRTC, connector, and primary
+        plane. The atomic commit path addresses every state change by
+        these property ids; looking them up once at open beats hitting
+        OBJ_GETPROPERTIES + GETPROPERTY per frame."""
+        self._crtc_props = self._get_object_properties(
+            self._crtc_id, DRM_MODE_OBJECT_CRTC
+        )
+        self._connector_props = self._get_object_properties(
+            self._connector_id, DRM_MODE_OBJECT_CONNECTOR
+        )
+        self._primary_plane_props = self._get_object_properties(
+            self._primary_plane_id, DRM_MODE_OBJECT_PLANE
+        )
+        # Sanity-check that the properties we'll address by name exist —
+        # better to fail loud at open than throw a cryptic EINVAL from
+        # the atomic commit because a property id is 0.
+        required = {
+            "crtc": (self._crtc_props, ("ACTIVE", "MODE_ID")),
+            "connector": (self._connector_props, ("CRTC_ID",)),
+            "primary plane": (
+                self._primary_plane_props,
+                (
+                    "FB_ID", "CRTC_ID",
+                    "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
+                    "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H",
+                ),
+            ),
+        }
+        for label, (props, names) in required.items():
+            missing = [n for n in names if n not in props]
+            if missing:
+                raise RuntimeError(
+                    f"{label} is missing required atomic properties: {missing}"
+                )
+
+    def _create_mode_blob(self, mode: _DrmModeInfo) -> int:
+        """Stash a struct drm_mode_modeinfo in a kernel-side property
+        blob and return its id. The atomic CRTC.MODE_ID property takes
+        a blob id, not the struct directly."""
+        assert self._fd is not None
+        req = _DrmModeCreateBlob()
+        req.data = ctypes.addressof(mode)
+        req.length = ctypes.sizeof(_DrmModeInfo)
+        _ioctl(self._fd, DRM_IOCTL_MODE_CREATEPROPBLOB, req)
+        return req.blob_id
+
+    def _atomic_commit(
+        self,
+        *,
+        flags: int,
+        object_props: list[tuple[int, list[tuple[int, int]]]],
+    ) -> None:
+        """Submit a flat list of (object_id, [(prop_id, value), ...])
+        as a single atomic commit. Layout follows drm_mode.h's
+        struct drm_mode_atomic — three parallel flat arrays plus a
+        per-object property-count array.
+
+        Memory note: the ctypes arrays MUST stay live until the ioctl
+        returns. We hold them in locals here, which is sufficient (the
+        ioctl is synchronous).
+        """
+        assert self._fd is not None
+        n_objs = len(object_props)
+        objs = (ctypes.c_uint32 * n_objs)(
+            *[obj_id for obj_id, _ in object_props]
+        )
+        counts = (ctypes.c_uint32 * n_objs)(
+            *[len(props) for _, props in object_props]
+        )
+        flat_pids: list[int] = []
+        flat_vals: list[int] = []
+        for _, props in object_props:
+            for pid, val in props:
+                flat_pids.append(pid)
+                flat_vals.append(val)
+        pids = (ctypes.c_uint32 * len(flat_pids))(*flat_pids)
+        vals = (ctypes.c_uint64 * len(flat_vals))(*flat_vals)
+
+        req = _DrmModeAtomic()
+        req.flags = flags
+        req.count_objs = n_objs
+        req.objs_ptr = ctypes.cast(objs, ctypes.c_void_p).value or 0
+        req.count_props_ptr = ctypes.cast(counts, ctypes.c_void_p).value or 0
+        req.props_ptr = ctypes.cast(pids, ctypes.c_void_p).value or 0
+        req.prop_values_ptr = ctypes.cast(vals, ctypes.c_void_p).value or 0
+        _ioctl(self._fd, DRM_IOCTL_MODE_ATOMIC, req)
+
+    def _atomic_modeset(self) -> None:
+        """Replace the legacy SETCRTC mode-set with an atomic commit.
+
+        Same single-primary-plane behavior as before — display lights up
+        with our framebuffer at the chosen mode — but the path is now
+        property-driven, which is the prerequisite for adding an
+        overlay plane in the next commit.
+        """
+        assert (
+            self._fd is not None
+            and self._mode is not None
+            and self._fb_id != 0
+            and self._primary_plane_id != 0
+        )
+        self._mode_blob_id = self._create_mode_blob(self._mode)
+        cp = self._crtc_props
+        np_ = self._connector_props
+        pp = self._primary_plane_props
+        # Fixed-point 16.16 SRC dims (DRM convention).
+        src_w = self.display_width << 16
+        src_h = self.display_height << 16
+        self._atomic_commit(
+            flags=DRM_MODE_ATOMIC_ALLOW_MODESET,
+            object_props=[
+                (self._crtc_id, [
+                    (cp["ACTIVE"], 1),
+                    (cp["MODE_ID"], self._mode_blob_id),
+                ]),
+                (self._connector_id, [
+                    (np_["CRTC_ID"], self._crtc_id),
+                ]),
+                (self._primary_plane_id, [
+                    (pp["FB_ID"], self._fb_id),
+                    (pp["CRTC_ID"], self._crtc_id),
+                    (pp["SRC_X"], 0),
+                    (pp["SRC_Y"], 0),
+                    (pp["SRC_W"], src_w),
+                    (pp["SRC_H"], src_h),
+                    (pp["CRTC_X"], 0),
+                    (pp["CRTC_Y"], 0),
+                    (pp["CRTC_W"], self.display_width),
+                    (pp["CRTC_H"], self.display_height),
+                ]),
+            ],
+        )
+        log.info("DRM: atomic mode-set committed (primary plane only)")
 
     # --- framebuffer alloc + map ---
 
@@ -451,22 +821,6 @@ class DRMRenderer:
             offset=int(map_dumb.offset),
         )
 
-    # --- mode-set ---
-
-    def _mode_set(self) -> None:
-        assert self._fd is not None and self._mode is not None
-        connector_arr = (ctypes.c_uint32 * 1)(self._connector_id)
-        crtc = _DrmModeCrtc()
-        crtc.crtc_id = self._crtc_id
-        crtc.fb_id = self._fb_id
-        crtc.set_connectors_ptr = ctypes.cast(connector_arr, ctypes.c_void_p).value or 0
-        crtc.count_connectors = 1
-        crtc.x = 0
-        crtc.y = 0
-        crtc.mode = self._mode
-        crtc.mode_valid = 1
-        _ioctl(self._fd, DRM_IOCTL_MODE_SETCRTC, crtc)
-
     # --- close ---
 
     def close(self) -> None:
@@ -504,6 +858,14 @@ class DRMRenderer:
                 self._dumb_handle = 0
         except OSError:
             log.exception("DRMRenderer: destroy dumb failed")
+        try:
+            if self._mode_blob_id:
+                blob = _DrmModeDestroyBlob()
+                blob.blob_id = self._mode_blob_id
+                _ioctl(self._fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, blob)
+                self._mode_blob_id = 0
+        except OSError:
+            log.exception("DRMRenderer: destroy mode blob failed")
         try:
             os.close(self._fd)
         except OSError:
