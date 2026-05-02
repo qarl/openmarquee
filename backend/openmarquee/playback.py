@@ -46,12 +46,13 @@ from uuid import UUID
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
-from openmarquee.auto_render import compose_auto_frame, resolve_timezone
+from openmarquee.auto_render import resolve_timezone
 from openmarquee.content import ContentItem
 from openmarquee.motion import (
     compose_motion_frame,
     load_motion_background,
     prerender_layer_bitmaps,
+    slide_has_dynamic_content,
     slide_has_motion,
 )
 from openmarquee.rendering import Renderer
@@ -293,31 +294,20 @@ class PlaybackLoop:
                     self._current_auto_mode = None
                     self._current_auto_format = None
 
-                is_auto = (
+                is_dynamic = (
                     item.type == "text_slide"
-                    and self._current_auto_mode is not None
+                    and slide_has_dynamic_content(item)
                 )
-                is_motion = (
-                    item.type == "text_slide"
-                    and not is_auto
-                    and slide_has_motion(item)
-                )
-                if is_auto:
-                    # Render-over path: the stored PNG is a placeholder;
-                    # compose a fresh frame with current time/date/day
-                    # each tick for the slide's full duration.
-                    current_image = await self._play_auto_slide(item)
-                    if current_image is None:
-                        continue
-                elif is_motion:
-                    # Step 3a (docs/text-layer-motion-spec.md): any
-                    # visible layer with motion!=static drives a per-
-                    # tick re-composition at _FADE_FPS (30 Hz). Auto
-                    # and motion are mutex for now — auto wins because
-                    # its tick rate (1 Hz) is too slow for motion's
-                    # 30 Hz target. A unified per-tick composer that
-                    # handles both is a step 3a follow-up.
-                    current_image = await self._play_motion_slide(item)
+                if is_dynamic:
+                    # Unified per-tick composer (docs/text-layer-motion-
+                    # spec.md): any visible layer with motion != static OR
+                    # auto_mode set drives a per-tick re-composition. The
+                    # composer handles both in one pass — a clock that
+                    # bounces gets its text refreshed AND its bitmap
+                    # bounced each tick. Tick rate adapts: 30 Hz when
+                    # motion is present, 1 Hz when only auto (avoids
+                    # burning 30 fps for clock-only slides).
+                    current_image = await self._play_dynamic_slide(item)
                     if current_image is None:
                         continue
                 else:
@@ -472,92 +462,55 @@ class PlaybackLoop:
         self._pause_event.clear()
         self._resume_event.set()
 
-    async def _play_auto_slide(self, item: ContentItem) -> Image.Image | None:
-        """Tick-render an auto-mode text slide for its full duration.
+    async def _play_dynamic_slide(self, item: ContentItem) -> Image.Image | None:
+        """Tick-render a slide with auto-mode and/or motion layers for
+        its full duration.
 
-        Re-composites the frame every `self._auto_tick` seconds using
-        the current time in the configured timezone, so a 'time' slide
-        with HH:MM:SS format visibly ticks seconds on the device.
+        Subsumes the prior `_play_auto_slide` (1 Hz tick, single-layer
+        clock / date / day) and `_play_motion_slide` (30 Hz tick,
+        cached layer bitmaps + motion transforms) into one path. The
+        composer in `motion.py` handles the auto × motion product per
+        layer — a layer can be BOTH auto and motion (e.g. a clock
+        that bounces) and gets text refreshed AND bitmap transformed
+        each tick.
 
-        Returns the last-composed frame so the caller's fade transition
-        into the next slide has something to fade from. Returns None if
-        stop or pause fires before the first frame lands. Pause exits
-        early so a stream takeover doesn't keep painting auto frames
-        over the live video — same rationale as the transition helpers.
+        Tick rate adapts to what the slide actually needs:
+        - any visible motion layer    → 1 / _FADE_FPS (30 Hz)
+        - auto-only (no motion)       → 1 Hz (matches the prior
+                                          auto-tick cadence; HH:MM:SS
+                                          updates per second, no
+                                          point burning 30 fps for
+                                          clock-only slides)
+
+        Returns the last-composed frame so the caller's transition
+        has something to fade from. Stop / pause exit early — same
+        rationale as the prior split functions: a stream takeover
+        shouldn't keep painting frames over live video.
         """
         tz = resolve_timezone(self._get_timezone())
-        total = item.duration_ms / 1000
-        end_at = asyncio.get_event_loop().time() + total
-        last: Image.Image | None = None
-        while True:
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return last
-            now = datetime.now(tz)
-            try:
-                frame = compose_auto_frame(
-                    item,
-                    self._renderer.width,
-                    self._renderer.height,
-                    now,
-                    read_asset=self._read_asset,
-                )
-            except Exception:
-                log.exception("playback: compose_auto_frame failed for %s", item.id)
-                return None
-            self._render_image(frame)
-            last = frame
-
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return last
-
-            remaining = end_at - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                return last
-            await self._wait(min(self._auto_tick, remaining))
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return last
-            if asyncio.get_event_loop().time() >= end_at:
-                return last
-
-    async def _play_motion_slide(self, item: ContentItem) -> Image.Image | None:
-        """Tick-render a motion-animated text slide for its full duration.
-
-        Re-composes the frame every 1/_FADE_FPS seconds so each layer's
-        motion (ticker / breathe / pulse / bounce / shake / blink) walks
-        forward on the shared global clock. Background is loaded once
-        and cached across ticks of this slide so we're not re-reading
-        the PNG (or re-allocating the solid-color canvas) 30× a second.
-
-        Returns the last-composed frame so the caller's transition has
-        something to fade from. Mirrors `_play_auto_slide`'s stop /
-        pause behavior — both exit early so a stream takeover doesn't
-        keep painting motion frames over live video.
-        """
         total = item.duration_ms / 1000
         loop = asyncio.get_event_loop()
         t0 = loop.time()
         end_at = t0 + total
-        tick_period = 1.0 / max(1, _FADE_FPS)
+        # 30 Hz when motion is present, 1 Hz for auto-only — preserves
+        # the prior _play_auto_slide cadence and avoids burning 29
+        # frames of work per second for clock-only slides.
+        if slide_has_motion(item):
+            tick_period = 1.0 / max(1, _FADE_FPS)
+        else:
+            tick_period = max(0.1, self._auto_tick)
         last: Image.Image | None = None
-        # Pre-load the background once so the per-tick composer doesn't
-        # re-read the background PNG (or re-allocate the solid-color
-        # canvas) 30× per second.
+        # Pre-load the background once. Pre-rasterize static layers
+        # once. Auto layers leave None placeholders in the cache —
+        # they re-render text each tick from `now`.
         try:
             background_cache: Image.Image | None = load_motion_background(
                 item, self._renderer.width, self._renderer.height, self._read_asset,
             )
         except Exception:
             background_cache = None
-        # Pre-rasterize each layer's text once at slide entry. Motion
-        # transforms (translate / scale / alpha-modulate) are pixel
-        # operations on this bitmap — no per-tick PIL text rendering.
-        # That keeps the 30 Hz tick under the 33 ms budget at 1080 p
-        # sign-native, where re-rasterizing N layers per frame would
-        # otherwise blow the budget on its own.
         try:
-            layer_bitmap_cache: list[Image.Image] | None = prerender_layer_bitmaps(
+            layer_bitmap_cache: list[Image.Image | None] | None = prerender_layer_bitmaps(
                 item, self._renderer.width, self._renderer.height,
             )
         except Exception:
@@ -568,6 +521,7 @@ class PlaybackLoop:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 return last
             elapsed = loop.time() - t0
+            now = datetime.now(tz)
             try:
                 frame = compose_motion_frame(
                     item,
@@ -577,6 +531,7 @@ class PlaybackLoop:
                     read_asset=self._read_asset,
                     background_cache=background_cache,
                     layer_bitmap_cache=layer_bitmap_cache,
+                    now=now,
                 )
             except Exception:
                 log.exception("playback: compose_motion_frame failed for %s", item.id)

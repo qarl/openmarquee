@@ -480,6 +480,7 @@ def _draw_text_into(
     slide_height: int,
     font_size_pct: float | None = None,
     font_size_px: int | None = None,
+    outline_color: str | None = None,
 ) -> None:
     """Compose one text layer onto `img` in place.
 
@@ -497,6 +498,13 @@ def _draw_text_into(
     exceeds box height; horizontal squish stays as a fallback for
     verbose single-line text. Both axes squish independently when
     both overflow.
+
+    Outline (2026-05-02, motion unification): when `outline_color`
+    is set, the glyphs render with a 1-px stroke in that color. The
+    auto-mode renderer (compose_auto_frame) used to bake a black
+    1-px halo for readability on mid-tone backgrounds; the unified
+    motion path preserves that behavior by setting outline_color
+    on auto-mode layers from render_layer_to_rgba.
     """
     if not text:
         return
@@ -529,6 +537,16 @@ def _draw_text_into(
     box_center_y = px_box_y + px_box_h / 2
     if natural_w <= 0 or natural_h <= 0:
         return
+    # Pillow's stroke_width / stroke_fill kwargs add an N-pixel halo in
+    # the stroke color around each glyph BEFORE the foreground fill is
+    # applied. Used by auto-mode layers for the readability outline
+    # the prior compose_auto_frame baked in.
+    stroke_kwargs = (
+        {"stroke_width": 1, "stroke_fill": outline_color}
+        if outline_color
+        else {}
+    )
+
     # Fits inside the box on both axes — paint directly, no squish.
     if natural_w <= px_box_w and natural_h <= px_box_h:
         draw.text(
@@ -537,6 +555,7 @@ def _draw_text_into(
             text,
             fill=fg,
             font=font,
+            **stroke_kwargs,
         )
         return
     # Squish: render at natural size on a transparent surface, then
@@ -557,7 +576,13 @@ def _draw_text_into(
         (0, 0, 0, 0),
     )
     td = ImageDraw.Draw(temp)
-    td.text((pad_pre_w - bbox[0], pad_pre_h - bbox[1]), text, fill=fg, font=font)
+    td.text(
+        (pad_pre_w - bbox[0], pad_pre_h - bbox[1]),
+        text,
+        fill=fg,
+        font=font,
+        **stroke_kwargs,
+    )
     squished = temp.resize(
         (target_w + pad_post * 2, target_h + pad_post * 2), Image.LANCZOS
     )

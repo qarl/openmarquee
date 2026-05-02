@@ -40,23 +40,21 @@ _DEFAULT_FORMAT = {
 }
 
 
-def render_auto_text(slide: TextSlide, now: datetime) -> str:
-    """Return the visible text for an auto-mode slide at the given `now`.
+def render_auto_text_for_layer(layer, now: datetime) -> str:
+    """Per-layer variant of `render_auto_text`. Returns the visible
+    string for one TextLayer at `now` — handles auto-mode formatting
+    if the layer has it set, otherwise returns `layer.text`.
+
+    Hoisted out so the unified per-tick composer (motion.py) can drive
+    auto-mode rendering for ANY layer in a multi-layer slide, not just
+    text_layers[0]. The slide-level wrapper `render_auto_text` is kept
+    as a compat shim for the older single-layer callers.
 
     `now` is expected to already be in the target timezone — this fn
     doesn't convert. Callers should pass `datetime.now(ZoneInfo(tz))`.
-
-    Non-auto slides get their `text` field back unchanged so the same
-    entry point works for the whole rendering path.
-
-    Schema v3 (qarl 2026-05-01): per-text fields live on text_layers[0].
-    Multi-layer auto-mode composition lands in phase 2 of the layered
-    rollout — for now this reads layer[0] and matches single-layer
-    behavior. (compose_auto_frame likewise.)
     """
-    layer = slide.text_layers[0]
-    if not layer.auto_mode:
-        return layer.text
+    if not getattr(layer, "auto_mode", None):
+        return getattr(layer, "text", "")
 
     fmt = layer.auto_format or _DEFAULT_FORMAT.get(layer.auto_mode)
 
@@ -86,6 +84,17 @@ def render_auto_text(slide: TextSlide, now: datetime) -> str:
     return layer.text
 
 
+def render_auto_text(slide: TextSlide, now: datetime) -> str:
+    """Slide-level compat wrapper for `render_auto_text_for_layer`.
+
+    Reads text_layers[0] only — single-layer behavior is preserved
+    for older callers (compose_auto_frame and the test surface that
+    imports this name). Multi-layer auto-mode rendering goes through
+    `render_auto_text_for_layer` directly via the unified composer.
+    """
+    return render_auto_text_for_layer(slide.text_layers[0], now)
+
+
 def resolve_timezone(tz_name: str | None) -> ZoneInfo:
     """Coerce a tz string (e.g. 'America/Los_Angeles') to a ZoneInfo.
 
@@ -109,6 +118,14 @@ def compose_auto_frame(
     read_asset: Callable[[UUID], bytes] | None = None,
 ) -> Image.Image:
     """Render a fresh RGB frame for an auto-mode slide at `now`.
+
+    NOTE (2026-05-02): the playback loop no longer calls this — the
+    unified per-tick composer in `motion.compose_motion_frame` handles
+    auto AND motion in one pass (with proper multi-layer support and
+    auto+motion combination). This function is kept as a single-layer
+    compat shim for `test_auto_render.py` and any ad-hoc callers; it
+    is NOT the production render path. New work should target
+    `compose_motion_frame` instead.
 
     Background resolution order:
       1. If slide.background_image_slide_id is set AND read_asset is

@@ -31,12 +31,13 @@ import hashlib
 import logging
 import math
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
 
-from openmarquee.auto_render import _load_background
+from openmarquee.auto_render import _load_background, render_auto_text_for_layer
 from openmarquee.seed import _draw_text_into
 
 if TYPE_CHECKING:
@@ -304,16 +305,36 @@ def apply_motion(
 
 
 def render_layer_to_rgba(
-    layer: "TextLayer", width: int, height: int
+    layer: "TextLayer",
+    width: int,
+    height: int,
+    now: datetime | None = None,
 ) -> Image.Image:
     """Render one layer's text into a transparent slide-sized RGBA
     bitmap. Reuses `_draw_text_into` so the pixels match what the
     asset PNG already on disk shows for static layers (operators
-    don't see a font / placement diff when toggling motion on)."""
+    don't see a font / placement diff when toggling motion on).
+
+    If the layer has `auto_mode` set AND `now` is provided, the
+    visible text comes from `render_auto_text_for_layer(layer, now)`
+    — the unified per-tick composer drives clock / date / day re-
+    rendering through this same path so a layer can be BOTH auto and
+    motion (e.g. a clock that bounces).
+    """
+    is_auto = bool(getattr(layer, "auto_mode", None))
+    if is_auto and now is not None:
+        text = render_auto_text_for_layer(layer, now)
+    else:
+        text = getattr(layer, "text", "")
+    # Auto-mode layers get a 1-px black outline for readability — the
+    # behavior compose_auto_frame baked in before the unified path.
+    # Without this, clocks on mid-tone backgrounds (the comment-cited
+    # rationale in the prior auto_render code) lose contrast.
+    outline_color = "#000000" if is_auto else None
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     _draw_text_into(
         img,
-        text=getattr(layer, "text", ""),
+        text=text,
         fg=getattr(layer, "text_color", "#FFFFFF"),
         font_family=getattr(layer, "font_family", None),
         box=getattr(layer, "box", None),
@@ -321,6 +342,7 @@ def render_layer_to_rgba(
         slide_height=height,
         font_size_pct=getattr(layer, "font_size_pct", None),
         font_size_px=getattr(layer, "font_size_px", None),
+        outline_color=outline_color,
     )
     return img
 
@@ -363,6 +385,14 @@ def prerender_layer_bitmaps(
         if not getattr(layer, "visible", True):
             out.append(None)
             continue
+        if getattr(layer, "auto_mode", None):
+            # Auto layers re-render their text every tick from the
+            # current `now` — pre-rasterizing here would just produce
+            # a stale snapshot. Leave a None placeholder so the
+            # composer falls through to a fresh render_layer_to_rgba
+            # with the current time.
+            out.append(None)
+            continue
         out.append(render_layer_to_rgba(layer, width, height))
     return out
 
@@ -394,6 +424,24 @@ def slide_has_motion(slide: "TextSlide") -> bool:
     return False
 
 
+def slide_has_auto(slide: "TextSlide") -> bool:
+    """True if any visible layer has `auto_mode` set. Used together
+    with `slide_has_motion` to decide whether to go through the
+    unified per-tick composer or the static (one-render) path."""
+    for layer in getattr(slide, "text_layers", []):
+        if not getattr(layer, "visible", True):
+            continue
+        if getattr(layer, "auto_mode", None):
+            return True
+    return False
+
+
+def slide_has_dynamic_content(slide: "TextSlide") -> bool:
+    """True if the slide needs per-tick re-rendering (motion or auto
+    or both). False = static slide, one render is enough."""
+    return slide_has_motion(slide) or slide_has_auto(slide)
+
+
 def compose_motion_frame(
     slide: "TextSlide",
     elapsed_s: float,
@@ -401,7 +449,8 @@ def compose_motion_frame(
     height: int,
     read_asset: Callable[["UUID"], bytes] | None = None,
     background_cache: Image.Image | None = None,
-    layer_bitmap_cache: list[Image.Image] | None = None,
+    layer_bitmap_cache: list[Image.Image | None] | None = None,
+    now: datetime | None = None,
 ) -> Image.Image:
     """Render an RGB frame for `slide` at `elapsed_s` on the shared
     global clock. Caches background across ticks of the same slide via
@@ -436,13 +485,23 @@ def compose_motion_frame(
         # hot-edit (which PlaybackLoop currently never does, but tests
         # + future callers might) falls through to a fresh rasterize
         # rather than IndexError- or AttributeError-ing.
+        # Auto layers re-render their text every tick from the current
+        # `now` — bypass the cache entirely (prerender_layer_bitmaps
+        # leaves None placeholders for them, so the cache check
+        # naturally falls through, but we also want to skip on the
+        # ad-hoc compose path where the caller forgot to skip them).
+        is_auto = bool(getattr(layer, "auto_mode", None))
         cached: Image.Image | None = None
-        if layer_bitmap_cache is not None and idx < len(layer_bitmap_cache):
+        if (
+            not is_auto
+            and layer_bitmap_cache is not None
+            and idx < len(layer_bitmap_cache)
+        ):
             entry = layer_bitmap_cache[idx]
             if entry is not None and entry.size == (width, height):
                 cached = entry
         layer_rgba = cached if cached is not None else render_layer_to_rgba(
-            layer, width, height
+            layer, width, height, now=now,
         )
         motion = getattr(layer, "motion", "static") or "static"
         if motion != "static":

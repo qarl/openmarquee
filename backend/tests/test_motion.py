@@ -10,6 +10,7 @@ same pixel offsets land.
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 
 import pytest
 from PIL import Image
@@ -29,6 +30,9 @@ from openmarquee.motion import (
     compute_phase,
     load_motion_background,
     prerender_layer_bitmaps,
+    render_layer_to_rgba,
+    slide_has_auto,
+    slide_has_dynamic_content,
     slide_has_motion,
 )
 
@@ -357,6 +361,55 @@ def test_slide_has_motion_false_when_all_static():
     assert slide_has_motion(slide) is False
 
 
+def test_slide_has_auto_true_when_any_layer_has_auto_mode():
+    slide = TextSlide(
+        name="s", text_layers=[
+            TextLayer(text="A"),
+            TextLayer(text="00:00", auto_mode="time", auto_format="time_hms"),
+        ],
+    )
+    assert slide_has_auto(slide) is True
+
+
+def test_slide_has_auto_false_for_static_layers():
+    slide = TextSlide(name="s", text_layers=[TextLayer(text="A")])
+    assert slide_has_auto(slide) is False
+
+
+def test_slide_has_auto_ignores_hidden_auto_layer():
+    """Same convention as slide_has_motion: a hidden auto layer doesn't
+    count, since the playback loop won't draw it."""
+    slide = TextSlide(
+        name="s", text_layers=[
+            TextLayer(text="x", auto_mode="time", visible=False),
+            TextLayer(text="y"),
+        ],
+    )
+    assert slide_has_auto(slide) is False
+
+
+def test_slide_has_dynamic_content_covers_motion_or_auto_or_both():
+    """The unified per-tick branch in PlaybackLoop checks this; it
+    must fire for motion-only slides, auto-only slides, and slides
+    with both."""
+    motion_only = TextSlide(
+        name="m", text_layers=[TextLayer(text="x", motion="ticker")],
+    )
+    auto_only = TextSlide(
+        name="a", text_layers=[TextLayer(text="x", auto_mode="time")],
+    )
+    both = TextSlide(
+        name="b", text_layers=[
+            TextLayer(text="x", motion="bounce", auto_mode="time"),
+        ],
+    )
+    static_only = TextSlide(name="s", text_layers=[TextLayer(text="x")])
+    assert slide_has_dynamic_content(motion_only) is True
+    assert slide_has_dynamic_content(auto_only) is True
+    assert slide_has_dynamic_content(both) is True
+    assert slide_has_dynamic_content(static_only) is False
+
+
 def test_slide_has_motion_ignores_hidden_animated_layer():
     """A hidden layer with motion!=static doesn't count — the operator
     toggled it off so we shouldn't drive 30 fps re-rendering for
@@ -450,6 +503,154 @@ def test_prerender_layer_bitmaps_returns_list_parallel_to_text_layers():
         assert bm is not None
         assert bm.mode == "RGBA"
         assert bm.size == (64, 32)
+
+
+def test_prerender_layer_bitmaps_skips_auto_layers():
+    """Auto layers re-render text every tick from the current `now`.
+    Pre-rasterizing them at slide entry would just produce a stale
+    snapshot. Skip → None placeholder so the composer's cache check
+    falls through to a fresh render_layer_to_rgba with the current
+    time."""
+    slide = TextSlide(
+        name="s",
+        text_layers=[
+            TextLayer(text="A"),
+            TextLayer(text="00:00", auto_mode="time", auto_format="time_hms"),
+            TextLayer(text="C"),
+        ],
+    )
+    bitmaps = prerender_layer_bitmaps(slide, 64, 32)
+    assert len(bitmaps) == 3
+    assert bitmaps[0] is not None
+    assert bitmaps[1] is None  # auto-mode layer skipped
+    assert bitmaps[2] is not None
+
+
+def test_render_layer_to_rgba_uses_now_for_auto_layer():
+    """When the layer has auto_mode and a `now` is provided, the text
+    rendered into the bitmap should be the auto-formatted string,
+    not the layer's stored placeholder text."""
+    layer = TextLayer(
+        text="placeholder",
+        auto_mode="time",
+        auto_format="time_hms",
+        text_color="#FFFFFF",
+        box=TextBox(x=0.05, y=0.05, w=0.9, h=0.9),
+    )
+    now = datetime(2026, 5, 2, 14, 30, 45, tzinfo=UTC)
+    bitmap_with_now = render_layer_to_rgba(layer, 200, 60, now=now)
+    bitmap_no_now = render_layer_to_rgba(layer, 200, 60)
+    # The two bitmaps should differ — one drew "14:30:45", the other
+    # drew "placeholder". (Without comparing exact text we just assert
+    # the pixels aren't identical, which only holds if the rendered
+    # strings differed.)
+    assert bitmap_with_now.tobytes() != bitmap_no_now.tobytes()
+
+
+def test_compose_motion_frame_re_renders_auto_layer_per_tick():
+    """A clock layer's pixels at t=0 vs t=1s with `now` advanced one
+    second should differ — auto re-renders even on the unified
+    motion path."""
+    slide = TextSlide(
+        name="clock",
+        background_color="#000000",
+        text_layers=[
+            TextLayer(
+                text="--:--:--",
+                auto_mode="time",
+                auto_format="time_hms",
+                text_color="#FFFFFF",
+                box=TextBox(x=0.05, y=0.05, w=0.9, h=0.9),
+            ),
+        ],
+    )
+    t1 = datetime(2026, 5, 2, 14, 30, 45, tzinfo=UTC)
+    t2 = datetime(2026, 5, 2, 14, 30, 46, tzinfo=UTC)  # +1s
+    frame1 = compose_motion_frame(slide, 0.0, 200, 60, now=t1)
+    frame2 = compose_motion_frame(slide, 1.0, 200, 60, now=t2)
+    # Different second → different rendered text → different pixels.
+    assert frame1.tobytes() != frame2.tobytes()
+
+
+def test_render_layer_to_rgba_auto_layer_has_outline():
+    """compose_auto_frame baked a 1-px black outline around clock /
+    date / day text for readability on mid-tone backgrounds. The
+    unified motion path preserves that — auto layers render with an
+    outline, static layers don't. This test catches the silent
+    regression subagent flagged on step 3a-unify: a darker pixel
+    adjacent to the bright glyph proves the halo landed."""
+    layer = TextLayer(
+        text="HELLO",
+        auto_mode=None,  # Static for the baseline.
+        text_color="#FFFFFF",
+        box=TextBox(x=0.05, y=0.05, w=0.9, h=0.9),
+    )
+    auto_layer = TextLayer(
+        text="placeholder",
+        auto_mode="time",
+        auto_format="time_hms",
+        text_color="#FFFFFF",
+        box=TextBox(x=0.05, y=0.05, w=0.9, h=0.9),
+    )
+    now = datetime(2026, 5, 2, 14, 30, 45, tzinfo=UTC)
+    static_img = render_layer_to_rgba(layer, 200, 60)
+    auto_img = render_layer_to_rgba(auto_layer, 200, 60, now=now)
+
+    # In the auto bitmap, find any opaque-black pixel — proves the
+    # halo rendered (the layer's text_color is white, so a black
+    # pixel can only come from the stroke).
+    has_black_outline = False
+    for y in range(60):
+        for x in range(200):
+            r, g, b, a = auto_img.getpixel((x, y))
+            if a > 0 and r == 0 and g == 0 and b == 0:
+                has_black_outline = True
+                break
+        if has_black_outline:
+            break
+    assert has_black_outline, "auto-mode layer should render with black outline"
+
+    # Sanity: the static layer (no auto_mode) renders WITHOUT outline.
+    has_static_black = any(
+        static_img.getpixel((x, y))[:4] == (0, 0, 0, a)
+        for y in range(60) for x in range(200)
+        for a in (255,)  # only opaque
+    )
+    assert not has_static_black, (
+        "static layer with white text shouldn't render any black pixels"
+    )
+
+
+def test_compose_motion_frame_auto_plus_motion_combine():
+    """Spec invariant: a layer can be BOTH auto AND motion (e.g. a
+    clock that bounces). Verify that the unified composer re-renders
+    the auto text AND applies the motion transform on the same tick.
+
+    Bounce at intensity=100 phase=0.25 is the spike of the sine →
+    max amplitude. Compare frame1 (no motion: phase=0) vs frame2
+    (full motion: phase=0.25) at the SAME `now` — bytes should
+    differ because of the bounce shift."""
+    slide = TextSlide(
+        name="clock",
+        background_color="#000000",
+        text_layers=[
+            TextLayer(
+                text="--:--",
+                auto_mode="time",
+                auto_format="time_hm",
+                motion="bounce",
+                motion_intensity=100,
+                text_color="#FFFFFF",
+                box=TextBox(x=0.05, y=0.05, w=0.9, h=0.9),
+            ),
+        ],
+    )
+    now = datetime(2026, 5, 2, 14, 30, 45, tzinfo=UTC)
+    # phase=0: bounce sin=0, no shift
+    frame_zero = compose_motion_frame(slide, 0.0, 200, 60, now=now)
+    # phase=0.25: bounce sin=1, max shift
+    frame_max = compose_motion_frame(slide, 0.25, 200, 60, now=now)
+    assert frame_zero.tobytes() != frame_max.tobytes()
 
 
 def test_prerender_layer_bitmaps_skips_hidden_layers():
