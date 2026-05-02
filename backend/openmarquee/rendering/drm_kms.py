@@ -14,12 +14,15 @@ The DRM/KMS path side-steps both:
 - A dumb buffer is mmap'd into our address space, so per-frame
   bytes go straight into the display buffer (no syscall copy
   beyond what mmap already established at __enter__).
-- Multi-plane composition: text on one plane, video on another,
-  GPU composites at scanout. Phase 2a-1 of this file lands the
-  atomic commit infrastructure on a single primary plane —
-  feature-parity with HDMIRenderer's fb0 path, but the path is
-  now property-driven so the next commit can add an overlay
-  plane (text-with-alpha) without reshaping anything.
+- Multi-plane composition: text on one plane, background on
+  another, GPU composites at scanout. Phase 2a-1 landed the
+  atomic-commit infrastructure on a single primary plane.
+  Phase 2a-2 adds an opt-in overlay plane in ARGB8888, held at
+  sign-native dims and scaled to the letterboxed CRTC region by
+  the vc4 HVS. With the overlay buffer at 128×96 ARGB instead of
+  display-native, per-frame overlay updates are sub-millisecond
+  (no software upscale, no software alpha-blend) — the actual
+  compositor win this whole rewrite was for.
 
 This is a Linux-only module; tests on the Mac side mock the
 ioctls. The Pi-side live-fire is the canonical correctness check.
@@ -347,12 +350,14 @@ class DRMRenderer:
     """Render RGB888 frames to an HDMI display via DRM/KMS direct mode-set.
 
     Mirrors HDMIRenderer's protocol (`width`, `height`, `render_frame(bytes)`)
-    so PlaybackLoop can swap one for the other without changes. This phase
-    (2a-1) ships the atomic mode-set on a single primary plane — same
-    behavior as the prior legacy SETCRTC implementation, but the path
-    is now property-driven (universal-planes + atomic client caps,
-    plane and property discovery, atomic commit). The overlay plane
-    for text-with-alpha composition lands in the follow-up commit.
+    so PlaybackLoop can swap one for the other without changes. With
+    `enable_overlay=True` an additional ARGB8888 overlay plane is
+    allocated at sign-native dims; `render_composite(primary_rgb,
+    overlay_rgba)` updates one or both planes and the GPU composites
+    overlay-over-primary at scanout. The overlay path lets text with
+    alpha animate at video rate without paying the 1080p software
+    alpha-blend cost (~208 ms/frame on Pi Zero 2 W) that pinned the
+    fb0 path well below 30 fps for any text-over-background work.
 
     Args:
         width, height: Sign-side dims (what the playback engine emits).
@@ -374,6 +379,7 @@ class DRMRenderer:
         display_height: int | None = None,
         device_path: Path = Path("/dev/dri/card0"),
         pixel_format: str = "rgb565",
+        enable_overlay: bool = False,
     ):
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive")
@@ -386,6 +392,7 @@ class DRMRenderer:
         self._drm_format = (
             DRM_FORMAT_RGB565 if pixel_format == "rgb565" else DRM_FORMAT_XRGB8888
         )
+        self.enable_overlay = bool(enable_overlay)
         self.device_path = Path(device_path)
         self._fd: int | None = None
         self._fb_id: int = 0
@@ -407,6 +414,27 @@ class DRMRenderer:
         self._crtc_props: dict[str, int] = {}
         self._connector_props: dict[str, int] = {}
         self._primary_plane_props: dict[str, int] = {}
+        # Overlay plane state — populated only when enable_overlay=True.
+        # Always 4 bytes/pixel ARGB8888 so alpha lands the way the GPU
+        # expects it for scanout-time compositing on top of the primary.
+        # The overlay fb is held at sign-native dims; vc4's HVS scales
+        # it to the letterboxed CRTC region at scanout. That's what
+        # turns "alpha text overlaid on a background" from a 200 ms/
+        # frame software composite into a sub-millisecond memcpy.
+        self._overlay_plane_id: int = 0
+        self._overlay_plane_props: dict[str, int] = {}
+        self._overlay_fb_id: int = 0
+        self._overlay_dumb_handle: int = 0
+        self._overlay_dumb_size: int = 0
+        self._overlay_dumb_pitch: int = 0
+        self._overlay_mmap: mmap.mmap | None = None
+        # Letterbox geometry on the CRTC — sign-native overlay fb gets
+        # scaled into this rect by the HVS. Set in _open() after the
+        # connector's preferred mode is known.
+        self._scaled_w: int = 0
+        self._scaled_h: int = 0
+        self._letterbox_x: int = 0
+        self._letterbox_y: int = 0
         # Override display dims if caller specified — otherwise we'll
         # detect from the connector's preferred mode at __enter__.
         self._explicit_display_w = display_width
@@ -429,13 +457,31 @@ class DRMRenderer:
         try:
             self._set_client_caps()
             self._discover()
+            self._compute_letterbox()
             self._discover_planes()
             self._discover_properties()
             self._allocate_framebuffer()
+            if self.enable_overlay:
+                self._discover_overlay_plane()
+                self._allocate_overlay_framebuffer()
             self._atomic_modeset()
         except Exception:
             self.close()
             raise
+
+    def _compute_letterbox(self) -> None:
+        """Letterbox the sign rect into the CRTC rect: same arithmetic
+        primary-plane software-scaling already uses, but pulled into a
+        member so the overlay plane's HVS scaling matches the primary's
+        letterboxed content region exactly."""
+        scale = min(
+            self.display_width / self.width,
+            self.display_height / self.height,
+        )
+        self._scaled_w = max(1, int(round(self.width * scale)))
+        self._scaled_h = max(1, int(round(self.height * scale)))
+        self._letterbox_x = (self.display_width - self._scaled_w) // 2
+        self._letterbox_y = (self.display_height - self._scaled_h) // 2
 
     # --- discovery ---
 
@@ -647,6 +693,120 @@ class DRMRenderer:
             )
         log.info("DRM: primary plane=%d", self._primary_plane_id)
 
+    def _discover_overlay_plane(self) -> None:
+        """Find an overlay plane bound to our CRTC that supports ARGB8888.
+
+        Run AFTER `_discover_planes` so we can skip the primary id we
+        already chose. Walks all planes again (cheap — counts are tiny)
+        and filters by: not-the-primary, possible_crtcs & our crtc bit,
+        type == OVERLAY, and format list contains ARGB8888 (without it
+        the alpha channel can't carry into the GPU compositor).
+        """
+        assert self._fd is not None and self._crtc_bit != 0
+        res = _DrmModeGetPlaneRes()
+        _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANERESOURCES, res)
+        plane_ids = (ctypes.c_uint32 * res.count_planes)()
+        res.plane_id_ptr = ctypes.cast(plane_ids, ctypes.c_void_p).value or 0
+        _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANERESOURCES, res)
+
+        for pid in plane_ids:
+            if pid == self._primary_plane_id:
+                continue
+            plane = _DrmModeGetPlane()
+            plane.plane_id = pid
+            _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANE, plane)
+            if not (plane.possible_crtcs & self._crtc_bit):
+                continue
+            if self._get_plane_type(pid) != DRM_PLANE_TYPE_OVERLAY:
+                continue
+            if plane.count_format_types == 0:
+                continue
+            # Second GETPLANE call to populate the format list.
+            formats = (ctypes.c_uint32 * plane.count_format_types)()
+            plane.format_type_ptr = ctypes.cast(formats, ctypes.c_void_p).value or 0
+            _ioctl(self._fd, DRM_IOCTL_MODE_GETPLANE, plane)
+            if DRM_FORMAT_ARGB8888 not in tuple(formats):
+                continue
+            self._overlay_plane_id = pid
+            break
+        if self._overlay_plane_id == 0:
+            raise RuntimeError(
+                f"no overlay plane bound to CRTC {self._crtc_id} "
+                f"that supports ARGB8888"
+            )
+        log.info("DRM: overlay plane=%d (ARGB8888)", self._overlay_plane_id)
+        self._overlay_plane_props = self._get_object_properties(
+            self._overlay_plane_id, DRM_MODE_OBJECT_PLANE
+        )
+        required = (
+            "FB_ID", "CRTC_ID",
+            "SRC_X", "SRC_Y", "SRC_W", "SRC_H",
+            "CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H",
+        )
+        missing = [n for n in required if n not in self._overlay_plane_props]
+        if missing:
+            raise RuntimeError(
+                f"overlay plane is missing required atomic properties: {missing}"
+            )
+
+    def _allocate_overlay_framebuffer(self) -> None:
+        """Second dumb buffer + DRM fb in ARGB8888, at SIGN-NATIVE dims.
+
+        The vc4 HVS (Hardware Video Scaler) scales the overlay plane's
+        source rect to its CRTC dest rect at scanout. Holding the fb
+        at sign-native (e.g. 128×96 = 49 KB at ARGB8888) instead of
+        display-native (8 MB at 1080p ARGB8888) cuts the per-frame
+        userspace work to a near-trivial split/merge + memcpy, which
+        is what makes "live-updating text over a background" actually
+        viable on Pi Zero 2 W.
+
+        Buffer is zero-initialized which (on LE arm64 with byte order
+        [B,G,R,A]) means fully transparent black — so before the
+        caller provides overlay content, the primary plane is what
+        eyeballs see, same as before this commit.
+        """
+        assert self._fd is not None
+        create = _DrmModeCreateDumb()
+        create.width = self.width
+        create.height = self.height
+        create.bpp = 32
+        _ioctl(self._fd, DRM_IOCTL_MODE_CREATE_DUMB, create)
+        self._overlay_dumb_handle = create.handle
+        self._overlay_dumb_size = int(create.size)
+        self._overlay_dumb_pitch = int(create.pitch)
+
+        fb = _DrmModeFbCmd2()
+        fb.width = self.width
+        fb.height = self.height
+        fb.pixel_format = DRM_FORMAT_ARGB8888
+        fb.handles[0] = self._overlay_dumb_handle
+        fb.pitches[0] = self._overlay_dumb_pitch
+        _ioctl(self._fd, DRM_IOCTL_MODE_ADDFB2, fb)
+        self._overlay_fb_id = fb.fb_id
+
+        map_dumb = _DrmModeMapDumb()
+        map_dumb.handle = self._overlay_dumb_handle
+        _ioctl(self._fd, DRM_IOCTL_MODE_MAP_DUMB, map_dumb)
+        self._overlay_mmap = mmap.mmap(
+            self._fd,
+            self._overlay_dumb_size,
+            mmap.MAP_SHARED,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=int(map_dumb.offset),
+        )
+        # CREATE_DUMB usually zeroes the buffer, but the kernel doesn't
+        # promise that across all drivers. Explicit init = transparent
+        # everywhere so first-frame doesn't show driver garbage.
+        self._overlay_mmap[: self._overlay_dumb_size] = b"\x00" * self._overlay_dumb_size
+        log.info(
+            "DRM: overlay fb_id=%d %dx%d ARGB8888 size=%d pitch=%d "
+            "(HVS-scaled to %dx%d at +%d+%d)",
+            self._overlay_fb_id, self.width, self.height,
+            self._overlay_dumb_size, self._overlay_dumb_pitch,
+            self._scaled_w, self._scaled_h,
+            self._letterbox_x, self._letterbox_y,
+        )
+
     def _discover_properties(self) -> None:
         """Cache property name→id for our CRTC, connector, and primary
         plane. The atomic commit path addresses every state change by
@@ -756,31 +916,55 @@ class DRMRenderer:
         # Fixed-point 16.16 SRC dims (DRM convention).
         src_w = self.display_width << 16
         src_h = self.display_height << 16
+        object_props: list[tuple[int, list[tuple[int, int]]]] = [
+            (self._crtc_id, [
+                (cp["ACTIVE"], 1),
+                (cp["MODE_ID"], self._mode_blob_id),
+            ]),
+            (self._connector_id, [
+                (np_["CRTC_ID"], self._crtc_id),
+            ]),
+            (self._primary_plane_id, [
+                (pp["FB_ID"], self._fb_id),
+                (pp["CRTC_ID"], self._crtc_id),
+                (pp["SRC_X"], 0),
+                (pp["SRC_Y"], 0),
+                (pp["SRC_W"], src_w),
+                (pp["SRC_H"], src_h),
+                (pp["CRTC_X"], 0),
+                (pp["CRTC_Y"], 0),
+                (pp["CRTC_W"], self.display_width),
+                (pp["CRTC_H"], self.display_height),
+            ]),
+        ]
+        if self.enable_overlay:
+            op = self._overlay_plane_props
+            # Overlay SRC = full sign-native fb (HVS reads everything).
+            # Overlay CRTC = letterboxed region of the display so the
+            # GPU-scaled overlay aligns pixel-for-pixel with the
+            # primary plane's letterboxed sign content.
+            sign_src_w = self.width << 16
+            sign_src_h = self.height << 16
+            object_props.append((self._overlay_plane_id, [
+                (op["FB_ID"], self._overlay_fb_id),
+                (op["CRTC_ID"], self._crtc_id),
+                (op["SRC_X"], 0),
+                (op["SRC_Y"], 0),
+                (op["SRC_W"], sign_src_w),
+                (op["SRC_H"], sign_src_h),
+                (op["CRTC_X"], self._letterbox_x),
+                (op["CRTC_Y"], self._letterbox_y),
+                (op["CRTC_W"], self._scaled_w),
+                (op["CRTC_H"], self._scaled_h),
+            ]))
         self._atomic_commit(
             flags=DRM_MODE_ATOMIC_ALLOW_MODESET,
-            object_props=[
-                (self._crtc_id, [
-                    (cp["ACTIVE"], 1),
-                    (cp["MODE_ID"], self._mode_blob_id),
-                ]),
-                (self._connector_id, [
-                    (np_["CRTC_ID"], self._crtc_id),
-                ]),
-                (self._primary_plane_id, [
-                    (pp["FB_ID"], self._fb_id),
-                    (pp["CRTC_ID"], self._crtc_id),
-                    (pp["SRC_X"], 0),
-                    (pp["SRC_Y"], 0),
-                    (pp["SRC_W"], src_w),
-                    (pp["SRC_H"], src_h),
-                    (pp["CRTC_X"], 0),
-                    (pp["CRTC_Y"], 0),
-                    (pp["CRTC_W"], self.display_width),
-                    (pp["CRTC_H"], self.display_height),
-                ]),
-            ],
+            object_props=object_props,
         )
-        log.info("DRM: atomic mode-set committed (primary plane only)")
+        log.info(
+            "DRM: atomic mode-set committed (%s)",
+            "primary + overlay" if self.enable_overlay else "primary only",
+        )
 
     # --- framebuffer alloc + map ---
 
@@ -858,6 +1042,31 @@ class DRMRenderer:
                 self._dumb_handle = 0
         except OSError:
             log.exception("DRMRenderer: destroy dumb failed")
+        # Overlay-plane resources mirror the primary cleanup pattern:
+        # mmap close → RMFB → DESTROY_DUMB. Each leg guarded so a
+        # partially-initialized renderer (e.g. enable_overlay open
+        # failed mid-allocation) still cleans up everything it owns.
+        try:
+            if self._overlay_mmap is not None:
+                self._overlay_mmap.close()
+                self._overlay_mmap = None
+        except Exception:
+            log.exception("DRMRenderer: overlay mmap close failed")
+        try:
+            if self._overlay_fb_id:
+                fb_id = ctypes.c_uint32(self._overlay_fb_id)
+                _ioctl(self._fd, DRM_IOCTL_MODE_RMFB, fb_id)
+                self._overlay_fb_id = 0
+        except OSError:
+            log.exception("DRMRenderer: overlay rmfb failed")
+        try:
+            if self._overlay_dumb_handle:
+                d = _DrmModeDestroyDumb()
+                d.handle = self._overlay_dumb_handle
+                _ioctl(self._fd, DRM_IOCTL_MODE_DESTROY_DUMB, d)
+                self._overlay_dumb_handle = 0
+        except OSError:
+            log.exception("DRMRenderer: overlay destroy dumb failed")
         try:
             if self._mode_blob_id:
                 blob = _DrmModeDestroyBlob()
@@ -952,3 +1161,69 @@ class DRMRenderer:
         off_y = (self.display_height - new_h) // 2
         canvas.paste(scaled, (off_x, off_y))
         return canvas
+
+    # --- multi-plane composite path ---
+
+    def render_composite(
+        self,
+        primary_rgb: bytes | None = None,
+        overlay_rgba: bytes | None = None,
+    ) -> None:
+        """Update the primary and/or overlay plane in one call.
+
+        primary_rgb: width*height*3 bytes of RGB888 (sign-side dims).
+            Goes through the same scaling + format-pack path as
+            render_frame. None leaves the primary plane untouched.
+        overlay_rgba: width*height*4 bytes of RGBA8888 (sign-side dims).
+            Scaled + letterboxed (transparent letterbox) to display dims,
+            channel-swizzled to ARGB8888 (B,G,R,A in memory on LE arm64),
+            written to the overlay plane's buffer. None leaves the
+            overlay plane untouched. Requires enable_overlay=True.
+
+        No atomic commit per call: the planes were bound at open and
+        keep reading their FB_IDs; in-place mmap writes show up at the
+        next scanout. The GPU composites overlay-over-primary at scanout
+        — no software alpha-blend, which is the entire point of moving
+        off the single-plane fb0/legacy path on Pi Zero 2 W (CPU blend
+        at 1080p costs 208 ms, beyond the 30 fps budget).
+        """
+        if self._mmap is None:
+            raise RuntimeError("DRMRenderer not opened")
+        if overlay_rgba is not None and not self.enable_overlay:
+            raise RuntimeError(
+                "render_composite() got overlay_rgba but enable_overlay=False"
+            )
+        if primary_rgb is not None:
+            self.render_frame(primary_rgb)
+        if overlay_rgba is not None:
+            self._write_overlay(overlay_rgba)
+
+    def _write_overlay(self, rgba: bytes) -> None:
+        """Swizzle RGBA → ARGB8888 (B,G,R,A on LE arm64) and write into
+        the sign-native overlay mmap. No software scaling, no paste —
+        the HVS scales the plane to its CRTC dest rect at scanout.
+
+        At 128×96 the per-channel split/merge is sub-millisecond and
+        the mmap write is 49 KB; the whole call clears in a couple ms.
+        """
+        assert self._overlay_mmap is not None
+        expected = self.width * self.height * 4
+        if len(rgba) != expected:
+            raise ValueError(
+                f"overlay length {len(rgba)} != {self.width}x{self.height} "
+                f"RGBA8888 ({expected})"
+            )
+        image = Image.frombytes("RGBA", (self.width, self.height), rgba)
+        r, g, b, a = image.split()
+        payload = Image.merge("RGBA", (b, g, r, a)).tobytes()
+
+        row_bytes = self.width * 4
+        if self._overlay_dumb_pitch == row_bytes:
+            self._overlay_mmap[: len(payload)] = payload
+        else:
+            for y in range(self.height):
+                start = y * row_bytes
+                self._overlay_mmap[
+                    y * self._overlay_dumb_pitch
+                    : y * self._overlay_dumb_pitch + row_bytes
+                ] = payload[start : start + row_bytes]
