@@ -17,12 +17,15 @@ The DRM/KMS path side-steps both:
 - Multi-plane composition: text on one plane, background on
   another, GPU composites at scanout. Phase 2a-1 landed the
   atomic-commit infrastructure on a single primary plane.
-  Phase 2a-2 adds an opt-in overlay plane in ARGB8888, held at
-  sign-native dims and scaled to the letterboxed CRTC region by
-  the vc4 HVS. With the overlay buffer at 128×96 ARGB instead of
-  display-native, per-frame overlay updates are sub-millisecond
-  (no software upscale, no software alpha-blend) — the actual
-  compositor win this whole rewrite was for.
+  Phase 2a-2 added an opt-in overlay plane in ARGB8888.
+  Phase 2a-3 (this file's current state) moves the PRIMARY plane
+  to the same HVS-scaled, sign-native pattern as the overlay —
+  both planes' fbs live at sign dims (e.g. 128×96), the vc4 HVS
+  scales them to the letterboxed CRTC region at scanout, and
+  per-frame software work for either plane is a sign-native
+  swizzle + tiny memcpy. This is the win that fixes the original
+  "Welcome transitions are slow" pain: render_frame goes from
+  ~100 ms / frame to ~1 ms / frame without changing its API.
 
 This is a Linux-only module; tests on the Mac side mock the
 ioctls. The Pi-side live-fire is the canonical correctness check.
@@ -896,12 +899,17 @@ class DRMRenderer:
         _ioctl(self._fd, DRM_IOCTL_MODE_ATOMIC, req)
 
     def _atomic_modeset(self) -> None:
-        """Replace the legacy SETCRTC mode-set with an atomic commit.
+        """Atomic mode-set — bind primary (and optional overlay) planes
+        to the CRTC at the discovered mode.
 
-        Same single-primary-plane behavior as before — display lights up
-        with our framebuffer at the chosen mode — but the path is now
-        property-driven, which is the prerequisite for adding an
-        overlay plane in the next commit.
+        Both planes use HVS plane-scaling: their fb is at sign-native
+        dims (e.g. 128×96), SRC is the full sign rect in 16.16 fp, and
+        CRTC dest is the letterboxed display region. The vc4 HVS scales
+        each plane to its CRTC rect at scanout, so per-frame software
+        cost is just a sign-native swizzle + tiny memcpy. Areas of the
+        CRTC outside the letterboxed region (the black bands) are
+        uncovered by any plane; the HVS programs the CRTC's background
+        register (default black on vc4) for those scanlines.
         """
         assert (
             self._fd is not None
@@ -913,9 +921,8 @@ class DRMRenderer:
         cp = self._crtc_props
         np_ = self._connector_props
         pp = self._primary_plane_props
-        # Fixed-point 16.16 SRC dims (DRM convention).
-        src_w = self.display_width << 16
-        src_h = self.display_height << 16
+        sign_src_w = self.width << 16
+        sign_src_h = self.height << 16
         object_props: list[tuple[int, list[tuple[int, int]]]] = [
             (self._crtc_id, [
                 (cp["ACTIVE"], 1),
@@ -929,22 +936,20 @@ class DRMRenderer:
                 (pp["CRTC_ID"], self._crtc_id),
                 (pp["SRC_X"], 0),
                 (pp["SRC_Y"], 0),
-                (pp["SRC_W"], src_w),
-                (pp["SRC_H"], src_h),
-                (pp["CRTC_X"], 0),
-                (pp["CRTC_Y"], 0),
-                (pp["CRTC_W"], self.display_width),
-                (pp["CRTC_H"], self.display_height),
+                (pp["SRC_W"], sign_src_w),
+                (pp["SRC_H"], sign_src_h),
+                (pp["CRTC_X"], self._letterbox_x),
+                (pp["CRTC_Y"], self._letterbox_y),
+                (pp["CRTC_W"], self._scaled_w),
+                (pp["CRTC_H"], self._scaled_h),
             ]),
         ]
         if self.enable_overlay:
             op = self._overlay_plane_props
-            # Overlay SRC = full sign-native fb (HVS reads everything).
-            # Overlay CRTC = letterboxed region of the display so the
-            # GPU-scaled overlay aligns pixel-for-pixel with the
-            # primary plane's letterboxed sign content.
-            sign_src_w = self.width << 16
-            sign_src_h = self.height << 16
+            # Overlay shares the same SRC and CRTC rects as primary —
+            # both are sign-native scaled to the same letterboxed
+            # region, so overlay alpha-pixels land directly on top of
+            # primary content pixels at scanout (no sub-pixel drift).
             object_props.append((self._overlay_plane_id, [
                 (op["FB_ID"], self._overlay_fb_id),
                 (op["CRTC_ID"], self._crtc_id),
@@ -962,38 +967,42 @@ class DRMRenderer:
             object_props=object_props,
         )
         log.info(
-            "DRM: atomic mode-set committed (%s)",
+            "DRM: atomic mode-set committed (%s, HVS-scaled to %dx%d at +%d+%d)",
             "primary + overlay" if self.enable_overlay else "primary only",
+            self._scaled_w, self._scaled_h,
+            self._letterbox_x, self._letterbox_y,
         )
 
     # --- framebuffer alloc + map ---
 
     def _allocate_framebuffer(self) -> None:
-        """Create a dumb buffer at display dims, mmap it, register it as
-        a DRM framebuffer with XRGB8888 format. The mmap'd region is
-        what render_frame writes to each tick — one userspace→display
-        copy, no syscall per pixel."""
+        """Create a dumb buffer at SIGN-NATIVE dims, mmap it, register
+        it as a DRM framebuffer in self.pixel_format.
+
+        The vc4 HVS scales this fb to the letterboxed CRTC region at
+        scanout; per-frame work is just a sign-native swizzle + tiny
+        memcpy (e.g. 24 KB at 128×96 RGB565 vs the 4 MB / display-
+        native fb the prior implementation wrote).
+        """
         assert self._fd is not None and self._mode is not None
         create = _DrmModeCreateDumb()
-        create.width = self.display_width
-        create.height = self.display_height
+        create.width = self.width
+        create.height = self.height
         create.bpp = self._bytes_per_pixel * 8
         _ioctl(self._fd, DRM_IOCTL_MODE_CREATE_DUMB, create)
         self._dumb_handle = create.handle
         self._dumb_size = int(create.size)
         self._dumb_pitch = int(create.pitch)
 
-        # Add the dumb buffer as a DRM framebuffer.
         fb = _DrmModeFbCmd2()
-        fb.width = self.display_width
-        fb.height = self.display_height
+        fb.width = self.width
+        fb.height = self.height
         fb.pixel_format = self._drm_format
         fb.handles[0] = self._dumb_handle
         fb.pitches[0] = self._dumb_pitch
         _ioctl(self._fd, DRM_IOCTL_MODE_ADDFB2, fb)
         self._fb_id = fb.fb_id
 
-        # mmap the dumb buffer at the offset MAP_DUMB returns.
         map_dumb = _DrmModeMapDumb()
         map_dumb.handle = self._dumb_handle
         _ioctl(self._fd, DRM_IOCTL_MODE_MAP_DUMB, map_dumb)
@@ -1003,6 +1012,14 @@ class DRMRenderer:
             mmap.MAP_SHARED,
             mmap.PROT_READ | mmap.PROT_WRITE,
             offset=int(map_dumb.offset),
+        )
+        log.info(
+            "DRM: primary fb_id=%d %dx%d %s size=%d pitch=%d "
+            "(HVS-scaled to %dx%d at +%d+%d)",
+            self._fb_id, self.width, self.height, self.pixel_format,
+            self._dumb_size, self._dumb_pitch,
+            self._scaled_w, self._scaled_h,
+            self._letterbox_x, self._letterbox_y,
         )
 
     # --- close ---
@@ -1085,14 +1102,16 @@ class DRMRenderer:
     # --- render path ---
 
     def render_frame(self, frame: bytes) -> None:
-        """Convert RGB888 `frame` to XRGB8888 and write to the mmap'd buffer.
+        """Convert RGB888 `frame` to the configured pixel format and
+        write to the sign-native primary mmap.
 
-        `frame` is `width * height * 3` bytes (sign-side dims). We resize
-        to display dims with NEAREST + letterbox (same shape HDMIRenderer
-        used), then convert RGB → XRGB8888 by inserting a 0xFF padding
-        byte after each pixel triplet (memory layout: B G R X per pixel
-        on little-endian arm64 — DRM_FORMAT_XRGB8888 has X in the high
-        byte of the 32-bit word, which is the LAST byte in memory).
+        `frame` is `width * height * 3` bytes (sign-side dims). No
+        software scaling, no letterbox paste — the vc4 HVS scales the
+        primary plane to its CRTC dest rect (the letterboxed display
+        region) at scanout. Per-frame work is dominated by the format
+        convert (Pillow's `BGR;16` for RGB565, split/merge for
+        XRGB8888) and the mmap memcpy of `width*height*bpp` bytes.
+        At 128×96 RGB565 that's 24 KB and clears in a millisecond.
         """
         if self._mmap is None:
             raise RuntimeError("DRMRenderer not opened")
@@ -1103,14 +1122,11 @@ class DRMRenderer:
             )
 
         image = Image.frombytes("RGB", (self.width, self.height), frame)
-        if (self.width, self.height) != (self.display_width, self.display_height):
-            image = self._scale_with_letterbox(image)
 
         if self.pixel_format == "rgb565":
-            # Pillow's "BGR;16" mode produces RGB565 little-endian — same
-            # path HDMIRenderer's fb0 RGB565 uses. ~30 ms at 1080p (C-side
-            # convert) and only 4 MB/frame to copy. Deprecated in Pillow
-            # 12; numpy fallback for forward-compat with that release.
+            # Pillow's deprecated "BGR;16" mode = RGB565 little-endian
+            # via a C-side per-pixel pack. numpy fallback covers Pillow
+            # 12's removal slated for 2025-10-15.
             import warnings
             try:
                 with warnings.catch_warnings():
@@ -1127,40 +1143,23 @@ class DRMRenderer:
                 )
                 payload = packed.astype("<u2").tobytes()
         else:
-            # XRGB8888 — bytes [B, G, R, X] per pixel. Split/merge runs
-            # at ~80 ms at 1080p (C-side per-channel rearrange). Use this
-            # only when we need the alpha channel (multi-plane phase).
+            # XRGB8888 — bytes [B, G, R, X] per pixel on LE arm64.
             r, g, b = image.split()
             alpha = Image.new("L", image.size, 255)
             payload = Image.merge("RGBA", (b, g, r, alpha)).tobytes()
 
-        # mmap slice-assignment is a single C-level memcpy from the
-        # bytes object's buffer into the kernel-mapped page. If the
-        # dumb buffer's pitch is wider than width*bpp (some drivers
-        # pad rows), fall back to per-row copy.
-        row_bytes = self.display_width * self._bytes_per_pixel
+        # mmap slice-assignment is a single C-level memcpy. If the kernel
+        # padded the row pitch beyond width*bpp (rare at small dims, but
+        # possible), fall back to per-row copy.
+        row_bytes = self.width * self._bytes_per_pixel
         if self._dumb_pitch == row_bytes:
             self._mmap[: len(payload)] = payload
         else:
-            for y in range(self.display_height):
+            for y in range(self.height):
                 start = y * row_bytes
                 self._mmap[
                     y * self._dumb_pitch : y * self._dumb_pitch + row_bytes
                 ] = payload[start : start + row_bytes]
-
-    def _scale_with_letterbox(self, image: Image.Image) -> Image.Image:
-        scale = min(
-            self.display_width / self.width,
-            self.display_height / self.height,
-        )
-        new_w = max(1, int(round(self.width * scale)))
-        new_h = max(1, int(round(self.height * scale)))
-        scaled = image.resize((new_w, new_h), resample=Image.Resampling.NEAREST)
-        canvas = Image.new("RGB", (self.display_width, self.display_height), (0, 0, 0))
-        off_x = (self.display_width - new_w) // 2
-        off_y = (self.display_height - new_h) // 2
-        canvas.paste(scaled, (off_x, off_y))
-        return canvas
 
     # --- multi-plane composite path ---
 
@@ -1171,21 +1170,21 @@ class DRMRenderer:
     ) -> None:
         """Update the primary and/or overlay plane in one call.
 
-        primary_rgb: width*height*3 bytes of RGB888 (sign-side dims).
-            Goes through the same scaling + format-pack path as
-            render_frame. None leaves the primary plane untouched.
-        overlay_rgba: width*height*4 bytes of RGBA8888 (sign-side dims).
-            Scaled + letterboxed (transparent letterbox) to display dims,
-            channel-swizzled to ARGB8888 (B,G,R,A in memory on LE arm64),
-            written to the overlay plane's buffer. None leaves the
-            overlay plane untouched. Requires enable_overlay=True.
+        primary_rgb: width*height*3 bytes of RGB888 at sign-side dims.
+            Format-converted (RGB565 or XRGB8888) and written to the
+            sign-native primary mmap. None leaves the primary plane
+            untouched.
+        overlay_rgba: width*height*4 bytes of RGBA8888 at sign-side dims.
+            Channel-swizzled to ARGB8888 (B,G,R,A in memory on LE
+            arm64) and written to the sign-native overlay mmap. None
+            leaves the overlay plane untouched. Requires
+            enable_overlay=True.
 
-        No atomic commit per call: the planes were bound at open and
-        keep reading their FB_IDs; in-place mmap writes show up at the
-        next scanout. The GPU composites overlay-over-primary at scanout
-        — no software alpha-blend, which is the entire point of moving
-        off the single-plane fb0/legacy path on Pi Zero 2 W (CPU blend
-        at 1080p costs 208 ms, beyond the 30 fps budget).
+        Both planes' fbs are at sign-native dims; the vc4 HVS scales
+        each to its CRTC dest rect (the letterboxed display region) at
+        scanout. No atomic commit per call — the planes were bound at
+        open and keep reading their FB_IDs. The GPU composites overlay-
+        over-primary at scanout — no software alpha-blend.
         """
         if self._mmap is None:
             raise RuntimeError("DRMRenderer not opened")
