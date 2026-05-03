@@ -1713,34 +1713,12 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     display: none;
 }
 
-/* Color row — 9 hex swatches + native picker. Per-layer text color only. */
-.editor-color-row {
-    display: flex;
-    gap: 4px;
-    flex-wrap: wrap;
-    align-items: center;
-}
-.editor-color-swatch {
-    width: 18px;
-    height: 18px;
-    border-radius: 6px;
-    border: 1px solid var(--om-line-2);
-    padding: 0;
-    cursor: pointer;
-    flex-shrink: 0;
-}
-.editor-color-swatch.editor-color-swatch--selected {
-    border: 2px solid var(--om-accent);
-}
-.editor-color-row .field-text-color {
-    width: 22px;
-    height: 18px;
-    padding: 0;
-    border: 1px solid var(--om-line-2);
-    border-radius: 6px;
-    background: transparent;
-    cursor: pointer;
-}
+/* Per-layer text color used to show a 9-hex hardcoded quick-row +
+   native picker (.editor-color-row + .editor-color-swatch). The
+   curated-palette picker (mountColorPicker) replaced both as of
+   6591985 — the .om-color-picker-* rules above own the layout now.
+   Old rules deleted to prevent the dupe-swatch + orphan-purple bug
+   qarl flagged on the live demo. */
 
 /* Compact pill-group segmented control. Used for Dynamic-source +
    Motion. Uses radio inputs under the hood for keyboard a11y; visual

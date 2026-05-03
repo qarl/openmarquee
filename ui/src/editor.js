@@ -324,23 +324,6 @@ const EDITOR_TEMPLATE = `
     </div>
 `;
 
-// Quick text-color swatches for the per-layer color row (§5.10a v3.1
-// accordion-editor handoff). Per-layer COLOR ONLY — bg color stayed
-// slide-level and lives in the Background-source card. Pulls the same
-// nine values the design ref uses (handoff/reference/app/layer-variants.jsx).
-const LAYER_QUICK_COLORS = [
-    "#FFFFFF", "#FFB43C", "#FF5FA7", "#5AF095", "#5FD5FF",
-    "#FF5A3C", "#A06CFF", "#1A1610", "#F4ECD8",
-];
-
-function quickColorSwatchesHtml() {
-    return LAYER_QUICK_COLORS.map(
-        (c) => `<button type="button" class="editor-color-swatch" data-color="${c}"
-                  aria-label="${c}" title="${c}"
-                  style="background:${c};"></button>`,
-    ).join("");
-}
-
 // Per-layer accordion card. Inserted dynamically into .editor-layers-list,
 // one element per layer in state.layers. The header row is always visible;
 // the body is only rendered open for the *expanded* layer (one-open-at-
@@ -401,10 +384,7 @@ const LAYER_GROUP_TEMPLATE = `
         </p>
         <div class="om-field">
             <span>Text color</span>
-            <div class="editor-color-row">
-                ${quickColorSwatchesHtml()}
-                <input type="color" class="field-text-color" value="#FFFFFF">
-            </div>
+            <input type="color" class="field-text-color" value="#FFFFFF">
         </div>
         <div class="om-row" style="gap: 10px; align-items: end;">
             <div class="om-field font-picker" style="flex: 1;">
@@ -950,20 +930,6 @@ export function mountEditor(
             });
         });
         autoFormatEl.addEventListener("change", () => syncLayerFromForm(groupEl));
-
-
-        // Quick-color swatches set this layer's text color (the BG color
-        // is slide-level and lives in the Background-source card —
-        // per-layer presets that paired text+bg colors are gone in v3.1).
-        groupEl.querySelectorAll(".editor-color-swatch").forEach((btn) => {
-            btn.addEventListener("click", (ev) => {
-                ev.preventDefault();
-                const color = btn.dataset.color;
-                if (!color) return;
-                textColorEl.value = color;
-                textColorEl.dispatchEvent(new Event("input", { bubbles: true }));
-            });
-        });
 
         // Bundled @font-face fonts load lazily — kick an explicit load on
         // selection and redraw once it's ready, so the preview catches up

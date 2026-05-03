@@ -475,26 +475,38 @@ describe("mountEditor — submit flow", () => {
         expect(status).toContain("backend boom");
     });
 
-    it("clicking a quick-color swatch updates the layer's text color and re-renders", () => {
-        // §5.10a v3.1 (accordion editor): the per-layer "Quick colors"
-        // pairs (text + bg "Aa" buttons) are gone; replaced by 9 hex
-        // swatches that set the LAYER'S text color only. Bg color stays
-        // slide-level in the Background-source card.
+    it("clicking a curated-palette swatch updates the layer's text color and re-renders", () => {
+        // qarl 2026-05-03 designer dispatch: the per-layer text color
+        // gets the 8-inline curated palette picker (mountColorPicker)
+        // — same widget as bg color + pattern Color A/B. The OLD
+        // hardcoded 9-swatch quick-row (LAYER_QUICK_COLORS) was
+        // removed because it duplicated and conflicted with the
+        // curated picker (caught on the live demo: dupe whites +
+        // orphan #A06CFF purple appearing alongside the curated row).
+        // This test now exercises the curated picker on the per-layer
+        // text-color input.
         const fakeCtx = patchCanvasPrototype();
         const container = document.createElement("div");
         mountEditor(container, { width: 64, height: 32, onSave: vi.fn() });
 
         const renderCallsBefore = fakeCtx.fillRect.mock.calls.length;
-        // Pick the amber accent swatch (#FFB43C — second in the row).
-        const swatch = container.querySelectorAll(".editor-color-swatch")[1];
-        expect(swatch.dataset.color).toBe("#FFB43C");
-        swatch.click();
+        // Pick the Amber inline swatch on the per-layer text color
+        // picker — Amber is at INLINE_SWATCHES[2] (#F4B755). The
+        // curated picker dispatches an input event on the wrapped
+        // .field-text-color input when a swatch is clicked.
+        const layerCard = container.querySelector(".editor-layer-group");
+        const textColorPicker = layerCard.querySelector(
+            ".field-text-color"
+        ).closest(".om-color-picker");
+        const amberSwatch = textColorPicker.querySelector(
+            '.om-color-picker-swatch[data-hex="#F4B755"]',
+        );
+        expect(amberSwatch).not.toBeNull();
+        amberSwatch.click();
 
-        // Native browsers lowercase color-input values; the editor
-        // uppercases on save, so just check case-insensitively.
         expect(
             container.querySelector(".field-text-color").value.toUpperCase(),
-        ).toBe("#FFB43C");
+        ).toBe("#F4B755");
         // Bg color was NOT touched — that's slide-level now.
         expect(container.querySelector(".field-bg-color").value).toBe("#000000");
         // Re-render happened.
