@@ -530,7 +530,13 @@ def _draw_text_into(
     else:
         size_px = max(12, int(px_box_w * 0.3))
     font = _load_text_font(font_family, size_px)
-    bbox = draw.textbbox((0, 0), text, font=font)
+    # Emoji font is None unless the operator dropped Noto Color Emoji
+    # at ui/fonts/noto-color-emoji.ttf. When present, mixed-content
+    # strings render in segmented runs; absent, emoji codepoints fall
+    # through to the regular font (showing .notdef tofu but not
+    # crashing).
+    emoji_font = _load_emoji_font(size_px)
+    bbox = _measure_text_runs(draw, text, font, emoji_font)
     natural_w = bbox[2] - bbox[0]
     natural_h = bbox[3] - bbox[1]
     box_center_x = px_box_x + px_box_w / 2
@@ -549,13 +555,13 @@ def _draw_text_into(
 
     # Fits inside the box on both axes — paint directly, no squish.
     if natural_w <= px_box_w and natural_h <= px_box_h:
-        draw.text(
+        _draw_text_runs(
+            draw,
             (box_center_x - natural_w / 2 - bbox[0],
              box_center_y - natural_h / 2 - bbox[1]),
             text,
-            fill=fg,
-            font=font,
-            **stroke_kwargs,
+            fg=fg, font=font, emoji_font=emoji_font,
+            stroke_kwargs=stroke_kwargs,
         )
         return
     # Squish: render at natural size on a transparent surface, then
@@ -576,12 +582,12 @@ def _draw_text_into(
         (0, 0, 0, 0),
     )
     td = ImageDraw.Draw(temp)
-    td.text(
+    _draw_text_runs(
+        td,
         (pad_pre_w - bbox[0], pad_pre_h - bbox[1]),
         text,
-        fill=fg,
-        font=font,
-        **stroke_kwargs,
+        fg=fg, font=font, emoji_font=emoji_font,
+        stroke_kwargs=stroke_kwargs,
     )
     squished = temp.resize(
         (target_w + pad_post * 2, target_h + pad_post * 2), Image.LANCZOS
@@ -680,6 +686,152 @@ def _cover_fit(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
     left = (new_w - target_w) // 2
     top = (new_h - target_h) // 2
     return resized.crop((left, top, left + target_w, top + target_h))
+
+
+# Codepoint ranges that render via the emoji font when one is bundled.
+# Per the post-arc spec from QA: U+1F000..U+1FFFF (Mahjong / supplementary
+# plane emoji) and U+2600..U+27BF (misc symbols + dingbats). Refining
+# beyond these ranges (ZWJ sequences, regional indicator pairs for
+# flags, skin-tone modifiers) is out of scope for v1 — those split into
+# multiple runs but each individual codepoint still finds an emoji
+# glyph in Noto Color Emoji.
+_EMOJI_CODEPOINT_RANGES: tuple[tuple[int, int], ...] = (
+    (0x1F000, 0x1FFFF),
+    (0x2600, 0x27BF),
+)
+
+
+def _is_emoji_codepoint(codepoint: int) -> bool:
+    """True if `codepoint` falls in any range that should render with
+    the bundled emoji font instead of the layer's regular font."""
+    return any(lo <= codepoint <= hi for lo, hi in _EMOJI_CODEPOINT_RANGES)
+
+
+def _segment_text_for_emoji(text: str) -> list[tuple[str, str]]:
+    """Split `text` into adjacent same-kind runs.
+
+    Returns a list of (kind, substring) tuples where kind is "text"
+    (render with the layer's font) or "emoji" (render with the
+    bundled emoji font, embedded_color=True). Adjacent codepoints of
+    the same kind merge into one run so each draw.text call is as
+    chunky as possible — fewer cursor-advance roundtrips, simpler
+    measurement.
+
+    Empty input returns []. A pure-text string returns one ("text",
+    full_text) run; a pure-emoji string returns one ("emoji",
+    full_text) run.
+    """
+    if not text:
+        return []
+    runs: list[tuple[str, str]] = []
+    cur_kind = "emoji" if _is_emoji_codepoint(ord(text[0])) else "text"
+    cur_buf = [text[0]]
+    for ch in text[1:]:
+        kind = "emoji" if _is_emoji_codepoint(ord(ch)) else "text"
+        if kind == cur_kind:
+            cur_buf.append(ch)
+        else:
+            runs.append((cur_kind, "".join(cur_buf)))
+            cur_kind = kind
+            cur_buf = [ch]
+    runs.append((cur_kind, "".join(cur_buf)))
+    return runs
+
+
+def _load_emoji_font(size_px: int):
+    """Load Noto Color Emoji at size_px from ui/fonts/, or None.
+
+    Operators wanting emoji on the device drop noto-color-emoji.ttf
+    (free download from Google Fonts) at ui/fonts/. Until they do,
+    this returns None and emoji codepoints render via the layer's
+    regular font (which on most fonts shows .notdef tofu boxes —
+    not great, but doesn't crash). Bundling the ~10 MB color-emoji
+    TTF in the repo is intentionally deferred to a future install
+    script (scripts/install/download-emoji-font.sh, TBD).
+    """
+    try:
+        from openmarquee.auto_render import _bundled_fonts_dir
+        path = _bundled_fonts_dir() / "noto-color-emoji.ttf"
+        if not path.exists():
+            return None
+        # Noto Color Emoji is a CBDT bitmap font; PIL picks the closest
+        # bitmap strike. Pass any size the layer wants — Pillow scales.
+        return ImageFont.truetype(str(path), size_px)
+    except (OSError, Exception):
+        return None
+
+
+def _measure_text_runs(draw, text: str, font, emoji_font) -> tuple[int, int, int, int]:
+    """Return a (x0, y0, x1, y1) bbox-shaped tuple measuring `text`
+    when rendered as emoji-segmented runs. Equivalent to
+    draw.textbbox when there's no emoji or no emoji_font available.
+
+    The runs are placed contiguously left-to-right with the cursor
+    advancing by each run's draw.textbbox width; vertical extent is
+    the union of all runs' bboxes. This matches the layout done by
+    _draw_text_runs so the natural-size measurement used for box-
+    fit / squish decisions stays accurate when emoji is present."""
+    if emoji_font is None:
+        return draw.textbbox((0, 0), text, font=font)
+    runs = _segment_text_for_emoji(text)
+    if all(kind == "text" for kind, _ in runs):
+        return draw.textbbox((0, 0), text, font=font)
+    cursor_x = 0.0
+    x0_first: int | None = None
+    min_y = 0
+    max_y = 0
+    for kind, run_text in runs:
+        run_font = emoji_font if kind == "emoji" else font
+        bbox = draw.textbbox((int(cursor_x), 0), run_text, font=run_font)
+        if x0_first is None:
+            x0_first = bbox[0]
+        if bbox[1] < min_y:
+            min_y = bbox[1]
+        if bbox[3] > max_y:
+            max_y = bbox[3]
+        # Advance by the run's horizontal advance width (font.getlength)
+        # not the ink-bbox right edge (bbox[2]). Glyphs with right-side
+        # bearing — common at text↔emoji run boundaries — would
+        # otherwise visually touch or overlap by a pixel.
+        cursor_x += run_font.getlength(run_text)
+    return (x0_first or 0, min_y, int(round(cursor_x)), max_y)
+
+
+def _draw_text_runs(
+    draw, xy: tuple[float, float], text: str, *,
+    fg: str, font, emoji_font, stroke_kwargs: dict,
+) -> None:
+    """Render `text` at `xy` using emoji_font for emoji codepoints
+    and `font` for the rest. Falls back to a single draw.text call
+    when emoji_font is None or text has no emoji."""
+    if emoji_font is None:
+        draw.text(xy, text, fill=fg, font=font, **stroke_kwargs)
+        return
+    runs = _segment_text_for_emoji(text)
+    if all(kind == "text" for kind, _ in runs):
+        draw.text(xy, text, fill=fg, font=font, **stroke_kwargs)
+        return
+    cursor_x = float(xy[0])
+    cursor_y = xy[1]
+    for kind, run_text in runs:
+        run_font = emoji_font if kind == "emoji" else font
+        if kind == "emoji":
+            # embedded_color=True renders the CBDT/COLR color glyphs.
+            # fill / stroke don't apply to color glyphs (the colors
+            # are baked into the font's bitmap data), so we omit them.
+            draw.text(
+                (cursor_x, cursor_y), run_text,
+                font=run_font, embedded_color=True,
+            )
+        else:
+            draw.text(
+                (cursor_x, cursor_y), run_text,
+                fill=fg, font=run_font, **stroke_kwargs,
+            )
+        # Advance by horizontal-advance width (not ink-bbox right edge)
+        # so consecutive runs in different fonts don't visually touch
+        # at glyph boundaries.
+        cursor_x += run_font.getlength(run_text)
 
 
 def _load_text_font(family: str | None, size_px: int):
