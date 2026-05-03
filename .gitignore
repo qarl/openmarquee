@@ -58,6 +58,12 @@ test-results/
 # vitest cache
 .vite/
 
+# Noto Color Emoji is fetched at build time by scripts/download-emoji-
+# font.sh — too heavy (~10 MB) to live in git, but bundled at runtime
+# alongside the in-repo @font-face fonts (Inter, Reenie Beanie, ...)
+# so editor preview and device renderer use the same color glyphs.
+ui/fonts/noto-color-emoji.ttf
+
 # Editor
 .vscode/
 .idea/

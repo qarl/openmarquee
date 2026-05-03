@@ -181,13 +181,22 @@ function setupFontPicker(layerEl) {
  * Generic keywords (sans-serif, serif, monospace) must NOT be quoted; named
  * families with spaces must be. Canvas will silently drop an unquoted
  * "Bebas Neue" otherwise.
+ *
+ * Appends "Noto Color Emoji" as the canvas-side fallback so the browser
+ * picks emoji glyphs from the bundled color-emoji TTF (loaded via
+ * @font-face in styles.css, populated at build time by
+ * scripts/download-emoji-font.sh) rather than the system's default
+ * emoji font. Pairs with the device-side codepoint segmentation in
+ * backend/openmarquee/seed.py:_draw_text_runs so editor preview and
+ * device output use the same color glyphs.
  */
 function cssFontFamily(value) {
     const GENERICS = new Set([
         "sans-serif", "serif", "monospace", "cursive", "fantasy",
         "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
     ]);
-    return GENERICS.has(value) ? value : `"${value}"`;
+    const primary = GENERICS.has(value) ? value : `"${value}"`;
+    return `${primary}, "Noto Color Emoji"`;
 }
 
 const EDITOR_TEMPLATE = `

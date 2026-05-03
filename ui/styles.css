@@ -31,6 +31,22 @@
 @font-face { font-family: "Reenie Beanie";      src: url("fonts/reenie-beanie.ttf") format("truetype"); font-weight: 400; font-display: swap; }
 @font-face { font-family: "Shadows Into Light"; src: url("fonts/shadows-into-light.ttf") format("truetype"); font-weight: 400; font-display: swap; }
 
+/* Noto Color Emoji — populated at build time by scripts/download-emoji-
+   font.sh (~10 MB, gitignored). When present, editor canvas paints
+   emoji codepoints via the same TTF the device renderer uses, so
+   editor preview matches what the device shows. When absent (font
+   missing on a fresh-clone-no-setup machine), the canvas falls back
+   to whatever the system has and the device falls back to tofu — no
+   crash either way. */
+@font-face {
+    font-family: "Noto Color Emoji";
+    src: url("fonts/noto-color-emoji.ttf") format("truetype");
+    font-display: swap;
+    unicode-range:
+        U+1F000-1FFFF,  /* supplementary plane: 😀 etc. */
+        U+2600-27BF;    /* misc symbols + dingbats: ☀ ✨ etc. */
+}
+
 :root {
     --bg: #0e0e10;
     --panel: #19191c;

@@ -52,6 +52,27 @@ if ! cmp -s "$OPENMARQUEE_BUILD_DIR/ui/package-lock.json" "$OPENMARQUEE_SRC/ui/p
     echo "==> package-lock.json updated; synced back to source"
 fi
 
+# --- Noto Color Emoji (build-time download) ---
+
+# Bundled color-emoji TTF used by the device renderer (Pillow side,
+# backend/openmarquee/seed.py:_load_emoji_font) AND the editor preview
+# (@font-face declaration in ui/styles.css), so emoji codepoints render
+# identically in editor and on glass. The TTF is ~10 MB — too heavy
+# for git — so we fetch it at setup time. Pinned + sha-verified inside
+# the download script. Idempotent: re-running setup.sh is cheap.
+echo "==> ensuring Noto Color Emoji is installed"
+bash "$OPENMARQUEE_SRC/scripts/download-emoji-font.sh"
+mkdir -p "$OPENMARQUEE_BUILD_DIR/ui/fonts"
+# Atomic copy via .tmp + mv so a partial write on a network-mounted
+# BUILD_DIR (NFS / SMB / rclone-fuse) doesn't leave a truncated TTF
+# that the dev server would serve as garbage. Plain `cp` on the
+# default local BUILD_DIR is fine, but the .tmp/mv cost is negligible
+# and covers the edge case.
+cp "$OPENMARQUEE_SRC/ui/fonts/noto-color-emoji.ttf" \
+    "$OPENMARQUEE_BUILD_DIR/ui/fonts/noto-color-emoji.ttf.tmp"
+mv "$OPENMARQUEE_BUILD_DIR/ui/fonts/noto-color-emoji.ttf.tmp" \
+    "$OPENMARQUEE_BUILD_DIR/ui/fonts/noto-color-emoji.ttf"
+
 cat <<EOF
 
 ready.
