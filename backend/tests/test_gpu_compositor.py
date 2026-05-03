@@ -329,18 +329,27 @@ def test_tick_breathe_changes_crtc_w_and_h():
     assert r.planes[0]["crtc_h"] < attach_h
 
 
-def test_tick_bounce_modulates_crtc_y_around_glyph_y():
+def test_tick_bounce_rebounds_up_only():
+    """True ball-on-floor bounce (qarl 2026-05-03 abs(sin) directive):
+    rest position is the floor; layer rebounds UP from rest twice per
+    cycle, never goes below. CRTC_Y is positive-down so "up" means
+    crtc_y < attach_y."""
     c, r, _ = _attached_compositor("bounce", motion_intensity=100)
     attach_y = r.planes[0]["crtc_y"]
-    # Bounce phase=0 → sin=0 → no offset.
+    # phase=0 → abs(sin(0)) = 0 → at floor.
     c.tick(0.0)
     assert r.planes[0]["crtc_y"] == attach_y
-    # phase=0.25 → sin=1 → positive offset.
+    # phase=0.25 → abs(sin(π/2)) = 1 → max rebound up.
     c.tick(0.25)
-    assert r.planes[0]["crtc_y"] > attach_y
-    # phase=0.75 → sin=-1 → negative offset.
+    quarter_y = r.planes[0]["crtc_y"]
+    assert quarter_y < attach_y
+    # phase=0.5 → abs(sin(π)) = 0 → back at floor.
+    c.tick(0.5)
+    assert r.planes[0]["crtc_y"] == attach_y
+    # phase=0.75 → abs(sin(3π/2)) = 1 → SAME upward offset as phase=0.25
+    # (the whole point of abs(sin) over plain sin — never below rest).
     c.tick(0.75)
-    assert r.planes[0]["crtc_y"] < attach_y
+    assert r.planes[0]["crtc_y"] == quarter_y
 
 
 def test_tick_shake_is_deterministic():

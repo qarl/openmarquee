@@ -197,15 +197,23 @@ def _apply_bounce(
     intensity: int,
     phase: float,
 ) -> Image.Image:
-    """Sine vertical bob inside the box. Unlike `ticker`, the bob does
-    NOT wrap — exiting the top/bottom box edge clips. Operators expect
-    bouncing text to disappear if it bounces too high, not to teleport
-    to the bottom."""
+    """Vertical bounce inside the box — true ball-on-floor pattern,
+    not a symmetric vibration (qarl 2026-05-03: "abs(sin) for true
+    bouncing"). The rest position is the FLOOR; the layer rebounds
+    UP and back down to the floor twice per cycle, never going below
+    rest. abs(sin) gives values in [0, 1]; the negative coefficient
+    converts that into negative-Y offset (PIL Y is positive-down,
+    so negative offset = UP).
+
+    Unlike `ticker`, the bounce does NOT wrap — exiting the top edge
+    clips. Operators expect bouncing text to disappear if it bounces
+    too high, not to teleport to the bottom.
+    """
     bx, by, bw, bh = box_px
     if bw <= 0 or bh <= 0:
         return layer_rgba
-    amplitude = (intensity / 100.0) * 0.10  # ±10 % box height at 100
-    offset_px = int(round(amplitude * bh * math.sin(2 * math.pi * phase)))
+    amplitude = (intensity / 100.0) * 0.10  # 0..10 % box height at 100
+    offset_px = -int(round(amplitude * bh * abs(math.sin(2 * math.pi * phase))))
     box_region = layer_rgba.crop((bx, by, bx + bw, by + bh))
     out_box = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
     out_box.paste(box_region, (0, offset_px))

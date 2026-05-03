@@ -253,22 +253,6 @@ const EDITOR_TEMPLATE = `
                         <input type="color" class="field-bg-color" value="#000000" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
                     </label>
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
-                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="slide">
-                        <span>Image slide</span>
-                    </label>
-                    <label class="om-field editor-bg-slide-wrap" hidden>
-                        <span>Saved image slide</span>
-                        <select class="om-select field-bg-slide"><option value="">(pick a slide)</option></select>
-                    </label>
-                    <label class="om-row" style="gap: 8px; cursor: pointer;">
-                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="video">
-                        <span>Video slide</span>
-                    </label>
-                    <label class="om-field editor-bg-video-wrap" hidden>
-                        <span>Saved video slide</span>
-                        <select class="om-select field-bg-video"><option value="">(pick a video)</option></select>
-                    </label>
-                    <label class="om-row" style="gap: 8px; cursor: pointer;">
                         <input type="radio" name="editor-bg-source" class="field-bg-source" value="gradient">
                         <span>Gradient</span>
                     </label>
@@ -288,6 +272,22 @@ const EDITOR_TEMPLATE = `
                             <input type="range" class="field-bg-grad-angle" min="0" max="359" step="1" value="0" style="width: 100%;">
                         </label>
                     </div>
+                    <label class="om-row" style="gap: 8px; cursor: pointer;">
+                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="slide">
+                        <span>Image slide</span>
+                    </label>
+                    <label class="om-field editor-bg-slide-wrap" hidden>
+                        <span>Saved image slide</span>
+                        <select class="om-select field-bg-slide"><option value="">(pick a slide)</option></select>
+                    </label>
+                    <label class="om-row" style="gap: 8px; cursor: pointer;">
+                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="video">
+                        <span>Video slide</span>
+                    </label>
+                    <label class="om-field editor-bg-video-wrap" hidden>
+                        <span>Saved video slide</span>
+                        <select class="om-select field-bg-video"><option value="">(pick a video)</option></select>
+                    </label>
                     <div class="editor-bg-generate" hidden>
                         <label class="om-field">
                             <span>Generate a new background (10-30s)</span>

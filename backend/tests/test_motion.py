@@ -214,25 +214,52 @@ def test_pulse_box_bounded():
 
 
 def test_bounce_at_phase_zero_is_unchanged():
-    """sin(0) = 0 → 0 px offset → frame matches input."""
+    """abs(sin(0)) = 0 → 0 px offset → frame matches input. The
+    rest position is the floor; phase=0 is the moment the ball is
+    on it."""
     img = _make_layer_rgba(40, 40, (10, 10, 20, 20), (255, 0, 0, 255))
     out = _apply_bounce(img, (10, 10, 20, 20), 50, 0.0)
     assert list(out.getdata()) == list(img.getdata())
 
 
-def test_bounce_at_quarter_phase_shifts_down():
-    """sin(π/2) = 1 → max amplitude. At intensity=100, amplitude is
-    0.10 of box height = 2 px on a 20-px box. Glyph shifts down by
-    +2 (positive offset, since sin returns +1, and PIL's paste-y
-    grows downward)."""
+def test_bounce_at_quarter_phase_rebounds_up():
+    """abs(sin(π/2)) = 1 → max amplitude. At intensity=100, amplitude
+    is 0.10 of box height = 2 px on a 20-px box. The layer rebounds
+    UP by 2 px within the box rect (negative Y offset; "true
+    bouncing" treats rest as the floor and the layer always rebounds
+    upward — qarl 2026-05-03). Bounce clips to the box, so the top
+    2 rows of the original glyph clip off above and the bottom 2
+    rows of the box become empty."""
     img = _make_layer_rgba(40, 40, (10, 10, 20, 20), (255, 0, 0, 255))
     out = _apply_bounce(img, (10, 10, 20, 20), 100, 0.25)
-    # Original top-left in-box pixel at (10, 10). After +2 offset the
-    # glyph starts at row 12 within box → slide row 12.
-    # The cell at the original (10, 10) should now be transparent (the
-    # glyph moved DOWN; the top 2 rows of the box are empty).
-    assert out.getpixel((20, 11))[3] == 0  # top of box, glyph cleared
-    assert out.getpixel((20, 13))[3] == 255  # 2 px below top, glyph here
+    # Pixel just inside the top of the box (row 10): glyph still
+    # there because the box-content shifted up but stays within the
+    # box rect.
+    assert out.getpixel((20, 11))[3] == 255  # near top, glyph here
+    # Bottom 2 rows of the box (rows 28, 29) are now empty — that's
+    # where the glyph used to fill before the upward rebound.
+    assert out.getpixel((20, 29))[3] == 0    # bottom of box, glyph cleared
+
+
+def test_bounce_at_three_quarter_phase_also_rebounds_up():
+    """The whole point of abs(sin) over plain sin: at phase=0.75
+    where plain sin would return -1 (offset DOWN, away from floor),
+    abs(sin) returns +1 — the layer rebounds UP again. Two
+    rebounds per cycle, never below rest."""
+    img = _make_layer_rgba(40, 40, (10, 10, 20, 20), (255, 0, 0, 255))
+    quarter = _apply_bounce(img, (10, 10, 20, 20), 100, 0.25)
+    three_quarter = _apply_bounce(img, (10, 10, 20, 20), 100, 0.75)
+    # Both peak phases produce the SAME upward offset (the
+    # symmetry of |sin|). Frames pixel-equal.
+    assert list(quarter.getdata()) == list(three_quarter.getdata())
+
+
+def test_bounce_at_half_phase_returns_to_floor():
+    """abs(sin(π)) = 0 → glyph back at rest. Confirms the bounce is
+    a true ball-on-floor pattern: rest → up → rest → up → rest."""
+    img = _make_layer_rgba(40, 40, (10, 10, 20, 20), (255, 0, 0, 255))
+    out = _apply_bounce(img, (10, 10, 20, 20), 100, 0.5)
+    assert list(out.getdata()) == list(img.getdata())
 
 
 def test_bounce_does_not_wrap():

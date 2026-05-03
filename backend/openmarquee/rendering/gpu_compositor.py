@@ -587,10 +587,14 @@ class GPUSlideCompositor:
             return
 
         if motion == "bounce":
-            # Sine vertical bob. CRTC_Y offsets from at-rest gy.
-            # No wrap (clipped at edges by HVS naturally).
+            # Ball-on-floor bounce: abs(sin) so the layer rebounds UP
+            # from rest twice per cycle, never going below (qarl
+            # 2026-05-03 "abs(sin) for true bouncing"). Negative
+            # coefficient converts the [0,1] abs(sin) into a negative
+            # CRTC_Y delta (DRM Y is positive-down, so negative = UP).
+            # No wrap; HVS clips naturally at display edges.
             amplitude = (intensity / 100.0) * 0.10
-            offset_px = int(round(amplitude * bh * math.sin(2 * math.pi * phase)))
+            offset_px = -int(round(amplitude * bh * abs(math.sin(2 * math.pi * phase))))
             self.renderer.update_animated_layer(slot_idx, crtc_y=gy + offset_px)
             return
 
