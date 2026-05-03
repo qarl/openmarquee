@@ -192,18 +192,48 @@ class GPUSlideCompositor:
 
         self.renderer.render_frame(bg.convert("RGB").tobytes())
 
-        # 2. Animated layers → one overlay plane each.
-        for slot_idx, (layer_idx, layer) in enumerate(animated):
+        # 2. Animated layers → one overlay plane each. If any attach
+        # fails (out-of-budget, transient kernel error, etc.), detach
+        # the slots we already bound + commit so PlaybackLoop's
+        # software fallback doesn't run on top of leaked overlay planes
+        # showing ghost text from the never-finished slide.
+        attached_so_far: list[int] = []
+        try:
+            for slot_idx, (layer_idx, layer) in enumerate(animated):
+                try:
+                    self._attach_animated(slot_idx, layer_idx, layer, now=now)
+                except IndexError as e:
+                    budget = getattr(self.renderer, "max_animated_planes", "?")
+                    raise RuntimeError(
+                        f"slide {self._slide_id}: {len(animated)} animated "
+                        f"layers exceed renderer's {budget}-plane budget "
+                        f"(slot {slot_idx} out of range). Either lower the "
+                        f"slide's animated count or fall back to the "
+                        f"software compose path."
+                    ) from e
+                attached_so_far.append(slot_idx)
+        except Exception:
+            # Detach the planes we bound before this failure so the
+            # screen doesn't carry their content into the fallback path.
+            for sid in attached_so_far:
+                try:
+                    self.renderer.detach_animated_layer(sid)
+                except Exception:
+                    log.exception(
+                        "GPUSlideCompositor: cleanup detach for slot %d failed",
+                        sid,
+                    )
             try:
-                self._attach_animated(slot_idx, layer_idx, layer, now=now)
-            except IndexError as e:
-                budget = getattr(self.renderer, "max_animated_planes", "?")
-                raise RuntimeError(
-                    f"slide {self._slide_id}: {len(animated)} animated layers "
-                    f"exceed renderer's {budget}-plane budget (slot {slot_idx} "
-                    f"out of range). Either lower the slide's animated count "
-                    f"or fall back to the software compose path."
-                ) from e
+                self.renderer.commit()
+            except Exception:
+                log.exception(
+                    "GPUSlideCompositor: cleanup commit failed during attach rollback",
+                )
+            self._slot_for_layer.clear()
+            self._box_px.clear()
+            self._glyph_dims.clear()
+            self._auto_text.clear()
+            raise
 
         self.renderer.commit()
         self._attached = True

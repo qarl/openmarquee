@@ -56,6 +56,26 @@ from openmarquee.motion import (
     slide_has_motion,
 )
 from openmarquee.rendering import Renderer
+from openmarquee.rendering.gpu_compositor import (
+    GPUSlideCompositor,
+    MultiPlaneRenderer,
+    classify_layer,
+)
+
+
+def _count_animated_layers(item: ContentItem) -> int:
+    """How many of `item`'s text layers will consume a DRM overlay
+    plane on the GPU path. Mirrors GPUSlideCompositor's animated
+    classification (motion non-static OR auto_mode set) — used by
+    PlaybackLoop to decide whether the slide fits the renderer's
+    plane budget. Returns 0 for non-text-slide content (image /
+    video / etc.) so the GPU path is skipped naturally."""
+    if getattr(item, "type", None) != "text_slide":
+        return 0
+    return sum(
+        1 for layer in getattr(item, "text_layers", [])
+        if classify_layer(layer) == "animated"
+    )
 
 if TYPE_CHECKING:
     from openmarquee.content.storage import ContentStorage
@@ -466,27 +486,55 @@ class PlaybackLoop:
         """Tick-render a slide with auto-mode and/or motion layers for
         its full duration.
 
-        Subsumes the prior `_play_auto_slide` (1 Hz tick, single-layer
-        clock / date / day) and `_play_motion_slide` (30 Hz tick,
-        cached layer bitmaps + motion transforms) into one path. The
-        composer in `motion.py` handles the auto × motion product per
-        layer — a layer can be BOTH auto and motion (e.g. a clock
-        that bounces) and gets text refreshed AND bitmap transformed
-        each tick.
+        Two paths share this entrypoint:
 
-        Tick rate adapts to what the slide actually needs:
-        - any visible motion layer    → 1 / _FADE_FPS (30 Hz)
-        - auto-only (no motion)       → 1 Hz (matches the prior
-                                          auto-tick cadence; HH:MM:SS
-                                          updates per second, no
-                                          point burning 30 fps for
-                                          clock-only slides)
+        - **GPU path** (HDMI 1080p target, qarl 2026-05-02): when the
+          renderer satisfies the MultiPlaneRenderer protocol AND has
+          enough animated-plane budget for the slide, route through
+          `GPUSlideCompositor` — bg + every static layer software-
+          composite into the primary plane once at slide entry, each
+          animated layer takes its own DRM overlay plane, per-tick
+          motion is one atomic ioctl. Zero per-pixel CPU work in the
+          inner loop.
+        - **Software path** (LED matrices, dev mock, anything without
+          multi-plane): per-tick `compose_motion_frame` builds an
+          RGB frame and pushes it through `render_frame`. Same code
+          path that has shipped since 5e75cf5.
 
-        Returns the last-composed frame so the caller's transition
-        has something to fade from. Stop / pause exit early — same
+        Selection is capability + budget gated. Slides that exceed the
+        plane budget (rare; default vc4 budget is well above any real
+        slide's animated count) fall back to software so playback
+        keeps working. Tick cadence (30 Hz motion / 1 Hz auto-only) is
+        identical across paths.
+
+        Returns the last-composed frame so the caller's transition has
+        something to fade from. Stop / pause exit early — same
         rationale as the prior split functions: a stream takeover
         shouldn't keep painting frames over live video.
         """
+        if (
+            item.type == "text_slide"
+            and isinstance(self._renderer, MultiPlaneRenderer)
+            and _count_animated_layers(item)
+            <= getattr(self._renderer, "max_animated_planes", 0)
+        ):
+            try:
+                return await self._play_dynamic_slide_gpu(item)
+            except Exception:
+                # Hard-fail in the GPU path falls back to software so a
+                # broken plane attach (e.g. transient kernel error on
+                # the dev Pi) doesn't take playback down with it.
+                log.exception(
+                    "playback: GPU compositor failed for %s, falling back",
+                    item.id,
+                )
+        return await self._play_dynamic_slide_software(item)
+
+    async def _play_dynamic_slide_software(
+        self, item: ContentItem
+    ) -> Image.Image | None:
+        """Software path: per-tick compose_motion_frame → render_frame.
+        The original implementation that has shipped since 5e75cf5."""
         tz = resolve_timezone(self._get_timezone())
         total = item.duration_ms / 1000
         loop = asyncio.get_event_loop()
@@ -550,6 +598,93 @@ class PlaybackLoop:
                 return last
             if loop.time() >= end_at:
                 return last
+
+    async def _play_dynamic_slide_gpu(
+        self, item: ContentItem
+    ) -> Image.Image | None:
+        """GPU path: GPUSlideCompositor lifecycle (attach → tick* →
+        detach). Per-tick = one atomic ioctl with the changed plane
+        properties; zero per-pixel CPU work in the inner loop.
+
+        Transition handoff: the loop exits and we run a single
+        compose_motion_frame at the slide's final state to give the
+        caller's transition function a "from" frame. That final
+        compose costs ~10-30 ms at 1080p, paid once per slide exit.
+        We paint it to the primary plane BEFORE detaching the
+        animated planes so the transition starts from the same
+        pixels the user just saw on the GPU path (modulo a brief
+        single-vblank period where motion text appears in both the
+        primary composite and the still-attached overlay planes —
+        visually the text agrees with itself, so no flicker)."""
+        tz = resolve_timezone(self._get_timezone())
+        total = item.duration_ms / 1000
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        end_at = t0 + total
+        if slide_has_motion(item):
+            tick_period = 1.0 / max(1, _FADE_FPS)
+        else:
+            tick_period = max(0.1, self._auto_tick)
+
+        compositor = GPUSlideCompositor(
+            item, self._renderer,
+            width=self._renderer.width,
+            height=self._renderer.height,
+            read_asset=self._read_asset,
+        )
+        compositor.attach(now=datetime.now(tz))
+        try:
+            while True:
+                assert self._stop_event is not None
+                assert self._pause_event is not None
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                elapsed = loop.time() - t0
+                now = datetime.now(tz)
+                try:
+                    compositor.tick(elapsed, now=now)
+                except Exception:
+                    log.exception(
+                        "playback: GPU compositor tick failed for %s", item.id,
+                    )
+                    break
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                remaining = end_at - loop.time()
+                if remaining <= 0:
+                    break
+                await self._wait(min(tick_period, remaining))
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                if loop.time() >= end_at:
+                    break
+
+            # Compose one final frame at the slide's final state for
+            # the transition handoff. Paint to primary BEFORE detaching
+            # animated planes so the transition starts from a primary
+            # plane that already mirrors what the user was just seeing.
+            elapsed = loop.time() - t0
+            try:
+                last = compose_motion_frame(
+                    item, elapsed,
+                    self._renderer.width, self._renderer.height,
+                    read_asset=self._read_asset,
+                    now=datetime.now(tz),
+                )
+                self._render_image(last)
+                return last
+            except Exception:
+                log.exception(
+                    "playback: GPU final-frame compose failed for %s", item.id,
+                )
+                return None
+        finally:
+            try:
+                compositor.detach()
+            except Exception:
+                log.exception(
+                    "playback: GPU compositor detach failed for %s", item.id,
+                )
 
     def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
         """Load + resize an item's PNG to renderer dimensions.
