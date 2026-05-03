@@ -77,6 +77,22 @@ if [ ! -d "$BUILD_DIR/ui/node_modules" ]; then
 fi
 
 echo "==> esbuild bundle"
+# Sweep stale esbuild atomic-write tempfiles from any prior interrupted
+# build. esbuild writes `dist/.<name>.<random>` then renames to
+# `dist/<name>` for atomicity; killed mid-write, the tempfiles linger
+# (mode 600, dated days back). Without this sweep, build.sh's rsync
+# would carry them into BUILD_DIR/demo/dist/ and deploy.sh would push
+# them to the live /demo/ as hidden-but-discoverable URLs — flagged
+# by www-Jimmy + QA 2026-05-03 (7 stale tempfiles dated Apr 28; QA
+# manually scrubbed before each deploy for 2 days).
+#
+# `find -name '.ffmpeg-worker.js.*'` matches the `.ffmpeg-worker.js.
+# <random>` shape — the random suffix means the tempfile DOESN'T end
+# in `.js`, so a glob like `.*.js` wouldn't catch it (caught my own
+# first-pass mistake). `-maxdepth 1` keeps us inside dist/ proper.
+if [ -d "$BUILD_DIR/ui/dist" ]; then
+    find "$BUILD_DIR/ui/dist" -maxdepth 1 -type f -name '.ffmpeg-worker.js.*' -delete 2>/dev/null || true
+fi
 (cd "$BUILD_DIR/ui" && npm run build --silent | tail -3)
 
 echo "==> assemble demo bundle into $BUILD_DIR/demo/"

@@ -37,10 +37,22 @@ cp static/sw.js "$DEST/sw.js"
 
 # Bundled UI. Skip vendor/ffmpeg-core (~30 MB of video-transcoding wasm)
 # because the demo disables uploads → ffmpeg never runs. Ships faster.
-rsync -a --delete \
+# Also exclude all dotfiles — covers esbuild's atomic-write tempfiles
+# (`.<name>.<random>` left after an interrupted build) AND macOS
+# AppleDouble metadata (`._<name>`) AND any other dotfile cruft. Both
+# would otherwise propagate to the live demo as hidden-but-discoverable
+# URLs (flagged by www-Jimmy + QA 2026-05-03; 7 stale tempfiles dated
+# Apr 28 + 4 ._ files in $DEST/dist/).
+rsync -a --delete --delete-excluded \
     --exclude='vendor/ffmpeg-core/' \
     --exclude='ffmpeg-worker.js' \
+    --exclude='.*' \
     "$SRC_UI/dist/" "$DEST/dist/"
+# Belt-and-suspenders: --delete-excluded above should remove dotfiles
+# that USED to exist in $DEST/dist/ but are now excluded. Run an
+# explicit `find -delete` afterwards in case a future rsync flag
+# change loses --delete-excluded — same shape sweep used in refresh.sh.
+find "$DEST/dist" -maxdepth 1 -type f -name '.*' -delete 2>/dev/null || true
 
 # Same stylesheet path (./styles.css) as the device UI so demo's
 # index.html doesn't need URL rewrites.
@@ -48,7 +60,13 @@ cp "$SRC_UI/styles.css" "$DEST/styles.css"
 
 # @font-face TTFs that styles.css references via url("fonts/<name>.ttf").
 # Without these, slides that pick a bundled face fall back to system.
-rsync -a --delete --exclude='LICENSES.md' "$SRC_UI/fonts/" "$DEST/fonts/"
+# Same dotfile-exclusion shape as the dist/ rsync above so any macOS
+# AppleDouble metadata that landed in fonts/ via SMB / Finder doesn't
+# propagate to the live demo.
+rsync -a --delete --delete-excluded \
+    --exclude='LICENSES.md' \
+    --exclude='.*' \
+    "$SRC_UI/fonts/" "$DEST/fonts/"
 
 echo "demo bundle ready at $DEST/"
 du -sh "$DEST" | awk '{print "total size:", $1}'
