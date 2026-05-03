@@ -194,18 +194,7 @@ const EDITOR_TEMPLATE = `
     <div class="editor">
         <div class="slide-browser-slot"></div>
         <form class="controls" autocomplete="off">
-            <div class="om-card" style="margin-bottom: 12px;">
-                <div class="om-row" style="gap: 10px;">
-                    <label class="om-field" style="flex: 1;">
-                        <span>Slide name</span>
-                        <input type="text" class="om-input field-name" value="Untitled" maxlength="200">
-                    </label>
-                    <label class="om-field" style="width: 110px;">
-                        <span>Duration (s)</span>
-                        <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
-                    </label>
-                </div>
-            </div>
+            <div class="editor-cols">
             <div class="preview-wrap">
                 <div class="editor-canvas-stack">
                     <canvas class="editor-canvas" aria-label="slide preview"></canvas>
@@ -219,6 +208,19 @@ const EDITOR_TEMPLATE = `
                         <div class="editor-box-handle" data-handle="sw"></div>
                         <div class="editor-box-handle" data-handle="w"></div>
                     </div>
+                </div>
+            </div>
+            <div class="editor-form-stack">
+            <div class="om-card" style="margin-bottom: 12px;">
+                <div class="om-row" style="gap: 10px;">
+                    <label class="om-field" style="flex: 1;">
+                        <span>Slide name</span>
+                        <input type="text" class="om-input field-name" value="Untitled" maxlength="200">
+                    </label>
+                    <label class="om-field" style="width: 110px;">
+                        <span>Duration (s)</span>
+                        <input type="number" class="om-input field-duration" value="5" min="1" max="300" step="1">
+                    </label>
                 </div>
             </div>
 
@@ -274,6 +276,8 @@ const EDITOR_TEMPLATE = `
             <p style="margin: 4px 0 0; font-family: var(--om-mono); font-size: 11px; color: var(--om-text-fade); text-align: center;">
                 <kbd>Esc</kbd> in a text field to clear.
             </p>
+            </div>  <!-- /.editor-form-stack -->
+            </div>  <!-- /.editor-cols -->
         </form>
     </div>
 `;

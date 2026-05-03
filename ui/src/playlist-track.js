@@ -74,26 +74,31 @@ const TEMPLATE = `
             </div>
         </div>
         <div class="playlist-browser-slot"></div>
-        <div class="om-card" style="margin-bottom: 12px;">
-            <label class="om-field">
-                <span>Playlist name</span>
-                <input type="text" class="om-input field-playlist-name" maxlength="64" pattern="[a-z0-9_-]+">
-            </label>
-        </div>
-        <div class="playlist-track-inline-preview"></div>
+        <div class="playlist-cols">
+            <div class="playlist-track-inline-preview"></div>
 
-        <div class="om-card om-card-tight playlist-track-scroll" role="region" aria-label="playlist timeline" style="padding: 12px;">
-            <ul class="playlist-track-list" role="list" data-empty-hint="Drag slides from the pallet below to build your playlist."></ul>
-        </div>
+            <div class="playlist-form-stack">
+                <div class="om-card" style="margin-bottom: 12px;">
+                    <label class="om-field">
+                        <span>Playlist name</span>
+                        <input type="text" class="om-input field-playlist-name" maxlength="64" pattern="[a-z0-9_-]+">
+                    </label>
+                </div>
 
-        <div class="om-pallet" style="margin-top: 14px;">
-            <div class="om-pallet-head">
-                <h3>Pallet · saved slides</h3>
+                <div class="om-card om-card-tight playlist-track-scroll" role="region" aria-label="playlist timeline" style="padding: 12px;">
+                    <ul class="playlist-track-list" role="list" data-empty-hint="Drag slides from the pallet below to build your playlist."></ul>
+                </div>
+
+                <div class="om-pallet" style="margin-top: 14px;">
+                    <div class="om-pallet-head">
+                        <h3>Pallet · saved slides</h3>
+                    </div>
+                    <ul class="playlist-pallet" role="list"></ul>
+                </div>
+
+                <p class="om-save-status playlist-track-status" role="status" aria-live="polite" data-state="idle"></p>
             </div>
-            <ul class="playlist-pallet" role="list"></ul>
         </div>
-
-        <p class="om-save-status playlist-track-status" role="status" aria-live="polite" data-state="idle"></p>
     </section>
 `;
 
