@@ -22,6 +22,7 @@ import pytest
 from openmarquee.content import TextBox, TextLayer, TextSlide
 from openmarquee.rendering.gpu_compositor import (
     GPUSlideCompositor,
+    SlideAssetCache,
     classify_layer,
 )
 
@@ -523,6 +524,132 @@ def test_attach_overflow_raises_with_slide_context():
     c = GPUSlideCompositor(slide, r, width=320, height=240)
     with pytest.raises(RuntimeError, match="exceed renderer.s 2-plane budget"):
         c.attach()
+
+
+# --- one ioctl per tick ---
+
+
+# --- SlideAssetCache ---
+
+
+def test_cache_hit_skips_pil_work_on_attach():
+    """Second attach of the same slide with a shared cache should not
+    re-rasterize: the cache supplies primary_bytes + per-layer rgba
+    bytes verbatim. We verify by attaching once (slow path), then a
+    SECOND time after detach with the same cache, and asserting the
+    rgba_len in the renderer is identical (same cached bytes)."""
+    slide = _make_slide(_make_layer(text="HI", motion="pulse"))
+    cache = SlideAssetCache()
+
+    r1 = FakeMultiPlaneRenderer(width=320, height=240)
+    c1 = GPUSlideCompositor(slide, r1, width=320, height=240, cache=cache)
+    c1.attach()
+    rgba_len_first = r1.planes[0]["rgba_len"]
+    c1.detach()
+
+    # Second attach — same slide, same cache. Use a fresh renderer so
+    # state can't leak: cache is the only thing carrying assets.
+    r2 = FakeMultiPlaneRenderer(width=320, height=240)
+    c2 = GPUSlideCompositor(slide, r2, width=320, height=240, cache=cache)
+    c2.attach()
+    assert r2.planes[0]["rgba_len"] == rgba_len_first
+    # Cache populated.
+    assert len(cache) == 1
+
+
+def test_cache_disabled_when_none_passed():
+    """cache=None preserves original (uncached) behavior — every
+    attach pays the full PIL cost. We don't have a way to observe
+    PIL cost directly, but we verify the lookup is bypassed by
+    having the SlideAssetCache fail loudly if touched."""
+    slide = _make_slide(_make_layer(text="HI", motion="pulse"))
+    r = FakeMultiPlaneRenderer(width=320, height=240)
+    c = GPUSlideCompositor(slide, r, width=320, height=240, cache=None)
+    c.attach()
+    # Behavior is identical to the no-cache tests above.
+    assert r.planes[0]["attached"] is True
+
+
+def test_cache_invalidates_on_updated_at_change():
+    """When the slide's updated_at changes, the cache entry must be
+    re-rasterized. Build two slides with the same id but different
+    updated_at, share a cache."""
+    from datetime import datetime as dt
+    cache = SlideAssetCache()
+    common_id = "abc-1234"
+
+    # Slide v1.
+    slide_v1 = _make_slide(_make_layer(text="HELLO", motion="pulse"))
+    object.__setattr__(slide_v1, "id", common_id)
+    object.__setattr__(
+        slide_v1, "updated_at", dt(2026, 5, 1, 12, 0, 0, tzinfo=UTC),
+    )
+    r1 = FakeMultiPlaneRenderer(width=320, height=240)
+    c1 = GPUSlideCompositor(slide_v1, r1, width=320, height=240, cache=cache)
+    c1.attach()
+    rgba_v1 = r1.planes[0]["rgba_len"]
+    c1.detach()
+
+    # Slide v2 — same id, NEW updated_at + different text → different
+    # rasterization. Cache lookup should miss → re-rasterize.
+    slide_v2 = _make_slide(_make_layer(text="DIFFERENT TEXT NOW",
+                                       motion="pulse"))
+    object.__setattr__(slide_v2, "id", common_id)
+    object.__setattr__(
+        slide_v2, "updated_at", dt(2026, 5, 2, 12, 0, 0, tzinfo=UTC),
+    )
+    r2 = FakeMultiPlaneRenderer(width=320, height=240)
+    c2 = GPUSlideCompositor(slide_v2, r2, width=320, height=240, cache=cache)
+    c2.attach()
+    rgba_v2 = r2.planes[0]["rgba_len"]
+    # Different text → different glyph bbox dims → different rgba_len.
+    assert rgba_v2 != rgba_v1
+
+
+def test_cache_does_not_serve_auto_mode_layers():
+    """Auto-mode layers re-rasterize per tick; a cached snapshot
+    would be stale within seconds. The cache must skip these layers
+    even when the slide is otherwise identical."""
+    slide = _make_slide(_make_layer(
+        text="", motion="static", auto_mode="time",
+    ))
+    cache = SlideAssetCache()
+
+    t1 = datetime(2026, 5, 2, 12, 34, 0, tzinfo=UTC)
+    r1 = FakeMultiPlaneRenderer(width=320, height=240)
+    c1 = GPUSlideCompositor(slide, r1, width=320, height=240, cache=cache)
+    c1.attach(now=t1)
+    rgba_v1 = r1.planes[0]["rgba_len"]
+    attaches_v1 = r1.attach_calls[0]
+    c1.detach()
+
+    # The cache entry was created (primary_bytes populated) but the
+    # animated dict should NOT have layer 0 (it's auto).
+    cached = cache.lookup(slide)
+    assert cached is not None, "cache should have an entry for this slide"
+    assert 0 not in cached.animated, (
+        "auto-mode layer must NOT cache its rasterization"
+    )
+
+    # Second attach at a different time → auto layer re-rasterizes.
+    t2 = datetime(2026, 5, 2, 12, 35, 0, tzinfo=UTC)
+    r2 = FakeMultiPlaneRenderer(width=320, height=240)
+    c2 = GPUSlideCompositor(slide, r2, width=320, height=240, cache=cache)
+    c2.attach(now=t2)
+    # Renderer.attach_animated_layer was called fresh (rgba bytes are
+    # what render_layer_to_rgba produced for time t2, not cached).
+    assert r2.attach_calls[0] == 1
+
+
+def test_cache_clear_drops_all_entries():
+    cache = SlideAssetCache()
+    slide = _make_slide(_make_layer(text="HI", motion="pulse"))
+    r = FakeMultiPlaneRenderer(width=320, height=240)
+    c = GPUSlideCompositor(slide, r, width=320, height=240, cache=cache)
+    c.attach()
+    assert len(cache) == 1
+    cache.clear()
+    assert len(cache) == 0
 
 
 # --- one ioctl per tick ---

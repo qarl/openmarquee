@@ -25,8 +25,10 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from uuid import UUID
 
 import numpy as np
 
@@ -40,11 +42,73 @@ from openmarquee.motion import (
 )
 
 if TYPE_CHECKING:
-    from uuid import UUID
-
     from openmarquee.content import TextLayer, TextSlide
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class _CachedSlideAssets:
+    """Per-slide cached PIL output keyed in SlideAssetCache by slide.id.
+    Invalidated when slide.updated_at changes."""
+    updated_at: datetime | None
+    primary_bytes: bytes | None = None
+    # layer_idx → (rgba_bytes, gx, gy, gw, gh). Only non-auto animated
+    # layers cache here — auto layers re-rasterize per tick when their
+    # text rolls over and would never match a cached snapshot.
+    animated: dict[int, tuple[bytes, int, int, int, int]] = field(default_factory=dict)
+
+
+class SlideAssetCache:
+    """Cross-slide PIL output cache for the GPU compositor's hot path.
+
+    Without a cache, every attach() pays for one bg load + one
+    alpha_composite per static layer + one render_layer_to_rgba +
+    crop per animated layer. At 1080p that's 50-200 ms — visible as
+    a stall at every slide transition. With a cache, the second time
+    through a playlist (and every time after) is a few hundred μs.
+
+    Keyed by slide.id; entries invalidate when slide.updated_at moves.
+    Lives on PlaybackLoop and is passed into each GPUSlideCompositor.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[UUID, _CachedSlideAssets] = {}
+
+    def lookup(self, slide: "TextSlide") -> _CachedSlideAssets | None:
+        """Return the cached entry IFF it matches slide.updated_at;
+        otherwise return None (caller does the slow path + stores)."""
+        slide_id = getattr(slide, "id", None)
+        if slide_id is None:
+            return None
+        entry = self._entries.get(slide_id)
+        if entry is None:
+            return None
+        cur_updated = getattr(slide, "updated_at", None)
+        if entry.updated_at != cur_updated:
+            return None
+        return entry
+
+    def ensure(self, slide: "TextSlide") -> _CachedSlideAssets:
+        """Return or freshly create an entry for `slide` at its current
+        updated_at. Replaces any stale entry."""
+        slide_id = getattr(slide, "id", None)
+        if slide_id is None:
+            # Anonymous slide (test harness, etc.) — return a throwaway.
+            return _CachedSlideAssets(updated_at=None)
+        cur_updated = getattr(slide, "updated_at", None)
+        entry = self._entries.get(slide_id)
+        if entry is None or entry.updated_at != cur_updated:
+            entry = _CachedSlideAssets(updated_at=cur_updated)
+            self._entries[slide_id] = entry
+        return entry
+
+    def clear(self) -> None:
+        """Drop all entries. Called by PlaybackLoop on stop()."""
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 @runtime_checkable
@@ -121,12 +185,18 @@ class GPUSlideCompositor:
         width: int,
         height: int,
         read_asset: Callable[["UUID"], bytes] | None = None,
+        cache: SlideAssetCache | None = None,
     ) -> None:
         self.slide = slide
         self.renderer = renderer
         self.width = width
         self.height = height
         self.read_asset = read_asset
+        # Optional cross-slide PIL output cache. None disables caching
+        # (every attach pays the full bg+static composite + per-animated-
+        # layer rasterization cost). PlaybackLoop passes one cache that
+        # lives across slides so playlist repeats are stall-free.
+        self._cache = cache
 
         # layer_idx (in slide.text_layers) → plane slot_idx on the
         # renderer. Only entries for animated layers (motion or
@@ -176,21 +246,49 @@ class GPUSlideCompositor:
 
         # 1. Background + static layers → primary plane (one-time CPU
         # composite). Static = motion is static AND auto_mode unset.
-        bg = _load_background(self.slide, self.width, self.height, self.read_asset)
-        if bg.mode != "RGBA":
-            bg = bg.convert("RGBA")
-        for idx, layer in enumerate(layers):
-            kind = classify_layer(layer)
-            if kind == "hidden":
-                continue
-            if kind == "static":
-                static_rgba = render_layer_to_rgba(layer, self.width, self.height)
-                bg.alpha_composite(static_rgba)
-                n_static += 1
-            else:
-                animated.append((idx, layer))
+        # Cache hit avoids the bg load + N alpha_composite + RGB convert
+        # at slide repeats — typically 30-100 ms saved per attach at
+        # 1080p.
+        # Explicit `is not None` check — SlideAssetCache defines __len__
+        # so an empty cache evaluates falsy under bare truthiness, which
+        # would skip the very-first store on a fresh cache and defeat
+        # the whole point of caching across playlist reps.
+        cached_entry = (
+            self._cache.lookup(self.slide) if self._cache is not None else None
+        )
+        cache_target = (
+            self._cache.ensure(self.slide) if self._cache is not None else None
+        )
+        if cached_entry is not None and cached_entry.primary_bytes is not None:
+            primary_bytes = cached_entry.primary_bytes
+            # Still need to classify layers (for the animated loop below).
+            for idx, layer in enumerate(layers):
+                kind = classify_layer(layer)
+                if kind == "hidden":
+                    continue
+                if kind == "static":
+                    n_static += 1
+                else:
+                    animated.append((idx, layer))
+        else:
+            bg = _load_background(self.slide, self.width, self.height, self.read_asset)
+            if bg.mode != "RGBA":
+                bg = bg.convert("RGBA")
+            for idx, layer in enumerate(layers):
+                kind = classify_layer(layer)
+                if kind == "hidden":
+                    continue
+                if kind == "static":
+                    static_rgba = render_layer_to_rgba(layer, self.width, self.height)
+                    bg.alpha_composite(static_rgba)
+                    n_static += 1
+                else:
+                    animated.append((idx, layer))
+            primary_bytes = bg.convert("RGB").tobytes()
+            if cache_target is not None:
+                cache_target.primary_bytes = primary_bytes
 
-        self.renderer.render_frame(bg.convert("RGB").tobytes())
+        self.renderer.render_frame(primary_bytes)
 
         # 2. Animated layers → one overlay plane each. If any attach
         # fails (out-of-budget, transient kernel error, etc.), detach
@@ -201,7 +299,28 @@ class GPUSlideCompositor:
         try:
             for slot_idx, (layer_idx, layer) in enumerate(animated):
                 try:
-                    self._attach_animated(slot_idx, layer_idx, layer, now=now)
+                    is_auto = bool(getattr(layer, "auto_mode", None))
+                    cached_anim = (
+                        cached_entry.animated.get(layer_idx)
+                        if (cached_entry is not None and not is_auto)
+                        else None
+                    )
+                    if cached_anim is not None:
+                        self._attach_animated_from_cache(
+                            slot_idx, layer_idx, layer, cached_anim,
+                        )
+                    else:
+                        rasterized = self._attach_animated(
+                            slot_idx, layer_idx, layer, now=now,
+                        )
+                        # Cache the rasterization for non-auto layers so
+                        # the next playlist rep skips the PIL work.
+                        if (
+                            rasterized is not None
+                            and not is_auto
+                            and cache_target is not None
+                        ):
+                            cache_target.animated[layer_idx] = rasterized
                 except IndexError as e:
                     budget = getattr(self.renderer, "max_animated_planes", "?")
                     raise RuntimeError(
@@ -312,11 +431,12 @@ class GPUSlideCompositor:
         layer: "TextLayer",
         *,
         now: datetime | None,
-    ) -> None:
+    ) -> tuple[bytes, int, int, int, int] | None:
         """Rasterize one layer at slide dims, find its glyph bbox,
-        crop, attach to the named plane slot. Used both at slide entry
-        and on auto-layer text rollover (re-attach replaces the plane
-        buffer).
+        crop, attach to the named plane slot. Returns the
+        (rgba_bytes, gx, gy, gw, gh) tuple so callers (attach()) can
+        cache it. Returns None when the layer rasterized to no ink.
+        Used both at slide entry and on auto-layer text rollover.
 
         Slot reservation is stable for the slide's lifetime — this
         method always sets `_slot_for_layer[layer_idx] = slot_idx` and
@@ -346,7 +466,7 @@ class GPUSlideCompositor:
                 "detached but mapping retained for rollover recovery",
                 layer_idx, slot_idx,
             )
-            return
+            return None
 
         gx, gy, gx2, gy2 = glyph_bbox
         gw, gh = gx2 - gx, gy2 - gy
@@ -362,6 +482,30 @@ class GPUSlideCompositor:
         self._glyph_dims[layer_idx] = (gx, gy, gw, gh)
         if getattr(layer, "auto_mode", None) and now is not None:
             self._auto_text[layer_idx] = render_auto_text_for_layer(layer, now)
+        return (rgba_bytes, gx, gy, gw, gh)
+
+    def _attach_animated_from_cache(
+        self,
+        slot_idx: int,
+        layer_idx: int,
+        layer: "TextLayer",
+        cached: tuple[bytes, int, int, int, int],
+    ) -> None:
+        """Fast-path animated-layer attach using a previously-rasterized
+        (rgba_bytes, gx, gy, gw, gh) tuple from SlideAssetCache. Skips
+        render_layer_to_rgba + getbbox + crop + tobytes — the stalls
+        the cache exists to eliminate."""
+        self._slot_for_layer[layer_idx] = slot_idx
+        self._box_px[layer_idx] = _box_px(layer, self.width, self.height)
+        rgba_bytes, gx, gy, gw, gh = cached
+        self.renderer.attach_animated_layer(
+            slot_idx,
+            rgba_bytes,
+            src_w=gw, src_h=gh,
+            crtc_x=gx, crtc_y=gy,
+            crtc_w=gw, crtc_h=gh,
+        )
+        self._glyph_dims[layer_idx] = (gx, gy, gw, gh)
 
     def _stage_motion(
         self,

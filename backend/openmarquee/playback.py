@@ -59,6 +59,7 @@ from openmarquee.rendering import Renderer
 from openmarquee.rendering.gpu_compositor import (
     GPUSlideCompositor,
     MultiPlaneRenderer,
+    SlideAssetCache,
     classify_layer,
 )
 
@@ -119,6 +120,12 @@ class PlaybackLoop:
         # cadence for a ticking-seconds display; tests override to a
         # much smaller value to keep runtime fast.
         self._auto_tick = auto_tick_seconds
+        # Cross-slide PIL output cache for the GPU compositor's hot
+        # path. First time through the playlist pays the bg+static
+        # composite + glyph rasterization cost; subsequent reps reuse
+        # the cached bytes and skip the 50-200 ms attach stall at
+        # 1080p. Cleared on stop() so a new playlist gets fresh state.
+        self._gpu_slide_cache = SlideAssetCache()
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
@@ -245,6 +252,10 @@ class PlaybackLoop:
             self._current_auto_mode = None
             self._current_auto_format = None
             self._current_playlist_id = None
+            # Drop GPU compositor PIL caches so a fresh start()
+            # doesn't reuse stale (slide_id, updated_at) entries
+            # against a content store that may have changed.
+            self._gpu_slide_cache.clear()
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
@@ -631,6 +642,7 @@ class PlaybackLoop:
             width=self._renderer.width,
             height=self._renderer.height,
             read_asset=self._read_asset,
+            cache=self._gpu_slide_cache,
         )
         compositor.attach(now=datetime.now(tz))
         try:
