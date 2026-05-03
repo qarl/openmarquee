@@ -200,6 +200,35 @@ class TextLayer(BaseModel):
         return self
 
 
+class BackgroundGradient(BaseModel):
+    """Two-stop linear gradient as a TextSlide background source.
+
+    Mutex with background_image_slide_id and background_video_slide_id
+    (enforced by TextSlide's model validator). Renders via numpy at
+    slide-native dims through auto_render._render_gradient.
+
+    `angle_deg` follows the CSS-like convention so editor UI and
+    backend rasterizer match what operators expect from `linear-
+    gradient(<angle>deg, ...)`:
+      0    → start_color on top,    end_color on bottom (top→bottom)
+      90   → start_color on left,   end_color on right  (left→right)
+      180  → start_color on bottom, end_color on top
+      270  → start_color on right,  end_color on left
+    The editor UI exposes a 0-359 angle slider; the model accepts any
+    float in [0, 360] inclusive (360 wraps to 0).
+    """
+
+    type: Literal["linear"] = "linear"
+    start_color: str = Field(pattern=_HEX_COLOR_PATTERN)
+    end_color: str = Field(pattern=_HEX_COLOR_PATTERN)
+    angle_deg: float = Field(default=0.0, ge=0.0, le=360.0)
+
+    @field_validator("start_color", "end_color")
+    @classmethod
+    def _uppercase_hex(cls, value: str) -> str:
+        return value.upper()
+
+
 class TextSlide(BaseModel):
     """A user-typed text slide composed of one or more TextLayers.
 
@@ -244,6 +273,12 @@ class TextSlide(BaseModel):
     # text PNG over each video frame at playback time. Mutually
     # exclusive with background_image_slide_id.
     background_video_slide_id: UUID | None = None
+    # Optional: render a two-stop linear gradient as the background
+    # under the text. Mutually exclusive with the image / video bg
+    # references. Solid `background_color` is still kept on the
+    # model (some clients fall back to it on render errors) but the
+    # gradient takes precedence when set.
+    background_gradient: "BackgroundGradient | None" = None
 
     # Transition INTO the next slide ("cut" = instant; "fade" =
     # alpha-blend across `transition_ms` after this slide's duration
@@ -269,16 +304,23 @@ class TextSlide(BaseModel):
     @model_validator(mode="after")
     def _bg_layers_are_exclusive(self) -> "TextSlide":
         """A TextSlide can have one background source: solid color, an
-        ImageSlide, or a VideoSlide — not two layered references at
-        once. The editor's bg-picker is a radio so this combo can't
-        be reached from the UI; the validator catches a malformed
-        payload before it round-trips through storage."""
-        if (
-            self.background_image_slide_id is not None
-            and self.background_video_slide_id is not None
-        ):
+        ImageSlide, a VideoSlide, or a two-stop gradient — not two
+        layered references at once. The editor's bg-picker is a radio
+        so this combo can't be reached from the UI; the validator
+        catches a malformed payload before it round-trips through
+        storage."""
+        present = sum(
+            1 for v in (
+                self.background_image_slide_id,
+                self.background_video_slide_id,
+                self.background_gradient,
+            ) if v is not None
+        )
+        if present > 1:
             raise ValueError(
-                "TextSlide cannot reference both an image and a video background; pick one"
+                "TextSlide background must be exactly one of: solid "
+                "background_color, background_image_slide_id, "
+                "background_video_slide_id, or background_gradient"
             )
         return self
 

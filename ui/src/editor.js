@@ -259,6 +259,26 @@ const EDITOR_TEMPLATE = `
                         <span>Saved video slide</span>
                         <select class="om-select field-bg-video"><option value="">(pick a video)</option></select>
                     </label>
+                    <label class="om-row" style="gap: 8px; cursor: pointer;">
+                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="gradient">
+                        <span>Gradient</span>
+                    </label>
+                    <div class="editor-bg-gradient-wrap" hidden>
+                        <div class="om-row" style="gap: 10px;">
+                            <label class="om-field" style="flex: 1;">
+                                <span>Start color</span>
+                                <input type="color" class="field-bg-grad-start" value="#FF6B6B" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
+                            </label>
+                            <label class="om-field" style="flex: 1;">
+                                <span>End color</span>
+                                <input type="color" class="field-bg-grad-end" value="#4ECDC4" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
+                            </label>
+                        </div>
+                        <label class="om-field" style="margin-top: 8px;">
+                            <span>Angle (<span class="field-bg-grad-angle-label">0</span>°)</span>
+                            <input type="range" class="field-bg-grad-angle" min="0" max="359" step="1" value="0" style="width: 100%;">
+                        </label>
+                    </div>
                     <div class="editor-bg-generate" hidden>
                         <label class="om-field">
                             <span>Generate a new background (10-30s)</span>
@@ -493,6 +513,11 @@ export function mountEditor(
     const bgVideoEl = container.querySelector(".field-bg-video");
     const bgVideoWrapEl = container.querySelector(".editor-bg-video-wrap");
     const bgColorWrapEl = container.querySelector(".editor-bg-color-wrap");
+    const bgGradWrapEl = container.querySelector(".editor-bg-gradient-wrap");
+    const bgGradStartEl = container.querySelector(".field-bg-grad-start");
+    const bgGradEndEl = container.querySelector(".field-bg-grad-end");
+    const bgGradAngleEl = container.querySelector(".field-bg-grad-angle");
+    const bgGradAngleLabelEl = container.querySelector(".field-bg-grad-angle-label");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const form = container.querySelector(".controls");
@@ -507,6 +532,16 @@ export function mountEditor(
         bgSlideId: null,
         bgVideoId: null,
         bgImage: null,
+        // Gradient-source state. start_color / end_color stay
+        // synced with the color inputs; angle_deg comes from the
+        // range slider (0-359). Mutex with the other bg sources —
+        // bgSource = "gradient" activates this object, otherwise
+        // it's ignored at save time.
+        bgGradient: {
+            start_color: bgGradStartEl.value,
+            end_color: bgGradEndEl.value,
+            angle_deg: parseInt(bgGradAngleEl.value, 10) || 0,
+        },
         layers: [makeAutoNamedLayer([])],
         // Selection drives the box overlay's binding. Expansion drives
         // which accordion card has its body visible. They stay coupled
@@ -1278,6 +1313,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = state.bgSource !== "color";
             bgSlideWrapEl.hidden = state.bgSource !== "slide";
             bgVideoWrapEl.hidden = state.bgSource !== "video";
+            bgGradWrapEl.hidden = state.bgSource !== "gradient";
             bgGenerateWrap.hidden =
                 state.bgSource !== "slide" || !onGenerateBackground;
             if (state.bgSource === "slide" && fetchItems && !bgSlidePopulated) {
@@ -1289,7 +1325,7 @@ export function mountEditor(
                 bgVideoPopulated = true;
             }
             // Clear references for the inactive paths so the save payload
-            // never carries both a bg image and a bg video.
+            // never carries multiple bg sources at once.
             if (state.bgSource === "color") {
                 state.bgImage = null;
                 state.bgSlideId = null;
@@ -1298,10 +1334,31 @@ export function mountEditor(
                 state.bgVideoId = null;
             } else if (state.bgSource === "video") {
                 state.bgSlideId = null;
+            } else if (state.bgSource === "gradient") {
+                state.bgImage = null;
+                state.bgSlideId = null;
+                state.bgVideoId = null;
             }
             drawCanvas(canvas, state);
         });
     }
+
+    // Gradient-source live editing: any of start, end, or angle change
+    // re-runs the canvas paint so the operator sees the result instantly.
+    bgGradStartEl.addEventListener("input", () => {
+        state.bgGradient.start_color = bgGradStartEl.value;
+        if (state.bgSource === "gradient") drawCanvas(canvas, state);
+    });
+    bgGradEndEl.addEventListener("input", () => {
+        state.bgGradient.end_color = bgGradEndEl.value;
+        if (state.bgSource === "gradient") drawCanvas(canvas, state);
+    });
+    bgGradAngleEl.addEventListener("input", () => {
+        const angle = parseInt(bgGradAngleEl.value, 10) || 0;
+        state.bgGradient.angle_deg = angle;
+        bgGradAngleLabelEl.textContent = String(angle);
+        if (state.bgSource === "gradient") drawCanvas(canvas, state);
+    });
 
     if (onGenerateBackground) {
         const generateBtn = container.querySelector(".bg-generate-btn");
@@ -1382,8 +1439,14 @@ export function mountEditor(
         const payload = {
             name: state.name || "Untitled",
             background_color: state.backgroundColor.toUpperCase(),
-            background_image_slide_id: state.bgSlideId || null,
-            background_video_slide_id: state.bgVideoId || null,
+            background_image_slide_id: state.bgSource === "slide" ? state.bgSlideId || null : null,
+            background_video_slide_id: state.bgSource === "video" ? state.bgVideoId || null : null,
+            background_gradient: state.bgSource === "gradient" ? {
+                type: "linear",
+                start_color: state.bgGradient.start_color.toUpperCase(),
+                end_color: state.bgGradient.end_color.toUpperCase(),
+                angle_deg: state.bgGradient.angle_deg,
+            } : null,
             duration_ms: Math.round(durationSeconds * 1000),
             text_layers,
             png_base64,
@@ -1427,6 +1490,7 @@ export function mountEditor(
         bgColorWrapEl.hidden = false;
         bgSlideWrapEl.hidden = true;
         bgVideoWrapEl.hidden = true;
+        bgGradWrapEl.hidden = true;
         state.bgSource = "color";
         drawCanvas(canvas, state);
         autoSave.cancel();
@@ -1566,6 +1630,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = false;
             bgVideoWrapEl.hidden = true;
+            bgGradWrapEl.hidden = true;
             bgSlideEl.value = String(slide.background_image_slide_id);
             state.bgSource = "slide";
             state.bgSlideId = String(slide.background_image_slide_id);
@@ -1585,6 +1650,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = false;
+            bgGradWrapEl.hidden = true;
             bgVideoEl.value = String(slide.background_video_slide_id);
             state.bgSource = "video";
             state.bgSlideId = null;
@@ -1592,6 +1658,28 @@ export function mountEditor(
             state.bgImage = await loadImageForSlide(state.bgVideoId).catch(
                 () => null,
             );
+        } else if (slide.background_gradient) {
+            const gradRadio = container.querySelector(
+                '.field-bg-source[value="gradient"]',
+            );
+            gradRadio.checked = true;
+            bgColorWrapEl.hidden = true;
+            bgSlideWrapEl.hidden = true;
+            bgVideoWrapEl.hidden = true;
+            bgGradWrapEl.hidden = false;
+            state.bgSource = "gradient";
+            state.bgSlideId = null;
+            state.bgVideoId = null;
+            state.bgImage = null;
+            state.bgGradient = {
+                start_color: slide.background_gradient.start_color,
+                end_color: slide.background_gradient.end_color,
+                angle_deg: slide.background_gradient.angle_deg,
+            };
+            bgGradStartEl.value = state.bgGradient.start_color;
+            bgGradEndEl.value = state.bgGradient.end_color;
+            bgGradAngleEl.value = String(state.bgGradient.angle_deg);
+            bgGradAngleLabelEl.textContent = String(state.bgGradient.angle_deg);
         } else {
             const colorRadio = container.querySelector(
                 '.field-bg-source[value="color"]',
@@ -1600,6 +1688,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = false;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = true;
+            bgGradWrapEl.hidden = true;
             state.bgSource = "color";
             state.bgSlideId = null;
             state.bgVideoId = null;
@@ -1856,6 +1945,7 @@ export function drawCanvas(canvas, state, opts) {
         backgroundColor = "#000000",
         bgSource = "color",
         bgImage = null,
+        bgGradient = null,
     } = state;
 
     ctx.save();
@@ -1874,6 +1964,25 @@ export function drawCanvas(canvas, state, opts) {
                 drawW,
                 drawH,
             );
+        } else if (bgSource === "gradient" && bgGradient) {
+            // CSS-like angle: 0 = top→bottom, 90 = left→right.
+            // Match the backend renderer's projection so editor preview
+            // and device output agree visually.
+            const rad = (bgGradient.angle_deg * Math.PI) / 180;
+            const dx = Math.sin(rad);
+            const dy = Math.cos(rad);
+            const cx = canvas.width / 2;
+            const cy = canvas.height / 2;
+            const half = Math.abs(dx) * (canvas.width / 2)
+                + Math.abs(dy) * (canvas.height / 2);
+            const grad = ctx.createLinearGradient(
+                cx - dx * half, cy - dy * half,
+                cx + dx * half, cy + dy * half,
+            );
+            grad.addColorStop(0, bgGradient.start_color);
+            grad.addColorStop(1, bgGradient.end_color);
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
         } else {
             ctx.fillStyle = backgroundColor;
             ctx.fillRect(0, 0, canvas.width, canvas.height);

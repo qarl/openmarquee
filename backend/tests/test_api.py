@@ -143,7 +143,7 @@ def test_upload_text_slide_rejects_both_image_and_video_bg_with_clean_422(
     body = response.json()
     # Detail is a list of error dicts (pydantic-shape, JSON round-tripped).
     assert isinstance(body["detail"], list)
-    assert any("image and a video" in err.get("msg", "") for err in body["detail"]), body
+    assert any("exactly one of" in err.get("msg", "") for err in body["detail"]), body
 
 
 # --- GET /api/content ---

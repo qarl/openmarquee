@@ -337,7 +337,7 @@ def test_text_slide_rejects_both_image_and_video_backgrounds():
     from a hand-rolled API client; reject at the model boundary."""
     from uuid import uuid4
 
-    with pytest.raises(ValidationError, match="image and a video"):
+    with pytest.raises(ValidationError, match="exactly one of"):
         TextSlide(
             name="x",
             text="x",
