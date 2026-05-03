@@ -24,8 +24,10 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 from openmarquee.rendering.drm_kms import DRMRenderer  # noqa: E402
 
-SIGN_W = 128
-SIGN_H = 96
+# 1080p canonical config (qarl 2026-05-02). LED-matrix smokes can
+# drop to 128x96 if needed.
+SIGN_W = 1920
+SIGN_H = 1080
 FPS_FRAMES = 30
 
 

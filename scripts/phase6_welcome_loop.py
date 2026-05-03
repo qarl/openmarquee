@@ -46,11 +46,25 @@ from openmarquee.rendering.drm_kms import DRMRenderer  # noqa: E402
 from openmarquee.schedule import ScheduleStorage  # noqa: E402
 from openmarquee.seed import seed_if_needed  # noqa: E402
 
-# Sign-side rasterize dims. The asset PNGs are written at this
-# resolution; the vc4 HVS scales each plane to the letterboxed display
-# region at scanout — no software upscale, no canvas/paste.
-SIGN_W = 128
-SIGN_H = 96
+# Sign-side rasterize dims. The canonical config for HDMI deployments
+# (qarl 2026-05-02 "stop thinking about low-rez for a while"; see
+# memory/project_hdmi_1080p_is_primary_target.md) is 1080p sign-native
+# — the GPU compositor (DRMRenderer multi-plane API + GPUSlideCompositor)
+# composites at scanout via vc4 HVS, so per-frame CPU work is zero in
+# the inner loop and 1080p fits the 30 fps budget cleanly. LED-matrix
+# deployments (rare) can still drop these dims to e.g. 128×96 and the
+# loop will fall through to the software compose_motion_frame path.
+SIGN_W = 1920
+SIGN_H = 1080
+
+# How many DRM overlay planes to reserve for animated text layers.
+# vc4's HDMI CRTC exposes 16-32 overlays (probed 2026-05-02), and at
+# 1080p the LBM ceiling for SIMULTANEOUS active planes is ~3 with
+# uncropped sources but much higher for glyph-bbox-cropped sources
+# (the GPU compositor's normal mode). 8 covers any plausible Welcome
+# slide (clock + ticker + breathe + a few + headroom) with memory
+# cost = 8 × 8 MB = 64 MB held idle on a 512 MB Pi Zero 2 W.
+MAX_ANIMATED_PLANES = 8
 
 DATA_ROOT = Path("/home/openmarquee/data")
 CONTENT_DIR = DATA_ROOT / "content"
@@ -105,11 +119,14 @@ async def main() -> int:
 
     with DRMRenderer(
         width=SIGN_W, height=SIGN_H, device_path=card,
+        max_animated_planes=MAX_ANIMATED_PLANES,
     ) as renderer:
         log.info(
-            "DRM: %dx%d display @ %s — primary plane HVS-scaled from %dx%d",
+            "DRM: %dx%d display @ %s — primary plane HVS-scaled from %dx%d, "
+            "%d animated planes reserved for GPU compositor",
             renderer.display_width, renderer.display_height,
             renderer.pixel_format, SIGN_W, SIGN_H,
+            MAX_ANIMATED_PLANES,
         )
         loop = PlaybackLoop(
             renderer=renderer,

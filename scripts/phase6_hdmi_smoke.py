@@ -37,8 +37,12 @@ from PIL import Image  # noqa: E402
 from openmarquee.rendering.hdmi import HDMIRenderer  # noqa: E402
 from openmarquee.seed import render_text_slide_png  # noqa: E402
 
-SIGN_W = 128
-SIGN_H = 96
+# 1080p canonical config (qarl 2026-05-02). The legacy /dev/fb0
+# path this smoke exercises is superseded by DRMRenderer; kept for
+# regression testing of the upscale path. LED-matrix smokes can
+# drop to 128x96 if needed.
+SIGN_W = 1920
+SIGN_H = 1080
 TEXT = "HELLO PHASE 6"
 
 

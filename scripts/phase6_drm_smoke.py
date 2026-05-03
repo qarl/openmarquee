@@ -27,8 +27,11 @@ from PIL import Image  # noqa: E402
 from openmarquee.rendering.drm_kms import DRMRenderer  # noqa: E402
 from openmarquee.seed import render_text_slide_png  # noqa: E402
 
-SIGN_W = 128
-SIGN_H = 96
+# 1080p canonical config (qarl 2026-05-02 architectural pivot; see
+# memory/project_hdmi_1080p_is_primary_target.md). LED-matrix smokes
+# can drop to 128x96 if needed.
+SIGN_W = 1920
+SIGN_H = 1080
 TEXT = "HELLO DRM"
 
 
