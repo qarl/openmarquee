@@ -16,7 +16,14 @@ from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, ValidationError
 
-from openmarquee.content import ContentItem, ImageSlide, TextBox, TextSlide, VideoSlide
+from openmarquee.content import (
+    BackgroundGradient,
+    ContentItem,
+    ImageSlide,
+    TextBox,
+    TextSlide,
+    VideoSlide,
+)
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_content_storage,
@@ -170,6 +177,13 @@ class TextSlideUpload(BaseModel):
     background_color: str = "#000000"
     background_image_slide_id: UUID | None = None
     background_video_slide_id: UUID | None = None
+    # Two-stop linear gradient. Mutex with the image / video bg refs;
+    # the cross-field validation lives on TextSlide so this just
+    # mirrors the wire shape. Adding a field on TextSlide without
+    # also adding it here is the silent-drop bug shape that bit us
+    # twice already (motion_intensity / motion_phase, then this) —
+    # see test_textslideupload_round_trips_gradient.
+    background_gradient: BackgroundGradient | None = None
     transition: str = "cut"
     transition_ms: int = 500
     text_layers: list[TextLayerUpload]

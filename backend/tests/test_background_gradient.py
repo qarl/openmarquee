@@ -1,18 +1,25 @@
 """Tests for the two-stop linear gradient background type.
 
 Covers schema (BackgroundGradient model + TextSlide mutex validator),
-renderer (_render_linear_gradient pixel sanity), and the renderer
-dispatch in _load_background.
+renderer (_render_linear_gradient pixel sanity), the renderer
+dispatch in _load_background, AND the TextSlideUpload wire-mirror
+(regression test for the silent-drop pattern that bit motion fields
+in 37ae520 and would have shipped here without QA's catch).
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import math
+from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 from PIL import Image
 from pydantic import ValidationError
 
+from openmarquee.app import app
 from openmarquee.auto_render import (
     _hex_to_rgb,
     _load_background,
@@ -22,6 +29,11 @@ from openmarquee.content import (
     BackgroundGradient,
     TextLayer,
     TextSlide,
+)
+from openmarquee.content.storage import ContentStorage
+from openmarquee.dependencies import (
+    _content_storage_singleton,
+    get_content_storage,
 )
 
 
@@ -225,3 +237,131 @@ def test_load_background_image_takes_precedence_over_gradient():
     # We get the gradient (image branch couldn't load).
     # angle=90 → start (red) on left.
     assert img.getpixel((0, 25))[0] > 250  # red
+
+
+# --- TextSlideUpload wire-mirror regression ---
+
+
+def _png_b64(width: int = 8, height: int = 8) -> str:
+    img = Image.new("RGB", (width, height), (0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@pytest.fixture
+def storage(tmp_path: Path) -> ContentStorage:
+    return ContentStorage(tmp_path / "content")
+
+
+@pytest.fixture
+def client(storage: ContentStorage):
+    app.dependency_overrides[get_content_storage] = lambda: storage
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+        _content_storage_singleton.cache_clear()
+
+
+def test_textslideupload_round_trips_gradient(client: TestClient):
+    """Regression for the silent-drop bug class (motion fields hit
+    this earlier in 37ae520; gradient hit it tonight before QA caught
+    it). POSTing a TextSlideUpload with background_gradient must
+    persist the gradient and surface it on subsequent GET."""
+    payload = {
+        "name": "GradientSlide",
+        "duration_ms": 3000,
+        "text_layers": [{"text": "Hi", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+        "background_gradient": {
+            "type": "linear",
+            "start_color": "#FF6B6B",
+            "end_color": "#4ECDC4",
+            "angle_deg": 45,
+        },
+        "png_base64": _png_b64(),
+    }
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["background_gradient"] is not None
+    assert body["background_gradient"]["start_color"] == "#FF6B6B"
+    assert body["background_gradient"]["end_color"] == "#4ECDC4"
+    assert body["background_gradient"]["angle_deg"] == 45.0
+
+    # Round-trip via GET on /api/content.
+    list_response = client.get("/api/content")
+    assert list_response.status_code == 200
+    slides = list_response.json()
+    found = next((s for s in slides if s["id"] == body["id"]), None)
+    assert found is not None
+    assert found["background_gradient"]["start_color"] == "#FF6B6B"
+
+
+def test_textslideupload_preserves_null_gradient(client: TestClient):
+    """A POST without background_gradient (or with explicit None)
+    must NOT default to a stray gradient on the persisted slide."""
+    payload = {
+        "name": "NoGradient",
+        "duration_ms": 3000,
+        "text_layers": [{"text": "Hi", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+        "png_base64": _png_b64(),
+    }
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["background_gradient"] is None
+
+
+def test_textslideupload_put_round_trips_gradient(client: TestClient):
+    """The PUT (edit-existing) route has its own model_dump
+    construction site (api.py:253). Verify it also preserves the
+    gradient field — same silent-drop risk shape."""
+    create = client.post("/api/content/text-slides", json={
+        "name": "EditMe",
+        "duration_ms": 3000,
+        "text_layers": [{"text": "x", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+        "png_base64": _png_b64(),
+    })
+    assert create.status_code == 200
+    item_id = create.json()["id"]
+
+    # Now PUT a gradient onto it.
+    update = client.put(f"/api/content/text-slides/{item_id}", json={
+        "name": "EditMe",
+        "duration_ms": 3000,
+        "text_layers": [{"text": "x", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+        "background_gradient": {
+            "type": "linear",
+            "start_color": "#000000",
+            "end_color": "#FFFFFF",
+            "angle_deg": 90,
+        },
+        "png_base64": _png_b64(),
+    })
+    assert update.status_code == 200, update.text
+    body = update.json()
+    assert body["background_gradient"]["start_color"] == "#000000"
+    assert body["background_gradient"]["angle_deg"] == 90.0
+
+
+def test_textslideupload_rejects_gradient_with_image_bg(client: TestClient):
+    """The mutex validator must surface as a 422 at the wire boundary.
+    Without the model-level validator, both fields would persist and
+    later renderers would see ambiguous state."""
+    payload = {
+        "name": "BadMutex",
+        "duration_ms": 3000,
+        "text_layers": [{"text": "x", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+        "background_gradient": {
+            "type": "linear",
+            "start_color": "#000000",
+            "end_color": "#FFFFFF",
+            "angle_deg": 0,
+        },
+        "background_image_slide_id": "00000000-0000-4000-8000-000000000099",
+        "png_base64": _png_b64(),
+    }
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 422, response.text
