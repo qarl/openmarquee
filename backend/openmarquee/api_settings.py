@@ -21,6 +21,7 @@ GET /api/content before the rerender bumped updated_at on disk
 for a guaranteed-coherent post-save state.
 """
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -29,16 +30,70 @@ from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_content_storage, get_settings_storage
 from openmarquee.settings import SettingsStorage, SystemSettings
 from openmarquee.text_rerender import rerender_text_slides_for_dims
+from openmarquee.wifi_prefill import read_system_wifi
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 SettingsDep = Annotated[SettingsStorage, Depends(get_settings_storage)]
 ContentDep = Annotated[ContentStorage, Depends(get_content_storage)]
 
+log = logging.getLogger(__name__)
+
 
 @router.get("", response_model=SystemSettings)
 async def get_settings(storage: SettingsDep) -> SystemSettings:
-    return storage.load()
+    """Load current settings, applying first-run wifi prefill on the
+    very first GET when the device hasn't completed first-run setup.
+
+    Prefill conditions (all must hold for the side-effect to fire):
+      - ui_first_run_seen is False (haven't completed first-run yet)
+      - wifi_station_ssid is empty (no operator-set creds yet)
+      - read_system_wifi() returns non-None (Pi has an active wifi
+        connection AND we can read its creds from
+        /etc/wpa_supplicant/wpa_supplicant.conf or the /var fallback)
+
+    On match, the settings are mutated + persisted with wifi_station_
+    enabled=true, ssid, and password populated. Subsequent GETs see
+    the saved values (idempotent — read_system_wifi only fires when
+    the SSID field is empty). The first-run UI then renders the
+    welcome form with wifi pre-populated; the operator can override
+    or accept and tap "Make it mine".
+    """
+    settings = storage.load()
+    if (
+        not settings.ui_first_run_seen
+        and not (settings.wifi_station_ssid or "").strip()
+    ):
+        creds = read_system_wifi()
+        if creds is not None:
+            ssid, psk = creds
+            try:
+                # Build a copy with the wifi fields populated. Pydantic
+                # validates the new values against the same constraints
+                # as a PUT — invalid creds (somehow) raise ValidationError
+                # and we fall through with original settings.
+                updated = settings.model_copy(update={
+                    "wifi_station_enabled": True,
+                    "wifi_station_ssid": ssid,
+                    "wifi_station_password": psk,
+                })
+                # Round-trip through the storage validator so any
+                # field-level rules (length, charset) get enforced
+                # before we persist.
+                SystemSettings.model_validate(updated.model_dump())
+                storage.save(updated)
+                settings = updated
+                log.info(
+                    "first-run: pre-filled wifi creds for SSID %r from "
+                    "system wpa_supplicant.conf",
+                    ssid,
+                )
+            except Exception:
+                log.exception(
+                    "first-run: wifi prefill failed validation; "
+                    "leaving settings untouched",
+                )
+    return settings
 
 
 @router.put("", response_model=SystemSettings)

@@ -240,3 +240,104 @@ def test_put_dim_change_with_no_text_slides_is_a_clean_noop(
         },
     )
     assert response.status_code == 200
+
+
+# --- first-run wifi prefill ---
+
+
+def test_get_prefills_wifi_on_first_run_when_system_creds_available(
+    client: TestClient, storage: SettingsStorage, monkeypatch
+):
+    """First GET on a fresh device with ui_first_run_seen=False AND
+    no operator wifi creds yet AND a readable system wpa_supplicant.
+    conf with active connection → the response carries the prefilled
+    SSID/password and the persisted settings have wifi_station_enabled
+    flipped to True."""
+    import openmarquee.api_settings as api_settings_mod
+    monkeypatch.setattr(
+        api_settings_mod, "read_system_wifi",
+        lambda: ("MyHomeWifi", "abcdefgh"),
+    )
+
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["wifi_station_enabled"] is True
+    assert body["wifi_station_ssid"] == "MyHomeWifi"
+    assert body["wifi_station_password"] == "abcdefgh"
+
+    # Persisted: subsequent GET (even if read_system_wifi later returns
+    # different creds) returns the saved values.
+    monkeypatch.setattr(
+        api_settings_mod, "read_system_wifi",
+        lambda: ("DifferentNet", "differentpass"),
+    )
+    response = client.get("/api/settings")
+    body = response.json()
+    assert body["wifi_station_ssid"] == "MyHomeWifi"  # persisted, not re-prefilled
+
+
+def test_get_does_not_prefill_when_system_creds_unavailable(
+    client: TestClient, storage: SettingsStorage, monkeypatch
+):
+    """No active connection / unreadable conf / etc. → read_system_wifi
+    returns None → settings come back unchanged with empty wifi fields."""
+    import openmarquee.api_settings as api_settings_mod
+    monkeypatch.setattr(api_settings_mod, "read_system_wifi", lambda: None)
+
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["wifi_station_enabled"] is False
+    assert body["wifi_station_ssid"] is None or body["wifi_station_ssid"] == ""
+
+
+def test_get_does_not_prefill_after_first_run_completed(
+    client: TestClient, storage: SettingsStorage, monkeypatch
+):
+    """Once ui_first_run_seen flips to True, prefill must not fire —
+    even if read_system_wifi has fresh creds. The operator owns the
+    field after first-run."""
+    # Persist ui_first_run_seen=True via a PUT first.
+    response = client.put(
+        "/api/settings",
+        json={"ui_first_run_seen": True},
+    )
+    assert response.status_code == 200
+
+    import openmarquee.api_settings as api_settings_mod
+    monkeypatch.setattr(
+        api_settings_mod, "read_system_wifi",
+        lambda: ("ShouldNotPrefill", "shouldnotpass"),
+    )
+
+    response = client.get("/api/settings")
+    body = response.json()
+    assert body["wifi_station_ssid"] is None or body["wifi_station_ssid"] == ""
+    assert body["wifi_station_enabled"] is False
+
+
+def test_get_does_not_prefill_when_operator_already_set_ssid(
+    client: TestClient, storage: SettingsStorage, monkeypatch
+):
+    """If the operator pre-filled the SSID some other way (manual
+    edit, prior GUI), don't clobber it — even on first run."""
+    response = client.put(
+        "/api/settings",
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "OperatorChose",
+            "wifi_station_password": "operatorpass",
+        },
+    )
+    assert response.status_code == 200
+
+    import openmarquee.api_settings as api_settings_mod
+    monkeypatch.setattr(
+        api_settings_mod, "read_system_wifi",
+        lambda: ("SystemNet", "systempass"),
+    )
+
+    response = client.get("/api/settings")
+    body = response.json()
+    assert body["wifi_station_ssid"] == "OperatorChose"
