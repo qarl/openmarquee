@@ -993,6 +993,78 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     }
 }
 
+/* --- pattern bg picker (qarl 2026-05-03 designer handoff) --- */
+
+/* Grid of pattern thumbnails. Each tile is ~64px square, auto-fitted
+   to the available column. Operator clicks one to set the active
+   pattern; live tile background updates whenever color_a/color_b
+   change so the picker previews how the operator's palette looks
+   in each pattern. */
+.editor-bg-pattern-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+    gap: 8px;
+    margin-bottom: 14px;
+}
+
+.editor-bg-pattern-tile {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    padding: 4px;
+    border: 1.5px solid var(--om-line, #2a2a2f);
+    border-radius: 8px;
+    background: var(--om-surface-2, #19191c);
+    cursor: pointer;
+    font: inherit;
+    color: var(--om-text, #e7eaee);
+    transition: border-color 0.15s, transform 0.1s;
+}
+.editor-bg-pattern-tile:hover {
+    border-color: var(--om-accent, #ffb43c);
+}
+.editor-bg-pattern-tile.is-selected {
+    border-color: var(--om-accent, #ffb43c);
+    box-shadow: 0 0 0 2px var(--om-accent, #ffb43c);
+}
+.editor-bg-pattern-tile-swatch {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border-radius: 4px;
+    background: var(--om-surface-3, #2a2a2f);
+}
+.editor-bg-pattern-tile-label {
+    font-family: var(--om-mono);
+    font-size: 10px;
+    text-align: center;
+    color: var(--om-text-fade, #8e8e96);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+/* Tweak rows below the grid: Color A, Color B (greyed for solid),
+   Density (relabeled "Angle" for gradient; greyed for solid). */
+.editor-bg-pattern-tweaks {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.editor-bg-pattern-label {
+    font-family: var(--om-mono);
+    font-size: 11px;
+    color: var(--om-text-fade, #8e8e96);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    min-width: 60px;
+}
+.editor-bg-pattern-tweak.is-disabled {
+    opacity: 0.45;
+    pointer-events: none;
+}
+
 .preview-wrap {
     /* The wrap owns the chrome (border / radius / LED background); the
        inner .editor-canvas just paints. Width capped at 26rem to match

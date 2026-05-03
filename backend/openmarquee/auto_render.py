@@ -29,7 +29,7 @@ from uuid import UUID
 import numpy as np
 
 if TYPE_CHECKING:
-    from openmarquee.content import BackgroundGradient
+    from openmarquee.content import BackgroundPattern
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
@@ -207,65 +207,344 @@ def _load_background(
                 "auto_render: failed to load background for auto slide %s",
                 slide.id,
             )
-    if slide.background_gradient is not None:
+    if slide.background_pattern is not None:
         try:
-            return _render_linear_gradient(
-                slide.background_gradient, width, height,
+            return render_pattern(
+                slide.background_pattern, width, height,
             )
         except Exception:
             log.exception(
-                "auto_render: gradient render failed for slide %s; "
+                "auto_render: pattern render failed for slide %s; "
                 "falling back to solid background_color",
                 slide.id,
             )
     return Image.new("RGB", (width, height), slide.background_color)
 
 
-def _render_linear_gradient(
-    gradient: "BackgroundGradient", width: int, height: int,
-) -> Image.Image:
-    """Rasterize a two-stop linear gradient at width × height.
+# --- procedural pattern renderers ---
+#
+# 11 patterns from the bg-system.js handoff (qarl 2026-05-03). Each is
+# a numpy-vectorized translation of the corresponding CSS `build(a, b,
+# density)` function. Visual parity with the editor canvas matters
+# (operator picks pattern in editor, expects device to render the
+# same thing); pixel-perfect parity does not (PIL antialiasing differs
+# slightly from CSS).
+#
+# All pattern renderers run ONCE at slide entry, get baked into the
+# bg cache, ride along with the GPU compositor's primary plane for
+# free. Per-frame cost is zero. Numpy keeps the one-shot cost
+# negligible at 1080p (each pattern under ~10 ms on a Pi Zero 2 W).
+#
+# `density` is a normalized 0..1 knob whose meaning is per-pattern;
+# see BackgroundPattern's docstring for the per-pattern range.
 
-    Math: project each pixel (x, y) onto the gradient axis (cos a,
-    sin a). The projection range is normalized so t=0 at the corner
-    closest to start_color and t=1 at the diagonally opposite corner,
-    irrespective of angle. RGB lerps between start and end at each
-    pixel's t. Numpy keeps the per-pixel cost negligible at 1080p
-    (~5 ms on a Pi Zero 2 W; called once at slide entry, cached for
-    the slide's lifetime through GPUSlideCompositor's cache so per-
-    frame cost is zero)."""
-    # CSS-like convention: angle 0 → top→bottom (positive y axis).
-    # angle 90 → left→right (positive x axis). dx = sin(angle),
-    # dy = cos(angle) so the (dx, dy) vector points from start_color
-    # corner to end_color corner.
-    rad = math.radians(gradient.angle_deg)
+
+def _lerp(a: float, b: float, t: float) -> float:
+    """CSS-side bg-system.js lerp: clamp t to [0, 1], map to [a, b]."""
+    t = max(0.0, min(1.0, t))
+    return a + (b - a) * t
+
+
+def render_pattern(
+    pattern: "BackgroundPattern", width: int, height: int,
+) -> Image.Image:
+    """Dispatch to the matching pattern renderer. Falls back to a
+    solid color_a fill on an unrecognized pattern name (forward-compat
+    with future patterns added to the schema before all clients
+    update)."""
+    p = pattern.pattern
+    a = pattern.color_a
+    b = pattern.color_b
+    d = pattern.density
+    if p == "solid":
+        return Image.new("RGB", (width, height), a)
+    if p == "gradient":
+        return _render_pattern_gradient(a, b, d, width, height)
+    if p == "dots":
+        return _render_pattern_dots(a, b, d, width, height)
+    if p == "halftone":
+        return _render_pattern_halftone(a, b, d, width, height)
+    if p == "stripes":
+        return _render_pattern_stripes(a, b, d, width, height)
+    if p == "scanlines":
+        return _render_pattern_scanlines(a, b, d, width, height)
+    if p == "checker":
+        return _render_pattern_checker(a, b, d, width, height)
+    if p == "rings":
+        return _render_pattern_rings(a, b, d, width, height)
+    if p == "rays":
+        return _render_pattern_rays(a, b, d, width, height)
+    if p == "confetti":
+        return _render_pattern_confetti(a, b, d, width, height)
+    if p == "bricks":
+        return _render_pattern_bricks(a, b, d, width, height)
+    log.warning("auto_render: unknown pattern %r; falling back to color_a", p)
+    return Image.new("RGB", (width, height), a)
+
+
+def _render_pattern_gradient(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Two-stop linear gradient. Density 0..1 maps to angle 0..270deg
+    per the bg-system.js convention (`density 0 → 0deg, 0.5 → ~135deg,
+    1 → 270deg`). 0deg = top→bottom; 90deg = left→right; 180deg =
+    bottom→top; 270deg = right→left."""
+    angle_deg = round(_lerp(0.0, 270.0, density))
+    rad = math.radians(angle_deg)
     dx = math.sin(rad)
     dy = math.cos(rad)
     xs = np.arange(width, dtype=np.float32).reshape(1, width)
     ys = np.arange(height, dtype=np.float32).reshape(height, 1)
-    proj = xs * dx + ys * dy  # shape (height, width)
-    # Range of projection over the rect's four corners.
+    proj = xs * dx + ys * dy
     proj_min = min(0.0, dx * (width - 1)) + min(0.0, dy * (height - 1))
     proj_max = max(0.0, dx * (width - 1)) + max(0.0, dy * (height - 1))
     span = proj_max - proj_min
     if span < 1e-6:
-        # Degenerate: angle that ends up with zero range over the
-        # rect (only happens if width == height == 1). Fall back to
-        # a solid start_color fill.
-        return Image.new("RGB", (width, height), gradient.start_color)
+        return Image.new("RGB", (width, height), color_a)
     t = np.clip((proj - proj_min) / span, 0.0, 1.0)
-    start = _hex_to_rgb(gradient.start_color)
-    end = _hex_to_rgb(gradient.end_color)
-    r = (start[0] + t * (end[0] - start[0])).astype(np.uint8)
-    g = (start[1] + t * (end[1] - start[1])).astype(np.uint8)
-    b = (start[2] + t * (end[2] - start[2])).astype(np.uint8)
-    arr = np.stack([r, g, b], axis=-1)
-    return Image.fromarray(arr, mode="RGB")
+    a_rgb = _hex_to_rgb(color_a)
+    b_rgb = _hex_to_rgb(color_b)
+    r = (a_rgb[0] + t * (b_rgb[0] - a_rgb[0])).astype(np.uint8)
+    g = (a_rgb[1] + t * (b_rgb[1] - a_rgb[1])).astype(np.uint8)
+    b_arr = (a_rgb[2] + t * (b_rgb[2] - a_rgb[2])).astype(np.uint8)
+    return Image.fromarray(np.stack([r, g, b_arr], axis=-1), mode="RGB")
+
+
+def _dot_grid_mask(
+    width: int, height: int, tile: int, radius: int,
+    offset_x: int = 0, offset_y: int = 0,
+) -> np.ndarray:
+    """Boolean mask: True wherever a pixel falls inside a dot of
+    radius `radius` centered in each `tile`-sized cell. Used by the
+    dot, halftone, and confetti patterns. `offset_x/y` shifts the
+    grid origin (halftone uses this for the second offset layer)."""
+    if tile <= 0:
+        return np.zeros((height, width), dtype=bool)
+    xs = (np.arange(width) - offset_x) % tile - tile / 2
+    ys = (np.arange(height) - offset_y) % tile - tile / 2
+    dx = xs.reshape(1, width)
+    dy = ys.reshape(height, 1)
+    return (dx * dx + dy * dy) <= (radius * radius)
+
+
+def _solid_fill(width: int, height: int, color_hex: str) -> np.ndarray:
+    """uint8 (H, W, 3) array filled with `color_hex`. Base layer for
+    most patterns."""
+    rgb = _hex_to_rgb(color_hex)
+    arr = np.empty((height, width, 3), dtype=np.uint8)
+    arr[..., 0] = rgb[0]
+    arr[..., 1] = rgb[1]
+    arr[..., 2] = rgb[2]
+    return arr
+
+
+def _apply_mask(
+    base: np.ndarray, mask: np.ndarray, color_hex: str,
+) -> np.ndarray:
+    """Where `mask` is True, set base pixels to `color_hex`. In-place
+    on `base`."""
+    rgb = _hex_to_rgb(color_hex)
+    base[mask, 0] = rgb[0]
+    base[mask, 1] = rgb[1]
+    base[mask, 2] = rgb[2]
+    return base
+
+
+def _render_pattern_dots(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Evenly-spaced filled dots of color_b on a color_a background.
+    Tile size shrinks with density (lerp(28, 8))."""
+    tile = round(_lerp(28, 8, density))
+    radius = max(2, round(tile * 0.22))
+    base = _solid_fill(width, height, color_a)
+    mask = _dot_grid_mask(width, height, tile, radius)
+    _apply_mask(base, mask, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_halftone(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Two offset dot grids — printer-style halftone. Larger tile +
+    bigger dots than `dots`; second layer offset by half a tile."""
+    tile = round(_lerp(36, 14, density))
+    radius = round(tile * 0.34)
+    half = tile // 2
+    base = _solid_fill(width, height, color_a)
+    mask = _dot_grid_mask(width, height, tile, radius)
+    mask |= _dot_grid_mask(width, height, tile, radius, half, half)
+    _apply_mask(base, mask, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_stripes(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Diagonal 45° alternating bands. Half each tile is color_a, the
+    other half is color_b. Tile size shrinks with density (lerp(40,
+    10)).
+
+    Tile is measured PERPENDICULAR to the stripe direction (matches
+    CSS repeating-linear-gradient + the canvas painter in bg-
+    system.js). The (x+y) projection is along a 45° axis whose
+    natural unit is √2 pixels per "1" of (x+y); dividing by √2 first
+    makes the modulus directly perpendicular-pixel-distance, so a
+    `tile`-sized cycle in our math = `tile` perpendicular pixels on
+    screen. Without the / √2 the bands were √2× too thin vs the
+    editor canvas (caught in pre-commit subagent review)."""
+    tile = round(_lerp(40, 10, density))
+    half = tile / 2
+    sqrt2 = math.sqrt(2)
+    xs = np.arange(width, dtype=np.float32).reshape(1, width)
+    ys = np.arange(height, dtype=np.float32).reshape(height, 1)
+    proj = ((xs + ys) / sqrt2) % tile
+    mask_b = proj >= half
+    base = _solid_fill(width, height, color_a)
+    _apply_mask(base, mask_b, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_scanlines(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Horizontal CRT-style 1-pixel lines of color_b on color_a, with
+    `tile` pixels between each line. Tile shrinks with density
+    (lerp(8, 3))."""
+    tile = max(2, round(_lerp(8, 3, density)))
+    base = _solid_fill(width, height, color_a)
+    rgb = _hex_to_rgb(color_b)
+    base[::tile, :, 0] = rgb[0]
+    base[::tile, :, 1] = rgb[1]
+    base[::tile, :, 2] = rgb[2]
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_checker(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Standard checker grid. Tile shrinks with density (lerp(32,
+    8))."""
+    tile = round(_lerp(32, 8, density))
+    if tile <= 0:
+        return Image.new("RGB", (width, height), color_a)
+    xs = (np.arange(width) // tile).reshape(1, width)
+    ys = (np.arange(height) // tile).reshape(height, 1)
+    mask_b = ((xs + ys) % 2) == 1
+    base = _solid_fill(width, height, color_a)
+    _apply_mask(base, mask_b, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_rings(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Concentric rings around the slide center. Ring period shrinks
+    with density (lerp(60, 18)). Each period: color_a band of
+    `half - 2` pixels, then a 2-pixel color_b ring."""
+    tile = max(4, round(_lerp(60, 18, density)))
+    half = tile // 2
+    cx = width / 2
+    cy = height / 2
+    xs = (np.arange(width, dtype=np.float32) - cx).reshape(1, width)
+    ys = (np.arange(height, dtype=np.float32) - cy).reshape(height, 1)
+    dist = np.sqrt(xs * xs + ys * ys)
+    period = dist % tile
+    mask_b = period >= (half - 2)
+    base = _solid_fill(width, height, color_a)
+    _apply_mask(base, mask_b, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_rays(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Conic gradient that flips between color_a and color_b in equal
+    angular slices. Slice count grows with density (lerp(8, 32))."""
+    slices = max(2, round(_lerp(8, 32, density)))
+    cx = width / 2
+    cy = height / 2
+    xs = (np.arange(width, dtype=np.float32) - cx).reshape(1, width)
+    ys = (np.arange(height, dtype=np.float32) - cy).reshape(height, 1)
+    angle = np.arctan2(ys, xs)  # -pi..pi
+    # Map to [0, 1) and assign slice index.
+    norm = (angle / (2 * math.pi) + 1.0) % 1.0
+    slice_idx = np.floor(norm * slices).astype(np.int32)
+    mask_b = (slice_idx % 2) == 1
+    base = _solid_fill(width, height, color_a)
+    _apply_mask(base, mask_b, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_confetti(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Pseudo-random scatter of color_b dots on color_a. Built from 4
+    offset radial-grid layers at different tile sizes — pure CSS
+    structurally, looks busy enough to read as confetti without any
+    actual randomness."""
+    t1 = max(8, round(_lerp(60, 28, density)))
+    t2 = max(4, round(t1 * 0.7))
+    t3 = max(4, round(t1 * 1.3))
+    r = max(2, round(t1 * 0.08))
+    base = _solid_fill(width, height, color_a)
+    # Layer 1: tile t1 at center
+    mask = _dot_grid_mask(width, height, t1, r)
+    # Layer 2: tile t2, offset by (t2/2, t2/3)
+    mask |= _dot_grid_mask(width, height, t2, r, t2 // 2, t2 // 3)
+    # Layer 3: tile t3, offset by (t3/4, t3/2), slightly bigger dots
+    mask |= _dot_grid_mask(width, height, t3, r + 1, t3 // 4, t3 // 2)
+    # Layer 4: tile t1 again at vertical offset t1/3
+    mask |= _dot_grid_mask(width, height, t1, r, 0, t1 // 3)
+    _apply_mask(base, mask, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_bricks(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Mortar-line brick layout — mimics LED-matrix tile seams.
+    Brick width shrinks with density (lerp(80, 32)); brick height is
+    half the width. Mortar = 1px lines of color_b."""
+    bw = max(8, round(_lerp(80, 32, density)))
+    bh = max(4, bw // 2)
+    half = bw // 2
+    base = _solid_fill(width, height, color_a)
+    rgb = _hex_to_rgb(color_b)
+    # Horizontal mortar: rows where y % bh == 0
+    mask_h = (np.arange(height) % bh) == 0
+    base[mask_h, :, 0] = rgb[0]
+    base[mask_h, :, 1] = rgb[1]
+    base[mask_h, :, 2] = rgb[2]
+    # Vertical mortar: alternates between offset 0 (rows 0..bh,
+    # 2*bh..3*bh, ...) and offset half (rows bh..2*bh, 3*bh..4*bh,
+    # ...). Compute which "brick course" each y is in: y // bh % 2.
+    course = (np.arange(height) // bh) % 2
+    # For course-0 rows: vertical lines where x % bw == 0.
+    # For course-1 rows: vertical lines where (x - half) % bw == 0.
+    course_0_rows = course == 0
+    course_1_rows = course == 1
+    x_indices = np.arange(width)
+    vert_0 = (x_indices % bw) == 0
+    vert_1 = ((x_indices - half) % bw) == 0
+    if course_0_rows.any():
+        rows_0 = np.where(course_0_rows)[0]
+        for col in np.where(vert_0)[0]:
+            base[rows_0, col, 0] = rgb[0]
+            base[rows_0, col, 1] = rgb[1]
+            base[rows_0, col, 2] = rgb[2]
+    if course_1_rows.any():
+        rows_1 = np.where(course_1_rows)[0]
+        for col in np.where(vert_1)[0]:
+            base[rows_1, col, 0] = rgb[0]
+            base[rows_1, col, 1] = rgb[1]
+            base[rows_1, col, 2] = rgb[2]
+    return Image.fromarray(base, mode="RGB")
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     """Parse `#RRGGBB` into (R, G, B) uint8 tuple. The TextSlide /
-    BackgroundGradient validators already enforce the format, so we
+    BackgroundPattern validators already enforce the format, so we
     don't re-validate here."""
     s = hex_color.lstrip("#")
     return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))

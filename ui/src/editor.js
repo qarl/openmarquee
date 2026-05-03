@@ -23,6 +23,15 @@ import Sortable from "sortablejs";
 import { attachAutoSave } from "./auto-save.js";
 import { formatAutoText } from "./auto-format.js";
 import {
+    PATTERN_NAMES,
+    PATTERN_LABELS,
+    buildBg as buildPatternBg,
+    paintPatternOnCanvas,
+    patternUsesColorB,
+    patternUsesDensity,
+    densityLabelFor,
+} from "./bg-system.js";
+import {
     anyLayerAnimated,
     paintLayerWithMotion,
 } from "./canvas-motion.js";
@@ -253,24 +262,27 @@ const EDITOR_TEMPLATE = `
                         <input type="color" class="field-bg-color" value="#000000" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
                     </label>
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
-                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="gradient">
-                        <span>Gradient</span>
+                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="pattern">
+                        <span>Pattern</span>
                     </label>
-                    <div class="editor-bg-gradient-wrap" hidden>
-                        <div class="om-row" style="gap: 10px;">
-                            <label class="om-field" style="flex: 1;">
-                                <span>Start color</span>
-                                <input type="color" class="field-bg-grad-start" value="#FF6B6B" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-                            </label>
-                            <label class="om-field" style="flex: 1;">
-                                <span>End color</span>
-                                <input type="color" class="field-bg-grad-end" value="#4ECDC4" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-                            </label>
+                    <div class="editor-bg-pattern-wrap" hidden>
+                        <div class="editor-bg-pattern-grid" role="radiogroup"
+                             aria-label="Pattern picker"></div>
+                        <div class="editor-bg-pattern-tweaks">
+                            <div class="om-row editor-bg-pattern-tweak" style="gap: 10px; align-items: center;">
+                                <span class="editor-bg-pattern-label">Color A</span>
+                                <input type="color" class="field-bg-pat-color-a" value="#1A0F00" style="flex: 1; height: 36px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
+                            </div>
+                            <div class="om-row editor-bg-pattern-tweak editor-bg-pattern-tweak-b" style="gap: 10px; align-items: center;">
+                                <span class="editor-bg-pattern-label">Color B</span>
+                                <input type="color" class="field-bg-pat-color-b" value="#FFB43C" style="flex: 1; height: 36px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
+                            </div>
+                            <div class="om-row editor-bg-pattern-tweak editor-bg-pattern-tweak-d" style="gap: 10px; align-items: center;">
+                                <span class="editor-bg-pattern-label field-bg-pat-density-label">Density</span>
+                                <input type="range" class="field-bg-pat-density" min="0" max="100" step="1" value="50" style="flex: 1;">
+                                <span class="field-bg-pat-density-val" style="font-family: var(--om-mono); font-size: 11px; color: var(--om-text-fade); min-width: 28px; text-align: right;">50</span>
+                            </div>
                         </div>
-                        <label class="om-field" style="margin-top: 8px;">
-                            <span>Angle (<span class="field-bg-grad-angle-label">0</span>°)</span>
-                            <input type="range" class="field-bg-grad-angle" min="0" max="359" step="1" value="0" style="width: 100%;">
-                        </label>
                     </div>
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
                         <input type="radio" name="editor-bg-source" class="field-bg-source" value="slide">
@@ -522,11 +534,15 @@ export function mountEditor(
     const bgVideoEl = container.querySelector(".field-bg-video");
     const bgVideoWrapEl = container.querySelector(".editor-bg-video-wrap");
     const bgColorWrapEl = container.querySelector(".editor-bg-color-wrap");
-    const bgGradWrapEl = container.querySelector(".editor-bg-gradient-wrap");
-    const bgGradStartEl = container.querySelector(".field-bg-grad-start");
-    const bgGradEndEl = container.querySelector(".field-bg-grad-end");
-    const bgGradAngleEl = container.querySelector(".field-bg-grad-angle");
-    const bgGradAngleLabelEl = container.querySelector(".field-bg-grad-angle-label");
+    const bgPatWrapEl = container.querySelector(".editor-bg-pattern-wrap");
+    const bgPatGridEl = container.querySelector(".editor-bg-pattern-grid");
+    const bgPatColorAEl = container.querySelector(".field-bg-pat-color-a");
+    const bgPatColorBEl = container.querySelector(".field-bg-pat-color-b");
+    const bgPatColorBRowEl = container.querySelector(".editor-bg-pattern-tweak-b");
+    const bgPatDensityEl = container.querySelector(".field-bg-pat-density");
+    const bgPatDensityValEl = container.querySelector(".field-bg-pat-density-val");
+    const bgPatDensityLabelEl = container.querySelector(".field-bg-pat-density-label");
+    const bgPatDensityRowEl = container.querySelector(".editor-bg-pattern-tweak-d");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const form = container.querySelector(".controls");
@@ -541,15 +557,18 @@ export function mountEditor(
         bgSlideId: null,
         bgVideoId: null,
         bgImage: null,
-        // Gradient-source state. start_color / end_color stay
-        // synced with the color inputs; angle_deg comes from the
-        // range slider (0-359). Mutex with the other bg sources —
-        // bgSource = "gradient" activates this object, otherwise
-        // it's ignored at save time.
-        bgGradient: {
-            start_color: bgGradStartEl.value,
-            end_color: bgGradEndEl.value,
-            angle_deg: parseInt(bgGradAngleEl.value, 10) || 0,
+        // Pattern-source state (qarl 2026-05-03 designer handoff —
+        // replaces the prior gradient state). pattern is one of the
+        // 11 names in PATTERN_NAMES; color_a / color_b stay synced
+        // with the color inputs; density (0-1 normalized) comes from
+        // the range slider scaled by 100. Mutex with the other bg
+        // sources — bgSource = "pattern" activates this object,
+        // otherwise it's ignored at save time.
+        bgPattern: {
+            pattern: "halftone",
+            color_a: bgPatColorAEl.value,
+            color_b: bgPatColorBEl.value,
+            density: (parseInt(bgPatDensityEl.value, 10) || 50) / 100,
         },
         layers: [makeAutoNamedLayer([])],
         // Selection drives the box overlay's binding. Expansion drives
@@ -1322,7 +1341,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = state.bgSource !== "color";
             bgSlideWrapEl.hidden = state.bgSource !== "slide";
             bgVideoWrapEl.hidden = state.bgSource !== "video";
-            bgGradWrapEl.hidden = state.bgSource !== "gradient";
+            bgPatWrapEl.hidden = state.bgSource !== "pattern";
             bgGenerateWrap.hidden =
                 state.bgSource !== "slide" || !onGenerateBackground;
             if (state.bgSource === "slide" && fetchItems && !bgSlidePopulated) {
@@ -1343,7 +1362,7 @@ export function mountEditor(
                 state.bgVideoId = null;
             } else if (state.bgSource === "video") {
                 state.bgSlideId = null;
-            } else if (state.bgSource === "gradient") {
+            } else if (state.bgSource === "pattern") {
                 state.bgImage = null;
                 state.bgSlideId = null;
                 state.bgVideoId = null;
@@ -1352,22 +1371,80 @@ export function mountEditor(
         });
     }
 
-    // Gradient-source live editing: any of start, end, or angle change
-    // re-runs the canvas paint so the operator sees the result instantly.
-    bgGradStartEl.addEventListener("input", () => {
-        state.bgGradient.start_color = bgGradStartEl.value;
-        if (state.bgSource === "gradient") drawCanvas(canvas, state);
+    // Pattern grid: render an 11-tile grid where each tile shows the
+    // pattern at the current color_a / color_b. Click sets the active
+    // pattern. Re-rendered any time color_a / color_b change so each
+    // thumbnail previews how the operator's chosen palette would look
+    // in that pattern.
+    function renderPatternGrid() {
+        bgPatGridEl.innerHTML = "";
+        for (const name of PATTERN_NAMES) {
+            const tile = document.createElement("button");
+            tile.type = "button";
+            tile.role = "radio";
+            tile.className = "editor-bg-pattern-tile";
+            tile.dataset.pattern = name;
+            tile.title = PATTERN_LABELS[name];
+            const isSelected = state.bgPattern.pattern === name;
+            tile.setAttribute("aria-checked", String(isSelected));
+            if (isSelected) tile.classList.add("is-selected");
+            const swatch = document.createElement("span");
+            swatch.className = "editor-bg-pattern-tile-swatch";
+            swatch.style.background = buildPatternBg(
+                name, state.bgPattern.color_a, state.bgPattern.color_b,
+                state.bgPattern.density,
+            );
+            const label = document.createElement("span");
+            label.className = "editor-bg-pattern-tile-label";
+            label.textContent = PATTERN_LABELS[name];
+            tile.append(swatch, label);
+            tile.addEventListener("click", () => {
+                state.bgPattern.pattern = name;
+                applyPatternTweakRowVisibility();
+                renderPatternGrid();
+                if (state.bgSource === "pattern") drawCanvas(canvas, state);
+                syncSlideFromForm();
+            });
+            bgPatGridEl.appendChild(tile);
+        }
+    }
+
+    function applyPatternTweakRowVisibility() {
+        const p = state.bgPattern.pattern;
+        // Color B greyed out (not hidden — keep layout stable) for
+        // patterns that don't use it.
+        bgPatColorBRowEl.classList.toggle("is-disabled", !patternUsesColorB(p));
+        bgPatColorBEl.disabled = !patternUsesColorB(p);
+        // Density row: relabel for gradient ("Angle" instead of
+        // "Density"); grey out for solid (which ignores it).
+        bgPatDensityLabelEl.textContent = densityLabelFor(p);
+        bgPatDensityRowEl.classList.toggle("is-disabled", !patternUsesDensity(p));
+        bgPatDensityEl.disabled = !patternUsesDensity(p);
+    }
+
+    bgPatColorAEl.addEventListener("input", () => {
+        state.bgPattern.color_a = bgPatColorAEl.value;
+        renderPatternGrid();
+        if (state.bgSource === "pattern") drawCanvas(canvas, state);
+        syncSlideFromForm();
     });
-    bgGradEndEl.addEventListener("input", () => {
-        state.bgGradient.end_color = bgGradEndEl.value;
-        if (state.bgSource === "gradient") drawCanvas(canvas, state);
+    bgPatColorBEl.addEventListener("input", () => {
+        state.bgPattern.color_b = bgPatColorBEl.value;
+        renderPatternGrid();
+        if (state.bgSource === "pattern") drawCanvas(canvas, state);
+        syncSlideFromForm();
     });
-    bgGradAngleEl.addEventListener("input", () => {
-        const angle = parseInt(bgGradAngleEl.value, 10) || 0;
-        state.bgGradient.angle_deg = angle;
-        bgGradAngleLabelEl.textContent = String(angle);
-        if (state.bgSource === "gradient") drawCanvas(canvas, state);
+    bgPatDensityEl.addEventListener("input", () => {
+        const v = parseInt(bgPatDensityEl.value, 10) || 0;
+        state.bgPattern.density = v / 100;
+        bgPatDensityValEl.textContent = String(v);
+        renderPatternGrid();
+        if (state.bgSource === "pattern") drawCanvas(canvas, state);
+        syncSlideFromForm();
     });
+
+    renderPatternGrid();
+    applyPatternTweakRowVisibility();
 
     if (onGenerateBackground) {
         const generateBtn = container.querySelector(".bg-generate-btn");
@@ -1450,11 +1527,11 @@ export function mountEditor(
             background_color: state.backgroundColor.toUpperCase(),
             background_image_slide_id: state.bgSource === "slide" ? state.bgSlideId || null : null,
             background_video_slide_id: state.bgSource === "video" ? state.bgVideoId || null : null,
-            background_gradient: state.bgSource === "gradient" ? {
-                type: "linear",
-                start_color: state.bgGradient.start_color.toUpperCase(),
-                end_color: state.bgGradient.end_color.toUpperCase(),
-                angle_deg: state.bgGradient.angle_deg,
+            background_pattern: state.bgSource === "pattern" ? {
+                pattern: state.bgPattern.pattern,
+                color_a: state.bgPattern.color_a.toUpperCase(),
+                color_b: state.bgPattern.color_b.toUpperCase(),
+                density: state.bgPattern.density,
             } : null,
             duration_ms: Math.round(durationSeconds * 1000),
             text_layers,
@@ -1499,7 +1576,7 @@ export function mountEditor(
         bgColorWrapEl.hidden = false;
         bgSlideWrapEl.hidden = true;
         bgVideoWrapEl.hidden = true;
-        bgGradWrapEl.hidden = true;
+        bgPatWrapEl.hidden = true;
         state.bgSource = "color";
         drawCanvas(canvas, state);
         autoSave.cancel();
@@ -1639,7 +1716,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = false;
             bgVideoWrapEl.hidden = true;
-            bgGradWrapEl.hidden = true;
+            bgPatWrapEl.hidden = true;
             bgSlideEl.value = String(slide.background_image_slide_id);
             state.bgSource = "slide";
             state.bgSlideId = String(slide.background_image_slide_id);
@@ -1659,7 +1736,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = false;
-            bgGradWrapEl.hidden = true;
+            bgPatWrapEl.hidden = true;
             bgVideoEl.value = String(slide.background_video_slide_id);
             state.bgSource = "video";
             state.bgSlideId = null;
@@ -1667,28 +1744,32 @@ export function mountEditor(
             state.bgImage = await loadImageForSlide(state.bgVideoId).catch(
                 () => null,
             );
-        } else if (slide.background_gradient) {
-            const gradRadio = container.querySelector(
-                '.field-bg-source[value="gradient"]',
+        } else if (slide.background_pattern) {
+            const patRadio = container.querySelector(
+                '.field-bg-source[value="pattern"]',
             );
-            gradRadio.checked = true;
+            patRadio.checked = true;
             bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = true;
-            bgGradWrapEl.hidden = false;
-            state.bgSource = "gradient";
+            bgPatWrapEl.hidden = false;
+            state.bgSource = "pattern";
             state.bgSlideId = null;
             state.bgVideoId = null;
             state.bgImage = null;
-            state.bgGradient = {
-                start_color: slide.background_gradient.start_color,
-                end_color: slide.background_gradient.end_color,
-                angle_deg: slide.background_gradient.angle_deg,
+            state.bgPattern = {
+                pattern: slide.background_pattern.pattern,
+                color_a: slide.background_pattern.color_a,
+                color_b: slide.background_pattern.color_b,
+                density: slide.background_pattern.density,
             };
-            bgGradStartEl.value = state.bgGradient.start_color;
-            bgGradEndEl.value = state.bgGradient.end_color;
-            bgGradAngleEl.value = String(state.bgGradient.angle_deg);
-            bgGradAngleLabelEl.textContent = String(state.bgGradient.angle_deg);
+            bgPatColorAEl.value = state.bgPattern.color_a;
+            bgPatColorBEl.value = state.bgPattern.color_b;
+            const densityPct = Math.round(state.bgPattern.density * 100);
+            bgPatDensityEl.value = String(densityPct);
+            bgPatDensityValEl.textContent = String(densityPct);
+            applyPatternTweakRowVisibility();
+            renderPatternGrid();
         } else {
             const colorRadio = container.querySelector(
                 '.field-bg-source[value="color"]',
@@ -1697,7 +1778,7 @@ export function mountEditor(
             bgColorWrapEl.hidden = false;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = true;
-            bgGradWrapEl.hidden = true;
+            bgPatWrapEl.hidden = true;
             state.bgSource = "color";
             state.bgSlideId = null;
             state.bgVideoId = null;
@@ -1954,7 +2035,7 @@ export function drawCanvas(canvas, state, opts) {
         backgroundColor = "#000000",
         bgSource = "color",
         bgImage = null,
-        bgGradient = null,
+        bgPattern = null,
     } = state;
 
     ctx.save();
@@ -1973,25 +2054,15 @@ export function drawCanvas(canvas, state, opts) {
                 drawW,
                 drawH,
             );
-        } else if (bgSource === "gradient" && bgGradient) {
-            // CSS-like angle: 0 = top→bottom, 90 = left→right.
-            // Match the backend renderer's projection so editor preview
-            // and device output agree visually.
-            const rad = (bgGradient.angle_deg * Math.PI) / 180;
-            const dx = Math.sin(rad);
-            const dy = Math.cos(rad);
-            const cx = canvas.width / 2;
-            const cy = canvas.height / 2;
-            const half = Math.abs(dx) * (canvas.width / 2)
-                + Math.abs(dy) * (canvas.height / 2);
-            const grad = ctx.createLinearGradient(
-                cx - dx * half, cy - dy * half,
-                cx + dx * half, cy + dy * half,
+        } else if (bgSource === "pattern" && bgPattern) {
+            // The bg-system.js canvas painter mirrors the backend's
+            // numpy render_pattern() so editor preview = device
+            // render. Tile sizes / dot radii / band spacing match.
+            paintPatternOnCanvas(
+                ctx, canvas.width, canvas.height,
+                bgPattern.pattern, bgPattern.color_a, bgPattern.color_b,
+                bgPattern.density,
             );
-            grad.addColorStop(0, bgGradient.start_color);
-            grad.addColorStop(1, bgGradient.end_color);
-            ctx.fillStyle = grad;
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
         } else {
             ctx.fillStyle = backgroundColor;
             ctx.fillRect(0, 0, canvas.width, canvas.height);

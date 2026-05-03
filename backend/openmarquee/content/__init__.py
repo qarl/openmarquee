@@ -200,30 +200,46 @@ class TextLayer(BaseModel):
         return self
 
 
-class BackgroundGradient(BaseModel):
-    """Two-stop linear gradient as a TextSlide background source.
+class BackgroundPattern(BaseModel):
+    """Procedural pattern as a TextSlide background source — replaces
+    BackgroundGradient (qarl 2026-05-03 designer handoff). Generalizes
+    "two-stop gradient" into 11 procedural patterns, all built from
+    two colors + a density knob, all rendered via PIL once at slide
+    entry and baked into the bg cache (same lifecycle as solid color).
 
     Mutex with background_image_slide_id and background_video_slide_id
-    (enforced by TextSlide's model validator). Renders via numpy at
-    slide-native dims through auto_render._render_gradient.
+    (enforced by TextSlide's model validator).
 
-    `angle_deg` follows the CSS-like convention so editor UI and
-    backend rasterizer match what operators expect from `linear-
-    gradient(<angle>deg, ...)`:
-      0    → start_color on top,    end_color on bottom (top→bottom)
-      90   → start_color on left,   end_color on right  (left→right)
-      180  → start_color on bottom, end_color on top
-      270  → start_color on right,  end_color on left
-    The editor UI exposes a 0-359 angle slider; the model accepts any
-    float in [0, 360] inclusive (360 wraps to 0).
+    Reference design lives in /tmp/handoffs/generated-bg-2026-05-03/
+    openmarquee-app-ui/project/app/bg-system.js — each pattern's CSS
+    `build(a, b, density)` function maps 1:1 to a Pillow renderer in
+    auto_render._render_pattern_*.
+
+    `density` is a normalized 0..1 knob whose meaning is per-pattern:
+      - solid:     ignored (color_b also ignored — single color)
+      - gradient:  repurposed as angle (density 0 → 0deg top→bottom,
+                   density 0.5 → 160deg "sunrise", density 1 → 270deg
+                   right→left)
+      - dots:      tile size lerp(28, 8) — higher density = tighter dots
+      - halftone:  tile size lerp(36, 14) — two offset dot grids
+      - stripes:   tile size lerp(40, 10) — diagonal 45deg
+      - scanlines: line spacing lerp(8, 3) — horizontal CRT lines
+      - checker:   tile size lerp(32, 8)
+      - rings:     concentric ring spacing lerp(60, 18)
+      - rays:      slice count lerp(8, 32) — conic A/B alternating
+      - confetti:  base tile lerp(60, 28) — 4 offset dot layers
+      - bricks:    brick width lerp(80, 32) — staggered courses
     """
 
-    type: Literal["linear"] = "linear"
-    start_color: str = Field(pattern=_HEX_COLOR_PATTERN)
-    end_color: str = Field(pattern=_HEX_COLOR_PATTERN)
-    angle_deg: float = Field(default=0.0, ge=0.0, le=360.0)
+    pattern: Literal[
+        "solid", "gradient", "dots", "halftone", "stripes",
+        "scanlines", "checker", "rings", "rays", "confetti", "bricks",
+    ]
+    color_a: str = Field(pattern=_HEX_COLOR_PATTERN)
+    color_b: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
+    density: float = Field(default=0.5, ge=0.0, le=1.0)
 
-    @field_validator("start_color", "end_color")
+    @field_validator("color_a", "color_b")
     @classmethod
     def _uppercase_hex(cls, value: str) -> str:
         return value.upper()
@@ -273,12 +289,19 @@ class TextSlide(BaseModel):
     # text PNG over each video frame at playback time. Mutually
     # exclusive with background_image_slide_id.
     background_video_slide_id: UUID | None = None
-    # Optional: render a two-stop linear gradient as the background
-    # under the text. Mutually exclusive with the image / video bg
-    # references. Solid `background_color` is still kept on the
-    # model (some clients fall back to it on render errors) but the
-    # gradient takes precedence when set.
-    background_gradient: "BackgroundGradient | None" = None
+    # Optional: render a procedural pattern (one of 11 — gradient,
+    # dots, halftone, stripes, scanlines, checker, rings, rays,
+    # confetti, bricks, solid) as the background under the text.
+    # Mutually exclusive with the image / video bg references. Solid
+    # `background_color` field above is still kept on the model (used
+    # as the implicit fallback when no pattern / image / video is
+    # set; some clients fall back to it on render errors). The
+    # pattern takes precedence when set.
+    #
+    # Replaces the prior `background_gradient` field (qarl 2026-05-03);
+    # a model_validator(mode="before") below migrates legacy gradient
+    # JSON in-place so existing slides keep deserializing.
+    background_pattern: "BackgroundPattern | None" = None
 
     # Transition INTO the next slide ("cut" = instant; "fade" =
     # alpha-blend across `transition_ms` after this slide's duration
@@ -301,10 +324,52 @@ class TextSlide(BaseModel):
         compare and dedupe as the same value."""
         return value.upper()
 
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_gradient_to_pattern(cls, data):
+        """One-shot migration of legacy `background_gradient` JSON to
+        the new `background_pattern` shape (qarl 2026-05-03 handoff:
+        gradient is now one of 11 patterns). Existing slides on disk
+        keep deserializing.
+
+        Field mapping:
+            background_gradient.start_color → background_pattern.color_a
+            background_gradient.end_color   → background_pattern.color_b
+            background_gradient.angle_deg   → background_pattern.density
+                                              (= angle_deg / 270, clamped 0..1)
+
+        The 270° divisor matches the bg-system.js convention where
+        `density: 0 → 0deg, 0.5 → ~135deg, 1 → 270deg` — so a
+        legacy 270° gradient becomes density=1, a 135° gradient
+        becomes density=0.5, and so on. Density values outside
+        [0, 1] (e.g. legacy 360° gradients) clamp to 1.
+        """
+        if not isinstance(data, dict):
+            return data
+        legacy = data.pop("background_gradient", None)
+        if legacy and "background_pattern" not in data:
+            # Defensive float coerce — the prior BackgroundGradient
+            # model required numeric angle_deg, but a hand-edited
+            # JSON or a partial-write could leave it None / "auto" /
+            # something. Fall back to mid-density 0.5 (≈ 135°)
+            # rather than crash content storage on load.
+            try:
+                angle_deg = float(legacy.get("angle_deg", 0.0))
+            except (TypeError, ValueError):
+                angle_deg = 0.5 * 270.0  # middle of legal range
+            density = max(0.0, min(1.0, angle_deg / 270.0))
+            data["background_pattern"] = {
+                "pattern": "gradient",
+                "color_a": legacy.get("start_color", "#000000"),
+                "color_b": legacy.get("end_color", "#FFFFFF"),
+                "density": density,
+            }
+        return data
+
     @model_validator(mode="after")
     def _bg_layers_are_exclusive(self) -> "TextSlide":
         """A TextSlide can have one background source: solid color, an
-        ImageSlide, a VideoSlide, or a two-stop gradient — not two
+        ImageSlide, a VideoSlide, or a procedural pattern — not two
         layered references at once. The editor's bg-picker is a radio
         so this combo can't be reached from the UI; the validator
         catches a malformed payload before it round-trips through
@@ -313,14 +378,14 @@ class TextSlide(BaseModel):
             1 for v in (
                 self.background_image_slide_id,
                 self.background_video_slide_id,
-                self.background_gradient,
+                self.background_pattern,
             ) if v is not None
         )
         if present > 1:
             raise ValueError(
                 "TextSlide background must be exactly one of: solid "
                 "background_color, background_image_slide_id, "
-                "background_video_slide_id, or background_gradient"
+                "background_video_slide_id, or background_pattern"
             )
         return self
 
