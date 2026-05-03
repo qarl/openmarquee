@@ -31,6 +31,7 @@ import {
     patternUsesDensity,
     densityLabelFor,
 } from "./bg-system.js";
+import { mountColorPicker } from "./color-picker.js";
 import {
     anyLayerAnimated,
     paintLayerWithMotion,
@@ -543,6 +544,22 @@ export function mountEditor(
     const bgPatDensityValEl = container.querySelector(".field-bg-pat-density-val");
     const bgPatDensityLabelEl = container.querySelector(".field-bg-pat-density-label");
     const bgPatDensityRowEl = container.querySelector(".editor-bg-pattern-tweak-d");
+
+    // Wrap the three slide-level color inputs with the curated palette
+    // picker (qarl 2026-05-03 designer dispatch). The per-layer text
+    // color is mounted later, inside the layer-card render loop, so
+    // each new layer's color input gets the same affordance. Pattern
+    // editor's Color A / Color B picker mirrors land here too.
+    // Capture the handles so loadForEdit can call .refresh() to update
+    // selected indicators after externally-set values — without that,
+    // the picker's internal selected state goes stale on slide load.
+    // (Refresh-not-input-dispatch because dispatching input during
+    // load would trigger the debounced autosave to re-save the slide
+    // as-is on every load — 900 ms later, server gets a no-op write.)
+    const bgColorPicker = mountColorPicker(bgColorEl);
+    const bgPatColorAPicker = mountColorPicker(bgPatColorAEl);
+    const bgPatColorBPicker = mountColorPicker(bgPatColorBEl);
+
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
     const form = container.querySelector(".controls");
@@ -869,6 +886,14 @@ export function mountEditor(
         const textEl = groupEl.querySelector(".field-text");
         const layerNameEl = groupEl.querySelector(".field-layer-name");
         const textColorEl = groupEl.querySelector(".field-text-color");
+        // Curated-palette picker on the per-layer text color input.
+        // Each layer card gets its own picker instance (independent
+        // selected state). Mount before the input-event listeners
+        // below since mountColorPicker dispatches 'input' on swatch
+        // click — which would otherwise create a setup-time spurious
+        // syncLayerFromForm call. Mounting first means the listeners
+        // bind AFTER the widget's wrap-and-hide DOM rearrangement.
+        mountColorPicker(textColorEl);
         const fontSizeEl = groupEl.querySelector(".field-font-size");
         const autoModeEl = groupEl.querySelector(".field-auto-mode");
         const autoModeSegEl = groupEl.querySelector(".field-auto-mode-segmented");
@@ -1676,6 +1701,13 @@ export function mountEditor(
         state.name = nameEl.value;
         bgColorEl.value = slide.background_color || "#000000";
         state.backgroundColor = bgColorEl.value;
+        // Refresh the curated-palette picker so the inline-row +
+        // More button paint matches the loaded value. Direct
+        // .refresh() instead of dispatching input — input dispatch
+        // would trigger the form-level debounced autosave to re-save
+        // the slide as-is 900 ms later (caught in pre-commit
+        // subagent review).
+        bgColorPicker.refresh();
         durationEl.value = String(Math.max(1, (slide.duration_ms || 5000) / 1000));
 
         const wireLayers = Array.isArray(slide.text_layers) && slide.text_layers.length
@@ -1765,6 +1797,11 @@ export function mountEditor(
             };
             bgPatColorAEl.value = state.bgPattern.color_a;
             bgPatColorBEl.value = state.bgPattern.color_b;
+            // Same .refresh() shape as bgColorPicker above — keeps
+            // the picker's selected indicator in sync with the
+            // loaded value without triggering autosave.
+            bgPatColorAPicker.refresh();
+            bgPatColorBPicker.refresh();
             const densityPct = Math.round(state.bgPattern.density * 100);
             bgPatDensityEl.value = String(densityPct);
             bgPatDensityValEl.textContent = String(densityPct);

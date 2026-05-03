@@ -1065,6 +1065,148 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     pointer-events: none;
 }
 
+/* --- curated-palette color picker (qarl 2026-05-03 designer dispatch) --- */
+
+/* Wraps a native <input type="color">. Layout: inline 8-swatch row
+   + a "More…" button. The native input is hidden but kept in the
+   form tree so existing form listeners still fire on swatch click
+   (the widget dispatches an 'input' event when it sets the value). */
+.om-color-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+}
+.om-color-picker-native {
+    /* Hidden native input — keeps in form tree, out of focus order. */
+    width: 0;
+    height: 0;
+    opacity: 0;
+    pointer-events: none;
+    position: absolute;
+}
+.om-color-picker-inline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+}
+.om-color-picker-swatch {
+    width: 24px;
+    height: 24px;
+    border: 1.5px solid var(--om-line, #2a2a2f);
+    border-radius: 6px;
+    background: var(--om-swatch);
+    cursor: pointer;
+    padding: 0;
+    transition: transform 0.1s, border-color 0.15s;
+}
+.om-color-picker-swatch:hover {
+    transform: scale(1.08);
+}
+.om-color-picker-swatch.is-selected {
+    /* Designer-spec'd orange outline on the selected swatch. */
+    border-color: #EE814C;
+    box-shadow: 0 0 0 2px #EE814C;
+}
+.om-color-picker-more {
+    width: 24px;
+    height: 24px;
+    border: 1.5px dashed var(--om-line, #2a2a2f);
+    border-radius: 6px;
+    background: var(--om-swatch, var(--om-surface-2, #19191c));
+    color: var(--om-text-fade, #8e8e96);
+    cursor: pointer;
+    padding: 0;
+    font-family: var(--om-mono);
+    font-size: 13px;
+    line-height: 1;
+    transition: border-color 0.15s, color 0.15s;
+}
+.om-color-picker-more:hover {
+    border-color: var(--om-accent, #ffb43c);
+    color: var(--om-text, #e7eaee);
+}
+.om-color-picker-more.has-custom-preview {
+    /* Current value isn't one of the inline 8 — paint the More button
+       in the actual color so the operator always sees their pick. */
+    border-style: solid;
+    border-color: #EE814C;
+    color: transparent;
+}
+
+/* Complex picker popover — opens on More click. All 17 swatches in
+   3 rows + custom-hex input + native OS picker. Position is set
+   inline by JS based on the More button's bounding rect. */
+.om-color-picker-popover {
+    z-index: 100;
+    background: var(--om-surface-1, #19191c);
+    border: 1px solid var(--om-line, #2a2a2f);
+    border-radius: 10px;
+    padding: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 240px;
+}
+.om-color-picker-popover-row {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+.om-color-picker-popover-row .om-color-picker-swatch {
+    width: 26px;
+    height: 26px;
+}
+.om-color-picker-popover-escape {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--om-line, #2a2a2f);
+}
+.om-color-picker-popover-hex {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-family: var(--om-mono);
+    font-size: 11px;
+    color: var(--om-text-fade, #8e8e96);
+}
+.om-color-picker-popover-hex span {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.om-color-picker-popover-hex input {
+    flex: 1;
+    background: var(--om-surface-2, #19191c);
+    border: 1px solid var(--om-line, #2a2a2f);
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: var(--om-text, #e7eaee);
+    font-family: var(--om-mono);
+    font-size: 12px;
+}
+.om-color-picker-popover-native {
+    background: var(--om-surface-2, #19191c);
+    border: 1px solid var(--om-line, #2a2a2f);
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: var(--om-text-fade, #8e8e96);
+    font-family: var(--om-mono);
+    font-size: 11px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    position: relative;
+}
+.om-color-picker-popover-native:hover {
+    color: var(--om-text, #e7eaee);
+    border-color: var(--om-accent, #ffb43c);
+}
+
 .preview-wrap {
     /* The wrap owns the chrome (border / radius / LED background); the
        inner .editor-canvas just paints. Width capped at 26rem to match
