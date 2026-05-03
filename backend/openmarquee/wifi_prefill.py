@@ -36,9 +36,27 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+def _default_iwgetid() -> str | None:
+    """Production iwgetid runner. Returns the active SSID or None."""
+    try:
+        out = subprocess.run(
+            ["iwgetid", "-r"], capture_output=True, text=True,
+            timeout=2.0, check=False,
+        )
+    except FileNotFoundError:
+        # iwgetid not installed (dev macOS, minimal container, etc.).
+        return None
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.debug("wifi_prefill: iwgetid failed: %s", e)
+        return None
+    ssid = out.stdout.strip()
+    return ssid or None
 
 # Locations checked in order. The /var copy is the recommended path
 # for stock Pi OS installs without chmod'ing /etc.
@@ -59,7 +77,7 @@ _KEY_VALUE_RE = re.compile(r"^\s*(\w+)\s*=\s*(.+?)\s*$", re.MULTILINE)
 def read_system_wifi(
     *,
     paths: tuple[Path, ...] = DEFAULT_WPA_CONF_PATHS,
-    iwgetid_cmd: tuple[str, ...] = ("iwgetid", "-r"),
+    get_active_ssid: Callable[[], str | None] = _default_iwgetid,
 ) -> tuple[str, str] | None:
     """Return (ssid, psk) for the SSID currently connected on wlan0,
     sourced from the first wpa_supplicant.conf we can read.
@@ -68,10 +86,15 @@ def read_system_wifi(
     file, permission denied, malformed conf, or no matching network.
     Never raises.
 
-    `paths` and `iwgetid_cmd` are exposed for tests; production
-    callers should leave the defaults.
+    `paths` and `get_active_ssid` are exposed for tests so they can
+    bypass real subprocess execution. Production callers leave both
+    at their defaults. The closure shape (instead of a tuple cmd)
+    means tests don't pay any fork cost — fork-state pollution from
+    other test files (Pillow / freetype / grpc / threading) was
+    SIGSEGV'ing real `printf` invocations on macOS when test_api_
+    flock ran first (caught 2026-05-02).
     """
-    active_ssid = _iwgetid_ssid(iwgetid_cmd)
+    active_ssid = get_active_ssid()
     if not active_ssid:
         log.debug("wifi_prefill: no active connection (iwgetid empty)")
         return None
@@ -111,24 +134,6 @@ def read_system_wifi(
             active_ssid,
         )
     return None
-
-
-def _iwgetid_ssid(cmd: tuple[str, ...]) -> str | None:
-    """Run `iwgetid -r` and return the trimmed SSID, or None on
-    failure / no connection."""
-    try:
-        out = subprocess.run(
-            list(cmd), capture_output=True, text=True,
-            timeout=2.0, check=False,
-        )
-    except FileNotFoundError:
-        # iwgetid not installed (dev macOS, minimal container, etc.).
-        return None
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log.debug("wifi_prefill: iwgetid failed: %s", e)
-        return None
-    ssid = out.stdout.strip()
-    return ssid or None
 
 
 def _find_matching_network(text: str, active_ssid: str) -> tuple[str, str] | None:

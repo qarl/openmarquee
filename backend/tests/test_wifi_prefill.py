@@ -42,7 +42,7 @@ network={
 ''')
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "MyHome"),  # fake iwgetid
+        get_active_ssid=lambda: "MyHome",  # fake iwgetid
     )
     assert result == ("MyHome", "hunter2pass")
 
@@ -63,7 +63,7 @@ network={
 ''')
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "ActiveNet"),
+        get_active_ssid=lambda: "ActiveNet",
     )
     assert result == ("ActiveNet", "activepass")
 
@@ -84,7 +84,7 @@ def test_returns_none_when_iwgetid_returns_empty(tmp_path: Path):
     conf = _write_conf(tmp_path, _MIN_CONF)
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", ""),
+        get_active_ssid=lambda: None,
     )
     assert result is None
 
@@ -94,7 +94,7 @@ def test_returns_none_when_iwgetid_missing(tmp_path: Path):
     conf = _write_conf(tmp_path, _MIN_CONF)
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("/this/binary/does/not/exist",),
+        get_active_ssid=lambda: None,
     )
     assert result is None
 
@@ -103,7 +103,7 @@ def test_returns_none_when_no_conf_file_exists(tmp_path: Path):
     missing = tmp_path / "nope.conf"
     result = read_system_wifi(
         paths=(missing,),
-        iwgetid_cmd=("printf", "X"),
+        get_active_ssid=lambda: "X",
     )
     assert result is None
 
@@ -115,7 +115,7 @@ def test_falls_through_to_second_path_when_first_missing(tmp_path: Path):
     conf = _write_conf(tmp_path, _MIN_CONF)
     result = read_system_wifi(
         paths=(missing, conf),
-        iwgetid_cmd=("printf", "X"),
+        get_active_ssid=lambda: "X",
     )
     assert result == ("X", "ypassxxx")
 
@@ -124,7 +124,7 @@ def test_returns_none_when_no_block_matches_active_ssid(tmp_path: Path):
     conf = _write_conf(tmp_path, _MIN_CONF)
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "DifferentNet"),  # different network
+        get_active_ssid=lambda: "DifferentNet",  # different network
     )
     assert result is None
 
@@ -143,7 +143,7 @@ network={
 ''')
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "MyNet"),
+        get_active_ssid=lambda: "MyNet",
     )
     assert result is None
 
@@ -159,7 +159,7 @@ network={
 ''')
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "OpenAP"),
+        get_active_ssid=lambda: "OpenAP",
     )
     assert result is None
 
@@ -178,7 +178,7 @@ network={{
 ''')
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "HexNet"),
+        get_active_ssid=lambda: "HexNet",
     )
     assert result is None
 
@@ -188,14 +188,15 @@ def test_handles_malformed_conf(tmp_path: Path):
     conf = _write_conf(tmp_path, "this is not a wpa_supplicant.conf at all\n{{{}}}\n")
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "MyNet"),
+        get_active_ssid=lambda: "MyNet",
     )
     assert result is None
 
 
-def test_strips_trailing_whitespace_from_ssid(tmp_path: Path):
-    """Operators sometimes hand-edit conf and leave trailing spaces.
-    The regex's `.+?\\s*$` handles it."""
+def test_handles_trailing_whitespace_in_conf(tmp_path: Path):
+    """Operators sometimes hand-edit conf and leave trailing spaces
+    inside the network={} block. The regex's `.+?\\s*$` handles it
+    so the SSID match against the active connection still works."""
     conf = _write_conf(tmp_path, '''
 network={
     ssid="MyNet"
@@ -204,6 +205,6 @@ network={
 ''')
     result = read_system_wifi(
         paths=(conf,),
-        iwgetid_cmd=("printf", "MyNet\n"),  # iwgetid output may have trailing newline
+        get_active_ssid=lambda: "MyNet",
     )
     assert result == ("MyNet", "mypass12")
