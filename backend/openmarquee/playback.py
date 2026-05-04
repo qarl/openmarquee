@@ -90,6 +90,27 @@ _SHADER_TRANSITION_KINDS = frozenset({
 })
 
 
+def _slide_has_animated_blend_mode_layer(item: ContentItem) -> bool:
+    """True iff the slide has at least one layer with motion (or
+    auto_mode) AND a non-normal blend mode. Such a layer can't run
+    on the multi-plane DRM path -- vc4 HVS overlay planes only do
+    alpha-blend (PREMULTI), not Photoshop blend modes -- so the GPU
+    path is skipped and the slide drops to compose_motion_frame
+    software path where blend modes are applied per-tick.
+    Per-tick-blend at 1080p is heavy (one composite_with_blend call
+    per tick = ~10 ms) but for the rare animated-blend-mode case it's
+    the right trade-off until shader-path blend mode work lands."""
+    if getattr(item, "type", None) != "text_slide":
+        return False
+    for layer in getattr(item, "text_layers", []):
+        if classify_layer(layer) != "animated":
+            continue
+        blend = getattr(layer, "blend", None) or "normal"
+        if blend != "normal":
+            return True
+    return False
+
+
 def _count_animated_layers(item: ContentItem) -> int:
     """How many of `item`'s text layers will consume a DRM overlay
     plane on the GPU path. Mirrors GPUSlideCompositor's animated
@@ -635,6 +656,7 @@ class PlaybackLoop:
             and isinstance(self._renderer, MultiPlaneRenderer)
             and _count_animated_layers(item)
             <= getattr(self._renderer, "max_animated_planes", 0)
+            and not _slide_has_animated_blend_mode_layer(item)
         ):
             try:
                 return await self._play_dynamic_slide_gpu(item)

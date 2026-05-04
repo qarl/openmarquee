@@ -34,6 +34,7 @@ from uuid import UUID
 
 from openmarquee.auto_render import _load_background
 from openmarquee.motion import render_layer_to_rgba
+from openmarquee.rendering.blend import composite_with_blend
 
 if TYPE_CHECKING:
     from openmarquee.content import TextSlide
@@ -93,7 +94,11 @@ def compose_slide_rgba(
         if not getattr(layer, "visible", True):
             continue
         layer_rgba = render_layer_to_rgba(layer, width, height, now=now)
-        bg.alpha_composite(layer_rgba)
+        mode = getattr(layer, "blend", "normal") or "normal"
+        if mode == "normal":
+            bg.alpha_composite(layer_rgba)
+        else:
+            bg = composite_with_blend(bg, layer_rgba, mode=mode)
     return bg.tobytes()
 
 
@@ -143,5 +148,9 @@ def compose_slide_bg_statics_rgba(
         if motion != "static" or auto:
             continue  # animated -- handled by overlay planes during transition
         layer_rgba = render_layer_to_rgba(layer, width, height, now=now)
-        bg.alpha_composite(layer_rgba)
+        mode = getattr(layer, "blend", "normal") or "normal"
+        if mode == "normal":
+            bg.alpha_composite(layer_rgba)
+        else:
+            bg = composite_with_blend(bg, layer_rgba, mode=mode)
     return bg.tobytes()

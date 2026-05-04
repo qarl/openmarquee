@@ -40,6 +40,7 @@ from openmarquee.motion import (
     compute_phase,
     render_layer_to_rgba,
 )
+from openmarquee.rendering.blend import composite_with_blend
 
 if TYPE_CHECKING:
     from openmarquee.content import TextLayer, TextSlide
@@ -280,7 +281,13 @@ class GPUSlideCompositor:
                     continue
                 if kind == "static":
                     static_rgba = render_layer_to_rgba(layer, self.width, self.height)
-                    bg.alpha_composite(static_rgba)
+                    blend_mode = getattr(layer, "blend", "normal") or "normal"
+                    if blend_mode == "normal":
+                        bg.alpha_composite(static_rgba)
+                    else:
+                        bg = composite_with_blend(
+                            bg, static_rgba, mode=blend_mode,
+                        )
                     n_static += 1
                 else:
                     animated.append((idx, layer))

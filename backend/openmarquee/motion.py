@@ -536,6 +536,15 @@ def compose_motion_frame(
                 layer_key,
                 float(getattr(layer, "motion_phase", 0.0)),
             )
-        base.alpha_composite(layer_rgba)
+        blend_mode = getattr(layer, "blend", "normal") or "normal"
+        if blend_mode == "normal":
+            base.alpha_composite(layer_rgba)
+        else:
+            # Lazy import (motion.py is on a hot per-frame software path
+            # for non-multi-plane renderers; the blend module pulls in
+            # numpy unconditionally so importing it here keeps motion.py
+            # leaner for callers that don't use blend modes).
+            from openmarquee.rendering.blend import composite_with_blend
+            base = composite_with_blend(base, layer_rgba, mode=blend_mode)
 
     return base.convert("RGB")
