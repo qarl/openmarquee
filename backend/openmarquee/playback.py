@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import io
 import logging
+import os
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -63,6 +64,17 @@ from openmarquee.rendering.gpu_compositor import (
     classify_layer,
 )
 
+# Transition kinds with a fragment shader implementation in
+# rendering.shader_compositor._TRANSITION_SHADERS. When the
+# OPENMARQUEE_SHADER_TRANSITIONS env var is "1" AND the renderer
+# exposes drm_fd (DRMRenderer in multi-plane mode), the dispatcher
+# routes these kinds through ShaderRenderer instead of the PIL
+# software path. fade and wipe are deliberately NOT here -- they
+# already have their own fast plane-property animation paths
+# (_fade_gpu / _wipe_gpu). New kinds get added here as their
+# fragments land in _TRANSITION_SHADERS.
+_SHADER_TRANSITION_KINDS = frozenset({"iris"})
+
 
 def _count_animated_layers(item: ContentItem) -> int:
     """How many of `item`'s text layers will consume a DRM overlay
@@ -81,6 +93,7 @@ def _count_animated_layers(item: ContentItem) -> int:
 if TYPE_CHECKING:
     from openmarquee.content.storage import ContentStorage
     from openmarquee.playlist import PlaylistStorage
+    from openmarquee.rendering.shader_compositor import ShaderRenderer
     from openmarquee.schedule import ScheduleStorage
 
 log = logging.getLogger(__name__)
@@ -126,6 +139,17 @@ class PlaybackLoop:
         # the cached bytes and skip the 50-200 ms attach stall at
         # 1080p. Cleared on stop() so a new playlist gets fresh state.
         self._gpu_slide_cache = SlideAssetCache()
+        # Lazily-constructed shader compositor for slide-to-slide
+        # transitions (iris/dissolve/etc.). Built on first use, reused
+        # across every transition for the lifetime of the loop --
+        # EGL/GL init is ~5 s on a cold mesa cache. None until either
+        # _get_or_create_shader_renderer() succeeds or the feature is
+        # disabled (env var unset, renderer lacks drm_fd, init failed).
+        self._shader_renderer: "ShaderRenderer | None" = None
+        # Lazily-flipped sentinel so we don't repeatedly attempt
+        # ShaderRenderer construction after a failure (e.g. on dev hosts
+        # without libdrm/libegl).
+        self._shader_renderer_disabled: bool = False
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
@@ -256,6 +280,21 @@ class PlaybackLoop:
             # doesn't reuse stale (slide_id, updated_at) entries
             # against a content store that may have changed.
             self._gpu_slide_cache.clear()
+            # Tear down the shader compositor if it was lazily built.
+            # ShaderRenderer holds DRM/EGL/GL state that survives
+            # individual transitions but should be released alongside
+            # the loop's lifecycle. close() is idempotent and safe in
+            # shared-fd mode (won't blank the CRTC; caller's DRMRenderer
+            # keeps owning master + scanout).
+            if self._shader_renderer is not None:
+                try:
+                    self._shader_renderer.close()
+                except Exception:
+                    log.exception(
+                        "playback: shader renderer close during stop failed"
+                    )
+                self._shader_renderer = None
+            self._shader_renderer_disabled = False
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
@@ -760,6 +799,177 @@ class PlaybackLoop:
             return False
         return getattr(self._renderer, "max_animated_planes", 0) >= needed
 
+    def _shader_transitions_enabled(self) -> bool:
+        """Feature flag for the shader compositor transition path.
+        Off by default; flip OPENMARQUEE_SHADER_TRANSITIONS=1 in the
+        environment to opt the welcome loop in. Designed as an env
+        var (rather than settings.json) for now so operators can A/B
+        the path on a single device without edits across surfaces."""
+        return os.environ.get("OPENMARQUEE_SHADER_TRANSITIONS") == "1"
+
+    def _get_or_create_shader_renderer(self) -> object | None:
+        """Lazily construct the shader compositor on first transition
+        that wants it. Reused for the lifetime of the loop. Returns
+        None when:
+          - the env flag is off,
+          - a prior construction attempt already failed,
+          - the renderer doesn't expose drm_fd (MockRenderer, fb0,
+            DRMRenderer in pre-shared-fd build, etc.),
+          - ShaderRenderer construction itself raises (libdrm/libegl
+            missing on a Mac dev host, the most common case).
+
+        On any failure we set _shader_renderer_disabled so the next
+        transition doesn't pay the same cold-import cost again."""
+        if self._shader_renderer is not None:
+            return self._shader_renderer
+        if self._shader_renderer_disabled:
+            return None
+        if not self._shader_transitions_enabled():
+            self._shader_renderer_disabled = True
+            return None
+        drm_fd = getattr(self._renderer, "drm_fd", None)
+        if drm_fd is None:
+            log.info(
+                "playback: shader transitions requested but renderer "
+                "doesn't expose drm_fd; falling back to software path"
+            )
+            self._shader_renderer_disabled = True
+            return None
+        # restage_primary_fb is load-bearing for the post-transition
+        # handoff: without it the shader's last fb stays on screen
+        # indefinitely (kernel implicit-pin keeps it; commit() with
+        # empty _pending_props is a no-op). Better to refuse the path
+        # at construction time than to discover the freeze 15 s into
+        # the first iris.
+        if not hasattr(self._renderer, "restage_primary_fb"):
+            log.warning(
+                "playback: renderer exposes drm_fd but lacks "
+                "restage_primary_fb; shader transitions disabled "
+                "(would silently freeze the screen post-transition)"
+            )
+            self._shader_renderer_disabled = True
+            return None
+        try:
+            from openmarquee.rendering.shader_compositor import ShaderRenderer
+            sr = ShaderRenderer(drm_fd=drm_fd)
+            sr.__enter__()
+        except Exception:
+            log.exception(
+                "playback: ShaderRenderer construction failed; "
+                "shader transitions disabled for this session"
+            )
+            self._shader_renderer_disabled = True
+            return None
+        self._shader_renderer = sr
+        log.info(
+            "playback: shader compositor up via shared fd=%d, %dx%d",
+            drm_fd, sr.width, sr.height,
+        )
+        return sr
+
+    async def _run_shader_transition(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        kind: str,
+        transition_ms: int,
+    ) -> bool:
+        """Drive one slide-to-slide transition through the shader
+        compositor. Returns True iff it ran via shader; False means
+        the caller must fall back to its own (PIL) transition path.
+
+        Shape mirrors phase7_loop_with_iris.py's transition body:
+          1. Convert from/to images to RGBA bytes at renderer dims.
+          2. set_kind(kind), set_from(...), set_to(...).
+          3. Frame loop: set_transition_t(t in [0,1]) + commit_frame +
+             cooperative-pause-aware sleep.
+          4. Hand the primary plane back to multi-plane DRMRenderer in
+             one atomic commit: render_frame(to_image), restage_primary
+             _fb(), commit. Order matters -- without restage,
+             _pending_props is empty and DRMRenderer.commit() is a
+             no-op, leaving the kernel scanning shader's last fb.
+        """
+        if kind not in _SHADER_TRANSITION_KINDS:
+            return False
+        sr = self._get_or_create_shader_renderer()
+        if sr is None:
+            return False
+        renderer = self._renderer
+        width, height = sr.width, sr.height
+
+        if from_image.mode != "RGBA":
+            from_image = from_image.convert("RGBA")
+        if from_image.size != (width, height):
+            from_image = from_image.resize((width, height), Image.NEAREST)
+        if to_image.mode != "RGBA":
+            to_image = to_image.convert("RGBA")
+        if to_image.size != (width, height):
+            to_image = to_image.resize((width, height), Image.NEAREST)
+
+        # Track why we exit the frame loop. Pause means a stream
+        # takeover is becoming the new owner of render_frame/commit
+        # (SYSTEM_SPEC §5.11) -- racing it with our handoff would
+        # double-commit the primary plane. Skip the handoff in that
+        # case and let the takeover own the plane. On stop or normal
+        # completion the handoff is correct and required.
+        paused = False
+        try:
+            sr.set_kind(kind)
+            sr.set_from(from_image.tobytes(), width, height)
+            sr.set_to(to_image.tobytes(), width, height)
+            n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+            frame_period = (transition_ms / 1000) / n_frames
+            assert self._stop_event is not None
+            assert self._pause_event is not None
+            for i in range(1, n_frames + 1):
+                if self._pause_event.is_set():
+                    paused = True
+                    break
+                if self._stop_event.is_set():
+                    break
+                t = i / n_frames
+                sr.set_transition_t(t)
+                sr.commit_frame()
+                await self._wait(frame_period)
+            if not paused and not self._stop_event.is_set():
+                # Land at t=1.0 so the final shader frame matches
+                # to_image before we hand the plane back. Skip on
+                # pause/stop -- nothing reads the result anyway.
+                sr.set_transition_t(1.0)
+                sr.commit_frame()
+        except Exception:
+            log.exception(
+                "playback: shader transition %r failed mid-flight; "
+                "primary plane will be reset to multi-plane content",
+                kind,
+            )
+            # Fall through to the handoff dance anyway (unless paused)
+            # so the screen recovers cleanly after a shader-side error.
+
+        if paused:
+            # Stream takeover owns the plane now. Don't fight it.
+            return True
+
+        # Hand the primary plane back to multi-plane DRMRenderer.
+        # render_frame paints the dumb buffer, restage_primary_fb
+        # stages the FB_ID + CRTC rects (otherwise commit() is a
+        # no-op when _pending_props is empty), commit atomically
+        # rebinds primary to OUR fb in one vblank.
+        # restage_primary_fb's existence is checked at construction
+        # time in _get_or_create_shader_renderer; if it's gone now,
+        # something is very wrong (renderer torn down mid-transition?).
+        try:
+            renderer.render_frame(to_image.convert("RGB").tobytes())
+            renderer.restage_primary_fb()
+            renderer.commit()
+        except Exception:
+            log.exception(
+                "playback: post-shader-transition handoff to "
+                "multi-plane failed; screen may be stuck on shader's "
+                "last frame until the next slide attach"
+            )
+        return True
+
     async def _fade(
         self,
         from_image: Image.Image,
@@ -903,7 +1113,17 @@ class PlaybackLoop:
         """Iris transition: `to_image` reveals through a circular mask
         that grows from a center pinpoint to fully cover the canvas.
         Reads as a film-projector aperture opening — distinct enough
-        from fade and wipe at small panel sizes that it stays legible."""
+        from fade and wipe at small panel sizes that it stays legible.
+
+        Routes through the shader compositor when available (env flag
+        OPENMARQUEE_SHADER_TRANSITIONS=1 + renderer.drm_fd present).
+        That hits 30 fps stable on Pi Zero 2 W at 1080p; the PIL
+        software path below is the fallback for non-DRM renderers
+        (LED-matrix, fb0, MockRenderer) and dev hosts."""
+        if await self._run_shader_transition(
+            from_image, to_image, "iris", transition_ms,
+        ):
+            return
         from PIL import ImageDraw
 
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
