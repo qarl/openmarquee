@@ -76,6 +76,19 @@ export const FONT_FAMILIES = [
 
 const FONT_WEIGHT_BY_VALUE = new Map(FONT_FAMILIES.map((f) => [f.value, f.weight]));
 
+// Map TextLayer.blend -> Canvas2D globalCompositeOperation so the
+// editor preview matches the backend's PIL composite_with_blend math
+// (W3C compositing spec: multiply/screen/overlay are first-class
+// canvas modes, parity with backend modulo anti-aliasing). Keys MUST
+// stay in sync with TextLayer.blend's Literal in content/__init__.py
+// and _BLEND_MODES in rendering/blend.py.
+const BLEND_TO_CANVAS = {
+    normal: "source-over",
+    multiply: "multiply",
+    screen: "screen",
+    overlay: "overlay",
+};
+
 const AUTO_FORMAT_OPTIONS = {
     time: [
         ["time_hm", "HH:MM — 14:30"],
@@ -2098,17 +2111,43 @@ export function drawCanvas(canvas, state, opts) {
             if (layer?.visible === false) continue;
             const resolved = resolveLayerForDraw(layer);
             const paint = () => paintLayer(ctx, canvas, resolved);
-            if (elapsed === undefined || elapsed === null) {
-                paint();
+            // Per-layer Photoshop blend mode. Canvas natively supports
+            // multiply / screen / overlay (W3C compositing). Map to
+            // 'source-over' for normal so the editor preview matches
+            // the backend's PIL composite_with_blend math (modulo
+            // small anti-aliasing differences -- same WYSIWYG parity
+            // rule we hold for gradient/pattern). Only save/restore
+            // when we're actually flipping the compositor away from
+            // the default; the common normal case skips the wrapper
+            // so drawCanvas's "exactly one save/restore" invariant
+            // (relied on by tests + the outer try/finally) holds.
+            const blendKey = layer?.blend || "normal";
+            const needsBlendWrap = blendKey !== "normal";
+            const drawOnce = () => {
+                if (elapsed === undefined || elapsed === null) {
+                    paint();
+                } else {
+                    // The motion wrapper takes the unresolved layer so
+                    // it reads .motion / .motion_intensity /
+                    // .motion_phase off the editor-state shape;
+                    // paintLayer is called via the closure with the
+                    // auto-resolved layer.
+                    paintLayerWithMotion(ctx, canvas, layer, paint, {
+                        elapsed_s: elapsed,
+                        layerKey: `editor:${i}`,
+                    });
+                }
+            };
+            if (needsBlendWrap) {
+                ctx.save();
+                ctx.globalCompositeOperation = BLEND_TO_CANVAS[blendKey];
+                try {
+                    drawOnce();
+                } finally {
+                    ctx.restore();
+                }
             } else {
-                // The motion wrapper takes the unresolved layer so it
-                // reads .motion / .motion_intensity / .motion_phase
-                // off the editor-state shape; paintLayer is called via
-                // the closure with the auto-resolved layer.
-                paintLayerWithMotion(ctx, canvas, layer, paint, {
-                    elapsed_s: elapsed,
-                    layerKey: `editor:${i}`,
-                });
+                drawOnce();
             }
         }
     } finally {
