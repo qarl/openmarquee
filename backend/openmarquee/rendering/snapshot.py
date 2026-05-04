@@ -28,17 +28,17 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from openmarquee.auto_render import _load_background
-from openmarquee.motion import render_layer_to_rgba
+from openmarquee.motion import _box_px, render_layer_to_rgba
 from openmarquee.rendering.blend import composite_with_blend
 
 if TYPE_CHECKING:
-    from openmarquee.content import TextSlide
+    from openmarquee.content import TextLayer, TextSlide
 
 log = logging.getLogger(__name__)
 
@@ -171,17 +171,95 @@ def compose_slide_bg_statics_rgba(
     return bg.tobytes()
 
 
+def extract_first_animated_layer(
+    slide: "TextSlide",
+    width: int,
+    height: int,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, "TextLayer", bytes, tuple[int, int, int, int], tuple[int, int, int, int]] | None:
+    """Find the first visible animated layer with rasterized ink in
+    `slide`, return (layer_idx, layer, glyph_bbox_rgba_bytes,
+    glyph_bbox_px=(gx,gy,gw,gh), box_px=(bx,by,bw,bh)) for the
+    shader's per-side anim path (#215). Returns None if no
+    animated layer with ink, or if `slide` has no text_layers.
+
+    Mirrors gpu_compositor._attach_animated's rasterize: render the
+    layer at slide dims, getbbox(), crop, tobytes. Caller passes the
+    bbox dims into ShaderRenderer.set_X_anim() and the box+glyph
+    dims into the per-frame motion math.
+
+    Pure function -- no I/O, no side effects beyond PIL. Safe to
+    call from asyncio.to_thread for off-loop prerender."""
+    if slide is None:
+        return None
+    layers = list(getattr(slide, "text_layers", []) or [])
+    if not layers:
+        return None
+    if now is None:
+        now = datetime.now(UTC)
+    for idx, layer in enumerate(layers):
+        if not getattr(layer, "visible", True):
+            continue
+        motion = getattr(layer, "motion", "static") or "static"
+        auto = getattr(layer, "auto_mode", None)
+        if motion == "static" and not auto:
+            continue
+        try:
+            layer_rgba = render_layer_to_rgba(
+                layer, width, height, now=now,
+            )
+        except Exception:
+            log.exception(
+                "snapshot: render_layer_to_rgba failed for animated "
+                "layer idx=%d -- skipping",
+                idx,
+            )
+            continue
+        bbox = layer_rgba.getbbox()
+        if bbox is None:
+            continue
+        gx, gy, gx2, gy2 = bbox
+        gw, gh = gx2 - gx, gy2 - gy
+        rgba_bytes = layer_rgba.crop(bbox).tobytes()
+        return (
+            idx, layer, rgba_bytes,
+            (gx, gy, gw, gh), _box_px(layer, width, height),
+        )
+    return None
+
+
+_AnimLayerData = tuple[
+    int,
+    "TextLayer",
+    bytes,
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+]
+
+
 @dataclass
 class _CachedSnapshot:
-    """One slide's RGBA snapshots, keyed by slide.updated_at. Both
-    full-composite (for u_to / static-slide transition input) and
+    """One slide's RGBA snapshots, keyed by slide.updated_at. The
+    full-composite (for u_to / static-slide transition input),
     bg+statics-only (for u_from in the #206 motion-through-transition
-    path) are cached lazily on first lookup. Either may be None until
-    populated."""
+    path), and the first animated layer (for the #215 shader-side
+    motion-through path) are cached lazily on first lookup. Each may
+    be None until populated; anim_layer can also be `_ANIM_NONE` to
+    record a confirmed "no animated layer" for slides that don't
+    have one (so we don't re-scan every transition)."""
 
     updated_at: datetime | None
     full_rgba: bytes | None = None
     bg_statics_rgba: bytes | None = None
+    # Tri-state: None = uncomputed; _ANIM_NONE = computed-but-no-anim;
+    # tuple = computed-and-found.
+    anim_layer: "_AnimLayerData | object | None" = None
+
+
+# Sentinel for "we ran extract_first_animated_layer and got None" so
+# the cache distinguishes uncomputed from confirmed-empty.
+_ANIM_NONE = object()
 
 
 class SlideSnapshotCache:
@@ -264,6 +342,66 @@ class SlideSnapshotCache:
         if entry is not None:
             entry.bg_statics_rgba = rgba
         return rgba
+
+    def get_anim_layer(
+        self,
+        slide: "TextSlide",
+        width: int,
+        height: int,
+        *,
+        now: datetime | None = None,
+    ) -> _AnimLayerData | None:
+        """Cached extract_first_animated_layer (#215 shader-side anim
+        path). Populates on first call. Returns None if the slide has
+        no animated layer with ink, OR if the slide has an auto-mode
+        layer (auto-mode skips cache; recompute every time so clock
+        text stays current). Subsequent visits to the same slide hit
+        cache in microseconds instead of paying ~100ms PIL render."""
+        entry = self._maybe_get(slide)
+        if entry is not None and entry.anim_layer is not None:
+            if entry.anim_layer is _ANIM_NONE:
+                return None
+            return entry.anim_layer  # type: ignore[return-value]
+        result = extract_first_animated_layer(slide, width, height, now=now)
+        if entry is not None:
+            entry.anim_layer = result if result is not None else _ANIM_NONE
+        return result
+
+    def prerender_for_transition(
+        self,
+        slide: "TextSlide",
+        width: int,
+        height: int,
+        *,
+        read_asset: Callable[[UUID], bytes] | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Warm both bg_statics + anim_layer cache slots for `slide`,
+        synchronously. Designed to be called from asyncio.to_thread
+        during a slide's display window (#216) so the upcoming
+        transition pays zero rasterize cost. Idempotent: a prerender
+        followed by another prerender is a cache hit on the second.
+
+        Auto-mode slides skip the cache via _maybe_get returning None,
+        so prerender for those is wasted work that gets discarded; we
+        still call to keep the call site uniform (one branch in the
+        scheduler vs. two)."""
+        try:
+            self.get_bg_statics(
+                slide, width, height, read_asset=read_asset, now=now,
+            )
+        except Exception:
+            log.exception(
+                "snapshot: prerender bg_statics failed for slide %s",
+                getattr(slide, "id", "<no-id>"),
+            )
+        try:
+            self.get_anim_layer(slide, width, height, now=now)
+        except Exception:
+            log.exception(
+                "snapshot: prerender anim_layer failed for slide %s",
+                getattr(slide, "id", "<no-id>"),
+            )
 
     def clear(self) -> None:
         """Drop all cached entries. Called on PlaybackLoop.stop() so

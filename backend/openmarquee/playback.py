@@ -51,13 +51,11 @@ from PIL import Image, UnidentifiedImageError
 from openmarquee.auto_render import resolve_timezone
 from openmarquee.content import ContentItem
 from openmarquee.motion import (
-    _box_px,
     _effect_freq,
     compose_motion_frame,
     compute_phase,
     load_motion_background,
     prerender_layer_bitmaps,
-    render_layer_to_rgba,
     slide_has_dynamic_content,
     slide_has_motion,
 )
@@ -235,6 +233,13 @@ class PlaybackLoop:
         # specifically would otherwise snap back to far-right at
         # transition entry because phase=0 puts it at scroll start).
         self._outgoing_slide_t0: float | None = None
+        # Background prerender tasks for the shader-transition snapshot
+        # cache (#216). Each task warms bg_statics + anim_layer for one
+        # slide via asyncio.to_thread during the slide's display window
+        # so the upcoming transition pays no rasterize cost. Tracked so
+        # stop() can cancel them; tasks self-discard from the set on
+        # completion via add_done_callback.
+        self._prerender_tasks: set[asyncio.Task] = set()
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
@@ -361,6 +366,17 @@ class PlaybackLoop:
             self._current_auto_mode = None
             self._current_auto_format = None
             self._current_playlist_id = None
+            # Cancel any in-flight prerender tasks (#216). Cancel is
+            # best-effort: PIL rasterize is CPU-bound and cancel() can
+            # only fire when the thread checks; in practice the task
+            # finishes the current rasterize (~100ms) and exits. We
+            # do NOT await them here -- letting them complete in the
+            # background while the loop tears down keeps stop()
+            # responsive. They write to the cache which gets cleared
+            # below; any race writes are wasted but not corrupt.
+            for task in list(self._prerender_tasks):
+                task.cancel()
+            self._prerender_tasks.clear()
             # Drop GPU compositor PIL caches so a fresh start()
             # doesn't reuse stale (slide_id, updated_at) entries
             # against a content store that may have changed.
@@ -382,6 +398,58 @@ class PlaybackLoop:
                 self._shader_renderer = None
             self._shader_renderer_disabled = False
             self._drain_outgoing_compositor()
+
+    def _schedule_prerender(self, item: ContentItem | None) -> None:
+        """Fire-and-forget background warm of `item`'s shader-transition
+        snapshot cache (#216). Runs PIL bg+statics composite + first-
+        animated-layer rasterize off the event loop via
+        asyncio.to_thread, so by the time the slide is the outgoing /
+        incoming side of a transition the cache is already populated
+        and the transition starts with no rasterize stall.
+
+        Skips:
+          - shader path disabled (no env flag, or test renderers
+            without drm_fd). The cache isn't read in that world, so
+            prerender is pure waste, AND keeps the test event loop
+            free of background to_thread activity that would
+            destabilize timing-sensitive playback tests.
+          - non-text-slide items (image/video have no animated layers
+            and no compose_slide_bg_statics_rgba path).
+
+        Auto-mode slides skip cache (recompute every transition since
+        clock text changes), so the prerender does work that gets
+        discarded. Acceptable -- auto slides are rarely the source of
+        real stall since their compose path was already paid by the
+        steady-state attach."""
+        if not self._shader_transitions_enabled():
+            return
+        if item is None or getattr(item, "type", None) != "text_slide":
+            return
+        renderer = self._renderer
+        if not hasattr(renderer, "width") or not hasattr(renderer, "height"):
+            return
+        width = renderer.width
+        height = renderer.height
+        cache = self._snapshot_cache
+        read_asset = self._read_asset
+
+        async def _run() -> None:
+            try:
+                await asyncio.to_thread(
+                    cache.prerender_for_transition,
+                    item, width, height, read_asset=read_asset,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "playback: prerender task crashed for slide %s",
+                    getattr(item, "id", "<no-id>"),
+                )
+
+        task = asyncio.create_task(_run())
+        self._prerender_tasks.add(task)
+        task.add_done_callback(self._prerender_tasks.discard)
 
     def _drain_outgoing_compositor(self) -> None:
         """Detach the outgoing slide's compositor (#206 cleanup) if one
@@ -468,6 +536,18 @@ class PlaybackLoop:
                 else:
                     self._current_auto_mode = None
                     self._current_auto_format = None
+
+                # Background prerender (#216): warm the snapshot cache
+                # for both the CURRENT item (it'll be the outgoing side
+                # in ~duration_ms) and the NEXT item (it'll be the
+                # incoming side at the same time). Both rasterizes
+                # finish well within the duration_ms window typically
+                # used (>=1s), so transition start pays no PIL cost.
+                # Schedules via asyncio.to_thread so the rasterize
+                # runs off the event loop.
+                self._schedule_prerender(item)
+                if len(items) > 1:
+                    self._schedule_prerender(items[(i + 1) % len(items)])
 
                 is_dynamic = (
                     item.type == "text_slide"
@@ -1112,16 +1192,20 @@ class PlaybackLoop:
         else:
             to_rgba = self._image_to_rgba_bytes(to_image, width, height)
 
-        # Extract first animated layer per side (#215). For each side:
-        # rasterize the layer at slide dims, crop to the glyph bbox,
-        # and stash everything _anim_uv_for_frame needs (layer schema +
-        # box_px + glyph bbox in slide pixel coords). The cached
-        # bytes go directly into ShaderRenderer's anim texture units.
-        outgoing_anim = self._extract_first_animated_layer(
-            outgoing_slide, width, height,
+        # Extract first animated layer per side (#215). Cached on
+        # SlideSnapshotCache (#216): warm-cache hits in microseconds,
+        # cold path pays ~100ms PIL rasterize. Background prerender
+        # at slide-attach time fills the cache before the transition
+        # fires so even cold-cache transitions start instantly.
+        outgoing_anim = (
+            self._snapshot_cache.get_anim_layer(
+                outgoing_slide, width, height,
+            ) if outgoing_slide is not None else None
         )
-        incoming_anim = self._extract_first_animated_layer(
-            incoming_slide, width, height,
+        incoming_anim = (
+            self._snapshot_cache.get_anim_layer(
+                incoming_slide, width, height,
+            ) if incoming_slide is not None else None
         )
 
         # Capture the outgoing slide's tick base BEFORE drain --
@@ -1274,73 +1358,6 @@ class PlaybackLoop:
         if image.size != (width, height):
             image = image.resize((width, height), Image.NEAREST)
         return image.tobytes()
-
-    def _extract_first_animated_layer(
-        self,
-        slide: "TextSlide | None",
-        width: int,
-        height: int,
-    ) -> tuple[int, "TextLayer", bytes, tuple[int, int, int, int], tuple[int, int, int, int]] | None:
-        """Find the first visible animated layer with rasterized ink in
-        `slide`, return (layer_idx, layer, glyph_bbox_rgba_bytes,
-        glyph_bbox_px=(gx,gy,gw,gh), box_px=(bx,by,bw,bh)) for the
-        shader's per-side anim path (#215). Returns None if no
-        animated layer with ink, or if `slide` isn't a TextSlide
-        (image / video slides have no animated layers).
-
-        Mirrors GPUSlideCompositor._attach_animated's rasterize path:
-        render_layer_to_rgba at slide dims, getbbox(), crop, tobytes.
-        Caller passes the bbox pixel dims into ShaderRenderer
-        .set_X_anim() and the box+glyph dims into _anim_uv_for_frame
-        each frame.
-
-        Only the FIRST animated layer is extracted. Multi-anim slides
-        get only one shader-side overlay; secondary animated layers
-        freeze through the transition window. Acceptable MVP since
-        most slides have one ticker; multi-anim transition fidelity
-        is a follow-on. The ANIM unit count would need to grow in
-        ShaderRenderer to support more (currently 2 = one per side)."""
-        if slide is None:
-            return None
-        layers = list(getattr(slide, "text_layers", []) or [])
-        if not layers:
-            return None
-        # render_layer_to_rgba accepts now=None and defaults to UTC-now
-        # internally for auto layers. Static-content layers ignore now.
-        from datetime import UTC as _UTC
-        now_dt = datetime.now(_UTC)
-        for idx, layer in enumerate(layers):
-            if not getattr(layer, "visible", True):
-                continue
-            motion = getattr(layer, "motion", "static") or "static"
-            auto = getattr(layer, "auto_mode", None)
-            if motion == "static" and not auto:
-                continue
-            try:
-                layer_rgba = render_layer_to_rgba(
-                    layer, width, height, now=now_dt,
-                )
-            except Exception:
-                log.exception(
-                    "playback: render_layer_to_rgba failed for animated "
-                    "layer idx=%d -- skipping for shader anim path",
-                    idx,
-                )
-                continue
-            bbox = layer_rgba.getbbox()
-            if bbox is None:
-                # Empty / whitespace-only / auto-format produced "" --
-                # nothing to overlay on either side. Continue scanning;
-                # a later layer might have ink.
-                continue
-            gx, gy, gx2, gy2 = bbox
-            gw, gh = gx2 - gx, gy2 - gy
-            rgba_bytes = layer_rgba.crop(bbox).tobytes()
-            return (
-                idx, layer, rgba_bytes,
-                (gx, gy, gw, gh), _box_px(layer, width, height),
-            )
-        return None
 
     def _anim_uv_for_frame(
         self,
