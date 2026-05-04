@@ -249,16 +249,68 @@ void main() {
 }
 """
 
-# Milestone A fragment shader: just sample one bg texture at v_uv.
-# Replaced by the multi-layer blend ladder in Milestone B.
-_FRAGMENT_SHADER_BG_ONLY = """#version 100
+# Milestone B fragment shader: 8-slot layer blend ladder, single pass.
+# Slot 0 conventionally carries the background (full-screen rect);
+# slots 1-7 carry text/element layers stacked on top in slot-index order.
+# Each slot has a sampler2D, a vec4 dst rect (x_min, y_min, x_max, y_max
+# in display UV [0,1]), and a float opacity. Inactive slots use opacity
+# = 0 + degenerate rect — a one-instruction early-return inside
+# _layer_contrib makes the cost negligible.
+#
+# GLES 2.0 doesn't allow dynamic indexing of sampler2D arrays, so the
+# 8-slot ladder is unrolled. Built from N_LAYERS so changing the slot
+# count is a single edit.
+N_LAYERS = 8
+
+
+def _build_fragment_shader(n_layers: int) -> str:
+    samplers = "\n".join(f"uniform sampler2D u_layer{i};" for i in range(n_layers))
+    ladder_lines = []
+    for i in range(n_layers):
+        ladder_lines.append(
+            f"  c = _layer_contrib(u_layer{i}, u_layer_rect[{i}], "
+            f"u_layer_opacity[{i}], v_uv);"
+        )
+        # Alpha-over for unpremultiplied input:
+        #   col.rgb = mix(col.rgb, c.rgb, c.a)
+        #   col.a   = c.a + col.a * (1.0 - c.a)
+        # Slot 0 conventionally has rect=[0,0,1,1] + opacity=1, so its
+        # mix() collapses to col.rgb = c.rgb (the bg replaces whatever
+        # the clear left).
+        ladder_lines.append(
+            "  col.rgb = mix(col.rgb, c.rgb, c.a);"
+            "  col.a = c.a + col.a * (1.0 - c.a);"
+        )
+    return f"""#version 100
 precision mediump float;
-uniform sampler2D u_bg;
+{samplers}
+uniform vec4 u_layer_rect[{n_layers}];
+uniform float u_layer_opacity[{n_layers}];
 varying vec2 v_uv;
-void main() {
-  gl_FragColor = texture2D(u_bg, v_uv);
-}
+
+vec4 _layer_contrib(sampler2D tex, vec4 rect, float opacity, vec2 uv) {{
+  vec2 sz = rect.zw - rect.xy;
+  if (sz.x <= 0.0 || sz.y <= 0.0 || opacity <= 0.0) return vec4(0.0);
+  if (uv.x < rect.x || uv.x > rect.z ||
+      uv.y < rect.y || uv.y > rect.w) return vec4(0.0);
+  vec2 local = (uv - rect.xy) / sz;
+  vec4 c = texture2D(tex, local);
+  c.a *= opacity;
+  return c;
+}}
+
+void main() {{
+  // Start fully transparent. Slot 0's mix() lays the bg down on the
+  // first iteration; remaining slots alpha-over on top.
+  vec4 col = vec4(0.0, 0.0, 0.0, 0.0);
+  vec4 c;
+{chr(10).join(ladder_lines)}
+  gl_FragColor = col;
+}}
 """
+
+
+_FRAGMENT_SHADER = _build_fragment_shader(N_LAYERS)
 
 
 # ---------------------------------------------------------------------------
@@ -360,8 +412,23 @@ class ShaderRenderer:
         self._program: int = 0
         self._vbo: int = 0
         self._a_pos_loc: int = -1
-        self._u_bg_loc: int = -1
-        self._tex_bg: int = 0
+        # Per-layer GL state. Index = slot 0..N_LAYERS-1.
+        # _tex_layer holds the texture id; 0 = unused. _u_layer_loc is
+        # the sampler uniform location. _layer_active mirrors the
+        # opacity > 0 + non-degenerate-rect bit so detach can flip a
+        # slot inactive in O(1) without reading uniforms back.
+        self._tex_layer: list[int] = [0] * N_LAYERS
+        self._u_layer_loc: list[int] = [-1] * N_LAYERS
+        self._u_layer_rect_loc: int = -1
+        self._u_layer_opacity_loc: int = -1
+        # Per-slot dst rect (x_min, y_min, x_max, y_max) in display UV
+        # [0,1] and opacity [0,1]. Pushed as uniforms each commit_frame.
+        # Inactive slot = rect (0,0,0,0) + opacity 0 (degenerate, shader
+        # short-circuits).
+        self._layer_rect: list[tuple[float, float, float, float]] = [
+            (0.0, 0.0, 0.0, 0.0)
+        ] * N_LAYERS
+        self._layer_opacity: list[float] = [0.0] * N_LAYERS
         # Connector / CRTC discovered at open time; mode held in
         # self._mode (kept alive — drmModeSetCrtc reads it by ref).
         self._connector_id: int = 0
@@ -568,7 +635,20 @@ class ShaderRenderer:
 
     def _compile_program(self) -> None:
         from OpenGL import GLES2 as _g
-        self._program = _link_program(_VERTEX_SHADER, _FRAGMENT_SHADER_BG_ONLY)
+
+        # Sanity-check the device's sampler-image-unit budget. GLES 2.0
+        # spec minimum is 8; vc4 V3D 2.1 reports 16 in practice. Either
+        # way we need N_LAYERS image units in the fragment shader.
+        max_units = _g.glGetIntegerv(_g.GL_MAX_TEXTURE_IMAGE_UNITS)
+        if int(max_units) < N_LAYERS:
+            raise RuntimeError(
+                f"GL_MAX_TEXTURE_IMAGE_UNITS={int(max_units)} < N_LAYERS="
+                f"{N_LAYERS}; reduce N_LAYERS or split into multi-pass "
+                f"(but see project_vc4_shader_feasibility.md — multi-pass "
+                f"blows the bandwidth budget at 1080p)"
+            )
+
+        self._program = _link_program(_VERTEX_SHADER, _FRAGMENT_SHADER)
         _g.glUseProgram(self._program)
         # VBO holds the fullscreen-quad triangle strip. Set up once.
         quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
@@ -580,58 +660,168 @@ class ShaderRenderer:
         self._a_pos_loc = _g.glGetAttribLocation(self._program, "a_pos")
         if self._a_pos_loc < 0:
             raise RuntimeError("a_pos attribute not found in vertex shader")
-        self._u_bg_loc = _g.glGetUniformLocation(self._program, "u_bg")
         _g.glEnableVertexAttribArray(self._a_pos_loc)
         _g.glVertexAttribPointer(
             self._a_pos_loc, 2, _g.GL_FLOAT, False, 0, None,
         )
-        # Allocate the bg texture; uploads happen via set_background().
-        self._tex_bg = int(_g.glGenTextures(1))
-        _g.glActiveTexture(_g.GL_TEXTURE0)
-        _g.glBindTexture(_g.GL_TEXTURE_2D, self._tex_bg)
-        _g.glTexParameteri(
-            _g.GL_TEXTURE_2D, _g.GL_TEXTURE_MIN_FILTER, _g.GL_LINEAR,
+
+        # Allocate one texture per slot; uploads happen via attach_layer.
+        # Bind each sampler uniform to its texture unit (slot i → unit i).
+        # Texture parameters get set per-slot when we glTexImage2D the
+        # actual data — defaults at allocate time would otherwise need
+        # to be reset on first upload anyway.
+        for i in range(N_LAYERS):
+            tex_id = int(_g.glGenTextures(1))
+            self._tex_layer[i] = tex_id
+            _g.glActiveTexture(_g.GL_TEXTURE0 + i)
+            _g.glBindTexture(_g.GL_TEXTURE_2D, tex_id)
+            # 1x1 transparent placeholder so the sampler doesn't get
+            # incomplete-texture warnings if a slot is sampled before
+            # its first attach. (Per the shader's rect/opacity short
+            # circuit, this should never actually happen, but the GLES
+            # validator can flag it.)
+            empty = (ctypes.c_uint8 * 4)(0, 0, 0, 0)
+            _g.glTexImage2D(
+                _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, 1, 1, 0,
+                _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, empty,
+            )
+            _g.glTexParameteri(
+                _g.GL_TEXTURE_2D, _g.GL_TEXTURE_MIN_FILTER, _g.GL_LINEAR,
+            )
+            _g.glTexParameteri(
+                _g.GL_TEXTURE_2D, _g.GL_TEXTURE_MAG_FILTER, _g.GL_LINEAR,
+            )
+            _g.glTexParameteri(
+                _g.GL_TEXTURE_2D, _g.GL_TEXTURE_WRAP_S, _g.GL_CLAMP_TO_EDGE,
+            )
+            _g.glTexParameteri(
+                _g.GL_TEXTURE_2D, _g.GL_TEXTURE_WRAP_T, _g.GL_CLAMP_TO_EDGE,
+            )
+            loc = _g.glGetUniformLocation(self._program, f"u_layer{i}")
+            self._u_layer_loc[i] = int(loc)
+            if loc >= 0:
+                _g.glUniform1i(loc, i)
+
+        self._u_layer_rect_loc = int(
+            _g.glGetUniformLocation(self._program, "u_layer_rect")
         )
-        _g.glTexParameteri(
-            _g.GL_TEXTURE_2D, _g.GL_TEXTURE_MAG_FILTER, _g.GL_LINEAR,
+        self._u_layer_opacity_loc = int(
+            _g.glGetUniformLocation(self._program, "u_layer_opacity")
         )
-        _g.glTexParameteri(
-            _g.GL_TEXTURE_2D, _g.GL_TEXTURE_WRAP_S, _g.GL_CLAMP_TO_EDGE,
-        )
-        _g.glTexParameteri(
-            _g.GL_TEXTURE_2D, _g.GL_TEXTURE_WRAP_T, _g.GL_CLAMP_TO_EDGE,
-        )
-        _g.glUniform1i(self._u_bg_loc, 0)
+
         _g.glViewport(0, 0, self.width, self.height)
         _check_gl("after _compile_program")
 
     def _upload_initial_bg(self) -> None:
-        """Black starting image — keeps the scanout buffer well-defined
+        """Black starting bg — keeps the scanout buffer well-defined
         from the moment we take DRM master, so the viewer never sees
         whatever the prior owner left in the framebuffer."""
-        self.set_background(b"\x00\x00\x00\xff" * (self.width * self.height))
+        self.set_background(
+            b"\x00\x00\x00\xff" * (self.width * self.height)
+        )
 
-    # --- public API ---
+    # --- public API: layer slots ---
 
     def set_background(self, rgba_bytes: bytes) -> None:
-        """Upload an RGBA bg covering the full display. Length must be
-        width * height * 4 bytes (premultiplied or not — there's no
-        blending in milestone A). Called once per slide entry."""
-        from OpenGL import GLES2 as _g
+        """Convenience wrapper for the common case: upload a full-display
+        RGBA image into slot 0 with a full-screen rect + opacity 1.0.
+        Equivalent to attach_layer(slot=0, ...) with the rect implied."""
         expected = self.width * self.height * 4
         if len(rgba_bytes) != expected:
             raise ValueError(
-                f"bg size mismatch: got {len(rgba_bytes)} bytes, "
-                f"expected {expected} for {self.width}x{self.height} RGBA"
+                f"bg size mismatch: got {len(rgba_bytes)} bytes, expected "
+                f"{expected} for {self.width}x{self.height} RGBA"
             )
-        _g.glActiveTexture(_g.GL_TEXTURE0)
-        _g.glBindTexture(_g.GL_TEXTURE_2D, self._tex_bg)
+        self.attach_layer(
+            0, rgba_bytes, self.width, self.height,
+            dst_x=0.0, dst_y=0.0, dst_w=1.0, dst_h=1.0, opacity=1.0,
+        )
+
+    def attach_layer(
+        self,
+        slot: int,
+        rgba_bytes: bytes,
+        src_w: int,
+        src_h: int,
+        *,
+        dst_x: float,
+        dst_y: float,
+        dst_w: float,
+        dst_h: float,
+        opacity: float = 1.0,
+    ) -> None:
+        """Upload an RGBA bitmap into one layer slot and place it on the
+        display.
+
+        rgba_bytes is the layer's bitmap — typically the glyph-bbox
+        crop from render_layer_to_rgba(). src_w/src_h are its pixel
+        dims. dst_(x,y,w,h) place the layer in DISPLAY UV [0,1] space
+        — top-left corner at (dst_x, dst_y), size (dst_w, dst_h).
+        opacity blends the layer over whatever is below.
+
+        Slot 0 conventionally holds the bg (full-screen rect, opacity
+        1.0); slots 1..N_LAYERS-1 hold text/element layers stacked in
+        slot-index order. Higher slot = drawn on top.
+        """
+        from OpenGL import GLES2 as _g
+        if not 0 <= slot < N_LAYERS:
+            raise ValueError(f"slot {slot} out of range [0, {N_LAYERS})")
+        if src_w <= 0 or src_h <= 0:
+            raise ValueError(f"src dims must be positive (got {src_w}x{src_h})")
+        expected = src_w * src_h * 4
+        if len(rgba_bytes) != expected:
+            raise ValueError(
+                f"layer slot {slot}: rgba size mismatch — got "
+                f"{len(rgba_bytes)} bytes, expected {expected} for "
+                f"{src_w}x{src_h} RGBA"
+            )
+
+        _g.glActiveTexture(_g.GL_TEXTURE0 + slot)
+        _g.glBindTexture(_g.GL_TEXTURE_2D, self._tex_layer[slot])
         _g.glTexImage2D(
-            _g.GL_TEXTURE_2D, 0, _g.GL_RGBA,
-            self.width, self.height, 0,
+            _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, src_w, src_h, 0,
             _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, rgba_bytes,
         )
-        _check_gl("set_background glTexImage2D")
+        _check_gl(f"attach_layer slot={slot} glTexImage2D")
+        self._layer_rect[slot] = (
+            dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
+        )
+        self._layer_opacity[slot] = float(opacity)
+
+    def update_layer(
+        self,
+        slot: int,
+        *,
+        dst_x: float | None = None,
+        dst_y: float | None = None,
+        dst_w: float | None = None,
+        dst_h: float | None = None,
+        opacity: float | None = None,
+    ) -> None:
+        """Patch a slot's dst rect / opacity without re-uploading the
+        bitmap. Hot-path helper for per-frame motion uniform updates
+        in Milestone D."""
+        if not 0 <= slot < N_LAYERS:
+            raise ValueError(f"slot {slot} out of range [0, {N_LAYERS})")
+        x_min, y_min, x_max, y_max = self._layer_rect[slot]
+        cur_w = x_max - x_min
+        cur_h = y_max - y_min
+        new_x = x_min if dst_x is None else dst_x
+        new_y = y_min if dst_y is None else dst_y
+        new_w = cur_w if dst_w is None else dst_w
+        new_h = cur_h if dst_h is None else dst_h
+        self._layer_rect[slot] = (new_x, new_y, new_x + new_w, new_y + new_h)
+        if opacity is not None:
+            self._layer_opacity[slot] = float(opacity)
+
+    def detach_layer(self, slot: int) -> None:
+        """Mark a slot inactive by zeroing its opacity. Shader short-
+        circuits on opacity <= 0. Rect is PRESERVED so a subsequent
+        update_layer can flip the slot back on without having to re-
+        supply the dst dims (Milestone D motion paths need this)."""
+        if not 0 <= slot < N_LAYERS:
+            raise ValueError(f"slot {slot} out of range [0, {N_LAYERS})")
+        self._layer_opacity[slot] = 0.0
 
     def commit_frame(self) -> None:
         """Render one frame (sample bg texture across the fullscreen
@@ -640,6 +830,22 @@ class ShaderRenderer:
         from OpenGL import EGL as _e
         from OpenGL import GLES2 as _g
         assert _gbm is not None and _libegl is not None and _libdrm is not None
+
+        # Push per-slot uniforms. The GLES2 spec lets us set N values
+        # at once via the *v variants — one ioctl-equivalent call each
+        # for rect and opacity.
+        rect_arr = (ctypes.c_float * (N_LAYERS * 4))()
+        op_arr = (ctypes.c_float * N_LAYERS)()
+        for i, (rect, op) in enumerate(zip(self._layer_rect, self._layer_opacity)):
+            rect_arr[i * 4 + 0] = rect[0]
+            rect_arr[i * 4 + 1] = rect[1]
+            rect_arr[i * 4 + 2] = rect[2]
+            rect_arr[i * 4 + 3] = rect[3]
+            op_arr[i] = op
+        if self._u_layer_rect_loc >= 0:
+            _g.glUniform4fv(self._u_layer_rect_loc, N_LAYERS, rect_arr)
+        if self._u_layer_opacity_loc >= 0:
+            _g.glUniform1fv(self._u_layer_opacity_loc, N_LAYERS, op_arr)
 
         _g.glClearColor(0.0, 0.0, 0.0, 1.0)
         _g.glClear(_g.GL_COLOR_BUFFER_BIT)
@@ -760,12 +966,12 @@ class ShaderRenderer:
                 # PyOpenGL's glDeleteBuffers / glDeleteTextures accept a
                 # ctypes array reliably; the (count, list) form is auto-
                 # converted on most builds but not all. Use the array
-                # form so Milestone B (which adds N more textures) doesn't
-                # surprise us with a TypeError on a different Pi build.
-                if self._tex_bg:
-                    arr = (ctypes.c_uint * 1)(self._tex_bg)
-                    _g.glDeleteTextures(1, arr)
-                    self._tex_bg = 0
+                # form for forward-compat across Pi/Mesa builds.
+                live_textures = [t for t in self._tex_layer if t]
+                if live_textures:
+                    arr = (ctypes.c_uint * len(live_textures))(*live_textures)
+                    _g.glDeleteTextures(len(live_textures), arr)
+                    self._tex_layer = [0] * N_LAYERS
                 if self._vbo:
                     arr = (ctypes.c_uint * 1)(self._vbo)
                     _g.glDeleteBuffers(1, arr)

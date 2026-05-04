@@ -70,6 +70,43 @@ def _build_test_bg(width: int, height: int) -> bytes:
     return img.tobytes()
 
 
+def _build_text_layer(
+    text: str,
+    font_size: int,
+    color: tuple[int, int, int, int],
+    outline: tuple[int, int, int, int] | None = None,
+) -> tuple[bytes, int, int]:
+    """Render text into a glyph-bbox-cropped RGBA bitmap. Returns
+    (rgba_bytes, w, h) so the smoke can pass src dims to
+    ShaderRenderer.attach_layer."""
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            font_size,
+        )
+    except OSError:
+        font = ImageFont.load_default()
+    # Render onto a generous canvas, then crop to ink bbox.
+    pad = font_size  # outline strokes can extend past the ascender
+    bbox = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox(
+        (0, 0), text, font=font, stroke_width=4 if outline else 0,
+    )
+    canvas_w = bbox[2] - bbox[0] + 2 * pad
+    canvas_h = bbox[3] - bbox[1] + 2 * pad
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.text(
+        (pad - bbox[0], pad - bbox[1]), text, font=font, fill=color,
+        stroke_width=4 if outline else 0,
+        stroke_fill=outline if outline else None,
+    )
+    crop = img.getbbox()
+    if crop is None:
+        raise RuntimeError("text rendered to no ink")
+    img = img.crop(crop)
+    return (img.tobytes(), img.width, img.height)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ShaderRenderer milestone A smoke")
     parser.add_argument("--seconds", type=float, default=5.0)
@@ -84,6 +121,38 @@ def main() -> int:
         log.info("renderer up: %dx%d", r.width, r.height)
         bg = _build_test_bg(r.width, r.height)
         r.set_background(bg)
+
+        # Milestone B: stack a few text layers on top of bg via the
+        # multi-slot blend ladder. Each layer is a glyph-bbox-cropped
+        # RGBA + a placement rect in display UV [0,1].
+        big = _build_text_layer(
+            "OPEN", font_size=420, color=(255, 255, 255, 255),
+            outline=(0, 0, 0, 200),
+        )
+        r.attach_layer(
+            1, big[0], big[1], big[2],
+            dst_x=0.20, dst_y=0.18, dst_w=0.60, dst_h=0.30,
+            opacity=1.0,
+        )
+        sub = _build_text_layer(
+            "for shader testing", font_size=88,
+            color=(255, 230, 80, 255),
+        )
+        r.attach_layer(
+            2, sub[0], sub[1], sub[2],
+            dst_x=0.10, dst_y=0.55, dst_w=0.80, dst_h=0.10,
+            opacity=0.95,
+        )
+        ribbon = _build_text_layer(
+            "Phase 7 Milestone B  -  multi-layer blend on glass",
+            font_size=56, color=(255, 255, 255, 255),
+            outline=(40, 40, 40, 255),
+        )
+        r.attach_layer(
+            3, ribbon[0], ribbon[1], ribbon[2],
+            dst_x=0.05, dst_y=0.85, dst_w=0.90, dst_h=0.07,
+            opacity=0.85,
+        )
 
         n_frames = int(args.seconds * args.fps)
         frame_dt = 1.0 / args.fps
