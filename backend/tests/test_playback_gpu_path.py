@@ -301,6 +301,93 @@ async def test_gpu_path_renders_primary_for_transition_handoff(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_fade_gpu_routes_through_overlay_alpha_animation():
+    """GPU fade attaches to_image on overlay slot 0, animates alpha
+    from 0 to 65535 over transition_ms, then paints to_image to
+    primary + detaches. The animation is "many alpha update_calls
+    with monotonically growing values" — much faster than the
+    software path's 30 PIL Image.blend ops."""
+    from PIL import Image
+    renderer = FakeMultiPlaneRendererWithPNG(64, 48)
+    loop = _new_loop(renderer, items=[])
+    # Manually instantiate event loop state so we can call _fade_gpu
+    # without spinning the playlist. Same shape as the existing
+    # _fade tests in test_playback.py.
+    await loop.start()
+    try:
+        from_image = Image.new("RGB", (64, 48), (255, 0, 0))
+        to_image = Image.new("RGB", (64, 48), (0, 0, 255))
+        await loop._fade_gpu(from_image, to_image, transition_ms=100)
+
+        # Slot 0 was attached + detached.
+        assert 0 in renderer.attach_calls
+        assert 0 in renderer.detach_calls
+        # alpha was animated — multiple update calls staging alpha
+        # with growing values.
+        alpha_updates = [
+            kw["alpha"] for slot, kw in renderer.update_calls
+            if slot == 0 and "alpha" in kw
+        ]
+        assert len(alpha_updates) >= 3
+        # First update should be < last update (monotone ramp).
+        assert alpha_updates[0] < alpha_updates[-1]
+        # Last alpha is 65535 (full opacity at transition end).
+        assert alpha_updates[-1] == 65535
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_wipe_gpu_routes_through_overlay_crtc_w_animation():
+    """GPU wipe attaches to_image fullscreen on overlay slot 0,
+    animates SRC_W + CRTC_W from 1 to width over transition_ms, then
+    paints + detaches. Width updates are monotone."""
+    from PIL import Image
+    renderer = FakeMultiPlaneRendererWithPNG(64, 48)
+    loop = _new_loop(renderer, items=[])
+    await loop.start()
+    try:
+        from_image = Image.new("RGB", (64, 48), (255, 0, 0))
+        to_image = Image.new("RGB", (64, 48), (0, 0, 255))
+        await loop._wipe_gpu(from_image, to_image, transition_ms=100)
+
+        assert 0 in renderer.attach_calls
+        assert 0 in renderer.detach_calls
+        # crtc_w updates ramp 1 → 64 (the renderer's width).
+        crtc_w_updates = [
+            kw["crtc_w"] for slot, kw in renderer.update_calls
+            if slot == 0 and "crtc_w" in kw
+        ]
+        assert len(crtc_w_updates) >= 3
+        assert crtc_w_updates[0] < crtc_w_updates[-1]
+        assert crtc_w_updates[-1] == 64  # full width at transition end
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_fade_falls_back_to_software_when_renderer_lacks_gpu(tmp_path):
+    """MockRenderer can't host an overlay plane → _fade goes
+    through the PIL Image.blend path. Verified indirectly: no
+    AttributeError calling attach_animated_layer (which MockRenderer
+    doesn't have), and the renderer's last_frame keeps getting
+    written via render_frame (the software path's _render_image
+    call)."""
+    from PIL import Image
+    renderer = MockRenderer(64, 48, tmp_path / "out.png")
+    loop = _new_loop(renderer, items=[])
+    await loop.start()
+    try:
+        from_image = Image.new("RGB", (64, 48), (255, 0, 0))
+        to_image = Image.new("RGB", (64, 48), (0, 0, 255))
+        await loop._fade(from_image, to_image, transition_ms=100)
+        # Software path wrote frames to the renderer.
+        assert renderer.last_frame is not None
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_auto_layer_routes_through_gpu_path(tmp_path):
     """An auto-mode layer (clock/date/day) classifies as animated even
     with motion=static — it should claim a plane and re-rasterize

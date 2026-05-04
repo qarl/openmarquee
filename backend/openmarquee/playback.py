@@ -750,6 +750,16 @@ class PlaybackLoop:
         currently active. Test-only setter is just self._current_playlist_id."""
         self._current_playlist_id = playlist_id
 
+    def _gpu_transition_slots_available(self, needed: int) -> bool:
+        """True when the renderer can host `needed` overlay planes for
+        a GPU-accelerated transition. Caller falls back to the
+        software path when this returns False — covers MockRenderer
+        (no multi-plane), DRMRenderer with max_animated_planes=0
+        (existing-deployment shape), and the budget-exceeded edge."""
+        if not isinstance(self._renderer, MultiPlaneRenderer):
+            return False
+        return getattr(self._renderer, "max_animated_planes", 0) >= needed
+
     async def _fade(
         self,
         from_image: Image.Image,
@@ -758,11 +768,25 @@ class PlaybackLoop:
     ) -> None:
         """Alpha-blend from `from_image` to `to_image` over `transition_ms`.
 
+        Routes through `_fade_gpu` when the renderer is multi-plane —
+        animating an overlay plane's `alpha` property gets the HVS
+        doing the blend at scanout (zero per-pixel CPU per frame).
+        Falls back to PIL Image.blend when the renderer can't host
+        an overlay (MockRenderer, LED-matrix renderers, DRMRenderer
+        constructed with max_animated_planes=0).
+
         Returns early on stop OR pause request — pause-awareness keeps
         the transition from painting playlist frames over an in-flight
-        stream takeover. Image.blend is the actual per-pixel math — at
-        alpha=0 we get from_image; at alpha=1 we get to_image.
+        stream takeover.
         """
+        if self._gpu_transition_slots_available(1):
+            try:
+                await self._fade_gpu(from_image, to_image, transition_ms)
+                return
+            except Exception:
+                log.exception(
+                    "playback: GPU fade failed, falling back to software",
+                )
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         for i in range(1, n_frames + 1):
@@ -774,6 +798,70 @@ class PlaybackLoop:
             blended = Image.blend(from_image, to_image, alpha)
             self._render_image(blended)
             await self._wait(frame_period)
+
+    async def _fade_gpu(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """GPU-accelerated fade via overlay plane.alpha.
+
+        from_image is already on the primary plane (the prior slide's
+        final compose painted it there). We attach to_image as a
+        fullscreen overlay at alpha=0, animate alpha 0→65535 over
+        transition_ms via atomic-commit per frame, then paint
+        to_image to primary + detach the overlay so the next slide's
+        attach starts from a clean slot 0 and the right primary
+        content. Per-frame is one ioctl; HVS does the blend. The
+        software path's PIL Image.blend at 1080p was 140-180 ms/frame
+        (~5-7 fps); this should hit a clean 30 fps."""
+        renderer = self._renderer
+        width, height = renderer.width, renderer.height
+
+        # Coerce to_image to RGBA at the renderer's native dims so the
+        # plane fb upload matches the dumb buffer's row pitch.
+        if to_image.mode != "RGBA":
+            to_image = to_image.convert("RGBA")
+        if to_image.size != (width, height):
+            to_image = to_image.resize((width, height), Image.NEAREST)
+        rgba_bytes = to_image.tobytes()
+
+        # Attach overlay slot 0 fullscreen, alpha=0 (invisible). Then
+        # one commit so the modeset takes effect before the alpha
+        # ramp begins.
+        renderer.attach_animated_layer(
+            0, rgba_bytes,
+            src_w=width, src_h=height,
+            crtc_x=0, crtc_y=0,
+            crtc_w=width, crtc_h=height,
+        )
+        renderer.update_animated_layer(0, alpha=0)
+        renderer.commit()
+
+        try:
+            n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+            frame_period = (transition_ms / 1000) / n_frames
+            for i in range(1, n_frames + 1):
+                assert self._stop_event is not None
+                assert self._pause_event is not None
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                alpha = max(0, min(65535, int(round(65535 * i / n_frames))))
+                renderer.update_animated_layer(0, alpha=alpha)
+                renderer.commit()
+                await self._wait(frame_period)
+            # Land at full alpha so the screen content matches
+            # to_image perfectly before we hand off.
+            renderer.update_animated_layer(0, alpha=65535)
+            renderer.commit()
+            # Paint to_image into the primary plane so when we detach
+            # the overlay, primary already has the same content — no
+            # visible flash. Convert back to RGB for render_frame.
+            self._render_image(to_image.convert("RGB"))
+        finally:
+            renderer.detach_animated_layer(0)
+            renderer.commit()
 
     async def _slide(
         self,
@@ -1466,9 +1554,22 @@ class PlaybackLoop:
         """Left-to-right wipe: `to_image` reveals from the left edge,
         pushing `from_image` out of the way over `transition_ms`.
 
+        Routes through `_wipe_gpu` when the renderer is multi-plane —
+        an overlay plane with growing CRTC_W gets HVS-clipped at scan-
+        out (zero per-pixel CPU). Falls back to PIL paste-and-crop
+        otherwise.
+
         Returns early on stop. Same frame cadence as _fade so the two
         transitions feel like the same smoothness at equal transition_ms.
         """
+        if self._gpu_transition_slots_available(1):
+            try:
+                await self._wipe_gpu(from_image, to_image, transition_ms)
+                return
+            except Exception:
+                log.exception(
+                    "playback: GPU wipe failed, falling back to software",
+                )
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         width, height = from_image.size
@@ -1484,6 +1585,70 @@ class PlaybackLoop:
                 frame.paste(to_image.crop((0, 0, split, height)), (0, 0))
             self._render_image(frame)
             await self._wait(frame_period)
+
+    async def _wipe_gpu(
+        self,
+        from_image: Image.Image,
+        to_image: Image.Image,
+        transition_ms: int,
+    ) -> None:
+        """GPU-accelerated wipe via overlay CRTC_W animation.
+
+        from_image stays on primary; to_image goes onto overlay slot
+        0 with full alpha. Each frame, the overlay's SRC_W + CRTC_W
+        animate 1→width so the overlay reveals the to_image from the
+        left edge. SRC_X / CRTC_X stay 0 (left-anchored). HVS does
+        the clip at scanout — zero per-pixel CPU per frame.
+
+        Same paint-to-primary-then-detach landing as _fade_gpu so the
+        next slide's attach starts clean."""
+        renderer = self._renderer
+        width, height = renderer.width, renderer.height
+
+        if to_image.mode != "RGBA":
+            to_image = to_image.convert("RGBA")
+        if to_image.size != (width, height):
+            to_image = to_image.resize((width, height), Image.NEAREST)
+        rgba_bytes = to_image.tobytes()
+
+        # Attach overlay covering only the leftmost 1px initially.
+        # vc4 doesn't accept CRTC_W=0; starting at 1 is safe and the
+        # 1-pixel wide stripe is invisible at the first frame.
+        # Critical invariant: src_w == crtc_w throughout the ramp so
+        # the vc4 HVS scaler is NEVER engaged. Equal dims = 1:1
+        # blit, which sidesteps vc4's scaler-minimum LBM constraints
+        # (which can floor at 8-16 px). If a future refactor splits
+        # them (e.g. fixed src_w + animating crtc_w to scale-reveal),
+        # the minimum needs revisiting.
+        renderer.attach_animated_layer(
+            0, rgba_bytes,
+            src_w=width, src_h=height,
+            crtc_x=0, crtc_y=0,
+            crtc_w=1, crtc_h=height,
+        )
+        renderer.update_animated_layer(0, src_w=1)
+        renderer.commit()
+
+        try:
+            n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
+            frame_period = (transition_ms / 1000) / n_frames
+            for i in range(1, n_frames + 1):
+                assert self._stop_event is not None
+                assert self._pause_event is not None
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                split = max(1, min(width, int(round(width * i / n_frames))))
+                renderer.update_animated_layer(0, src_w=split, crtc_w=split)
+                renderer.commit()
+                await self._wait(frame_period)
+            # Land at full width so the screen exactly matches
+            # to_image before primary takes over.
+            renderer.update_animated_layer(0, src_w=width, crtc_w=width)
+            renderer.commit()
+            self._render_image(to_image.convert("RGB"))
+        finally:
+            renderer.detach_animated_layer(0)
+            renderer.commit()
 
 
 def scheduled_fetch_items(
