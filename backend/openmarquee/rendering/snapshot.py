@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -40,6 +41,20 @@ if TYPE_CHECKING:
     from openmarquee.content import TextSlide
 
 log = logging.getLogger(__name__)
+
+
+def _slide_has_auto_layer(slide: "TextSlide") -> bool:
+    """True iff any visible layer carries auto_mode (clock/date/day).
+    Auto-mode layers re-render text from the current time on every
+    call, so their snapshots are NOT stable across calls -- caching
+    them would either serve stale clock text or invalidate every
+    second. Slides with auto layers skip the cache entirely."""
+    for layer in getattr(slide, "text_layers", []):
+        if not getattr(layer, "visible", True):
+            continue
+        if getattr(layer, "auto_mode", None):
+            return True
+    return False
 
 
 def compose_slide_rgba(
@@ -154,3 +169,107 @@ def compose_slide_bg_statics_rgba(
         else:
             bg = composite_with_blend(bg, layer_rgba, mode=mode)
     return bg.tobytes()
+
+
+@dataclass
+class _CachedSnapshot:
+    """One slide's RGBA snapshots, keyed by slide.updated_at. Both
+    full-composite (for u_to / static-slide transition input) and
+    bg+statics-only (for u_from in the #206 motion-through-transition
+    path) are cached lazily on first lookup. Either may be None until
+    populated."""
+
+    updated_at: datetime | None
+    full_rgba: bytes | None = None
+    bg_statics_rgba: bytes | None = None
+
+
+class SlideSnapshotCache:
+    """Cross-slide RGBA snapshot cache for the shader transition path.
+
+    Without a cache, every shader transition pays for one PIL bg load
+    + alpha_composite per layer for u_from AND for u_to. On Pi Zero 2 W
+    at 1080p that's ~600 ms per slide -- the playback thread stalls
+    ~1.2 s before each fade begins (visible as a freeze on the
+    outgoing slide). With this cache, the second time through a
+    playlist (and every time after) is a few hundred microseconds.
+
+    Keyed by slide.id; entries invalidate when slide.updated_at moves.
+    Slides with auto-mode layers (clocks etc.) skip the cache entirely
+    -- their text re-renders from the current time, so any cached
+    bytes would either serve stale text or invalidate every second.
+
+    Lives on PlaybackLoop (set in __init__, cleared in stop).
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[UUID, _CachedSnapshot] = {}
+
+    def _maybe_get(
+        self, slide: "TextSlide",
+    ) -> _CachedSnapshot | None:
+        """Return the cache entry for `slide` IFF it matches the
+        slide's current `updated_at`. Returns None when the slide has
+        an auto layer (no caching) or the slide has no id; otherwise
+        ensures an entry exists (possibly empty) and returns it."""
+        if _slide_has_auto_layer(slide):
+            return None
+        slide_id = getattr(slide, "id", None)
+        if slide_id is None:
+            return None
+        entry = self._entries.get(slide_id)
+        slide_updated = getattr(slide, "updated_at", None)
+        if entry is None or entry.updated_at != slide_updated:
+            entry = _CachedSnapshot(updated_at=slide_updated)
+            self._entries[slide_id] = entry
+        return entry
+
+    def get_full(
+        self,
+        slide: "TextSlide",
+        width: int,
+        height: int,
+        *,
+        read_asset: Callable[[UUID], bytes] | None = None,
+        now: datetime | None = None,
+    ) -> bytes:
+        """Cached compose_slide_rgba. Populates on first call."""
+        entry = self._maybe_get(slide)
+        if entry is not None and entry.full_rgba is not None:
+            return entry.full_rgba
+        rgba = compose_slide_rgba(
+            slide, width, height, read_asset=read_asset, now=now,
+        )
+        if entry is not None:
+            entry.full_rgba = rgba
+        return rgba
+
+    def get_bg_statics(
+        self,
+        slide: "TextSlide",
+        width: int,
+        height: int,
+        *,
+        read_asset: Callable[[UUID], bytes] | None = None,
+        now: datetime | None = None,
+    ) -> bytes:
+        """Cached compose_slide_bg_statics_rgba. Populates on first
+        call."""
+        entry = self._maybe_get(slide)
+        if entry is not None and entry.bg_statics_rgba is not None:
+            return entry.bg_statics_rgba
+        rgba = compose_slide_bg_statics_rgba(
+            slide, width, height, read_asset=read_asset, now=now,
+        )
+        if entry is not None:
+            entry.bg_statics_rgba = rgba
+        return rgba
+
+    def clear(self) -> None:
+        """Drop all cached entries. Called on PlaybackLoop.stop() so
+        a fresh start() doesn't reuse stale (slide_id, updated_at)
+        entries against a content store that may have changed."""
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)

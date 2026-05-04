@@ -175,6 +175,14 @@ class PlaybackLoop:
         # the cached bytes and skip the 50-200 ms attach stall at
         # 1080p. Cleared on stop() so a new playlist gets fresh state.
         self._gpu_slide_cache = SlideAssetCache()
+        # Snapshot cache for the shader-transition path (#205): a
+        # transition's u_from + u_to RGBA snapshots are ~600 ms each
+        # to compose at 1080p (PIL bg load + alpha_composite per
+        # layer + blend math). Caching keyed by (slide.id, updated_at)
+        # makes the second pass through a playlist instant. Slides
+        # with auto-mode layers (clocks) skip the cache.
+        from openmarquee.rendering.snapshot import SlideSnapshotCache
+        self._snapshot_cache = SlideSnapshotCache()
         # Lazily-constructed shader compositor for slide-to-slide
         # transitions (iris/dissolve/etc.). Built on first use, reused
         # across every transition for the lifetime of the loop --
@@ -332,6 +340,7 @@ class PlaybackLoop:
             # doesn't reuse stale (slide_id, updated_at) entries
             # against a content store that may have changed.
             self._gpu_slide_cache.clear()
+            self._snapshot_cache.clear()
             # Tear down the shader compositor if it was lazily built.
             # ShaderRenderer holds DRM/EGL/GL state that survives
             # individual transitions but should be released alongside
@@ -1014,10 +1023,13 @@ class PlaybackLoop:
         from_rgba: bytes
         if outgoing is not None and outgoing_slide is not None:
             try:
-                from openmarquee.rendering.snapshot import (
-                    compose_slide_bg_statics_rgba,
-                )
-                from_rgba = compose_slide_bg_statics_rgba(
+                # Cached snapshot path (#205): on the second + every
+                # subsequent shader transition for the same slide, this
+                # is microseconds; first call composes (~600 ms at
+                # 1080p) and stores. Slides with auto-mode layers skip
+                # the cache and compose every time (clock text changes
+                # by the second).
+                from_rgba = self._snapshot_cache.get_bg_statics(
                     outgoing_slide, width, height,
                     read_asset=self._read_asset,
                 )
