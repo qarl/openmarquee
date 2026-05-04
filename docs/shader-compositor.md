@@ -89,16 +89,18 @@ choice in the design:
 
 ## The transition pipeline
 
+All 15 transition kinds (fade, wipe, iris, dissolve, pixelate,
+scanline, halftone, glitch, slide, push, scroll, blinds, flip,
+marquee, shutter) route through the same shader path. fade and
+wipe used to have separate `_fade_gpu` / `_wipe_gpu` paths driving
+HVS plane-property animation, but those were deleted in the
+unification cleanup so motion-through-transitions (#206) works
+uniformly across every kind.
+
 ```
 PlaybackLoop dispatcher
     │
-    ├─ kind == "fade" or "wipe":
-    │      → _fade_gpu / _wipe_gpu
-    │      → multi-plane DRM plane-property animation (HVS)
-    │      → _drain_outgoing_compositor BEFORE this fires
-    │      → no shader involvement
-    │
-    └─ kind in _SHADER_TRANSITION_KINDS (12 others):
+    └─ ALL kinds in _SHADER_TRANSITION_KINDS:
            → _run_shader_transition
               │
               ├─ outgoing slide was dynamic (#206):
@@ -246,17 +248,15 @@ fallback path takes over (still works, just heavier).
 
 ## Transition kinds (#197)
 
-All 14 kinds in qarl's transition palette have implementations:
-
-- **HVS plane-property** (faster, no shader): fade, wipe.
-- **Shader fragments** (`_TRANSITION_SHADERS` dict): iris,
-  dissolve, pixelate, scanline, halftone, glitch, slide, push,
-  scroll, blinds, flip, marquee, shutter.
+All 15 kinds in qarl's transition palette have shader fragment
+implementations in `_TRANSITION_SHADERS`: fade, wipe, iris,
+dissolve, pixelate, scanline, halftone, glitch, slide, push,
+scroll, blinds, flip, marquee, shutter.
 
 Each shader is 10-50 lines of GLSL. Live-fire on dev Pi:
 
-- 13/14 at **30.0 fps stable** at 1080p.
-- glitch at **23.6 fps** (highp `fract(sin(*))` hash + 2 hash
+- 14/15 at **30.0 fps stable** at 1080p.
+- glitch at **~24 fps** (highp `fract(sin(*))` hash + 2 hash
   calls per fragment is heavy; the slight stutter reads as part
   of the corruption effect, intentional).
 

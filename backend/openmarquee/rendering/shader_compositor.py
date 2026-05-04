@@ -275,6 +275,26 @@ void main() {
 }
 """
 
+# Wipe: u_to reveals from the left edge with a hard line at x = t.
+# Equivalent in visual identity to the prior `_wipe_gpu` overlay
+# CRTC_W animation, but routed through the same shader pipeline as
+# every other transition kind so motion stays alive on the outgoing
+# slide's overlays during the wipe (#206).
+_FRAGMENT_WIPE = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  float mask = step(v_uv.x, u_transition_t);
+  gl_FragColor = mix(a, b, mask);
+}
+"""
+
 # Iris: u_to reveals through a circle that expands from screen center
 # to the corners. The 0.71 max-radius covers the diagonal — center to
 # corner distance in normalized [0,1] UV space is sqrt(0.5) = 0.707.
@@ -670,6 +690,7 @@ void main() {
 # program at startup and picks one per transition via set_kind().
 _TRANSITION_SHADERS: dict[str, str] = {
     "fade": _FRAGMENT_FADE,
+    "wipe": _FRAGMENT_WIPE,
     "iris": _FRAGMENT_IRIS,
     "dissolve": _FRAGMENT_DISSOLVE,
     "pixelate": _FRAGMENT_PIXELATE,
