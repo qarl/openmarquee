@@ -1,33 +1,34 @@
-"""GLES2 single-pass shader compositor — alternative to gpu_compositor.
+"""GLES2 shader compositor — slide-to-slide transitions only.
 
-EGL → GBM → GLES2 → dmabuf → DRM-plane atomic-commit pipeline. Single
-primary plane carries the composited frame; multi-layer blending,
-per-frame motion, and slide transitions all happen in the fragment
-shader. Replaces GPUSlideCompositor (multi-plane DRM compositing at
-scanout) when the shader compositor feature flag is on; the
-multi-plane path stays in tree as the fallback.
+Hybrid architecture (qarl 2026-05-03 evening):
 
-Architecture (qarl 2026-05-03 decision; see project_shader_compositor_
-decision.md and project_vc4_shader_feasibility.md):
+  - Multi-plane DRM (gpu_compositor.py + drm_kms.py) keeps doing the
+    within-slide layer compositing. The vc4 HVS does the alpha blend
+    + scaling at scanout, with zero per-pixel CPU work, well within
+    the perf budget at 1080p. No change to that path.
 
-  - ONE fragment-shader pass per frame, sampling bg + N layer textures
-    in the same fragment. NEVER multi-pass FBO ping-pong — the vc4
-    bandwidth budget on Pi Zero 2 W (1.2-1.6 GB/s DDR) does not allow
-    a second full-resolution read+write per frame.
-  - Pre-rasterize text + bg to GLES2 textures at slide entry; per-frame
-    only updates uniforms (transform mat3, opacity, blend_mode int,
-    transition_t).
-  - Single GBM surface with double/triple-buffer rotation; locked
-    front bo → drmModeAddFB2 → atomic commit. Page-flip event per
-    frame ties commit to vsync.
+  - This module runs ONLY during slide-to-slide transitions: a
+    2-input fragment shader takes "from" and "to" slide snapshots
+    and a `transition_t: 0..1` uniform, mixes them per-pixel, and
+    drives the primary plane FB during the transition window.
 
-Milestone A (this file's current state): single background texture,
-single draw, single SetCrtc + page-flip per frame. Validates the
-production rendering pipeline before adding layers (B), motion (C),
-transitions (D), blend modes (E), fence sync (F).
+  - Same module also covers Photoshop-style blend modes via a
+    similar 2-input + blend_mode_id pattern (multiply, screen,
+    overlay, soft-light, hard-light, color-dodge, color-burn,
+    lighten, darken, difference) — vc4's HVS only implements
+    plane.alpha+PREMULTI; everything else needs the shader.
+
+Per-pixel cost: 2 texture2D + 1 mix + 1 write ≈ 8-12 ALU ops per
+pixel × 2M pixels × 30 fps = ~600 MOps/sec. WELL within vc4 V3D 2.1's
+~16 GFLOPS budget. The earlier Milestone B 8-slot blend ladder was
+GPU-bound (8.6 fps at 1080p); the 2-input transition path isn't.
+
+Bindings + DRM/EGL/GBM/GL plumbing are unchanged from the Milestone A/B
+scaffolding (see commit a4347d2 / 9b2ea0c). The hot rewrite is the
+fragment shader + the layer-slot API → 2-input + transition_t.
 
 This is a Linux/vc4-specific module; tests on the Mac side mock the
-renderer. The Pi-side live-fire (`scripts/phase7_shader_renderer_smoke.py`)
+renderer. The Pi-side live-fire (scripts/phase7_shader_renderer_smoke.py)
 is the canonical correctness check.
 """
 
@@ -249,68 +250,37 @@ void main() {
 }
 """
 
-# Milestone B fragment shader: 8-slot layer blend ladder, single pass.
-# Slot 0 conventionally carries the background (full-screen rect);
-# slots 1-7 carry text/element layers stacked on top in slot-index order.
-# Each slot has a sampler2D, a vec4 dst rect (x_min, y_min, x_max, y_max
-# in display UV [0,1]), and a float opacity. Inactive slots use opacity
-# = 0 + degenerate rect — a one-instruction early-return inside
-# _layer_contrib makes the cost negligible.
+# Transition fragment shader: 2 samplers + transition_t. Different
+# transition kinds (fade, wipe, iris, dissolve, ...) each get their
+# own compiled program; selection happens via _compile_transition().
+# Per-pixel cost is one 2-tex sample + one mix() + the kind-specific
+# mask math (a step + maybe a distance/dot/hash). Trivially fits on
+# vc4 V3D 2.1 at 1080p × 30 fps.
 #
-# GLES 2.0 doesn't allow dynamic indexing of sampler2D arrays, so the
-# 8-slot ladder is unrolled. Built from N_LAYERS so changing the slot
-# count is a single edit.
-N_LAYERS = 8
+# u_from = outgoing slide snapshot, u_to = incoming slide snapshot.
+# u_transition_t goes 0 -> 1 over the transition duration; at 0 the
+# screen shows u_from unchanged, at 1 it shows u_to unchanged.
 
-
-def _build_fragment_shader(n_layers: int) -> str:
-    samplers = "\n".join(f"uniform sampler2D u_layer{i};" for i in range(n_layers))
-    ladder_lines = []
-    for i in range(n_layers):
-        ladder_lines.append(
-            f"  c = _layer_contrib(u_layer{i}, u_layer_rect[{i}], "
-            f"u_layer_opacity[{i}], v_uv);"
-        )
-        # Alpha-over for unpremultiplied input:
-        #   col.rgb = mix(col.rgb, c.rgb, c.a)
-        #   col.a   = c.a + col.a * (1.0 - c.a)
-        # Slot 0 conventionally has rect=[0,0,1,1] + opacity=1, so its
-        # mix() collapses to col.rgb = c.rgb (the bg replaces whatever
-        # the clear left).
-        ladder_lines.append(
-            "  col.rgb = mix(col.rgb, c.rgb, c.a);"
-            "  col.a = c.a + col.a * (1.0 - c.a);"
-        )
-    return f"""#version 100
+_FRAGMENT_FADE = """#version 100
 precision mediump float;
-{samplers}
-uniform vec4 u_layer_rect[{n_layers}];
-uniform float u_layer_opacity[{n_layers}];
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
 varying vec2 v_uv;
 
-vec4 _layer_contrib(sampler2D tex, vec4 rect, float opacity, vec2 uv) {{
-  vec2 sz = rect.zw - rect.xy;
-  if (sz.x <= 0.0 || sz.y <= 0.0 || opacity <= 0.0) return vec4(0.0);
-  if (uv.x < rect.x || uv.x > rect.z ||
-      uv.y < rect.y || uv.y > rect.w) return vec4(0.0);
-  vec2 local = (uv - rect.xy) / sz;
-  vec4 c = texture2D(tex, local);
-  c.a *= opacity;
-  return c;
-}}
-
-void main() {{
-  // Start fully transparent. Slot 0's mix() lays the bg down on the
-  // first iteration; remaining slots alpha-over on top.
-  vec4 col = vec4(0.0, 0.0, 0.0, 0.0);
-  vec4 c;
-{chr(10).join(ladder_lines)}
-  gl_FragColor = col;
-}}
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  gl_FragColor = mix(a, b, u_transition_t);
+}
 """
 
-
-_FRAGMENT_SHADER = _build_fragment_shader(N_LAYERS)
+# Transition-kind ID -> fragment shader source. Add new kinds here as
+# their per-fragment math is worked out; ShaderRenderer compiles each
+# program at startup and picks one per transition via set_kind().
+_TRANSITION_SHADERS: dict[str, str] = {
+    "fade": _FRAGMENT_FADE,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -355,44 +325,54 @@ def _link_program(vs_src: str, fs_src: str) -> int:
     vs = _compile_shader(_g.GL_VERTEX_SHADER, vs_src)
     fs = _compile_shader(_g.GL_FRAGMENT_SHADER, fs_src)
     prog = _g.glCreateProgram()
-    _g.glAttachShader(prog, vs)
-    _g.glAttachShader(prog, fs)
-    _g.glLinkProgram(prog)
-    if not _g.glGetProgramiv(prog, _g.GL_LINK_STATUS):
-        raise RuntimeError(
-            f"program link failed: {_g.glGetProgramInfoLog(prog).decode()}"
-        )
-    _g.glDeleteShader(vs)
-    _g.glDeleteShader(fs)
-    return prog
+    try:
+        _g.glAttachShader(prog, vs)
+        _g.glAttachShader(prog, fs)
+        _g.glLinkProgram(prog)
+        # Mark shaders for deletion now that they're attached. GL ref-
+        # counts them: they stay alive until the program is destroyed
+        # OR detached. This way a link failure can't leak the shader
+        # objects even when the program itself is glDeleteProgram'd.
+        _g.glDeleteShader(vs)
+        _g.glDeleteShader(fs)
+        if not _g.glGetProgramiv(prog, _g.GL_LINK_STATUS):
+            raise RuntimeError(
+                f"program link failed: {_g.glGetProgramInfoLog(prog).decode()}"
+            )
+        return prog
+    except Exception:
+        _g.glDeleteProgram(prog)
+        raise
 
 
 # ---------------------------------------------------------------------------
 # ShaderRenderer — owns DRM master + GL context for the lifetime of a
-# playback session. ShaderSlideCompositor (Milestone B) sits on top.
+# transition. Activated only during slide-to-slide transitions and
+# Photoshop blend modes; multi-plane DRM does within-slide compositing.
 # ---------------------------------------------------------------------------
 
 
 class ShaderRenderer:
-    """GLES2 shader-driven HDMI renderer. Owns DRM master + EGL/GBM/GL
-    context. Renders frames through a fullscreen quad fragment shader;
-    output goes directly to a GBM-backed buffer scanned out via DRM.
+    """GLES2 shader-driven transition renderer. Owns DRM master +
+    EGL/GBM/GL context. Renders frames through a 2-input fragment
+    shader (u_from + u_to + u_transition_t); output goes directly to a
+    GBM-backed buffer scanned out via DRM.
 
-    Usage (from PlaybackLoop or smoke script):
+    Usage (from PlaybackLoop transition handlers or smoke script):
 
         with ShaderRenderer() as r:
-            r.set_background(rgba_bytes_1920x1080)
-            r.commit_frame()  # draws + page-flips
-            ...
+            r.set_kind("fade")
+            r.set_from(snapshot_a_rgba, w, h)
+            r.set_to(snapshot_b_rgba, w, h)
+            for i in range(n_frames):
+                r.set_transition_t(i / (n_frames - 1))
+                r.commit_frame()
 
     Width/height are auto-derived from the connector's preferred mode
-    (1920x1080 on the dev Pi). The renderer takes DRM master at __enter__
-    and releases it at close — only one DRM master per device, so the
-    welcome loop / multi-plane compositor must be stopped first.
-
-    Milestone A: single background texture, no layers, no motion. Holds
-    the most-recent set_background() output until next set_background().
-    Milestone B will add per-layer textures + uniforms.
+    (1920x1080 on the dev Pi). The renderer takes DRM master at
+    __enter__ and releases it at close — only one DRM master per
+    device, so the welcome loop / multi-plane compositor must be
+    stopped (or hand off the FB cleanly) first.
     """
 
     def __init__(
@@ -409,26 +389,21 @@ class ShaderRenderer:
         self._egl_display: int = 0
         self._egl_context: int = 0
         self._egl_surface: int = 0
-        self._program: int = 0
+        # GL state — one program per transition kind, two textures
+        # (from + to slide snapshots), shared VBO/quad. _programs maps
+        # kind name -> compiled program id; _kind_locs caches the
+        # uniform locations per kind so set_kind() is O(1).
+        self._programs: dict[str, int] = {}
+        self._kind_locs: dict[str, dict[str, int]] = {}
+        self._active_kind: str = "fade"
         self._vbo: int = 0
         self._a_pos_loc: int = -1
-        # Per-layer GL state. Index = slot 0..N_LAYERS-1.
-        # _tex_layer holds the texture id; 0 = unused. _u_layer_loc is
-        # the sampler uniform location. _layer_active mirrors the
-        # opacity > 0 + non-degenerate-rect bit so detach can flip a
-        # slot inactive in O(1) without reading uniforms back.
-        self._tex_layer: list[int] = [0] * N_LAYERS
-        self._u_layer_loc: list[int] = [-1] * N_LAYERS
-        self._u_layer_rect_loc: int = -1
-        self._u_layer_opacity_loc: int = -1
-        # Per-slot dst rect (x_min, y_min, x_max, y_max) in display UV
-        # [0,1] and opacity [0,1]. Pushed as uniforms each commit_frame.
-        # Inactive slot = rect (0,0,0,0) + opacity 0 (degenerate, shader
-        # short-circuits).
-        self._layer_rect: list[tuple[float, float, float, float]] = [
-            (0.0, 0.0, 0.0, 0.0)
-        ] * N_LAYERS
-        self._layer_opacity: list[float] = [0.0] * N_LAYERS
+        # Two textures, fixed: unit 0 = from, unit 1 = to. The shader
+        # pipeline never grows beyond two inputs in the hybrid model;
+        # multi-layer compositing stays on the multi-plane DRM path.
+        self._tex_from: int = 0
+        self._tex_to: int = 0
+        self._transition_t: float = 0.0
         # Connector / CRTC discovered at open time; mode held in
         # self._mode (kept alive — drmModeSetCrtc reads it by ref).
         self._connector_id: int = 0
@@ -636,28 +611,36 @@ class ShaderRenderer:
     def _compile_program(self) -> None:
         from OpenGL import GLES2 as _g
 
-        # Sanity-check the device's sampler-image-unit budget. GLES 2.0
-        # spec minimum is 8; vc4 V3D 2.1 reports 16 in practice. Either
-        # way we need N_LAYERS image units in the fragment shader.
-        max_units = _g.glGetIntegerv(_g.GL_MAX_TEXTURE_IMAGE_UNITS)
-        if int(max_units) < N_LAYERS:
-            raise RuntimeError(
-                f"GL_MAX_TEXTURE_IMAGE_UNITS={int(max_units)} < N_LAYERS="
-                f"{N_LAYERS}; reduce N_LAYERS or split into multi-pass "
-                f"(but see project_vc4_shader_feasibility.md — multi-pass "
-                f"blows the bandwidth budget at 1080p)"
-            )
+        # Compile every transition program once at startup. Selection
+        # at transition start is then a glUseProgram + uniform sampler
+        # bind — no compile cost in the hot path. Programs all share
+        # the same vertex shader, so vs is compiled implicitly per
+        # link via _link_program (cheap).
+        for kind, fs_src in _TRANSITION_SHADERS.items():
+            prog = _link_program(_VERTEX_SHADER, fs_src)
+            self._programs[kind] = prog
+            self._kind_locs[kind] = {
+                "u_from": int(_g.glGetUniformLocation(prog, "u_from")),
+                "u_to": int(_g.glGetUniformLocation(prog, "u_to")),
+                "u_transition_t": int(
+                    _g.glGetUniformLocation(prog, "u_transition_t")
+                ),
+                "a_pos": int(_g.glGetAttribLocation(prog, "a_pos")),
+            }
 
-        self._program = _link_program(_VERTEX_SHADER, _FRAGMENT_SHADER)
-        _g.glUseProgram(self._program)
-        # VBO holds the fullscreen-quad triangle strip. Set up once.
+        # Set up the shared VBO + a_pos attribute for the default kind.
+        # set_kind() switches programs but the attribute layout (one
+        # vec2 a_pos at the start of the buffer) is identical for
+        # every program, so the bind survives the program switch.
+        prog = self._programs[self._active_kind]
+        _g.glUseProgram(prog)
         quad = (ctypes.c_float * 8)(-1, -1, 1, -1, -1, 1, 1, 1)
         self._vbo = int(_g.glGenBuffers(1))
         _g.glBindBuffer(_g.GL_ARRAY_BUFFER, self._vbo)
         _g.glBufferData(
             _g.GL_ARRAY_BUFFER, ctypes.sizeof(quad), quad, _g.GL_STATIC_DRAW,
         )
-        self._a_pos_loc = _g.glGetAttribLocation(self._program, "a_pos")
+        self._a_pos_loc = self._kind_locs[self._active_kind]["a_pos"]
         if self._a_pos_loc < 0:
             raise RuntimeError("a_pos attribute not found in vertex shader")
         _g.glEnableVertexAttribArray(self._a_pos_loc)
@@ -665,22 +648,15 @@ class ShaderRenderer:
             self._a_pos_loc, 2, _g.GL_FLOAT, False, 0, None,
         )
 
-        # Allocate one texture per slot; uploads happen via attach_layer.
-        # Bind each sampler uniform to its texture unit (slot i → unit i).
-        # Texture parameters get set per-slot when we glTexImage2D the
-        # actual data — defaults at allocate time would otherwise need
-        # to be reset on first upload anyway.
-        for i in range(N_LAYERS):
-            tex_id = int(_g.glGenTextures(1))
-            self._tex_layer[i] = tex_id
-            _g.glActiveTexture(_g.GL_TEXTURE0 + i)
-            _g.glBindTexture(_g.GL_TEXTURE_2D, tex_id)
-            # 1x1 transparent placeholder so the sampler doesn't get
-            # incomplete-texture warnings if a slot is sampled before
-            # its first attach. (Per the shader's rect/opacity short
-            # circuit, this should never actually happen, but the GLES
-            # validator can flag it.)
-            empty = (ctypes.c_uint8 * 4)(0, 0, 0, 0)
+        # Two textures: unit 0 = from, unit 1 = to. Both get a 1x1
+        # opaque-black placeholder so the sampler is complete before
+        # the first set_from/set_to.
+        empty = (ctypes.c_uint8 * 4)(0, 0, 0, 255)
+        self._tex_from = int(_g.glGenTextures(1))
+        self._tex_to = int(_g.glGenTextures(1))
+        for unit, tex in ((0, self._tex_from), (1, self._tex_to)):
+            _g.glActiveTexture(_g.GL_TEXTURE0 + unit)
+            _g.glBindTexture(_g.GL_TEXTURE_2D, tex)
             _g.glTexImage2D(
                 _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, 1, 1, 0,
                 _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, empty,
@@ -697,131 +673,100 @@ class ShaderRenderer:
             _g.glTexParameteri(
                 _g.GL_TEXTURE_2D, _g.GL_TEXTURE_WRAP_T, _g.GL_CLAMP_TO_EDGE,
             )
-            loc = _g.glGetUniformLocation(self._program, f"u_layer{i}")
-            self._u_layer_loc[i] = int(loc)
-            if loc >= 0:
-                _g.glUniform1i(loc, i)
 
-        self._u_layer_rect_loc = int(
-            _g.glGetUniformLocation(self._program, "u_layer_rect")
-        )
-        self._u_layer_opacity_loc = int(
-            _g.glGetUniformLocation(self._program, "u_layer_opacity")
-        )
+        # Sampler bindings are per-program but always (u_from -> 0,
+        # u_to -> 1). Set them on every program once.
+        for kind, p in self._programs.items():
+            _g.glUseProgram(p)
+            locs = self._kind_locs[kind]
+            if locs["u_from"] >= 0:
+                _g.glUniform1i(locs["u_from"], 0)
+            if locs["u_to"] >= 0:
+                _g.glUniform1i(locs["u_to"], 1)
+        _g.glUseProgram(self._programs[self._active_kind])
 
         _g.glViewport(0, 0, self.width, self.height)
         _check_gl("after _compile_program")
 
     def _upload_initial_bg(self) -> None:
-        """Black starting bg — keeps the scanout buffer well-defined
-        from the moment we take DRM master, so the viewer never sees
-        whatever the prior owner left in the framebuffer."""
-        self.set_background(
-            b"\x00\x00\x00\xff" * (self.width * self.height)
-        )
+        """Opaque-black starting frame — keeps the scanout buffer
+        well-defined from the moment we take DRM master, so the viewer
+        never sees whatever the prior owner left in the framebuffer.
+        At t=0 with both textures = black, mix() outputs black."""
+        black = b"\x00\x00\x00\xff" * (self.width * self.height)
+        self.set_from(black, self.width, self.height)
+        self.set_to(black, self.width, self.height)
+        self._transition_t = 0.0
 
-    # --- public API: layer slots ---
+    # --- public API: transition inputs ---
 
-    def set_background(self, rgba_bytes: bytes) -> None:
-        """Convenience wrapper for the common case: upload a full-display
-        RGBA image into slot 0 with a full-screen rect + opacity 1.0.
-        Equivalent to attach_layer(slot=0, ...) with the rect implied."""
-        expected = self.width * self.height * 4
-        if len(rgba_bytes) != expected:
-            raise ValueError(
-                f"bg size mismatch: got {len(rgba_bytes)} bytes, expected "
-                f"{expected} for {self.width}x{self.height} RGBA"
-            )
-        self.attach_layer(
-            0, rgba_bytes, self.width, self.height,
-            dst_x=0.0, dst_y=0.0, dst_w=1.0, dst_h=1.0, opacity=1.0,
-        )
+    def set_from(self, rgba_bytes: bytes, src_w: int, src_h: int) -> None:
+        """Upload the OUTGOING slide snapshot to texture unit 0. Called
+        once at transition start by the caller (typically the
+        multi-plane DRM compositor freezing the current display state).
+        src_w * src_h * 4 bytes; the shader samples it at v_uv across
+        the full display."""
+        self._upload_texture(self._tex_from, 0, rgba_bytes, src_w, src_h, "from")
 
-    def attach_layer(
-        self,
-        slot: int,
-        rgba_bytes: bytes,
-        src_w: int,
-        src_h: int,
-        *,
-        dst_x: float,
-        dst_y: float,
-        dst_w: float,
-        dst_h: float,
-        opacity: float = 1.0,
+    def set_to(self, rgba_bytes: bytes, src_w: int, src_h: int) -> None:
+        """Upload the INCOMING slide snapshot to texture unit 1. Called
+        once at transition start by the caller (the new slide composited
+        into a single RGBA via PIL alpha_composite at slide entry)."""
+        self._upload_texture(self._tex_to, 1, rgba_bytes, src_w, src_h, "to")
+
+    def _upload_texture(
+        self, tex: int, unit: int, rgba: bytes, w: int, h: int, label: str,
     ) -> None:
-        """Upload an RGBA bitmap into one layer slot and place it on the
-        display.
-
-        rgba_bytes is the layer's bitmap — typically the glyph-bbox
-        crop from render_layer_to_rgba(). src_w/src_h are its pixel
-        dims. dst_(x,y,w,h) place the layer in DISPLAY UV [0,1] space
-        — top-left corner at (dst_x, dst_y), size (dst_w, dst_h).
-        opacity blends the layer over whatever is below.
-
-        Slot 0 conventionally holds the bg (full-screen rect, opacity
-        1.0); slots 1..N_LAYERS-1 hold text/element layers stacked in
-        slot-index order. Higher slot = drawn on top.
-        """
         from OpenGL import GLES2 as _g
-        if not 0 <= slot < N_LAYERS:
-            raise ValueError(f"slot {slot} out of range [0, {N_LAYERS})")
-        if src_w <= 0 or src_h <= 0:
-            raise ValueError(f"src dims must be positive (got {src_w}x{src_h})")
-        expected = src_w * src_h * 4
-        if len(rgba_bytes) != expected:
+        if w <= 0 or h <= 0:
+            raise ValueError(f"set_{label}: src dims must be positive ({w}x{h})")
+        expected = w * h * 4
+        if len(rgba) != expected:
             raise ValueError(
-                f"layer slot {slot}: rgba size mismatch — got "
-                f"{len(rgba_bytes)} bytes, expected {expected} for "
-                f"{src_w}x{src_h} RGBA"
+                f"set_{label}: rgba size mismatch — got {len(rgba)} bytes, "
+                f"expected {expected} for {w}x{h} RGBA"
             )
-
-        _g.glActiveTexture(_g.GL_TEXTURE0 + slot)
-        _g.glBindTexture(_g.GL_TEXTURE_2D, self._tex_layer[slot])
+        _g.glActiveTexture(_g.GL_TEXTURE0 + unit)
+        _g.glBindTexture(_g.GL_TEXTURE_2D, tex)
         _g.glTexImage2D(
-            _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, src_w, src_h, 0,
-            _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, rgba_bytes,
+            _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, w, h, 0,
+            _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, rgba,
         )
-        _check_gl(f"attach_layer slot={slot} glTexImage2D")
-        self._layer_rect[slot] = (
-            dst_x, dst_y, dst_x + dst_w, dst_y + dst_h,
+        _check_gl(f"set_{label} glTexImage2D")
+
+    def set_transition_t(self, t: float) -> None:
+        """Set the transition progress, 0.0..1.0. At 0 the screen
+        shows u_from unchanged; at 1 it shows u_to unchanged. Caller
+        drives this from the transition timeline."""
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        self._transition_t = float(t)
+
+    def set_kind(self, kind: str) -> None:
+        """Pick which transition fragment shader runs. Must match a
+        key in _TRANSITION_SHADERS. Cheap (glUseProgram); no compile
+        cost since every program is built at startup."""
+        from OpenGL import GLES2 as _g
+        if kind not in self._programs:
+            raise ValueError(
+                f"unknown transition kind {kind!r}; available: "
+                f"{sorted(self._programs)}"
+            )
+        if kind == self._active_kind:
+            return
+        self._active_kind = kind
+        _g.glUseProgram(self._programs[kind])
+        # The a_pos attrib bind is identical for every program (same
+        # vertex shader), but the attribute LOCATION may differ across
+        # link units, so re-bind.
+        self._a_pos_loc = self._kind_locs[kind]["a_pos"]
+        _g.glEnableVertexAttribArray(self._a_pos_loc)
+        _g.glBindBuffer(_g.GL_ARRAY_BUFFER, self._vbo)
+        _g.glVertexAttribPointer(
+            self._a_pos_loc, 2, _g.GL_FLOAT, False, 0, None,
         )
-        self._layer_opacity[slot] = float(opacity)
-
-    def update_layer(
-        self,
-        slot: int,
-        *,
-        dst_x: float | None = None,
-        dst_y: float | None = None,
-        dst_w: float | None = None,
-        dst_h: float | None = None,
-        opacity: float | None = None,
-    ) -> None:
-        """Patch a slot's dst rect / opacity without re-uploading the
-        bitmap. Hot-path helper for per-frame motion uniform updates
-        in Milestone D."""
-        if not 0 <= slot < N_LAYERS:
-            raise ValueError(f"slot {slot} out of range [0, {N_LAYERS})")
-        x_min, y_min, x_max, y_max = self._layer_rect[slot]
-        cur_w = x_max - x_min
-        cur_h = y_max - y_min
-        new_x = x_min if dst_x is None else dst_x
-        new_y = y_min if dst_y is None else dst_y
-        new_w = cur_w if dst_w is None else dst_w
-        new_h = cur_h if dst_h is None else dst_h
-        self._layer_rect[slot] = (new_x, new_y, new_x + new_w, new_y + new_h)
-        if opacity is not None:
-            self._layer_opacity[slot] = float(opacity)
-
-    def detach_layer(self, slot: int) -> None:
-        """Mark a slot inactive by zeroing its opacity. Shader short-
-        circuits on opacity <= 0. Rect is PRESERVED so a subsequent
-        update_layer can flip the slot back on without having to re-
-        supply the dst dims (Milestone D motion paths need this)."""
-        if not 0 <= slot < N_LAYERS:
-            raise ValueError(f"slot {slot} out of range [0, {N_LAYERS})")
-        self._layer_opacity[slot] = 0.0
 
     def commit_frame(self) -> None:
         """Render one frame (sample bg texture across the fullscreen
@@ -831,21 +776,12 @@ class ShaderRenderer:
         from OpenGL import GLES2 as _g
         assert _gbm is not None and _libegl is not None and _libdrm is not None
 
-        # Push per-slot uniforms. The GLES2 spec lets us set N values
-        # at once via the *v variants — one ioctl-equivalent call each
-        # for rect and opacity.
-        rect_arr = (ctypes.c_float * (N_LAYERS * 4))()
-        op_arr = (ctypes.c_float * N_LAYERS)()
-        for i, (rect, op) in enumerate(zip(self._layer_rect, self._layer_opacity)):
-            rect_arr[i * 4 + 0] = rect[0]
-            rect_arr[i * 4 + 1] = rect[1]
-            rect_arr[i * 4 + 2] = rect[2]
-            rect_arr[i * 4 + 3] = rect[3]
-            op_arr[i] = op
-        if self._u_layer_rect_loc >= 0:
-            _g.glUniform4fv(self._u_layer_rect_loc, N_LAYERS, rect_arr)
-        if self._u_layer_opacity_loc >= 0:
-            _g.glUniform1fv(self._u_layer_opacity_loc, N_LAYERS, op_arr)
+        # Push the single transition_t uniform for the active program.
+        # u_from / u_to sampler bindings are sticky from _compile_program;
+        # only the t value changes per frame.
+        loc = self._kind_locs[self._active_kind]["u_transition_t"]
+        if loc >= 0:
+            _g.glUniform1f(loc, self._transition_t)
 
         _g.glClearColor(0.0, 0.0, 0.0, 1.0)
         _g.glClear(_g.GL_COLOR_BUFFER_BIT)
@@ -967,18 +903,21 @@ class ShaderRenderer:
                 # ctypes array reliably; the (count, list) form is auto-
                 # converted on most builds but not all. Use the array
                 # form for forward-compat across Pi/Mesa builds.
-                live_textures = [t for t in self._tex_layer if t]
+                live_textures = [t for t in (self._tex_from, self._tex_to) if t]
                 if live_textures:
                     arr = (ctypes.c_uint * len(live_textures))(*live_textures)
                     _g.glDeleteTextures(len(live_textures), arr)
-                    self._tex_layer = [0] * N_LAYERS
+                    self._tex_from = 0
+                    self._tex_to = 0
                 if self._vbo:
                     arr = (ctypes.c_uint * 1)(self._vbo)
                     _g.glDeleteBuffers(1, arr)
                     self._vbo = 0
-                if self._program:
-                    _g.glDeleteProgram(self._program)
-                    self._program = 0
+                for kind, prog in list(self._programs.items()):
+                    if prog:
+                        _g.glDeleteProgram(prog)
+                self._programs.clear()
+                self._kind_locs.clear()
             except Exception:
                 log.exception("GL(shader): GL object cleanup failed")
             try:
