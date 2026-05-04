@@ -84,6 +84,9 @@ _SHADER_TRANSITION_KINDS = frozenset({
     "push",
     "scroll",
     "blinds",
+    "flip",
+    "marquee",
+    "shutter",
 })
 
 
@@ -1218,7 +1221,13 @@ class PlaybackLoop:
         no visible motion (the only column collapses to itself), so we
         fall back to fade. Per QA's 2026-04-28 transition-palette spec:
         "flip on a strip is meaningless — fall back to fade."
+
+        Routes through the shader compositor when available.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "flip", transition_ms,
+        ):
+            return
         width, height = from_image.size
         if width < 2:
             await self._fade(from_image, to_image, transition_ms)
@@ -1266,7 +1275,13 @@ class PlaybackLoop:
 
         Strip-graceful: width<2 → no horizontal motion is meaningful,
         fall back to fade. Per QA's spec for strip rendering.
+
+        Routes through the shader compositor when available.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "marquee", transition_ms,
+        ):
+            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -1793,7 +1808,13 @@ class PlaybackLoop:
         hexagon to read as anything other than a stripe (six vertices
         overlap at low resolution), so delegate to fade. Same shape as
         halftone's strip fallback.
+
+        Routes through the shader compositor when available.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "shutter", transition_ms,
+        ):
+            return
         from math import cos, pi, sin
 
         from PIL import ImageDraw

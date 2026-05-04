@@ -554,6 +554,117 @@ void main() {
 }
 """
 
+# Flip: 2D card-flip approximation. First half (t < 0.5):
+# u_from scaleX-shrinks 1.0 -> 0.0 around the vertical center line.
+# Second half (t >= 0.5): u_to scaleX-grows 0.0 -> 1.0. At t=0.5
+# the card is collapsed to a hairline at center; off-card pixels
+# show black (matches the PIL Image.new("RGB", ...) default).
+_FRAGMENT_FLIP = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  float t = u_transition_t;
+  float scaleX = abs(2.0 * t - 1.0);  // 1 at t=0, 0 at t=0.5, 1 at t=1
+  float useTo = step(0.5, t);
+  vec4 col = vec4(0.0, 0.0, 0.0, 1.0);
+  if (scaleX > 0.001) {
+    float src_x = (v_uv.x - 0.5) / scaleX + 0.5;
+    if (src_x >= 0.0 && src_x <= 1.0) {
+      vec2 uv = vec2(src_x, v_uv.y);
+      vec4 a = texture2D(u_from, uv);
+      vec4 b = texture2D(u_to, uv);
+      col = mix(a, b, useTo);
+    }
+  }
+  gl_FragColor = col;
+}
+"""
+
+# Marquee: tickertape wraparound. u_from scrolls off to the left;
+# a gap zone with a centered white dot passes through; u_to enters
+# from the right. Total compound width = 1 + gap_uv (from + gap +
+# to laid end-to-end). Scroll position advances 0 -> 1 + gap_uv as
+# t goes 0 -> 1. Per-pixel zone selection via step() masks; no
+# branches in the hot path.
+_FRAGMENT_MARQUEE = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  float gap_uv = 0.125;  // ~240px at 1080p, matches PIL gap_w = width/8
+  float scroll = u_transition_t * (1.0 + gap_uv);
+  float cx = scroll + v_uv.x;
+
+  // Sample all three zones unconditionally; mask out below.
+  vec4 from_col = texture2D(u_from, vec2(cx, v_uv.y));
+  vec4 to_col = texture2D(u_to, vec2(cx - 1.0 - gap_uv, v_uv.y));
+
+  // Gap zone: white dot centered. PIL uses radius = min(gap_w/3,
+  // height/3); on 1080p 16:9 with gap_w=240, height=1080, that's
+  // min(80, 360) = 80 px = 80/1080 = 0.074 in v_uv.y units.
+  // Aspect-correct the dot so it reads circular.
+  float gap_local_x = (cx - 1.0) / gap_uv;  // 0..1 within gap
+  float dx_uv = (gap_local_x - 0.5) * gap_uv;  // back to global UV scale
+  float dy = v_uv.y - 0.5;
+  float dist = length(vec2(dx_uv, dy));
+  float dot_r = 0.074;
+  float in_dot = step(dist, dot_r);
+  vec4 gap_col = mix(vec4(0.0, 0.0, 0.0, 1.0), vec4(1.0), in_dot);
+
+  // Zone selection.
+  float in_from = step(cx, 1.0);
+  float in_to = step(1.0 + gap_uv, cx);
+  float in_gap = 1.0 - in_from - in_to;
+
+  gl_FragColor = from_col * in_from + gap_col * in_gap + to_col * in_to;
+}
+"""
+
+# Shutter: hexagonal aperture. A regular hexagon centered on the
+# canvas grows from a point at t=0 to fully covering the canvas at
+# t=1. Inside hex = u_to; outside = u_from. Pointy-top orientation
+# (vertex on +y); aspect-corrected for 16:9 so the hex reads
+# regular. Hexagon distance test: max of three edge-normal
+# projections (other three are mirror via abs()) compared against
+# the inscribed radius.
+_FRAGMENT_SHUTTER = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  vec2 d = v_uv - vec2(0.5);
+  d.x *= 16.0 / 9.0;  // aspect correction so hex is geometrically regular
+
+  // Edge-normal projections. cos(pi/6) = sqrt(3)/2 ~= 0.866.
+  // Three normals at 30, 90, 150 deg cover the hexagon's six edges
+  // via the abs(); fourth quadrant edges fall out by symmetry.
+  float k = 0.866025;
+  float c1 = abs(d.x * k + d.y * 0.5);
+  float c2 = abs(d.y);
+  float c3 = abs(d.x * k - d.y * 0.5);
+  float hex_d = max(max(c1, c2), c3);
+
+  // Inscribed radius grows 0 -> 1.5 over t. 1.5 over-covers the
+  // canvas by t=1 with margin, so corners fully reveal u_to before
+  // the aperture math could leave a sliver.
+  float inscribed = 1.5 * u_transition_t;
+  float mask = step(hex_d, inscribed);
+  gl_FragColor = mix(a, b, mask);
+}
+"""
+
 # Transition-kind ID -> fragment shader source. Add new kinds here as
 # their per-fragment math is worked out; ShaderRenderer compiles each
 # program at startup and picks one per transition via set_kind().
@@ -569,6 +680,9 @@ _TRANSITION_SHADERS: dict[str, str] = {
     "push": _FRAGMENT_PUSH,
     "scroll": _FRAGMENT_SCROLL,
     "blinds": _FRAGMENT_BLINDS,
+    "flip": _FRAGMENT_FLIP,
+    "marquee": _FRAGMENT_MARQUEE,
+    "shutter": _FRAGMENT_SHUTTER,
 }
 
 
