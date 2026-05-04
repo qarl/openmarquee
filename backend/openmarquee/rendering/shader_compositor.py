@@ -379,6 +379,80 @@ void main() {
 }
 """
 
+# Halftone: u_to emerges through a regular grid of growing circular
+# dots, one per cell. Cell pitch = ~8 cells across the smaller dim
+# (matches the PIL halftone's pitch = min(w,h) // 8). Per-cell radius
+# grows 0 -> ~half-diagonal over t, so by t=1 every dot covers its
+# cell entirely and u_to is fully revealed.
+#
+# Aspect correction: 16:9 hardcoded for the HDMI 1080p target -- LED
+# matrix and fb0 paths don't reach the shader compositor (they lack
+# drm_fd). On a non-16:9 panel cells would render as ovals; that's a
+# visual compromise to defer until non-16:9 deployments matter.
+_FRAGMENT_HALFTONE = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  // 8 cells vertical (smaller dim), 8 * 16/9 ~= 14 horizontal on 1080p.
+  // fract(uv * grid) gives cell-local UV in [0,1).
+  float grid_y = 8.0;
+  float aspect = 16.0 / 9.0;
+  vec2 cell_uv = fract(vec2(v_uv.x * grid_y * aspect, v_uv.y * grid_y));
+  // Distance to cell center, in cell-relative coords.
+  float d = distance(cell_uv, vec2(0.5));
+  // Radius grows 0 -> 0.71 (cell half-diagonal) over t.
+  float mask = step(d, u_transition_t * 0.71);
+  gl_FragColor = mix(a, b, mask);
+}
+"""
+
+# Glitch: digital-corruption look. Per-row horizontal jitter + linear
+# cross-fade + occasional cyan tear rows. Animated frame-to-frame so
+# the corruption "breaks" actively rather than sitting still -- the
+# canonical "screen tearing" read.
+#
+# frame_seed below quantizes u_transition_t into ~30 distinct buckets
+# over the transition window, so the per-row hash gets a fresh seed
+# every frame even though u_transition_t is the only time uniform.
+_FRAGMENT_GLITCH = """#version 100
+precision highp float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+float _hash(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main() {
+  // ~1080 rows at 1080p; floor() to get a stable per-row index.
+  float row = floor(v_uv.y * 1080.0);
+  // 30 distinct frame buckets across the transition window. Each
+  // bucket gets its own per-row jitter -- looks like new corruption
+  // appearing every frame.
+  float frame_seed = floor(u_transition_t * 30.0);
+  float jitter = (_hash(vec2(row, frame_seed)) - 0.5) * 0.1 * u_transition_t;
+  vec2 uv2 = vec2(v_uv.x + jitter, v_uv.y);
+  vec4 a = texture2D(u_from, uv2);
+  vec4 b = texture2D(u_to, uv2);
+  vec4 col = mix(a, b, u_transition_t);
+  // Tear bands: ~5% of rows in each frame get a cyan overlay. Hash
+  // (coarser row groups, frame_seed) so tears are wider than 1px and
+  // jump around per frame.
+  float tear_row = floor(v_uv.y * 60.0);  // 60 horizontal bands
+  float tear = step(0.95, _hash(vec2(tear_row, frame_seed + 1.0)));
+  col.rgb = mix(col.rgb, vec3(0.0, 1.0, 1.0), tear * 0.5 * u_transition_t);
+  gl_FragColor = col;
+}
+"""
+
 # Transition-kind ID -> fragment shader source. Add new kinds here as
 # their per-fragment math is worked out; ShaderRenderer compiles each
 # program at startup and picks one per transition via set_kind().
@@ -388,6 +462,8 @@ _TRANSITION_SHADERS: dict[str, str] = {
     "dissolve": _FRAGMENT_DISSOLVE,
     "pixelate": _FRAGMENT_PIXELATE,
     "scanline": _FRAGMENT_SCANLINE,
+    "halftone": _FRAGMENT_HALFTONE,
+    "glitch": _FRAGMENT_GLITCH,
 }
 
 

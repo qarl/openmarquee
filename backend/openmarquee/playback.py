@@ -78,6 +78,8 @@ _SHADER_TRANSITION_KINDS = frozenset({
     "dissolve",
     "pixelate",
     "scanline",
+    "halftone",
+    "glitch",
 })
 
 
@@ -1424,7 +1426,13 @@ class PlaybackLoop:
         Strip-graceful: width<4 or height<4 leaves nothing for the dot
         grid to cohere into (a single column of cells just degenerates
         to a stripe), so delegate to fade.
+
+        Routes through the shader compositor when available.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "halftone", transition_ms,
+        ):
+            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -1552,7 +1560,13 @@ class PlaybackLoop:
         Strip-graceful: works at any geometry. Per-row jitter is
         shape-agnostic; even a 1×N strip just sees its single row jitter
         each frame. No fallback needed (and none added). Per QA's spec.
+
+        Routes through the shader compositor when available.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "glitch", transition_ms,
+        ):
+            return
         width, height = from_image.size
         rng = np.random.default_rng()
         # Jitter ceiling ~10% of canvas width, min 1. Bigger jitter
