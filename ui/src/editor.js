@@ -414,6 +414,15 @@ const LAYER_GROUP_TEMPLATE = `
                     <option value="blink">Blink (on/off)</option>
                 </select>
             </label>
+            <label class="om-field" style="flex: 1;">
+                <span>Blend</span>
+                <select class="om-select field-blend" aria-label="layer blend mode">
+                    <option value="normal">Normal</option>
+                    <option value="multiply">Multiply (darken)</option>
+                    <option value="screen">Screen (lighten)</option>
+                    <option value="overlay">Overlay (contrast)</option>
+                </select>
+            </label>
             <button type="button" class="om-btn ghost editor-layer-delete" aria-label="delete layer" title="delete layer" style="color: var(--om-bad); align-self: end; margin-bottom: 1px;">🗑</button>
         </div>
         <div class="om-row field-motion-controls" style="gap: 10px; align-items: end;" hidden>
@@ -446,6 +455,7 @@ function defaultLayer() {
         motion: "static",
         motionIntensity: 50,
         motionPhase: 0,
+        blend: "normal",
         visible: true,
         box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
     };
@@ -801,6 +811,8 @@ export function mountEditor(
         layer.autoFormat = layer.autoMode ? fmtEl.value || null : null;
         const motionEl = groupEl.querySelector(".field-motion");
         layer.motion = motionEl ? motionEl.value || "static" : "static";
+        const blendEl = groupEl.querySelector(".field-blend");
+        layer.blend = blendEl ? blendEl.value || "normal" : "normal";
         const intensityEl = groupEl.querySelector(".field-motion-intensity");
         const parsedIntensity = Number(intensityEl?.value);
         if (Number.isFinite(parsedIntensity)) {
@@ -882,10 +894,11 @@ export function mountEditor(
         const motionEl = groupEl.querySelector(".field-motion");
         const motionIntensityEl = groupEl.querySelector(".field-motion-intensity");
         const motionPhaseEl = groupEl.querySelector(".field-motion-phase");
+        const blendEl = groupEl.querySelector(".field-blend");
 
         for (const el of [
             textEl, layerNameEl, textColorEl, fontSizeEl, fontFamilyEl,
-            motionEl, motionIntensityEl, motionPhaseEl,
+            motionEl, motionIntensityEl, motionPhaseEl, blendEl,
         ]) {
             if (!el) continue;
             // <select> fires "change" on commit; <input> fires "input"
@@ -1149,6 +1162,8 @@ export function mountEditor(
             layer.autoMode || "",
         );
         motionEl.value = layer.motion || "static";
+        const blendEl = groupEl.querySelector(".field-blend");
+        if (blendEl) blendEl.value = layer.blend || "normal";
         const intensityEl = groupEl.querySelector(".field-motion-intensity");
         const phaseEl = groupEl.querySelector(".field-motion-phase");
         const intensityVal = layer.motionIntensity ?? 50;
@@ -1510,6 +1525,7 @@ export function mountEditor(
             motion: layer.motion || "static",
             motion_intensity: layer.motionIntensity ?? 50,
             motion_phase: layer.motionPhase ?? 0,
+            blend: layer.blend || "normal",
             visible: layer.visible !== false,
             box: { ...layer.box },
         }));
@@ -1641,6 +1657,7 @@ export function mountEditor(
             motion: wire?.motion || "static",
             motionIntensity: wire?.motion_intensity ?? 50,
             motionPhase: wire?.motion_phase ?? 0,
+            blend: wire?.blend || "normal",
             visible: wire?.visible !== false,
             box:
                 wire?.box && typeof wire.box === "object"
