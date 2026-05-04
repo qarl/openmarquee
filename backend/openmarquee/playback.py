@@ -210,6 +210,13 @@ class PlaybackLoop:
         # plane budget statically (incoming gets [N/2..N-1]).
         self._outgoing_compositor: "GPUSlideCompositor | None" = None
         self._outgoing_slide: "TextSlide | None" = None
+        # Slide-relative monotonic time at the moment the outgoing
+        # slide started ticking. _tick_outgoing_during_transition
+        # uses this as the elapsed_s base so motion phase stays
+        # continuous across the handoff (fixes #207: ticker
+        # specifically would otherwise snap back to far-right at
+        # transition entry because phase=0 puts it at scroll start).
+        self._outgoing_slide_t0: float | None = None
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
@@ -367,6 +374,7 @@ class PlaybackLoop:
         c = self._outgoing_compositor
         self._outgoing_compositor = None
         self._outgoing_slide = None
+        self._outgoing_slide_t0 = None
         if c is None:
             return
         try:
@@ -842,6 +850,14 @@ class PlaybackLoop:
             if self._shader_transitions_enabled():
                 self._outgoing_compositor = compositor
                 self._outgoing_slide = item  # type: ignore[assignment]
+                # Stash the slide's tick base so motion phase stays
+                # continuous across the transition handoff (#207). t0
+                # is the loop's monotonic time when the slide started
+                # ticking; _tick_outgoing_during_transition computes
+                # elapsed_s = monotonic.now() - t0 so the same phase
+                # the slide had at end-of-duration carries into the
+                # transition window.
+                self._outgoing_slide_t0 = t0
             else:
                 try:
                     compositor.detach()
@@ -1055,12 +1071,17 @@ class PlaybackLoop:
         import time as _time
 
         paused = False
-        # Outgoing-compositor tick base: elapsed_s for tick() should
-        # continue from where the slide left off, but the slide didn't
-        # track that across the handoff. Restart at 0 from transition
-        # entry; a small phase discontinuity at the seam is invisible
-        # vs the transition itself.
-        outgoing_t0 = _time.monotonic() if outgoing is not None else None
+        # Outgoing-compositor tick base: prefer the slide's stashed t0
+        # so motion phase stays continuous across the handoff (#207).
+        # Fall back to "0 = now" if the stash is missing for any
+        # reason -- pulse / breathe / bounce / shake / blink are all
+        # cycle-symmetric so the seam is invisible there. Ticker
+        # specifically would snap back to far-right without the
+        # passthrough; with it, the marquee continues from its
+        # mid-scroll position.
+        outgoing_t0 = self._outgoing_slide_t0 if (
+            outgoing is not None and self._outgoing_slide_t0 is not None
+        ) else (_time.monotonic() if outgoing is not None else None)
         try:
             sr.set_kind(kind)
             sr.set_from(from_rgba, width, height)
