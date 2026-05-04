@@ -369,21 +369,35 @@ class ShaderRenderer:
                 r.commit_frame()
 
     Width/height are auto-derived from the connector's preferred mode
-    (1920x1080 on the dev Pi). The renderer takes DRM master at
-    __enter__ and releases it at close — only one DRM master per
-    device, so the welcome loop / multi-plane compositor must be
-    stopped (or hand off the FB cleanly) first.
+    (1920x1080 on the dev Pi). DRM-fd ownership has two modes:
+
+    * Default (no `drm_fd` arg): we open `/dev/dri/card0`, take DRM
+      master at __enter__, blank the CRTC + close the fd at close().
+      The welcome loop / multi-plane compositor must be stopped first.
+
+    * Shared (`drm_fd` arg): the caller's renderer (typically
+      DRMRenderer in multi-plane mode) holds master and passes its
+      live fd in. We do plane discovery + GBM/EGL setup against the
+      same fd; commit_frame's SetCrtc/PageFlip uses the existing
+      master authorization. close() releases GL/EGL/GBM but does NOT
+      close the fd or blank the CRTC — the caller resumes scanout by
+      SetCrtc'ing back to its own primary fb. This is the path
+      PlaybackLoop drives during a slide-to-slide transition window.
     """
 
     def __init__(
         self,
         *,
         device_path: Path = Path("/dev/dri/card0"),
+        drm_fd: int | None = None,
     ) -> None:
         self.device_path = Path(device_path)
+        # When drm_fd is supplied, the caller owns master + fd lifecycle.
+        # close() must not close it nor blank the CRTC.
+        self._owns_fd: bool = drm_fd is None
         self.width: int = 0
         self.height: int = 0
-        self._fd: int = -1
+        self._fd: int = -1 if drm_fd is None else drm_fd
         self._gbm_dev: int = 0  # gbm_device*, raw int
         self._gbm_surf: int = 0  # gbm_surface*, raw int
         self._egl_display: int = 0
@@ -441,8 +455,16 @@ class ShaderRenderer:
 
     def _open_drm(self) -> None:
         assert _libdrm is not None
-        self._fd = os.open(str(self.device_path), os.O_RDWR | os.O_CLOEXEC)
-        log.info("DRM(shader): opened %s fd=%d", self.device_path, self._fd)
+        if self._owns_fd:
+            self._fd = os.open(
+                str(self.device_path), os.O_RDWR | os.O_CLOEXEC,
+            )
+            log.info("DRM(shader): opened %s fd=%d", self.device_path, self._fd)
+        else:
+            log.info(
+                "DRM(shader): using shared fd=%d (caller owns master)",
+                self._fd,
+            )
 
         res_ptr = _libdrm.drmModeGetResources(self._fd)
         if not res_ptr:
@@ -864,12 +886,16 @@ class ShaderRenderer:
         from OpenGL import GLES2 as _g
 
         # Blank the CRTC FIRST so the kernel isn't scanning out a fb
-        # we're about to RmFB.
+        # we're about to RmFB. SKIPPED in shared-fd mode: the caller
+        # owns master and is about to SetCrtc back to its own primary
+        # fb, so blanking would just add a single black frame between
+        # the last shader frame and the caller's resumed scanout.
         if (
             _libdrm is not None
             and self._fd >= 0
             and self._setcrtc_done
             and self._connector_arr is not None
+            and self._owns_fd
         ):
             try:
                 null_mode = ctypes.POINTER(_DrmModeModeInfo)()
@@ -960,7 +986,7 @@ class ShaderRenderer:
                 pass
             self._gbm_dev = 0
 
-        if self._fd >= 0:
+        if self._fd >= 0 and self._owns_fd:
             try:
                 os.close(self._fd)
             except Exception:
