@@ -95,3 +95,53 @@ def compose_slide_rgba(
         layer_rgba = render_layer_to_rgba(layer, width, height, now=now)
         bg.alpha_composite(layer_rgba)
     return bg.tobytes()
+
+
+def compose_slide_bg_statics_rgba(
+    slide: "TextSlide",
+    width: int,
+    height: int,
+    *,
+    read_asset: Callable[[UUID], bytes] | None = None,
+    now: datetime | None = None,
+) -> bytes:
+    """Variant of `compose_slide_rgba` that includes only bg + STATIC
+    layers (motion="static" AND no auto_mode), skipping every animated
+    layer.
+
+    Used as the shader transition's u_from / u_to when keeping the
+    outgoing/incoming slide's animated overlays alive on multi-plane
+    overlay planes (#206). The shader transitions the flat bg+statics
+    portion of the slide; HVS composites the animated overlays on top
+    at scanout, so animation keeps moving through the transition
+    window instead of freezing.
+
+    Without this, baking animated layers' positions into u_from /
+    u_to would double-paint with the live overlay planes (frozen
+    shader copy + moving HVS copy of the same text).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    if (
+        getattr(slide, "background_image_slide_id", None) is not None
+        and read_asset is None
+    ):
+        log.warning(
+            "snapshot: slide %s has background_image_slide_id but no "
+            "read_asset; bg falls through to pattern/solid",
+            getattr(slide, "id", "<no-id>"),
+        )
+
+    bg = _load_background(slide, width, height, read_asset)
+    if bg.mode != "RGBA":
+        bg = bg.convert("RGBA")
+    for layer in getattr(slide, "text_layers", []):
+        if not getattr(layer, "visible", True):
+            continue
+        motion = getattr(layer, "motion", None) or "static"
+        auto = getattr(layer, "auto_mode", None)
+        if motion != "static" or auto:
+            continue  # animated -- handled by overlay planes during transition
+        layer_rgba = render_layer_to_rgba(layer, width, height, now=now)
+        bg.alpha_composite(layer_rgba)
+    return bg.tobytes()

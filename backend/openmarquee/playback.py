@@ -105,6 +105,7 @@ def _count_animated_layers(item: ContentItem) -> int:
     )
 
 if TYPE_CHECKING:
+    from openmarquee.content import TextSlide
     from openmarquee.content.storage import ContentStorage
     from openmarquee.playlist import PlaylistStorage
     from openmarquee.rendering.shader_compositor import ShaderRenderer
@@ -164,6 +165,22 @@ class PlaybackLoop:
         # ShaderRenderer construction after a failure (e.g. on dev hosts
         # without libdrm/libegl).
         self._shader_renderer_disabled: bool = False
+        # Outgoing slide's GPUSlideCompositor, held alive across the
+        # transition so animated text overlays keep moving (#206)
+        # rather than freezing while the shader transitions the
+        # bg+statics layer underneath. Set by _play_dynamic_slide_gpu
+        # when shader transitions are enabled; consumed (and detached)
+        # by _run_shader_transition or by _drain_outgoing_compositor
+        # before non-shader transitions / new slide attaches.
+        #
+        # The outgoing compositor owns its overlay slots [0..N-1] until
+        # drain. Future symmetric "fade-in for incoming compositor"
+        # work must NOT pre-attach the next compositor before this one
+        # drains -- they'd collide on slot indices. Either drain first
+        # (sacrifice continuous incoming-side motion) or split the
+        # plane budget statically (incoming gets [N/2..N-1]).
+        self._outgoing_compositor: "GPUSlideCompositor | None" = None
+        self._outgoing_slide: "TextSlide | None" = None
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
@@ -309,6 +326,23 @@ class PlaybackLoop:
                     )
                 self._shader_renderer = None
             self._shader_renderer_disabled = False
+            self._drain_outgoing_compositor()
+
+    def _drain_outgoing_compositor(self) -> None:
+        """Detach the outgoing slide's compositor (#206 cleanup) if one
+        is being held alive across a transition. Idempotent. Called
+        BEFORE non-shader transitions (so overlay slot 0 is free for
+        _fade_gpu / _wipe_gpu), AFTER any transition that didn't claim
+        the compositor itself, and on stop()."""
+        c = self._outgoing_compositor
+        self._outgoing_compositor = None
+        self._outgoing_slide = None
+        if c is None:
+            return
+        try:
+            c.detach()
+        except Exception:
+            log.exception("playback: outgoing compositor detach failed")
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
@@ -442,6 +476,18 @@ class PlaybackLoop:
                     next_image = self._safe_load_image(next_item)
                     if next_image is not None:
                         kind = item.transition
+                        # If the next transition isn't shader-routed
+                        # (or shader transitions are off), drain the
+                        # outgoing compositor NOW so its overlay slots
+                        # are free for _fade_gpu / _wipe_gpu / etc.
+                        # Shader-routed transitions get the compositor
+                        # passed through via self._outgoing_compositor
+                        # and detach it themselves.
+                        if (
+                            self._outgoing_compositor is not None
+                            and kind not in _SHADER_TRANSITION_KINDS
+                        ):
+                            self._drain_outgoing_compositor()
                         if kind == "fade":
                             await self._fade(current_image, next_image, item.transition_ms)
                         elif kind == "wipe":
@@ -472,6 +518,14 @@ class PlaybackLoop:
                             await self._blinds(current_image, next_image, item.transition_ms)
                         elif kind == "shutter":
                             await self._shutter(current_image, next_image, item.transition_ms)
+
+                # Catch-all: drain any compositor still alive after the
+                # transition. Shader-routed transitions normally detach
+                # inside _run_shader_transition, but if shader was
+                # unavailable (env off, exception, fall-through to PIL)
+                # the compositor stays here and would otherwise leak
+                # into the next slide. Idempotent.
+                self._drain_outgoing_compositor()
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -744,12 +798,26 @@ class PlaybackLoop:
                 )
                 return None
         finally:
-            try:
-                compositor.detach()
-            except Exception:
-                log.exception(
-                    "playback: GPU compositor detach failed for %s", item.id,
-                )
+            # When shader transitions are enabled, hand the compositor
+            # to the loop so the next transition can keep its overlays
+            # ticking through the transition window (#206). The loop
+            # is responsible for eventual detach: shader-routed
+            # transitions detach inside _run_shader_transition; non-
+            # shader transitions detach via _drain_outgoing_compositor
+            # before they fire (so overlay slot 0 is free for
+            # _fade_gpu / _wipe_gpu). Otherwise (shader path off):
+            # detach immediately, current behavior, no slot conflict
+            # risk.
+            if self._shader_transitions_enabled():
+                self._outgoing_compositor = compositor
+                self._outgoing_slide = item  # type: ignore[assignment]
+            else:
+                try:
+                    compositor.detach()
+                except Exception:
+                    log.exception(
+                        "playback: GPU compositor detach failed for %s", item.id,
+                    )
 
     def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
         """Load + resize an item's PNG to renderer dimensions.
@@ -911,14 +979,38 @@ class PlaybackLoop:
         renderer = self._renderer
         width, height = sr.width, sr.height
 
-        if from_image.mode != "RGBA":
-            from_image = from_image.convert("RGBA")
-        if from_image.size != (width, height):
-            from_image = from_image.resize((width, height), Image.NEAREST)
-        if to_image.mode != "RGBA":
-            to_image = to_image.convert("RGBA")
-        if to_image.size != (width, height):
-            to_image = to_image.resize((width, height), Image.NEAREST)
+        # If the outgoing slide had animated text layers (motion or
+        # auto_mode), keep its overlays alive on multi-plane during the
+        # transition so motion doesn't freeze (#206). u_from is then
+        # bg+statics-ONLY of the outgoing slide -- the animated layers
+        # come from live overlay planes scanned out by the HVS on top
+        # of the shader's primary plane output. Without this, baking
+        # animated layers' positions into u_from would double-paint
+        # with the live overlays.
+        outgoing = self._outgoing_compositor
+        outgoing_slide = self._outgoing_slide
+        from_rgba: bytes
+        if outgoing is not None and outgoing_slide is not None:
+            try:
+                from openmarquee.rendering.snapshot import (
+                    compose_slide_bg_statics_rgba,
+                )
+                from_rgba = compose_slide_bg_statics_rgba(
+                    outgoing_slide, width, height,
+                    read_asset=self._read_asset,
+                )
+            except Exception:
+                log.exception(
+                    "playback: bg+statics compose failed for outgoing "
+                    "slide; falling back to full from_image (motion "
+                    "will freeze through transition)"
+                )
+                outgoing = None  # disable the live-overlay path
+                from_rgba = self._image_to_rgba_bytes(from_image, width, height)
+        else:
+            from_rgba = self._image_to_rgba_bytes(from_image, width, height)
+
+        to_rgba = self._image_to_rgba_bytes(to_image, width, height)
 
         # Track why we exit the frame loop. Pause means a stream
         # takeover is becoming the new owner of render_frame/commit
@@ -926,11 +1018,19 @@ class PlaybackLoop:
         # double-commit the primary plane. Skip the handoff in that
         # case and let the takeover own the plane. On stop or normal
         # completion the handoff is correct and required.
+        import time as _time
+
         paused = False
+        # Outgoing-compositor tick base: elapsed_s for tick() should
+        # continue from where the slide left off, but the slide didn't
+        # track that across the handoff. Restart at 0 from transition
+        # entry; a small phase discontinuity at the seam is invisible
+        # vs the transition itself.
+        outgoing_t0 = _time.monotonic() if outgoing is not None else None
         try:
             sr.set_kind(kind)
-            sr.set_from(from_image.tobytes(), width, height)
-            sr.set_to(to_image.tobytes(), width, height)
+            sr.set_from(from_rgba, width, height)
+            sr.set_to(to_rgba, width, height)
             n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
             frame_period = (transition_ms / 1000) / n_frames
             assert self._stop_event is not None
@@ -944,6 +1044,14 @@ class PlaybackLoop:
                 t = i / n_frames
                 sr.set_transition_t(t)
                 sr.commit_frame()
+                # Tick outgoing compositor + ramp its overlays' alpha
+                # from 65535 -> 0 over t. Animation continues; the
+                # fade-out smooths the transition end so slide A's
+                # text doesn't snap off when we detach below.
+                if outgoing is not None and outgoing_t0 is not None:
+                    self._tick_outgoing_during_transition(
+                        outgoing, outgoing_t0, t,
+                    )
                 await self._wait(frame_period)
             if not paused and not self._stop_event.is_set():
                 # Land at t=1.0 so the final shader frame matches
@@ -951,6 +1059,10 @@ class PlaybackLoop:
                 # pause/stop -- nothing reads the result anyway.
                 sr.set_transition_t(1.0)
                 sr.commit_frame()
+                if outgoing is not None and outgoing_t0 is not None:
+                    self._tick_outgoing_during_transition(
+                        outgoing, outgoing_t0, 1.0,
+                    )
         except Exception:
             log.exception(
                 "playback: shader transition %r failed mid-flight; "
@@ -959,6 +1071,15 @@ class PlaybackLoop:
             )
             # Fall through to the handoff dance anyway (unless paused)
             # so the screen recovers cleanly after a shader-side error.
+
+        # Detach the outgoing compositor now -- it's done its job (kept
+        # motion alive through the transition), and its overlay slots
+        # need to be free for the next slide's GPUSlideCompositor.attach.
+        # Done BEFORE the primary handoff so the kernel doesn't have to
+        # honor a queue of overlay-property atomic commits that race the
+        # primary FB_ID swap.
+        if outgoing is not None:
+            self._drain_outgoing_compositor()
 
         if paused:
             # Stream takeover owns the plane now. Don't fight it.
@@ -983,6 +1104,64 @@ class PlaybackLoop:
                 "last frame until the next slide attach"
             )
         return True
+
+    def _image_to_rgba_bytes(
+        self, image: Image.Image, width: int, height: int,
+    ) -> bytes:
+        """Resize + RGBA-convert a PIL image to width*height*4 bytes."""
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.NEAREST)
+        return image.tobytes()
+
+    def _tick_outgoing_during_transition(
+        self,
+        compositor: "GPUSlideCompositor",
+        t0_monotonic: float,
+        transition_t: float,
+    ) -> None:
+        """Per-shader-frame tick for the outgoing slide's compositor
+        during a transition (#206). Calls compositor.tick(elapsed) so
+        motion phase keeps advancing, then ramps every active overlay
+        plane's alpha from 65535 (full) at transition_t=0 to 0 (gone)
+        at transition_t=1. The HVS composites each overlay over the
+        shader's primary-plane output at scanout; the ramp gives a
+        smooth fade-out instead of a snap-off when we detach at the
+        end of _run_shader_transition.
+
+        Tick exceptions are logged but non-fatal -- a one-frame motion
+        glitch is preferable to a crashed transition mid-flight.
+
+        Note: alpha-ramp runs AFTER compositor.tick() and clobbers any
+        per-frame alpha that pulse/blink motion staged on the same
+        slots. Last-write-wins is correct for the transition: we want
+        a smooth monotonic fade-out, not pulse-during-fade. For
+        layers with non-pulse motion the alpha override is invisible.
+        """
+        import time as _time
+        from datetime import UTC
+        elapsed = _time.monotonic() - t0_monotonic
+        try:
+            compositor.tick(elapsed, now=datetime.now(UTC))
+        except Exception:
+            log.exception(
+                "playback: outgoing-compositor tick during transition failed"
+            )
+        # Now ramp alpha. Reach into the compositor's slot mapping;
+        # _slot_for_layer is module-internal but the shape is stable
+        # (private inside the gpu_compositor.py module, fine for our
+        # adjacent module). Update each animated plane's alpha + commit.
+        try:
+            alpha = max(0, min(65535, int(round(65535 * (1.0 - transition_t)))))
+            renderer = self._renderer
+            for slot_idx in compositor._slot_for_layer.values():
+                renderer.update_animated_layer(slot_idx, alpha=alpha)
+            renderer.commit()
+        except Exception:
+            log.exception(
+                "playback: outgoing-compositor alpha ramp during transition failed"
+            )
 
     async def _fade(
         self,
