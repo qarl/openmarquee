@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import io
 import logging
+import math
 import os
 from collections.abc import Callable
 from datetime import datetime
@@ -50,9 +51,13 @@ from PIL import Image, UnidentifiedImageError
 from openmarquee.auto_render import resolve_timezone
 from openmarquee.content import ContentItem
 from openmarquee.motion import (
+    _box_px,
+    _effect_freq,
     compose_motion_frame,
+    compute_phase,
     load_motion_background,
     prerender_layer_bitmaps,
+    render_layer_to_rgba,
     slide_has_dynamic_content,
     slide_has_motion,
 )
@@ -130,7 +135,7 @@ def _count_animated_layers(item: ContentItem) -> int:
     )
 
 if TYPE_CHECKING:
-    from openmarquee.content import TextSlide
+    from openmarquee.content import TextLayer, TextSlide
     from openmarquee.content.storage import ContentStorage
     from openmarquee.playlist import PlaylistStorage
     from openmarquee.rendering.shader_compositor import ShaderRenderer
@@ -1019,16 +1024,33 @@ class PlaybackLoop:
         compositor. Returns True iff it ran via shader; False means
         the caller must fall back to its own (PIL) transition path.
 
-        Shape mirrors phase7_loop_with_iris.py's transition body:
-          1. Convert from/to images to RGBA bytes at renderer dims.
-          2. set_kind(kind), set_from(...), set_to(...).
-          3. Frame loop: set_transition_t(t in [0,1]) + commit_frame +
+        Animated text on either side is composited in-shader via
+        per-side anim texture units (#215): the outgoing slide's first
+        animated layer (and the incoming slide's first) are rasterized
+        once at transition start, uploaded, and updated per frame with
+        motion math (ticker / breathe / pulse / bounce / blink). The
+        transition shader's per-pixel mask then clips the composited
+        anim+base correctly -- iris, wipe, dissolve etc. all separate
+        the two slides cleanly even with motion. Pre-#215 this was
+        attempted via HVS overlay planes layered ON TOP of the shader
+        primary, but HVS can only do plane-uniform alpha (no per-pixel
+        shape clip), so motion bled through the iris boundary. Pulling
+        motion INTO the shader's primary plane is the fix.
+
+        Shape:
+          1. Compose u_from / u_to bg+statics-only RGBA snapshots.
+          2. Extract one animated layer per side (if present),
+             rasterize glyph bbox, set_X_anim().
+          3. Detach outgoing compositor (its overlay slots are about
+             to be re-claimed by the next slide's GPUSlideCompositor;
+             motion now lives in the shader, not on overlays).
+          4. set_kind(kind), set_from(...), set_to(...).
+          5. Frame loop: per-frame motion math -> update_X_anim;
+             set_transition_t(t in [0,1]) + commit_frame +
              cooperative-pause-aware sleep.
-          4. Hand the primary plane back to multi-plane DRMRenderer in
+          6. Hand the primary plane back to multi-plane DRMRenderer in
              one atomic commit: render_frame(to_image), restage_primary
-             _fb(), commit. Order matters -- without restage,
-             _pending_props is empty and DRMRenderer.commit() is a
-             no-op, leaving the kernel scanning shader's last fb.
+             _fb(), commit.
         """
         if kind not in _SHADER_TRANSITION_KINDS:
             # Shouldn't be reached today (every kind is in the set);
@@ -1049,25 +1071,17 @@ class PlaybackLoop:
         renderer = self._renderer
         width, height = sr.width, sr.height
 
-        # If the outgoing slide had animated text layers (motion or
-        # auto_mode), keep its overlays alive on multi-plane during the
-        # transition so motion doesn't freeze (#206). u_from is then
-        # bg+statics-ONLY of the outgoing slide -- the animated layers
-        # come from live overlay planes scanned out by the HVS on top
-        # of the shader's primary plane output. Without this, baking
-        # animated layers' positions into u_from would double-paint
-        # with the live overlays.
-        outgoing = self._outgoing_compositor
+        # u_from / u_to: bg+statics-only snapshots of each side. The
+        # animated layers are pulled out separately and uploaded to
+        # the per-side anim texture units below; this two-channel
+        # split is what lets the transition mask clip motion correctly
+        # per-pixel.
         outgoing_slide = self._outgoing_slide
         from_rgba: bytes
-        if outgoing is not None and outgoing_slide is not None:
+        if outgoing_slide is not None:
             try:
-                # Cached snapshot path (#205): on the second + every
-                # subsequent shader transition for the same slide, this
-                # is microseconds; first call composes (~600 ms at
-                # 1080p) and stores. Slides with auto-mode layers skip
-                # the cache and compose every time (clock text changes
-                # by the second).
+                # Cached snapshot path (#205): microseconds on the
+                # second+ visit, ~600ms first time.
                 from_rgba = self._snapshot_cache.get_bg_statics(
                     outgoing_slide, width, height,
                     read_asset=self._read_asset,
@@ -1075,26 +1089,12 @@ class PlaybackLoop:
             except Exception:
                 log.exception(
                     "playback: bg+statics compose failed for outgoing "
-                    "slide; falling back to full from_image (motion "
-                    "will freeze through transition)"
+                    "slide; falling back to full from_image"
                 )
-                outgoing = None  # disable the live-overlay path
                 from_rgba = self._image_to_rgba_bytes(from_image, width, height)
         else:
             from_rgba = self._image_to_rgba_bytes(from_image, width, height)
 
-        # u_to: prefer bg+statics-only of the incoming slide so its
-        # animated layers don't appear as frozen ghosts in the shader-
-        # revealed area while the outgoing slide's overlay-plane
-        # animation is still scrolling on top (qarl 2026-05-04: "i'm
-        # seeing both slides moving text overlapping each other"). The
-        # incoming slide's animated layers attach via its own
-        # GPUSlideCompositor.attach AFTER the transition completes --
-        # there's a one-frame "snap" at the transition boundary as the
-        # animated text appears, but that's preferable to a ghost
-        # baked-in copy visible during the entire transition.
-        # Falls back to the PIL Image path when the incoming slide
-        # is non-TextSlide (image / video) or unavailable.
         to_rgba: bytes
         incoming_slide = self._incoming_slide
         if incoming_slide is not None:
@@ -1106,12 +1106,45 @@ class PlaybackLoop:
             except Exception:
                 log.exception(
                     "playback: bg+statics compose failed for incoming "
-                    "slide; falling back to full to_image (animated "
-                    "layers may ghost during transition)"
+                    "slide; falling back to full to_image"
                 )
                 to_rgba = self._image_to_rgba_bytes(to_image, width, height)
         else:
             to_rgba = self._image_to_rgba_bytes(to_image, width, height)
+
+        # Extract first animated layer per side (#215). For each side:
+        # rasterize the layer at slide dims, crop to the glyph bbox,
+        # and stash everything _anim_uv_for_frame needs (layer schema +
+        # box_px + glyph bbox in slide pixel coords). The cached
+        # bytes go directly into ShaderRenderer's anim texture units.
+        outgoing_anim = self._extract_first_animated_layer(
+            outgoing_slide, width, height,
+        )
+        incoming_anim = self._extract_first_animated_layer(
+            incoming_slide, width, height,
+        )
+
+        # Capture the outgoing slide's tick base BEFORE drain --
+        # _drain_outgoing_compositor unconditionally clears
+        # _outgoing_slide_t0, and we need it after the drain to keep
+        # motion phase continuous through the seam (#207). Without
+        # this, ticker snaps back to its phase-0 right-edge position
+        # the moment the transition starts.
+        import time as _time
+        outgoing_t0 = (
+            self._outgoing_slide_t0
+            if self._outgoing_slide_t0 is not None
+            else _time.monotonic()
+        )
+
+        # Now drain the outgoing compositor. Pre-#215 this happened at
+        # the END of the transition because overlays were animating in
+        # parallel with the shader; with shader-side anim that's
+        # obsolete -- the overlay slots are free immediately. Done
+        # BEFORE the frame loop so any committed atomic state is fully
+        # settled before the shader's primary-plane PageFlips begin
+        # (avoids fighting the kernel's CRTC serialization).
+        self._drain_outgoing_compositor()
 
         # Track why we exit the frame loop. Pause means a stream
         # takeover is becoming the new owner of render_frame/commit
@@ -1119,30 +1152,27 @@ class PlaybackLoop:
         # double-commit the primary plane. Skip the handoff in that
         # case and let the takeover own the plane. On stop or normal
         # completion the handoff is correct and required.
-        import time as _time
-
         paused = False
-        # Outgoing-compositor tick base: prefer the slide's stashed t0
-        # so motion phase stays continuous across the handoff (#207).
-        # Fall back to "0 = now" if the stash is missing for any
-        # reason -- pulse / breathe / bounce / shake / blink are all
-        # cycle-symmetric so the seam is invisible there. Ticker
-        # specifically would snap back to far-right without the
-        # passthrough; with it, the marquee continues from its
-        # mid-scroll position.
-        outgoing_t0 = self._outgoing_slide_t0 if (
-            outgoing is not None and self._outgoing_slide_t0 is not None
-        ) else (_time.monotonic() if outgoing is not None else None)
         try:
             sr.set_kind(kind)
             sr.set_from(from_rgba, width, height)
             sr.set_to(to_rgba, width, height)
+            sr.clear_anim()
+            if outgoing_anim is not None:
+                _, _, rgba, gbbox, _ = outgoing_anim
+                sr.set_from_anim(rgba, gbbox[2], gbbox[3])
+            if incoming_anim is not None:
+                _, _, rgba, gbbox, _ = incoming_anim
+                sr.set_to_anim(rgba, gbbox[2], gbbox[3])
             n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
             frame_period = (transition_ms / 1000) / n_frames
             assert self._stop_event is not None
             assert self._pause_event is not None
             transition_start = _time.monotonic()
             frames_drawn = 0
+            has_motion = (
+                outgoing_anim is not None or incoming_anim is not None
+            )
             for i in range(1, n_frames + 1):
                 if self._pause_event.is_set():
                     paused = True
@@ -1151,15 +1181,26 @@ class PlaybackLoop:
                     break
                 t = i / n_frames
                 sr.set_transition_t(t)
-                sr.commit_frame()
-                # Tick outgoing compositor + ramp its overlays' alpha
-                # from 65535 -> 0 over t. Animation continues; the
-                # fade-out smooths the transition end so slide A's
-                # text doesn't snap off when we detach below.
-                if outgoing is not None and outgoing_t0 is not None:
-                    self._tick_outgoing_during_transition(
-                        outgoing, outgoing_t0, t,
+                # Per-side motion math -> shader uniforms. Outgoing's
+                # phase clock is the slide's stashed t0 so phase
+                # passes through the transition seam without snap;
+                # incoming starts at transition_start (slide enters
+                # fresh).
+                if outgoing_anim is not None:
+                    _, layer, _, gbbox, bx = outgoing_anim
+                    elapsed_out = _time.monotonic() - outgoing_t0
+                    box_uv, alpha = self._anim_uv_for_frame(
+                        layer, bx, gbbox, width, height, elapsed_out,
                     )
+                    sr.update_from_anim(box_uv, alpha)
+                if incoming_anim is not None:
+                    _, layer, _, gbbox, bx = incoming_anim
+                    elapsed_in = _time.monotonic() - transition_start
+                    box_uv, alpha = self._anim_uv_for_frame(
+                        layer, bx, gbbox, width, height, elapsed_in,
+                    )
+                    sr.update_to_anim(box_uv, alpha)
+                sr.commit_frame()
                 frames_drawn += 1
                 await self._wait(frame_period)
             transition_elapsed = _time.monotonic() - transition_start
@@ -1170,7 +1211,7 @@ class PlaybackLoop:
                 "playback: shader transition %r %s: %d/%d frames in "
                 "%.2fs (%.1f fps achieved, target %.1f)",
                 kind,
-                "with-motion" if outgoing is not None else "snapshot-only",
+                "with-motion" if has_motion else "snapshot-only",
                 frames_drawn, n_frames,
                 transition_elapsed, achieved_fps, _FADE_FPS,
             )
@@ -1179,11 +1220,21 @@ class PlaybackLoop:
                 # to_image before we hand the plane back. Skip on
                 # pause/stop -- nothing reads the result anyway.
                 sr.set_transition_t(1.0)
-                sr.commit_frame()
-                if outgoing is not None and outgoing_t0 is not None:
-                    self._tick_outgoing_during_transition(
-                        outgoing, outgoing_t0, 1.0,
+                if outgoing_anim is not None:
+                    _, layer, _, gbbox, bx = outgoing_anim
+                    elapsed_out = _time.monotonic() - outgoing_t0
+                    box_uv, alpha = self._anim_uv_for_frame(
+                        layer, bx, gbbox, width, height, elapsed_out,
                     )
+                    sr.update_from_anim(box_uv, alpha)
+                if incoming_anim is not None:
+                    _, layer, _, gbbox, bx = incoming_anim
+                    elapsed_in = _time.monotonic() - transition_start
+                    box_uv, alpha = self._anim_uv_for_frame(
+                        layer, bx, gbbox, width, height, elapsed_in,
+                    )
+                    sr.update_to_anim(box_uv, alpha)
+                sr.commit_frame()
         except Exception:
             log.exception(
                 "playback: shader transition %r failed mid-flight; "
@@ -1192,15 +1243,6 @@ class PlaybackLoop:
             )
             # Fall through to the handoff dance anyway (unless paused)
             # so the screen recovers cleanly after a shader-side error.
-
-        # Detach the outgoing compositor now -- it's done its job (kept
-        # motion alive through the transition), and its overlay slots
-        # need to be free for the next slide's GPUSlideCompositor.attach.
-        # Done BEFORE the primary handoff so the kernel doesn't have to
-        # honor a queue of overlay-property atomic commits that race the
-        # primary FB_ID swap.
-        if outgoing is not None:
-            self._drain_outgoing_compositor()
 
         if paused:
             # Stream takeover owns the plane now. Don't fight it.
@@ -1211,9 +1253,6 @@ class PlaybackLoop:
         # stages the FB_ID + CRTC rects (otherwise commit() is a
         # no-op when _pending_props is empty), commit atomically
         # rebinds primary to OUR fb in one vblank.
-        # restage_primary_fb's existence is checked at construction
-        # time in _get_or_create_shader_renderer; if it's gone now,
-        # something is very wrong (renderer torn down mid-transition?).
         try:
             renderer.render_frame(to_image.convert("RGB").tobytes())
             renderer.restage_primary_fb()
@@ -1236,80 +1275,147 @@ class PlaybackLoop:
             image = image.resize((width, height), Image.NEAREST)
         return image.tobytes()
 
-    def _tick_outgoing_during_transition(
+    def _extract_first_animated_layer(
         self,
-        compositor: "GPUSlideCompositor",
-        t0_monotonic: float,
-        transition_t: float,
-    ) -> None:
-        """Per-shader-frame tick for the outgoing slide's compositor
-        during a transition (#206). Calls compositor.tick(elapsed) so
-        motion phase keeps advancing, then ramps every active overlay
-        plane's alpha from 65535 (full) at transition_t=0 to 0 (gone)
-        at transition_t=1. The HVS composites each overlay over the
-        shader's primary-plane output at scanout; the ramp gives a
-        smooth fade-out instead of a snap-off when we detach at the
-        end of _run_shader_transition.
+        slide: "TextSlide | None",
+        width: int,
+        height: int,
+    ) -> tuple[int, "TextLayer", bytes, tuple[int, int, int, int], tuple[int, int, int, int]] | None:
+        """Find the first visible animated layer with rasterized ink in
+        `slide`, return (layer_idx, layer, glyph_bbox_rgba_bytes,
+        glyph_bbox_px=(gx,gy,gw,gh), box_px=(bx,by,bw,bh)) for the
+        shader's per-side anim path (#215). Returns None if no
+        animated layer with ink, or if `slide` isn't a TextSlide
+        (image / video slides have no animated layers).
 
-        Tick exceptions are logged but non-fatal -- a one-frame motion
-        glitch is preferable to a crashed transition mid-flight.
+        Mirrors GPUSlideCompositor._attach_animated's rasterize path:
+        render_layer_to_rgba at slide dims, getbbox(), crop, tobytes.
+        Caller passes the bbox pixel dims into ShaderRenderer
+        .set_X_anim() and the box+glyph dims into _anim_uv_for_frame
+        each frame.
 
-        Note: alpha-ramp runs AFTER compositor.tick() and clobbers any
-        per-frame alpha that pulse/blink motion staged on the same
-        slots. Last-write-wins is correct for the transition: we want
-        a smooth monotonic fade-out, not pulse-during-fade. For
-        layers with non-pulse motion the alpha override is invisible.
-        """
-        import time as _time
-        from datetime import UTC
-        elapsed = _time.monotonic() - t0_monotonic
-        # Stage the alpha ramp BEFORE compositor.tick so they ride
-        # the same atomic commit -- without this we did 2 ioctls
-        # per shader frame on the overlay side and the with-motion
-        # path measured at ~10 fps (per #208 measurement). Reach
-        # into _slot_for_layer (module-private but adjacent to ours).
-        try:
-            alpha = max(0, min(65535, int(round(65535 * (1.0 - transition_t)))))
-            renderer = self._renderer
-            for slot_idx in compositor._slot_for_layer.values():
-                renderer.update_animated_layer(slot_idx, alpha=alpha)
-        except Exception:
-            log.exception(
-                "playback: outgoing-compositor alpha ramp during transition failed"
-            )
-        # tick stages motion-property changes and flushes via
-        # renderer.commit(nonblock=True). The alpha-ramp staged
-        # above rides in the same atomic commit. ONE atomic ioctl
-        # per overlay-side update per frame, AND with NONBLOCK the
-        # kernel returns immediately instead of serializing behind
-        # the shader's pending primary-plane PageFlip on the same
-        # CRTC (#214 fix; without NONBLOCK with-motion fps was
-        # ~11 fps because each tick waited for vblank).
-        #
-        # EBUSY (errno 16) is the kernel's "previous NONBLOCK commit
-        # not landed yet" signal -- expected when shader frames
-        # outpace vblank. We log it once at debug level (not
-        # exception) so the dropped tick is visible without spamming
-        # the log; the alpha-ramp staged just above is reissued on
-        # the next tick that succeeds.
-        try:
-            compositor.tick(
-                elapsed, now=datetime.now(UTC), nonblock_commit=True,
-            )
-        except OSError as exc:
-            if exc.errno == 16:  # EBUSY -- expected with NONBLOCK
-                log.debug(
-                    "playback: tick EBUSY during shader transition "
-                    "(prior NONBLOCK commit still pending; tick dropped)"
+        Only the FIRST animated layer is extracted. Multi-anim slides
+        get only one shader-side overlay; secondary animated layers
+        freeze through the transition window. Acceptable MVP since
+        most slides have one ticker; multi-anim transition fidelity
+        is a follow-on. The ANIM unit count would need to grow in
+        ShaderRenderer to support more (currently 2 = one per side)."""
+        if slide is None:
+            return None
+        layers = list(getattr(slide, "text_layers", []) or [])
+        if not layers:
+            return None
+        # render_layer_to_rgba accepts now=None and defaults to UTC-now
+        # internally for auto layers. Static-content layers ignore now.
+        from datetime import UTC as _UTC
+        now_dt = datetime.now(_UTC)
+        for idx, layer in enumerate(layers):
+            if not getattr(layer, "visible", True):
+                continue
+            motion = getattr(layer, "motion", "static") or "static"
+            auto = getattr(layer, "auto_mode", None)
+            if motion == "static" and not auto:
+                continue
+            try:
+                layer_rgba = render_layer_to_rgba(
+                    layer, width, height, now=now_dt,
                 )
-            else:
+            except Exception:
                 log.exception(
-                    "playback: outgoing-compositor tick during transition failed"
+                    "playback: render_layer_to_rgba failed for animated "
+                    "layer idx=%d -- skipping for shader anim path",
+                    idx,
                 )
-        except Exception:
-            log.exception(
-                "playback: outgoing-compositor tick during transition failed"
+                continue
+            bbox = layer_rgba.getbbox()
+            if bbox is None:
+                # Empty / whitespace-only / auto-format produced "" --
+                # nothing to overlay on either side. Continue scanning;
+                # a later layer might have ink.
+                continue
+            gx, gy, gx2, gy2 = bbox
+            gw, gh = gx2 - gx, gy2 - gy
+            rgba_bytes = layer_rgba.crop(bbox).tobytes()
+            return (
+                idx, layer, rgba_bytes,
+                (gx, gy, gw, gh), _box_px(layer, width, height),
             )
+        return None
+
+    def _anim_uv_for_frame(
+        self,
+        layer: "TextLayer",
+        box_px: tuple[int, int, int, int],
+        glyph_bbox_px: tuple[int, int, int, int],
+        sign_w: int,
+        sign_h: int,
+        elapsed_s: float,
+    ) -> tuple[tuple[float, float, float, float], float]:
+        """Compute per-frame (box_uv, alpha) for `layer` at `elapsed_s`
+        on the slide's tick clock. Mirrors GPUSlideCompositor._stage_
+        motion's per-effect math but emits SCREEN-UV box rect + 0..1
+        alpha instead of CRTC pixel coords + 16-bit plane alpha. The
+        two paths share `compute_phase` + `_effect_freq` so phase math
+        on slide A's overlay-plane motion (pre-transition) is
+        identical to slide A's shader-anim motion (during transition)
+        -- continuous animation across the seam.
+
+        Returns ((x, y, w, h), alpha) where x/y/w/h ∈ [0, 1] in
+        screen-UV (top-down origin) and alpha ∈ [0, 1]."""
+        motion = getattr(layer, "motion", "static") or "static"
+        intensity = int(getattr(layer, "motion_intensity", 50))
+        motion_phase_offset = float(getattr(layer, "motion_phase", 0.0))
+        phase = compute_phase(
+            elapsed_s, _effect_freq(motion, intensity), motion_phase_offset,
+        )
+        bx, by, bw, bh = box_px
+        gx, gy, gw, gh = glyph_bbox_px
+        # Defaults: glyph at rest position, fully opaque.
+        crtc_x, crtc_y, crtc_w, crtc_h = gx, gy, gw, gh
+        alpha = 1.0
+        if motion == "ticker":
+            # Sweep glyph leftward across the box. Mirrors
+            # _stage_motion's ticker. Same snap-then-restart behavior.
+            sweep_total = bw + gw
+            crtc_x = bx + bw - int(round(phase * sweep_total))
+        elif motion == "breathe":
+            amplitude = (intensity / 100.0) * 0.20
+            s = 1.0 + amplitude * math.sin(2 * math.pi * phase)
+            new_w = max(1, int(round(gw * s)))
+            new_h = max(1, int(round(gh * s)))
+            box_cx = bx + bw / 2.0
+            box_cy = by + bh / 2.0
+            glyph_cx = gx + gw / 2.0
+            glyph_cy = gy + gh / 2.0
+            new_cx = box_cx + s * (glyph_cx - box_cx)
+            new_cy = box_cy + s * (glyph_cy - box_cy)
+            crtc_x = int(round(new_cx - new_w / 2.0))
+            crtc_y = int(round(new_cy - new_h / 2.0))
+            crtc_w = new_w
+            crtc_h = new_h
+        elif motion == "pulse":
+            min_a = 1.0 - intensity / 100.0
+            s = (math.sin(2 * math.pi * phase) + 1.0) / 2.0
+            alpha = min_a + (1.0 - min_a) * s
+        elif motion == "bounce":
+            amp = (intensity / 100.0) * 0.10
+            offset_px = -int(round(amp * bh * abs(math.sin(2 * math.pi * phase))))
+            crtc_y = gy + offset_px
+        elif motion == "blink":
+            # Square wave: half cycle on, half off. Matches blink's
+            # alpha pattern in _stage_motion.
+            alpha = 1.0 if phase < 0.5 else 0.0
+        # Other kinds (shake / unknown): freeze at rest position --
+        # acceptable since transition windows are short (200-1000ms)
+        # and shake's deterministic-Gaussian step counter would need
+        # to thread layer.id through here.
+        return (
+            (
+                crtc_x / sign_w, crtc_y / sign_h,
+                crtc_w / sign_w, crtc_h / sign_h,
+            ),
+            max(0.0, min(1.0, alpha)),
+        )
 
     async def _fade(
         self,

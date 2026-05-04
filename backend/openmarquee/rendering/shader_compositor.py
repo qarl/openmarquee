@@ -250,46 +250,75 @@ void main() {
 }
 """
 
-# Transition fragment shader: 2 samplers + transition_t. Different
-# transition kinds (fade, wipe, iris, dissolve, ...) each get their
-# own compiled program; selection happens via _compile_transition().
-# Per-pixel cost is one 2-tex sample + one mix() + the kind-specific
-# mask math (a step + maybe a distance/dot/hash). Trivially fits on
-# vc4 V3D 2.1 at 1080p × 30 fps.
+# Transition fragment shaders share a common preamble: precision, base
+# uniforms (u_from / u_to + transition_t), animated-layer uniforms (one
+# overlay per side, units 2/3) and the per-side compositing helpers
+# from_at(uv) / to_at(uv). Each kind contributes only the void main()
+# that selects a per-pixel mix of from/to via its mask logic; the
+# preamble keeps texture sampling consistent (so e.g. an iris correctly
+# clips the OUTGOING slide's animated text outside the iris circle).
 #
-# u_from = outgoing slide snapshot, u_to = incoming slide snapshot.
+# All-highp: dissolve and glitch need highp for their sin/dot/fract
+# hash to avoid mantissa collapse on vc4 V3D 2.1; running every
+# program in highp keeps the helpers' precision consistent across
+# shaders and is well within the ALU budget at 1080p × 30 fps. Mesa
+# emulates highp on vc4 (hardware is mediump).
+#
+# u_from = outgoing slide bg+statics; u_to = incoming slide bg+statics.
+# u_X_anim = an optional per-side animated text overlay (typically the
+# active ticker layer). u_X_anim_box describes the overlay's screen-UV
+# rect (x, y, w, h); inside the box, anim is sampled with the box-local
+# UV and alpha-overed onto base. u_X_anim_alpha = 0 disables the
+# overlay (default), 1 fully shows it; PlaybackLoop drives both.
+#
 # u_transition_t goes 0 -> 1 over the transition duration; at 0 the
 # screen shows u_from unchanged, at 1 it shows u_to unchanged.
 
-_FRAGMENT_FADE = """#version 100
-precision mediump float;
+_FRAGMENT_PREAMBLE = """#version 100
+precision highp float;
 uniform sampler2D u_from;
 uniform sampler2D u_to;
+uniform sampler2D u_from_anim;
+uniform sampler2D u_to_anim;
+uniform vec4 u_from_anim_box;
+uniform vec4 u_to_anim_box;
+uniform float u_from_anim_alpha;
+uniform float u_to_anim_alpha;
 uniform float u_transition_t;
 varying vec2 v_uv;
 
+vec4 sample_side(sampler2D base, sampler2D anim, vec4 box, float a_alpha, vec2 uv) {
+  vec4 base_col = texture2D(base, uv);
+  if (a_alpha < 0.001) return base_col;
+  vec2 inbox = (uv - box.xy) / box.zw;
+  if (inbox.x < 0.0 || inbox.x > 1.0 || inbox.y < 0.0 || inbox.y > 1.0) {
+    return base_col;
+  }
+  vec4 anim_col = texture2D(anim, inbox);
+  return mix(base_col, anim_col, anim_col.a * a_alpha);
+}
+
+vec4 from_at(vec2 uv) {
+  return sample_side(u_from, u_from_anim, u_from_anim_box, u_from_anim_alpha, uv);
+}
+vec4 to_at(vec2 uv) {
+  return sample_side(u_to, u_to_anim, u_to_anim_box, u_to_anim_alpha, uv);
+}
+"""
+
+_FRAGMENT_FADE = _FRAGMENT_PREAMBLE + """
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   gl_FragColor = mix(a, b, u_transition_t);
 }
 """
 
 # Wipe: u_to reveals from the left edge with a hard line at x = t.
-# Equivalent in visual identity to the prior `_wipe_gpu` overlay
-# CRTC_W animation, but routed through the same shader pipeline as
-# every other transition kind so motion stays alive on the outgoing
-# slide's overlays during the wipe (#206).
-_FRAGMENT_WIPE = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+_FRAGMENT_WIPE = _FRAGMENT_PREAMBLE + """
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   float mask = step(v_uv.x, u_transition_t);
   gl_FragColor = mix(a, b, mask);
 }
@@ -298,16 +327,10 @@ void main() {
 # Iris: u_to reveals through a circle that expands from screen center
 # to the corners. The 0.71 max-radius covers the diagonal — center to
 # corner distance in normalized [0,1] UV space is sqrt(0.5) = 0.707.
-_FRAGMENT_IRIS = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+_FRAGMENT_IRIS = _FRAGMENT_PREAMBLE + """
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   float r = distance(v_uv, vec2(0.5));
   float mask = step(r, u_transition_t * 0.71);
   gl_FragColor = mix(a, b, mask);
@@ -316,31 +339,16 @@ void main() {
 
 # Dissolve: per-pixel reveal threshold sampled from a hash of v_uv.
 # Each pixel "rolls a die" once and reveals when transition_t crosses
-# its threshold — reads as a noise-driven crossfade matching the PIL
-# path (np.random.default_rng().random per pixel). The hash is
-# deterministic per fragment, so no per-frame jitter; smooth reveal.
-_FRAGMENT_DISSOLVE = """#version 100
-// highp -- the canonical sin/dot/fract hash needs the *43758.5453
-// product to wrap well past the integer range before fract() peels
-// off the fractional part. mediump on vc4 V3D 2.1 (~10-bit mantissa
-// in fragment shaders) drops bits before fract, collapsing adjacent
-// pixels to identical thresholds and producing visible diagonal
-// banding instead of pepper-noise. highp gives ~24-bit and is
-// emulated by Mesa on vc4 even though hardware mediump is the
-// default. Per pre-commit review (#197).
-precision highp float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# its threshold. highp throughout (preamble) keeps the sin/dot/fract
+# hash from collapsing on vc4 mediump (~10-bit mantissa).
+_FRAGMENT_DISSOLVE = _FRAGMENT_PREAMBLE + """
 float _hash(vec2 p) {
   return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   float threshold = _hash(v_uv);
   float mask = step(threshold, u_transition_t);
   gl_FragColor = mix(a, b, mask);
@@ -348,18 +356,8 @@ void main() {
 """
 
 # Pixelate: both images sample at a coarsened grid whose block size
-# grows to a peak at midpoint, then shrinks back. The peak (0.04 in UV
-# = ~80 px at 1080p) gives an obvious chunky-blocks moment around
-# t=0.5; ends are ~native resolution. mix() blends a → b with t so the
-# whole motion reads as "current slide pixelates harder, then sharpens
-# into the next."
-_FRAGMENT_PIXELATE = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# grows to a peak at midpoint, then shrinks back.
+_FRAGMENT_PIXELATE = _FRAGMENT_PREAMBLE + """
 void main() {
   // Wave: 0 at t=0/1, 1 at t=0.5. (1 - 4(t-0.5)^2).
   float wave = 1.0 - 4.0 * (u_transition_t - 0.5) * (u_transition_t - 0.5);
@@ -367,32 +365,21 @@ void main() {
   // 0.0425 peak = ~80px at midpoint.
   float blockSize = 0.0025 + 0.04 * wave;
   vec2 cell = floor(v_uv / blockSize) * blockSize + 0.5 * blockSize;
-  vec4 a = texture2D(u_from, cell);
-  vec4 b = texture2D(u_to, cell);
+  vec4 a = from_at(cell);
+  vec4 b = to_at(cell);
   gl_FragColor = mix(a, b, u_transition_t);
 }
 """
 
 # Scanline: top-to-bottom sweep with a bright band at the sweep line.
-# Pixels above the sweep show u_to; below show u_from; the band is a
-# brightness boost at the sweep edge. Matches the PIL scanline's CRT
-# look (band height ~3% of panel = 0.03 in UV).
-_FRAGMENT_SCANLINE = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+_FRAGMENT_SCANLINE = _FRAGMENT_PREAMBLE + """
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   float sweep = u_transition_t;
-  float band_half = 0.015;  // half-height of the bright band
-  // Pixels above the sweep line are b; below are a.
+  float band_half = 0.015;
   float mask = step(v_uv.y, sweep);
   vec4 col = mix(a, b, mask);
-  // Bright glow: white-ish boost where v_uv.y is within band of sweep.
   float band = 1.0 - smoothstep(0.0, band_half, abs(v_uv.y - sweep));
   col.rgb = mix(col.rgb, vec3(1.0), band * 0.7);
   gl_FragColor = col;
@@ -400,73 +387,38 @@ void main() {
 """
 
 # Halftone: u_to emerges through a regular grid of growing circular
-# dots, one per cell. Cell pitch = ~8 cells across the smaller dim
-# (matches the PIL halftone's pitch = min(w,h) // 8). Per-cell radius
-# grows 0 -> ~half-diagonal over t, so by t=1 every dot covers its
-# cell entirely and u_to is fully revealed.
-#
-# Aspect correction: 16:9 hardcoded for the HDMI 1080p target -- LED
-# matrix and fb0 paths don't reach the shader compositor (they lack
-# drm_fd). On a non-16:9 panel cells would render as ovals; that's a
-# visual compromise to defer until non-16:9 deployments matter.
-_FRAGMENT_HALFTONE = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# dots, one per cell. 16:9 hardcoded for the HDMI 1080p target.
+_FRAGMENT_HALFTONE = _FRAGMENT_PREAMBLE + """
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
-  // 8 cells vertical (smaller dim), 8 * 16/9 ~= 14 horizontal on 1080p.
-  // fract(uv * grid) gives cell-local UV in [0,1).
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   float grid_y = 8.0;
   float aspect = 16.0 / 9.0;
   vec2 cell_uv = fract(vec2(v_uv.x * grid_y * aspect, v_uv.y * grid_y));
-  // Distance to cell center, in cell-relative coords.
   float d = distance(cell_uv, vec2(0.5));
-  // Radius grows 0 -> 0.71 (cell half-diagonal) over t.
   float mask = step(d, u_transition_t * 0.71);
   gl_FragColor = mix(a, b, mask);
 }
 """
 
-# Glitch: digital-corruption look. Per-row horizontal jitter + linear
-# cross-fade + occasional cyan tear rows. Animated frame-to-frame so
-# the corruption "breaks" actively rather than sitting still -- the
-# canonical "screen tearing" read.
-#
-# frame_seed below quantizes u_transition_t into ~30 distinct buckets
-# over the transition window, so the per-row hash gets a fresh seed
-# every frame even though u_transition_t is the only time uniform.
-_FRAGMENT_GLITCH = """#version 100
-precision highp float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# Glitch: digital-corruption look. Per-row horizontal jitter +
+# linear cross-fade + occasional cyan tear rows. Frame_seed quantizes
+# u_transition_t into ~30 distinct buckets so the per-row hash gets a
+# fresh seed every frame.
+_FRAGMENT_GLITCH = _FRAGMENT_PREAMBLE + """
 float _hash(vec2 p) {
   return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
 void main() {
-  // ~1080 rows at 1080p; floor() to get a stable per-row index.
   float row = floor(v_uv.y * 1080.0);
-  // 30 distinct frame buckets across the transition window. Each
-  // bucket gets its own per-row jitter -- looks like new corruption
-  // appearing every frame.
   float frame_seed = floor(u_transition_t * 30.0);
   float jitter = (_hash(vec2(row, frame_seed)) - 0.5) * 0.1 * u_transition_t;
   vec2 uv2 = vec2(v_uv.x + jitter, v_uv.y);
-  vec4 a = texture2D(u_from, uv2);
-  vec4 b = texture2D(u_to, uv2);
+  vec4 a = from_at(uv2);
+  vec4 b = to_at(uv2);
   vec4 col = mix(a, b, u_transition_t);
-  // Tear bands: ~5% of rows in each frame get a cyan overlay. Hash
-  // (coarser row groups, frame_seed) so tears are wider than 1px and
-  // jump around per frame.
-  float tear_row = floor(v_uv.y * 60.0);  // 60 horizontal bands
+  float tear_row = floor(v_uv.y * 60.0);
   float tear = step(0.95, _hash(vec2(tear_row, frame_seed + 1.0)));
   col.rgb = mix(col.rgb, vec3(0.0, 1.0, 1.0), tear * 0.5 * u_transition_t);
   gl_FragColor = col;
@@ -474,50 +426,31 @@ void main() {
 """
 
 # Slide: both images translate horizontally; u_to enters from the
-# right edge as u_from exits left. The "seam" at x = 1 - t separates
-# the visible portions: left of the seam shows the part of u_from
-# that hasn't yet shifted off; right of the seam shows the leading
-# columns of u_to entering from the right.
-_FRAGMENT_SLIDE = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# right edge as u_from exits left.
+_FRAGMENT_SLIDE = _FRAGMENT_PREAMBLE + """
 void main() {
   float t = u_transition_t;
   float seam = 1.0 - t;
   float onTo = step(seam, v_uv.x);
   vec2 fromUV = vec2(v_uv.x + t, v_uv.y);
   vec2 toUV = vec2(v_uv.x - seam, v_uv.y);
-  vec4 a = texture2D(u_from, fromUV);
-  vec4 b = texture2D(u_to, toUV);
+  vec4 a = from_at(fromUV);
+  vec4 b = to_at(toUV);
   gl_FragColor = mix(a, b, onTo);
 }
 """
 
 # Push: u_to enters from the LEFT, pushing u_from off the right.
-# Mirror of slide. Bright 2-px-equivalent vertical separator at the
-# seam (x = t) gives the projector-blade look that distinguishes
-# push from slide visually.
-_FRAGMENT_PUSH = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# Bright projector-blade separator at the seam.
+_FRAGMENT_PUSH = _FRAGMENT_PREAMBLE + """
 void main() {
   float t = u_transition_t;
   float onTo = step(v_uv.x, t);
   vec2 fromUV = vec2(v_uv.x - t, v_uv.y);
   vec2 toUV = vec2(v_uv.x + (1.0 - t), v_uv.y);
-  vec4 a = texture2D(u_from, fromUV);
-  vec4 b = texture2D(u_to, toUV);
+  vec4 a = from_at(fromUV);
+  vec4 b = to_at(toUV);
   vec4 col = mix(a, b, onTo);
-  // Projector-blade separator at the seam. Width ~0.001 in UV
-  // ~= 2px at 1080p.
   float blade = 1.0 - smoothstep(0.0, 0.001, abs(v_uv.x - t));
   col.rgb = mix(col.rgb, vec3(1.0), blade * 0.8);
   gl_FragColor = col;
@@ -526,77 +459,47 @@ void main() {
 
 # Scroll: vertical analog of slide. u_to enters from the bottom edge
 # as u_from rolls up off the top.
-_FRAGMENT_SCROLL = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+_FRAGMENT_SCROLL = _FRAGMENT_PREAMBLE + """
 void main() {
   float t = u_transition_t;
   float seam = 1.0 - t;
-  // v_uv.y is top-down (vertex shader Y-flips), so seam at y=1-t
-  // means u_from visible above the seam (rolling up), u_to below
-  // (rolling in from the bottom).
   float onTo = step(seam, v_uv.y);
   vec2 fromUV = vec2(v_uv.x, v_uv.y + t);
   vec2 toUV = vec2(v_uv.x, v_uv.y - seam);
-  vec4 a = texture2D(u_from, fromUV);
-  vec4 b = texture2D(u_to, toUV);
+  vec4 a = from_at(fromUV);
+  vec4 b = to_at(toUV);
   gl_FragColor = mix(a, b, onTo);
 }
 """
 
-# Blinds: horizontal slats opening. n_slats slats stacked vertically;
-# each slat reveals u_to from its midline outward. fract(v_uv.y *
-# n_slats) gives slat-local UV; abs(slat_uv - 0.5) is distance from
-# midline; band grows midline-out with t.
-_FRAGMENT_BLINDS = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# Blinds: horizontal slats opening; each slat reveals u_to from its
+# midline outward.
+_FRAGMENT_BLINDS = _FRAGMENT_PREAMBLE + """
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
-  // 16 slats vertical for a 1080p panel ~= 67 px slats. Reads as
-  // distinct slats without being so coarse it loses the blind look.
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   float n_slats = 16.0;
   float slat_uv = fract(v_uv.y * n_slats);
   float dist_to_mid = abs(slat_uv - 0.5);
-  // Band grows from midline (dist=0) to slat edges (dist=0.5) as t
-  // goes 0 -> 1.
   float mask = step(dist_to_mid, u_transition_t * 0.5);
   gl_FragColor = mix(a, b, mask);
 }
 """
 
-# Flip: 2D card-flip approximation. First half (t < 0.5):
-# u_from scaleX-shrinks 1.0 -> 0.0 around the vertical center line.
-# Second half (t >= 0.5): u_to scaleX-grows 0.0 -> 1.0. At t=0.5
-# the card is collapsed to a hairline at center; off-card pixels
-# show black (matches the PIL Image.new("RGB", ...) default).
-_FRAGMENT_FLIP = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# Flip: 2D card-flip approximation. u_from scaleX-shrinks 1.0 -> 0.0
+# in the first half, then u_to scaleX-grows 0.0 -> 1.0 in the second.
+_FRAGMENT_FLIP = _FRAGMENT_PREAMBLE + """
 void main() {
   float t = u_transition_t;
-  float scaleX = abs(2.0 * t - 1.0);  // 1 at t=0, 0 at t=0.5, 1 at t=1
+  float scaleX = abs(2.0 * t - 1.0);
   float useTo = step(0.5, t);
   vec4 col = vec4(0.0, 0.0, 0.0, 1.0);
   if (scaleX > 0.001) {
     float src_x = (v_uv.x - 0.5) / scaleX + 0.5;
     if (src_x >= 0.0 && src_x <= 1.0) {
       vec2 uv = vec2(src_x, v_uv.y);
-      vec4 a = texture2D(u_from, uv);
-      vec4 b = texture2D(u_to, uv);
+      vec4 a = from_at(uv);
+      vec4 b = to_at(uv);
       col = mix(a, b, useTo);
     }
   }
@@ -606,39 +509,24 @@ void main() {
 
 # Marquee: tickertape wraparound. u_from scrolls off to the left;
 # a gap zone with a centered white dot passes through; u_to enters
-# from the right. Total compound width = 1 + gap_uv (from + gap +
-# to laid end-to-end). Scroll position advances 0 -> 1 + gap_uv as
-# t goes 0 -> 1. Per-pixel zone selection via step() masks; no
-# branches in the hot path.
-_FRAGMENT_MARQUEE = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# from the right.
+_FRAGMENT_MARQUEE = _FRAGMENT_PREAMBLE + """
 void main() {
-  float gap_uv = 0.125;  // ~240px at 1080p, matches PIL gap_w = width/8
+  float gap_uv = 0.125;
   float scroll = u_transition_t * (1.0 + gap_uv);
   float cx = scroll + v_uv.x;
 
-  // Sample all three zones unconditionally; mask out below.
-  vec4 from_col = texture2D(u_from, vec2(cx, v_uv.y));
-  vec4 to_col = texture2D(u_to, vec2(cx - 1.0 - gap_uv, v_uv.y));
+  vec4 from_col = from_at(vec2(cx, v_uv.y));
+  vec4 to_col = to_at(vec2(cx - 1.0 - gap_uv, v_uv.y));
 
-  // Gap zone: white dot centered. PIL uses radius = min(gap_w/3,
-  // height/3); on 1080p 16:9 with gap_w=240, height=1080, that's
-  // min(80, 360) = 80 px = 80/1080 = 0.074 in v_uv.y units.
-  // Aspect-correct the dot so it reads circular.
-  float gap_local_x = (cx - 1.0) / gap_uv;  // 0..1 within gap
-  float dx_uv = (gap_local_x - 0.5) * gap_uv;  // back to global UV scale
+  float gap_local_x = (cx - 1.0) / gap_uv;
+  float dx_uv = (gap_local_x - 0.5) * gap_uv;
   float dy = v_uv.y - 0.5;
   float dist = length(vec2(dx_uv, dy));
   float dot_r = 0.074;
   float in_dot = step(dist, dot_r);
   vec4 gap_col = mix(vec4(0.0, 0.0, 0.0, 1.0), vec4(1.0), in_dot);
 
-  // Zone selection.
   float in_from = step(cx, 1.0);
   float in_to = step(1.0 + gap_uv, cx);
   float in_gap = 1.0 - in_from - in_to;
@@ -649,36 +537,18 @@ void main() {
 
 # Shutter: hexagonal aperture. A regular hexagon centered on the
 # canvas grows from a point at t=0 to fully covering the canvas at
-# t=1. Inside hex = u_to; outside = u_from. Pointy-top orientation
-# (vertex on +y); aspect-corrected for 16:9 so the hex reads
-# regular. Hexagon distance test: max of three edge-normal
-# projections (other three are mirror via abs()) compared against
-# the inscribed radius.
-_FRAGMENT_SHUTTER = """#version 100
-precision mediump float;
-uniform sampler2D u_from;
-uniform sampler2D u_to;
-uniform float u_transition_t;
-varying vec2 v_uv;
-
+# t=1.
+_FRAGMENT_SHUTTER = _FRAGMENT_PREAMBLE + """
 void main() {
-  vec4 a = texture2D(u_from, v_uv);
-  vec4 b = texture2D(u_to, v_uv);
+  vec4 a = from_at(v_uv);
+  vec4 b = to_at(v_uv);
   vec2 d = v_uv - vec2(0.5);
-  d.x *= 16.0 / 9.0;  // aspect correction so hex is geometrically regular
-
-  // Edge-normal projections. cos(pi/6) = sqrt(3)/2 ~= 0.866.
-  // Three normals at 30, 90, 150 deg cover the hexagon's six edges
-  // via the abs(); fourth quadrant edges fall out by symmetry.
+  d.x *= 16.0 / 9.0;
   float k = 0.866025;
   float c1 = abs(d.x * k + d.y * 0.5);
   float c2 = abs(d.y);
   float c3 = abs(d.x * k - d.y * 0.5);
   float hex_d = max(max(c1, c2), c3);
-
-  // Inscribed radius grows 0 -> 1.5 over t. 1.5 over-covers the
-  // canvas by t=1 with margin, so corners fully reveal u_to before
-  // the aperture math could leave a sliver.
   float inscribed = 1.5 * u_transition_t;
   float mask = step(hex_d, inscribed);
   gl_FragColor = mix(a, b, mask);
@@ -836,11 +706,31 @@ class ShaderRenderer:
         self._active_kind: str = "fade"
         self._vbo: int = 0
         self._a_pos_loc: int = -1
-        # Two textures, fixed: unit 0 = from, unit 1 = to. The shader
-        # pipeline never grows beyond two inputs in the hybrid model;
-        # multi-layer compositing stays on the multi-plane DRM path.
+        # Base textures: unit 0 = from (outgoing slide bg+statics),
+        # unit 1 = to (incoming slide bg+statics). These hold the
+        # static portions composited once per slide entry; animated
+        # text overlays for each side go in the _anim slots below.
         self._tex_from: int = 0
         self._tex_to: int = 0
+        # Per-side animated layer textures: unit 2 = from_anim,
+        # unit 3 = to_anim. Each holds ONE layer's glyph-bbox RGBA
+        # (typically the active ticker on each slide). The fragment
+        # shader's sample_side helper alpha-overs the anim texture
+        # onto base when alpha > 0; default alpha = 0 means no overlay
+        # which is identical to the pre-#215 transition behavior.
+        # The shape-based transition mask (iris/wipe/etc.) clips the
+        # composited anim+base correctly per-pixel — that's the whole
+        # point of pulling the animated text into the shader's primary
+        # plane instead of an HVS overlay (qarl 2026-05-04).
+        self._tex_from_anim: int = 0
+        self._tex_to_anim: int = 0
+        # Per-frame animated-layer state: box xywh in [0,1] screen UV
+        # and alpha 0..1. PlaybackLoop drives these from the layer's
+        # motion math (ticker crtc_x → box.x; pulse → alpha; etc.).
+        self._from_anim_box: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        self._to_anim_box: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        self._from_anim_alpha: float = 0.0
+        self._to_anim_alpha: float = 0.0
         self._transition_t: float = 0.0
         # Connector / CRTC discovered at open time; mode held in
         # self._mode (kept alive — drmModeSetCrtc reads it by ref).
@@ -1074,6 +964,24 @@ class ShaderRenderer:
             self._kind_locs[kind] = {
                 "u_from": int(_g.glGetUniformLocation(prog, "u_from")),
                 "u_to": int(_g.glGetUniformLocation(prog, "u_to")),
+                "u_from_anim": int(
+                    _g.glGetUniformLocation(prog, "u_from_anim")
+                ),
+                "u_to_anim": int(
+                    _g.glGetUniformLocation(prog, "u_to_anim")
+                ),
+                "u_from_anim_box": int(
+                    _g.glGetUniformLocation(prog, "u_from_anim_box")
+                ),
+                "u_to_anim_box": int(
+                    _g.glGetUniformLocation(prog, "u_to_anim_box")
+                ),
+                "u_from_anim_alpha": int(
+                    _g.glGetUniformLocation(prog, "u_from_anim_alpha")
+                ),
+                "u_to_anim_alpha": int(
+                    _g.glGetUniformLocation(prog, "u_to_anim_alpha")
+                ),
                 "u_transition_t": int(
                     _g.glGetUniformLocation(prog, "u_transition_t")
                 ),
@@ -1100,18 +1008,30 @@ class ShaderRenderer:
             self._a_pos_loc, 2, _g.GL_FLOAT, False, 0, None,
         )
 
-        # Two textures: unit 0 = from, unit 1 = to. Both get a 1x1
-        # opaque-black placeholder so the sampler is complete before
-        # the first set_from/set_to.
-        empty = (ctypes.c_uint8 * 4)(0, 0, 0, 255)
+        # Four textures: unit 0 = from (base), unit 1 = to (base),
+        # unit 2 = from_anim (animated overlay), unit 3 = to_anim.
+        # All get a 1x1 transparent placeholder so the sampler is
+        # complete before the first set_*. Anim textures default to
+        # transparent (alpha = 0) so an unused overlay is invisible
+        # even if u_X_anim_alpha somehow reads non-zero.
+        opaque_black = (ctypes.c_uint8 * 4)(0, 0, 0, 255)
+        transparent = (ctypes.c_uint8 * 4)(0, 0, 0, 0)
         self._tex_from = int(_g.glGenTextures(1))
         self._tex_to = int(_g.glGenTextures(1))
-        for unit, tex in ((0, self._tex_from), (1, self._tex_to)):
+        self._tex_from_anim = int(_g.glGenTextures(1))
+        self._tex_to_anim = int(_g.glGenTextures(1))
+        tex_init = (
+            (0, self._tex_from, opaque_black),
+            (1, self._tex_to, opaque_black),
+            (2, self._tex_from_anim, transparent),
+            (3, self._tex_to_anim, transparent),
+        )
+        for unit, tex, init_pixel in tex_init:
             _g.glActiveTexture(_g.GL_TEXTURE0 + unit)
             _g.glBindTexture(_g.GL_TEXTURE_2D, tex)
             _g.glTexImage2D(
                 _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, 1, 1, 0,
-                _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, empty,
+                _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, init_pixel,
             )
             _g.glTexParameteri(
                 _g.GL_TEXTURE_2D, _g.GL_TEXTURE_MIN_FILTER, _g.GL_LINEAR,
@@ -1126,8 +1046,9 @@ class ShaderRenderer:
                 _g.GL_TEXTURE_2D, _g.GL_TEXTURE_WRAP_T, _g.GL_CLAMP_TO_EDGE,
             )
 
-        # Sampler bindings are per-program but always (u_from -> 0,
-        # u_to -> 1). Set them on every program once.
+        # Sampler bindings are per-program but stable across kinds:
+        # u_from -> 0, u_to -> 1, u_from_anim -> 2, u_to_anim -> 3.
+        # Set them on every program once.
         for kind, p in self._programs.items():
             _g.glUseProgram(p)
             locs = self._kind_locs[kind]
@@ -1135,6 +1056,10 @@ class ShaderRenderer:
                 _g.glUniform1i(locs["u_from"], 0)
             if locs["u_to"] >= 0:
                 _g.glUniform1i(locs["u_to"], 1)
+            if locs["u_from_anim"] >= 0:
+                _g.glUniform1i(locs["u_from_anim"], 2)
+            if locs["u_to_anim"] >= 0:
+                _g.glUniform1i(locs["u_to_anim"], 3)
         _g.glUseProgram(self._programs[self._active_kind])
 
         _g.glViewport(0, 0, self.width, self.height)
@@ -1165,6 +1090,68 @@ class ShaderRenderer:
         once at transition start by the caller (the new slide composited
         into a single RGBA via PIL alpha_composite at slide entry)."""
         self._upload_texture(self._tex_to, 1, rgba_bytes, src_w, src_h, "to")
+
+    # --- public API: per-side animated overlay (#215) ---
+
+    def set_from_anim(
+        self, rgba_bytes: bytes, src_w: int, src_h: int,
+    ) -> None:
+        """Upload the OUTGOING slide's animated-layer glyph bbox to
+        texture unit 2 (used by every transition's from_at()). Called
+        once at transition start. Pair with update_from_anim() per
+        frame to drive ticker scroll / pulse alpha / breathe scale.
+        Until update_from_anim() is called the overlay stays at
+        alpha=0 (invisible) — set_from_anim alone is a no-op visually."""
+        self._upload_texture(
+            self._tex_from_anim, 2, rgba_bytes, src_w, src_h, "from_anim",
+        )
+
+    def set_to_anim(
+        self, rgba_bytes: bytes, src_w: int, src_h: int,
+    ) -> None:
+        """Mirror of set_from_anim for the INCOMING slide (texture
+        unit 3, sampled by to_at())."""
+        self._upload_texture(
+            self._tex_to_anim, 3, rgba_bytes, src_w, src_h, "to_anim",
+        )
+
+    def update_from_anim(
+        self,
+        box: tuple[float, float, float, float],
+        alpha: float,
+    ) -> None:
+        """Per-frame update for the OUTGOING animated overlay. `box`
+        is (x, y, w, h) in screen-UV [0,1] (where on the panel the
+        glyph bbox should appear THIS frame -- ticker translates x;
+        breathe scales w/h around center; bounce shifts y; etc.).
+        `alpha` is 0..1, 0 = hidden. Cheap (just stages uniform
+        values; commit_frame pushes them on the next draw)."""
+        self._from_anim_box = (
+            float(box[0]), float(box[1]), float(box[2]), float(box[3]),
+        )
+        self._from_anim_alpha = max(0.0, min(1.0, float(alpha)))
+
+    def update_to_anim(
+        self,
+        box: tuple[float, float, float, float],
+        alpha: float,
+    ) -> None:
+        """Mirror of update_from_anim for the INCOMING side."""
+        self._to_anim_box = (
+            float(box[0]), float(box[1]), float(box[2]), float(box[3]),
+        )
+        self._to_anim_alpha = max(0.0, min(1.0, float(alpha)))
+
+    def clear_anim(self) -> None:
+        """Disable both animated overlays (alpha = 0). Called at
+        transition end / before set_kind for a slide with no
+        animation, so the prior transition's stale anim state can't
+        bleed in. The anim textures stay in GL state but render
+        invisibly thanks to the alpha < 0.001 short-circuit."""
+        self._from_anim_box = (0.0, 0.0, 0.0, 0.0)
+        self._to_anim_box = (0.0, 0.0, 0.0, 0.0)
+        self._from_anim_alpha = 0.0
+        self._to_anim_alpha = 0.0
 
     def _upload_texture(
         self, tex: int, unit: int, rgba: bytes, w: int, h: int, label: str,
@@ -1228,12 +1215,26 @@ class ShaderRenderer:
         from OpenGL import GLES2 as _g
         assert _gbm is not None and _libegl is not None and _libdrm is not None
 
-        # Push the single transition_t uniform for the active program.
-        # u_from / u_to sampler bindings are sticky from _compile_program;
-        # only the t value changes per frame.
-        loc = self._kind_locs[self._active_kind]["u_transition_t"]
+        # Push per-frame uniforms for the active program.
+        # u_from / u_to / u_*_anim sampler bindings are sticky from
+        # _compile_program; per-frame state is just transition_t plus
+        # the per-side animated overlay box + alpha (#215). When alpha
+        # is 0 the helper short-circuits before the texture sample, so
+        # the (otherwise garbage) box uniform doesn't matter for cost.
+        locs = self._kind_locs[self._active_kind]
+        loc = locs["u_transition_t"]
         if loc >= 0:
             _g.glUniform1f(loc, self._transition_t)
+        if locs["u_from_anim_box"] >= 0:
+            box = self._from_anim_box
+            _g.glUniform4f(locs["u_from_anim_box"], box[0], box[1], box[2], box[3])
+        if locs["u_to_anim_box"] >= 0:
+            box = self._to_anim_box
+            _g.glUniform4f(locs["u_to_anim_box"], box[0], box[1], box[2], box[3])
+        if locs["u_from_anim_alpha"] >= 0:
+            _g.glUniform1f(locs["u_from_anim_alpha"], self._from_anim_alpha)
+        if locs["u_to_anim_alpha"] >= 0:
+            _g.glUniform1f(locs["u_to_anim_alpha"], self._to_anim_alpha)
 
         _g.glClearColor(0.0, 0.0, 0.0, 1.0)
         _g.glClear(_g.GL_COLOR_BUFFER_BIT)
@@ -1430,12 +1431,19 @@ class ShaderRenderer:
                 # ctypes array reliably; the (count, list) form is auto-
                 # converted on most builds but not all. Use the array
                 # form for forward-compat across Pi/Mesa builds.
-                live_textures = [t for t in (self._tex_from, self._tex_to) if t]
+                live_textures = [
+                    t for t in (
+                        self._tex_from, self._tex_to,
+                        self._tex_from_anim, self._tex_to_anim,
+                    ) if t
+                ]
                 if live_textures:
                     arr = (ctypes.c_uint * len(live_textures))(*live_textures)
                     _g.glDeleteTextures(len(live_textures), arr)
                     self._tex_from = 0
                     self._tex_to = 0
+                    self._tex_from_anim = 0
+                    self._tex_to_anim = 0
                 if self._vbo:
                     arr = (ctypes.c_uint * 1)(self._vbo)
                     _g.glDeleteBuffers(1, arr)
