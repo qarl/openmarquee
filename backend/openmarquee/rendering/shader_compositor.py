@@ -838,6 +838,12 @@ class ShaderRenderer:
         self._pending_bo: int = 0
         self._pending_fb_id: int = 0
         self._setcrtc_done: bool = False
+        # PageFlip + DRM_MODE_PAGE_FLIP_EVENT (#200): kernel queues an
+        # event per flip; subsequent flip on the same CRTC returns
+        # -EBUSY until userspace consumes the event. _pageflip_pending
+        # tracks whether a queued event is still outstanding; the next
+        # commit_frame drains it before issuing a new flip.
+        self._pageflip_pending: bool = False
 
     def __enter__(self) -> "ShaderRenderer":
         _load_libs()
@@ -1250,15 +1256,25 @@ class ShaderRenderer:
                 raise RuntimeError(f"drmModeSetCrtc failed rc={rc}")
             self._setcrtc_done = True
         else:
-            # PageFlip is non-blocking and vsync-tied; we don't drain
-            # the page-flip event in milestone A (no fence sync yet).
-            # Without DRM_MODE_PAGE_FLIP_EVENT it just queues the flip.
+            # PageFlip + DRM_MODE_PAGE_FLIP_EVENT (#200): drain any
+            # event queued by the previous flip first; without this,
+            # the kernel returns -EBUSY on every subsequent flip and
+            # we fall to SetCrtc (synchronous, slower) on every frame
+            # past the first. Drain timeout = ~one vblank so a tightly
+            # paced 60 fps loop blocks just long enough to acquire the
+            # next slot.
+            self._drain_pageflip_events(timeout=0.020)
             rc = _libdrm.drmModePageFlip(
-                self._fd, self._crtc_id, fb_id.value, 0, None,
+                self._fd, self._crtc_id, fb_id.value,
+                DRM_MODE_PAGE_FLIP_EVENT,
+                None,
             )
-            if rc != 0:
+            if rc == 0:
+                self._pageflip_pending = True
+            else:
                 # Most common cause: previous page flip not yet
-                # consumed. Fall back to SetCrtc (synchronous).
+                # consumed (drain timed out, framerate above vblank).
+                # Fall back to SetCrtc (synchronous).
                 rc2 = _libdrm.drmModeSetCrtc(
                     self._fd, self._crtc_id, fb_id.value, 0, 0,
                     self._connector_arr, 1, ctypes.byref(self._mode),
@@ -1281,12 +1297,73 @@ class ShaderRenderer:
         self._pending_bo = bo
         self._pending_fb_id = fb_id.value
 
+    def _drain_pageflip_events(self, timeout: float = 0.0) -> None:
+        """Read and discard any pending page-flip events from the DRM
+        fd. The kernel queues an event per drmModePageFlip+EVENT and
+        refuses further flips on the same CRTC until userspace
+        consumes them (returns -EBUSY).
+
+        With timeout=0, returns immediately after consuming whatever's
+        queued (called when commit_frame is paced slower than vblank
+        so the prior event has already arrived). With timeout > 0,
+        waits up to `timeout` seconds for the event -- used when the
+        commit cadence approaches vblank rate and the prior event may
+        not yet have fired.
+
+        DRM events are 32 bytes for vblank/page-flip (struct
+        drm_event_vblank in drm.h); the read here is sized to consume
+        a few events at once if backed up.
+        """
+        if not self._pageflip_pending:
+            return
+        import select
+        import time as _time
+        deadline = _time.monotonic() + timeout if timeout > 0.0 else 0.0
+        while True:
+            wait = max(0.0, deadline - _time.monotonic()) if deadline else 0.0
+            r, _w, _x = select.select([self._fd], [], [], wait)
+            if not r:
+                # No event ready within the timeout. Caller falls back
+                # to SetCrtc; _pageflip_pending stays True so we don't
+                # mis-claim the slot is free, but the SetCrtc itself
+                # supersedes the pending flip implicitly (CRTC moves
+                # to the new fb regardless of whether the prior flip
+                # was acknowledged).
+                break
+            try:
+                data = os.read(self._fd, 256)
+            except (BlockingIOError, OSError):
+                break
+            if not data:
+                break
+            # We don't parse the event payload -- just consuming it
+            # off the fd unblocks the next flip. drmHandleEvent's
+            # callback machinery would let us track per-CRTC vblank
+            # counts, but we don't need that today.
+            self._pageflip_pending = False
+            return
+        # Either timed out or read returned empty. Best-effort: clear
+        # the flag so the SetCrtc fallback path doesn't loop forever.
+        self._pageflip_pending = False
+
     # --- teardown ---
 
     def close(self) -> None:
         """Tear down GL context, GBM, DRM. Idempotent."""
         from OpenGL import EGL as _e
         from OpenGL import GLES2 as _g
+
+        # Drain any pending page-flip event (#200) so we don't leave
+        # the kernel-side event queue holding state that the caller's
+        # next read on the shared fd would consume unexpectedly. Best-
+        # effort + short timeout; even if the drain fails the caller's
+        # SetCrtc supersedes the pending flip implicitly.
+        if self._fd >= 0 and self._pageflip_pending:
+            try:
+                self._drain_pageflip_events(timeout=0.020)
+            except Exception:
+                log.exception("DRM(shader): pageflip drain during close failed")
+            self._pageflip_pending = False
 
         # Blank the CRTC FIRST so the kernel isn't scanning out a fb
         # we're about to RmFB. SKIPPED in shared-fd mode: the caller
