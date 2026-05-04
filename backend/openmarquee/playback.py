@@ -1227,11 +1227,17 @@ class PlaybackLoop:
                 "playback: outgoing-compositor alpha ramp during transition failed"
             )
         # tick stages motion-property changes and flushes via
-        # renderer.commit(). The alpha-ramp staged above rides in
-        # the same atomic commit. ONE atomic ioctl per overlay-side
-        # update per frame.
+        # renderer.commit(nonblock=True). The alpha-ramp staged
+        # above rides in the same atomic commit. ONE atomic ioctl
+        # per overlay-side update per frame, AND with NONBLOCK the
+        # kernel returns immediately instead of serializing behind
+        # the shader's pending primary-plane PageFlip on the same
+        # CRTC (#214 fix; without NONBLOCK with-motion fps was
+        # ~11 fps because each tick waited for vblank).
         try:
-            compositor.tick(elapsed, now=datetime.now(UTC))
+            compositor.tick(
+                elapsed, now=datetime.now(UTC), nonblock_commit=True,
+            )
         except Exception:
             log.exception(
                 "playback: outgoing-compositor tick during transition failed"

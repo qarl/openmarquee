@@ -361,8 +361,15 @@ DRM_MODE_OBJECT_CONNECTOR = 0xC0C0C0C0
 DRM_MODE_OBJECT_PLANE = 0xEEEEEEEE
 
 # Atomic commit flags. ALLOW_MODESET is required for the initial
-# mode-set commit; per-frame commits leave it off.
+# mode-set commit; per-frame commits leave it off. NONBLOCK lets
+# the commit return immediately instead of waiting for the next
+# vblank ack -- used when commit is racing a primary-plane PageFlip
+# on the same CRTC (during shader transitions, #214). Without
+# NONBLOCK the kernel serializes commits on the CRTC so our overlay
+# update waits for the shader's pending PageFlip to land, blowing
+# the per-frame budget.
 DRM_MODE_ATOMIC_ALLOW_MODESET = 0x0400
+DRM_MODE_ATOMIC_NONBLOCK = 0x0200
 
 # pixel blend mode enum values — stable kernel-defined constants from
 # include/drm/drm_blend.h, exposed by drm_plane_create_blend_mode_property().
@@ -1574,13 +1581,26 @@ class DRMRenderer:
             alpha=alpha, zpos=zpos,
         )
 
-    def commit(self) -> None:
+    def commit(self, *, nonblock: bool = False) -> None:
         """Flush all staged property changes via one DRM_IOCTL_MODE_
         ATOMIC. Per-frame hot path: this is the only kernel call. No
         ALLOW_MODESET — only flips plane state, not CRTC mode.
 
+        With nonblock=True, the kernel returns immediately rather
+        than waiting for the next vblank ack. Used during shader
+        transitions (#214): a primary-plane PageFlip is in flight on
+        the same CRTC and the kernel would otherwise serialize our
+        overlay commit behind it (~16-30ms wait per tick). Different
+        plane = no data race, just a scheduling hint to the kernel
+        that we don't need synchronous landing.
+
+        For steady-state (slide-internal motion ticks), the default
+        blocking commit is correct -- pacing to vblank gives clean
+        visual cadence without the overhead of a queued non-block
+        commit competing with itself.
+
         After commit, the staging buffer clears and the changes take
-        effect at the next vblank."""
+        effect at the next vblank regardless of which mode."""
         if not self._pending_props:
             return
         # Build (plane_id, [(prop_id, value), ...]) groups from the
@@ -1589,7 +1609,8 @@ class DRMRenderer:
         for (plane_id, prop_id), value in self._pending_props.items():
             by_plane.setdefault(plane_id, []).append((prop_id, value))
         object_props = list(by_plane.items())
-        self._atomic_commit(flags=0, object_props=object_props)
+        flags = DRM_MODE_ATOMIC_NONBLOCK if nonblock else 0
+        self._atomic_commit(flags=flags, object_props=object_props)
         self._pending_props.clear()
 
     # ---- internal staging helpers ----

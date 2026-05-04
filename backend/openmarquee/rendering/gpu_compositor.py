@@ -369,7 +369,13 @@ class GPUSlideCompositor:
             self._slide_id, n_static, len(animated),
         )
 
-    def tick(self, elapsed_s: float, now: datetime | None = None) -> None:
+    def tick(
+        self,
+        elapsed_s: float,
+        now: datetime | None = None,
+        *,
+        nonblock_commit: bool = False,
+    ) -> None:
         """Per-tick (called at PlaybackLoop's render rate, typically
         30 Hz for motion / 1 Hz for auto-only): refresh any auto-layer
         text whose source changed, then stage motion-driven property
@@ -380,7 +386,14 @@ class GPUSlideCompositor:
         whose text just rolled over (e.g. clock 12:34 → 12:35), one
         layer re-rasterizes (~5-10 ms at 1080p) and the plane buffer
         is re-uploaded. Still well under the 33 ms budget for one
-        layer roll-over per tick."""
+        layer roll-over per tick.
+
+        nonblock_commit=True passes DRM_MODE_ATOMIC_NONBLOCK to the
+        atomic commit so the kernel returns immediately instead of
+        serializing behind any pending PageFlip on the same CRTC.
+        Used during shader transitions (#214) where a primary-plane
+        PageFlip is in flight; for steady-state ticks the default
+        blocking commit is correct."""
         if not self._attached:
             raise RuntimeError("GPUSlideCompositor not attached — call attach() first")
 
@@ -411,7 +424,15 @@ class GPUSlideCompositor:
                 continue
             self._stage_motion(slot_idx, layer_idx, layer, motion, elapsed_s)
 
-        self.renderer.commit()
+        if nonblock_commit:
+            try:
+                self.renderer.commit(nonblock=True)
+            except TypeError:
+                # Renderer doesn't support nonblock kwarg (older
+                # MockRenderer in tests). Fall through to blocking.
+                self.renderer.commit()
+        else:
+            self.renderer.commit()
 
     def detach(self) -> None:
         """Slide exit: detach every animated plane (CRTC_ID = 0 / FB_ID =

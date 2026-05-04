@@ -94,25 +94,45 @@ def _build_ticker_slide() -> TextSlide:
 
 
 def _build_static_slide() -> TextSlide:
-    """Slide B: static target after the iris."""
+    """Slide B: a different ticker direction so every transition
+    exercises the with-motion path -- snapshot-only would mask the
+    very perf delta we want to verify."""
     return TextSlide(
         id=uuid4(),
-        name="motion-static-target",
+        name="motion-target",
         background_color="#2e0a1a",
         text_layers=[
             TextLayer(
-                text="STATIC SLIDE B",
-                name="static",
-                font_size_pct=20.0,
+                text="SLIDE B HEADER",
+                name="header",
+                font_size_pct=12.0,
                 text_color="#ffffff",
-                box=TextBox(x=0.1, y=0.4, w=0.8, h=0.2),
+                box=TextBox(x=0.1, y=0.1, w=0.8, h=0.2),
                 motion="static",
+            ),
+            TextLayer(
+                text=(
+                    "second slide ticker -- different content so you "
+                    "can tell which direction the transition is going"
+                ),
+                name="ticker-b",
+                font_size_pct=8.0,
+                text_color="#a0d0ff",
+                box=TextBox(x=0.05, y=0.5, w=0.9, h=0.3),
+                motion="ticker",
             ),
         ],
     )
 
 
 async def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--duration", type=float, default=600.0,
+        help="seconds to run before stopping (default 600 = 10 min)",
+    )
+    args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -171,9 +191,14 @@ async def main() -> int:
             read_asset=_read_asset,
         )
         await loop.start()
-        log.info("playback loop started; cycling for 30 s -- watch the screen")
+        log.info(
+            "playback loop started; cycling for %.0f s -- watch the screen "
+            "(Ctrl-C to stop earlier)", args.duration,
+        )
         try:
-            await asyncio.sleep(30.0)
+            await asyncio.sleep(args.duration)
+        except KeyboardInterrupt:
+            log.info("interrupted; stopping cleanly")
         finally:
             await loop.stop()
             log.info("loop stopped after %d fetch_items calls", fetch_items_called)
