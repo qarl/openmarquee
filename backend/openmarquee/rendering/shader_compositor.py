@@ -453,6 +453,107 @@ void main() {
 }
 """
 
+# Slide: both images translate horizontally; u_to enters from the
+# right edge as u_from exits left. The "seam" at x = 1 - t separates
+# the visible portions: left of the seam shows the part of u_from
+# that hasn't yet shifted off; right of the seam shows the leading
+# columns of u_to entering from the right.
+_FRAGMENT_SLIDE = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  float t = u_transition_t;
+  float seam = 1.0 - t;
+  float onTo = step(seam, v_uv.x);
+  vec2 fromUV = vec2(v_uv.x + t, v_uv.y);
+  vec2 toUV = vec2(v_uv.x - seam, v_uv.y);
+  vec4 a = texture2D(u_from, fromUV);
+  vec4 b = texture2D(u_to, toUV);
+  gl_FragColor = mix(a, b, onTo);
+}
+"""
+
+# Push: u_to enters from the LEFT, pushing u_from off the right.
+# Mirror of slide. Bright 2-px-equivalent vertical separator at the
+# seam (x = t) gives the projector-blade look that distinguishes
+# push from slide visually.
+_FRAGMENT_PUSH = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  float t = u_transition_t;
+  float onTo = step(v_uv.x, t);
+  vec2 fromUV = vec2(v_uv.x - t, v_uv.y);
+  vec2 toUV = vec2(v_uv.x + (1.0 - t), v_uv.y);
+  vec4 a = texture2D(u_from, fromUV);
+  vec4 b = texture2D(u_to, toUV);
+  vec4 col = mix(a, b, onTo);
+  // Projector-blade separator at the seam. Width ~0.001 in UV
+  // ~= 2px at 1080p.
+  float blade = 1.0 - smoothstep(0.0, 0.001, abs(v_uv.x - t));
+  col.rgb = mix(col.rgb, vec3(1.0), blade * 0.8);
+  gl_FragColor = col;
+}
+"""
+
+# Scroll: vertical analog of slide. u_to enters from the bottom edge
+# as u_from rolls up off the top.
+_FRAGMENT_SCROLL = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  float t = u_transition_t;
+  float seam = 1.0 - t;
+  // v_uv.y is top-down (vertex shader Y-flips), so seam at y=1-t
+  // means u_from visible above the seam (rolling up), u_to below
+  // (rolling in from the bottom).
+  float onTo = step(seam, v_uv.y);
+  vec2 fromUV = vec2(v_uv.x, v_uv.y + t);
+  vec2 toUV = vec2(v_uv.x, v_uv.y - seam);
+  vec4 a = texture2D(u_from, fromUV);
+  vec4 b = texture2D(u_to, toUV);
+  gl_FragColor = mix(a, b, onTo);
+}
+"""
+
+# Blinds: horizontal slats opening. n_slats slats stacked vertically;
+# each slat reveals u_to from its midline outward. fract(v_uv.y *
+# n_slats) gives slat-local UV; abs(slat_uv - 0.5) is distance from
+# midline; band grows midline-out with t.
+_FRAGMENT_BLINDS = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  // 16 slats vertical for a 1080p panel ~= 67 px slats. Reads as
+  // distinct slats without being so coarse it loses the blind look.
+  float n_slats = 16.0;
+  float slat_uv = fract(v_uv.y * n_slats);
+  float dist_to_mid = abs(slat_uv - 0.5);
+  // Band grows from midline (dist=0) to slat edges (dist=0.5) as t
+  // goes 0 -> 1.
+  float mask = step(dist_to_mid, u_transition_t * 0.5);
+  gl_FragColor = mix(a, b, mask);
+}
+"""
+
 # Transition-kind ID -> fragment shader source. Add new kinds here as
 # their per-fragment math is worked out; ShaderRenderer compiles each
 # program at startup and picks one per transition via set_kind().
@@ -464,6 +565,10 @@ _TRANSITION_SHADERS: dict[str, str] = {
     "scanline": _FRAGMENT_SCANLINE,
     "halftone": _FRAGMENT_HALFTONE,
     "glitch": _FRAGMENT_GLITCH,
+    "slide": _FRAGMENT_SLIDE,
+    "push": _FRAGMENT_PUSH,
+    "scroll": _FRAGMENT_SCROLL,
+    "blinds": _FRAGMENT_BLINDS,
 }
 
 

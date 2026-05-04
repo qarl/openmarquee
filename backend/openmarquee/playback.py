@@ -80,6 +80,10 @@ _SHADER_TRANSITION_KINDS = frozenset({
     "scanline",
     "halftone",
     "glitch",
+    "slide",
+    "push",
+    "scroll",
+    "blinds",
 })
 
 
@@ -1089,7 +1093,13 @@ class PlaybackLoop:
         """Push transition: `from_image` slides off to the left while
         `to_image` slides in from the right at the same rate. Distinct
         from wipe in that BOTH frames move (rather than to_image
-        revealing under a stationary from_image)."""
+        revealing under a stationary from_image).
+
+        Routes through the shader compositor when available."""
+        if await self._run_shader_transition(
+            from_image, to_image, "slide", transition_ms,
+        ):
+            return
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         width, height = from_image.size
@@ -1164,7 +1174,13 @@ class PlaybackLoop:
         `to_image` rolls in from the bottom at the same rate. Reads as
         a stadium scoreboard advancing rows. Distinct from slide in
         that the motion is vertical — natural on tall WS281x columns
-        and ticker-style HUB75 strips."""
+        and ticker-style HUB75 strips.
+
+        Routes through the shader compositor when available."""
+        if await self._run_shader_transition(
+            from_image, to_image, "scroll", transition_ms,
+        ):
+            return
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         width, height = from_image.size
@@ -1635,7 +1651,13 @@ class PlaybackLoop:
 
         Strip-graceful: width<2 -> fall back to fade. Same shape as
         flip/marquee/pixelate strip fallbacks.
+
+        Routes through the shader compositor when available.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "push", transition_ms,
+        ):
+            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -1701,7 +1723,13 @@ class PlaybackLoop:
 
         Strip-graceful: height<4 leaves no room for two slats with
         meaningful midline-spread bands, so delegate to fade.
+
+        Routes through the shader compositor when available.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "blinds", transition_ms,
+        ):
+            return
         from PIL import ImageDraw
 
         width, height = from_image.size
