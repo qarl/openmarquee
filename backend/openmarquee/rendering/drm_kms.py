@@ -1235,6 +1235,52 @@ class DRMRenderer:
 
     # --- close ---
 
+    @property
+    def drm_fd(self) -> int | None:
+        """The active DRM file descriptor, or None if not opened.
+        Exposed so a peer renderer (e.g. ShaderRenderer for a transition
+        window) can issue ioctls under THIS renderer's master without
+        re-opening the device or fighting for master. The peer must
+        not close this fd; that stays our responsibility."""
+        return self._fd
+
+    def restage_primary_fb(self) -> None:
+        """Re-stage the primary plane's FB_ID + CRTC binding so the
+        next `commit()` atomic-rebinds OUR primary fb to the CRTC.
+
+        Required after a peer renderer (e.g. ShaderRenderer for a
+        transition window) has driven the primary plane via legacy
+        drmModeSetCrtc with its own GBM-backed fbs. By the time the
+        peer closes, the kernel implicitly pins its last fb to the
+        CRTC; without this restage, our subsequent `commit()` runs
+        through `_pending_props` empty and the screen keeps showing
+        the peer's last frame indefinitely (until the next mode-set
+        or any other primary-FB_ID-touching atomic commit).
+
+        Caller order for a clean handoff back to multi-plane:
+          drm.render_frame(new_bytes)   # paint our dumb buffer
+          drm.restage_primary_fb()      # stage primary FB_ID
+          drm.commit()                  # atomic rebind
+          shader.close()                # peer RmFB's a now-idle fb
+        """
+        pp = self._primary_plane_props
+        sign_src_w = self.width << 16
+        sign_src_h = self.height << 16
+        pid = self._primary_plane_id
+        # Mirrors the property set in _commit_initial_modeset for
+        # primary; matches whatever HVS scaling the renderer was
+        # constructed for (sign-native source, letterboxed CRTC dest).
+        self._pending_props[(pid, pp["FB_ID"])] = self._fb_id
+        self._pending_props[(pid, pp["CRTC_ID"])] = self._crtc_id
+        self._pending_props[(pid, pp["SRC_X"])] = 0
+        self._pending_props[(pid, pp["SRC_Y"])] = 0
+        self._pending_props[(pid, pp["SRC_W"])] = sign_src_w
+        self._pending_props[(pid, pp["SRC_H"])] = sign_src_h
+        self._pending_props[(pid, pp["CRTC_X"])] = self._letterbox_x
+        self._pending_props[(pid, pp["CRTC_Y"])] = self._letterbox_y
+        self._pending_props[(pid, pp["CRTC_W"])] = self._scaled_w
+        self._pending_props[(pid, pp["CRTC_H"])] = self._scaled_h
+
     def close(self) -> None:
         if self._fd is None:
             return

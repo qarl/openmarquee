@@ -275,11 +275,31 @@ void main() {
 }
 """
 
+# Iris: u_to reveals through a circle that expands from screen center
+# to the corners. The 0.71 max-radius covers the diagonal — center to
+# corner distance in normalized [0,1] UV space is sqrt(0.5) = 0.707.
+_FRAGMENT_IRIS = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  float r = distance(v_uv, vec2(0.5));
+  float mask = step(r, u_transition_t * 0.71);
+  gl_FragColor = mix(a, b, mask);
+}
+"""
+
 # Transition-kind ID -> fragment shader source. Add new kinds here as
 # their per-fragment math is worked out; ShaderRenderer compiles each
 # program at startup and picks one per transition via set_kind().
 _TRANSITION_SHADERS: dict[str, str] = {
     "fade": _FRAGMENT_FADE,
+    "iris": _FRAGMENT_IRIS,
 }
 
 
