@@ -214,6 +214,15 @@ class PlaybackLoop:
         # plane budget statically (incoming gets [N/2..N-1]).
         self._outgoing_compositor: "GPUSlideCompositor | None" = None
         self._outgoing_slide: "TextSlide | None" = None
+        # Incoming slide reference set by the dispatcher BEFORE the
+        # transition method fires; consumed by _run_shader_transition
+        # to compose u_to as bg+statics-only (excluding animated
+        # layers, parallel to u_from). Without this, slide B's
+        # animated text would appear as a frozen ghost in the
+        # iris-revealed area of the shader output -- overlapping with
+        # slide A's live-moving ticker on the overlay plane until the
+        # incoming compositor attaches after the transition.
+        self._incoming_slide: "TextSlide | None" = None
         # Slide-relative monotonic time at the moment the outgoing
         # slide started ticking. _tick_outgoing_during_transition
         # uses this as the elapsed_s base so motion phase stays
@@ -519,6 +528,15 @@ class PlaybackLoop:
                     next_image = self._safe_load_image(next_item)
                     if next_image is not None:
                         kind = item.transition
+                        # Stash next_item so _run_shader_transition can
+                        # compose u_to as bg+statics-only (parallel to
+                        # u_from). TextSlides only -- ImageSlide /
+                        # VideoSlide don't have animated layers to skip
+                        # so their full composite IS bg+statics anyway.
+                        self._incoming_slide = (
+                            next_item if next_item.type == "text_slide"
+                            else None
+                        )
                         # Every transition kind is shader-routed since
                         # the unification cleanup. Shader path drains
                         # outgoing internally; if shader is unavailable
@@ -564,6 +582,11 @@ class PlaybackLoop:
                 # the compositor stays here and would otherwise leak
                 # into the next slide. Idempotent.
                 self._drain_outgoing_compositor()
+                # Same housekeeping for the incoming-slide stash --
+                # _run_shader_transition reads it on entry; clear it
+                # so a future transition without a known incoming
+                # slide doesn't stale-read a previous next_item.
+                self._incoming_slide = None
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -1060,7 +1083,35 @@ class PlaybackLoop:
         else:
             from_rgba = self._image_to_rgba_bytes(from_image, width, height)
 
-        to_rgba = self._image_to_rgba_bytes(to_image, width, height)
+        # u_to: prefer bg+statics-only of the incoming slide so its
+        # animated layers don't appear as frozen ghosts in the shader-
+        # revealed area while the outgoing slide's overlay-plane
+        # animation is still scrolling on top (qarl 2026-05-04: "i'm
+        # seeing both slides moving text overlapping each other"). The
+        # incoming slide's animated layers attach via its own
+        # GPUSlideCompositor.attach AFTER the transition completes --
+        # there's a one-frame "snap" at the transition boundary as the
+        # animated text appears, but that's preferable to a ghost
+        # baked-in copy visible during the entire transition.
+        # Falls back to the PIL Image path when the incoming slide
+        # is non-TextSlide (image / video) or unavailable.
+        to_rgba: bytes
+        incoming_slide = self._incoming_slide
+        if incoming_slide is not None:
+            try:
+                to_rgba = self._snapshot_cache.get_bg_statics(
+                    incoming_slide, width, height,
+                    read_asset=self._read_asset,
+                )
+            except Exception:
+                log.exception(
+                    "playback: bg+statics compose failed for incoming "
+                    "slide; falling back to full to_image (animated "
+                    "layers may ghost during transition)"
+                )
+                to_rgba = self._image_to_rgba_bytes(to_image, width, height)
+        else:
+            to_rgba = self._image_to_rgba_bytes(to_image, width, height)
 
         # Track why we exit the frame loop. Pause means a stream
         # takeover is becoming the new owner of render_frame/commit
@@ -1234,10 +1285,27 @@ class PlaybackLoop:
         # the shader's pending primary-plane PageFlip on the same
         # CRTC (#214 fix; without NONBLOCK with-motion fps was
         # ~11 fps because each tick waited for vblank).
+        #
+        # EBUSY (errno 16) is the kernel's "previous NONBLOCK commit
+        # not landed yet" signal -- expected when shader frames
+        # outpace vblank. We log it once at debug level (not
+        # exception) so the dropped tick is visible without spamming
+        # the log; the alpha-ramp staged just above is reissued on
+        # the next tick that succeeds.
         try:
             compositor.tick(
                 elapsed, now=datetime.now(UTC), nonblock_commit=True,
             )
+        except OSError as exc:
+            if exc.errno == 16:  # EBUSY -- expected with NONBLOCK
+                log.debug(
+                    "playback: tick EBUSY during shader transition "
+                    "(prior NONBLOCK commit still pending; tick dropped)"
+                )
+            else:
+                log.exception(
+                    "playback: outgoing-compositor tick during transition failed"
+                )
         except Exception:
             log.exception(
                 "playback: outgoing-compositor tick during transition failed"
