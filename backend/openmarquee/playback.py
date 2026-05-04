@@ -1090,6 +1090,8 @@ class PlaybackLoop:
             frame_period = (transition_ms / 1000) / n_frames
             assert self._stop_event is not None
             assert self._pause_event is not None
+            transition_start = _time.monotonic()
+            frames_drawn = 0
             for i in range(1, n_frames + 1):
                 if self._pause_event.is_set():
                     paused = True
@@ -1107,7 +1109,20 @@ class PlaybackLoop:
                     self._tick_outgoing_during_transition(
                         outgoing, outgoing_t0, t,
                     )
+                frames_drawn += 1
                 await self._wait(frame_period)
+            transition_elapsed = _time.monotonic() - transition_start
+            achieved_fps = (
+                frames_drawn / transition_elapsed if transition_elapsed > 0 else 0.0
+            )
+            log.info(
+                "playback: shader transition %r %s: %d/%d frames in "
+                "%.2fs (%.1f fps achieved, target %.1f)",
+                kind,
+                "with-motion" if outgoing is not None else "snapshot-only",
+                frames_drawn, n_frames,
+                transition_elapsed, achieved_fps, _FADE_FPS,
+            )
             if not paused and not self._stop_event.is_set():
                 # Land at t=1.0 so the final shader frame matches
                 # to_image before we hand the plane back. Skip on
@@ -1197,25 +1212,29 @@ class PlaybackLoop:
         import time as _time
         from datetime import UTC
         elapsed = _time.monotonic() - t0_monotonic
-        try:
-            compositor.tick(elapsed, now=datetime.now(UTC))
-        except Exception:
-            log.exception(
-                "playback: outgoing-compositor tick during transition failed"
-            )
-        # Now ramp alpha. Reach into the compositor's slot mapping;
-        # _slot_for_layer is module-internal but the shape is stable
-        # (private inside the gpu_compositor.py module, fine for our
-        # adjacent module). Update each animated plane's alpha + commit.
+        # Stage the alpha ramp BEFORE compositor.tick so they ride
+        # the same atomic commit -- without this we did 2 ioctls
+        # per shader frame on the overlay side and the with-motion
+        # path measured at ~10 fps (per #208 measurement). Reach
+        # into _slot_for_layer (module-private but adjacent to ours).
         try:
             alpha = max(0, min(65535, int(round(65535 * (1.0 - transition_t)))))
             renderer = self._renderer
             for slot_idx in compositor._slot_for_layer.values():
                 renderer.update_animated_layer(slot_idx, alpha=alpha)
-            renderer.commit()
         except Exception:
             log.exception(
                 "playback: outgoing-compositor alpha ramp during transition failed"
+            )
+        # tick stages motion-property changes and flushes via
+        # renderer.commit(). The alpha-ramp staged above rides in
+        # the same atomic commit. ONE atomic ioctl per overlay-side
+        # update per frame.
+        try:
+            compositor.tick(elapsed, now=datetime.now(UTC))
+        except Exception:
+            log.exception(
+                "playback: outgoing-compositor tick during transition failed"
             )
 
     async def _fade(
