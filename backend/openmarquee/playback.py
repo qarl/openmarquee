@@ -73,7 +73,12 @@ from openmarquee.rendering.gpu_compositor import (
 # already have their own fast plane-property animation paths
 # (_fade_gpu / _wipe_gpu). New kinds get added here as their
 # fragments land in _TRANSITION_SHADERS.
-_SHADER_TRANSITION_KINDS = frozenset({"iris"})
+_SHADER_TRANSITION_KINDS = frozenset({
+    "iris",
+    "dissolve",
+    "pixelate",
+    "scanline",
+})
 
 
 def _count_animated_layers(item: ContentItem) -> int:
@@ -1301,7 +1306,16 @@ class PlaybackLoop:
         Strip-graceful: works at any width or height — the per-pixel
         randomization doesn't depend on geometry, so a 1×N strip just
         sees its individual pixels reveal independently. No fallback.
+
+        Routes through the shader compositor when available. Hashes
+        v_uv per fragment for the threshold (deterministic per pixel,
+        same shape as the np.random thresholds below — different RNG,
+        same visual class).
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "dissolve", transition_ms,
+        ):
+            return
         width, height = from_image.size
         # Per-pixel reveal thresholds. Generated once per transition so
         # pixels reveal in a stable random order across frames; using a
@@ -1343,7 +1357,16 @@ class PlaybackLoop:
         pixelate (block_size collapses to 1 → identity), so delegate
         to fade. Cleaner than emitting frames identical to fade under
         a different name.
+
+        Routes through the shader compositor when available. The
+        shader version uses a UV-space block-quantize on both samplers
+        with a wave that peaks at t=0.5 — same visual class as the
+        PIL path's PIL.Image.resize(NEAREST) chunk-blur.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "pixelate", transition_ms,
+        ):
+            return
         width, height = from_image.size
         if width < 2 or height < 2:
             await self._fade(from_image, to_image, transition_ms)
@@ -1463,7 +1486,16 @@ class PlaybackLoop:
         duration. Fall back to fade. Per QA's spec ("scanline on a 1×N
         strip is just a fade"); we make it explicit here so the
         operator's pulldown choice doesn't silently degrade.
+
+        Routes through the shader compositor when available. The
+        shader version uses smoothstep around the sweep line for the
+        glow band — slightly softer than the PIL path's solid white
+        rectangle but reads as the same CRT-beam look.
         """
+        if await self._run_shader_transition(
+            from_image, to_image, "scanline", transition_ms,
+        ):
+            return
         from PIL import ImageDraw
 
         width, height = from_image.size

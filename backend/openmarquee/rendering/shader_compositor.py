@@ -294,12 +294,100 @@ void main() {
 }
 """
 
+# Dissolve: per-pixel reveal threshold sampled from a hash of v_uv.
+# Each pixel "rolls a die" once and reveals when transition_t crosses
+# its threshold — reads as a noise-driven crossfade matching the PIL
+# path (np.random.default_rng().random per pixel). The hash is
+# deterministic per fragment, so no per-frame jitter; smooth reveal.
+_FRAGMENT_DISSOLVE = """#version 100
+// highp -- the canonical sin/dot/fract hash needs the *43758.5453
+// product to wrap well past the integer range before fract() peels
+// off the fractional part. mediump on vc4 V3D 2.1 (~10-bit mantissa
+// in fragment shaders) drops bits before fract, collapsing adjacent
+// pixels to identical thresholds and producing visible diagonal
+// banding instead of pepper-noise. highp gives ~24-bit and is
+// emulated by Mesa on vc4 even though hardware mediump is the
+// default. Per pre-commit review (#197).
+precision highp float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+float _hash(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  float threshold = _hash(v_uv);
+  float mask = step(threshold, u_transition_t);
+  gl_FragColor = mix(a, b, mask);
+}
+"""
+
+# Pixelate: both images sample at a coarsened grid whose block size
+# grows to a peak at midpoint, then shrinks back. The peak (0.04 in UV
+# = ~80 px at 1080p) gives an obvious chunky-blocks moment around
+# t=0.5; ends are ~native resolution. mix() blends a → b with t so the
+# whole motion reads as "current slide pixelates harder, then sharpens
+# into the next."
+_FRAGMENT_PIXELATE = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  // Wave: 0 at t=0/1, 1 at t=0.5. (1 - 4(t-0.5)^2).
+  float wave = 1.0 - 4.0 * (u_transition_t - 0.5) * (u_transition_t - 0.5);
+  // 0.0025 base = ~5px blocks at 1080p (effectively native);
+  // 0.0425 peak = ~80px at midpoint.
+  float blockSize = 0.0025 + 0.04 * wave;
+  vec2 cell = floor(v_uv / blockSize) * blockSize + 0.5 * blockSize;
+  vec4 a = texture2D(u_from, cell);
+  vec4 b = texture2D(u_to, cell);
+  gl_FragColor = mix(a, b, u_transition_t);
+}
+"""
+
+# Scanline: top-to-bottom sweep with a bright band at the sweep line.
+# Pixels above the sweep show u_to; below show u_from; the band is a
+# brightness boost at the sweep edge. Matches the PIL scanline's CRT
+# look (band height ~3% of panel = 0.03 in UV).
+_FRAGMENT_SCANLINE = """#version 100
+precision mediump float;
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_transition_t;
+varying vec2 v_uv;
+
+void main() {
+  vec4 a = texture2D(u_from, v_uv);
+  vec4 b = texture2D(u_to, v_uv);
+  float sweep = u_transition_t;
+  float band_half = 0.015;  // half-height of the bright band
+  // Pixels above the sweep line are b; below are a.
+  float mask = step(v_uv.y, sweep);
+  vec4 col = mix(a, b, mask);
+  // Bright glow: white-ish boost where v_uv.y is within band of sweep.
+  float band = 1.0 - smoothstep(0.0, band_half, abs(v_uv.y - sweep));
+  col.rgb = mix(col.rgb, vec3(1.0), band * 0.7);
+  gl_FragColor = col;
+}
+"""
+
 # Transition-kind ID -> fragment shader source. Add new kinds here as
 # their per-fragment math is worked out; ShaderRenderer compiles each
 # program at startup and picks one per transition via set_kind().
 _TRANSITION_SHADERS: dict[str, str] = {
     "fade": _FRAGMENT_FADE,
     "iris": _FRAGMENT_IRIS,
+    "dissolve": _FRAGMENT_DISSOLVE,
+    "pixelate": _FRAGMENT_PIXELATE,
+    "scanline": _FRAGMENT_SCANLINE,
 }
 
 
