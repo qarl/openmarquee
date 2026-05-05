@@ -460,8 +460,10 @@ def _render_pattern_rays(
     color_a: str, color_b: str, density: float, width: int, height: int,
 ) -> Image.Image:
     """Conic gradient that flips between color_a and color_b in equal
-    angular slices. Slice count grows with density (lerp(8, 32))."""
-    slices = max(2, round(_lerp(8, 32, density)))
+    angular slices. Slice count grows with density (lerp(8, 32)) and
+    is always even -- an odd count joins two same-colored slices at
+    the wrap seam, doubling the top ray (B15, 2026-05-05)."""
+    slices = max(2, 2 * round(_lerp(4, 16, density)))
     cx = width / 2
     cy = height / 2
     xs = (np.arange(width, dtype=np.float32) - cx).reshape(1, width)

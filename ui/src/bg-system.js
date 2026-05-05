@@ -91,7 +91,10 @@ const BUILDERS = {
     },
 
     rays: (a, b, d = 0.5) => {
-        const slices = Math.round(lerp(8, 32, d));
+        // Slice count is always even -- with an odd count the slice at
+        // angle wrap-around (0 / 2pi) joins two same-colored slices,
+        // visibly doubling the top ray (B15, 2026-05-05).
+        const slices = 2 * Math.round(lerp(4, 16, d));
         const stops = [];
         const step = 100 / slices;
         for (let i = 0; i < slices; i++) {
@@ -288,7 +291,8 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "rays") {
-            const slices = Math.max(2, Math.round(lerp(8, 32, density)));
+            // Always even -- see B15 note in the rays builder above.
+            const slices = Math.max(2, 2 * Math.round(lerp(4, 16, density)));
             const cx = width / 2;
             const cy = height / 2;
             const maxR = Math.ceil(Math.sqrt(cx * cx + cy * cy)) + 1;

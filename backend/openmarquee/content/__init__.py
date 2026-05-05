@@ -226,7 +226,7 @@ class BackgroundPattern(BaseModel):
       - scanlines: line spacing lerp(8, 3) — horizontal CRT lines
       - checker:   tile size lerp(32, 8)
       - rings:     concentric ring spacing lerp(60, 18)
-      - rays:      slice count lerp(8, 32) — conic A/B alternating
+      - rays:      slice count 2*round(lerp(4, 16)) — conic A/B alternating, always even
       - confetti:  base tile lerp(60, 28) — 4 offset dot layers
       - bricks:    brick width lerp(80, 32) — staggered courses
     """
