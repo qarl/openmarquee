@@ -636,18 +636,23 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         ),
         layers=(
             _DemoLayer(
+                # Cream-yellow on amber→scarlet so the type pops against
+                # both gradient stops -- prior #1A0F00 disappeared on the
+                # dark-red bottom (B20, 2026-05-05).
                 text="UNCAGE\nYOUR SIGN!!",
                 font_family="Alfa Slab One",
-                text_color="#1A0F00",
+                text_color="#FFF1B0",
                 box=_b(0.05, 0.15, 0.9, 0.65),
                 font_size_pct=33.0,
                 motion="shake",
                 motion_intensity=70,
             ),
             _DemoLayer(
+                # Same B20 fix -- soft amber-cream caption on the dark
+                # gradient bottom; was #3A1A00 dark-brown-on-dark-red.
                 text="// synonyms.length === 2",
                 font_family="VT323",
-                text_color="#3A1A00",
+                text_color="#FFD580",
                 box=_b(0.1, 0.85, 0.8, 0.1),
                 font_size_pct=4.0,
             ),
