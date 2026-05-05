@@ -504,25 +504,28 @@ def _render_pattern_rays(
 def _render_pattern_confetti(
     color_a: str, color_b: str, density: float, width: int, height: int,
 ) -> Image.Image:
-    """Pseudo-random scatter of color_b dots on color_a. Built from 4
-    offset radial-grid layers at different tile sizes — pure CSS
-    structurally, looks busy enough to read as confetti without any
-    actual randomness."""
-    t1 = max(8, round(_lerp(100, 14, density)))  # B12: widened from (60, 28)
-    t2 = max(4, round(t1 * 0.7))
-    t3 = max(4, round(t1 * 1.3))
-    r = max(2, round(t1 * 0.08))
-    base = _solid_fill(width, height, color_a)
-    # Layer 1: tile t1 at center
-    mask = _dot_grid_mask(width, height, t1, r)
-    # Layer 2: tile t2, offset by (t2/2, t2/3)
-    mask |= _dot_grid_mask(width, height, t2, r, t2 // 2, t2 // 3)
-    # Layer 3: tile t3, offset by (t3/4, t3/2), slightly bigger dots
-    mask |= _dot_grid_mask(width, height, t3, r + 1, t3 // 4, t3 // 2)
-    # Layer 4: tile t1 again at vertical offset t1/3
-    mask |= _dot_grid_mask(width, height, t1, r, 0, t1 // 3)
-    _apply_mask(base, mask, color_b)
-    return Image.fromarray(base, mode="RGB")
+    """Deterministic full-canvas scatter of color_b dots on color_a.
+    Replaces the prior 4-layer offset dot grid that had visible repeat
+    seams at 1080p (B5, 2026-05-05). Particle count grows with density
+    via lerp(80, 2000). Fixed PRNG seed so a given (density, width,
+    height) renders the same scatter every time -- live edits feel
+    stable, not random. NB: editor canvas and device backend use
+    different RNG families with the same seed -- both deterministic
+    per-surface but the scatters will not pixel-match. Visual
+    character is the same."""
+    count = max(40, round(_lerp(80, 2000, density)))
+    rng = np.random.default_rng(0xC0FFE71)
+    img = Image.new("RGB", (width, height), color_a)
+    draw = ImageDraw.Draw(img)
+    xs = rng.integers(0, width, count)
+    ys = rng.integers(0, height, count)
+    radii = rng.integers(2, 6, count)
+    for x, y, r in zip(xs, ys, radii):
+        draw.ellipse(
+            [(int(x - r), int(y - r)), (int(x + r), int(y + r))],
+            fill=color_b,
+        )
+    return img
 
 
 def _render_pattern_bricks(

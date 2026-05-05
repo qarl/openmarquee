@@ -14,6 +14,18 @@
 const lerp = (a, b, t) =>
     a + (b - a) * Math.max(0, Math.min(1, t));
 
+// Numerical Recipes LCG -- deterministic 0..1 stream from a seed.
+// Used by patterns that need stable per-render randomness (e.g.
+// confetti scatter, B5). Not cryptographic; just needs to be
+// reproducible across calls with the same seed.
+function lcgRandom(seed) {
+    let state = (seed | 0) || 1;
+    return () => {
+        state = (Math.imul(state, 1664525) + 1013904223) | 0;
+        return ((state >>> 0) / 0x100000000);
+    };
+}
+
 // 12-name list in display order (matches the picker grid order).
 export const PATTERN_NAMES = [
     "solid", "gradient", "dots", "halftone", "stripes",
@@ -359,25 +371,24 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "confetti") {
-            const t1 = Math.max(8, Math.round(lerp(100, 14, density)));
-            const t2 = Math.max(4, Math.round(t1 * 0.7));
-            const t3 = Math.max(4, Math.round(t1 * 1.3));
-            const r = Math.max(2, Math.round(t1 * 0.08));
+            // Deterministic full-canvas particle scatter -- replaces the
+            // tiled 4-layer dot grid that had visible repeat seams at
+            // 1080p (B5, 2026-05-05). Particle count grows with density.
+            // Fixed PRNG seed means a given (density) produces the same
+            // scatter every render -- live edits feel stable, not random.
+            // NB: editor preview and device renderer use different RNG
+            // families with the same seed -- both deterministic per-surface
+            // but they will not pixel-match. Visual character is the same.
+            const count = Math.round(lerp(80, 2000, density));
+            const rng = lcgRandom(0xC0FFE71);
             ctx.fillStyle = b;
-            const layers = [
-                { tile: t1, ox: 0, oy: 0, radius: r },
-                { tile: t2, ox: t2 / 2, oy: t2 / 3, radius: r },
-                { tile: t3, ox: t3 / 4, oy: t3 / 2, radius: r + 1 },
-                { tile: t1, ox: 0, oy: t1 / 3, radius: r },
-            ];
-            for (const L of layers) {
-                for (let y = L.oy + L.tile / 2; y < height; y += L.tile) {
-                    for (let x = L.ox + L.tile / 2; x < width; x += L.tile) {
-                        ctx.beginPath();
-                        ctx.arc(x, y, L.radius, 0, Math.PI * 2);
-                        ctx.fill();
-                    }
-                }
+            for (let i = 0; i < count; i++) {
+                const x = rng() * width;
+                const y = rng() * height;
+                const r = 2 + Math.floor(rng() * 4);
+                ctx.beginPath();
+                ctx.arc(x, y, r, 0, Math.PI * 2);
+                ctx.fill();
             }
             return;
         }
