@@ -140,6 +140,7 @@ class TextLayerUpload(BaseModel):
     font_size_pct: float | None = None
     weight: int | None = None
     text_color: str = "#FFFFFF"
+    text_align: str | None = None
     outline: bool | None = None
     opacity: float | None = None
     anchor: str | None = None

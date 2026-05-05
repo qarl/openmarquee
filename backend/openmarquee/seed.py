@@ -42,7 +42,14 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from openmarquee.content import ImageSlide, TextLayer, TextSlide, VideoSlide
+from openmarquee.content import (
+    BackgroundPattern,
+    ImageSlide,
+    TextBox,
+    TextLayer,
+    TextSlide,
+    VideoSlide,
+)
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playlist import PlaylistStorage
 
@@ -204,63 +211,32 @@ def seed_if_needed(
         if demo is not None:
             created.append(demo)
 
-        # 3. What we auto-append to the default playlist: three text
-        #    slides reading "Welcome" → "to" → "openMarquee". A fresh
-        #    device plays them in order so the sign isn't a black screen
-        #    until the operator does anything. Each pairs a bundled
-        #    background + a distinct font + transition so the demo
-        #    shows off the editor's range immediately.
-        welcome_slides = _seed_welcome_playlist_slides(
-            storage,
-            width,
-            height,
-            bundled_backgrounds_dir=bg_dir,
-            bundled_bg_slides=bundled,
-        )
-        created.extend(welcome_slides)
-        for slide, spec in zip(welcome_slides, _WELCOME_SPECS, strict=True):
-            playlist.append(slide.id, transition=spec.transition_out)
+        # 3. The first-boot demo reel — FREE YOUR SIGN. 19 slides
+        #    (15 design frames; the typo + panic-flash live-edits each
+        #    expand to 3 quick-cut sub-slides) escalating from a boot log
+        #    through synonyms / chant / scream / silence / stadium /
+        #    panic / cooldown, stitched with all 16 device transitions.
+        #    Replaces the previous Welcome (3-slide) + Freedom (3-slide)
+        #    seed per qarl's 2026-05-04 ask after the design handoff.
+        demo_slides = _seed_demo_reel_slides(storage, width, height)
+        created.extend(demo_slides)
+        for slide, spec in zip(demo_slides, _DEMO_REEL, strict=True):
+            playlist.append(
+                slide.id,
+                transition=spec.transition_out,
+                transition_ms=spec.transition_ms,
+            )
 
         # save() coerces the playlist's id + name to DEFAULT_PLAYLIST_ID +
         # "Welcome" — preserves the default-playlist identity while
         # giving the operator a friendlier display name than "default".
         playlist_storage.save(playlist)
 
-        # 4. Freedom playlist: three protest-poster-style text slides
-        #    (FREE / YOUR / SIGN) on a separate playlist. Available
-        #    content from the moment seed runs; activated by the Friday
-        #    schedule rule below. Operators who want it more often can
-        #    edit the schedule, or drag the slides into other playlists.
-        freedom_slides = _seed_text_slide_set(
-            storage,
-            _FREEDOM_SPECS,
-            width,
-            height,
-            duration_ms=_FREEDOM_DURATION_MS,
-            bundled_backgrounds_dir=bg_dir,
-            bundled_bg_slides=bundled,
-        )
-        created.extend(freedom_slides)
-
-        from openmarquee.playlist import Playlist, PlaylistItem
-
-        freedom_playlist = Playlist(
-            name=FREEDOM_PLAYLIST_NAME,
-            items=[
-                PlaylistItem(item_id=slide.id, transition=spec.transition_out)
-                for slide, spec in zip(freedom_slides, _FREEDOM_SPECS, strict=True)
-            ],
-        )
-        # set_by_id, NOT save() — save() would coerce both id and name
-        # back to the default-playlist constants and overwrite Welcome.
-        playlist_storage.set_by_id(freedom_playlist)
-
-        # 5. Friday 20:00-20:10 schedule rule pointing at Freedom; default
-        #    fallback stays on the Welcome playlist (DEFAULT_PLAYLIST_ID).
-        #    Skipped when no schedule_storage is wired (tests that don't
-        #    care about scheduling).
-        if schedule_storage is not None:
-            _seed_friday_freedom_rule(schedule_storage, freedom_playlist.id)
+        # The previous Welcome + Freedom 2-playlist split (and its
+        # Friday-night Freedom schedule rule) collapses into the demo
+        # reel above. The "FREE / YOUR / SIGN" beats live in the reel
+        # frames 02-04; the protest-poster vibe is captured by the reel's
+        # own escalation arc.
     except Exception:
         logger.exception("seed: failed while creating starter slides")
         # Roll back any already-saved items so a half-seeded disk doesn't
@@ -462,11 +438,686 @@ _FREEDOM_DURATION_MS = 1500
 FREEDOM_PLAYLIST_NAME = "Freedom"
 
 
+# ─── FREE YOUR SIGN demo reel ────────────────────────────────
+# Designer-handoff bundle 2026-05-04 (claude.ai/design):
+# /Users/qarl/project/openmarquee/design/free-your-sign-2026-05-04/.
+# A self-running first-boot demo that escalates
+#   boot → FREE → YOUR → SIGN → sentence → Liberate → UNCAGE → typo →
+#   3×3 chaos → chant wall → scream → silence → stadium → panic flash → cooldown
+# stitched with all 16 device transitions. Replaces the previous
+# Welcome+Freedom 2-playlist seed per qarl's 2026-05-04 ask.
+#
+# The two "live edit" frames the designer wrote with React state-
+# machines (TypoFix character-swap, PanicFlash multi-font flicker)
+# are expanded here into rapid sub-slide sequences with `cut`
+# transitions between them, per qarl's explicit greenlight.
+
+@dataclass(frozen=True)
+class _DemoLayer:
+    """One TextLayer's worth of config for a demo reel frame."""
+    text: str
+    font_family: str | None = None
+    text_color: str = "#FFFFFF"
+    box: tuple[float, float, float, float] = (0.1, 0.1, 0.8, 0.8)
+    font_size_pct: float | None = None
+    font_size_px: int | None = None
+    motion: str = "static"
+    motion_intensity: int = 50
+    motion_phase: float = 0.0
+    blend: str = "normal"
+
+
+@dataclass(frozen=True)
+class _DemoFrame:
+    """One slide in the demo reel."""
+    name: str  # display name in the slide list (numbered for ordering)
+    layers: tuple[_DemoLayer, ...]
+    duration_ms: int = 1000
+    background_color: str = "#050608"
+    background_pattern: BackgroundPattern | None = None
+    transition_out: str = "cut"
+    transition_ms: int = 1000
+
+
+# Box helper — design uses pixel-y positions; the box model is normalized.
+def _b(x, y, w, h):
+    return (round(x, 4), round(y, 4), round(w, 4), round(h, 4))
+
+
+# Multi-line boot-log text (fits a left-aligned box; centered horizontally
+# inside the box because _draw_text_into centers).
+_BOOT_LOG_TEXT = (
+    "> openMarquee v0.4.2 boot\n"
+    "  panel-0 . . . . . . . . ok\n"
+    "  motion-engine . . . . . ok\n"
+    "  flock-mesh . . . . . . . ok\n"
+    "  9.6V / 0.41A / 27°C\n"
+    "  ready."
+)
+
+# Long-string repeated text used by ticker/marquee frames so the scrolling
+# never shows a gap. The motion engine wraps within the box.
+_SCREAM_TEXT = "FREE YOUR SIGN!!!!!  " * 4
+_CHANT_TEXT = "FREE  YOUR  SIGN  •  " * 6
+
+
+_DEMO_REEL: tuple[_DemoFrame, ...] = (
+    # 1 · BOOT — VT323 boot log + breathing status badge.
+    _DemoFrame(
+        name="01 · Boot",
+        duration_ms=1200,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text=_BOOT_LOG_TEXT,
+                font_family="VT323",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.18, 0.9, 0.64),
+                font_size_pct=10.0,
+            ),
+            _DemoLayer(
+                text="● PANEL-0 OK",
+                font_family="VT323",
+                text_color="#FFB43C",
+                box=_b(0.55, 0.05, 0.4, 0.1),
+                font_size_pct=12.0,
+                motion="breathe",
+                motion_intensity=45,
+            ),
+        ),
+        transition_out="iris",
+    ),
+
+    # 2 · FREE — narrow Anton, amber, definitive.
+    _DemoFrame(
+        name="02 · FREE",
+        duration_ms=800,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="FREE",
+                font_family="Anton",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.1, 0.9, 0.8),
+                font_size_pct=80.0,
+            ),
+        ),
+        transition_out="wipe",
+    ),
+
+    # 3 · YOUR — Alfa Slab, mint green.
+    _DemoFrame(
+        name="03 · YOUR",
+        duration_ms=800,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="YOUR",
+                font_family="Alfa Slab One",
+                text_color="#5AF095",
+                box=_b(0.05, 0.1, 0.9, 0.8),
+                font_size_pct=70.0,
+            ),
+        ),
+        transition_out="slide",
+    ),
+
+    # 4 · SIGN — Bowlby, hot pink, breathing.
+    _DemoFrame(
+        name="04 · SIGN",
+        duration_ms=1000,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="SIGN",
+                font_family="Bowlby One SC",
+                text_color="#FF5FA7",
+                box=_b(0.05, 0.1, 0.9, 0.8),
+                font_size_pct=88.0,
+                motion="breathe",
+                motion_intensity=35,
+            ),
+        ),
+        transition_out="fade",
+    ),
+
+    # 5 · THE SENTENCE — Playfair italic on cream. Mic-drop.
+    _DemoFrame(
+        name="05 · The Sentence",
+        duration_ms=1800,
+        background_color="#FBF3DC",
+        layers=(
+            _DemoLayer(
+                text="Free your sign.",
+                font_family="Playfair Display",
+                text_color="#1A1610",
+                box=_b(0.05, 0.25, 0.9, 0.5),
+                font_size_pct=30.0,
+                motion="breathe",
+                motion_intensity=20,
+            ),
+        ),
+        transition_out="cut",
+    ),
+
+    # 6 · LIBERATE — first synonym, dignified Playfair on cream.
+    _DemoFrame(
+        name="06 · Liberate",
+        duration_ms=1000,
+        background_color="#FBF3DC",
+        layers=(
+            _DemoLayer(
+                text="// thesaurus.next()",
+                font_family="VT323",
+                text_color="#7A6A4E",
+                box=_b(0.1, 0.15, 0.8, 0.1),
+                font_size_pct=4.0,
+            ),
+            _DemoLayer(
+                text="Liberate\nyour sign.",
+                font_family="Playfair Display",
+                text_color="#1A1610",
+                box=_b(0.05, 0.27, 0.9, 0.6),
+                font_size_pct=30.0,
+            ),
+        ),
+        transition_out="push",
+    ),
+
+    # 7 · UNCAGE — Alfa Slab on amber→scarlet gradient, shaking.
+    _DemoFrame(
+        name="07 · Uncage!!",
+        duration_ms=900,
+        background_pattern=BackgroundPattern(
+            pattern="gradient",
+            color_a="#FFB43C",
+            color_b="#5E1A1A",
+            density=0.0,  # 0deg = top→bottom
+        ),
+        layers=(
+            _DemoLayer(
+                text="UNCAGE\nYOUR SIGN!!",
+                font_family="Alfa Slab One",
+                text_color="#1A0F00",
+                box=_b(0.05, 0.15, 0.9, 0.65),
+                font_size_pct=33.0,
+                motion="shake",
+                motion_intensity=70,
+            ),
+            _DemoLayer(
+                text="// synonyms.length === 2",
+                font_family="VT323",
+                text_color="#3A1A00",
+                box=_b(0.1, 0.85, 0.8, 0.1),
+                font_size_pct=4.0,
+            ),
+        ),
+        transition_out="flip",
+    ),
+
+    # 8a · TYPO (broken) — confidently displayed mistake.
+    _DemoFrame(
+        name="08a · Typo (oops)",
+        duration_ms=900,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="FREE YOUR SGIN!!",
+                font_family="Bowlby One SC",
+                text_color="#FFFFFF",
+                box=_b(0.05, 0.25, 0.9, 0.45),
+                font_size_pct=14.0,
+            ),
+            _DemoLayer(
+                text="// it's your sign.",
+                font_family="VT323",
+                text_color="#FF5A6B",
+                box=_b(0.1, 0.78, 0.8, 0.1),
+                font_size_pct=5.0,
+            ),
+        ),
+        transition_out="cut",  # internal cut to mid-fix
+        transition_ms=200,
+    ),
+
+    # 8b · TYPO (mid-fix) — striking through SG, glow on insertion.
+    _DemoFrame(
+        name="08b · Typo (mid-fix)",
+        duration_ms=350,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="FREE YOUR S?IN!!",  # placeholder while letters swap
+                font_family="Bowlby One SC",
+                text_color="#FFFFFF",
+                box=_b(0.05, 0.25, 0.9, 0.45),
+                font_size_pct=14.0,
+                motion="pulse",
+                motion_intensity=80,
+            ),
+            _DemoLayer(
+                text="// fixing...",
+                font_family="VT323",
+                text_color="#5AF095",
+                box=_b(0.1, 0.78, 0.8, 0.1),
+                font_size_pct=5.0,
+            ),
+        ),
+        transition_out="cut",  # internal cut to fixed
+        transition_ms=200,
+    ),
+
+    # 8c · TYPO (fixed) — clean, with green confirmation caption.
+    _DemoFrame(
+        name="08c · Typo (fixed)",
+        duration_ms=900,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="FREE YOUR SIGN.",
+                font_family="Bowlby One SC",
+                text_color="#FFFFFF",
+                box=_b(0.05, 0.25, 0.9, 0.45),
+                font_size_pct=14.0,
+            ),
+            _DemoLayer(
+                text="// fixed.",
+                font_family="VT323",
+                text_color="#5AF095",
+                box=_b(0.1, 0.78, 0.8, 0.1),
+                font_size_pct=5.0,
+            ),
+        ),
+        transition_out="shutter",
+    ),
+
+    # 9 · TILE CHAOS — 4 quadrants, each different font + motion.
+    _DemoFrame(
+        name="09 · Tile Chaos",
+        duration_ms=800,
+        background_color="#050608",
+        layers=(
+            # Top-left: Bowlby amber, shake high
+            _DemoLayer(
+                text="FREE YOUR\nSIGN!!!",
+                font_family="Bowlby One SC",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.05, 0.4, 0.4),
+                font_size_pct=22.0,
+                motion="shake",
+                motion_intensity=80,
+                motion_phase=0.0,
+            ),
+            # Top-right: Anton mint, bounce
+            _DemoLayer(
+                text="FREE YOUR\nSIGN!!!",
+                font_family="Anton",
+                text_color="#5AF095",
+                box=_b(0.55, 0.05, 0.4, 0.4),
+                font_size_pct=24.0,
+                motion="bounce",
+                motion_intensity=70,
+                motion_phase=0.25,
+            ),
+            # Bottom-left: Marker cyan, pulse
+            _DemoLayer(
+                text="FREE YOUR\nSIGN!!!",
+                font_family="Permanent Marker",
+                text_color="#5FD5FF",
+                box=_b(0.05, 0.55, 0.4, 0.4),
+                font_size_pct=22.0,
+                motion="pulse",
+                motion_intensity=80,
+                motion_phase=0.5,
+            ),
+            # Bottom-right: Caveat amber, blink
+            _DemoLayer(
+                text="FREE YOUR\nSIGN!!!",
+                font_family="Caveat Brush",
+                text_color="#FFB43C",
+                box=_b(0.55, 0.55, 0.4, 0.4),
+                font_size_pct=24.0,
+                motion="blink",
+                motion_intensity=70,
+                motion_phase=0.7,
+            ),
+        ),
+        transition_out="pixelate",
+    ),
+
+    # 10 · CHANT WALL — 5 horizontal stripes, ticker per row, varied fonts.
+    _DemoFrame(
+        name="10 · Chant Wall",
+        duration_ms=1000,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text=_CHANT_TEXT, font_family="Bowlby One SC",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.06, 0.9, 0.16),
+                font_size_pct=16.0,
+                motion="ticker", motion_intensity=70, motion_phase=0.0,
+            ),
+            _DemoLayer(
+                text=_CHANT_TEXT, font_family="Anton",
+                text_color="#5AF095",
+                box=_b(0.05, 0.24, 0.9, 0.16),
+                font_size_pct=18.0,
+                motion="ticker", motion_intensity=60, motion_phase=0.5,
+            ),
+            _DemoLayer(
+                text=_CHANT_TEXT, font_family="Alfa Slab One",
+                text_color="#FF5FA7",
+                box=_b(0.05, 0.42, 0.9, 0.16),
+                font_size_pct=15.0,
+                motion="ticker", motion_intensity=70, motion_phase=0.2,
+            ),
+            _DemoLayer(
+                text=_CHANT_TEXT, font_family="Permanent Marker",
+                text_color="#5FD5FF",
+                box=_b(0.05, 0.60, 0.9, 0.16),
+                font_size_pct=14.0,
+                motion="ticker", motion_intensity=60, motion_phase=0.8,
+            ),
+            _DemoLayer(
+                text=_CHANT_TEXT, font_family="Caveat Brush",
+                text_color="#FFFFFF",
+                box=_b(0.05, 0.78, 0.9, 0.16),
+                font_size_pct=15.0,
+                motion="ticker", motion_intensity=80, motion_phase=0.3,
+            ),
+        ),
+        transition_out="marquee",
+    ),
+
+    # 11 · SCREAM — Anton ticker on rainbow gradient.
+    _DemoFrame(
+        name="11 · Scream",
+        duration_ms=500,
+        background_pattern=BackgroundPattern(
+            pattern="gradient",
+            color_a="#FF5FA7",
+            color_b="#5AF095",
+            density=0.0,
+        ),
+        layers=(
+            _DemoLayer(
+                text=_SCREAM_TEXT,
+                font_family="Anton",
+                text_color="#050608",
+                box=_b(0.05, 0.25, 0.9, 0.5),
+                font_size_pct=40.0,
+                motion="ticker",
+                motion_intensity=85,
+            ),
+        ),
+        transition_out="cut",
+    ),
+
+    # 12 · SILENCE — // signal lost, dying carrier on slow pulse.
+    _DemoFrame(
+        name="12 · Silence",
+        duration_ms=400,
+        background_color="#000000",
+        layers=(
+            _DemoLayer(
+                text="// signal lost",
+                font_family="VT323",
+                text_color="#7A4318",
+                box=_b(0.1, 0.4, 0.8, 0.2),
+                font_size_pct=10.0,
+                motion="pulse",
+                motion_intensity=80,
+            ),
+        ),
+        transition_out="scanline",
+    ),
+
+    # 13 · STADIUM — typed line + ticker echo.
+    _DemoFrame(
+        name="13 · Stadium",
+        duration_ms=1400,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="> chant.start()",
+                font_family="JetBrains Mono",
+                text_color="#7A5418",
+                box=_b(0.1, 0.18, 0.8, 0.1),
+                font_size_pct=5.0,
+            ),
+            _DemoLayer(
+                text="FREE YOUR SIGN_",
+                font_family="JetBrains Mono",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.32, 0.9, 0.32),
+                font_size_pct=12.5,
+            ),
+            _DemoLayer(
+                text="free your sign · free your sign · free your sign",
+                font_family="Bowlby One SC",
+                text_color="#FFFFFF",
+                box=_b(0.05, 0.7, 0.9, 0.18),
+                font_size_pct=8.0,
+                motion="ticker",
+                motion_intensity=60,
+            ),
+        ),
+        transition_out="glitch",
+    ),
+
+    # 14a · PANIC FLASH (1/3) — Bowlby amber, shake max.
+    _DemoFrame(
+        name="14a · Panic 1",
+        duration_ms=130,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="FREE YOUR SIGN!!!",
+                font_family="Bowlby One SC",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.2, 0.9, 0.6),
+                font_size_pct=14.0,
+                motion="shake",
+                motion_intensity=100,
+            ),
+        ),
+        transition_out="cut",
+        transition_ms=80,
+    ),
+
+    # 14b · PANIC FLASH (2/3) — Alfa Slab pink, shake max.
+    _DemoFrame(
+        name="14b · Panic 2",
+        duration_ms=130,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="FREE YOUR SIGN!!!",
+                font_family="Alfa Slab One",
+                text_color="#FF5FA7",
+                box=_b(0.05, 0.2, 0.9, 0.6),
+                font_size_pct=13.0,
+                motion="shake",
+                motion_intensity=100,
+            ),
+        ),
+        transition_out="cut",
+        transition_ms=80,
+    ),
+
+    # 14c · PANIC FLASH (3/3) — Permanent Marker cyan, shake max.
+    _DemoFrame(
+        name="14c · Panic 3",
+        duration_ms=130,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="FREE YOUR SIGN!!!",
+                font_family="Permanent Marker",
+                text_color="#5FD5FF",
+                box=_b(0.05, 0.2, 0.9, 0.6),
+                font_size_pct=13.0,
+                motion="shake",
+                motion_intensity=100,
+            ),
+        ),
+        transition_out="iris",
+    ),
+
+    # 15 · COOLDOWN — credits, slow blink "// loop · 1/∞".
+    _DemoFrame(
+        name="15 · Cooldown",
+        duration_ms=2000,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text="// openMarquee",
+                font_family="VT323",
+                text_color="#7A5418",
+                box=_b(0.1, 0.18, 0.8, 0.1),
+                font_size_pct=7.0,
+            ),
+            _DemoLayer(
+                text="FREE YOUR\nSIGN.",
+                font_family="Bowlby One SC",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.30, 0.9, 0.45),
+                font_size_pct=24.0,
+            ),
+            _DemoLayer(
+                text="// loop · 1/∞",
+                font_family="VT323",
+                text_color="#A87830",
+                box=_b(0.1, 0.83, 0.8, 0.1),
+                font_size_pct=6.0,
+                motion="blink",
+                motion_intensity=20,
+            ),
+        ),
+        transition_out="scroll",  # back to BOOT
+    ),
+)
+
+
+def _seed_demo_reel_slides(
+    storage: ContentStorage,
+    width: int,
+    height: int,
+) -> list[TextSlide]:
+    """Render + save the FREE YOUR SIGN demo reel as a list of TextSlides.
+
+    Each frame becomes one TextSlide with multi-layer text + per-layer
+    motion + an optional background_pattern. The slides preserve the
+    `transition_out` choice on the spec — the caller threads that into
+    the playlist's per-item transition.
+    """
+    from openmarquee.auto_render import render_pattern as render_bg_pattern
+
+    slides: list[TextSlide] = []
+    for spec in _DEMO_REEL:
+        # Build the bg image: pattern → solid color fallback.
+        if spec.background_pattern is not None:
+            bg_img = render_bg_pattern(spec.background_pattern, width, height)
+        else:
+            bg_img = Image.new("RGB", (width, height), spec.background_color)
+
+        # Composite each layer's text on top in array order (index 0 first;
+        # later entries paint over). Same contract as
+        # render_layered_text_slide_png + the device's compose_motion_frame.
+        for layer in spec.layers:
+            box = TextBox(
+                x=layer.box[0], y=layer.box[1], w=layer.box[2], h=layer.box[3],
+            )
+            _draw_text_into(
+                bg_img,
+                text=layer.text,
+                fg=layer.text_color,
+                font_family=layer.font_family,
+                box=box,
+                slide_width=width,
+                slide_height=height,
+                font_size_pct=layer.font_size_pct,
+                font_size_px=layer.font_size_px,
+            )
+        buf = BytesIO()
+        bg_img.save(buf, format="PNG")
+        png = buf.getvalue()
+
+        # Build the TextSlide record. Per-layer motion + box + blend +
+        # font + color all carry forward; the device's playback engine
+        # re-composes per-tick at playback time using these.
+        text_layers = [
+            TextLayer(
+                text=layer.text,
+                font_family=layer.font_family,
+                text_color=layer.text_color,
+                font_size_pct=layer.font_size_pct,
+                font_size_px=layer.font_size_px,
+                box=TextBox(
+                    x=layer.box[0], y=layer.box[1],
+                    w=layer.box[2], h=layer.box[3],
+                ),
+                motion=layer.motion,
+                motion_intensity=layer.motion_intensity,
+                motion_phase=layer.motion_phase,
+                blend=layer.blend,
+            )
+            for layer in spec.layers
+        ]
+        slide = TextSlide(
+            name=spec.name,
+            background_color=spec.background_color,
+            background_pattern=spec.background_pattern,
+            duration_ms=spec.duration_ms,
+            text_layers=text_layers,
+        )
+        storage.save_text_slide(slide, png)
+        slides.append(slide)
+    return slides
+
+
 def render_welcome_png(width: int, height: int) -> bytes:
     """PNG for the first 'Welcome' slide at the panel's native dims. Kept
     as a thin shim for tests + historical callers; new code should prefer
     render_text_slide_png()."""
     return render_text_slide_png("Welcome", width, height)
+
+
+def _wrap_text_to_width(
+    text: str, draw, font, emoji_font, max_width: int,
+) -> str:
+    """Insert \\n at word boundaries so each line fits within
+    `max_width`. Preserves any pre-existing literal \\n breaks.
+    Single words wider than the box are left intact (the existing
+    horizontal-squish path will handle overflow).
+
+    Used by _draw_text_into for B4 word-wrap (2026-05-05) so prose
+    that exceeds the box width flows onto multiple lines instead of
+    requiring squish or visual clipping."""
+    if not text or max_width <= 0:
+        return text
+    out_lines: list[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            out_lines.append("")
+            continue
+        words = paragraph.split(" ")
+        line: list[str] = []
+        for word in words:
+            if not line:
+                line.append(word)
+                continue
+            test_line = " ".join(line + [word])
+            bbox = _measure_text_runs(draw, test_line, font, emoji_font)
+            if (bbox[2] - bbox[0]) > max_width:
+                out_lines.append(" ".join(line))
+                line = [word]
+            else:
+                line.append(word)
+        if line:
+            out_lines.append(" ".join(line))
+    return "\n".join(out_lines)
 
 
 def _draw_text_into(
@@ -480,6 +1131,7 @@ def _draw_text_into(
     slide_height: int,
     font_size_pct: float | None = None,
     font_size_px: int | None = None,
+    text_align: str = "center",
     outline_color: str | None = None,
 ) -> None:
     """Compose one text layer onto `img` in place.
@@ -536,6 +1188,10 @@ def _draw_text_into(
     # through to the regular font (showing .notdef tofu but not
     # crashing).
     emoji_font = _load_emoji_font(size_px)
+    # B4 (2026-05-05): word-wrap to box width before measurement so
+    # prose flows onto multiple lines instead of requiring squish or
+    # clipping. Pre-existing literal \n breaks are preserved.
+    text = _wrap_text_to_width(text, draw, font, emoji_font, px_box_w)
     bbox = _measure_text_runs(draw, text, font, emoji_font)
     natural_w = bbox[2] - bbox[0]
     natural_h = bbox[3] - bbox[1]
@@ -555,13 +1211,24 @@ def _draw_text_into(
 
     # Fits inside the box on both axes — paint directly, no squish.
     if natural_w <= px_box_w and natural_h <= px_box_h:
+        # Anchor the bbox to the box's left/center/right edge per
+        # text_align so single-line short labels align to the box
+        # itself, not to the bbox center. Multi-line per-line
+        # alignment within the bbox happens via PIL's align kwarg
+        # in _draw_text_runs.
+        if text_align == "left":
+            anchor_x = px_box_x - bbox[0]
+        elif text_align == "right":
+            anchor_x = px_box_x + px_box_w - natural_w - bbox[0]
+        else:
+            anchor_x = box_center_x - natural_w / 2 - bbox[0]
         _draw_text_runs(
             draw,
-            (box_center_x - natural_w / 2 - bbox[0],
-             box_center_y - natural_h / 2 - bbox[1]),
+            (anchor_x, box_center_y - natural_h / 2 - bbox[1]),
             text,
             fg=fg, font=font, emoji_font=emoji_font,
             stroke_kwargs=stroke_kwargs,
+            align=text_align,
         )
         return
     # Squish: render at natural size on a transparent surface, then
@@ -588,6 +1255,7 @@ def _draw_text_into(
         text,
         fg=fg, font=font, emoji_font=emoji_font,
         stroke_kwargs=stroke_kwargs,
+        align=text_align,
     )
     squished = temp.resize(
         (target_w + pad_post * 2, target_h + pad_post * 2), Image.LANCZOS
@@ -628,6 +1296,7 @@ def render_layered_text_slide_png(
             slide_height=height,
             font_size_pct=getattr(layer, "font_size_pct", None),
             font_size_px=getattr(layer, "font_size_px", None),
+            text_align=getattr(layer, "text_align", "center") or "center",
         )
     buf = BytesIO()
     img.save(buf, format="PNG")
@@ -800,16 +1469,28 @@ def _measure_text_runs(draw, text: str, font, emoji_font) -> tuple[int, int, int
 def _draw_text_runs(
     draw, xy: tuple[float, float], text: str, *,
     fg: str, font, emoji_font, stroke_kwargs: dict,
+    align: str = "center",
 ) -> None:
     """Render `text` at `xy` using emoji_font for emoji codepoints
     and `font` for the rest. Falls back to a single draw.text call
-    when emoji_font is None or text has no emoji."""
+    when emoji_font is None or text has no emoji.
+
+    `align` controls per-line horizontal alignment within the text's
+    natural bbox for multi-line input ("left"/"center"/"right").
+    Emoji-segmented text uses center alignment regardless (B4 limit,
+    2026-05-05 -- align with emoji is a follow-up if it ever shows
+    up in practice)."""
+    pil_align = align if align in ("left", "center", "right") else "center"
     if emoji_font is None:
-        draw.text(xy, text, fill=fg, font=font, **stroke_kwargs)
+        draw.text(
+            xy, text, fill=fg, font=font, align=pil_align, **stroke_kwargs,
+        )
         return
     runs = _segment_text_for_emoji(text)
     if all(kind == "text" for kind, _ in runs):
-        draw.text(xy, text, fill=fg, font=font, **stroke_kwargs)
+        draw.text(
+            xy, text, fill=fg, font=font, align=pil_align, **stroke_kwargs,
+        )
         return
     cursor_x = float(xy[0])
     cursor_y = xy[1]

@@ -350,6 +350,7 @@ def render_layer_to_rgba(
         slide_height=height,
         font_size_pct=getattr(layer, "font_size_pct", None),
         font_size_px=getattr(layer, "font_size_px", None),
+        text_align=getattr(layer, "text_align", "center") or "center",
         outline_color=outline_color,
     )
     return img

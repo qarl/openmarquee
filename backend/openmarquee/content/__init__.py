@@ -109,6 +109,11 @@ class TextLayer(BaseModel):
     # variable-weight ones (Inter, Oswald, Roboto Slab, …).
     weight: int | None = Field(default=None, ge=100, le=900)
     text_color: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
+    # Horizontal alignment within the box. Default center matches the
+    # historical centered render. left/right introduced for B4 word-wrap
+    # support (2026-05-05) -- multi-line wrapped text reads better
+    # left-aligned for prose, center stays the default for short labels.
+    text_align: Literal["left", "center", "right"] = "center"
     # Stroke outline around the glyphs. Editor-set; render support TBD.
     outline: bool = False
     # Layer opacity, 0–1. Composited by the renderer when < 1.

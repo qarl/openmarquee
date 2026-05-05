@@ -384,6 +384,15 @@ const LAYER_GROUP_TEMPLATE = `
             <textarea class="om-textarea field-text" rows="2" placeholder="(enter text here)"></textarea>
         </label>
         <div class="om-field">
+            <span>Align</span>
+            <div class="editor-segmented field-text-align-segmented" role="group" aria-label="text alignment">
+                <button type="button" data-value="left" aria-pressed="false">Left</button>
+                <button type="button" data-value="center" aria-pressed="true">Center</button>
+                <button type="button" data-value="right" aria-pressed="false">Right</button>
+            </div>
+            <input type="hidden" class="field-text-align" value="center">
+        </div>
+        <div class="om-field">
             <span>Dynamic Text</span>
             <div class="editor-segmented field-auto-mode-segmented" role="group" aria-label="dynamic source">
                 <button type="button" data-value="" aria-pressed="true">Off</button>
@@ -467,6 +476,7 @@ function defaultLayer() {
         fontSizePct: pickFontSizePct(),
         autoMode: null,
         autoFormat: null,
+        textAlign: "center",
         motion: "static",
         motionIntensity: 50,
         motionPhase: 0,
@@ -830,6 +840,8 @@ export function mountEditor(
         layer.autoMode = groupEl.querySelector(".field-auto-mode").value || null;
         const fmtEl = groupEl.querySelector(".field-auto-format");
         layer.autoFormat = layer.autoMode ? fmtEl.value || null : null;
+        const textAlignEl = groupEl.querySelector(".field-text-align");
+        layer.textAlign = textAlignEl ? textAlignEl.value || "center" : "center";
         const motionEl = groupEl.querySelector(".field-motion");
         layer.motion = motionEl ? motionEl.value || "static" : "static";
         const blendEl = groupEl.querySelector(".field-blend");
@@ -985,6 +997,24 @@ export function mountEditor(
             });
         });
         autoFormatEl.addEventListener("change", () => syncLayerFromForm(groupEl));
+
+        // Text-align segmented control (B4, 2026-05-05). Mirrors the
+        // dynamic-text segmented pattern: buttons drive a hidden
+        // .field-text-align input that the form-state sync reads from.
+        const textAlignSegEl = groupEl.querySelector(".field-text-align-segmented");
+        const textAlignEl = groupEl.querySelector(".field-text-align");
+        if (textAlignSegEl && textAlignEl) {
+            textAlignSegEl.querySelectorAll("button").forEach((btn) => {
+                btn.addEventListener("click", () => {
+                    const value = btn.dataset.value;
+                    if (textAlignEl.value === value) return;
+                    textAlignEl.value = value;
+                    refreshSegmentedPressed(textAlignSegEl, value);
+                    syncLayerFromForm(groupEl);
+                    autoSave?.kick();
+                });
+            });
+        }
 
         // Bundled @font-face fonts load lazily — kick an explicit load on
         // selection and redraw once it's ready, so the preview catches up
@@ -1202,6 +1232,13 @@ export function mountEditor(
         refreshSegmentedPressed(
             groupEl.querySelector(".field-auto-mode-segmented"),
             layer.autoMode || "",
+        );
+        const textAlignVal = layer.textAlign || "center";
+        const textAlignEl = groupEl.querySelector(".field-text-align");
+        if (textAlignEl) textAlignEl.value = textAlignVal;
+        refreshSegmentedPressed(
+            groupEl.querySelector(".field-text-align-segmented"),
+            textAlignVal,
         );
         motionEl.value = layer.motion || "static";
         const blendEl = groupEl.querySelector(".field-blend");
@@ -1570,6 +1607,7 @@ export function mountEditor(
             font_size_pct: layer.fontSizePct,
             auto_mode: layer.autoMode || null,
             auto_format: layer.autoMode ? layer.autoFormat || null : null,
+            text_align: layer.textAlign || "center",
             motion: layer.motion || "static",
             motion_intensity: layer.motionIntensity ?? 50,
             motion_phase: layer.motionPhase ?? 0,
@@ -1709,6 +1747,7 @@ export function mountEditor(
                     : pickFontSizePct()),
             autoMode: wire?.auto_mode || null,
             autoFormat: wire?.auto_format || null,
+            textAlign: wire?.text_align || "center",
             motion: wire?.motion || "static",
             motionIntensity: wire?.motion_intensity ?? 50,
             motionPhase: wire?.motion_phase ?? 0,
@@ -2050,14 +2089,29 @@ function paintLayer(ctx, canvas, layer) {
     ctx.fillStyle = textColor;
     const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
     ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
-    ctx.textAlign = "center";
+    const textAlign = layer.text_align || layer.textAlign || "center";
+    ctx.textAlign = textAlign === "left"
+        ? "left"
+        : textAlign === "right"
+            ? "right"
+            : "center";
     ctx.textBaseline = "middle";
 
-    const lines = text.split(/\r?\n/);
+    // Word-wrap (B4, 2026-05-05): any paragraph longer than the box
+    // width gets broken at word boundaries onto multiple lines. Pre-
+    // existing literal newlines are preserved.
+    const wrapped = wrapTextToWidth(ctx, text, boxW);
+    const lines = wrapped.split(/\r?\n/);
     const lineHeight = fontSizePx * 1.1;
     const totalHeight = lineHeight * lines.length;
-    const boxCenterX = boxX + boxW / 2;
     const boxCenterY = boxY + boxH / 2;
+    // Anchor x depends on textAlign: left = box left, right = box right,
+    // center = box center. Canvas's textAlign+x interplay handles the
+    // per-line offset.
+    let anchorX;
+    if (textAlign === "left") anchorX = boxX;
+    else if (textAlign === "right") anchorX = boxX + boxW;
+    else anchorX = boxX + boxW / 2;
     const maxWidth = Math.max(1, boxW);
     // Vertical squish (qarl 2026-05-01 ask #1): when total rendered
     // text height exceeds box height, scale-y around the box center
@@ -2067,13 +2121,13 @@ function paintLayer(ctx, canvas, layer) {
     if (yScale === 1) {
         const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
         for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], boxCenterX, startY + i * lineHeight, maxWidth);
+            ctx.fillText(lines[i], anchorX, startY + i * lineHeight, maxWidth);
         }
     } else {
         ctx.save();
-        ctx.translate(boxCenterX, boxCenterY);
+        ctx.translate(anchorX, boxCenterY);
         ctx.scale(1, yScale);
-        // Draw centered around (0,0) under the local transform; each
+        // Draw aligned around (0,0) under the local transform; each
         // line's y-offset is from the centered origin. fillText's
         // maxWidth is in untransformed coords, so it still clamps
         // horizontal width correctly.
@@ -2083,6 +2137,41 @@ function paintLayer(ctx, canvas, layer) {
         }
         ctx.restore();
     }
+}
+
+/**
+ * Insert \n at word boundaries so each line measures within `maxWidth`
+ * via the current ctx.font. Preserves existing literal newlines.
+ * Mirrors the backend's _wrap_text_to_width helper (B4, 2026-05-05).
+ * Single words wider than maxWidth are left intact -- the existing
+ * fillText maxWidth + horizontal squish handles overflow.
+ */
+function wrapTextToWidth(ctx, text, maxWidth) {
+    if (!text || maxWidth <= 0) return text;
+    const out = [];
+    for (const paragraph of text.split(/\r?\n/)) {
+        if (!paragraph) {
+            out.push("");
+            continue;
+        }
+        const words = paragraph.split(" ");
+        let line = [];
+        for (const word of words) {
+            if (line.length === 0) {
+                line.push(word);
+                continue;
+            }
+            const candidate = line.concat(word).join(" ");
+            if (ctx.measureText(candidate).width > maxWidth) {
+                out.push(line.join(" "));
+                line = [word];
+            } else {
+                line.push(word);
+            }
+        }
+        if (line.length > 0) out.push(line.join(" "));
+    }
+    return out.join("\n");
 }
 
 /**
