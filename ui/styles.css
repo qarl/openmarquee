@@ -238,11 +238,14 @@ header h1 {
     /* Same 720px cap as the slide editor -- B13, 2026-05-05. */
     max-width: 720px;
 }
-@media (min-width: 720px) {
+/* B21: 1080 breakpoint matches .editor-cols -- see comment there. */
+@media (min-width: 1080px) {
     .playlist-cols {
         display: grid;
-        /* preview = 1fr, form = auto (sized to its 720px cap). B13. */
-        grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+        /* preview = 1fr, form = stable 720px track. Same B21 fix as
+           .editor-cols: auto-sized track caused the column to jump
+           when its inner controls changed visibility. */
+        grid-template-columns: minmax(0, 1fr) 720px;
         gap: 1.25rem;
         align-items: start;
     }
@@ -993,13 +996,25 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
        flows to the preview column instead (B13, 2026-05-05). */
     max-width: 720px;
 }
-@media (min-width: 720px) {
+/* Breakpoint bumped from 720 to 1080 (B21, 2026-05-05): with the
+   form column pinned to a stable 720px (not auto-sized), splitting
+   into two cols at the previous 720px breakpoint left the preview
+   track at near-zero width on viewports between 720 and 1080. The
+   single-column stacked layout reads better at those widths anyway
+   -- preview-above-form, both full-width. Above 1080 the preview
+   gets at least ~340px of meaningful space. */
+@media (min-width: 1080px) {
     .editor-cols {
         display: grid;
-        /* preview = 1fr (grows to fill leftover), form = auto (sizes
-           to its 720px max). Inverts the prior preview-natural /
-           form-1fr layout (B13, 2026-05-05). */
-        grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+        /* preview = 1fr (grows to fill leftover), form = stable 720px
+           track. Was minmax(0, auto) (B13) which sized to intrinsic
+           content width -- so showing/hiding motion controls (3 flex:1
+           sliders) made the form column jump wider/narrower and the
+           preview column resize with it (B21, 2026-05-05). The track is
+           now a fixed 720px to match .editor-form-stack's max-width
+           cap; column width stays constant regardless of which controls
+           are visible. */
+        grid-template-columns: minmax(0, 1fr) 720px;
         gap: 1.25rem;
         align-items: start;
     }
