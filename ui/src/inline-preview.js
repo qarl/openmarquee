@@ -317,11 +317,12 @@ export function mountInlinePreview(container, options) {
                 }
                 ctx.putImageData(composed, 0, 0);
             } else if (slot.transition === "pixelate") {
-                // Chunky-pixel cross-fade. Both slots pixelate to a
-                // peak block size at progress=0.5 then sharpen back to
-                // native resolution as the alpha-blend lands. Mirrors
-                // playback.py::_pixelate: triangular block-size,
-                // linear cross-fade.
+                // Chunky-pixel cross-fade. Mirrors playback.py::_pixelate:
+                // NEAREST-resample each frame down to (w/blockSize,
+                // h/blockSize) then back up to (w, h), alpha-blend.
+                // Replaces a per-pixel ImageData loop that QA found
+                // showing only an upper-left quadrant of pixelation
+                // (B22, 2026-05-05).
                 const w = canvas.width;
                 const h = canvas.height;
                 if (w < 2 || h < 2) {
@@ -336,36 +337,38 @@ export function mountInlinePreview(container, options) {
                         1,
                         Math.round(1 + triangular * (maxBlock - 1)),
                     );
-                    // Capture from-slot (drawSlot(slot) above pre-painted),
-                    // draw to-slot, capture, then build the pixelated +
-                    // blended composite manually. Manual is cheaper than
-                    // an offscreen <canvas> per frame and keeps the
-                    // smoothing-flag dance off the main ctx.
-                    const fromImg = ctx.getImageData(0, 0, w, h);
+                    const smallW = Math.max(1, Math.floor(w / blockSize));
+                    const smallH = Math.max(1, Math.floor(h / blockSize));
+                    // Snapshot-from-canvas-then-draw-to-then-snapshot
+                    // order matters: the main canvas already holds
+                    // from-slot's content from the outer drawSlot call.
+                    const fromCanvas = document.createElement("canvas");
+                    fromCanvas.width = w;
+                    fromCanvas.height = h;
+                    fromCanvas.getContext("2d").drawImage(canvas, 0, 0);
                     drawSlot(timeline[nextIdx]);
-                    const toImg = ctx.getImageData(0, 0, w, h);
-                    const out = ctx.createImageData(w, h);
-                    const oneMinusP = 1 - progress;
-                    for (let y = 0; y < h; y++) {
-                        const by = Math.floor(y / blockSize) * blockSize;
-                        for (let x = 0; x < w; x++) {
-                            const bx = Math.floor(x / blockSize) * blockSize;
-                            const srcOff = (by * w + bx) * 4;
-                            const dstOff = (y * w + x) * 4;
-                            // Pixel-block sample from each side, then blend.
-                            out.data[dstOff] =
-                                fromImg.data[srcOff] * oneMinusP +
-                                toImg.data[srcOff] * progress;
-                            out.data[dstOff + 1] =
-                                fromImg.data[srcOff + 1] * oneMinusP +
-                                toImg.data[srcOff + 1] * progress;
-                            out.data[dstOff + 2] =
-                                fromImg.data[srcOff + 2] * oneMinusP +
-                                toImg.data[srcOff + 2] * progress;
-                            out.data[dstOff + 3] = 255;
-                        }
-                    }
-                    ctx.putImageData(out, 0, 0);
+                    const toCanvas = document.createElement("canvas");
+                    toCanvas.width = w;
+                    toCanvas.height = h;
+                    toCanvas.getContext("2d").drawImage(canvas, 0, 0);
+                    // Save the smoothing flag so toggling it off here
+                    // doesn't bleed into other transitions in the
+                    // session.
+                    ctx.save();
+                    const tmp = document.createElement("canvas");
+                    tmp.width = smallW;
+                    tmp.height = smallH;
+                    const tctx = tmp.getContext("2d");
+                    tctx.imageSmoothingEnabled = false;
+                    ctx.imageSmoothingEnabled = false;
+                    ctx.clearRect(0, 0, w, h);
+                    tctx.drawImage(fromCanvas, 0, 0, smallW, smallH);
+                    ctx.globalAlpha = 1 - progress;
+                    ctx.drawImage(tmp, 0, 0, smallW, smallH, 0, 0, w, h);
+                    tctx.drawImage(toCanvas, 0, 0, smallW, smallH);
+                    ctx.globalAlpha = progress;
+                    ctx.drawImage(tmp, 0, 0, smallW, smallH, 0, 0, w, h);
+                    ctx.restore();
                 }
             } else if (slot.transition === "halftone") {
                 // Halftone-dot reveal. Mirrors playback.py::_halftone:
