@@ -281,25 +281,39 @@ class SlideSnapshotCache:
     """
 
     def __init__(self) -> None:
-        self._entries: dict[UUID, _CachedSnapshot] = {}
+        # Keyed by (slide.id, width, height). Same slide composed at
+        # different dims (e.g. DRMRenderer's sign-native 1920x1080 for
+        # the multi-plane primary path AND ShaderRenderer's connector
+        # dims 1024x768 for the shader textures) needs separate cache
+        # entries -- otherwise a (1920, 1080) prerender's bytes get
+        # returned to a (1024, 768) call site and the size mismatch
+        # crashes the shader texture upload.
+        self._entries: dict[
+            tuple[UUID, int, int], _CachedSnapshot,
+        ] = {}
 
     def _maybe_get(
-        self, slide: "TextSlide",
+        self,
+        slide: "TextSlide",
+        width: int,
+        height: int,
     ) -> _CachedSnapshot | None:
-        """Return the cache entry for `slide` IFF it matches the
-        slide's current `updated_at`. Returns None when the slide has
-        an auto layer (no caching) or the slide has no id; otherwise
-        ensures an entry exists (possibly empty) and returns it."""
+        """Return the cache entry for `slide` at `(width, height)` IFF
+        it matches the slide's current `updated_at`. Returns None
+        when the slide has an auto layer (no caching) or the slide
+        has no id; otherwise ensures an entry exists (possibly empty)
+        and returns it."""
         if _slide_has_auto_layer(slide):
             return None
         slide_id = getattr(slide, "id", None)
         if slide_id is None:
             return None
-        entry = self._entries.get(slide_id)
+        key = (slide_id, width, height)
+        entry = self._entries.get(key)
         slide_updated = getattr(slide, "updated_at", None)
         if entry is None or entry.updated_at != slide_updated:
             entry = _CachedSnapshot(updated_at=slide_updated)
-            self._entries[slide_id] = entry
+            self._entries[key] = entry
         return entry
 
     def get_full(
@@ -312,7 +326,7 @@ class SlideSnapshotCache:
         now: datetime | None = None,
     ) -> bytes:
         """Cached compose_slide_rgba. Populates on first call."""
-        entry = self._maybe_get(slide)
+        entry = self._maybe_get(slide, width, height)
         if entry is not None and entry.full_rgba is not None:
             return entry.full_rgba
         rgba = compose_slide_rgba(
@@ -333,7 +347,7 @@ class SlideSnapshotCache:
     ) -> bytes:
         """Cached compose_slide_bg_statics_rgba. Populates on first
         call."""
-        entry = self._maybe_get(slide)
+        entry = self._maybe_get(slide, width, height)
         if entry is not None and entry.bg_statics_rgba is not None:
             return entry.bg_statics_rgba
         rgba = compose_slide_bg_statics_rgba(
@@ -357,7 +371,7 @@ class SlideSnapshotCache:
         layer (auto-mode skips cache; recompute every time so clock
         text stays current). Subsequent visits to the same slide hit
         cache in microseconds instead of paying ~100ms PIL render."""
-        entry = self._maybe_get(slide)
+        entry = self._maybe_get(slide, width, height)
         if entry is not None and entry.anim_layer is not None:
             if entry.anim_layer is _ANIM_NONE:
                 return None

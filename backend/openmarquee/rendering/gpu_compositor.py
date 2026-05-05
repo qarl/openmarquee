@@ -54,6 +54,13 @@ class _CachedSlideAssets:
     Invalidated when slide.updated_at changes."""
     updated_at: datetime | None
     primary_bytes: bytes | None = None
+    # Renderer-native pre-encoded primary buffer (#218). When the
+    # renderer exposes encode_native_payload + render_frame_native
+    # (DRMRenderer does; MockRenderer doesn't), attach() encodes
+    # primary_bytes -> primary_native_bytes ONCE and reuses it on
+    # every subsequent attach. Saves 30-70 ms PIL conversion at 1080p
+    # RGB565 -- the main cost of the post-transition freeze.
+    primary_native_bytes: bytes | None = None
     # layer_idx → (rgba_bytes, gx, gy, gw, gh). Only non-auto animated
     # layers cache here — auto layers re-rasterize per tick when their
     # text rolls over and would never match a cached snapshot.
@@ -245,7 +252,7 @@ class GPUSlideCompositor:
         self,
         *,
         now: datetime | None = None,
-        t0_monotonic: float | None = None,
+        freeze_at_elapsed: float | None = None,
     ) -> None:
         """Slide entry: classify layers, paint primary plane (bg + every
         static layer software-composited), attach each animated layer
@@ -255,19 +262,16 @@ class GPUSlideCompositor:
         1080p (one slide-sized alpha_composite per static layer, one
         glyph-bbox crop per animated layer). Subsequent ticks are free.
 
-        `t0_monotonic`: when supplied, the slide's tick base in
-        time.monotonic() coordinates. Right before the initial commit,
-        elapsed_s = time.monotonic() - t0_monotonic is computed FRESHLY
-        and motion-derived plane properties are staged for each
-        animated layer (mirrors what the next tick would compute).
-        Used by PlaybackLoop's transition seam path (#217) so a slide
-        attaching mid-cycle shows ticker at the correct phase from the
-        first commit, not at the glyph's natural-rest gx position.
-        Computing elapsed_s INSIDE attach (vs taking it as a parameter)
-        is critical: the static-composite + per-layer rasterize before
-        this point can take 100+ ms; computing elapsed_s outside attach
-        and passing it in left the staged crtc_x stale by that amount,
-        causing a visible ticker snap-forward when the kernel commits.
+        `freeze_at_elapsed`: when supplied (and > 0), the initial commit
+        stages motion-derived plane properties for each animated layer
+        AT this elapsed value -- frozen from a prior shader transition's
+        last frame (#217 v2). Caller is responsible for setting their
+        own t0 such that the first while-loop tick fires at this same
+        elapsed; with that combination the ticker resumes from the
+        frozen position with no jump, even though attach takes
+        ~100-300 ms. The transition gap is invisible motion-wise
+        because we don't compute elapsed from "real time since
+        transition_start" -- we use the explicit frozen value.
         """
         if self._attached:
             raise RuntimeError("GPUSlideCompositor already attached — call detach() first")
@@ -291,8 +295,20 @@ class GPUSlideCompositor:
         cache_target = (
             self._cache.ensure(self.slide) if self._cache is not None else None
         )
+        # Pool fast path takes precedence -- skip the bg+statics
+        # composite + format convert entirely if the slide's primary
+        # buffer is already painted in the pool. (~10-30ms RGBA->RGB
+        # saved per pool hit.) primary_bytes stays None; we'll still
+        # classify animated layers in the loop below, and the
+        # render-decision block at the end picks the pool fast path.
+        pool_will_hit = (
+            hasattr(self.renderer, "has_primary_buffer")
+            and self.renderer.has_primary_buffer(self._slide_id)
+        )
         primary_bytes = None
-        if cached_entry is not None and cached_entry.primary_bytes is not None:
+        if pool_will_hit:
+            pass  # skip recompose
+        elif cached_entry is not None and cached_entry.primary_bytes is not None:
             primary_bytes = cached_entry.primary_bytes
         elif self._snapshot_cache is not None:
             # Snapshot-cache fast path (#217 follow-on). The shader
@@ -335,9 +351,10 @@ class GPUSlideCompositor:
                 n_static += 1
             else:
                 animated.append((idx, layer))
-        if primary_bytes is None:
+        if primary_bytes is None and not pool_will_hit:
             # Cold path: full bg load + alpha_composite. ~600ms first
-            # time on a 1080p Pi Zero 2 W.
+            # time on a 1080p Pi Zero 2 W. Pool path skips this; pool
+            # has the rendered bytes already in the slide's mmap.
             bg = _load_background(self.slide, self.width, self.height, self.read_asset)
             if bg.mode != "RGBA":
                 bg = bg.convert("RGBA")
@@ -357,7 +374,48 @@ class GPUSlideCompositor:
             if cache_target is not None:
                 cache_target.primary_bytes = primary_bytes
 
-        self.renderer.render_frame(primary_bytes)
+        # Per-slide primary buffer pool fast path (#218 part 2). If
+        # this slide's primary bytes are already painted into a
+        # dedicated pool buffer (allocated + filled in a worker
+        # thread during steady-state via prepare_primary_buffer),
+        # stage_primary_buffer just sets FB_ID = pool entry's fb_id
+        # in the upcoming atomic commit. ZERO encode + ZERO memcpy
+        # on the seam -- just the kernel commit, vblank-bound.
+        used_pool = False
+        if (
+            hasattr(self.renderer, "stage_primary_buffer")
+            and hasattr(self.renderer, "has_primary_buffer")
+            and self.renderer.has_primary_buffer(self._slide_id)
+        ):
+            used_pool = self.renderer.stage_primary_buffer(self._slide_id)
+            if used_pool:
+                log.info(
+                    "GPUSlideCompositor: pool HIT for slide %s "
+                    "(skipping primary memcpy at seam)",
+                    self._slide_id,
+                )
+        if not used_pool:
+            # Fall-back paths.
+            # Native-format payload cache: skip RGB -> native PIL
+            # conversion (30-70 ms at 1080p) on warm visits.
+            if (
+                cached_entry is not None
+                and cached_entry.primary_native_bytes is not None
+                and hasattr(self.renderer, "render_frame_native")
+            ):
+                self.renderer.render_frame_native(
+                    cached_entry.primary_native_bytes,
+                )
+            elif (
+                hasattr(self.renderer, "encode_native_payload")
+                and hasattr(self.renderer, "render_frame_native")
+            ):
+                native = self.renderer.encode_native_payload(primary_bytes)
+                self.renderer.render_frame_native(native)
+                if cache_target is not None:
+                    cache_target.primary_native_bytes = native
+            else:
+                self.renderer.render_frame(primary_bytes)
 
         # 2. Animated layers → one overlay plane each. If any attach
         # fails (out-of-budget, transient kernel error, etc.), detach
@@ -423,49 +481,47 @@ class GPUSlideCompositor:
             self._auto_text.clear()
             raise
 
-        # Mid-cycle attach (#217): if the caller passed t0_monotonic,
-        # this slide's animated layers should appear at their motion-
-        # derived phase position from the very first commit. Compute
-        # elapsed_s FRESHLY here (not earlier in the call site) so the
-        # ~50-150ms PIL composite + per-layer rasterize that just ran
-        # don't leave the staged crtc_x stale -- a stale stage shows
-        # the ticker at a position ~100ms in the past, and the user
-        # sees a ticker SNAP-FORWARD when the kernel commits.
-        if t0_monotonic is not None:
-            import time as _time
-            elapsed_s = _time.monotonic() - t0_monotonic
-            if elapsed_s > 0.0:
-                layers = list(getattr(self.slide, "text_layers", []))
-                for layer_idx, slot_idx in self._slot_for_layer.items():
-                    if layer_idx not in self._glyph_dims:
-                        continue
-                    layer = layers[layer_idx]
-                    motion = getattr(layer, "motion", "static") or "static"
-                    if motion == "static":
-                        continue
-                    try:
-                        self._stage_motion(
-                            slot_idx, layer_idx, layer, motion, elapsed_s,
-                        )
-                    except Exception:
-                        log.exception(
-                            "GPUSlideCompositor: initial-motion stage for "
-                            "layer %d failed; falling back to natural rest",
-                            layer_idx,
-                        )
+        # Mid-cycle attach (#217 v2): if the caller passed freeze_at_
+        # elapsed, this slide's animated layers should appear at the
+        # motion-derived phase for that EXACT elapsed value (frozen
+        # from a prior shader transition's last frame). Don't recompute
+        # from a real-time clock here -- the whole point is to skip
+        # the ~150-300ms attach gap as if it were zero motion-wise.
+        if freeze_at_elapsed is not None and freeze_at_elapsed > 0.0:
+            elapsed_s = freeze_at_elapsed
+            layers = list(getattr(self.slide, "text_layers", []))
+            for layer_idx, slot_idx in self._slot_for_layer.items():
+                if layer_idx not in self._glyph_dims:
+                    continue
+                layer = layers[layer_idx]
+                motion = getattr(layer, "motion", "static") or "static"
+                if motion == "static":
+                    continue
+                try:
+                    self._stage_motion(
+                        slot_idx, layer_idx, layer, motion, elapsed_s,
+                    )
+                except Exception:
+                    log.exception(
+                        "GPUSlideCompositor: initial-motion stage for "
+                        "layer %d failed; falling back to natural rest",
+                        layer_idx,
+                    )
 
         # Restage primary FB_ID + CRTC rects so the atomic commit
-        # below switches primary back from a shader-owned fb (if a
-        # shader transition just ran) to our multi-plane dumb buffer
-        # in the same atomic flip as the overlay setup (#217). Without
-        # this, the shader's last fb stays on primary indefinitely
-        # because render_frame writes pixels into the dumb buffer but
-        # doesn't stage the FB_ID change. Idempotent -- if primary's
-        # FB_ID is already our fb, restage_primary_fb just stages
-        # identical values, the kernel sees no diff, no harm done.
-        # The hasattr check keeps the test-time MockRenderer happy
-        # (no DRM, no FB_ID concept).
-        if hasattr(self.renderer, "restage_primary_fb"):
+        # below switches primary from a shader-owned fb (if a shader
+        # transition just ran) to OUR fb in the same atomic flip as
+        # the overlay setup (#217). When the pool fast path was used
+        # above, stage_primary_buffer already staged FB_ID = pool
+        # entry; calling restage_primary_fb() would overwrite that
+        # with the default fb_id -- skip it in that case. For the
+        # fall-back paths, render_frame_native / render_frame write
+        # into the default mmap but DON'T stage FB_ID, so we still
+        # need restage_primary_fb to swap from shader's fb back.
+        # Idempotent -- if primary's FB_ID is already our fb, restage
+        # _primary_fb just stages identical values. The hasattr check
+        # keeps test-time MockRenderer happy (no DRM, no FB_ID).
+        if not used_pool and hasattr(self.renderer, "restage_primary_fb"):
             try:
                 self.renderer.restage_primary_fb()
             except Exception:

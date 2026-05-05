@@ -226,23 +226,26 @@ class PlaybackLoop:
         # slide A's live-moving ticker on the overlay plane until the
         # incoming compositor attaches after the transition.
         self._incoming_slide: "TextSlide | None" = None
-        # Slide-relative monotonic time at the moment the outgoing
-        # slide started ticking. _tick_outgoing_during_transition
-        # uses this as the elapsed_s base so motion phase stays
-        # continuous across the handoff (fixes #207: ticker
-        # specifically would otherwise snap back to far-right at
-        # transition entry because phase=0 puts it at scroll start).
-        self._outgoing_slide_t0: float | None = None
-        # Tick base for the INCOMING slide of the next compositor
-        # attach (#217). Stashed by _run_shader_transition right at
-        # transition start; consumed by _play_dynamic_slide_gpu when
-        # the new slide attaches its compositor. Without this, the
-        # incoming compositor's t0 = loop.time() at attach, which is
-        # transition_ms LATER than the shader-anim's t0 -- ticker
-        # phase snaps backward by transition_ms*freq at the seam.
-        # Same passthrough pattern as _outgoing_slide_t0 (#207) but
-        # for the OTHER side of the transition.
-        self._incoming_slide_t0: float | None = None
+        # Last steady-tick elapsed for the outgoing slide (#218).
+        # Stashed in _play_dynamic_slide_gpu's finally as the elapsed
+        # at slide-end. _run_shader_transition uses this as the
+        # OUTGOING ANCHOR: shader-anim's first frame stages the ticker
+        # at this elapsed, then advances naturally. The "lost time"
+        # between last steady tick and first shader frame (texture
+        # upload + drain) is FROZEN -- the clock pauses during the
+        # gap, so ticker doesn't snap forward when the screen
+        # un-freezes.
+        self._outgoing_slide_last_elapsed: float | None = None
+        # Frozen elapsed for the incoming slide at the moment shader-
+        # anim stops painting (#217 v2). Captured at end of frame loop
+        # in _run_shader_transition. _play_dynamic_slide_gpu reads it
+        # to set compositor's t0 such that the FIRST tick fires at
+        # this exact elapsed -- ticker resumes from shader-anim's last
+        # painted position with no jump, even though the compositor
+        # .attach gap freeze duration is variable. The clock pauses
+        # during the gap; subsequent ticks advance from the freeze
+        # point.
+        self._incoming_slide_freeze_elapsed: float | None = None
         # Background prerender tasks for the shader-transition snapshot
         # cache (#216). Each task warms bg_statics + anim_layer for one
         # slide via asyncio.to_thread during the slide's display window
@@ -424,7 +427,7 @@ class PlaybackLoop:
                     )
                 self._shader_renderer = None
             self._shader_renderer_disabled = False
-            self._incoming_slide_t0 = None
+            self._incoming_slide_freeze_elapsed = None
             self._drain_outgoing_compositor()
 
     def _schedule_prerender(self, item: ContentItem | None) -> None:
@@ -460,6 +463,21 @@ class PlaybackLoop:
         height = renderer.height
         cache = self._snapshot_cache
         read_asset = self._read_asset
+        # Stringify the slide id so the pool key matches what
+        # GPUSlideCompositor uses (`str(slide.id)`) at attach time --
+        # otherwise UUID vs str mismatch silently misses the pool.
+        raw_id = getattr(item, "id", None)
+        slide_id = str(raw_id) if raw_id is not None else None
+        # If renderer supports the per-slide primary buffer pool
+        # (#218 part 2 - DRMRenderer in shader-transition mode), also
+        # warm the slide's dedicated primary fb in the same to_thread
+        # task. By the time this slide's compositor.attach runs, the
+        # buffer is already painted; attach just flips FB_ID atomically.
+        # ZERO memcpy on the seam.
+        supports_pool = (
+            slide_id is not None
+            and hasattr(renderer, "prepare_primary_buffer")
+        )
 
         async def _run() -> None:
             try:
@@ -467,6 +485,33 @@ class PlaybackLoop:
                     cache.prerender_for_transition,
                     item, width, height, read_asset=read_asset,
                 )
+                if supports_pool:
+                    # Snapshot cache now has bg+statics RGBA. Convert
+                    # to RGB and pre-paint the slide's pool buffer.
+                    # All on this worker thread so the asyncio main
+                    # thread stays free. content_version = updated_at
+                    # so an edit to the slide invalidates the pool's
+                    # cached pixels and we repaint in place (#218
+                    # SHOULD-FIX from pre-commit review).
+                    try:
+                        rgba = cache.get_bg_statics(
+                            item, width, height, read_asset=read_asset,
+                        )
+                        rgb = (
+                            Image.frombytes("RGBA", (width, height), rgba)
+                            .convert("RGB")
+                            .tobytes()
+                        )
+                        await asyncio.to_thread(
+                            renderer.prepare_primary_buffer,
+                            slide_id, rgb,
+                            content_version=getattr(item, "updated_at", None),
+                        )
+                    except Exception:
+                        log.exception(
+                            "playback: pool buffer prerender failed "
+                            "for slide %s", slide_id,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -489,7 +534,7 @@ class PlaybackLoop:
         c = self._outgoing_compositor
         self._outgoing_compositor = None
         self._outgoing_slide = None
-        self._outgoing_slide_t0 = None
+        self._outgoing_slide_last_elapsed = None
         if c is None:
             return
         try:
@@ -912,20 +957,20 @@ class PlaybackLoop:
         tz = resolve_timezone(self._get_timezone())
         total = item.duration_ms / 1000
         loop = asyncio.get_event_loop()
-        # Phase passthrough across the transition seam (#217). If the
-        # outgoing transition stashed transition_start as the incoming
-        # tick base, inherit it so this compositor's elapsed_s starts
-        # at ~transition_ms, matching what shader-anim was using for
-        # this slide just before the handoff. Without inheritance,
-        # ticker would snap backward by transition_ms*freq when the
-        # overlay-plane scanout takes over from the shader's UV box.
-        # Cleared here so a subsequent non-shader path / clean restart
-        # doesn't reuse a stale stash.
-        if self._incoming_slide_t0 is not None:
-            t0 = self._incoming_slide_t0
-            self._incoming_slide_t0 = None
-        else:
-            t0 = loop.time()
+        # Freeze-resume from prior shader transition (#217 v2). If
+        # the outgoing transition stashed an incoming-side freeze
+        # elapsed, the compositor.attach() will stage motion at that
+        # elapsed (frozen from shader-anim's last frame), and we set
+        # t0 AFTER attach so the first while-loop tick computes
+        # elapsed = freeze_elapsed + tiny -- ticker resumes from the
+        # frozen position with no jump. The compositor.attach gap
+        # itself (~150-300ms) is FROZEN: clock pauses, no advance.
+        # If no stash (fresh slide / non-shader path), fall through
+        # to fresh t0 = loop.time().
+        freeze_elapsed = self._incoming_slide_freeze_elapsed
+        self._incoming_slide_freeze_elapsed = None
+        # t0 placeholder for end_at; updated after attach if freeze.
+        t0 = loop.time()
         end_at = t0 + total
         if slide_has_motion(item):
             tick_period = 1.0 / max(1, _FADE_FPS)
@@ -940,14 +985,22 @@ class PlaybackLoop:
             cache=self._gpu_slide_cache,
             snapshot_cache=self._snapshot_cache,
         )
-        # Pass t0 directly to attach() (#217). Inside attach, after the
-        # static composite + animated rasterize work, elapsed_s is
-        # recomputed freshly as monotonic.now() - t0 so the staged
-        # crtc_x reflects "now" at commit time, not "now" at attach
-        # call time (~100ms staler). Asyncio's loop.time() == time
-        # .monotonic() in CPython, so passing loop time as monotonic
-        # is sound.
-        compositor.attach(now=datetime.now(tz), t0_monotonic=t0)
+        # If we're inheriting a freeze elapsed from the just-ended
+        # shader transition (#217 v2), pass it to attach(). Compositor
+        # will stage motion at that exact elapsed (FROZEN clock; the
+        # ticker stays where shader-anim left it). After attach, we
+        # set t0 such that elapsed-now = freeze_elapsed -- subsequent
+        # while-loop ticks then advance smoothly from that position.
+        # The 150-300ms attach gap is invisible motion-wise: clock
+        # paused; no jump on un-freeze.
+        compositor.attach(
+            now=datetime.now(tz), freeze_at_elapsed=freeze_elapsed,
+        )
+        if freeze_elapsed is not None:
+            # Reset t0 + end_at so subsequent ticks resume from the
+            # frozen position (NOT from real-time-since-transition).
+            t0 = loop.time() - freeze_elapsed
+            end_at = t0 + total
         try:
             while True:
                 assert self._stop_event is not None
@@ -1044,14 +1097,13 @@ class PlaybackLoop:
             if self._shader_transitions_enabled():
                 self._outgoing_compositor = compositor
                 self._outgoing_slide = item  # type: ignore[assignment]
-                # Stash the slide's tick base so motion phase stays
-                # continuous across the transition handoff (#207). t0
-                # is the loop's monotonic time when the slide started
-                # ticking; _tick_outgoing_during_transition computes
-                # elapsed_s = monotonic.now() - t0 so the same phase
-                # the slide had at end-of-duration carries into the
-                # transition window.
-                self._outgoing_slide_t0 = t0
+                # Stash the slide's last-tick elapsed so the next
+                # transition can FREEZE the motion clock at this value
+                # during the upload+drain gap (#218). Without freeze,
+                # shader-anim's first frame would compute elapsed via
+                # real time and ticker would snap forward by the
+                # gap_ms * velocity at the seam.
+                self._outgoing_slide_last_elapsed = elapsed
             else:
                 try:
                     compositor.detach()
@@ -1309,16 +1361,20 @@ class PlaybackLoop:
             "hit" if incoming_anim is not None else "miss/none",
         )
 
-        # Capture the outgoing slide's tick base BEFORE drain --
-        # _drain_outgoing_compositor unconditionally clears
-        # _outgoing_slide_t0, and we need it after the drain to keep
-        # motion phase continuous through the seam (#207). Without
-        # this, ticker snaps back to its phase-0 right-edge position
-        # the moment the transition starts.
-        outgoing_t0 = (
-            self._outgoing_slide_t0
-            if self._outgoing_slide_t0 is not None
-            else _time.monotonic()
+        # Capture outgoing motion-clock anchor BEFORE drain (#217 v2).
+        # _drain_outgoing_compositor clears self._outgoing_slide_*
+        # state. The OUTGOING ANCHOR is (anchor_elapsed, anchor_time):
+        # shader-anim's elapsed = anchor_elapsed + (now - anchor_time).
+        # anchor_elapsed = the elapsed value the slide had at its
+        # last steady tick (so shader-anim's ticker resumes from the
+        # SAME position the user just saw on the overlay plane).
+        # anchor_time will be set right at frame loop start so the
+        # texture upload + drain gap doesn't count as motion -- the
+        # clock pauses during the freeze, no jump on screen un-freeze.
+        outgoing_anchor_elapsed = (
+            self._outgoing_slide_last_elapsed
+            if self._outgoing_slide_last_elapsed is not None
+            else 0.0
         )
 
         # Track why we exit the frame loop. Pause means a stream
@@ -1362,7 +1418,15 @@ class PlaybackLoop:
             frame_period = (transition_ms / 1000) / n_frames
             assert self._stop_event is not None
             assert self._pause_event is not None
+            # Anchor times for both motion clocks (#217 v2). The
+            # texture-upload + drain gap that just ran is FROZEN --
+            # not counted toward motion. anchor_time = NOW; anchors
+            # advance from here as wall-clock time progresses inside
+            # the frame loop.
             transition_start = _time.monotonic()
+            outgoing_anchor_time = transition_start
+            incoming_anchor_time = transition_start
+            incoming_anchor_elapsed = 0.0  # incoming enters fresh
             log.info(
                 "playback: transition phase timing -- upload=%.0fms "
                 "drain=%.0fms (now entering frame loop, %d frames @ %.0fms)",
@@ -1374,6 +1438,11 @@ class PlaybackLoop:
             has_motion = (
                 outgoing_anim is not None or incoming_anim is not None
             )
+            # Track incoming's last elapsed so we can stash it on
+            # success for the next compositor.attach to inherit
+            # (freeze-resume: ticker resumes from this exact position
+            # without a jump even though attach takes ~150-300ms).
+            last_elapsed_in = incoming_anchor_elapsed
             for i in range(1, n_frames + 1):
                 if self._pause_event.is_set():
                     paused = True
@@ -1382,28 +1451,42 @@ class PlaybackLoop:
                     break
                 t = i / n_frames
                 sr.set_transition_t(t)
-                # Per-side motion math -> shader uniforms. Outgoing's
-                # phase clock is the slide's stashed t0 so phase
-                # passes through the transition seam without snap;
-                # incoming starts at transition_start (slide enters
-                # fresh).
+                # Anchor-based clock: elapsed = anchor_elapsed +
+                # (now - anchor_time). Outgoing resumes from its
+                # last-steady-tick elapsed; incoming starts at 0
+                # and advances. The pre-frame-loop gap (texture
+                # upload + drain) is FROZEN -- doesn't count.
+                _now = _time.monotonic()
                 if outgoing_anim is not None:
                     _, layer, _, gbbox, bx = outgoing_anim
-                    elapsed_out = _time.monotonic() - outgoing_t0
+                    elapsed_out = (
+                        outgoing_anchor_elapsed
+                        + (_now - outgoing_anchor_time)
+                    )
                     box_uv, alpha = self._anim_uv_for_frame(
                         layer, bx, gbbox, width, height, elapsed_out,
                     )
                     sr.update_from_anim(box_uv, alpha)
                 if incoming_anim is not None:
                     _, layer, _, gbbox, bx = incoming_anim
-                    elapsed_in = _time.monotonic() - transition_start
+                    elapsed_in = (
+                        incoming_anchor_elapsed
+                        + (_now - incoming_anchor_time)
+                    )
+                    last_elapsed_in = elapsed_in
                     box_uv, alpha = self._anim_uv_for_frame(
                         layer, bx, gbbox, width, height, elapsed_in,
                     )
                     sr.update_to_anim(box_uv, alpha)
                 sr.commit_frame()
                 frames_drawn += 1
-                await self._wait(frame_period)
+                # Skip the wait after the LAST frame -- it's pure
+                # dead air before the next slide's compositor.attach,
+                # adding ~one frame_period (~33ms at 30fps) to the
+                # seam freeze for no benefit. Pacing matters between
+                # frames; after the last frame the loop's done (#218).
+                if i < n_frames:
+                    await self._wait(frame_period)
             transition_elapsed = _time.monotonic() - transition_start
             achieved_fps = (
                 frames_drawn / transition_elapsed if transition_elapsed > 0 else 0.0
@@ -1417,36 +1500,23 @@ class PlaybackLoop:
                 transition_elapsed, achieved_fps, _FADE_FPS,
             )
             if not paused and not self._stop_event.is_set():
-                # Land at t=1.0 so the final shader frame matches
-                # to_image before we hand the plane back. Skip on
-                # pause/stop -- nothing reads the result anyway.
-                sr.set_transition_t(1.0)
-                if outgoing_anim is not None:
-                    _, layer, _, gbbox, bx = outgoing_anim
-                    elapsed_out = _time.monotonic() - outgoing_t0
-                    box_uv, alpha = self._anim_uv_for_frame(
-                        layer, bx, gbbox, width, height, elapsed_out,
-                    )
-                    sr.update_from_anim(box_uv, alpha)
-                if incoming_anim is not None:
-                    _, layer, _, gbbox, bx = incoming_anim
-                    elapsed_in = _time.monotonic() - transition_start
-                    box_uv, alpha = self._anim_uv_for_frame(
-                        layer, bx, gbbox, width, height, elapsed_in,
-                    )
-                    sr.update_to_anim(box_uv, alpha)
-                sr.commit_frame()
-                # Stash for #217: the incoming slide's compositor will
-                # inherit this as its tick base when it attaches after
-                # the transition completes, so motion phase is
-                # continuous across the seam (no snap-back when
-                # shader-anim hands off to overlay-plane scanout).
-                # Set ONLY on the success branch so a paused/stopped/
-                # exception transition doesn't leak a stale
-                # transition_start into the next slide's t0 (could be
-                # minutes old after a pause→stream-takeover→resume,
-                # ticker would advance way ahead).
-                self._incoming_slide_t0 = transition_start
+                # The frame loop's last iteration (i=n_frames) already
+                # fires at t = n_frames/n_frames = 1.0, so the prior
+                # post-loop "land at t=1.0" frame was redundant -- the
+                # shader's final commit already had t=1.0 content.
+                # Removed (#218): saves ~50ms per transition (one full
+                # commit_frame + atomic ioctl) of dead work that
+                # showed visually identical pixels.
+                #
+                # Stash for #217 v2: the incoming slide's compositor
+                # will FREEZE-RESUME at this elapsed when it attaches.
+                # The compositor.attach gap is invisible motion-wise
+                # -- ticker stays at last_elapsed_in's position
+                # through the freeze, then resumes naturally from
+                # there. Set ONLY on success: a paused / stopped /
+                # exception transition shouldn't leak stale state
+                # into the next slide's compositor.
+                self._incoming_slide_freeze_elapsed = last_elapsed_in
         except Exception:
             log.exception(
                 "playback: shader transition %r failed mid-flight; "

@@ -455,6 +455,29 @@ class DRMRenderer:
         self._dumb_size: int = 0
         self._dumb_pitch: int = 0
         self._mmap: mmap.mmap | None = None
+        # Per-slide primary buffer pool (#218 part 2). Each entry is a
+        # fully-allocated dumb buffer + fb_id + mmap, painted with a
+        # specific slide's bg+statics in renderer-native format. At
+        # slide attach we just stage FB_ID = pool[slide_id].fb_id in
+        # the atomic commit -- ZERO memcpy on the critical path. The
+        # painting happens during steady-state in a background thread,
+        # so the encode + write into the mmap are off the asyncio main
+        # thread entirely. LRU-ordered; soft-capped at 20 slides
+        # (~80 MB at 1080p RGB565) to bound memory on Pi Zero 2 W.
+        # Once a slide has been visited once and is in the pool, every
+        # subsequent attach is a single FB_ID flip -- the screen
+        # freeze drops to the kernel's vblank floor (~16 ms).
+        from collections import OrderedDict
+        # Value: (fb_id, dumb_handle, mmap, content_version). The
+        # content_version (caller-supplied opaque token, typically
+        # slide.updated_at) lets prepare_primary_buffer detect when
+        # a cached buffer's content is stale and needs repaint --
+        # without it, an operator editing a slide mid-loop would see
+        # the old pixels until LRU eviction.
+        self._primary_buffer_pool: OrderedDict[
+            object, tuple[int, int, "mmap.mmap", object],
+        ] = OrderedDict()
+        self._max_pool_buffers: int = 20
         self._mode: _DrmModeInfo | None = None
         self._connector_id: int = 0
         self._encoder_id: int = 0
@@ -1193,9 +1216,88 @@ class DRMRenderer:
 
     # --- framebuffer alloc + map ---
 
+    def _alloc_dumb_primary_fb(
+        self,
+    ) -> tuple[int, int, "mmap.mmap", int, int]:
+        """Allocate a sign-native dumb buffer + register as DRM fb +
+        mmap. Used both for the default primary buffer and per-slide
+        cached buffers in the pool (#218 part 2). Returns (fb_id,
+        dumb_handle, mmap, size, pitch). Caller is responsible for
+        cleanup via _destroy_dumb_primary_fb."""
+        assert self._fd is not None
+        create = _DrmModeCreateDumb()
+        create.width = self.width
+        create.height = self.height
+        create.bpp = self._bytes_per_pixel * 8
+        _ioctl(self._fd, DRM_IOCTL_MODE_CREATE_DUMB, create)
+        dumb_handle = create.handle
+        dumb_size = int(create.size)
+        dumb_pitch = int(create.pitch)
+        try:
+            fb = _DrmModeFbCmd2()
+            fb.width = self.width
+            fb.height = self.height
+            fb.pixel_format = self._drm_format
+            fb.handles[0] = dumb_handle
+            fb.pitches[0] = dumb_pitch
+            _ioctl(self._fd, DRM_IOCTL_MODE_ADDFB2, fb)
+            fb_id = fb.fb_id
+            try:
+                map_dumb = _DrmModeMapDumb()
+                map_dumb.handle = dumb_handle
+                _ioctl(self._fd, DRM_IOCTL_MODE_MAP_DUMB, map_dumb)
+                buf_mmap = mmap.mmap(
+                    self._fd,
+                    dumb_size,
+                    mmap.MAP_SHARED,
+                    mmap.PROT_READ | mmap.PROT_WRITE,
+                    offset=int(map_dumb.offset),
+                )
+            except Exception:
+                fb_id_c = ctypes.c_uint32(fb_id)
+                _ioctl(self._fd, DRM_IOCTL_MODE_RMFB, fb_id_c)
+                raise
+        except Exception:
+            d = _DrmModeDestroyDumb()
+            d.handle = dumb_handle
+            _ioctl(self._fd, DRM_IOCTL_MODE_DESTROY_DUMB, d)
+            raise
+        return fb_id, dumb_handle, buf_mmap, dumb_size, dumb_pitch
+
+    def _destroy_dumb_primary_fb(
+        self, fb_id: int, dumb_handle: int, buf_mmap: "mmap.mmap | None",
+    ) -> None:
+        """Tear down a dumb-buffer-backed primary fb: mmap.close ->
+        RmFB -> DESTROY_DUMB. Each leg guarded -- a partially-
+        allocated buffer (e.g. _alloc_dumb_primary_fb threw mid-way)
+        still cleans up cleanly."""
+        if self._fd is None:
+            return
+        try:
+            if buf_mmap is not None:
+                buf_mmap.close()
+        except Exception:
+            log.exception("DRMRenderer: dumb buffer mmap close failed")
+        try:
+            if fb_id:
+                fb_id_c = ctypes.c_uint32(fb_id)
+                _ioctl(self._fd, DRM_IOCTL_MODE_RMFB, fb_id_c)
+        except OSError:
+            log.exception("DRMRenderer: dumb buffer RmFB failed")
+        try:
+            if dumb_handle:
+                d = _DrmModeDestroyDumb()
+                d.handle = dumb_handle
+                _ioctl(self._fd, DRM_IOCTL_MODE_DESTROY_DUMB, d)
+        except OSError:
+            log.exception("DRMRenderer: DESTROY_DUMB failed")
+
     def _allocate_framebuffer(self) -> None:
-        """Create a dumb buffer at SIGN-NATIVE dims, mmap it, register
-        it as a DRM framebuffer in self.pixel_format.
+        """Create the DEFAULT primary dumb buffer at sign-native dims.
+        This is the always-allocated buffer for render_frame() / fallback
+        paths (welcome screen, stream takeover, MockRenderer-style
+        per-frame painting). Per-slide cached buffers (#218) are
+        separate -- see prepare_primary_buffer / stage_primary_buffer.
 
         The vc4 HVS scales this fb to the letterboxed CRTC region at
         scanout; per-frame work is just a sign-native swizzle + tiny
@@ -1203,34 +1305,14 @@ class DRMRenderer:
         native fb the prior implementation wrote).
         """
         assert self._fd is not None and self._mode is not None
-        create = _DrmModeCreateDumb()
-        create.width = self.width
-        create.height = self.height
-        create.bpp = self._bytes_per_pixel * 8
-        _ioctl(self._fd, DRM_IOCTL_MODE_CREATE_DUMB, create)
-        self._dumb_handle = create.handle
-        self._dumb_size = int(create.size)
-        self._dumb_pitch = int(create.pitch)
-
-        fb = _DrmModeFbCmd2()
-        fb.width = self.width
-        fb.height = self.height
-        fb.pixel_format = self._drm_format
-        fb.handles[0] = self._dumb_handle
-        fb.pitches[0] = self._dumb_pitch
-        _ioctl(self._fd, DRM_IOCTL_MODE_ADDFB2, fb)
-        self._fb_id = fb.fb_id
-
-        map_dumb = _DrmModeMapDumb()
-        map_dumb.handle = self._dumb_handle
-        _ioctl(self._fd, DRM_IOCTL_MODE_MAP_DUMB, map_dumb)
-        self._mmap = mmap.mmap(
-            self._fd,
-            self._dumb_size,
-            mmap.MAP_SHARED,
-            mmap.PROT_READ | mmap.PROT_WRITE,
-            offset=int(map_dumb.offset),
+        fb_id, dumb_handle, buf_mmap, dumb_size, dumb_pitch = (
+            self._alloc_dumb_primary_fb()
         )
+        self._fb_id = fb_id
+        self._dumb_handle = dumb_handle
+        self._mmap = buf_mmap
+        self._dumb_size = dumb_size
+        self._dumb_pitch = dumb_pitch
         log.info(
             "DRM: primary fb_id=%d %dx%d %s size=%d pitch=%d "
             "(HVS-scaled to %dx%d at +%d+%d)",
@@ -1302,6 +1384,19 @@ class DRMRenderer:
         except OSError as exc:
             if exc.errno != 22:  # EINVAL
                 log.exception("DRMRenderer: failed to restore original CRTC")
+        # Per-slide primary buffer pool cleanup (#218 part 2). Tear
+        # down each cached slide's dumb buffer + fb + mmap. Done
+        # BEFORE the default primary teardown so RmFB ordering is
+        # consistent (kernel doesn't care, but tidier).
+        try:
+            while self._primary_buffer_pool:
+                _, entry = self._primary_buffer_pool.popitem(last=True)
+                fb_id, dumb_handle, buf_mmap, _version = entry
+                self._destroy_dumb_primary_fb(
+                    fb_id, dumb_handle, buf_mmap,
+                )
+        except Exception:
+            log.exception("DRMRenderer: primary buffer pool teardown failed")
         try:
             if self._mmap is not None:
                 self._mmap.close()
@@ -1401,37 +1496,34 @@ class DRMRenderer:
 
     # --- render path ---
 
-    def render_frame(self, frame: bytes) -> None:
-        """Convert RGB888 `frame` to the configured pixel format and
-        write to the sign-native primary mmap.
+    def encode_native_payload(self, frame: bytes) -> bytes:
+        """Convert RGB888 `frame` to the renderer's native pixel format
+        bytes (BGR;16 for rgb565, [B,G,R,X] for xrgb8888). Pure CPU
+        work; no I/O, no global state. Splitting this out from
+        render_frame lets callers cache the result across slide
+        re-attaches (#218): the conversion is content-dependent only
+        (same RGB in -> same native bytes out), and PlaybackLoop's
+        prerender thread can run it BEFORE the slide actually
+        attaches so render_frame_native (just the mmap memcpy) is
+        the only critical-path work at the seam.
 
-        `frame` is `width * height * 3` bytes (sign-side dims). No
-        software scaling, no letterbox paste — the vc4 HVS scales the
-        primary plane to its CRTC dest rect (the letterboxed display
-        region) at scanout. Per-frame work is dominated by the format
-        convert (Pillow's `BGR;16` for RGB565, split/merge for
-        XRGB8888) and the mmap memcpy of `width*height*bpp` bytes.
-        At 128×96 RGB565 that's 24 KB and clears in a millisecond.
-        """
-        if self._mmap is None:
-            raise RuntimeError("DRMRenderer not opened")
+        ~30-70 ms at 1080p on Pi Zero 2 W; all the time saved here is
+        time the user doesn't see the screen frozen at the seam."""
         expected = self.width * self.height * 3
         if len(frame) != expected:
             raise ValueError(
                 f"frame length {len(frame)} != {self.width}x{self.height} RGB888 ({expected})"
             )
-
         image = Image.frombytes("RGB", (self.width, self.height), frame)
-
         if self.pixel_format == "rgb565":
             # Pillow's deprecated "BGR;16" mode = RGB565 little-endian
-            # via a C-side per-pixel pack. numpy fallback covers Pillow
-            # 12's removal slated for 2025-10-15.
+            # via a C-side per-pixel pack. numpy fallback covers
+            # Pillow 12's removal slated for 2025-10-15.
             import warnings
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", DeprecationWarning)
-                    payload = image.convert("BGR;16").tobytes()
+                    return image.convert("BGR;16").tobytes()
             except (ValueError, OSError):
                 arr = np.frombuffer(image.tobytes(), dtype=np.uint8).reshape(
                     image.height, image.width, 3
@@ -1441,16 +1533,23 @@ class DRMRenderer:
                     | ((arr[..., 1] & 0xFC) << 3)
                     | (arr[..., 2] >> 3)
                 )
-                payload = packed.astype("<u2").tobytes()
-        else:
-            # XRGB8888 — bytes [B, G, R, X] per pixel on LE arm64.
-            r, g, b = image.split()
-            alpha = Image.new("L", image.size, 255)
-            payload = Image.merge("RGBA", (b, g, r, alpha)).tobytes()
+                return packed.astype("<u2").tobytes()
+        # XRGB8888 — bytes [B, G, R, X] per pixel on LE arm64.
+        r, g, b = image.split()
+        alpha = Image.new("L", image.size, 255)
+        return Image.merge("RGBA", (b, g, r, alpha)).tobytes()
 
-        # mmap slice-assignment is a single C-level memcpy. If the kernel
-        # padded the row pitch beyond width*bpp (rare at small dims, but
-        # possible), fall back to per-row copy.
+    def render_frame_native(self, payload: bytes) -> None:
+        """Memcpy pre-encoded native-format bytes into the primary
+        plane's mmap. Bypasses the PIL conversion in render_frame --
+        callers that have a cached native payload (from
+        encode_native_payload) skip ~30-70 ms of work at slide attach
+        (#218). No-op if the renderer hasn't opened yet."""
+        if self._mmap is None:
+            raise RuntimeError("DRMRenderer not opened")
+        # mmap slice-assignment is a single C-level memcpy. If the
+        # kernel padded the row pitch beyond width*bpp (rare at small
+        # dims, but possible), fall back to per-row copy.
         row_bytes = self.width * self._bytes_per_pixel
         if self._dumb_pitch == row_bytes:
             self._mmap[: len(payload)] = payload
@@ -1460,6 +1559,181 @@ class DRMRenderer:
                 self._mmap[
                     y * self._dumb_pitch : y * self._dumb_pitch + row_bytes
                 ] = payload[start : start + row_bytes]
+
+    def render_frame(self, frame: bytes) -> None:
+        """Convert RGB888 `frame` to the configured pixel format and
+        write to the sign-native primary mmap. Combines
+        encode_native_payload + render_frame_native; callers that
+        want to cache the encoded bytes should call those directly."""
+        self.render_frame_native(self.encode_native_payload(frame))
+
+    # --- per-slide primary buffer pool (#218 part 2) ---
+    #
+    # Each cached slide gets its own dumb buffer + fb_id + mmap, pre-
+    # painted in renderer-native format during steady-state. At slide
+    # attach we just stage FB_ID = pool[slide_id].fb_id in the atomic
+    # commit -- zero memcpy on the seam, only the kernel's atomic
+    # commit + vblank wait remain. The painting (encode + write into
+    # the slide's mmap) happens off the asyncio main thread via
+    # PlaybackLoop's prerender to_thread tasks, so even the encoding
+    # cost is invisible to the user.
+
+    def has_primary_buffer(self, key: object) -> bool:
+        """True if a per-slide primary buffer for `key` is already
+        allocated + painted. Caller (compositor.attach) checks this
+        to decide between pool fast path and the legacy
+        render_frame_native fallback."""
+        return key in self._primary_buffer_pool
+
+    def prepare_primary_buffer(
+        self,
+        key: object,
+        rgb_bytes: bytes,
+        *,
+        content_version: object = None,
+    ) -> None:
+        """Allocate a dumb buffer + fb for `key` (idempotent) and
+        encode rgb_bytes directly into its mmap. Safe to call from a
+        worker thread (it's pure CPU work + an mmap memcpy that's
+        unrelated to the active scanout). At slide attach time, the
+        buffer is already painted -- just stage_primary_buffer flips
+        FB_ID, no encode + memcpy on the critical path.
+
+        Soft-caps the pool at _max_pool_buffers (20 by default); LRU-
+        evicts the least-recently-attached slide when over cap. Eviction
+        cost is O(1) ioctls (RmFB + DESTROY_DUMB).
+
+        Idempotent only when `content_version` matches the cached
+        version. If `content_version` differs (e.g. slide.updated_at
+        moved), the cached buffer's mmap is repainted with the new
+        bytes -- preserves fb_id but updates pixels, so any
+        outstanding stage_primary_buffer references stay valid."""
+        if self._fd is None:
+            raise RuntimeError("DRMRenderer not opened")
+        existing = self._primary_buffer_pool.get(key)
+        if existing is not None:
+            ex_fb_id, ex_dumb, ex_mmap, ex_version = existing
+            if ex_version == content_version:
+                # Content unchanged; mark MRU and skip.
+                self._primary_buffer_pool.move_to_end(key)
+                return
+            # Content changed (slide.updated_at moved): repaint the
+            # SAME buffer in place. Don't release+realloc -- that would
+            # change fb_id and break any in-flight atomic commit.
+            try:
+                payload = self.encode_native_payload(rgb_bytes)
+                row_bytes = self.width * self._bytes_per_pixel
+                if self._dumb_pitch == row_bytes:
+                    ex_mmap[: len(payload)] = payload
+                else:
+                    for y in range(self.height):
+                        start = y * row_bytes
+                        ex_mmap[
+                            y * self._dumb_pitch : y * self._dumb_pitch + row_bytes
+                        ] = payload[start : start + row_bytes]
+                self._primary_buffer_pool[key] = (
+                    ex_fb_id, ex_dumb, ex_mmap, content_version,
+                )
+                self._primary_buffer_pool.move_to_end(key)
+                log.info(
+                    "DRM: pool repainted slide %s fb_id=%d "
+                    "(updated_at changed)",
+                    key, ex_fb_id,
+                )
+            except Exception:
+                log.exception(
+                    "DRM: pool repaint failed for slide %s; "
+                    "buffer left in stale state",
+                    key,
+                )
+            return
+        # Evict LRU until under cap. (We're about to add one entry.)
+        while len(self._primary_buffer_pool) >= self._max_pool_buffers:
+            evict_key, evict_buf = (
+                self._primary_buffer_pool.popitem(last=False)
+            )
+            evict_fb_id, evict_dumb_handle, evict_mmap, _ = evict_buf
+            self._destroy_dumb_primary_fb(
+                evict_fb_id, evict_dumb_handle, evict_mmap,
+            )
+            log.debug(
+                "DRM: pool LRU-evicted slide %r (fb_id=%d)",
+                evict_key, evict_fb_id,
+            )
+        # Allocate + encode.
+        fb_id, dumb_handle, buf_mmap, _, dumb_pitch = (
+            self._alloc_dumb_primary_fb()
+        )
+        try:
+            payload = self.encode_native_payload(rgb_bytes)
+            row_bytes = self.width * self._bytes_per_pixel
+            if dumb_pitch == row_bytes:
+                buf_mmap[: len(payload)] = payload
+            else:
+                for y in range(self.height):
+                    start = y * row_bytes
+                    buf_mmap[
+                        y * dumb_pitch : y * dumb_pitch + row_bytes
+                    ] = payload[start : start + row_bytes]
+        except Exception:
+            # Encode/write failed; tear down the half-prepared buffer
+            # so we don't leak a kernel handle.
+            self._destroy_dumb_primary_fb(fb_id, dumb_handle, buf_mmap)
+            raise
+        self._primary_buffer_pool[key] = (
+            fb_id, dumb_handle, buf_mmap, content_version,
+        )
+        log.info(
+            "DRM: pool added slide %s fb_id=%d (pool size=%d/%d)",
+            key, fb_id,
+            len(self._primary_buffer_pool), self._max_pool_buffers,
+        )
+
+    def release_primary_buffer(self, key: object) -> bool:
+        """Free `key`'s pool buffer. Returns True if freed, False if
+        not present. Called when a slide leaves the playlist
+        (updated_at-driven content refresh repaints in place via
+        prepare_primary_buffer instead, preserving fb_id)."""
+        entry = self._primary_buffer_pool.pop(key, None)
+        if entry is None:
+            return False
+        fb_id, dumb_handle, buf_mmap, _ = entry
+        self._destroy_dumb_primary_fb(fb_id, dumb_handle, buf_mmap)
+        return True
+
+    def stage_primary_buffer(self, key: object) -> bool:
+        """Stage atomic commit FB_ID = pool[key].fb_id (and primary
+        plane CRTC rects). Returns True if staged, False if `key` not
+        in pool (caller falls back to render_frame_native + restage_
+        primary_fb path). Updates LRU."""
+        if key not in self._primary_buffer_pool:
+            return False
+        fb_id, _, _, _ = self._primary_buffer_pool[key]
+        self._primary_buffer_pool.move_to_end(key)
+        # Stage primary plane: FB_ID + CRTC binding + sign-source rect
+        # + letterboxed dest rect. Mirrors restage_primary_fb but with
+        # the pool buffer's fb_id, not the default _fb_id.
+        if self._primary_plane_id == 0:
+            log.warning(
+                "DRMRenderer: primary plane not configured; "
+                "stage_primary_buffer is a no-op",
+            )
+            return False
+        pid = self._primary_plane_id
+        pp = self._primary_plane_props
+        sign_src_w = self.width << 16
+        sign_src_h = self.height << 16
+        self._pending_props[(pid, pp["FB_ID"])] = fb_id
+        self._pending_props[(pid, pp["CRTC_ID"])] = self._crtc_id
+        self._pending_props[(pid, pp["SRC_X"])] = 0
+        self._pending_props[(pid, pp["SRC_Y"])] = 0
+        self._pending_props[(pid, pp["SRC_W"])] = sign_src_w
+        self._pending_props[(pid, pp["SRC_H"])] = sign_src_h
+        self._pending_props[(pid, pp["CRTC_X"])] = self._letterbox_x
+        self._pending_props[(pid, pp["CRTC_Y"])] = self._letterbox_y
+        self._pending_props[(pid, pp["CRTC_W"])] = self._scaled_w
+        self._pending_props[(pid, pp["CRTC_H"])] = self._scaled_h
+        return True
 
     # --- GPU-compositor public API ---
 
