@@ -536,6 +536,19 @@ def compose_motion_frame(
                 layer_key,
                 float(getattr(layer, "motion_phase", 0.0)),
             )
+        # Apply per-layer opacity by scaling the RGBA's alpha channel
+        # before compositing. opacity = 1.0 leaves the bitmap unchanged
+        # (B10, 2026-05-05). Done once here so both alpha_composite and
+        # composite_with_blend get the same upstream alpha. Note: 0.0
+        # is a legitimate value (fully invisible layer) -- the explicit
+        # `is None` check avoids the falsy-coalesce trap that would
+        # have promoted opacity=0 back to 1.0.
+        opacity_raw = getattr(layer, "opacity", 1.0)
+        opacity = float(opacity_raw if opacity_raw is not None else 1.0)
+        if opacity < 1.0 - 1e-6:
+            r, g, b, a = layer_rgba.split()
+            a = a.point(lambda v, o=opacity: max(0, min(255, int(v * o))))
+            layer_rgba = Image.merge("RGBA", (r, g, b, a))
         blend_mode = getattr(layer, "blend", "normal") or "normal"
         if blend_mode == "normal":
             base.alpha_composite(layer_rgba)

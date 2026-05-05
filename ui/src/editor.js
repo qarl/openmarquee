@@ -360,15 +360,21 @@ const LAYER_GROUP_TEMPLATE = `
         <span class="editor-layer-chevron" aria-hidden="true">▾</span>
     </header>
     <div class="editor-layer-body">
-        <label class="om-field">
-            <span>Blend</span>
-            <select class="om-select field-blend" aria-label="layer blend mode">
-                <option value="normal">Normal</option>
-                <option value="multiply">Multiply</option>
-                <option value="screen">Screen</option>
-                <option value="overlay">Overlay</option>
-            </select>
-        </label>
+        <div class="om-row" style="gap: 10px; align-items: end;">
+            <label class="om-field" style="flex: 1;">
+                <span>Blend</span>
+                <select class="om-select field-blend" aria-label="layer blend mode">
+                    <option value="normal">Normal</option>
+                    <option value="multiply">Multiply</option>
+                    <option value="screen">Screen</option>
+                    <option value="overlay">Overlay</option>
+                </select>
+            </label>
+            <label class="om-field" style="flex: 1;">
+                <span>Opacity <span class="field-opacity-display"></span></span>
+                <input type="range" class="om-range field-opacity" min="0" max="100" step="1" value="100">
+            </label>
+        </div>
         <label class="om-field">
             <span>Layer name</span>
             <input type="text" class="om-input field-layer-name" placeholder="Headline" maxlength="200">
@@ -461,6 +467,7 @@ function defaultLayer() {
         motionIntensity: 50,
         motionPhase: 0,
         blend: "normal",
+        opacity: 1.0,
         visible: true,
         box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
     };
@@ -822,6 +829,15 @@ export function mountEditor(
         layer.motion = motionEl ? motionEl.value || "static" : "static";
         const blendEl = groupEl.querySelector(".field-blend");
         layer.blend = blendEl ? blendEl.value || "normal" : "normal";
+        const opacityEl = groupEl.querySelector(".field-opacity");
+        const parsedOpacity = Number(opacityEl?.value);
+        if (Number.isFinite(parsedOpacity)) {
+            layer.opacity = Math.max(0, Math.min(1, parsedOpacity / 100));
+        }
+        const opacityDisplayEl = groupEl.querySelector(".field-opacity-display");
+        if (opacityDisplayEl) {
+            opacityDisplayEl.textContent = `(${Math.round((layer.opacity ?? 1) * 100)}%)`;
+        }
         const intensityEl = groupEl.querySelector(".field-motion-intensity");
         const parsedIntensity = Number(intensityEl?.value);
         if (Number.isFinite(parsedIntensity)) {
@@ -904,10 +920,11 @@ export function mountEditor(
         const motionIntensityEl = groupEl.querySelector(".field-motion-intensity");
         const motionPhaseEl = groupEl.querySelector(".field-motion-phase");
         const blendEl = groupEl.querySelector(".field-blend");
+        const opacityEl = groupEl.querySelector(".field-opacity");
 
         for (const el of [
             textEl, layerNameEl, textColorEl, fontSizeEl, fontFamilyEl,
-            motionEl, motionIntensityEl, motionPhaseEl, blendEl,
+            motionEl, motionIntensityEl, motionPhaseEl, blendEl, opacityEl,
         ]) {
             if (!el) continue;
             // <select> fires "change" on commit; <input> fires "input"
@@ -1173,6 +1190,11 @@ export function mountEditor(
         motionEl.value = layer.motion || "static";
         const blendEl = groupEl.querySelector(".field-blend");
         if (blendEl) blendEl.value = layer.blend || "normal";
+        const opacityEl = groupEl.querySelector(".field-opacity");
+        const opacityVal = Math.round((layer.opacity ?? 1) * 100);
+        if (opacityEl) opacityEl.value = String(opacityVal);
+        const opacityDisplayEl = groupEl.querySelector(".field-opacity-display");
+        if (opacityDisplayEl) opacityDisplayEl.textContent = `(${opacityVal}%)`;
         const intensityEl = groupEl.querySelector(".field-motion-intensity");
         const phaseEl = groupEl.querySelector(".field-motion-phase");
         const intensityVal = layer.motionIntensity ?? 50;
@@ -1529,6 +1551,7 @@ export function mountEditor(
             motion_intensity: layer.motionIntensity ?? 50,
             motion_phase: layer.motionPhase ?? 0,
             blend: layer.blend || "normal",
+            opacity: layer.opacity ?? 1.0,
             visible: layer.visible !== false,
             box: { ...layer.box },
         }));
@@ -1666,6 +1689,7 @@ export function mountEditor(
             motionIntensity: wire?.motion_intensity ?? 50,
             motionPhase: wire?.motion_phase ?? 0,
             blend: wire?.blend || "normal",
+            opacity: typeof wire?.opacity === "number" ? wire.opacity : 1.0,
             visible: wire?.visible !== false,
             box:
                 wire?.box && typeof wire.box === "object"
@@ -2105,7 +2129,9 @@ export function drawCanvas(canvas, state, opts) {
             // so drawCanvas's "exactly one save/restore" invariant
             // (relied on by tests + the outer try/finally) holds.
             const blendKey = layer?.blend || "normal";
+            const opacityVal = typeof layer?.opacity === "number" ? layer.opacity : 1;
             const needsBlendWrap = blendKey !== "normal";
+            const needsAlphaWrap = opacityVal < 1;
             const drawOnce = () => {
                 if (elapsed === undefined || elapsed === null) {
                     paint();
@@ -2121,9 +2147,14 @@ export function drawCanvas(canvas, state, opts) {
                     });
                 }
             };
-            if (needsBlendWrap) {
+            if (needsBlendWrap || needsAlphaWrap) {
                 ctx.save();
-                ctx.globalCompositeOperation = BLEND_TO_CANVAS[blendKey];
+                if (needsBlendWrap) {
+                    ctx.globalCompositeOperation = BLEND_TO_CANVAS[blendKey];
+                }
+                if (needsAlphaWrap) {
+                    ctx.globalAlpha = Math.max(0, Math.min(1, opacityVal));
+                }
                 try {
                     drawOnce();
                 } finally {
