@@ -88,6 +88,12 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
     }
     const intensity = layer.motion_intensity ?? layer.motionIntensity ?? 50;
     const motionPhase = layer.motion_phase ?? layer.motionPhase ?? 0;
+    // motion_speed multiplies the effect's frequency (B2, 2026-05-05).
+    // 1.0 = original speed, 0.0 = frozen, 2.0 = double speed. Schema
+    // range is [0, 2]; clamp defensively in case a hand-edited slide
+    // ships an out-of-range value.
+    const speedRaw = layer.motion_speed ?? layer.motionSpeed ?? 1.0;
+    const speed = Math.max(0, Math.min(2, Number(speedRaw) || 0));
     const layerKey = (opts && opts.layerKey) || "0";
 
     const box = layer.box || _DEFAULT_BOX;
@@ -96,7 +102,7 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
     const bw = Math.max(1, box.w * canvas.width);
     const bh = Math.max(1, box.h * canvas.height);
 
-    const freq = effectFreq(motion, intensity);
+    const freq = effectFreq(motion, intensity) * speed;
     const phase = computePhase(elapsed, freq, motionPhase);
 
     ctx.save();

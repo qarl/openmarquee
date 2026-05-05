@@ -1595,8 +1595,13 @@ class PlaybackLoop:
         motion = getattr(layer, "motion", "static") or "static"
         intensity = int(getattr(layer, "motion_intensity", 50))
         motion_phase_offset = float(getattr(layer, "motion_phase", 0.0))
+        # B2 (2026-05-05): motion_speed multiplies the effect's frequency.
+        # Mirrors the same scaling on the software + multi-plane paths so
+        # all three render surfaces tick at the operator-set speed.
+        speed_raw = getattr(layer, "motion_speed", 1.0)
+        speed = max(0.0, min(2.0, float(speed_raw if speed_raw is not None else 1.0)))
         phase = compute_phase(
-            elapsed_s, _effect_freq(motion, intensity), motion_phase_offset,
+            elapsed_s, _effect_freq(motion, intensity) * speed, motion_phase_offset,
         )
         bx, by, bw, bh = box_px
         gx, gy, gw, gh = glyph_bbox_px

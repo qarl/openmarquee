@@ -514,9 +514,11 @@ def compose_motion_frame(
         motion = getattr(layer, "motion", "static") or "static"
         if motion != "static":
             box_px = _box_px(layer, width, height)
+            speed_raw = getattr(layer, "motion_speed", 1.0)
+            speed = max(0.0, min(2.0, float(speed_raw if speed_raw is not None else 1.0)))
             phase = compute_phase(
                 elapsed_s,
-                _effect_freq(motion, getattr(layer, "motion_intensity", 50)),
+                _effect_freq(motion, getattr(layer, "motion_intensity", 50)) * speed,
                 float(getattr(layer, "motion_phase", 0.0)),
             )
             # Stable per-layer key for the deterministic shake seed.

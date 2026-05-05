@@ -145,6 +145,11 @@ class TextLayer(BaseModel):
     # 0.5=opposition, 1.0=full cycle = in-phase). Lets two layers with
     # the same effect run out-of-sync without per-layer tick clocks.
     motion_phase: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Frequency multiplier for the effect's cycle. 1.0 = spec default,
+    # 0.0 = frozen, 2.0 = double speed (B2, 2026-05-05). Multiplies
+    # _effect_freq's per-effect Hz. Capped at 2.0 -- ticker beyond that
+    # would scroll faster than the eye can track at typical font sizes.
+    motion_speed: float = Field(default=1.0, ge=0.0, le=2.0)
     # Compositing mode against the layers below. "normal" = source-over
     # (today's behavior); the rest are reserved for the render-side
     # wave.

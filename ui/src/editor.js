@@ -442,6 +442,10 @@ const LAYER_GROUP_TEMPLATE = `
                 <input type="range" class="om-range field-motion-intensity" min="0" max="100" step="1" value="50">
             </label>
             <label class="om-field" style="flex: 1;">
+                <span>Speed <span class="field-motion-speed-display"></span></span>
+                <input type="range" class="om-range field-motion-speed" min="0" max="200" step="5" value="100">
+            </label>
+            <label class="om-field" style="flex: 1;">
                 <span>Phase <span class="field-motion-phase-display"></span></span>
                 <input type="range" class="om-range field-motion-phase" min="0" max="1" step="0.01" value="0">
             </label>
@@ -466,6 +470,7 @@ function defaultLayer() {
         motion: "static",
         motionIntensity: 50,
         motionPhase: 0,
+        motionSpeed: 1.0,
         blend: "normal",
         opacity: 1.0,
         visible: true,
@@ -848,10 +853,19 @@ export function mountEditor(
         if (Number.isFinite(parsedPhase)) {
             layer.motionPhase = Math.max(0, Math.min(1, parsedPhase));
         }
+        const speedEl = groupEl.querySelector(".field-motion-speed");
+        const parsedSpeed = Number(speedEl?.value);
+        if (Number.isFinite(parsedSpeed)) {
+            layer.motionSpeed = Math.max(0, Math.min(2, parsedSpeed / 100));
+        }
         // Update the inline numeric readouts next to the slider labels.
         const intensityDisplayEl = groupEl.querySelector(".field-motion-intensity-display");
         if (intensityDisplayEl) {
             intensityDisplayEl.textContent = `(${layer.motionIntensity ?? 50})`;
+        }
+        const speedDisplayEl = groupEl.querySelector(".field-motion-speed-display");
+        if (speedDisplayEl) {
+            speedDisplayEl.textContent = `(${Math.round((layer.motionSpeed ?? 1) * 100)}%)`;
         }
         const phaseDisplayEl = groupEl.querySelector(".field-motion-phase-display");
         if (phaseDisplayEl) {
@@ -919,12 +933,14 @@ export function mountEditor(
         const motionEl = groupEl.querySelector(".field-motion");
         const motionIntensityEl = groupEl.querySelector(".field-motion-intensity");
         const motionPhaseEl = groupEl.querySelector(".field-motion-phase");
+        const motionSpeedEl = groupEl.querySelector(".field-motion-speed");
         const blendEl = groupEl.querySelector(".field-blend");
         const opacityEl = groupEl.querySelector(".field-opacity");
 
         for (const el of [
             textEl, layerNameEl, textColorEl, fontSizeEl, fontFamilyEl,
-            motionEl, motionIntensityEl, motionPhaseEl, blendEl, opacityEl,
+            motionEl, motionIntensityEl, motionPhaseEl, motionSpeedEl,
+            blendEl, opacityEl,
         ]) {
             if (!el) continue;
             // <select> fires "change" on commit; <input> fires "input"
@@ -1197,14 +1213,21 @@ export function mountEditor(
         if (opacityDisplayEl) opacityDisplayEl.textContent = `(${opacityVal}%)`;
         const intensityEl = groupEl.querySelector(".field-motion-intensity");
         const phaseEl = groupEl.querySelector(".field-motion-phase");
+        const speedEl = groupEl.querySelector(".field-motion-speed");
         const intensityVal = layer.motionIntensity ?? 50;
         const phaseVal = layer.motionPhase ?? 0;
+        const speedVal = layer.motionSpeed ?? 1.0;
         intensityEl.value = String(intensityVal);
         phaseEl.value = String(phaseVal);
+        if (speedEl) speedEl.value = String(Math.round(speedVal * 100));
         groupEl.querySelector(".field-motion-intensity-display").textContent =
             `(${intensityVal})`;
         groupEl.querySelector(".field-motion-phase-display").textContent =
             `(${Number(phaseVal).toFixed(2)})`;
+        const speedDisplayEl = groupEl.querySelector(".field-motion-speed-display");
+        if (speedDisplayEl) {
+            speedDisplayEl.textContent = `(${Math.round(speedVal * 100)}%)`;
+        }
         groupEl.querySelector(".field-motion-controls").hidden =
             (layer.motion || "static") === "static";
         refreshLayerHeader(groupEl, layer, idx);
@@ -1550,6 +1573,7 @@ export function mountEditor(
             motion: layer.motion || "static",
             motion_intensity: layer.motionIntensity ?? 50,
             motion_phase: layer.motionPhase ?? 0,
+            motion_speed: layer.motionSpeed ?? 1.0,
             blend: layer.blend || "normal",
             opacity: layer.opacity ?? 1.0,
             visible: layer.visible !== false,
@@ -1688,6 +1712,7 @@ export function mountEditor(
             motion: wire?.motion || "static",
             motionIntensity: wire?.motion_intensity ?? 50,
             motionPhase: wire?.motion_phase ?? 0,
+            motionSpeed: typeof wire?.motion_speed === "number" ? wire.motion_speed : 1.0,
             blend: wire?.blend || "normal",
             opacity: typeof wire?.opacity === "number" ? wire.opacity : 1.0,
             visible: wire?.visible !== false,
