@@ -229,11 +229,12 @@ class BackgroundPattern(BaseModel):
       - rays:      slice count 2*round(lerp(4, 16)) — conic A/B alternating, always even
       - confetti:  base tile lerp(60, 28) — 4 offset dot layers
       - bricks:    brick width lerp(80, 32) — staggered courses
+      - grid:      cell size lerp(60, 12) — color_a lines on color_b paper
     """
 
     pattern: Literal[
         "solid", "gradient", "dots", "halftone", "stripes",
-        "scanlines", "checker", "rings", "rays", "confetti", "bricks",
+        "scanlines", "checker", "grid", "rings", "rays", "confetti", "bricks",
     ]
     color_a: str = Field(pattern=_HEX_COLOR_PATTERN)
     color_b: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)

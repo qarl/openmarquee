@@ -278,6 +278,8 @@ def render_pattern(
         return _render_pattern_confetti(a, b, d, width, height)
     if p == "bricks":
         return _render_pattern_bricks(a, b, d, width, height)
+    if p == "grid":
+        return _render_pattern_grid(a, b, d, width, height)
     log.warning("auto_render: unknown pattern %r; falling back to color_a", p)
     return Image.new("RGB", (width, height), a)
 
@@ -433,6 +435,27 @@ def _render_pattern_checker(
     mask_b = ((xs + ys) % 2) == 1
     base = _solid_fill(width, height, color_a)
     _apply_mask(base, mask_b, color_b)
+    return Image.fromarray(base, mode="RGB")
+
+
+def _render_pattern_grid(
+    color_a: str, color_b: str, density: float, width: int, height: int,
+) -> Image.Image:
+    """Graph-paper grid -- color_a lines on color_b paper. Cell size
+    shrinks with density (lerp(60, 12)). 1px lines (B17, 2026-05-05)."""
+    tile = max(4, round(_lerp(60, 12, density)))
+    base = _solid_fill(width, height, color_b)
+    rgb_a = _hex_to_rgb(color_a)
+    # Horizontal lines: 1px-tall stripe at every `tile`-th row.
+    mask_h = (np.arange(height) % tile) == 0
+    base[mask_h, :, 0] = rgb_a[0]
+    base[mask_h, :, 1] = rgb_a[1]
+    base[mask_h, :, 2] = rgb_a[2]
+    # Vertical lines: 1px-wide stripe at every `tile`-th column.
+    mask_v = (np.arange(width) % tile) == 0
+    base[:, mask_v, 0] = rgb_a[0]
+    base[:, mask_v, 1] = rgb_a[1]
+    base[:, mask_v, 2] = rgb_a[2]
     return Image.fromarray(base, mode="RGB")
 
 

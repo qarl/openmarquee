@@ -14,10 +14,10 @@
 const lerp = (a, b, t) =>
     a + (b - a) * Math.max(0, Math.min(1, t));
 
-// 11-name list in display order (matches the picker grid order).
+// 12-name list in display order (matches the picker grid order).
 export const PATTERN_NAMES = [
     "solid", "gradient", "dots", "halftone", "stripes",
-    "scanlines", "checker", "rings", "rays", "confetti", "bricks",
+    "scanlines", "checker", "grid", "rings", "rays", "confetti", "bricks",
 ];
 
 // Friendly label per pattern (for the picker tile + readout).
@@ -29,6 +29,7 @@ export const PATTERN_LABELS = {
     stripes: "Stripes",
     scanlines: "Scanlines",
     checker: "Checker",
+    grid: "Grid",
     rings: "Rings",
     rays: "Rays",
     confetti: "Confetti",
@@ -82,6 +83,18 @@ const BUILDERS = {
     checker: (a, b, d = 0.5) => {
         const tile = Math.round(lerp(32, 8, d));
         return `conic-gradient(${b} 0 25%, ${a} 0 50%, ${b} 0 75%, ${a} 0) 0 0 / ${tile}px ${tile}px`;
+    },
+
+    grid: (a, b, d = 0.5) => {
+        // Graph-paper layout. Color A = grid line, Color B = paper.
+        // Cell size shrinks with density (lerp(60, 12)). 1px lines.
+        // (B17, 2026-05-05.)
+        const tile = Math.round(lerp(60, 12, d));
+        return [
+            `repeating-linear-gradient(0deg, ${a} 0 1px, transparent 1px ${tile}px)`,
+            `repeating-linear-gradient(90deg, ${a} 0 1px, transparent 1px ${tile}px)`,
+            b,
+        ].join(", ");
     },
 
     rings: (a, b, d = 0.5) => {
@@ -273,6 +286,23 @@ export function paintPatternOnCanvas(
                         ctx.fillRect(col * tile, row * tile, tile, tile);
                     }
                 }
+            }
+            return;
+        }
+
+        if (pattern === "grid") {
+            // Color A = grid line, Color B = paper. Repaint base from
+            // color_a (set above) to color_b first, then 1px lines in
+            // color_a. (B17, 2026-05-05.)
+            ctx.fillStyle = b;
+            ctx.fillRect(0, 0, width, height);
+            const tile = Math.max(4, Math.round(lerp(60, 12, density)));
+            ctx.fillStyle = a;
+            for (let y = 0; y < height; y += tile) {
+                ctx.fillRect(0, y, width, 1);
+            }
+            for (let x = 0; x < width; x += tile) {
+                ctx.fillRect(x, 0, 1, height);
             }
             return;
         }

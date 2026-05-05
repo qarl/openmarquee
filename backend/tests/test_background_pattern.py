@@ -80,9 +80,9 @@ def test_pattern_model_rejects_unknown_pattern():
 
 @pytest.mark.parametrize("name", [
     "solid", "gradient", "dots", "halftone", "stripes",
-    "scanlines", "checker", "rings", "rays", "confetti", "bricks",
+    "scanlines", "checker", "grid", "rings", "rays", "confetti", "bricks",
 ])
-def test_pattern_model_accepts_all_11_pattern_names(name):
+def test_pattern_model_accepts_all_pattern_names(name):
     p = BackgroundPattern(pattern=name, color_a="#000000", color_b="#FFFFFF")
     assert p.pattern == name
 
@@ -253,7 +253,7 @@ def _pat(name: str, color_a: str = "#FF0000", color_b: str = "#00FF00",
 
 @pytest.mark.parametrize("name", [
     "solid", "gradient", "dots", "halftone", "stripes",
-    "scanlines", "checker", "rings", "rays", "confetti", "bricks",
+    "scanlines", "checker", "grid", "rings", "rays", "confetti", "bricks",
 ])
 def test_render_each_pattern_produces_correct_image_size(name):
     img = render_pattern(_pat(name), 200, 100)
@@ -371,6 +371,16 @@ def test_render_bricks_has_mortar_lines():
     pixels = set(img.getdata())
     assert (0, 0, 0) in pixels
     assert (255, 255, 255) in pixels
+
+
+def test_render_grid_lines_on_paper():
+    """Grid: color_a lines on color_b paper (B17)."""
+    img = render_pattern(
+        _pat("grid", "#FF0000", "#0000FF", density=0.5), 200, 200,
+    )
+    pixels = set(img.getdata())
+    assert (255, 0, 0) in pixels  # grid lines
+    assert (0, 0, 255) in pixels  # paper
 
 
 def test_render_halftone_two_offset_grids():
