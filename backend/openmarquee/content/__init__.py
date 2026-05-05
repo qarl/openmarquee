@@ -97,8 +97,12 @@ class TextLayer(BaseModel):
     name: str = Field(default="", max_length=200)
     font_family: str | None = None
     font_size_px: int | None = Field(default=None, ge=4, le=2048)
-    # Per §5.10a fu (qarl 2026-04-30): font_size_pct is a percentage of
-    # the SLIDE height, not the box height.
+    # Per §5.10a v3.1.2 (qarl 2026-05-01 review #3, refining ask #1):
+    # font_size_pct is a percentage of BOX WIDTH. Resizing the box
+    # visibly resizes the text -- operators expected box-resize ->
+    # text-resize. Earlier same day went % of slide width; the review
+    # correction pinned it to box width because it gives operators
+    # the layout intent they're already used to.
     font_size_pct: float | None = Field(default=None, ge=0.5, le=100.0)
     # Optional CSS-style font weight (300–900, multiples of 100). Most
     # bundled @font-face families are single-weight; this is for the

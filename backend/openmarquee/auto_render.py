@@ -141,7 +141,8 @@ def compose_auto_frame(
 
     Text drawing:
       - render_auto_text → current string
-      - Slide's font_family (if available system-side) + font_size_px
+      - Slide's font_family (if available system-side) + font_size_pct
+        of box width (or font_size_px as fallback)
       - text_color; centered within the frame
     """
     # Base canvas.
@@ -160,7 +161,14 @@ def compose_auto_frame(
     # slides that haven't been re-saved with the new field.
     layer = slide.text_layers[0]
     if layer.font_size_pct is not None:
-        size_px = max(4, int(round(height * layer.font_size_pct / 100)))
+        # Spec 5.10a v3.1.2: pct is of BOX WIDTH, not slide height.
+        # Resizing the box visibly resizes the text -- operators
+        # expected that math (B3, 2026-05-05). Mirrors the
+        # _draw_text_into convention in seed.py and the editor canvas
+        # preview in ui/src/editor.js.
+        box_w_frac = float(getattr(getattr(layer, "box", None), "w", 1.0))
+        px_box_w = max(1, int(box_w_frac * width))
+        size_px = max(4, int(round(px_box_w * layer.font_size_pct / 100)))
     else:
         size_px = layer.font_size_px
     font = _load_font(layer.font_family, size_px, height)
