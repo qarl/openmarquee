@@ -122,10 +122,13 @@ const BUILDERS = {
         const w = Math.round(lerp(80, 32, d));
         const h = Math.round(w / 2);
         const half = w / 2;
+        // 2px mortar -- 1px reads as a uniform grid at thumbnail scale
+        // (B16, 2026-05-05); 2px lets the offset alternating rows
+        // actually register as bricks.
         return [
-            `repeating-linear-gradient(0deg, ${b} 0 1px, transparent 1px ${h}px)`,
-            `repeating-linear-gradient(90deg, ${b} 0 1px, transparent 1px ${w}px) 0 0 / ${w}px ${h * 2}px`,
-            `repeating-linear-gradient(90deg, ${b} 0 1px, transparent 1px ${w}px) ${half}px ${h}px / ${w}px ${h * 2}px`,
+            `repeating-linear-gradient(0deg, ${b} 0 2px, transparent 2px ${h}px)`,
+            `repeating-linear-gradient(90deg, ${b} 0 2px, transparent 2px ${w}px) 0 0 / ${w}px ${h * 2}px`,
+            `repeating-linear-gradient(90deg, ${b} 0 2px, transparent 2px ${w}px) ${half}px ${h}px / ${w}px ${h * 2}px`,
             a,
         ].join(", ");
     },
@@ -339,15 +342,14 @@ export function paintPatternOnCanvas(
             const h = Math.max(4, Math.round(w / 2));
             const half = w / 2;
             ctx.fillStyle = b;
-            // Horizontal mortar
+            // 2px mortar -- see B16 note in bricks builder.
             for (let y = 0; y < height; y += h) {
-                ctx.fillRect(0, y, width, 1);
+                ctx.fillRect(0, y, width, 2);
             }
-            // Vertical mortar staggered between rows
             for (let row = 0, y = 0; y < height; row++, y += h) {
                 const offset = row % 2 === 0 ? 0 : half;
                 for (let x = offset; x < width; x += w) {
-                    ctx.fillRect(x, y, 1, h);
+                    ctx.fillRect(x, y, 2, h);
                 }
             }
             return;

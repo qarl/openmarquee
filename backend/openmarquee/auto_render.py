@@ -507,14 +507,16 @@ def _render_pattern_bricks(
 ) -> Image.Image:
     """Mortar-line brick layout — mimics LED-matrix tile seams.
     Brick width shrinks with density (lerp(80, 32)); brick height is
-    half the width. Mortar = 1px lines of color_b."""
+    half the width. Mortar = 2px lines of color_b -- 1px read as a
+    uniform grid at thumbnail scale and lost the offset character of
+    the bricks (B16, 2026-05-05)."""
     bw = max(8, round(_lerp(80, 32, density)))
     bh = max(4, bw // 2)
     half = bw // 2
     base = _solid_fill(width, height, color_a)
     rgb = _hex_to_rgb(color_b)
-    # Horizontal mortar: rows where y % bh == 0
-    mask_h = (np.arange(height) % bh) == 0
+    # Horizontal mortar: 2px-tall strip at rows where y % bh < 2.
+    mask_h = (np.arange(height) % bh) < 2
     base[mask_h, :, 0] = rgb[0]
     base[mask_h, :, 1] = rgb[1]
     base[mask_h, :, 2] = rgb[2]
@@ -522,13 +524,13 @@ def _render_pattern_bricks(
     # 2*bh..3*bh, ...) and offset half (rows bh..2*bh, 3*bh..4*bh,
     # ...). Compute which "brick course" each y is in: y // bh % 2.
     course = (np.arange(height) // bh) % 2
-    # For course-0 rows: vertical lines where x % bw == 0.
-    # For course-1 rows: vertical lines where (x - half) % bw == 0.
+    # For course-0 rows: vertical 2px-wide stripe where x % bw < 2.
+    # For course-1 rows: vertical 2px-wide stripe where (x - half) % bw < 2.
     course_0_rows = course == 0
     course_1_rows = course == 1
     x_indices = np.arange(width)
-    vert_0 = (x_indices % bw) == 0
-    vert_1 = ((x_indices - half) % bw) == 0
+    vert_0 = (x_indices % bw) < 2
+    vert_1 = ((x_indices - half) % bw) < 2
     if course_0_rows.any():
         rows_0 = np.where(course_0_rows)[0]
         for col in np.where(vert_0)[0]:
