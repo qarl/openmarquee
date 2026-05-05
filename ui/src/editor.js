@@ -268,15 +268,7 @@ const EDITOR_TEMPLATE = `
                 <div class="om-eyebrow" style="margin-bottom: 10px; font-family: var(--om-mono); letter-spacing: 0.14em; font-size: 10.5px; color: var(--om-text-fade); text-transform: uppercase;">Background source</div>
                 <div class="om-stack" style="gap: 10px;">
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
-                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="color" checked>
-                        <span>Solid color</span>
-                    </label>
-                    <label class="om-field editor-bg-color-wrap">
-                        <span>Background color</span>
-                        <input type="color" class="field-bg-color" value="#000000" style="width: 100%; height: 40px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-                    </label>
-                    <label class="om-row" style="gap: 8px; cursor: pointer;">
-                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="pattern">
+                        <input type="radio" name="editor-bg-source" class="field-bg-source" value="pattern" checked>
                         <span>Pattern</span>
                     </label>
                     <div class="editor-bg-pattern-wrap" hidden>
@@ -285,7 +277,7 @@ const EDITOR_TEMPLATE = `
                         <div class="editor-bg-pattern-tweaks">
                             <div class="om-row editor-bg-pattern-tweak" style="gap: 10px; align-items: center;">
                                 <span class="editor-bg-pattern-label">Color A</span>
-                                <input type="color" class="field-bg-pat-color-a" value="#1A0F00" style="flex: 1; height: 36px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
+                                <input type="color" class="field-bg-pat-color-a" value="#000000" style="flex: 1; height: 36px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
                             </div>
                             <div class="om-row editor-bg-pattern-tweak editor-bg-pattern-tweak-b" style="gap: 10px; align-items: center;">
                                 <span class="editor-bg-pattern-label">Color B</span>
@@ -532,12 +524,10 @@ export function mountEditor(
     canvas.height = height;
     canvas.style.aspectRatio = `${width} / ${height}`;
 
-    const bgColorEl = container.querySelector(".field-bg-color");
     const bgSlideEl = container.querySelector(".field-bg-slide");
     const bgSlideWrapEl = container.querySelector(".editor-bg-slide-wrap");
     const bgVideoEl = container.querySelector(".field-bg-video");
     const bgVideoWrapEl = container.querySelector(".editor-bg-video-wrap");
-    const bgColorWrapEl = container.querySelector(".editor-bg-color-wrap");
     const bgPatWrapEl = container.querySelector(".editor-bg-pattern-wrap");
     const bgPatGridEl = container.querySelector(".editor-bg-pattern-grid");
     const bgPatColorAEl = container.querySelector(".field-bg-pat-color-a");
@@ -548,18 +538,16 @@ export function mountEditor(
     const bgPatDensityLabelEl = container.querySelector(".field-bg-pat-density-label");
     const bgPatDensityRowEl = container.querySelector(".editor-bg-pattern-tweak-d");
 
-    // Wrap the three slide-level color inputs with the curated palette
-    // picker (qarl 2026-05-03 designer dispatch). The per-layer text
-    // color is mounted later, inside the layer-card render loop, so
-    // each new layer's color input gets the same affordance. Pattern
-    // editor's Color A / Color B picker mirrors land here too.
-    // Capture the handles so loadForEdit can call .refresh() to update
-    // selected indicators after externally-set values — without that,
-    // the picker's internal selected state goes stale on slide load.
+    // Wrap the pattern color inputs with the curated palette picker
+    // (qarl 2026-05-03 designer dispatch). The per-layer text color
+    // is mounted later, inside the layer-card render loop, so each
+    // new layer's color input gets the same affordance. Capture the
+    // handles so loadForEdit can call .refresh() to update selected
+    // indicators after externally-set values — without that, the
+    // picker's internal selected state goes stale on slide load.
     // (Refresh-not-input-dispatch because dispatching input during
     // load would trigger the debounced autosave to re-save the slide
     // as-is on every load — 900 ms later, server gets a no-op write.)
-    const bgColorPicker = mountColorPicker(bgColorEl);
     const bgPatColorAPicker = mountColorPicker(bgPatColorAEl);
     const bgPatColorBPicker = mountColorPicker(bgPatColorBEl);
 
@@ -572,8 +560,8 @@ export function mountEditor(
 
     const state = {
         name: nameEl.value,
-        backgroundColor: bgColorEl.value,
-        bgSource: "color",
+        backgroundColor: bgPatColorAEl.value,
+        bgSource: "pattern",
         bgSlideId: null,
         bgVideoId: null,
         bgImage: null,
@@ -583,9 +571,11 @@ export function mountEditor(
         // with the color inputs; density (0-1 normalized) comes from
         // the range slider scaled by 100. Mutex with the other bg
         // sources — bgSource = "pattern" activates this object,
-        // otherwise it's ignored at save time.
+        // otherwise it's ignored at save time. Default pattern is
+        // "solid" (B14, 2026-05-05) — replaces the removed top-level
+        // "Solid color" radio; solid pattern uses color_a only.
         bgPattern: {
-            pattern: "halftone",
+            pattern: "solid",
             color_a: bgPatColorAEl.value,
             color_b: bgPatColorBEl.value,
             density: (parseInt(bgPatDensityEl.value, 10) || 50) / 100,
@@ -791,7 +781,13 @@ export function mountEditor(
 
     function syncSlideFromForm() {
         state.name = nameEl.value;
-        state.backgroundColor = bgColorEl.value;
+        // backgroundColor mirrors the solid pattern's color_a so the
+        // payload's background_color field stays in sync with what the
+        // user effectively sees (pattern-solid replaced the dropped
+        // top-level "Solid color" mode in B14).
+        if (state.bgSource === "pattern" && state.bgPattern.pattern === "solid") {
+            state.backgroundColor = state.bgPattern.color_a;
+        }
         drawCanvas(canvas, state);
     }
 
@@ -1345,19 +1341,17 @@ export function mountEditor(
     addLayerBtn.addEventListener("click", addLayer);
 
     nameEl.addEventListener("input", syncSlideFromForm);
-    bgColorEl.addEventListener("input", syncSlideFromForm);
 
     // Background-source radios toggle the slide picker. When "slide" or
     // "video" is selected, populate the dropdown lazily (first time only)
     // via fetchItems so a first-mount doesn't burn a fetch on an operator
-    // who's going to stick with solid-color anyway.
+    // who's going to stick with the default pattern anyway.
     const bgGenerateWrap = container.querySelector(".editor-bg-generate");
     let bgSlidePopulated = false;
     let bgVideoPopulated = false;
     for (const radio of container.querySelectorAll(".field-bg-source")) {
         radio.addEventListener("change", async () => {
             state.bgSource = radio.value;
-            bgColorWrapEl.hidden = state.bgSource !== "color";
             bgSlideWrapEl.hidden = state.bgSource !== "slide";
             bgVideoWrapEl.hidden = state.bgSource !== "video";
             bgPatWrapEl.hidden = state.bgSource !== "pattern";
@@ -1373,11 +1367,7 @@ export function mountEditor(
             }
             // Clear references for the inactive paths so the save payload
             // never carries multiple bg sources at once.
-            if (state.bgSource === "color") {
-                state.bgImage = null;
-                state.bgSlideId = null;
-                state.bgVideoId = null;
-            } else if (state.bgSource === "slide") {
+            if (state.bgSource === "slide") {
                 state.bgVideoId = null;
             } else if (state.bgSource === "video") {
                 state.bgSlideId = null;
@@ -1589,15 +1579,20 @@ export function mountEditor(
         state.activeLayerIndex = 0;
         state.expandedLayerIndex = 0;
         renderLayers();
-        const colorRadio = container.querySelector(
-            '.field-bg-source[value="color"]',
+        // Default to pattern-solid (replaces the dropped top-level
+        // "Solid color" mode in B14 — solid is now reachable as a
+        // pattern type).
+        const patternRadio = container.querySelector(
+            '.field-bg-source[value="pattern"]',
         );
-        colorRadio.checked = true;
-        bgColorWrapEl.hidden = false;
+        patternRadio.checked = true;
         bgSlideWrapEl.hidden = true;
         bgVideoWrapEl.hidden = true;
-        bgPatWrapEl.hidden = true;
-        state.bgSource = "color";
+        bgPatWrapEl.hidden = false;
+        state.bgSource = "pattern";
+        state.bgPattern.pattern = "solid";
+        renderPatternGrid();
+        applyPatternTweakRowVisibility();
         drawCanvas(canvas, state);
         autoSave.cancel();
         statusEl.textContent = "";
@@ -1695,15 +1690,7 @@ export function mountEditor(
 
         nameEl.value = slide.name || "Untitled";
         state.name = nameEl.value;
-        bgColorEl.value = slide.background_color || "#000000";
-        state.backgroundColor = bgColorEl.value;
-        // Refresh the curated-palette picker so the inline-row +
-        // More button paint matches the loaded value. Direct
-        // .refresh() instead of dispatching input — input dispatch
-        // would trigger the form-level debounced autosave to re-save
-        // the slide as-is 900 ms later (caught in pre-commit
-        // subagent review).
-        bgColorPicker.refresh();
+        state.backgroundColor = slide.background_color || "#000000";
         durationEl.value = String(Math.max(1, (slide.duration_ms || 5000) / 1000));
 
         const wireLayers = Array.isArray(slide.text_layers) && slide.text_layers.length
@@ -1741,7 +1728,6 @@ export function mountEditor(
                 await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
                 bgSlidePopulated = true;
             }
-            bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = false;
             bgVideoWrapEl.hidden = true;
             bgPatWrapEl.hidden = true;
@@ -1761,7 +1747,6 @@ export function mountEditor(
                 await populateBgVideoOptions(bgVideoEl, fetchItems, statusEl);
                 bgVideoPopulated = true;
             }
-            bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = false;
             bgPatWrapEl.hidden = true;
@@ -1772,12 +1757,15 @@ export function mountEditor(
             state.bgImage = await loadImageForSlide(state.bgVideoId).catch(
                 () => null,
             );
-        } else if (slide.background_pattern) {
+        } else {
+            // Pattern path -- handles both new pattern-bearing slides
+            // and legacy color-only slides (B14 migration: bg_color
+            // becomes pattern.color_a with pattern="solid"). Save
+            // will persist the migration the next time the user edits.
             const patRadio = container.querySelector(
                 '.field-bg-source[value="pattern"]',
             );
             patRadio.checked = true;
-            bgColorWrapEl.hidden = true;
             bgSlideWrapEl.hidden = true;
             bgVideoWrapEl.hidden = true;
             bgPatWrapEl.hidden = false;
@@ -1785,17 +1773,25 @@ export function mountEditor(
             state.bgSlideId = null;
             state.bgVideoId = null;
             state.bgImage = null;
-            state.bgPattern = {
-                pattern: slide.background_pattern.pattern,
-                color_a: slide.background_pattern.color_a,
-                color_b: slide.background_pattern.color_b,
-                density: slide.background_pattern.density,
+            const pat = slide.background_pattern;
+            state.bgPattern = pat ? {
+                pattern: pat.pattern,
+                color_a: pat.color_a,
+                color_b: pat.color_b,
+                density: pat.density,
+            } : {
+                pattern: "solid",
+                color_a: slide.background_color || "#000000",
+                color_b: state.bgPattern.color_b,
+                density: 0.5,
             };
             bgPatColorAEl.value = state.bgPattern.color_a;
             bgPatColorBEl.value = state.bgPattern.color_b;
-            // Same .refresh() shape as bgColorPicker above — keeps
-            // the picker's selected indicator in sync with the
-            // loaded value without triggering autosave.
+            // Refresh the curated-palette pickers so the inline-row +
+            // More button paint matches the loaded value. Direct
+            // .refresh() instead of dispatching input -- input dispatch
+            // would trigger the form-level debounced autosave to re-save
+            // the slide as-is 900 ms later.
             bgPatColorAPicker.refresh();
             bgPatColorBPicker.refresh();
             const densityPct = Math.round(state.bgPattern.density * 100);
@@ -1803,19 +1799,6 @@ export function mountEditor(
             bgPatDensityValEl.textContent = String(densityPct);
             applyPatternTweakRowVisibility();
             renderPatternGrid();
-        } else {
-            const colorRadio = container.querySelector(
-                '.field-bg-source[value="color"]',
-            );
-            colorRadio.checked = true;
-            bgColorWrapEl.hidden = false;
-            bgSlideWrapEl.hidden = true;
-            bgVideoWrapEl.hidden = true;
-            bgPatWrapEl.hidden = true;
-            state.bgSource = "color";
-            state.bgSlideId = null;
-            state.bgVideoId = null;
-            state.bgImage = null;
         }
         drawCanvas(canvas, state);
 

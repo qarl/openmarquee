@@ -507,8 +507,8 @@ describe("mountEditor — submit flow", () => {
         expect(
             container.querySelector(".field-text-color").value.toUpperCase(),
         ).toBe("#F4B755");
-        // Bg color was NOT touched — that's slide-level now.
-        expect(container.querySelector(".field-bg-color").value).toBe("#000000");
+        // Bg color was NOT touched — that's slide-level now (via pattern color_a after B14).
+        expect(container.querySelector(".field-bg-pat-color-a").value).toBe("#000000");
         // Re-render happened.
         expect(fakeCtx.fillRect.mock.calls.length).toBeGreaterThan(renderCallsBefore);
     });

@@ -16,7 +16,8 @@ test("save a text slide → it shows up in the Playlists pallet + the asset serv
         el.value = "#ffffff";
         el.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await page.locator(".editor .field-bg-color").evaluate((el) => {
+    // Slide bg color is now reached via pattern color_a (B14).
+    await page.locator(".editor .field-bg-pat-color-a").evaluate((el) => {
         el.value = "#cc0000";
         el.dispatchEvent(new Event("input", { bubbles: true }));
     });
