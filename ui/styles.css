@@ -1538,6 +1538,11 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 .editor-layer-card.editor-layer-expanded {
     border-color: var(--om-accent);
+    /* Let popovers (font picker dropdown, color "..." popover) escape
+       the card's rounded clip when the card is expanded. Collapsed
+       cards keep overflow:hidden for clean header chrome. (B8,
+       2026-05-05.) */
+    overflow: visible;
 }
 .editor-layer-head {
     display: flex;
