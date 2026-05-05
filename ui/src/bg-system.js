@@ -47,7 +47,9 @@ const BUILDERS = {
     },
 
     dots: (a, b, d = 0.5) => {
-        const tile = Math.round(lerp(28, 8, d));
+        // Widened lerp(48, 4) -- prior lerp(28, 8) was visually narrow
+        // at both extremes (B12, 2026-05-05).
+        const tile = Math.round(lerp(48, 4, d));
         const r = Math.max(2, Math.round(tile * 0.22));
         return [
             `radial-gradient(circle at center, ${b} ${r}px, transparent ${r + 1}px) 0 0 / ${tile}px ${tile}px`,
@@ -56,7 +58,9 @@ const BUILDERS = {
     },
 
     halftone: (a, b, d = 0.5) => {
-        const tile = Math.round(lerp(36, 14, d));
+        // Widened lerp(60, 6) for more striking sparse/dense extremes
+        // (B12, 2026-05-05).
+        const tile = Math.round(lerp(60, 6, d));
         const r = Math.round(tile * 0.34);
         const half = tile / 2;
         return [
@@ -67,13 +71,15 @@ const BUILDERS = {
     },
 
     stripes: (a, b, d = 0.5) => {
-        const tile = Math.round(lerp(40, 10, d));
+        // Widened lerp(80, 4) -- B12, 2026-05-05.
+        const tile = Math.round(lerp(80, 4, d));
         const half = tile / 2;
         return `repeating-linear-gradient(45deg, ${a} 0 ${half}px, ${b} ${half}px ${tile}px)`;
     },
 
     scanlines: (a, b, d = 0.5) => {
-        const tile = Math.round(lerp(8, 3, d));
+        // Widened lerp(16, 2) -- B12, 2026-05-05.
+        const tile = Math.round(lerp(16, 2, d));
         return [
             `repeating-linear-gradient(0deg, ${b} 0 1px, transparent 1px ${tile}px)`,
             a,
@@ -81,15 +87,16 @@ const BUILDERS = {
     },
 
     checker: (a, b, d = 0.5) => {
-        const tile = Math.round(lerp(32, 8, d));
+        // Widened lerp(60, 4) -- B12, 2026-05-05.
+        const tile = Math.round(lerp(60, 4, d));
         return `conic-gradient(${b} 0 25%, ${a} 0 50%, ${b} 0 75%, ${a} 0) 0 0 / ${tile}px ${tile}px`;
     },
 
     grid: (a, b, d = 0.5) => {
         // Graph-paper layout. Color A = grid line, Color B = paper.
-        // Cell size shrinks with density (lerp(60, 12)). 1px lines.
-        // (B17, 2026-05-05.)
-        const tile = Math.round(lerp(60, 12, d));
+        // Cell size shrinks with density (lerp(120, 4)). 1px lines.
+        // (B17 + widened by B12, 2026-05-05.)
+        const tile = Math.round(lerp(120, 4, d));
         return [
             `repeating-linear-gradient(0deg, ${a} 0 1px, transparent 1px ${tile}px)`,
             `repeating-linear-gradient(90deg, ${a} 0 1px, transparent 1px ${tile}px)`,
@@ -98,7 +105,8 @@ const BUILDERS = {
     },
 
     rings: (a, b, d = 0.5) => {
-        const tile = Math.round(lerp(60, 18, d));
+        // Widened lerp(120, 6) -- B12, 2026-05-05.
+        const tile = Math.round(lerp(120, 6, d));
         const half = tile / 2;
         return `repeating-radial-gradient(circle at 50% 50%, ${a} 0 ${half - 2}px, ${b} ${half - 2}px ${half}px)`;
     },
@@ -107,7 +115,9 @@ const BUILDERS = {
         // Slice count is always even -- with an odd count the slice at
         // angle wrap-around (0 / 2pi) joins two same-colored slices,
         // visibly doubling the top ray (B15, 2026-05-05).
-        const slices = 2 * Math.round(lerp(4, 16, d));
+        // Widened to 2*round(lerp(2, 24)) so range is 4..48 -- B12,
+        // 2026-05-05.
+        const slices = 2 * Math.round(lerp(2, 24, d));
         const stops = [];
         const step = 100 / slices;
         for (let i = 0; i < slices; i++) {
@@ -118,7 +128,8 @@ const BUILDERS = {
     },
 
     confetti: (a, b, d = 0.5) => {
-        const t1 = Math.round(lerp(60, 28, d));
+        // Widened lerp(100, 14) -- B12, 2026-05-05.
+        const t1 = Math.round(lerp(100, 14, d));
         const t2 = Math.round(t1 * 0.7);
         const t3 = Math.round(t1 * 1.3);
         const r = Math.max(2, Math.round(t1 * 0.08));
@@ -132,7 +143,8 @@ const BUILDERS = {
     },
 
     bricks: (a, b, d = 0.5) => {
-        const w = Math.round(lerp(80, 32, d));
+        // Widened lerp(140, 16) -- B12, 2026-05-05.
+        const w = Math.round(lerp(140, 16, d));
         const h = Math.round(w / 2);
         const half = w / 2;
         // 2px mortar -- 1px reads as a uniform grid at thumbnail scale
@@ -216,7 +228,7 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "dots") {
-            const tile = Math.round(lerp(28, 8, density));
+            const tile = Math.round(lerp(48, 4, density));
             const r = Math.max(2, Math.round(tile * 0.22));
             ctx.fillStyle = b;
             for (let y = tile / 2; y < height; y += tile) {
@@ -230,7 +242,7 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "halftone") {
-            const tile = Math.round(lerp(36, 14, density));
+            const tile = Math.round(lerp(60, 6, density));
             const r = Math.round(tile * 0.34);
             ctx.fillStyle = b;
             for (let layer = 0; layer < 2; layer++) {
@@ -254,7 +266,7 @@ export function paintPatternOnCanvas(
         if (pattern === "stripes") {
             // 45deg diagonal alternating bands. Use repeating linear
             // gradient via CanvasPattern.
-            const tile = Math.round(lerp(40, 10, density));
+            const tile = Math.round(lerp(80, 4, density));
             const half = tile / 2;
             // Build an off-canvas tile aligned to the diagonal.
             // Simpler: rotate context, draw vertical bands, restore.
@@ -270,7 +282,7 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "scanlines") {
-            const tile = Math.max(2, Math.round(lerp(8, 3, density)));
+            const tile = Math.max(2, Math.round(lerp(16, 2, density)));
             ctx.fillStyle = b;
             for (let y = 0; y < height; y += tile) {
                 ctx.fillRect(0, y, width, 1);
@@ -279,7 +291,7 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "checker") {
-            const tile = Math.round(lerp(32, 8, density));
+            const tile = Math.round(lerp(60, 4, density));
             ctx.fillStyle = b;
             const cols = Math.ceil(width / tile);
             const rows = Math.ceil(height / tile);
@@ -299,7 +311,7 @@ export function paintPatternOnCanvas(
             // color_a. (B17, 2026-05-05.)
             ctx.fillStyle = b;
             ctx.fillRect(0, 0, width, height);
-            const tile = Math.max(4, Math.round(lerp(60, 12, density)));
+            const tile = Math.max(4, Math.round(lerp(120, 4, density)));
             ctx.fillStyle = a;
             for (let y = 0; y < height; y += tile) {
                 ctx.fillRect(0, y, width, 1);
@@ -311,7 +323,7 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "rings") {
-            const tile = Math.max(4, Math.round(lerp(60, 18, density)));
+            const tile = Math.max(4, Math.round(lerp(120, 6, density)));
             const half = tile / 2;
             const cx = width / 2;
             const cy = height / 2;
@@ -328,7 +340,7 @@ export function paintPatternOnCanvas(
 
         if (pattern === "rays") {
             // Always even -- see B15 note in the rays builder above.
-            const slices = Math.max(2, 2 * Math.round(lerp(4, 16, density)));
+            const slices = Math.max(2, 2 * Math.round(lerp(2, 24, density)));
             const cx = width / 2;
             const cy = height / 2;
             const maxR = Math.ceil(Math.sqrt(cx * cx + cy * cy)) + 1;
@@ -347,7 +359,7 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "confetti") {
-            const t1 = Math.max(8, Math.round(lerp(60, 28, density)));
+            const t1 = Math.max(8, Math.round(lerp(100, 14, density)));
             const t2 = Math.max(4, Math.round(t1 * 0.7));
             const t3 = Math.max(4, Math.round(t1 * 1.3));
             const r = Math.max(2, Math.round(t1 * 0.08));
@@ -371,7 +383,7 @@ export function paintPatternOnCanvas(
         }
 
         if (pattern === "bricks") {
-            const w = Math.max(8, Math.round(lerp(80, 32, density)));
+            const w = Math.max(8, Math.round(lerp(140, 16, density)));
             const h = Math.max(4, Math.round(w / 2));
             const half = w / 2;
             ctx.fillStyle = b;

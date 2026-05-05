@@ -356,8 +356,8 @@ def _render_pattern_dots(
     color_a: str, color_b: str, density: float, width: int, height: int,
 ) -> Image.Image:
     """Evenly-spaced filled dots of color_b on a color_a background.
-    Tile size shrinks with density (lerp(28, 8))."""
-    tile = round(_lerp(28, 8, density))
+    Tile size shrinks with density (lerp(48, 4))."""
+    tile = round(_lerp(48, 4, density))  # B12: widened from (28, 8)
     radius = max(2, round(tile * 0.22))
     base = _solid_fill(width, height, color_a)
     mask = _dot_grid_mask(width, height, tile, radius)
@@ -370,7 +370,7 @@ def _render_pattern_halftone(
 ) -> Image.Image:
     """Two offset dot grids — printer-style halftone. Larger tile +
     bigger dots than `dots`; second layer offset by half a tile."""
-    tile = round(_lerp(36, 14, density))
+    tile = round(_lerp(60, 6, density))  # B12: widened from (36, 14)
     radius = round(tile * 0.34)
     half = tile // 2
     base = _solid_fill(width, height, color_a)
@@ -395,7 +395,7 @@ def _render_pattern_stripes(
     `tile`-sized cycle in our math = `tile` perpendicular pixels on
     screen. Without the / √2 the bands were √2× too thin vs the
     editor canvas (caught in pre-commit subagent review)."""
-    tile = round(_lerp(40, 10, density))
+    tile = round(_lerp(80, 4, density))  # B12: widened from (40, 10)
     half = tile / 2
     sqrt2 = math.sqrt(2)
     xs = np.arange(width, dtype=np.float32).reshape(1, width)
@@ -412,8 +412,8 @@ def _render_pattern_scanlines(
 ) -> Image.Image:
     """Horizontal CRT-style 1-pixel lines of color_b on color_a, with
     `tile` pixels between each line. Tile shrinks with density
-    (lerp(8, 3))."""
-    tile = max(2, round(_lerp(8, 3, density)))
+    (lerp(16, 2))."""
+    tile = max(2, round(_lerp(16, 2, density)))  # B12: widened from (8, 3)
     base = _solid_fill(width, height, color_a)
     rgb = _hex_to_rgb(color_b)
     base[::tile, :, 0] = rgb[0]
@@ -427,7 +427,7 @@ def _render_pattern_checker(
 ) -> Image.Image:
     """Standard checker grid. Tile shrinks with density (lerp(32,
     8))."""
-    tile = round(_lerp(32, 8, density))
+    tile = round(_lerp(60, 4, density))  # B12: widened from (32, 8)
     if tile <= 0:
         return Image.new("RGB", (width, height), color_a)
     xs = (np.arange(width) // tile).reshape(1, width)
@@ -442,8 +442,8 @@ def _render_pattern_grid(
     color_a: str, color_b: str, density: float, width: int, height: int,
 ) -> Image.Image:
     """Graph-paper grid -- color_a lines on color_b paper. Cell size
-    shrinks with density (lerp(60, 12)). 1px lines (B17, 2026-05-05)."""
-    tile = max(4, round(_lerp(60, 12, density)))
+    shrinks with density (lerp(120, 4)). 1px lines (B17, 2026-05-05)."""
+    tile = max(4, round(_lerp(120, 4, density)))  # B12: widened from (60, 12)
     base = _solid_fill(width, height, color_b)
     rgb_a = _hex_to_rgb(color_a)
     # Horizontal lines: 1px-tall stripe at every `tile`-th row.
@@ -463,9 +463,9 @@ def _render_pattern_rings(
     color_a: str, color_b: str, density: float, width: int, height: int,
 ) -> Image.Image:
     """Concentric rings around the slide center. Ring period shrinks
-    with density (lerp(60, 18)). Each period: color_a band of
+    with density (lerp(120, 6)). Each period: color_a band of
     `half - 2` pixels, then a 2-pixel color_b ring."""
-    tile = max(4, round(_lerp(60, 18, density)))
+    tile = max(4, round(_lerp(120, 6, density)))  # B12: widened from (60, 18)
     half = tile // 2
     cx = width / 2
     cy = height / 2
@@ -483,10 +483,10 @@ def _render_pattern_rays(
     color_a: str, color_b: str, density: float, width: int, height: int,
 ) -> Image.Image:
     """Conic gradient that flips between color_a and color_b in equal
-    angular slices. Slice count grows with density (lerp(8, 32)) and
+    angular slices. Slice count grows with density (4..48) and
     is always even -- an odd count joins two same-colored slices at
     the wrap seam, doubling the top ray (B15, 2026-05-05)."""
-    slices = max(2, 2 * round(_lerp(4, 16, density)))
+    slices = max(2, 2 * round(_lerp(2, 24, density)))  # B12: widened from (4, 16)
     cx = width / 2
     cy = height / 2
     xs = (np.arange(width, dtype=np.float32) - cx).reshape(1, width)
@@ -508,7 +508,7 @@ def _render_pattern_confetti(
     offset radial-grid layers at different tile sizes — pure CSS
     structurally, looks busy enough to read as confetti without any
     actual randomness."""
-    t1 = max(8, round(_lerp(60, 28, density)))
+    t1 = max(8, round(_lerp(100, 14, density)))  # B12: widened from (60, 28)
     t2 = max(4, round(t1 * 0.7))
     t3 = max(4, round(t1 * 1.3))
     r = max(2, round(t1 * 0.08))
@@ -529,11 +529,11 @@ def _render_pattern_bricks(
     color_a: str, color_b: str, density: float, width: int, height: int,
 ) -> Image.Image:
     """Mortar-line brick layout — mimics LED-matrix tile seams.
-    Brick width shrinks with density (lerp(80, 32)); brick height is
+    Brick width shrinks with density (lerp(140, 16)); brick height is
     half the width. Mortar = 2px lines of color_b -- 1px read as a
     uniform grid at thumbnail scale and lost the offset character of
     the bricks (B16, 2026-05-05)."""
-    bw = max(8, round(_lerp(80, 32, density)))
+    bw = max(8, round(_lerp(140, 16, density)))  # B12: widened from (80, 32)
     bh = max(4, bw // 2)
     half = bw // 2
     base = _solid_fill(width, height, color_a)

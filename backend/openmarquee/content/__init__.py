@@ -220,16 +220,16 @@ class BackgroundPattern(BaseModel):
       - gradient:  repurposed as angle (density 0 → 0deg top→bottom,
                    density 0.5 → 160deg "sunrise", density 1 → 270deg
                    right→left)
-      - dots:      tile size lerp(28, 8) — higher density = tighter dots
-      - halftone:  tile size lerp(36, 14) — two offset dot grids
-      - stripes:   tile size lerp(40, 10) — diagonal 45deg
-      - scanlines: line spacing lerp(8, 3) — horizontal CRT lines
-      - checker:   tile size lerp(32, 8)
-      - rings:     concentric ring spacing lerp(60, 18)
-      - rays:      slice count 2*round(lerp(4, 16)) — conic A/B alternating, always even
-      - confetti:  base tile lerp(60, 28) — 4 offset dot layers
-      - bricks:    brick width lerp(80, 32) — staggered courses
-      - grid:      cell size lerp(60, 12) — color_a lines on color_b paper
+      - dots:      tile size lerp(48, 4) — higher density = tighter dots
+      - halftone:  tile size lerp(60, 6) — two offset dot grids
+      - stripes:   tile size lerp(80, 4) — diagonal 45deg
+      - scanlines: line spacing lerp(16, 2) — horizontal CRT lines
+      - checker:   tile size lerp(60, 4)
+      - rings:     concentric ring spacing lerp(120, 6)
+      - rays:      slice count 2*round(lerp(2, 24)) — conic A/B alternating, always even
+      - confetti:  base tile lerp(100, 14) — 4 offset dot layers
+      - bricks:    brick width lerp(140, 16) — staggered courses
+      - grid:      cell size lerp(120, 4) — color_a lines on color_b paper
     """
 
     pattern: Literal[
