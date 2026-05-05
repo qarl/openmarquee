@@ -51,9 +51,12 @@ export function mountSlideBrowser(container, options) {
         refreshVersion += 1;
         const filtered = items
             .filter((it) => it && it.type === type)
-            // Most-recent first so newly-created slides land in view.
+            // Chronological: oldest at top, newest appended at the end
+            // (B19, 2026-05-05). Operators read top-to-bottom; new items
+            // landing at the bottom matches "I just made this, it's the
+            // most recent thing."
             .sort((a, b) =>
-                String(b.created_at || "").localeCompare(String(a.created_at || "")),
+                String(a.created_at || "").localeCompare(String(b.created_at || "")),
             );
 
         listEl.innerHTML = "";

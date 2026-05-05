@@ -64,9 +64,10 @@ describe("mountSlideBrowser", () => {
         // 2 text_slide items — the inline +New tile is gone (the slides
         // shell page-head now owns the create affordance).
         expect(tiles).toHaveLength(2);
-        // Most-recent first (Charlie 12:00 before Alpha 10:00).
-        expect(tiles[0].dataset.id).toBe("c");
-        expect(tiles[1].dataset.id).toBe("a");
+        // Chronological order: oldest first (Alpha 10:00 before Charlie 12:00),
+        // so new slides land at the end (B19, 2026-05-05).
+        expect(tiles[0].dataset.id).toBe("a");
+        expect(tiles[1].dataset.id).toBe("c");
     });
 
     it("filters out items that don't match the requested type", async () => {

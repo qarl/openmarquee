@@ -56,12 +56,16 @@ export function mountPlaylistBrowser(container, options) {
             collection = { playlists: [] };
         }
         const itemById = new Map(items.map((it) => [String(it.id), it]));
-        // Sort: default first (by id, not name — rename-safe), then alphabetical
-        // by display name. This mirrors the previous "default first" UX.
+        // Sort: default first (by id, not name -- rename-safe), then
+        // preserve insertion order so newly-created playlists appear at
+        // the end of the list (B19, 2026-05-05). The collection array
+        // is in creation order on the backend (PlaylistCollection
+        // appends new playlists), so a stable sort that only pulls
+        // the default to the front leaves the rest in place.
         const playlists = [...(collection.playlists || [])].sort((a, b) => {
             if (String(a.id) === DEFAULT_PLAYLIST_ID) return -1;
             if (String(b.id) === DEFAULT_PLAYLIST_ID) return 1;
-            return String(a.name || "").localeCompare(String(b.name || ""));
+            return 0;
         });
         listEl.innerHTML = "";
         for (const playlist of playlists) {

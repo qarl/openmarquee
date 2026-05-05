@@ -470,7 +470,12 @@ def list_in_playlist_order(
             for item_id, item in items_by_id.items()
             if item_id not in used
         ]
-        extras.sort(key=lambda item: str(item.id))
+        # Chronological order so newly-created items land at the end of
+        # the list (B19, 2026-05-05). Was sort-by-uuid (deterministic
+        # but effectively random). The frontend slide-browser re-sorts
+        # for its own display, but other API consumers see the same
+        # creation-order intent.
+        extras.sort(key=lambda item: (str(item.created_at or ""), str(item.id)))
         ordered.extend(extras)
 
     return ordered

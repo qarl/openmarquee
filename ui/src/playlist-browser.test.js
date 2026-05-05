@@ -49,7 +49,7 @@ describe("mountPlaylistBrowser", () => {
         ],
     };
 
-    it("puts 'default' first (by id), then alphabetical by name, with item counts", async () => {
+    it("puts 'default' first (by id), then preserves insertion order so new playlists land at the end (B19)", async () => {
         const container = document.createElement("div");
         mountPlaylistBrowser(container, {
             fetchPlaylists: async () => COLLECTION,
@@ -60,10 +60,12 @@ describe("mountPlaylistBrowser", () => {
         const tiles = container.querySelectorAll(
             ".playlist-browser-tile[data-id]",
         );
+        // COLLECTION.playlists insertion order is [default, lunch, evening];
+        // post-B19 that's preserved (with default pulled to the front).
         expect(Array.from(tiles).map((t) => t.dataset.id)).toEqual([
             DEFAULT_PLAYLIST_ID,
-            EVENING_ID,
             LUNCH_ID,
+            EVENING_ID,
         ]);
         const defaultTile = container.querySelector(
             `[data-id="${DEFAULT_PLAYLIST_ID}"]`,
