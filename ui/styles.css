@@ -1089,7 +1089,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
-    flex: 1;
     min-width: 0;
 }
 .om-color-picker-swatch {
