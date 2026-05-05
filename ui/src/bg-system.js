@@ -232,13 +232,16 @@ export function paintPatternOnCanvas(
         if (pattern === "halftone") {
             const tile = Math.round(lerp(36, 14, density));
             const r = Math.round(tile * 0.34);
-            const half = tile / 2;
             ctx.fillStyle = b;
             for (let layer = 0; layer < 2; layer++) {
                 const ox = layer === 0 ? tile / 2 : tile;
                 const oy = layer === 0 ? tile / 2 : tile;
-                for (let y = oy; y < height + tile; y += tile) {
-                    for (let x = ox; x < width + tile; x += tile) {
+                // Start one tile before the canvas origin so layer 1's
+                // dot centered at (0, 0) renders -- otherwise the top
+                // and left edges clip while right and bottom bleed
+                // (B18, 2026-05-05).
+                for (let y = oy - tile; y < height + tile; y += tile) {
+                    for (let x = ox - tile; x < width + tile; x += tile) {
                         ctx.beginPath();
                         ctx.arc(x, y, r, 0, Math.PI * 2);
                         ctx.fill();
