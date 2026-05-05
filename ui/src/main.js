@@ -581,7 +581,7 @@ async function boot() {
         "slides/video": "Video slides",
         playlists: "Playlists",
         stream: "Stream",
-        flock: "Your flock",
+        flock: "Flock",
         schedule: "Schedule",
         settings: "Settings",
     };

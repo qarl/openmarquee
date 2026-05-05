@@ -50,7 +50,7 @@ const SECTION_TEMPLATE = `
         <div class="om-page-head">
             <div>
                 <span class="om-eyebrow flock-eyebrow"></span>
-                <h1>Your flock</h1>
+                <h1>Flock</h1>
                 <p>Every openMarquee on your local network. Sync media to one or all — works offline, no cloud.</p>
             </div>
         </div>
