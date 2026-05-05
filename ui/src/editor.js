@@ -419,21 +419,21 @@ const LAYER_GROUP_TEMPLATE = `
                 <span>Motion</span>
                 <select class="om-select field-motion" aria-label="layer motion">
                     <option value="static">Static</option>
-                    <option value="ticker">Ticker (horizontal travel)</option>
-                    <option value="breathe">Breathe (scale)</option>
-                    <option value="pulse">Pulse (alpha)</option>
-                    <option value="bounce">Bounce (vertical bob)</option>
-                    <option value="shake">Shake (jitter)</option>
-                    <option value="blink">Blink (on/off)</option>
+                    <option value="ticker">Ticker</option>
+                    <option value="breathe">Breathe</option>
+                    <option value="pulse">Pulse</option>
+                    <option value="bounce">Bounce</option>
+                    <option value="shake">Shake</option>
+                    <option value="blink">Blink</option>
                 </select>
             </label>
             <label class="om-field" style="flex: 1;">
                 <span>Blend</span>
                 <select class="om-select field-blend" aria-label="layer blend mode">
                     <option value="normal">Normal</option>
-                    <option value="multiply">Multiply (darken)</option>
-                    <option value="screen">Screen (lighten)</option>
-                    <option value="overlay">Overlay (contrast)</option>
+                    <option value="multiply">Multiply</option>
+                    <option value="screen">Screen</option>
+                    <option value="overlay">Overlay</option>
                 </select>
             </label>
             <button type="button" class="om-btn ghost editor-layer-delete" aria-label="delete layer" title="delete layer" style="color: var(--om-bad); align-self: end; margin-bottom: 1px;">🗑</button>
