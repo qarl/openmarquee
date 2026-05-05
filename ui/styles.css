@@ -235,17 +235,29 @@ header h1 {
     flex-direction: column;
     gap: 0.75rem;
     min-width: 0;  /* timeline + pallet must shrink, not overflow */
+    /* Same 720px cap as the slide editor -- B13, 2026-05-05. */
+    max-width: 720px;
 }
 @media (min-width: 720px) {
     .playlist-cols {
         display: grid;
-        grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+        /* preview = 1fr, form = auto (sized to its 720px cap). B13. */
+        grid-template-columns: minmax(0, 1fr) minmax(0, auto);
         gap: 1.25rem;
         align-items: start;
     }
     .playlist-cols > .playlist-track-inline-preview {
         position: sticky;
         top: 1rem;
+        /* Allow the playlist preview to grow into the leftover space
+           when form caps at 720px. B13, 2026-05-05. */
+        max-width: none;
+    }
+    /* Override the .inline-preview-stage 26rem cap when it lives
+       inside the playlist editor cols -- the preview should fill the
+       leftover horizontal space, not stay at 26rem (B13). */
+    .playlist-cols .inline-preview-stage {
+        max-width: none;
     }
 }
 
@@ -975,21 +987,31 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     flex-direction: column;
     gap: 0.75rem;
     min-width: 0;  /* let cards shrink rather than overflow the column */
+    /* Cap the parameter group at 720px on wide viewports -- without
+       this the form stretches into wasted horizontal space and the
+       preview stays at its 26rem cap. With the cap, leftover space
+       flows to the preview column instead (B13, 2026-05-05). */
+    max-width: 720px;
 }
 @media (min-width: 720px) {
     .editor-cols {
         display: grid;
-        /* preview takes its natural max-width (26rem cap on
-           .preview-wrap), form fills the remaining space. */
-        grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+        /* preview = 1fr (grows to fill leftover), form = auto (sizes
+           to its 720px max). Inverts the prior preview-natural /
+           form-1fr layout (B13, 2026-05-05). */
+        grid-template-columns: minmax(0, 1fr) minmax(0, auto);
         gap: 1.25rem;
         align-items: start;
     }
     /* preview-wrap inside editor-cols sticks to the top so it stays
-       visible while the operator scrolls the form-stack on the right. */
+       visible while the operator scrolls the form-stack on the right.
+       Override the global 26rem max-width so the preview can grow into
+       the leftover space when the viewport is wider than 720px form +
+       preview-natural. */
     .editor-cols > .preview-wrap {
         position: sticky;
         top: 1rem;
+        max-width: none;
     }
 }
 
