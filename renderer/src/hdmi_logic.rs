@@ -27,6 +27,55 @@ pub fn pick_largest_mode_index(modes: &[ModeSpec]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Pre-computed inputs for the gradient fragment shader. Mirrors
+/// `backend/openmarquee/auto_render.py::_render_pattern_gradient`'s
+/// math so the shader produces visually-identical output to the
+/// Python PIL reference.
+///
+/// Convention (from bg-system.js):
+///   density 0   → 0°   = top→bottom   (color_a at top, color_b at bottom)
+///   density 0.5 → 135° (linear lerp; matches Python implementation)
+///   density 1   → 270° = right→left
+///   90°  = left→right
+///   180° = bottom→top
+///
+/// Coordinate convention here matches Python (image coords: y=0 at top,
+/// y=height-1 at bottom). The shader flips gl_FragCoord.y to match.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientUniforms {
+    pub dx: f32,
+    pub dy: f32,
+    pub proj_min: f32,
+    pub span: f32,
+}
+
+/// Compute the gradient direction + projection bounds for a (width,
+/// height, density) triple. Returns `None` when the gradient
+/// degenerates (zero span — should fall back to a solid `color_a`).
+///
+/// Lifted into a pure function so the math (angle = lerp(0, 270,
+/// density), proj_min/max derivation) is unit-tested against known
+/// reference values from the Python implementation, independent of
+/// any GL state.
+pub fn gradient_uniforms(width: u32, height: u32, density: f32) -> Option<GradientUniforms> {
+    // density 0..1 → 0..270°; rounded to integer degrees for parity
+    // with Python's `round(lerp(...))`.
+    let density = density.clamp(0.0, 1.0);
+    let angle_deg = (density * 270.0).round();
+    let rad = angle_deg.to_radians();
+    let dx = rad.sin();
+    let dy = rad.cos();
+    let w = width.saturating_sub(1) as f32;
+    let h = height.saturating_sub(1) as f32;
+    let proj_min = (dx * w).min(0.0) + (dy * h).min(0.0);
+    let proj_max = (dx * w).max(0.0) + (dy * h).max(0.0);
+    let span = proj_max - proj_min;
+    if span < 1e-6 {
+        return None;
+    }
+    Some(GradientUniforms { dx, dy, proj_min, span })
+}
+
 /// Parse a `#RRGGBB` or `#RRGGBBAA` hex color into RGBA in [0, 1].
 /// Accepts upper or lower case, with or without leading `#`. Returns
 /// `None` on malformed input. Alpha defaults to 1.0 when not given.
@@ -293,6 +342,65 @@ mod tests {
     fn crtc_filter_rejects_empty() {
         assert_eq!(parse_crtc_list_filter_bits(""), None);
         assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter()"), None);
+    }
+
+    fn approx(a: f32, b: f32, eps: f32) -> bool {
+        (a - b).abs() < eps
+    }
+
+    #[test]
+    fn gradient_density_zero_is_top_to_bottom() {
+        // density 0 → 0° → top-to-bottom. dx=sin(0)=0, dy=cos(0)=1.
+        let g = gradient_uniforms(1024, 768, 0.0).unwrap();
+        assert!(approx(g.dx, 0.0, 1e-6), "dx={}", g.dx);
+        assert!(approx(g.dy, 1.0, 1e-6), "dy={}", g.dy);
+        // proj at y=0 is 0, at y=767 is 767. min=0, span=767.
+        assert!(approx(g.proj_min, 0.0, 1e-3));
+        assert!(approx(g.span, 767.0, 1e-3));
+    }
+
+    #[test]
+    fn gradient_density_one_is_right_to_left() {
+        // density 1 → 270° → right-to-left. dx=sin(270°)=-1, dy=cos(270°)=0.
+        let g = gradient_uniforms(1024, 768, 1.0).unwrap();
+        assert!(approx(g.dx, -1.0, 1e-5), "dx={}", g.dx);
+        assert!(approx(g.dy, 0.0, 1e-5), "dy={}", g.dy);
+        // proj range across x: dx*x for x in [0, 1023] → [-1023, 0].
+        assert!(approx(g.proj_min, -1023.0, 1e-3));
+        assert!(approx(g.span, 1023.0, 1e-3));
+    }
+
+    #[test]
+    fn gradient_density_half_is_135_degrees() {
+        // density 0.5 → 135° → bottom-left to top-right diagonal.
+        // dx=sin(135°)=√2/2≈0.7071, dy=cos(135°)=-√2/2.
+        let g = gradient_uniforms(1024, 768, 0.5).unwrap();
+        assert!(approx(g.dx, 0.7071, 1e-3), "dx={}", g.dx);
+        assert!(approx(g.dy, -0.7071, 1e-3), "dy={}", g.dy);
+    }
+
+    #[test]
+    fn gradient_density_clamps_above_one() {
+        // Out-of-range density should clamp to 1.0 (270°), not
+        // produce wraparound or NaN.
+        let g_clamped = gradient_uniforms(1024, 768, 1.5).unwrap();
+        let g_one = gradient_uniforms(1024, 768, 1.0).unwrap();
+        assert_eq!(g_clamped, g_one);
+    }
+
+    #[test]
+    fn gradient_density_clamps_below_zero() {
+        let g_clamped = gradient_uniforms(1024, 768, -0.3).unwrap();
+        let g_zero = gradient_uniforms(1024, 768, 0.0).unwrap();
+        assert_eq!(g_clamped, g_zero);
+    }
+
+    #[test]
+    fn gradient_returns_none_for_degenerate_dimensions() {
+        // 1x1 viewport at any density has zero span — caller should
+        // fall back to a solid color_a fill.
+        assert_eq!(gradient_uniforms(1, 1, 0.5), None);
+        assert_eq!(gradient_uniforms(0, 0, 0.0), None);
     }
 
     #[test]

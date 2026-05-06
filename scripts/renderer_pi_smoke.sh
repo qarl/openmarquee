@@ -88,12 +88,44 @@ for playlist in pl.get('playlists', []):
             print(item_id)
             raise SystemExit
 \"")
+
+# Phase 4.1b: same but specifically picks a slide whose
+# background_pattern is "gradient" so we exercise the fragment-shader
+# path, not just the clear_color path. FYS has 2 such slides.
+echo "==> Phase 4.1b -- --play-slide (first GRADIENT-pattern slide)"
+GRAD_LOG="$LOG_DIR/play-slide-gradient.log"
+GRAD_EXIT=0
+GRAD_ID=$(ssh "$TARGET" "python3 -c \"
+import json, pathlib
+pl = json.loads(pathlib.Path('/var/openmarquee/playlist.json').read_text())
+content_root = pathlib.Path('/var/openmarquee/content')
+for playlist in pl.get('playlists', []):
+    for item in playlist.get('items', []):
+        item_id = item.get('item_id')
+        ip = content_root / item_id / 'item.json'
+        if not ip.exists(): continue
+        env = json.loads(ip.read_text())
+        it = env.get('item', {})
+        if it.get('type') != 'text_slide': continue
+        bp = it.get('background_pattern')
+        if bp and bp.get('pattern') == 'gradient':
+            print(item_id)
+            raise SystemExit
+\"" || true)
 if [ -z "${SLIDE_ID:-}" ]; then
     echo "FAIL: couldn't find a text_slide in /var/openmarquee/playlist.json"
     exit 1
 fi
 ssh "$TARGET" "$BIN_PI --output hdmi --play-slide $SLIDE_ID --hold-secs 3" \
     > "$SLIDE_LOG" 2>&1 || SLIDE_EXIT=$?
+
+# Gradient-pattern slide is optional — if the seed doesn't include
+# one, skip the assertion rather than failing. FYS does include
+# them (slides "06 · Uncage!!" and "10 · Scream").
+if [ -n "${GRAD_ID:-}" ]; then
+    ssh "$TARGET" "$BIN_PI --output hdmi --play-slide $GRAD_ID --hold-secs 3" \
+        > "$GRAD_LOG" 2>&1 || GRAD_EXIT=$?
+fi
 
 # Always try to bring the backend back up before we assert anything.
 echo "==> restarting openmarquee-backend"
@@ -143,6 +175,26 @@ grep -qi 'panic\|panicked' "$SLIDE_LOG" && \
 grep -q "rendering slide $SLIDE_ID" "$SLIDE_LOG" || \
     { echo "FAIL: --play-slide didn't log the slide id we requested"; cat "$SLIDE_LOG"; exit 1; }
 echo "    --play-slide ok ($SLIDE_ID)"
+
+# Gradient assertion is conditional on the seed having a gradient
+# slide. When present, it must complete cleanly via the fragment
+# shader path.
+if [ -n "${GRAD_ID:-}" ]; then
+    if [ "$GRAD_EXIT" -ne 0 ]; then
+        echo "FAIL: --play-slide gradient exit $GRAD_EXIT"
+        cat "$GRAD_LOG"
+        exit 1
+    fi
+    grep -q 'gradient render complete' "$GRAD_LOG" || \
+        { echo "FAIL: gradient slide didn't complete via fragment-shader path"; cat "$GRAD_LOG"; exit 1; }
+    grep -qi 'panic\|panicked' "$GRAD_LOG" && \
+        { echo "FAIL: panic in gradient slide output"; exit 1; }
+    grep -q "pattern=gradient" "$GRAD_LOG" || \
+        { echo "FAIL: gradient slide didn't log pattern=gradient (might've fallen back?)"; cat "$GRAD_LOG"; exit 1; }
+    echo "    --play-slide gradient ok ($GRAD_ID)"
+else
+    echo "    --play-slide gradient skipped (no gradient slide in seed)"
+fi
 
 echo "==> backend recovery check (DRM master returned)"
 BACKEND_STATE=$(ssh "$TARGET" "systemctl is-active openmarquee-backend" || true)

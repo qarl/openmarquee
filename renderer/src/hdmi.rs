@@ -34,10 +34,326 @@ use khronos_egl as egl;
 
 use crate::content::{solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
-    fourcc_for_argb_family, hex_to_rgba, hsv_to_rgb, parse_crtc_list_filter_bits,
-    pick_largest_mode_index, ModeSpec,
+    fourcc_for_argb_family, gradient_uniforms, hex_to_rgba, hsv_to_rgb,
+    parse_crtc_list_filter_bits, pick_largest_mode_index, ModeSpec,
 };
 use crate::Card;
+
+// =====================================================================
+// Phase 4.1b — gradient pattern via fragment shader.
+//
+// Architectural decisions (per QA's "spend the cycles deliberately"
+// note for the shader infrastructure that text glyphs + remaining
+// patterns will build on):
+//
+//   * Shader sources: inline raw strings for now. Phase 4.1b ships
+//     ONE fragment shader (gradient) so a `shaders/` dir +
+//     include_str! is premature. Move to a directory when the
+//     count grows past ~3.
+//   * Uniform passing: individual glow `uniform_*` calls. UBOs are
+//     GLES3-only; vc4 only exposes GLES2. No alternative.
+//   * Vertex shader: ONE shared shader for all bg-pattern + future
+//     compositor passes (a fullscreen NDC quad). Pulled out as
+//     `VS_FULLSCREEN_QUAD` const and reused.
+//   * Fragment compile errors: anyhow context with the GL info-log
+//     attached. Matches the rest of the renderer's chatty-context
+//     error model. Not a panic — operators see the log, not a stack
+//     trace.
+// =====================================================================
+
+/// Vertex shader: emit each input vertex as-is (fullscreen quad in
+/// NDC, no transform). Shared across every fragment shader the
+/// renderer compiles.
+const VS_FULLSCREEN_QUAD: &str = r#"#version 100
+attribute vec2 a_pos;
+void main() {
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+"#;
+
+/// Fragment shader: two-color linear gradient. Mirrors the Python
+/// reference (`backend.openmarquee.auto_render._render_pattern_
+/// gradient`). Coordinate convention is image-space (y=0 at top), so
+/// gl_FragCoord.y is flipped against u_viewport.y to match.
+const FS_GRADIENT: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform vec2 u_dir;
+uniform vec2 u_proj_bounds;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    float proj = dot(pos, u_dir);
+    float t = clamp((proj - u_proj_bounds.x) / u_proj_bounds.y, 0.0, 1.0);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
+/// Compile a single shader stage, returning the GL handle on success
+/// or an anyhow error with the compile log attached.
+fn compile_shader(gl: &glow::Context, kind: u32, source: &str) -> Result<glow::NativeShader> {
+    use glow::HasContext;
+    unsafe {
+        let sh = gl
+            .create_shader(kind)
+            .map_err(|e| anyhow!("glCreateShader: {e}"))?;
+        gl.shader_source(sh, source);
+        gl.compile_shader(sh);
+        if !gl.get_shader_compile_status(sh) {
+            let log = gl.get_shader_info_log(sh);
+            gl.delete_shader(sh);
+            return Err(anyhow!("shader compile failed:\n{log}\n--source--\n{source}"));
+        }
+        Ok(sh)
+    }
+}
+
+/// Compile + link a vertex + fragment shader pair into a program,
+/// returning the program handle. Both shader stages are deleted
+/// after link (their objects are no longer referenced).
+fn link_program(gl: &glow::Context, vs_src: &str, fs_src: &str) -> Result<glow::NativeProgram> {
+    use glow::HasContext;
+    let vs = compile_shader(gl, glow::VERTEX_SHADER, vs_src)?;
+    let fs = compile_shader(gl, glow::FRAGMENT_SHADER, fs_src)?;
+    unsafe {
+        let prog = gl
+            .create_program()
+            .map_err(|e| anyhow!("glCreateProgram: {e}"))?;
+        gl.attach_shader(prog, vs);
+        gl.attach_shader(prog, fs);
+        gl.link_program(prog);
+        let linked = gl.get_program_link_status(prog);
+        gl.detach_shader(prog, vs);
+        gl.detach_shader(prog, fs);
+        gl.delete_shader(vs);
+        gl.delete_shader(fs);
+        if !linked {
+            let log = gl.get_program_info_log(prog);
+            gl.delete_program(prog);
+            return Err(anyhow!("program link failed: {log}"));
+        }
+        Ok(prog)
+    }
+}
+
+/// Set up the two-triangle fullscreen quad: 4 vertices in NDC,
+/// drawn as TRIANGLE_STRIP. Returns (VBO, attribute location). The
+/// caller is responsible for binding the VBO + enabling the attrib
+/// before drawing.
+fn create_fullscreen_quad(
+    gl: &glow::Context,
+    program: glow::NativeProgram,
+) -> Result<(glow::NativeBuffer, u32)> {
+    use glow::HasContext;
+    unsafe {
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("glGenBuffers: {e}"))?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        // Two triangles via TRIANGLE_STRIP: BL, BR, TL, TR.
+        let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            verts.len() * std::mem::size_of::<f32>(),
+        );
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+        let attrib = gl.get_attrib_location(program, "a_pos").ok_or_else(|| {
+            anyhow!("vertex shader is missing the `a_pos` attribute")
+        })?;
+        Ok((vbo, attrib))
+    }
+}
+
+/// Phase 4.1b — render a two-color linear gradient via fragment
+/// shader, push one frame to the HDMI display via legacy
+/// `drmModeSetCrtc`, hold for `hold_secs` seconds, clean up.
+///
+/// Uses the same GBM/EGL/DRM bring-up as `render_solid_color`. The
+/// duplication is deliberate — Phase 4.1c factors both onto a
+/// shared `EglGbmFrame` helper now that there's a real second
+/// caller. Until then, copy-paste keeps each function readable
+/// end-to-end.
+pub fn render_slide_bg_gradient(
+    card: &Card,
+    color_a: [f32; 4],
+    color_b: [f32; 4],
+    density: f32,
+    hold_secs: u64,
+) -> Result<()> {
+    let resources = card
+        .resource_handles()
+        .context("drmModeGetResources failed")?;
+    let (connector_info, mode) = pick_connector_and_mode(card, &resources)
+        .context("no connected HDMI connector with a usable mode")?;
+    let (mode_w, mode_h) = mode.size();
+    eprintln!(
+        "selected connector {:?} {:?} at {}x{}@{}",
+        connector_info.handle(),
+        connector_info.interface(),
+        mode_w,
+        mode_h,
+        mode.vrefresh(),
+    );
+
+    let encoder_handle = connector_info
+        .current_encoder()
+        .or_else(|| connector_info.encoders().first().copied())
+        .ok_or_else(|| anyhow!("connector advertises no encoders"))?;
+    let encoder_info = card
+        .get_encoder(encoder_handle)
+        .context("drmModeGetEncoder failed")?;
+    let crtc_handle = encoder_info
+        .crtc()
+        .or_else(|| resources.crtcs().first().copied())
+        .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
+
+    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
+        .context("gbm_create_device failed")?;
+    let gbm_surface = gbm_dev
+        .create_surface::<()>(
+            mode_w as u32,
+            mode_h as u32,
+            GbmFormat::Argb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+        )
+        .context("gbm_surface_create failed")?;
+
+    let egl_lib = unsafe {
+        egl::DynamicInstance::<egl::EGL1_5>::load_required().map_err(|e| {
+            anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
+        })?
+    };
+    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
+    let display = unsafe {
+        egl_lib
+            .get_display(gbm_dev_ptr as egl::NativeDisplayType)
+            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
+    };
+    egl_lib
+        .initialize(display)
+        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
+    egl_lib
+        .bind_api(egl::OPENGL_ES_API)
+        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
+    let cfg_attribs = [
+        egl::SURFACE_TYPE, egl::WINDOW_BIT,
+        egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
+        egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE,
+    ];
+    let configs = egl_lib
+        .choose_first_config(display, &cfg_attribs)
+        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
+        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
+    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+    let context = egl_lib
+        .create_context(display, configs, None, &ctx_attribs)
+        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
+    let egl_surface = unsafe {
+        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
+        egl_lib
+            .create_window_surface(display, configs, raw_surface, None)
+            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
+    };
+    egl_lib
+        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
+        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
+
+    let gl = unsafe {
+        glow::Context::from_loader_function(|name| {
+            egl_lib.get_proc_address(name).map(|fp| fp as *const _).unwrap_or(ptr::null())
+        })
+    };
+
+    // Compile + draw the gradient. Falls back to a solid `color_a`
+    // fill if the gradient degenerates (1×1 viewport) — matches the
+    // Python reference.
+    let g = gradient_uniforms(mode_w as u32, mode_h as u32, density);
+    {
+        use glow::HasContext;
+        unsafe {
+            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            if let Some(g) = g {
+                let program = link_program(&gl, VS_FULLSCREEN_QUAD, FS_GRADIENT)?;
+                let (vbo, attrib) = create_fullscreen_quad(&gl, program)?;
+                gl.use_program(Some(program));
+                let u_viewport = gl.get_uniform_location(program, "u_viewport");
+                let u_dir = gl.get_uniform_location(program, "u_dir");
+                let u_proj_bounds = gl.get_uniform_location(program, "u_proj_bounds");
+                let u_color_a = gl.get_uniform_location(program, "u_color_a");
+                let u_color_b = gl.get_uniform_location(program, "u_color_b");
+                gl.uniform_2_f32(u_viewport.as_ref(), mode_w as f32, mode_h as f32);
+                gl.uniform_2_f32(u_dir.as_ref(), g.dx, g.dy);
+                gl.uniform_2_f32(u_proj_bounds.as_ref(), g.proj_min, g.span);
+                gl.uniform_3_f32(u_color_a.as_ref(), color_a[0], color_a[1], color_a[2]);
+                gl.uniform_3_f32(u_color_b.as_ref(), color_b[0], color_b[1], color_b[2]);
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.enable_vertex_attrib_array(attrib);
+                gl.vertex_attrib_pointer_f32(attrib, 2, glow::FLOAT, false, 0, 0);
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.disable_vertex_attrib_array(attrib);
+                gl.delete_buffer(vbo);
+                gl.delete_program(program);
+            } else {
+                // Degenerate gradient (1×1 viewport): fall back to
+                // a solid color_a fill via clear_color.
+                gl.clear_color(color_a[0], color_a[1], color_a[2], 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            gl.flush();
+        }
+    }
+
+    egl_lib
+        .swap_buffers(display, egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+
+    let bo = unsafe {
+        gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer failed")?
+    };
+    let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
+    let fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .context("drmModeAddFB on GBM front buffer failed")?;
+    eprintln!("gradient registered fb {:?}", fb);
+
+    card.set_crtc(
+        crtc_handle,
+        Some(fb),
+        (0, 0),
+        &[connector_info.handle()],
+        Some(mode),
+    )
+    .context("drmModeSetCrtc failed")?;
+    eprintln!(
+        "gradient scanout active: holding {:?} for {}s",
+        crtc_handle, hold_secs
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(hold_secs));
+
+    if let Err(e) = egl_lib.make_current(display, None, None, None) {
+        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_context(display, context) {
+        eprintln!("warn: eglDestroyContext: {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
+        eprintln!("warn: eglDestroySurface: {e:?}");
+    }
+    if let Err(e) = egl_lib.terminate(display) {
+        eprintln!("warn: eglTerminate: {e:?}");
+    }
+    drop(bo);
+    if let Err(e) = card.destroy_framebuffer(fb) {
+        eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+    }
+
+    eprintln!("gradient render complete");
+    Ok(())
+}
 
 /// Phase 4 entry — render a TextSlide's `background_color` (a
 /// `#RRGGBB` hex string) for `hold_secs` seconds. Procedural
@@ -50,11 +366,25 @@ use crate::Card;
 /// When the procedural-pattern shader path lands we'll route based
 /// on whether `slide.background_pattern.is_some()`.
 pub fn render_slide_bg(card: &Card, slide: &TextSlide, hold_secs: u64) -> Result<()> {
-    // Phase 4.1a: dispatch to the effective solid color. `pattern: solid`
-    // uses color_a; non-solid patterns (gradient/dots/halftone/...) fall
-    // back to background_color until their shader path lands. Pure
-    // dispatch logic is in `content::solid_bg_hex` so it's testable
-    // without a live DRM stack.
+    // Dispatch:
+    //   pattern: gradient → fragment-shader gradient (Phase 4.1b)
+    //   pattern: solid    → color_a as solid fill (Phase 4.1a)
+    //   pattern: <other>  → fall back to background_color + warn
+    //   pattern: None     → background_color
+    if let Some(p) = &slide.background_pattern {
+        if p.pattern == "gradient" {
+            let color_a = hex_to_rgba(&p.color_a)
+                .ok_or_else(|| anyhow!("invalid color_a {:?} for slide {}", p.color_a, slide.id))?;
+            let color_b = hex_to_rgba(&p.color_b)
+                .ok_or_else(|| anyhow!("invalid color_b {:?} for slide {}", p.color_b, slide.id))?;
+            eprintln!(
+                "rendering slide {} ({:?}) pattern=gradient density={:.3} a={} b={} for {}s",
+                slide.id, slide.name, p.density, p.color_a, p.color_b, hold_secs,
+            );
+            return render_slide_bg_gradient(card, color_a, color_b, p.density, hold_secs);
+        }
+    }
+    // Pure dispatch in `content::solid_bg_hex` for unit testability.
     let hex = solid_bg_hex(slide).to_string();
     let color = hex_to_rgba(&hex)
         .ok_or_else(|| anyhow!("invalid hex color {hex:?} for slide {}", slide.id))?;
