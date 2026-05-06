@@ -370,48 +370,65 @@ fn main() -> Result<()> {
                     hdmi::render_animated_atomic(&card, args.hold_secs, args.fps)?;
                     return Ok(());
                 }
-                if let Some(slide_id) = args.play_slide {
-                    let playlist_path = args
-                        .playlist
-                        .as_deref()
-                        .unwrap_or_else(|| Path::new("/var/openmarquee/playlist.json"));
+                // Phase 4.2b: --play-slide and --play-slide-text now
+                // route through the same unified render_slide_bg path
+                // (bg + first text layer in one frame). The two flags
+                // differ only in playlist-sanity-check behavior:
+                // --play-slide loads the playlist as a wiring sanity
+                // check; --play-slide-text bypasses it for tighter
+                // smoke-test isolation.
+                let render_slide = |slide_id: uuid::Uuid, load_playlist: bool| -> Result<()> {
                     let content_root = args
                         .content_root
                         .as_deref()
                         .unwrap_or_else(|| Path::new("/var/openmarquee/content"));
-                    // Load playlist mainly for validation (assumption:
-                    // any --play-slide UUID should be one the playlist
-                    // references; we'd surface a warning otherwise).
-                    // For Phase 4 entry we don't strictly need the
-                    // playlist — we just need the slide JSON. Loading
-                    // anyway sanity-checks that path is wired.
-                    let _env = content::load_playlist(playlist_path)?;
+                    if load_playlist {
+                        let playlist_path = args
+                            .playlist
+                            .as_deref()
+                            .unwrap_or_else(|| Path::new("/var/openmarquee/playlist.json"));
+                        let _env = content::load_playlist(playlist_path)?;
+                    }
                     let slide = content::find_text_slide(content_root, slide_id)?
                         .ok_or_else(|| anyhow::anyhow!(
                             "no text_slide found for {slide_id} under {}",
                             content_root.display(),
                         ))?;
-                    hdmi::render_slide_bg(&card, &slide, args.hold_secs)?;
+                    // Phase 4.2b loads the font for every slide-render
+                    // path. If the font path is missing, we still want
+                    // bg-only to render rather than failing the whole
+                    // call — fall through with None in that case.
+                    let font_opt = match std::fs::read(&args.font_path) {
+                        Ok(bytes) => match fontdue::Font::from_bytes(
+                            bytes,
+                            fontdue::FontSettings::default(),
+                        ) {
+                            Ok(f) => Some(f),
+                            Err(e) => {
+                                eprintln!(
+                                    "warn: parse font {}: {e} — rendering bg only",
+                                    args.font_path.display()
+                                );
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!(
+                                "warn: read font {}: {e} — rendering bg only",
+                                args.font_path.display()
+                            );
+                            None
+                        }
+                    };
+                    hdmi::render_slide_bg(&card, &slide, font_opt.as_ref(), args.hold_secs)
+                };
+
+                if let Some(slide_id) = args.play_slide {
+                    render_slide(slide_id, true)?;
                     return Ok(());
                 }
                 if let Some(slide_id) = args.play_slide_text {
-                    let content_root = args
-                        .content_root
-                        .as_deref()
-                        .unwrap_or_else(|| Path::new("/var/openmarquee/content"));
-                    let slide = content::find_text_slide(content_root, slide_id)?
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no text_slide found for {slide_id} under {}",
-                            content_root.display(),
-                        ))?;
-                    let font_bytes = std::fs::read(&args.font_path)
-                        .with_context(|| format!("read font {}", args.font_path.display()))?;
-                    let font = fontdue::Font::from_bytes(
-                        font_bytes,
-                        fontdue::FontSettings::default(),
-                    )
-                    .map_err(|e| anyhow::anyhow!("parse font {}: {e}", args.font_path.display()))?;
-                    hdmi::render_slide_text(&card, &slide, &font, args.hold_secs)?;
+                    render_slide(slide_id, false)?;
                     return Ok(());
                 }
                 eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, or --play-slide-text UUID");

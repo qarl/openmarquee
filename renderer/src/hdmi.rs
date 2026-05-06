@@ -195,9 +195,10 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// (warn-on-Err) regardless of whether the closure succeeded —
 /// matches the Phase 3 followups pattern.
 ///
-/// Phase 4.1c — extracted from `render_solid_color` and
-/// `render_slide_bg_gradient` now that we have two callers. Phase
-/// 4.1d+ bg-pattern shaders reuse this helper directly.
+/// Phase 4.1c — extracted from `render_solid_color` and the
+/// (then-public) gradient-render path now that we have two callers.
+/// Phase 4.1d+ bg-pattern shaders reuse this helper directly; Phase
+/// 4.2b's `draw_*` helpers compose under the same closure too.
 ///
 /// `draw` receives the GLES2 context and the viewport (mode_w,
 /// mode_h) so the closure can `glViewport`, `glClear`, or
@@ -367,102 +368,283 @@ where
     Ok(())
 }
 
-/// Phase 4.1b — render a two-color linear gradient via fragment
-/// shader, push one frame to the HDMI display via legacy
-/// `drmModeSetCrtc`, hold for `hold_secs` seconds, clean up.
-///
-/// Phase 4.1c factored the GBM/EGL/DRM bring-up onto
-/// `render_one_frame_to_hdmi`; this function only owns the GLES
-/// draw work.
-pub fn render_slide_bg_gradient(
-    card: &Card,
+/// Draw a two-color linear gradient that fills the viewport. The
+/// fragment shader matches Python's PIL reference (image-space y,
+/// flipped from gl_FragCoord). Phase 4.2b extracted into a helper
+/// so `render_slide_bg` can compose it with the text pass in one
+/// closure.
+fn draw_gradient_pattern(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
     color_a: [f32; 4],
     color_b: [f32; 4],
     density: f32,
-    hold_secs: u64,
 ) -> Result<()> {
-    // Phase 4.1c: closure body owns just the GLES draw work
-    // (compile + draw the gradient, or fall back to clear_color when
-    // the gradient degenerates). `render_one_frame_to_hdmi` handles
-    // the GBM/EGL/DRM bring-up + swap/addFB/SetCrtc/hold/teardown.
-    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
-        use glow::HasContext;
-        let g = gradient_uniforms(mode_w, mode_h, density);
-        unsafe {
-            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-            if let Some(g) = g {
-                let program = link_program(gl, VS_FULLSCREEN_QUAD, FS_GRADIENT)?;
-                let (vbo, attrib) = match create_fullscreen_quad(gl, program) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        gl.delete_program(program);
-                        return Err(e);
-                    }
-                };
-                gl.use_program(Some(program));
-                let u_viewport = gl.get_uniform_location(program, "u_viewport");
-                let u_dir = gl.get_uniform_location(program, "u_dir");
-                let u_proj_bounds = gl.get_uniform_location(program, "u_proj_bounds");
-                let u_color_a = gl.get_uniform_location(program, "u_color_a");
-                let u_color_b = gl.get_uniform_location(program, "u_color_b");
-                gl.uniform_2_f32(u_viewport.as_ref(), mode_w as f32, mode_h as f32);
-                gl.uniform_2_f32(u_dir.as_ref(), g.dx, g.dy);
-                gl.uniform_2_f32(u_proj_bounds.as_ref(), g.proj_min, g.span);
-                gl.uniform_3_f32(u_color_a.as_ref(), color_a[0], color_a[1], color_a[2]);
-                gl.uniform_3_f32(u_color_b.as_ref(), color_b[0], color_b[1], color_b[2]);
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-                gl.enable_vertex_attrib_array(attrib);
-                gl.vertex_attrib_pointer_f32(attrib, 2, glow::FLOAT, false, 0, 0);
-                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-                gl.disable_vertex_attrib_array(attrib);
-                gl.delete_buffer(vbo);
-                gl.delete_program(program);
-            } else {
-                // Degenerate gradient (1×1 viewport): solid color_a.
-                gl.clear_color(color_a[0], color_a[1], color_a[2], 1.0);
-                gl.clear(glow::COLOR_BUFFER_BIT);
-            }
-            gl.flush();
+    use glow::HasContext;
+    let g = gradient_uniforms(mode_w, mode_h, density);
+    unsafe {
+        if let Some(g) = g {
+            let program = link_program(gl, VS_FULLSCREEN_QUAD, FS_GRADIENT)?;
+            let (vbo, attrib) = match create_fullscreen_quad(gl, program) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    gl.delete_program(program);
+                    return Err(e);
+                }
+            };
+            gl.use_program(Some(program));
+            let u_viewport = gl.get_uniform_location(program, "u_viewport");
+            let u_dir = gl.get_uniform_location(program, "u_dir");
+            let u_proj_bounds = gl.get_uniform_location(program, "u_proj_bounds");
+            let u_color_a = gl.get_uniform_location(program, "u_color_a");
+            let u_color_b = gl.get_uniform_location(program, "u_color_b");
+            gl.uniform_2_f32(u_viewport.as_ref(), mode_w as f32, mode_h as f32);
+            gl.uniform_2_f32(u_dir.as_ref(), g.dx, g.dy);
+            gl.uniform_2_f32(u_proj_bounds.as_ref(), g.proj_min, g.span);
+            gl.uniform_3_f32(u_color_a.as_ref(), color_a[0], color_a[1], color_a[2]);
+            gl.uniform_3_f32(u_color_b.as_ref(), color_b[0], color_b[1], color_b[2]);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            gl.enable_vertex_attrib_array(attrib);
+            gl.vertex_attrib_pointer_f32(attrib, 2, glow::FLOAT, false, 0, 0);
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.disable_vertex_attrib_array(attrib);
+            gl.delete_buffer(vbo);
+            gl.delete_program(program);
+        } else {
+            // Degenerate gradient (1×1 viewport): solid color_a.
+            gl.clear_color(color_a[0], color_a[1], color_a[2], 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
         }
-        Ok(())
-    })?;
-    eprintln!("gradient render complete");
+    }
     Ok(())
 }
 
-/// Phase 4 entry — render a TextSlide's `background_color` (a
-/// `#RRGGBB` hex string) for `hold_secs` seconds. Procedural
-/// `background_pattern` (12 patterns) lands in a follow-up commit;
-/// for now any pattern-only slide falls back to the slide's
-/// `background_color` (which the model defaults to `#000000`).
+/// Clear the viewport to a solid RGBA. Trivial helper extracted so
+/// the bg dispatch in `render_slide_bg` is purely structural — the
+/// closure's match arm reads as "gradient or clear" without
+/// inlined GLES.
+fn draw_solid_clear(gl: &glow::Context, color: [f32; 4]) {
+    use glow::HasContext;
+    unsafe {
+        gl.clear_color(color[0], color[1], color[2], color[3]);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+}
+
+/// Phase 4.2 — rasterize and draw a single text layer's text on top
+/// of whatever's already in the framebuffer. Premultiplied-alpha
+/// blend so the glyph composites cleanly over the bg pass.
 ///
-/// Reuses `render_solid_color`'s legacy SetCrtc path — the parsed
-/// hex is just an `[f32; 4]`, identical to what --solid-color takes.
-/// When the procedural-pattern shader path lands we'll route based
-/// on whether `slide.background_pattern.is_some()`.
-pub fn render_slide_bg(card: &Card, slide: &TextSlide, hold_secs: u64) -> Result<()> {
-    // Dispatch:
-    //   pattern: gradient → fragment-shader gradient (Phase 4.1b)
-    //   pattern: solid    → color_a as solid fill (Phase 4.1a)
-    //   pattern: <other>  → fall back to background_color + warn
-    //   pattern: None     → background_color
+/// `text_color` is the layer's `text_color` already parsed from hex
+/// (caller does it once outside the closure for early error
+/// reporting). `opacity` is the layer's opacity in [0, 1] —
+/// multiplied into the rgb channel so antialiased edges still
+/// resolve via the glyph alpha.
+///
+/// Resource discipline matches `draw_gradient_pattern`'s pattern:
+/// every early-return path frees the right subset (texture /
+/// texture+program / texture+program+vbo); happy path frees all
+/// three.
+fn draw_text_layer(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    layer: &crate::content::TextLayer,
+    font: &fontdue::Font,
+    text_color: [f32; 4],
+) -> Result<()> {
+    use glow::HasContext;
+
+    // Effective pixel size — Phase 4.2 heuristic (NOT the Python
+    // model semantics; 4.2c lands a real fit-to-box pass):
+    //   - font_size_px wins when set.
+    //   - font_size_pct treated as percent-of-box-HEIGHT (the
+    //     Python reference is percent-of-box-WIDTH).
+    //   - default 64px when neither set.
+    let box_h_px = (layer.r#box.h * mode_h as f32).max(1.0);
+    let size_px = layer
+        .font_size_px
+        .or(layer.font_size_pct.map(|p| (p / 100.0) * box_h_px))
+        .unwrap_or(64.0)
+        .max(8.0);
+
+    let bm = layout_text_to_alpha(font, &layer.text, size_px).ok_or_else(|| {
+        anyhow!(
+            "layout_text_to_alpha returned None for text={:?} size={}",
+            layer.text,
+            size_px
+        )
+    })?;
+    eprintln!(
+        "rasterized text {:?} @ {:.1}px → {}x{} alpha bitmap",
+        layer.text, size_px, bm.width, bm.height,
+    );
+
+    let opacity = layer.opacity.clamp(0.0, 1.0);
+    let box_x = layer.r#box.x;
+    let box_y = layer.r#box.y;
+    // box.w intentionally unused at Phase 4.2 — the bitmap is placed
+    // at its rasterized pixel size, not fit to the box. 4.2c uses
+    // box.w when scale-to-fit lands.
+
+    unsafe {
+        // -- Glyph atlas as a LUMINANCE texture. GLES2 doesn't
+        // expose GL_RED; LUMINANCE is the analog for single-channel
+        // grayscale and returns the value in r/g/b/a on sample
+        // (FS_GLYPH reads `.r`).
+        let tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures: {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        // Tightly-packed 1-byte rows. R2: restore the default of 4
+        // before returning so a future persistent context (4.3+)
+        // can't accidentally inherit this state.
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::LUMINANCE as i32,
+            bm.width as i32,
+            bm.height as i32,
+            0,
+            glow::LUMINANCE,
+            glow::UNSIGNED_BYTE,
+            Some(&bm.data),
+        );
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+
+        // -- Build the textured quad in NDC. Top-left placement at
+        // the box origin, no scaling. 4.2c lands fit + center.
+        let dst_left = box_x * mode_w as f32;
+        let dst_top = box_y * mode_h as f32;
+        let dst_right = dst_left + bm.width as f32;
+        let dst_bottom = dst_top + bm.height as f32;
+        let to_ndc_x = |px: f32| (px / mode_w as f32) * 2.0 - 1.0;
+        let to_ndc_y = |px: f32| 1.0 - (px / mode_h as f32) * 2.0;
+        let ndc_l = to_ndc_x(dst_left);
+        let ndc_r = to_ndc_x(dst_right);
+        let ndc_t = to_ndc_y(dst_top);
+        let ndc_b = to_ndc_y(dst_bottom);
+        // Verts: TRIANGLE_STRIP order BL, BR, TL, TR. Each vert is
+        // [x, y, u, v]. UV (0,0) is top-left of the bitmap, which
+        // matches our row-major top-down `data`.
+        let verts: [f32; 16] = [
+            ndc_l, ndc_b, 0.0, 1.0,
+            ndc_r, ndc_b, 1.0, 1.0,
+            ndc_l, ndc_t, 0.0, 0.0,
+            ndc_r, ndc_t, 1.0, 0.0,
+        ];
+
+        let program = match link_program(gl, VS_TEXTURED_QUAD, FS_GLYPH) {
+            Ok(p) => p,
+            Err(e) => {
+                gl.delete_texture(tex);
+                return Err(e);
+            }
+        };
+        let vbo = match gl.create_buffer() {
+            Ok(b) => b,
+            Err(e) => {
+                gl.delete_program(program);
+                gl.delete_texture(tex);
+                return Err(anyhow!("glGenBuffers: {e}"));
+            }
+        };
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            std::mem::size_of_val(&verts),
+        );
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+        let a_pos = match gl.get_attrib_location(program, "a_pos") {
+            Some(loc) => loc,
+            None => {
+                gl.delete_buffer(vbo);
+                gl.delete_program(program);
+                gl.delete_texture(tex);
+                return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos attribute"));
+            }
+        };
+        let a_uv = match gl.get_attrib_location(program, "a_uv") {
+            Some(loc) => loc,
+            None => {
+                gl.delete_buffer(vbo);
+                gl.delete_program(program);
+                gl.delete_texture(tex);
+                return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv attribute"));
+            }
+        };
+
+        gl.use_program(Some(program));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        let u_atlas = gl.get_uniform_location(program, "u_atlas");
+        gl.uniform_1_i32(u_atlas.as_ref(), 0);
+        let r = text_color[0] * opacity;
+        let g = text_color[1] * opacity;
+        let b = text_color[2] * opacity;
+        let u_text_color = gl.get_uniform_location(program, "u_text_color");
+        gl.uniform_3_f32(u_text_color.as_ref(), r, g, b);
+
+        // Premultiplied alpha blend so the glyph composites over
+        // the already-rendered bg correctly.
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+
+        let stride = (4 * std::mem::size_of::<f32>()) as i32;
+        gl.enable_vertex_attrib_array(a_pos);
+        gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(a_uv);
+        gl.vertex_attrib_pointer_f32(
+            a_uv,
+            2,
+            glow::FLOAT,
+            false,
+            stride,
+            (2 * std::mem::size_of::<f32>()) as i32,
+        );
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.disable_vertex_attrib_array(a_pos);
+        gl.disable_vertex_attrib_array(a_uv);
+        gl.disable(glow::BLEND);
+        gl.delete_buffer(vbo);
+        gl.delete_program(program);
+        gl.delete_texture(tex);
+    }
+    Ok(())
+}
+
+/// Resolved background-pass kind. Pre-resolved before the render
+/// closure so any hex-parse or pattern-name issues surface as a
+/// clean Err before EGL bring-up.
+enum BgKind {
+    Gradient {
+        color_a: [f32; 4],
+        color_b: [f32; 4],
+        density: f32,
+    },
+    Solid([f32; 4]),
+}
+
+fn resolve_slide_bg(slide: &TextSlide) -> Result<(BgKind, &'static str)> {
     if let Some(p) = &slide.background_pattern {
         if p.pattern == "gradient" {
             let color_a = hex_to_rgba(&p.color_a)
                 .ok_or_else(|| anyhow!("invalid color_a {:?} for slide {}", p.color_a, slide.id))?;
             let color_b = hex_to_rgba(&p.color_b)
                 .ok_or_else(|| anyhow!("invalid color_b {:?} for slide {}", p.color_b, slide.id))?;
-            eprintln!(
-                "rendering slide {} ({:?}) pattern=gradient density={:.3} a={} b={} for {}s",
-                slide.id, slide.name, p.density, p.color_a, p.color_b, hold_secs,
-            );
-            return render_slide_bg_gradient(card, color_a, color_b, p.density, hold_secs);
+            return Ok((
+                BgKind::Gradient { color_a, color_b, density: p.density },
+                "gradient",
+            ));
         }
     }
-    // Pure dispatch in `content::solid_bg_hex` for unit testability.
-    let hex = solid_bg_hex(slide).to_string();
-    let color = hex_to_rgba(&hex)
-        .ok_or_else(|| anyhow!("invalid hex color {hex:?} for slide {}", slide.id))?;
     let pattern_label = slide
         .background_pattern
         .as_ref()
@@ -473,273 +655,96 @@ pub fn render_slide_bg(card: &Card, slide: &TextSlide, hold_secs: u64) -> Result
             "warn: pattern {pattern_label:?} not yet implemented; falling back to background_color"
         );
     }
-    eprintln!(
-        "rendering slide {} ({:?}) pattern={} bg={} for {}s",
-        slide.id, slide.name, pattern_label, hex, hold_secs,
-    );
-    render_solid_color(card, color, hold_secs)
+    let hex = solid_bg_hex(slide).to_string();
+    let color = hex_to_rgba(&hex)
+        .ok_or_else(|| anyhow!("invalid hex color {hex:?} for slide {}", slide.id))?;
+    let label = match pattern_label {
+        "solid" => "solid",
+        _ => "none",
+    };
+    Ok((BgKind::Solid(color), label))
 }
 
-/// Phase 4.2a — render a TextSlide's first visible text_layer over
-/// its background color. Single-pass GLES2 composite:
-///   1. clear_color → bg (slide.background_color, or pattern color_a
-///      when pattern == "solid"; gradient/other patterns fall back
-///      to the same `solid_bg_hex` dispatch as `render_slide_bg`).
-///   2. rasterize the layer's text via fontdue + `layout_text_to_alpha`.
-///   3. upload as a single-channel `LUMINANCE` texture.
-///   4. draw a textured quad sized + positioned by the layer's
-///      slide-relative `box`.
+/// Phase 4.2b — render a TextSlide as bg + first text layer in ONE
+/// frame on the shared `render_one_frame_to_hdmi` harness. Pattern
+/// dispatch:
+///   - `gradient` → fragment-shader gradient (Phase 4.1b)
+///   - `solid`    → color_a as solid fill (Phase 4.1a)
+///   - `<other>`  → fall back to background_color + warn (4.1d
+///                  fills these in)
+///   - None       → background_color
 ///
-/// Phase 4.2a constraints (intentional, narrowed for the 4.2a slice):
-///   - First visible layer only (multi-layer composite is 4.2c).
-///   - Bg pattern beyond solid falls back to `background_color`.
-///     Gradient bg + text on top is 4.2b's slice.
-///   - Layer alignment: top-left placement of the rasterized bitmap
-///     inside the box. text_align/scale-to-fit/center is 4.2c.
-///   - Single-line layout from `layout_text_to_alpha`.
-///
-/// Holds for `hold_secs` and tears down (same harness as the bg
-/// paths via `render_one_frame_to_hdmi`).
-pub fn render_slide_text(
+/// When `font` is provided AND the slide has a visible non-empty
+/// text_layer, the first such layer is rasterized + composited over
+/// the bg via the glyph-shader path. Multi-layer composite lands in
+/// 4.2c; gradient + text in one frame is the 4.2b deliverable.
+pub fn render_slide_bg(
     card: &Card,
     slide: &TextSlide,
-    font: &fontdue::Font,
+    font: Option<&fontdue::Font>,
     hold_secs: u64,
 ) -> Result<()> {
-    // First visible layer with non-empty `text`. Empty-text layers
-    // exist in the model (operator dragged a text widget but never
-    // typed anything) and would fail layout — skip them silently
-    // here so the slide still renders.
-    let layer = slide
-        .text_layers
-        .iter()
-        .find(|l| l.visible && !l.text.is_empty())
-        .ok_or_else(|| anyhow!("slide {} has no visible non-empty text_layers", slide.id))?;
+    let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
 
-    // Bg color (Phase 4.2a: solid fill underneath. Gradient + text
-    // composite is 4.2b.)
-    let bg_hex = solid_bg_hex(slide).to_string();
-    let bg = hex_to_rgba(&bg_hex)
-        .ok_or_else(|| anyhow!("invalid bg hex {bg_hex:?} for slide {}", slide.id))?;
+    // First visible non-empty text layer. Empty-text layers exist
+    // in the model (operator dragged a widget but never typed) and
+    // would fail layout — skip them silently.
+    let text_layer: Option<&crate::content::TextLayer> = if font.is_some() {
+        slide
+            .text_layers
+            .iter()
+            .find(|l| l.visible && !l.text.is_empty())
+    } else {
+        None
+    };
+    let text_color: Option<[f32; 4]> = text_layer
+        .map(|l| {
+            hex_to_rgba(&l.text_color)
+                .ok_or_else(|| anyhow!(
+                    "invalid text_color {:?} for slide {}",
+                    l.text_color,
+                    slide.id,
+                ))
+        })
+        .transpose()?;
 
-    // Layer-side state copied out before the closure so we don't
-    // borrow `slide`/`layer` for `'static`-ish lifetimes through the
-    // FnOnce.
-    let text_color = hex_to_rgba(&layer.text_color)
-        .ok_or_else(|| anyhow!("invalid text_color {:?} for slide {}", layer.text_color, slide.id))?;
-    let text = layer.text.clone();
-    let box_x = layer.r#box.x;
-    let box_y = layer.r#box.y;
-    // box.w is intentionally unused at Phase 4.2a — the bitmap is
-    // placed at its rasterized pixel size, not fit to the box.
-    // 4.2c uses box.w when scale-to-fit lands.
-    let box_h = layer.r#box.h;
-    let font_size_px = layer.font_size_px;
-    let font_size_pct = layer.font_size_pct;
-    let opacity = layer.opacity.clamp(0.0, 1.0);
-
+    let bg_log = match &bg_kind {
+        BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
+        BgKind::Solid(c) => format!(
+            "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
+            c[0], c[1], c[2]
+        ),
+    };
+    let text_log = match text_layer {
+        Some(l) => format!(
+            " text={:?} box=({:.3},{:.3},{:.3},{:.3}) text_color={}",
+            l.text, l.r#box.x, l.r#box.y, l.r#box.w, l.r#box.h, l.text_color
+        ),
+        None => String::new(),
+    };
     eprintln!(
-        "rendering slide {} text_layer text={:?} box=({:.3},{:.3},{:.3},{:.3}) text_color={} bg={} for {}s",
-        slide.id,
-        text,
-        box_x,
-        box_y,
-        layer.r#box.w,
-        box_h,
-        layer.text_color,
-        bg_hex,
-        hold_secs,
+        "rendering slide {} ({:?}) {bg_log}{text_log} for {}s",
+        slide.id, slide.name, hold_secs,
     );
 
-    render_one_frame_to_hdmi(card, hold_secs, move |gl, mode_w, mode_h| {
+    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
         use glow::HasContext;
-
-        // Resolve effective pixel size.
-        // Phase 4.2a heuristic (NOT the Python model semantics —
-        // 4.2c lands a real fit-to-box pass):
-        //   - font_size_px wins when set.
-        //   - font_size_pct treated as percent-of-box-HEIGHT (the
-        //     Python reference is percent-of-box-WIDTH; we deviate
-        //     here so FYS canonical slides at font_size_pct=80 and
-        //     box-height=0.8 produce a sensibly-sized atlas without
-        //     any fit pass. Replaced wholesale in 4.2c).
-        //   - default 64px when neither set.
-        let box_h_px = (box_h * mode_h as f32).max(1.0);
-        let size_px = font_size_px
-            .or(font_size_pct.map(|p| (p / 100.0) * box_h_px))
-            .unwrap_or(64.0)
-            .max(8.0);
-
-        let bm = layout_text_to_alpha(font, &text, size_px).ok_or_else(|| {
-            anyhow!("layout_text_to_alpha returned None for text={text:?} size={size_px}")
-        })?;
-        eprintln!(
-            "rasterized text {:?} @ {:.1}px → {}x{} alpha bitmap",
-            text, size_px, bm.width, bm.height,
-        );
-
-        unsafe {
-            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-            gl.clear_color(bg[0], bg[1], bg[2], bg[3]);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-
-            // -- Glyph atlas (single-line bitmap) as a LUMINANCE
-            // texture. GLES2 doesn't expose GL_RED; LUMINANCE is the
-            // analog for single-channel grayscale and returns the
-            // value in r/g/b/a on sample (FS_GLYPH reads `.r`).
-            let tex = gl
-                .create_texture()
-                .map_err(|e| anyhow!("glGenTextures: {e}"))?;
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            // Tightly-packed 1-byte rows.
-            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::LUMINANCE as i32,
-                bm.width as i32,
-                bm.height as i32,
-                0,
-                glow::LUMINANCE,
-                glow::UNSIGNED_BYTE,
-                Some(&bm.data),
-            );
-            // Linear filter for upsampling, clamp-to-edge so the
-            // tightly-cropped atlas doesn't wrap-bleed at quad edges.
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_S,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_T,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-
-            // -- Build the textured quad in NDC.
-            // Box position in image-pixel coords (y=0 at top):
-            let box_left_px = box_x * mode_w as f32;
-            let box_top_px = box_y * mode_h as f32;
-            // Place the bitmap at the box top-left at its rasterized
-            // pixel size. 4.2c will fit + center; 4.2a draws it as-is
-            // so we can verify glyph correctness without confounding
-            // it with a layout-fit pass.
-            let dst_left = box_left_px;
-            let dst_top = box_top_px;
-            let dst_right = dst_left + bm.width as f32;
-            let dst_bottom = dst_top + bm.height as f32;
-            let to_ndc_x = |px: f32| (px / mode_w as f32) * 2.0 - 1.0;
-            let to_ndc_y = |px: f32| 1.0 - (px / mode_h as f32) * 2.0;
-            let ndc_l = to_ndc_x(dst_left);
-            let ndc_r = to_ndc_x(dst_right);
-            let ndc_t = to_ndc_y(dst_top);
-            let ndc_b = to_ndc_y(dst_bottom);
-            // Verts: TRIANGLE_STRIP order BL, BR, TL, TR. Each vert is
-            // [x, y, u, v]. UV (0,0) is top-left of the bitmap, which
-            // matches our row-major top-down `data`.
-            let verts: [f32; 16] = [
-                ndc_l, ndc_b, 0.0, 1.0,
-                ndc_r, ndc_b, 1.0, 1.0,
-                ndc_l, ndc_t, 0.0, 0.0,
-                ndc_r, ndc_t, 1.0, 0.0,
-            ];
-
-            let program = match link_program(gl, VS_TEXTURED_QUAD, FS_GLYPH) {
-                Ok(p) => p,
-                Err(e) => {
-                    gl.delete_texture(tex);
-                    return Err(e);
-                }
-            };
-            let vbo = match gl.create_buffer() {
-                Ok(b) => b,
-                Err(e) => {
-                    gl.delete_program(program);
-                    gl.delete_texture(tex);
-                    return Err(anyhow!("glGenBuffers: {e}"));
-                }
-            };
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            let bytes = std::slice::from_raw_parts(
-                verts.as_ptr() as *const u8,
-                std::mem::size_of_val(&verts),
-            );
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-
-            let a_pos = match gl.get_attrib_location(program, "a_pos") {
-                Some(loc) => loc,
-                None => {
-                    gl.delete_buffer(vbo);
-                    gl.delete_program(program);
-                    gl.delete_texture(tex);
-                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos attribute"));
-                }
-            };
-            let a_uv = match gl.get_attrib_location(program, "a_uv") {
-                Some(loc) => loc,
-                None => {
-                    gl.delete_buffer(vbo);
-                    gl.delete_program(program);
-                    gl.delete_texture(tex);
-                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv attribute"));
-                }
-            };
-
-            gl.use_program(Some(program));
-            // Sampler unit 0 holds the atlas.
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            let u_atlas = gl.get_uniform_location(program, "u_atlas");
-            gl.uniform_1_i32(u_atlas.as_ref(), 0);
-            // Premultiplied text color (FS emits `vec4(color * a, a)`).
-            // Layer opacity multiplies the rgb path; alpha stays driven
-            // by the glyph atlas so partial-glyph edges still antialias.
-            let r = text_color[0] * opacity;
-            let g = text_color[1] * opacity;
-            let b = text_color[2] * opacity;
-            let u_text_color = gl.get_uniform_location(program, "u_text_color");
-            gl.uniform_3_f32(u_text_color.as_ref(), r, g, b);
-
-            // Premultiplied alpha blend so the glyph composite over the
-            // already-cleared bg looks right.
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-
-            let stride = (4 * std::mem::size_of::<f32>()) as i32;
-            gl.enable_vertex_attrib_array(a_pos);
-            gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
-            gl.enable_vertex_attrib_array(a_uv);
-            gl.vertex_attrib_pointer_f32(
-                a_uv,
-                2,
-                glow::FLOAT,
-                false,
-                stride,
-                (2 * std::mem::size_of::<f32>()) as i32,
-            );
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-            gl.disable_vertex_attrib_array(a_pos);
-            gl.disable_vertex_attrib_array(a_uv);
-            gl.disable(glow::BLEND);
-            gl.delete_buffer(vbo);
-            gl.delete_program(program);
-            gl.delete_texture(tex);
-            gl.flush();
+        unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
+        match bg_kind {
+            BgKind::Gradient { color_a, color_b, density } => {
+                draw_gradient_pattern(gl, mode_w, mode_h, color_a, color_b, density)?;
+            }
+            BgKind::Solid(color) => {
+                draw_solid_clear(gl, color);
+            }
         }
+        if let (Some(font), Some(layer), Some(tc)) = (font, text_layer, text_color) {
+            draw_text_layer(gl, mode_w, mode_h, layer, font, tc)?;
+        }
+        unsafe { gl.flush(); }
         Ok(())
     })?;
-    eprintln!("text-layer render complete");
+    eprintln!("slide render complete");
     Ok(())
 }
 
@@ -753,8 +758,8 @@ pub fn render_solid_color(card: &Card, color: [f32; 4], duration_secs: u64) -> R
     // Phase 4.1c: thin wrapper over `render_one_frame_to_hdmi`. The
     // GLES draw work is just `glClearColor` + `glClear`; everything
     // else (GBM bring-up, EGL context, swap, addFB, SetCrtc, hold,
-    // teardown) is shared with `render_slide_bg_gradient` and the
-    // upcoming pattern shaders.
+    // teardown) is shared with the slide-render path through the
+    // same harness.
     render_one_frame_to_hdmi(card, duration_secs, |gl, mode_w, mode_h| {
         use glow::HasContext;
         unsafe {

@@ -200,36 +200,45 @@ if [ "$SLIDE_EXIT" -ne 0 ]; then
     cat "$SLIDE_LOG"
     exit 1
 fi
-grep -q 'solid-color render complete' "$SLIDE_LOG" || \
-    { echo "FAIL: --play-slide didn't complete the underlying render"; cat "$SLIDE_LOG"; exit 1; }
+# Phase 4.2b: --play-slide now renders bg + first text layer in
+# ONE frame. The unified completion line is "slide render complete";
+# FYS slide #01 has text_layers so "rasterized text" must also fire.
+grep -q 'slide render complete' "$SLIDE_LOG" || \
+    { echo "FAIL: --play-slide didn't complete the unified render"; cat "$SLIDE_LOG"; exit 1; }
 grep -qi 'panic\|panicked' "$SLIDE_LOG" && \
     { echo "FAIL: panic in --play-slide output"; exit 1; }
 grep -q "rendering slide $SLIDE_ID" "$SLIDE_LOG" || \
     { echo "FAIL: --play-slide didn't log the slide id we requested"; cat "$SLIDE_LOG"; exit 1; }
-echo "    --play-slide ok ($SLIDE_ID)"
+grep -q 'rasterized text' "$SLIDE_LOG" || \
+    { echo "FAIL: --play-slide didn't rasterize a text layer (FYS #01 has text — fold regression?)"; cat "$SLIDE_LOG"; exit 1; }
+echo "    --play-slide ok ($SLIDE_ID, bg + text composited)"
 
 # Gradient assertion is conditional on the seed having a gradient
-# slide. When present, it must complete cleanly via the fragment
-# shader path.
+# slide. When present, the unified render must log
+# pattern=gradient AND rasterize text (FYS gradient slides do have
+# text_layers — that's the whole point of 4.2b).
 if [ -n "${GRAD_ID:-}" ]; then
     if [ "$GRAD_EXIT" -ne 0 ]; then
         echo "FAIL: --play-slide gradient exit $GRAD_EXIT"
         cat "$GRAD_LOG"
         exit 1
     fi
-    grep -q 'gradient render complete' "$GRAD_LOG" || \
-        { echo "FAIL: gradient slide didn't complete via fragment-shader path"; cat "$GRAD_LOG"; exit 1; }
+    grep -q 'slide render complete' "$GRAD_LOG" || \
+        { echo "FAIL: gradient slide didn't complete via unified render"; cat "$GRAD_LOG"; exit 1; }
     grep -qi 'panic\|panicked' "$GRAD_LOG" && \
         { echo "FAIL: panic in gradient slide output"; exit 1; }
     grep -q "pattern=gradient" "$GRAD_LOG" || \
         { echo "FAIL: gradient slide didn't log pattern=gradient (might've fallen back?)"; cat "$GRAD_LOG"; exit 1; }
-    echo "    --play-slide gradient ok ($GRAD_ID)"
+    grep -q 'rasterized text' "$GRAD_LOG" || \
+        { echo "FAIL: gradient slide didn't rasterize text — 4.2b's whole point is gradient + text in ONE frame"; cat "$GRAD_LOG"; exit 1; }
+    echo "    --play-slide gradient ok ($GRAD_ID, gradient bg + text composited)"
 else
     echo "    --play-slide gradient skipped (no gradient slide in seed)"
 fi
 
-# Phase 4.2a text-layer assertion: completion line + no panics +
-# the layer log line ("rasterized text") is present so we know the
+# Phase 4.2a text-layer assertion (kept post-4.2b as the
+# playlist-bypass path's smoke): completion line + no panics + the
+# layer log line ("rasterized text") is present so we know the
 # layout pass actually ran (and didn't fall through to a None path).
 if [ -n "${TEXT_ID:-}" ]; then
     if [ "$TEXT_EXIT" -ne 0 ]; then
@@ -237,7 +246,7 @@ if [ -n "${TEXT_ID:-}" ]; then
         cat "$TEXT_LOG"
         exit 1
     fi
-    grep -q 'text-layer render complete' "$TEXT_LOG" || \
+    grep -q 'slide render complete' "$TEXT_LOG" || \
         { echo "FAIL: --play-slide-text didn't complete"; cat "$TEXT_LOG"; exit 1; }
     grep -qi 'panic\|panicked' "$TEXT_LOG" && \
         { echo "FAIL: panic in --play-slide-text output"; exit 1; }

@@ -34,39 +34,46 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
     }
 
     // First pass: rasterize each glyph + measure the line's bbox.
-    // Track per-glyph (metrics, alpha-bytes, x-advance-pre, y-bearing).
     // We measure ascent/descent in the font's own units to size the
-    // canvas; metrics.bounds gives x/y-min relative to the baseline.
+    // canvas. fontdue exposes BOTH a float OutlineBounds (`m.bounds`)
+    // and integer pixel offsets (`m.xmin`, `m.ymin`); the latter are
+    // pre-snapped to the bitmap rows the rasterizer actually wrote,
+    // so using bounds + .round() introduces an off-by-one between
+    // the placement and the bitmap (descender hairline gaps,
+    // ascender AA-edge clip). Phase 4.2b QA-flagged R1 fix.
+    //
+    // `m.ymin` semantics: distance from baseline to the BOTTOM of
+    // the glyph bitmap, in pixels, with y-up. Negative for
+    // descenders (g, j, p, q, y) — the bottom of the bitmap sits
+    // below the baseline.
     let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::with_capacity(text.chars().count());
     let mut total_advance = 0.0_f32;
-    let mut max_ymin = 0.0_f32; // pixels above baseline (negative ymin in fontdue)
-    let mut min_ymin = 0.0_f32; // pixels below baseline
+    let mut max_ascent = 0_i32;  // pixels above baseline
+    let mut min_descent = 0_i32; // pixels below baseline (m.ymin is ≤ 0 typically)
     for ch in text.chars() {
         let (m, alpha) = font.rasterize(ch, size_px);
-        // m.advance_width = horizontal step; m.bounds.{xmin, ymin}
-        // give the glyph's bbox bottom-left in baseline-relative
-        // coords (y up). We need to convert to top-down image coords
-        // when blitting.
-        let ascent = m.bounds.ymin + m.height as f32; // top of glyph above baseline
-        max_ymin = max_ymin.max(ascent);
-        min_ymin = min_ymin.min(m.bounds.ymin);
+        // ascent_above_baseline = ymin + height (top of bitmap
+        // relative to baseline, y-up).
+        let ascent = m.ymin + m.height as i32;
+        max_ascent = max_ascent.max(ascent);
+        min_descent = min_descent.min(m.ymin);
         total_advance += m.advance_width;
         glyphs.push((m, alpha));
     }
     let line_w = total_advance.ceil() as u32;
-    let line_h = (max_ymin - min_ymin).ceil() as u32;
+    let line_h = (max_ascent - min_descent).max(0) as u32;
     if line_w == 0 || line_h == 0 {
         return None;
     }
-    let baseline_y = max_ymin.ceil() as i32; // pixels from top to baseline
+    let baseline_y: i32 = max_ascent; // pixels from top of canvas to baseline (y-down)
 
-    // Second pass: blit each glyph into the canvas at (cursor_x +
-    // glyph_xmin, baseline_y - glyph_ymin - glyph_height).
+    // Second pass: blit each glyph at (cursor_x + glyph_xmin,
+    // baseline_y - (glyph_ymin + glyph_height)).
     let mut data = vec![0u8; (line_w * line_h) as usize];
     let mut cursor_x = 0.0_f32;
     for (m, alpha) in &glyphs {
-        let glyph_x = (cursor_x + m.bounds.xmin).round() as i32;
-        let glyph_top = baseline_y - m.bounds.ymin.round() as i32 - m.height as i32;
+        let glyph_x = (cursor_x + m.xmin as f32).round() as i32;
+        let glyph_top = baseline_y - m.ymin - m.height as i32;
         for gy in 0..m.height as i32 {
             let dst_y = glyph_top + gy;
             if dst_y < 0 || dst_y as u32 >= line_h {
@@ -656,7 +663,7 @@ mod tests {
 
     #[test]
     fn fs_gradient_uniform_names_pinned() {
-        // The dispatch in hdmi.rs's render_slide_bg_gradient looks up
+        // The dispatch in hdmi.rs's draw_gradient_pattern looks up
         // these uniforms by name. If a future refactor renames them
         // without updating dispatch, the lookup returns None and
         // glow's uniform_*(None, ...) silently no-ops — black frames
@@ -739,6 +746,69 @@ mod tests {
             free.height,
             f.height
         );
+    }
+
+    #[test]
+    fn layout_descender_taller_than_non_descender() {
+        // Phase 4.2b R1: a descender (g/j/p/q/y) extends below the
+        // baseline. Its bitmap height should be strictly greater
+        // than a non-descender of the same nominal size, AND the
+        // ink should land in the lower portion of the canvas.
+        // Using m.bounds.ymin + .round() (pre-fix) loses up to
+        // 1px of descender vs the integer m.ymin path; this test
+        // pins the integer-snapped behavior.
+        let font = load_anton();
+        let f = layout_text_to_alpha(&font, "F", 64.0).expect("F bitmap");
+        // Anton's lowercase descenders are tame compared to a
+        // serif font, but g/p still descend below the baseline.
+        for ch in ["g", "p", "y"] {
+            let bm = layout_text_to_alpha(&font, ch, 64.0)
+                .unwrap_or_else(|| panic!("descender {ch:?} bitmap"));
+            assert!(
+                bm.height >= f.height,
+                "descender {ch:?} h={} should be >= F h={} (descender extends below baseline)",
+                bm.height, f.height,
+            );
+            // Ink should appear in the bottom half of the canvas
+            // (descender body sits below F's baseline).
+            let bottom_half_has_ink = bm
+                .data
+                .iter()
+                .skip((bm.width * bm.height / 2) as usize)
+                .any(|&p| p > 0);
+            assert!(
+                bottom_half_has_ink,
+                "descender {ch:?} should have ink in bottom half of bitmap",
+            );
+        }
+    }
+
+    #[test]
+    fn layout_descender_with_caps_extends_below() {
+        // Mixed-case word: "Pgy" combines a cap (P, full ascender)
+        // with two descenders (g, y). The bitmap height should
+        // exceed the cap-only width "PPP" since descenders push
+        // the canvas down beyond the baseline.
+        let font = load_anton();
+        let caps = layout_text_to_alpha(&font, "PPP", 64.0).unwrap();
+        let mixed = layout_text_to_alpha(&font, "Pgy", 64.0).unwrap();
+        assert!(
+            mixed.height > caps.height,
+            "mixed h={} should be > all-caps h={} (descenders extend canvas)",
+            mixed.height, caps.height,
+        );
+    }
+
+    #[test]
+    fn layout_whitespace_only_returns_none() {
+        // R4: a space-only string has zero ink and should yield
+        // None — caller falls back / skips the layer rather than
+        // uploading a 0-byte texture. (Tab glyphs are font-
+        // dependent — Anton rasterizes \t to a non-empty bitmap;
+        // we don't assert anything about non-space whitespace.)
+        let font = load_anton();
+        assert!(layout_text_to_alpha(&font, " ", 64.0).is_none());
+        assert!(layout_text_to_alpha(&font, "   ", 64.0).is_none());
     }
 
     #[test]
