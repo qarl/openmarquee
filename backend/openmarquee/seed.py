@@ -500,8 +500,10 @@ _BOOT_LOG_TEXT = (
 
 # Long-string repeated text used by ticker/marquee frames so the scrolling
 # never shows a gap. The motion engine wraps within the box.
-_SCREAM_TEXT = "FREE YOUR SIGN!!!!!  " * 4
-_CHANT_TEXT = "FREE  YOUR  SIGN  •  " * 6
+# qarl 2026-05-06 reel edits: shortened to single-instance strings —
+# the motion-engine ticker handles repetition visually as it scrolls.
+_SCREAM_TEXT = "FREE YOUR SIGN!!!!!  "
+_CHANT_TEXT = "FREE  YOUR  SIGN  "
 
 
 # Reel v2 (2026-05-06):
@@ -562,10 +564,11 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_ms=600,
     ),
 
-    # 3 · SIGN — Bowlby, hot pink, breathing.
+    # 3 · SIGN — Bowlby, hot pink, breathing. qarl 2026-05-06 edits:
+    # bumped duration 1600→2000 + breathe intensity 35→86 (more dramatic).
     _DemoFrame(
         name="03 · SIGN",
-        duration_ms=1600,
+        duration_ms=2000,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -575,7 +578,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 box=_b(0.05, 0.1, 0.9, 0.8),
                 font_size_pct=88.0,
                 motion="breathe",
-                motion_intensity=35,
+                motion_intensity=86,
             ),
         ),
         transition_out="fade",
@@ -604,17 +607,18 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
             _DemoLayer(
                 # Subtitle deliberately wraps multi-line within its
-                # narrower box -- B4 word-wrap demo.
+                # narrower box -- B4 word-wrap demo. qarl 2026-05-06
+                # editor pass: subtitle box moved + tightened.
                 text="say what you mean. mean what you say.",
                 font_family="Playfair Display",
                 text_color="#5A4A2E",
-                box=_b(0.18, 0.62, 0.64, 0.22),
+                box=_b(0.2493, 0.7508, 0.4415, 0.1183),
                 font_size_pct=8.0,
                 text_align="left",
             ),
         ),
         transition_out="cut",
-        transition_ms=0,
+        transition_ms=500,
     ),
 
     # 5 · LIBERATE — first synonym, dignified Playfair on cream.
@@ -708,7 +712,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="cut",  # internal cut to mid-fix
-        transition_ms=0,
+        transition_ms=500,
     ),
 
     # 7b · TYPO (mid-fix) — striking through SG, glow on insertion.
@@ -737,7 +741,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="cut",  # internal cut to fixed
-        transition_ms=0,
+        transition_ms=500,
     ),
 
     # 7c · TYPO (fixed) — clean, with green confirmation caption.
@@ -839,45 +843,52 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_ms=600,
     ),
 
-    # 9 · CHANT WALL — 5 horizontal stripes, ticker per row, varied fonts.
+    # 9 · CHANT WALL — 5 ticker stripes. qarl 2026-05-06 editor pass:
+    # duration 1700→2000ms; layers re-stacked with overlapping boxes
+    # for a denser look + reduced font sizes per stripe.
     _DemoFrame(
         name="09 · Chant Wall",
-        duration_ms=1700,
+        duration_ms=2000,
         background_color="#050608",
         layers=(
             _DemoLayer(
                 text=_CHANT_TEXT, font_family="Bowlby One SC",
                 text_color="#FFB43C",
-                box=_b(0.05, 0.06, 0.9, 0.16),
-                font_size_pct=16.0,
+                box=_b(0.048, 0.1261, 0.9, 0.16),
+                font_size_pct=8.0,
                 motion="ticker", motion_intensity=70, motion_phase=0.0,
             ),
             _DemoLayer(
                 text=_CHANT_TEXT, font_family="Anton",
                 text_color="#5AF095",
-                box=_b(0.05, 0.24, 0.9, 0.16),
-                font_size_pct=18.0,
+                box=_b(0.0658, 0.0727, 0.9, 0.5574),
+                font_size_pct=15.0,
                 motion="ticker", motion_intensity=60, motion_phase=0.5,
             ),
             _DemoLayer(
                 text=_CHANT_TEXT, font_family="Alfa Slab One",
                 text_color="#FF5FA7",
-                box=_b(0.05, 0.42, 0.9, 0.16),
-                font_size_pct=15.0,
+                box=_b(0.0646, 0.3489, 0.9, 0.3293),
+                font_size_pct=8.5,
                 motion="ticker", motion_intensity=70, motion_phase=0.2,
             ),
             _DemoLayer(
-                text=_CHANT_TEXT, font_family="Permanent Marker",
+                # qarl edit landed with one trailing space dropped on
+                # this layer; preserved as-is to match Pi state.
+                text="FREE  YOUR  SIGN ",
+                font_family="Permanent Marker",
                 text_color="#5FD5FF",
-                box=_b(0.05, 0.60, 0.9, 0.16),
-                font_size_pct=14.0,
+                box=_b(0.0529, 0.4715, 0.9, 0.2852),
+                font_size_pct=10.0,
                 motion="ticker", motion_intensity=60, motion_phase=0.8,
             ),
             _DemoLayer(
-                text=_CHANT_TEXT, font_family="Caveat Brush",
+                # qarl edit landed with no trailing space on this layer.
+                text="FREE  YOUR  SIGN",
+                font_family="Caveat Brush",
                 text_color="#FFFFFF",
-                box=_b(0.05, 0.78, 0.9, 0.16),
-                font_size_pct=15.0,
+                box=_b(0.05, 0.5851, 0.9, 0.272),
+                font_size_pct=12.5,
                 motion="ticker", motion_intensity=80, motion_phase=0.3,
             ),
         ),
@@ -885,10 +896,12 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_ms=600,
     ),
 
-    # 10 · SCREAM — Anton ticker on rainbow gradient. Quick beat.
+    # 10 · SCREAM — Anton ticker on rainbow gradient. qarl 2026-05-06
+    # editor pass: duration 600→1000ms, ticker font size 40→11.5,
+    # box stretched to fill more of the slide vertically.
     _DemoFrame(
         name="10 · Scream",
-        duration_ms=600,
+        duration_ms=1000,
         background_pattern=BackgroundPattern(
             pattern="gradient",
             color_a="#FF5FA7",
@@ -900,14 +913,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text=_SCREAM_TEXT,
                 font_family="Anton",
                 text_color="#050608",
-                box=_b(0.05, 0.25, 0.9, 0.5),
-                font_size_pct=40.0,
+                box=_b(0.05, 0.0817, 0.9, 0.8151),
+                font_size_pct=11.5,
                 motion="ticker",
                 motion_intensity=85,
             ),
         ),
         transition_out="cut",
-        transition_ms=0,
+        transition_ms=500,
     ),
 
     # 11 · SILENCE — // signal lost, dying carrier on slow pulse.
@@ -949,17 +962,17 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_align="left",
             ),
             _DemoLayer(
-                # 9% of box width keeps the mono "FREE YOUR SIGN_" on
-                # one line. v1's 12.5% reads as 2 lines under post-B3
-                # width sizing.
+                # qarl 2026-05-06: bumped 9 → 10.5 for more presence.
                 text="FREE YOUR SIGN_",
                 font_family="JetBrains Mono",
                 text_color="#FFB43C",
                 box=_b(0.05, 0.32, 0.9, 0.32),
-                font_size_pct=9.0,
+                font_size_pct=10.5,
             ),
             _DemoLayer(
-                text="free your sign · free your sign · free your sign",
+                # qarl 2026-05-06: shortened to single instance — ticker
+                # repeats it visually as it scrolls.
+                text="free your sign",
                 font_family="Bowlby One SC",
                 text_color="#FFFFFF",
                 box=_b(0.05, 0.7, 0.9, 0.18),
@@ -991,7 +1004,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="cut",
-        transition_ms=0,
+        transition_ms=500,
     ),
 
     # 13b · PANIC FLASH (2/3) — Alfa Slab pink, shake max.
@@ -1011,7 +1024,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="cut",
-        transition_ms=0,
+        transition_ms=500,
     ),
 
     # 13c · PANIC FLASH (3/3) — Permanent Marker cyan, shake max.
@@ -1052,11 +1065,12 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_align="left",
             ),
             _DemoLayer(
+                # qarl 2026-05-06: 24 → 14 for tighter cooldown headline.
                 text="FREE YOUR\nSIGN.",
                 font_family="Bowlby One SC",
                 text_color="#FFB43C",
                 box=_b(0.05, 0.30, 0.9, 0.45),
-                font_size_pct=24.0,
+                font_size_pct=14.0,
             ),
             _DemoLayer(
                 text="// loop · 1/∞",
@@ -1105,7 +1119,8 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 motion_speed=0.7,  # slow heartbeat (B2)
             ),
         ),
-        transition_out="iris",
+        # qarl 2026-05-06: loop transition Boot→FREE switched iris→scroll.
+        transition_out="scroll",
         transition_ms=600,
     ),
 )
