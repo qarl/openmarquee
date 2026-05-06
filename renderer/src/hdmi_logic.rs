@@ -27,6 +27,54 @@ pub fn pick_largest_mode_index(modes: &[ModeSpec]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Parse a `#RRGGBB` or `#RRGGBBAA` hex color into RGBA in [0, 1].
+/// Accepts upper or lower case, with or without leading `#`. Returns
+/// `None` on malformed input. Alpha defaults to 1.0 when not given.
+///
+/// Used by Phase 4 entry to drive `clear_color()` from a
+/// `TextSlide.background_color` string. Pure function — split out so
+/// the parsing rules round-trip-test against known references.
+pub fn hex_to_rgba(hex: &str) -> Option<[f32; 4]> {
+    let s = hex.trim().trim_start_matches('#');
+    let bytes = s.as_bytes();
+    let (r, g, b, a) = match bytes.len() {
+        6 => (
+            hex_byte(bytes, 0)?,
+            hex_byte(bytes, 2)?,
+            hex_byte(bytes, 4)?,
+            255,
+        ),
+        8 => (
+            hex_byte(bytes, 0)?,
+            hex_byte(bytes, 2)?,
+            hex_byte(bytes, 4)?,
+            hex_byte(bytes, 6)?,
+        ),
+        _ => return None,
+    };
+    Some([
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ])
+}
+
+fn hex_byte(bytes: &[u8], offset: usize) -> Option<u8> {
+    let hi = hex_nibble(bytes[offset])?;
+    let lo = hex_nibble(bytes[offset + 1])?;
+    Some((hi << 4) | lo)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Parse the integer bits out of drm-rs 0.12's `CrtcListFilter`
 /// Debug repr — the wrapper holds a `pub(crate) u32` which isn't
 /// readable from outside the crate, so we fall back to formatting +
@@ -245,6 +293,75 @@ mod tests {
     fn crtc_filter_rejects_empty() {
         assert_eq!(parse_crtc_list_filter_bits(""), None);
         assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter()"), None);
+    }
+
+    #[test]
+    fn hex_pure_red() {
+        let c = hex_to_rgba("#FF0000").unwrap();
+        assert!(approx_eq(c[0], 1.0));
+        assert!(approx_eq(c[1], 0.0));
+        assert!(approx_eq(c[2], 0.0));
+        assert!(approx_eq(c[3], 1.0));
+    }
+
+    #[test]
+    fn hex_pure_black_default_alpha() {
+        let c = hex_to_rgba("#000000").unwrap();
+        assert_eq!(c, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn hex_lowercase_accepted() {
+        let c = hex_to_rgba("#aabbcc").unwrap();
+        let upper = hex_to_rgba("#AABBCC").unwrap();
+        assert_eq!(c, upper);
+    }
+
+    #[test]
+    fn hex_without_leading_hash_accepted() {
+        // Some operator-input paths strip the `#`; tolerate that.
+        assert_eq!(hex_to_rgba("050608"), hex_to_rgba("#050608"));
+    }
+
+    #[test]
+    fn hex_8_digits_alpha() {
+        let c = hex_to_rgba("#FF000080").unwrap();
+        assert!(approx_eq(c[0], 1.0));
+        assert!(approx_eq(c[3], 128.0 / 255.0));
+    }
+
+    #[test]
+    fn hex_seed_slide_color_round_trips() {
+        // First slide of FREE YOUR SIGN — near-black background.
+        // Verify the bit-pattern matches the hex string exactly.
+        let c = hex_to_rgba("#050608").unwrap();
+        assert!(approx_eq(c[0], 5.0 / 255.0));
+        assert!(approx_eq(c[1], 6.0 / 255.0));
+        assert!(approx_eq(c[2], 8.0 / 255.0));
+    }
+
+    #[test]
+    fn hex_rejects_wrong_length() {
+        assert_eq!(hex_to_rgba("#FFF"), None); // 3 digits not yet supported
+        assert_eq!(hex_to_rgba("#FFFFF"), None);
+        assert_eq!(hex_to_rgba("#FFFFFFFFF"), None);
+        assert_eq!(hex_to_rgba(""), None);
+        assert_eq!(hex_to_rgba("#"), None);
+    }
+
+    #[test]
+    fn hex_rejects_non_hex_chars() {
+        assert_eq!(hex_to_rgba("#GGGGGG"), None);
+        assert_eq!(hex_to_rgba("#12345Z"), None);
+        assert_eq!(hex_to_rgba("#-12345"), None);
+    }
+
+    #[test]
+    fn hex_trims_whitespace() {
+        // Python's hex strings are `.upper()`-normalized at the
+        // model layer; whitespace shouldn't be there but the trim
+        // is cheap defense against operator-paste-with-newline.
+        assert_eq!(hex_to_rgba("  #ABCDEF  "), hex_to_rgba("#ABCDEF"));
     }
 
     #[test]

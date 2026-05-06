@@ -68,6 +68,33 @@ ANIM_EXIT=0
 ssh "$TARGET" "$BIN_PI --output hdmi --animate --hold-secs 3 --fps 30" \
     > "$ANIM_LOG" 2>&1 || ANIM_EXIT=$?
 
+# Phase 4 entry: --play-slide. Asks the Pi to pick the first item_id
+# from its live playlist.json so the test isn't tied to a specific
+# UUID (seed regenerates them).
+echo "==> Phase 4 -- --play-slide (first text_slide from live playlist)"
+SLIDE_LOG="$LOG_DIR/play-slide.log"
+SLIDE_EXIT=0
+SLIDE_ID=$(ssh "$TARGET" "python3 -c \"
+import json, pathlib
+pl = json.loads(pathlib.Path('/var/openmarquee/playlist.json').read_text())
+content_root = pathlib.Path('/var/openmarquee/content')
+for playlist in pl.get('playlists', []):
+    for item in playlist.get('items', []):
+        item_id = item.get('item_id')
+        ip = content_root / item_id / 'item.json'
+        if not ip.exists(): continue
+        env = json.loads(ip.read_text())
+        if env.get('item', {}).get('type') == 'text_slide':
+            print(item_id)
+            raise SystemExit
+\"")
+if [ -z "${SLIDE_ID:-}" ]; then
+    echo "FAIL: couldn't find a text_slide in /var/openmarquee/playlist.json"
+    exit 1
+fi
+ssh "$TARGET" "$BIN_PI --output hdmi --play-slide $SLIDE_ID --hold-secs 3" \
+    > "$SLIDE_LOG" 2>&1 || SLIDE_EXIT=$?
+
 # Always try to bring the backend back up before we assert anything.
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl start openmarquee-backend"
@@ -103,6 +130,19 @@ if [ -z "${FRAMES:-}" ] || [ "$FRAMES" -lt 30 ]; then
     exit 1
 fi
 echo "    --animate ok ($FRAMES frames in 3s)"
+
+if [ "$SLIDE_EXIT" -ne 0 ]; then
+    echo "FAIL: --play-slide exit $SLIDE_EXIT"
+    cat "$SLIDE_LOG"
+    exit 1
+fi
+grep -q 'solid-color render complete' "$SLIDE_LOG" || \
+    { echo "FAIL: --play-slide didn't complete the underlying render"; cat "$SLIDE_LOG"; exit 1; }
+grep -qi 'panic\|panicked' "$SLIDE_LOG" && \
+    { echo "FAIL: panic in --play-slide output"; exit 1; }
+grep -q "rendering slide $SLIDE_ID" "$SLIDE_LOG" || \
+    { echo "FAIL: --play-slide didn't log the slide id we requested"; cat "$SLIDE_LOG"; exit 1; }
+echo "    --play-slide ok ($SLIDE_ID)"
 
 echo "==> backend recovery check (DRM master returned)"
 BACKEND_STATE=$(ssh "$TARGET" "systemctl is-active openmarquee-backend" || true)

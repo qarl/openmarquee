@@ -18,6 +18,7 @@
 // Mac dev box for the pure-logic surfaces.
 #[cfg(target_os = "linux")]
 mod hdmi;
+mod content;
 mod hdmi_logic;
 
 use std::path::PathBuf;
@@ -108,6 +109,14 @@ struct Args {
     /// video) builds on. Holds for `--hold-secs` seconds.
     #[arg(long, default_value_t = false)]
     animate: bool,
+
+    /// Phase 4 entry — load a TextSlide by UUID from the configured
+    /// playlist + content_root and render its background_color.
+    /// Smallest end-to-end test of the playlist→content→GLES path.
+    /// Procedural background_pattern (12 patterns) lands in a
+    /// follow-up commit.
+    #[arg(long)]
+    play_slide: Option<uuid::Uuid>,
 
     /// Target frame rate for `--animate`. The atomic-commit page-flip
     /// loop caps to display vrefresh regardless; this just sets the
@@ -346,7 +355,31 @@ fn main() -> Result<()> {
                     hdmi::render_animated_atomic(&card, args.hold_secs, args.fps)?;
                     return Ok(());
                 }
-                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, or --animate");
+                if let Some(slide_id) = args.play_slide {
+                    let playlist_path = args
+                        .playlist
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("/var/openmarquee/playlist.json"));
+                    let content_root = args
+                        .content_root
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("/var/openmarquee/content"));
+                    // Load playlist mainly for validation (assumption:
+                    // any --play-slide UUID should be one the playlist
+                    // references; we'd surface a warning otherwise).
+                    // For Phase 4 entry we don't strictly need the
+                    // playlist — we just need the slide JSON. Loading
+                    // anyway sanity-checks that path is wired.
+                    let _env = content::load_playlist(playlist_path)?;
+                    let slide = content::find_text_slide(content_root, slide_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide found for {slide_id} under {}",
+                            content_root.display(),
+                        ))?;
+                    hdmi::render_slide_bg(&card, &slide, args.hold_secs)?;
+                    return Ok(());
+                }
+                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, or --play-slide UUID");
             }
             #[cfg(not(target_os = "linux"))]
             {

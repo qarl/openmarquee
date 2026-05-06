@@ -13,6 +13,12 @@ publish = false
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 
+# Phase 4 — playlist + content JSON. Pre-approved in plan §2.
+# Pure Rust, no link deps; works fine on Mac for tests.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1", features = ["serde"] }
+
 # Hardware-bring-up deps (drm/gbm/EGL/GLES2) are Linux-only — they
 # require libdrm, libgbm, libEGL at link time, none of which exist
 # on macOS. Gating them behind cfg(target_os="linux") keeps

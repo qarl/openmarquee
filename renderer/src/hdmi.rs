@@ -32,11 +32,33 @@ use drm::control::{
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 
+use crate::content::TextSlide;
 use crate::hdmi_logic::{
-    fourcc_for_argb_family, hsv_to_rgb, parse_crtc_list_filter_bits, pick_largest_mode_index,
-    ModeSpec,
+    fourcc_for_argb_family, hex_to_rgba, hsv_to_rgb, parse_crtc_list_filter_bits,
+    pick_largest_mode_index, ModeSpec,
 };
 use crate::Card;
+
+/// Phase 4 entry — render a TextSlide's `background_color` (a
+/// `#RRGGBB` hex string) for `hold_secs` seconds. Procedural
+/// `background_pattern` (12 patterns) lands in a follow-up commit;
+/// for now any pattern-only slide falls back to the slide's
+/// `background_color` (which the model defaults to `#000000`).
+///
+/// Reuses `render_solid_color`'s legacy SetCrtc path — the parsed
+/// hex is just an `[f32; 4]`, identical to what --solid-color takes.
+/// When the procedural-pattern shader path lands we'll route based
+/// on whether `slide.background_pattern.is_some()`.
+pub fn render_slide_bg(card: &Card, slide: &TextSlide, hold_secs: u64) -> Result<()> {
+    let color = hex_to_rgba(&slide.background_color).ok_or_else(|| {
+        anyhow!("invalid background_color {:?}", slide.background_color)
+    })?;
+    eprintln!(
+        "rendering slide {} ({:?}) bg={} for {}s",
+        slide.id, slide.name, slide.background_color, hold_secs,
+    );
+    render_solid_color(card, color, hold_secs)
+}
 
 /// Render a single solid-color frame, push it to the HDMI display via
 /// legacy `drmModeSetCrtc`, and hold for `duration_secs` seconds.
