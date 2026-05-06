@@ -356,6 +356,129 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     (r1 + m, g1 + m, b1 + m)
 }
 
+/// Effective rasterization pixel size for a text layer.
+///
+/// Resolution rules (Phase 4.2c — replaces 4.2a/b heuristic):
+///   - `font_size_px` wins when set (already absolute pixels).
+///   - `font_size_pct` is interpreted as **percent of box WIDTH** in
+///     pixels, matching the Python content-model semantics
+///     (`backend.openmarquee.content.TextLayer.font_size_pct`).
+///   - default 64px when neither is set.
+///
+/// Pure function so the math is host-testable independent of GL.
+/// Returns at least 8.0 to avoid sub-glyph sizes that fontdue
+/// degenerates on.
+pub fn effective_font_size_px(
+    font_size_px: Option<f32>,
+    font_size_pct: Option<f32>,
+    box_w: f32,
+    mode_w: u32,
+) -> f32 {
+    let box_w_px = (box_w * mode_w as f32).max(1.0);
+    font_size_px
+        .or(font_size_pct.map(|p| (p / 100.0) * box_w_px))
+        .unwrap_or(64.0)
+        .max(8.0)
+}
+
+/// Horizontal alignment within a layer's box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// Vertical alignment within a layer's box. Phase 4.2c always
+/// centers vertically — the Python content model has no vertical-
+/// align field, so this enum is just future-proofing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VAlign {
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// Parse the `text_align` string from the layer model. Unrecognized
+/// values default to `Left` (matches Python's tolerant defaults).
+pub fn parse_h_align(s: &str) -> HAlign {
+    match s {
+        "center" => HAlign::Center,
+        "right" => HAlign::Right,
+        _ => HAlign::Left,
+    }
+}
+
+/// NDC quad for placing a `bm_w × bm_h` bitmap inside a slide-
+/// relative `box(x, y, w, h)` (fractions of mode_w / mode_h) on a
+/// `mode_w × mode_h` viewport, aligned per `(halign, valign)`.
+///
+/// **Fit policy (Phase 4.2c):** if the bitmap fits inside the box at
+/// its rasterized size, place it without scaling. If it overflows
+/// the box width or height, uniformly scale-down (preserving aspect)
+/// so the scaled bitmap fits. The bitmap is then aligned within the
+/// (possibly larger) box per the alignment knobs.
+///
+/// Returns `(ndc_left, ndc_right, ndc_top, ndc_bottom)`. NDC y-axis
+/// is up: `ndc_top > ndc_bottom` (i.e. ndc_top is at the top of the
+/// rendered image, ndc_bottom at the bottom). Image-coord input is
+/// flipped to NDC by the math.
+///
+/// Pure function — split out so a fit-to-box regression flips a
+/// host test, not a Pi visual diff.
+pub fn box_to_ndc_quad(
+    box_x: f32,
+    box_y: f32,
+    box_w: f32,
+    box_h: f32,
+    bm_w: u32,
+    bm_h: u32,
+    mode_w: u32,
+    mode_h: u32,
+    halign: HAlign,
+    valign: VAlign,
+) -> (f32, f32, f32, f32) {
+    // Box rect in image-pixel coords (y=0 at top).
+    let box_left_px = box_x * mode_w as f32;
+    let box_top_px = box_y * mode_h as f32;
+    let box_w_px = (box_w * mode_w as f32).max(1.0);
+    let box_h_px = (box_h * mode_h as f32).max(1.0);
+
+    // Scale-down-only: never upscale. If bitmap fits, scale=1.0.
+    let bm_w_f = bm_w as f32;
+    let bm_h_f = bm_h as f32;
+    let s_w = if bm_w_f > box_w_px { box_w_px / bm_w_f } else { 1.0 };
+    let s_h = if bm_h_f > box_h_px { box_h_px / bm_h_f } else { 1.0 };
+    let scale = s_w.min(s_h);
+    let placed_w = bm_w_f * scale;
+    let placed_h = bm_h_f * scale;
+
+    // Align inside the box.
+    let dst_left = box_left_px
+        + match halign {
+            HAlign::Left => 0.0,
+            HAlign::Center => (box_w_px - placed_w) * 0.5,
+            HAlign::Right => box_w_px - placed_w,
+        };
+    let dst_top = box_top_px
+        + match valign {
+            VAlign::Top => 0.0,
+            VAlign::Middle => (box_h_px - placed_h) * 0.5,
+            VAlign::Bottom => box_h_px - placed_h,
+        };
+    let dst_right = dst_left + placed_w;
+    let dst_bottom = dst_top + placed_h;
+
+    let to_ndc_x = |px: f32| (px / mode_w as f32) * 2.0 - 1.0;
+    let to_ndc_y = |px: f32| 1.0 - (px / mode_h as f32) * 2.0;
+    (
+        to_ndc_x(dst_left),
+        to_ndc_x(dst_right),
+        to_ndc_y(dst_top),
+        to_ndc_y(dst_bottom),
+    )
+}
+
 /// Map a fourcc code (the four-byte ASCII encoding the DRM/GBM specs
 /// share for buffer formats) to its ARGB-family fourcc bytes.
 ///
@@ -908,6 +1031,209 @@ mod tests {
         // model layer; whitespace shouldn't be there but the trim
         // is cheap defense against operator-paste-with-newline.
         assert_eq!(hex_to_rgba("  #ABCDEF  "), hex_to_rgba("#ABCDEF"));
+    }
+
+    // -- effective_font_size_px ---------------------------------
+
+    #[test]
+    fn effective_size_px_wins_when_set() {
+        // px-explicit short-circuits the pct math.
+        let s = effective_font_size_px(Some(120.0), Some(80.0), 0.5, 1920);
+        assert!((s - 120.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn effective_size_pct_uses_box_width() {
+        // Phase 4.2c semantics: percent-of-box-WIDTH.
+        // box_w_px = 0.5 * 1920 = 960; size = 80% * 960 = 768.
+        let s = effective_font_size_px(None, Some(80.0), 0.5, 1920);
+        assert!((s - 768.0).abs() < 1e-3, "got {s}");
+    }
+
+    #[test]
+    fn effective_size_default_when_neither() {
+        let s = effective_font_size_px(None, None, 0.5, 1920);
+        assert!((s - 64.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn effective_size_floor_8px() {
+        // Microscopic sizes round up to 8.0 — fontdue degenerates
+        // sub-pixel, and any glyph that small is invisible anyway.
+        let s = effective_font_size_px(Some(2.0), None, 0.0, 1920);
+        assert!((s - 8.0).abs() < 1e-3, "got {s}");
+        let s = effective_font_size_px(None, Some(0.1), 0.0, 1920);
+        assert!((s - 8.0).abs() < 1e-3, "got {s}");
+    }
+
+    #[test]
+    fn effective_size_zero_box_w_clamps_min_1() {
+        // 0-width box: pct math degenerates to 0 → floor at 8.
+        let s = effective_font_size_px(None, Some(80.0), 0.0, 1920);
+        assert!((s - 8.0).abs() < 1e-3);
+    }
+
+    // -- parse_h_align -------------------------------------------
+
+    #[test]
+    fn parse_h_align_recognized() {
+        assert_eq!(parse_h_align("left"), HAlign::Left);
+        assert_eq!(parse_h_align("center"), HAlign::Center);
+        assert_eq!(parse_h_align("right"), HAlign::Right);
+    }
+
+    #[test]
+    fn parse_h_align_unknown_falls_back_left() {
+        // Tolerant defaults match the rest of the renderer's stance
+        // on operator/model drift.
+        assert_eq!(parse_h_align(""), HAlign::Left);
+        assert_eq!(parse_h_align("justify"), HAlign::Left);
+        assert_eq!(parse_h_align("CENTER"), HAlign::Left); // case-sensitive
+    }
+
+    // -- box_to_ndc_quad -----------------------------------------
+
+    fn approx_ndc_eq(actual: (f32, f32, f32, f32), expected: (f32, f32, f32, f32)) -> bool {
+        let eps = 1e-4;
+        (actual.0 - expected.0).abs() < eps
+            && (actual.1 - expected.1).abs() < eps
+            && (actual.2 - expected.2).abs() < eps
+            && (actual.3 - expected.3).abs() < eps
+    }
+
+    #[test]
+    fn box_quad_full_viewport_left_top_no_scale() {
+        // Box covers the full viewport, bitmap exactly fills it,
+        // align top-left → NDC corners are -1..+1 on both axes.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 1.0, 1.0, 1920, 1080, 1920, 1080, HAlign::Left, VAlign::Top,
+        );
+        assert!(
+            approx_ndc_eq(q, (-1.0, 1.0, 1.0, -1.0)),
+            "got ({}, {}, {}, {})", q.0, q.1, q.2, q.3,
+        );
+    }
+
+    #[test]
+    fn box_quad_smaller_bitmap_left_top_no_overflow() {
+        // 100x50 bitmap inside a 0.5x0.5 box on 1920x1080 viewport,
+        // top-left aligned → bitmap sits at box top-left, no scaling.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 0.5, 0.5, 100, 50, 1920, 1080, HAlign::Left, VAlign::Top,
+        );
+        // Pixel rect: (0, 0) → (100, 50). NDC:
+        //   left:   0/1920*2-1 = -1.0
+        //   right:  100/1920*2-1 ≈ -0.8958
+        //   top:    1 - 0/1080*2 = 1.0
+        //   bottom: 1 - 50/1080*2 ≈ 0.9074
+        assert!(
+            approx_ndc_eq(q, (-1.0, -0.89583, 1.0, 0.90741)),
+            "got ({}, {}, {}, {})", q.0, q.1, q.2, q.3,
+        );
+    }
+
+    #[test]
+    fn box_quad_centered_horizontally() {
+        // 100px-wide bitmap inside a 1.0-wide (full-screen) box
+        // on 1920px viewport, h-align center: bitmap NDC width is
+        // 100/1920*2 = 0.10417, centered around 0 → -0.05208..0.05208.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 1.0, 1.0, 100, 50, 1920, 1080, HAlign::Center, VAlign::Top,
+        );
+        assert!(
+            (q.0 + 0.05208).abs() < 1e-3 && (q.1 - 0.05208).abs() < 1e-3,
+            "centered NDC l/r: {} / {}", q.0, q.1,
+        );
+    }
+
+    #[test]
+    fn box_quad_right_aligned() {
+        // 100px-wide bitmap inside a 1.0-wide box, h-align right:
+        // bitmap right edge at viewport right = 1.0; left edge at
+        // 1.0 - 100/1920*2 = 0.89583.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 1.0, 1.0, 100, 50, 1920, 1080, HAlign::Right, VAlign::Top,
+        );
+        assert!(
+            (q.1 - 1.0).abs() < 1e-3 && (q.0 - 0.89583).abs() < 1e-3,
+            "right-aligned NDC l/r: {} / {}", q.0, q.1,
+        );
+    }
+
+    #[test]
+    fn box_quad_centered_vertically() {
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 1.0, 1.0, 100, 50, 1920, 1080,
+            HAlign::Left, VAlign::Middle,
+        );
+        // 50px tall in 1080 viewport → NDC h = 50/1080*2 = 0.09259
+        // centered → top ≈ 0.04630, bottom ≈ -0.04630.
+        assert!(
+            (q.2 - 0.04630).abs() < 1e-3 && (q.3 + 0.04630).abs() < 1e-3,
+            "v-centered NDC t/b: {} / {}", q.2, q.3,
+        );
+    }
+
+    #[test]
+    fn box_quad_overflow_scales_down_uniformly() {
+        // 4000x2000 bitmap into a 1000x1000 box → scale = min(0.25, 0.5) = 0.25,
+        // so placed = 1000x500. Top-left at box origin.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
+            4000, 2000, 1920, 1080,
+            HAlign::Left, VAlign::Top,
+        );
+        // Placed pixel rect: (0, 0) → (1000, 500).
+        let exp_l = -1.0;
+        let exp_r = 1000.0 / 1920.0 * 2.0 - 1.0;
+        let exp_t = 1.0;
+        let exp_b = 1.0 - 500.0 / 1080.0 * 2.0;
+        assert!(
+            approx_ndc_eq(q, (exp_l, exp_r, exp_t, exp_b)),
+            "got ({}, {}, {}, {}); expected ({exp_l}, {exp_r}, {exp_t}, {exp_b})",
+            q.0, q.1, q.2, q.3,
+        );
+    }
+
+    #[test]
+    fn box_quad_overflow_only_one_dim() {
+        // Very wide bitmap (3000x100) into a 1000x1000 box →
+        // s_w = 1000/3000 ≈ 0.333, s_h = 1.0 (no overflow on h),
+        // scale = 0.333. Placed = 1000 x 33.3.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
+            3000, 100, 1920, 1080,
+            HAlign::Left, VAlign::Top,
+        );
+        let placed_h = 100.0 / 3.0;
+        let exp_b = 1.0 - placed_h / 1080.0 * 2.0;
+        assert!(
+            (q.3 - exp_b).abs() < 1e-2,
+            "scaled placed h: NDC bottom {} expected {}",
+            q.3, exp_b,
+        );
+    }
+
+    #[test]
+    fn box_quad_centered_align_after_scale_down() {
+        // 4000x2000 bitmap into 1000x1000 box at center alignment.
+        // scale = 0.25 → placed = 1000x500. Box is 1000x1000.
+        // After centering: x-offset = 0 (placed_w == box_w),
+        //                  y-offset = (1000-500)/2 = 250.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
+            4000, 2000, 1920, 1080,
+            HAlign::Center, VAlign::Middle,
+        );
+        // x: placed fills box → -1 .. (1000/1920*2-1)
+        // y: top at 250px → 1 - 250/1080*2 ≈ 0.5370
+        let exp_t = 1.0 - 250.0 / 1080.0 * 2.0;
+        let exp_b = 1.0 - 750.0 / 1080.0 * 2.0;
+        assert!(
+            (q.2 - exp_t).abs() < 1e-3 && (q.3 - exp_b).abs() < 1e-3,
+            "v-centered after scale: NDC t/b {} / {} expected {} / {}",
+            q.2, q.3, exp_t, exp_b,
+        );
     }
 
     #[test]

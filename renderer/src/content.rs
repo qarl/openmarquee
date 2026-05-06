@@ -104,7 +104,7 @@ pub struct TextSlide {
 /// Python model semantics for percent are "percent of box width"; the
 /// Phase 4.2a renderer uses a height-based heuristic instead until
 /// the real fit-to-box pass lands in 4.2c (see hdmi.rs::
-/// `render_slide_bg`'s `draw_text_layer` for details).
+/// `render_slide`'s `draw_text_layer` for details).
 #[derive(Debug, Deserialize, Clone)]
 pub struct TextLayer {
     #[serde(default)]

@@ -371,13 +371,13 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 // Phase 4.2b: --play-slide and --play-slide-text now
-                // route through the same unified render_slide_bg path
+                // route through the same unified render_slide path
                 // (bg + first text layer in one frame). The two flags
                 // differ only in playlist-sanity-check behavior:
                 // --play-slide loads the playlist as a wiring sanity
                 // check; --play-slide-text bypasses it for tighter
                 // smoke-test isolation.
-                let render_slide = |slide_id: uuid::Uuid, load_playlist: bool| -> Result<()> {
+                let dispatch_slide = |slide_id: uuid::Uuid, load_playlist: bool| -> Result<()> {
                     let content_root = args
                         .content_root
                         .as_deref()
@@ -420,15 +420,15 @@ fn main() -> Result<()> {
                             None
                         }
                     };
-                    hdmi::render_slide_bg(&card, &slide, font_opt.as_ref(), args.hold_secs)
+                    hdmi::render_slide(&card, &slide, font_opt.as_ref(), args.hold_secs)
                 };
 
                 if let Some(slide_id) = args.play_slide {
-                    render_slide(slide_id, true)?;
+                    dispatch_slide(slide_id, true)?;
                     return Ok(());
                 }
                 if let Some(slide_id) = args.play_slide_text {
-                    render_slide(slide_id, false)?;
+                    dispatch_slide(slide_id, false)?;
                     return Ok(());
                 }
                 eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, or --play-slide-text UUID");

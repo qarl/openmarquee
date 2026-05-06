@@ -34,8 +34,9 @@ use khronos_egl as egl;
 
 use crate::content::{solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
-    fourcc_for_argb_family, gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha,
-    parse_crtc_list_filter_bits, pick_largest_mode_index, ModeSpec, FS_GLYPH, FS_GRADIENT,
+    box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, gradient_uniforms,
+    hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, parse_crtc_list_filter_bits,
+    parse_h_align, pick_largest_mode_index, ModeSpec, VAlign, FS_GLYPH, FS_GRADIENT,
     VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -371,7 +372,7 @@ where
 /// Draw a two-color linear gradient that fills the viewport. The
 /// fragment shader matches Python's PIL reference (image-space y,
 /// flipped from gl_FragCoord). Phase 4.2b extracted into a helper
-/// so `render_slide_bg` can compose it with the text pass in one
+/// so `render_slide` can compose it with the text pass in one
 /// closure.
 fn draw_gradient_pattern(
     gl: &glow::Context,
@@ -421,7 +422,7 @@ fn draw_gradient_pattern(
 }
 
 /// Clear the viewport to a solid RGBA. Trivial helper extracted so
-/// the bg dispatch in `render_slide_bg` is purely structural — the
+/// the bg dispatch in `render_slide` is purely structural — the
 /// closure's match arm reads as "gradient or clear" without
 /// inlined GLES.
 fn draw_solid_clear(gl: &glow::Context, color: [f32; 4]) {
@@ -456,18 +457,15 @@ fn draw_text_layer(
 ) -> Result<()> {
     use glow::HasContext;
 
-    // Effective pixel size — Phase 4.2 heuristic (NOT the Python
-    // model semantics; 4.2c lands a real fit-to-box pass):
-    //   - font_size_px wins when set.
-    //   - font_size_pct treated as percent-of-box-HEIGHT (the
-    //     Python reference is percent-of-box-WIDTH).
-    //   - default 64px when neither set.
-    let box_h_px = (layer.r#box.h * mode_h as f32).max(1.0);
-    let size_px = layer
-        .font_size_px
-        .or(layer.font_size_pct.map(|p| (p / 100.0) * box_h_px))
-        .unwrap_or(64.0)
-        .max(8.0);
+    // Phase 4.2c: real Python-model semantics via the
+    // host-tested `effective_font_size_px` helper. font_size_pct =
+    // percent-of-box-WIDTH.
+    let size_px = effective_font_size_px(
+        layer.font_size_px,
+        layer.font_size_pct,
+        layer.r#box.w,
+        mode_w,
+    );
 
     let bm = layout_text_to_alpha(font, &layer.text, size_px).ok_or_else(|| {
         anyhow!(
@@ -482,11 +480,12 @@ fn draw_text_layer(
     );
 
     let opacity = layer.opacity.clamp(0.0, 1.0);
-    let box_x = layer.r#box.x;
-    let box_y = layer.r#box.y;
-    // box.w intentionally unused at Phase 4.2 — the bitmap is placed
-    // at its rasterized pixel size, not fit to the box. 4.2c uses
-    // box.w when scale-to-fit lands.
+    let halign = parse_h_align(&layer.text_align);
+    // The Python content model has no v-align field. Phase 4.2c
+    // matches the Python auto_render reference behavior of vertical-
+    // centering text inside the box. If a v-align field lands later,
+    // route through `parse_v_align(layer.v_align)`.
+    let valign = VAlign::Middle;
 
     unsafe {
         // -- Glyph atlas as a LUMINANCE texture. GLES2 doesn't
@@ -518,18 +517,21 @@ fn draw_text_layer(
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
 
-        // -- Build the textured quad in NDC. Top-left placement at
-        // the box origin, no scaling. 4.2c lands fit + center.
-        let dst_left = box_x * mode_w as f32;
-        let dst_top = box_y * mode_h as f32;
-        let dst_right = dst_left + bm.width as f32;
-        let dst_bottom = dst_top + bm.height as f32;
-        let to_ndc_x = |px: f32| (px / mode_w as f32) * 2.0 - 1.0;
-        let to_ndc_y = |px: f32| 1.0 - (px / mode_h as f32) * 2.0;
-        let ndc_l = to_ndc_x(dst_left);
-        let ndc_r = to_ndc_x(dst_right);
-        let ndc_t = to_ndc_y(dst_top);
-        let ndc_b = to_ndc_y(dst_bottom);
+        // -- Build the textured quad in NDC via the host-tested
+        // `box_to_ndc_quad` helper. Scale-down-only (no upscaling),
+        // aligned per `halign`/`valign` inside the box.
+        let (ndc_l, ndc_r, ndc_t, ndc_b) = box_to_ndc_quad(
+            layer.r#box.x,
+            layer.r#box.y,
+            layer.r#box.w,
+            layer.r#box.h,
+            bm.width,
+            bm.height,
+            mode_w,
+            mode_h,
+            halign,
+            valign,
+        );
         // Verts: TRIANGLE_STRIP order BL, BR, TL, TR. Each vert is
         // [x, y, u, v]. UV (0,0) is top-left of the bitmap, which
         // matches our row-major top-down `data`.
@@ -592,10 +594,9 @@ fn draw_text_layer(
         let u_text_color = gl.get_uniform_location(program, "u_text_color");
         gl.uniform_3_f32(u_text_color.as_ref(), r, g, b);
 
-        // Premultiplied alpha blend so the glyph composites over
-        // the already-rendered bg correctly.
-        gl.enable(glow::BLEND);
-        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        // BLEND state is set by the caller (render_slide) once
+        // around the layer loop — same blend func for every layer,
+        // so toggling per-layer would just churn driver state.
 
         let stride = (4 * std::mem::size_of::<f32>()) as i32;
         gl.enable_vertex_attrib_array(a_pos);
@@ -612,7 +613,6 @@ fn draw_text_layer(
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         gl.disable_vertex_attrib_array(a_pos);
         gl.disable_vertex_attrib_array(a_uv);
-        gl.disable(glow::BLEND);
         gl.delete_buffer(vbo);
         gl.delete_program(program);
         gl.delete_texture(tex);
@@ -676,9 +676,11 @@ fn resolve_slide_bg(slide: &TextSlide) -> Result<(BgKind, &'static str)> {
 ///
 /// When `font` is provided AND the slide has a visible non-empty
 /// text_layer, the first such layer is rasterized + composited over
-/// the bg via the glyph-shader path. Multi-layer composite lands in
-/// 4.2c; gradient + text in one frame is the 4.2b deliverable.
-pub fn render_slide_bg(
+/// the bg via the glyph-shader path. Phase 4.2c iterates over ALL
+/// visible non-empty text_layers (front-to-back per the model),
+/// supports `text_align`, scale-to-fit, and font catalog lookup
+/// (the latter at the call-site via `font_lookup`).
+pub fn render_slide(
     card: &Card,
     slide: &TextSlide,
     font: Option<&fontdue::Font>,
@@ -686,27 +688,33 @@ pub fn render_slide_bg(
 ) -> Result<()> {
     let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
 
-    // First visible non-empty text layer. Empty-text layers exist
-    // in the model (operator dragged a widget but never typed) and
-    // would fail layout — skip them silently.
-    let text_layer: Option<&crate::content::TextLayer> = if font.is_some() {
+    // All visible non-empty text layers. Empty-text layers exist in
+    // the model (operator dragged a widget but never typed) and
+    // would fail layout — skip them silently. Front-to-back order
+    // matches the Python content-model semantic: index 0 paints
+    // first, later layers composite over earlier ones.
+    //
+    // We pre-parse text_color hex on the host side so a malformed
+    // color errors before EGL bring-up.
+    let text_layers: Vec<(&crate::content::TextLayer, [f32; 4])> = if font.is_some() {
         slide
             .text_layers
             .iter()
-            .find(|l| l.visible && !l.text.is_empty())
+            .filter(|l| l.visible && !l.text.is_empty())
+            .map(|l| {
+                let tc = hex_to_rgba(&l.text_color).ok_or_else(|| {
+                    anyhow!(
+                        "invalid text_color {:?} for slide {}",
+                        l.text_color,
+                        slide.id,
+                    )
+                })?;
+                Ok::<_, anyhow::Error>((l, tc))
+            })
+            .collect::<Result<Vec<_>>>()?
     } else {
-        None
+        Vec::new()
     };
-    let text_color: Option<[f32; 4]> = text_layer
-        .map(|l| {
-            hex_to_rgba(&l.text_color)
-                .ok_or_else(|| anyhow!(
-                    "invalid text_color {:?} for slide {}",
-                    l.text_color,
-                    slide.id,
-                ))
-        })
-        .transpose()?;
 
     let bg_log = match &bg_kind {
         BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
@@ -715,16 +723,12 @@ pub fn render_slide_bg(
             c[0], c[1], c[2]
         ),
     };
-    let text_log = match text_layer {
-        Some(l) => format!(
-            " text={:?} box=({:.3},{:.3},{:.3},{:.3}) text_color={}",
-            l.text, l.r#box.x, l.r#box.y, l.r#box.w, l.r#box.h, l.text_color
-        ),
-        None => String::new(),
-    };
     eprintln!(
-        "rendering slide {} ({:?}) {bg_log}{text_log} for {}s",
-        slide.id, slide.name, hold_secs,
+        "rendering slide {} ({:?}) {bg_log} text_layers={} for {}s",
+        slide.id,
+        slide.name,
+        text_layers.len(),
+        hold_secs,
     );
 
     render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
@@ -738,8 +742,32 @@ pub fn render_slide_bg(
                 draw_solid_clear(gl, color);
             }
         }
-        if let (Some(font), Some(layer), Some(tc)) = (font, text_layer, text_color) {
-            draw_text_layer(gl, mode_w, mode_h, layer, font, tc)?;
+        // BLEND toggle once around the layer loop (Phase 4.2c
+        // optimization vs. per-layer enable/disable) — every text
+        // layer uses the same premultiplied-alpha blend func and
+        // disabling/re-enabling between layers is wasted state.
+        //
+        // The IIFE guard ensures `gl.disable(BLEND)` always runs even
+        // when a layer's draw errors mid-loop. Today that doesn't
+        // matter (the harness tears down EGL on Err), but a future
+        // persistent-context phase (4.3+) inherits this state across
+        // calls — same future-correctness principle as R2's
+        // UNPACK_ALIGNMENT restore.
+        if let Some(font) = font {
+            if !text_layers.is_empty() {
+                unsafe {
+                    gl.enable(glow::BLEND);
+                    gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                }
+                let layer_loop_result: Result<()> = (|| {
+                    for (layer, tc) in &text_layers {
+                        draw_text_layer(gl, mode_w, mode_h, layer, font, *tc)?;
+                    }
+                    Ok(())
+                })();
+                unsafe { gl.disable(glow::BLEND); }
+                layer_loop_result?;
+            }
         }
         unsafe { gl.flush(); }
         Ok(())
