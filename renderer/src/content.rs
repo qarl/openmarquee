@@ -395,4 +395,127 @@ mod tests {
         };
         assert_eq!(solid_bg_hex(&slide), "#050608");
     }
+
+    // ------------------------------------------------------------
+    // Integration tests — file IO via tempdirs, per QA Rule 3
+    // (integration coverage where a feature touches other systems).
+    // These test the load_playlist + find_text_slide wrappers
+    // against actual std::fs reads, not just JSON parsing in
+    // isolation. Catches things like context-message wording, IO
+    // error propagation, missing-file vs malformed-file distinction.
+    // ------------------------------------------------------------
+
+    use tempfile::TempDir;
+
+    fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, contents).expect("write tempfile");
+        p
+    }
+
+    #[test]
+    fn load_playlist_round_trip_through_fs() {
+        let td = TempDir::new().unwrap();
+        let path = write_file(td.path(), "playlist.json", SAMPLE_PLAYLIST);
+        let env = load_playlist(&path).expect("load");
+        assert_eq!(env.schema_version, 4);
+        assert_eq!(env.playlists.len(), 1);
+        assert_eq!(env.playlists[0].items.len(), 2);
+    }
+
+    #[test]
+    fn load_playlist_missing_file_says_read() {
+        let td = TempDir::new().unwrap();
+        let missing = td.path().join("nope.json");
+        let err = load_playlist(&missing).unwrap_err();
+        // The context chain should mention "read" so a stat/IO
+        // failure is distinguishable from a parse failure. We don't
+        // pin the exact OS message — just the helper's prefix.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("read"),
+            "expected 'read' in error chain, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_playlist_malformed_says_parse() {
+        let td = TempDir::new().unwrap();
+        let path = write_file(td.path(), "playlist.json", "{ not valid json }");
+        let err = load_playlist(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse"),
+            "expected 'parse' in error chain, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn find_text_slide_returns_some_for_text_item() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let item_dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&item_dir).unwrap();
+        write_file(&item_dir, "item.json", SAMPLE_TEXT_ITEM);
+        let slide = find_text_slide(td.path(), id).unwrap().expect("text slide");
+        assert_eq!(slide.background_color, "#050608");
+        assert_eq!(slide.duration_ms, 1500);
+    }
+
+    #[test]
+    fn find_text_slide_returns_none_for_image_item() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let item_dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&item_dir).unwrap();
+        write_file(&item_dir, "item.json", SAMPLE_IMAGE_ITEM);
+        let result = find_text_slide(td.path(), id).unwrap();
+        assert!(result.is_none(), "image item should yield Ok(None)");
+    }
+
+    #[test]
+    fn find_text_slide_returns_err_for_missing_item_file() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        // Don't create the item dir at all — file is missing.
+        let err = find_text_slide(td.path(), id).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("read item"),
+            "expected 'read item' in error chain, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn find_text_slide_returns_err_for_malformed_envelope() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let item_dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&item_dir).unwrap();
+        write_file(&item_dir, "item.json", "{ broken");
+        let err = find_text_slide(td.path(), id).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse item envelope"),
+            "expected 'parse item envelope' in error chain, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn item_dir_path_safety_invariant() {
+        // The UUID typedef guarantees the joined component is always
+        // a 36-char hex-with-dashes string. This test asserts that
+        // invariant: no path traversal possible because the dir
+        // segment is always a UUID, never operator input.
+        let root = Path::new("/var/openmarquee/content");
+        let id = Uuid::parse_str("00000000-0000-4000-8000-000000000099").unwrap();
+        let dir = item_dir(root, id);
+        let suffix = dir.strip_prefix(root).unwrap();
+        assert_eq!(
+            suffix.to_str().unwrap(),
+            "00000000-0000-4000-8000-000000000099"
+        );
+        // Sanity: the resolved path stays under content_root.
+        assert!(dir.starts_with(root));
+    }
 }

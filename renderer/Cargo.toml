@@ -17,7 +17,10 @@ anyhow = "1.0"
 # Pure Rust, no link deps; works fine on Mac for tests.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1", features = ["serde"] }
+# `default-features=false` drops the wasm-bindgen / js-sys / web-sys /
+# bumpalo / futures-util dep chain that uuid pulls in for browser
+# targets. We only need serde derive on aarch64-unknown-linux-gnu.
+uuid = { version = "1", default-features = false, features = ["serde"] }
 
 # Hardware-bring-up deps (drm/gbm/EGL/GLES2) are Linux-only — they
 # require libdrm, libgbm, libEGL at link time, none of which exist
@@ -30,6 +33,10 @@ gbm = { version = "0.15", default-features = false, features = ["import-egl"] }
 khronos-egl = { version = "6.0", features = ["dynamic"] }
 libloading = "0.8"
 glow = "0.14"
+
+[dev-dependencies]
+# Integration tests for content.rs's file-IO wrappers.
+tempfile = "3"
 
 [[bin]]
 name = "openmarquee-render"
