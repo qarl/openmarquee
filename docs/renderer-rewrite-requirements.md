@@ -305,6 +305,25 @@ These were open questions in the first draft of this doc. Answered:
   first; document the result.
 - **Memory budget:** must fit Pi Zero 2 W. Implementing agent
   produces a defensible breakdown before writing compositor code.
+- **Implementation language: Rust.** The leak class we keep hitting is
+  the seam between Python's GC and ctypes-managed CMA / GL / DRM
+  resources. Native code with explicit lifetimes sidesteps that
+  category. Process boundary (renderer as a sidecar to the FastAPI
+  backend) gives us guaranteed CMA reclaim on death as a
+  defense-in-depth.
+- **Standalone testability against the canonical playlist.** The
+  Rust renderer must be exercisable as a standalone binary that
+  parses the canonical playlist + content directory directly and
+  plays the FREE YOUR SIGN reel through HDMI without requiring the
+  FastAPI backend to be running. This is the primary smoke test
+  during development. Production integration with playback comes
+  after standalone parity.
+- **Feature-parity acceptance test.** The Rust renderer is "done"
+  for v1 when the FREE YOUR SIGN reel runs at 30 fps with shader
+  transitions enabled and no OOM kills across an extended soak (see
+  §8.2). Until then, the existing Python renderer (currently under
+  `backend/openmarquee/rendering/`) stays in the tree as the live
+  path; once Rust hits acceptance, Python is retired.
 
 The combination of "1080p + all 16 transitions + all 4 blend modes +
 real video decode + motion through shader transitions, all fitting on
@@ -320,12 +339,22 @@ half-implemented version.
 - The playback loop under `backend/openmarquee/playback.py` (treat
   its renderer-call sites as a list of *requirements*, not a contract
   to preserve verbatim — they will be rewritten to match the new
-  surface).
-- The seed playlist under `backend/openmarquee/seed.py` as a working
-  test case.
+  surface once the Rust renderer reaches feature parity).
+- The seed playlist under `backend/openmarquee/seed.py` as the source
+  of the canonical FREE YOUR SIGN reel — the standalone smoke-test
+  target in §11. Generated content lives under
+  `/var/openmarquee/content/` on the dev Pi (or
+  `./openmarquee-content/` in dev).
+- The hardware spike data at
+  [`renderer-rewrite-spike-data.md`](renderer-rewrite-spike-data.md)
+  — measured GL limits, bandwidth ceilings, EGL extensions, etc. on
+  the canonical Pi. Read this before designing the shader pass.
 - The dev Pi at `openmarquee@openMarqueeDev` (Tailscale magic-DNS) for
   on-hardware verification. systemd unit at
   `system/openmarquee-backend.service`. Redeploy via
   `bash scripts/deploy.sh openmarquee@openMarqueeDev`.
-- Permission to delete every file under `backend/openmarquee/rendering/`
-  except `__init__.py`'s public surface, which they redesign.
+- Permission to add a new top-level Rust crate (location is the
+  implementing agent's call — likely `renderer/` at the repo root or
+  `backend/renderer-rs/`). The existing Python renderer under
+  `backend/openmarquee/rendering/` stays put until Rust reaches
+  parity per §11; do not delete it as a first move.
