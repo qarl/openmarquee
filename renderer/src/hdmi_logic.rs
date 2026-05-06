@@ -5,6 +5,58 @@
 //! cross-platform — it compiles on macOS so `cargo test` can run on
 //! the dev box and exercise these functions without a real DRM stack.
 
+// =====================================================================
+// Shader sources (cross-platform — pure GLSL strings).
+//
+// Lifted out of hdmi.rs (Linux-only) so host tests can snapshot-
+// assert their shape: we want a missing `#version 100` directive or
+// a renamed uniform to fail on the Mac dev box, not by going
+// black-pixels on the Pi at runtime.
+// =====================================================================
+
+/// Vertex shader: emit each input vertex as-is (fullscreen quad in
+/// NDC, no transform). Shared across every fragment shader the
+/// renderer compiles.
+///
+/// **Coordinate decision (Phase 4.1c)**: this VS deliberately does
+/// NOT emit a `v_uv` varying. Fragment shaders compute their own
+/// coordinates from `gl_FragCoord` + a `u_viewport` uniform — see
+/// `FS_GRADIENT` for the convention. Two reasons:
+///   1. Image-coord conventions differ per pattern (gradient wants
+///      [0, w-1] image space matching Python; tiled patterns may
+///      want pixel coords; UV-normalized variants would still want
+///      access to viewport for tile sizing). Forcing a single
+///      varying convention now would constrain future patterns.
+///   2. `gl_FragCoord.xy / u_viewport` is one trivial line per
+///      fragment shader. Negligible vs the cost of a wrong varying.
+/// If a future pattern *really* wants UVs — add a parallel
+/// `VS_FULLSCREEN_QUAD_WITH_UV` rather than retro-fitting this one.
+pub const VS_FULLSCREEN_QUAD: &str = r#"#version 100
+attribute vec2 a_pos;
+void main() {
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+"#;
+
+/// Fragment shader: two-color linear gradient. Mirrors the Python
+/// reference (`backend.openmarquee.auto_render._render_pattern_
+/// gradient`). Coordinate convention is image-space (y=0 at top), so
+/// gl_FragCoord.y is flipped against u_viewport.y to match.
+pub const FS_GRADIENT: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform vec2 u_dir;
+uniform vec2 u_proj_bounds;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    float proj = dot(pos, u_dir);
+    float t = clamp((proj - u_proj_bounds.x) / u_proj_bounds.y, 0.0, 1.0);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
 /// A minimal, drm-independent representation of a connector mode.
 /// `width`/`height` are in pixels, `vrefresh` in Hz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +109,16 @@ pub struct GradientUniforms {
 /// density), proj_min/max derivation) is unit-tested against known
 /// reference values from the Python implementation, independent of
 /// any GL state.
+///
+/// Banker-rounding-vs-away-from-zero ack: Rust's `f32::round` is
+/// away-from-zero (n.5 rounds away from zero), Python 3's `round()`
+/// is banker's (n.5 rounds to even). They diverge only at exact
+/// n.5 boundaries — which means densities that produce angles like
+/// 0.5°/1.5°/etc. The FYS slide-editor density slider has 4-decimal
+/// precision and the FYS canonical seeds use 0.0/0.5/1.0 anchors;
+/// none hit the boundary. If a future content path produces an
+/// n.5 angle, the visual difference is one degree of rotation —
+/// not perceptible. Accepted.
 pub fn gradient_uniforms(width: u32, height: u32, density: f32) -> Option<GradientUniforms> {
     // density 0..1 → 0..270°; rounded to integer degrees for parity
     // with Python's `round(lerp(...))`.
@@ -401,6 +463,76 @@ mod tests {
         // fall back to a solid color_a fill.
         assert_eq!(gradient_uniforms(1, 1, 0.5), None);
         assert_eq!(gradient_uniforms(0, 0, 0.0), None);
+    }
+
+    #[test]
+    fn gradient_at_1080p() {
+        // The eventual production path runs against 1920x1080. Confirm
+        // the math stays sane at production resolution and that
+        // density 0 produces a top→bottom gradient covering the
+        // full vertical range.
+        let g = gradient_uniforms(1920, 1080, 0.0).unwrap();
+        assert!(approx(g.dx, 0.0, 1e-6));
+        assert!(approx(g.dy, 1.0, 1e-6));
+        assert!(approx(g.proj_min, 0.0, 1e-3));
+        assert!(approx(g.span, 1079.0, 1e-3));
+    }
+
+    #[test]
+    fn vs_fullscreen_quad_targets_gles2() {
+        // GLES2 requires `#version 100`. Catch an accidental drift to
+        // `#version 300 es` (GLES3, vc4 doesn't support it) at host
+        // test time, not at first compile on the Pi.
+        assert!(
+            VS_FULLSCREEN_QUAD.starts_with("#version 100\n"),
+            "VS must declare #version 100; got: {:?}",
+            &VS_FULLSCREEN_QUAD[..32.min(VS_FULLSCREEN_QUAD.len())]
+        );
+        assert!(VS_FULLSCREEN_QUAD.contains("attribute vec2 a_pos"));
+    }
+
+    #[test]
+    fn fs_gradient_targets_gles2() {
+        assert!(
+            FS_GRADIENT.starts_with("#version 100\n"),
+            "FS must declare #version 100; got: {:?}",
+            &FS_GRADIENT[..32.min(FS_GRADIENT.len())]
+        );
+        assert!(FS_GRADIENT.contains("precision mediump float"));
+    }
+
+    #[test]
+    fn fs_gradient_uniform_names_pinned() {
+        // The dispatch in hdmi.rs's render_slide_bg_gradient looks up
+        // these uniforms by name. If a future refactor renames them
+        // without updating dispatch, the lookup returns None and
+        // glow's uniform_*(None, ...) silently no-ops — black frames
+        // at runtime. Pin them by name so a host test catches the
+        // drift instead.
+        for uniform in [
+            "u_viewport",
+            "u_dir",
+            "u_proj_bounds",
+            "u_color_a",
+            "u_color_b",
+        ] {
+            assert!(
+                FS_GRADIENT.contains(uniform),
+                "FS_GRADIENT missing uniform {uniform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gradient_fys_canonical_density_zero() {
+        // Both FYS gradient slides ("06 · Uncage!!" and "10 · Scream")
+        // ship with density=0.0. Cross-check that this produces the
+        // top-to-bottom direction the seed comment claims.
+        let g = gradient_uniforms(1024, 768, 0.0).unwrap();
+        // angle=0° → dx=sin(0)=0, dy=cos(0)=1 → t increases as y
+        // increases → color_a at top (small y), color_b at bottom.
+        assert!(approx(g.dx, 0.0, 1e-6), "FYS density=0 should be vertical");
+        assert!(approx(g.dy, 1.0, 1e-6), "FYS density=0 dy should be 1");
     }
 
     #[test]

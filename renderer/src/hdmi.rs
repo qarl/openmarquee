@@ -35,7 +35,8 @@ use khronos_egl as egl;
 use crate::content::{solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
     fourcc_for_argb_family, gradient_uniforms, hex_to_rgba, hsv_to_rgb,
-    parse_crtc_list_filter_bits, pick_largest_mode_index, ModeSpec,
+    parse_crtc_list_filter_bits, pick_largest_mode_index, ModeSpec, FS_GRADIENT,
+    VS_FULLSCREEN_QUAD,
 };
 use crate::Card;
 
@@ -61,34 +62,6 @@ use crate::Card;
 //     trace.
 // =====================================================================
 
-/// Vertex shader: emit each input vertex as-is (fullscreen quad in
-/// NDC, no transform). Shared across every fragment shader the
-/// renderer compiles.
-const VS_FULLSCREEN_QUAD: &str = r#"#version 100
-attribute vec2 a_pos;
-void main() {
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-"#;
-
-/// Fragment shader: two-color linear gradient. Mirrors the Python
-/// reference (`backend.openmarquee.auto_render._render_pattern_
-/// gradient`). Coordinate convention is image-space (y=0 at top), so
-/// gl_FragCoord.y is flipped against u_viewport.y to match.
-const FS_GRADIENT: &str = r#"#version 100
-precision mediump float;
-uniform vec2 u_viewport;
-uniform vec2 u_dir;
-uniform vec2 u_proj_bounds;
-uniform vec3 u_color_a;
-uniform vec3 u_color_b;
-void main() {
-    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
-    float proj = dot(pos, u_dir);
-    float t = clamp((proj - u_proj_bounds.x) / u_proj_bounds.y, 0.0, 1.0);
-    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
-}
-"#;
 
 /// Compile a single shader stage, returning the GL handle on success
 /// or an anyhow error with the compile log attached.
@@ -112,14 +85,32 @@ fn compile_shader(gl: &glow::Context, kind: u32, source: &str) -> Result<glow::N
 /// Compile + link a vertex + fragment shader pair into a program,
 /// returning the program handle. Both shader stages are deleted
 /// after link (their objects are no longer referenced).
+///
+/// Cleanup is exhaustive: if the FRAGMENT compile fails, the
+/// already-compiled VERTEX shader is deleted before the early-
+/// return; if create_program fails, both stage shaders are
+/// deleted; if link fails, the program plus both stage shaders
+/// are deleted. Phase 4.2 (text glyphs) calls this repeatedly,
+/// so leaks compound.
 fn link_program(gl: &glow::Context, vs_src: &str, fs_src: &str) -> Result<glow::NativeProgram> {
     use glow::HasContext;
     let vs = compile_shader(gl, glow::VERTEX_SHADER, vs_src)?;
-    let fs = compile_shader(gl, glow::FRAGMENT_SHADER, fs_src)?;
+    let fs = match compile_shader(gl, glow::FRAGMENT_SHADER, fs_src) {
+        Ok(fs) => fs,
+        Err(e) => {
+            unsafe { gl.delete_shader(vs) };
+            return Err(e);
+        }
+    };
     unsafe {
-        let prog = gl
-            .create_program()
-            .map_err(|e| anyhow!("glCreateProgram: {e}"))?;
+        let prog = match gl.create_program() {
+            Ok(p) => p,
+            Err(e) => {
+                gl.delete_shader(vs);
+                gl.delete_shader(fs);
+                return Err(anyhow!("glCreateProgram: {e}"));
+            }
+        };
         gl.attach_shader(prog, vs);
         gl.attach_shader(prog, fs);
         gl.link_program(prog);
@@ -141,6 +132,9 @@ fn link_program(gl: &glow::Context, vs_src: &str, fs_src: &str) -> Result<glow::
 /// drawn as TRIANGLE_STRIP. Returns (VBO, attribute location). The
 /// caller is responsible for binding the VBO + enabling the attrib
 /// before drawing.
+///
+/// On `get_attrib_location` failure we delete the VBO before
+/// returning Err so a misnamed-attribute build doesn't leak buffers.
 fn create_fullscreen_quad(
     gl: &glow::Context,
     program: glow::NativeProgram,
@@ -158,29 +152,60 @@ fn create_fullscreen_quad(
             verts.len() * std::mem::size_of::<f32>(),
         );
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-        let attrib = gl.get_attrib_location(program, "a_pos").ok_or_else(|| {
-            anyhow!("vertex shader is missing the `a_pos` attribute")
-        })?;
-        Ok((vbo, attrib))
+        match gl.get_attrib_location(program, "a_pos") {
+            Some(loc) => Ok((vbo, loc)),
+            None => {
+                gl.delete_buffer(vbo);
+                Err(anyhow!("vertex shader is missing the `a_pos` attribute"))
+            }
+        }
     }
 }
 
-/// Phase 4.1b — render a two-color linear gradient via fragment
-/// shader, push one frame to the HDMI display via legacy
-/// `drmModeSetCrtc`, hold for `hold_secs` seconds, clean up.
+/// Sweep `glGetError` and `eprintln!` any sticky errors with a
+/// caller-supplied label. Debug-build-only — release builds skip the
+/// sweep entirely so production hot loops don't pay for it.
 ///
-/// Uses the same GBM/EGL/DRM bring-up as `render_solid_color`. The
-/// duplication is deliberate — Phase 4.1c factors both onto a
-/// shared `EglGbmFrame` helper now that there's a real second
-/// caller. Until then, copy-paste keeps each function readable
-/// end-to-end.
-pub fn render_slide_bg_gradient(
-    card: &Card,
-    color_a: [f32; 4],
-    color_b: [f32; 4],
-    density: f32,
-    hold_secs: u64,
-) -> Result<()> {
+/// Bad uniform-location lookups (an optimizer-stripped uniform's
+/// `get_uniform_location` returning `None`) silently no-op via
+/// glow's `uniform_*_f32(None, ...)` wrappers. The sweep is the
+/// catch-all for those plus other "should never happen" GL errors
+/// that would otherwise surface only as black/garbage frames.
+#[cfg(debug_assertions)]
+fn gl_error_sweep(gl: &glow::Context, label: &str) {
+    use glow::HasContext;
+    loop {
+        let err = unsafe { gl.get_error() };
+        if err == glow::NO_ERROR {
+            break;
+        }
+        eprintln!("warn: GL error 0x{err:x} after {label}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
+
+/// Bring up GBM + EGL + GLES2 against the HDMI display, run the
+/// caller's `draw` closure once with a live `glow::Context`, then
+/// `eglSwapBuffers` + lock the front BO + register the DRM
+/// framebuffer + legacy `drmModeSetCrtc` to push it to scanout.
+/// Hold for `hold_secs` seconds. Cleanup runs unconditionally
+/// (warn-on-Err) regardless of whether the closure succeeded —
+/// matches the Phase 3 followups pattern.
+///
+/// Phase 4.1c — extracted from `render_solid_color` and
+/// `render_slide_bg_gradient` now that we have two callers. Phase
+/// 4.1d+ bg-pattern shaders reuse this helper directly.
+///
+/// `draw` receives the GLES2 context and the viewport (mode_w,
+/// mode_h) so the closure can `glViewport`, `glClear`, or
+/// compile/link/draw a quad without re-deriving size.
+fn render_one_frame_to_hdmi<F>(card: &Card, hold_secs: u64, draw: F) -> Result<()>
+where
+    F: FnOnce(&glow::Context, u32, u32) -> Result<()>,
+{
     let resources = card
         .resource_handles()
         .context("drmModeGetResources failed")?;
@@ -207,9 +232,14 @@ pub fn render_slide_bg_gradient(
         .crtc()
         .or_else(|| resources.crtcs().first().copied())
         .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
+    eprintln!("using encoder {:?} crtc {:?}", encoder_handle, crtc_handle);
 
     let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
         .context("gbm_create_device failed")?;
+    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
+    if gbm_dev_ptr.is_null() {
+        bail!("gbm_device raw pointer is null");
+    }
     let gbm_surface = gbm_dev
         .create_surface::<()>(
             mode_w as u32,
@@ -224,15 +254,16 @@ pub fn render_slide_bg_gradient(
             anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
         })?
     };
-    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
     let display = unsafe {
         egl_lib
             .get_display(gbm_dev_ptr as egl::NativeDisplayType)
             .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
     };
-    egl_lib
+    let (egl_major, egl_minor) = egl_lib
         .initialize(display)
         .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
+    eprintln!("EGL {}.{}", egl_major, egl_minor);
+
     egl_lib
         .bind_api(egl::OPENGL_ES_API)
         .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
@@ -265,17 +296,109 @@ pub fn render_slide_bg_gradient(
         })
     };
 
-    // Compile + draw the gradient. Falls back to a solid `color_a`
-    // fill if the gradient degenerates (1×1 viewport) — matches the
-    // Python reference.
-    let g = gradient_uniforms(mode_w as u32, mode_h as u32, density);
-    {
+    // Resources the work block creates (BO + FB) need cleanup
+    // regardless of whether the work succeeds. Track via Options
+    // populated mid-closure; cleanup walks them after.
+    let mut bo_holder: Option<BufferObject<()>> = None;
+    let mut fb_holder: Option<framebuffer::Handle> = None;
+
+    let work: Result<()> = (|| {
+        draw(&gl, mode_w as u32, mode_h as u32)?;
+        gl_error_sweep(&gl, "user draw closure");
+        egl_lib
+            .swap_buffers(display, egl_surface)
+            .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+        let bo = unsafe {
+            gbm_surface
+                .lock_front_buffer()
+                .context("gbm_surface_lock_front_buffer failed")?
+        };
+        let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
+        let fb = match card.add_framebuffer(&fb_buf, 32, 32) {
+            Ok(fb) => fb,
+            Err(e) => {
+                drop(bo);
+                return Err(anyhow!("drmModeAddFB failed: {e}"));
+            }
+        };
+        bo_holder = Some(bo);
+        fb_holder = Some(fb);
+        eprintln!("registered fb {fb:?}");
+        card.set_crtc(
+            crtc_handle,
+            Some(fb),
+            (0, 0),
+            &[connector_info.handle()],
+            Some(mode),
+        )
+        .context("drmModeSetCrtc failed")?;
+        eprintln!(
+            "scanout active on {:?}; holding for {}s",
+            crtc_handle, hold_secs
+        );
+        std::thread::sleep(std::time::Duration::from_secs(hold_secs));
+        Ok(())
+    })();
+
+    // Cleanup — unconditional, warn-on-Err so the original cause
+    // propagates via `work?`.
+    if let Err(e) = egl_lib.make_current(display, None, None, None) {
+        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_context(display, context) {
+        eprintln!("warn: eglDestroyContext: {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
+        eprintln!("warn: eglDestroySurface: {e:?}");
+    }
+    if let Err(e) = egl_lib.terminate(display) {
+        eprintln!("warn: eglTerminate: {e:?}");
+    }
+    if let Some(bo) = bo_holder {
+        drop(bo);
+    }
+    if let Some(fb) = fb_holder {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+        }
+    }
+
+    work?;
+    Ok(())
+}
+
+/// Phase 4.1b — render a two-color linear gradient via fragment
+/// shader, push one frame to the HDMI display via legacy
+/// `drmModeSetCrtc`, hold for `hold_secs` seconds, clean up.
+///
+/// Phase 4.1c factored the GBM/EGL/DRM bring-up onto
+/// `render_one_frame_to_hdmi`; this function only owns the GLES
+/// draw work.
+pub fn render_slide_bg_gradient(
+    card: &Card,
+    color_a: [f32; 4],
+    color_b: [f32; 4],
+    density: f32,
+    hold_secs: u64,
+) -> Result<()> {
+    // Phase 4.1c: closure body owns just the GLES draw work
+    // (compile + draw the gradient, or fall back to clear_color when
+    // the gradient degenerates). `render_one_frame_to_hdmi` handles
+    // the GBM/EGL/DRM bring-up + swap/addFB/SetCrtc/hold/teardown.
+    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
         use glow::HasContext;
+        let g = gradient_uniforms(mode_w, mode_h, density);
         unsafe {
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             if let Some(g) = g {
-                let program = link_program(&gl, VS_FULLSCREEN_QUAD, FS_GRADIENT)?;
-                let (vbo, attrib) = create_fullscreen_quad(&gl, program)?;
+                let program = link_program(gl, VS_FULLSCREEN_QUAD, FS_GRADIENT)?;
+                let (vbo, attrib) = match create_fullscreen_quad(gl, program) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        gl.delete_program(program);
+                        return Err(e);
+                    }
+                };
                 gl.use_program(Some(program));
                 let u_viewport = gl.get_uniform_location(program, "u_viewport");
                 let u_dir = gl.get_uniform_location(program, "u_dir");
@@ -295,62 +418,14 @@ pub fn render_slide_bg_gradient(
                 gl.delete_buffer(vbo);
                 gl.delete_program(program);
             } else {
-                // Degenerate gradient (1×1 viewport): fall back to
-                // a solid color_a fill via clear_color.
+                // Degenerate gradient (1×1 viewport): solid color_a.
                 gl.clear_color(color_a[0], color_a[1], color_a[2], 1.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
             gl.flush();
         }
-    }
-
-    egl_lib
-        .swap_buffers(display, egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
-
-    let bo = unsafe {
-        gbm_surface
-            .lock_front_buffer()
-            .context("gbm_surface_lock_front_buffer failed")?
-    };
-    let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
-    let fb = card
-        .add_framebuffer(&fb_buf, 32, 32)
-        .context("drmModeAddFB on GBM front buffer failed")?;
-    eprintln!("gradient registered fb {:?}", fb);
-
-    card.set_crtc(
-        crtc_handle,
-        Some(fb),
-        (0, 0),
-        &[connector_info.handle()],
-        Some(mode),
-    )
-    .context("drmModeSetCrtc failed")?;
-    eprintln!(
-        "gradient scanout active: holding {:?} for {}s",
-        crtc_handle, hold_secs
-    );
-
-    std::thread::sleep(std::time::Duration::from_secs(hold_secs));
-
-    if let Err(e) = egl_lib.make_current(display, None, None, None) {
-        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
-    }
-    if let Err(e) = egl_lib.destroy_context(display, context) {
-        eprintln!("warn: eglDestroyContext: {e:?}");
-    }
-    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
-        eprintln!("warn: eglDestroySurface: {e:?}");
-    }
-    if let Err(e) = egl_lib.terminate(display) {
-        eprintln!("warn: eglTerminate: {e:?}");
-    }
-    drop(bo);
-    if let Err(e) = card.destroy_framebuffer(fb) {
-        eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
-    }
-
+        Ok(())
+    })?;
     eprintln!("gradient render complete");
     Ok(())
 }
@@ -412,165 +487,12 @@ pub fn render_slide_bg(card: &Card, slide: &TextSlide, hold_secs: u64) -> Result
 /// gamma at scanout per the connector's Colorspace property — we just
 /// hand it premultiplied float color and let the hardware do the rest.
 pub fn render_solid_color(card: &Card, color: [f32; 4], duration_secs: u64) -> Result<()> {
-    // -----------------------------------------------------------------
-    // 1. Find a connected HDMI connector + a usable mode.
-    // -----------------------------------------------------------------
-    let resources = card
-        .resource_handles()
-        .context("drmModeGetResources failed")?;
-
-    let (connector_info, mode) = pick_connector_and_mode(card, &resources)
-        .context("no connected HDMI connector with a usable mode")?;
-    let (mode_w, mode_h) = mode.size();
-    eprintln!(
-        "selected connector {:?} {:?} at {}x{}@{}",
-        connector_info.handle(),
-        connector_info.interface(),
-        mode_w,
-        mode_h,
-        mode.vrefresh(),
-    );
-
-    // -----------------------------------------------------------------
-    // 2. Find an encoder + CRTC that can drive this connector.
-    //
-    // Legacy path: `connector.current_encoder()` is the encoder the
-    // kernel last bound. If it's not set (cold boot, headless prior),
-    // fall back to the connector's first listed encoder.
-    // -----------------------------------------------------------------
-    let encoder_handle = connector_info
-        .current_encoder()
-        .or_else(|| connector_info.encoders().first().copied())
-        .ok_or_else(|| anyhow!("connector advertises no encoders"))?;
-    let encoder_info = card
-        .get_encoder(encoder_handle)
-        .context("drmModeGetEncoder failed")?;
-
-    // Pick a CRTC that's actually compatible with this encoder. The
-    // kernel exposes which CRTCs each encoder can drive via the
-    // `possible_crtcs` bitmask — bit N = `resources.crtcs()[N]`.
-    // possible_crtcs would let us skip incompatible CRTCs, but the
-    // bitfield's u32 representation isn't exposed via a public method
-    // in drm-rs 0.12. Phase 2 just falls back to the encoder's
-    // currently-bound CRTC if there is one, otherwise the first one
-    // resources advertises. The vc4 driver exposes 4 CRTCs and any
-    // encoder's possible_crtcs is generally compatible with the first.
-    // Atomic commit (plan §4 Step 2) replaces this whole block.
-    let crtc_handle = encoder_info
-        .crtc()
-        .or_else(|| resources.crtcs().first().copied())
-        .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
-    eprintln!("using encoder {:?} crtc {:?}", encoder_handle, crtc_handle);
-
-    // -----------------------------------------------------------------
-    // 3. Bring up GBM on the DRM fd.
-    //
-    // GBM is the "Generic Buffer Manager" that hands out scanout-
-    // capable buffers we can render into via EGL/GLES and present via
-    // `drmModeAddFB`. The surface is sized to the chosen mode.
-    // -----------------------------------------------------------------
-    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
-        .context("gbm_create_device failed")?;
-    let gbm_surface = gbm_dev
-        .create_surface::<()>(
-            mode_w as u32,
-            mode_h as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
-        )
-        .context("gbm_surface_create failed")?;
-
-    // -----------------------------------------------------------------
-    // 4. Bring up EGL — load libEGL.so.1 at runtime, find a config
-    //    matching ARGB8888 + GLES2-renderable, create context + surface.
-    // -----------------------------------------------------------------
-    // EGL 1.5 is required for `eglGetPlatformDisplay`. Mesa 25 on the Pi
-    // ships 1.5; spike data confirms.
-    let egl_lib = unsafe {
-        egl::DynamicInstance::<egl::EGL1_5>::load_required().map_err(|e| {
-            anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
-        })?
-    };
-
-    // GBM platform display. khronos_egl's wrapper hands the gbm_device
-    // pointer to `eglGetPlatformDisplay`. We log the pointer because a
-    // null/invalid value is the usual cause of `BadParameter` here.
-    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
-    eprintln!("gbm_device raw ptr: {gbm_dev_ptr:p}");
-    if gbm_dev_ptr.is_null() {
-        bail!("gbm_device raw pointer is null");
-    }
-    // Legacy `eglGetDisplay(gbm_device*)` is what the prior Python
-    // spike used and what most production code paths use against
-    // Mesa+GBM. Core 1.5's `eglGetPlatformDisplay` is functionally
-    // equivalent but Mesa expects the legacy entry point for GBM
-    // displays; eglGetPlatformDisplay returns BadParameter otherwise.
-    let native_display = gbm_dev_ptr as egl::NativeDisplayType;
-    let display = unsafe {
-        egl_lib
-            .get_display(native_display)
-            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
-    };
-    let (egl_major, egl_minor) = egl_lib
-        .initialize(display)
-        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
-    eprintln!("EGL {}.{}", egl_major, egl_minor);
-
-    egl_lib
-        .bind_api(egl::OPENGL_ES_API)
-        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
-
-    let cfg_attribs = [
-        egl::SURFACE_TYPE,
-        egl::WINDOW_BIT,
-        egl::RED_SIZE,
-        8,
-        egl::GREEN_SIZE,
-        8,
-        egl::BLUE_SIZE,
-        8,
-        egl::ALPHA_SIZE,
-        8,
-        egl::RENDERABLE_TYPE,
-        egl::OPENGL_ES2_BIT,
-        egl::NONE,
-    ];
-    let configs = egl_lib
-        .choose_first_config(display, &cfg_attribs)
-        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
-        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
-
-    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-    let context = egl_lib
-        .create_context(display, configs, None, &ctx_attribs)
-        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
-
-    let egl_surface = unsafe {
-        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
-        egl_lib
-            .create_window_surface(display, configs, raw_surface, None)
-            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
-    };
-
-    egl_lib
-        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
-        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
-
-    // -----------------------------------------------------------------
-    // 5. GLES2 — clear the framebuffer with the chosen color, swap.
-    //
-    // glow needs a function loader; we hand it the EGL `get_proc_address`.
-    // -----------------------------------------------------------------
-    let gl = unsafe {
-        glow::Context::from_loader_function(|name| {
-            egl_lib
-                .get_proc_address(name)
-                .map(|fp| fp as *const _)
-                .unwrap_or(ptr::null())
-        })
-    };
-
-    {
+    // Phase 4.1c: thin wrapper over `render_one_frame_to_hdmi`. The
+    // GLES draw work is just `glClearColor` + `glClear`; everything
+    // else (GBM bring-up, EGL context, swap, addFB, SetCrtc, hold,
+    // teardown) is shared with `render_slide_bg_gradient` and the
+    // upcoming pattern shaders.
+    render_one_frame_to_hdmi(card, duration_secs, |gl, mode_w, mode_h| {
         use glow::HasContext;
         unsafe {
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
@@ -578,85 +500,8 @@ pub fn render_solid_color(card: &Card, color: [f32; 4], duration_secs: u64) -> R
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.flush();
         }
-    }
-
-    egl_lib
-        .swap_buffers(display, egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
-
-    // -----------------------------------------------------------------
-    // 6. Lock the GBM surface's front buffer object, register it as a
-    //    DRM framebuffer, and push to the CRTC via legacy SetCrtc.
-    // -----------------------------------------------------------------
-    let bo = unsafe {
-        gbm_surface
-            .lock_front_buffer()
-            .context("gbm_surface_lock_front_buffer failed")?
-    };
-
-    // Bridge gbm::BufferObject → drm::buffer::Buffer so we can hand
-    // the GPU-rendered front BO to drmModeAddFB. The crates don't
-    // know about each other, so we wrap and re-expose the four
-    // fields drm-rs needs (size, format, pitch, handle).
-    let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
-    let fb = card
-        .add_framebuffer(&fb_buf, 32, 32)
-        .context("drmModeAddFB on GBM front buffer failed")?;
-    eprintln!("registered fb {:?}", fb);
-
-    // Legacy SetCrtc is the simplest path to scanout — it sets the
-    // mode, picks a primary plane internally, and binds the fb. Atomic
-    // commit follows in plan §4 Step 2.
-    card.set_crtc(
-        crtc_handle,
-        Some(fb),
-        (0, 0),
-        &[connector_info.handle()],
-        Some(mode),
-    )
-    .context("drmModeSetCrtc failed")?;
-    eprintln!(
-        "scanout active: holding {:?} for {}s",
-        crtc_handle, duration_secs
-    );
-
-    // -----------------------------------------------------------------
-    // 7. Hold for `duration_secs` seconds, then explicit cleanup.
-    //
-    // Drop order matters. Code below does, in this order:
-    //   1. Unbind the EGL context (so subsequent destroys are valid).
-    //   2. Destroy EGL context + surface, terminate display.
-    //   3. Drop the GBM front BO (releases the lock).
-    //   4. drmModeRmFB on the framebuffer.
-    //
-    // The FB-after-BO order is fine because DRM framebuffers are
-    // reference-counted by the kernel: drmModeRmFB just removes our
-    // userspace reference, the actual destroy happens once scanout
-    // releases its hold (which we don't explicitly clear — last
-    // frame stays latched on the display until the next scanout
-    // acquires the CRTC). The remaining gbm_surface/gbm_dev/drm fd
-    // tear down via Drop on scope exit, in correct order.
-    // -----------------------------------------------------------------
-    std::thread::sleep(std::time::Duration::from_secs(duration_secs));
-
-    // Explicit teardown: detach FB, drop GBM bo, drop EGL state.
-    egl_lib
-        .make_current(display, None, None, None)
-        .map_err(|e| anyhow!("eglMakeCurrent(unbind) failed: {e:?}"))?;
-    egl_lib
-        .destroy_context(display, context)
-        .map_err(|e| anyhow!("eglDestroyContext failed: {e:?}"))?;
-    egl_lib
-        .destroy_surface(display, egl_surface)
-        .map_err(|e| anyhow!("eglDestroySurface failed: {e:?}"))?;
-    egl_lib
-        .terminate(display)
-        .map_err(|e| anyhow!("eglTerminate failed: {e:?}"))?;
-
-    drop(bo);
-    card.destroy_framebuffer(fb)
-        .context("drmModeRmFB failed")?;
-
+        Ok(())
+    })?;
     eprintln!("solid-color render complete");
     Ok(())
 }
