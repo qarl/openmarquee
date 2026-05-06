@@ -1,0 +1,7 @@
+[toolchain]
+# 1.85 is the floor: clap_derive 4.6+ and other current crates require
+# edition2024, stabilized in Rust 1.85 (Feb 2025). Plan §2 said 1.79.0
+# but that predates the edition2024 requirement; bumped at first build.
+channel = "1.85.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
