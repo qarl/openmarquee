@@ -292,6 +292,18 @@ class PlaybackLoop:
         # Set by fetch_items if it carries playlist context (the
         # scheduled_fetch_items closure stamps this each fetch).
         self._current_playlist_id: UUID | None = None
+        # Slot-start monotonic timestamp -- stamped by the play methods
+        # at t0 so capture_current_frame() can compute elapsed_s from
+        # the same clock the live render uses. None when no slot is
+        # active. Added 2026-05-06 for /api/playback/current-frame.
+        self._slot_t0: float | None = None
+        # In-memory cache for /api/playback/current-frame: tuple of
+        # (png_bytes, captured_at_monotonic, captured_playlist_id).
+        # Cache hit when both (a) age < 5 minutes AND (b) playlist
+        # hasn't changed. None until first capture. Lock prevents two
+        # concurrent captures racing the readback path.
+        self._frame_cache: tuple[bytes, float, UUID | None] | None = None
+        self._frame_capture_lock: asyncio.Lock | None = None
 
     @property
     def is_running(self) -> bool:
@@ -396,6 +408,12 @@ class PlaybackLoop:
             self._current_auto_mode = None
             self._current_auto_format = None
             self._current_playlist_id = None
+            self._slot_t0 = None
+            # Drop the lock so the next start() rebinds against the
+            # fresh event loop. Without this, tests that run multiple
+            # asyncio.run() rounds against the same PlaybackLoop hit
+            # "RuntimeError: ... attached to a different loop".
+            self._frame_capture_lock = None
             # Cancel any in-flight prerender tasks (#216). Cancel is
             # best-effort: PIL rasterize is CPU-bound and cancel() can
             # only fire when the thread checks; in practice the task
@@ -566,6 +584,7 @@ class PlaybackLoop:
                 self._current_transition_ms = None
                 self._current_auto_mode = None
                 self._current_auto_format = None
+                self._slot_t0 = None
                 await self._wait(self._empty_poll)
                 continue
 
@@ -598,6 +617,13 @@ class PlaybackLoop:
                 self._current_type = item.type
                 self._current_transition = item.transition
                 self._current_transition_ms = item.transition_ms
+                # Stamp slot t0 here so EVERY slot (static image,
+                # static text, dynamic text, video) has a correct
+                # baseline for capture_current_frame's elapsed_s.
+                # The dynamic-text play methods overwrite this after
+                # their own freeze-aware t0 calc, which is fine -- by
+                # then their override IS the authoritative one.
+                self._slot_t0 = asyncio.get_event_loop().time()
                 # Schema v3 (qarl 2026-05-01): per-text fields live on
                 # text_layers[0]. Phase 1 reads layer[0]; phase 2 of the
                 # layered rollout will composite all layers and the
@@ -877,6 +903,9 @@ class PlaybackLoop:
         total = item.duration_ms / 1000
         loop = asyncio.get_event_loop()
         t0 = loop.time()
+        # Stamp for capture_current_frame() so its compose at "now"
+        # shares the same elapsed_s clock as the live tick.
+        self._slot_t0 = t0
         end_at = t0 + total
         # 30 Hz when motion is present, 1 Hz for auto-only — preserves
         # the prior _play_auto_slide cadence and avoids burning 29
@@ -1001,6 +1030,9 @@ class PlaybackLoop:
             # frozen position (NOT from real-time-since-transition).
             t0 = loop.time() - freeze_elapsed
             end_at = t0 + total
+        # Stamp for capture_current_frame() so its compose shares the
+        # same elapsed_s clock as the live tick (post-freeze adjusted).
+        self._slot_t0 = t0
         try:
             while True:
                 assert self._stop_event is not None
@@ -1163,6 +1195,139 @@ class PlaybackLoop:
         """Hook for the scheduled fetch fn to publish which playlist is
         currently active. Test-only setter is just self._current_playlist_id."""
         self._current_playlist_id = playlist_id
+
+    # --- /api/playback/current-frame capture (added 2026-05-06) ----------
+
+    # Cache TTL: bound the GPU-readback / compose-recompose cost. 5 min
+    # is the spec-set ceiling; the cache also invalidates immediately
+    # when current_playlist_id changes. See `cached_current_frame_png`
+    # docstring for the freshness contract.
+    _FRAME_CACHE_TTL_S: float = 300.0
+
+    async def cached_current_frame_png(self) -> bytes | None:
+        """PNG of what's currently rendering, with a 5-min TTL +
+        playlist-change invalidation.
+
+        Cache hit when BOTH:
+          - age < 5 minutes since last capture, AND
+          - current_playlist_id matches the captured slot
+
+        Otherwise: capture fresh (compose_motion_frame at the live
+        elapsed_s, or the asset PNG for image slides), store, return.
+        Concurrent callers serialize behind a lock so a burst of
+        requests issues exactly one capture; subsequent waiters get
+        the freshly cached frame.
+
+        Returns None when nothing is currently playing or capture
+        otherwise fails (the API layer maps None to 503). For image
+        slides the asset PNG IS the current frame -- no recompose
+        needed. For text slides we re-run compose_motion_frame at the
+        live elapsed_s so motion + auto-mode (clock, etc.) reflect
+        the actual on-screen state, not a stale rasterize. Video
+        slides return None today (writeback from the hardware decoder
+        path isn't wired up; not a regression because nothing was
+        capturing video frames before).
+        """
+        loop = asyncio.get_event_loop()
+        now_mono = loop.time()
+        cached = self._frame_cache
+        current_playlist = self._current_playlist_id
+        if (
+            cached is not None
+            and (now_mono - cached[1]) < self._FRAME_CACHE_TTL_S
+            and cached[2] == current_playlist
+        ):
+            return cached[0]
+        # Need fresh capture. Lock-bind on first use; the loop's start
+        # rebinds events anyway, but the lock survives across runs
+        # since it's only contended when capture is mid-flight.
+        if self._frame_capture_lock is None:
+            self._frame_capture_lock = asyncio.Lock()
+        async with self._frame_capture_lock:
+            # Re-check inside the lock -- another waiter may have
+            # refreshed the cache while we were queued.
+            cached = self._frame_cache
+            now_mono = loop.time()
+            if (
+                cached is not None
+                and (now_mono - cached[1]) < self._FRAME_CACHE_TTL_S
+                and cached[2] == current_playlist
+            ):
+                return cached[0]
+            slot_t0 = self._slot_t0
+            elapsed_s = (
+                0.0 if slot_t0 is None else max(0.0, loop.time() - slot_t0)
+            )
+            try:
+                png = await asyncio.to_thread(
+                    self._capture_current_frame_sync, elapsed_s
+                )
+            except Exception:
+                log.exception("playback: capture_current_frame failed")
+                # Fall back to whatever the previous cache had so a
+                # transient failure (e.g. mid-transition race, brief
+                # font-load stall) doesn't 503 the whole endpoint.
+                return cached[0] if cached else None
+            if png is None:
+                return cached[0] if cached else None
+            self._frame_cache = (png, loop.time(), current_playlist)
+            return png
+
+    def _capture_current_frame_sync(self, elapsed_s: float) -> bytes | None:
+        """Synchronous worker for cached_current_frame_png. Runs on a
+        thread -- compose_motion_frame is CPU-bound PIL work and
+        shouldn't block the event loop. Caller passes elapsed_s
+        because asyncio's loop.time() can't be read from a worker
+        thread."""
+        item_id = self._current_id
+        if item_id is None:
+            return None
+        try:
+            items = self._fetch_items()
+        except Exception:
+            log.exception("playback: capture fetch_items failed")
+            return None
+        item = next((it for it in items if it.id == item_id), None)
+        if item is None:
+            return None
+        if item.type == "text_slide":
+            tz = resolve_timezone(self._get_timezone())
+            try:
+                background_cache = load_motion_background(
+                    item, self._renderer.width, self._renderer.height,
+                    self._read_asset,
+                )
+            except Exception:
+                background_cache = None
+            try:
+                layer_bitmap_cache = prerender_layer_bitmaps(
+                    item, self._renderer.width, self._renderer.height,
+                )
+            except Exception:
+                layer_bitmap_cache = None
+            img = compose_motion_frame(
+                item,
+                self._renderer.width,
+                self._renderer.height,
+                read_asset=self._read_asset,
+                now=datetime.now(tz),
+                elapsed_s=elapsed_s,
+                background_cache=background_cache,
+                layer_bitmap_cache=layer_bitmap_cache,
+            )
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        if item.type == "image":
+            # The asset PNG already IS the rendered frame -- images
+            # don't have motion / auto-mode -- so just relay it.
+            try:
+                return self._read_asset(item.id)
+            except Exception:
+                log.exception("playback: capture image asset read failed")
+                return None
+        # Video and any future type: no readback path yet.
+        return None
 
     def _shader_transitions_enabled(self) -> bool:
         """Feature flag for the shader compositor transition path.

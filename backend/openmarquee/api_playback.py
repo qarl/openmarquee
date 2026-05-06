@@ -125,6 +125,49 @@ async def get_current_thumbnail(
     )
 
 
+@router.get(
+    "/current-frame",
+    responses={
+        200: {"content": {"image/png": {}}},
+        503: {"description": "Capture not available (nothing playing or non-text/non-image slide)."},
+    },
+)
+async def get_current_frame(loop: LoopDep) -> Response:
+    """PNG of what's actually rendering right now -- the slide's live
+    composite at current elapsed_s, NOT the playlist cover art that
+    /current-thumbnail returns. Distinct from /current-thumbnail in
+    that it reflects motion + auto-mode (clock ticks, ticker
+    position, etc.) at the captured moment.
+
+    Backed by an in-memory cache in the playback loop with a 5-minute
+    TTL plus immediate playlist-change invalidation. The cache caps
+    capture cost at ~one compose_motion_frame per 5 minutes per
+    distinct playlist; concurrent callers serialize behind a single
+    lock so a burst of requests issues at most one capture.
+
+    Returns 503 when nothing is playing OR the current slide type
+    has no readback path (video). On error we honestly fail rather
+    than fall back to the playlist cover -- the whole point of this
+    endpoint is "real frame, or nothing." (Use /current-thumbnail if
+    cover art is what the caller actually wants.)
+    """
+    png = await loop.cached_current_frame_png()
+    if png is None:
+        return Response(
+            status_code=503,
+            content="capture not available",
+            media_type="text/plain",
+        )
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
 @router.post("/start", status_code=204)
 async def start_playback(loop: LoopDep) -> None:
     await loop.start()
