@@ -24,3 +24,11 @@ os.environ.setdefault("OPENMARQUEE_DISABLE_AUTOSTART", "1")
 # stamped in the production flock.json. Tests that need it call
 # PullWorker.start() directly on an isolated FlockSync.
 os.environ.setdefault("OPENMARQUEE_DISABLE_PULL_WORKER", "1")
+
+# Pin the renderer to the in-process mock so tests don't hit DRM init.
+# Without this, every TestClient lifespan tries to open /dev/dri/card0
+# (FileNotFoundError on Mac/CI), logs an exception traceback, falls
+# back to mock -- functional but noisy. The production wiring's
+# fallback path is exercised by an explicit test, not every fixture
+# setup.
+os.environ.setdefault("OPENMARQUEE_RENDERER", "mock")

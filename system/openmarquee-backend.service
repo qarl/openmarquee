@@ -32,6 +32,20 @@ Environment="OPENMARQUEE_DEV_PREVIEW_PATH=/var/openmarquee/preview.png"
 # from the HTTP surface. The gate is read by app.py at startup.
 Environment="OPENMARQUEE_DISABLE_DEV=1"
 
+# Use the multi-plane DRM/KMS renderer when output_mode=hdmi (per
+# settings.json). Stress-tests the new rendering system end-to-end:
+# bg + statics on the primary plane, animated layers on overlays,
+# scanout via vc4 HVS instead of per-tick PIL composite. Falls back
+# to MockRenderer at startup if DRM init fails (see app.py lifespan).
+Environment="OPENMARQUEE_RENDERER=auto"
+
+# Route iris / dissolve / glitch / etc. transitions through the
+# vc4 GLES2 ShaderRenderer instead of the legacy fade-only fallback.
+# 14 transition kinds run at 22-30 fps at 1080p (per phase 7 glass
+# tests). Without this the GPU compositor's transition path silently
+# downgrades to fade.
+Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
+
 # Bind to all interfaces on port 80 — the device is its own captive-portal
 # WiFi so this is the primary UI.
 ExecStart=/opt/openmarquee/venv/bin/uvicorn openmarquee.app:app \

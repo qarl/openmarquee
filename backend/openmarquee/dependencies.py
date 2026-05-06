@@ -53,6 +53,71 @@ def _resolve_dev_preview_path() -> Path:
 
 
 @lru_cache
+def _real_renderer_singleton():
+    """Pick + construct (but don't open) the production renderer based
+    on settings.output_mode and OPENMARQUEE_RENDERER env override.
+
+    output_mode=hdmi -> DRMRenderer (multi-plane KMS, vc4 HVS scanout).
+    Anything else (or DRM init failure) -> MockRenderer.
+
+    Two opt-out levers:
+      OPENMARQUEE_RENDERER=mock  -> always mock
+      OPENMARQUEE_RENDERER=drm   -> always try DRM (override settings)
+
+    The renderer is constructed eagerly here but opened by app.py's
+    lifespan so a __enter__ failure surfaces at startup, not first
+    frame. lru_cache lifts construction out of the hot path; the
+    singleton holds for the process lifetime.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    override = os.environ.get("OPENMARQUEE_RENDERER", "auto").lower()
+    if override == "mock":
+        return _mock_renderer_singleton()
+
+    settings = _settings_storage_singleton().load()
+    output_mode = settings.output_mode
+
+    want_drm = override == "drm" or (override == "auto" and output_mode == "hdmi")
+    if not want_drm:
+        return _mock_renderer_singleton()
+
+    try:
+        from openmarquee.rendering.drm_kms import DRMRenderer
+    except Exception:
+        log.exception("DRM module import failed; falling back to mock")
+        return _mock_renderer_singleton()
+
+    width = int(settings.display_width)
+    height = int(settings.display_height)
+    # vc4 on Pi Zero 2 W has 3+ overlay planes; 4 covers typical
+    # slides (1 ticker + a few breathing accents) without exceeding
+    # plane budget. Slides above this fall back to compose_motion_frame
+    # software via the play loop's gating in _play_dynamic_slide.
+    max_animated_planes = int(
+        os.environ.get("OPENMARQUEE_MAX_ANIMATED_PLANES", "4")
+    )
+    try:
+        return DRMRenderer(
+            width=width,
+            height=height,
+            display_width=width,
+            display_height=height,
+            max_animated_planes=max_animated_planes,
+        )
+    except Exception:
+        log.exception("DRMRenderer construction failed; falling back to mock")
+        return _mock_renderer_singleton()
+
+
+def get_renderer():
+    """Production renderer dependency provider. The lifespan opens it
+    at startup and closes it at shutdown."""
+    return _real_renderer_singleton()
+
+
+@lru_cache
 def _mock_renderer_singleton() -> MockRenderer:
     """Build the dev MockRenderer with dims sourced from SystemSettings.
 
@@ -310,7 +375,10 @@ def _playback_loop_singleton() -> PlaybackLoop:
     from openmarquee.playback import scheduled_fetch_items
 
     storage = _content_storage_singleton()
-    renderer = _mock_renderer_singleton()
+    # Real renderer (DRM/HDMI on the device, mock in dev). Was hardwired
+    # to mock; now selects on settings.output_mode + env override and
+    # falls back to mock on init failure.
+    renderer = _real_renderer_singleton()
     playlist_storage = _playlist_storage_singleton()
     schedule_storage = _schedule_storage_singleton()
     settings_storage = _settings_storage_singleton()

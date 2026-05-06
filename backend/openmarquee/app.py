@@ -27,6 +27,7 @@ from openmarquee.dependencies import (
     get_playback_loop,
     get_playlist_storage,
     get_pull_worker,
+    get_renderer,
     get_schedule_storage,
     get_seed_marker_path,
     get_settings_storage,
@@ -81,6 +82,35 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         logging.getLogger(__name__).exception("startup playlist prune failed")
 
+    # Open the production renderer if it's a context manager (DRMRenderer
+    # acquires the DRM master fd, allocates the dumb buffer, and mode-sets
+    # the connector here -- failure should surface at startup, not on the
+    # first render_frame call). MockRenderer is a plain class with no
+    # __enter__; check before calling. On failure we fall back to mock so
+    # the service still serves the UI even with a misconfigured display.
+    renderer = get_renderer()
+    if hasattr(renderer, "__enter__"):
+        try:
+            renderer.__enter__()
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "startup: renderer __enter__ failed; degrading to mock"
+            )
+            # Force the singleton to swap to mock for the rest of the
+            # process lifetime so the playback loop has a working target.
+            # The next get_playback_loop() resolution will go through
+            # _real_renderer_singleton again, see env=mock, and bind
+            # the existing _mock_renderer_singleton.
+            from openmarquee.dependencies import (
+                _playback_loop_singleton,
+                _real_renderer_singleton,
+            )
+            _real_renderer_singleton.cache_clear()
+            _playback_loop_singleton.cache_clear()
+            os.environ["OPENMARQUEE_RENDERER"] = "mock"
+
     # "Hardware always running" — the device's real playback loop starts
     # at boot and runs until shutdown. The UI's inline preview is a
     # parallel client-side simulator, not a control surface for the loop.
@@ -116,6 +146,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await get_playback_loop().stop()
     with suppress(Exception):
         await get_pull_worker().stop()
+    # Close the renderer last -- after the playback loop has stopped
+    # writing frames -- so we don't free its buffers mid-render.
+    renderer = get_renderer()
+    if hasattr(renderer, "__exit__"):
+        with suppress(Exception):
+            renderer.__exit__(None, None, None)
 
 
 app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
