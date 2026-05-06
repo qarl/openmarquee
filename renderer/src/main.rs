@@ -13,32 +13,52 @@
 //! and exits 0 on success. The eventual command shape is the standalone
 //! mode from the plan: --playlist + --content-root + --settings + --output hdmi.
 
+// Hardware bring-up modules link against drm/gbm/EGL — Linux-only at
+// build + link time. Gating them keeps `cargo test` runnable on the
+// Mac dev box for the pure-logic surfaces.
+#[cfg(target_os = "linux")]
 mod hdmi;
+mod hdmi_logic;
 
-use std::fs::File;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
+
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+#[cfg(target_os = "linux")]
 use drm::control::Device as ControlDevice;
+#[cfg(target_os = "linux")]
 use drm::Device;
 
 /// Wrapper around a raw fd that satisfies `drm::Device` + `drm::control::Device`.
 ///
 /// drm-rs trait implementations key off `AsFd`, so this thin newtype owning
-/// a `File` is enough to talk to the kernel.
+/// a `File` is enough to talk to the kernel. Linux-only — the trait impls
+/// require drm-rs which doesn't link on macOS.
+#[cfg(target_os = "linux")]
 pub struct Card(pub File);
 
+#[cfg(target_os = "linux")]
 impl AsFd for Card {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Device for Card {}
+#[cfg(target_os = "linux")]
 impl ControlDevice for Card {}
 
+#[cfg(target_os = "linux")]
 impl Card {
     fn open(path: &Path) -> Result<Self> {
         let f = std::fs::OpenOptions::new()
@@ -100,6 +120,7 @@ struct Args {
     settings: Option<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
 fn open_drm(explicit: Option<&Path>) -> Result<(PathBuf, Card)> {
     if let Some(p) = explicit {
         return Ok((p.to_path_buf(), Card::open(p)?));
@@ -120,6 +141,7 @@ fn open_drm(explicit: Option<&Path>) -> Result<(PathBuf, Card)> {
     bail!("no usable DRM card found at /dev/dri/card{{0,1}}");
 }
 
+#[cfg(target_os = "linux")]
 fn probe(card: &Card) -> Result<()> {
     let resources = card
         .resource_handles()
@@ -222,20 +244,94 @@ fn parse_color(s: &str) -> Result<[f32; 4], String> {
     Ok(color)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_color;
+
+    #[test]
+    fn parse_color_three_components() {
+        assert_eq!(parse_color("0,0.5,1"), Ok([0.0, 0.5, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn parse_color_four_components_explicit_alpha() {
+        assert_eq!(parse_color("1,0,0,0.5"), Ok([1.0, 0.0, 0.0, 0.5]));
+    }
+
+    #[test]
+    fn parse_color_default_alpha_is_one() {
+        let c = parse_color("0.2,0.4,0.6").unwrap();
+        assert_eq!(c[3], 1.0);
+    }
+
+    #[test]
+    fn parse_color_trims_whitespace_per_component() {
+        assert_eq!(parse_color(" 0.5 , 0.5 , 0.5 "), Ok([0.5, 0.5, 0.5, 1.0]));
+    }
+
+    #[test]
+    fn parse_color_rejects_two_components() {
+        let err = parse_color("0.5,0.5").unwrap_err();
+        assert!(err.contains("got 2"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_color_rejects_five_components() {
+        let err = parse_color("0,0,0,0,0").unwrap_err();
+        assert!(err.contains("got 5"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_color_rejects_above_unit_range() {
+        let err = parse_color("0,0,1.5").unwrap_err();
+        assert!(err.contains("out of [0,1]"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_color_rejects_below_unit_range() {
+        let err = parse_color("0,-0.1,0").unwrap_err();
+        assert!(err.contains("out of [0,1]"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_color_rejects_non_numeric() {
+        let err = parse_color("0,red,0").unwrap_err();
+        assert!(err.contains("component 1"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_color_zero_zero_zero_is_valid_black() {
+        assert_eq!(parse_color("0,0,0"), Ok([0.0, 0.0, 0.0, 1.0]));
+    }
+
+    #[test]
+    fn parse_color_one_one_one_is_valid_white() {
+        assert_eq!(parse_color("1,1,1"), Ok([1.0, 1.0, 1.0, 1.0]));
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.output {
         OutputMode::Hdmi => {
-            let (path, card) = open_drm(args.drm_card.as_deref())?;
-            eprintln!("opened DRM device: {}", path.display());
-            if args.probe {
-                probe(&card)?;
-                return Ok(());
+            #[cfg(target_os = "linux")]
+            {
+                let (path, card) = open_drm(args.drm_card.as_deref())?;
+                eprintln!("opened DRM device: {}", path.display());
+                if args.probe {
+                    probe(&card)?;
+                    return Ok(());
+                }
+                if let Some(color) = args.solid_color {
+                    hdmi::render_solid_color(&card, color, args.hold_secs)?;
+                    return Ok(());
+                }
             }
-            if let Some(color) = args.solid_color {
-                hdmi::render_solid_color(&card, color, args.hold_secs)?;
-                return Ok(());
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = &args;
+                bail!("--output hdmi requires Linux (drm/gbm/EGL); not available on this host");
             }
             eprintln!("nothing to do — pass --probe or --solid-color R,G,B");
         }

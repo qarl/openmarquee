@@ -27,6 +27,7 @@ use drm::control::{
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 
+use crate::hdmi_logic::{fourcc_for_argb_family, pick_largest_mode_index, ModeSpec};
 use crate::Card;
 
 /// Render a single solid-color frame, push it to the HDMI display via
@@ -348,24 +349,26 @@ impl DrmBuffer for GbmBufferAdapter {
 }
 
 /// gbm 0.15's Format enum doesn't expose `.bits()` or `Into<u32>`;
-/// match on the variants we care about and emit the corresponding
-/// fourcc bytes (matching DRM_FORMAT_*).
+/// match on the variants we care about and delegate to `hdmi_logic`'s
+/// shared lookup table so the bytes are tested against the DRM spec
+/// in a host-runnable test.
 fn gbm_fourcc_bytes(fmt: GbmFormat) -> [u8; 4] {
-    match fmt {
-        GbmFormat::Argb8888 => *b"AR24",
-        GbmFormat::Xrgb8888 => *b"XR24",
-        GbmFormat::Abgr8888 => *b"AB24",
-        GbmFormat::Xbgr8888 => *b"XB24",
-        GbmFormat::Rgba8888 => *b"RA24",
-        GbmFormat::Rgbx8888 => *b"RX24",
-        // Any format we hit that isn't in this list will fail
-        // DrmFourcc::try_from below; that's an acceptable error for
-        // Phase 2's narrow ARGB scanout path.
-        _ => [0, 0, 0, 0],
-    }
+    let name = match fmt {
+        GbmFormat::Argb8888 => "Argb8888",
+        GbmFormat::Xrgb8888 => "Xrgb8888",
+        GbmFormat::Abgr8888 => "Abgr8888",
+        GbmFormat::Xbgr8888 => "Xbgr8888",
+        GbmFormat::Rgba8888 => "Rgba8888",
+        GbmFormat::Rgbx8888 => "Rgbx8888",
+        _ => return [0, 0, 0, 0],
+    };
+    fourcc_for_argb_family(name).unwrap_or([0, 0, 0, 0])
 }
 
-/// Find the first connected connector and its largest mode.
+/// Find the first connected connector and its largest mode. Mode
+/// selection delegates to `hdmi_logic::pick_largest_mode_index` so
+/// the tie-breaking + max-area logic is testable without a real DRM
+/// connector.
 fn pick_connector_and_mode(
     card: &Card,
     resources: &drm::control::ResourceHandles,
@@ -377,18 +380,22 @@ fn pick_connector_and_mode(
         if info.state() != ConnectorState::Connected {
             continue;
         }
-        // Pick the mode with the largest pixel area, breaking ties by
-        // refresh rate.
-        if let Some(mode) = info
+        let specs: Vec<ModeSpec> = info
             .modes()
             .iter()
-            .max_by_key(|m| {
+            .map(|m| {
                 let (w, h) = m.size();
-                (w as u32 * h as u32, m.vrefresh())
+                ModeSpec {
+                    width: w,
+                    height: h,
+                    vrefresh: m.vrefresh(),
+                }
             })
-            .copied()
-        {
-            return Ok((info, mode));
+            .collect();
+        if let Some(idx) = pick_largest_mode_index(&specs) {
+            // Copy the chosen Mode out of the borrow before moving info.
+            let chosen = info.modes()[idx];
+            return Ok((info, chosen));
         }
     }
     bail!("no connected connector with any modes")

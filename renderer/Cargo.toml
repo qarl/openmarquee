@@ -8,36 +8,21 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# Phase 1 keeps the dep set as small as possible — pulling in
-# tracing-subscriber/glow/khronos-egl/gbm before we need them caused
-# zigbuild dep-graph hangs. They come back as the relevant phases
-# land.
-
-# CLI parsing.
+# Cross-platform deps used by both the binary and host-side tests.
+# Pure Rust, link clean on macOS for `cargo test`.
 clap = { version = "4.5", features = ["derive"] }
-
-# Error handling.
 anyhow = "1.0"
 
-# Phase 1 hardware path: DRM/KMS only. GBM + EGL + GLES come once
-# probe -> render-frame milestone is reached.
+# Hardware-bring-up deps (drm/gbm/EGL/GLES2) are Linux-only — they
+# require libdrm, libgbm, libEGL at link time, none of which exist
+# on macOS. Gating them behind cfg(target_os="linux") keeps
+# `cargo test` runnable on the Mac dev box for the pure-logic
+# surfaces (parse_color, hdmi_logic, etc.) per the QA test gate.
+[target.'cfg(target_os = "linux")'.dependencies]
 drm = "0.12"
-
-# Phase 2 — pixels on screen via GBM scanout + EGL + GLES2 single
-# fullscreen quad. `gbm` default features pull in wayland-server
-# which we don't need for direct-DRM scanout; the `import-egl`
-# feature exposes gbm_bo_get_fd / EGLImage import for the
-# eventual H.264 dmabuf path.
 gbm = { version = "0.15", default-features = false, features = ["import-egl"] }
-
-# `dynamic` keeps libEGL.so loaded at runtime instead of linked at
-# build, so the binary works against whatever Mesa version the Pi
-# happens to have.
 khronos-egl = { version = "6.0", features = ["dynamic"] }
 libloading = "0.8"
-
-# GLES2 function bindings. glow handles the function-pointer dance;
-# we provide it the EGL loader.
 glow = "0.14"
 
 [[bin]]
