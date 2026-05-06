@@ -39,14 +39,16 @@ Environment="OPENMARQUEE_DISABLE_DEV=1"
 # to MockRenderer at startup if DRM init fails (see app.py lifespan).
 Environment="OPENMARQUEE_RENDERER=auto"
 
-# Route iris / dissolve / glitch / etc. transitions through the
-# vc4 GLES2 ShaderRenderer (Phase 7). 14 transition kinds run at
-# 22-30 fps at 1080p. Re-enabled 2026-05-06 after the cycle-aware
-# cache eviction landed -- SlideSnapshotCache + SlideAssetCache
-# now bound to {current, next} per play-loop iteration so the
-# 32-slide welcome reel fits alongside the EGL/GBM context on a
-# 416 MB Pi Zero 2 W.
-Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
+# Shader transitions still off on Pi Zero 2 W. The cycle-aware
+# cache eviction (2026-05-06) brought anon-RSS at OOM time down
+# from ~263 MB to ~155 MB but the device still OOM'd every ~2 min
+# under shader load -- the GBM/EGL buffers + 32 MB of GL textures
+# on top of the bounded caches still leaves the kernel killing
+# uvicorn on global memory pressure. The Pi Zero 2 W's 416 MB
+# can't host 1080p shader transitions + the full welcome reel
+# concurrently. Re-enable on bigger Pis (Pi 4, 4+ GB) by
+# uncommenting:
+# Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
 
 # Bind to all interfaces on port 80 — the device is its own captive-portal
 # WiFi so this is the primary UI.
