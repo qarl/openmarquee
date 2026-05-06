@@ -98,12 +98,12 @@ fn open_drm(explicit: Option<&Path>) -> Result<(PathBuf, Card)> {
             match Card::open(p) {
                 Ok(c) => return Ok((p.to_path_buf(), c)),
                 Err(e) => {
-                    tracing::warn!(card = cand, err = %e, "failed to open card; trying next");
+                    eprintln!("warn: failed to open card {cand}: {e}; trying next");
                 }
             }
         }
     }
-    bail!("no usable DRM card found at /dev/dri/card{0,1}");
+    bail!("no usable DRM card found at /dev/dri/card{{0,1}}");
 }
 
 fn probe(card: &Card) -> Result<()> {
@@ -144,7 +144,7 @@ fn probe(card: &Card) -> Result<()> {
     for &handle in resources.encoders() {
         match card.get_encoder(handle) {
             Ok(info) => println!(
-                "  {:?}: kind={:?} crtc={:?} possible_crtcs=0x{:x}",
+                "  {:?}: kind={:?} crtc={:?} possible_crtcs={:?}",
                 handle,
                 info.kind(),
                 info.crtc(),
@@ -174,7 +174,7 @@ fn probe(card: &Card) -> Result<()> {
     for &handle in plane_handles.iter() {
         match card.get_plane(handle) {
             Ok(info) => println!(
-                "  {:?}: crtc={:?} fb={:?} possible_crtcs=0x{:x}",
+                "  {:?}: crtc={:?} fb={:?} possible_crtcs={:?}",
                 handle,
                 info.crtc(),
                 info.framebuffer(),
@@ -188,29 +188,20 @@ fn probe(card: &Card) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
-
     let args = Args::parse();
 
     match args.output {
         OutputMode::Hdmi => {
             let (path, card) = open_drm(args.drm_card.as_deref())?;
-            tracing::info!(card = %path.display(), "opened DRM device");
+            eprintln!("opened DRM device: {}", path.display());
             if args.probe {
                 probe(&card)?;
                 return Ok(());
             }
-            // Pre-pixels Phase 1: probe + exit until GBM/EGL/GLES land.
-            tracing::info!("Phase 1 stub: --probe to enumerate; pixels-on-screen is the next slice.");
+            eprintln!("Phase 1 stub: --probe to enumerate; pixels-on-screen is the next slice.");
         }
         OutputMode::Mock => {
-            tracing::info!("mock output mode (placeholder); not yet implemented");
+            eprintln!("mock output mode (placeholder); not yet implemented");
         }
     }
 

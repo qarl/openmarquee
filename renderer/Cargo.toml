@@ -8,23 +8,20 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# Phase 1 keeps the dep set as small as possible — pulling in
+# tracing-subscriber/glow/khronos-egl/gbm before we need them caused
+# zigbuild dep-graph hangs. They come back as the relevant phases
+# land.
+
 # CLI parsing.
 clap = { version = "4.5", features = ["derive"] }
 
 # Error handling.
 anyhow = "1.0"
-thiserror = "1.0"
 
-# Structured logging — journald-friendly when systemd-managed.
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Phase 1 hardware path: DRM/KMS atomic + GBM scanout + EGL/GLES2.
+# Phase 1 hardware path: DRM/KMS only. GBM + EGL + GLES come once
+# probe -> render-frame milestone is reached.
 drm = "0.12"
-gbm = "0.15"
-khronos-egl = { version = "6.0", features = ["dynamic"] }
-libloading = "0.8"
-glow = "0.14"
 
 [[bin]]
 name = "openmarquee-render"
@@ -32,8 +29,6 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
 strip = "symbols"
 
 [profile.dev]
