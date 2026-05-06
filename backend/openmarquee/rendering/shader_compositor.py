@@ -712,6 +712,13 @@ class ShaderRenderer:
         # text overlays for each side go in the _anim slots below.
         self._tex_from: int = 0
         self._tex_to: int = 0
+        # Per-texture allocated (w, h). Lets _upload_texture pick
+        # glTexSubImage2D (writes into existing storage) when the
+        # incoming RGBA matches current dims, vs. glTexImage2D
+        # (reallocates GPU storage) when they differ. Without this
+        # tracking, every set_from/_to/_anim reallocated -- Mesa/vc4
+        # leaked GPU memory until OOM (caught 2026-05-06 leak hunt).
+        self._tex_dims: dict[int, tuple[int, int]] = {}
         # Per-side animated layer textures: unit 2 = from_anim,
         # unit 3 = to_anim. Each holds ONE layer's glyph-bbox RGBA
         # (typically the active ticker on each slide). The fragment
@@ -1167,11 +1174,28 @@ class ShaderRenderer:
             )
         _g.glActiveTexture(_g.GL_TEXTURE0 + unit)
         _g.glBindTexture(_g.GL_TEXTURE_2D, tex)
-        _g.glTexImage2D(
-            _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, w, h, 0,
-            _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, rgba,
-        )
-        _check_gl(f"set_{label} glTexImage2D")
+        # Use glTexSubImage2D when the texture is already allocated at
+        # the same dimensions -- writes into existing storage, no GPU
+        # realloc. Without this, Mesa/vc4 leaked ~16 MB of GPU memory
+        # per shader transition (4 textures * 8 MB at 1080p) until
+        # OOM-killed uvicorn after ~75 s on a 416 MB Pi Zero 2 W
+        # (caught 2026-05-06 leak hunt). Falls back to glTexImage2D
+        # when the texture's first upload OR when dims change (the
+        # anim layer textures size to glyph bbox, which varies).
+        cached_dims = self._tex_dims.get(tex)
+        if cached_dims == (w, h):
+            _g.glTexSubImage2D(
+                _g.GL_TEXTURE_2D, 0, 0, 0, w, h,
+                _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, rgba,
+            )
+            _check_gl(f"set_{label} glTexSubImage2D")
+        else:
+            _g.glTexImage2D(
+                _g.GL_TEXTURE_2D, 0, _g.GL_RGBA, w, h, 0,
+                _g.GL_RGBA, _g.GL_UNSIGNED_BYTE, rgba,
+            )
+            _check_gl(f"set_{label} glTexImage2D")
+            self._tex_dims[tex] = (w, h)
 
     def set_transition_t(self, t: float) -> None:
         """Set the transition progress, 0.0..1.0. At 0 the screen
