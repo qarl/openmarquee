@@ -1307,11 +1307,11 @@ class PlaybackLoop:
                 layer_bitmap_cache = None
             img = compose_motion_frame(
                 item,
+                elapsed_s,
                 self._renderer.width,
                 self._renderer.height,
                 read_asset=self._read_asset,
                 now=datetime.now(tz),
-                elapsed_s=elapsed_s,
                 background_cache=background_cache,
                 layer_bitmap_cache=layer_bitmap_cache,
             )
