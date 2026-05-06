@@ -823,15 +823,16 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 motion_intensity=70,
                 motion_phase=0.7,
             ),
-            # Bonus 5th layer — mono, white, dead center, blinking fast,
-            # half-opacity so it reads as a glitch overlay rather than
-            # competing with the four corners.
+            # Bonus 5th layer — mono, white, blinking fast, half-opacity
+            # so it reads as a glitch overlay rather than competing
+            # with the four corners. qarl 2026-05-06 round-2: enlarged
+            # + repositioned up-left so it dominates more of the frame.
             _DemoLayer(
                 text="FREE YOUR\nSIGN!!!",
                 font_family="JetBrains Mono",
                 text_color="#FFFFFF",
-                box=_b(0.22, 0.28, 0.56, 0.5),
-                font_size_pct=20.0,
+                box=_b(0.1599, 0.1667, 0.6711, 0.7013),
+                font_size_pct=24.5,
                 motion="blink",
                 motion_intensity=90,
                 motion_phase=0.4,
@@ -962,12 +963,13 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_align="left",
             ),
             _DemoLayer(
-                # qarl 2026-05-06: bumped 9 → 10.5 for more presence.
+                # qarl 2026-05-06 round-2: dialed back to 8% with a
+                # small box nudge for tighter terminal-line proportions.
                 text="FREE YOUR SIGN_",
                 font_family="JetBrains Mono",
                 text_color="#FFB43C",
-                box=_b(0.05, 0.32, 0.9, 0.32),
-                font_size_pct=10.5,
+                box=_b(0.0555, 0.3298, 0.9, 0.3418),
+                font_size_pct=8.0,
             ),
             _DemoLayer(
                 # qarl 2026-05-06: shortened to single instance — ticker
