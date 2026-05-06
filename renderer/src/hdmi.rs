@@ -32,7 +32,10 @@ use drm::control::{
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 
-use crate::hdmi_logic::{fourcc_for_argb_family, hsv_to_rgb, pick_largest_mode_index, ModeSpec};
+use crate::hdmi_logic::{
+    fourcc_for_argb_family, hsv_to_rgb, parse_crtc_list_filter_bits, pick_largest_mode_index,
+    ModeSpec,
+};
 use crate::Card;
 
 /// Render a single solid-color frame, push it to the HDMI display via
@@ -584,13 +587,17 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
     // and the eventual destroy_property_blob.
     let mode_blob_id = match mode_blob {
         PropValue::Blob(id) => id,
-        other => bail!("create_property_blob returned unexpected variant: {other:?}"),
+        other => {
+            // No resources held yet; safe to bail directly.
+            bail!("create_property_blob returned unexpected variant: {other:?}")
+        }
     };
 
     // -----------------------------------------------------------------
-    // Render the FIRST frame and do an ALLOW_MODESET atomic commit
-    // that sets up the connector → CRTC binding, activates the CRTC,
-    // and binds the primary plane's FB to our first frame.
+    // From here we have kernel-side resources (mode blob, EGL state,
+    // future BOs+FBs) that leak if we early-return on error. Wrap the
+    // animation work in an inner closure so cleanup runs unconditionally
+    // regardless of whether the work succeeded or `?`-bailed.
     // -----------------------------------------------------------------
     use glow::HasContext;
 
@@ -609,27 +616,33 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
         }
     };
 
-    render_frame(&gl, 0.0);
-    egl_lib
-        .swap_buffers(display, egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
-
-    let mut bos: VecDeque<(BufferObject<()>, framebuffer::Handle)> = VecDeque::with_capacity(3);
-
-    let first_bo = unsafe {
-        gbm_surface
-            .lock_front_buffer()
-            .context("gbm_surface_lock_front_buffer (frame 0) failed")?
-    };
-    let first_fb_buf = GbmBufferAdapter::new(&first_bo).context("first frame fb adapter")?;
-    let first_fb = card
-        .add_framebuffer(&first_fb_buf, 32, 32)
-        .context("drmModeAddFB (frame 0) failed")?;
-
     let src_w_fp16 = (mode_w as u32) << 16;
     let src_h_fp16 = (mode_h as u32) << 16;
 
-    {
+    let mut bos: VecDeque<(BufferObject<()>, framebuffer::Handle)> = VecDeque::with_capacity(3);
+    let mut frame_count: u64 = 1;
+
+    let work: Result<()> = (|| {
+        // Render frame 0 + ALLOW_MODESET commit that binds connector
+        // → CRTC and primary plane → FB.
+        render_frame(&gl, 0.0);
+        egl_lib
+            .swap_buffers(display, egl_surface)
+            .map_err(|e| anyhow!("eglSwapBuffers (frame 0) failed: {e:?}"))?;
+        let first_bo = unsafe {
+            gbm_surface
+                .lock_front_buffer()
+                .context("gbm_surface_lock_front_buffer (frame 0) failed")?
+        };
+        let first_fb_buf = GbmBufferAdapter::new(&first_bo).context("first frame fb adapter")?;
+        let first_fb = match card.add_framebuffer(&first_fb_buf, 32, 32) {
+            Ok(fb) => fb,
+            Err(e) => {
+                drop(first_bo);
+                return Err(anyhow!("drmModeAddFB (frame 0) failed: {e}"));
+            }
+        };
+
         let mut req = AtomicModeReq::new();
         req.add_property(crtc_handle, crtc_mode_id, PropValue::Blob(mode_blob_id));
         req.add_property(crtc_handle, crtc_active, PropValue::Boolean(true));
@@ -644,108 +657,144 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
         req.add_property(primary_plane, plane_crtc_y, PropValue::SignedRange(0));
         req.add_property(primary_plane, plane_crtc_w, PropValue::UnsignedRange(mode_w as u64));
         req.add_property(primary_plane, plane_crtc_h, PropValue::UnsignedRange(mode_h as u64));
-        card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-            .context("initial atomic_commit (mode-set) failed")?;
-    }
-    bos.push_back((first_bo, first_fb));
-    eprintln!(
-        "scanout active via atomic commit; animating for {}s at target {} fps",
-        duration_secs, fps
-    );
-
-    // -----------------------------------------------------------------
-    // Per-frame loop: render → swap → lock new BO → addFB → atomic
-    // page-flip → wait for event → release the prior BO+FB.
-    // -----------------------------------------------------------------
-    let mut frame_count: u64 = 1;
-    while Instant::now() < end {
-        let t = start.elapsed().as_secs_f32();
-        render_frame(&gl, t);
-        egl_lib
-            .swap_buffers(display, egl_surface)
-            .map_err(|e| anyhow!("eglSwapBuffers (frame {frame_count}) failed: {e:?}"))?;
-        let bo = unsafe {
-            gbm_surface
-                .lock_front_buffer()
-                .with_context(|| format!("lock_front_buffer (frame {frame_count})"))?
-        };
-        let fb_buf = GbmBufferAdapter::new(&bo)
-            .with_context(|| format!("fb adapter (frame {frame_count})"))?;
-        let fb = card
-            .add_framebuffer(&fb_buf, 32, 32)
-            .with_context(|| format!("add_framebuffer (frame {frame_count})"))?;
-
-        let mut req = AtomicModeReq::new();
-        req.add_property(primary_plane, plane_fb_id, PropValue::Framebuffer(Some(fb)));
-        // PAGE_FLIP_EVENT asks the kernel to deliver an event on the
-        // DRM fd when this commit reaches scanout. NONBLOCK lets the
-        // commit return immediately; we wait for the event below.
-        let flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
-        if let Err(e) = card.atomic_commit(flags, req) {
-            // A failed commit means the FB never makes it to scanout
-            // — release it now to avoid leaking.
-            let _ = card.destroy_framebuffer(fb);
-            drop(bo);
-            return Err(anyhow!("atomic_commit (page-flip frame {frame_count}) failed: {e}"));
+        if let Err(e) = card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req) {
+            // Initial commit failed; we own first_bo + first_fb but
+            // they're not on scanout. Release before bailing — the
+            // outer cleanup only handles bos[].
+            let _ = card.destroy_framebuffer(first_fb);
+            drop(first_bo);
+            return Err(anyhow!("initial atomic_commit (mode-set) failed: {e}"));
         }
+        bos.push_back((first_bo, first_fb));
+        eprintln!(
+            "scanout active via atomic commit; animating for {}s at target {} fps",
+            duration_secs, fps
+        );
 
-        // Block until the kernel delivers the page-flip event for the
-        // commit we just submitted. drm-rs's `receive_events` reads
-        // all currently-pending events from the fd.
-        //
-        // KNOWN RACE (Phase 4 will fix): we don't filter the event
-        // stream by sequence/CRTC, so if the kernel queues an event
-        // before we re-enter receive_events on the next frame, we'll
-        // consume it as if it were the *current* commit's. At
-        // sustained sub-vrefresh rates the kernel queue stays
-        // drained and the race doesn't fire (181 fps observed clean
-        // on vc4); at vsync-pinned rates we'd need to track the
-        // expected sequence and skip stale events. Atomic commit
-        // returns a "user data" cookie we can plumb through and
-        // match here when this matters.
-        let _events = card
-            .receive_events()
-            .context("receive_events after atomic commit")?;
+        // Per-frame loop: render → swap → lock new BO → addFB → atomic
+        // page-flip → wait for event → release the prior BO+FB.
+        while Instant::now() < end {
+            let t = start.elapsed().as_secs_f32();
+            render_frame(&gl, t);
+            egl_lib
+                .swap_buffers(display, egl_surface)
+                .map_err(|e| anyhow!("eglSwapBuffers (frame {frame_count}) failed: {e:?}"))?;
+            let bo = unsafe {
+                gbm_surface
+                    .lock_front_buffer()
+                    .with_context(|| format!("lock_front_buffer (frame {frame_count})"))?
+            };
+            let fb_buf = GbmBufferAdapter::new(&bo)
+                .with_context(|| format!("fb adapter (frame {frame_count})"))?;
+            let fb = match card.add_framebuffer(&fb_buf, 32, 32) {
+                Ok(fb) => fb,
+                Err(e) => {
+                    drop(bo);
+                    return Err(anyhow!("add_framebuffer (frame {frame_count}) failed: {e}"));
+                }
+            };
 
-        bos.push_back((bo, fb));
-        // Keep just the most recent two BOs/FBs alive: the one
-        // currently scanning out and the one we just queued. The
-        // older one is now safely off-screen.
-        while bos.len() > 2 {
-            let (old_bo, old_fb) = bos.pop_front().unwrap();
-            let _ = card.destroy_framebuffer(old_fb);
-            drop(old_bo);
+            let mut req = AtomicModeReq::new();
+            req.add_property(primary_plane, plane_fb_id, PropValue::Framebuffer(Some(fb)));
+            // PAGE_FLIP_EVENT asks the kernel to deliver an event on
+            // the DRM fd when this commit reaches scanout. NONBLOCK
+            // lets the commit return immediately; we drain the event
+            // below.
+            let flags = AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK;
+            if let Err(e) = card.atomic_commit(flags, req) {
+                let _ = card.destroy_framebuffer(fb);
+                drop(bo);
+                return Err(anyhow!("atomic_commit (page-flip frame {frame_count}) failed: {e}"));
+            }
+
+            // Drain the page-flip event the atomic commit just queued.
+            // drm-rs's `receive_events` is *non-blocking* — it returns
+            // whatever's currently pending in the fd's event queue.
+            //
+            // Probed 2026-05-06 (--animate 3s @ 30 fps target, vc4
+            // 1024×768@60): events=1 on 179/179 frames, 59.3 fps avg
+            // matching display vrefresh. Every event was already
+            // queued by the time we got here. The actual vsync gate
+            // is `eglSwapBuffers` — vc4's Mesa EGL is vsync-locked by
+            // default, so swap blocks ~16.7 ms. receive_events just
+            // drains the resulting page-flip event; it's not the
+            // gate.
+            //
+            // Implication for Phase 4: if we ever render off-screen
+            // (no EGL swap to gate us), we have to block on the DRM
+            // fd ourselves via poll(2) — receive_events alone won't
+            // wait. Until then, EGL-swap + drain is correct and
+            // tear-free.
+            let _events = card
+                .receive_events()
+                .context("receive_events after atomic commit")?;
+
+            bos.push_back((bo, fb));
+            // Keep last 2 BOs/FBs alive: the one currently scanning
+            // out and the one we just queued. The older one is now
+            // safely off-screen.
+            while bos.len() > 2 {
+                let (old_bo, old_fb) = bos.pop_front().unwrap();
+                if let Err(e) = card.destroy_framebuffer(old_fb) {
+                    eprintln!("warn: destroy_framebuffer(old_fb) on hot loop: {e}");
+                }
+                drop(old_bo);
+            }
+            frame_count += 1;
         }
-        frame_count += 1;
+        eprintln!(
+            "rendered {} frames in {:.2}s ({:.1} fps avg)",
+            frame_count,
+            start.elapsed().as_secs_f32(),
+            frame_count as f32 / start.elapsed().as_secs_f32(),
+        );
+        Ok(())
+    })();
+
+    // -----------------------------------------------------------------
+    // Cleanup runs unconditionally — both the success and error paths
+    // pass through here. We log but don't propagate cleanup errors,
+    // since they'd hide the original cause.
+    //
+    // Order matters:
+    //   1. Unbind the EGL context (so destroys are valid).
+    //   2. Destroy EGL context + surface, terminate display.
+    //   3. drmModeRmFB on every queued framebuffer.
+    //   4. Drop all GBM BOs.
+    //   5. drmModeDestroyPropertyBlob on the mode blob.
+    //
+    // gbm_surface and gbm_dev fall out via Drop on scope exit.
+    //
+    // drmDropMaster is NOT called explicitly here. We never call
+    // drmSetMaster — the kernel drops master on fd close (Card's
+    // File field) when the renderer exits. A long-running renderer
+    // process holding master across requests would need an explicit
+    // Drop on Card to cover crash-mid-run; deferring that to the
+    // sidecar IPC slice (plan §5) where Card outlives a single render.
+    // -----------------------------------------------------------------
+    if let Err(e) = egl_lib.make_current(display, None, None, None) {
+        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
     }
-    eprintln!(
-        "rendered {} frames in {:.2}s ({:.1} fps avg)",
-        frame_count,
-        start.elapsed().as_secs_f32(),
-        frame_count as f32 / start.elapsed().as_secs_f32(),
-    );
-
-    // -----------------------------------------------------------------
-    // Teardown.
-    // -----------------------------------------------------------------
-    egl_lib
-        .make_current(display, None, None, None)
-        .map_err(|e| anyhow!("eglMakeCurrent(unbind) failed: {e:?}"))?;
-    egl_lib
-        .destroy_context(display, context)
-        .map_err(|e| anyhow!("eglDestroyContext failed: {e:?}"))?;
-    egl_lib
-        .destroy_surface(display, egl_surface)
-        .map_err(|e| anyhow!("eglDestroySurface failed: {e:?}"))?;
-    egl_lib
-        .terminate(display)
-        .map_err(|e| anyhow!("eglTerminate failed: {e:?}"))?;
-
-    for (bo, fb) in bos {
-        let _ = card.destroy_framebuffer(fb);
+    if let Err(e) = egl_lib.destroy_context(display, context) {
+        eprintln!("warn: eglDestroyContext: {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
+        eprintln!("warn: eglDestroySurface: {e:?}");
+    }
+    if let Err(e) = egl_lib.terminate(display) {
+        eprintln!("warn: eglTerminate: {e:?}");
+    }
+    for (bo, fb) in bos.drain(..) {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+        }
         drop(bo);
     }
-    let _ = card.destroy_property_blob(mode_blob_id);
+    if let Err(e) = card.destroy_property_blob(mode_blob_id) {
+        eprintln!("warn: destroy_property_blob({mode_blob_id}): {e}");
+    }
+
+    work?;
 
     eprintln!("animated atomic render complete");
     Ok(())
@@ -771,14 +820,13 @@ fn find_primary_plane(card: &Card, crtc_handle: drm::control::crtc::Handle) -> R
             Err(_) => continue,
         };
         // possible_crtcs's bits map onto resources.crtcs(). We can't
-        // read the wrapper's bits directly — fall back to formatting
-        // the Debug repr (Rust's drm 0.12 doesn't expose .bits()).
+        // read the wrapper's bits directly — drm 0.12 keeps the u32
+        // pub(crate). Fall back to formatting the Debug repr and
+        // parsing it; lifted to hdmi_logic::parse_crtc_list_filter_bits
+        // so a drm-rs Debug-derive change is caught by the host
+        // test gate, not by a runtime regression.
         let possible_dbg = format!("{:?}", plane_info.possible_crtcs());
-        let possible_bits = possible_dbg
-            .strip_prefix("CrtcListFilter(")
-            .and_then(|s| s.strip_suffix(')'))
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
+        let possible_bits = parse_crtc_list_filter_bits(&possible_dbg).unwrap_or(0);
         if (possible_bits & crtc_mask) == 0 {
             continue;
         }

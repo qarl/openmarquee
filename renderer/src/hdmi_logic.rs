@@ -27,6 +27,21 @@ pub fn pick_largest_mode_index(modes: &[ModeSpec]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Parse the integer bits out of drm-rs 0.12's `CrtcListFilter`
+/// Debug repr — the wrapper holds a `pub(crate) u32` which isn't
+/// readable from outside the crate, so we fall back to formatting +
+/// parsing. Format is `CrtcListFilter(N)` for some unsigned integer N.
+///
+/// This is the single highest-fragility piece in `find_primary_plane`
+/// — it silently breaks the moment drm-rs changes its Debug derive.
+/// Lifted out of hdmi.rs and unit-tested so a Debug-format change is
+/// caught by the host test gate, not by a Phase-N runtime regression.
+pub fn parse_crtc_list_filter_bits(dbg: &str) -> Option<u32> {
+    dbg.strip_prefix("CrtcListFilter(")
+        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
 /// HSV → RGB conversion for animation color cycling. h ∈ [0, 360),
 /// s and v ∈ [0, 1]. Returns RGB in [0, 1].
 ///
@@ -195,5 +210,50 @@ mod tests {
     #[test]
     fn hsv_cyan_at_180() {
         assert!(approx_eq_rgb(hsv_to_rgb(180.0, 1.0, 1.0), (0.0, 1.0, 1.0)));
+    }
+
+    #[test]
+    fn crtc_filter_parses_well_formed() {
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter(8)"), Some(8));
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter(0)"), Some(0));
+        assert_eq!(
+            parse_crtc_list_filter_bits("CrtcListFilter(4294967295)"),
+            Some(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn crtc_filter_rejects_missing_prefix() {
+        assert_eq!(parse_crtc_list_filter_bits("(8)"), None);
+        assert_eq!(parse_crtc_list_filter_bits("Filter(8)"), None);
+    }
+
+    #[test]
+    fn crtc_filter_rejects_missing_suffix() {
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter(8"), None);
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter(8))"), None);
+    }
+
+    #[test]
+    fn crtc_filter_rejects_non_numeric() {
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter(abc)"), None);
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter(0x8)"), None);
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter(-1)"), None);
+    }
+
+    #[test]
+    fn crtc_filter_rejects_empty() {
+        assert_eq!(parse_crtc_list_filter_bits(""), None);
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter()"), None);
+    }
+
+    #[test]
+    fn crtc_filter_alternate_spacing_rejected() {
+        // We deliberately don't accept variations — if drm-rs's
+        // Debug derive starts emitting "CrtcListFilter ( 8 )" or
+        // similar, we want the parse to fail and the host test to
+        // catch it, rather than silently coerce.
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter ( 8 )"), None);
+        assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter( 8)"), None);
     }
 }
