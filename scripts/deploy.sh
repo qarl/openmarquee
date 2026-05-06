@@ -48,7 +48,7 @@ echo "==> rebuilding UI bundle in $OPENMARQUEE_BUILD_DIR/ui"
 (cd "$OPENMARQUEE_BUILD_DIR/ui" && npm run build --silent)
 
 echo "==> rsync backend to $TARGET:$REMOTE_ROOT/backend/"
-rsync -avz --delete \
+rsync -avz --delete --delete-excluded \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude '.ruff_cache' \
@@ -56,10 +56,11 @@ rsync -avz --delete \
     --exclude '.mypy_cache' \
     --exclude '*.egg-info' \
     --exclude 'tests/' \
+    --exclude '._*' \
     "$OPENMARQUEE_BUILD_DIR/backend/" "$TARGET:$REMOTE_ROOT/backend/"
 
 echo "==> rsync UI to $TARGET:$REMOTE_ROOT/ui/"
-rsync -avz --delete \
+rsync -avz --delete --delete-excluded \
     --exclude 'src/' \
     --exclude 'e2e/' \
     --exclude 'node_modules' \
@@ -69,6 +70,7 @@ rsync -avz --delete \
     --exclude 'playwright-report/' \
     --exclude 'test-results/' \
     --exclude 'package-lock.json' \
+    --exclude '._*' \
     "$OPENMARQUEE_BUILD_DIR/ui/" "$TARGET:$REMOTE_ROOT/ui/"
 
 echo "==> installing / updating backend deps in remote venv"
