@@ -22,13 +22,18 @@ dependencies = [
     # ModuleNotFoundError: numpy. Caught by Jimmy-openmarquee-qa
     # post-Phase-12.1 verification.
     "numpy>=2.0",
+    # flock_sync.py imports httpx at module level (the AsyncClient for
+    # peer-to-peer sync calls). Was previously only in `dev`, which
+    # broke fresh device deploys with ModuleNotFoundError on import of
+    # openmarquee.dependencies (which pulls in flock_sync) -- caught
+    # 2026-05-05 during the openmarquee-dev.local provisioning.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "httpx>=0.27",
     "ruff>=0.3",
 ]
 
