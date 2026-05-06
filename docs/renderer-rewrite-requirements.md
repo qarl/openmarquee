@@ -175,10 +175,10 @@ The renderer is responsible for, at any wall-clock time:
    strong preference is to do this **on the GPU side, inside the
    shader path**, so motion and transition share the same per-pixel
    pass. If that proves infeasible on the primary target's bandwidth /
-   ALU envelope, fall back to today's behavior (multi-plane DRM
-   compositor advances motion on overlays while the shader cross-
-   fades the primary plane). The rewrite must attempt the shader-side
-   approach first; document the result.
+   ALU envelope, a split fallback is acceptable: motion advances on
+   one path while the transition runs on another, recombined at
+   scanout. The rewrite must attempt the unified shader-side approach
+   first; document the result.
 3. **Producing a PNG snapshot** of the current composite on demand
    (backs the `/api/playback/current-frame` endpoint). Snapshot must
    reflect motion + auto-mode at the captured instant. Snapshot
@@ -210,21 +210,27 @@ The renderer is **not** responsible for:
    decoder ring buffers / etc.) before writing the first line of
    compositor code, and must verify on the dev Pi that the budget
    holds under the canonical welcome reel.
-2. **No leaks.** Run a 24-hour soak on the canonical playlist and
-   confirm zero monotonic growth in `VmData`, `VmRSS`, `Swap`, or
-   `CmaUsed`.
-3. **Frame rate.** ≥30 fps sustained at 1080p on the primary target
-   during the steady state of the welcome reel (see
-   `backend/openmarquee/seed.py` for the canonical playlist). During
-   transitions the floor is 24 fps. Frame drops on motion ticks are
-   not acceptable.
+2. **No leaks.** Across an extended soak on the canonical playlist
+   (duration to be set by the implementing agent at a length that
+   would surface a real leak — start point: ≥6 hours, ideally
+   overnight), `VmData`, `VmRSS`, `Swap`, and `CmaUsed` must show no
+   monotonic growth.
+3. **Frame rate.** Smooth, judder-free playback at 1080p on the
+   primary target. Concretely: motion ticks must not drop frames at
+   steady state, and transitions must not show visible stutter on a
+   60 Hz HDMI display. Specific fps targets (e.g. 30 fps steady, some
+   floor through transitions) are for the implementing agent to set
+   based on what's achievable on the canonical hardware; surface the
+   chosen targets to qarl in the design doc.
 4. **Cold start.** First frame on screen ≤ 4 seconds from process
-   start. (Today's lifespan opens DRM at startup and that's fine.)
+   start. (Spec-author starting point; tighten or loosen if the chosen
+   architecture demands.)
 5. **Reconfig.** A settings change (rotation, brightness, dims) takes
    effect within one playback iteration, ≤ 2 seconds.
-6. **Lifecycle.** Clean `close()` releases all GPU/kernel resources
-   so a subsequent `__enter__` succeeds. systemd `restart` should not
-   leak buffers across the gap.
+6. **Lifecycle.** Closing the renderer releases all GPU/kernel
+   resources so a subsequent open succeeds. A systemd `restart` (or
+   any other re-instantiation in the same process) must not leak
+   buffers, fds, or kernel objects across the gap.
 7. **Testable on a Mac.** All non-hardware logic (compositing math,
    motion math, auto-mode formatting, blend modes, transition
    parameter math) must be unit-testable without DRM/EGL.
@@ -253,13 +259,17 @@ in-tree caller of the renderer. The implementing agent owns the actual
 method signatures, but the *operations* the playback loop needs are:
 
 1. **Construct + open** a renderer for the configured output mode and
-   dimensions. (Context manager today; keep that contract.)
+   dimensions, with a clean lifecycle (open → use → close, with
+   guaranteed resource release on close — see §8.6).
 2. **Begin a slide presentation** at wall-clock time T0 — give the
    renderer the slide's content model and any pre-loaded asset bytes,
    tell it the duration.
-3. **Advance** — tell the renderer the current elapsed wall-clock
-   time. The renderer figures out motion, auto-mode, and what to put
-   on screen this tick. The playback loop does not push pixel buffers.
+3. **Advance** — drive the renderer forward to a given wall-clock
+   instant. The renderer is responsible for resolving motion,
+   auto-mode, and what to put on screen at that instant. The
+   playback loop does not implement compositing math or push raw
+   pixel buffers; whether the renderer pulls timing or accepts
+   pushed events is for the implementing agent to choose.
 4. **Begin a transition** from the current slide to the next, with the
    transition kind and duration. Continue calling Advance during the
    transition; both slides remain logically active until it completes.
@@ -289,9 +299,10 @@ These were open questions in the first draft of this doc. Answered:
 - **Motion through transitions:** mandatory. Strong preference is to
   do motion *inside the shader transition pass* so it's all one
   per-pixel program. If the bandwidth / ALU envelope on the Pi Zero 2
-  W can't carry it, fall back to today's split (multi-plane DRM
-  advances motion overlays while shader cross-fades the primary
-  plane). The rewrite must attempt shader-side first.
+  W can't carry it, a split fallback is acceptable: motion advances
+  on one path while the transition runs on another, recombined at
+  scanout. The rewrite must attempt the unified shader-side approach
+  first; document the result.
 - **Memory budget:** must fit Pi Zero 2 W. Implementing agent
   produces a defensible breakdown before writing compositor code.
 
