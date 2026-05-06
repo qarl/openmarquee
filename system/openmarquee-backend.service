@@ -39,12 +39,13 @@ Environment="OPENMARQUEE_DISABLE_DEV=1"
 # to MockRenderer at startup if DRM init fails (see app.py lifespan).
 Environment="OPENMARQUEE_RENDERER=auto"
 
-# Route iris / dissolve / glitch / etc. transitions through the
-# vc4 GLES2 ShaderRenderer instead of the legacy fade-only fallback.
-# 14 transition kinds run at 22-30 fps at 1080p (per phase 7 glass
-# tests). Without this the GPU compositor's transition path silently
-# downgrades to fade.
-Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
+# Shader transitions disabled by default after the 2026-05-06 stress
+# test: the EGL/GBM context + per-transition GL buffers pushed
+# uvicorn over the 416 MB Pi Zero 2 W budget under the 32-slide
+# welcome reel, OOM'ing every ~2 min. Iris / dissolve / etc. degrade
+# to fade silently. Re-enable on Pis with more RAM (Pi 4, etc.) by
+# uncommenting:
+# Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
 
 # Bind to all interfaces on port 80 — the device is its own captive-portal
 # WiFi so this is the primary UI.
