@@ -228,8 +228,8 @@ def seed_if_needed(
             )
 
         # save() coerces the playlist's id + name to DEFAULT_PLAYLIST_ID +
-        # "Welcome" — preserves the default-playlist identity while
-        # giving the operator a friendlier display name than "default".
+        # "Demo" — preserves the default-playlist identity while giving
+        # the operator a friendlier display name than "default".
         playlist_storage.save(playlist)
 
         # The previous Welcome + Freedom 2-playlist split (and its
@@ -464,7 +464,10 @@ class _DemoLayer:
     motion: str = "static"
     motion_intensity: int = 50
     motion_phase: float = 0.0
+    motion_speed: float = 1.0
     blend: str = "normal"
+    opacity: float = 1.0
+    text_align: str = "center"
 
 
 @dataclass(frozen=True)
@@ -501,37 +504,32 @@ _SCREAM_TEXT = "FREE YOUR SIGN!!!!!  " * 4
 _CHANT_TEXT = "FREE  YOUR  SIGN  •  " * 6
 
 
-_DEMO_REEL: tuple[_DemoFrame, ...] = (
-    # 1 · BOOT — VT323 boot log + breathing status badge.
-    _DemoFrame(
-        name="01 · Boot",
-        duration_ms=1200,
-        background_color="#050608",
-        layers=(
-            _DemoLayer(
-                text=_BOOT_LOG_TEXT,
-                font_family="VT323",
-                text_color="#FFB43C",
-                box=_b(0.05, 0.18, 0.9, 0.64),
-                font_size_pct=10.0,
-            ),
-            _DemoLayer(
-                text="● PANEL-0 OK",
-                font_family="VT323",
-                text_color="#FFB43C",
-                box=_b(0.55, 0.05, 0.4, 0.1),
-                font_size_pct=12.0,
-                motion="breathe",
-                motion_intensity=45,
-            ),
-        ),
-        transition_out="iris",
-    ),
+# Reel v2 (2026-05-06):
+#   * Boot moved from slot 01 → slot 15 (last); the loop wraps Boot→FREE.
+#   * Durations re-budgeted with cut=0ms / non-cut=600ms transitions so
+#     every readable frame has ≥800ms effective hold (qarl 2026-05-04:
+#     "slide time gets eaten by transitions, so a 1 second slide is all
+#     transition, you can't read it"). The math:
+#       effective_hold = duration_ms − (in_trans_ms / 2) − (out_trans_ms / 2)
+#   * Tile Chaos: 4-quadrant grid → 5 overlapping center-crossing layers
+#     so the chaos actually reads as chaos, not as a clean grid (qarl).
+#   * Uses post-bug-list slide behaviors:
+#       - text_align (B4) — left-aligned terminal/code captions and the
+#         long Sentence prose; center elsewhere.
+#       - opacity (B10) — Stadium ticker echo at 0.4 for ghost feel,
+#         Cooldown loop counter at 0.7 for a fading credits beat.
+#       - motion_speed (B2) — Silence pulse slowed to 0.5x for ominous
+#         dying carrier; Stadium ticker 1.4x for urgency; Cooldown
+#         blink 0.5x; Boot breathing badge 0.7x for slow heartbeat.
+#       - font_size_pct now correctly = % of box width (B3 spec fix).
+#       - word-wrap (B4) — Sentence's longer subtitle prose flows
+#         multi-line within its narrower box.
 
-    # 2 · FREE — narrow Anton, amber, definitive.
+_DEMO_REEL: tuple[_DemoFrame, ...] = (
+    # 1 · FREE — narrow Anton, amber, definitive.
     _DemoFrame(
-        name="02 · FREE",
-        duration_ms=800,
+        name="01 · FREE",
+        duration_ms=1500,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -543,12 +541,13 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="wipe",
+        transition_ms=600,
     ),
 
-    # 3 · YOUR — Alfa Slab, mint green.
+    # 2 · YOUR — Alfa Slab, mint green.
     _DemoFrame(
-        name="03 · YOUR",
-        duration_ms=800,
+        name="02 · YOUR",
+        duration_ms=1500,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -560,12 +559,13 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="slide",
+        transition_ms=600,
     ),
 
-    # 4 · SIGN — Bowlby, hot pink, breathing.
+    # 3 · SIGN — Bowlby, hot pink, breathing.
     _DemoFrame(
-        name="04 · SIGN",
-        duration_ms=1000,
+        name="03 · SIGN",
+        duration_ms=1600,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -579,11 +579,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="fade",
+        transition_ms=600,
     ),
 
-    # 5 · THE SENTENCE — Playfair italic on cream. Mic-drop.
+    # 4 · THE SENTENCE — Playfair italic on cream. Mic-drop + a
+    # left-aligned subtitle that uses word-wrap (B4) to flow across
+    # multiple lines within its narrower box.
     _DemoFrame(
-        name="05 · The Sentence",
+        name="04 · The Sentence",
         duration_ms=1800,
         background_color="#FBF3DC",
         layers=(
@@ -591,19 +594,29 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text="Free your sign.",
                 font_family="Playfair Display",
                 text_color="#1A1610",
-                box=_b(0.05, 0.25, 0.9, 0.5),
+                box=_b(0.05, 0.22, 0.9, 0.36),
                 font_size_pct=30.0,
                 motion="breathe",
                 motion_intensity=20,
             ),
+            _DemoLayer(
+                text="say what you mean. mean what you say.",
+                font_family="Playfair Display",
+                text_color="#5A4A2E",
+                box=_b(0.18, 0.62, 0.64, 0.22),
+                font_size_pct=14.0,
+                text_align="left",
+            ),
         ),
         transition_out="cut",
+        transition_ms=0,
     ),
 
-    # 6 · LIBERATE — first synonym, dignified Playfair on cream.
+    # 5 · LIBERATE — first synonym, dignified Playfair on cream.
+    # Caption text_align=left so the // comment reads as code.
     _DemoFrame(
-        name="06 · Liberate",
-        duration_ms=1000,
+        name="05 · Liberate",
+        duration_ms=1400,
         background_color="#FBF3DC",
         layers=(
             _DemoLayer(
@@ -612,6 +625,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#7A6A4E",
                 box=_b(0.1, 0.15, 0.8, 0.1),
                 font_size_pct=4.0,
+                text_align="left",
             ),
             _DemoLayer(
                 text="Liberate\nyour sign.",
@@ -622,12 +636,13 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="push",
+        transition_ms=600,
     ),
 
-    # 7 · UNCAGE — Alfa Slab on amber→scarlet gradient, shaking.
+    # 6 · UNCAGE — Alfa Slab on amber→scarlet gradient, shaking.
     _DemoFrame(
-        name="07 · Uncage!!",
-        duration_ms=900,
+        name="06 · Uncage!!",
+        duration_ms=1700,
         background_pattern=BackgroundPattern(
             pattern="gradient",
             color_a="#FFB43C",
@@ -655,15 +670,17 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#FFD580",
                 box=_b(0.1, 0.85, 0.8, 0.1),
                 font_size_pct=4.0,
+                text_align="left",
             ),
         ),
         transition_out="flip",
+        transition_ms=600,
     ),
 
-    # 8a · TYPO (broken) — confidently displayed mistake.
+    # 7a · TYPO (broken) — confidently displayed mistake.
     _DemoFrame(
-        name="08a · Typo (oops)",
-        duration_ms=900,
+        name="07a · Typo (oops)",
+        duration_ms=800,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -679,15 +696,16 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#FF5A6B",
                 box=_b(0.1, 0.78, 0.8, 0.1),
                 font_size_pct=5.0,
+                text_align="left",
             ),
         ),
         transition_out="cut",  # internal cut to mid-fix
-        transition_ms=200,
+        transition_ms=0,
     ),
 
-    # 8b · TYPO (mid-fix) — striking through SG, glow on insertion.
+    # 7b · TYPO (mid-fix) — striking through SG, glow on insertion.
     _DemoFrame(
-        name="08b · Typo (mid-fix)",
+        name="07b · Typo (mid-fix)",
         duration_ms=350,
         background_color="#050608",
         layers=(
@@ -699,6 +717,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_size_pct=14.0,
                 motion="pulse",
                 motion_intensity=80,
+                motion_speed=1.4,
             ),
             _DemoLayer(
                 text="// fixing...",
@@ -706,16 +725,17 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#5AF095",
                 box=_b(0.1, 0.78, 0.8, 0.1),
                 font_size_pct=5.0,
+                text_align="left",
             ),
         ),
         transition_out="cut",  # internal cut to fixed
-        transition_ms=200,
+        transition_ms=0,
     ),
 
-    # 8c · TYPO (fixed) — clean, with green confirmation caption.
+    # 7c · TYPO (fixed) — clean, with green confirmation caption.
     _DemoFrame(
-        name="08c · Typo (fixed)",
-        duration_ms=900,
+        name="07c · Typo (fixed)",
+        duration_ms=1200,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -731,69 +751,90 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#5AF095",
                 box=_b(0.1, 0.78, 0.8, 0.1),
                 font_size_pct=5.0,
+                text_align="left",
             ),
         ),
         transition_out="shutter",
+        transition_ms=600,
     ),
 
-    # 9 · TILE CHAOS — 4 quadrants, each different font + motion.
+    # 8 · TILE CHAOS — 5 overlapping center-crossing layers, each with a
+    # different font/color/motion/phase. Boxes are ~0.5×0.5 with off-grid
+    # positions so they cross the center and read as chaos, not as a
+    # clean 2×2 grid (qarl 2026-05-04 rebuild ask).
     _DemoFrame(
-        name="09 · Tile Chaos",
-        duration_ms=800,
+        name="08 · Tile Chaos",
+        duration_ms=1500,
         background_color="#050608",
         layers=(
-            # Top-left: Bowlby amber, shake high
+            # Top-left, slightly offset down-right
             _DemoLayer(
                 text="FREE YOUR\nSIGN!!!",
                 font_family="Bowlby One SC",
                 text_color="#FFB43C",
-                box=_b(0.05, 0.05, 0.4, 0.4),
+                box=_b(0.02, 0.04, 0.5, 0.5),
                 font_size_pct=22.0,
                 motion="shake",
                 motion_intensity=80,
                 motion_phase=0.0,
             ),
-            # Top-right: Anton mint, bounce
+            # Top-right, offset slightly down
             _DemoLayer(
                 text="FREE YOUR\nSIGN!!!",
                 font_family="Anton",
                 text_color="#5AF095",
-                box=_b(0.55, 0.05, 0.4, 0.4),
+                box=_b(0.48, 0.10, 0.5, 0.5),
                 font_size_pct=24.0,
                 motion="bounce",
                 motion_intensity=70,
                 motion_phase=0.25,
             ),
-            # Bottom-left: Marker cyan, pulse
+            # Bottom-left, slightly offset right
             _DemoLayer(
                 text="FREE YOUR\nSIGN!!!",
                 font_family="Permanent Marker",
                 text_color="#5FD5FF",
-                box=_b(0.05, 0.55, 0.4, 0.4),
+                box=_b(0.08, 0.48, 0.5, 0.5),
                 font_size_pct=22.0,
                 motion="pulse",
                 motion_intensity=80,
                 motion_phase=0.5,
             ),
-            # Bottom-right: Caveat amber, blink
+            # Bottom-right, slight offset down
             _DemoLayer(
                 text="FREE YOUR\nSIGN!!!",
                 font_family="Caveat Brush",
                 text_color="#FFB43C",
-                box=_b(0.55, 0.55, 0.4, 0.4),
+                box=_b(0.46, 0.52, 0.5, 0.48),
                 font_size_pct=24.0,
                 motion="blink",
                 motion_intensity=70,
                 motion_phase=0.7,
             ),
+            # Bonus 5th layer — mono, white, dead center, blinking fast,
+            # half-opacity so it reads as a glitch overlay rather than
+            # competing with the four corners.
+            _DemoLayer(
+                text="FREE YOUR\nSIGN!!!",
+                font_family="JetBrains Mono",
+                text_color="#FFFFFF",
+                box=_b(0.22, 0.28, 0.56, 0.5),
+                font_size_pct=20.0,
+                motion="blink",
+                motion_intensity=90,
+                motion_phase=0.4,
+                motion_speed=1.6,
+                opacity=0.55,
+            ),
         ),
         transition_out="pixelate",
+        transition_ms=600,
     ),
 
-    # 10 · CHANT WALL — 5 horizontal stripes, ticker per row, varied fonts.
+    # 9 · CHANT WALL — 5 horizontal stripes, ticker per row, varied fonts.
     _DemoFrame(
-        name="10 · Chant Wall",
-        duration_ms=1000,
+        name="09 · Chant Wall",
+        duration_ms=1700,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -833,12 +874,13 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="marquee",
+        transition_ms=600,
     ),
 
-    # 11 · SCREAM — Anton ticker on rainbow gradient.
+    # 10 · SCREAM — Anton ticker on rainbow gradient. Quick beat.
     _DemoFrame(
-        name="11 · Scream",
-        duration_ms=500,
+        name="10 · Scream",
+        duration_ms=600,
         background_pattern=BackgroundPattern(
             pattern="gradient",
             color_a="#FF5FA7",
@@ -857,12 +899,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="cut",
+        transition_ms=0,
     ),
 
-    # 12 · SILENCE — // signal lost, dying carrier on slow pulse.
+    # 11 · SILENCE — // signal lost, dying carrier on slow pulse.
+    # motion_speed=0.5 for an ominous half-tempo heartbeat (B2).
     _DemoFrame(
-        name="12 · Silence",
-        duration_ms=400,
+        name="11 · Silence",
+        duration_ms=1100,
         background_color="#000000",
         layers=(
             _DemoLayer(
@@ -873,15 +917,19 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_size_pct=10.0,
                 motion="pulse",
                 motion_intensity=80,
+                motion_speed=0.5,
+                text_align="left",
             ),
         ),
         transition_out="scanline",
+        transition_ms=600,
     ),
 
-    # 13 · STADIUM — typed line + ticker echo.
+    # 12 · STADIUM — typed line + ticker echo. Echo at 0.4 opacity for
+    # ghost-trail feel; ticker at 1.4x speed for urgency.
     _DemoFrame(
-        name="13 · Stadium",
-        duration_ms=1400,
+        name="12 · Stadium",
+        duration_ms=2100,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -890,6 +938,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#7A5418",
                 box=_b(0.1, 0.18, 0.8, 0.1),
                 font_size_pct=5.0,
+                text_align="left",
             ),
             _DemoLayer(
                 text="FREE YOUR SIGN_",
@@ -906,14 +955,17 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_size_pct=8.0,
                 motion="ticker",
                 motion_intensity=60,
+                motion_speed=1.4,
+                opacity=0.4,
             ),
         ),
         transition_out="glitch",
+        transition_ms=600,
     ),
 
-    # 14a · PANIC FLASH (1/3) — Bowlby amber, shake max.
+    # 13a · PANIC FLASH (1/3) — Bowlby amber, shake max.
     _DemoFrame(
-        name="14a · Panic 1",
+        name="13a · Panic 1",
         duration_ms=130,
         background_color="#050608",
         layers=(
@@ -928,12 +980,12 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="cut",
-        transition_ms=80,
+        transition_ms=0,
     ),
 
-    # 14b · PANIC FLASH (2/3) — Alfa Slab pink, shake max.
+    # 13b · PANIC FLASH (2/3) — Alfa Slab pink, shake max.
     _DemoFrame(
-        name="14b · Panic 2",
+        name="13b · Panic 2",
         duration_ms=130,
         background_color="#050608",
         layers=(
@@ -948,13 +1000,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
             ),
         ),
         transition_out="cut",
-        transition_ms=80,
+        transition_ms=0,
     ),
 
-    # 14c · PANIC FLASH (3/3) — Permanent Marker cyan, shake max.
+    # 13c · PANIC FLASH (3/3) — Permanent Marker cyan, shake max.
+    # Slightly longer hold so the iris-out has air to breathe.
     _DemoFrame(
-        name="14c · Panic 3",
-        duration_ms=130,
+        name="13c · Panic 3",
+        duration_ms=500,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -965,15 +1018,18 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_size_pct=13.0,
                 motion="shake",
                 motion_intensity=100,
+                motion_speed=1.2,
             ),
         ),
         transition_out="iris",
+        transition_ms=600,
     ),
 
-    # 15 · COOLDOWN — credits, slow blink "// loop · 1/∞".
+    # 14 · COOLDOWN — credits, slow blink "// loop · 1/∞" at 0.7
+    # opacity for a fading-out vibe.
     _DemoFrame(
-        name="15 · Cooldown",
-        duration_ms=2000,
+        name="14 · Cooldown",
+        duration_ms=2400,
         background_color="#050608",
         layers=(
             _DemoLayer(
@@ -982,6 +1038,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#7A5418",
                 box=_b(0.1, 0.18, 0.8, 0.1),
                 font_size_pct=7.0,
+                text_align="left",
             ),
             _DemoLayer(
                 text="FREE YOUR\nSIGN.",
@@ -998,9 +1055,44 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_size_pct=6.0,
                 motion="blink",
                 motion_intensity=20,
+                motion_speed=0.5,
+                opacity=0.7,
+                text_align="left",
             ),
         ),
-        transition_out="scroll",  # back to BOOT
+        transition_out="scroll",  # to BOOT
+        transition_ms=600,
+    ),
+
+    # 15 · BOOT — VT323 boot log + breathing status badge. Loop
+    # transition Boot→FREE uses iris (qarl 2026-05-04: "iris was
+    # the original Boot→FREE choice and still works").
+    _DemoFrame(
+        name="15 · Boot",
+        duration_ms=2000,
+        background_color="#050608",
+        layers=(
+            _DemoLayer(
+                text=_BOOT_LOG_TEXT,
+                font_family="VT323",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.18, 0.9, 0.64),
+                font_size_pct=10.0,
+                text_align="left",
+            ),
+            _DemoLayer(
+                text="● PANEL-0 OK",
+                font_family="VT323",
+                text_color="#FFB43C",
+                box=_b(0.55, 0.05, 0.4, 0.1),
+                font_size_pct=12.0,
+                motion="breathe",
+                motion_intensity=45,
+                motion_speed=0.7,  # slow heartbeat (B2)
+            ),
+        ),
+        transition_out="iris",
+        transition_ms=600,
     ),
 )
 
@@ -1044,6 +1136,7 @@ def _seed_demo_reel_slides(
                 slide_height=height,
                 font_size_pct=layer.font_size_pct,
                 font_size_px=layer.font_size_px,
+                text_align=layer.text_align,
             )
         buf = BytesIO()
         bg_img.save(buf, format="PNG")
@@ -1066,7 +1159,10 @@ def _seed_demo_reel_slides(
                 motion=layer.motion,
                 motion_intensity=layer.motion_intensity,
                 motion_phase=layer.motion_phase,
+                motion_speed=layer.motion_speed,
                 blend=layer.blend,
+                opacity=layer.opacity,
+                text_align=layer.text_align,
             )
             for layer in spec.layers
         ]

@@ -73,10 +73,12 @@ PLAYLIST_SCHEMA_VERSION = 4
 DEFAULT_PLAYLIST_ID = UUID("00000000-0000-4000-8000-000000000001")
 # Display name applied to the default playlist on fresh-install bootstrap
 # and on legacy-save-path coercion. Was "default" through Phase 5; renamed
-# to "Welcome" 2026-04-28 to match the seeded slide content. The change
-# is name-only — the playlist's identity is its UUID, so schedule rules
-# / API references keep working across the rename.
-DEFAULT_PLAYLIST_NAME = "Welcome"
+# to "Welcome" 2026-04-28 to match the seeded slide content; renamed again
+# to "Demo" 2026-05-06 when the FREE YOUR SIGN reel landed as the
+# self-running first-boot demo. The changes are name-only — the
+# playlist's identity is its UUID, so schedule rules / API references
+# keep working across the renames.
+DEFAULT_PLAYLIST_NAME = "Demo"
 # Legacy name used in v2/v3 storage to identify which playlist is the
 # default during migration. Kept as "default" so devices upgrading from
 # pre-v4 schemas still match their existing default playlist by name —
