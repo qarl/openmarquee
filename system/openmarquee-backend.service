@@ -39,14 +39,16 @@ Environment="OPENMARQUEE_DISABLE_DEV=1"
 # to MockRenderer at startup if DRM init fails (see app.py lifespan).
 Environment="OPENMARQUEE_RENDERER=auto"
 
-# Route iris / dissolve / glitch / etc. transitions through the
-# vc4 GLES2 ShaderRenderer (Phase 7). Required to coexist with the
-# multi-plane DRMRenderer's primary-buffer pool on a 416 MB Pi Zero
-# 2 W: pool default lowered from 20 -> 6 entries (24 MB instead of
-# 80 MB of kernel-side dumb buffers) leaves headroom for the EGL/
-# GBM context here. Caught 2026-05-06 stress test: 20-buffer pool
-# OOM'd the device every ~2 min once the pool saturated; 6 holds.
-Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
+# Shader transitions disabled by default on Pi Zero 2 W. The
+# 2026-05-06 stress test surfaced unbounded SlideSnapshotCache +
+# SlideAssetCache dicts in userspace (one PIL RGBA per slide ~ 8MB
+# at 1080p; with the 32-slide welcome reel they grow to ~512 MB
+# total, which doesn't leave room for the EGL/GBM context). Lower-
+# ing OPENMARQUEE_MAX_POOL_BUFFERS helped kernel memory but
+# couldn't compensate for the userspace tier. Re-enable once the
+# snapshot/asset caches grow LRU bounds (#TBD), or on Pis with
+# enough RAM to absorb the unbounded growth.
+# Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
 
 # Bind to all interfaces on port 80 — the device is its own captive-portal
 # WiFi so this is the primary UI.
