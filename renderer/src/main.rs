@@ -100,8 +100,23 @@ struct Args {
     #[arg(long, value_parser = parse_color)]
     solid_color: Option<[f32; 4]>,
 
+    /// Phase 2.1 — animate a full-screen HSV hue rotation via DRM
+    /// atomic commit + double-buffered scanout. Proves the per-frame
+    /// rendering loop, atomic property writes, page-flip events, and
+    /// buffer rotation all work cleanly. This is plan §4 Step 2 — the
+    /// foundation every subsequent phase (slide bake, transitions,
+    /// video) builds on. Holds for `--hold-secs` seconds.
+    #[arg(long, default_value_t = false)]
+    animate: bool,
+
+    /// Target frame rate for `--animate`. The atomic-commit page-flip
+    /// loop caps to display vrefresh regardless; this just sets the
+    /// animation speed (hue cycle period).
+    #[arg(long, default_value_t = 30)]
+    fps: u32,
+
     /// How long to hold the rendered frame on screen before exiting.
-    /// Only used with `--solid-color`.
+    /// Used by `--solid-color` and `--animate`.
     #[arg(long, default_value_t = 5)]
     hold_secs: u64,
 
@@ -327,13 +342,17 @@ fn main() -> Result<()> {
                     hdmi::render_solid_color(&card, color, args.hold_secs)?;
                     return Ok(());
                 }
+                if args.animate {
+                    hdmi::render_animated_atomic(&card, args.hold_secs, args.fps)?;
+                    return Ok(());
+                }
+                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, or --animate");
             }
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = &args;
                 bail!("--output hdmi requires Linux (drm/gbm/EGL); not available on this host");
             }
-            eprintln!("nothing to do — pass --probe or --solid-color R,G,B");
         }
         OutputMode::Mock => {
             eprintln!("mock output mode (placeholder); not yet implemented");

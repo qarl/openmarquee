@@ -62,6 +62,12 @@ COLOR_EXIT=0
 ssh "$TARGET" "$BIN_PI --output hdmi --solid-color 0,1,1 --hold-secs 3" \
     > "$COLOR_LOG" 2>&1 || COLOR_EXIT=$?
 
+echo "==> Phase 2.1 -- --animate --hold-secs 3 --fps 30"
+ANIM_LOG="$LOG_DIR/animate.log"
+ANIM_EXIT=0
+ssh "$TARGET" "$BIN_PI --output hdmi --animate --hold-secs 3 --fps 30" \
+    > "$ANIM_LOG" 2>&1 || ANIM_EXIT=$?
+
 # Always try to bring the backend back up before we assert anything.
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl start openmarquee-backend"
@@ -76,7 +82,27 @@ grep -q 'solid-color render complete' "$COLOR_LOG" || \
     { echo "FAIL: --solid-color didn't print completion line"; cat "$COLOR_LOG"; exit 1; }
 grep -qi 'panic\|panicked' "$COLOR_LOG" && \
     { echo "FAIL: panic in --solid-color output"; exit 1; }
-echo "    ok"
+echo "    --solid-color ok"
+
+if [ "$ANIM_EXIT" -ne 0 ]; then
+    echo "FAIL: --animate exit $ANIM_EXIT"
+    cat "$ANIM_LOG"
+    exit 1
+fi
+grep -q 'animated atomic render complete' "$ANIM_LOG" || \
+    { echo "FAIL: --animate didn't print completion line"; cat "$ANIM_LOG"; exit 1; }
+grep -qi 'panic\|panicked' "$ANIM_LOG" && \
+    { echo "FAIL: panic in --animate output"; exit 1; }
+# Frame-count sanity: a 3-second animate run at any reasonable fps
+# should land at least ~30 frames. The completion line includes a
+# count we can grep for.
+FRAMES=$(grep -oE 'rendered [0-9]+ frames' "$ANIM_LOG" | grep -oE '[0-9]+' | head -1)
+if [ -z "${FRAMES:-}" ] || [ "$FRAMES" -lt 30 ]; then
+    echo "FAIL: --animate rendered too few frames (got '${FRAMES:-none}', want >=30)"
+    cat "$ANIM_LOG"
+    exit 1
+fi
+echo "    --animate ok ($FRAMES frames in 3s)"
 
 echo "==> backend recovery check (DRM master returned)"
 BACKEND_STATE=$(ssh "$TARGET" "systemctl is-active openmarquee-backend" || true)
