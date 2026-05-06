@@ -89,6 +89,30 @@ for playlist in pl.get('playlists', []):
             raise SystemExit
 \"")
 
+# Phase 4.2a: pick a text_slide that has at least one non-empty
+# text_layer (FYS slide #01 = "FREE" qualifies). Exercises the layout
+# → atlas-upload → glyph-shader → composite path on real DRM scanout.
+echo "==> Phase 4.2a -- --play-slide-text (first text_slide with text_layers)"
+TEXT_LOG="$LOG_DIR/play-slide-text.log"
+TEXT_EXIT=0
+TEXT_ID=$(ssh "$TARGET" "python3 -c \"
+import json, pathlib
+pl = json.loads(pathlib.Path('/var/openmarquee/playlist.json').read_text())
+content_root = pathlib.Path('/var/openmarquee/content')
+for playlist in pl.get('playlists', []):
+    for item in playlist.get('items', []):
+        item_id = item.get('item_id')
+        ip = content_root / item_id / 'item.json'
+        if not ip.exists(): continue
+        env = json.loads(ip.read_text())
+        it = env.get('item', {})
+        if it.get('type') != 'text_slide': continue
+        layers = it.get('text_layers') or []
+        if any(l.get('text') for l in layers):
+            print(item_id)
+            raise SystemExit
+\"" || true)
+
 # Phase 4.1b: same but specifically picks a slide whose
 # background_pattern is "gradient" so we exercise the fragment-shader
 # path, not just the clear_color path. FYS has 2 such slides.
@@ -125,6 +149,14 @@ ssh "$TARGET" "$BIN_PI --output hdmi --play-slide $SLIDE_ID --hold-secs 3" \
 if [ -n "${GRAD_ID:-}" ]; then
     ssh "$TARGET" "$BIN_PI --output hdmi --play-slide $GRAD_ID --hold-secs 3" \
         > "$GRAD_LOG" 2>&1 || GRAD_EXIT=$?
+fi
+
+# Text-layer render is optional only on the off chance the seed has
+# no text_layers anywhere — every FYS slide does, so on the dev Pi
+# this is always exercised.
+if [ -n "${TEXT_ID:-}" ]; then
+    ssh "$TARGET" "$BIN_PI --output hdmi --play-slide-text $TEXT_ID --hold-secs 3" \
+        > "$TEXT_LOG" 2>&1 || TEXT_EXIT=$?
 fi
 
 # Always try to bring the backend back up before we assert anything.
@@ -194,6 +226,26 @@ if [ -n "${GRAD_ID:-}" ]; then
     echo "    --play-slide gradient ok ($GRAD_ID)"
 else
     echo "    --play-slide gradient skipped (no gradient slide in seed)"
+fi
+
+# Phase 4.2a text-layer assertion: completion line + no panics +
+# the layer log line ("rasterized text") is present so we know the
+# layout pass actually ran (and didn't fall through to a None path).
+if [ -n "${TEXT_ID:-}" ]; then
+    if [ "$TEXT_EXIT" -ne 0 ]; then
+        echo "FAIL: --play-slide-text exit $TEXT_EXIT"
+        cat "$TEXT_LOG"
+        exit 1
+    fi
+    grep -q 'text-layer render complete' "$TEXT_LOG" || \
+        { echo "FAIL: --play-slide-text didn't complete"; cat "$TEXT_LOG"; exit 1; }
+    grep -qi 'panic\|panicked' "$TEXT_LOG" && \
+        { echo "FAIL: panic in --play-slide-text output"; exit 1; }
+    grep -q 'rasterized text' "$TEXT_LOG" || \
+        { echo "FAIL: --play-slide-text didn't log rasterization (layout fell through?)"; cat "$TEXT_LOG"; exit 1; }
+    echo "    --play-slide-text ok ($TEXT_ID)"
+else
+    echo "    --play-slide-text skipped (no text-layer slide in seed)"
 fi
 
 echo "==> backend recovery check (DRM master returned)"

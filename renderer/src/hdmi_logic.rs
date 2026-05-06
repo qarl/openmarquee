@@ -5,6 +5,98 @@
 //! cross-platform — it compiles on macOS so `cargo test` can run on
 //! the dev box and exercise these functions without a real DRM stack.
 
+/// 8-bit grayscale-alpha bitmap. Output of the text-layout pass; the
+/// renderer uploads it as a GL_ALPHA texture for the glyph fragment
+/// shader to sample.
+#[derive(Debug, Clone)]
+pub struct AlphaBitmap {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major, top-left-origin. Length = width * height. Each
+    /// byte is 0..=255 = transparent..=opaque.
+    pub data: Vec<u8>,
+}
+
+/// Lay out a single line of `text` rasterized at `size_px`. Each glyph
+/// is rasterized via `fontdue` and blitted onto a single grayscale
+/// bitmap whose width is the sum of glyph advances and whose height
+/// is the max ascent + descent across the line. No wrapping, no
+/// kerning beyond the font's natural metrics, no bidi.
+///
+/// Returns `None` if the resulting bitmap would be empty (e.g. empty
+/// text, or every char rasterized to a 0×0 box like a single space).
+///
+/// Phase 4.2a: simple single-line layout. Phase 4.2c will pull in
+/// multiline + alignment when the FYS slides that need them land.
+pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> Option<AlphaBitmap> {
+    if text.is_empty() {
+        return None;
+    }
+
+    // First pass: rasterize each glyph + measure the line's bbox.
+    // Track per-glyph (metrics, alpha-bytes, x-advance-pre, y-bearing).
+    // We measure ascent/descent in the font's own units to size the
+    // canvas; metrics.bounds gives x/y-min relative to the baseline.
+    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::with_capacity(text.chars().count());
+    let mut total_advance = 0.0_f32;
+    let mut max_ymin = 0.0_f32; // pixels above baseline (negative ymin in fontdue)
+    let mut min_ymin = 0.0_f32; // pixels below baseline
+    for ch in text.chars() {
+        let (m, alpha) = font.rasterize(ch, size_px);
+        // m.advance_width = horizontal step; m.bounds.{xmin, ymin}
+        // give the glyph's bbox bottom-left in baseline-relative
+        // coords (y up). We need to convert to top-down image coords
+        // when blitting.
+        let ascent = m.bounds.ymin + m.height as f32; // top of glyph above baseline
+        max_ymin = max_ymin.max(ascent);
+        min_ymin = min_ymin.min(m.bounds.ymin);
+        total_advance += m.advance_width;
+        glyphs.push((m, alpha));
+    }
+    let line_w = total_advance.ceil() as u32;
+    let line_h = (max_ymin - min_ymin).ceil() as u32;
+    if line_w == 0 || line_h == 0 {
+        return None;
+    }
+    let baseline_y = max_ymin.ceil() as i32; // pixels from top to baseline
+
+    // Second pass: blit each glyph into the canvas at (cursor_x +
+    // glyph_xmin, baseline_y - glyph_ymin - glyph_height).
+    let mut data = vec![0u8; (line_w * line_h) as usize];
+    let mut cursor_x = 0.0_f32;
+    for (m, alpha) in &glyphs {
+        let glyph_x = (cursor_x + m.bounds.xmin).round() as i32;
+        let glyph_top = baseline_y - m.bounds.ymin.round() as i32 - m.height as i32;
+        for gy in 0..m.height as i32 {
+            let dst_y = glyph_top + gy;
+            if dst_y < 0 || dst_y as u32 >= line_h {
+                continue;
+            }
+            for gx in 0..m.width as i32 {
+                let dst_x = glyph_x + gx;
+                if dst_x < 0 || dst_x as u32 >= line_w {
+                    continue;
+                }
+                let src = alpha[(gy as usize) * m.width + gx as usize];
+                if src == 0 {
+                    continue;
+                }
+                let idx = (dst_y as u32 * line_w + dst_x as u32) as usize;
+                // Glyphs in a single line don't overlap (fontdue
+                // emits non-overlapping bboxes per glyph), so a
+                // direct write is safe — no max/saturate needed.
+                data[idx] = src;
+            }
+        }
+        cursor_x += m.advance_width;
+    }
+    Some(AlphaBitmap {
+        width: line_w,
+        height: line_h,
+        data,
+    })
+}
+
 // =====================================================================
 // Shader sources (cross-platform — pure GLSL strings).
 //
@@ -35,6 +127,40 @@ pub const VS_FULLSCREEN_QUAD: &str = r#"#version 100
 attribute vec2 a_pos;
 void main() {
     gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+"#;
+
+/// Vertex shader for textured quads: takes per-vertex position +
+/// per-vertex UV, emits position to NDC + UV as a varying for the
+/// fragment shader to sample. Used by the glyph path; eventually by
+/// any pattern that needs per-vertex UVs (vs `gl_FragCoord` math
+/// against `u_viewport`).
+///
+/// VBO layout: tight, 4 floats per vertex — `[x, y, u, v]`.
+pub const VS_TEXTURED_QUAD: &str = r#"#version 100
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+    v_uv = a_uv;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+"#;
+
+/// Fragment shader for glyph rendering. The atlas/bitmap stores
+/// alpha as a single channel (LUMINANCE-or-ALPHA in GLES2; we use
+/// LUMINANCE because GLES2 ALPHA-only sampling returns the alpha
+/// in `.a` only, while LUMINANCE returns in `.r/.g/.b/.a` which
+/// is more flexible). Multiply by `u_text_color` for the layer's
+/// foreground color and use the sampled alpha for blending.
+pub const FS_GLYPH: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform vec3 u_text_color;
+varying vec2 v_uv;
+void main() {
+    float a = texture2D(u_atlas, v_uv).r;
+    gl_FragColor = vec4(u_text_color * a, a);
 }
 "#;
 
@@ -502,6 +628,33 @@ mod tests {
     }
 
     #[test]
+    fn vs_textured_quad_targets_gles2_with_uv() {
+        // Phase 4.2 textured-quad VS is the parallel
+        // VS_FULLSCREEN_QUAD_WITH_UV the gradient VS doc-comment
+        // names. Confirm GLES2 + a_uv attribute + v_uv varying
+        // surfaces by name (the dispatch in hdmi.rs binds them).
+        assert!(VS_TEXTURED_QUAD.starts_with("#version 100\n"));
+        assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_pos"));
+        assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_uv"));
+        assert!(VS_TEXTURED_QUAD.contains("varying vec2 v_uv"));
+    }
+
+    #[test]
+    fn fs_glyph_targets_gles2_and_pins_uniforms() {
+        assert!(FS_GLYPH.starts_with("#version 100\n"));
+        assert!(FS_GLYPH.contains("precision mediump float"));
+        for uniform in ["u_atlas", "u_text_color"] {
+            assert!(
+                FS_GLYPH.contains(uniform),
+                "FS_GLYPH missing uniform {uniform:?}"
+            );
+        }
+        // Must read the alpha out of the LUMINANCE-uploaded texture
+        // via `.r` (GLES2 LUMINANCE puts the value in r, g, b, a).
+        assert!(FS_GLYPH.contains(".r"));
+    }
+
+    #[test]
     fn fs_gradient_uniform_names_pinned() {
         // The dispatch in hdmi.rs's render_slide_bg_gradient looks up
         // these uniforms by name. If a future refactor renames them
@@ -521,6 +674,89 @@ mod tests {
                 "FS_GRADIENT missing uniform {uniform:?}"
             );
         }
+    }
+
+    /// Load Anton (the FYS canonical font) from the repo's UI fonts
+    /// dir. Tests that need a real font use this so we exercise the
+    /// same TTF the Pi backend ships.
+    fn load_anton() -> fontdue::Font {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("ui/fonts/anton.ttf");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+            .expect("parse Anton TTF")
+    }
+
+    #[test]
+    fn layout_empty_text_returns_none() {
+        let font = load_anton();
+        assert!(layout_text_to_alpha(&font, "", 64.0).is_none());
+    }
+
+    #[test]
+    fn layout_single_char_produces_nonempty_bitmap() {
+        let font = load_anton();
+        let bm = layout_text_to_alpha(&font, "F", 64.0).expect("F bitmap");
+        assert!(bm.width > 0, "F width should be > 0");
+        assert!(bm.height > 0, "F height should be > 0");
+        assert_eq!(
+            bm.data.len() as u32,
+            bm.width * bm.height,
+            "data length must equal width*height"
+        );
+        // At 64px Anton, F should be roughly half as wide as tall —
+        // sanity check on order of magnitude.
+        assert!(bm.height >= 30 && bm.height <= 80, "h={}", bm.height);
+        // F has ink. The rasterized bitmap should have at least
+        // *some* non-zero pixels.
+        assert!(
+            bm.data.iter().any(|&p| p > 0),
+            "F should have at least one non-zero pixel"
+        );
+    }
+
+    #[test]
+    fn layout_multi_char_widens_with_advance() {
+        let font = load_anton();
+        let f = layout_text_to_alpha(&font, "F", 64.0).unwrap();
+        let free = layout_text_to_alpha(&font, "FREE", 64.0).unwrap();
+        // "FREE" must be wider than "F" alone — at least 2x for a
+        // 4-letter word with no kerning weirdness.
+        assert!(
+            free.width > 2 * f.width,
+            "FREE width {} should be at least 2x F width {}",
+            free.width,
+            f.width
+        );
+        // Heights should be in the same ballpark — both lines have
+        // ascender + maybe descender from the wider variant.
+        assert!(
+            (free.height as i32 - f.height as i32).abs() <= 2,
+            "FREE h={} F h={} should match within ±2px",
+            free.height,
+            f.height
+        );
+    }
+
+    #[test]
+    fn layout_size_scales_bitmap() {
+        let font = load_anton();
+        let small = layout_text_to_alpha(&font, "F", 32.0).unwrap();
+        let big = layout_text_to_alpha(&font, "F", 128.0).unwrap();
+        // 4x size should yield ~4x dimensions (within ±5% rounding).
+        let ratio_w = big.width as f32 / small.width as f32;
+        let ratio_h = big.height as f32 / small.height as f32;
+        assert!(
+            (3.5..=4.5).contains(&ratio_w),
+            "width ratio {ratio_w} should be ~4"
+        );
+        assert!(
+            (3.5..=4.5).contains(&ratio_h),
+            "height ratio {ratio_h} should be ~4"
+        );
     }
 
     #[test]

@@ -118,6 +118,21 @@ struct Args {
     #[arg(long)]
     play_slide: Option<uuid::Uuid>,
 
+    /// Phase 4.2a — load a TextSlide by UUID and render its FIRST
+    /// visible text_layer composited over the bg color. Smallest
+    /// end-to-end test of the layout→atlas-upload→shader→composite
+    /// path. Multi-layer + gradient-bg-with-text composite land in
+    /// 4.2b/4.2c. Uses the font at `--font-path`.
+    #[arg(long)]
+    play_slide_text: Option<uuid::Uuid>,
+
+    /// Path to the TTF the renderer rasterizes glyphs from. Phase
+    /// 4.2a uses a single hard-coded font (typically Anton — FYS
+    /// canonical). 4.2c wires the layer's `font_family` to a real
+    /// catalog. Defaults to the Pi deploy path.
+    #[arg(long, default_value = "/opt/openmarquee/ui/fonts/anton.ttf")]
+    font_path: PathBuf,
+
     /// Target frame rate for `--animate`. The atomic-commit page-flip
     /// loop caps to display vrefresh regardless; this just sets the
     /// animation speed (hue cycle period).
@@ -379,7 +394,27 @@ fn main() -> Result<()> {
                     hdmi::render_slide_bg(&card, &slide, args.hold_secs)?;
                     return Ok(());
                 }
-                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, or --play-slide UUID");
+                if let Some(slide_id) = args.play_slide_text {
+                    let content_root = args
+                        .content_root
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("/var/openmarquee/content"));
+                    let slide = content::find_text_slide(content_root, slide_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide found for {slide_id} under {}",
+                            content_root.display(),
+                        ))?;
+                    let font_bytes = std::fs::read(&args.font_path)
+                        .with_context(|| format!("read font {}", args.font_path.display()))?;
+                    let font = fontdue::Font::from_bytes(
+                        font_bytes,
+                        fontdue::FontSettings::default(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("parse font {}: {e}", args.font_path.display()))?;
+                    hdmi::render_slide_text(&card, &slide, &font, args.hold_secs)?;
+                    return Ok(());
+                }
+                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, or --play-slide-text UUID");
             }
             #[cfg(not(target_os = "linux"))]
             {

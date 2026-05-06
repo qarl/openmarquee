@@ -90,6 +90,70 @@ pub struct TextSlide {
     /// `background_color` until their phases land.
     #[serde(default)]
     pub background_pattern: Option<BackgroundPattern>,
+    /// Ordered text layers; index 0 draws first, later entries
+    /// composite over earlier ones. Phase 4.2a renders only the
+    /// FIRST layer; multi-layer compositing lands in Phase 4.2c.
+    #[serde(default)]
+    pub text_layers: Vec<TextLayer>,
+}
+
+/// Mirror of `backend.openmarquee.content.TextLayer` — the subset of
+/// fields Phase 4.2 reads. Position + size of the layer's box are in
+/// slide-relative fractions [0, 1]. Font size is either absolute
+/// pixels (`font_size_px`) OR a percent (`font_size_pct`). The
+/// Python model semantics for percent are "percent of box width"; the
+/// Phase 4.2a renderer uses a height-based heuristic instead until
+/// the real fit-to-box pass lands in 4.2c (see hdmi.rs::
+/// render_slide_text for details).
+#[derive(Debug, Deserialize, Clone)]
+pub struct TextLayer {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub name: String,
+    /// Family name (e.g. `"Anton"`). The renderer maps this to a
+    /// TTF on disk via `font_family_to_path`. None / unknown family
+    /// → fallback (TBD; currently always Anton).
+    #[serde(default)]
+    pub font_family: Option<String>,
+    #[serde(default)]
+    pub font_size_px: Option<f32>,
+    #[serde(default)]
+    pub font_size_pct: Option<f32>,
+    #[serde(default = "default_text_color")]
+    pub text_color: String,
+    /// `left | center | right`. Phase 4.2a ignores this (left-only);
+    /// 4.2c implements it.
+    #[serde(default = "default_text_align")]
+    pub text_align: String,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+    #[serde(default = "default_visible")]
+    pub visible: bool,
+    pub r#box: TextBox,
+}
+
+/// Position + size of a text layer relative to the slide. All four
+/// fields are 0..1 fractions of slide dimensions.
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct TextBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+fn default_text_color() -> String {
+    "#FFFFFF".to_string()
+}
+fn default_text_align() -> String {
+    "center".to_string()
+}
+fn default_opacity() -> f32 {
+    1.0
+}
+fn default_visible() -> bool {
+    true
 }
 
 /// Mirror of `backend.openmarquee.content.BackgroundPattern`. Pattern
@@ -329,7 +393,43 @@ mod tests {
                 color_b: "#FFFFFF".to_string(),
                 density: 0.5,
             }),
+            text_layers: vec![],
         }
+    }
+
+    #[test]
+    fn parses_fys_first_text_layer() {
+        // Real FYS slide #01: "FREE", #FFB43C, font_size_pct=80,
+        // box covers the inner 90% of the slide. Pinning the field
+        // names + types so a backend rename is a loud test failure
+        // rather than a silent serde-default zero.
+        let env: ItemEnvelope = serde_json::from_str(SAMPLE_TEXT_ITEM).unwrap();
+        let slide: TextSlide = serde_json::from_value(env.item).unwrap();
+        assert_eq!(slide.text_layers.len(), 1);
+        let layer = &slide.text_layers[0];
+        assert_eq!(layer.text, "FREE");
+        assert_eq!(layer.text_color, "#FFB43C");
+        assert!((layer.font_size_pct.unwrap() - 80.0).abs() < 1e-6);
+        assert!(layer.font_size_px.is_none());
+        assert!((layer.r#box.x - 0.05).abs() < 1e-6);
+        assert!((layer.r#box.y - 0.10).abs() < 1e-6);
+        assert!((layer.r#box.w - 0.90).abs() < 1e-6);
+        assert!((layer.r#box.h - 0.80).abs() < 1e-6);
+        // Defaults applied for omitted fields:
+        assert!(layer.visible);
+        assert!((layer.opacity - 1.0).abs() < 1e-6);
+        assert_eq!(layer.text_align, "center");
+    }
+
+    #[test]
+    fn text_layers_default_to_empty_when_omitted() {
+        // Operator strips text_layers — must not panic.
+        let json = r##"{
+            "id": "00000000-0000-4000-8000-000000000099",
+            "name": "stub"
+        }"##;
+        let slide: TextSlide = serde_json::from_str(json).unwrap();
+        assert!(slide.text_layers.is_empty());
     }
 
     #[test]
@@ -392,6 +492,7 @@ mod tests {
             duration_ms: 5000,
             background_color: "#050608".to_string(),
             background_pattern: None,
+            text_layers: vec![],
         };
         assert_eq!(solid_bg_hex(&slide), "#050608");
     }
