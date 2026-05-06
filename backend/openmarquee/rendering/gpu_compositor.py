@@ -115,6 +115,44 @@ class SlideAssetCache:
         """Drop all entries. Called by PlaybackLoop on stop()."""
         self._entries.clear()
 
+    def evict_except(
+        self,
+        keep_ids: "set[UUID]",
+        *,
+        renderer: object | None = None,
+    ) -> int:
+        """Drop every entry whose slide_id is NOT in `keep_ids`. When
+        `renderer` is provided AND it has `release_primary_buffer`,
+        also release the renderer-side dumb buffer keyed on the same
+        slide_id -- otherwise the userspace dict shrinks but the
+        kernel-side primary buffer pool keeps holding ~4 MB per slide
+        until the renderer's own LRU eviction kicks in.
+
+        Cycle-aware bound for the OOM fix (2026-05-06): a circular
+        playlist defeats plain LRU; the play loop computes the
+        {previous, current, next} keep set and calls in on each
+        iteration. Without this, 32 slides cycling fills the cache
+        unbounded (~12 MB userspace per slide + ~4 MB kernel buffer).
+        Returns count of entries dropped.
+        """
+        to_drop = [sid for sid in self._entries if sid not in keep_ids]
+        for sid in to_drop:
+            del self._entries[sid]
+            if renderer is not None and hasattr(renderer, "release_primary_buffer"):
+                try:
+                    # Renderer pool keys on str(uuid) (see prerender
+                    # path which stringifies before prepare_primary_
+                    # buffer). A bare UUID here would silently miss
+                    # the pool and leak ~4 MB per evicted slide of
+                    # kernel-side dumb buffer -- defeating half the
+                    # OOM fix. Convert explicitly.
+                    renderer.release_primary_buffer(str(sid))
+                except Exception:
+                    # Eviction shouldn't crash playback; log via the
+                    # caller's discretion.
+                    pass
+        return len(to_drop)
+
     def __len__(self) -> int:
         return len(self._entries)
 

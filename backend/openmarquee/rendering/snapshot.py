@@ -423,5 +423,24 @@ class SlideSnapshotCache:
         entries against a content store that may have changed."""
         self._entries.clear()
 
+    def evict_except(self, keep_ids: "set[UUID]") -> int:
+        """Drop every cached entry whose slide_id is NOT in `keep_ids`.
+
+        The cycle-aware bound for the OOM fix (2026-05-06): a circular
+        playlist's working set is "all of it," so plain LRU has 0% hit
+        rate when the cache size is below the playlist size. The right
+        bound is "keep current + next-prefetched + previous-still-in-
+        flight" (the play loop computes that set and calls in here on
+        each iteration). Each (slide_id, w, h) entry holds ~8 MB of
+        PIL RGBA at 1080p; with 32 slides cycling and no bound the
+        cache grew to ~256+ MB and OOM'd a Pi Zero 2 W.
+
+        Returns count of entries dropped (for logging / metrics).
+        """
+        to_drop = [k for k in self._entries if k[0] not in keep_ids]
+        for k in to_drop:
+            del self._entries[k]
+        return len(to_drop)
+
     def __len__(self) -> int:
         return len(self._entries)

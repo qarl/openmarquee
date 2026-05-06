@@ -542,6 +542,29 @@ class PlaybackLoop:
         self._prerender_tasks.add(task)
         task.add_done_callback(self._prerender_tasks.discard)
 
+    def _evict_caches_to_window(self, keep_ids: set[UUID]) -> None:
+        """Drop both the snapshot and asset caches' entries whose
+        slide_id isn't in `keep_ids`. The play loop calls this once
+        per iteration with {current, next} so the caches stay bounded
+        on a circular playlist (where plain LRU is 0% hit-rate).
+
+        Coordinates with DRMRenderer's per-slide primary buffer pool:
+        SlideAssetCache.evict_except passes the renderer through so
+        the kernel-side dumb buffer for an evicted slide gets released
+        too -- otherwise userspace shrinks but kernel memory stays
+        held.
+        """
+        try:
+            self._snapshot_cache.evict_except(keep_ids)
+        except Exception:
+            log.exception("playback: snapshot cache eviction failed")
+        try:
+            self._gpu_slide_cache.evict_except(
+                keep_ids, renderer=self._renderer,
+            )
+        except Exception:
+            log.exception("playback: asset cache eviction failed")
+
     def _drain_outgoing_compositor(self) -> None:
         """Detach the outgoing slide's compositor (#206 cleanup) if one
         is being held alive across a transition. Idempotent. Called
@@ -645,8 +668,27 @@ class PlaybackLoop:
                 # Schedules via asyncio.to_thread so the rasterize
                 # runs off the event loop.
                 self._schedule_prerender(item)
-                if len(items) > 1:
-                    self._schedule_prerender(items[(i + 1) % len(items)])
+                next_item = items[(i + 1) % len(items)] if len(items) > 1 else None
+                if next_item is not None:
+                    self._schedule_prerender(next_item)
+
+                # Cycle-aware cache eviction (2026-05-06 OOM fix). A
+                # circular playlist's working set is "all of it," so
+                # plain LRU has 0% hit rate when the cache size is
+                # below playlist size -- the wrap-around always cold-
+                # misses. The right bound is "current + next-prefetched
+                # only"; everything else is dead weight at ~12 MB
+                # userspace per slide × 32 slides => 400 MB on a 416 MB
+                # Pi Zero 2 W. Done here (after prerender scheduling)
+                # so the prerender's cache writes for current + next
+                # don't get evicted by the same call. Per-iteration
+                # rather than per-transition so a schedule-rule mid-
+                # cycle naturally drops the prior playlist's stale
+                # prerender.
+                keep_ids: set[UUID] = {item.id}
+                if next_item is not None:
+                    keep_ids.add(next_item.id)
+                self._evict_caches_to_window(keep_ids)
 
                 is_dynamic = (
                     item.type == "text_slide"
