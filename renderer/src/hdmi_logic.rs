@@ -5,6 +5,111 @@
 //! cross-platform — it compiles on macOS so `cargo test` can run on
 //! the dev box and exercise these functions without a real DRM stack.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+/// Lazy catalog mapping `font_family` strings (as the editor stores
+/// them in `TextLayer.font_family`) to loaded `fontdue::Font`
+/// instances on demand.
+///
+/// The renderer is single-threaded; `Rc` over `Arc` is deliberate.
+/// Every render call goes through `get(family)`; the first call
+/// per family pays the disk read + parse cost, subsequent calls
+/// return the cached `Rc`.
+///
+/// Fallback: if the requested family isn't in the static map OR
+/// the TTF can't be loaded, the catalog tries `fallback_family`.
+/// Returns `None` only when even the fallback is unavailable.
+///
+/// Phase 4.2c-4 — replaces the single `--font-path` cli arg with
+/// per-layer family lookup.
+pub struct FontCatalog {
+    dir: PathBuf,
+    fallback_family: String,
+    /// Cache holds BOTH hits and misses (`None` for "tried this
+    /// family, came up empty"). Negative-result caching keeps
+    /// per-layer get() calls from re-issuing the static-map lookup
+    /// and re-emitting the fallback-warn log line on every render
+    /// for a slide that uses an unknown family. Bounded by the set
+    /// of distinct family strings on the live deck — small.
+    cache: RefCell<HashMap<String, Option<Rc<fontdue::Font>>>>,
+}
+
+impl FontCatalog {
+    pub fn new(dir: PathBuf, fallback_family: String) -> Self {
+        Self {
+            dir,
+            fallback_family,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The operator-specified fallback family. `render_slide` uses
+    /// this when a layer's `font_family` field is `None`, so an
+    /// operator override flows through (vs. silently hardcoding
+    /// "Anton" at the call site).
+    pub fn fallback_family(&self) -> &str {
+        &self.fallback_family
+    }
+
+    /// Look up a font by family name. Falls back to the catalog's
+    /// `fallback_family` if the requested one isn't available.
+    /// Returns `None` only if even the fallback can't be loaded.
+    pub fn get(&self, family: &str) -> Option<Rc<fontdue::Font>> {
+        if let Some(f) = self.try_load(family) {
+            return Some(f);
+        }
+        if family != self.fallback_family {
+            if let Some(f) = self.try_load(&self.fallback_family) {
+                eprintln!(
+                    "warn: font_family {family:?} unavailable; fell back to {:?}",
+                    self.fallback_family,
+                );
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    fn try_load(&self, family: &str) -> Option<Rc<fontdue::Font>> {
+        // Cache hit (Some) AND cache miss (None) both short-circuit.
+        if let Some(entry) = self.cache.borrow().get(family) {
+            return entry.as_ref().map(Rc::clone);
+        }
+        let result = (|| -> Option<Rc<fontdue::Font>> {
+            let filename = font_family_to_filename(family)?;
+            let path = self.dir.join(filename);
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("warn: read font {}: {e}", path.display());
+                    return None;
+                }
+            };
+            match fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
+                Ok(f) => Some(Rc::new(f)),
+                Err(e) => {
+                    eprintln!("warn: parse font {}: {e}", path.display());
+                    None
+                }
+            }
+        })();
+        self.cache
+            .borrow_mut()
+            .insert(family.to_string(), result.as_ref().map(Rc::clone));
+        result
+    }
+
+    /// True iff the catalog's fallback family is loadable. Useful
+    /// at startup so we can tell the operator early that NO text
+    /// will render rather than failing per-layer.
+    pub fn fallback_available(&self) -> bool {
+        self.try_load(&self.fallback_family).is_some()
+    }
+}
+
 /// 8-bit grayscale-alpha bitmap. Output of the text-layout pass; the
 /// renderer uploads it as a GL_ALPHA texture for the glyph fragment
 /// shader to sample.
@@ -354,6 +459,43 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     };
     let m = v - c;
     (r1 + m, g1 + m, b1 + m)
+}
+
+/// Map a font-family display name (as the editor stores it in
+/// `TextLayer.font_family`) to the basename of the TTF on disk
+/// under `ui/fonts/`. Returns `None` for unknown families — the
+/// catalog falls back to its fallback family in that case.
+///
+/// Pure function so a backend rename of a font drops a host test
+/// rather than going silent-fallback at runtime. The list mirrors
+/// `ui/fonts/` and the editor's font picker.
+pub fn font_family_to_filename(family: &str) -> Option<&'static str> {
+    match family {
+        "Anton" => Some("anton.ttf"),
+        "Alfa Slab One" => Some("alfa-slab-one.ttf"),
+        "Archivo Black" => Some("archivo-black.ttf"),
+        "Bebas Neue" => Some("bebas-neue.ttf"),
+        "Bowlby One SC" => Some("bowlby-one-sc.ttf"),
+        "Caveat" => Some("caveat.ttf"),
+        "Caveat Brush" => Some("caveat-brush.ttf"),
+        "Cinzel" => Some("cinzel.ttf"),
+        "DM Serif Display" => Some("dm-serif-display.ttf"),
+        "Inter" => Some("inter.ttf"),
+        "JetBrains Mono" => Some("jetbrains-mono.ttf"),
+        "Oswald" => Some("oswald.ttf"),
+        "Pacifico" => Some("pacifico.ttf"),
+        "Permanent Marker" => Some("permanent-marker.ttf"),
+        "Playfair Display" => Some("playfair-display.ttf"),
+        "Reenie Beanie" => Some("reenie-beanie.ttf"),
+        "Roboto Slab" => Some("roboto-slab.ttf"),
+        "Rye" => Some("rye.ttf"),
+        "Sedgwick Ave Display" => Some("sedgwick-ave-display.ttf"),
+        "Shadows Into Light" => Some("shadows-into-light.ttf"),
+        "Space Mono" => Some("space-mono.ttf"),
+        "UnifrakturCook" => Some("unifrakturcook.ttf"),
+        "VT323" => Some("vt323.ttf"),
+        _ => None,
+    }
 }
 
 /// Effective rasterization pixel size for a text layer.
@@ -1031,6 +1173,181 @@ mod tests {
         // model layer; whitespace shouldn't be there but the trim
         // is cheap defense against operator-paste-with-newline.
         assert_eq!(hex_to_rgba("  #ABCDEF  "), hex_to_rgba("#ABCDEF"));
+    }
+
+    // -- font_family_to_filename --------------------------------
+
+    #[test]
+    fn font_family_anton_maps() {
+        assert_eq!(font_family_to_filename("Anton"), Some("anton.ttf"));
+    }
+
+    #[test]
+    fn font_family_multi_word_names_map() {
+        // Editor's display names use spaces; filenames use hyphens.
+        // Pin a few representative cases so a backend rename of the
+        // display name flips a test rather than going silent-fallback.
+        assert_eq!(
+            font_family_to_filename("Bebas Neue"),
+            Some("bebas-neue.ttf")
+        );
+        assert_eq!(
+            font_family_to_filename("Permanent Marker"),
+            Some("permanent-marker.ttf")
+        );
+        assert_eq!(
+            font_family_to_filename("Roboto Slab"),
+            Some("roboto-slab.ttf")
+        );
+    }
+
+    #[test]
+    fn font_family_case_sensitive() {
+        // Display names are case-significant (the editor stores the
+        // canonical Title Case form). Lower/upper variants should
+        // miss → caller falls back. Pin so no one slips a
+        // case-insensitive `match` past review.
+        assert_eq!(font_family_to_filename("anton"), None);
+        assert_eq!(font_family_to_filename("ANTON"), None);
+        assert_eq!(font_family_to_filename("Bebas neue"), None);
+    }
+
+    #[test]
+    fn font_family_unknown_returns_none() {
+        assert_eq!(font_family_to_filename(""), None);
+        assert_eq!(font_family_to_filename("Helvetica"), None);
+        assert_eq!(font_family_to_filename("NotAFont"), None);
+    }
+
+    #[test]
+    fn font_family_full_catalog_complete() {
+        // The 23 entries the renderer ships. If a font is added to
+        // ui/fonts/ AND added to the editor picker, this list grows;
+        // this test catches accidental drift between the static map
+        // and the canonical ui/fonts/ inventory.
+        let expected = [
+            "Anton",
+            "Alfa Slab One",
+            "Archivo Black",
+            "Bebas Neue",
+            "Bowlby One SC",
+            "Caveat",
+            "Caveat Brush",
+            "Cinzel",
+            "DM Serif Display",
+            "Inter",
+            "JetBrains Mono",
+            "Oswald",
+            "Pacifico",
+            "Permanent Marker",
+            "Playfair Display",
+            "Reenie Beanie",
+            "Roboto Slab",
+            "Rye",
+            "Sedgwick Ave Display",
+            "Shadows Into Light",
+            "Space Mono",
+            "UnifrakturCook",
+            "VT323",
+        ];
+        for family in expected {
+            assert!(
+                font_family_to_filename(family).is_some(),
+                "missing mapping for {family:?}"
+            );
+        }
+    }
+
+    // -- FontCatalog --------------------------------------------
+
+    #[test]
+    fn catalog_loads_anton_from_repo_fonts_dir() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("ui/fonts");
+        let cat = FontCatalog::new(dir, "Anton".to_string());
+        let font = cat.get("Anton").expect("Anton must load");
+        // Round-trip a glyph rasterization to confirm the font is
+        // actually parsed (not just bytes-loaded).
+        let (m, _) = font.rasterize('F', 64.0);
+        assert!(m.width > 0 && m.height > 0);
+    }
+
+    #[test]
+    fn catalog_falls_back_on_unknown_family() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("ui/fonts");
+        let cat = FontCatalog::new(dir, "Anton".to_string());
+        // Unknown family → fallback to Anton. Returns Some.
+        let font = cat
+            .get("ThisFontDoesNotExist")
+            .expect("fallback to Anton should succeed");
+        let (m, _) = font.rasterize('F', 64.0);
+        assert!(m.width > 0 && m.height > 0);
+    }
+
+    #[test]
+    fn catalog_caches_repeat_lookups() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("ui/fonts");
+        let cat = FontCatalog::new(dir, "Anton".to_string());
+        let a = cat.get("Anton").unwrap();
+        let b = cat.get("Anton").unwrap();
+        // Same Rc → same allocation.
+        assert!(Rc::ptr_eq(&a, &b), "second lookup should hit cache");
+    }
+
+    #[test]
+    fn catalog_returns_none_when_dir_missing_and_fallback_unavailable() {
+        // Empty/nonexistent dir → even the fallback can't load.
+        let cat = FontCatalog::new(
+            PathBuf::from("/nonexistent/path/that/does/not/exist"),
+            "Anton".to_string(),
+        );
+        assert!(cat.get("Anton").is_none());
+        assert!(!cat.fallback_available());
+    }
+
+    #[test]
+    fn catalog_caches_negative_lookups() {
+        // After a known-bad family lookup, the cache should hold a
+        // None entry so a second lookup short-circuits (no re-read,
+        // no duplicate warn). We can't easily observe the warn-count
+        // without capturing stderr, but we CAN observe that the
+        // cache map gained an entry for the missing family.
+        let cat = FontCatalog::new(
+            PathBuf::from("/nonexistent/font/dir"),
+            "Anton".to_string(),
+        );
+        // First lookup of an unknown-static-family family.
+        assert!(cat.try_load("NotARealFont").is_none());
+        let cache = cat.cache.borrow();
+        assert!(
+            cache.contains_key("NotARealFont"),
+            "miss should be cached so next lookup is a hit"
+        );
+        assert!(cache["NotARealFont"].is_none());
+    }
+
+    #[test]
+    fn catalog_fallback_family_getter() {
+        let cat = FontCatalog::new(PathBuf::from("/tmp"), "Bebas Neue".to_string());
+        assert_eq!(cat.fallback_family(), "Bebas Neue");
+    }
+
+    #[test]
+    fn catalog_fallback_available_check() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("ui/fonts");
+        let cat = FontCatalog::new(dir, "Anton".to_string());
+        assert!(cat.fallback_available());
     }
 
     // -- effective_font_size_px ---------------------------------

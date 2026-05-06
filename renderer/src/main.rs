@@ -126,12 +126,20 @@ struct Args {
     #[arg(long)]
     play_slide_text: Option<uuid::Uuid>,
 
-    /// Path to the TTF the renderer rasterizes glyphs from. Phase
-    /// 4.2a uses a single hard-coded font (typically Anton — FYS
-    /// canonical). 4.2c wires the layer's `font_family` to a real
-    /// catalog. Defaults to the Pi deploy path.
-    #[arg(long, default_value = "/opt/openmarquee/ui/fonts/anton.ttf")]
-    font_path: PathBuf,
+    /// Directory holding the renderer's font catalog. Each layer's
+    /// `font_family` is mapped to a TTF basename under this dir
+    /// (Anton → anton.ttf, "Bebas Neue" → bebas-neue.ttf, etc.).
+    /// Defaults to the Pi deploy path.
+    #[arg(long, default_value = "/opt/openmarquee/ui/fonts")]
+    font_dir: PathBuf,
+
+    /// Fallback font family used when a layer's `font_family` isn't
+    /// recognized OR its TTF can't be loaded. Defaults to "Anton"
+    /// (the FYS canonical face). If even the fallback can't be
+    /// loaded, layers are skipped with a warning rather than the
+    /// whole slide failing.
+    #[arg(long, default_value = "Anton")]
+    fallback_font_family: String,
 
     /// Target frame rate for `--animate`. The atomic-commit page-flip
     /// loop caps to display vrefresh regardless; this just sets the
@@ -394,33 +402,28 @@ fn main() -> Result<()> {
                             "no text_slide found for {slide_id} under {}",
                             content_root.display(),
                         ))?;
-                    // Phase 4.2b loads the font for every slide-render
-                    // path. If the font path is missing, we still want
-                    // bg-only to render rather than failing the whole
-                    // call — fall through with None in that case.
-                    let font_opt = match std::fs::read(&args.font_path) {
-                        Ok(bytes) => match fontdue::Font::from_bytes(
-                            bytes,
-                            fontdue::FontSettings::default(),
-                        ) {
-                            Ok(f) => Some(f),
-                            Err(e) => {
-                                eprintln!(
-                                    "warn: parse font {}: {e} — rendering bg only",
-                                    args.font_path.display()
-                                );
-                                None
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!(
-                                "warn: read font {}: {e} — rendering bg only",
-                                args.font_path.display()
-                            );
-                            None
-                        }
+                    // Phase 4.2c-4: per-layer font lookup via the
+                    // catalog. If the catalog can't even load the
+                    // fallback (font_dir missing/empty), pass None
+                    // so the slide renders bg-only rather than
+                    // failing the whole call — operator gets a
+                    // clear log line.
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        eprintln!(
+                            "warn: font catalog at {} can't load fallback {:?} \
+                             — rendering bg only",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                        None
                     };
-                    hdmi::render_slide(&card, &slide, font_opt.as_ref(), args.hold_secs)
+                    hdmi::render_slide(&card, &slide, catalog_opt, args.hold_secs)
                 };
 
                 if let Some(slide_id) = args.play_slide {

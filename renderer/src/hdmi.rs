@@ -32,12 +32,14 @@ use drm::control::{
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 
+use std::rc::Rc;
+
 use crate::content::{solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
     box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, gradient_uniforms,
     hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, parse_crtc_list_filter_bits,
-    parse_h_align, pick_largest_mode_index, ModeSpec, VAlign, FS_GLYPH, FS_GRADIENT,
-    VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
+    parse_h_align, pick_largest_mode_index, FontCatalog, ModeSpec, VAlign, FS_GLYPH,
+    FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -679,11 +681,11 @@ fn resolve_slide_bg(slide: &TextSlide) -> Result<(BgKind, &'static str)> {
 /// the bg via the glyph-shader path. Phase 4.2c iterates over ALL
 /// visible non-empty text_layers (front-to-back per the model),
 /// supports `text_align`, scale-to-fit, and font catalog lookup
-/// (the latter at the call-site via `font_lookup`).
+/// per-layer via `layer.font_family`.
 pub fn render_slide(
     card: &Card,
     slide: &TextSlide,
-    font: Option<&fontdue::Font>,
+    fonts: Option<&FontCatalog>,
     hold_secs: u64,
 ) -> Result<()> {
     let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
@@ -694,27 +696,60 @@ pub fn render_slide(
     // matches the Python content-model semantic: index 0 paints
     // first, later layers composite over earlier ones.
     //
-    // We pre-parse text_color hex on the host side so a malformed
-    // color errors before EGL bring-up.
-    let text_layers: Vec<(&crate::content::TextLayer, [f32; 4])> = if font.is_some() {
-        slide
-            .text_layers
-            .iter()
-            .filter(|l| l.visible && !l.text.is_empty())
-            .map(|l| {
-                let tc = hex_to_rgba(&l.text_color).ok_or_else(|| {
-                    anyhow!(
-                        "invalid text_color {:?} for slide {}",
-                        l.text_color,
-                        slide.id,
-                    )
-                })?;
-                Ok::<_, anyhow::Error>((l, tc))
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
+    // Per-layer font lookup: layer.font_family → catalog. Falls
+    // back to the catalog's fallback family ("Anton" by default) if
+    // the requested family isn't available; layers whose font fails
+    // to load (because even the fallback is missing) are dropped
+    // with a warning rather than failing the whole slide.
+    //
+    // We pre-parse text_color hex AND resolve the font on the host
+    // side so any malformed color or missing-font warning surfaces
+    // before EGL bring-up.
+    let text_layers: Vec<(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)> =
+        if let Some(catalog) = fonts {
+            slide
+                .text_layers
+                .iter()
+                .filter(|l| l.visible && !l.text.is_empty())
+                .filter_map(|l| {
+                    // Layer's font_family field can be absent
+                    // (operator dragged a widget without picking a
+                    // face). Route through the catalog's fallback
+                    // explicitly — hardcoding "Anton" here would
+                    // bypass --fallback-font-family.
+                    let family = l
+                        .font_family
+                        .as_deref()
+                        .unwrap_or_else(|| catalog.fallback_family());
+                    let font = match catalog.get(family) {
+                        Some(f) => f,
+                        None => {
+                            eprintln!(
+                                "warn: no font available for family {family:?} \
+                                 (and fallback also missing) — skipping layer {:?} \
+                                 in slide {}",
+                                l.text, slide.id,
+                            );
+                            return None;
+                        }
+                    };
+                    let tc = match hex_to_rgba(&l.text_color) {
+                        Some(c) => c,
+                        None => {
+                            eprintln!(
+                                "warn: invalid text_color {:?} for slide {} — \
+                                 skipping layer {:?}",
+                                l.text_color, slide.id, l.text,
+                            );
+                            return None;
+                        }
+                    };
+                    Some((l, tc, font))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     let bg_log = match &bg_kind {
         BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
@@ -747,27 +782,25 @@ pub fn render_slide(
         // layer uses the same premultiplied-alpha blend func and
         // disabling/re-enabling between layers is wasted state.
         //
-        // The IIFE guard ensures `gl.disable(BLEND)` always runs even
-        // when a layer's draw errors mid-loop. Today that doesn't
-        // matter (the harness tears down EGL on Err), but a future
-        // persistent-context phase (4.3+) inherits this state across
-        // calls — same future-correctness principle as R2's
-        // UNPACK_ALIGNMENT restore.
-        if let Some(font) = font {
-            if !text_layers.is_empty() {
-                unsafe {
-                    gl.enable(glow::BLEND);
-                    gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                }
-                let layer_loop_result: Result<()> = (|| {
-                    for (layer, tc) in &text_layers {
-                        draw_text_layer(gl, mode_w, mode_h, layer, font, *tc)?;
-                    }
-                    Ok(())
-                })();
-                unsafe { gl.disable(glow::BLEND); }
-                layer_loop_result?;
+        // The IIFE guard ensures `gl.disable(BLEND)` always runs
+        // even when a layer's draw errors mid-loop. Today that
+        // doesn't matter (the harness tears down EGL on Err), but a
+        // future persistent-context phase (4.3+) inherits this
+        // state across calls — same future-correctness principle as
+        // R2's UNPACK_ALIGNMENT restore.
+        if !text_layers.is_empty() {
+            unsafe {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
             }
+            let layer_loop_result: Result<()> = (|| {
+                for (layer, tc, font) in &text_layers {
+                    draw_text_layer(gl, mode_w, mode_h, layer, font.as_ref(), *tc)?;
+                }
+                Ok(())
+            })();
+            unsafe { gl.disable(glow::BLEND); }
+            layer_loop_result?;
         }
         unsafe { gl.flush(); }
         Ok(())
