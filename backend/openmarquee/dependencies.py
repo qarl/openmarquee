@@ -91,12 +91,17 @@ def _real_renderer_singleton():
 
     width = int(settings.display_width)
     height = int(settings.display_height)
-    # vc4 on Pi Zero 2 W has 3+ overlay planes; 4 covers typical
-    # slides (1 ticker + a few breathing accents) without exceeding
-    # plane budget. Slides above this fall back to compose_motion_frame
-    # software via the play loop's gating in _play_dynamic_slide.
+    # vc4 on Pi Zero 2 W has 3+ overlay planes; default 2 keeps RAM
+    # budget under control on the 416 MB device (each ARGB8888
+    # overlay buffer at 1080p is ~8 MB, multiplied by ring depth +
+    # GL context overhead). Slides with more animated layers fall
+    # back to compose_motion_frame software via the play loop's
+    # gating in _play_dynamic_slide. Larger Pis can override via
+    # OPENMARQUEE_MAX_ANIMATED_PLANES env (4 worked in phase 7
+    # smoke runs but OOM'd at full 32-slide welcome reel on Pi Zero
+    # 2 W -- 2026-05-06 stress test).
     max_animated_planes = int(
-        os.environ.get("OPENMARQUEE_MAX_ANIMATED_PLANES", "4")
+        os.environ.get("OPENMARQUEE_MAX_ANIMATED_PLANES", "2")
     )
     try:
         return DRMRenderer(
