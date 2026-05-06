@@ -13,6 +13,8 @@
 //! and exits 0 on success. The eventual command shape is the standalone
 //! mode from the plan: --playlist + --content-root + --settings + --output hdmi.
 
+mod hdmi;
+
 use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
@@ -26,7 +28,7 @@ use drm::Device;
 ///
 /// drm-rs trait implementations key off `AsFd`, so this thin newtype owning
 /// a `File` is enough to talk to the kernel.
-struct Card(File);
+pub struct Card(pub File);
 
 impl AsFd for Card {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -70,6 +72,18 @@ struct Args {
     /// CRTCs/planes, print, exit 0. No GBM/EGL/GLES yet.
     #[arg(long, default_value_t = false)]
     probe: bool,
+
+    /// Phase 2 — render a solid color via GBM + EGL + GLES2 + legacy
+    /// SetCrtc, hold for `--hold-secs` seconds. Format: "R,G,B" (or
+    /// "R,G,B,A") with each component in [0.0, 1.0]. Example:
+    /// `--solid-color 0,0.5,1` for cyan-ish.
+    #[arg(long, value_parser = parse_color)]
+    solid_color: Option<[f32; 4]>,
+
+    /// How long to hold the rendered frame on screen before exiting.
+    /// Only used with `--solid-color`.
+    #[arg(long, default_value_t = 5)]
+    hold_secs: u64,
 
     /// Path to the playlist JSON for standalone mode (placeholder; not used
     /// in Phase 1).
@@ -187,6 +201,27 @@ fn probe(card: &Card) -> Result<()> {
     Ok(())
 }
 
+fn parse_color(s: &str) -> Result<[f32; 4], String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 && parts.len() != 4 {
+        return Err(format!(
+            "expected 3 or 4 comma-separated floats, got {}: {s:?}",
+            parts.len()
+        ));
+    }
+    let mut color = [0.0f32, 0.0, 0.0, 1.0];
+    for (i, p) in parts.iter().enumerate() {
+        color[i] = p
+            .trim()
+            .parse::<f32>()
+            .map_err(|e| format!("component {i} ({p:?}): {e}"))?;
+        if !(0.0..=1.0).contains(&color[i]) {
+            return Err(format!("component {i} = {} out of [0,1]", color[i]));
+        }
+    }
+    Ok(color)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -198,7 +233,11 @@ fn main() -> Result<()> {
                 probe(&card)?;
                 return Ok(());
             }
-            eprintln!("Phase 1 stub: --probe to enumerate; pixels-on-screen is the next slice.");
+            if let Some(color) = args.solid_color {
+                hdmi::render_solid_color(&card, color, args.hold_secs)?;
+                return Ok(());
+            }
+            eprintln!("nothing to do — pass --probe or --solid-color R,G,B");
         }
         OutputMode::Mock => {
             eprintln!("mock output mode (placeholder); not yet implemented");

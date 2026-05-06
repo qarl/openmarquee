@@ -23,6 +23,23 @@ anyhow = "1.0"
 # probe -> render-frame milestone is reached.
 drm = "0.12"
 
+# Phase 2 — pixels on screen via GBM scanout + EGL + GLES2 single
+# fullscreen quad. `gbm` default features pull in wayland-server
+# which we don't need for direct-DRM scanout; the `import-egl`
+# feature exposes gbm_bo_get_fd / EGLImage import for the
+# eventual H.264 dmabuf path.
+gbm = { version = "0.15", default-features = false, features = ["import-egl"] }
+
+# `dynamic` keeps libEGL.so loaded at runtime instead of linked at
+# build, so the binary works against whatever Mesa version the Pi
+# happens to have.
+khronos-egl = { version = "6.0", features = ["dynamic"] }
+libloading = "0.8"
+
+# GLES2 function bindings. glow handles the function-pointer dance;
+# we provide it the EGL loader.
+glow = "0.14"
+
 [[bin]]
 name = "openmarquee-render"
 path = "src/main.rs"
