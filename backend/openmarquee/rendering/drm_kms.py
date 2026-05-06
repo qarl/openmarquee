@@ -428,6 +428,7 @@ class DRMRenderer:
         pixel_format: str = "rgb565",
         enable_overlay: bool = False,
         max_animated_planes: int = 0,
+        max_pool_buffers: int = 20,
     ):
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive")
@@ -477,7 +478,9 @@ class DRMRenderer:
         self._primary_buffer_pool: OrderedDict[
             object, tuple[int, int, "mmap.mmap", object],
         ] = OrderedDict()
-        self._max_pool_buffers: int = 20
+        if max_pool_buffers < 0:
+            raise ValueError("max_pool_buffers must be >= 0")
+        self._max_pool_buffers: int = max_pool_buffers
         self._mode: _DrmModeInfo | None = None
         self._connector_id: int = 0
         self._encoder_id: int = 0

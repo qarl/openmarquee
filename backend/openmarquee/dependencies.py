@@ -91,17 +91,24 @@ def _real_renderer_singleton():
 
     width = int(settings.display_width)
     height = int(settings.display_height)
-    # vc4 on Pi Zero 2 W has 3+ overlay planes; default 2 keeps RAM
-    # budget under control on the 416 MB device (each ARGB8888
-    # overlay buffer at 1080p is ~8 MB, multiplied by ring depth +
-    # GL context overhead). Slides with more animated layers fall
+    # vc4 on Pi Zero 2 W has 3+ overlay planes; default 2 keeps GL
+    # context overhead modest. Slides with more animated layers fall
     # back to compose_motion_frame software via the play loop's
-    # gating in _play_dynamic_slide. Larger Pis can override via
-    # OPENMARQUEE_MAX_ANIMATED_PLANES env (4 worked in phase 7
-    # smoke runs but OOM'd at full 32-slide welcome reel on Pi Zero
-    # 2 W -- 2026-05-06 stress test).
+    # gating in _play_dynamic_slide. Override via env on bigger Pis.
     max_animated_planes = int(
         os.environ.get("OPENMARQUEE_MAX_ANIMATED_PLANES", "2")
+    )
+    # Per-slide primary buffer pool size. Each entry is a kernel
+    # dumb buffer at width*height*bytes_per_pixel (~4 MB at 1080p
+    # RGB565). 20 was the original default but the 32-slide welcome
+    # reel saturated all 20 entries in steady state -- 80 MB of
+    # kernel memory left no room for ShaderRenderer's GBM/EGL
+    # buffers and the system OOM'd uvicorn on a 416 MB Pi Zero 2 W
+    # (caught 2026-05-06). 6 keeps recently-visited slides warm
+    # (single-fb-flip attach) while bounding kernel memory at ~24 MB
+    # so shader transitions fit. Raise on bigger Pis via env.
+    max_pool_buffers = int(
+        os.environ.get("OPENMARQUEE_MAX_POOL_BUFFERS", "6")
     )
     try:
         return DRMRenderer(
@@ -110,6 +117,7 @@ def _real_renderer_singleton():
             display_width=width,
             display_height=height,
             max_animated_planes=max_animated_planes,
+            max_pool_buffers=max_pool_buffers,
         )
     except Exception:
         log.exception("DRMRenderer construction failed; falling back to mock")
