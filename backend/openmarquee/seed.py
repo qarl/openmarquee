@@ -591,20 +591,25 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         background_color="#FBF3DC",
         layers=(
             _DemoLayer(
+                # 14% of box width (post-B3 sizing) keeps the headline
+                # to one big-but-readable line; v1's 30% reads huge and
+                # word-wraps now that B4 word-wrap landed.
                 text="Free your sign.",
                 font_family="Playfair Display",
                 text_color="#1A1610",
                 box=_b(0.05, 0.22, 0.9, 0.36),
-                font_size_pct=30.0,
+                font_size_pct=14.0,
                 motion="breathe",
                 motion_intensity=20,
             ),
             _DemoLayer(
+                # Subtitle deliberately wraps multi-line within its
+                # narrower box -- B4 word-wrap demo.
                 text="say what you mean. mean what you say.",
                 font_family="Playfair Display",
                 text_color="#5A4A2E",
                 box=_b(0.18, 0.62, 0.64, 0.22),
-                font_size_pct=14.0,
+                font_size_pct=8.0,
                 text_align="left",
             ),
         ),
@@ -628,11 +633,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_align="left",
             ),
             _DemoLayer(
+                # 16% of box width keeps "Liberate" on one line at the
+                # \n break. v1's 30% (height-based) → ~324px font; B3
+                # made it width-based which would be ~518px and wraps.
                 text="Liberate\nyour sign.",
                 font_family="Playfair Display",
                 text_color="#1A1610",
                 box=_b(0.05, 0.27, 0.9, 0.6),
-                font_size_pct=30.0,
+                font_size_pct=16.0,
             ),
         ),
         transition_out="push",
@@ -941,11 +949,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_align="left",
             ),
             _DemoLayer(
+                # 9% of box width keeps the mono "FREE YOUR SIGN_" on
+                # one line. v1's 12.5% reads as 2 lines under post-B3
+                # width sizing.
                 text="FREE YOUR SIGN_",
                 font_family="JetBrains Mono",
                 text_color="#FFB43C",
                 box=_b(0.05, 0.32, 0.9, 0.32),
-                font_size_pct=12.5,
+                font_size_pct=9.0,
             ),
             _DemoLayer(
                 text="free your sign · free your sign · free your sign",
@@ -1073,11 +1084,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         background_color="#050608",
         layers=(
             _DemoLayer(
+                # 5% of box width fits each boot-log line on one line.
+                # v1's 10% (height-based) was ~108px; B3 width-based at
+                # 10% would be ~173px and wraps the longest lines.
                 text=_BOOT_LOG_TEXT,
                 font_family="VT323",
                 text_color="#FFB43C",
                 box=_b(0.05, 0.18, 0.9, 0.64),
-                font_size_pct=10.0,
+                font_size_pct=5.0,
                 text_align="left",
             ),
             _DemoLayer(
