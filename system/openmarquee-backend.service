@@ -39,15 +39,18 @@ Environment="OPENMARQUEE_DISABLE_DEV=1"
 # to MockRenderer at startup if DRM init fails (see app.py lifespan).
 Environment="OPENMARQUEE_RENDERER=auto"
 
-# Shader transitions still off on Pi Zero 2 W. The cycle-aware
-# cache eviction (2026-05-06) brought anon-RSS at OOM time down
-# from ~263 MB to ~155 MB but the device still OOM'd every ~2 min
-# under shader load -- the GBM/EGL buffers + 32 MB of GL textures
-# on top of the bounded caches still leaves the kernel killing
-# uvicorn on global memory pressure. The Pi Zero 2 W's 416 MB
-# can't host 1080p shader transitions + the full welcome reel
-# concurrently. Re-enable on bigger Pis (Pi 4, 4+ GB) by
-# uncommenting:
+# Shader transitions still off on Pi Zero 2 W. Three rounds of
+# fixes -- cycle-aware cache eviction (2026-05-06), pool 20->6,
+# and glTexSubImage2D for same-dim re-uploads (dca94d5) -- each
+# bought time but none made the box fit. Last retest 2026-05-05:
+# 11 minutes shader-on, 4 OOM kills, cadence ~2-3 min. The hard
+# constraint: CMA region is pinned at ~247/256 MB before the
+# first transition (GBM dumb buffer pool dominates the kernel's
+# GPU budget), and shader transitions need EGL backbuffers + 4x
+# 1080p GL textures on top of that. 416 MB of physical RAM minus
+# the CMA carveout doesn't leave room for both the welcome reel's
+# slide-asset cache AND the shader's transient buffers. Re-enable
+# on a Pi with >=1 GB physical RAM by uncommenting:
 # Environment="OPENMARQUEE_SHADER_TRANSITIONS=1"
 
 # Bind to all interfaces on port 80 — the device is its own captive-portal
