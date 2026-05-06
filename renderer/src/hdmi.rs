@@ -32,7 +32,7 @@ use drm::control::{
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 
-use crate::content::TextSlide;
+use crate::content::{solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
     fourcc_for_argb_family, hex_to_rgba, hsv_to_rgb, parse_crtc_list_filter_bits,
     pick_largest_mode_index, ModeSpec,
@@ -50,12 +50,27 @@ use crate::Card;
 /// When the procedural-pattern shader path lands we'll route based
 /// on whether `slide.background_pattern.is_some()`.
 pub fn render_slide_bg(card: &Card, slide: &TextSlide, hold_secs: u64) -> Result<()> {
-    let color = hex_to_rgba(&slide.background_color).ok_or_else(|| {
-        anyhow!("invalid background_color {:?}", slide.background_color)
-    })?;
+    // Phase 4.1a: dispatch to the effective solid color. `pattern: solid`
+    // uses color_a; non-solid patterns (gradient/dots/halftone/...) fall
+    // back to background_color until their shader path lands. Pure
+    // dispatch logic is in `content::solid_bg_hex` so it's testable
+    // without a live DRM stack.
+    let hex = solid_bg_hex(slide).to_string();
+    let color = hex_to_rgba(&hex)
+        .ok_or_else(|| anyhow!("invalid hex color {hex:?} for slide {}", slide.id))?;
+    let pattern_label = slide
+        .background_pattern
+        .as_ref()
+        .map(|p| p.pattern.as_str())
+        .unwrap_or("none");
+    if pattern_label != "none" && pattern_label != "solid" {
+        eprintln!(
+            "warn: pattern {pattern_label:?} not yet implemented; falling back to background_color"
+        );
+    }
     eprintln!(
-        "rendering slide {} ({:?}) bg={} for {}s",
-        slide.id, slide.name, slide.background_color, hold_secs,
+        "rendering slide {} ({:?}) pattern={} bg={} for {}s",
+        slide.id, slide.name, pattern_label, hex, hold_secs,
     );
     render_solid_color(card, color, hold_secs)
 }

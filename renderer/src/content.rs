@@ -70,8 +70,8 @@ pub struct ItemEnvelope {
     pub item: serde_json::Value,
 }
 
-/// Minimal mirror of `TextSlide`. We expose only what Phase 4 entry
-/// uses; later phases extend.
+/// Minimal mirror of `TextSlide`. We expose only what Phase 4 uses;
+/// later phases extend.
 #[derive(Debug, Deserialize, Clone)]
 pub struct TextSlide {
     pub id: Uuid,
@@ -79,12 +79,41 @@ pub struct TextSlide {
     pub name: String,
     #[serde(default = "default_duration_ms")]
     pub duration_ms: u32,
-    /// Hex `#RRGGBB`. `background_pattern` overrides this when set;
-    /// Phase 4 entry only reads this field.
+    /// Hex `#RRGGBB`. Used when `background_pattern` is `None`, OR
+    /// as the fallback for patterns this renderer phase doesn't yet
+    /// support.
     #[serde(default = "default_bg_color")]
     pub background_color: String,
-    // Reserved for next slice (12-pattern shader path):
-    //   #[serde(default)] pub background_pattern: Option<BackgroundPattern>,
+    /// Procedural pattern over two colors. When set, takes precedence
+    /// over `background_color`. Phase 4.1a renders only the `solid`
+    /// pattern (uses `color_a`); other patterns fall back to
+    /// `background_color` until their phases land.
+    #[serde(default)]
+    pub background_pattern: Option<BackgroundPattern>,
+}
+
+/// Mirror of `backend.openmarquee.content.BackgroundPattern`. Pattern
+/// is one of 12: `solid`, `gradient`, `dots`, `halftone`, `stripes`,
+/// `scanlines`, `checker`, `grid`, `rings`, `rays`, `confetti`,
+/// `bricks`. `color_a` and `color_b` are hex `#RRGGBB`. `density` is
+/// a normalized 0..1 knob with per-pattern meaning (see Python
+/// docstring for full table).
+#[derive(Debug, Deserialize, Clone)]
+pub struct BackgroundPattern {
+    pub pattern: String,
+    pub color_a: String,
+    #[serde(default = "default_color_b")]
+    pub color_b: String,
+    #[serde(default = "default_density")]
+    pub density: f32,
+}
+
+fn default_color_b() -> String {
+    "#FFFFFF".to_string()
+}
+
+fn default_density() -> f32 {
+    0.5
 }
 
 fn default_duration_ms() -> u32 {
@@ -133,6 +162,24 @@ pub fn find_text_slide(content_root: &Path, item_id: Uuid) -> Result<Option<Text
 /// same path without re-deriving the layout convention.
 pub fn item_dir(content_root: &Path, item_id: Uuid) -> PathBuf {
     content_root.join(item_id.to_string())
+}
+
+/// Picked-out hex color for a slide's effective solid background,
+/// returning the source as a string for logging. Pure function so
+/// the dispatch logic is testable on the host.
+///
+/// Phase 4.1a rules:
+///   - `pattern: solid` → `color_a` (color_b/density ignored).
+///   - `pattern: <anything else>` → fall back to `background_color`.
+///     The shader paths for the other 11 patterns land in follow-up
+///     commits; falling back keeps non-Phase-4.1a slides renderable
+///     even before their pattern shader exists.
+///   - `pattern: None` → `background_color`.
+pub fn solid_bg_hex(slide: &TextSlide) -> &str {
+    match &slide.background_pattern {
+        Some(p) if p.pattern == "solid" => &p.color_a,
+        _ => &slide.background_color,
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +315,84 @@ mod tests {
             dir.to_str().unwrap(),
             "/var/openmarquee/content/3964c302-311f-44f2-a6c9-efd24a16cfc0"
         );
+    }
+
+    fn slide_with_pattern(pattern: &str, color_a: &str) -> TextSlide {
+        TextSlide {
+            id: Uuid::nil(),
+            name: String::new(),
+            duration_ms: 5000,
+            background_color: "#222222".to_string(),
+            background_pattern: Some(BackgroundPattern {
+                pattern: pattern.to_string(),
+                color_a: color_a.to_string(),
+                color_b: "#FFFFFF".to_string(),
+                density: 0.5,
+            }),
+        }
+    }
+
+    #[test]
+    fn parses_background_pattern_solid() {
+        let json = r##"{
+            "id": "00000000-0000-4000-8000-000000000099",
+            "background_color": "#000000",
+            "background_pattern": {"pattern": "solid", "color_a": "#ABCDEF"}
+        }"##;
+        let slide: TextSlide = serde_json::from_str(json).unwrap();
+        let p = slide.background_pattern.as_ref().unwrap();
+        assert_eq!(p.pattern, "solid");
+        assert_eq!(p.color_a, "#ABCDEF");
+        assert_eq!(p.color_b, "#FFFFFF"); // default
+        assert!((p.density - 0.5).abs() < 1e-6); // default
+    }
+
+    #[test]
+    fn parses_background_pattern_gradient_full() {
+        let json = r##"{
+            "id": "00000000-0000-4000-8000-000000000099",
+            "background_color": "#000000",
+            "background_pattern": {"pattern": "gradient", "color_a": "#FF0000", "color_b": "#00FF00", "density": 0.75}
+        }"##;
+        let slide: TextSlide = serde_json::from_str(json).unwrap();
+        let p = slide.background_pattern.unwrap();
+        assert_eq!(p.pattern, "gradient");
+        assert_eq!(p.color_a, "#FF0000");
+        assert_eq!(p.color_b, "#00FF00");
+        assert!((p.density - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn solid_bg_hex_uses_pattern_color_a_for_solid() {
+        let slide = slide_with_pattern("solid", "#ABCDEF");
+        assert_eq!(solid_bg_hex(&slide), "#ABCDEF");
+    }
+
+    #[test]
+    fn solid_bg_hex_falls_back_for_unsupported_pattern() {
+        // Phase 4.1a only handles "solid"; other patterns get the
+        // background_color fallback until their shader lands.
+        for kind in ["gradient", "dots", "halftone", "stripes",
+                     "scanlines", "checker", "grid", "rings", "rays",
+                     "confetti", "bricks"] {
+            let slide = slide_with_pattern(kind, "#ABCDEF");
+            assert_eq!(
+                solid_bg_hex(&slide),
+                "#222222",
+                "pattern {kind} should fall back to background_color"
+            );
+        }
+    }
+
+    #[test]
+    fn solid_bg_hex_uses_background_color_when_no_pattern() {
+        let slide = TextSlide {
+            id: Uuid::nil(),
+            name: String::new(),
+            duration_ms: 5000,
+            background_color: "#050608".to_string(),
+            background_pattern: None,
+        };
+        assert_eq!(solid_bg_hex(&slide), "#050608");
     }
 }
