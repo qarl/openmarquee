@@ -363,6 +363,76 @@ void main() {
 }
 "#;
 
+/// Fragment shader: pixelate — both images sample at a coarsened
+/// grid whose block size grows to a peak at midpoint then shrinks
+/// back. Mirrors Python ref `_FRAGMENT_PIXELATE`. The wave envelope
+/// `1 - 4(t-0.5)^2` is 0 at t=0/1, 1 at t=0.5; block size 0.0025
+/// (≈ 5px at 1080p, effectively native) at the endpoints, 0.0425
+/// (≈ 80px at 1080p) at midpoint.
+pub const FS_PIXELATE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    float wave = 1.0 - 4.0 * (u_t - 0.5) * (u_t - 0.5);
+    float blockSize = 0.0025 + 0.04 * wave;
+    vec2 cell = floor(v_uv / blockSize) * blockSize + 0.5 * blockSize;
+    vec4 a = texture2D(u_src_a, cell);
+    vec4 b = texture2D(u_src_b, cell);
+    gl_FragColor = mix(a, b, u_t);
+}
+"#;
+
+/// Fragment shader: scanline — top-to-bottom sweep with a bright
+/// white band at the sweep line. Mirrors Python ref
+/// `_FRAGMENT_SCANLINE`. The 0.015 band-half-width is in normalized
+/// UV (≈ 1.6% of screen height); the 0.7 brightness multiplier
+/// keeps the band readable but not blown out.
+pub const FS_SCANLINE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    float sweep = u_t;
+    float band_half = 0.015;
+    float mask = step(v_uv.y, sweep);
+    vec4 col = mix(a, b, mask);
+    float band = 1.0 - smoothstep(0.0, band_half, abs(v_uv.y - sweep));
+    col.rgb = mix(col.rgb, vec3(1.0), band * 0.7);
+    gl_FragColor = col;
+}
+"#;
+
+/// Fragment shader: halftone — slide_b emerges through a regular
+/// grid of growing circular dots, one per cell. Mirrors Python ref
+/// `_FRAGMENT_HALFTONE`. 16:9 grid hardcoded for the HDMI 1080p
+/// target (8 rows × ~14 cols at that aspect); the 0.71 max-radius
+/// is sqrt(0.5), the diagonal half-distance from cell center to
+/// corner so dots fully overlap at t=1.
+pub const FS_HALFTONE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    float grid_y = 8.0;
+    float aspect = 16.0 / 9.0;
+    vec2 cell_uv = fract(vec2(v_uv.x * grid_y * aspect, v_uv.y * grid_y));
+    float d = distance(cell_uv, vec2(0.5));
+    float mask = step(d, u_t * 0.71);
+    gl_FragColor = mix(a, b, mask);
+}
+"#;
+
 /// Fragment shader: linear cross-fade between two textures by `u_t`.
 /// Mirrors backend.openmarquee.rendering.shader_compositor's
 /// `_FRAGMENT_FADE`: at t=0 emits src_a, at t=1 emits src_b,
@@ -401,10 +471,13 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
         "wipe" => Some(FS_WIPE),
         "iris" => Some(FS_IRIS),
         "dissolve" => Some(FS_DISSOLVE),
-        // Phase 5-c-2 added iris + dissolve. Remaining 11
-        // (pixelate/scanline/halftone/glitch/slide/push/scroll/
-        //  blinds/flip/marquee/shutter) land in 5-c-3/4; until
-        // then they hit the fallback (FS_CUT).
+        "pixelate" => Some(FS_PIXELATE),
+        "scanline" => Some(FS_SCANLINE),
+        "halftone" => Some(FS_HALFTONE),
+        // Phase 5-c-3 added pixelate + scanline + halftone.
+        // Remaining 8 (glitch/slide/push/scroll/blinds/flip/
+        // marquee/shutter) land in 5-c-4; until then they hit the
+        // fallback (FS_CUT).
         _ => None,
     }
 }
@@ -1126,6 +1199,59 @@ mod tests {
     }
 
     #[test]
+    fn fs_pixelate_targets_gles2_and_pins_uniforms() {
+        assert!(FS_PIXELATE.starts_with("#version 100\n"));
+        assert!(FS_PIXELATE.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_PIXELATE.contains(uniform));
+        }
+        // Wave envelope: 1 - 4*(t-0.5)^2. Pin so a refactor can't
+        // accidentally invert (4*(t-0.5)^2 - 1 — wrong sign) or
+        // shift the peak (e.g. 4*(t-0.25)^2 — peak at 0.25).
+        assert!(FS_PIXELATE.contains("1.0 - 4.0 * (u_t - 0.5) * (u_t - 0.5)"));
+        // Block size endpoints: 0.0025 base, 0.04 wave amplitude
+        // (so 0.0025 to 0.0425 sweep). Pin so the block-size scale
+        // can't accidentally shift.
+        assert!(FS_PIXELATE.contains("0.0025"));
+        assert!(FS_PIXELATE.contains("0.04 * wave"));
+    }
+
+    #[test]
+    fn fs_scanline_targets_gles2_and_pins_uniforms() {
+        assert!(FS_SCANLINE.starts_with("#version 100\n"));
+        assert!(FS_SCANLINE.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_SCANLINE.contains(uniform));
+        }
+        // Sweep direction: top-to-bottom (step on v_uv.y, not .x).
+        // Pin to catch an accidental .x flip (would become a wipe).
+        assert!(FS_SCANLINE.contains("step(v_uv.y, sweep)"));
+        // Band-half width 0.015 + brightness mix 0.7 pinned. Visual
+        // tuning constants — host-test gates them so an idle edit
+        // doesn't drift them silently.
+        assert!(FS_SCANLINE.contains("0.015"));
+        assert!(FS_SCANLINE.contains("band * 0.7"));
+        assert!(FS_SCANLINE.contains("smoothstep"));
+    }
+
+    #[test]
+    fn fs_halftone_targets_gles2_and_pins_uniforms() {
+        assert!(FS_HALFTONE.starts_with("#version 100\n"));
+        assert!(FS_HALFTONE.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_HALFTONE.contains(uniform));
+        }
+        // 16:9 grid hardcoded — 8 rows. Pin both the row count and
+        // the aspect math so a rewrite can't silently change the
+        // visual layout.
+        assert!(FS_HALFTONE.contains("grid_y = 8.0"));
+        assert!(FS_HALFTONE.contains("16.0 / 9.0"));
+        // Same 0.71 sqrt(0.5) max-radius as iris (cell-local here,
+        // not screen-global). Pin direction.
+        assert!(FS_HALFTONE.contains("step(d, u_t * 0.71)"));
+    }
+
+    #[test]
     fn fs_for_transition_kind_routes_known_kinds() {
         // Compare by content (str equality) rather than pointer
         // identity — Rust may dedupe identical &'static str into a
@@ -1139,14 +1265,17 @@ mod tests {
         assert_eq!(fs_for_transition_kind("wipe"), Some(FS_WIPE));
         assert_eq!(fs_for_transition_kind("iris"), Some(FS_IRIS));
         assert_eq!(fs_for_transition_kind("dissolve"), Some(FS_DISSOLVE));
+        assert_eq!(fs_for_transition_kind("pixelate"), Some(FS_PIXELATE));
+        assert_eq!(fs_for_transition_kind("scanline"), Some(FS_SCANLINE));
+        assert_eq!(fs_for_transition_kind("halftone"), Some(FS_HALFTONE));
     }
 
     #[test]
     fn fs_for_transition_kind_unknown_returns_none() {
         // Unknown kinds — caller falls back. Pin this so the
         // dispatch can't accidentally start guessing.
-        assert!(fs_for_transition_kind("pixelate").is_none()); // 5-c-3
-        assert!(fs_for_transition_kind("glitch").is_none());   // 5-c-4
+        assert!(fs_for_transition_kind("glitch").is_none()); // 5-c-4
+        assert!(fs_for_transition_kind("slide").is_none());  // 5-c-4
         assert!(fs_for_transition_kind("").is_none());
         assert!(fs_for_transition_kind("FADE").is_none()); // case-sensitive
     }

@@ -273,17 +273,53 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
     ANDIS_WALL_MS=$((ANDIS_END - ANDIS_START))
 fi
 
+# Phase 5-c-3: pixelate, scanline, halftone.
+echo "==> Phase 5-c-3 -- --animate-fade --transition pixelate (per-frame @ 800ms / 30fps)"
+ANPIX_LOG="$LOG_DIR/animate-pixelate.log"
+ANPIX_EXIT=0
+ANPIX_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANPIX_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition pixelate --transition-ms 800 --fps 30" \
+        > "$ANPIX_LOG" 2>&1 || ANPIX_EXIT=$?
+    ANPIX_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANPIX_WALL_MS=$((ANPIX_END - ANPIX_START))
+fi
+
+echo "==> Phase 5-c-3 -- --animate-fade --transition scanline (per-frame @ 800ms / 30fps)"
+ANSCAN_LOG="$LOG_DIR/animate-scanline.log"
+ANSCAN_EXIT=0
+ANSCAN_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANSCAN_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition scanline --transition-ms 800 --fps 30" \
+        > "$ANSCAN_LOG" 2>&1 || ANSCAN_EXIT=$?
+    ANSCAN_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANSCAN_WALL_MS=$((ANSCAN_END - ANSCAN_START))
+fi
+
+echo "==> Phase 5-c-3 -- --animate-fade --transition halftone (per-frame @ 800ms / 30fps)"
+ANHALF_LOG="$LOG_DIR/animate-halftone.log"
+ANHALF_EXIT=0
+ANHALF_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANHALF_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition halftone --transition-ms 800 --fps 30" \
+        > "$ANHALF_LOG" 2>&1 || ANHALF_EXIT=$?
+    ANHALF_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANHALF_WALL_MS=$((ANHALF_END - ANHALF_START))
+fi
+
 # Phase 5-c F1 followup: exercise the unknown-kind warn-fallback
-# path. A kind that isn't in fs_for_transition_kind should hit the
-# eprintln warn AND still complete (FS_CUT fallback). Pi smoke
-# just asserts the warn log line + the still-completes outcome.
-echo "==> Phase 5-c -- --animate-fade --transition pixelate (unknown→cut fallback)"
+# path. Use "glitch" since pixelate/scanline/halftone are all
+# implemented now.
+echo "==> Phase 5-c -- --animate-fade --transition glitch (unknown→cut fallback)"
 ANUNK_LOG="$LOG_DIR/animate-unknown.log"
 ANUNK_EXIT=0
 ANUNK_WALL_MS=0
 if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
     ANUNK_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
-    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition pixelate --transition-ms 500 --fps 30" \
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition glitch --transition-ms 500 --fps 30" \
         > "$ANUNK_LOG" 2>&1 || ANUNK_EXIT=$?
     ANUNK_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
     ANUNK_WALL_MS=$((ANUNK_END - ANUNK_START))
@@ -485,6 +521,9 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
     assert_anim_transition "wipe"     "$ANWIPE_LOG" "$ANWIPE_EXIT" 20 800 "$ANWIPE_WALL_MS"
     assert_anim_transition "iris"     "$ANIRIS_LOG" "$ANIRIS_EXIT" 20 800 "$ANIRIS_WALL_MS"
     assert_anim_transition "dissolve" "$ANDIS_LOG"  "$ANDIS_EXIT"  20 800 "$ANDIS_WALL_MS"
+    assert_anim_transition "pixelate" "$ANPIX_LOG"  "$ANPIX_EXIT"  20 800 "$ANPIX_WALL_MS"
+    assert_anim_transition "scanline" "$ANSCAN_LOG" "$ANSCAN_EXIT" 20 800 "$ANSCAN_WALL_MS"
+    assert_anim_transition "halftone" "$ANHALF_LOG" "$ANHALF_EXIT" 20 800 "$ANHALF_WALL_MS"
     # Unknown-kind fallback: the renderer keeps the REQUESTED kind
     # in its log line ("kind=\"pixelate\"") so operators can
     # correlate logs with what they asked for; the warn line above
@@ -495,15 +534,18 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
         cat "$ANUNK_LOG"
         exit 1
     fi
-    grep -q 'warn: transition kind "pixelate" not yet implemented' "$ANUNK_LOG" || \
+    # The unknown-kind label changes as more transitions land; pick
+    # whichever's still unimplemented. 5-c-3 uses "glitch".
+    UNKNOWN_KIND="glitch"
+    grep -q "warn: transition kind \"$UNKNOWN_KIND\" not yet implemented" "$ANUNK_LOG" || \
         { echo "FAIL: unknown-kind warn didn't fire"; cat "$ANUNK_LOG"; exit 1; }
-    # The completion line keeps the REQUESTED kind ("pixelate") so
-    # the operator can correlate logs with what they asked for; the
-    # warn above is what proves the FS fallback to FS_CUT actually
-    # ran. Both must be present.
-    grep -q 'animated transition complete: kind="pixelate"' "$ANUNK_LOG" || \
+    # The completion line keeps the REQUESTED kind so the operator
+    # can correlate logs with what they asked for; the warn above
+    # is what proves the FS fallback to FS_CUT actually ran. Both
+    # must be present.
+    grep -q "animated transition complete: kind=\"$UNKNOWN_KIND\"" "$ANUNK_LOG" || \
         { echo "FAIL: unknown-kind completion line missing"; cat "$ANUNK_LOG"; exit 1; }
-    echo "    --animate-fade --transition pixelate ok (unknown → cut fallback fired)"
+    echo "    --animate-fade --transition $UNKNOWN_KIND ok (unknown → cut fallback fired)"
 else
     echo "    --animate-fade skipped (couldn't find 2 text slides in seed)"
 fi
