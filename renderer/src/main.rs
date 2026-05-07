@@ -126,6 +126,14 @@ struct Args {
     #[arg(long)]
     play_slide_text: Option<uuid::Uuid>,
 
+    /// Phase 5-a — render a slide via the offscreen-FBO path
+    /// (paint into a color texture, then blit to screen via a
+    /// textured quad). Visual output is identical to --play-slide;
+    /// the flag exists so smoke can verify the FBO path is wired
+    /// correctly before Phase 5-b's transitions land.
+    #[arg(long)]
+    play_slide_via_fbo: Option<uuid::Uuid>,
+
     /// Directory holding the renderer's font catalog. Each layer's
     /// `font_family` is mapped to a TTF basename under this dir
     /// (Anton → anton.ttf, "Bebas Neue" → bebas-neue.ttf, etc.).
@@ -385,7 +393,14 @@ fn main() -> Result<()> {
                 // --play-slide loads the playlist as a wiring sanity
                 // check; --play-slide-text bypasses it for tighter
                 // smoke-test isolation.
-                let dispatch_slide = |slide_id: uuid::Uuid, load_playlist: bool| -> Result<()> {
+                //
+                // Phase 5-a adds --play-slide-via-fbo on the same
+                // closure. `via_fbo` selects which renderer fn the
+                // closure calls.
+                let dispatch_slide = |slide_id: uuid::Uuid,
+                                      load_playlist: bool,
+                                      via_fbo: bool|
+                 -> Result<()> {
                     let content_root = args
                         .content_root
                         .as_deref()
@@ -423,18 +438,26 @@ fn main() -> Result<()> {
                         );
                         None
                     };
-                    hdmi::render_slide(&card, &slide, catalog_opt, args.hold_secs)
+                    if via_fbo {
+                        hdmi::render_slide_via_fbo(&card, &slide, catalog_opt, args.hold_secs)
+                    } else {
+                        hdmi::render_slide(&card, &slide, catalog_opt, args.hold_secs)
+                    }
                 };
 
                 if let Some(slide_id) = args.play_slide {
-                    dispatch_slide(slide_id, true)?;
+                    dispatch_slide(slide_id, true, false)?;
                     return Ok(());
                 }
                 if let Some(slide_id) = args.play_slide_text {
-                    dispatch_slide(slide_id, false)?;
+                    dispatch_slide(slide_id, false, false)?;
                     return Ok(());
                 }
-                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, or --play-slide-text UUID");
+                if let Some(slide_id) = args.play_slide_via_fbo {
+                    dispatch_slide(slide_id, false, true)?;
+                    return Ok(());
+                }
+                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, --play-slide-text UUID, or --play-slide-via-fbo UUID");
             }
             #[cfg(not(target_os = "linux"))]
             {

@@ -159,6 +159,19 @@ if [ -n "${TEXT_ID:-}" ]; then
         > "$TEXT_LOG" 2>&1 || TEXT_EXIT=$?
 fi
 
+# Phase 5-a: FBO render-to-texture parity. Same slide as the text
+# path but routed through the offscreen-FBO blit rather than direct
+# render. Output should be visually identical; the smoke just
+# asserts the FBO path completes cleanly + still rasterizes text
+# (proving paint_slide is being called inside the FBO bind).
+echo "==> Phase 5-a -- --play-slide-via-fbo (FBO path parity)"
+FBO_LOG="$LOG_DIR/play-slide-via-fbo.log"
+FBO_EXIT=0
+if [ -n "${TEXT_ID:-}" ]; then
+    ssh "$TARGET" "$BIN_PI --output hdmi --play-slide-via-fbo $TEXT_ID --hold-secs 3" \
+        > "$FBO_LOG" 2>&1 || FBO_EXIT=$?
+fi
+
 # Always try to bring the backend back up before we assert anything.
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl start openmarquee-backend"
@@ -255,6 +268,26 @@ if [ -n "${TEXT_ID:-}" ]; then
     echo "    --play-slide-text ok ($TEXT_ID)"
 else
     echo "    --play-slide-text skipped (no text-layer slide in seed)"
+fi
+
+# Phase 5-a FBO-path assertion: completion line + no panics +
+# rasterized text fired (proves paint_slide ran inside the FBO
+# bind, not just a black blit).
+if [ -n "${TEXT_ID:-}" ]; then
+    if [ "$FBO_EXIT" -ne 0 ]; then
+        echo "FAIL: --play-slide-via-fbo exit $FBO_EXIT"
+        cat "$FBO_LOG"
+        exit 1
+    fi
+    grep -q 'slide render complete (via FBO)' "$FBO_LOG" || \
+        { echo "FAIL: --play-slide-via-fbo didn't complete via FBO path"; cat "$FBO_LOG"; exit 1; }
+    grep -qi 'panic\|panicked' "$FBO_LOG" && \
+        { echo "FAIL: panic in --play-slide-via-fbo output"; exit 1; }
+    grep -q 'rasterized text' "$FBO_LOG" || \
+        { echo "FAIL: --play-slide-via-fbo didn't paint text inside the FBO"; cat "$FBO_LOG"; exit 1; }
+    echo "    --play-slide-via-fbo ok ($TEXT_ID)"
+else
+    echo "    --play-slide-via-fbo skipped (no text-layer slide in seed)"
 fi
 
 echo "==> backend recovery check (DRM master returned)"

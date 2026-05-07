@@ -276,6 +276,22 @@ void main() {
 }
 "#;
 
+/// Fragment shader: identity blit — sample a texture by UV and
+/// emit unchanged. Used by Phase 5-a's FBO path to push the
+/// offscreen color texture to the default framebuffer with no
+/// blending, no color modification. Phase 5 transitions chain
+/// onto this pattern with a `t` uniform + a second texture.
+///
+/// Pairs with `VS_TEXTURED_QUAD` (interleaved [x, y, u, v] verts).
+pub const FS_BLIT: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_src, v_uv);
+}
+"#;
+
 /// Fragment shader: two-color linear gradient. Mirrors the Python
 /// reference (`backend.openmarquee.auto_render._render_pattern_
 /// gradient`). Coordinate convention is image-space (y=0 at top), so
@@ -909,6 +925,18 @@ mod tests {
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_pos"));
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_uv"));
         assert!(VS_TEXTURED_QUAD.contains("varying vec2 v_uv"));
+    }
+
+    #[test]
+    fn fs_blit_targets_gles2_and_pins_uniform() {
+        // Phase 5-a: blit shader pairs with VS_TEXTURED_QUAD. Pin
+        // GLES2 + the single sampler uniform name so a rename
+        // doesn't silently no-op the screen blit.
+        assert!(FS_BLIT.starts_with("#version 100\n"));
+        assert!(FS_BLIT.contains("precision mediump float"));
+        assert!(FS_BLIT.contains("u_src"));
+        assert!(FS_BLIT.contains("v_uv"));
+        assert!(FS_BLIT.contains("texture2D"));
     }
 
     #[test]

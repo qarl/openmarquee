@@ -38,8 +38,8 @@ use crate::content::{solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
     box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, gradient_uniforms,
     hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, parse_crtc_list_filter_bits,
-    parse_h_align, pick_largest_mode_index, FontCatalog, ModeSpec, VAlign, FS_GLYPH,
-    FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
+    parse_h_align, pick_largest_mode_index, FontCatalog, ModeSpec, VAlign, FS_BLIT,
+    FS_GLYPH, FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -768,44 +768,301 @@ pub fn render_slide(
 
     render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
         use glow::HasContext;
-        unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
-        match bg_kind {
-            BgKind::Gradient { color_a, color_b, density } => {
-                draw_gradient_pattern(gl, mode_w, mode_h, color_a, color_b, density)?;
-            }
-            BgKind::Solid(color) => {
-                draw_solid_clear(gl, color);
-            }
-        }
-        // BLEND toggle once around the layer loop (Phase 4.2c
-        // optimization vs. per-layer enable/disable) — every text
-        // layer uses the same premultiplied-alpha blend func and
-        // disabling/re-enabling between layers is wasted state.
-        //
-        // The IIFE guard ensures `gl.disable(BLEND)` always runs
-        // even when a layer's draw errors mid-loop. Today that
-        // doesn't matter (the harness tears down EGL on Err), but a
-        // future persistent-context phase (4.3+) inherits this
-        // state across calls — same future-correctness principle as
-        // R2's UNPACK_ALIGNMENT restore.
-        if !text_layers.is_empty() {
-            unsafe {
-                gl.enable(glow::BLEND);
-                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-            }
-            let layer_loop_result: Result<()> = (|| {
-                for (layer, tc, font) in &text_layers {
-                    draw_text_layer(gl, mode_w, mode_h, layer, font.as_ref(), *tc)?;
-                }
-                Ok(())
-            })();
-            unsafe { gl.disable(glow::BLEND); }
-            layer_loop_result?;
-        }
+        paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers)?;
         unsafe { gl.flush(); }
         Ok(())
     })?;
     eprintln!("slide render complete");
+    Ok(())
+}
+
+/// Paint a slide (bg pass + text-layer passes) into the currently-
+/// bound framebuffer. Phase 5-a — extracted from `render_slide`'s
+/// closure so the same painting logic can target either the default
+/// framebuffer (direct path) OR an offscreen FBO color texture
+/// (transition path: render slide A and slide B into separate
+/// textures, then blend them via a transition shader).
+///
+/// Caller is responsible for binding the target framebuffer BEFORE
+/// the call. Caller flushes/swaps AFTER. We do set the viewport so
+/// the caller doesn't have to re-derive size against the binding.
+fn paint_slide(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    bg_kind: &BgKind,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+) -> Result<()> {
+    use glow::HasContext;
+    unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
+    match *bg_kind {
+        BgKind::Gradient { color_a, color_b, density } => {
+            draw_gradient_pattern(gl, mode_w, mode_h, color_a, color_b, density)?;
+        }
+        BgKind::Solid(color) => {
+            draw_solid_clear(gl, color);
+        }
+    }
+    // BLEND toggle once around the layer loop (Phase 4.2c
+    // optimization vs. per-layer enable/disable) — every text layer
+    // uses the same premultiplied-alpha blend func and
+    // disabling/re-enabling between layers is wasted state. The
+    // IIFE guard ensures `gl.disable(BLEND)` always runs even when
+    // a layer's draw errors mid-loop (4.3+ persistent-context
+    // future-correctness).
+    if !text_layers.is_empty() {
+        unsafe {
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        }
+        let layer_loop_result: Result<()> = (|| {
+            for (layer, tc, font) in text_layers {
+                draw_text_layer(gl, mode_w, mode_h, layer, font.as_ref(), *tc)?;
+            }
+            Ok(())
+        })();
+        unsafe { gl.disable(glow::BLEND); }
+        layer_loop_result?;
+    }
+    Ok(())
+}
+
+/// Phase 5-a — render a slide into an offscreen color texture
+/// attached to a fresh FBO, then blit that texture to the default
+/// framebuffer via a textured-quad pass. End-to-end visual output
+/// is identical to `render_slide`, but the intermediate texture is
+/// the foundation Phase 5 transitions need (render slide A and
+/// slide B into separate textures, then blend via a transition
+/// shader instead of the simple FS_BLIT).
+///
+/// At Phase 5-a this is one extra textured-quad blit per frame
+/// vs. the direct path — fine for a one-shot render at hold-secs.
+/// Phase 5-b's transition path will run per-frame at 30fps with
+/// TWO source textures + a fragment shader composite, which is the
+/// architectural shape this function bootstraps.
+pub fn render_slide_via_fbo(
+    card: &Card,
+    slide: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    hold_secs: u64,
+) -> Result<()> {
+    let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
+
+    let text_layers: Vec<(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)> =
+        if let Some(catalog) = fonts {
+            slide
+                .text_layers
+                .iter()
+                .filter(|l| l.visible && !l.text.is_empty())
+                .filter_map(|l| {
+                    let family = l
+                        .font_family
+                        .as_deref()
+                        .unwrap_or_else(|| catalog.fallback_family());
+                    let font = catalog.get(family)?;
+                    let tc = hex_to_rgba(&l.text_color)?;
+                    Some((l, tc, font))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    let bg_log = match &bg_kind {
+        BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
+        BgKind::Solid(c) => format!(
+            "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
+            c[0], c[1], c[2]
+        ),
+    };
+    eprintln!(
+        "rendering slide via FBO {} ({:?}) {bg_log} text_layers={} for {}s",
+        slide.id,
+        slide.name,
+        text_layers.len(),
+        hold_secs,
+    );
+
+    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
+        use glow::HasContext;
+        unsafe {
+            // -- Build offscreen color texture sized to the mode.
+            let color_tex = gl
+                .create_texture()
+                .map_err(|e| anyhow!("glGenTextures(color_tex): {e}"))?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(color_tex));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                mode_w as i32,
+                mode_h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                None,
+            );
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+
+            // -- Build FBO and attach the color texture.
+            let fbo = match gl.create_framebuffer() {
+                Ok(f) => f,
+                Err(e) => {
+                    gl.delete_texture(color_tex);
+                    return Err(anyhow!("glGenFramebuffers: {e}"));
+                }
+            };
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(color_tex),
+                0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(color_tex);
+                return Err(anyhow!(
+                    "framebuffer incomplete: status=0x{status:x} (FRAMEBUFFER_COMPLETE=0x{:x})",
+                    glow::FRAMEBUFFER_COMPLETE,
+                ));
+            }
+
+            // -- Paint the slide into the FBO.
+            let paint_result = paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers);
+            // Always rebind default FBO before propagating Err so
+            // cleanup/teardown doesn't operate on the offscreen one.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            // R5-a/F1: free fbo+color_tex on the paint_slide-Err
+            // path. Today the harness tears down EGL on Err so this
+            // is invisible, but Phase 5-b runs this code per-frame
+            // and Phase 4.3+ persistent-context inherits state —
+            // leaks compound under both.
+            if let Err(e) = paint_result {
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(color_tex);
+                return Err(e);
+            }
+
+            // -- Blit the color texture to the default framebuffer
+            // via a fullscreen textured quad. FS_BLIT is the
+            // identity sampler; Phase 5-b swaps in a transition
+            // shader sampling TWO textures + a `t` uniform.
+            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+
+            let program = match link_program(gl, VS_TEXTURED_QUAD, FS_BLIT) {
+                Ok(p) => p,
+                Err(e) => {
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(color_tex);
+                    return Err(e);
+                }
+            };
+            // Fullscreen quad in NDC, TRIANGLE_STRIP order BL, BR,
+            // TL, TR with UV (0,0)..(1,1). End-to-end orientation
+            // trace (image-top stays at screen-top, no mirror):
+            //
+            //   1. paint_slide's `box_to_ndc_quad` maps image-y=0
+            //      (top-of-slide) to NDC y=+1.
+            //   2. Render-to-texture writes NDC y=+1 to texture
+            //      v=1 (the FBO's UV-up convention).
+            //   3. Blit verts pair NDC (+1, +1) ↔ UV (1, 1) and
+            //      NDC (-1, -1) ↔ UV (0, 0).
+            //   4. So sampling the FBO with this UV layout puts
+            //      image-top at screen-top — same NDC↔UV pairing
+            //      on both write and read. No flip needed.
+            //
+            // If a future blend/transition shader changes either
+            // the write UV convention or the verts, recheck steps
+            // 2-3 against the new ones.
+            let verts: [f32; 16] = [
+                -1.0, -1.0, 0.0, 0.0,
+                 1.0, -1.0, 1.0, 0.0,
+                -1.0,  1.0, 0.0, 1.0,
+                 1.0,  1.0, 1.0, 1.0,
+            ];
+            let vbo = match gl.create_buffer() {
+                Ok(b) => b,
+                Err(e) => {
+                    gl.delete_program(program);
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(color_tex);
+                    return Err(anyhow!("glGenBuffers(blit): {e}"));
+                }
+            };
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let bytes = std::slice::from_raw_parts(
+                verts.as_ptr() as *const u8,
+                std::mem::size_of_val(&verts),
+            );
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+            let a_pos = match gl.get_attrib_location(program, "a_pos") {
+                Some(loc) => loc,
+                None => {
+                    gl.delete_buffer(vbo);
+                    gl.delete_program(program);
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(color_tex);
+                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos (blit path)"));
+                }
+            };
+            let a_uv = match gl.get_attrib_location(program, "a_uv") {
+                Some(loc) => loc,
+                None => {
+                    gl.delete_buffer(vbo);
+                    gl.delete_program(program);
+                    gl.delete_framebuffer(fbo);
+                    gl.delete_texture(color_tex);
+                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv (blit path)"));
+                }
+            };
+            gl.use_program(Some(program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(color_tex));
+            let u_src = gl.get_uniform_location(program, "u_src");
+            gl.uniform_1_i32(u_src.as_ref(), 0);
+
+            let stride = (4 * std::mem::size_of::<f32>()) as i32;
+            gl.enable_vertex_attrib_array(a_pos);
+            gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+            gl.enable_vertex_attrib_array(a_uv);
+            gl.vertex_attrib_pointer_f32(
+                a_uv,
+                2,
+                glow::FLOAT,
+                false,
+                stride,
+                (2 * std::mem::size_of::<f32>()) as i32,
+            );
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.disable_vertex_attrib_array(a_pos);
+            gl.disable_vertex_attrib_array(a_uv);
+
+            gl.delete_buffer(vbo);
+            gl.delete_program(program);
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(color_tex);
+            gl.flush();
+        }
+        Ok(())
+    })?;
+    eprintln!("slide render complete (via FBO)");
     Ok(())
 }
 
