@@ -933,6 +933,52 @@ pub fn font_family_to_filename(family: &str) -> Option<&'static str> {
     }
 }
 
+/// Pick the predecessor index for a Phase 6 reel iteration.
+///
+/// Given the current item index `i`, the pass counter `pass`
+/// (0 = first sweep through the reel), and the resolved-item
+/// count `len`, returns:
+///   * `None` only when there's no predecessor — i.e. pass 0,
+///     item 0 (the very first slide of a single-pass run has no
+///     entry transition).
+///   * `Some(prev)` otherwise, with wraparound on `--reel-loop`
+///     passes: at pass>=1 item 0 transitions in from the LAST
+///     resolved item.
+///
+/// Pure function so the orchestration's most-likely-to-drift
+/// piece (the wraparound math) is host-testable independent of
+/// any DRM / EGL state. Phase 6 / Rule-3 followup landed here.
+pub fn prev_idx_for_reel(i: usize, pass: u32, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    if i == 0 && pass == 0 {
+        None
+    } else {
+        Some((i + len - 1) % len)
+    }
+}
+
+/// Clamp a transition_ms to a sane minimum so degenerate
+/// playlist values (0 or near-zero) don't slip through to the
+/// per-frame loop where transition_ms = 0 is an error. 50ms ≈
+/// 1.5 frames at 30fps — effectively-zero but not actually-zero.
+pub fn clamp_transition_ms(transition_ms: u32) -> u32 {
+    transition_ms.max(50)
+}
+
+/// Per-slide hold duration in seconds for the reel driver.
+///
+/// `slide_duration_ms` is the slide's `duration_ms` field from
+/// the content model. `override_secs` is the operator's CLI
+/// override (`--hold-secs`); when `Some`, it replaces the per-
+/// slide value so smoke runs can compress hold time.
+///
+/// Floors at 1 second so a 0-duration slide doesn't snap-skip.
+pub fn effective_hold_secs(slide_duration_ms: u32, override_secs: Option<u64>) -> u64 {
+    override_secs.unwrap_or_else(|| (slide_duration_ms as u64 / 1000).max(1))
+}
+
 /// Effective rasterization pixel size for a text layer.
 ///
 /// Resolution rules (Phase 4.2c — replaces 4.2a/b heuristic):
@@ -2104,6 +2150,91 @@ mod tests {
             .join("ui/fonts");
         let cat = FontCatalog::new(dir, "Anton".to_string());
         assert!(cat.fallback_available());
+    }
+
+    // -- prev_idx_for_reel --------------------------------------
+
+    #[test]
+    fn prev_idx_first_item_first_pass_is_none() {
+        // Pass 0, item 0: no predecessor — first slide of a
+        // single-pass reel has no entry transition.
+        assert_eq!(prev_idx_for_reel(0, 0, 19), None);
+    }
+
+    #[test]
+    fn prev_idx_first_item_later_pass_wraps_to_last() {
+        // Pass >= 1, item 0: --reel-loop wraparound. Comes from
+        // the last item of the prior pass.
+        assert_eq!(prev_idx_for_reel(0, 1, 19), Some(18));
+        assert_eq!(prev_idx_for_reel(0, 99, 5), Some(4));
+    }
+
+    #[test]
+    fn prev_idx_middle_item_is_predecessor() {
+        // Any non-first item: the previous item, regardless of
+        // pass.
+        assert_eq!(prev_idx_for_reel(1, 0, 19), Some(0));
+        assert_eq!(prev_idx_for_reel(5, 0, 19), Some(4));
+        assert_eq!(prev_idx_for_reel(18, 0, 19), Some(17));
+        assert_eq!(prev_idx_for_reel(7, 3, 19), Some(6));
+    }
+
+    #[test]
+    fn prev_idx_handles_single_item_reel() {
+        // Edge: 1-item reel + --reel-loop wraps slide 0 to itself.
+        // Caller is expected to no-op the self-transition (cheap
+        // defensive guard not in this fn's contract).
+        assert_eq!(prev_idx_for_reel(0, 1, 1), Some(0));
+    }
+
+    #[test]
+    fn prev_idx_handles_empty_reel() {
+        // Edge: caller bail!s before this hits, but defensive
+        // None for a 0-len reel anyway.
+        assert_eq!(prev_idx_for_reel(0, 0, 0), None);
+        assert_eq!(prev_idx_for_reel(0, 1, 0), None);
+    }
+
+    // -- clamp_transition_ms ------------------------------------
+
+    #[test]
+    fn clamp_transition_ms_floors_at_50() {
+        assert_eq!(clamp_transition_ms(0), 50);
+        assert_eq!(clamp_transition_ms(1), 50);
+        assert_eq!(clamp_transition_ms(49), 50);
+    }
+
+    #[test]
+    fn clamp_transition_ms_passes_through_at_or_above_floor() {
+        assert_eq!(clamp_transition_ms(50), 50);
+        assert_eq!(clamp_transition_ms(500), 500);
+        assert_eq!(clamp_transition_ms(800), 800);
+        assert_eq!(clamp_transition_ms(60_000), 60_000);
+    }
+
+    // -- effective_hold_secs ------------------------------------
+
+    #[test]
+    fn effective_hold_secs_uses_override_when_set() {
+        // Override always wins, even at 1s for compressed smoke.
+        assert_eq!(effective_hold_secs(5000, Some(1)), 1);
+        assert_eq!(effective_hold_secs(5000, Some(0)), 0);
+        assert_eq!(effective_hold_secs(0, Some(7)), 7);
+    }
+
+    #[test]
+    fn effective_hold_secs_uses_slide_duration_when_no_override() {
+        // 5000ms → 5s, 8500ms → 8s (truncates sub-second).
+        assert_eq!(effective_hold_secs(5000, None), 5);
+        assert_eq!(effective_hold_secs(8500, None), 8);
+    }
+
+    #[test]
+    fn effective_hold_secs_floors_to_1s_when_no_override_and_short_slide() {
+        // 0ms or sub-1000ms slide → 1s floor (no snap-skip).
+        assert_eq!(effective_hold_secs(0, None), 1);
+        assert_eq!(effective_hold_secs(500, None), 1);
+        assert_eq!(effective_hold_secs(999, None), 1);
     }
 
     // -- effective_font_size_px ---------------------------------

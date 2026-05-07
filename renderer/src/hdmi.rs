@@ -37,11 +37,11 @@ use std::rc::Rc;
 
 use crate::content::{find_text_slide, load_playlist, solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
-    box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, fs_for_transition_kind,
-    gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha,
-    parse_crtc_list_filter_bits, parse_h_align, pick_largest_mode_index, FontCatalog,
-    ModeSpec, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GRADIENT, VS_FULLSCREEN_QUAD,
-    VS_TEXTURED_QUAD,
+    box_to_ndc_quad, clamp_transition_ms, effective_font_size_px, effective_hold_secs,
+    fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, hex_to_rgba, hsv_to_rgb,
+    layout_text_to_alpha, parse_crtc_list_filter_bits, parse_h_align, pick_largest_mode_index,
+    prev_idx_for_reel, FontCatalog, ModeSpec, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
+    FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -1736,46 +1736,46 @@ pub fn render_playlist_reel(
             hold_secs_override,
         );
         for (i, (slide, _, _)) in resolved.iter().enumerate() {
-            // Entry transition (skip for first item of the very
-            // first pass — no predecessor). For loop_forever
-            // wraparound the first slide gets a transition from
-            // the LAST slide on subsequent passes (i.e. previous
-            // slide is resolved[len-1]).
-            let prev_idx = if i == 0 {
-                if pass == 0 {
-                    None
-                } else {
-                    Some(resolved.len() - 1)
-                }
-            } else {
-                Some(i - 1)
-            };
-            if let Some(p) = prev_idx {
-                let (prev_slide, _, _) = &resolved[p];
-                let (_, kind, transition_ms) = &resolved[i];
-                let transition_ms = (*transition_ms).max(50); // sanity floor
-                eprintln!(
-                    "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
-                    resolved.len() - 1,
-                );
-                if let Err(e) = render_transition_animated(
-                    card,
-                    prev_slide,
-                    slide,
-                    fonts,
-                    kind,
-                    transition_ms,
-                    fps,
-                ) {
+            // Entry transition (skip when no predecessor). The
+            // wraparound math + first-pass semantics is in the
+            // host-tested `prev_idx_for_reel`.
+            //
+            // Defensive guard: if the predecessor IS the current
+            // item (1-item reel + --reel-loop), there's nothing
+            // visually meaningful to transition — slide_b ≡
+            // slide_a. Skip the per-frame loop entirely so we
+            // don't burn compute on a no-op.
+            if let Some(p) = prev_idx_for_reel(i, pass, resolved.len()) {
+                if p != i {
+                    let (prev_slide, _, _) = &resolved[p];
+                    let (_, kind, transition_ms) = &resolved[i];
+                    let transition_ms = clamp_transition_ms(*transition_ms);
                     eprintln!(
-                        "reel: warn — transition into item {i} failed: {e:#}; \
-                         continuing with hard cut"
+                        "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
+                        resolved.len() - 1,
                     );
+                    if let Err(e) = render_transition_animated(
+                        card,
+                        prev_slide,
+                        slide,
+                        fonts,
+                        kind,
+                        transition_ms,
+                        fps,
+                    ) {
+                        // Skip-with-warn (no replay frame): the
+                        // next render_slide call below will paint
+                        // the new slide, which functions as a
+                        // hard cut.
+                        eprintln!(
+                            "reel: warn — transition into item {i} failed: {e:#}; \
+                             skipping to slide hold (acts as hard cut)"
+                        );
+                    }
                 }
             }
 
-            let hold_secs = hold_secs_override
-                .unwrap_or_else(|| (slide.duration_ms as u64 / 1000).max(1));
+            let hold_secs = effective_hold_secs(slide.duration_ms, hold_secs_override);
             eprintln!(
                 "reel: holding item {i}/{} ({:?}) for {hold_secs}s",
                 resolved.len() - 1,

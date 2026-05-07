@@ -204,9 +204,15 @@ struct Args {
     fps: u32,
 
     /// How long to hold the rendered frame on screen before exiting.
-    /// Used by `--solid-color` and `--animate`.
-    #[arg(long, default_value_t = 5)]
-    hold_secs: u64,
+    /// Used by `--solid-color` / `--animate` / `--play-slide` /
+    /// `--play-slide-text` / `--play-slide-via-fbo` / `--fade-from`
+    /// (default 5s when not set). For `--play-reel` mode, leaving
+    /// this unset uses each slide's `duration_ms` from the
+    /// playlist; setting it explicitly overrides every slide's
+    /// hold duration to the same value (handy for compressing
+    /// smoke-test runtime).
+    #[arg(long)]
+    hold_secs: Option<u64>,
 
     /// Path to the playlist JSON for standalone mode (placeholder; not used
     /// in Phase 1).
@@ -427,11 +433,11 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 if let Some(color) = args.solid_color {
-                    hdmi::render_solid_color(&card, color, args.hold_secs)?;
+                    hdmi::render_solid_color(&card, color, args.hold_secs.unwrap_or(5))?;
                     return Ok(());
                 }
                 if args.animate {
-                    hdmi::render_animated_atomic(&card, args.hold_secs, args.fps)?;
+                    hdmi::render_animated_atomic(&card, args.hold_secs.unwrap_or(5), args.fps)?;
                     return Ok(());
                 }
                 // Phase 4.2b: --play-slide and --play-slide-text now
@@ -487,9 +493,9 @@ fn main() -> Result<()> {
                         None
                     };
                     if via_fbo {
-                        hdmi::render_slide_via_fbo(&card, &slide, catalog_opt, args.hold_secs)
+                        hdmi::render_slide_via_fbo(&card, &slide, catalog_opt, args.hold_secs.unwrap_or(5))
                     } else {
-                        hdmi::render_slide(&card, &slide, catalog_opt, args.hold_secs)
+                        hdmi::render_slide(&card, &slide, catalog_opt, args.hold_secs.unwrap_or(5))
                     }
                 };
 
@@ -517,14 +523,12 @@ fn main() -> Result<()> {
                         );
                         None
                     };
-                    // hold-secs override only kicks in when the
-                    // operator explicitly set it; the default 5
-                    // already lives in args.hold_secs.
-                    let override_hold = if std::env::args().any(|a| a == "--hold-secs") {
-                        Some(args.hold_secs)
-                    } else {
-                        None
-                    };
+                    // hold-secs is Option<u64>: None means
+                    // "use slide.duration_ms per item" (the
+                    // production reel behavior); Some(N) means
+                    // "override every slide to N seconds" (handy
+                    // for compressed smoke-test runtime).
+                    let override_hold = args.hold_secs;
                     hdmi::render_playlist_reel(
                         &card,
                         playlist_path,
@@ -595,7 +599,7 @@ fn main() -> Result<()> {
                             &slide_b,
                             catalog_opt,
                             args.fade_t,
-                            args.hold_secs,
+                            args.hold_secs.unwrap_or(5),
                         )?;
                     }
                     return Ok(());
