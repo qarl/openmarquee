@@ -134,6 +134,23 @@ struct Args {
     #[arg(long)]
     play_slide_via_fbo: Option<uuid::Uuid>,
 
+    /// Phase 5-b-1 — render a single-frame fade composite of two
+    /// slides at a fixed `--fade-t` ∈ [0, 1]. Smallest test of the
+    /// dual-FBO + FS_FADE blend path. Phase 5-b-2 wraps this in a
+    /// per-frame loop driving t over `transition_ms`. Format:
+    /// `--fade-from UUID --fade-to UUID --fade-t 0.5`.
+    #[arg(long)]
+    fade_from: Option<uuid::Uuid>,
+
+    /// Destination slide for `--fade-from`.
+    #[arg(long)]
+    fade_to: Option<uuid::Uuid>,
+
+    /// Transition `t` for the fade composite (0.0 = source, 1.0 =
+    /// destination, 0.5 = even cross-fade).
+    #[arg(long, default_value_t = 0.5)]
+    fade_t: f32,
+
     /// Directory holding the renderer's font catalog. Each layer's
     /// `font_family` is mapped to a TTF basename under this dir
     /// (Anton → anton.ttf, "Bebas Neue" → bebas-neue.ttf, etc.).
@@ -457,7 +474,47 @@ fn main() -> Result<()> {
                     dispatch_slide(slide_id, false, true)?;
                     return Ok(());
                 }
-                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, --play-slide-text UUID, or --play-slide-via-fbo UUID");
+                if let (Some(from_id), Some(to_id)) = (args.fade_from, args.fade_to) {
+                    let content_root = args
+                        .content_root
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("/var/openmarquee/content"));
+                    let slide_a = content::find_text_slide(content_root, from_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide found for {from_id} under {}",
+                            content_root.display(),
+                        ))?;
+                    let slide_b = content::find_text_slide(content_root, to_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide found for {to_id} under {}",
+                            content_root.display(),
+                        ))?;
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        eprintln!(
+                            "warn: font catalog at {} can't load fallback {:?} \
+                             — fade composite without text",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                        None
+                    };
+                    hdmi::render_fade_composite(
+                        &card,
+                        &slide_a,
+                        &slide_b,
+                        catalog_opt,
+                        args.fade_t,
+                        args.hold_secs,
+                    )?;
+                    return Ok(());
+                }
+                eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, --play-slide-text UUID, --play-slide-via-fbo UUID, or --fade-from UUID --fade-to UUID");
             }
             #[cfg(not(target_os = "linux"))]
             {

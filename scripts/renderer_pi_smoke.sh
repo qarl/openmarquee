@@ -172,6 +172,38 @@ if [ -n "${TEXT_ID:-}" ]; then
         > "$FBO_LOG" 2>&1 || FBO_EXIT=$?
 fi
 
+# Phase 5-b-1: dual-FBO + FS_FADE single-frame composite at t=0.5.
+# Picks the first two text slides from the playlist as a/b. The
+# fade composite renders BOTH slides into FBOs once and blends them
+# at the given t — at t=0.5 we expect both to rasterize text.
+echo "==> Phase 5-b-1 -- --fade-from/to (single-frame fade @ t=0.5)"
+FADE_LOG="$LOG_DIR/fade-composite.log"
+FADE_EXIT=0
+FADE_PAIR=$(ssh "$TARGET" "python3 -c \"
+import json, pathlib
+pl = json.loads(pathlib.Path('/var/openmarquee/playlist.json').read_text())
+content_root = pathlib.Path('/var/openmarquee/content')
+ids = []
+for playlist in pl.get('playlists', []):
+    for item in playlist.get('items', []):
+        item_id = item.get('item_id')
+        ip = content_root / item_id / 'item.json'
+        if not ip.exists(): continue
+        env = json.loads(ip.read_text())
+        it = env.get('item', {})
+        if it.get('type') != 'text_slide': continue
+        ids.append(item_id)
+        if len(ids) == 2:
+            print(' '.join(ids))
+            raise SystemExit
+\"" || true)
+FADE_FROM=$(echo "$FADE_PAIR" | awk '{print $1}')
+FADE_TO=$(echo "$FADE_PAIR" | awk '{print $2}')
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --fade-t 0.5 --hold-secs 3" \
+        > "$FADE_LOG" 2>&1 || FADE_EXIT=$?
+fi
+
 # Always try to bring the backend back up before we assert anything.
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl start openmarquee-backend"
@@ -288,6 +320,33 @@ if [ -n "${TEXT_ID:-}" ]; then
     echo "    --play-slide-via-fbo ok ($TEXT_ID)"
 else
     echo "    --play-slide-via-fbo skipped (no text-layer slide in seed)"
+fi
+
+# Phase 5-b-1 fade-composite assertion: completion + both slides
+# log a "rasterized text" line (proves both make_slide_fbo calls
+# ran and paint_slide fired inside each FBO bind).
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    if [ "$FADE_EXIT" -ne 0 ]; then
+        echo "FAIL: --fade-from/to exit $FADE_EXIT"
+        cat "$FADE_LOG"
+        exit 1
+    fi
+    grep -q 'fade composite render complete' "$FADE_LOG" || \
+        { echo "FAIL: fade composite didn't complete"; cat "$FADE_LOG"; exit 1; }
+    grep -qi 'panic\|panicked' "$FADE_LOG" && \
+        { echo "FAIL: panic in fade composite output"; exit 1; }
+    # Two FBOs → at minimum 1 rasterized-text line per slide that
+    # has any. FYS slides always have text, so at least 1 should
+    # appear. (If both slides have text, expect 2 lines.)
+    RAST_COUNT=$(grep -c 'rasterized text' "$FADE_LOG" || true)
+    if [ "${RAST_COUNT:-0}" -lt 1 ]; then
+        echo "FAIL: fade composite didn't paint any text (got $RAST_COUNT lines)"
+        cat "$FADE_LOG"
+        exit 1
+    fi
+    echo "    --fade-from/to ok ($FADE_FROM → $FADE_TO @ t=0.5, $RAST_COUNT text rasterizations)"
+else
+    echo "    --fade-from/to skipped (couldn't find 2 text slides in seed)"
 fi
 
 echo "==> backend recovery check (DRM master returned)"

@@ -276,6 +276,27 @@ void main() {
 }
 "#;
 
+/// Fragment shader: linear cross-fade between two textures by `u_t`.
+/// Mirrors backend.openmarquee.rendering.shader_compositor's
+/// `_FRAGMENT_FADE`: at t=0 emits src_a, at t=1 emits src_b,
+/// linearly interpolated between. Phase 5-b-1 — first transition.
+///
+/// Pairs with `VS_TEXTURED_QUAD`. Caller binds src_a to texture
+/// unit 0, src_b to unit 1, and sets `u_t` per-frame from
+/// `elapsed_ms / transition_ms` clamped to [0, 1].
+pub const FS_FADE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    gl_FragColor = mix(a, b, clamp(u_t, 0.0, 1.0));
+}
+"#;
+
 /// Fragment shader: identity blit — sample a texture by UV and
 /// emit unchanged. Used by Phase 5-a's FBO path to push the
 /// offscreen color texture to the default framebuffer with no
@@ -925,6 +946,26 @@ mod tests {
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_pos"));
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_uv"));
         assert!(VS_TEXTURED_QUAD.contains("varying vec2 v_uv"));
+    }
+
+    #[test]
+    fn fs_fade_targets_gles2_and_pins_uniforms() {
+        // Phase 5-b-1: fade transition shader. Pin GLES2 + the
+        // sampler/scalar uniform names so a rename doesn't break
+        // the bind sites in hdmi.rs.
+        assert!(FS_FADE.starts_with("#version 100\n"));
+        assert!(FS_FADE.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(
+                FS_FADE.contains(uniform),
+                "FS_FADE missing uniform {uniform:?}"
+            );
+        }
+        assert!(FS_FADE.contains("v_uv"));
+        // mix(a, b, t) is the canonical fade math; pin so a refactor
+        // to e.g. (1-t)*a + t*b stays equivalent or trips the test.
+        assert!(FS_FADE.contains("mix("));
+        assert!(FS_FADE.contains("clamp"));
     }
 
     #[test]

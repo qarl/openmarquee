@@ -39,7 +39,7 @@ use crate::hdmi_logic::{
     box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, gradient_uniforms,
     hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, parse_crtc_list_filter_bits,
     parse_h_align, pick_largest_mode_index, FontCatalog, ModeSpec, VAlign, FS_BLIT,
-    FS_GLYPH, FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
+    FS_FADE, FS_GLYPH, FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -688,23 +688,128 @@ pub fn render_slide(
     fonts: Option<&FontCatalog>,
     hold_secs: u64,
 ) -> Result<()> {
-    let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
+    let (bg_kind, pattern_label, text_layers) = resolve_slide_layers(slide, fonts)?;
 
-    // All visible non-empty text layers. Empty-text layers exist in
-    // the model (operator dragged a widget but never typed) and
-    // would fail layout — skip them silently. Front-to-back order
-    // matches the Python content-model semantic: index 0 paints
-    // first, later layers composite over earlier ones.
-    //
-    // Per-layer font lookup: layer.font_family → catalog. Falls
-    // back to the catalog's fallback family ("Anton" by default) if
-    // the requested family isn't available; layers whose font fails
-    // to load (because even the fallback is missing) are dropped
-    // with a warning rather than failing the whole slide.
-    //
-    // We pre-parse text_color hex AND resolve the font on the host
-    // side so any malformed color or missing-font warning surfaces
-    // before EGL bring-up.
+    let bg_log = match &bg_kind {
+        BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
+        BgKind::Solid(c) => format!(
+            "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
+            c[0], c[1], c[2]
+        ),
+    };
+    eprintln!(
+        "rendering slide {} ({:?}) {bg_log} text_layers={} for {}s",
+        slide.id,
+        slide.name,
+        text_layers.len(),
+        hold_secs,
+    );
+
+    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
+        use glow::HasContext;
+        paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers)?;
+        unsafe { gl.flush(); }
+        Ok(())
+    })?;
+    eprintln!("slide render complete");
+    Ok(())
+}
+
+/// Phase 5-b — create an FBO + RGBA color texture sized to the
+/// mode, paint the slide into it, then leave the binding on the
+/// default FB. Returns `(fbo, color_tex)` on success — caller is
+/// responsible for `delete_framebuffer` + `delete_texture` after
+/// they're done sampling. On any failure, all created resources
+/// are freed before propagating Err.
+///
+/// Used by render_fade_composite (Phase 5-b-1) to materialize
+/// slide_a and slide_b textures that the fade shader samples.
+unsafe fn make_slide_fbo(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    bg_kind: &BgKind,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(slide_fbo): {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        mode_w as i32,
+        mode_h as i32,
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        None,
+    );
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_S,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_T,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    let fbo = match gl.create_framebuffer() {
+        Ok(f) => f,
+        Err(e) => {
+            gl.delete_texture(tex);
+            return Err(anyhow!("glGenFramebuffers(slide_fbo): {e}"));
+        }
+    };
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+    gl.framebuffer_texture_2d(
+        glow::FRAMEBUFFER,
+        glow::COLOR_ATTACHMENT0,
+        glow::TEXTURE_2D,
+        Some(tex),
+        0,
+    );
+    let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+    if status != glow::FRAMEBUFFER_COMPLETE {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        return Err(anyhow!("framebuffer incomplete (slide_fbo): status=0x{status:x}"));
+    }
+    let paint_result = paint_slide(gl, mode_w, mode_h, bg_kind, text_layers);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    if let Err(e) = paint_result {
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        return Err(e);
+    }
+    Ok((fbo, tex))
+}
+
+/// Resolve a slide's bg + visible non-empty text layers up-front,
+/// shared by render_slide / render_slide_via_fbo /
+/// render_fade_composite. Pre-EGL validation: malformed hex colors
+/// error before we bring up the scanout pipeline.
+///
+/// Layers whose font fails to load OR whose text_color is malformed
+/// are skipped with an `eprintln!` warn (NOT silently dropped) so
+/// per-frame transition loops in Phase 5-b-2+ keep emitting a
+/// diagnostic when a slide has a bad layer. The whole-slide bg
+/// resolution still hard-errors on bad hex (unrecoverable).
+fn resolve_slide_layers<'a>(
+    slide: &'a TextSlide,
+    fonts: Option<&FontCatalog>,
+) -> Result<(
+    BgKind,
+    &'static str,
+    Vec<(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)>,
+)> {
+    let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
     let text_layers: Vec<(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)> =
         if let Some(catalog) = fonts {
             slide
@@ -712,11 +817,6 @@ pub fn render_slide(
                 .iter()
                 .filter(|l| l.visible && !l.text.is_empty())
                 .filter_map(|l| {
-                    // Layer's font_family field can be absent
-                    // (operator dragged a widget without picking a
-                    // face). Route through the catalog's fallback
-                    // explicitly — hardcoding "Anton" here would
-                    // bypass --fallback-font-family.
                     let family = l
                         .font_family
                         .as_deref()
@@ -750,29 +850,158 @@ pub fn render_slide(
         } else {
             Vec::new()
         };
+    Ok((bg_kind, pattern_label, text_layers))
+}
 
-    let bg_log = match &bg_kind {
-        BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
-        BgKind::Solid(c) => format!(
-            "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
-            c[0], c[1], c[2]
-        ),
-    };
+/// Phase 5-b-1 — single-frame composite of two slides via the
+/// fade transition shader at a fixed `t` ∈ [0, 1]. Renders each
+/// slide into its own FBO once, then runs FS_FADE against both
+/// textures at the given t and pushes one frame to scanout.
+/// Holds for `hold_secs`. Same one-shot legacy SetCrtc path as
+/// render_slide_via_fbo.
+///
+/// At t=0 the screen shows slide_a unchanged. At t=1 the screen
+/// shows slide_b unchanged. At t=0.5 a 50/50 cross-fade. Phase
+/// 5-b-2 wraps this in a per-frame loop driving t from 0..1 over
+/// `transition_ms`.
+pub fn render_fade_composite(
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    t: f32,
+    hold_secs: u64,
+) -> Result<()> {
+    let t = t.clamp(0.0, 1.0);
+    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts)?;
+    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts)?;
+
     eprintln!(
-        "rendering slide {} ({:?}) {bg_log} text_layers={} for {}s",
-        slide.id,
-        slide.name,
-        text_layers.len(),
-        hold_secs,
+        "rendering fade composite slide_a={} slide_b={} t={:.3} for {}s",
+        slide_a.id, slide_b.id, t, hold_secs,
     );
 
     render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
         use glow::HasContext;
-        paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers)?;
-        unsafe { gl.flush(); }
+        unsafe {
+            // -- Render each slide into its own FBO.
+            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a)?;
+            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                    return Err(e);
+                }
+            };
+
+            // -- Composite via FS_FADE on the default FB.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+
+            let program = match link_program(gl, VS_TEXTURED_QUAD, FS_FADE) {
+                Ok(p) => p,
+                Err(e) => {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                    gl.delete_framebuffer(fbo_b);
+                    gl.delete_texture(tex_b);
+                    return Err(e);
+                }
+            };
+            // Fullscreen NDC quad with UVs (0,0)..(1,1). Same NDC↔UV
+            // pairing as render_slide_via_fbo so image-top maps to
+            // screen-top (see that function's comment for the trace).
+            let verts: [f32; 16] = [
+                -1.0, -1.0, 0.0, 0.0,
+                 1.0, -1.0, 1.0, 0.0,
+                -1.0,  1.0, 0.0, 1.0,
+                 1.0,  1.0, 1.0, 1.0,
+            ];
+            let vbo = match gl.create_buffer() {
+                Ok(b) => b,
+                Err(e) => {
+                    gl.delete_program(program);
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                    gl.delete_framebuffer(fbo_b);
+                    gl.delete_texture(tex_b);
+                    return Err(anyhow!("glGenBuffers(fade): {e}"));
+                }
+            };
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let bytes = std::slice::from_raw_parts(
+                verts.as_ptr() as *const u8,
+                std::mem::size_of_val(&verts),
+            );
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+            let cleanup = |gl: &glow::Context| unsafe {
+                gl.delete_buffer(vbo);
+                gl.delete_program(program);
+                gl.delete_framebuffer(fbo_a);
+                gl.delete_texture(tex_a);
+                gl.delete_framebuffer(fbo_b);
+                gl.delete_texture(tex_b);
+                // Restore active texture unit back to TEXTURE0 so a
+                // future per-frame loop (5-b-2 / 4.3+) doesn't
+                // inherit selector=TEXTURE1 — paint_slide's glyph
+                // bind happens to use explicit active_texture(TEXTURE0)
+                // calls, but defensive restore is cheap.
+                gl.active_texture(glow::TEXTURE0);
+            };
+
+            let a_pos = match gl.get_attrib_location(program, "a_pos") {
+                Some(loc) => loc,
+                None => {
+                    cleanup(gl);
+                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos (fade)"));
+                }
+            };
+            let a_uv = match gl.get_attrib_location(program, "a_uv") {
+                Some(loc) => loc,
+                None => {
+                    cleanup(gl);
+                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv (fade)"));
+                }
+            };
+
+            gl.use_program(Some(program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+            let u_src_a = gl.get_uniform_location(program, "u_src_a");
+            let u_src_b = gl.get_uniform_location(program, "u_src_b");
+            let u_t = gl.get_uniform_location(program, "u_t");
+            gl.uniform_1_i32(u_src_a.as_ref(), 0);
+            gl.uniform_1_i32(u_src_b.as_ref(), 1);
+            gl.uniform_1_f32(u_t.as_ref(), t);
+
+            let stride = (4 * std::mem::size_of::<f32>()) as i32;
+            gl.enable_vertex_attrib_array(a_pos);
+            gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+            gl.enable_vertex_attrib_array(a_uv);
+            gl.vertex_attrib_pointer_f32(
+                a_uv,
+                2,
+                glow::FLOAT,
+                false,
+                stride,
+                (2 * std::mem::size_of::<f32>()) as i32,
+            );
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.disable_vertex_attrib_array(a_pos);
+            gl.disable_vertex_attrib_array(a_uv);
+
+            cleanup(gl);
+            gl.flush();
+        }
         Ok(())
     })?;
-    eprintln!("slide render complete");
+    eprintln!("fade composite render complete");
     Ok(())
 }
 
@@ -846,27 +1075,7 @@ pub fn render_slide_via_fbo(
     fonts: Option<&FontCatalog>,
     hold_secs: u64,
 ) -> Result<()> {
-    let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
-
-    let text_layers: Vec<(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)> =
-        if let Some(catalog) = fonts {
-            slide
-                .text_layers
-                .iter()
-                .filter(|l| l.visible && !l.text.is_empty())
-                .filter_map(|l| {
-                    let family = l
-                        .font_family
-                        .as_deref()
-                        .unwrap_or_else(|| catalog.fallback_family());
-                    let font = catalog.get(family)?;
-                    let tc = hex_to_rgba(&l.text_color)?;
-                    Some((l, tc, font))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let (bg_kind, pattern_label, text_layers) = resolve_slide_layers(slide, fonts)?;
 
     let bg_log = match &bg_kind {
         BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
