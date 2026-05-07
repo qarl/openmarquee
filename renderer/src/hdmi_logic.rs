@@ -967,16 +967,29 @@ pub fn clamp_transition_ms(transition_ms: u32) -> u32 {
     transition_ms.max(50)
 }
 
-/// Per-slide hold duration in seconds for the reel driver.
+/// Per-slide hold duration in **milliseconds** for the reel
+/// driver.
+///
+/// v1-spec-delta #1 — was previously seconds (u64), with a
+/// `/1000` truncation that snapped the FYS Panic flash slides
+/// (130/350/500/800 ms) to a 1-second floor and erased the
+/// flash effect entirely. ms-precision restores the spec
+/// behavior: a 130 ms slide holds for 130 ms.
 ///
 /// `slide_duration_ms` is the slide's `duration_ms` field from
-/// the content model. `override_secs` is the operator's CLI
-/// override (`--hold-secs`); when `Some`, it replaces the per-
-/// slide value so smoke runs can compress hold time.
+/// the content model (already in ms — no conversion). The
+/// optional override is in seconds at the CLI for operator
+/// ergonomics (`--hold-secs 1` = 1000 ms internally); a None
+/// override means "use the slide's own duration_ms verbatim."
 ///
-/// Floors at 1 second so a 0-duration slide doesn't snap-skip.
-pub fn effective_hold_secs(slide_duration_ms: u32, override_secs: Option<u64>) -> u64 {
-    override_secs.unwrap_or_else(|| (slide_duration_ms as u64 / 1000).max(1))
+/// No floor — a 0-duration slide effectively skips. The reel
+/// driver is allowed to play degenerate-short slides as a flash
+/// effect; the previous 1-second floor was a bug masquerading
+/// as a guard.
+pub fn effective_hold_ms(slide_duration_ms: u32, override_secs: Option<u64>) -> u64 {
+    override_secs
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(slide_duration_ms as u64)
 }
 
 /// Effective rasterization pixel size for a text layer.
@@ -2212,29 +2225,47 @@ mod tests {
         assert_eq!(clamp_transition_ms(60_000), 60_000);
     }
 
-    // -- effective_hold_secs ------------------------------------
+    // -- effective_hold_ms (v1-spec-delta #1) -------------------
 
     #[test]
-    fn effective_hold_secs_uses_override_when_set() {
-        // Override always wins, even at 1s for compressed smoke.
-        assert_eq!(effective_hold_secs(5000, Some(1)), 1);
-        assert_eq!(effective_hold_secs(5000, Some(0)), 0);
-        assert_eq!(effective_hold_secs(0, Some(7)), 7);
+    fn effective_hold_ms_uses_override_when_set() {
+        // Override is in seconds at the CLI for operator
+        // ergonomics; multiplied by 1000 internally.
+        assert_eq!(effective_hold_ms(5000, Some(1)), 1000);
+        assert_eq!(effective_hold_ms(5000, Some(0)), 0);
+        assert_eq!(effective_hold_ms(0, Some(7)), 7000);
     }
 
     #[test]
-    fn effective_hold_secs_uses_slide_duration_when_no_override() {
-        // 5000ms → 5s, 8500ms → 8s (truncates sub-second).
-        assert_eq!(effective_hold_secs(5000, None), 5);
-        assert_eq!(effective_hold_secs(8500, None), 8);
+    fn effective_hold_ms_uses_slide_duration_ms_verbatim_when_no_override() {
+        // Slide's duration_ms already in ms — no conversion. The
+        // FYS Panic flash slides (130/350/500/800 ms) drove this
+        // fix; before v1-spec-delta #1 they snapped to 1s.
+        assert_eq!(effective_hold_ms(5000, None), 5000);
+        assert_eq!(effective_hold_ms(8500, None), 8500);
+        assert_eq!(effective_hold_ms(130, None), 130);
+        assert_eq!(effective_hold_ms(350, None), 350);
+        assert_eq!(effective_hold_ms(500, None), 500);
+        assert_eq!(effective_hold_ms(800, None), 800);
     }
 
     #[test]
-    fn effective_hold_secs_floors_to_1s_when_no_override_and_short_slide() {
-        // 0ms or sub-1000ms slide → 1s floor (no snap-skip).
-        assert_eq!(effective_hold_secs(0, None), 1);
-        assert_eq!(effective_hold_secs(500, None), 1);
-        assert_eq!(effective_hold_secs(999, None), 1);
+    fn effective_hold_ms_no_floor_for_zero_duration() {
+        // Spec doesn't mandate a floor; a 0-duration slide is a
+        // degenerate but valid flash. The previous 1-second floor
+        // was a bug masquerading as a guard. Pin no-floor here so
+        // a future re-add of a floor lands as a host-test diff
+        // rather than going silent.
+        assert_eq!(effective_hold_ms(0, None), 0);
+        assert_eq!(effective_hold_ms(1, None), 1);
+    }
+
+    #[test]
+    fn effective_hold_ms_override_saturates_on_huge_seconds() {
+        // saturating_mul guards against overflow if someone
+        // passes u64::MAX for the override (degenerate but
+        // possible).
+        assert_eq!(effective_hold_ms(0, Some(u64::MAX)), u64::MAX);
     }
 
     // -- effective_font_size_px ---------------------------------

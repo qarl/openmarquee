@@ -39,7 +39,7 @@ use crate::content::{
     load_playlist, resolve_reel_items, solid_bg_hex, TextSlide,
 };
 use crate::hdmi_logic::{
-    box_to_ndc_quad, clamp_transition_ms, effective_font_size_px, effective_hold_secs,
+    box_to_ndc_quad, clamp_transition_ms, effective_font_size_px, effective_hold_ms,
     fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, hex_to_rgba, hsv_to_rgb,
     layout_text_to_alpha, parse_crtc_list_filter_bits, parse_h_align, pick_largest_mode_index,
     prev_idx_for_reel, FontCatalog, ModeSpec, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
@@ -198,9 +198,14 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// caller's `draw` closure once with a live `glow::Context`, then
 /// `eglSwapBuffers` + lock the front BO + register the DRM
 /// framebuffer + legacy `drmModeSetCrtc` to push it to scanout.
-/// Hold for `hold_secs` seconds. Cleanup runs unconditionally
+/// Hold for `hold_ms` milliseconds. Cleanup runs unconditionally
 /// (warn-on-Err) regardless of whether the closure succeeded —
 /// matches the Phase 3 followups pattern.
+///
+/// v1-spec-delta #1 (2026-05-07): hold parameter is now ms, not
+/// seconds. The FYS Panic flash slides at 130/350/500/800 ms
+/// were previously snapping to a 1-second floor inside
+/// `effective_hold_secs`'s `/1000` truncation.
 ///
 /// Phase 4.1c — extracted from `render_solid_color` and the
 /// (then-public) gradient-render path now that we have two callers.
@@ -210,7 +215,7 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// `draw` receives the GLES2 context and the viewport (mode_w,
 /// mode_h) so the closure can `glViewport`, `glClear`, or
 /// compile/link/draw a quad without re-deriving size.
-fn render_one_frame_to_hdmi<F>(card: &Card, hold_secs: u64, draw: F) -> Result<()>
+fn render_one_frame_to_hdmi<F>(card: &Card, hold_ms: u64, draw: F) -> Result<()>
 where
     F: FnOnce(&glow::Context, u32, u32) -> Result<()>,
 {
@@ -341,10 +346,10 @@ where
         )
         .context("drmModeSetCrtc failed")?;
         eprintln!(
-            "scanout active on {:?}; holding for {}s",
-            crtc_handle, hold_secs
+            "scanout active on {:?}; holding for {}ms",
+            crtc_handle, hold_ms
         );
-        std::thread::sleep(std::time::Duration::from_secs(hold_secs));
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
         Ok(())
     })();
 
@@ -690,7 +695,7 @@ pub fn render_slide(
     card: &Card,
     slide: &TextSlide,
     fonts: Option<&FontCatalog>,
-    hold_secs: u64,
+    hold_ms: u64,
 ) -> Result<()> {
     let (bg_kind, pattern_label, text_layers) = resolve_slide_layers(slide, fonts)?;
 
@@ -702,14 +707,14 @@ pub fn render_slide(
         ),
     };
     eprintln!(
-        "rendering slide {} ({:?}) {bg_log} text_layers={} for {}s",
+        "rendering slide {} ({:?}) {bg_log} text_layers={} for {}ms",
         slide.id,
         slide.name,
         text_layers.len(),
-        hold_secs,
+        hold_ms,
     );
 
-    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
+    render_one_frame_to_hdmi(card, hold_ms, |gl, mode_w, mode_h| {
         use glow::HasContext;
         paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers)?;
         unsafe { gl.flush(); }
@@ -861,8 +866,8 @@ fn resolve_slide_layers<'a>(
 /// fade transition shader at a fixed `t` ∈ [0, 1]. Renders each
 /// slide into its own FBO once, then runs FS_FADE against both
 /// textures at the given t and pushes one frame to scanout.
-/// Holds for `hold_secs`. Same one-shot legacy SetCrtc path as
-/// render_slide_via_fbo.
+/// Holds for `hold_ms` milliseconds. Same one-shot legacy
+/// SetCrtc path as render_slide_via_fbo.
 ///
 /// At t=0 the screen shows slide_a unchanged. At t=1 the screen
 /// shows slide_b unchanged. At t=0.5 a 50/50 cross-fade. Phase
@@ -874,18 +879,18 @@ pub fn render_fade_composite(
     slide_b: &TextSlide,
     fonts: Option<&FontCatalog>,
     t: f32,
-    hold_secs: u64,
+    hold_ms: u64,
 ) -> Result<()> {
     let t = t.clamp(0.0, 1.0);
     let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts)?;
     let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts)?;
 
     eprintln!(
-        "rendering fade composite slide_a={} slide_b={} t={:.3} for {}s",
-        slide_a.id, slide_b.id, t, hold_secs,
+        "rendering fade composite slide_a={} slide_b={} t={:.3} for {}ms",
+        slide_a.id, slide_b.id, t, hold_ms,
     );
 
-    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
+    render_one_frame_to_hdmi(card, hold_ms, |gl, mode_w, mode_h| {
         use glow::HasContext;
         unsafe {
             // -- Render each slide into its own FBO.
@@ -1447,7 +1452,7 @@ pub fn render_slide_via_fbo(
     card: &Card,
     slide: &TextSlide,
     fonts: Option<&FontCatalog>,
-    hold_secs: u64,
+    hold_ms: u64,
 ) -> Result<()> {
     let (bg_kind, pattern_label, text_layers) = resolve_slide_layers(slide, fonts)?;
 
@@ -1459,14 +1464,14 @@ pub fn render_slide_via_fbo(
         ),
     };
     eprintln!(
-        "rendering slide via FBO {} ({:?}) {bg_log} text_layers={} for {}s",
+        "rendering slide via FBO {} ({:?}) {bg_log} text_layers={} for {}ms",
         slide.id,
         slide.name,
         text_layers.len(),
-        hold_secs,
+        hold_ms,
     );
 
-    render_one_frame_to_hdmi(card, hold_secs, |gl, mode_w, mode_h| {
+    render_one_frame_to_hdmi(card, hold_ms, |gl, mode_w, mode_h| {
         use glow::HasContext;
         unsafe {
             // -- Build offscreen color texture sized to the mode.
@@ -1655,9 +1660,13 @@ pub fn render_slide_via_fbo(
 ///      transition (kind + duration from the playlist item's
 ///      `transition` / `transition_ms` fields). The first item
 ///      has no predecessor so its entry transition is skipped.
-///   2. Holds the slide for `slide.duration_ms / 1000` seconds
-///      (overridable via `hold_secs_override` for smoke-test
-///      iteration speed).
+///   2. Holds the slide for `slide.duration_ms` milliseconds
+///      verbatim (v1-spec-delta #1, 2026-05-07 — was previously
+///      `/1000` truncated to seconds, which collapsed the FYS
+///      Panic flash slides at 130/350/500/800 ms onto a 1s
+///      floor). Operator's `--hold-secs N` override stays
+///      seconds-semantic at the CLI for ergonomics; the helper
+///      internally ×1000's it.
 ///
 /// Make-best-guess decisions logged inline:
 ///   * **Loop semantics** — single-pass for now. `loop_forever`
@@ -1759,13 +1768,19 @@ pub fn render_playlist_reel(
                 }
             }
 
-            let hold_secs = effective_hold_secs(slide.duration_ms, hold_secs_override);
+            // v1-spec-delta #1: ms precision. slide.duration_ms is
+            // in ms verbatim; the override (operator's --hold-secs)
+            // is in seconds and gets ×1000'd inside effective_hold_ms.
+            // FYS Panic flash slides at 130/350/500/800 ms now hold
+            // for the actual specified duration instead of snapping
+            // to a 1-second floor.
+            let hold_ms = effective_hold_ms(slide.duration_ms, hold_secs_override);
             eprintln!(
-                "reel: holding item {i}/{} ({:?}) for {hold_secs}s",
+                "reel: holding item {i}/{} ({:?}) for {hold_ms}ms",
                 resolved.len() - 1,
                 slide.name,
             );
-            if let Err(e) = render_slide(card, slide, fonts, hold_secs) {
+            if let Err(e) = render_slide(card, slide, fonts, hold_ms) {
                 eprintln!(
                     "reel: warn — render_slide failed for item {i}: {e:#}; \
                      skipping"
@@ -1784,18 +1799,18 @@ pub fn render_playlist_reel(
 }
 
 /// Render a single solid-color frame, push it to the HDMI display via
-/// legacy `drmModeSetCrtc`, and hold for `duration_secs` seconds.
+/// legacy `drmModeSetCrtc`, and hold for `duration_ms` milliseconds.
 ///
 /// `color` is RGBA in [0.0, 1.0] linear space. The vc4 HVS handles
 /// gamma at scanout per the connector's Colorspace property — we just
 /// hand it premultiplied float color and let the hardware do the rest.
-pub fn render_solid_color(card: &Card, color: [f32; 4], duration_secs: u64) -> Result<()> {
+pub fn render_solid_color(card: &Card, color: [f32; 4], duration_ms: u64) -> Result<()> {
     // Phase 4.1c: thin wrapper over `render_one_frame_to_hdmi`. The
     // GLES draw work is just `glClearColor` + `glClear`; everything
     // else (GBM bring-up, EGL context, swap, addFB, SetCrtc, hold,
     // teardown) is shared with the slide-render path through the
     // same harness.
-    render_one_frame_to_hdmi(card, duration_secs, |gl, mode_w, mode_h| {
+    render_one_frame_to_hdmi(card, duration_ms, |gl, mode_w, mode_h| {
         use glow::HasContext;
         unsafe {
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);

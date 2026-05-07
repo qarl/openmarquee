@@ -433,7 +433,14 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 if let Some(color) = args.solid_color {
-                    hdmi::render_solid_color(&card, color, args.hold_secs.unwrap_or(5))?;
+                    // v1-spec-delta #1: render_solid_color takes ms.
+                    // CLI --hold-secs stays seconds for operator
+                    // ergonomics; ×1000 here.
+                    hdmi::render_solid_color(
+                        &card,
+                        color,
+                        args.hold_secs.unwrap_or(5).saturating_mul(1000),
+                    )?;
                     return Ok(());
                 }
                 if args.animate {
@@ -493,9 +500,12 @@ fn main() -> Result<()> {
                         None
                     };
                     if via_fbo {
-                        hdmi::render_slide_via_fbo(&card, &slide, catalog_opt, args.hold_secs.unwrap_or(5))
+                        // v1-spec-delta #1: render_slide* take ms.
+                        let hold_ms = args.hold_secs.unwrap_or(5).saturating_mul(1000);
+                        hdmi::render_slide_via_fbo(&card, &slide, catalog_opt, hold_ms)
                     } else {
-                        hdmi::render_slide(&card, &slide, catalog_opt, args.hold_secs.unwrap_or(5))
+                        let hold_ms = args.hold_secs.unwrap_or(5).saturating_mul(1000);
+                        hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)
                     }
                 };
 
@@ -593,13 +603,14 @@ fn main() -> Result<()> {
                             args.fps,
                         )?;
                     } else {
+                        // v1-spec-delta #1: render_fade_composite takes ms.
                         hdmi::render_fade_composite(
                             &card,
                             &slide_a,
                             &slide_b,
                             catalog_opt,
                             args.fade_t,
-                            args.hold_secs.unwrap_or(5),
+                            args.hold_secs.unwrap_or(5).saturating_mul(1000),
                         )?;
                     }
                     return Ok(());
