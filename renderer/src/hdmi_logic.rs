@@ -433,6 +433,212 @@ void main() {
 }
 "#;
 
+/// Fragment shader: glitch — digital-corruption look. Per-row
+/// horizontal jitter + linear cross-fade + occasional cyan tear
+/// rows. The frame_seed quantizes u_t into ~30 distinct buckets so
+/// the per-row hash gets a fresh seed every frame. Mirrors Python
+/// ref `_FRAGMENT_GLITCH`.
+///
+/// Uses `precision highp float` for the same vc4-mantissa reason
+/// as FS_DISSOLVE — the sin/dot/fract hash collapses on mediump.
+pub const FS_GLITCH: &str = r#"#version 100
+precision highp float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+float _hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+void main() {
+    float row = floor(v_uv.y * 1080.0);
+    float frame_seed = floor(u_t * 30.0);
+    float jitter = (_hash(vec2(row, frame_seed)) - 0.5) * 0.1 * u_t;
+    vec2 uv2 = vec2(v_uv.x + jitter, v_uv.y);
+    vec4 a = texture2D(u_src_a, uv2);
+    vec4 b = texture2D(u_src_b, uv2);
+    vec4 col = mix(a, b, u_t);
+    float tear_row = floor(v_uv.y * 60.0);
+    float tear = step(0.95, _hash(vec2(tear_row, frame_seed + 1.0)));
+    col.rgb = mix(col.rgb, vec3(0.0, 1.0, 1.0), tear * 0.5 * u_t);
+    gl_FragColor = col;
+}
+"#;
+
+/// Fragment shader: slide — both images translate horizontally;
+/// slide_b enters from the right edge as slide_a exits left.
+/// Mirrors Python ref `_FRAGMENT_SLIDE`.
+pub const FS_SLIDE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    float t = u_t;
+    float seam = 1.0 - t;
+    float onTo = step(seam, v_uv.x);
+    vec2 fromUV = vec2(v_uv.x + t, v_uv.y);
+    vec2 toUV = vec2(v_uv.x - seam, v_uv.y);
+    vec4 a = texture2D(u_src_a, fromUV);
+    vec4 b = texture2D(u_src_b, toUV);
+    gl_FragColor = mix(a, b, onTo);
+}
+"#;
+
+/// Fragment shader: push — slide_b enters from the LEFT, pushing
+/// slide_a off the right. Bright projector-blade separator at the
+/// seam (smoothstep'd 0.001 wide × 0.8 brightness). Mirrors Python
+/// ref `_FRAGMENT_PUSH`.
+pub const FS_PUSH: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    float t = u_t;
+    float onTo = step(v_uv.x, t);
+    vec2 fromUV = vec2(v_uv.x - t, v_uv.y);
+    vec2 toUV = vec2(v_uv.x + (1.0 - t), v_uv.y);
+    vec4 a = texture2D(u_src_a, fromUV);
+    vec4 b = texture2D(u_src_b, toUV);
+    vec4 col = mix(a, b, onTo);
+    float blade = 1.0 - smoothstep(0.0, 0.001, abs(v_uv.x - t));
+    col.rgb = mix(col.rgb, vec3(1.0), blade * 0.8);
+    gl_FragColor = col;
+}
+"#;
+
+/// Fragment shader: scroll — vertical analog of slide. slide_b
+/// enters from the bottom as slide_a rolls up off the top. Mirrors
+/// Python ref `_FRAGMENT_SCROLL`.
+pub const FS_SCROLL: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    float t = u_t;
+    float seam = 1.0 - t;
+    float onTo = step(seam, v_uv.y);
+    vec2 fromUV = vec2(v_uv.x, v_uv.y + t);
+    vec2 toUV = vec2(v_uv.x, v_uv.y - seam);
+    vec4 a = texture2D(u_src_a, fromUV);
+    vec4 b = texture2D(u_src_b, toUV);
+    gl_FragColor = mix(a, b, onTo);
+}
+"#;
+
+/// Fragment shader: blinds — 16 horizontal slats opening from each
+/// slat's midline outward. Mirrors Python ref `_FRAGMENT_BLINDS`.
+pub const FS_BLINDS: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    float n_slats = 16.0;
+    float slat_uv = fract(v_uv.y * n_slats);
+    float dist_to_mid = abs(slat_uv - 0.5);
+    float mask = step(dist_to_mid, u_t * 0.5);
+    gl_FragColor = mix(a, b, mask);
+}
+"#;
+
+/// Fragment shader: flip — 2D card-flip approximation. slide_a
+/// scaleX-shrinks 1.0 → 0.0 in the first half, then slide_b
+/// scaleX-grows 0.0 → 1.0 in the second half. Mirrors Python ref
+/// `_FRAGMENT_FLIP`.
+pub const FS_FLIP: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    float t = u_t;
+    float scaleX = abs(2.0 * t - 1.0);
+    float useTo = step(0.5, t);
+    vec4 col = vec4(0.0, 0.0, 0.0, 1.0);
+    if (scaleX > 0.001) {
+        float src_x = (v_uv.x - 0.5) / scaleX + 0.5;
+        if (src_x >= 0.0 && src_x <= 1.0) {
+            vec2 uv = vec2(src_x, v_uv.y);
+            vec4 a = texture2D(u_src_a, uv);
+            vec4 b = texture2D(u_src_b, uv);
+            col = mix(a, b, useTo);
+        }
+    }
+    gl_FragColor = col;
+}
+"#;
+
+/// Fragment shader: marquee — tickertape wraparound. slide_a
+/// scrolls off to the left; a gap zone with a centered white dot
+/// passes through; slide_b enters from the right. Mirrors Python
+/// ref `_FRAGMENT_MARQUEE`.
+pub const FS_MARQUEE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    float gap_uv = 0.125;
+    float scroll = u_t * (1.0 + gap_uv);
+    float cx = scroll + v_uv.x;
+
+    vec4 from_col = texture2D(u_src_a, vec2(cx, v_uv.y));
+    vec4 to_col = texture2D(u_src_b, vec2(cx - 1.0 - gap_uv, v_uv.y));
+
+    float gap_local_x = (cx - 1.0) / gap_uv;
+    float dx_uv = (gap_local_x - 0.5) * gap_uv;
+    float dy = v_uv.y - 0.5;
+    float dist = length(vec2(dx_uv, dy));
+    float dot_r = 0.074;
+    float in_dot = step(dist, dot_r);
+    vec4 gap_col = mix(vec4(0.0, 0.0, 0.0, 1.0), vec4(1.0), in_dot);
+
+    float in_from = step(cx, 1.0);
+    float in_to = step(1.0 + gap_uv, cx);
+    float in_gap = 1.0 - in_from - in_to;
+
+    gl_FragColor = from_col * in_from + gap_col * in_gap + to_col * in_to;
+}
+"#;
+
+/// Fragment shader: shutter — hexagonal aperture. A regular hexagon
+/// centered on the canvas grows from a point at t=0 to fully
+/// covering the canvas at t=1. The 16:9 aspect-correct projection
+/// keeps the hex regular at 1080p. The 0.866025 constant is
+/// cos(30°). Mirrors Python ref `_FRAGMENT_SHUTTER`.
+pub const FS_SHUTTER: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    vec2 d = v_uv - vec2(0.5);
+    d.x *= 16.0 / 9.0;
+    float k = 0.866025;
+    float c1 = abs(d.x * k + d.y * 0.5);
+    float c2 = abs(d.y);
+    float c3 = abs(d.x * k - d.y * 0.5);
+    float hex_d = max(max(c1, c2), c3);
+    float inscribed = 1.5 * u_t;
+    float mask = step(hex_d, inscribed);
+    gl_FragColor = mix(a, b, mask);
+}
+"#;
+
 /// Fragment shader: linear cross-fade between two textures by `u_t`.
 /// Mirrors backend.openmarquee.rendering.shader_compositor's
 /// `_FRAGMENT_FADE`: at t=0 emits src_a, at t=1 emits src_b,
@@ -474,10 +680,17 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
         "pixelate" => Some(FS_PIXELATE),
         "scanline" => Some(FS_SCANLINE),
         "halftone" => Some(FS_HALFTONE),
-        // Phase 5-c-3 added pixelate + scanline + halftone.
-        // Remaining 8 (glitch/slide/push/scroll/blinds/flip/
-        // marquee/shutter) land in 5-c-4; until then they hit the
-        // fallback (FS_CUT).
+        "glitch" => Some(FS_GLITCH),
+        "slide" => Some(FS_SLIDE),
+        "push" => Some(FS_PUSH),
+        "scroll" => Some(FS_SCROLL),
+        "blinds" => Some(FS_BLINDS),
+        "flip" => Some(FS_FLIP),
+        "marquee" => Some(FS_MARQUEE),
+        "shutter" => Some(FS_SHUTTER),
+        // Phase 5-c-4 closed out the remaining 8. The full
+        // Python-ref deck is now mirrored. Unknown kinds beyond
+        // these 16 still hit the fallback (FS_CUT).
         _ => None,
     }
 }
@@ -1252,6 +1465,118 @@ mod tests {
     }
 
     #[test]
+    fn fs_glitch_uses_highp_precision() {
+        // Same vc4-mantissa concern as FS_DISSOLVE — sin/dot/fract
+        // hash needs more than mediump's ~10 bits or the per-row
+        // jitter collapses into stripes.
+        assert!(FS_GLITCH.starts_with("#version 100\n"));
+        assert!(FS_GLITCH.contains("precision highp float"));
+        assert!(!FS_GLITCH.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_GLITCH.contains(uniform));
+        }
+        // Hash constants pinned (same magic numbers as dissolve).
+        assert!(FS_GLITCH.contains("12.9898"));
+        assert!(FS_GLITCH.contains("78.233"));
+        assert!(FS_GLITCH.contains("43758.5453"));
+        // Frame-seed quantization at 30 buckets, jitter scale 0.1,
+        // tear threshold 0.95, cyan tear color (0,1,1) at 0.5
+        // brightness — visual tuning constants pinned.
+        assert!(FS_GLITCH.contains("u_t * 30.0"));
+        assert!(FS_GLITCH.contains("0.1 * u_t"));
+        assert!(FS_GLITCH.contains("step(0.95"));
+        assert!(FS_GLITCH.contains("vec3(0.0, 1.0, 1.0)"));
+    }
+
+    #[test]
+    fn fs_slide_targets_gles2_and_pins_uniforms() {
+        assert!(FS_SLIDE.starts_with("#version 100\n"));
+        assert!(FS_SLIDE.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_SLIDE.contains(uniform));
+        }
+        // Slide direction: slide_b enters from RIGHT. Pin step
+        // direction (slide vs push uses inverted step args).
+        assert!(FS_SLIDE.contains("step(seam, v_uv.x)"));
+    }
+
+    #[test]
+    fn fs_push_targets_gles2_and_pins_uniforms() {
+        assert!(FS_PUSH.starts_with("#version 100\n"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_PUSH.contains(uniform));
+        }
+        // Push direction: slide_b enters from LEFT (step inverted
+        // vs slide). Bright projector blade at the seam pinned.
+        assert!(FS_PUSH.contains("step(v_uv.x, t)"));
+        assert!(FS_PUSH.contains("smoothstep(0.0, 0.001"));
+        assert!(FS_PUSH.contains("blade * 0.8"));
+    }
+
+    #[test]
+    fn fs_scroll_targets_gles2_and_pins_uniforms() {
+        assert!(FS_SCROLL.starts_with("#version 100\n"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_SCROLL.contains(uniform));
+        }
+        // Vertical analog of slide — step on v_uv.y not .x.
+        assert!(FS_SCROLL.contains("step(seam, v_uv.y)"));
+    }
+
+    #[test]
+    fn fs_blinds_targets_gles2_and_pins_uniforms() {
+        assert!(FS_BLINDS.starts_with("#version 100\n"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_BLINDS.contains(uniform));
+        }
+        // 16 horizontal slats; reveal from each slat's midline.
+        // Pin slat count + the 0.5 max-distance (each slat
+        // extends 0..0.5 from its midline).
+        assert!(FS_BLINDS.contains("n_slats = 16.0"));
+        assert!(FS_BLINDS.contains("u_t * 0.5"));
+    }
+
+    #[test]
+    fn fs_flip_targets_gles2_and_pins_uniforms() {
+        assert!(FS_FLIP.starts_with("#version 100\n"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_FLIP.contains(uniform));
+        }
+        // ScaleX = |2t - 1| (1 at t=0/1, 0 at t=0.5). useTo
+        // switches at midpoint via step(0.5, t).
+        assert!(FS_FLIP.contains("abs(2.0 * t - 1.0)"));
+        assert!(FS_FLIP.contains("step(0.5, t)"));
+    }
+
+    #[test]
+    fn fs_marquee_targets_gles2_and_pins_uniforms() {
+        assert!(FS_MARQUEE.starts_with("#version 100\n"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_MARQUEE.contains(uniform));
+        }
+        // Gap width 0.125 normalized = 1/8 screen width. Dot
+        // radius 0.074 (small white dot in the gap).
+        assert!(FS_MARQUEE.contains("gap_uv = 0.125"));
+        assert!(FS_MARQUEE.contains("dot_r = 0.074"));
+    }
+
+    #[test]
+    fn fs_shutter_targets_gles2_and_pins_uniforms() {
+        assert!(FS_SHUTTER.starts_with("#version 100\n"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_SHUTTER.contains(uniform));
+        }
+        // 0.866025 = cos(30°), the half-height-to-half-width ratio
+        // of a regular hexagon. 16:9 aspect correction keeps the
+        // hex regular at 1080p. 1.5*u_t is the inscribed-radius
+        // growth (1.5 = ~max hex_d at the corners with aspect
+        // correction).
+        assert!(FS_SHUTTER.contains("0.866025"));
+        assert!(FS_SHUTTER.contains("16.0 / 9.0"));
+        assert!(FS_SHUTTER.contains("1.5 * u_t"));
+    }
+
+    #[test]
     fn fs_for_transition_kind_routes_known_kinds() {
         // Compare by content (str equality) rather than pointer
         // identity — Rust may dedupe identical &'static str into a
@@ -1268,14 +1593,44 @@ mod tests {
         assert_eq!(fs_for_transition_kind("pixelate"), Some(FS_PIXELATE));
         assert_eq!(fs_for_transition_kind("scanline"), Some(FS_SCANLINE));
         assert_eq!(fs_for_transition_kind("halftone"), Some(FS_HALFTONE));
+        assert_eq!(fs_for_transition_kind("glitch"), Some(FS_GLITCH));
+        assert_eq!(fs_for_transition_kind("slide"), Some(FS_SLIDE));
+        assert_eq!(fs_for_transition_kind("push"), Some(FS_PUSH));
+        assert_eq!(fs_for_transition_kind("scroll"), Some(FS_SCROLL));
+        assert_eq!(fs_for_transition_kind("blinds"), Some(FS_BLINDS));
+        assert_eq!(fs_for_transition_kind("flip"), Some(FS_FLIP));
+        assert_eq!(fs_for_transition_kind("marquee"), Some(FS_MARQUEE));
+        assert_eq!(fs_for_transition_kind("shutter"), Some(FS_SHUTTER));
+    }
+
+    #[test]
+    fn fs_for_transition_kind_full_deck_count() {
+        // Phase 5-c-4: the 16 Python-ref transitions are now all
+        // mirrored. Pin the count so a future delete OR add slips
+        // a host test rather than going silent. If a 17th lands,
+        // bump this number AND add it to the routes-known test.
+        let known_kinds = [
+            "cut", "fade", "wipe", "iris", "dissolve",
+            "pixelate", "scanline", "halftone",
+            "glitch", "slide", "push", "scroll",
+            "blinds", "flip", "marquee", "shutter",
+        ];
+        assert_eq!(known_kinds.len(), 16);
+        for kind in known_kinds {
+            assert!(
+                fs_for_transition_kind(kind).is_some(),
+                "kind {kind:?} should be in the dispatch but isn't"
+            );
+        }
     }
 
     #[test]
     fn fs_for_transition_kind_unknown_returns_none() {
-        // Unknown kinds — caller falls back. Pin this so the
-        // dispatch can't accidentally start guessing.
-        assert!(fs_for_transition_kind("glitch").is_none()); // 5-c-4
-        assert!(fs_for_transition_kind("slide").is_none());  // 5-c-4
+        // The full deck is implemented now; unknown-kind callers
+        // get None and fall back. Pin a few obviously-not-present
+        // names so the dispatch can't accidentally start guessing.
+        assert!(fs_for_transition_kind("nonexistent").is_none());
+        assert!(fs_for_transition_kind("zoom").is_none());
         assert!(fs_for_transition_kind("").is_none());
         assert!(fs_for_transition_kind("FADE").is_none()); // case-sensitive
     }
