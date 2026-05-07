@@ -276,6 +276,44 @@ void main() {
 }
 "#;
 
+/// Fragment shader: hard cut between two textures at t=0.5. Doesn't
+/// exist as a shader in the Python ref (cut is a playback-level
+/// instant switch) but adding it here keeps the transition dispatch
+/// uniform — every transition kind goes through the same per-frame
+/// loop with a single FS_FOR_KIND lookup. At t<0.5 emits src_a, at
+/// t>=0.5 emits src_b. Pairs with VS_TEXTURED_QUAD.
+pub const FS_CUT: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    gl_FragColor = mix(a, b, step(0.5, u_t));
+}
+"#;
+
+/// Fragment shader: horizontal wipe — slide_b reveals from the left
+/// edge with a hard line at x=t. Mirrors backend.openmarquee
+/// .rendering.shader_compositor's `_FRAGMENT_WIPE` minus the motion-
+/// overlay logic (we don't render motion overlays from the renderer
+/// side at this phase). Pairs with VS_TEXTURED_QUAD.
+pub const FS_WIPE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    float mask = step(v_uv.x, u_t);
+    gl_FragColor = mix(a, b, mask);
+}
+"#;
+
 /// Fragment shader: linear cross-fade between two textures by `u_t`.
 /// Mirrors backend.openmarquee.rendering.shader_compositor's
 /// `_FRAGMENT_FADE`: at t=0 emits src_a, at t=1 emits src_b,
@@ -296,6 +334,29 @@ void main() {
     gl_FragColor = mix(a, b, clamp(u_t, 0.0, 1.0));
 }
 "#;
+
+/// Map a transition `kind` string (as the Python content model
+/// stores it in `PlaylistItemRef.transition`) to the fragment
+/// shader source the renderer should run.
+///
+/// Returns `None` for unknown kinds — caller falls back to FS_CUT
+/// (a hard switch at t=0.5) so the transition still completes
+/// rather than a silent black frame.
+///
+/// Pure function so a renderer-side rename of a shader const
+/// flips a host test rather than going silent at runtime.
+pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "cut" => Some(FS_CUT),
+        "fade" => Some(FS_FADE),
+        "wipe" => Some(FS_WIPE),
+        // Phase 5-c-1 ports cut + fade + wipe. The remaining 12
+        // (iris/dissolve/pixelate/scanline/halftone/glitch/slide/
+        //  push/scroll/blinds/flip/marquee/shutter) land in
+        // 5-c-2/3/etc; until then they hit the fallback.
+        _ => None,
+    }
+}
 
 /// Fragment shader: identity blit — sample a texture by UV and
 /// emit unchanged. Used by Phase 5-a's FBO path to push the
@@ -946,6 +1007,57 @@ mod tests {
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_pos"));
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_uv"));
         assert!(VS_TEXTURED_QUAD.contains("varying vec2 v_uv"));
+    }
+
+    #[test]
+    fn fs_cut_targets_gles2_and_pins_uniforms() {
+        assert!(FS_CUT.starts_with("#version 100\n"));
+        assert!(FS_CUT.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_CUT.contains(uniform), "FS_CUT missing {uniform:?}");
+        }
+        // Hard switch at midpoint: step(0.5, u_t) returns 0 below
+        // 0.5, 1 at-or-above. Pin so a refactor to step(u_t, 0.5)
+        // (which is wrong — would emit src_b on the wrong half)
+        // flips this test.
+        assert!(FS_CUT.contains("step(0.5, u_t)"));
+    }
+
+    #[test]
+    fn fs_wipe_targets_gles2_and_pins_uniforms() {
+        assert!(FS_WIPE.starts_with("#version 100\n"));
+        assert!(FS_WIPE.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_WIPE.contains(uniform));
+        }
+        // Wipe direction: x-axis, src_b reveals from left as t grows.
+        // step(v_uv.x, u_t) is 1 where v_uv.x <= u_t (left of the
+        // wipe edge) — that side gets src_b after mix.
+        assert!(FS_WIPE.contains("step(v_uv.x, u_t)"));
+    }
+
+    #[test]
+    fn fs_for_transition_kind_routes_known_kinds() {
+        // Compare by content (str equality) rather than pointer
+        // identity — Rust may dedupe identical &'static str into a
+        // single allocation OR keep them distinct depending on
+        // codegen, so ptr::eq is fragile across optimization
+        // settings. Content equality is what the dispatch actually
+        // cares about: "did kind X return the SAME shader source
+        // as the canonical FS_X const?"
+        assert_eq!(fs_for_transition_kind("cut"), Some(FS_CUT));
+        assert_eq!(fs_for_transition_kind("fade"), Some(FS_FADE));
+        assert_eq!(fs_for_transition_kind("wipe"), Some(FS_WIPE));
+    }
+
+    #[test]
+    fn fs_for_transition_kind_unknown_returns_none() {
+        // Unknown kinds — caller falls back. Pin this so the
+        // dispatch can't accidentally start guessing.
+        assert!(fs_for_transition_kind("dissolve").is_none()); // 5-c-2
+        assert!(fs_for_transition_kind("iris").is_none());     // 5-c-2
+        assert!(fs_for_transition_kind("").is_none());
+        assert!(fs_for_transition_kind("FADE").is_none()); // case-sensitive
     }
 
     #[test]

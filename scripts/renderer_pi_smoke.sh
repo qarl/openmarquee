@@ -204,14 +204,49 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
         > "$FADE_LOG" 2>&1 || FADE_EXIT=$?
 fi
 
-# Phase 5-b-2: animated fade. Same slide pair but driven over
-# transition_ms by a per-frame loop.
-echo "==> Phase 5-b-2 -- --animate-fade (per-frame loop @ 800ms / 30fps)"
+# Phase 5-b-2 / 5-c: animated transitions. Same slide pair driven
+# over transition_ms by a per-frame loop. We exercise the three
+# transition kinds 5-c-1 ships: cut + fade + wipe. Each is its own
+# smoke run since `--transition` selects which shader runs.
+# Wall-clock timing per run so the assertion can catch GPU
+# saturation: if the loop emits the expected frame count but takes
+# WAY longer than transition_ms (because per-frame work missed its
+# 33ms budget), the gate must fail loudly instead of going
+# silent-slow. This bites hardest at 1080p.
+echo "==> Phase 5-c-1 -- --animate-fade --transition cut (per-frame @ 500ms / 30fps)"
+ANCUT_LOG="$LOG_DIR/animate-cut.log"
+ANCUT_EXIT=0
+ANCUT_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANCUT_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition cut --transition-ms 500 --fps 30" \
+        > "$ANCUT_LOG" 2>&1 || ANCUT_EXIT=$?
+    ANCUT_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANCUT_WALL_MS=$((ANCUT_END - ANCUT_START))
+fi
+
+echo "==> Phase 5-b-2 -- --animate-fade --transition fade (per-frame @ 800ms / 30fps)"
 ANFADE_LOG="$LOG_DIR/animate-fade.log"
 ANFADE_EXIT=0
+ANFADE_WALL_MS=0
 if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
-    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition-ms 800 --fps 30" \
+    ANFADE_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition fade --transition-ms 800 --fps 30" \
         > "$ANFADE_LOG" 2>&1 || ANFADE_EXIT=$?
+    ANFADE_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANFADE_WALL_MS=$((ANFADE_END - ANFADE_START))
+fi
+
+echo "==> Phase 5-c-1 -- --animate-fade --transition wipe (per-frame @ 800ms / 30fps)"
+ANWIPE_LOG="$LOG_DIR/animate-wipe.log"
+ANWIPE_EXIT=0
+ANWIPE_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANWIPE_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition wipe --transition-ms 800 --fps 30" \
+        > "$ANWIPE_LOG" 2>&1 || ANWIPE_EXIT=$?
+    ANWIPE_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANWIPE_WALL_MS=$((ANWIPE_END - ANWIPE_START))
 fi
 
 # Always try to bring the backend back up before we assert anything.
@@ -359,28 +394,51 @@ else
     echo "    --fade-from/to skipped (couldn't find 2 text slides in seed)"
 fi
 
-# Phase 5-b-2 animated-fade assertion: completion line + frame
-# count floor (a 800ms transition at 30fps should be ~24 frames;
-# float scheduling may wobble by ±2). Per-frame loop proves the
-# harness handles BO/FB rotation across frames without leaking
-# scanout under the renderer.
+# Phase 5-b-2 / 5-c-1 animated-transition assertions. Each kind:
+# completion line ("animated transition complete: kind=KIND ..."),
+# no panics, frame-count floor. cut runs at 500ms = 15 frames @
+# 30fps (floor 12); fade/wipe at 800ms = 24 frames (floor 20).
+assert_anim_transition() {
+    local kind="$1"
+    local log="$2"
+    local exit_code="$3"
+    local floor="$4"
+    local transition_ms="$5"
+    local wall_ms="$6"
+    if [ "$exit_code" -ne 0 ]; then
+        echo "FAIL: --animate-fade --transition $kind exit $exit_code"
+        cat "$log"
+        exit 1
+    fi
+    grep -q "animated transition complete: kind=\"$kind\"" "$log" || \
+        { echo "FAIL: animated $kind didn't print expected completion line"; cat "$log"; exit 1; }
+    grep -qi 'panic\|panicked' "$log" && \
+        { echo "FAIL: panic in animated $kind output"; exit 1; }
+    local frames
+    frames=$(grep -oE 'rendered [0-9]+ frames' "$log" | grep -oE '[0-9]+' | head -1)
+    if [ -z "${frames:-}" ] || [ "$frames" -lt "$floor" ]; then
+        echo "FAIL: --animate-fade --transition $kind frame count too low (got '${frames:-none}', want >=$floor)"
+        cat "$log"
+        exit 1
+    fi
+    # Wall-clock upper bound: transition_ms + 1500ms slack for ssh
+    # roundtrip + EGL bring-up + cleanup. Catches GPU saturation
+    # (loop emits the expected frame count but each frame missed
+    # its 33ms budget, so wall-clock blows past transition_ms).
+    # Generous slack so ssh latency wobble doesn't false-fail.
+    local cap_ms=$((transition_ms + 1500))
+    if [ "$wall_ms" -gt "$cap_ms" ]; then
+        echo "FAIL: --animate-fade --transition $kind wall-clock too high (got ${wall_ms}ms, cap ${cap_ms}ms)"
+        echo "      possible GPU saturation — frames missed their per-frame budget"
+        cat "$log"
+        exit 1
+    fi
+    echo "    --animate-fade --transition $kind ok ($frames frames in ${wall_ms}ms wall-clock)"
+}
 if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
-    if [ "$ANFADE_EXIT" -ne 0 ]; then
-        echo "FAIL: --animate-fade exit $ANFADE_EXIT"
-        cat "$ANFADE_LOG"
-        exit 1
-    fi
-    grep -q 'animated fade complete' "$ANFADE_LOG" || \
-        { echo "FAIL: animated fade didn't print completion line"; cat "$ANFADE_LOG"; exit 1; }
-    grep -qi 'panic\|panicked' "$ANFADE_LOG" && \
-        { echo "FAIL: panic in animated fade output"; exit 1; }
-    ANFADE_FRAMES=$(grep -oE 'rendered [0-9]+ frames' "$ANFADE_LOG" | grep -oE '[0-9]+' | head -1)
-    if [ -z "${ANFADE_FRAMES:-}" ] || [ "$ANFADE_FRAMES" -lt 20 ]; then
-        echo "FAIL: --animate-fade frame count too low (got '${ANFADE_FRAMES:-none}', want >=20)"
-        cat "$ANFADE_LOG"
-        exit 1
-    fi
-    echo "    --animate-fade ok ($FADE_FROM → $FADE_TO over 800ms, $ANFADE_FRAMES frames)"
+    assert_anim_transition "cut"  "$ANCUT_LOG"  "$ANCUT_EXIT"  12 500 "$ANCUT_WALL_MS"
+    assert_anim_transition "fade" "$ANFADE_LOG" "$ANFADE_EXIT" 20 800 "$ANFADE_WALL_MS"
+    assert_anim_transition "wipe" "$ANWIPE_LOG" "$ANWIPE_EXIT" 20 800 "$ANWIPE_WALL_MS"
 else
     echo "    --animate-fade skipped (couldn't find 2 text slides in seed)"
 fi

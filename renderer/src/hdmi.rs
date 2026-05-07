@@ -36,10 +36,11 @@ use std::rc::Rc;
 
 use crate::content::{solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
-    box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, gradient_uniforms,
-    hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, parse_crtc_list_filter_bits,
-    parse_h_align, pick_largest_mode_index, FontCatalog, ModeSpec, VAlign, FS_BLIT,
-    FS_FADE, FS_GLYPH, FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
+    box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, fs_for_transition_kind,
+    gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha,
+    parse_crtc_list_filter_bits, parse_h_align, pick_largest_mode_index, FontCatalog,
+    ModeSpec, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GRADIENT, VS_FULLSCREEN_QUAD,
+    VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -1005,24 +1006,29 @@ pub fn render_fade_composite(
     Ok(())
 }
 
-/// Phase 5-b-2 — animate the fade transition between two slides
-/// over `transition_ms` at `fps`. Renders slide_a + slide_b into
-/// FBOs ONCE before the loop; per-frame just runs the FS_FADE
-/// composite at the current `t = elapsed / transition_ms` clamped
-/// to [0, 1] and pushes via legacy SetCrtc.
+/// Phase 5-b-2/5-c — animate a transition between two slides over
+/// `transition_ms` at `fps`. Renders slide_a + slide_b into FBOs
+/// ONCE before the loop; per-frame runs the kind-selected
+/// transition shader at `t = elapsed / transition_ms` clamped to
+/// [0, 1] and pushes via legacy SetCrtc.
+///
+/// `kind` selects the shader via `fs_for_transition_kind`. Unknown
+/// kinds fall back to `cut` (hard switch at t=0.5) with a warn so
+/// the transition still completes rather than a black frame.
 ///
 /// Single-buffered scanout — there's tearing at the swap boundary
-/// for the brief transition duration. Phase 5-c may switch to
-/// atomic + double-buffered (see render_animated_atomic) once the
-/// transition deck is complete; for 5-b-2 the simpler path keeps
-/// the scope reviewable.
+/// for the brief transition duration. May switch to atomic +
+/// double-buffered (see render_animated_atomic) once the
+/// transition deck is complete; for now the simpler path keeps the
+/// slice scope reviewable.
 ///
 /// Returns the rendered frame count for smoke-script floor checks.
-pub fn render_fade_animated(
+pub fn render_transition_animated(
     card: &Card,
     slide_a: &TextSlide,
     slide_b: &TextSlide,
     fonts: Option<&FontCatalog>,
+    kind: &str,
     transition_ms: u32,
     fps: u32,
 ) -> Result<u32> {
@@ -1033,11 +1039,22 @@ pub fn render_fade_animated(
         bail!("fps must be > 0");
     }
 
+    let fs = match fs_for_transition_kind(kind) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "warn: transition kind {kind:?} not yet implemented; \
+                 falling back to cut"
+            );
+            FS_CUT
+        }
+    };
     let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts)?;
     let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts)?;
 
     eprintln!(
-        "rendering animated fade slide_a={} slide_b={} transition_ms={transition_ms} fps={fps}",
+        "rendering animated transition kind={kind:?} slide_a={} slide_b={} \
+         transition_ms={transition_ms} fps={fps}",
         slide_a.id, slide_b.id,
     );
 
@@ -1161,9 +1178,9 @@ pub fn render_fade_animated(
             }
         };
 
-        // -- Compile fade program + build VBO once.
+        // -- Compile transition program + build VBO once.
         let program = unsafe {
-            match link_program(&gl, VS_TEXTURED_QUAD, FS_FADE) {
+            match link_program(&gl, VS_TEXTURED_QUAD, fs) {
                 Ok(p) => p,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -1354,7 +1371,7 @@ pub fn render_fade_animated(
 
     let frame_count = work?;
     eprintln!(
-        "animated fade complete: rendered {frame_count} frames in {transition_ms}ms"
+        "animated transition complete: kind={kind:?} rendered {frame_count} frames in {transition_ms}ms"
     );
     Ok(frame_count)
 }

@@ -151,14 +151,20 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     fade_t: f32,
 
-    /// Phase 5-b-2 — animate the fade between `--fade-from` and
-    /// `--fade-to` over `--transition-ms` at `--fps`. When this
-    /// flag is set, `--fade-t` is ignored. Pass-through to
-    /// `render_fade_animated`.
+    /// Phase 5-b-2 — animate the transition between `--fade-from`
+    /// and `--fade-to` over `--transition-ms` at `--fps`. When this
+    /// flag is set, `--fade-t` is ignored.
     #[arg(long, default_value_t = false)]
     animate_fade: bool,
 
-    /// Animated-fade transition duration in milliseconds.
+    /// Phase 5-c — transition kind to run when `--animate-fade` is
+    /// set. Currently supported: `cut` / `fade` / `wipe`. Unknown
+    /// kinds fall back to `cut` with a warn. The Python content
+    /// model has 16 kinds total; remaining 13 land in 5-c-2/3/etc.
+    #[arg(long, default_value = "fade")]
+    transition: String,
+
+    /// Animated transition duration in milliseconds.
     #[arg(long, default_value_t = 800)]
     transition_ms: u32,
 
@@ -516,11 +522,12 @@ fn main() -> Result<()> {
                         None
                     };
                     if args.animate_fade {
-                        hdmi::render_fade_animated(
+                        hdmi::render_transition_animated(
                             &card,
                             &slide_a,
                             &slide_b,
                             catalog_opt,
+                            &args.transition,
                             args.transition_ms,
                             args.fps,
                         )?;
