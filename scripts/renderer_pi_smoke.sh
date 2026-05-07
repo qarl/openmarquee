@@ -249,6 +249,46 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
     ANWIPE_WALL_MS=$((ANWIPE_END - ANWIPE_START))
 fi
 
+echo "==> Phase 5-c-2 -- --animate-fade --transition iris (per-frame @ 800ms / 30fps)"
+ANIRIS_LOG="$LOG_DIR/animate-iris.log"
+ANIRIS_EXIT=0
+ANIRIS_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANIRIS_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition iris --transition-ms 800 --fps 30" \
+        > "$ANIRIS_LOG" 2>&1 || ANIRIS_EXIT=$?
+    ANIRIS_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANIRIS_WALL_MS=$((ANIRIS_END - ANIRIS_START))
+fi
+
+echo "==> Phase 5-c-2 -- --animate-fade --transition dissolve (per-frame @ 800ms / 30fps)"
+ANDIS_LOG="$LOG_DIR/animate-dissolve.log"
+ANDIS_EXIT=0
+ANDIS_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANDIS_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition dissolve --transition-ms 800 --fps 30" \
+        > "$ANDIS_LOG" 2>&1 || ANDIS_EXIT=$?
+    ANDIS_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANDIS_WALL_MS=$((ANDIS_END - ANDIS_START))
+fi
+
+# Phase 5-c F1 followup: exercise the unknown-kind warn-fallback
+# path. A kind that isn't in fs_for_transition_kind should hit the
+# eprintln warn AND still complete (FS_CUT fallback). Pi smoke
+# just asserts the warn log line + the still-completes outcome.
+echo "==> Phase 5-c -- --animate-fade --transition pixelate (unknown→cut fallback)"
+ANUNK_LOG="$LOG_DIR/animate-unknown.log"
+ANUNK_EXIT=0
+ANUNK_WALL_MS=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ANUNK_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition pixelate --transition-ms 500 --fps 30" \
+        > "$ANUNK_LOG" 2>&1 || ANUNK_EXIT=$?
+    ANUNK_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
+    ANUNK_WALL_MS=$((ANUNK_END - ANUNK_START))
+fi
+
 # Always try to bring the backend back up before we assert anything.
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl start openmarquee-backend"
@@ -421,12 +461,16 @@ assert_anim_transition() {
         cat "$log"
         exit 1
     fi
-    # Wall-clock upper bound: transition_ms + 1500ms slack for ssh
+    # Wall-clock upper bound: transition_ms + 2000ms slack for ssh
     # roundtrip + EGL bring-up + cleanup. Catches GPU saturation
     # (loop emits the expected frame count but each frame missed
     # its 33ms budget, so wall-clock blows past transition_ms).
-    # Generous slack so ssh latency wobble doesn't false-fail.
-    local cap_ms=$((transition_ms + 1500))
+    # Bumped from 1500ms after 5-c-1 verify saw 27ms margin on the
+    # 800ms wipe (2273ms vs 2300ms cap) — ssh latency wobble alone
+    # could false-fail. Tightens to a per-frame budget assertion
+    # once 1080p bring-up happens (where GPU saturation becomes
+    # the real risk vs ssh wobble).
+    local cap_ms=$((transition_ms + 2000))
     if [ "$wall_ms" -gt "$cap_ms" ]; then
         echo "FAIL: --animate-fade --transition $kind wall-clock too high (got ${wall_ms}ms, cap ${cap_ms}ms)"
         echo "      possible GPU saturation — frames missed their per-frame budget"
@@ -436,9 +480,30 @@ assert_anim_transition() {
     echo "    --animate-fade --transition $kind ok ($frames frames in ${wall_ms}ms wall-clock)"
 }
 if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
-    assert_anim_transition "cut"  "$ANCUT_LOG"  "$ANCUT_EXIT"  12 500 "$ANCUT_WALL_MS"
-    assert_anim_transition "fade" "$ANFADE_LOG" "$ANFADE_EXIT" 20 800 "$ANFADE_WALL_MS"
-    assert_anim_transition "wipe" "$ANWIPE_LOG" "$ANWIPE_EXIT" 20 800 "$ANWIPE_WALL_MS"
+    assert_anim_transition "cut"      "$ANCUT_LOG"  "$ANCUT_EXIT"  12 500 "$ANCUT_WALL_MS"
+    assert_anim_transition "fade"     "$ANFADE_LOG" "$ANFADE_EXIT" 20 800 "$ANFADE_WALL_MS"
+    assert_anim_transition "wipe"     "$ANWIPE_LOG" "$ANWIPE_EXIT" 20 800 "$ANWIPE_WALL_MS"
+    assert_anim_transition "iris"     "$ANIRIS_LOG" "$ANIRIS_EXIT" 20 800 "$ANIRIS_WALL_MS"
+    assert_anim_transition "dissolve" "$ANDIS_LOG"  "$ANDIS_EXIT"  20 800 "$ANDIS_WALL_MS"
+    # Unknown-kind fallback: the renderer keeps the REQUESTED kind
+    # in its log line ("kind=\"pixelate\"") so operators can
+    # correlate logs with what they asked for; the warn line above
+    # is what proves the FS fallback to FS_CUT actually ran. Both
+    # must be present.
+    if [ "$ANUNK_EXIT" -ne 0 ]; then
+        echo "FAIL: --transition pixelate (unknown) exit $ANUNK_EXIT"
+        cat "$ANUNK_LOG"
+        exit 1
+    fi
+    grep -q 'warn: transition kind "pixelate" not yet implemented' "$ANUNK_LOG" || \
+        { echo "FAIL: unknown-kind warn didn't fire"; cat "$ANUNK_LOG"; exit 1; }
+    # The completion line keeps the REQUESTED kind ("pixelate") so
+    # the operator can correlate logs with what they asked for; the
+    # warn above is what proves the FS fallback to FS_CUT actually
+    # ran. Both must be present.
+    grep -q 'animated transition complete: kind="pixelate"' "$ANUNK_LOG" || \
+        { echo "FAIL: unknown-kind completion line missing"; cat "$ANUNK_LOG"; exit 1; }
+    echo "    --animate-fade --transition pixelate ok (unknown → cut fallback fired)"
 else
     echo "    --animate-fade skipped (couldn't find 2 text slides in seed)"
 fi

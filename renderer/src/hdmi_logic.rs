@@ -314,6 +314,55 @@ void main() {
 }
 "#;
 
+/// Fragment shader: iris — slide_b reveals through a circle that
+/// expands from screen center to the corners. The `0.71` factor is
+/// `sqrt(0.5)` (≈ 0.7071), the diagonal distance from center
+/// (0.5, 0.5) to the corner (1, 1) in normalized [0, 1] UV space —
+/// so at u_t=1 the circle exactly covers the screen. Mirrors Python
+/// ref `_FRAGMENT_IRIS`.
+pub const FS_IRIS: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    float r = distance(v_uv, vec2(0.5));
+    float mask = step(r, u_t * 0.71);
+    gl_FragColor = mix(a, b, mask);
+}
+"#;
+
+/// Fragment shader: dissolve — per-pixel reveal threshold sampled
+/// from a hash of v_uv. Each pixel "rolls a die" once and reveals
+/// when u_t crosses its threshold. Mirrors Python ref
+/// `_FRAGMENT_DISSOLVE`.
+///
+/// **Precision note**: the Python ref uses `highp` throughout the
+/// preamble specifically because the hash math (sin/dot/fract on
+/// large constants) collapses on vc4's mediump (~10-bit mantissa).
+/// Match that here — every other transition can stay mediump, but
+/// dissolve needs the higher precision or it stripes/banded on Pi.
+pub const FS_DISSOLVE: &str = r#"#version 100
+precision highp float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+float _hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+void main() {
+    vec4 a = texture2D(u_src_a, v_uv);
+    vec4 b = texture2D(u_src_b, v_uv);
+    float threshold = _hash(v_uv);
+    float mask = step(threshold, u_t);
+    gl_FragColor = mix(a, b, mask);
+}
+"#;
+
 /// Fragment shader: linear cross-fade between two textures by `u_t`.
 /// Mirrors backend.openmarquee.rendering.shader_compositor's
 /// `_FRAGMENT_FADE`: at t=0 emits src_a, at t=1 emits src_b,
@@ -350,10 +399,12 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
         "cut" => Some(FS_CUT),
         "fade" => Some(FS_FADE),
         "wipe" => Some(FS_WIPE),
-        // Phase 5-c-1 ports cut + fade + wipe. The remaining 12
-        // (iris/dissolve/pixelate/scanline/halftone/glitch/slide/
-        //  push/scroll/blinds/flip/marquee/shutter) land in
-        // 5-c-2/3/etc; until then they hit the fallback.
+        "iris" => Some(FS_IRIS),
+        "dissolve" => Some(FS_DISSOLVE),
+        // Phase 5-c-2 added iris + dissolve. Remaining 11
+        // (pixelate/scanline/halftone/glitch/slide/push/scroll/
+        //  blinds/flip/marquee/shutter) land in 5-c-3/4; until
+        // then they hit the fallback (FS_CUT).
         _ => None,
     }
 }
@@ -1037,6 +1088,44 @@ mod tests {
     }
 
     #[test]
+    fn fs_iris_targets_gles2_and_pins_uniforms() {
+        assert!(FS_IRIS.starts_with("#version 100\n"));
+        assert!(FS_IRIS.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_IRIS.contains(uniform));
+        }
+        // Iris radius math: distance from center (0.5, 0.5),
+        // compared to t * 0.71 (≈ sqrt(0.5), the diagonal half-
+        // length). Pin so a refactor can't accidentally swap to
+        // step(t * 0.71, r) (inverted) or drop the 0.71 (would
+        // leave a strip of slide_a in the corners at t=1).
+        assert!(FS_IRIS.contains("distance(v_uv, vec2(0.5))"));
+        assert!(FS_IRIS.contains("step(r, u_t * 0.71)"));
+    }
+
+    #[test]
+    fn fs_dissolve_uses_highp_precision() {
+        // Critical for vc4 — the sin/dot/fract hash needs more than
+        // the ~10-bit mantissa of mediump or the threshold values
+        // collapse and the dissolve goes banded. Pin at host-test
+        // time so a copy-paste from another shader can't downgrade
+        // it.
+        assert!(FS_DISSOLVE.starts_with("#version 100\n"));
+        assert!(FS_DISSOLVE.contains("precision highp float"));
+        assert!(!FS_DISSOLVE.contains("precision mediump float"));
+        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+            assert!(FS_DISSOLVE.contains(uniform));
+        }
+        // Hash structure pinned: sin(dot(p, vec2(...))) * big
+        // constant, fract'd. Pin the magic constants so a future
+        // edit doesn't silently change the noise pattern.
+        assert!(FS_DISSOLVE.contains("12.9898"));
+        assert!(FS_DISSOLVE.contains("78.233"));
+        assert!(FS_DISSOLVE.contains("43758.5453"));
+        assert!(FS_DISSOLVE.contains("step(threshold, u_t)"));
+    }
+
+    #[test]
     fn fs_for_transition_kind_routes_known_kinds() {
         // Compare by content (str equality) rather than pointer
         // identity — Rust may dedupe identical &'static str into a
@@ -1048,14 +1137,16 @@ mod tests {
         assert_eq!(fs_for_transition_kind("cut"), Some(FS_CUT));
         assert_eq!(fs_for_transition_kind("fade"), Some(FS_FADE));
         assert_eq!(fs_for_transition_kind("wipe"), Some(FS_WIPE));
+        assert_eq!(fs_for_transition_kind("iris"), Some(FS_IRIS));
+        assert_eq!(fs_for_transition_kind("dissolve"), Some(FS_DISSOLVE));
     }
 
     #[test]
     fn fs_for_transition_kind_unknown_returns_none() {
         // Unknown kinds — caller falls back. Pin this so the
         // dispatch can't accidentally start guessing.
-        assert!(fs_for_transition_kind("dissolve").is_none()); // 5-c-2
-        assert!(fs_for_transition_kind("iris").is_none());     // 5-c-2
+        assert!(fs_for_transition_kind("pixelate").is_none()); // 5-c-3
+        assert!(fs_for_transition_kind("glitch").is_none());   // 5-c-4
         assert!(fs_for_transition_kind("").is_none());
         assert!(fs_for_transition_kind("FADE").is_none()); // case-sensitive
     }
