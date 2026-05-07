@@ -992,6 +992,271 @@ pub fn effective_hold_ms(slide_duration_ms: u32, override_secs: Option<u64>) -> 
         .unwrap_or(slide_duration_ms as u64)
 }
 
+// ---------------------------------------------------------------
+// Motion engine (v1-spec-delta #2) — pure host-testable math.
+// docs/text-layer-motion-spec.md is the source of truth for the
+// menu, semantics, and per-effect intensity ranges.
+// ---------------------------------------------------------------
+
+/// The seven motion modes the spec defines. Anything not in this
+/// enum (including future-added strings) falls back to `Static`
+/// in `parse_motion_kind`, which the renderer treats as "no
+/// animation" — preserving the field on save without rendering an
+/// undefined effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionKind {
+    Static,
+    Ticker,
+    Breathe,
+    Pulse,
+    Bounce,
+    Shake,
+    Blink,
+}
+
+/// Map the schema string to the renderer's motion enum. Unknown
+/// values resolve to `Static` (safe fallback) so a forward-added
+/// motion kind in the editor doesn't crash the renderer.
+pub fn parse_motion_kind(s: &str) -> MotionKind {
+    match s {
+        "ticker" => MotionKind::Ticker,
+        "breathe" => MotionKind::Breathe,
+        "pulse" => MotionKind::Pulse,
+        "bounce" => MotionKind::Bounce,
+        "shake" => MotionKind::Shake,
+        "blink" => MotionKind::Blink,
+        _ => MotionKind::Static,
+    }
+}
+
+/// Per-frame motion contribution for one text layer. The renderer
+/// applies these on top of the layer's authored placement +
+/// opacity:
+///   - `offset_x_norm` / `offset_y_norm` are translation offsets
+///     expressed as fractions of the layer's box dimensions
+///     (ticker / bounce / shake) or glyph-height for shake. The
+///     `effective_motion_translate_px` helper does the
+///     box→pixels conversion at the renderer boundary.
+///   - `scale` is the breathe scale around box center (1.0 = no
+///     change). Ticker / pulse / blink return 1.0.
+///   - `alpha_mul` multiplies the layer's authored opacity (1.0 =
+///     no change). pulse / blink modulate this.
+///
+/// The shared global tick is a `f64` of seconds since clock start;
+/// passing the same tick to multiple layers keeps them in sync,
+/// and `motion_phase` (0..1) lets two layers with the same effect
+/// run in opposition.
+#[derive(Debug, Clone, Copy)]
+pub struct MotionState {
+    pub offset_x_norm: f32,
+    pub offset_y_norm: f32,
+    pub scale: f32,
+    pub alpha_mul: f32,
+}
+
+impl MotionState {
+    pub const IDENTITY: MotionState = MotionState {
+        offset_x_norm: 0.0,
+        offset_y_norm: 0.0,
+        scale: 1.0,
+        alpha_mul: 1.0,
+    };
+}
+
+/// Compute the per-frame motion state for a layer at `tick_seconds`
+/// on the shared global clock.
+///
+/// `intensity` is clamped to 0..=100 (Python validates 0-100 but
+/// we mirror loosely so out-of-range values don't panic the
+/// renderer); `phase` is clamped to 0..=1; `speed` is clamped to
+/// 0..=2 (matches the Python field validator).
+///
+/// `layer_id_seed` is used by `Shake` to seed a deterministic PRNG
+/// — same layer + same phase = same shake sequence across
+/// reloads, different layers across one slide produce visually
+/// different jitter.
+pub fn compute_motion_state(
+    kind: MotionKind,
+    intensity: u8,
+    phase: f32,
+    speed: f32,
+    layer_id_seed: u64,
+    tick_seconds: f64,
+) -> MotionState {
+    let i = (intensity.min(100) as f32) / 100.0;
+    let phase = phase.clamp(0.0, 1.0);
+    let speed = speed.clamp(0.0, 2.0);
+    match kind {
+        MotionKind::Static => MotionState::IDENTITY,
+        MotionKind::Ticker => motion_ticker(i, phase, speed, tick_seconds),
+        MotionKind::Breathe => motion_breathe(i, phase, speed, tick_seconds),
+        MotionKind::Pulse => motion_pulse(i, phase, speed, tick_seconds),
+        MotionKind::Bounce => motion_bounce(i, phase, speed, tick_seconds),
+        MotionKind::Shake => {
+            motion_shake(i, phase, speed, layer_id_seed, tick_seconds)
+        }
+        MotionKind::Blink => motion_blink(i, phase, speed, tick_seconds),
+    }
+}
+
+/// Linear horizontal travel, LTR (text enters from the right edge,
+/// exits left). Period at intensity=50 is ~3.5 s; ranges from 6 s
+/// slow to 1 s fast over 0..100. Returns offset_x_norm in
+/// [-1, +1] units of the box width — the renderer converts to
+/// pixels using the actual box dim.
+fn motion_ticker(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) -> MotionState {
+    // Period: 6 s @ 0  →  1 s @ 100. At 50: 3.5 s (close to spec's
+    // ~3 s). Linear interp keeps the math obvious; the spec
+    // explicitly tolerates approximate timing because operators
+    // can't perceive sub-second period differences.
+    let base_period = 6.0 - 5.0 * intensity_norm as f32;
+    if speed == 0.0 {
+        // Frozen: hold at phase=0 visual state (entry edge).
+        return MotionState {
+            offset_x_norm: 1.0 - 2.0 * phase,
+            ..MotionState::IDENTITY
+        };
+    }
+    let period = (base_period / speed).max(0.05);
+    let t = tick_seconds + (phase as f64) * period as f64;
+    let cycle = (t.rem_euclid(period as f64)) / (period as f64);
+    // Offset goes +1 → -1 over one cycle (right-edge → left-edge).
+    let offset_x = 1.0 - 2.0 * cycle as f32;
+    MotionState {
+        offset_x_norm: offset_x,
+        ..MotionState::IDENTITY
+    }
+}
+
+/// Sine scale around the box center. 1 Hz, amplitude ±2 % at
+/// intensity=0 → ±20 % at intensity=100, ±11 % at intensity=50
+/// (close to spec's "±10 %"). Renderer pivots on the box center,
+/// preserving operator-authored offset within the box.
+fn motion_breathe(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) -> MotionState {
+    let amp = 0.02 + 0.18 * intensity_norm;
+    let phase_rad = 2.0 * std::f32::consts::PI
+        * ((tick_seconds * speed as f64) as f32 + phase);
+    MotionState {
+        scale: 1.0 + amp * phase_rad.sin(),
+        ..MotionState::IDENTITY
+    }
+}
+
+/// Sine alpha sweep. 1 Hz, range [0.70, 1.0] at intensity=0 →
+/// [0.0, 1.0] at intensity=100, [0.35, 1.0] at intensity=50
+/// (close to spec's "30 %→100 %"). Multiplies the layer's
+/// authored opacity.
+fn motion_pulse(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) -> MotionState {
+    let min_alpha = 0.70 * (1.0 - intensity_norm);
+    let phase_rad = 2.0 * std::f32::consts::PI
+        * ((tick_seconds * speed as f64) as f32 + phase);
+    // 0.5 * (1 + sin) maps to [0, 1], then scale into [min, 1].
+    let frac = 0.5 * (1.0 + phase_rad.sin());
+    MotionState {
+        alpha_mul: min_alpha + (1.0 - min_alpha) * frac,
+        ..MotionState::IDENTITY
+    }
+}
+
+/// Sine vertical bob. 1 Hz, amplitude ±1 % at intensity=0 → ±10 %
+/// at intensity=100, ±5.5 % at intensity=50 (close to spec's
+/// "±5 %"). Returns offset_y_norm in box-height units.
+fn motion_bounce(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) -> MotionState {
+    let amp = 0.01 + 0.09 * intensity_norm;
+    let phase_rad = 2.0 * std::f32::consts::PI
+        * ((tick_seconds * speed as f64) as f32 + phase);
+    MotionState {
+        offset_y_norm: amp * phase_rad.sin(),
+        ..MotionState::IDENTITY
+    }
+}
+
+/// Per-frame Gaussian micro-jitter, deterministically seeded from
+/// `layer_id` + `motion_phase` so the same layer at the same phase
+/// produces the same sequence across reloads (matches the spec's
+/// phase=0-on-load determinism). Frame index advances at ~10 Hz
+/// (every 100 ms tick), independent of motion_speed; intensity
+/// modulates amplitude only.
+///
+/// Returned offsets are in glyph-height units; the renderer
+/// converts to pixels using the layer's effective rasterization
+/// size (caller multiplies by `effective_font_size_px`).
+fn motion_shake(
+    intensity_norm: f32,
+    phase: f32,
+    _speed: f32,
+    layer_id_seed: u64,
+    tick_seconds: f64,
+) -> MotionState {
+    // ~10 Hz sampling: floor to 100 ms buckets.
+    let tick_index = (tick_seconds * 10.0).floor() as u64;
+    // Mix layer_id + phase + tick_index into a u64. xxhash-style
+    // splitmix64 keeps it dependency-free and fast.
+    let phase_bits = phase.to_bits() as u64;
+    let mut state = layer_id_seed
+        ^ phase_bits.rotate_left(17)
+        ^ tick_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let dx = gaussian_from_state(&mut state);
+    let dy = gaussian_from_state(&mut state);
+    // Cap amplitude at ±4 % of glyph height (intensity=100); 0.5 %
+    // at intensity=0; ~2.25 % at intensity=50 (close to spec's
+    // "±2 %"). Clamp the Gaussian to ±1.0 so a 3-sigma tail can't
+    // suddenly throw the layer halfway across the slide.
+    let amp = 0.005 + 0.035 * intensity_norm;
+    MotionState {
+        offset_x_norm: amp * dx.clamp(-1.0, 1.0),
+        offset_y_norm: amp * dy.clamp(-1.0, 1.0),
+        ..MotionState::IDENTITY
+    }
+}
+
+/// Square-wave on/off opacity. 0.5 Hz at intensity=0 → 1 Hz at 50
+/// → 4 Hz at 100, piecewise-linear so the spec's "1 Hz at default"
+/// lands exactly. 50 % duty (visible half the cycle).
+fn motion_blink(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) -> MotionState {
+    // Piecewise linear: 0..0.5 → 0.5..1.0, 0.5..1.0 → 1.0..4.0.
+    // Endpoints + midpoint match spec exactly.
+    let base_freq = if intensity_norm <= 0.5 {
+        0.5 + intensity_norm * 1.0
+    } else {
+        1.0 + (intensity_norm - 0.5) * 6.0
+    };
+    let freq = base_freq * speed;
+    if freq <= 0.0 {
+        // Frozen at phase=0 → visible (the "on" half of the
+        // square wave starts at phase=0).
+        return MotionState::IDENTITY;
+    }
+    let phase_rad = 2.0 * std::f32::consts::PI
+        * ((tick_seconds * freq as f64) as f32 + phase);
+    let visible = phase_rad.sin() >= 0.0;
+    MotionState {
+        alpha_mul: if visible { 1.0 } else { 0.0 },
+        ..MotionState::IDENTITY
+    }
+}
+
+/// SplitMix64 + Box-Muller for a deterministic standard-normal
+/// draw. Advances `state` in place so consecutive calls produce
+/// independent samples. Used by `motion_shake`.
+fn gaussian_from_state(state: &mut u64) -> f32 {
+    fn next_u64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn unit(state: &mut u64) -> f32 {
+        // 24 mantissa bits → [0, 1) with no bias near 0.
+        ((next_u64(state) >> 40) as f32) / (1u32 << 24) as f32
+    }
+    let u1 = unit(state).max(f32::MIN_POSITIVE);
+    let u2 = unit(state);
+    // Box-Muller. Guard against u1=0 producing -inf via ln.
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
 /// Effective rasterization pixel size for a text layer.
 ///
 /// Resolution rules (Phase 4.2c — replaces 4.2a/b heuristic):
@@ -2266,6 +2531,254 @@ mod tests {
         // passes u64::MAX for the override (degenerate but
         // possible).
         assert_eq!(effective_hold_ms(0, Some(u64::MAX)), u64::MAX);
+    }
+
+    // -- motion engine (v1-spec-delta #2) -----------------------
+
+    #[test]
+    fn parse_motion_kind_recognized_values() {
+        assert_eq!(parse_motion_kind("static"), MotionKind::Static);
+        assert_eq!(parse_motion_kind("ticker"), MotionKind::Ticker);
+        assert_eq!(parse_motion_kind("breathe"), MotionKind::Breathe);
+        assert_eq!(parse_motion_kind("pulse"), MotionKind::Pulse);
+        assert_eq!(parse_motion_kind("bounce"), MotionKind::Bounce);
+        assert_eq!(parse_motion_kind("shake"), MotionKind::Shake);
+        assert_eq!(parse_motion_kind("blink"), MotionKind::Blink);
+    }
+
+    #[test]
+    fn parse_motion_kind_unknown_falls_back_static() {
+        // Forward-added schema values render as static (no
+        // animation) rather than crashing the renderer.
+        assert_eq!(parse_motion_kind("warp"), MotionKind::Static);
+        assert_eq!(parse_motion_kind(""), MotionKind::Static);
+    }
+
+    #[test]
+    fn motion_static_is_identity() {
+        // Static at any tick / phase / intensity = no contribution.
+        let m = compute_motion_state(MotionKind::Static, 100, 0.5, 1.0, 0xDEAD, 7.42);
+        assert!((m.offset_x_norm - 0.0).abs() < 1e-6);
+        assert!((m.offset_y_norm - 0.0).abs() < 1e-6);
+        assert!((m.scale - 1.0).abs() < 1e-6);
+        assert!((m.alpha_mul - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_ticker_starts_right_at_phase_zero() {
+        // t=0, phase=0 → offset_x_norm = +1.0 (text positioned at
+        // the right edge, about to enter from there per LTR).
+        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 0.0);
+        assert!((m.offset_x_norm - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_ticker_sawtooth_zero_at_half_cycle() {
+        // Sawtooth offset: +1 → -1 over one period (linear), wraps
+        // back to +1 at period boundary. At intensity=50 the period
+        // is 6 - 5*0.5 = 3.5 s; halfway through, offset_x_norm = 0
+        // (text centered between entry and exit).
+        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 1.75);
+        assert!(m.offset_x_norm.abs() < 1e-3, "offset was {}", m.offset_x_norm);
+    }
+
+    #[test]
+    fn motion_ticker_sawtooth_near_minus_one_just_before_wrap() {
+        // Just before the period boundary, offset is asymptotically
+        // approaching -1 (text fully exited left). Period = 3.5 s;
+        // sample at t = 0.999 * period.
+        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 3.5 * 0.999);
+        assert!(m.offset_x_norm < -0.99, "offset was {}", m.offset_x_norm);
+    }
+
+    #[test]
+    fn motion_ticker_wraps_back_to_right_at_period_boundary() {
+        // At t = period exactly, the cycle wraps and offset jumps
+        // back to +1 (text re-enters from right edge).
+        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 3.5);
+        assert!((m.offset_x_norm - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_ticker_speed_zero_freezes_at_phase_position() {
+        // motion_speed=0 holds offset_x at the phase-0 visual
+        // state (no temporal advancement). Same value at t=0 and
+        // t=100 for a frozen ticker.
+        let m1 = compute_motion_state(MotionKind::Ticker, 50, 0.0, 0.0, 0, 0.0);
+        let m2 = compute_motion_state(MotionKind::Ticker, 50, 0.0, 0.0, 0, 100.0);
+        assert!((m1.offset_x_norm - m2.offset_x_norm).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_breathe_is_unity_at_zero_phase_zero_tick() {
+        // sin(0) = 0 → scale = 1.0 + amp*0 = 1.0 exactly.
+        let m = compute_motion_state(MotionKind::Breathe, 50, 0.0, 1.0, 0, 0.0);
+        assert!((m.scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_breathe_peak_at_quarter_period() {
+        // At t = 0.25 s (quarter of a 1 Hz cycle), sin(π/2) = 1, so
+        // scale = 1 + amp. Intensity=50 → amp = 0.02 + 0.18*0.5 =
+        // 0.11. Pin the math so a regression here is loud.
+        let m = compute_motion_state(MotionKind::Breathe, 50, 0.0, 1.0, 0, 0.25);
+        assert!((m.scale - 1.11).abs() < 1e-3, "scale was {}", m.scale);
+    }
+
+    #[test]
+    fn motion_breathe_amplitude_scales_with_intensity() {
+        // Intensity=0 produces ±2 % swing; intensity=100 produces
+        // ±20 %. Pin both endpoints.
+        let m_lo = compute_motion_state(MotionKind::Breathe, 0, 0.0, 1.0, 0, 0.25);
+        assert!((m_lo.scale - 1.02).abs() < 1e-3);
+        let m_hi = compute_motion_state(MotionKind::Breathe, 100, 0.0, 1.0, 0, 0.25);
+        assert!((m_hi.scale - 1.20).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_pulse_alpha_at_min_at_three_quarter_period() {
+        // sin at 3π/2 = -1, so alpha = min + (1-min)*0 = min.
+        // Intensity=50 → min = 0.70 * (1 - 0.5) = 0.35.
+        let m = compute_motion_state(MotionKind::Pulse, 50, 0.0, 1.0, 0, 0.75);
+        assert!((m.alpha_mul - 0.35).abs() < 1e-3, "alpha was {}", m.alpha_mul);
+    }
+
+    #[test]
+    fn motion_pulse_intensity_zero_keeps_above_seventy_percent() {
+        // Spec: intensity=0 produces 70-100 % shallow sweep.
+        let m = compute_motion_state(MotionKind::Pulse, 0, 0.0, 1.0, 0, 0.75);
+        assert!((m.alpha_mul - 0.70).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_bounce_offset_y_zero_at_zero_tick() {
+        let m = compute_motion_state(MotionKind::Bounce, 50, 0.0, 1.0, 0, 0.0);
+        assert!((m.offset_y_norm - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_bounce_peak_at_quarter_period() {
+        // 1 Hz, intensity=50 → amp = 0.01 + 0.09*0.5 = 0.055.
+        let m = compute_motion_state(MotionKind::Bounce, 50, 0.0, 1.0, 0, 0.25);
+        assert!((m.offset_y_norm - 0.055).abs() < 1e-3, "y was {}", m.offset_y_norm);
+    }
+
+    #[test]
+    fn motion_blink_freq_one_hz_at_intensity_fifty() {
+        // Spec lock: at intensity=50, blink runs at 1 Hz exactly
+        // (piecewise linear endpoint). At t=0.25 s (quarter of a
+        // 1 Hz cycle) sin(π/2) > 0 → visible.
+        let m = compute_motion_state(MotionKind::Blink, 50, 0.0, 1.0, 0, 0.25);
+        assert!((m.alpha_mul - 1.0).abs() < 1e-6);
+        // At t=0.75 s (3/4 cycle), sin(3π/2) < 0 → hidden.
+        let m2 = compute_motion_state(MotionKind::Blink, 50, 0.0, 1.0, 0, 0.75);
+        assert!((m2.alpha_mul - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_blink_intensity_zero_runs_at_half_hz() {
+        // 0.5 Hz cycle = 2 s period. At t=0.5 s (1/4 cycle)
+        // sin > 0 → visible; at t=1.5 s (3/4 cycle) hidden.
+        let m1 = compute_motion_state(MotionKind::Blink, 0, 0.0, 1.0, 0, 0.5);
+        assert!((m1.alpha_mul - 1.0).abs() < 1e-6);
+        let m2 = compute_motion_state(MotionKind::Blink, 0, 0.0, 1.0, 0, 1.5);
+        assert!((m2.alpha_mul - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_blink_intensity_hundred_runs_at_four_hz() {
+        // 4 Hz cycle = 0.25 s period. At t=0.0625 s (1/4 cycle)
+        // visible.
+        let m = compute_motion_state(MotionKind::Blink, 100, 0.0, 1.0, 0, 0.0625);
+        assert!((m.alpha_mul - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_shake_deterministic_from_seed_and_phase() {
+        // Same seed + phase + tick → same offset across calls.
+        // This is the "across-reload determinism" property the
+        // spec calls out.
+        let m1 = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0xCAFE, 0.5);
+        let m2 = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0xCAFE, 0.5);
+        assert!((m1.offset_x_norm - m2.offset_x_norm).abs() < 1e-9);
+        assert!((m1.offset_y_norm - m2.offset_y_norm).abs() < 1e-9);
+    }
+
+    #[test]
+    fn motion_shake_different_seeds_diverge() {
+        // Different layer ids should produce different shake
+        // sequences, otherwise multiple shake layers would
+        // mechanically march in lockstep.
+        let m1 = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0xAAAA, 0.5);
+        let m2 = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0xBBBB, 0.5);
+        let dist =
+            ((m1.offset_x_norm - m2.offset_x_norm).powi(2)
+                + (m1.offset_y_norm - m2.offset_y_norm).powi(2))
+            .sqrt();
+        assert!(dist > 1e-6, "seeds collided: dist={dist}");
+    }
+
+    #[test]
+    fn motion_shake_amplitude_clamped_at_intensity_hundred() {
+        // ±4 % cap at intensity=100. Sample many ticks to confirm
+        // no value escapes the cap.
+        for tick in 0..200 {
+            let t = tick as f64 * 0.05;
+            let m = compute_motion_state(MotionKind::Shake, 100, 0.0, 1.0, 0xFEED, t);
+            // amp = 0.005 + 0.035 * 1.0 = 0.04. Gaussian clamped
+            // at ±1 → max output ±0.04.
+            assert!(
+                m.offset_x_norm.abs() <= 0.04 + 1e-6,
+                "x out of bounds: {}",
+                m.offset_x_norm
+            );
+            assert!(
+                m.offset_y_norm.abs() <= 0.04 + 1e-6,
+                "y out of bounds: {}",
+                m.offset_y_norm
+            );
+        }
+    }
+
+    #[test]
+    fn motion_shake_advances_at_ten_hz() {
+        // The shake RNG re-samples every 100 ms. Within a 100 ms
+        // bucket the offset should be constant (same tick_index).
+        let t1 = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0x1234, 0.50);
+        let t2 = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0x1234, 0.59);
+        assert!((t1.offset_x_norm - t2.offset_x_norm).abs() < 1e-9);
+        // Cross a bucket boundary (0.50 → 0.60) and the offset
+        // changes (probabilistically — guard against the
+        // astronomical chance the next Gaussian draw == previous).
+        let t3 = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0x1234, 0.60);
+        assert!(
+            (t1.offset_x_norm - t3.offset_x_norm).abs() > 1e-9
+                || (t1.offset_y_norm - t3.offset_y_norm).abs() > 1e-9
+        );
+    }
+
+    #[test]
+    fn motion_phase_offsets_two_layers_into_opposition() {
+        // Spec: "two breathe layers with motion_phase=0 and 0.5
+        // run in opposition." Confirm: scale at phase=0 is mirror
+        // of scale at phase=0.5 around 1.0.
+        let a = compute_motion_state(MotionKind::Breathe, 50, 0.0, 1.0, 0, 0.25);
+        let b = compute_motion_state(MotionKind::Breathe, 50, 0.5, 1.0, 0, 0.25);
+        // a.scale = 1 + amp; b.scale = 1 - amp (cycle phase
+        // offset by half — sin(π/2 + π) = -1).
+        let amp_a = a.scale - 1.0;
+        let amp_b = b.scale - 1.0;
+        assert!((amp_a + amp_b).abs() < 1e-3, "a={amp_a} b={amp_b}");
+    }
+
+    #[test]
+    fn motion_intensity_clamps_above_one_hundred() {
+        // Schema says 0..=100 but the field is u8 so values up to
+        // 255 are technically representable. Clamp at 100 so a
+        // weird envelope can't drive the math out of range.
+        let clamped = compute_motion_state(MotionKind::Breathe, 200, 0.0, 1.0, 0, 0.25);
+        let pinned = compute_motion_state(MotionKind::Breathe, 100, 0.0, 1.0, 0, 0.25);
+        assert!((clamped.scale - pinned.scale).abs() < 1e-6);
     }
 
     // -- effective_font_size_px ---------------------------------

@@ -130,6 +130,29 @@ pub struct TextLayer {
     pub opacity: f32,
     #[serde(default = "default_visible")]
     pub visible: bool,
+    /// v1-spec-delta #2 -- per-layer animation. One of seven values
+    /// (`static` / `ticker` / `breathe` / `pulse` / `bounce` /
+    /// `shake` / `blink`); see `docs/text-layer-motion-spec.md` for
+    /// the operator-facing menu and per-effect intensity mapping.
+    /// Legacy "scroll" is migrated to "ticker" in
+    /// `deserialize_motion` so v3 envelopes continue to load.
+    #[serde(default = "default_motion", deserialize_with = "deserialize_motion")]
+    pub motion: String,
+    /// 0..100 single-knob intensity. Spec default 50. Per-effect
+    /// table maps this to amplitude/frequency ranges; see
+    /// `effective_motion_*` helpers in `hdmi_logic.rs`.
+    #[serde(default = "default_motion_intensity")]
+    pub motion_intensity: u8,
+    /// 0.0..1.0 phase offset on the shared global tick. Two layers
+    /// with the same effect at phase=0.0 and phase=0.5 run in
+    /// opposition. Also seeds the deterministic RNG for `shake`.
+    #[serde(default = "default_motion_phase")]
+    pub motion_phase: f32,
+    /// 0.0..2.0 frequency multiplier (B2, 2026-05-05). 1.0 = spec
+    /// default, 0.0 = frozen, 2.0 = double speed. Multiplies the
+    /// per-effect Hz from the intensity table.
+    #[serde(default = "default_motion_speed")]
+    pub motion_speed: f32,
     pub r#box: TextBox,
 }
 
@@ -154,6 +177,36 @@ fn default_opacity() -> f32 {
 }
 fn default_visible() -> bool {
     true
+}
+fn default_motion() -> String {
+    "static".to_string()
+}
+fn default_motion_intensity() -> u8 {
+    50
+}
+fn default_motion_phase() -> f32 {
+    0.0
+}
+fn default_motion_speed() -> f32 {
+    1.0
+}
+
+/// Mirror of `TextLayer._migrate_legacy_motion` -- rename "scroll"
+/// to "ticker" before storing. Old v3 envelopes have "scroll"; the
+/// editor's next save() writes "ticker" back, so this validator
+/// drains lazily as content is edited (no SCHEMA_VERSION bump).
+/// Unknown values fall through unchanged so a future-added value
+/// doesn't get silently mangled here.
+fn deserialize_motion<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(d)?;
+    Ok(if raw == "scroll" {
+        "ticker".to_string()
+    } else {
+        raw
+    })
 }
 
 /// Mirror of `backend.openmarquee.content.BackgroundPattern`. Pattern
@@ -457,6 +510,64 @@ mod tests {
         assert!(layer.visible);
         assert!((layer.opacity - 1.0).abs() < 1e-6);
         assert_eq!(layer.text_align, "center");
+        // v1-spec-delta #2: motion fields default to "static" /
+        // intensity 50 / phase 0 / speed 1.0 when absent (mirrors
+        // Python's defaults).
+        assert_eq!(layer.motion, "static");
+        assert_eq!(layer.motion_intensity, 50);
+        assert!((layer.motion_phase - 0.0).abs() < 1e-6);
+        assert!((layer.motion_speed - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_field_round_trips_all_seven_values() {
+        // Every value the spec defines must load. Pin them so a
+        // schema rename or accidental drop fires here loudly.
+        for kind in [
+            "static", "ticker", "breathe", "pulse", "bounce", "shake",
+            "blink",
+        ] {
+            let json = format!(
+                r##"{{
+                    "text": "X",
+                    "motion": "{kind}",
+                    "box": {{"x": 0, "y": 0, "w": 1, "h": 1}}
+                }}"##
+            );
+            let layer: TextLayer = serde_json::from_str(&json).unwrap();
+            assert_eq!(layer.motion, kind, "kind={kind}");
+        }
+    }
+
+    #[test]
+    fn motion_legacy_scroll_migrates_to_ticker() {
+        // v3 envelopes saved before the rename have motion="scroll".
+        // The deserializer rewrites it to "ticker" so the renderer
+        // sees one canonical name. Mirrors Python's
+        // _migrate_legacy_motion validator.
+        let json = r##"{
+            "text": "Old envelope",
+            "motion": "scroll",
+            "box": {"x": 0, "y": 0, "w": 1, "h": 1}
+        }"##;
+        let layer: TextLayer = serde_json::from_str(json).unwrap();
+        assert_eq!(layer.motion, "ticker");
+    }
+
+    #[test]
+    fn motion_unknown_value_passes_through_unchanged() {
+        // Future-added motion values shouldn't be silently rewritten
+        // to "static" or anything else by the migration validator.
+        // The motion-resolution code in hdmi_logic treats unknown as
+        // static (the safe fallback) but the field itself is preserved
+        // so a re-save doesn't lose information.
+        let json = r##"{
+            "text": "Future",
+            "motion": "warp",
+            "box": {"x": 0, "y": 0, "w": 1, "h": 1}
+        }"##;
+        let layer: TextLayer = serde_json::from_str(json).unwrap();
+        assert_eq!(layer.motion, "warp");
     }
 
     #[test]
