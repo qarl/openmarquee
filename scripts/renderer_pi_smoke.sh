@@ -204,6 +204,16 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
         > "$FADE_LOG" 2>&1 || FADE_EXIT=$?
 fi
 
+# Phase 5-b-2: animated fade. Same slide pair but driven over
+# transition_ms by a per-frame loop.
+echo "==> Phase 5-b-2 -- --animate-fade (per-frame loop @ 800ms / 30fps)"
+ANFADE_LOG="$LOG_DIR/animate-fade.log"
+ANFADE_EXIT=0
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition-ms 800 --fps 30" \
+        > "$ANFADE_LOG" 2>&1 || ANFADE_EXIT=$?
+fi
+
 # Always try to bring the backend back up before we assert anything.
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl start openmarquee-backend"
@@ -347,6 +357,32 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
     echo "    --fade-from/to ok ($FADE_FROM → $FADE_TO @ t=0.5, $RAST_COUNT text rasterizations)"
 else
     echo "    --fade-from/to skipped (couldn't find 2 text slides in seed)"
+fi
+
+# Phase 5-b-2 animated-fade assertion: completion line + frame
+# count floor (a 800ms transition at 30fps should be ~24 frames;
+# float scheduling may wobble by ±2). Per-frame loop proves the
+# harness handles BO/FB rotation across frames without leaking
+# scanout under the renderer.
+if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
+    if [ "$ANFADE_EXIT" -ne 0 ]; then
+        echo "FAIL: --animate-fade exit $ANFADE_EXIT"
+        cat "$ANFADE_LOG"
+        exit 1
+    fi
+    grep -q 'animated fade complete' "$ANFADE_LOG" || \
+        { echo "FAIL: animated fade didn't print completion line"; cat "$ANFADE_LOG"; exit 1; }
+    grep -qi 'panic\|panicked' "$ANFADE_LOG" && \
+        { echo "FAIL: panic in animated fade output"; exit 1; }
+    ANFADE_FRAMES=$(grep -oE 'rendered [0-9]+ frames' "$ANFADE_LOG" | grep -oE '[0-9]+' | head -1)
+    if [ -z "${ANFADE_FRAMES:-}" ] || [ "$ANFADE_FRAMES" -lt 20 ]; then
+        echo "FAIL: --animate-fade frame count too low (got '${ANFADE_FRAMES:-none}', want >=20)"
+        cat "$ANFADE_LOG"
+        exit 1
+    fi
+    echo "    --animate-fade ok ($FADE_FROM → $FADE_TO over 800ms, $ANFADE_FRAMES frames)"
+else
+    echo "    --animate-fade skipped (couldn't find 2 text slides in seed)"
 fi
 
 echo "==> backend recovery check (DRM master returned)"

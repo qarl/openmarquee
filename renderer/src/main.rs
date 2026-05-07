@@ -151,6 +151,17 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     fade_t: f32,
 
+    /// Phase 5-b-2 — animate the fade between `--fade-from` and
+    /// `--fade-to` over `--transition-ms` at `--fps`. When this
+    /// flag is set, `--fade-t` is ignored. Pass-through to
+    /// `render_fade_animated`.
+    #[arg(long, default_value_t = false)]
+    animate_fade: bool,
+
+    /// Animated-fade transition duration in milliseconds.
+    #[arg(long, default_value_t = 800)]
+    transition_ms: u32,
+
     /// Directory holding the renderer's font catalog. Each layer's
     /// `font_family` is mapped to a TTF basename under this dir
     /// (Anton → anton.ttf, "Bebas Neue" → bebas-neue.ttf, etc.).
@@ -504,14 +515,25 @@ fn main() -> Result<()> {
                         );
                         None
                     };
-                    hdmi::render_fade_composite(
-                        &card,
-                        &slide_a,
-                        &slide_b,
-                        catalog_opt,
-                        args.fade_t,
-                        args.hold_secs,
-                    )?;
+                    if args.animate_fade {
+                        hdmi::render_fade_animated(
+                            &card,
+                            &slide_a,
+                            &slide_b,
+                            catalog_opt,
+                            args.transition_ms,
+                            args.fps,
+                        )?;
+                    } else {
+                        hdmi::render_fade_composite(
+                            &card,
+                            &slide_a,
+                            &slide_b,
+                            catalog_opt,
+                            args.fade_t,
+                            args.hold_secs,
+                        )?;
+                    }
                     return Ok(());
                 }
                 eprintln!("nothing to do — pass --probe, --solid-color R,G,B, --animate, --play-slide UUID, --play-slide-text UUID, --play-slide-via-fbo UUID, or --fade-from UUID --fade-to UUID");

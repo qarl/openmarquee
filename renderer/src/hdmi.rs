@@ -1005,6 +1005,360 @@ pub fn render_fade_composite(
     Ok(())
 }
 
+/// Phase 5-b-2 — animate the fade transition between two slides
+/// over `transition_ms` at `fps`. Renders slide_a + slide_b into
+/// FBOs ONCE before the loop; per-frame just runs the FS_FADE
+/// composite at the current `t = elapsed / transition_ms` clamped
+/// to [0, 1] and pushes via legacy SetCrtc.
+///
+/// Single-buffered scanout — there's tearing at the swap boundary
+/// for the brief transition duration. Phase 5-c may switch to
+/// atomic + double-buffered (see render_animated_atomic) once the
+/// transition deck is complete; for 5-b-2 the simpler path keeps
+/// the scope reviewable.
+///
+/// Returns the rendered frame count for smoke-script floor checks.
+pub fn render_fade_animated(
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    transition_ms: u32,
+    fps: u32,
+) -> Result<u32> {
+    if transition_ms == 0 {
+        bail!("transition_ms must be > 0");
+    }
+    if fps == 0 {
+        bail!("fps must be > 0");
+    }
+
+    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts)?;
+    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts)?;
+
+    eprintln!(
+        "rendering animated fade slide_a={} slide_b={} transition_ms={transition_ms} fps={fps}",
+        slide_a.id, slide_b.id,
+    );
+
+    // -- DRM + GBM + EGL bring-up (same as render_one_frame_to_hdmi).
+    let resources = card
+        .resource_handles()
+        .context("drmModeGetResources failed")?;
+    let (connector_info, mode) = pick_connector_and_mode(card, &resources)
+        .context("no connected HDMI connector with a usable mode")?;
+    let (mode_w, mode_h) = mode.size();
+    eprintln!(
+        "selected connector {:?} {:?} at {}x{}@{}",
+        connector_info.handle(),
+        connector_info.interface(),
+        mode_w,
+        mode_h,
+        mode.vrefresh(),
+    );
+
+    let encoder_handle = connector_info
+        .current_encoder()
+        .or_else(|| connector_info.encoders().first().copied())
+        .ok_or_else(|| anyhow!("connector advertises no encoders"))?;
+    let encoder_info = card
+        .get_encoder(encoder_handle)
+        .context("drmModeGetEncoder failed")?;
+    let crtc_handle = encoder_info
+        .crtc()
+        .or_else(|| resources.crtcs().first().copied())
+        .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
+
+    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
+        .context("gbm_create_device failed")?;
+    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
+    if gbm_dev_ptr.is_null() {
+        bail!("gbm_device raw pointer is null");
+    }
+    let gbm_surface = gbm_dev
+        .create_surface::<()>(
+            mode_w as u32,
+            mode_h as u32,
+            GbmFormat::Argb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+        )
+        .context("gbm_surface_create failed")?;
+
+    let egl_lib = unsafe {
+        egl::DynamicInstance::<egl::EGL1_5>::load_required().map_err(|e| {
+            anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
+        })?
+    };
+    let display = unsafe {
+        egl_lib
+            .get_display(gbm_dev_ptr as egl::NativeDisplayType)
+            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
+    };
+    egl_lib
+        .initialize(display)
+        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
+    egl_lib
+        .bind_api(egl::OPENGL_ES_API)
+        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
+    let cfg_attribs = [
+        egl::SURFACE_TYPE, egl::WINDOW_BIT,
+        egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
+        egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE,
+    ];
+    let configs = egl_lib
+        .choose_first_config(display, &cfg_attribs)
+        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
+        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
+    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+    let context = egl_lib
+        .create_context(display, configs, None, &ctx_attribs)
+        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
+    let egl_surface = unsafe {
+        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
+        egl_lib
+            .create_window_surface(display, configs, raw_surface, None)
+            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
+    };
+    egl_lib
+        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
+        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
+
+    let gl = unsafe {
+        glow::Context::from_loader_function(|name| {
+            egl_lib.get_proc_address(name).map(|fp| fp as *const _).unwrap_or(ptr::null())
+        })
+    };
+
+    // -- Animated render work + per-frame BO/FB tracking.
+    let mode_w_u32 = mode_w as u32;
+    let mode_h_u32 = mode_h as u32;
+    let frame_budget = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+    let total_frames = ((transition_ms as f64) / 1000.0 * fps as f64).round().max(1.0) as u32;
+
+    // Track previous-frame's BO/FB so we can drop them after the
+    // next setCrtc takes effect (single-buffered legacy: we can't
+    // drop the currently-scanning FB until the new one is in
+    // scanout). Simplest pattern: keep N and N-1, drop N-1 after
+    // frame N's setCrtc.
+    let mut prev_bo: Option<BufferObject<()>> = None;
+    let mut prev_fb: Option<framebuffer::Handle> = None;
+    let mut current_bo: Option<BufferObject<()>> = None;
+    let mut current_fb: Option<framebuffer::Handle> = None;
+
+    let work: Result<u32> = (|| {
+        use glow::HasContext;
+
+        // -- Build slide_a and slide_b FBOs once.
+        let (fbo_a, tex_a) = unsafe { make_slide_fbo(&gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a)? };
+        let (fbo_b, tex_b) = unsafe {
+            match make_slide_fbo(&gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                    return Err(e);
+                }
+            }
+        };
+
+        // -- Compile fade program + build VBO once.
+        let program = unsafe {
+            match link_program(&gl, VS_TEXTURED_QUAD, FS_FADE) {
+                Ok(p) => p,
+                Err(e) => {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                    gl.delete_framebuffer(fbo_b);
+                    gl.delete_texture(tex_b);
+                    return Err(e);
+                }
+            }
+        };
+        let cleanup_static = |gl: &glow::Context, vbo: Option<glow::NativeBuffer>| unsafe {
+            if let Some(b) = vbo { gl.delete_buffer(b); }
+            gl.delete_program(program);
+            gl.delete_framebuffer(fbo_a);
+            gl.delete_texture(tex_a);
+            gl.delete_framebuffer(fbo_b);
+            gl.delete_texture(tex_b);
+        };
+        let vbo = unsafe {
+            match gl.create_buffer() {
+                Ok(b) => b,
+                Err(e) => {
+                    cleanup_static(&gl, None);
+                    return Err(anyhow!("glGenBuffers(animated fade): {e}"));
+                }
+            }
+        };
+        let verts: [f32; 16] = [
+            -1.0, -1.0, 0.0, 0.0,
+             1.0, -1.0, 1.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+        ];
+        unsafe {
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let bytes = std::slice::from_raw_parts(
+                verts.as_ptr() as *const u8,
+                std::mem::size_of_val(&verts),
+            );
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+        }
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") };
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") };
+        let (a_pos, a_uv) = match (a_pos, a_uv) {
+            (Some(p), Some(u)) => (p, u),
+            _ => {
+                cleanup_static(&gl, Some(vbo));
+                return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos / a_uv (animated fade)"));
+            }
+        };
+        let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
+        let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
+        let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+
+        // -- Per-frame loop. The loop body is wrapped in an IIFE so
+        // the cleanup_static call below runs UNCONDITIONALLY even
+        // if a frame errors mid-iteration. Without this, an
+        // eglSwapBuffers / lock_front_buffer / setCrtc failure on
+        // (say) frame 7 would leak program/vbo/fbo_a/tex_a/fbo_b/
+        // tex_b until EGL teardown invalidated the context. Today
+        // that's invisible (teardown happens immediately on Err);
+        // 5-c may persistize the context across calls, where the
+        // leak would compound.
+        let start = Instant::now();
+        let mut rendered = 0_u32;
+        let loop_result: Result<()> = (|| {
+        for frame in 0..total_frames {
+            let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
+            unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+                gl.use_program(Some(program));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+                gl.uniform_1_i32(u_src_a.as_ref(), 0);
+                gl.uniform_1_i32(u_src_b.as_ref(), 1);
+                gl.uniform_1_f32(u_t.as_ref(), t);
+
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let stride = (4 * std::mem::size_of::<f32>()) as i32;
+                gl.enable_vertex_attrib_array(a_pos);
+                gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(a_uv);
+                gl.vertex_attrib_pointer_f32(
+                    a_uv,
+                    2,
+                    glow::FLOAT,
+                    false,
+                    stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
+                );
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.disable_vertex_attrib_array(a_pos);
+                gl.disable_vertex_attrib_array(a_uv);
+                gl.flush();
+            }
+
+            // -- Push to scanout.
+            egl_lib
+                .swap_buffers(display, egl_surface)
+                .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
+            let bo = unsafe {
+                gbm_surface
+                    .lock_front_buffer()
+                    .with_context(|| format!("lock_front_buffer (frame {frame})"))?
+            };
+            let fb_buf = GbmBufferAdapter::new(&bo)
+                .with_context(|| format!("read GBM bo metadata (frame {frame})"))?;
+            let fb = card
+                .add_framebuffer(&fb_buf, 32, 32)
+                .with_context(|| format!("drmModeAddFB (frame {frame})"))?;
+            card.set_crtc(
+                crtc_handle,
+                Some(fb),
+                (0, 0),
+                &[connector_info.handle()],
+                Some(mode),
+            )
+            .with_context(|| format!("drmModeSetCrtc (frame {frame})"))?;
+
+            // -- Rotate frames: free the frame from TWO iterations
+            // ago — `prev` is no longer in scanout because
+            // `current` (set last iter) is now the source. Up to
+            // 3 BO/FB pairs alive transiently at the rotation
+            // moment; 2 between iterations.
+            if let Some(old_fb) = prev_fb.take() {
+                if let Err(e) = card.destroy_framebuffer(old_fb) {
+                    eprintln!("warn: destroy_framebuffer(prev): {e}");
+                }
+            }
+            if let Some(old_bo) = prev_bo.take() {
+                drop(old_bo);
+            }
+            prev_fb = current_fb.take();
+            prev_bo = current_bo.take();
+            current_fb = Some(fb);
+            current_bo = Some(bo);
+
+            rendered += 1;
+            let target = start + frame_budget * (frame + 1);
+            let now = Instant::now();
+            if target > now {
+                std::thread::sleep(target - now);
+            }
+        }
+        Ok(())
+        })();
+        cleanup_static(&gl, Some(vbo));
+        loop_result?;
+        Ok(rendered)
+    })();
+
+    // Cleanup — unconditional. Free any remaining BO/FB pairs from
+    // the loop (current + prev), then EGL state.
+    for (fb_opt, bo_opt) in [
+        (current_fb.take(), current_bo.take()),
+        (prev_fb.take(), prev_bo.take()),
+    ] {
+        // Match the in-loop rotation order: destroy_framebuffer
+        // first, then drop the BO. The kernel refcounts the
+        // underlying buffer either way, but consistency aids
+        // future readers.
+        if let Some(fb) = fb_opt {
+            if let Err(e) = card.destroy_framebuffer(fb) {
+                eprintln!("warn: destroy_framebuffer(cleanup): {e}");
+            }
+        }
+        if let Some(bo) = bo_opt {
+            drop(bo);
+        }
+    }
+    if let Err(e) = egl_lib.make_current(display, None, None, None) {
+        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_context(display, context) {
+        eprintln!("warn: eglDestroyContext: {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
+        eprintln!("warn: eglDestroySurface: {e:?}");
+    }
+    if let Err(e) = egl_lib.terminate(display) {
+        eprintln!("warn: eglTerminate: {e:?}");
+    }
+
+    let frame_count = work?;
+    eprintln!(
+        "animated fade complete: rendered {frame_count} frames in {transition_ms}ms"
+    );
+    Ok(frame_count)
+}
+
 /// Paint a slide (bg pass + text-layer passes) into the currently-
 /// bound framebuffer. Phase 5-a — extracted from `render_slide`'s
 /// closure so the same painting logic can target either the default
