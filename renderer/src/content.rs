@@ -228,6 +228,44 @@ pub fn item_dir(content_root: &Path, item_id: Uuid) -> PathBuf {
     content_root.join(item_id.to_string())
 }
 
+/// Resolve a playlist's items into a flat list of
+/// `(TextSlide, transition_kind, transition_ms)` tuples ready for
+/// the reel driver to iterate. Per Phase 6's skip-with-warn policy:
+///   * Non-text-slide items (image / video) are dropped with a
+///     warn — image/video item playback is post-Phase-6 scope.
+///   * Items whose JSON can't be loaded are dropped with a warn.
+///   * Empty result is allowed; the caller decides whether to bail.
+///
+/// Pure-ish — file IO via `find_text_slide` per item, but no GL or
+/// EGL state. Host-testable via the existing tempdir fixtures in
+/// the test module.
+pub fn resolve_reel_items(
+    content_root: &Path,
+    playlist: &Playlist,
+) -> Vec<(TextSlide, String, u32)> {
+    let mut out: Vec<(TextSlide, String, u32)> = Vec::with_capacity(playlist.items.len());
+    for item in &playlist.items {
+        match find_text_slide(content_root, item.item_id) {
+            Ok(Some(slide)) => {
+                out.push((slide, item.transition.clone(), item.transition_ms));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "reel: skipping non-text item {} (image/video — out of scope this phase)",
+                    item.item_id,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "reel: skipping item {} — find_text_slide failed: {e:#}",
+                    item.item_id,
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Picked-out hex color for a slide's effective solid background,
 /// returning the source as a string for logging. Pure function so
 /// the dispatch logic is testable on the host.
@@ -600,6 +638,136 @@ mod tests {
             msg.contains("parse item envelope"),
             "expected 'parse item envelope' in error chain, got: {msg}"
         );
+    }
+
+    // -- resolve_reel_items -------------------------------------
+
+    fn build_playlist_with_items(refs: Vec<PlaylistItemRef>) -> Playlist {
+        Playlist {
+            id: Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+            name: "test".to_string(),
+            items: refs,
+        }
+    }
+
+    fn item_ref(id: Uuid, kind: &str, ms: u32) -> PlaylistItemRef {
+        PlaylistItemRef {
+            item_id: id,
+            transition: kind.to_string(),
+            transition_ms: ms,
+        }
+    }
+
+    #[test]
+    fn resolve_reel_items_keeps_text_slides() {
+        // Two text-slide items in the playlist; both resolve.
+        let td = TempDir::new().unwrap();
+        let id_a = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir_a = td.path().join(id_a.to_string());
+        std::fs::create_dir_all(&dir_a).unwrap();
+        write_file(&dir_a, "item.json", SAMPLE_TEXT_ITEM);
+
+        let id_b = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc1").unwrap();
+        let dir_b = td.path().join(id_b.to_string());
+        std::fs::create_dir_all(&dir_b).unwrap();
+        // Reuse SAMPLE_TEXT_ITEM (content is parsable; the inner id
+        // doesn't have to match the dir name for find_text_slide
+        // — that's keyed on the path).
+        write_file(&dir_b, "item.json", SAMPLE_TEXT_ITEM);
+
+        let playlist = build_playlist_with_items(vec![
+            item_ref(id_a, "fade", 800),
+            item_ref(id_b, "wipe", 600),
+        ]);
+        let resolved = resolve_reel_items(td.path(), &playlist);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].1, "fade");
+        assert_eq!(resolved[0].2, 800);
+        assert_eq!(resolved[1].1, "wipe");
+        assert_eq!(resolved[1].2, 600);
+    }
+
+    #[test]
+    fn resolve_reel_items_skips_image_items() {
+        // Image items return Ok(None) from find_text_slide; the
+        // resolver skips them with a warn rather than dropping the
+        // whole reel.
+        let td = TempDir::new().unwrap();
+        let id_text = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir_text = td.path().join(id_text.to_string());
+        std::fs::create_dir_all(&dir_text).unwrap();
+        write_file(&dir_text, "item.json", SAMPLE_TEXT_ITEM);
+
+        let id_image = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cff0").unwrap();
+        let dir_image = td.path().join(id_image.to_string());
+        std::fs::create_dir_all(&dir_image).unwrap();
+        write_file(&dir_image, "item.json", SAMPLE_IMAGE_ITEM);
+
+        let playlist = build_playlist_with_items(vec![
+            item_ref(id_text, "fade", 800),
+            item_ref(id_image, "wipe", 600),
+        ]);
+        let resolved = resolve_reel_items(td.path(), &playlist);
+        assert_eq!(resolved.len(), 1, "image should be skipped");
+        assert_eq!(resolved[0].1, "fade");
+    }
+
+    #[test]
+    fn resolve_reel_items_skips_missing_items() {
+        // An item whose item.json file doesn't exist gets dropped
+        // with a warn — reel survives orphan playlist references.
+        let td = TempDir::new().unwrap();
+        let id_text = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir_text = td.path().join(id_text.to_string());
+        std::fs::create_dir_all(&dir_text).unwrap();
+        write_file(&dir_text, "item.json", SAMPLE_TEXT_ITEM);
+
+        let id_missing = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cffe").unwrap();
+        // NO files written for id_missing — its item dir doesn't
+        // exist.
+
+        let playlist = build_playlist_with_items(vec![
+            item_ref(id_text, "fade", 800),
+            item_ref(id_missing, "wipe", 600),
+        ]);
+        let resolved = resolve_reel_items(td.path(), &playlist);
+        assert_eq!(resolved.len(), 1, "missing should be skipped");
+        assert_eq!(resolved[0].1, "fade");
+    }
+
+    #[test]
+    fn resolve_reel_items_empty_playlist_returns_empty() {
+        let td = TempDir::new().unwrap();
+        let playlist = build_playlist_with_items(vec![]);
+        let resolved = resolve_reel_items(td.path(), &playlist);
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_reel_items_preserves_playlist_order() {
+        // Order matters: the reel iterates in playlist order, so
+        // the resolver must too. Pin the order with 3 items.
+        let td = TempDir::new().unwrap();
+        for hex in [
+            "3964c302-311f-44f2-a6c9-efd24a16cfc1",
+            "3964c302-311f-44f2-a6c9-efd24a16cfc2",
+            "3964c302-311f-44f2-a6c9-efd24a16cfc3",
+        ] {
+            let id = Uuid::parse_str(hex).unwrap();
+            let d = td.path().join(id.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            write_file(&d, "item.json", SAMPLE_TEXT_ITEM);
+        }
+        let playlist = build_playlist_with_items(vec![
+            item_ref(Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc3").unwrap(), "cut", 0),
+            item_ref(Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc1").unwrap(), "fade", 800),
+            item_ref(Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc2").unwrap(), "wipe", 600),
+        ]);
+        let resolved = resolve_reel_items(td.path(), &playlist);
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].1, "cut");
+        assert_eq!(resolved[1].1, "fade");
+        assert_eq!(resolved[2].1, "wipe");
     }
 
     #[test]

@@ -35,7 +35,9 @@ use khronos_egl as egl;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::content::{find_text_slide, load_playlist, solid_bg_hex, TextSlide};
+use crate::content::{
+    load_playlist, resolve_reel_items, solid_bg_hex, TextSlide,
+};
 use crate::hdmi_logic::{
     box_to_ndc_quad, clamp_transition_ms, effective_font_size_px, effective_hold_secs,
     fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, hex_to_rgba, hsv_to_rgb,
@@ -1700,29 +1702,11 @@ pub fn render_playlist_reel(
         playlist.items.len(),
     );
 
-    // Pre-resolve to (TextSlide, transition_kind, transition_ms),
-    // skipping non-text and missing-slide items with warn so
-    // malformed entries don't crash mid-reel.
-    let mut resolved: Vec<(TextSlide, String, u32)> = Vec::with_capacity(playlist.items.len());
-    for item in &playlist.items {
-        match find_text_slide(content_root, item.item_id) {
-            Ok(Some(slide)) => {
-                resolved.push((slide, item.transition.clone(), item.transition_ms));
-            }
-            Ok(None) => {
-                eprintln!(
-                    "reel: skipping non-text item {} (image/video — out of scope this phase)",
-                    item.item_id,
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "reel: skipping item {} — find_text_slide failed: {e:#}",
-                    item.item_id,
-                );
-            }
-        }
-    }
+    // Pre-resolve via content::resolve_reel_items — host-tested
+    // with the tempdir fixture matrix (text-only / image-skip /
+    // missing-skip / empty / order-preserved). Reel logs a count
+    // here; any per-item warns came out of the helper.
+    let resolved = resolve_reel_items(content_root, playlist);
     if resolved.is_empty() {
         bail!("reel: no playable text-slide items in playlist");
     }
