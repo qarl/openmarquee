@@ -47,7 +47,7 @@ grep -q '=== Connectors ===' "$PROBE_LOG" || \
     { echo "FAIL: --probe didn't print Connectors section"; exit 1; }
 grep -q 'HDMIA' "$PROBE_LOG" || \
     { echo "FAIL: --probe didn't list an HDMI connector"; exit 1; }
-grep -qi 'panic\|panicked' "$PROBE_LOG" && \
+grep -qE 'panicked at|RUST_BACKTRACE' "$PROBE_LOG" && \
     { echo "FAIL: panic in --probe output"; exit 1; }
 echo "    ok ($(grep -c 'connector::Handle' "$PROBE_LOG") connectors,"\
 "$(grep -c 'plane::Handle' "$PROBE_LOG") planes)"
@@ -348,6 +348,15 @@ run_anim_smoke "flip"    ANFLP_LOG ANFLP_EXIT ANFLP_WALL_MS
 run_anim_smoke "marquee" ANMRQ_LOG ANMRQ_EXIT ANMRQ_WALL_MS
 run_anim_smoke "shutter" ANSHT_LOG ANSHT_EXIT ANSHT_WALL_MS
 
+# Phase 6: full playlist-driven reel. Single pass through the
+# live FYS playlist with --hold-secs 1 (compress hold to keep
+# smoke tractable; production would use slide.duration_ms).
+echo "==> Phase 6 -- --play-reel (single pass FYS playlist)"
+REEL_LOG="$LOG_DIR/play-reel.log"
+REEL_EXIT=0
+ssh "$TARGET" "$BIN_PI --output hdmi --play-reel --hold-secs 1 --fps 30" \
+    > "$REEL_LOG" 2>&1 || REEL_EXIT=$?
+
 # Unknown-kind fallback: pick a name that's NOT in the deck.
 echo "==> Phase 5-c -- --animate-fade --transition nonexistent (unknown→cut fallback)"
 ANUNK_LOG="$LOG_DIR/animate-unknown.log"
@@ -373,7 +382,7 @@ if [ "$COLOR_EXIT" -ne 0 ]; then
 fi
 grep -q 'solid-color render complete' "$COLOR_LOG" || \
     { echo "FAIL: --solid-color didn't print completion line"; cat "$COLOR_LOG"; exit 1; }
-grep -qi 'panic\|panicked' "$COLOR_LOG" && \
+grep -qE 'panicked at|RUST_BACKTRACE' "$COLOR_LOG" && \
     { echo "FAIL: panic in --solid-color output"; exit 1; }
 echo "    --solid-color ok"
 
@@ -384,7 +393,7 @@ if [ "$ANIM_EXIT" -ne 0 ]; then
 fi
 grep -q 'animated atomic render complete' "$ANIM_LOG" || \
     { echo "FAIL: --animate didn't print completion line"; cat "$ANIM_LOG"; exit 1; }
-grep -qi 'panic\|panicked' "$ANIM_LOG" && \
+grep -qE 'panicked at|RUST_BACKTRACE' "$ANIM_LOG" && \
     { echo "FAIL: panic in --animate output"; exit 1; }
 # Frame-count sanity: a 3-second animate run at any reasonable fps
 # should land at least ~30 frames. The completion line includes a
@@ -407,7 +416,7 @@ fi
 # FYS slide #01 has text_layers so "rasterized text" must also fire.
 grep -q 'slide render complete' "$SLIDE_LOG" || \
     { echo "FAIL: --play-slide didn't complete the unified render"; cat "$SLIDE_LOG"; exit 1; }
-grep -qi 'panic\|panicked' "$SLIDE_LOG" && \
+grep -qE 'panicked at|RUST_BACKTRACE' "$SLIDE_LOG" && \
     { echo "FAIL: panic in --play-slide output"; exit 1; }
 grep -q "rendering slide $SLIDE_ID" "$SLIDE_LOG" || \
     { echo "FAIL: --play-slide didn't log the slide id we requested"; cat "$SLIDE_LOG"; exit 1; }
@@ -427,7 +436,7 @@ if [ -n "${GRAD_ID:-}" ]; then
     fi
     grep -q 'slide render complete' "$GRAD_LOG" || \
         { echo "FAIL: gradient slide didn't complete via unified render"; cat "$GRAD_LOG"; exit 1; }
-    grep -qi 'panic\|panicked' "$GRAD_LOG" && \
+    grep -qE 'panicked at|RUST_BACKTRACE' "$GRAD_LOG" && \
         { echo "FAIL: panic in gradient slide output"; exit 1; }
     grep -q "pattern=gradient" "$GRAD_LOG" || \
         { echo "FAIL: gradient slide didn't log pattern=gradient (might've fallen back?)"; cat "$GRAD_LOG"; exit 1; }
@@ -450,7 +459,7 @@ if [ -n "${TEXT_ID:-}" ]; then
     fi
     grep -q 'slide render complete' "$TEXT_LOG" || \
         { echo "FAIL: --play-slide-text didn't complete"; cat "$TEXT_LOG"; exit 1; }
-    grep -qi 'panic\|panicked' "$TEXT_LOG" && \
+    grep -qE 'panicked at|RUST_BACKTRACE' "$TEXT_LOG" && \
         { echo "FAIL: panic in --play-slide-text output"; exit 1; }
     grep -q 'rasterized text' "$TEXT_LOG" || \
         { echo "FAIL: --play-slide-text didn't log rasterization (layout fell through?)"; cat "$TEXT_LOG"; exit 1; }
@@ -470,7 +479,7 @@ if [ -n "${TEXT_ID:-}" ]; then
     fi
     grep -q 'slide render complete (via FBO)' "$FBO_LOG" || \
         { echo "FAIL: --play-slide-via-fbo didn't complete via FBO path"; cat "$FBO_LOG"; exit 1; }
-    grep -qi 'panic\|panicked' "$FBO_LOG" && \
+    grep -qE 'panicked at|RUST_BACKTRACE' "$FBO_LOG" && \
         { echo "FAIL: panic in --play-slide-via-fbo output"; exit 1; }
     grep -q 'rasterized text' "$FBO_LOG" || \
         { echo "FAIL: --play-slide-via-fbo didn't paint text inside the FBO"; cat "$FBO_LOG"; exit 1; }
@@ -490,7 +499,7 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
     fi
     grep -q 'fade composite render complete' "$FADE_LOG" || \
         { echo "FAIL: fade composite didn't complete"; cat "$FADE_LOG"; exit 1; }
-    grep -qi 'panic\|panicked' "$FADE_LOG" && \
+    grep -qE 'panicked at|RUST_BACKTRACE' "$FADE_LOG" && \
         { echo "FAIL: panic in fade composite output"; exit 1; }
     # Two FBOs → at minimum 1 rasterized-text line per slide that
     # has any. FYS slides always have text, so at least 1 should
@@ -524,7 +533,7 @@ assert_anim_transition() {
     fi
     grep -q "animated transition complete: kind=\"$kind\"" "$log" || \
         { echo "FAIL: animated $kind didn't print expected completion line"; cat "$log"; exit 1; }
-    grep -qi 'panic\|panicked' "$log" && \
+    grep -qE 'panicked at|RUST_BACKTRACE' "$log" && \
         { echo "FAIL: panic in animated $kind output"; exit 1; }
     local frames
     frames=$(grep -oE 'rendered [0-9]+ frames' "$log" | grep -oE '[0-9]+' | head -1)
@@ -594,6 +603,42 @@ if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
 else
     echo "    --animate-fade skipped (couldn't find 2 text slides in seed)"
 fi
+
+# Phase 6 reel assertion: completion + slide count + transition
+# count + no panics. The reel logs "reel: resolved N items" once
+# and "reel: transition into item I/N" for each transition.
+# A 4-item playlist (the FYS seed) at single-pass should fire
+# 3 transitions (no entry transition for the first item).
+if [ "$REEL_EXIT" -ne 0 ]; then
+    echo "FAIL: --play-reel exit $REEL_EXIT"
+    cat "$REEL_LOG"
+    exit 1
+fi
+grep -q 'reel: complete after' "$REEL_LOG" || \
+    { echo "FAIL: --play-reel didn't print completion line"; cat "$REEL_LOG"; exit 1; }
+grep -qE 'panicked at|RUST_BACKTRACE' "$REEL_LOG" && \
+    { echo "FAIL: panic in --play-reel output"; exit 1; }
+REEL_RESOLVED=$(grep -oE 'reel: resolved [0-9]+ playable' "$REEL_LOG" | grep -oE '[0-9]+' | head -1)
+REEL_TRANSITIONS=$(grep -c 'reel: transition into item' "$REEL_LOG" || true)
+REEL_HOLDS=$(grep -c 'reel: holding item' "$REEL_LOG" || true)
+if [ -z "${REEL_RESOLVED:-}" ] || [ "$REEL_RESOLVED" -lt 2 ]; then
+    echo "FAIL: --play-reel resolved too few playable items (got '${REEL_RESOLVED:-none}', want >=2)"
+    cat "$REEL_LOG"
+    exit 1
+fi
+# N items → N holds, N-1 transitions on a single pass.
+EXPECTED_TRANSITIONS=$((REEL_RESOLVED - 1))
+if [ "$REEL_TRANSITIONS" -ne "$EXPECTED_TRANSITIONS" ]; then
+    echo "FAIL: --play-reel transitions count mismatch (got $REEL_TRANSITIONS, expected $EXPECTED_TRANSITIONS for $REEL_RESOLVED items)"
+    cat "$REEL_LOG"
+    exit 1
+fi
+if [ "$REEL_HOLDS" -ne "$REEL_RESOLVED" ]; then
+    echo "FAIL: --play-reel holds count mismatch (got $REEL_HOLDS, expected $REEL_RESOLVED)"
+    cat "$REEL_LOG"
+    exit 1
+fi
+echo "    --play-reel ok ($REEL_RESOLVED items, $REEL_TRANSITIONS transitions, $REEL_HOLDS holds — single pass)"
 
 echo "==> backend recovery check (DRM master returned)"
 BACKEND_STATE=$(ssh "$TARGET" "systemctl is-active openmarquee-backend" || true)

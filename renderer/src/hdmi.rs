@@ -32,9 +32,10 @@ use drm::control::{
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 
+use std::path::Path;
 use std::rc::Rc;
 
-use crate::content::{solid_bg_hex, TextSlide};
+use crate::content::{find_text_slide, load_playlist, solid_bg_hex, TextSlide};
 use crate::hdmi_logic::{
     box_to_ndc_quad, effective_font_size_px, fourcc_for_argb_family, fs_for_transition_kind,
     gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha,
@@ -1643,6 +1644,158 @@ pub fn render_slide_via_fbo(
         Ok(())
     })?;
     eprintln!("slide render complete (via FBO)");
+    Ok(())
+}
+
+/// Phase 6 — playlist-driven playback loop. Walks `playlist.json`
+/// in order, and for each text-slide item:
+///   1. Renders the previous slide → this slide via the entry
+///      transition (kind + duration from the playlist item's
+///      `transition` / `transition_ms` fields). The first item
+///      has no predecessor so its entry transition is skipped.
+///   2. Holds the slide for `slide.duration_ms / 1000` seconds
+///      (overridable via `hold_secs_override` for smoke-test
+///      iteration speed).
+///
+/// Make-best-guess decisions logged inline:
+///   * **Loop semantics** — single-pass for now. `loop_forever`
+///     wraps back to the first item indefinitely; first slice
+///     just exposes it as a flag for testing the wraparound
+///     code path. Production playback chooses behavior.
+///   * **Item filter** — non-text-slide items (image / video) get
+///     skipped with a warn. Image/video playback is post-Phase-6.
+///   * **Bad-hex / missing-slide policy** — skip with warn +
+///     continue, mirroring the per-layer skip-with-warn policy
+///     resolve_slide_layers established. The reel doesn't bail
+///     on a malformed item.
+///   * **Transition association** — `transition` field is the
+///     ENTRY transition (i.e. how slide N appears). First slide
+///     has no entry; cut implicitly.
+///   * **EGL bring-up cost** — each call to render_slide /
+///     render_transition_animated does its own GBM+EGL+GLES2
+///     bring-up + teardown. For an N-slide reel that's ~2N
+///     bring-ups per pass. ~500ms each on the dev Pi. Acceptable
+///     overhead at this slice; FBO + harness recycling is post-
+///     Phase-6 optimization.
+pub fn render_playlist_reel(
+    card: &Card,
+    playlist_path: &Path,
+    content_root: &Path,
+    fonts: Option<&FontCatalog>,
+    fps: u32,
+    loop_forever: bool,
+    hold_secs_override: Option<u64>,
+) -> Result<()> {
+    let envelope = load_playlist(playlist_path)?;
+    if envelope.playlists.is_empty() {
+        bail!("playlist {} has no playlists", playlist_path.display());
+    }
+    // Phase 6 first slice: take playlist[0]; multi-playlist
+    // routing is a backend-side concern, not Phase 6's job.
+    let playlist = &envelope.playlists[0];
+    eprintln!(
+        "reel: playlist {:?} ({}) {} items",
+        playlist.name,
+        playlist.id,
+        playlist.items.len(),
+    );
+
+    // Pre-resolve to (TextSlide, transition_kind, transition_ms),
+    // skipping non-text and missing-slide items with warn so
+    // malformed entries don't crash mid-reel.
+    let mut resolved: Vec<(TextSlide, String, u32)> = Vec::with_capacity(playlist.items.len());
+    for item in &playlist.items {
+        match find_text_slide(content_root, item.item_id) {
+            Ok(Some(slide)) => {
+                resolved.push((slide, item.transition.clone(), item.transition_ms));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "reel: skipping non-text item {} (image/video — out of scope this phase)",
+                    item.item_id,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "reel: skipping item {} — find_text_slide failed: {e:#}",
+                    item.item_id,
+                );
+            }
+        }
+    }
+    if resolved.is_empty() {
+        bail!("reel: no playable text-slide items in playlist");
+    }
+    eprintln!("reel: resolved {} playable text-slide items", resolved.len());
+
+    let mut pass = 0_u32;
+    loop {
+        eprintln!(
+            "reel: starting pass #{pass} ({} items, hold_override={:?}, fps={fps})",
+            resolved.len(),
+            hold_secs_override,
+        );
+        for (i, (slide, _, _)) in resolved.iter().enumerate() {
+            // Entry transition (skip for first item of the very
+            // first pass — no predecessor). For loop_forever
+            // wraparound the first slide gets a transition from
+            // the LAST slide on subsequent passes (i.e. previous
+            // slide is resolved[len-1]).
+            let prev_idx = if i == 0 {
+                if pass == 0 {
+                    None
+                } else {
+                    Some(resolved.len() - 1)
+                }
+            } else {
+                Some(i - 1)
+            };
+            if let Some(p) = prev_idx {
+                let (prev_slide, _, _) = &resolved[p];
+                let (_, kind, transition_ms) = &resolved[i];
+                let transition_ms = (*transition_ms).max(50); // sanity floor
+                eprintln!(
+                    "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
+                    resolved.len() - 1,
+                );
+                if let Err(e) = render_transition_animated(
+                    card,
+                    prev_slide,
+                    slide,
+                    fonts,
+                    kind,
+                    transition_ms,
+                    fps,
+                ) {
+                    eprintln!(
+                        "reel: warn — transition into item {i} failed: {e:#}; \
+                         continuing with hard cut"
+                    );
+                }
+            }
+
+            let hold_secs = hold_secs_override
+                .unwrap_or_else(|| (slide.duration_ms as u64 / 1000).max(1));
+            eprintln!(
+                "reel: holding item {i}/{} ({:?}) for {hold_secs}s",
+                resolved.len() - 1,
+                slide.name,
+            );
+            if let Err(e) = render_slide(card, slide, fonts, hold_secs) {
+                eprintln!(
+                    "reel: warn — render_slide failed for item {i}: {e:#}; \
+                     skipping"
+                );
+            }
+        }
+
+        pass += 1;
+        if !loop_forever {
+            break;
+        }
+    }
+
+    eprintln!("reel: complete after {pass} pass(es)");
     Ok(())
 }
 

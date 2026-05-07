@@ -168,6 +168,20 @@ struct Args {
     #[arg(long, default_value_t = 800)]
     transition_ms: u32,
 
+    /// Phase 6 — walk the playlist sequentially and render every
+    /// text-slide item with its entry transition. Each item's
+    /// `transition` / `transition_ms` from playlist.json drives
+    /// the inter-slide animation; `slide.duration_ms` (or
+    /// `--hold-secs` if set) controls the hold per slide.
+    #[arg(long, default_value_t = false)]
+    play_reel: bool,
+
+    /// When `--play-reel` is set, loop the reel forever (wrapping
+    /// from last slide back to first via the first slide's
+    /// transition). Default: single pass.
+    #[arg(long, default_value_t = false)]
+    reel_loop: bool,
+
     /// Directory holding the renderer's font catalog. Each layer's
     /// `font_family` is mapped to a TTF basename under this dir
     /// (Anton → anton.ttf, "Bebas Neue" → bebas-neue.ttf, etc.).
@@ -479,6 +493,49 @@ fn main() -> Result<()> {
                     }
                 };
 
+                if args.play_reel {
+                    let playlist_path = args
+                        .playlist
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("/var/openmarquee/playlist.json"));
+                    let content_root = args
+                        .content_root
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("/var/openmarquee/content"));
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        eprintln!(
+                            "warn: font catalog at {} can't load fallback {:?} \
+                             — reel will render bg-only",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                        None
+                    };
+                    // hold-secs override only kicks in when the
+                    // operator explicitly set it; the default 5
+                    // already lives in args.hold_secs.
+                    let override_hold = if std::env::args().any(|a| a == "--hold-secs") {
+                        Some(args.hold_secs)
+                    } else {
+                        None
+                    };
+                    hdmi::render_playlist_reel(
+                        &card,
+                        playlist_path,
+                        content_root,
+                        catalog_opt,
+                        args.fps,
+                        args.reel_loop,
+                        override_hold,
+                    )?;
+                    return Ok(());
+                }
                 if let Some(slide_id) = args.play_slide {
                     dispatch_slide(slide_id, true, false)?;
                     return Ok(());
