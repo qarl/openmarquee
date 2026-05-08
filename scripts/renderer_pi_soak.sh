@@ -16,6 +16,12 @@
 #                        ≥6h ideally overnight; CI gates use shorter.
 #   SOAK_MAX_SLOPE_MBH   default 5.0   (MB/hour ceiling for slope test)
 #   SOAK_MAX_CMA_MB      default 200.0 (CMA hard ceiling per budget §4)
+#   SOAK_FORCE_MODE      unset by default; e.g. "1920x1080@30" runs
+#                        the soak under --force-mode (CEA-861 Mode
+#                        synthesis per slice 17(c)). Use for §8.2
+#                        acceptance runs that need to measure at
+#                        the spec'd 1080p target on a Pi with EDID
+#                        issues.
 #
 # TARGET defaults to openmarquee@openMarqueeDev. The cross-built binary
 # is expected at the same host path the smoke uses.
@@ -33,6 +39,12 @@ MAX_RSS="${SOAK_MAX_RSS_MB:-100.0}"
 # passes per minute on short runs.
 SOAK_HOLD_OVERRIDE="${SOAK_HOLD_SECS:-}"
 WARMUP_PASSES="${SOAK_WARMUP_PASSES:-0}"
+# v1-spec-delta #17 followup: optional --force-mode override so the
+# §8.2 6h soak can run at the spec'd 1080p target instead of the
+# dev Pi's native panel mode (1024x768 absent EDID). Format
+# matches the renderer's --force-mode CLI: WxH@Hz, e.g.
+# 1920x1080@30. Unset = use connector's reported modes.
+FORCE_MODE_OVERRIDE="${SOAK_FORCE_MODE:-}"
 BIN_HOST="renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-render"
 BIN_PI="/tmp/openmarquee-render"
 LOG_DIR="/tmp/renderer-soak"
@@ -70,9 +82,13 @@ HOLD_FLAG=""
 if [ -n "$SOAK_HOLD_OVERRIDE" ]; then
     HOLD_FLAG="--hold-secs $SOAK_HOLD_OVERRIDE"
 fi
-echo "==> running soak: ${DURATION}s @ canonical FYS reel --reel-loop ${HOLD_FLAG:-(canonical timings)}"
+FORCE_MODE_FLAG=""
+if [ -n "$FORCE_MODE_OVERRIDE" ]; then
+    FORCE_MODE_FLAG="--force-mode $FORCE_MODE_OVERRIDE"
+fi
+echo "==> running soak: ${DURATION}s @ canonical FYS reel --reel-loop ${HOLD_FLAG:-(canonical timings)} ${FORCE_MODE_FLAG:-(EDID-driven mode)}"
 set +e
-ssh "$TARGET" "timeout ${DURATION} $BIN_PI --output hdmi --play-reel --reel-loop --fps 30 $HOLD_FLAG 2>&1" \
+ssh "$TARGET" "timeout ${DURATION} $BIN_PI --output hdmi --play-reel --reel-loop --fps 30 $HOLD_FLAG $FORCE_MODE_FLAG 2>&1" \
     > "$SOAK_LOG" 2>&1
 SOAK_EXIT=$?
 set -e
