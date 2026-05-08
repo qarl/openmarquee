@@ -293,6 +293,13 @@ where
                 result: OpResult::OpenOk { mode_w: mw, mode_h: mh },
             },
         )?;
+        // v1-spec-delta #12 (slice b-3): IPC sidecar [mem]
+        // emission. Mirrors the standalone reel's session=
+        // open / per-N / session=close cadence using
+        // BeginSlide as the natural slide-boundary anchor
+        // (Advance fires per-frame, too noisy for slope test).
+        crate::mem::log_mem_snapshot("session=open", Some(session.gpu_counters()));
+        let mut begin_slide_count = 0_u32;
         let mut state = PlaybackState::new();
         let mut cache = SlideCache::new();
         // v1-spec-delta #10 (slice c): SettingsWatcher polls
@@ -327,6 +334,7 @@ where
                 }
             };
             let is_close = matches!(req, IpcRequest::Close);
+            let is_begin_slide = matches!(req, IpcRequest::BeginSlide(_));
 
             // v1-spec-delta #9 (slice e -- Capture wired now;
             // Reconfigure remains architectural-quality defer).
@@ -359,7 +367,15 @@ where
             );
 
             emit_response(stdout, &resp)?;
+            if is_begin_slide {
+                crate::mem::log_mem_snapshot(
+                    &format!("begin_slide={begin_slide_count}"),
+                    Some(session.gpu_counters()),
+                );
+                begin_slide_count += 1;
+            }
             if is_close {
+                crate::mem::log_mem_snapshot("session=close", Some(session.gpu_counters()));
                 break;
             }
         }
