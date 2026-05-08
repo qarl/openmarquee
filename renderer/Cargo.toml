@@ -29,6 +29,14 @@ uuid = { version = "1", default-features = false, features = ["serde"] }
 # if we hit a slide that needs shaping/bidi/ligatures.
 fontdue = "0.9"
 
+# v1-spec-delta #8 (slice a) — ImageSlide rendering. The browser
+# pre-scales operator uploads to PNG at the panel's native
+# resolution (per backend ImageSlide docstring), so the renderer
+# only ever sees PNG. Pure Rust, cross-platform. Pre-approved by
+# QA in slice (a) framing. `png` is lighter than `image` and
+# covers the only format we need.
+png = "0.17"
+
 # Hardware-bring-up deps (drm/gbm/EGL/GLES2) are Linux-only — they
 # require libdrm, libgbm, libEGL at link time, none of which exist
 # on macOS. Gating them behind cfg(target_os="linux") keeps

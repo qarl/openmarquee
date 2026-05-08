@@ -37,7 +37,8 @@ use std::rc::Rc;
 use uuid::Uuid;
 
 use crate::content::{
-    load_playlist, resolve_reel_items, solid_bg_hex, TextSlide,
+    image_slide_asset_path, load_playlist, resolve_reel_items, solid_bg_hex, ContentItem,
+    ImageSlide, TextSlide,
 };
 use crate::hdmi_logic::{
     blend_mode_label, box_to_ndc_quad, bricks_uniforms, checker_uniforms,
@@ -1445,6 +1446,132 @@ pub fn render_slide(
 ) -> Result<()> {
     with_egl_session(card, |session| {
         render_slide_in_session(session, card, slide, fonts, hold_ms)
+    })
+}
+
+/// v1-spec-delta #8 (slice a) -- public wrapper for one-shot
+/// ImageSlide rendering. Mirrors render_slide's shape: open an
+/// EglSession, render the image asset, hold for hold_ms, tear
+/// down. Used by the --play-image-slide CLI flag.
+pub fn render_image_slide(
+    card: &Card,
+    asset_path: &Path,
+    hold_ms: u64,
+) -> Result<()> {
+    with_egl_session(card, |session| {
+        render_image_slide_in_session(session, card, asset_path, hold_ms)
+    })
+}
+
+/// v1-spec-delta #8 (slice a, 2026-05-08) -- decode a PNG file
+/// to RGBA8 bytes + dimensions. Handles the two PIL-default color
+/// types we expect to see from the openMarquee browser pipeline:
+/// RGB (3 bytes/px) and RGBA (4 bytes/px). RGB is expanded to
+/// RGBA in-place with alpha=255. Other color types (greyscale,
+/// indexed, 16-bit) bail with a context-rich error -- the
+/// browser doesn't produce them, but the diagnostic surfaces if
+/// an operator hand-edits an asset.
+fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open png {}", path.display()))?;
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder
+        .read_info()
+        .with_context(|| format!("png read_info {}", path.display()))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .with_context(|| format!("png next_frame {}", path.display()))?;
+    if info.bit_depth != png::BitDepth::Eight {
+        bail!(
+            "png {}: bit depth {:?} not supported (need 8-bit)",
+            path.display(),
+            info.bit_depth,
+        );
+    }
+    let (w, h) = (info.width, info.height);
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity((w * h) as usize * 4);
+            for px in buf.chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            }
+            out
+        }
+        other => bail!(
+            "png {}: color type {other:?} not supported (need RGB or RGBA)",
+            path.display(),
+        ),
+    };
+    Ok((rgba, w, h))
+}
+
+/// v1-spec-delta #8 (slice a, 2026-05-08) -- render an ImageSlide
+/// for hold_ms milliseconds. Loads the PNG asset from
+/// `<content_root>/<id>/asset.png`, uploads as an RGBA8 GLES2
+/// texture, blits it via FS_BLIT to fill the viewport, and holds
+/// the frame on scanout for the slide's duration.
+///
+/// The browser pre-scales operator uploads to the panel's native
+/// resolution per the ImageSlide schema docstring, so the texture
+/// matches the viewport without further scaling. If the asset
+/// dims don't match the mode (e.g., dev playback at a different
+/// panel), FS_BLIT samples the texture across the full quad
+/// regardless -- visually correct stretch with linear filtering.
+///
+/// Slice (a) doesn't yet support image-side transitions; the
+/// reel driver hard-cuts into image slides via skip-with-warn.
+/// Slice (b) extends transitions to cover image inputs.
+fn render_image_slide_in_session(
+    session: &mut EglSession,
+    card: &Card,
+    asset_path: &Path,
+    hold_ms: u64,
+) -> Result<()> {
+    let (rgba, img_w, img_h) = load_png_rgba(asset_path)?;
+    eprintln!(
+        "rendering image_slide from {} ({}x{} RGBA) for {hold_ms}ms",
+        asset_path.display(),
+        img_w,
+        img_h,
+    );
+    render_one_frame_in_session(session, card, hold_ms, |gl, mode_w, mode_h| {
+        use glow::HasContext;
+        unsafe {
+            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            // Upload PNG bytes as a fresh GLES2 RGBA8 texture.
+            let tex = gl
+                .create_texture()
+                .map_err(|e| anyhow!("glGenTextures(image_slide): {e}"))?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                img_w as i32,
+                img_h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                Some(&rgba),
+            );
+            // Blit via FS_BLIT (existing slice 7c helper).
+            let blit_result = run_blit_pass(gl, tex);
+            gl.delete_texture(tex);
+            blit_result?;
+        }
+        Ok(())
     })
 }
 
@@ -3162,9 +3289,9 @@ pub fn render_playlist_reel(
     // here; any per-item warns came out of the helper.
     let resolved = resolve_reel_items(content_root, playlist);
     if resolved.is_empty() {
-        bail!("reel: no playable text-slide items in playlist");
+        bail!("reel: no playable items in playlist");
     }
-    eprintln!("reel: resolved {} playable text-slide items", resolved.len());
+    eprintln!("reel: resolved {} playable items", resolved.len());
 
     // v1-spec-delta #5 (slice c, 2026-05-08): one with_egl_session
     // wraps the entire reel pass. Per-slide and per-transition
@@ -3196,69 +3323,86 @@ pub fn render_playlist_reel(
             // time would balloon.
             let mut transitions_run = 0_u32;
             let mut slides_held = 0_u32;
-            for (i, (slide, _, _)) in resolved.iter().enumerate() {
+            for (i, (item, _, _)) in resolved.iter().enumerate() {
                 // Entry transition (skip when no predecessor).
-                // wraparound math + first-pass semantics is in
-                // the host-tested `prev_idx_for_reel`.
-                //
-                // Defensive guard: if the predecessor IS the
-                // current item (1-item reel + --reel-loop),
-                // there's nothing visually meaningful to
-                // transition — slide_b ≡ slide_a. Skip the per-
-                // frame loop entirely so we don't burn compute
-                // on a no-op.
+                // v1-spec-delta #8 (slice a): image-involving
+                // transitions are not yet implemented. The
+                // animated-transition harness expects two
+                // TextSlides for the FBO bake. When EITHER side
+                // is an image, hard-cut into the new item by
+                // skipping the transition with a warn line.
                 if let Some(p) = prev_idx_for_reel(i, pass, resolved.len()) {
                     if p != i {
-                        let (prev_slide, _, _) = &resolved[p];
+                        let (prev_item, _, _) = &resolved[p];
                         let (_, kind, transition_ms) = &resolved[i];
                         let transition_ms = clamp_transition_ms(*transition_ms);
-                        eprintln!(
-                            "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
-                            resolved.len() - 1,
-                        );
-                        if let Err(e) = render_transition_animated_in_session(
-                            session,
-                            card,
-                            prev_slide,
-                            slide,
-                            fonts,
-                            kind,
-                            transition_ms,
-                            fps,
-                        ) {
-                            // Skip-with-warn (no replay frame):
-                            // the next render_slide call below
-                            // will paint the new slide, which
-                            // functions as a hard cut.
-                            eprintln!(
-                                "reel: warn — transition into item {i} failed: {e:#}; \
-                                 skipping to slide hold (acts as hard cut)"
-                            );
-                        } else {
-                            transitions_run += 1;
+                        match (prev_item, item) {
+                            (ContentItem::Text(prev_slide), ContentItem::Text(slide)) => {
+                                eprintln!(
+                                    "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
+                                    resolved.len() - 1,
+                                );
+                                if let Err(e) = render_transition_animated_in_session(
+                                    session,
+                                    card,
+                                    prev_slide,
+                                    slide,
+                                    fonts,
+                                    kind,
+                                    transition_ms,
+                                    fps,
+                                ) {
+                                    eprintln!(
+                                        "reel: warn — transition into item {i} failed: {e:#}; \
+                                         skipping to slide hold (acts as hard cut)"
+                                    );
+                                } else {
+                                    transitions_run += 1;
+                                }
+                            }
+                            _ => {
+                                // Image-involving transition not
+                                // yet supported -- slice (b)
+                                // bundles image transition support
+                                // with the FBO-bake refactor.
+                                eprintln!(
+                                    "reel: image-involving transition into item {i} ({} -> {}) not yet implemented; using hard cut",
+                                    prev_item.type_label(),
+                                    item.type_label(),
+                                );
+                            }
                         }
                     }
                 }
 
-                // v1-spec-delta #1: ms precision. slide.duration_ms
-                // is in ms verbatim; the override (operator's
-                // --hold-secs) is in seconds and gets ×1000'd
-                // inside effective_hold_ms. FYS Panic flash slides
-                // at 130/350/500/800 ms now hold for the actual
-                // specified duration instead of snapping to a 1-
-                // second floor.
-                let hold_ms = effective_hold_ms(slide.duration_ms, hold_secs_override);
+                // v1-spec-delta #1: ms precision. duration_ms is in
+                // ms verbatim; the operator's --hold-secs override is
+                // in seconds and gets ×1000'd inside
+                // effective_hold_ms. FYS Panic flash slides at
+                // 130/350/500/800 ms now hold for the actual
+                // specified duration instead of snapping to a
+                // 1-second floor.
+                let hold_ms = effective_hold_ms(item.duration_ms(), hold_secs_override);
                 eprintln!(
-                    "reel: holding item {i}/{} ({:?}) for {hold_ms}ms",
+                    "reel: holding item {i}/{} ({:?} type={}) for {hold_ms}ms",
                     resolved.len() - 1,
-                    slide.name,
+                    item.name(),
+                    item.type_label(),
                 );
-                if let Err(e) =
-                    render_slide_in_session(session, card, slide, fonts, hold_ms)
-                {
+                let render_result = match item {
+                    ContentItem::Text(slide) => {
+                        render_slide_in_session(session, card, slide, fonts, hold_ms)
+                    }
+                    ContentItem::Image(slide) => {
+                        let asset = image_slide_asset_path(content_root, slide.id);
+                        render_image_slide_in_session(session, card, &asset, hold_ms)
+                    }
+                };
+                if let Err(e) = render_result {
                     eprintln!(
-                        "reel: warn — render_slide failed for item {i}: {e:#}; \
-                         skipping"
+                        "reel: warn — render_{} failed for item {i}: {e:#}; \
+                         skipping",
+                        item.type_label(),
                     );
                 } else {
                     slides_held += 1;

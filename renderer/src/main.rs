@@ -227,6 +227,16 @@ struct Args {
     #[arg(long)]
     play_blend_test: Option<String>,
 
+    /// v1-spec-delta #8 (slice a+) -- render a PNG asset directly
+    /// via the ImageSlide path. PATH is a filesystem path to a
+    /// PNG; the smoke harness uploads a known asset to the Pi
+    /// and runs `--play-image-slide /path/to/asset.png`. Hold for
+    /// `--hold-secs` (default 2). Smoke gate validates the PNG
+    /// decode + texture upload + FS_BLIT path on real DRM
+    /// scanout.
+    #[arg(long)]
+    play_image_slide: Option<String>,
+
     /// v1-spec-delta #4 (slice b/d) — render a synthesized slide
     /// with the layer's `outline` set. Validates that the
     /// FS_GLYPH_OUTLINE shader path links + draws on real DRM
@@ -943,6 +953,12 @@ fn main() -> Result<()> {
                     let slide = build_pattern_test_slide(pattern_name);
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
                     hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    return Ok(());
+                }
+                if let Some(asset_path) = args.play_image_slide.as_deref() {
+                    let path = Path::new(asset_path);
+                    let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
+                    hdmi::render_image_slide(&card, path, hold_ms)?;
                     return Ok(());
                 }
                 if let Some(blend_name) = args.play_blend_test.as_deref() {

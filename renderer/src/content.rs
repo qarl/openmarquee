@@ -310,6 +310,99 @@ pub fn find_text_slide(content_root: &Path, item_id: Uuid) -> Result<Option<Text
     Ok(Some(slide))
 }
 
+/// v1-spec-delta #8 (slice a, 2026-05-08) -- minimal mirror of
+/// Python's `ImageSlide`. Asset (PNG, browser-pre-scaled to the
+/// sign's native resolution) lives at `<content_root>/<id>/
+/// asset.png` per backend storage convention. The schema fields
+/// the renderer needs are id + duration_ms + transition; name is
+/// kept for log lines.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ImageSlide {
+    #[serde(default = "Uuid::nil")]
+    pub id: Uuid,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_image_duration_ms")]
+    pub duration_ms: u32,
+    #[serde(default = "default_transition")]
+    pub transition: String,
+    #[serde(default = "default_transition_ms")]
+    pub transition_ms: u32,
+}
+
+fn default_image_duration_ms() -> u32 {
+    5000
+}
+
+/// v1-spec-delta #8 (slice a) -- locate the image-slide JSON for
+/// a given item_id. Mirrors find_text_slide; returns Ok(None)
+/// when the item exists but isn't an image slide. Caller
+/// dispatches the type selection -- find_text_slide /
+/// find_image_slide are parallel narrow loaders.
+pub fn find_image_slide(content_root: &Path, item_id: Uuid) -> Result<Option<ImageSlide>> {
+    let path = item_dir(content_root, item_id).join("item.json");
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read item {}", path.display()))?;
+    let envelope: ItemEnvelope = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse item envelope {}", path.display()))?;
+    let kind = envelope
+        .item
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if kind != "image" {
+        return Ok(None);
+    }
+    let slide: ImageSlide = serde_json::from_value(envelope.item)
+        .with_context(|| format!("parse image_slide {}", path.display()))?;
+    Ok(Some(slide))
+}
+
+/// v1-spec-delta #8 (slice a) -- the asset PNG path for an
+/// ImageSlide. The browser pre-scales to the panel's native
+/// resolution + uploads as PNG, so the renderer only ever sees
+/// PNG. Path: `<content_root>/<id>/asset.png`.
+pub fn image_slide_asset_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
+    item_dir(content_root, slide_id).join("asset.png")
+}
+
+/// v1-spec-delta #8 (slice a) -- typed reel item. The reel
+/// driver dispatches on this enum; each variant has its own
+/// render path (Text via render_slide_in_session, Image via
+/// render_image_slide_in_session). Slice (c) will add Video.
+#[derive(Debug, Clone)]
+pub enum ContentItem {
+    Text(TextSlide),
+    Image(ImageSlide),
+}
+
+impl ContentItem {
+    pub fn id(&self) -> Uuid {
+        match self {
+            ContentItem::Text(s) => s.id,
+            ContentItem::Image(s) => s.id,
+        }
+    }
+    pub fn name(&self) -> &str {
+        match self {
+            ContentItem::Text(s) => &s.name,
+            ContentItem::Image(s) => &s.name,
+        }
+    }
+    pub fn duration_ms(&self) -> u32 {
+        match self {
+            ContentItem::Text(s) => s.duration_ms,
+            ContentItem::Image(s) => s.duration_ms,
+        }
+    }
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            ContentItem::Text(_) => "text_slide",
+            ContentItem::Image(_) => "image",
+        }
+    }
+}
+
 /// `<content_root>/<item_id>/`. Pulled out so tests can build the
 /// same path without re-deriving the layout convention.
 pub fn item_dir(content_root: &Path, item_id: Uuid) -> PathBuf {
@@ -330,22 +423,47 @@ pub fn item_dir(content_root: &Path, item_id: Uuid) -> PathBuf {
 pub fn resolve_reel_items(
     content_root: &Path,
     playlist: &Playlist,
-) -> Vec<(TextSlide, String, u32)> {
-    let mut out: Vec<(TextSlide, String, u32)> = Vec::with_capacity(playlist.items.len());
+) -> Vec<(ContentItem, String, u32)> {
+    let mut out: Vec<(ContentItem, String, u32)> = Vec::with_capacity(playlist.items.len());
     for item in &playlist.items {
+        // Try text slide first; fall through to image; warn on
+        // anything else (video lands in slice (c)).
         match find_text_slide(content_root, item.item_id) {
             Ok(Some(slide)) => {
-                out.push((slide, item.transition.clone(), item.transition_ms));
+                out.push((
+                    ContentItem::Text(slide),
+                    item.transition.clone(),
+                    item.transition_ms,
+                ));
+                continue;
+            }
+            Ok(None) => {} // not a text slide; try image.
+            Err(e) => {
+                eprintln!(
+                    "reel: skipping item {} — find_text_slide failed: {e:#}",
+                    item.item_id,
+                );
+                continue;
+            }
+        }
+        match find_image_slide(content_root, item.item_id) {
+            Ok(Some(slide)) => {
+                out.push((
+                    ContentItem::Image(slide),
+                    item.transition.clone(),
+                    item.transition_ms,
+                ));
+                continue;
             }
             Ok(None) => {
                 eprintln!(
-                    "reel: skipping non-text item {} (image/video — out of scope this phase)",
+                    "reel: skipping item {} -- type not text_slide or image (video out of scope until slice c)",
                     item.item_id,
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "reel: skipping item {} — find_text_slide failed: {e:#}",
+                    "reel: skipping item {} -- find_image_slide failed: {e:#}",
                     item.item_id,
                 );
             }
@@ -834,10 +952,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reel_items_skips_image_items() {
-        // Image items return Ok(None) from find_text_slide; the
-        // resolver skips them with a warn rather than dropping the
-        // whole reel.
+    fn resolve_reel_items_returns_image_items_as_content_item_image() {
+        // v1-spec-delta #8 (slice a): image items are now first-
+        // class reel content. They surface as ContentItem::Image
+        // alongside ContentItem::Text -- the reel driver
+        // dispatches on type at render time. Pre-slice-a, image
+        // items were skipped with a warn.
         let td = TempDir::new().unwrap();
         let id_text = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
         let dir_text = td.path().join(id_text.to_string());
@@ -854,8 +974,11 @@ mod tests {
             item_ref(id_image, "wipe", 600),
         ]);
         let resolved = resolve_reel_items(td.path(), &playlist);
-        assert_eq!(resolved.len(), 1, "image should be skipped");
+        assert_eq!(resolved.len(), 2, "both items should be returned");
+        assert!(matches!(resolved[0].0, ContentItem::Text(_)));
+        assert!(matches!(resolved[1].0, ContentItem::Image(_)));
         assert_eq!(resolved[0].1, "fade");
+        assert_eq!(resolved[1].1, "wipe");
     }
 
     #[test]

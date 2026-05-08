@@ -829,6 +829,32 @@ for kind in $BLEND_KINDS_IMPL; do
     echo "    --play-blend-test $kind ok (blend func dispatched correctly)"
 done
 
+# v1-spec-delta #8 (slice a) ImageSlide smoke. Picks the first
+# asset.png from the live content store on the Pi and renders it
+# via --play-image-slide. Asserts no panic + slide-render-complete
+# + the PNG decode + texture-upload + FS_BLIT path linked. Visual
+# verification (the PNG actually shows on screen) is qarl-eyeball.
+echo "==> Phase d-smoke -- --play-image-slide (first content/<uuid>/asset.png)"
+IMAGE_ASSET=$(ssh "$TARGET" 'ls -1 /var/openmarquee/content/*/asset.png 2>/dev/null | head -1' || true)
+if [ -z "$IMAGE_ASSET" ]; then
+    echo "    --play-image-slide skipped (no asset.png on target)"
+else
+    IS_LOG="$LOG_DIR/play-image-slide.log"
+    IS_EXIT=0
+    ssh "$TARGET" "$BIN_PI --output hdmi --play-image-slide $IMAGE_ASSET --hold-secs 2" \
+        > "$IS_LOG" 2>&1 || IS_EXIT=$?
+    if [ "$IS_EXIT" -ne 0 ]; then
+        echo "FAIL: --play-image-slide exit $IS_EXIT (asset=$IMAGE_ASSET)"
+        cat "$IS_LOG"
+        exit 1
+    fi
+    grep -qE 'panicked at|RUST_BACKTRACE' "$IS_LOG" && \
+        { echo "FAIL: panic in --play-image-slide"; cat "$IS_LOG"; exit 1; }
+    grep -q 'rendering image_slide from' "$IS_LOG" || \
+        { echo "FAIL: --play-image-slide didn't reach renderer"; cat "$IS_LOG"; exit 1; }
+    echo "    --play-image-slide ok (decoded + uploaded + drew on hw)"
+fi
+
 # Phase 6 reel assertion: completion + slide count + transition
 # count + no panics. The reel logs "reel: resolved N items" once
 # and "reel: transition into item I/N" for each transition.

@@ -2472,6 +2472,23 @@ mod tests {
         assert!(FS_PATTERN_CONFETTI.contains("u_cell"));
     }
 
+    // v1-spec-delta #7 F1k -- shader source pin for FS_OVERLAY_BLEND.
+    // Catches accidental edits to the overlay shader that would
+    // change the per-channel branch / composite shape.
+    #[test]
+    fn fs_overlay_blend_has_gles2_preamble_and_uniforms() {
+        assert!(FS_OVERLAY_BLEND.starts_with("#version 100\n"));
+        assert!(FS_OVERLAY_BLEND.contains("precision mediump float"));
+        assert!(FS_OVERLAY_BLEND.contains("u_layer_tex"));
+        assert!(FS_OVERLAY_BLEND.contains("u_slide_tex"));
+        // Per-channel branch on dst:
+        assert!(FS_OVERLAY_BLEND.contains("step(0.5, dst)"));
+        // Source-over composite by α:
+        assert!(FS_OVERLAY_BLEND.contains("mix(dst, ovl, a)"));
+        // Premultiplied recovery short-circuit at α<0.001:
+        assert!(FS_OVERLAY_BLEND.contains("a < 0.001"));
+    }
+
     // v1-spec-delta #6 (slice c) -- halftone / scanlines / grid /
     // rings uniform helpers. Math mirrors Python anchors at
     // density 0/0.5/1.
