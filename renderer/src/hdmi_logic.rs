@@ -795,6 +795,67 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
 /// onto this pattern with a `t` uniform + a second texture.
 ///
 /// Pairs with `VS_TEXTURED_QUAD` (interleaved [x, y, u, v] verts).
+/// v1-spec-delta #10 (slice b, 2026-05-08) -- brightness / gamma
+/// post-pass shader. Applied as a fullscreen blit after the
+/// scene FBO is composed, before commit_fb. Simple per-pixel:
+///   out.rgb = pow(in.rgb * brightness, 1.0 / gamma)
+///
+/// Identity case: brightness == 1.0 AND gamma == 1.0 means the
+/// caller can skip this pass entirely (bind FS_BLIT instead).
+/// At spec defaults (brightness=100/gamma=2.2 in the schema's
+/// 100-scale + 2.2 anchor) the renderer applies a real
+/// sRGB-ish gamma correction; operators can dim via
+/// brightness in [0, 100].
+///
+/// brightness uniform is the schema value DIVIDED BY 100 (so
+/// the shader sees [0, 1]); gamma is the schema value
+/// directly. Caller does the division to keep the shader
+/// scale-agnostic.
+pub const FS_BRIGHT_GAMMA: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src;
+uniform float u_brightness;
+uniform float u_gamma;
+varying vec2 v_uv;
+void main() {
+    vec4 c = texture2D(u_src, v_uv);
+    vec3 rgb = c.rgb * u_brightness;
+    // Avoid pow(0, x) edge cases via a tiny epsilon. GLSL's
+    // pow is undefined for negative bases; clamping rgb to
+    // [0, 1+eps] keeps it well-defined.
+    rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+    rgb = pow(rgb, vec3(1.0 / max(u_gamma, 0.001)));
+    gl_FragColor = vec4(rgb, c.a);
+}
+"#;
+
+/// v1-spec-delta #10 (slice b) -- pure-CPU brightness/gamma
+/// math mirror of FS_BRIGHT_GAMMA. Used for host tests + a
+/// reference encode for capture-with-settings paths. Does the
+/// same per-pixel transform: rgb' = pow(clamp(rgb * b), 1/g).
+/// alpha is passed through unchanged.
+///
+/// `brightness` is in [0, 1] (caller pre-divides if the
+/// schema value is in [0, 100]). `gamma` > 0; near-zero
+/// values clamp to avoid divide-by-zero in the shader's
+/// 1/gamma exponent.
+pub fn apply_brightness_gamma_rgba(
+    rgba: &mut [u8],
+    brightness: f32,
+    gamma: f32,
+) {
+    let inv_gamma = 1.0 / gamma.max(0.001);
+    for px in rgba.chunks_exact_mut(4) {
+        for i in 0..3 {
+            let v = (px[i] as f32) / 255.0;
+            let scaled = (v * brightness).clamp(0.0, 1.0);
+            let corrected = scaled.powf(inv_gamma);
+            px[i] = (corrected * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        // alpha unchanged.
+    }
+}
+
 /// v1-spec-delta #11 (slice b, 2026-05-08) -- encode an RGBA8
 /// pixel buffer to PNG bytes. Pure-CPU helper; no GL deps so
 /// it lives in hdmi_logic.rs (cross-platform; runs on Mac in
@@ -2524,6 +2585,74 @@ mod tests {
         assert!(FS_OVERLAY_BLEND.contains("mix(dst, ovl, a)"));
         // Premultiplied recovery short-circuit at α<0.001:
         assert!(FS_OVERLAY_BLEND.contains("a < 0.001"));
+    }
+
+    // v1-spec-delta #10 (slice b) -- brightness/gamma post-pass
+    // CPU mirror tests. Pin the math vs FS_BRIGHT_GAMMA shader
+    // semantics.
+    #[test]
+    fn apply_brightness_gamma_identity_at_b1_g1() {
+        // brightness=1, gamma=1 -> identity transform.
+        let mut rgba: Vec<u8> = vec![64, 128, 192, 255, 0, 0, 0, 200];
+        let original = rgba.clone();
+        apply_brightness_gamma_rgba(&mut rgba, 1.0, 1.0);
+        assert_eq!(rgba, original);
+    }
+
+    #[test]
+    fn apply_brightness_gamma_halves_at_b_half() {
+        // brightness=0.5, gamma=1 -> halve RGB; alpha unchanged.
+        let mut rgba: Vec<u8> = vec![200, 100, 50, 255];
+        apply_brightness_gamma_rgba(&mut rgba, 0.5, 1.0);
+        // 200 * 0.5 = 100; 100 * 0.5 = 50; 50 * 0.5 = 25.
+        assert_eq!(rgba[0], 100);
+        assert_eq!(rgba[1], 50);
+        assert_eq!(rgba[2], 25);
+        assert_eq!(rgba[3], 255);  // alpha untouched.
+    }
+
+    #[test]
+    fn apply_brightness_gamma_lightens_at_g_22() {
+        // brightness=1, gamma=2.2 -> lighten via 1/2.2 power
+        // (pow(0.5, 1/2.2) ~= 0.7297).
+        let mut rgba: Vec<u8> = vec![128, 128, 128, 255];
+        apply_brightness_gamma_rgba(&mut rgba, 1.0, 2.2);
+        // 128/255 = 0.502; pow(0.502, 1/2.2) = pow(0.502, 0.4545)
+        // ~= 0.731; * 255 = ~186.
+        assert!(rgba[0] >= 184 && rgba[0] <= 188, "got {}", rgba[0]);
+        assert_eq!(rgba[3], 255);  // alpha untouched.
+    }
+
+    #[test]
+    fn apply_brightness_gamma_clamps_overflow_at_b_2() {
+        // brightness=2.0 doubles RGB; 200*2=400 should clamp
+        // to 255 (saturate to white) rather than overflow u8.
+        let mut rgba: Vec<u8> = vec![200, 100, 50, 255];
+        apply_brightness_gamma_rgba(&mut rgba, 2.0, 1.0);
+        assert_eq!(rgba[0], 255);  // 400 clamped to 255.
+        assert_eq!(rgba[1], 200);  // 100 * 2 = 200.
+        assert_eq!(rgba[2], 100);  // 50 * 2 = 100.
+    }
+
+    #[test]
+    fn apply_brightness_gamma_handles_zero_gamma_via_floor() {
+        // gamma = 0.0 would divide-by-zero; the helper clamps
+        // gamma at min 0.001 to keep the shader stable.
+        let mut rgba: Vec<u8> = vec![128, 128, 128, 255];
+        apply_brightness_gamma_rgba(&mut rgba, 1.0, 0.0);
+        // pow(0.502, 1/0.001) = pow(0.502, 1000) = ~0.
+        assert_eq!(rgba[0], 0);
+    }
+
+    #[test]
+    fn fs_bright_gamma_has_gles2_preamble() {
+        assert!(FS_BRIGHT_GAMMA.starts_with("#version 100\n"));
+        assert!(FS_BRIGHT_GAMMA.contains("precision mediump float"));
+        assert!(FS_BRIGHT_GAMMA.contains("u_brightness"));
+        assert!(FS_BRIGHT_GAMMA.contains("u_gamma"));
+        assert!(FS_BRIGHT_GAMMA.contains("u_src"));
+        // Per-channel pow on the gamma corrected channel.
+        assert!(FS_BRIGHT_GAMMA.contains("pow(rgb"));
     }
 
     // v1-spec-delta #11 (slice b) -- rgba_to_png_bytes round-trips.
