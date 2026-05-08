@@ -656,14 +656,17 @@ if [ "$ANIM_LINES" -lt 6 ]; then
     cat "$MOTION_LOG"
     exit 1
 fi
-# Frame-count floor: each animated kind in 1 s should render >= 10
-# frames. Below 10 indicates a stalled per-frame loop. The spec's
-# 30 fps target is currently unmet at 1080p (~15 fps observed) due
-# to per-frame text rasterization -- documented as a v1-spec-delta
-# followup; smoke gates correctness ("loop runs"), not perf.
+# Frame-count floor: each animated kind held for 1 s should hit
+# the spec §11 30 fps target (=30 frames). v1-spec-delta #3 (b)
+# glyph cache (commit 9368e0e) eliminated the per-frame fontdue
+# rasterization on motion paths; a regression to per-frame raster
+# would land at ~15 fps. Floor at 25 catches the regression class
+# (anything below 25 indicates either the cache stopped working
+# OR a new fontdue path was introduced) while allowing ±5 frame
+# jitter from the 30 fps target. QA F1 bump 2026-05-08.
 LOWEST_FRAMES=$(grep -oE 'animated slide complete: [0-9]+ frames' "$MOTION_LOG" | grep -oE '[0-9]+' | sort -n | head -1)
-if [ -z "${LOWEST_FRAMES:-}" ] || [ "$LOWEST_FRAMES" -lt 10 ]; then
-    echo "FAIL: --play-motion-test min frame count $LOWEST_FRAMES < 10 floor (per-frame loop stalled)"
+if [ -z "${LOWEST_FRAMES:-}" ] || [ "$LOWEST_FRAMES" -lt 25 ]; then
+    echo "FAIL: --play-motion-test min frame count $LOWEST_FRAMES < 25 floor (cache regression -- expected ~30 fps)"
     cat "$MOTION_LOG"
     exit 1
 fi
@@ -683,9 +686,17 @@ if [ "$TRANS_LINES" -lt 3 ]; then
     cat "$MOTION_TRANS_LOG"
     exit 1
 fi
+# Frame-count floor: render_transition_animated parametrizes
+# total_frames = round(transition_ms/1000 * fps). At
+# transition_ms=800 / fps=30 that's 24. Anything <20 indicates
+# either total_frames was changed silently OR the loop stalled.
+# Wall-clock perf to actually hit the 30 fps target is bound by
+# legacy drmModeSetCrtc per frame -- tracked separately under
+# v1-spec-delta #5 (atomic + persistent context). QA F1 bump
+# 2026-05-08: floor was 10, now 20.
 LOWEST_TRANS_FRAMES=$(grep -oE 'animated transition complete: kind="[a-z]+" rendered [0-9]+ frames' "$MOTION_TRANS_LOG" | grep -oE '[0-9]+ frames' | grep -oE '[0-9]+' | sort -n | head -1)
-if [ -z "${LOWEST_TRANS_FRAMES:-}" ] || [ "$LOWEST_TRANS_FRAMES" -lt 10 ]; then
-    echo "FAIL: --play-motion-transition min frame count $LOWEST_TRANS_FRAMES < 10 floor"
+if [ -z "${LOWEST_TRANS_FRAMES:-}" ] || [ "$LOWEST_TRANS_FRAMES" -lt 20 ]; then
+    echo "FAIL: --play-motion-transition min frame count $LOWEST_TRANS_FRAMES < 20 floor"
     cat "$MOTION_TRANS_LOG"
     exit 1
 fi
