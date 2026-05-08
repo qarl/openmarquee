@@ -138,7 +138,7 @@ but the budget tolerates it.
 | Single texture/FBO dimension  | 2048 px      | vc4 hardware limit           |
 | Concurrent FBOs allocated     | 8            | Mesa state-tracker pressure  |
 | GBM BO chain depth (explicit) | 4            | CMA cost vs latency tradeoff |
-| Image-bg cache entries        | 6            | 6 × 8 MB = 48 MB CMA cap (eviction unlanded — see §6 #2) |
+| Image-bg cache entries        | 6            | 6 × 8 MB = 48 MB CMA cap (LRU eviction landed in slice 12 image-bg)        |
 
 ## 5. Verification methodology
 
@@ -187,14 +187,16 @@ lines, gate on:
    adjacent slides, peak FBO count grows. Currently lazy-bake
    per-transition; this doc presumes that cadence holds.
 
-2. **Image-bg cache eviction (UNLANDED — top risk).** `image_bg_cache:
-   HashMap<PathBuf, ...>` in `EglSession` is currently unbounded.
-   FYS canonical reel has ≤4 distinct images so this saturates
-   benignly today, but a playlist with N >> 4 distinct images grows
-   CMA without bound until the soak gate (or OOM) catches it. Slice
-   to add: LRU eviction policy with the §4 hard cap of 6 entries +
-   ~32 MB target CMA. Until then, the §4 hard cap is an aspirational
-   ceiling, not an enforced invariant.
+2. **Image-bg cache eviction — LANDED 2026-05-08.** `image_bg_cache`
+   is now a `crate::lru::LruMap<PathBuf, ...>` with the §4 hard cap
+   of 6 entries enforced via LRU eviction on insert. The eviction
+   policy is unit-tested cross-platform in `renderer/src/lru.rs`
+   (8 tests covering: under-cap no-evict, at-cap evicts LRU, get
+   touches MRU, replace returns prior value no-evict, capacity-0
+   clamp, drain-then-reinsert, cycle-N>cap keeps recent only,
+   touch-then-insert evicts other-entry). Caller (draw_image_bg)
+   handles InsertOutcome: deletes any returned evicted-LRU
+   texture + replaced texture via the gl context.
 
 3. **Video decoder ring depth.** H.264 main-profile B-frame chains
    can require 4-deep DPB. Raising to 6-deep is +6 MB CMA. Item #8

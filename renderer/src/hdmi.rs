@@ -227,7 +227,16 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// because FYS has no image-bg slides, but production demos
 /// will trigger the regression the moment the editor wires
 /// background_image_slide_id under a motion-bearing layer.
-pub type ImageBgCache = HashMap<PathBuf, (glow::NativeTexture, u32, u32)>;
+///
+/// v1-spec-delta #12 (image-bg eviction, 2026-05-08): bounded LRU
+/// per memory budget §4 (image-bg cache hard ceiling = 6 entries
+/// = 48 MB CMA cap). Without eviction, a long-running renderer
+/// with many distinct images grows CMA without bound until OOM.
+/// Implementation lives in crate::lru as a generic LruMap so the
+/// eviction policy is host-testable on Mac (hdmi.rs is Linux-only).
+pub const IMAGE_BG_CACHE_CAPACITY: usize = 6;
+
+pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
 pub struct EglSession<'a> {
     egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
@@ -410,7 +419,7 @@ where
         mode_h,
         modeset_done: false,
         flip_pending: false,
-        image_bg_cache: HashMap::new(),
+        image_bg_cache: ImageBgCache::with_capacity(IMAGE_BG_CACHE_CAPACITY),
         scanout_prev_bo: None,
         scanout_prev_fb: None,
         scanout_current_bo: None,
@@ -428,8 +437,7 @@ where
     // clean and surfaces leaks via warn-on-Err pattern.
     {
         use glow::HasContext;
-        let cache = std::mem::take(&mut session.image_bg_cache);
-        for (path, (tex, _, _)) in cache {
+        for (path, (tex, _, _)) in session.image_bg_cache.drain() {
             unsafe { gl.delete_texture(tex); }
             // Trace-level diagnostic: cached image freed.
             // Comment-only -- production logs stay quiet.
@@ -1031,13 +1039,15 @@ fn draw_image_bg(
     gl: &glow::Context,
     asset_path: &Path,
     solid_fallback: [f32; 4],
-    image_bg_cache: Option<&mut ImageBgCache>,
+    mut image_bg_cache: Option<&mut ImageBgCache>,
 ) {
     use glow::HasContext;
-    // Cache hit -- skip decode + upload, just bind + blit.
-    if let Some(cache) = image_bg_cache.as_deref() {
+    // Cache hit -- skip decode + upload, just bind + blit. Touches
+    // the entry to back-of-LRU-order via cache.get's &mut self.
+    if let Some(cache) = image_bg_cache.as_deref_mut() {
         if let Some((tex, _, _)) = cache.get(asset_path) {
-            let blit_result = unsafe { run_blit_pass(gl, *tex) };
+            let tex = *tex;
+            let blit_result = unsafe { run_blit_pass(gl, tex) };
             if let Err(e) = blit_result {
                 eprintln!(
                     "warn: image-bg blit failed (cache-hit) for {}: {e:#}; result may be partial",
@@ -1094,10 +1104,20 @@ fn draw_image_bg(
         // Cache insertion (or free) decision: when a cache is
         // provided, transfer ownership of the texture into the
         // cache so the next call with the same asset_path skips
-        // decode+upload. Otherwise free now.
+        // decode+upload. Otherwise free now. Bounded LRU: insert
+        // returns evicted_lru when at capacity, replaced when the
+        // key already existed (rare; only on retry-after-failure).
+        // Both must be deleted via gl since the cache only owns
+        // the *key*, not the GPU resource.
         match image_bg_cache {
             Some(cache) => {
-                cache.insert(asset_path.to_path_buf(), (tex, w, h));
+                let outcome = cache.insert(asset_path.to_path_buf(), (tex, w, h));
+                if let Some((evicted, _, _)) = outcome.evicted_lru {
+                    gl.delete_texture(evicted);
+                }
+                if let Some((replaced, _, _)) = outcome.replaced {
+                    gl.delete_texture(replaced);
+                }
             }
             None => {
                 gl.delete_texture(tex);
