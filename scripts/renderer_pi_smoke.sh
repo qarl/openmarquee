@@ -768,7 +768,7 @@ PATTERN_KINDS_IMPL="stripes checker dots halftone scanlines grid rings rays bric
 # v1-spec-delta #7 -- blend modes shipped by slice. (b) lands
 # screen + multiply via blend func tweaks; (c) lands overlay via
 # FBO sample. normal is shipped from day one.
-BLEND_KINDS_IMPL="normal screen multiply"
+BLEND_KINDS_IMPL="normal screen multiply overlay"
 for kind in $PATTERN_KINDS_IMPL; do
     echo "==> Phase d-smoke -- --play-pattern-test $kind"
     PT_LOG="$LOG_DIR/pattern-test-$kind.log"

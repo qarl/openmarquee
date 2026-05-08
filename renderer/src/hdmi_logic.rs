@@ -804,6 +804,46 @@ void main() {
 }
 "#;
 
+/// v1-spec-delta #7 (slice c, 2026-05-08) -- Photoshop/Pillow
+/// `overlay` blend mode. Per-channel formula:
+///   if dst < 0.5:  out = 2 · src · dst
+///   else:          out = 1 - 2 · (1-src) · (1-dst)
+/// Then source-over composite by α: dst' = (1-α) dst + α · out.
+///
+/// `u_layer_tex` holds the rasterized text layer with PREMULTIPLIED
+/// alpha (FS_GLYPH emit shape: text·α, α). Recover unpremultiplied
+/// src.rgb via `layer.rgb / layer.a` with an epsilon guard so
+/// out-of-glyph fragments (α ~= 0) don't divide-by-zero. When α is
+/// effectively 0, the composite reduces to dst (no change).
+///
+/// `u_slide_tex` is the current scene state (bg + earlier layers).
+/// We sample, compute overlay, write to the destination FBO. The
+/// destination is bound by the caller; this shader is a pure
+/// fragment-only composite pass with no blend func required (the
+/// formula is an explicit mix).
+pub const FS_OVERLAY_BLEND: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_layer_tex;
+uniform sampler2D u_slide_tex;
+varying vec2 v_uv;
+void main() {
+    vec4 layer = texture2D(u_layer_tex, v_uv);
+    vec3 dst = texture2D(u_slide_tex, v_uv).rgb;
+    float a = layer.a;
+    // Out-of-glyph short-circuit so the divide is safe.
+    if (a < 0.001) {
+        gl_FragColor = vec4(dst, 1.0);
+        return;
+    }
+    vec3 src = layer.rgb / a;
+    vec3 mul = 2.0 * src * dst;
+    vec3 scr = 1.0 - 2.0 * (1.0 - src) * (1.0 - dst);
+    vec3 ovl = mix(mul, scr, step(0.5, dst));
+    vec3 result = mix(dst, ovl, a);
+    gl_FragColor = vec4(result, 1.0);
+}
+"#;
+
 /// Fragment shader: two-color linear gradient. Mirrors the Python
 /// reference (`backend.openmarquee.auto_render._render_pattern_
 /// gradient`). Coordinate convention is image-space (y=0 at top), so

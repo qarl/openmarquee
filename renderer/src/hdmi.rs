@@ -50,10 +50,10 @@ use crate::hdmi_logic::{
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
     stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT, FS_CUT, FS_FADE,
-    FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_PATTERN_BRICKS, FS_PATTERN_CHECKER,
-    FS_PATTERN_CONFETTI, FS_PATTERN_DOTS, FS_PATTERN_GRID, FS_PATTERN_HALFTONE,
-    FS_PATTERN_RAYS, FS_PATTERN_RINGS, FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES,
-    VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
+    FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND, FS_PATTERN_BRICKS,
+    FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS, FS_PATTERN_GRID,
+    FS_PATTERN_HALFTONE, FS_PATTERN_RAYS, FS_PATTERN_RINGS, FS_PATTERN_SCANLINES,
+    FS_PATTERN_STRIPES, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -2425,6 +2425,31 @@ fn paint_slide(
                 });
             }
         }
+        // v1-spec-delta #7 (slice c): if any layer has blend=
+        // overlay, take the FBO ping-pong route. Overlay's per-
+        // pixel formula `mix(2·src·dst, 1-2·(1-src)·(1-dst),
+        // step(0.5, dst))` needs to read dst, which fixed-function
+        // blend can't express on vc4 (no GL_EXT_shader_framebuffer_
+        // fetch). The FBO route renders bg + non-overlay layers
+        // into a scene FBO, processes overlay layers via a
+        // separate layer FBO + overlay shader pass to a scratch
+        // FBO, swaps scene/scratch ping-pong, and finally blits
+        // the scene FBO to the default framebuffer.
+        let any_overlay = text_layers
+            .iter()
+            .any(|(l, _, _)| matches!(parse_blend_mode(&l.blend), BlendMode::Overlay));
+        if any_overlay {
+            paint_layers_via_overlay_route(
+                gl,
+                mode_w,
+                mode_h,
+                bg_kind,
+                text_layers,
+                motion_states,
+                cache_ref,
+            )?;
+            return Ok(());
+        }
         let layer_loop_result: Result<()> = (|| {
             for (i, (layer, tc, _)) in text_layers.iter().enumerate() {
                 let motion_state = motion_states
@@ -2443,7 +2468,7 @@ fn paint_slide(
                 //             dst' = (text·α) · dst + (1-α) dst   = source-over multiply
                 //   Screen:   src_factor = ONE_MINUS_DST_COLOR,   dst_factor = ONE
                 //             dst' = (text·α)·(1-dst) + dst        = source-over screen
-                //   Overlay:  needs FBO sample (slice c).
+                //   Overlay:  handled via the FBO route above.
                 let blend_mode = parse_blend_mode(&layer.blend);
                 unsafe {
                     match blend_mode {
@@ -2457,10 +2482,11 @@ fn paint_slide(
                             gl.blend_func(glow::ONE_MINUS_DST_COLOR, glow::ONE);
                         }
                         BlendMode::Overlay => {
-                            eprintln!(
-                                "warn: blend=overlay on layer {i} not yet implemented (needs slice c FBO sample); rendering as normal"
-                            );
-                            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                            // Unreachable: any_overlay above
+                            // diverted to paint_layers_via_overlay_
+                            // route. Defensive in case the early
+                            // return is removed.
+                            unreachable!("overlay layer reached non-overlay loop");
                         }
                     }
                 }
@@ -2483,6 +2509,356 @@ fn paint_slide(
         unsafe { gl.disable(glow::BLEND); }
         layer_loop_result?;
     }
+    Ok(())
+}
+
+/// v1-spec-delta #7 (slice c, 2026-05-08) -- overlay-route layer
+/// composite. Allocates a scene FBO + scratch FBO (ping-pong) +
+/// layer FBO, renders the bg into scene_fbo, then walks the layer
+/// list:
+///   - normal/multiply/screen layers draw directly into the current
+///     scene FBO with the slice (b) blend-func dispatch.
+///   - overlay layers render their text into the layer FBO, then
+///     run FS_OVERLAY_BLEND with scene_tex + layer_tex as inputs,
+///     writing the composite to the scratch FBO. Scene/scratch swap.
+/// At the end, the scene FBO is blitted to the default framebuffer
+/// via FS_BLIT.
+///
+/// Resources are allocated unconditionally on entry (one each of
+/// scene/scratch/layer FBO+texture) and freed unconditionally on
+/// exit, including all early-return error paths. Cleanup ordering:
+/// programs/VBOs first (no kernel scanout dependency), then FBOs +
+/// textures.
+fn paint_layers_via_overlay_route(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    bg_kind: &BgKind,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    motion_states: Option<&[MotionState]>,
+    cache_ref: &mut GlyphCache,
+) -> Result<()> {
+    use glow::HasContext;
+    let (scene_fbo_a, scene_tex_a) = unsafe { create_color_fbo(gl, mode_w, mode_h)? };
+    let (scene_fbo_b, scene_tex_b) = unsafe {
+        match create_color_fbo(gl, mode_w, mode_h) {
+            Ok(p) => p,
+            Err(e) => {
+                gl.delete_framebuffer(scene_fbo_a);
+                gl.delete_texture(scene_tex_a);
+                return Err(e);
+            }
+        }
+    };
+    let (layer_fbo, layer_tex) = unsafe {
+        match create_color_fbo(gl, mode_w, mode_h) {
+            Ok(p) => p,
+            Err(e) => {
+                gl.delete_framebuffer(scene_fbo_a);
+                gl.delete_texture(scene_tex_a);
+                gl.delete_framebuffer(scene_fbo_b);
+                gl.delete_texture(scene_tex_b);
+                return Err(e);
+            }
+        }
+    };
+
+    let work: Result<glow::NativeTexture> = (|| unsafe {
+        let mut current_scene_fbo = scene_fbo_a;
+        let mut current_scene_tex = scene_tex_a;
+        let mut other_scene_fbo = scene_fbo_b;
+        let mut other_scene_tex = scene_tex_b;
+
+        // Render bg into the initial scene FBO.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(current_scene_fbo));
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        match *bg_kind {
+            BgKind::Gradient { color_a, color_b, density } => {
+                draw_gradient_pattern(gl, mode_w, mode_h, color_a, color_b, density)?;
+            }
+            BgKind::Pattern { kind, color_a, color_b, density } => {
+                draw_pattern(gl, mode_w, mode_h, kind, color_a, color_b, density)?;
+            }
+            BgKind::Solid(color) => {
+                draw_solid_clear(gl, color);
+            }
+        }
+
+        gl.enable(glow::BLEND);
+        for (i, (layer, tc, _)) in text_layers.iter().enumerate() {
+            let motion_state = motion_states
+                .map(|ms| ms[i])
+                .unwrap_or(MotionState::IDENTITY);
+            let motion_kind = parse_motion_kind(&layer.motion);
+            let blend_mode = parse_blend_mode(&layer.blend);
+            let cached = cache_ref[i]
+                .as_ref()
+                .expect("cache entry populated above");
+
+            if !matches!(blend_mode, BlendMode::Overlay) {
+                // Direct-draw into current_scene_fbo with the slice
+                // (b) blend-func dispatch. Same as the non-overlay
+                // path in paint_slide; just bound to an FBO instead
+                // of the default framebuffer.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(current_scene_fbo));
+                gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                match blend_mode {
+                    BlendMode::Normal => {
+                        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                    }
+                    BlendMode::Multiply => {
+                        gl.blend_func(glow::DST_COLOR, glow::ONE_MINUS_SRC_ALPHA);
+                    }
+                    BlendMode::Screen => {
+                        gl.blend_func(glow::ONE_MINUS_DST_COLOR, glow::ONE);
+                    }
+                    BlendMode::Overlay => unreachable!(),
+                }
+                draw_text_layer(
+                    gl,
+                    mode_w,
+                    mode_h,
+                    layer,
+                    *tc,
+                    motion_kind,
+                    motion_state,
+                    &cached.bitmap,
+                )?;
+            } else {
+                // Overlay: render text to layer_fbo (premultiplied
+                // source-over to a transparent clear), then run
+                // FS_OVERLAY_BLEND from current_scene_tex + layer_tex
+                // into other_scene_fbo. Swap scene FBOs at end.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(layer_fbo));
+                gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                draw_text_layer(
+                    gl,
+                    mode_w,
+                    mode_h,
+                    layer,
+                    *tc,
+                    motion_kind,
+                    motion_state,
+                    &cached.bitmap,
+                )?;
+
+                // Composite layer_tex over current_scene_tex into
+                // other_scene_fbo.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(other_scene_fbo));
+                gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                gl.disable(glow::BLEND);
+                run_overlay_blend_pass(gl, current_scene_tex, layer_tex)?;
+                gl.enable(glow::BLEND);
+
+                // Swap.
+                std::mem::swap(&mut current_scene_fbo, &mut other_scene_fbo);
+                std::mem::swap(&mut current_scene_tex, &mut other_scene_tex);
+            }
+        }
+        gl.disable(glow::BLEND);
+
+        // Final blit: current_scene_tex -> default framebuffer.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        run_blit_pass(gl, current_scene_tex)?;
+        Ok(current_scene_tex)
+    })();
+
+    // Cleanup unconditional. Delete all FBOs + textures regardless
+    // of which one was "current" at error time.
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.delete_framebuffer(scene_fbo_a);
+        gl.delete_texture(scene_tex_a);
+        gl.delete_framebuffer(scene_fbo_b);
+        gl.delete_texture(scene_tex_b);
+        gl.delete_framebuffer(layer_fbo);
+        gl.delete_texture(layer_tex);
+    }
+    work.map(|_| ())
+}
+
+/// v1-spec-delta #7 (slice c) helper -- build a fullscreen
+/// textured quad (NDC -1..1 × -1..1, UV 0..1 × 0..1) for a shader
+/// that takes `a_pos: vec2` + `a_uv: vec2`. Returns the (VBO,
+/// a_pos location, a_uv location) tuple. On any setup error,
+/// frees the program before propagating.
+unsafe fn create_textured_quad(
+    gl: &glow::Context,
+    program: glow::Program,
+) -> Result<(glow::Buffer, u32, u32)> {
+    use glow::HasContext;
+    // Fullscreen quad with UV (0,0) at top-left -> bottom in NDC
+    // because gl_FragCoord origin is bottom-left. We sample
+    // textures that were rendered in the same convention so the
+    // composite is identity-aligned.
+    let verts: [f32; 16] = [
+        -1.0, -1.0, 0.0, 0.0,
+         1.0, -1.0, 1.0, 0.0,
+        -1.0,  1.0, 0.0, 1.0,
+         1.0,  1.0, 1.0, 1.0,
+    ];
+    let vbo = gl
+        .create_buffer()
+        .map_err(|e| anyhow!("glGenBuffers(textured-quad): {e}"))?;
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    let bytes = std::slice::from_raw_parts(
+        verts.as_ptr() as *const u8,
+        std::mem::size_of_val(&verts),
+    );
+    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+    let a_pos = match gl.get_attrib_location(program, "a_pos") {
+        Some(loc) => loc,
+        None => {
+            gl.delete_buffer(vbo);
+            return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos"));
+        }
+    };
+    let a_uv = match gl.get_attrib_location(program, "a_uv") {
+        Some(loc) => loc,
+        None => {
+            gl.delete_buffer(vbo);
+            return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv"));
+        }
+    };
+    Ok((vbo, a_pos, a_uv))
+}
+
+/// v1-spec-delta #7 (slice c) helper -- create an RGBA8 color FBO
+/// + bound texture sized to (w, h). Returns the (FBO, texture)
+/// pair. On framebuffer-incomplete, frees both before propagating.
+unsafe fn create_color_fbo(
+    gl: &glow::Context,
+    w: u32,
+    h: u32,
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(overlay-route): {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        w as i32,
+        h as i32,
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        None,
+    );
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    let fbo = match gl.create_framebuffer() {
+        Ok(f) => f,
+        Err(e) => {
+            gl.delete_texture(tex);
+            return Err(anyhow!("glGenFramebuffers(overlay-route): {e}"));
+        }
+    };
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+    gl.framebuffer_texture_2d(
+        glow::FRAMEBUFFER,
+        glow::COLOR_ATTACHMENT0,
+        glow::TEXTURE_2D,
+        Some(tex),
+        0,
+    );
+    let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+    if status != glow::FRAMEBUFFER_COMPLETE {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        return Err(anyhow!("framebuffer incomplete (overlay-route): status=0x{status:x}"));
+    }
+    Ok((fbo, tex))
+}
+
+/// v1-spec-delta #7 (slice c) helper -- run the FS_OVERLAY_BLEND
+/// shader with `scene_tex` (current dst) + `layer_tex` (layer src,
+/// premultiplied alpha) bound. Caller must have bound the target
+/// FBO and disabled BLEND. The shader writes opaque alpha=1 output.
+unsafe fn run_overlay_blend_pass(
+    gl: &glow::Context,
+    scene_tex: glow::NativeTexture,
+    layer_tex: glow::NativeTexture,
+) -> Result<()> {
+    use glow::HasContext;
+    let program = link_program(gl, VS_TEXTURED_QUAD, FS_OVERLAY_BLEND)?;
+    let (vbo, a_pos, a_uv) = match create_textured_quad(gl, program) {
+        Ok(t) => t,
+        Err(e) => {
+            gl.delete_program(program);
+            return Err(e);
+        }
+    };
+    gl.use_program(Some(program));
+    let u_layer_tex = gl.get_uniform_location(program, "u_layer_tex");
+    let u_slide_tex = gl.get_uniform_location(program, "u_slide_tex");
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(layer_tex));
+    gl.uniform_1_i32(u_layer_tex.as_ref(), 0);
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, Some(scene_tex));
+    gl.uniform_1_i32(u_slide_tex.as_ref(), 1);
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.enable_vertex_attrib_array(a_pos);
+    gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(a_uv);
+    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    gl.disable_vertex_attrib_array(a_pos);
+    gl.disable_vertex_attrib_array(a_uv);
+    gl.delete_buffer(vbo);
+    gl.delete_program(program);
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.active_texture(glow::TEXTURE0);
+    Ok(())
+}
+
+/// v1-spec-delta #7 (slice c) helper -- blit a texture to the
+/// currently-bound framebuffer via FS_BLIT. Used at end of the
+/// overlay route to copy the final scene texture to the default
+/// framebuffer. Caller must have bound the target FBO and set
+/// the viewport.
+unsafe fn run_blit_pass(
+    gl: &glow::Context,
+    src_tex: glow::NativeTexture,
+) -> Result<()> {
+    use glow::HasContext;
+    let program = link_program(gl, VS_TEXTURED_QUAD, FS_BLIT)?;
+    let (vbo, a_pos, a_uv) = match create_textured_quad(gl, program) {
+        Ok(t) => t,
+        Err(e) => {
+            gl.delete_program(program);
+            return Err(e);
+        }
+    };
+    gl.use_program(Some(program));
+    let u_src = gl.get_uniform_location(program, "u_src");
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
+    gl.uniform_1_i32(u_src.as_ref(), 0);
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.enable_vertex_attrib_array(a_pos);
+    gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(a_uv);
+    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    gl.disable_vertex_attrib_array(a_pos);
+    gl.disable_vertex_attrib_array(a_uv);
+    gl.delete_buffer(vbo);
+    gl.delete_program(program);
+    gl.bind_texture(glow::TEXTURE_2D, None);
     Ok(())
 }
 
