@@ -444,6 +444,12 @@ where
             let _ = path;
         }
     }
+    // qarl-direct perf-profile (2026-05-08): free thread-local
+    // cached glyph programs while the GL context is still bound.
+    // The thread_local Cells live across function invocations
+    // within the process; clearing here keeps them in sync with
+    // the GL context lifecycle.
+    clear_glyph_program_cache(&gl);
     // v1-spec-delta #9 (slice d): drain pending flip + free
     // session-level scanout BO/FB rotation. Mirrors the
     // animated_slide end-of-call cleanup but at session
@@ -877,19 +883,32 @@ fn render_animated_slide_in_session(
     // the fontdue ~50ms/layer bottleneck on every iteration.
     let mut glyph_cache: GlyphCache = Vec::with_capacity(text_layers.len());
     glyph_cache.resize_with(text_layers.len(), || None);
+    // v1-spec-delta perf-profile: parallel GL texture cache. Saves
+    // ~3.5 MB / layer / frame of glTexImage2D upload at 1080p.
+    // Cleanup at end of loop deletes any cached textures.
+    let mut tex_cache: TextureCache = Vec::with_capacity(text_layers.len());
+    tex_cache.resize_with(text_layers.len(), || None);
 
     let work: Result<()> = (|| {
         use glow::HasContext;
+        let profile_active = crate::profile::is_enabled();
         loop {
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_millis() as u64;
             if elapsed_ms >= hold_ms {
                 break;
             }
+            // qarl-direct perf-profile: stop after N captured
+            // frames when the profile budget is set.
+            if profile_active && crate::profile::frames_remaining() == Some(0) {
+                break;
+            }
+            let frame_start = std::time::Instant::now();
             let tick_seconds = elapsed.as_secs_f64();
             let motion_states =
                 motion_states_for_layers(slide_id, text_layers, tick_seconds);
             let wall_clock_unix = current_unix_seconds();
+            let t_paint = std::time::Instant::now();
             paint_slide(
                 session.gl,
                 session.mode_w as u32,
@@ -904,12 +923,17 @@ fn render_animated_slide_in_session(
                 // image bg upload exactly once. Closes the per-
                 // frame re-decode regression QA flagged.
                 Some(&mut session.image_bg_cache),
+                Some(&mut tex_cache),
             )?;
             unsafe { session.gl.flush(); }
+            crate::profile::record_phase("paint", t_paint.elapsed().as_nanos() as u64);
+            let t_swap = std::time::Instant::now();
             session
                 .egl_lib
                 .swap_buffers(session.display, session.egl_surface)
                 .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+            crate::profile::record_phase("swap", t_swap.elapsed().as_nanos() as u64);
+            let t_lockfb = std::time::Instant::now();
             let bo = unsafe {
                 session
                     .gbm_surface
@@ -920,6 +944,7 @@ fn render_animated_slide_in_session(
             let fb = card
                 .add_framebuffer(&fb_buf, 32, 32)
                 .map_err(|e| anyhow!("drmModeAddFB failed: {e}"))?;
+            crate::profile::record_phase("lockfb", t_lockfb.elapsed().as_nanos() as u64);
             // QA F2 (slice c carry-over): on commit fail, the
             // just-added fb is a u32 with no Drop and would leak.
             // Explicitly rmFB on the unhappy path. The BO Drops
@@ -929,6 +954,7 @@ fn render_animated_slide_in_session(
             // SetCrtc-on-first-call vs page_flip-thereafter, and
             // drains any pending flip event before issuing the
             // next one (natural vsync pacing).
+            let t_commit = std::time::Instant::now();
             if let Err(e) = commit_fb(session, card, fb) {
                 if let Err(de) = card.destroy_framebuffer(fb) {
                     eprintln!(
@@ -938,11 +964,13 @@ fn render_animated_slide_in_session(
                 drop(bo);
                 return Err(e);
             }
+            crate::profile::record_phase("commit", t_commit.elapsed().as_nanos() as u64);
 
             // v1-spec-delta #5 (slice e F1e fix): rotate N-2.
             // After commit_fb returns, kernel still scans current
             // (page_flip queued, fires next vblank). prev was
             // scanned 2+ frames ago — safe to free.
+            let t_rotate = std::time::Instant::now();
             if let Some(old_fb) = prev_fb.take() {
                 if let Err(e) = card.destroy_framebuffer(old_fb) {
                     eprintln!("warn: destroy_framebuffer({old_fb:?}): {e}");
@@ -956,16 +984,25 @@ fn render_animated_slide_in_session(
             current_fb = Some(fb);
             current_bo = Some(bo);
             frames += 1;
+            crate::profile::record_phase("rotate", t_rotate.elapsed().as_nanos() as u64);
+            crate::profile::record_phase(
+                "frame_total",
+                frame_start.elapsed().as_nanos() as u64,
+            );
+            crate::profile::frame_complete();
 
             // Pace to fps. next-deadline math, not sleep-by-period
             // — accumulated drift would walk us off cadence after a
-            // few seconds.
-            let next_deadline_ns = (frames as u64).wrapping_mul(frame_period_ns);
-            let now = start.elapsed().as_nanos() as u64;
-            if next_deadline_ns > now {
-                std::thread::sleep(std::time::Duration::from_nanos(
-                    next_deadline_ns - now,
-                ));
+            // few seconds. SKIP when profiling so the histogram
+            // captures real shader-bound cadence, not vsync-padded.
+            if !profile_active {
+                let next_deadline_ns = (frames as u64).wrapping_mul(frame_period_ns);
+                let now = start.elapsed().as_nanos() as u64;
+                if next_deadline_ns > now {
+                    std::thread::sleep(std::time::Duration::from_nanos(
+                        next_deadline_ns - now,
+                    ));
+                }
             }
         }
         eprintln!(
@@ -974,6 +1011,19 @@ fn render_animated_slide_in_session(
         );
         Ok(())
     })();
+
+    // v1-spec-delta perf-profile: free any GL textures the loop
+    // cached. paint_slide owns invalidation on bitmap regen; this
+    // is just end-of-call cleanup for the live entries. GL context
+    // is still bound here; safe to delete.
+    {
+        use glow::HasContext;
+        for slot in tex_cache.iter_mut() {
+            if let Some(t) = slot.take() {
+                unsafe { session.gl.delete_texture(t); }
+            }
+        }
+    }
 
     // v1-spec-delta #5 (slice d): drain the last frame's pending
     // page-flip event before per-call BO/FB cleanup. Otherwise
@@ -1421,6 +1471,7 @@ fn draw_text_layer(
     motion_kind: MotionKind,
     motion_state: MotionState,
     bm: &AlphaBitmap,
+    tex_slot: Option<&mut Option<glow::NativeTexture>>,
 ) -> Result<()> {
     use glow::HasContext;
 
@@ -1460,30 +1511,47 @@ fn draw_text_layer(
         // expose GL_RED; LUMINANCE is the analog for single-channel
         // grayscale and returns the value in r/g/b/a on sample
         // (FS_GLYPH reads `.r`).
-        let tex = gl
-            .create_texture()
-            .map_err(|e| anyhow!("glGenTextures: {e}"))?;
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        // Tightly-packed 1-byte rows. R2: restore the default of 4
-        // before returning so a future persistent context (4.3+)
-        // can't accidentally inherit this state.
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::LUMINANCE as i32,
-            bm.width as i32,
-            bm.height as i32,
-            0,
-            glow::LUMINANCE,
-            glow::UNSIGNED_BYTE,
-            Some(&bm.data),
-        );
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        //
+        // v1-spec-delta perf-profile (qarl-direct 2026-05-08): when
+        // tex_slot has a cached texture, just bind + skip the
+        // create+upload (~3.5 MB / 1080p alpha bitmap). Slot empty
+        // = create + upload + (optionally) store back. Slot None
+        // (caller didn't pass cache) = legacy create+upload+delete
+        // path, freed at end of this function.
+        let (tex, owns_tex) = match tex_slot.as_deref() {
+            Some(Some(t)) => {
+                crate::profile::record_phase("draw_tex_hit", 1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(*t));
+                (*t, false)
+            }
+            _ => {
+                crate::profile::record_phase("draw_tex_miss", 1);
+                let t_upload = std::time::Instant::now();
+                let t = gl
+                    .create_texture()
+                    .map_err(|e| anyhow!("glGenTextures: {e}"))?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::LUMINANCE as i32,
+                    bm.width as i32,
+                    bm.height as i32,
+                    0,
+                    glow::LUMINANCE,
+                    glow::UNSIGNED_BYTE,
+                    Some(&bm.data),
+                );
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                crate::profile::record_phase("tex_upload", t_upload.elapsed().as_nanos() as u64);
+                (t, true)
+            }
+        };
 
         // -- Build the textured quad in NDC via the host-tested
         // `box_to_ndc_quad` helper. Scale-down-only (no upscaling),
@@ -1547,23 +1615,40 @@ fn draw_text_layer(
         // v1-spec-delta #4 (b): outline=true picks the dilated-
         // alpha shader; outline=false uses FS_GLYPH (cheap path).
         // Both write premultiplied-alpha output.
-        let fs = if layer.outline { FS_GLYPH_OUTLINE } else { FS_GLYPH };
-        let program = match link_program(gl, VS_TEXTURED_QUAD, fs) {
+        //
+        // qarl-direct perf-profile (2026-05-08): glyph programs
+        // are cached in thread-local Cells across paint_slide
+        // calls within the same EGL session. Cuts ~5 ms / frame
+        // / layer of GLSL compile cost — was the dominant per-
+        // frame cost in motion-shake at 1080p (paint p50 7.4 ms,
+        // of which link_program p50 was 5 ms).
+        let t_link = std::time::Instant::now();
+        let program = match cached_glyph_program(gl, layer.outline) {
             Ok(p) => p,
             Err(e) => {
-                gl.delete_texture(tex);
+                if owns_tex {
+                    gl.delete_texture(tex);
+                }
                 return Err(e);
             }
         };
+        crate::profile::record_phase("link_program", t_link.elapsed().as_nanos() as u64);
+        // Programs come from the thread-local cache; never freed
+        // here even on error. clear_glyph_program_cache handles
+        // session-teardown cleanup.
+        let owns_program = false;
+        let t_vbo = std::time::Instant::now();
         let vbo = match gl.create_buffer() {
             Ok(b) => b,
             Err(e) => {
-                gl.delete_program(program);
-                gl.delete_texture(tex);
+                if owns_tex {
+                    gl.delete_texture(tex);
+                }
                 return Err(anyhow!("glGenBuffers: {e}"));
             }
         };
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        crate::profile::record_phase("create_vbo", t_vbo.elapsed().as_nanos() as u64);
         let bytes = std::slice::from_raw_parts(
             verts.as_ptr() as *const u8,
             std::mem::size_of_val(&verts),
@@ -1574,8 +1659,9 @@ fn draw_text_layer(
             Some(loc) => loc,
             None => {
                 gl.delete_buffer(vbo);
-                gl.delete_program(program);
-                gl.delete_texture(tex);
+                if owns_tex {
+                    gl.delete_texture(tex);
+                }
                 return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos attribute"));
             }
         };
@@ -1583,8 +1669,9 @@ fn draw_text_layer(
             Some(loc) => loc,
             None => {
                 gl.delete_buffer(vbo);
-                gl.delete_program(program);
-                gl.delete_texture(tex);
+                if owns_tex {
+                    gl.delete_texture(tex);
+                }
                 return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv attribute"));
             }
         };
@@ -1641,8 +1728,21 @@ fn draw_text_layer(
         gl.disable_vertex_attrib_array(a_pos);
         gl.disable_vertex_attrib_array(a_uv);
         gl.delete_buffer(vbo);
-        gl.delete_program(program);
-        gl.delete_texture(tex);
+        if owns_program {
+            gl.delete_program(program);
+        }
+        // Texture lifecycle: if caller passed a slot AND we created
+        // the texture this call, store it back so the next draw
+        // reuses it. If caller didn't pass a slot, the texture is
+        // ours to free now (legacy one-shot paint path). If we
+        // bound a pre-cached texture (owns_tex=false), the slot
+        // already owns it; do nothing.
+        if owns_tex {
+            match tex_slot {
+                Some(slot) => *slot = Some(tex),
+                None => gl.delete_texture(tex),
+            }
+        }
     }
     Ok(())
 }
@@ -1988,6 +2088,7 @@ pub fn paint_and_present_one_frame_for_slide(
         wall_clock_unix,
         None,
         Some(&mut session.image_bg_cache),
+        None,  // tex_cache: one-shot capture path, no caching needed
     )?;
     unsafe { session.gl.flush(); }
 
@@ -2350,6 +2451,7 @@ pub fn capture_slide_to_png(
             wall_clock_unix,
             None,
             Some(&mut session.image_bg_cache),
+            None,  // tex_cache: one-shot path, no caching needed
         )?;
         unsafe {
             use glow::HasContext;
@@ -2529,6 +2631,7 @@ pub fn paint_one_for_capture(
         wall_clock_unix,
         None,
         Some(&mut session.image_bg_cache),
+        None,  // tex_cache: one-shot path, no caching needed
     )?;
     unsafe { session.gl.flush(); }
 
@@ -2620,6 +2723,7 @@ fn render_slide_in_session(
                 wall_clock_unix,
                 None,
                 None,  // image_bg_cache: closure-captured, no session access
+                None,  // tex_cache: one-shot path, no caching needed
             )?;
             unsafe { gl.flush(); }
             Ok(())
@@ -2768,6 +2872,7 @@ unsafe fn make_slide_fbo(
         current_unix_seconds(),
         None,
         None,  // image_bg_cache: standalone bake, no session
+        None,  // tex_cache: standalone bake, no caching needed
     );
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
@@ -3206,10 +3311,23 @@ fn render_transition_animated_in_session(
         glyph_cache_a.resize_with(layers_a.len(), || None);
         let mut glyph_cache_b: GlyphCache = Vec::with_capacity(layers_b.len());
         glyph_cache_b.resize_with(layers_b.len(), || None);
+        // v1-spec-delta perf-profile: parallel GL texture caches
+        // for both bake passes. Saves ~3.5 MB / layer / frame /
+        // SIDE of texture re-upload in the motion-through-
+        // transition hot path.
+        let mut tex_cache_a: TextureCache = Vec::with_capacity(layers_a.len());
+        tex_cache_a.resize_with(layers_a.len(), || None);
+        let mut tex_cache_b: TextureCache = Vec::with_capacity(layers_b.len());
+        tex_cache_b.resize_with(layers_b.len(), || None);
         let start = Instant::now();
         let mut rendered = 0_u32;
+        let profile_active_t = crate::profile::is_enabled();
         let loop_result: Result<()> = (|| {
         for frame in 0..total_frames {
+            if profile_active_t && crate::profile::frames_remaining() == Some(0) {
+                break;
+            }
+            let frame_start_t = std::time::Instant::now();
             let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
             // Each transition frame's tick_seconds is the elapsed
             // time inside the transition loop. Slide A "continues"
@@ -3221,6 +3339,7 @@ fn render_transition_animated_in_session(
             let tick_seconds = start.elapsed().as_secs_f64();
             let wall_clock_unix = current_unix_seconds();
             unsafe {
+                let t_bake_a = std::time::Instant::now();
                 if any_animated_a || any_auto_a {
                     let states_a = motion_states_for_layers(
                         slide_a.id,
@@ -3238,8 +3357,11 @@ fn render_transition_animated_in_session(
                         wall_clock_unix,
                         Some(&mut glyph_cache_a),
                         Some(&mut session.image_bg_cache),
+                        Some(&mut tex_cache_a),
                     )?;
                 }
+                crate::profile::record_phase("bake_a", t_bake_a.elapsed().as_nanos() as u64);
+                let t_bake_b = std::time::Instant::now();
                 if any_animated_b || any_auto_b {
                     let states_b = motion_states_for_layers(
                         slide_b.id,
@@ -3257,8 +3379,11 @@ fn render_transition_animated_in_session(
                         wall_clock_unix,
                         Some(&mut glyph_cache_b),
                         Some(&mut session.image_bg_cache),
+                        Some(&mut tex_cache_b),
                     )?;
                 }
+                crate::profile::record_phase("bake_b", t_bake_b.elapsed().as_nanos() as u64);
+                let t_composite = std::time::Instant::now();
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
                 gl.clear_color(0.0, 0.0, 0.0, 1.0);
@@ -3289,13 +3414,17 @@ fn render_transition_animated_in_session(
                 gl.disable_vertex_attrib_array(a_pos);
                 gl.disable_vertex_attrib_array(a_uv);
                 gl.flush();
+                crate::profile::record_phase("composite", t_composite.elapsed().as_nanos() as u64);
             }
 
             // -- Push to scanout.
+            let t_swap_t = std::time::Instant::now();
             session
                 .egl_lib
                 .swap_buffers(session.display, session.egl_surface)
                 .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
+            crate::profile::record_phase("swap", t_swap_t.elapsed().as_nanos() as u64);
+            let t_lockfb_t = std::time::Instant::now();
             let bo = unsafe {
                 session
                     .gbm_surface
@@ -3307,6 +3436,7 @@ fn render_transition_animated_in_session(
             let fb = card
                 .add_framebuffer(&fb_buf, 32, 32)
                 .with_context(|| format!("drmModeAddFB (frame {frame})"))?;
+            crate::profile::record_phase("lockfb", t_lockfb_t.elapsed().as_nanos() as u64);
             // QA F2 (slice c carry-over): rmFB the just-added fb
             // on commit-fail unhappy path. Pre-existing leak in
             // this transition harness mirrored across the slice
@@ -3320,6 +3450,7 @@ fn render_transition_animated_in_session(
             // were 12.6 fps with set_crtc-per-frame; page_flip
             // moves them to vsync-paced (60Hz hw vsync, target
             // 30 fps via the deadline sleep below).
+            let t_commit_t = std::time::Instant::now();
             if let Err(e) = commit_fb(session, card, fb) {
                 if let Err(de) = card.destroy_framebuffer(fb) {
                     eprintln!(
@@ -3329,6 +3460,7 @@ fn render_transition_animated_in_session(
                 drop(bo);
                 return Err(e.context(format!("commit_fb (frame {frame})")));
             }
+            crate::profile::record_phase("commit", t_commit_t.elapsed().as_nanos() as u64);
 
             // -- Rotate frames: free the frame from TWO iterations
             // ago — `prev` is no longer in scanout because
@@ -3349,15 +3481,35 @@ fn render_transition_animated_in_session(
             current_bo = Some(bo);
 
             rendered += 1;
-            let target = start + frame_budget * (frame + 1);
-            let now = Instant::now();
-            if target > now {
-                std::thread::sleep(target - now);
+            crate::profile::record_phase("frame_total", frame_start_t.elapsed().as_nanos() as u64);
+            crate::profile::frame_complete();
+            // Skip pace-sleep when profiling so the histogram
+            // captures real shader-bound cadence.
+            if !profile_active_t {
+                let target = start + frame_budget * (frame + 1);
+                let now = Instant::now();
+                if target > now {
+                    std::thread::sleep(target - now);
+                }
             }
         }
         Ok(())
         })();
         cleanup_static(gl, Some(vbo));
+        // v1-spec-delta perf-profile: free per-side cached
+        // textures while the GL context is still bound.
+        unsafe {
+            for slot in tex_cache_a.iter_mut() {
+                if let Some(t) = slot.take() {
+                    gl.delete_texture(t);
+                }
+            }
+            for slot in tex_cache_b.iter_mut() {
+                if let Some(t) = slot.take() {
+                    gl.delete_texture(t);
+                }
+            }
+        }
         loop_result?;
         Ok(rendered)
     })();
@@ -3418,6 +3570,57 @@ fn render_transition_animated_in_session(
 // `Option<&mut GlyphCache>`.
 pub use crate::hdmi_logic::{CachedGlyph, GlyphCache};
 
+/// qarl-direct perf-profile (2026-05-08): thread-local cache of
+/// compiled glyph programs. Renderer is single-threaded, so
+/// thread_local + Cell is mutex-free. EglSession teardown calls
+/// clear_glyph_program_cache to delete the programs while the GL
+/// context is still bound; without that they'd outlive the
+/// context as dangling driver handles.
+std::thread_local! {
+    static FS_GLYPH_PROGRAM: std::cell::Cell<Option<glow::NativeProgram>> =
+        const { std::cell::Cell::new(None) };
+    static FS_GLYPH_OUTLINE_PROGRAM: std::cell::Cell<Option<glow::NativeProgram>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_glyph_program(gl: &glow::Context, outline: bool) -> Result<glow::NativeProgram> {
+    let cell = if outline { &FS_GLYPH_OUTLINE_PROGRAM } else { &FS_GLYPH_PROGRAM };
+    cell.with(|c| {
+        if let Some(p) = c.get() {
+            return Ok(p);
+        }
+        let fs = if outline { FS_GLYPH_OUTLINE } else { FS_GLYPH };
+        let p = link_program(gl, VS_TEXTURED_QUAD, fs)?;
+        c.set(Some(p));
+        Ok(p)
+    })
+}
+
+/// Delete the cached programs while the GL context is still bound.
+/// Called from with_egl_session teardown.
+fn clear_glyph_program_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    FS_GLYPH_PROGRAM.with(|c| {
+        if let Some(p) = c.replace(None) {
+            unsafe { gl.delete_program(p); }
+        }
+    });
+    FS_GLYPH_OUTLINE_PROGRAM.with(|c| {
+        if let Some(p) = c.replace(None) {
+            unsafe { gl.delete_program(p); }
+        }
+    });
+}
+
+/// v1-spec-delta perf-profile (qarl-direct 2026-05-08): per-layer
+/// GL texture cache parallel to glyph_cache. Same indexing (Vec
+/// position = layer index). When a layer's bitmap is re-rasterized
+/// (text/size change), paint_slide deletes the stale texture so
+/// draw_text_layer re-uploads. When the bitmap is unchanged, the
+/// cached texture is reused — saving ~3.5 MB / layer / frame of
+/// glTexImage2D upload at 1080p text sizes.
+pub type TextureCache = Vec<Option<glow::NativeTexture>>;
+
 fn paint_slide(
     gl: &glow::Context,
     mode_w: u32,
@@ -3428,6 +3631,7 @@ fn paint_slide(
     wall_clock_unix: i64,
     glyph_cache: Option<&mut GlyphCache>,
     mut image_bg_cache: Option<&mut ImageBgCache>,
+    mut tex_cache: Option<&mut TextureCache>,
 ) -> Result<()> {
     use glow::HasContext;
     unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
@@ -3515,10 +3719,21 @@ fn paint_slide(
         };
         // Stage 1: rasterize-or-reuse per layer. Bitmaps owned by
         // cache_ref entries; we'll borrow them in stage 2's GL draw.
+        // v1-spec-delta perf-profile: when raster fires, also
+        // invalidate the parallel tex_cache slot — the new bitmap
+        // needs a fresh GL texture upload. Cache hit = bitmap
+        // unchanged = tex stays.
         for (i, (layer, _, font)) in text_layers.iter().enumerate() {
             let resolved_text = &resolved_texts[i];
             let needs_raster = should_rerasterize(cache_ref[i].as_ref(), resolved_text);
             if needs_raster {
+                if let Some(tc) = tex_cache.as_deref_mut() {
+                    if i < tc.len() {
+                        if let Some(old_tex) = tc[i].take() {
+                            unsafe { gl.delete_texture(old_tex); }
+                        }
+                    }
+                }
                 let size_px = effective_font_size_px(
                     layer.font_size_px,
                     layer.font_size_pct,
@@ -3610,6 +3825,9 @@ fn paint_slide(
                 let cached = cache_ref[i]
                     .as_ref()
                     .expect("cache entry populated above");
+                let tex_slot = tex_cache.as_deref_mut().and_then(|tc| {
+                    if i < tc.len() { Some(&mut tc[i]) } else { None }
+                });
                 draw_text_layer(
                     gl,
                     mode_w,
@@ -3619,6 +3837,7 @@ fn paint_slide(
                     motion_kind,
                     motion_state,
                     &cached.bitmap,
+                    tex_slot,
                 )?;
             }
             Ok(())
@@ -3744,6 +3963,7 @@ fn paint_layers_via_overlay_route(
                     motion_kind,
                     motion_state,
                     &cached.bitmap,
+                    None,  // tex_slot: overlay route is not hot path
                 )?;
             } else {
                 // Overlay: render text to layer_fbo (premultiplied
@@ -3764,6 +3984,7 @@ fn paint_layers_via_overlay_route(
                     motion_kind,
                     motion_state,
                     &cached.bitmap,
+                    None,  // tex_slot: overlay route is not hot path
                 )?;
 
                 // Composite layer_tex over current_scene_tex into
@@ -4103,6 +4324,7 @@ pub fn render_slide_via_fbo(
                 current_unix_seconds(),
                 None,
                 None,  // image_bg_cache: standalone debug bake, no session
+                None,  // tex_cache: standalone debug bake, no caching
             );
             // Always rebind default FBO before propagating Err so
             // cleanup/teardown doesn't operate on the offscreen one.

@@ -25,6 +25,7 @@ mod ipc_main;
 mod lru;
 mod mem;
 mod playback;
+mod profile;
 
 use std::path::PathBuf;
 
@@ -352,6 +353,16 @@ struct Args {
     /// Path to settings.json (placeholder; not used in Phase 1).
     #[arg(long)]
     settings: Option<PathBuf>,
+
+    /// qarl-direct perf-profile (2026-05-08): when set, enables
+    /// per-frame phase timing + caps the animated render loop to
+    /// N frames. Histogram dumps to stderr as a markdown table on
+    /// exit. Use `--profile-frames 150` to capture ~5s of motion
+    /// at the spec'd 30 fps target. Profile mode also SKIPS the
+    /// fps-pacing sleep so we measure real shader-bound cadence,
+    /// not vsync-padded.
+    #[arg(long)]
+    profile_frames: Option<u32>,
 
     /// v1-spec-delta #17 (2026-05-08): force a specific HDMI mode
     /// when EDID is missing/invalid (the dev Pi's safe-mode list
@@ -925,6 +936,26 @@ mod tests {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // qarl-direct perf-profile: enable profile mode at startup
+    // if --profile-frames is set. Renderer hot loops check
+    // profile::is_enabled() / frames_remaining() to record
+    // phase timings and stop after N frames. summarize() dumps
+    // the histogram on the way out.
+    if let Some(n) = args.profile_frames {
+        profile::enable(n);
+    }
+    // Drop-guard so summarize() fires regardless of which
+    // OutputMode branch returns. No-op when profile is disabled.
+    struct ProfileGuard;
+    impl Drop for ProfileGuard {
+        fn drop(&mut self) {
+            if profile::is_enabled() {
+                profile::summarize();
+            }
+        }
+    }
+    let _profile_guard = ProfileGuard;
 
     // v1-spec-delta #17 (slice c): wire --force-mode CLI flag
     // through to hdmi.rs's process-wide OnceLock. Parse failures
