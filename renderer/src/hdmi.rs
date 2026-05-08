@@ -34,15 +34,17 @@ use khronos_egl as egl;
 
 use std::path::Path;
 use std::rc::Rc;
+use uuid::Uuid;
 
 use crate::content::{
     load_playlist, resolve_reel_items, solid_bg_hex, TextSlide,
 };
 use crate::hdmi_logic::{
-    box_to_ndc_quad, clamp_transition_ms, effective_font_size_px, effective_hold_ms,
-    fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, hex_to_rgba, hsv_to_rgb,
-    layout_text_to_alpha, parse_crtc_list_filter_bits, parse_h_align, pick_largest_mode_index,
-    prev_idx_for_reel, FontCatalog, ModeSpec, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
+    box_to_ndc_quad, clamp_transition_ms, compute_motion_state, effective_font_size_px,
+    effective_hold_ms, fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms,
+    hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px, parse_crtc_list_filter_bits,
+    parse_h_align, parse_motion_kind, pick_largest_mode_index, prev_idx_for_reel, FontCatalog,
+    ModeSpec, MotionKind, MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
     FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -380,6 +382,229 @@ where
     Ok(())
 }
 
+/// v1-spec-delta #2 (slice c-2) — per-frame animated render path
+/// for a TextSlide containing one or more non-static layers.
+///
+/// Architecture mirrors `render_one_frame_to_hdmi`: GBM + EGL +
+/// GLES2 bring-up, then a loop that paints, swaps, locks the
+/// front BO, adds a DRM framebuffer, and pushes it to scanout via
+/// legacy `drmModeSetCrtc`. The previous frame's (BO, FB) is held
+/// until the next SetCrtc commits, then released — N-1 rotation
+/// matches the dev Pi's vc4-double-buffered GBM surface.
+///
+/// Pacing: target `fps`, naive `Instant::now`-based sleep loop.
+/// Frame-time is dominated by EGL bring-up (~500 ms one-shot) +
+/// the per-frame `drmModeSetCrtc` (~16 ms) — at 30 fps the SetCrtc
+/// cost alone is half the frame budget. Slice (e+) can refactor to
+/// atomic page flips. For v1 functional motion this is sufficient.
+///
+/// `hold_ms` is the spec'd slide duration (ms-precision per item
+/// #1); the loop runs until `start.elapsed() >= hold_ms` regardless
+/// of how many frames actually rendered. A frame in flight when
+/// the deadline hits is allowed to complete (no mid-frame abort).
+#[allow(clippy::too_many_arguments)]
+fn render_animated_slide(
+    card: &Card,
+    bg_kind: &BgKind,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    slide_id: Uuid,
+    hold_ms: u64,
+    fps: u32,
+) -> Result<()> {
+    let resources = card
+        .resource_handles()
+        .context("drmModeGetResources failed")?;
+    let (connector_info, mode) = pick_connector_and_mode(card, &resources)
+        .context("no connected HDMI connector with a usable mode")?;
+    let (mode_w, mode_h) = mode.size();
+    eprintln!(
+        "selected connector {:?} {:?} at {}x{}@{}",
+        connector_info.handle(),
+        connector_info.interface(),
+        mode_w,
+        mode_h,
+        mode.vrefresh(),
+    );
+
+    let encoder_handle = connector_info
+        .current_encoder()
+        .or_else(|| connector_info.encoders().first().copied())
+        .ok_or_else(|| anyhow!("connector advertises no encoders"))?;
+    let encoder_info = card
+        .get_encoder(encoder_handle)
+        .context("drmModeGetEncoder failed")?;
+    let crtc_handle = encoder_info
+        .crtc()
+        .or_else(|| resources.crtcs().first().copied())
+        .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
+
+    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
+        .context("gbm_create_device failed")?;
+    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
+    if gbm_dev_ptr.is_null() {
+        bail!("gbm_device raw pointer is null");
+    }
+    let gbm_surface = gbm_dev
+        .create_surface::<()>(
+            mode_w as u32,
+            mode_h as u32,
+            GbmFormat::Argb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+        )
+        .context("gbm_surface_create failed")?;
+
+    let egl_lib = unsafe {
+        egl::DynamicInstance::<egl::EGL1_5>::load_required().map_err(|e| {
+            anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
+        })?
+    };
+    let display = unsafe {
+        egl_lib
+            .get_display(gbm_dev_ptr as egl::NativeDisplayType)
+            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
+    };
+    egl_lib
+        .initialize(display)
+        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
+    egl_lib
+        .bind_api(egl::OPENGL_ES_API)
+        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
+    let cfg_attribs = [
+        egl::SURFACE_TYPE, egl::WINDOW_BIT,
+        egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
+        egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE,
+    ];
+    let configs = egl_lib
+        .choose_first_config(display, &cfg_attribs)
+        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
+        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
+    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+    let context = egl_lib
+        .create_context(display, configs, None, &ctx_attribs)
+        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
+    let egl_surface = unsafe {
+        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
+        egl_lib
+            .create_window_surface(display, configs, raw_surface, None)
+            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
+    };
+    egl_lib
+        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
+        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
+    let gl = unsafe {
+        glow::Context::from_loader_function(|name| {
+            egl_lib.get_proc_address(name).map(|fp| fp as *const _).unwrap_or(ptr::null())
+        })
+    };
+
+    // Hold (BO, FB) of the previous frame across the loop body so
+    // the kernel is never asked to scan out a destroyed BO. After
+    // the next `drmModeSetCrtc` commits, the previous FB is
+    // detached and safe to destroy.
+    let mut prev_bo: Option<BufferObject<()>> = None;
+    let mut prev_fb: Option<framebuffer::Handle> = None;
+    // Frame deadline tracking.
+    let frame_period_ns: u64 = 1_000_000_000_u64 / fps.max(1) as u64;
+    let start = std::time::Instant::now();
+    let mut frames: u32 = 0;
+
+    let work: Result<()> = (|| {
+        use glow::HasContext;
+        loop {
+            let elapsed = start.elapsed();
+            let elapsed_ms = elapsed.as_millis() as u64;
+            if elapsed_ms >= hold_ms {
+                break;
+            }
+            let tick_seconds = elapsed.as_secs_f64();
+            let motion_states =
+                motion_states_for_layers(slide_id, text_layers, tick_seconds);
+            paint_slide(
+                &gl,
+                mode_w as u32,
+                mode_h as u32,
+                bg_kind,
+                text_layers,
+                Some(&motion_states),
+            )?;
+            unsafe { gl.flush(); }
+            egl_lib
+                .swap_buffers(display, egl_surface)
+                .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+            let bo = unsafe {
+                gbm_surface
+                    .lock_front_buffer()
+                    .context("gbm_surface_lock_front_buffer failed")?
+            };
+            let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
+            let fb = card
+                .add_framebuffer(&fb_buf, 32, 32)
+                .map_err(|e| anyhow!("drmModeAddFB failed: {e}"))?;
+            card.set_crtc(
+                crtc_handle,
+                Some(fb),
+                (0, 0),
+                &[connector_info.handle()],
+                Some(mode),
+            )
+            .context("drmModeSetCrtc failed")?;
+
+            // Previous frame is no longer scanout — safe to release.
+            if let Some(old_fb) = prev_fb.take() {
+                if let Err(e) = card.destroy_framebuffer(old_fb) {
+                    eprintln!("warn: destroy_framebuffer({old_fb:?}): {e}");
+                }
+            }
+            if let Some(old_bo) = prev_bo.take() {
+                drop(old_bo);
+            }
+            prev_bo = Some(bo);
+            prev_fb = Some(fb);
+            frames += 1;
+
+            // Pace to fps. next-deadline math, not sleep-by-period
+            // — accumulated drift would walk us off cadence after a
+            // few seconds.
+            let next_deadline_ns = (frames as u64).wrapping_mul(frame_period_ns);
+            let now = start.elapsed().as_nanos() as u64;
+            if next_deadline_ns > now {
+                std::thread::sleep(std::time::Duration::from_nanos(
+                    next_deadline_ns - now,
+                ));
+            }
+        }
+        eprintln!(
+            "animated slide complete: {frames} frames in {}ms",
+            start.elapsed().as_millis()
+        );
+        Ok(())
+    })();
+
+    if let Err(e) = egl_lib.make_current(display, None, None, None) {
+        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_context(display, context) {
+        eprintln!("warn: eglDestroyContext: {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
+        eprintln!("warn: eglDestroySurface: {e:?}");
+    }
+    if let Err(e) = egl_lib.terminate(display) {
+        eprintln!("warn: eglTerminate: {e:?}");
+    }
+    if let Some(bo) = prev_bo {
+        drop(bo);
+    }
+    if let Some(fb) = prev_fb {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+        }
+    }
+
+    work?;
+    Ok(())
+}
+
 /// Draw a two-color linear gradient that fills the viewport. The
 /// fragment shader matches Python's PIL reference (image-space y,
 /// flipped from gl_FragCoord). Phase 4.2b extracted into a helper
@@ -465,6 +690,8 @@ fn draw_text_layer(
     layer: &crate::content::TextLayer,
     font: &fontdue::Font,
     text_color: [f32; 4],
+    motion_kind: MotionKind,
+    motion_state: MotionState,
 ) -> Result<()> {
     use glow::HasContext;
 
@@ -490,7 +717,15 @@ fn draw_text_layer(
         layer.text, size_px, bm.width, bm.height,
     );
 
-    let opacity = layer.opacity.clamp(0.0, 1.0);
+    // v1-spec-delta #2 (slice c-1): apply per-layer motion.
+    // alpha_mul folds in pulse / blink. A fully transparent layer
+    // (e.g. blink off-half) skips the GPU work entirely.
+    let opacity =
+        (layer.opacity.clamp(0.0, 1.0) * motion_state.alpha_mul.clamp(0.0, 1.0))
+            .clamp(0.0, 1.0);
+    if opacity < 1e-3 {
+        return Ok(());
+    }
     let halign = parse_h_align(&layer.text_align);
     // The Python content model has no v-align field. Phase 4.2c
     // matches the Python auto_render reference behavior of vertical-
@@ -531,7 +766,7 @@ fn draw_text_layer(
         // -- Build the textured quad in NDC via the host-tested
         // `box_to_ndc_quad` helper. Scale-down-only (no upscaling),
         // aligned per `halign`/`valign` inside the box.
-        let (ndc_l, ndc_r, ndc_t, ndc_b) = box_to_ndc_quad(
+        let (mut ndc_l, mut ndc_r, mut ndc_t, mut ndc_b) = box_to_ndc_quad(
             layer.r#box.x,
             layer.r#box.y,
             layer.r#box.w,
@@ -543,6 +778,40 @@ fn draw_text_layer(
             halign,
             valign,
         );
+
+        // v1-spec-delta #2 (slice c-1): breathe scales the rendered
+        // quad around the box center (not the glyph bbox center —
+        // see motion-spec.md §"breathe pivot"). Operator-authored
+        // offset within the box is preserved because we scale the
+        // already-aligned quad about the box center.
+        let scale = motion_state.scale.max(0.05);
+        if (scale - 1.0).abs() > 1e-4 {
+            let box_cx_ndc = (layer.r#box.x + layer.r#box.w * 0.5) * 2.0 - 1.0;
+            let box_cy_ndc = 1.0 - (layer.r#box.y + layer.r#box.h * 0.5) * 2.0;
+            ndc_l = box_cx_ndc + scale * (ndc_l - box_cx_ndc);
+            ndc_r = box_cx_ndc + scale * (ndc_r - box_cx_ndc);
+            ndc_t = box_cy_ndc + scale * (ndc_t - box_cy_ndc);
+            ndc_b = box_cy_ndc + scale * (ndc_b - box_cy_ndc);
+        }
+
+        // v1-spec-delta #2 (slice c-1): translation for ticker /
+        // bounce / shake. motion_offset_to_px applies the spec's
+        // per-effect unit convention (box-width / box-height /
+        // glyph-height). Convert the resulting pixel offset into
+        // NDC and shift the quad. Note: NDC y is up, screen y is
+        // down, hence the negation.
+        let box_w_px = (layer.r#box.w * mode_w as f32).max(1.0);
+        let box_h_px = (layer.r#box.h * mode_h as f32).max(1.0);
+        let (dx_px, dy_px) =
+            motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px);
+        if dx_px.abs() > 1e-4 || dy_px.abs() > 1e-4 {
+            let dx_ndc = (dx_px / mode_w as f32) * 2.0;
+            let dy_ndc = -(dy_px / mode_h as f32) * 2.0;
+            ndc_l += dx_ndc;
+            ndc_r += dx_ndc;
+            ndc_t += dy_ndc;
+            ndc_b += dy_ndc;
+        }
         // Verts: TRIANGLE_STRIP order BL, BR, TL, TR. Each vert is
         // [x, y, u, v]. UV (0,0) is top-left of the bitmap, which
         // matches our row-major top-down `data`.
@@ -714,14 +983,80 @@ pub fn render_slide(
         hold_ms,
     );
 
-    render_one_frame_to_hdmi(card, hold_ms, |gl, mode_w, mode_h| {
-        use glow::HasContext;
-        paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers)?;
-        unsafe { gl.flush(); }
-        Ok(())
-    })?;
+    // v1-spec-delta #2 (slice c-2): dispatch on whether ANY layer
+    // is animated. Static-only slides keep the cheap one-shot
+    // bring-up + sleep path (no perf regression on FYS today).
+    // Animated slides take the per-frame loop with the same legacy
+    // SetCrtc bring-up. 30 fps is the target, picked to match
+    // spec §11's frame-rate ask.
+    let any_animated = text_layers.iter().any(|(layer, _, _)| {
+        parse_motion_kind(&layer.motion) != MotionKind::Static
+    });
+    if any_animated {
+        eprintln!("slide has animated layers — entering per-frame loop @ 30 fps");
+        render_animated_slide(card, &bg_kind, &text_layers, slide.id, hold_ms, 30)?;
+    } else {
+        let motion_states = motion_states_for_layers(slide.id, &text_layers, 0.0);
+        render_one_frame_to_hdmi(card, hold_ms, |gl, mode_w, mode_h| {
+            use glow::HasContext;
+            paint_slide(
+                gl,
+                mode_w,
+                mode_h,
+                &bg_kind,
+                &text_layers,
+                Some(&motion_states),
+            )?;
+            unsafe { gl.flush(); }
+            Ok(())
+        })?;
+    }
     eprintln!("slide render complete");
     Ok(())
+}
+
+/// Resolve a stable u64 RNG seed for a text layer at `index` within
+/// `slide_id`. The TextLayer schema has no `id` field, so the
+/// renderer derives identity from (slide UUID, layer index). Stable
+/// across reloads as long as the operator doesn't reorder layers
+/// (which would re-seed shake — acceptable; reorder is a
+/// deliberate edit, not an idle re-render).
+fn layer_id_seed(slide_id: Uuid, index: usize) -> u64 {
+    let bytes = slide_id.as_bytes();
+    let high = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    let low = u64::from_le_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+        bytes[15],
+    ]);
+    high ^ low.rotate_left(13) ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Build a motion state vector parallel to `text_layers` at the
+/// given tick. Pure helper used by render_slide (and render_animated
+/// _slide once slice c-2 lands) to avoid duplicating the per-layer
+/// resolve loop.
+fn motion_states_for_layers(
+    slide_id: Uuid,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    tick_seconds: f64,
+) -> Vec<MotionState> {
+    text_layers
+        .iter()
+        .enumerate()
+        .map(|(i, (layer, _, _))| {
+            let kind = parse_motion_kind(&layer.motion);
+            compute_motion_state(
+                kind,
+                layer.motion_intensity,
+                layer.motion_phase,
+                layer.motion_speed,
+                layer_id_seed(slide_id, i),
+                tick_seconds,
+            )
+        })
+        .collect()
 }
 
 /// Phase 5-b — create an FBO + RGBA color texture sized to the
@@ -790,7 +1125,11 @@ unsafe fn make_slide_fbo(
         gl.delete_texture(tex);
         return Err(anyhow!("framebuffer incomplete (slide_fbo): status=0x{status:x}"));
     }
-    let paint_result = paint_slide(gl, mode_w, mode_h, bg_kind, text_layers);
+    // v1-spec-delta #2 (slice c-1): FBO bake takes the static
+    // snapshot path. Slice (d) — motion through transitions — will
+    // pass per-frame motion states here so the bake re-runs each
+    // transition frame; for now this is the existing freeze.
+    let paint_result = paint_slide(gl, mode_w, mode_h, bg_kind, text_layers, None);
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
         gl.delete_framebuffer(fbo);
@@ -1400,6 +1739,7 @@ fn paint_slide(
     mode_h: u32,
     bg_kind: &BgKind,
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    motion_states: Option<&[MotionState]>,
 ) -> Result<()> {
     use glow::HasContext;
     unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
@@ -1419,13 +1759,39 @@ fn paint_slide(
     // a layer's draw errors mid-loop (4.3+ persistent-context
     // future-correctness).
     if !text_layers.is_empty() {
+        // v1-spec-delta #2 (slice c-1): None = all-identity (no
+        // animation). FBO bake / transition snapshots / static
+        // slides take this path. Animated slides pass per-frame
+        // motion states.
+        if let Some(ms) = motion_states {
+            if ms.len() != text_layers.len() {
+                bail!(
+                    "paint_slide: motion_states len {} != layers len {}",
+                    ms.len(),
+                    text_layers.len(),
+                );
+            }
+        }
         unsafe {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
         }
         let layer_loop_result: Result<()> = (|| {
-            for (layer, tc, font) in text_layers {
-                draw_text_layer(gl, mode_w, mode_h, layer, font.as_ref(), *tc)?;
+            for (i, (layer, tc, font)) in text_layers.iter().enumerate() {
+                let motion_state = motion_states
+                    .map(|ms| ms[i])
+                    .unwrap_or(MotionState::IDENTITY);
+                let motion_kind = parse_motion_kind(&layer.motion);
+                draw_text_layer(
+                    gl,
+                    mode_w,
+                    mode_h,
+                    layer,
+                    font.as_ref(),
+                    *tc,
+                    motion_kind,
+                    motion_state,
+                )?;
             }
             Ok(())
         })();
@@ -1531,7 +1897,12 @@ pub fn render_slide_via_fbo(
             }
 
             // -- Paint the slide into the FBO.
-            let paint_result = paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers);
+            // v1-spec-delta #2 (slice c-1): debug FBO-parity path
+            // takes the static snapshot. Slice (d) wires per-frame
+            // motion through here when the test path needs it; for
+            // now this is a deliberate freeze for visual diff
+            // against render_slide.
+            let paint_result = paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers, None);
             // Always rebind default FBO before propagating Err so
             // cleanup/teardown doesn't operate on the offscreen one.
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);

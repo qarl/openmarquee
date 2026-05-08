@@ -1223,9 +1223,16 @@ fn motion_blink(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) 
     };
     let freq = base_freq * speed;
     if freq <= 0.0 {
-        // Frozen at phase=0 → visible (the "on" half of the
-        // square wave starts at phase=0).
-        return MotionState::IDENTITY;
+        // QA F1 (slice c): frozen state must still honor phase, to
+        // match the other 5 modes' speed=0 behavior and the spec's
+        // "phase=0 + motion_phase visual state at t=0" rule
+        // (lines 277-280). Pre-fix this branch returned IDENTITY
+        // unconditionally, ignoring phase.
+        let visible = (2.0 * std::f32::consts::PI * phase).sin() >= 0.0;
+        return MotionState {
+            alpha_mul: if visible { 1.0 } else { 0.0 },
+            ..MotionState::IDENTITY
+        };
     }
     let phase_rad = 2.0 * std::f32::consts::PI
         * ((tick_seconds * freq as f64) as f32 + phase);
@@ -1233,6 +1240,40 @@ fn motion_blink(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) 
     MotionState {
         alpha_mul: if visible { 1.0 } else { 0.0 },
         ..MotionState::IDENTITY
+    }
+}
+
+/// Convert a `MotionState`'s normalized translate offsets to
+/// screen-space pixels, using the spec's per-effect unit
+/// convention:
+///   - `Ticker` -> offset_x in box-width units
+///   - `Bounce` -> offset_y in box-height units
+///   - `Shake`  -> offset_x/y in glyph-height units (spec line 274)
+///   - other modes return (0, 0); they don't translate.
+///
+/// Pure helper so the renderer's draw_text_layer doesn't need a
+/// per-mode switch and the unit conversion stays host-testable.
+/// `box_w_px`, `box_h_px`, `font_size_px` are the rendered
+/// dimensions in screen pixels; the renderer already computes them
+/// for layout.
+pub fn motion_offset_to_px(
+    kind: MotionKind,
+    state: MotionState,
+    box_w_px: f32,
+    box_h_px: f32,
+    font_size_px: f32,
+) -> (f32, f32) {
+    match kind {
+        MotionKind::Ticker => (state.offset_x_norm * box_w_px, 0.0),
+        MotionKind::Bounce => (0.0, state.offset_y_norm * box_h_px),
+        MotionKind::Shake => (
+            state.offset_x_norm * font_size_px,
+            state.offset_y_norm * font_size_px,
+        ),
+        MotionKind::Static
+        | MotionKind::Breathe
+        | MotionKind::Pulse
+        | MotionKind::Blink => (0.0, 0.0),
     }
 }
 
@@ -2769,6 +2810,254 @@ mod tests {
         let amp_a = a.scale - 1.0;
         let amp_b = b.scale - 1.0;
         assert!((amp_a + amp_b).abs() < 1e-3, "a={amp_a} b={amp_b}");
+    }
+
+    // -- QA F1 (slice c): blink speed=0 honors phase ----------
+
+    #[test]
+    fn motion_blink_speed_zero_honors_phase() {
+        // Pre-F1, blink at speed=0 returned IDENTITY unconditionally
+        // (visible). Fix: evaluate the square wave at the layer's
+        // motion_phase so phase=0 → visible, phase=0.6 → hidden.
+        // Matches spec lines 277-280 ("frozen visual = phase=0 +
+        // motion_phase").
+        let m_visible =
+            compute_motion_state(MotionKind::Blink, 50, 0.0, 0.0, 0, 12.0);
+        assert!((m_visible.alpha_mul - 1.0).abs() < 1e-6);
+        let m_hidden =
+            compute_motion_state(MotionKind::Blink, 50, 0.6, 0.0, 0, 12.0);
+        assert!((m_hidden.alpha_mul - 0.0).abs() < 1e-6);
+    }
+
+    // -- QA F3 (slice c): speed=0 freeze coverage on the
+    //    remaining five modes (ticker is already pinned via
+    //    motion_ticker_speed_zero_freezes_at_phase_position).
+
+    #[test]
+    fn motion_breathe_speed_zero_freezes_at_phase_visual() {
+        // sin(2π * phase) determines the frozen scale; phase=0.25
+        // gives sin(π/2)=1, peak amplitude.
+        let frozen =
+            compute_motion_state(MotionKind::Breathe, 50, 0.25, 0.0, 0, 7.0);
+        // At intensity=50 amp=0.11, scale=1.11.
+        assert!((frozen.scale - 1.11).abs() < 1e-3);
+        let frozen2 =
+            compute_motion_state(MotionKind::Breathe, 50, 0.25, 0.0, 0, 99.0);
+        assert!((frozen.scale - frozen2.scale).abs() < 1e-9);
+    }
+
+    #[test]
+    fn motion_pulse_speed_zero_freezes_at_phase_visual() {
+        // phase=0 → sin=0 → frac=0.5 → at intensity=50: 0.35 + 0.65*0.5
+        // = 0.675. Same value across any tick because tick*0=0.
+        let a = compute_motion_state(MotionKind::Pulse, 50, 0.0, 0.0, 0, 1.0);
+        let b = compute_motion_state(MotionKind::Pulse, 50, 0.0, 0.0, 0, 50.0);
+        assert!((a.alpha_mul - b.alpha_mul).abs() < 1e-9);
+        assert!((a.alpha_mul - 0.675).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_bounce_speed_zero_freezes_at_phase_visual() {
+        let a = compute_motion_state(MotionKind::Bounce, 50, 0.25, 0.0, 0, 1.0);
+        let b = compute_motion_state(MotionKind::Bounce, 50, 0.25, 0.0, 0, 99.0);
+        assert!((a.offset_y_norm - b.offset_y_norm).abs() < 1e-9);
+        assert!((a.offset_y_norm - 0.055).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_shake_speed_zero_advances_anyway() {
+        // Shake explicitly ignores `speed` (spec line 230: "shake
+        // modulates amplitude not frequency"). The 10 Hz bucket
+        // sampling is wall-clock-driven, so speed=0 doesn't freeze
+        // shake — pinning that intent here so a future "freeze on
+        // speed=0" refactor doesn't silently change behavior.
+        let a = compute_motion_state(MotionKind::Shake, 50, 0.0, 0.0, 0xC0DE, 0.5);
+        let b = compute_motion_state(MotionKind::Shake, 50, 0.0, 0.0, 0xC0DE, 1.5);
+        // Values should differ — different tick buckets.
+        let dist =
+            ((a.offset_x_norm - b.offset_x_norm).powi(2)
+                + (a.offset_y_norm - b.offset_y_norm).powi(2))
+            .sqrt();
+        assert!(dist > 1e-9, "shake-at-speed=0 should still tick (dist={dist})");
+    }
+
+    // -- QA F3: speed=2.0 upper-clamp pin (period halves).
+
+    #[test]
+    fn motion_ticker_speed_two_halves_period() {
+        // intensity=50 → period=3.5s. speed=2 → effective 1.75s.
+        // At t=0.875 (= half of effective period), expect cycle=0.5
+        // → offset=0.0.
+        let m =
+            compute_motion_state(MotionKind::Ticker, 50, 0.0, 2.0, 0, 0.875);
+        assert!(m.offset_x_norm.abs() < 1e-3, "off was {}", m.offset_x_norm);
+    }
+
+    #[test]
+    fn motion_breathe_speed_two_halves_period() {
+        // 1 Hz → 2 Hz with speed=2. Quarter of 2 Hz period = 0.125s.
+        let m =
+            compute_motion_state(MotionKind::Breathe, 50, 0.0, 2.0, 0, 0.125);
+        assert!((m.scale - 1.11).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_pulse_speed_two_halves_period() {
+        // Pulse min at 3/4 of effective period. speed=2: 3/4 of 0.5s
+        // = 0.375s.
+        let m =
+            compute_motion_state(MotionKind::Pulse, 50, 0.0, 2.0, 0, 0.375);
+        assert!((m.alpha_mul - 0.35).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_bounce_speed_two_halves_period() {
+        let m =
+            compute_motion_state(MotionKind::Bounce, 50, 0.0, 2.0, 0, 0.125);
+        assert!((m.offset_y_norm - 0.055).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_blink_speed_two_doubles_freq() {
+        // intensity=50 → 1 Hz. speed=2 → 2 Hz. Quarter cycle =
+        // 0.125s → visible. 3/4 cycle = 0.375s → hidden.
+        let v =
+            compute_motion_state(MotionKind::Blink, 50, 0.0, 2.0, 0, 0.125);
+        assert!((v.alpha_mul - 1.0).abs() < 1e-6);
+        let h =
+            compute_motion_state(MotionKind::Blink, 50, 0.0, 2.0, 0, 0.375);
+        assert!((h.alpha_mul - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_shake_speed_two_independent_of_speed() {
+        // Spec: shake amp depends on intensity, frequency is 10 Hz
+        // wall-clock regardless of speed. Same tick = same offset
+        // across speeds.
+        let a = compute_motion_state(MotionKind::Shake, 50, 0.0, 1.0, 0xBEEF, 0.5);
+        let b = compute_motion_state(MotionKind::Shake, 50, 0.0, 2.0, 0xBEEF, 0.5);
+        assert!((a.offset_x_norm - b.offset_x_norm).abs() < 1e-9);
+        assert!((a.offset_y_norm - b.offset_y_norm).abs() < 1e-9);
+    }
+
+    // -- QA F3: intensity=0 != static — pin the deliberate spec
+    //    choice. A future "i=0 disables effect" refactor would
+    //    fire these.
+
+    #[test]
+    fn motion_breathe_intensity_zero_still_animates() {
+        // amp = 0.02 + 0.18*0 = 0.02 — small but non-zero.
+        let m = compute_motion_state(MotionKind::Breathe, 0, 0.0, 1.0, 0, 0.25);
+        assert!((m.scale - 1.02).abs() < 1e-3);
+        assert!((m.scale - 1.0).abs() > 1e-4, "scale was {}", m.scale);
+    }
+
+    #[test]
+    fn motion_pulse_intensity_zero_still_animates() {
+        // min_alpha = 0.70. At t=0.75s: alpha = 0.70.
+        let m = compute_motion_state(MotionKind::Pulse, 0, 0.0, 1.0, 0, 0.75);
+        assert!((m.alpha_mul - 0.70).abs() < 1e-3);
+        assert!((m.alpha_mul - 1.0).abs() > 1e-4);
+    }
+
+    #[test]
+    fn motion_bounce_intensity_zero_still_animates() {
+        // amp = 0.01.
+        let m = compute_motion_state(MotionKind::Bounce, 0, 0.0, 1.0, 0, 0.25);
+        assert!((m.offset_y_norm - 0.01).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_shake_intensity_zero_still_animates() {
+        // amp = 0.005. 200-tick fuzz must produce at least one
+        // non-zero offset (the all-zero case has astronomical odds).
+        let mut nonzero = 0;
+        for tick in 0..200 {
+            let m = compute_motion_state(
+                MotionKind::Shake,
+                0,
+                0.0,
+                1.0,
+                0xBABE,
+                tick as f64 * 0.05,
+            );
+            if m.offset_x_norm.abs() > 1e-9 || m.offset_y_norm.abs() > 1e-9 {
+                nonzero += 1;
+            }
+        }
+        assert!(nonzero > 100, "expected most ticks non-zero, got {nonzero}");
+    }
+
+    // -- QA F3: defensive negative-speed clamp pin. Pydantic
+    //    rejects negative speed on save, but the renderer is the
+    //    second line of defense for stale envelopes / IPC bugs.
+
+    #[test]
+    fn motion_speed_negative_clamps_to_zero() {
+        // Negative speed clamps to 0.0 (the lower edge of the
+        // 0..2 spec range). Same as speed=0 visually.
+        let frozen =
+            compute_motion_state(MotionKind::Ticker, 50, 0.0, -1.0, 0, 0.0);
+        let zero =
+            compute_motion_state(MotionKind::Ticker, 50, 0.0, 0.0, 0, 0.0);
+        assert!((frozen.offset_x_norm - zero.offset_x_norm).abs() < 1e-9);
+    }
+
+    #[test]
+    fn motion_offset_to_px_ticker_uses_box_width() {
+        let s = MotionState {
+            offset_x_norm: 0.5,
+            ..MotionState::IDENTITY
+        };
+        let (dx, dy) = motion_offset_to_px(MotionKind::Ticker, s, 800.0, 200.0, 64.0);
+        assert!((dx - 400.0).abs() < 1e-3);
+        assert!(dy.abs() < 1e-6);
+    }
+
+    #[test]
+    fn motion_offset_to_px_bounce_uses_box_height() {
+        let s = MotionState {
+            offset_y_norm: 0.1,
+            ..MotionState::IDENTITY
+        };
+        let (dx, dy) = motion_offset_to_px(MotionKind::Bounce, s, 800.0, 200.0, 64.0);
+        assert!(dx.abs() < 1e-6);
+        assert!((dy - 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_offset_to_px_shake_uses_glyph_height() {
+        // Shake is glyph-height-relative per the spec; pin to
+        // font_size_px not box dims.
+        let s = MotionState {
+            offset_x_norm: 0.04,
+            offset_y_norm: -0.02,
+            ..MotionState::IDENTITY
+        };
+        let (dx, dy) = motion_offset_to_px(MotionKind::Shake, s, 800.0, 200.0, 100.0);
+        assert!((dx - 4.0).abs() < 1e-3);
+        assert!((dy - (-2.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn motion_offset_to_px_other_modes_return_zero() {
+        // Static / Breathe / Pulse / Blink don't translate; their
+        // motion expresses through `scale` / `alpha_mul` instead.
+        for kind in [
+            MotionKind::Static,
+            MotionKind::Breathe,
+            MotionKind::Pulse,
+            MotionKind::Blink,
+        ] {
+            let s = MotionState {
+                offset_x_norm: 0.5,
+                offset_y_norm: 0.5,
+                ..MotionState::IDENTITY
+            };
+            let (dx, dy) = motion_offset_to_px(kind, s, 800.0, 200.0, 64.0);
+            assert!(dx.abs() < 1e-6, "kind={:?} dx={}", kind, dx);
+            assert!(dy.abs() < 1e-6, "kind={:?} dy={}", kind, dy);
+        }
     }
 
     #[test]
