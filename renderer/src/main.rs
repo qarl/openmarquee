@@ -20,6 +20,7 @@
 mod hdmi;
 mod content;
 mod hdmi_logic;
+mod playback;
 
 use std::path::PathBuf;
 
