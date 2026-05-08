@@ -122,6 +122,40 @@ pub struct AlphaBitmap {
     pub data: Vec<u8>,
 }
 
+/// v1-spec-delta #3 (slice b cache): per-layer rasterized-bitmap
+/// cache. Each entry holds the (resolved_text, AlphaBitmap) for
+/// one layer. When the resolved text is unchanged across frames
+/// (motion-only animations or the 29 frames between auto_mode
+/// second-bucket boundaries), the expensive fontdue rasterization
+/// is skipped and the cached bitmap is reused. Cache miss = text
+/// changed = re-rasterize.
+///
+/// Vec parallel to text_layers; len matches. Initialized to None
+/// at slide-render entry; populated lazily on first paint.
+pub type GlyphCache = Vec<Option<CachedGlyph>>;
+
+#[derive(Debug)]
+pub struct CachedGlyph {
+    pub text: String,
+    pub bitmap: AlphaBitmap,
+}
+
+/// v1-spec-delta #3 (slice b cache, QA F2): the cache hit/miss
+/// decision. None entry -> miss. Some entry with matching text ->
+/// hit (skip rasterization). Some entry with differing text ->
+/// miss (re-rasterize).
+///
+/// Pure function, host-testable. Extracted from paint_slide's
+/// inline match so the decision logic gets coverage in
+/// hdmi_logic.rs rather than living only inside the GL-bound
+/// render path.
+pub fn should_rerasterize(cache_entry: Option<&CachedGlyph>, resolved_text: &str) -> bool {
+    match cache_entry {
+        Some(cached) => cached.text != resolved_text,
+        None => true,
+    }
+}
+
 /// Lay out a single line of `text` rasterized at `size_px`. Each glyph
 /// is rasterized via `fontdue` and blitted onto a single grayscale
 /// bitmap whose width is the sum of glyph advances and whose height
@@ -2885,6 +2919,87 @@ mod tests {
         // passes u64::MAX for the override (degenerate but
         // possible).
         assert_eq!(effective_hold_ms(0, Some(u64::MAX)), u64::MAX);
+    }
+
+    // -- glyph cache hit/miss (v1-spec-delta #3 QA F2) ----------
+
+    fn dummy_bitmap() -> AlphaBitmap {
+        AlphaBitmap {
+            width: 1,
+            height: 1,
+            data: vec![0],
+        }
+    }
+
+    #[test]
+    fn should_rerasterize_misses_on_none_entry() {
+        // First-frame paint: cache slot empty -> miss, rasterize.
+        assert!(should_rerasterize(None, "hello"));
+        assert!(should_rerasterize(None, ""));
+    }
+
+    #[test]
+    fn should_rerasterize_hits_on_matching_text() {
+        // Steady-state on a motion-only path: resolved_text doesn't
+        // change between frames, cache hit, skip fontdue.
+        let cached = CachedGlyph {
+            text: "hello".to_string(),
+            bitmap: dummy_bitmap(),
+        };
+        assert!(!should_rerasterize(Some(&cached), "hello"));
+    }
+
+    #[test]
+    fn should_rerasterize_misses_on_differing_text() {
+        // auto_mode=time second-bucket boundary: text changes from
+        // "14:35:09" to "14:35:10", cache miss, re-rasterize.
+        let cached = CachedGlyph {
+            text: "14:35:09".to_string(),
+            bitmap: dummy_bitmap(),
+        };
+        assert!(should_rerasterize(Some(&cached), "14:35:10"));
+    }
+
+    #[test]
+    fn should_rerasterize_handles_empty_string_match() {
+        // Degenerate but valid: empty text on both sides -> hit.
+        // (layout_text_to_alpha returns None for empty input so
+        // this case is unreachable in practice, but the helper is
+        // pure and shouldn't special-case it.)
+        let cached = CachedGlyph {
+            text: String::new(),
+            bitmap: dummy_bitmap(),
+        };
+        assert!(!should_rerasterize(Some(&cached), ""));
+    }
+
+    #[test]
+    fn should_rerasterize_handles_empty_to_nonempty_transition() {
+        // Cached empty, resolved non-empty -> miss. Catches a
+        // degenerate edge where a paint happened with empty text
+        // and the next frame has real content.
+        let cached = CachedGlyph {
+            text: String::new(),
+            bitmap: dummy_bitmap(),
+        };
+        assert!(should_rerasterize(Some(&cached), "anything"));
+    }
+
+    #[test]
+    fn should_rerasterize_distinguishes_unicode_canonical_forms() {
+        // Pure byte-comparison: NFC vs NFD of the same character
+        // are different cache keys (renders differently if fontdue
+        // shapes them differently). Pinning the byte-equality
+        // semantic so a future "smart" comparator that normalizes
+        // doesn't silently change behavior.
+        let cached = CachedGlyph {
+            // "café" in NFC (U+00E9)
+            text: "caf\u{00E9}".to_string(),
+            bitmap: dummy_bitmap(),
+        };
+        // Same string in NFD: "cafe" + combining acute (U+0301).
+        let nfd = "cafe\u{0301}";
+        assert!(should_rerasterize(Some(&cached), nfd));
     }
 
     // -- auto-mode (v1-spec-delta #3) ---------------------------

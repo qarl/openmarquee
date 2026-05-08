@@ -44,8 +44,9 @@ use crate::hdmi_logic::{
     effective_hold_ms, format_auto_text, fourcc_for_argb_family, fs_for_transition_kind,
     gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
     parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, pick_largest_mode_index,
-    prev_idx_for_reel, unix_to_calendar_utc, AlphaBitmap, FontCatalog, ModeSpec, MotionKind,
-    MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE,
+    prev_idx_for_reel, should_rerasterize, unix_to_calendar_utc, AlphaBitmap, FontCatalog,
+    ModeSpec, MotionKind, MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
+    FS_GLYPH_OUTLINE,
     FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -1957,23 +1958,11 @@ pub fn render_transition_animated(
 /// Caller is responsible for binding the target framebuffer BEFORE
 /// the call. Caller flushes/swaps AFTER. We do set the viewport so
 /// the caller doesn't have to re-derive size against the binding.
-/// v1-spec-delta #3 (slice b cache, QA followup): per-layer
-/// rasterized-bitmap cache. Each entry holds the
-/// (resolved_text, AlphaBitmap) for one layer. When the resolved
-/// text is unchanged across frames (motion-only animations or the
-/// 29 frames between auto_mode second-bucket boundaries), the
-/// expensive fontdue rasterization is skipped and the cached
-/// bitmap is reused. Cache miss = text changed = re-rasterize.
-///
-/// Vec parallel to text_layers; len matches. Initialized to None
-/// at slide-render entry; populated lazily on first paint.
-pub type GlyphCache = Vec<Option<CachedGlyph>>;
-
-#[derive(Debug)]
-pub struct CachedGlyph {
-    text: String,
-    bitmap: AlphaBitmap,
-}
+// v1-spec-delta #3 (slice b cache): GlyphCache + CachedGlyph
+// types live in hdmi_logic.rs (host-testable surface). Re-export
+// here for the existing render_*_slide signatures that take
+// `Option<&mut GlyphCache>`.
+pub use crate::hdmi_logic::{CachedGlyph, GlyphCache};
 
 fn paint_slide(
     gl: &glow::Context,
@@ -2063,10 +2052,7 @@ fn paint_slide(
         // cache_ref entries; we'll borrow them in stage 2's GL draw.
         for (i, (layer, _, font)) in text_layers.iter().enumerate() {
             let resolved_text = &resolved_texts[i];
-            let needs_raster = match &cache_ref[i] {
-                Some(cached) => cached.text != *resolved_text,
-                None => true,
-            };
+            let needs_raster = should_rerasterize(cache_ref[i].as_ref(), resolved_text);
             if needs_raster {
                 let size_px = effective_font_size_px(
                     layer.font_size_px,
