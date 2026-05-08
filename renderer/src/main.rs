@@ -20,6 +20,7 @@
 mod hdmi;
 mod content;
 mod hdmi_logic;
+mod ipc_main;
 mod playback;
 
 use std::path::PathBuf;
@@ -176,6 +177,17 @@ struct Args {
     /// `--hold-secs` if set) controls the hold per slide.
     #[arg(long, default_value_t = false)]
     play_reel: bool,
+
+    /// v1-spec-delta #9 (slice c+) -- enter IPC sidecar mode.
+    /// The renderer reads JSON-line IpcRequest messages from
+    /// stdin, dispatches via the playback state machine, and
+    /// writes JSON-line IpcResponse messages to stdout. The
+    /// 7-op contract per spec §10. This slice ships the
+    /// dispatcher + state-machine integration; slice (d) wires
+    /// the actual GL paint to Advance's PaintSlide /
+    /// PaintTransition results.
+    #[arg(long, default_value_t = false)]
+    ipc_sidecar: bool,
 
     /// v1-spec-delta #2 — render a synthesized text slide whose
     /// single layer has the given motion kind, exercising the
@@ -786,6 +798,16 @@ mod tests {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // v1-spec-delta #9 (slice c): IPC sidecar mode short-circuits
+    // the standalone CLI dispatch. The dispatcher loop opens DRM
+    // lazily via the Open op (slice (d)); slice (c) only handles
+    // state-machine ops + emits OpResults derived from the
+    // playback state. Cross-platform -- IPC sidecar mode is
+    // useful in dev / CI where the Mac host doesn't have DRM.
+    if args.ipc_sidecar {
+        return ipc_main::run_ipc_sidecar();
+    }
 
     match args.output {
         OutputMode::Hdmi => {
