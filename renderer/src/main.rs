@@ -351,6 +351,58 @@ struct Args {
     /// Path to settings.json (placeholder; not used in Phase 1).
     #[arg(long)]
     settings: Option<PathBuf>,
+
+    /// v1-spec-delta #17 (2026-05-08): force a specific HDMI mode
+    /// when EDID is missing/invalid (the dev Pi's safe-mode list
+    /// tops out at 1024×768 absent EDID). Format: `WxH@Hz` like
+    /// `1920x1080@30` or `1920x1080@60`. When unset, the renderer
+    /// uses pick_largest_mode_index against the connector's
+    /// reported modes (existing behavior). When set, the renderer
+    /// synthesizes a CEA-861 mode with the given dimensions and
+    /// uses it via SetCrtc -- this requires the panel to actually
+    /// support the mode physically; an unsupported mode surfaces
+    /// as a kernel SetCrtc error which the renderer logs + bails.
+    #[arg(long)]
+    force_mode: Option<String>,
+}
+
+/// v1-spec-delta #17: parsed --force-mode shape. `WxH@Hz` only;
+/// flag suffixes (D, etc.) are not parsed today since they don't
+/// change the kernel's mode validation outcome -- the kernel-side
+/// timing-table match is what gates acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForcedMode {
+    pub width: u16,
+    pub height: u16,
+    pub vrefresh_hz: u32,
+}
+
+impl ForcedMode {
+    /// Parse `WxH@Hz` -- width and height are u16 (drm cap), vrefresh
+    /// is u32. Returns Err on any malformation rather than silently
+    /// degrading to defaults; --force-mode that doesn't parse is a
+    /// CLI bug, not a "fall back to EDID" intent.
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        let (wh, hz) = s.split_once('@').ok_or_else(|| {
+            anyhow::anyhow!("--force-mode {s:?} missing '@' (expected WxH@Hz like 1920x1080@30)")
+        })?;
+        let (w, h) = wh.split_once('x').ok_or_else(|| {
+            anyhow::anyhow!("--force-mode {s:?} missing 'x' (expected WxH@Hz like 1920x1080@30)")
+        })?;
+        let width: u16 = w
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--force-mode width {w:?}: {e}"))?;
+        let height: u16 = h
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--force-mode height {h:?}: {e}"))?;
+        let vrefresh_hz: u32 = hz
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--force-mode vrefresh {hz:?}: {e}"))?;
+        if width == 0 || height == 0 || vrefresh_hz == 0 {
+            anyhow::bail!("--force-mode {s:?} dimensions/vrefresh must all be > 0");
+        }
+        Ok(ForcedMode { width, height, vrefresh_hz })
+    }
 }
 
 /// v1-spec-delta #2 (slice d-smoke) -- synthesize an in-memory
@@ -763,7 +815,7 @@ fn parse_color(s: &str) -> Result<[f32; 4], String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_color;
+    use super::{parse_color, ForcedMode};
 
     #[test]
     fn parse_color_three_components() {
@@ -824,6 +876,49 @@ mod tests {
     #[test]
     fn parse_color_one_one_one_is_valid_white() {
         assert_eq!(parse_color("1,1,1"), Ok([1.0, 1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn forced_mode_parses_canonical_1080p_30() {
+        let m = ForcedMode::parse("1920x1080@30").unwrap();
+        assert_eq!(m.width, 1920);
+        assert_eq!(m.height, 1080);
+        assert_eq!(m.vrefresh_hz, 30);
+    }
+
+    #[test]
+    fn forced_mode_parses_1080p_60() {
+        let m = ForcedMode::parse("1920x1080@60").unwrap();
+        assert_eq!((m.width, m.height, m.vrefresh_hz), (1920, 1080, 60));
+    }
+
+    #[test]
+    fn forced_mode_rejects_missing_at() {
+        assert!(ForcedMode::parse("1920x1080").is_err());
+    }
+
+    #[test]
+    fn forced_mode_rejects_missing_x() {
+        assert!(ForcedMode::parse("1920@30").is_err());
+    }
+
+    #[test]
+    fn forced_mode_rejects_zero_dim() {
+        assert!(ForcedMode::parse("0x1080@30").is_err());
+        assert!(ForcedMode::parse("1920x0@30").is_err());
+        assert!(ForcedMode::parse("1920x1080@0").is_err());
+    }
+
+    #[test]
+    fn forced_mode_rejects_non_numeric() {
+        assert!(ForcedMode::parse("axb@c").is_err());
+        assert!(ForcedMode::parse("1920x1080@30D").is_err());
+    }
+
+    #[test]
+    fn forced_mode_rejects_empty() {
+        assert!(ForcedMode::parse("").is_err());
+        assert!(ForcedMode::parse("@").is_err());
     }
 }
 
