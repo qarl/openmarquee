@@ -19,6 +19,7 @@
 //! wires the JSON-line IPC dispatcher. Slice (d) preps Python-
 //! side integration. Slice (e) adds Pi-smoke gates.
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Per-slide context tracked between begin_slide and the advance
@@ -199,6 +200,183 @@ impl PlaybackState {
     }
 }
 
+// ============================================================
+// v1-spec-delta #9 (slice b, 2026-05-08) -- 7-op IPC contract
+// per spec §10. Request/response types for the JSON-line
+// protocol the IPC sidecar dispatcher will read from stdin and
+// write to stdout. Pure-data types -- no I/O, no dispatch
+// logic. Slice (c) wires the actual stdin/stdout JSON-line
+// loop over these types.
+//
+// Wire format: one request per stdin line, one response per
+// stdout line. Both are JSON. The protocol is request-response
+// synchronous (no pipelining); the caller reads each response
+// before sending the next request. This matches the playback
+// loop's natural cadence (one advance per frame budget) and
+// avoids out-of-order failures.
+// ============================================================
+
+/// Tagged request envelope. The `op` field discriminates among
+/// the 7 ops; `params` is the per-op payload. serde's tagged-
+/// enum representation handles both encode and decode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", content = "params", rename_all = "snake_case")]
+pub enum IpcRequest {
+    /// Op 1: construct + open. Sets up the renderer's output
+    /// (DRM card / Mock framebuffer / HUB75) and dimensions.
+    /// Subsequent ops assume open() has succeeded.
+    Open(OpenParams),
+    /// Op 2: begin a slide presentation at wall-clock t0_ms.
+    /// duration_ms is how long the caller intends to hold the
+    /// slide before transitioning; the renderer uses it for
+    /// completion detection but does NOT auto-transition.
+    BeginSlide(BeginSlideParams),
+    /// Op 3: advance to wall-clock t_ms. Returns AdvanceResult
+    /// telling the caller what was painted (or "idle" /
+    /// "slide_complete").
+    Advance(AdvanceParams),
+    /// Op 4: begin a transition from current slide to a new
+    /// slide. Equivalent to "stage the next slide and run the
+    /// blend"; advance() drives the actual per-frame paint.
+    BeginTransition(BeginTransitionParams),
+    /// Op 5: capture the current screen as a PNG written to
+    /// the given path. Spec §7.3.
+    Capture(CaptureParams),
+    /// Op 6: apply new settings without losing playback state.
+    /// Currently scopes to rotation / brightness / gamma per
+    /// spec §6.3.
+    Reconfigure(ReconfigureParams),
+    /// Op 7: release everything. Caller is expected to close
+    /// the IPC pipe after receiving the response.
+    Close,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenParams {
+    /// Output target name. One of `hdmi` / `mock` / `hub75` /
+    /// `ws2812b` per spec §5. Slice (c) only wires `hdmi`;
+    /// other targets warn-and-bail until their phases land.
+    pub output: String,
+    /// Optional DRM card path override. None falls back to
+    /// the existing /dev/dri/card{1,0} scan.
+    #[serde(default)]
+    pub drm_card: Option<String>,
+    /// Optional content_root override. Required for slides
+    /// with background_image_slide_id / type=image / type=
+    /// video.
+    #[serde(default)]
+    pub content_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BeginSlideParams {
+    pub slide_id: Uuid,
+    pub t0_ms: u64,
+    pub duration_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdvanceParams {
+    pub t_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BeginTransitionParams {
+    pub to_slide_id: Uuid,
+    pub to_duration_ms: u32,
+    pub kind: String,
+    pub transition_ms: u32,
+    pub t0_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureParams {
+    /// Filesystem path to write the PNG. Caller is responsible
+    /// for the directory existing + write permissions.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReconfigureParams {
+    /// Rotation in degrees, multiple of 90. Spec §6.3.
+    #[serde(default)]
+    pub rotation: Option<i32>,
+    /// Brightness scalar in [0.0, 1.0]. None = no change.
+    #[serde(default)]
+    pub brightness: Option<f32>,
+    /// Gamma scalar > 0. None = no change.
+    #[serde(default)]
+    pub gamma: Option<f32>,
+}
+
+/// Tagged response envelope. `ok` is the outcome flag; on
+/// success `result` carries the per-op return data; on
+/// failure `error` carries a human-readable diagnostic. The
+/// caller dispatches on `ok` first, then on `result.command`
+/// for advance() responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcResponse {
+    /// Successful op completion. Per-op return data in
+    /// `result`. For ops with no meaningful return (begin_*,
+    /// reconfigure, close), result is OpResult::Empty.
+    Ok { result: OpResult },
+    /// Op failed. `error` is a human-readable message; the
+    /// caller decides whether to retry, fail-the-frame, or
+    /// abort the renderer process.
+    Err { error: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum OpResult {
+    /// open() result: the negotiated output dimensions in
+    /// pixels. The caller can use these to scale slide assets
+    /// before sending content.
+    OpenOk { mode_w: u32, mode_h: u32 },
+    /// advance() result: PaintSlide. The renderer painted the
+    /// current slide at progress t_in_slide_ms.
+    PaintSlide { slide_id: Uuid, t_in_slide_ms: u64 },
+    /// advance() result: PaintTransition. The renderer
+    /// painted the blend at progress in [0, 1].
+    PaintTransition {
+        from: Uuid,
+        to: Uuid,
+        kind: String,
+        progress: f32,
+    },
+    /// advance() result: SlideComplete. The slide's
+    /// duration_ms has elapsed; caller should begin_
+    /// transition or begin_slide.
+    SlideComplete { slide_id: Uuid },
+    /// advance() result: Idle. No slide loaded. Caller must
+    /// begin_slide before further advance() calls produce
+    /// useful output.
+    Idle,
+    /// capture() result: bytes written to path.
+    CaptureOk { path: String, bytes: u64 },
+    /// Empty result for ops without meaningful return data
+    /// (begin_slide / begin_transition / reconfigure / close).
+    Empty,
+}
+
+/// Helper: convert the pure-state-machine AdvanceCommand to the
+/// IPC OpResult shape. Used by slice (c)'s dispatcher.
+pub fn advance_command_to_op_result(cmd: AdvanceCommand) -> OpResult {
+    match cmd {
+        AdvanceCommand::Idle => OpResult::Idle,
+        AdvanceCommand::PaintSlide { slide_id, t_in_slide_ms } => {
+            OpResult::PaintSlide { slide_id, t_in_slide_ms }
+        }
+        AdvanceCommand::PaintTransition { from, to, kind, progress } => {
+            OpResult::PaintTransition { from, to, kind, progress }
+        }
+        AdvanceCommand::SlideComplete { slide_id } => {
+            OpResult::SlideComplete { slide_id }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +534,216 @@ mod tests {
         assert_eq!(
             s.advance(100),
             AdvanceCommand::SlideComplete { slide_id: uuid(1) }
+        );
+    }
+
+    // ============================================================
+    // v1-spec-delta #9 (slice b) -- IPC contract serde tests.
+    // Locks the wire format so the Python playback.py side can
+    // depend on stable JSON shapes. Each test round-trips a
+    // request/response variant and asserts both the encoded JSON
+    // shape AND that decode(encode(x)) == x.
+    // ============================================================
+
+    fn roundtrip_request(req: &IpcRequest) {
+        let encoded = serde_json::to_string(req).unwrap();
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(*req, decoded, "round-trip mismatch for: {encoded}");
+    }
+
+    fn roundtrip_response(resp: &IpcResponse) {
+        let encoded = serde_json::to_string(resp).unwrap();
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(*resp, decoded, "round-trip mismatch for: {encoded}");
+    }
+
+    #[test]
+    fn ipc_request_open_round_trips() {
+        let req = IpcRequest::Open(OpenParams {
+            output: "hdmi".to_string(),
+            drm_card: Some("/dev/dri/card1".to_string()),
+            content_root: Some("/var/openmarquee/content".to_string()),
+        });
+        roundtrip_request(&req);
+        // Pin wire format (op + params shape).
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert!(encoded.contains(r#""op":"open""#));
+        assert!(encoded.contains(r#""output":"hdmi""#));
+    }
+
+    #[test]
+    fn ipc_request_open_decodes_with_omitted_optional_fields() {
+        // drm_card and content_root are Option<String> with
+        // serde default; they should decode to None when
+        // missing.
+        let json = r#"{"op":"open","params":{"output":"hdmi"}}"#;
+        let req: IpcRequest = serde_json::from_str(json).unwrap();
+        match req {
+            IpcRequest::Open(OpenParams { output, drm_card, content_root }) => {
+                assert_eq!(output, "hdmi");
+                assert!(drm_card.is_none());
+                assert!(content_root.is_none());
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_request_begin_slide_round_trips() {
+        let req = IpcRequest::BeginSlide(BeginSlideParams {
+            slide_id: uuid(7),
+            t0_ms: 12345,
+            duration_ms: 5000,
+        });
+        roundtrip_request(&req);
+    }
+
+    #[test]
+    fn ipc_request_advance_round_trips() {
+        let req = IpcRequest::Advance(AdvanceParams { t_ms: 9876543 });
+        roundtrip_request(&req);
+    }
+
+    #[test]
+    fn ipc_request_begin_transition_round_trips() {
+        let req = IpcRequest::BeginTransition(BeginTransitionParams {
+            to_slide_id: uuid(9),
+            to_duration_ms: 5000,
+            kind: "fade".to_string(),
+            transition_ms: 800,
+            t0_ms: 1500,
+        });
+        roundtrip_request(&req);
+    }
+
+    #[test]
+    fn ipc_request_capture_round_trips() {
+        let req = IpcRequest::Capture(CaptureParams {
+            path: "/tmp/snap.png".to_string(),
+        });
+        roundtrip_request(&req);
+    }
+
+    #[test]
+    fn ipc_request_reconfigure_round_trips_with_partial_fields() {
+        let req = IpcRequest::Reconfigure(ReconfigureParams {
+            rotation: Some(180),
+            brightness: None,
+            gamma: Some(2.2),
+        });
+        roundtrip_request(&req);
+    }
+
+    #[test]
+    fn ipc_request_close_round_trips() {
+        let req = IpcRequest::Close;
+        roundtrip_request(&req);
+        let encoded = serde_json::to_string(&req).unwrap();
+        // Close is a no-params op; serde renders it as a
+        // tag-only object.
+        assert!(encoded.contains(r#""op":"close""#));
+    }
+
+    #[test]
+    fn ipc_response_ok_open_round_trips() {
+        let resp = IpcResponse::Ok {
+            result: OpResult::OpenOk { mode_w: 1024, mode_h: 768 },
+        };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn ipc_response_ok_advance_paint_slide_round_trips() {
+        let resp = IpcResponse::Ok {
+            result: OpResult::PaintSlide { slide_id: uuid(3), t_in_slide_ms: 250 },
+        };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn ipc_response_ok_advance_paint_transition_round_trips() {
+        let resp = IpcResponse::Ok {
+            result: OpResult::PaintTransition {
+                from: uuid(1),
+                to: uuid(2),
+                kind: "wipe".to_string(),
+                progress: 0.42,
+            },
+        };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn ipc_response_ok_advance_slide_complete_round_trips() {
+        let resp = IpcResponse::Ok {
+            result: OpResult::SlideComplete { slide_id: uuid(5) },
+        };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn ipc_response_ok_advance_idle_round_trips() {
+        let resp = IpcResponse::Ok { result: OpResult::Idle };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn ipc_response_ok_capture_round_trips() {
+        let resp = IpcResponse::Ok {
+            result: OpResult::CaptureOk {
+                path: "/tmp/snap.png".to_string(),
+                bytes: 184320,
+            },
+        };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn ipc_response_ok_empty_round_trips() {
+        let resp = IpcResponse::Ok { result: OpResult::Empty };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn ipc_response_err_round_trips() {
+        let resp = IpcResponse::Err {
+            error: "begin_transition requires a current slide".to_string(),
+        };
+        roundtrip_response(&resp);
+    }
+
+    #[test]
+    fn advance_command_to_op_result_maps_each_variant() {
+        assert_eq!(
+            advance_command_to_op_result(AdvanceCommand::Idle),
+            OpResult::Idle
+        );
+        assert_eq!(
+            advance_command_to_op_result(AdvanceCommand::PaintSlide {
+                slide_id: uuid(1),
+                t_in_slide_ms: 100,
+            }),
+            OpResult::PaintSlide { slide_id: uuid(1), t_in_slide_ms: 100 }
+        );
+        assert_eq!(
+            advance_command_to_op_result(AdvanceCommand::PaintTransition {
+                from: uuid(1),
+                to: uuid(2),
+                kind: "fade".to_string(),
+                progress: 0.5,
+            }),
+            OpResult::PaintTransition {
+                from: uuid(1),
+                to: uuid(2),
+                kind: "fade".to_string(),
+                progress: 0.5,
+            }
+        );
+        assert_eq!(
+            advance_command_to_op_result(AdvanceCommand::SlideComplete {
+                slide_id: uuid(7),
+            }),
+            OpResult::SlideComplete { slide_id: uuid(7) }
         );
     }
 }
