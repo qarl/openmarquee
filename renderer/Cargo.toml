@@ -48,6 +48,14 @@ gbm = { version = "0.15", default-features = false, features = ["import-egl"] }
 khronos-egl = { version = "6.0", features = ["dynamic"] }
 libloading = "0.8"
 glow = "0.14"
+# v1-spec-delta F1d (V1-GA-blocker, 2026-05-08): poll(2) syscall
+# wrapper for the page-flip-event drain timeout. drm-rs's
+# receive_events is not non-blocking; without a poll-gated wrapper
+# the renderer hangs forever on a HW vblank miss. libc is already
+# in the dep tree transitively (drm-rs pulls it via rustix); this
+# direct declaration just exposes the API. Linux-only since the
+# whole hdmi.rs module is.
+libc = "0.2"
 
 [dev-dependencies]
 # Integration tests for content.rs's file-IO wrappers.

@@ -32,6 +32,7 @@ MAX_RSS="${SOAK_MAX_RSS_MB:-100.0}"
 # §8.2 acceptance runs; smoke embedding overrides to 1s for more
 # passes per minute on short runs.
 SOAK_HOLD_OVERRIDE="${SOAK_HOLD_SECS:-}"
+WARMUP_PASSES="${SOAK_WARMUP_PASSES:-0}"
 BIN_HOST="renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-render"
 BIN_PI="/tmp/openmarquee-render"
 LOG_DIR="/tmp/renderer-soak"
@@ -94,7 +95,8 @@ PARSER="$(dirname "$0")/renderer_soak_parse.py"
 if ! python3 "$PARSER" "$SOAK_LOG" \
     --max-slope-mb-per-hour "$MAX_SLOPE" \
     --max-cma-mb "$MAX_CMA" \
-    --max-rss-mb "$MAX_RSS"; then
+    --max-rss-mb "$MAX_RSS" \
+    --warmup-passes "$WARMUP_PASSES"; then
     echo "FAIL: soak slope/budget gate"
     exit 1
 fi

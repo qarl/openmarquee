@@ -87,13 +87,26 @@ def main() -> int:
     ap.add_argument("--passes-per-hour", type=float, default=120.0,
                     help="nominal passes/hour for slope→hour conversion "
                          "(default 120 = 30s/pass on FYS reel)")
+    ap.add_argument("--warmup-passes", type=int, default=0,
+                    help="skip the first N pass=N samples before slope test. "
+                         "Cold-start memory grows during the first few passes "
+                         "(allocator preheat, glyph atlas fills, etc) which "
+                         "biases slope upward. Production 6h+ runs default 0; "
+                         "short smoke runs benefit from N=2-3.")
     args = ap.parse_args()
 
-    samples = parse_log(args.log)
+    raw_samples = parse_log(args.log)
+    if args.warmup_passes > 0:
+        samples = [s for s in raw_samples if s["pass"] >= args.warmup_passes]
+        skipped = len(raw_samples) - len(samples)
+        if skipped > 0:
+            print(f"warmup: skipped first {skipped} sample(s) (--warmup-passes={args.warmup_passes})")
+    else:
+        samples = raw_samples
     if len(samples) < 3:
         print(
             f"FAIL: insufficient pass=N samples "
-            f"({len(samples)} < 3) -- soak too short or log malformed",
+            f"({len(samples)} < 3 after warmup) -- soak too short or log malformed",
             file=sys.stderr,
         )
         return 1

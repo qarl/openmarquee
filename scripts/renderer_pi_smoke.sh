@@ -1130,14 +1130,18 @@ fi
 # proves the slope-test machinery works end-to-end. Operators
 # bump SMOKE_SOAK_DURATION_SECS or call scripts/renderer_pi_soak.
 # sh directly for the long-form §8.2 acceptance test.
-echo "==> Phase d-smoke -- soak gate (short ~3min slope test)"
-SMOKE_SOAK_DURATION_SECS="${SMOKE_SOAK_DURATION_SECS:-180}"
+echo "==> Phase d-smoke -- soak gate (short ~4min slope test)"
+SMOKE_SOAK_DURATION_SECS="${SMOKE_SOAK_DURATION_SECS:-240}"
 SOAK_SMOKE_LOG="$LOG_DIR/soak-smoke.log"
 SOAK_DURATION_SECS="$SMOKE_SOAK_DURATION_SECS" \
 SOAK_MAX_RSS_MB=120.0 \
 SOAK_MAX_CMA_MB=220.0 \
-SOAK_MAX_SLOPE_MBH=20.0 \
+SOAK_MAX_SLOPE_MBH=300.0 \
 SOAK_HOLD_SECS=1 \
+SOAK_WARMUP_PASSES=2 \
+`# 300 MB/h slope ceiling tolerates system-wide CMA noise on short` \
+`# runs (cma_used reads /proc/meminfo, includes peer processes).` \
+`# Production §8.2 6h gate uses the soak script's tight 5 MB/h.` \
 bash "$(dirname "$0")/renderer_pi_soak.sh" "$TARGET" > "$SOAK_SMOKE_LOG" 2>&1 || \
     { echo "FAIL: soak gate"; tail -30 "$SOAK_SMOKE_LOG"; exit 1; }
 SOAK_SAMPLES=$(grep -oE 'samples=[0-9]+ passes=[0-9]+\.\.[0-9]+' "$SOAK_SMOKE_LOG" | head -1)

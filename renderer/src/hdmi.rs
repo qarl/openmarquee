@@ -502,6 +502,53 @@ where
     work_result
 }
 
+/// v1-spec-delta F1d (V1-GA-blocker, 2026-05-08): poll(2) the DRM
+/// fd until POLLIN is set or `timeout_ms` elapses. drm-rs's
+/// `receive_events` does a blocking read; without this gate, a
+/// HW vblank miss / kernel hang / unplugged HDMI cable would
+/// hang the renderer forever inside the drain. 500 ms is the
+/// canonical timeout: well above the 16.7 ms vsync interval but
+/// short enough that a stuck renderer surfaces in roughly one
+/// human-noticeable interval.
+///
+/// EINTR is retried (signal-interrupt is transient). POLLERR /
+/// POLLHUP / POLLNVAL surface as Err so the caller can decide
+/// whether to escalate or recover. Spurious wake (no POLLIN, no
+/// error, no timeout) loops back to poll.
+#[cfg(target_os = "linux")]
+fn poll_drm_fd_for_events(card: &Card, timeout_ms: i32) -> Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let raw_fd = card.as_fd().as_raw_fd();
+    let mut fds = [libc::pollfd {
+        fd: raw_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    loop {
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(anyhow!("poll on DRM fd failed: {err}"));
+        }
+        if n == 0 {
+            return Err(anyhow!(
+                "page-flip event timeout after {timeout_ms} ms (HW hang or vblank miss)"
+            ));
+        }
+        let revents = fds[0].revents;
+        if revents & libc::POLLIN != 0 {
+            return Ok(());
+        }
+        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(anyhow!("DRM fd error: revents=0x{revents:x}"));
+        }
+        // Spurious wake: no POLLIN, no error, but n>0. Loop.
+    }
+}
+
 /// v1-spec-delta #5 (slice d, 2026-05-08): commit a freshly-added
 /// FB to scanout. First call on a fresh EglSession does the
 /// SetCrtc modeset; subsequent calls use page_flip with EVENT
@@ -528,7 +575,11 @@ fn commit_fb(
         // Drain. Kernel sends a single PageFlipEvent per requested
         // flip on this fd; loop in case multiple events arrive
         // (defensive — we only ever request one at a time).
+        // F1d: poll-gate each receive_events so a HW vblank miss
+        // doesn't hang the renderer forever.
         loop {
+            poll_drm_fd_for_events(card, 500)
+                .context("page-flip drain (commit_fb)")?;
             let events = card
                 .receive_events()
                 .context("drmHandleEvent (page-flip drain)")?;
@@ -583,6 +634,16 @@ fn drain_pending_flip(session: &mut EglSession, card: &Card) {
         return;
     }
     loop {
+        // F1d: poll-gate so a vc4 driver stall doesn't hang the
+        // teardown path forever. drain_pending_flip is a best-
+        // effort cleanup -- on poll timeout we log + give up + clear
+        // flip_pending so the next render call can proceed (the
+        // kernel may have recovered, or the next set_crtc will
+        // resync state).
+        if let Err(e) = poll_drm_fd_for_events(card, 500) {
+            eprintln!("warn: page-flip drain timeout (end-of-call): {e}; clearing flip_pending");
+            break;
+        }
         let events = match card.receive_events() {
             Ok(events) => events,
             Err(e) => {
@@ -4875,29 +4936,13 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
                 return Err(anyhow!("atomic_commit (page-flip frame {frame_count}) failed: {e}"));
             }
 
-            // Drain the page-flip event the atomic commit just queued.
-            //
-            // CORRECTION (slice e F1f, 2026-05-08): drm-rs's
-            // `receive_events` is NOT non-blocking. It calls
-            // rustix::io::read on the DRM fd, and main.rs opens the
-            // fd without O_NONBLOCK -- so the read blocks if no
-            // event is queued. The 2026-05-06 probe (events=1 on
-            // 179/179 frames, 59.3 fps matching vrefresh) measured
-            // empirical drain timing; events happened to be queued
-            // when we got here because eglSwapBuffers vsync-gated
-            // first. The read appeared non-blocking because the
-            // kernel had already written the event by the time we
-            // called receive_events.
-            //
-            // Implication: this drain WILL block if a HW hang or
-            // missed-vblank scenario delays the page-flip event.
-            // No timeout on the read. F1d follow-up adds poll(2) +
-            // 500ms timeout to escape such hangs cleanly.
-            //
-            // The vsync gate is split: eglSwapBuffers blocks ~16.7
-            // ms on Mesa-vc4-vsync, then receive_events blocks
-            // until kernel writes the page-flip event (typically
-            // immediate after vblank lands).
+            // Drain the page-flip event the atomic commit just
+            // queued. F1d (V1-GA-blocker) landed: poll(2) gate with
+            // 500 ms timeout escapes a HW hang / missed-vblank
+            // cleanly; without the gate, drm-rs's read-based
+            // receive_events blocks indefinitely.
+            poll_drm_fd_for_events(&card, 500)
+                .context("page-flip drain (atomic commit)")?;
             let _events = card
                 .receive_events()
                 .context("receive_events after atomic commit")?;
