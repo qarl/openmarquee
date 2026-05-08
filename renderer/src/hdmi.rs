@@ -25,7 +25,7 @@ use drm::Device as DrmBaseDevice;
 use drm::control::{
     atomic::AtomicModeReq,
     connector::{self, State as ConnectorState},
-    framebuffer, plane,
+    crtc, framebuffer, plane,
     property::{self, Value as PropValue},
     AtomicCommitFlags, Device as ControlDevice, Mode,
 };
@@ -197,30 +197,36 @@ fn gl_error_sweep(gl: &glow::Context, label: &str) {
 #[inline]
 fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 
-/// Bring up GBM + EGL + GLES2 against the HDMI display, run the
-/// caller's `draw` closure once with a live `glow::Context`, then
-/// `eglSwapBuffers` + lock the front BO + register the DRM
-/// framebuffer + legacy `drmModeSetCrtc` to push it to scanout.
-/// Hold for `hold_ms` milliseconds. Cleanup runs unconditionally
-/// (warn-on-Err) regardless of whether the closure succeeded —
-/// matches the Phase 3 followups pattern.
-///
-/// v1-spec-delta #1 (2026-05-07): hold parameter is now ms, not
-/// seconds. The FYS Panic flash slides at 130/350/500/800 ms
-/// were previously snapping to a 1-second floor inside
-/// `effective_hold_secs`'s `/1000` truncation.
-///
-/// Phase 4.1c — extracted from `render_solid_color` and the
-/// (then-public) gradient-render path now that we have two callers.
-/// Phase 4.1d+ bg-pattern shaders reuse this helper directly; Phase
-/// 4.2b's `draw_*` helpers compose under the same closure too.
-///
-/// `draw` receives the GLES2 context and the viewport (mode_w,
-/// mode_h) so the closure can `glViewport`, `glClear`, or
-/// compile/link/draw a quad without re-deriving size.
-fn render_one_frame_to_hdmi<F>(card: &Card, hold_ms: u64, draw: F) -> Result<()>
+/// v1-spec-delta #5 (slice a) -- handles a render session can
+/// reuse across multiple draws. Created by `with_egl_session`,
+/// borrows refs to the bring-up scope (GBM + EGL handles owned
+/// there). Slice (a) only migrates `render_one_frame_to_hdmi`;
+/// slice (b)+ will let the reel driver acquire one session and
+/// loop slides through it without re-paying the ~500 ms bring-up
+/// cost per slide (closes spec-delta MAJOR #19's BLACK gaps).
+struct EglSession<'a> {
+    egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
+    display: egl::Display,
+    egl_surface: egl::Surface,
+    gbm_surface: &'a mut gbm::Surface<()>,
+    gl: &'a glow::Context,
+    crtc_handle: crtc::Handle,
+    connector_handle: connector::Handle,
+    mode: drm::control::Mode,
+    mode_w: u16,
+    mode_h: u16,
+}
+
+/// v1-spec-delta #5 (slice a) -- bring up GBM + EGL + GLES2,
+/// invoke the closure with a borrowed `EglSession`, tear down
+/// unconditionally. Behavior matches the inline bring-up pattern
+/// every existing render path uses today; slice (a) is pure
+/// extraction so slice (b)+ can compose multiple draws under one
+/// session. The cleanup is warn-on-Err so the original error
+/// propagates via the closure's return.
+fn with_egl_session<F, R>(card: &Card, work: F) -> Result<R>
 where
-    F: FnOnce(&glow::Context, u32, u32) -> Result<()>,
+    F: FnOnce(&mut EglSession) -> Result<R>,
 {
     let resources = card
         .resource_handles()
@@ -256,7 +262,7 @@ where
     if gbm_dev_ptr.is_null() {
         bail!("gbm_device raw pointer is null");
     }
-    let gbm_surface = gbm_dev
+    let mut gbm_surface = gbm_dev
         .create_surface::<()>(
             mode_w as u32,
             mode_h as u32,
@@ -312,52 +318,25 @@ where
         })
     };
 
-    // Resources the work block creates (BO + FB) need cleanup
-    // regardless of whether the work succeeds. Track via Options
-    // populated mid-closure; cleanup walks them after.
-    let mut bo_holder: Option<BufferObject<()>> = None;
-    let mut fb_holder: Option<framebuffer::Handle> = None;
-
-    let work: Result<()> = (|| {
-        draw(&gl, mode_w as u32, mode_h as u32)?;
-        gl_error_sweep(&gl, "user draw closure");
-        egl_lib
-            .swap_buffers(display, egl_surface)
-            .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
-        let bo = unsafe {
-            gbm_surface
-                .lock_front_buffer()
-                .context("gbm_surface_lock_front_buffer failed")?
-        };
-        let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
-        let fb = match card.add_framebuffer(&fb_buf, 32, 32) {
-            Ok(fb) => fb,
-            Err(e) => {
-                drop(bo);
-                return Err(anyhow!("drmModeAddFB failed: {e}"));
-            }
-        };
-        bo_holder = Some(bo);
-        fb_holder = Some(fb);
-        eprintln!("registered fb {fb:?}");
-        card.set_crtc(
+    let work_result = {
+        let mut session = EglSession {
+            egl_lib: &egl_lib,
+            display,
+            egl_surface,
+            gbm_surface: &mut gbm_surface,
+            gl: &gl,
             crtc_handle,
-            Some(fb),
-            (0, 0),
-            &[connector_info.handle()],
-            Some(mode),
-        )
-        .context("drmModeSetCrtc failed")?;
-        eprintln!(
-            "scanout active on {:?}; holding for {}ms",
-            crtc_handle, hold_ms
-        );
-        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-        Ok(())
-    })();
+            connector_handle: connector_info.handle(),
+            mode,
+            mode_w,
+            mode_h,
+        };
+        work(&mut session)
+    };
 
     // Cleanup — unconditional, warn-on-Err so the original cause
-    // propagates via `work?`.
+    // propagates via `work_result?`. gbm_surface and gbm_dev drop
+    // via their RAII Drop impls when this scope exits.
     if let Err(e) = egl_lib.make_current(display, None, None, None) {
         eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
     }
@@ -370,17 +349,103 @@ where
     if let Err(e) = egl_lib.terminate(display) {
         eprintln!("warn: eglTerminate: {e:?}");
     }
-    if let Some(bo) = bo_holder {
-        drop(bo);
-    }
-    if let Some(fb) = fb_holder {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
-        }
-    }
 
-    work?;
-    Ok(())
+    work_result
+}
+
+/// Bring up GBM + EGL + GLES2 against the HDMI display, run the
+/// caller's `draw` closure once with a live `glow::Context`, then
+/// `eglSwapBuffers` + lock the front BO + register the DRM
+/// framebuffer + legacy `drmModeSetCrtc` to push it to scanout.
+/// Hold for `hold_ms` milliseconds. Cleanup runs unconditionally
+/// (warn-on-Err) regardless of whether the closure succeeded —
+/// matches the Phase 3 followups pattern.
+///
+/// v1-spec-delta #1 (2026-05-07): hold parameter is now ms, not
+/// seconds. The FYS Panic flash slides at 130/350/500/800 ms
+/// were previously snapping to a 1-second floor inside
+/// `effective_hold_secs`'s `/1000` truncation.
+///
+/// v1-spec-delta #5 (slice a, 2026-05-08): the EGL/GBM bring-up
+/// + teardown is now extracted into `with_egl_session`. This
+/// function still does its own session per call (no behavior
+/// change vs slice 0); slice (b)+ will let the reel driver hold
+/// one session across the slide loop and skip the ~500 ms
+/// bring-up cost per slide.
+///
+/// Phase 4.1c — extracted from `render_solid_color` and the
+/// (then-public) gradient-render path now that we have two callers.
+/// Phase 4.1d+ bg-pattern shaders reuse this helper directly; Phase
+/// 4.2b's `draw_*` helpers compose under the same closure too.
+///
+/// `draw` receives the GLES2 context and the viewport (mode_w,
+/// mode_h) so the closure can `glViewport`, `glClear`, or
+/// compile/link/draw a quad without re-deriving size.
+fn render_one_frame_to_hdmi<F>(card: &Card, hold_ms: u64, draw: F) -> Result<()>
+where
+    F: FnOnce(&glow::Context, u32, u32) -> Result<()>,
+{
+    with_egl_session(card, |session| {
+        // Resources the work block creates (BO + FB) need cleanup
+        // regardless of whether the work succeeds. Track via
+        // Options populated mid-closure; cleanup walks them after.
+        let mut bo_holder: Option<BufferObject<()>> = None;
+        let mut fb_holder: Option<framebuffer::Handle> = None;
+
+        let work: Result<()> = (|| {
+            draw(session.gl, session.mode_w as u32, session.mode_h as u32)?;
+            gl_error_sweep(session.gl, "user draw closure");
+            session
+                .egl_lib
+                .swap_buffers(session.display, session.egl_surface)
+                .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+            let bo = unsafe {
+                session
+                    .gbm_surface
+                    .lock_front_buffer()
+                    .context("gbm_surface_lock_front_buffer failed")?
+            };
+            let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
+            let fb = match card.add_framebuffer(&fb_buf, 32, 32) {
+                Ok(fb) => fb,
+                Err(e) => {
+                    drop(bo);
+                    return Err(anyhow!("drmModeAddFB failed: {e}"));
+                }
+            };
+            bo_holder = Some(bo);
+            fb_holder = Some(fb);
+            eprintln!("registered fb {fb:?}");
+            card.set_crtc(
+                session.crtc_handle,
+                Some(fb),
+                (0, 0),
+                &[session.connector_handle],
+                Some(session.mode),
+            )
+            .context("drmModeSetCrtc failed")?;
+            eprintln!(
+                "scanout active on {:?}; holding for {}ms",
+                session.crtc_handle, hold_ms
+            );
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            Ok(())
+        })();
+
+        // BO/FB cleanup -- happens before with_egl_session's EGL
+        // teardown so the FB-handle rmFB lands while DRM master
+        // is still held cleanly.
+        if let Some(bo) = bo_holder {
+            drop(bo);
+        }
+        if let Some(fb) = fb_holder {
+            if let Err(e) = card.destroy_framebuffer(fb) {
+                eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+            }
+        }
+
+        work
+    })
 }
 
 /// v1-spec-delta #2 (slice c-2) — per-frame animated render path
