@@ -229,7 +229,7 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// background_image_slide_id under a motion-bearing layer.
 pub type ImageBgCache = HashMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
-struct EglSession<'a> {
+pub struct EglSession<'a> {
     egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
     display: egl::Display,
     egl_surface: egl::Surface,
@@ -245,6 +245,20 @@ struct EglSession<'a> {
     /// docs. The reel driver passes &mut self.image_bg_cache
     /// to paint_slide via render_*_in_session.
     image_bg_cache: ImageBgCache,
+    /// v1-spec-delta #9 (slice d): per-session N-2 BO/FB
+    /// rotation for IPC sidecar mode. The standalone render_*_
+    /// in_session loops keep their own loop-local rotation;
+    /// the IPC dispatcher's Advance op uses these so the
+    /// rotation persists across stdin-driven Advance calls
+    /// (which are independent function invocations from the
+    /// renderer's perspective). Both paths must NOT use the
+    /// other's rotation -- standalone callers reset modeset_
+    /// done = false on exit, which would mid-stream the IPC
+    /// flow.
+    scanout_prev_bo: Option<BufferObject<()>>,
+    scanout_prev_fb: Option<framebuffer::Handle>,
+    scanout_current_bo: Option<BufferObject<()>>,
+    scanout_current_fb: Option<framebuffer::Handle>,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -385,6 +399,10 @@ where
         modeset_done: false,
         flip_pending: false,
         image_bg_cache: HashMap::new(),
+        scanout_prev_bo: None,
+        scanout_prev_fb: None,
+        scanout_current_bo: None,
+        scanout_current_fb: None,
     };
     let work_result = work(&mut session);
 
@@ -402,6 +420,30 @@ where
             // Comment-only -- production logs stay quiet.
             let _ = path;
         }
+    }
+    // v1-spec-delta #9 (slice d): drain pending flip + free
+    // session-level scanout BO/FB rotation. Mirrors the
+    // animated_slide end-of-call cleanup but at session
+    // teardown for the IPC path (where each Advance is one
+    // frame of a long-lived loop). drain_pending_flip
+    // confirms kernel switched to current; then both prev
+    // and current are safe to free.
+    drain_pending_flip(&mut session, card);
+    if let Some(fb) = session.scanout_current_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_current): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_current_bo.take() {
+        drop(bo);
+    }
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
     }
     drop(session);
 
@@ -1769,6 +1811,284 @@ fn render_image_slide_in_session(
         }
         Ok(())
     })
+}
+
+/// v1-spec-delta #9 (slice d, 2026-05-08) -- single-frame
+/// paint + present helper for the IPC sidecar. Called once per
+/// Advance op (PaintSlide branch). Holds NO sleep / loop --
+/// the caller (IPC dispatcher) drives pacing via stdin. The
+/// session's scanout_prev / scanout_current BO/FB pair holds
+/// the N-2 rotation across Advance calls.
+///
+/// Pre-conditions:
+///   * EglSession is bound (with_egl_session is the caller).
+///   * slide layers + bg are pre-resolved by caller.
+///   * t_in_slide_ms is the relative ms since slide entry; the
+///     state machine produces this from advance() so the
+///     render side stays purely a function of (slide,
+///     t_in_slide).
+///
+/// Post-conditions:
+///   * One frame painted to scanout (set_crtc on first call,
+///     page_flip thereafter via commit_fb).
+///   * scanout_prev / scanout_current rotated. Stale prev BO/
+///     FB freed (kernel done with it via drain in commit_fb).
+///   * No sleeps. The IPC caller paces via wall-clock advance.
+pub fn paint_and_present_one_frame_for_slide(
+    session: &mut EglSession,
+    card: &Card,
+    slide: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    t_in_slide_ms: u64,
+) -> Result<()> {
+    use glow::HasContext;
+    let (bg_kind, _pattern_label, text_layers) =
+        resolve_slide_layers(slide, fonts, content_root)?;
+    let tick_seconds = t_in_slide_ms as f64 / 1000.0;
+    let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
+    let wall_clock_unix = current_unix_seconds();
+
+    // GL paint into the bound default framebuffer.
+    paint_slide(
+        session.gl,
+        session.mode_w as u32,
+        session.mode_h as u32,
+        &bg_kind,
+        &text_layers,
+        Some(&motion_states),
+        wall_clock_unix,
+        None,
+        Some(&mut session.image_bg_cache),
+    )?;
+    unsafe { session.gl.flush(); }
+
+    // swap_buffers → lock → addFB → commit_fb. Same primitive
+    // sequence as render_animated_slide_in_session's per-frame
+    // loop body, with the (BO, FB) holders coming off session
+    // instead of loop locals.
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer failed")?
+    };
+    let fb_buf = GbmBufferAdapter::new(&new_bo).context("read GBM bo metadata")?;
+    let new_fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card, new_fb) {
+        // Roll back: free the new FB + drop the new BO before
+        // propagating. session's scanout_*_* holders untouched
+        // on this error path.
+        if let Err(de) = card.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail: {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+
+    // commit_fb's drain confirmed kernel switched to scanout_
+    // current (the previous frame's commit). scanout_prev (the
+    // frame before that) is now safe to free.
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    // Shift: current → prev. Then store new as current.
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+    Ok(())
+}
+
+/// v1-spec-delta #9 (slice d) -- one-frame transition paint
+/// for the IPC dispatcher's Advance(PaintTransition) branch.
+/// Bakes both slide_a and slide_b into FBOs (per-call, no
+/// cache yet), runs the transition shader at `progress`,
+/// presents one frame. Same scanout-rotation discipline as
+/// paint_and_present_one_frame_for_slide.
+///
+/// SLICE-D SCOPE NOTE: the FBO bake happens every call.
+/// Slice (e) or follow-up adds a session-level cache keyed
+/// on (from, to, fps_bucket) so a transition's per-frame
+/// Advance calls don't re-bake the inputs. Today's per-call
+/// rebake costs ~30 ms on vc4 at 1080p -- borderline 30 fps;
+/// acceptable for v1 demo posture, but flagged for follow-up.
+pub fn paint_and_present_one_transition_frame(
+    session: &mut EglSession,
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    kind: &str,
+    progress: f32,
+) -> Result<()> {
+    use glow::HasContext;
+    let fs = match fs_for_transition_kind(kind) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "warn: transition kind {kind:?} not yet implemented; falling back to cut"
+            );
+            FS_CUT
+        }
+    };
+    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
+    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    let mode_w_u32 = session.mode_w as u32;
+    let mode_h_u32 = session.mode_h as u32;
+
+    let work: Result<()> = (|| unsafe {
+        // Bake slide_a + slide_b into FBOs (same machinery as
+        // render_transition_animated_in_session's bake).
+        let (fbo_a, tex_a) = make_slide_fbo(session.gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a)?;
+        let (fbo_b, tex_b) = match make_slide_fbo(session.gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b) {
+            Ok(p) => p,
+            Err(e) => {
+                session.gl.delete_framebuffer(fbo_a);
+                session.gl.delete_texture(tex_a);
+                return Err(e);
+            }
+        };
+        let cleanup_static = |gl: &glow::Context, vbo: Option<glow::Buffer>| {
+            if let Some(vbo) = vbo { gl.delete_buffer(vbo); }
+            gl.delete_framebuffer(fbo_a);
+            gl.delete_texture(tex_a);
+            gl.delete_framebuffer(fbo_b);
+            gl.delete_texture(tex_b);
+        };
+        let program = match link_program(session.gl, VS_TEXTURED_QUAD, fs) {
+            Ok(p) => p,
+            Err(e) => {
+                cleanup_static(session.gl, None);
+                return Err(e);
+            }
+        };
+        // Build the textured-quad VBO inline (mirrors
+        // render_transition_animated_in_session). a_pos / a_uv
+        // attribs at offsets 0 / 8 with stride 16.
+        let vbo = match session.gl.create_buffer() {
+            Ok(b) => b,
+            Err(e) => {
+                cleanup_static(session.gl, None);
+                session.gl.delete_program(program);
+                return Err(anyhow!("glGenBuffers(transition-frame): {e}"));
+            }
+        };
+        let verts: [f32; 16] = [
+            -1.0, -1.0, 0.0, 0.0,
+             1.0, -1.0, 1.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+        ];
+        session.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            std::mem::size_of_val(&verts),
+        );
+        session.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+        let a_pos = session.gl.get_attrib_location(program, "a_pos")
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos"))?;
+        let a_uv = session.gl.get_attrib_location(program, "a_uv")
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv"))?;
+        let u_src_a = session.gl.get_uniform_location(program, "u_src_a");
+        let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
+        let u_t = session.gl.get_uniform_location(program, "u_t");
+
+        // Bind default framebuffer + run transition shader.
+        session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+        session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        session.gl.clear(glow::COLOR_BUFFER_BIT);
+        session.gl.use_program(Some(program));
+        session.gl.active_texture(glow::TEXTURE0);
+        session.gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+        session.gl.uniform_1_i32(u_src_a.as_ref(), 0);
+        session.gl.active_texture(glow::TEXTURE1);
+        session.gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+        session.gl.uniform_1_i32(u_src_b.as_ref(), 1);
+        session.gl.uniform_1_f32(u_t.as_ref(), progress);
+        session.gl.enable_vertex_attrib_array(a_pos);
+        session.gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
+        session.gl.enable_vertex_attrib_array(a_uv);
+        session.gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 16, 8);
+        session.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        session.gl.disable_vertex_attrib_array(a_pos);
+        session.gl.disable_vertex_attrib_array(a_uv);
+
+        // Cleanup static (per-call FBOs + program + VBO).
+        cleanup_static(session.gl, Some(vbo));
+        session.gl.delete_program(program);
+        session.gl.flush();
+        Ok(())
+    })();
+    work?;
+
+    // swap → lock → addFB → commit_fb same as paint_and_
+    // present_one_frame_for_slide.
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer failed")?
+    };
+    let fb_buf = GbmBufferAdapter::new(&new_bo).context("read GBM bo metadata")?;
+    let new_fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card, new_fb) {
+        if let Err(de) = card.destroy_framebuffer(new_fb) {
+            eprintln!("warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail: {de}");
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+    Ok(())
+}
+
+/// Public adapter: open a fresh EglSession and run the
+/// supplied closure with it. The IPC sidecar's Open op uses
+/// this so the inner loop runs inside a held session.
+pub fn run_in_egl_session<F, R>(card: &Card, work: F) -> Result<R>
+where
+    F: FnOnce(&mut EglSession) -> Result<R>,
+{
+    with_egl_session(card, work)
+}
+
+/// Public accessor for IPC sidecar Open op: the negotiated
+/// mode (w, h) of the EglSession's CRTC.
+pub fn egl_session_mode_size(session: &EglSession) -> (u32, u32) {
+    (session.mode_w as u32, session.mode_h as u32)
 }
 
 /// v1-spec-delta #5 (slice c, 2026-05-08): render a slide given

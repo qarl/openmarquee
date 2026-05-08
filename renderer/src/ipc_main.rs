@@ -18,7 +18,7 @@
 //! process exits via the outer loop's `return`.
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
@@ -27,6 +27,8 @@ use crate::playback::{
     advance_command_to_op_result, AdvanceCommand, IpcRequest, IpcResponse, OpResult,
     OpenParams, PlaybackState,
 };
+#[cfg(target_os = "linux")]
+use crate::hdmi_logic::FontCatalog;
 
 /// Cached slide content keyed by UUID. Populated on BeginSlide
 /// + BeginTransition; consumed by Advance's actual-paint path
@@ -144,9 +146,12 @@ pub fn run_ipc_sidecar() -> Result<()> {
     Ok(())
 }
 
-/// Inner loop body invoked after Open succeeds. Slice (c)
-/// scope: state-machine ops only. Slice (d) wires actual GL
-/// paint via the EglSession.
+/// Inner loop body invoked after Open succeeds. Slice (d)
+/// branches on cfg(target_os = "linux"): on Linux, run the
+/// inner loop inside with_egl_session so EglSession is held
+/// across Advance calls + actual GL paint fires; on Mac
+/// (cargo test only), run state-machine-only mode (slice c
+/// behavior).
 fn run_open_and_inner_loop<I, W>(
     params: OpenParams,
     lines: &mut I,
@@ -156,16 +161,9 @@ where
     I: Iterator<Item = std::io::Result<String>>,
     W: Write,
 {
-    // Slice (c): validate Open params + emit a synthetic
-    // OpenOk. Slice (d) opens the actual DRM card + EGL
-    // session; for now the response carries the assumed
-    // 1024x768 mode (the dev Pi's HDMI-attached panel) so
-    // callers can develop against a real envelope.
     if params.output != "hdmi" {
-        // Other outputs (mock / hub75 / ws2812b) land in
-        // their respective phases.
         return Err(anyhow!(
-            "output {:?} not supported in slice (c); only hdmi",
+            "output {:?} not supported; only hdmi",
             params.output
         ));
     }
@@ -181,18 +179,38 @@ where
         ));
     }
 
-    // Slice (c): emit a placeholder mode size. Slice (d)
-    // probes the actual DRM connector for the real dims.
+    #[cfg(target_os = "linux")]
+    {
+        return run_open_and_inner_loop_linux(params, lines, stdout, &content_root);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return run_open_and_inner_loop_state_only(lines, stdout, &content_root);
+    }
+}
+
+/// Mac / non-Linux build: state-machine-only inner loop. Used
+/// by cargo test on the dev box where DRM isn't available.
+/// Mirrors slice (c) behavior: emit placeholder OpenOk, run
+/// the state machine, ignore paint hooks.
+#[cfg(not(target_os = "linux"))]
+fn run_open_and_inner_loop_state_only<I, W>(
+    lines: &mut I,
+    stdout: &mut W,
+    content_root: &Path,
+) -> Result<()>
+where
+    I: Iterator<Item = std::io::Result<String>>,
+    W: Write,
+{
     emit_response(
         stdout,
         &IpcResponse::Ok {
             result: OpResult::OpenOk { mode_w: 1024, mode_h: 768 },
         },
     )?;
-
     let mut state = PlaybackState::new();
     let mut cache = SlideCache::new();
-
     while let Some(line) = lines.next() {
         let line = line?;
         let req: IpcRequest = match serde_json::from_str(&line) {
@@ -203,16 +221,190 @@ where
             }
         };
         let is_close = matches!(req, IpcRequest::Close);
-        let resp = handle_inner_request(req, &mut state, &mut cache, &content_root);
+        let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
         emit_response(stdout, &resp)?;
         if is_close {
-            // Close ends the inner loop regardless of whether
-            // the response is Ok or Err -- the renderer
-            // cleanup runs on the way out.
             break;
         }
     }
     Ok(())
+}
+
+/// Linux build: open the DRM card, enter run_in_egl_session,
+/// and run the inner loop inside the closure. Each Advance op
+/// that produces PaintSlide / PaintTransition triggers an
+/// actual GL paint via paint_and_present_one_frame_*. Errors
+/// in paint surface as IpcResponse::Err{message}; the loop
+/// continues so the caller can recover (e.g., re-BeginSlide
+/// after a transient FBO failure).
+#[cfg(target_os = "linux")]
+fn run_open_and_inner_loop_linux<I, W>(
+    params: OpenParams,
+    lines: &mut I,
+    stdout: &mut W,
+    content_root: &Path,
+) -> Result<()>
+where
+    I: Iterator<Item = std::io::Result<String>>,
+    W: Write,
+{
+    use crate::hdmi;
+    use crate::Card;
+
+    let card_path = match params.drm_card.as_deref() {
+        Some(p) => Path::new(p).to_path_buf(),
+        None => {
+            // Same scan order as the standalone CLI: card1
+            // before card0.
+            let candidates = [Path::new("/dev/dri/card1"), Path::new("/dev/dri/card0")];
+            candidates
+                .iter()
+                .find(|p| p.exists())
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| anyhow!("no /dev/dri/card{{0,1}} found"))?
+        }
+    };
+    let card = Card::open(&card_path)
+        .map_err(|e| anyhow!("DRM open {} failed: {e:#}", card_path.display()))?;
+
+    // Font catalog -- needed by paint_slide for the text-layer
+    // rasterization. Use the same defaults as the standalone
+    // CLI.
+    let catalog = FontCatalog::new(
+        std::path::PathBuf::from("/opt/openmarquee/ui/fonts"),
+        "Anton".to_string(),
+    );
+    let fonts: Option<&FontCatalog> = if catalog.fallback_available() {
+        Some(&catalog)
+    } else {
+        eprintln!(
+            "warn: ipc_sidecar font catalog at /opt/openmarquee/ui/fonts can't load fallback Anton; rendering bg only"
+        );
+        None
+    };
+
+    hdmi::run_in_egl_session(&card, |session| {
+        let (mw, mh) = hdmi::egl_session_mode_size(session);
+        emit_response(
+            stdout,
+            &IpcResponse::Ok {
+                result: OpResult::OpenOk { mode_w: mw, mode_h: mh },
+            },
+        )?;
+        let mut state = PlaybackState::new();
+        let mut cache = SlideCache::new();
+        while let Some(line) = lines.next() {
+            let line = line?;
+            let req: IpcRequest = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    emit_response(stdout, &err(format!("invalid request: {e}")))?;
+                    continue;
+                }
+            };
+            let is_close = matches!(req, IpcRequest::Close);
+            let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
+
+            // Linux paint hook: when the dispatcher returned a
+            // PaintSlide / PaintTransition OpResult, fire the
+            // actual GL paint. If paint errors, override the
+            // response so the caller sees Err{message} rather
+            // than a fake-success response.
+            let resp = run_paint_hook(
+                &resp,
+                session,
+                &card,
+                &cache,
+                fonts,
+                Some(content_root),
+            );
+
+            emit_response(stdout, &resp)?;
+            if is_close {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Linux paint hook: translate PaintSlide / PaintTransition
+/// OpResults into actual paint_and_present_one_frame_* calls.
+/// Returns the original response on success, or an Err
+/// response on paint failure. State machine + cache state are
+/// already updated; this hook only paints.
+#[cfg(target_os = "linux")]
+fn run_paint_hook(
+    resp: &IpcResponse,
+    session: &mut crate::hdmi::EglSession,
+    card: &crate::Card,
+    cache: &SlideCache,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+) -> IpcResponse {
+    use crate::content::ContentItem;
+    use crate::hdmi;
+
+    let result = match resp {
+        IpcResponse::Ok { result } => result,
+        // Pass through errors unchanged.
+        IpcResponse::Err { .. } => return resp.clone(),
+    };
+    match result {
+        OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
+            let item = match cache.items.get(slide_id) {
+                Some(i) => i,
+                None => {
+                    return err(format!(
+                        "paint_slide: slide {slide_id} not in cache (begin_slide first?)"
+                    ));
+                }
+            };
+            match item {
+                ContentItem::Text(slide) => {
+                    if let Err(e) = hdmi::paint_and_present_one_frame_for_slide(
+                        session,
+                        card,
+                        slide,
+                        fonts,
+                        content_root,
+                        *t_in_slide_ms,
+                    ) {
+                        return err(format!("paint_slide failed: {e:#}"));
+                    }
+                    resp.clone()
+                }
+                _ => err("paint_slide: only text slides supported in slice (d); image/video TBD"),
+            }
+        }
+        OpResult::PaintTransition { from, to, kind, progress } => {
+            let from_item = match cache.items.get(from) {
+                Some(ContentItem::Text(s)) => s,
+                Some(_) => return err("paint_transition: from non-text slide TBD"),
+                None => return err(format!("paint_transition: from slide {from} not in cache")),
+            };
+            let to_item = match cache.items.get(to) {
+                Some(ContentItem::Text(s)) => s,
+                Some(_) => return err("paint_transition: to non-text slide TBD"),
+                None => return err(format!("paint_transition: to slide {to} not in cache")),
+            };
+            if let Err(e) = hdmi::paint_and_present_one_transition_frame(
+                session,
+                card,
+                from_item,
+                to_item,
+                fonts,
+                content_root,
+                kind,
+                *progress,
+            ) {
+                return err(format!("paint_transition failed: {e:#}"));
+            }
+            resp.clone()
+        }
+        // Non-paint OpResults: pass through unchanged.
+        _ => resp.clone(),
+    }
 }
 
 /// Per-request dispatch. Returns the response to emit. State-
