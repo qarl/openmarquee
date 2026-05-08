@@ -2070,8 +2070,21 @@ pub fn paint_and_present_one_transition_frame(
         let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
         let u_t = session.gl.get_uniform_location(program, "u_t");
 
-        // Bind default framebuffer + run transition shader.
-        session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        // v1-spec-delta #10 (slice c-2): when settings have non-
+        // identity brightness/gamma, route the transition shader
+        // output through the session's scene FBO + FS_BRIGHT_GAMMA
+        // post-pass before scanout. Identity skips the FBO bind +
+        // post-pass.
+        let identity = session.current_settings.is_color_identity();
+        let scene_for_post_pass = if !identity {
+            Some(ensure_scene_fbo(session, mode_w_u32, mode_h_u32)?)
+        } else {
+            None
+        };
+        // Bind transition target: scene FBO (non-identity) or
+        // default fb (identity).
+        let transition_target = scene_for_post_pass.map(|(fbo, _)| fbo);
+        session.gl.bind_framebuffer(glow::FRAMEBUFFER, transition_target);
         session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
         session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
         session.gl.clear(glow::COLOR_BUFFER_BIT);
@@ -2094,6 +2107,19 @@ pub fn paint_and_present_one_transition_frame(
         // Cleanup static (per-call FBOs + program + VBO).
         cleanup_static(session.gl, Some(vbo));
         session.gl.delete_program(program);
+
+        // v1-spec-delta #10 (slice c-2): post-pass blit from
+        // scene FBO to default fb when non-identity. Mirrors
+        // paint_and_present_one_frame_for_slide's slice-c
+        // dispatch.
+        if let Some((_fbo, tex)) = scene_for_post_pass {
+            let brightness = (session.current_settings.brightness as f32) / 100.0;
+            let gamma = session.current_settings.gamma;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+        }
+
         session.gl.flush();
         Ok(())
     })();
