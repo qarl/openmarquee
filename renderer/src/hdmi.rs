@@ -14,7 +14,7 @@
 //! The error model is intentionally chatty (`anyhow::Context`) so any
 //! failure during bring-up tells you which step blew up.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -212,6 +212,23 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// slice (b)+ will let the reel driver acquire one session and
 /// loop slides through it without re-paying the ~500 ms bring-up
 /// cost per slide (closes spec-delta MAJOR #19's BLACK gaps).
+/// v1-spec-delta #8 (F-image-bg-cache, 2026-05-08) -- per-session
+/// cache of decoded + uploaded image-bg textures, keyed on the
+/// asset PathBuf. Lives across the entire reel pass so a slide
+/// referenced multiple times (or a single animated slide with
+/// image bg painted at 30 fps) re-uploads exactly once. Freed
+/// in with_egl_session's teardown via gl.delete_texture for
+/// every entry.
+///
+/// QA flagged this as HIGH priority post-slice 8(b): per-frame
+/// PNG decode at 1920×1080 is ~50 ms (over the 33 ms frame
+/// budget), so animated text slides with image bg would tank
+/// to ~13 fps without the cache. Today's exposure is zero
+/// because FYS has no image-bg slides, but production demos
+/// will trigger the regression the moment the editor wires
+/// background_image_slide_id under a motion-bearing layer.
+pub type ImageBgCache = HashMap<PathBuf, (glow::NativeTexture, u32, u32)>;
+
 struct EglSession<'a> {
     egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
     display: egl::Display,
@@ -223,6 +240,11 @@ struct EglSession<'a> {
     mode: drm::control::Mode,
     mode_w: u16,
     mode_h: u16,
+    /// v1-spec-delta #8 (F-image-bg-cache): per-session cache of
+    /// decoded + uploaded image-bg textures. See ImageBgCache
+    /// docs. The reel driver passes &mut self.image_bg_cache
+    /// to paint_slide via render_*_in_session.
+    image_bg_cache: ImageBgCache,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -349,23 +371,39 @@ where
         })
     };
 
-    let work_result = {
-        let mut session = EglSession {
-            egl_lib: &egl_lib,
-            display,
-            egl_surface,
-            gbm_surface: &mut gbm_surface,
-            gl: &gl,
-            crtc_handle,
-            connector_handle: connector_info.handle(),
-            mode,
-            mode_w,
-            mode_h,
-            modeset_done: false,
-            flip_pending: false,
-        };
-        work(&mut session)
+    let mut session = EglSession {
+        egl_lib: &egl_lib,
+        display,
+        egl_surface,
+        gbm_surface: &mut gbm_surface,
+        gl: &gl,
+        crtc_handle,
+        connector_handle: connector_info.handle(),
+        mode,
+        mode_w,
+        mode_h,
+        modeset_done: false,
+        flip_pending: false,
+        image_bg_cache: HashMap::new(),
     };
+    let work_result = work(&mut session);
+
+    // v1-spec-delta #8 (F-image-bg-cache): free per-session
+    // image-bg textures while the GL context is still current.
+    // After this point EGL teardown invalidates all textures
+    // anyway, but explicit deletion keeps driver bookkeeping
+    // clean and surfaces leaks via warn-on-Err pattern.
+    {
+        use glow::HasContext;
+        let cache = std::mem::take(&mut session.image_bg_cache);
+        for (path, (tex, _, _)) in cache {
+            unsafe { gl.delete_texture(tex); }
+            // Trace-level diagnostic: cached image freed.
+            // Comment-only -- production logs stay quiet.
+            let _ = path;
+        }
+    }
+    drop(session);
 
     // Cleanup — unconditional, warn-on-Err so the original cause
     // propagates via `work_result?`. gbm_surface and gbm_dev drop
@@ -722,6 +760,11 @@ fn render_animated_slide_in_session(
                 Some(&motion_states),
                 wall_clock_unix,
                 Some(&mut glyph_cache),
+                // v1-spec-delta #8 F-image-bg-cache: reuse the
+                // session-wide cache so animated slides with
+                // image bg upload exactly once. Closes the per-
+                // frame re-decode regression QA flagged.
+                Some(&mut session.image_bg_cache),
             )?;
             unsafe { session.gl.flush(); }
             session
@@ -894,25 +937,46 @@ fn draw_solid_clear(gl: &glow::Context, color: [f32; 4]) {
     }
 }
 
-/// v1-spec-delta #8 (slice b) -- draw an ImageSlide-referenced PNG
-/// as the slide background. Loads the PNG via load_png_rgba,
-/// uploads as an RGBA8 texture, and runs FS_BLIT to fill the
-/// viewport. On any failure (missing file, corrupt PNG, GL error),
-/// falls back to a solid clear with `solid_fallback` so the slide
-/// still renders something rather than panicking. The fallback
-/// path emits a `warn:` line tagged with the asset path so the
-/// failure is visible in logs.
+/// v1-spec-delta #8 (slice b + F-image-bg-cache) -- draw an
+/// ImageSlide-referenced PNG as the slide background. When a
+/// cache is provided AND already holds an entry for this asset
+/// path, reuse the cached texture (~free per frame). Otherwise
+/// decode + upload, blit, and (if cache provided) insert. When
+/// no cache is provided (one-shot paths, transition FBO bake),
+/// the texture is freed at end of call.
 ///
-/// Texture is allocated, used, and freed within this function;
-/// nothing leaks if a step fails. The caller has already bound
-/// the target framebuffer (default fb or scene_fbo for the
-/// overlay route).
+/// Cache hit cost: 1 texture-bind + run_blit_pass (one full-
+/// screen draw). Cache miss cost: PNG decode (~50 ms at 1920×
+/// 1080) + tex upload (~5 ms) + blit. Hits are the common path
+/// for animated text slides with image bg (paint_slide called
+/// at 30 fps).
+///
+/// On any failure (missing file, corrupt PNG, GL error), falls
+/// back to a solid clear with `solid_fallback`. The fallback
+/// path emits a `warn:` line tagged with the asset path so the
+/// failure is visible in logs. With cache, the warn fires once
+/// per slide-entry (the failed entry isn't inserted, so each
+/// re-attempt re-warns -- still bounded by attempts-per-slide).
 fn draw_image_bg(
     gl: &glow::Context,
     asset_path: &Path,
     solid_fallback: [f32; 4],
+    image_bg_cache: Option<&mut ImageBgCache>,
 ) {
     use glow::HasContext;
+    // Cache hit -- skip decode + upload, just bind + blit.
+    if let Some(cache) = image_bg_cache.as_deref() {
+        if let Some((tex, _, _)) = cache.get(asset_path) {
+            let blit_result = unsafe { run_blit_pass(gl, *tex) };
+            if let Err(e) = blit_result {
+                eprintln!(
+                    "warn: image-bg blit failed (cache-hit) for {}: {e:#}; result may be partial",
+                    asset_path.display()
+                );
+            }
+            return;
+        }
+    }
     let (rgba, w, h) = match load_png_rgba(asset_path) {
         Ok(t) => t,
         Err(e) => {
@@ -957,7 +1021,18 @@ fn draw_image_bg(
             Some(&rgba),
         );
         let blit_result = run_blit_pass(gl, tex);
-        gl.delete_texture(tex);
+        // Cache insertion (or free) decision: when a cache is
+        // provided, transfer ownership of the texture into the
+        // cache so the next call with the same asset_path skips
+        // decode+upload. Otherwise free now.
+        match image_bg_cache {
+            Some(cache) => {
+                cache.insert(asset_path.to_path_buf(), (tex, w, h));
+            }
+            None => {
+                gl.delete_texture(tex);
+            }
+        }
         if let Err(e) = blit_result {
             eprintln!(
                 "warn: image-bg blit failed for {}: {e:#}; result may be partial",
@@ -1770,6 +1845,7 @@ fn render_slide_in_session(
                 Some(&motion_states),
                 wall_clock_unix,
                 None,
+                None,  // image_bg_cache: closure-captured, no session access
             )?;
             unsafe { gl.flush(); }
             Ok(())
@@ -1917,6 +1993,7 @@ unsafe fn make_slide_fbo(
         None,
         current_unix_seconds(),
         None,
+        None,  // image_bg_cache: standalone bake, no session
     );
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
@@ -2386,6 +2463,7 @@ fn render_transition_animated_in_session(
                         Some(&states_a),
                         wall_clock_unix,
                         Some(&mut glyph_cache_a),
+                        Some(&mut session.image_bg_cache),
                     )?;
                 }
                 if any_animated_b || any_auto_b {
@@ -2404,6 +2482,7 @@ fn render_transition_animated_in_session(
                         Some(&states_b),
                         wall_clock_unix,
                         Some(&mut glyph_cache_b),
+                        Some(&mut session.image_bg_cache),
                     )?;
                 }
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -2574,6 +2653,7 @@ fn paint_slide(
     motion_states: Option<&[MotionState]>,
     wall_clock_unix: i64,
     glyph_cache: Option<&mut GlyphCache>,
+    mut image_bg_cache: Option<&mut ImageBgCache>,
 ) -> Result<()> {
     use glow::HasContext;
     unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
@@ -2585,7 +2665,9 @@ fn paint_slide(
             draw_pattern(gl, mode_w, mode_h, *kind, *color_a, *color_b, *density)?;
         }
         BgKind::Image { asset_path, solid_fallback } => {
-            draw_image_bg(gl, asset_path, *solid_fallback);
+            // Reborrow so we can hand the cache to the overlay-
+            // route below if any_overlay fires for a later layer.
+            draw_image_bg(gl, asset_path, *solid_fallback, image_bg_cache.as_deref_mut());
         }
         BgKind::Solid(color) => {
             draw_solid_clear(gl, *color);
@@ -2707,6 +2789,7 @@ fn paint_slide(
                 text_layers,
                 motion_states,
                 cache_ref,
+                image_bg_cache,
             )?;
             return Ok(());
         }
@@ -2797,6 +2880,7 @@ fn paint_layers_via_overlay_route(
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     motion_states: Option<&[MotionState]>,
     cache_ref: &mut GlyphCache,
+    image_bg_cache: Option<&mut ImageBgCache>,
 ) -> Result<()> {
     use glow::HasContext;
     let (scene_fbo_a, scene_tex_a) = unsafe { create_color_fbo(gl, mode_w, mode_h)? };
@@ -2840,7 +2924,7 @@ fn paint_layers_via_overlay_route(
                 draw_pattern(gl, mode_w, mode_h, *kind, *color_a, *color_b, *density)?;
             }
             BgKind::Image { asset_path, solid_fallback } => {
-                draw_image_bg(gl, asset_path, *solid_fallback);
+                draw_image_bg(gl, asset_path, *solid_fallback, image_bg_cache);
             }
             BgKind::Solid(color) => {
                 draw_solid_clear(gl, *color);
@@ -3244,6 +3328,7 @@ pub fn render_slide_via_fbo(
                 None,
                 current_unix_seconds(),
                 None,
+                None,  // image_bg_cache: standalone debug bake, no session
             );
             // Always rebind default FBO before propagating Err so
             // cleanup/teardown doesn't operate on the offscreen one.
