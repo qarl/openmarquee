@@ -205,6 +205,19 @@ struct Args {
     #[arg(long)]
     play_auto_mode_test: Option<String>,
 
+    /// v1-spec-delta #6 (slice b+) -- render a synthesized slide
+    /// with `background_pattern.pattern = KIND` and density 0.5.
+    /// One of: `dots` / `halftone` / `stripes` / `scanlines` /
+    /// `checker` / `grid` / `rings` / `rays` / `confetti` /
+    /// `bricks`. Held for `--hold-secs` (default 2 s). Smoke gate
+    /// validates the per-pattern shader compiles + draws on real
+    /// DRM scanout. Each pattern's smoke phase asserts no panic +
+    /// shader linked + bg drawn. Patterns whose shader hasn't
+    /// landed yet warn-and-fall to color_a clear (still passes
+    /// the no-panic gate; visual verification is per-slice).
+    #[arg(long)]
+    play_pattern_test: Option<String>,
+
     /// v1-spec-delta #4 (slice b/d) — render a synthesized slide
     /// with the layer's `outline` set. Validates that the
     /// FS_GLYPH_OUTLINE shader path links + draws on real DRM
@@ -363,6 +376,55 @@ fn build_auto_mode_test_slide(kind: &str) -> content::TextSlide {
 /// TextSlide with outline=true. Used by --play-outline-test to
 /// exercise the FS_GLYPH_OUTLINE shader path on real DRM scanout.
 #[cfg(target_os = "linux")]
+/// v1-spec-delta #6 (slice b+) -- synthesize a slide whose
+/// background is a single procedural pattern with the given
+/// kind name + density 0.5. Color_a / color_b chosen so any
+/// pattern shader produces a visible result on real hw (cyan +
+/// orange; high contrast in both luma and chroma channels).
+/// One text layer is added so the smoke can also assert text
+/// composites correctly over the pattern (the FYS text layer
+/// is the canonical user-facing content).
+fn build_pattern_test_slide(pattern_name: &str) -> content::TextSlide {
+    use uuid::Uuid;
+    let layer = content::TextLayer {
+        text: pattern_name.to_uppercase(),
+        name: String::new(),
+        font_family: None,
+        font_size_px: None,
+        font_size_pct: Some(40.0),
+        text_color: "#FFFFFF".to_string(),
+        text_align: "center".to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: "static".to_string(),
+        motion_intensity: 50,
+        motion_phase: 0.0,
+        motion_speed: 1.0,
+        auto_mode: None,
+        auto_format: None,
+        outline: true,
+        r#box: content::TextBox {
+            x: 0.05,
+            y: 0.40,
+            w: 0.90,
+            h: 0.20,
+        },
+    };
+    content::TextSlide {
+        id: Uuid::nil(),
+        name: format!("pattern-test-{pattern_name}"),
+        duration_ms: 2000,
+        background_color: "#222222".to_string(),
+        background_pattern: Some(content::BackgroundPattern {
+            pattern: pattern_name.to_string(),
+            color_a: "#00BFFF".to_string(),  // cyan
+            color_b: "#FF6B00".to_string(),  // orange
+            density: 0.5,
+        }),
+        text_layers: vec![layer],
+    }
+}
+
 fn build_outline_test_slide() -> content::TextSlide {
     use uuid::Uuid;
     let layer = content::TextLayer {
@@ -798,6 +860,30 @@ fn main() -> Result<()> {
                         args.transition_ms,
                         args.fps,
                     )?;
+                    return Ok(());
+                }
+                if let Some(pattern_name) = args.play_pattern_test.as_deref() {
+                    // v1-spec-delta #6 (slice b+): synthesize a
+                    // slide with the named procedural pattern at
+                    // density 0.5 and render via the standard
+                    // render_slide path. Smoke gate for the per-
+                    // pattern fragment shader on real DRM hw.
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for pattern smoke",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide = build_pattern_test_slide(pattern_name);
+                    let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
+                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
                     return Ok(());
                 }
                 if args.play_outline_test {

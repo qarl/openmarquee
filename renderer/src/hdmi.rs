@@ -40,14 +40,16 @@ use crate::content::{
     load_playlist, resolve_reel_items, solid_bg_hex, TextSlide,
 };
 use crate::hdmi_logic::{
-    box_to_ndc_quad, clamp_transition_ms, compute_motion_state, effective_font_size_px,
-    effective_hold_ms, format_auto_text, fourcc_for_argb_family, fs_for_transition_kind,
-    gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
-    parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, parse_pattern_kind,
-    pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel, should_rerasterize,
+    box_to_ndc_quad, checker_uniforms, clamp_transition_ms, compute_motion_state,
+    dots_uniforms, effective_font_size_px, effective_hold_ms, format_auto_text,
+    fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, hex_to_rgba,
+    hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px, parse_crtc_list_filter_bits,
+    parse_h_align, parse_motion_kind, parse_pattern_kind, pattern_kind_label,
+    pick_largest_mode_index, prev_idx_for_reel, should_rerasterize, stripes_uniforms,
     unix_to_calendar_utc, AlphaBitmap, FontCatalog, ModeSpec, MotionKind, MotionState,
     PatternKind, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE,
-    FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
+    FS_GRADIENT, FS_PATTERN_CHECKER, FS_PATTERN_DOTS, FS_PATTERN_STRIPES,
+    VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -888,27 +890,130 @@ fn draw_solid_clear(gl: &glow::Context, color: [f32; 4]) {
 }
 
 /// v1-spec-delta #6 (slice a, 2026-05-08): dispatch table for the
-/// 10 procedural patterns. Slice a only wires the dispatch shape;
-/// every PatternKind currently warns + falls back to a solid
-/// `color_a` clear. Subsequent slices (b)/(c)/(d) replace each
-/// arm with its actual fragment shader. The fallback is
-/// intentional -- it lets the schema accept all 10 names today
-/// (no playlist authoring blocked) while the renderer ships the
-/// shaders incrementally.
+/// 10 procedural patterns. Slice a wired the dispatch shape;
+/// slices (b)/(c)/(d) fill in fragment shaders. Until a pattern's
+/// shader lands, the dispatch warns + falls back to a solid
+/// color_a clear so the schema can accept all 10 names without
+/// blocking playlist authoring.
 fn draw_pattern(
     gl: &glow::Context,
-    _mode_w: u32,
-    _mode_h: u32,
+    mode_w: u32,
+    mode_h: u32,
     kind: PatternKind,
     color_a: [f32; 4],
-    _color_b: [f32; 4],
-    _density: f32,
+    color_b: [f32; 4],
+    density: f32,
 ) -> Result<()> {
-    eprintln!(
-        "warn: pattern={} shader not yet implemented; falling back to color_a clear",
-        pattern_kind_label(kind)
-    );
-    draw_solid_clear(gl, color_a);
+    match kind {
+        PatternKind::Stripes => {
+            let u = stripes_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_STRIPES, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_tile = gl.get_uniform_location(program, "u_tile");
+                    gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                },
+            )
+        }
+        PatternKind::Checker => {
+            let u = checker_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_CHECKER, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_tile = gl.get_uniform_location(program, "u_tile");
+                    gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                },
+            )
+        }
+        PatternKind::Dots => {
+            let u = dots_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_DOTS, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_tile = gl.get_uniform_location(program, "u_tile");
+                    let u_radius = gl.get_uniform_location(program, "u_radius");
+                    gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                    gl.uniform_1_f32(u_radius.as_ref(), u.radius);
+                },
+            )
+        }
+        // Patterns whose shaders haven't landed yet: warn-and-fall.
+        // Subsequent slices replace each arm with its draw helper.
+        PatternKind::Halftone
+        | PatternKind::Scanlines
+        | PatternKind::Grid
+        | PatternKind::Rings
+        | PatternKind::Rays
+        | PatternKind::Confetti
+        | PatternKind::Bricks => {
+            eprintln!(
+                "warn: pattern={} shader not yet implemented; falling back to color_a clear",
+                pattern_kind_label(kind)
+            );
+            draw_solid_clear(gl, color_a);
+            Ok(())
+        }
+    }
+}
+
+/// v1-spec-delta #6 (slice b, 2026-05-08): generic full-screen-
+/// quad pattern draw helper. Mirrors `draw_gradient_pattern`'s
+/// resource discipline (link program -> create VBO -> set
+/// uniforms -> draw -> tear down) but factors out the per-pattern
+/// uniform setup into a closure. Each pattern slice wires its
+/// shader + extra uniforms via this helper instead of duplicating
+/// the GL plumbing 10 times.
+///
+/// Standard uniforms (set unconditionally before the closure):
+///   u_viewport (vec2: w, h)
+///   u_color_a  (vec3 RGB)
+///   u_color_b  (vec3 RGB)
+/// Per-pattern uniforms (set by the closure):
+///   stripes:  u_tile
+///   checker:  u_tile
+///   dots:     u_tile, u_radius
+///   ... (slice c+)
+fn draw_full_screen_pattern<F>(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    fs_src: &str,
+    color_a: [f32; 4],
+    color_b: [f32; 4],
+    set_extra_uniforms: F,
+) -> Result<()>
+where
+    F: FnOnce(&glow::Context, glow::Program),
+{
+    use glow::HasContext;
+    unsafe {
+        let program = link_program(gl, VS_FULLSCREEN_QUAD, fs_src)?;
+        let (vbo, attrib) = match create_fullscreen_quad(gl, program) {
+            Ok(pair) => pair,
+            Err(e) => {
+                gl.delete_program(program);
+                return Err(e);
+            }
+        };
+        gl.use_program(Some(program));
+        let u_viewport = gl.get_uniform_location(program, "u_viewport");
+        let u_color_a = gl.get_uniform_location(program, "u_color_a");
+        let u_color_b = gl.get_uniform_location(program, "u_color_b");
+        gl.uniform_2_f32(u_viewport.as_ref(), mode_w as f32, mode_h as f32);
+        gl.uniform_3_f32(u_color_a.as_ref(), color_a[0], color_a[1], color_a[2]);
+        gl.uniform_3_f32(u_color_b.as_ref(), color_b[0], color_b[1], color_b[2]);
+        set_extra_uniforms(gl, program);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.enable_vertex_attrib_array(attrib);
+        gl.vertex_attrib_pointer_f32(attrib, 2, glow::FLOAT, false, 0, 0);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.disable_vertex_attrib_array(attrib);
+        gl.delete_buffer(vbo);
+        gl.delete_program(program);
+    }
     Ok(())
 }
 

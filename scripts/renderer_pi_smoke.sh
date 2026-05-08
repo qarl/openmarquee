@@ -757,6 +757,43 @@ grep -q 'rasterized text "OUTLINE TEST"' "$OUTLINE_LOG" || \
     { echo "FAIL: --play-outline-test didn't rasterize the test text"; cat "$OUTLINE_LOG"; exit 1; }
 echo "    --play-outline-test ok (FS_GLYPH_OUTLINE linked + drew on hw)"
 
+# v1-spec-delta #6 (slice b+) procedural pattern smoke. Renders a
+# synthesized slide for each pattern whose shader has landed and
+# asserts no panic + slide render complete + cyan/orange test
+# colors composited (color_a #00BFFF / color_b #FF6B00 hex).
+# Patterns whose shader hasn't landed warn-and-fall to color_a;
+# they're left out of this list until they ship. The list grows
+# slice-by-slice (b: stripes/checker/dots; c: ...; d: ...).
+PATTERN_KINDS_IMPL="stripes checker dots"
+for kind in $PATTERN_KINDS_IMPL; do
+    echo "==> Phase d-smoke -- --play-pattern-test $kind"
+    PT_LOG="$LOG_DIR/pattern-test-$kind.log"
+    PT_EXIT=0
+    ssh "$TARGET" "$BIN_PI --output hdmi --play-pattern-test $kind --hold-secs 2" \
+        > "$PT_LOG" 2>&1 || PT_EXIT=$?
+    if [ "$PT_EXIT" -ne 0 ]; then
+        echo "FAIL: --play-pattern-test $kind exit $PT_EXIT"
+        cat "$PT_LOG"
+        exit 1
+    fi
+    grep -qE 'panicked at|RUST_BACKTRACE' "$PT_LOG" && \
+        { echo "FAIL: panic in --play-pattern-test $kind"; cat "$PT_LOG"; exit 1; }
+    grep -q 'slide render complete' "$PT_LOG" || \
+        { echo "FAIL: --play-pattern-test $kind didn't reach slide render complete"; cat "$PT_LOG"; exit 1; }
+    # The dispatch must NOT have fallen back to the warn-clear
+    # path for an implemented shader. The unimplemented warn line
+    # has the form `warn: pattern=X shader not yet implemented`;
+    # if it shows up for a pattern in PATTERN_KINDS_IMPL, the
+    # dispatch arm regressed.
+    if grep -q "warn: pattern=$kind shader not yet implemented" "$PT_LOG"; then
+        echo "FAIL: --play-pattern-test $kind hit unimplemented-fallback warn (dispatch arm regressed?)"
+        cat "$PT_LOG"
+        exit 1
+    fi
+    KIND_UPPER=$(echo "$kind" | tr '[:lower:]' '[:upper:]')
+    echo "    --play-pattern-test $kind ok (FS_PATTERN_${KIND_UPPER} linked + drew on hw)"
+done
+
 # Phase 6 reel assertion: completion + slide count + transition
 # count + no panics. The reel logs "reel: resolved N items" once
 # and "reel: transition into item I/N" for each transition.

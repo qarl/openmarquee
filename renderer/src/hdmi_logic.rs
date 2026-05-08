@@ -823,6 +823,64 @@ void main() {
 }
 "#;
 
+/// v1-spec-delta #6 (slice b) -- diagonal 45° stripes. Each tile
+/// (perp-pixel-spacing) is split half color_a / half color_b
+/// along the (x+y)/sqrt(2) projection. Coordinate convention
+/// matches FS_GRADIENT: y is flipped from gl_FragCoord so density
+/// maps the same as the Python PIL reference.
+pub const FS_PATTERN_STRIPES: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_tile;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    float proj = (pos.x + pos.y) / 1.41421356;
+    float modv = mod(proj, u_tile);
+    float t = step(u_tile * 0.5, modv);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
+/// v1-spec-delta #6 (slice b) -- standard checker. Cells alternate
+/// color_a / color_b based on (floor(x/tile) + floor(y/tile)) %
+/// 2. y flipped to match Python's image-coord convention.
+pub const FS_PATTERN_CHECKER: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_tile;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    float gx = floor(pos.x / u_tile);
+    float gy = floor(pos.y / u_tile);
+    float t = mod(gx + gy, 2.0);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
+/// v1-spec-delta #6 (slice b) -- dot grid. Each `tile`-sized cell
+/// has a filled circle of `u_radius` pixels at its center. y
+/// flipped to match Python.
+pub const FS_PATTERN_DOTS: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_tile;
+uniform float u_radius;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    vec2 cell = mod(pos, u_tile) - vec2(u_tile * 0.5);
+    float d2 = dot(cell, cell);
+    float r2 = u_radius * u_radius;
+    float t = step(d2, r2);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
 /// v1-spec-delta #6 (slice a, 2026-05-08): typed enum of the 10
 /// procedural background patterns from Python's
 /// `auto_render._render_pattern_*`. `solid` and `gradient` aren't
@@ -867,6 +925,76 @@ pub fn parse_pattern_kind(s: &str) -> Option<PatternKind> {
         "bricks" => Some(PatternKind::Bricks),
         _ => None,
     }
+}
+
+/// CSS-side bg-system.js lerp: clamp t to [0, 1], map to [a, b].
+/// Mirrors Python's `_lerp` in auto_render.py exactly. Used by
+/// every pattern's tile-size formula (`round(lerp(big, small,
+/// density))`), so a centralized helper keeps the renderer +
+/// Python implementations bit-aligned.
+///
+/// Rounding parity ack: Rust's `f32::round` is half-away-from-
+/// zero; Python 3's `round()` is banker's (half-to-even). They
+/// diverge ONLY at densities where the lerped value lands on an
+/// exact `.5` boundary -- e.g., for stripes (lerp(80, 4)),
+/// density ≈ 0.4934 puts lerp at exactly 42.5: Python rounds to
+/// 42, Rust to 43. The off-by-one tile is visually undetectable
+/// (one perpendicular pixel of stripe), and FYS density-slider
+/// snap (typically 0.05 / 0.1 increments) only hits a half-
+/// integer ~once per range. Same divergence shape applies to
+/// every pattern's tile + radius formula. Pixel-exact diff vs
+/// the Python PIL reference will fail at these densities; visual
+/// QA will not.
+fn pattern_lerp(a: f32, b: f32, t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    a + (b - a) * t
+}
+
+/// v1-spec-delta #6 (slice b) -- stripes pattern uniforms. Tile
+/// size is the perpendicular-pixel spacing of the diagonal 45°
+/// bands. Each tile is split half-color_a / half-color_b along
+/// the (x+y)/sqrt(2) projection axis. Mirrors Python's
+/// `_render_pattern_stripes`: tile = round(lerp(80, 4, density));
+/// floored to 2 to keep the half-tile threshold sub-pixel-stable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StripesUniforms {
+    pub tile: f32,
+}
+
+pub fn stripes_uniforms(density: f32) -> StripesUniforms {
+    let tile = pattern_lerp(80.0, 4.0, density).round().max(2.0);
+    StripesUniforms { tile }
+}
+
+/// v1-spec-delta #6 (slice b) -- checker pattern uniforms. Tile
+/// is the cell size; cells alternate color_a / color_b in a
+/// classic checkerboard. Mirrors Python's
+/// `_render_pattern_checker`: tile = round(lerp(60, 4, density)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CheckerUniforms {
+    pub tile: f32,
+}
+
+pub fn checker_uniforms(density: f32) -> CheckerUniforms {
+    let tile = pattern_lerp(60.0, 4.0, density).round().max(2.0);
+    CheckerUniforms { tile }
+}
+
+/// v1-spec-delta #6 (slice b) -- dots pattern uniforms. Tile is
+/// the cell size; each cell has a filled circle of `radius`
+/// pixels at its center. Mirrors Python's `_render_pattern_dots`:
+/// tile = round(lerp(48, 4, density)); radius = max(2,
+/// round(tile * 0.22)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DotsUniforms {
+    pub tile: f32,
+    pub radius: f32,
+}
+
+pub fn dots_uniforms(density: f32) -> DotsUniforms {
+    let tile = pattern_lerp(48.0, 4.0, density).round().max(2.0);
+    let radius = (tile * 0.22).round().max(2.0);
+    DotsUniforms { tile, radius }
 }
 
 /// Stable label for log output / smoke parsing. Matches the
@@ -1817,6 +1945,83 @@ mod tests {
             assert_eq!(parse_pattern_kind(label), Some(k),
                 "round-trip failed for {label:?}");
         }
+    }
+
+    // v1-spec-delta #6 (slice b) -- per-pattern uniform helpers.
+    // Math mirrors Python auto_render.py (round(lerp(big, small,
+    // density))). Pinned values here MUST match the Python
+    // reference at the same density anchors.
+    #[test]
+    fn stripes_tile_size_matches_python_lerp() {
+        // density 0 -> tile 80 (max), density 1 -> tile 4 (min).
+        assert_eq!(stripes_uniforms(0.0).tile, 80.0);
+        assert_eq!(stripes_uniforms(1.0).tile, 4.0);
+        // density 0.5 -> round(80 + (4-80)*0.5) = round(42) = 42.
+        assert_eq!(stripes_uniforms(0.5).tile, 42.0);
+    }
+
+    #[test]
+    fn stripes_tile_size_floors_at_2() {
+        // Even at density slightly under 1 the formula stays >=2.
+        // Floor exists to keep the half-tile threshold meaningful.
+        let u = stripes_uniforms(0.99);
+        assert!(u.tile >= 2.0, "tile {} below floor", u.tile);
+    }
+
+    #[test]
+    fn stripes_density_clamps_out_of_range() {
+        // Out-of-spec densities (negative, >1) clamp to bounds.
+        assert_eq!(stripes_uniforms(-0.5).tile, 80.0);
+        assert_eq!(stripes_uniforms(2.0).tile, 4.0);
+    }
+
+    #[test]
+    fn checker_tile_size_matches_python_lerp() {
+        // density 0 -> 60, density 1 -> 4. round(lerp(60,4,0.5))
+        // = round(32) = 32.
+        assert_eq!(checker_uniforms(0.0).tile, 60.0);
+        assert_eq!(checker_uniforms(1.0).tile, 4.0);
+        assert_eq!(checker_uniforms(0.5).tile, 32.0);
+    }
+
+    #[test]
+    fn dots_uniforms_match_python_lerp_and_radius_formula() {
+        // tile = round(lerp(48, 4, density)); radius = max(2,
+        // round(tile * 0.22)).
+        // density 0: tile=48, radius=round(48*0.22)=round(10.56)=11.
+        let u0 = dots_uniforms(0.0);
+        assert_eq!(u0.tile, 48.0);
+        assert_eq!(u0.radius, 11.0);
+        // density 1: tile=4, radius=max(2, round(4*0.22)) =
+        // max(2, round(0.88)) = max(2, 1) = 2 (floor kicks in).
+        let u1 = dots_uniforms(1.0);
+        assert_eq!(u1.tile, 4.0);
+        assert_eq!(u1.radius, 2.0);
+        // density 0.5: tile=round(26)=26, radius=round(5.72)=6.
+        let u05 = dots_uniforms(0.5);
+        assert_eq!(u05.tile, 26.0);
+        assert_eq!(u05.radius, 6.0);
+    }
+
+    // Slice (b) shader sanity: the FS_PATTERN_* constants must
+    // start with the GLES2 #version preamble + carry the
+    // documented uniforms. Catches accidental shader-source
+    // regressions before they hit the GPU.
+    #[test]
+    fn pattern_shaders_have_gles2_preamble() {
+        for (name, src) in [
+            ("FS_PATTERN_STRIPES", FS_PATTERN_STRIPES),
+            ("FS_PATTERN_CHECKER", FS_PATTERN_CHECKER),
+            ("FS_PATTERN_DOTS", FS_PATTERN_DOTS),
+        ] {
+            assert!(src.starts_with("#version 100\n"), "{name} missing #version 100");
+            assert!(src.contains("precision mediump float"), "{name} missing precision");
+            assert!(src.contains("u_color_a"), "{name} missing u_color_a");
+            assert!(src.contains("u_color_b"), "{name} missing u_color_b");
+            assert!(src.contains("u_viewport"), "{name} missing u_viewport");
+            assert!(src.contains("u_tile"), "{name} missing u_tile");
+        }
+        assert!(FS_PATTERN_DOTS.contains("u_radius"), "dots shader missing u_radius");
     }
 
     #[test]
