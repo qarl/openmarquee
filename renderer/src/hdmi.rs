@@ -3725,7 +3725,17 @@ fn paint_slide(
         // unchanged = tex stays.
         for (i, (layer, _, font)) in text_layers.iter().enumerate() {
             let resolved_text = &resolved_texts[i];
-            let needs_raster = should_rerasterize(cache_ref[i].as_ref(), resolved_text);
+            // Compute size_px first so should_rerasterize can key
+            // on (text, size_px). Pre-fix the cache keyed only on
+            // text — a layout-changing edit (box.w / mode_w shrink)
+            // silently kept the stale bitmap + texture.
+            let size_px = effective_font_size_px(
+                layer.font_size_px,
+                layer.font_size_pct,
+                layer.r#box.w,
+                mode_w,
+            );
+            let needs_raster = should_rerasterize(cache_ref[i].as_ref(), resolved_text, size_px);
             if needs_raster {
                 if let Some(tc) = tex_cache.as_deref_mut() {
                     if i < tc.len() {
@@ -3734,12 +3744,6 @@ fn paint_slide(
                         }
                     }
                 }
-                let size_px = effective_font_size_px(
-                    layer.font_size_px,
-                    layer.font_size_pct,
-                    layer.r#box.w,
-                    mode_w,
-                );
                 let bm = layout_text_to_alpha(font.as_ref(), resolved_text, size_px)
                     .ok_or_else(|| {
                         anyhow!(
@@ -3752,6 +3756,7 @@ fn paint_slide(
                 );
                 cache_ref[i] = Some(CachedGlyph {
                     text: resolved_text.clone(),
+                    size_px,
                     bitmap: bm,
                 });
             }

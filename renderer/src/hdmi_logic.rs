@@ -137,21 +137,39 @@ pub type GlyphCache = Vec<Option<CachedGlyph>>;
 #[derive(Debug)]
 pub struct CachedGlyph {
     pub text: String,
+    /// qarl-direct perf-profile (2026-05-08): cache the size we
+    /// rasterized at, so a size change (box.w / mode_w shrink)
+    /// invalidates the cache. Pre-fix the cache keyed only on
+    /// text — a layout-changing edit silently kept the stale
+    /// bitmap. With the parallel TextureCache landing, the GL
+    /// texture would also stay stale; fixing both at the
+    /// CachedGlyph level invalidates them in lockstep via
+    /// paint_slide's existing rasterize-stage logic.
+    pub size_px: f32,
     pub bitmap: AlphaBitmap,
 }
 
 /// v1-spec-delta #3 (slice b cache, QA F2): the cache hit/miss
-/// decision. None entry -> miss. Some entry with matching text ->
-/// hit (skip rasterization). Some entry with differing text ->
-/// miss (re-rasterize).
+/// decision. None entry -> miss. Some entry with matching
+/// (text, size_px) -> hit (skip rasterization). Some entry
+/// with differing text OR size -> miss (re-rasterize).
 ///
 /// Pure function, host-testable. Extracted from paint_slide's
 /// inline match so the decision logic gets coverage in
 /// hdmi_logic.rs rather than living only inside the GL-bound
 /// render path.
-pub fn should_rerasterize(cache_entry: Option<&CachedGlyph>, resolved_text: &str) -> bool {
+///
+/// Size comparison uses an exact equality on the f32 because
+/// effective_font_size_px produces a deterministic value from
+/// (font_size_px, font_size_pct, box.w, mode_w) — bitwise
+/// identical inputs yield bitwise identical outputs.
+pub fn should_rerasterize(
+    cache_entry: Option<&CachedGlyph>,
+    resolved_text: &str,
+    size_px: f32,
+) -> bool {
     match cache_entry {
-        Some(cached) => cached.text != resolved_text,
+        Some(cached) => cached.text != resolved_text || cached.size_px != size_px,
         None => true,
     }
 }
@@ -4029,8 +4047,8 @@ mod tests {
     #[test]
     fn should_rerasterize_misses_on_none_entry() {
         // First-frame paint: cache slot empty -> miss, rasterize.
-        assert!(should_rerasterize(None, "hello"));
-        assert!(should_rerasterize(None, ""));
+        assert!(should_rerasterize(None, "hello", 100.0));
+        assert!(should_rerasterize(None, "", 100.0));
     }
 
     #[test]
@@ -4039,9 +4057,10 @@ mod tests {
         // change between frames, cache hit, skip fontdue.
         let cached = CachedGlyph {
             text: "hello".to_string(),
+            size_px: 100.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(!should_rerasterize(Some(&cached), "hello"));
+        assert!(!should_rerasterize(Some(&cached), "hello", 100.0));
     }
 
     #[test]
@@ -4050,9 +4069,10 @@ mod tests {
         // "14:35:09" to "14:35:10", cache miss, re-rasterize.
         let cached = CachedGlyph {
             text: "14:35:09".to_string(),
+            size_px: 100.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(should_rerasterize(Some(&cached), "14:35:10"));
+        assert!(should_rerasterize(Some(&cached), "14:35:10", 100.0));
     }
 
     #[test]
@@ -4063,9 +4083,10 @@ mod tests {
         // pure and shouldn't special-case it.)
         let cached = CachedGlyph {
             text: String::new(),
+            size_px: 100.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(!should_rerasterize(Some(&cached), ""));
+        assert!(!should_rerasterize(Some(&cached), "", 100.0));
     }
 
     #[test]
@@ -4075,9 +4096,10 @@ mod tests {
         // and the next frame has real content.
         let cached = CachedGlyph {
             text: String::new(),
+            size_px: 100.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(should_rerasterize(Some(&cached), "anything"));
+        assert!(should_rerasterize(Some(&cached), "anything", 100.0));
     }
 
     #[test]
@@ -4090,11 +4112,38 @@ mod tests {
         let cached = CachedGlyph {
             // "café" in NFC (U+00E9)
             text: "caf\u{00E9}".to_string(),
+            size_px: 100.0,
             bitmap: dummy_bitmap(),
         };
         // Same string in NFD: "cafe" + combining acute (U+0301).
         let nfd = "cafe\u{0301}";
-        assert!(should_rerasterize(Some(&cached), nfd));
+        assert!(should_rerasterize(Some(&cached), nfd, 100.0));
+    }
+
+    #[test]
+    fn should_rerasterize_misses_on_size_change() {
+        // qarl-direct perf-profile (2026-05-08): same text, smaller
+        // size_px (e.g. box.w shrunk by an editor edit). Pre-fix
+        // the cache hit silently — rendering the old large bitmap
+        // at the new small layout. Now correctly invalidates.
+        let cached = CachedGlyph {
+            text: "hello".to_string(),
+            size_px: 100.0,
+            bitmap: dummy_bitmap(),
+        };
+        assert!(should_rerasterize(Some(&cached), "hello", 80.0));
+        assert!(should_rerasterize(Some(&cached), "hello", 120.0));
+    }
+
+    #[test]
+    fn should_rerasterize_hits_on_exact_size_match() {
+        // Same text + same size_px -> hit. Bitmap is reusable.
+        let cached = CachedGlyph {
+            text: "hello".to_string(),
+            size_px: 100.0,
+            bitmap: dummy_bitmap(),
+        };
+        assert!(!should_rerasterize(Some(&cached), "hello", 100.0));
     }
 
     // -- auto-mode (v1-spec-delta #3) ---------------------------
