@@ -90,6 +90,17 @@ pub struct TextSlide {
     /// `background_color` until their phases land.
     #[serde(default)]
     pub background_pattern: Option<BackgroundPattern>,
+    /// v1-spec-delta #8 (slice b) -- per-spec, a TextSlide can
+    /// reference an ImageSlide to use as its background. When set,
+    /// the renderer loads `<content_root>/<id>/asset.png`, uploads
+    /// it as a fullscreen-blit texture, and composites text layers
+    /// on top. Mutex with `background_pattern` per the Python
+    /// validator (only one of the three bg sources is meaningful);
+    /// the renderer doesn't enforce mutex -- if both are set,
+    /// background_image_slide_id wins as the actual scanout source
+    /// and background_pattern is ignored with a warn.
+    #[serde(default)]
+    pub background_image_slide_id: Option<Uuid>,
     /// Ordered text layers; index 0 draws first, later entries
     /// composite over earlier ones. Phase 4.2a renders only the
     /// FIRST layer; multi-layer compositing lands in Phase 4.2c.
@@ -631,6 +642,7 @@ mod tests {
             name: String::new(),
             duration_ms: 5000,
             background_color: "#222222".to_string(),
+            background_image_slide_id: None,
             background_pattern: Some(BackgroundPattern {
                 pattern: pattern.to_string(),
                 color_a: color_a.to_string(),
@@ -794,6 +806,7 @@ mod tests {
             duration_ms: 5000,
             background_color: "#050608".to_string(),
             background_pattern: None,
+            background_image_slide_id: None,
             text_layers: vec![],
         };
         assert_eq!(solid_bg_hex(&slide), "#050608");

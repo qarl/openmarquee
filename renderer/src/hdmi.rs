@@ -32,7 +32,7 @@ use drm::control::{
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use uuid::Uuid;
 
@@ -894,6 +894,79 @@ fn draw_solid_clear(gl: &glow::Context, color: [f32; 4]) {
     }
 }
 
+/// v1-spec-delta #8 (slice b) -- draw an ImageSlide-referenced PNG
+/// as the slide background. Loads the PNG via load_png_rgba,
+/// uploads as an RGBA8 texture, and runs FS_BLIT to fill the
+/// viewport. On any failure (missing file, corrupt PNG, GL error),
+/// falls back to a solid clear with `solid_fallback` so the slide
+/// still renders something rather than panicking. The fallback
+/// path emits a `warn:` line tagged with the asset path so the
+/// failure is visible in logs.
+///
+/// Texture is allocated, used, and freed within this function;
+/// nothing leaks if a step fails. The caller has already bound
+/// the target framebuffer (default fb or scene_fbo for the
+/// overlay route).
+fn draw_image_bg(
+    gl: &glow::Context,
+    asset_path: &Path,
+    solid_fallback: [f32; 4],
+) {
+    use glow::HasContext;
+    let (rgba, w, h) = match load_png_rgba(asset_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "warn: image-bg load failed for {}: {e:#}; falling back to solid",
+                asset_path.display()
+            );
+            draw_solid_clear(gl, solid_fallback);
+            return;
+        }
+    };
+    unsafe {
+        let tex = match gl.create_texture() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warn: image-bg glGenTextures failed for {}: {e}; falling back to solid",
+                    asset_path.display()
+                );
+                draw_solid_clear(gl, solid_fallback);
+                return;
+            }
+        };
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA as i32,
+            w as i32,
+            h as i32,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            Some(&rgba),
+        );
+        let blit_result = run_blit_pass(gl, tex);
+        gl.delete_texture(tex);
+        if let Err(e) = blit_result {
+            eprintln!(
+                "warn: image-bg blit failed for {}: {e:#}; result may be partial",
+                asset_path.display()
+            );
+        }
+    }
+}
+
 /// v1-spec-delta #6 (slice a, 2026-05-08): dispatch table for the
 /// 10 procedural patterns. Slice a wired the dispatch shape;
 /// slices (b)/(c)/(d) fill in fragment shaders. Until a pattern's
@@ -1371,10 +1444,57 @@ enum BgKind {
         color_b: [f32; 4],
         density: f32,
     },
+    /// v1-spec-delta #8 (slice b): TextSlide bg via a referenced
+    /// ImageSlide. Resolved at slide-entry time from
+    /// background_image_slide_id + content_root. paint_slide's
+    /// BgKind::Image arm loads the PNG, uploads it as a fullscreen-
+    /// blit texture, and runs FS_BLIT before the text-layer pass.
+    /// `solid_fallback` is the slide's `background_color` -- if
+    /// the PNG fails to load, paint_slide falls back to a solid
+    /// clear so the slide still renders something.
+    Image {
+        asset_path: PathBuf,
+        solid_fallback: [f32; 4],
+    },
     Solid([f32; 4]),
 }
 
-fn resolve_slide_bg(slide: &TextSlide) -> Result<(BgKind, &'static str)> {
+fn resolve_slide_bg(
+    slide: &TextSlide,
+    content_root: Option<&Path>,
+) -> Result<(BgKind, &'static str)> {
+    // v1-spec-delta #8 (slice b): image bg takes precedence over
+    // background_pattern + background_color when the schema
+    // references an ImageSlide AND the renderer was given a
+    // content_root to resolve it. If image_slide_id is set but
+    // content_root is None (one-shot CLI without --content-root),
+    // warn-and-fall to the existing pattern/solid path. If
+    // image_slide_id is set + content_root is Some, return
+    // BgKind::Image with the resolved asset path; paint_slide
+    // does the actual load + upload at draw time.
+    if let Some(image_id) = slide.background_image_slide_id {
+        match content_root {
+            Some(root) => {
+                let asset_path = crate::content::image_slide_asset_path(root, image_id);
+                let hex = solid_bg_hex(slide).to_string();
+                let solid_fallback = hex_to_rgba(&hex)
+                    .ok_or_else(|| anyhow!("invalid hex color {hex:?} for slide {}", slide.id))?;
+                if slide.background_pattern.is_some() {
+                    eprintln!(
+                        "warn: slide {} has both background_image_slide_id and background_pattern -- image wins",
+                        slide.id
+                    );
+                }
+                return Ok((BgKind::Image { asset_path, solid_fallback }, "image"));
+            }
+            None => {
+                eprintln!(
+                    "warn: slide {} has background_image_slide_id but no content_root provided; falling back to background_color",
+                    slide.id
+                );
+            }
+        }
+    }
     if let Some(p) = &slide.background_pattern {
         if p.pattern == "gradient" {
             let color_a = hex_to_rgba(&p.color_a)
@@ -1442,10 +1562,11 @@ pub fn render_slide(
     card: &Card,
     slide: &TextSlide,
     fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
     hold_ms: u64,
 ) -> Result<()> {
     with_egl_session(card, |session| {
-        render_slide_in_session(session, card, slide, fonts, hold_ms)
+        render_slide_in_session(session, card, slide, fonts, content_root, hold_ms)
     })
 }
 
@@ -1587,9 +1708,11 @@ fn render_slide_in_session(
     card: &Card,
     slide: &TextSlide,
     fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
     hold_ms: u64,
 ) -> Result<()> {
-    let (bg_kind, pattern_label, text_layers) = resolve_slide_layers(slide, fonts)?;
+    let (bg_kind, pattern_label, text_layers) =
+        resolve_slide_layers(slide, fonts, content_root)?;
 
     let bg_log = match &bg_kind {
         BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
@@ -1597,6 +1720,9 @@ fn render_slide_in_session(
             "pattern={} density={density:.3}",
             pattern_kind_label(*kind)
         ),
+        BgKind::Image { asset_path, .. } => {
+            format!("pattern=image asset={}", asset_path.display())
+        }
         BgKind::Solid(c) => format!(
             "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
             c[0], c[1], c[2]
@@ -1814,12 +1940,13 @@ unsafe fn make_slide_fbo(
 fn resolve_slide_layers<'a>(
     slide: &'a TextSlide,
     fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
 ) -> Result<(
     BgKind,
     &'static str,
     Vec<(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)>,
 )> {
-    let (bg_kind, pattern_label) = resolve_slide_bg(slide)?;
+    let (bg_kind, pattern_label) = resolve_slide_bg(slide, content_root)?;
     let text_layers: Vec<(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)> =
         if let Some(catalog) = fonts {
             slide
@@ -1879,12 +2006,13 @@ pub fn render_fade_composite(
     slide_a: &TextSlide,
     slide_b: &TextSlide,
     fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
     t: f32,
     hold_ms: u64,
 ) -> Result<()> {
     let t = t.clamp(0.0, 1.0);
-    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts)?;
-    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts)?;
+    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
+    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
 
     eprintln!(
         "rendering fade composite slide_a={} slide_b={} t={:.3} for {}ms",
@@ -2037,13 +2165,14 @@ pub fn render_transition_animated(
     slide_a: &TextSlide,
     slide_b: &TextSlide,
     fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
     kind: &str,
     transition_ms: u32,
     fps: u32,
 ) -> Result<u32> {
     with_egl_session(card, |session| {
         render_transition_animated_in_session(
-            session, card, slide_a, slide_b, fonts, kind, transition_ms, fps,
+            session, card, slide_a, slide_b, fonts, content_root, kind, transition_ms, fps,
         )
     })
 }
@@ -2067,6 +2196,7 @@ fn render_transition_animated_in_session(
     slide_a: &TextSlide,
     slide_b: &TextSlide,
     fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
     kind: &str,
     transition_ms: u32,
     fps: u32,
@@ -2088,8 +2218,8 @@ fn render_transition_animated_in_session(
             FS_CUT
         }
     };
-    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts)?;
-    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts)?;
+    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
+    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
 
     eprintln!(
         "rendering animated transition kind={kind:?} slide_a={} slide_b={} \
@@ -2447,15 +2577,18 @@ fn paint_slide(
 ) -> Result<()> {
     use glow::HasContext;
     unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
-    match *bg_kind {
+    match bg_kind {
         BgKind::Gradient { color_a, color_b, density } => {
-            draw_gradient_pattern(gl, mode_w, mode_h, color_a, color_b, density)?;
+            draw_gradient_pattern(gl, mode_w, mode_h, *color_a, *color_b, *density)?;
         }
         BgKind::Pattern { kind, color_a, color_b, density } => {
-            draw_pattern(gl, mode_w, mode_h, kind, color_a, color_b, density)?;
+            draw_pattern(gl, mode_w, mode_h, *kind, *color_a, *color_b, *density)?;
+        }
+        BgKind::Image { asset_path, solid_fallback } => {
+            draw_image_bg(gl, asset_path, *solid_fallback);
         }
         BgKind::Solid(color) => {
-            draw_solid_clear(gl, color);
+            draw_solid_clear(gl, *color);
         }
     }
     // BLEND toggle once around the layer loop (Phase 4.2c
@@ -2699,15 +2832,18 @@ fn paint_layers_via_overlay_route(
         // Render bg into the initial scene FBO.
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(current_scene_fbo));
         gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-        match *bg_kind {
+        match bg_kind {
             BgKind::Gradient { color_a, color_b, density } => {
-                draw_gradient_pattern(gl, mode_w, mode_h, color_a, color_b, density)?;
+                draw_gradient_pattern(gl, mode_w, mode_h, *color_a, *color_b, *density)?;
             }
             BgKind::Pattern { kind, color_a, color_b, density } => {
-                draw_pattern(gl, mode_w, mode_h, kind, color_a, color_b, density)?;
+                draw_pattern(gl, mode_w, mode_h, *kind, *color_a, *color_b, *density)?;
+            }
+            BgKind::Image { asset_path, solid_fallback } => {
+                draw_image_bg(gl, asset_path, *solid_fallback);
             }
             BgKind::Solid(color) => {
-                draw_solid_clear(gl, color);
+                draw_solid_clear(gl, *color);
             }
         }
 
@@ -3006,9 +3142,11 @@ pub fn render_slide_via_fbo(
     card: &Card,
     slide: &TextSlide,
     fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
     hold_ms: u64,
 ) -> Result<()> {
-    let (bg_kind, pattern_label, text_layers) = resolve_slide_layers(slide, fonts)?;
+    let (bg_kind, pattern_label, text_layers) =
+        resolve_slide_layers(slide, fonts, content_root)?;
 
     let bg_log = match &bg_kind {
         BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
@@ -3016,6 +3154,9 @@ pub fn render_slide_via_fbo(
             "pattern={} density={density:.3}",
             pattern_kind_label(*kind)
         ),
+        BgKind::Image { asset_path, .. } => {
+            format!("pattern=image asset={}", asset_path.display())
+        }
         BgKind::Solid(c) => format!(
             "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
             c[0], c[1], c[2]
@@ -3348,6 +3489,7 @@ pub fn render_playlist_reel(
                                     prev_slide,
                                     slide,
                                     fonts,
+                                    Some(content_root),
                                     kind,
                                     transition_ms,
                                     fps,
@@ -3391,7 +3533,9 @@ pub fn render_playlist_reel(
                 );
                 let render_result = match item {
                     ContentItem::Text(slide) => {
-                        render_slide_in_session(session, card, slide, fonts, hold_ms)
+                        render_slide_in_session(
+                            session, card, slide, fonts, Some(content_root), hold_ms,
+                        )
                     }
                     ContentItem::Image(slide) => {
                         let asset = image_slide_asset_path(content_root, slide.id);

@@ -339,6 +339,7 @@ fn build_motion_test_slide(kind: &str) -> content::TextSlide {
         duration_ms: 2000,
         background_color: "#1A1A1A".to_string(),
         background_pattern: None,
+        background_image_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -389,6 +390,7 @@ fn build_auto_mode_test_slide(kind: &str) -> content::TextSlide {
         duration_ms: 5000,
         background_color: "#1A1A1A".to_string(),
         background_pattern: None,
+        background_image_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -443,6 +445,7 @@ fn build_pattern_test_slide(pattern_name: &str) -> content::TextSlide {
             color_b: "#FF6B00".to_string(),  // orange
             density: 0.5,
         }),
+        background_image_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -489,6 +492,7 @@ fn build_blend_test_slide(blend_name: &str) -> content::TextSlide {
         duration_ms: 2000,
         background_color: "#FF6B00".to_string(),  // orange
         background_pattern: None,
+        background_image_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -530,6 +534,7 @@ fn build_outline_test_slide() -> content::TextSlide {
         duration_ms: 2000,
         background_color: "#666666".to_string(),
         background_pattern: None,
+        background_image_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -807,10 +812,10 @@ fn main() -> Result<()> {
                     if via_fbo {
                         // v1-spec-delta #1: render_slide* take ms.
                         let hold_ms = args.hold_secs.unwrap_or(5).saturating_mul(1000);
-                        hdmi::render_slide_via_fbo(&card, &slide, catalog_opt, hold_ms)
+                        hdmi::render_slide_via_fbo(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)
                     } else {
                         let hold_ms = args.hold_secs.unwrap_or(5).saturating_mul(1000);
-                        hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)
+                        hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)
                     }
                 };
 
@@ -890,7 +895,7 @@ fn main() -> Result<()> {
                     };
                     let slide = build_motion_test_slide(kind);
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
-                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)?;
                     return Ok(());
                 }
                 if let Some(spec) = args.play_motion_transition.as_deref() {
@@ -925,6 +930,7 @@ fn main() -> Result<()> {
                         &slide_a,
                         &slide_b,
                         catalog_opt,
+                        args.content_root.as_deref(),
                         &args.transition,
                         args.transition_ms,
                         args.fps,
@@ -952,7 +958,7 @@ fn main() -> Result<()> {
                     };
                     let slide = build_pattern_test_slide(pattern_name);
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
-                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)?;
                     return Ok(());
                 }
                 if let Some(asset_path) = args.play_image_slide.as_deref() {
@@ -977,7 +983,7 @@ fn main() -> Result<()> {
                     };
                     let slide = build_blend_test_slide(blend_name);
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
-                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)?;
                     return Ok(());
                 }
                 if args.play_outline_test {
@@ -1000,7 +1006,7 @@ fn main() -> Result<()> {
                     };
                     let slide = build_outline_test_slide();
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
-                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)?;
                     return Ok(());
                 }
                 if let Some(kind) = args.play_auto_mode_test.as_deref() {
@@ -1023,7 +1029,7 @@ fn main() -> Result<()> {
                     };
                     let slide = build_auto_mode_test_slide(kind);
                     let hold_ms = args.hold_secs.unwrap_or(5).saturating_mul(1000);
-                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)?;
                     return Ok(());
                 }
                 if let (Some(from_id), Some(to_id)) = (args.fade_from, args.fade_to) {
@@ -1062,6 +1068,7 @@ fn main() -> Result<()> {
                             &slide_a,
                             &slide_b,
                             catalog_opt,
+                            args.content_root.as_deref(),
                             &args.transition,
                             args.transition_ms,
                             args.fps,
@@ -1073,6 +1080,7 @@ fn main() -> Result<()> {
                             &slide_a,
                             &slide_b,
                             catalog_opt,
+                            args.content_root.as_deref(),
                             args.fade_t,
                             args.hold_secs.unwrap_or(5).saturating_mul(1000),
                         )?;
