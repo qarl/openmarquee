@@ -823,6 +823,70 @@ void main() {
 }
 "#;
 
+/// v1-spec-delta #6 (slice a, 2026-05-08): typed enum of the 10
+/// procedural background patterns from Python's
+/// `auto_render._render_pattern_*`. `solid` and `gradient` aren't
+/// in this enum -- they're separate `BgKind` variants because the
+/// gradient already has a special uniform shape (proj_min/span)
+/// and solid has zero shaders. The 10 patterns here all share
+/// the (color_a, color_b, density) signature, so they fit one
+/// `BgKind::Pattern` variant + one fragment-shader-per-kind
+/// dispatch table.
+///
+/// Variant order matches the Python `BackgroundPattern.pattern`
+/// Literal order so smoke + spec readers can cross-reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternKind {
+    Dots,
+    Halftone,
+    Stripes,
+    Scanlines,
+    Checker,
+    Grid,
+    Rings,
+    Rays,
+    Confetti,
+    Bricks,
+}
+
+/// Parse the Python `BackgroundPattern.pattern` string into a
+/// typed `PatternKind`. Returns `None` for `"solid"` / `"gradient"`
+/// (handled by their dedicated BgKind variants) and for any
+/// unknown name (resolve dispatch will warn-and-fall-back to solid).
+pub fn parse_pattern_kind(s: &str) -> Option<PatternKind> {
+    match s {
+        "dots" => Some(PatternKind::Dots),
+        "halftone" => Some(PatternKind::Halftone),
+        "stripes" => Some(PatternKind::Stripes),
+        "scanlines" => Some(PatternKind::Scanlines),
+        "checker" => Some(PatternKind::Checker),
+        "grid" => Some(PatternKind::Grid),
+        "rings" => Some(PatternKind::Rings),
+        "rays" => Some(PatternKind::Rays),
+        "confetti" => Some(PatternKind::Confetti),
+        "bricks" => Some(PatternKind::Bricks),
+        _ => None,
+    }
+}
+
+/// Stable label for log output / smoke parsing. Matches the
+/// Python pattern name (lowercase, no spaces) so a single grep
+/// covers both renderer-side log lines and Python-baked PNGs.
+pub fn pattern_kind_label(k: PatternKind) -> &'static str {
+    match k {
+        PatternKind::Dots => "dots",
+        PatternKind::Halftone => "halftone",
+        PatternKind::Stripes => "stripes",
+        PatternKind::Scanlines => "scanlines",
+        PatternKind::Checker => "checker",
+        PatternKind::Grid => "grid",
+        PatternKind::Rings => "rings",
+        PatternKind::Rays => "rays",
+        PatternKind::Confetti => "confetti",
+        PatternKind::Bricks => "bricks",
+    }
+}
+
 /// A minimal, drm-independent representation of a connector mode.
 /// `width`/`height` are in pixels, `vrefresh` in Hz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1707,6 +1771,52 @@ mod tests {
     #[test]
     fn pick_largest_returns_none_for_empty() {
         assert_eq!(pick_largest_mode_index(&[]), None);
+    }
+
+    // v1-spec-delta #6 (slice a) -- pattern dispatch parsing.
+    #[test]
+    fn parse_pattern_kind_handles_all_ten_python_names() {
+        assert_eq!(parse_pattern_kind("dots"), Some(PatternKind::Dots));
+        assert_eq!(parse_pattern_kind("halftone"), Some(PatternKind::Halftone));
+        assert_eq!(parse_pattern_kind("stripes"), Some(PatternKind::Stripes));
+        assert_eq!(parse_pattern_kind("scanlines"), Some(PatternKind::Scanlines));
+        assert_eq!(parse_pattern_kind("checker"), Some(PatternKind::Checker));
+        assert_eq!(parse_pattern_kind("grid"), Some(PatternKind::Grid));
+        assert_eq!(parse_pattern_kind("rings"), Some(PatternKind::Rings));
+        assert_eq!(parse_pattern_kind("rays"), Some(PatternKind::Rays));
+        assert_eq!(parse_pattern_kind("confetti"), Some(PatternKind::Confetti));
+        assert_eq!(parse_pattern_kind("bricks"), Some(PatternKind::Bricks));
+    }
+
+    #[test]
+    fn parse_pattern_kind_returns_none_for_solid_and_gradient() {
+        // These have dedicated BgKind variants with different uniform
+        // shapes (gradient has proj_min/span, solid has no shader);
+        // they're NOT in the PatternKind enum.
+        assert_eq!(parse_pattern_kind("solid"), None);
+        assert_eq!(parse_pattern_kind("gradient"), None);
+    }
+
+    #[test]
+    fn parse_pattern_kind_returns_none_for_unknown() {
+        assert_eq!(parse_pattern_kind(""), None);
+        assert_eq!(parse_pattern_kind("STRIPES"), None);  // case-sensitive
+        assert_eq!(parse_pattern_kind("stripe"), None);   // singular vs plural
+        assert_eq!(parse_pattern_kind("garbage"), None);
+    }
+
+    #[test]
+    fn pattern_kind_label_round_trips_through_parse() {
+        for k in [
+            PatternKind::Dots, PatternKind::Halftone, PatternKind::Stripes,
+            PatternKind::Scanlines, PatternKind::Checker, PatternKind::Grid,
+            PatternKind::Rings, PatternKind::Rays, PatternKind::Confetti,
+            PatternKind::Bricks,
+        ] {
+            let label = pattern_kind_label(k);
+            assert_eq!(parse_pattern_kind(label), Some(k),
+                "round-trip failed for {label:?}");
+        }
     }
 
     #[test]

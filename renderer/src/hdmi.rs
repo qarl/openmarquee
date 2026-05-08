@@ -43,10 +43,10 @@ use crate::hdmi_logic::{
     box_to_ndc_quad, clamp_transition_ms, compute_motion_state, effective_font_size_px,
     effective_hold_ms, format_auto_text, fourcc_for_argb_family, fs_for_transition_kind,
     gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
-    parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, pick_largest_mode_index,
-    prev_idx_for_reel, should_rerasterize, unix_to_calendar_utc, AlphaBitmap, FontCatalog,
-    ModeSpec, MotionKind, MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
-    FS_GLYPH_OUTLINE,
+    parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, parse_pattern_kind,
+    pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel, should_rerasterize,
+    unix_to_calendar_utc, AlphaBitmap, FontCatalog, ModeSpec, MotionKind, MotionState,
+    PatternKind, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE,
     FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -887,6 +887,31 @@ fn draw_solid_clear(gl: &glow::Context, color: [f32; 4]) {
     }
 }
 
+/// v1-spec-delta #6 (slice a, 2026-05-08): dispatch table for the
+/// 10 procedural patterns. Slice a only wires the dispatch shape;
+/// every PatternKind currently warns + falls back to a solid
+/// `color_a` clear. Subsequent slices (b)/(c)/(d) replace each
+/// arm with its actual fragment shader. The fallback is
+/// intentional -- it lets the schema accept all 10 names today
+/// (no playlist authoring blocked) while the renderer ships the
+/// shaders incrementally.
+fn draw_pattern(
+    gl: &glow::Context,
+    _mode_w: u32,
+    _mode_h: u32,
+    kind: PatternKind,
+    color_a: [f32; 4],
+    _color_b: [f32; 4],
+    _density: f32,
+) -> Result<()> {
+    eprintln!(
+        "warn: pattern={} shader not yet implemented; falling back to color_a clear",
+        pattern_kind_label(kind)
+    );
+    draw_solid_clear(gl, color_a);
+    Ok(())
+}
+
 /// Phase 4.2 — rasterize and draw a single text layer's text on top
 /// of whatever's already in the framebuffer. Premultiplied-alpha
 /// blend so the glyph composites cleanly over the bg pass.
@@ -1145,6 +1170,20 @@ enum BgKind {
         color_b: [f32; 4],
         density: f32,
     },
+    /// v1-spec-delta #6 (slice a): the 10 procedural patterns
+    /// share a (color_a, color_b, density) signature. Each
+    /// pattern dispatches to its own fragment shader from
+    /// paint_slide's BgKind::Pattern arm. Slice a only adds the
+    /// dispatch shape; subsequent slices add per-pattern shaders.
+    /// Until a pattern's shader lands, the dispatch falls back
+    /// to a solid `color_a` fill + a `warn:` line tagged with
+    /// the pattern name.
+    Pattern {
+        kind: PatternKind,
+        color_a: [f32; 4],
+        color_b: [f32; 4],
+        density: f32,
+    },
     Solid([f32; 4]),
 }
 
@@ -1160,6 +1199,22 @@ fn resolve_slide_bg(slide: &TextSlide) -> Result<(BgKind, &'static str)> {
                 "gradient",
             ));
         }
+        // v1-spec-delta #6 (slice a): typed dispatch for the 10
+        // procedural patterns. Even when the per-kind shader
+        // hasn't landed yet, the typed dispatch unifies the
+        // resolve path; paint_slide's BgKind::Pattern arm
+        // handles the unimplemented-shader fallback to solid
+        // color_a.
+        if let Some(kind) = parse_pattern_kind(&p.pattern) {
+            let color_a = hex_to_rgba(&p.color_a)
+                .ok_or_else(|| anyhow!("invalid color_a {:?} for slide {}", p.color_a, slide.id))?;
+            let color_b = hex_to_rgba(&p.color_b)
+                .ok_or_else(|| anyhow!("invalid color_b {:?} for slide {}", p.color_b, slide.id))?;
+            return Ok((
+                BgKind::Pattern { kind, color_a, color_b, density: p.density },
+                pattern_kind_label(kind),
+            ));
+        }
     }
     let pattern_label = slide
         .background_pattern
@@ -1168,7 +1223,7 @@ fn resolve_slide_bg(slide: &TextSlide) -> Result<(BgKind, &'static str)> {
         .unwrap_or("none");
     if pattern_label != "none" && pattern_label != "solid" {
         eprintln!(
-            "warn: pattern {pattern_label:?} not yet implemented; falling back to background_color"
+            "warn: pattern {pattern_label:?} unrecognized; falling back to background_color"
         );
     }
     let hex = solid_bg_hex(slide).to_string();
@@ -1225,6 +1280,10 @@ fn render_slide_in_session(
 
     let bg_log = match &bg_kind {
         BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
+        BgKind::Pattern { kind, density, .. } => format!(
+            "pattern={} density={density:.3}",
+            pattern_kind_label(*kind)
+        ),
         BgKind::Solid(c) => format!(
             "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
             c[0], c[1], c[2]
@@ -2079,6 +2138,9 @@ fn paint_slide(
         BgKind::Gradient { color_a, color_b, density } => {
             draw_gradient_pattern(gl, mode_w, mode_h, color_a, color_b, density)?;
         }
+        BgKind::Pattern { kind, color_a, color_b, density } => {
+            draw_pattern(gl, mode_w, mode_h, kind, color_a, color_b, density)?;
+        }
         BgKind::Solid(color) => {
             draw_solid_clear(gl, color);
         }
@@ -2226,6 +2288,10 @@ pub fn render_slide_via_fbo(
 
     let bg_log = match &bg_kind {
         BgKind::Gradient { density, .. } => format!("pattern=gradient density={density:.3}"),
+        BgKind::Pattern { kind, density, .. } => format!(
+            "pattern={} density={density:.3}",
+            pattern_kind_label(*kind)
+        ),
         BgKind::Solid(c) => format!(
             "pattern={pattern_label} bg=[{:.3},{:.3},{:.3}]",
             c[0], c[1], c[2]
