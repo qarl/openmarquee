@@ -450,6 +450,7 @@ where
     // within the process; clearing here keeps them in sync with
     // the GL context lifecycle.
     clear_glyph_program_cache(&gl);
+    clear_transition_program_cache(&gl);
     // v1-spec-delta #9 (slice d): drain pending flip + free
     // session-level scanout BO/FB rotation. Mirrors the
     // animated_slide end-of-call cleanup but at session
@@ -3222,22 +3223,28 @@ fn render_transition_animated_in_session(
             }
         };
 
-        // -- Compile transition program + build VBO once.
-        let program = unsafe {
-            match link_program(gl, VS_TEXTURED_QUAD, fs) {
-                Ok(p) => p,
-                Err(e) => {
+        // -- Get/compile transition program (cached) + build VBO.
+        // qarl-direct perf-profile (2026-05-08): cached_transition_
+        // program shares the FS_<KIND> compile cost across all
+        // calls in the session. Cleanup at session teardown via
+        // clear_transition_program_cache.
+        let program = match cached_transition_program(gl, fs) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
                     gl.delete_framebuffer(fbo_a);
                     gl.delete_texture(tex_a);
                     gl.delete_framebuffer(fbo_b);
                     gl.delete_texture(tex_b);
-                    return Err(e);
                 }
+                return Err(e);
             }
         };
         let cleanup_static = |gl: &glow::Context, vbo: Option<glow::NativeBuffer>| unsafe {
             if let Some(b) = vbo { gl.delete_buffer(b); }
-            gl.delete_program(program);
+            // Don't delete program -- it's owned by the thread-
+            // local TRANSITION_PROGRAMS cache. clear_transition_
+            // program_cache handles it at session teardown.
             gl.delete_framebuffer(fbo_a);
             gl.delete_texture(tex_a);
             gl.delete_framebuffer(fbo_b);
@@ -3630,6 +3637,42 @@ fn clear_glyph_program_cache(gl: &glow::Context) {
     });
     FS_GLYPH_OUTLINE_PROGRAM.with(|c| {
         if let Some(p) = c.replace(None) {
+            unsafe { gl.delete_program(p); }
+        }
+    });
+}
+
+/// qarl-direct perf-profile (2026-05-08): transition shader cache.
+/// Each render_transition_animated_in_session invocation was
+/// link_program-ing its FS source per call (~5 ms on warm cache,
+/// ~165 ms on the very first compile). With 18 transitions/pass
+/// in the FYS reel that's 90 ms+ of repeat compile per pass.
+/// Caching by &'static str pointer (the FS source is a constant)
+/// lets all 16 transition kinds share their compile cost across
+/// the session.
+std::thread_local! {
+    static TRANSITION_PROGRAMS: std::cell::RefCell<std::collections::HashMap<*const u8, glow::NativeProgram>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn cached_transition_program(gl: &glow::Context, fs: &'static str) -> Result<glow::NativeProgram> {
+    TRANSITION_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        let key = fs.as_ptr();
+        if let Some(&p) = cache.get(&key) {
+            return Ok(p);
+        }
+        let p = link_program(gl, VS_TEXTURED_QUAD, fs)?;
+        cache.insert(key, p);
+        Ok(p)
+    })
+}
+
+fn clear_transition_program_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    TRANSITION_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        for (_, p) in cache.drain() {
             unsafe { gl.delete_program(p); }
         }
     });
