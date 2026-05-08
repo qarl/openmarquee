@@ -4164,6 +4164,7 @@ pub fn render_playlist_reel(
     playlist_path: &Path,
     content_root: &Path,
     fonts: Option<&FontCatalog>,
+    settings_path: Option<&Path>,
     fps: u32,
     loop_forever: bool,
     hold_secs_override: Option<u64>,
@@ -4205,6 +4206,22 @@ pub fn render_playlist_reel(
     // (BO, FB) rotation across its own frames and releases all of
     // it on exit -- no BO/FB state leaks between calls.
     with_egl_session(card, |session| {
+        // v1-spec-delta #10 (slice c-2-b): SettingsWatcher in
+        // standalone reel. When --settings is provided, poll
+        // between slides and apply changes to the session;
+        // matches the IPC sidecar pattern but with per-slide
+        // cadence (vs. per-Advance) since the reel driver
+        // sleeps inside slide hold rather than yielding to a
+        // tick loop. ≤2s apply per spec §8.5 holds at typical
+        // FYS slide durations (1-5s).
+        let mut settings_watcher = settings_path.map(|p|
+            crate::content::SettingsWatcher::new(p.to_path_buf())
+        );
+        if let Some(w) = settings_watcher.as_mut() {
+            if let Some(initial) = w.check() {
+                session.apply_settings(initial);
+            }
+        }
         let mut pass = 0_u32;
         loop {
             let pass_start = std::time::Instant::now();
@@ -4223,6 +4240,20 @@ pub fn render_playlist_reel(
             let mut transitions_run = 0_u32;
             let mut slides_held = 0_u32;
             for (i, (item, _, _)) in resolved.iter().enumerate() {
+                // v1-spec-delta #10 (slice c-2-b): poll settings
+                // between slides. ≤2s apply at typical 1-5s
+                // slide durations. Best-effort: parse failures
+                // absorbed silently (last-known kept).
+                if let Some(w) = settings_watcher.as_mut() {
+                    if let Some(updated) = w.check() {
+                        eprintln!(
+                            "reel: settings.json changed (brightness={} gamma={:.2}); applying",
+                            updated.brightness,
+                            updated.gamma,
+                        );
+                        session.apply_settings(updated);
+                    }
+                }
                 // Entry transition (skip when no predecessor).
                 // v1-spec-delta #8 (slice a): image-involving
                 // transitions are not yet implemented. The

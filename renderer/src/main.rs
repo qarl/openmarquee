@@ -960,6 +960,7 @@ fn main() -> Result<()> {
                         playlist_path,
                         content_root,
                         catalog_opt,
+                        args.settings.as_deref(),
                         args.fps,
                         args.reel_loop,
                         override_hold,
