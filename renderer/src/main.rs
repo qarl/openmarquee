@@ -76,7 +76,22 @@ impl Card {
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum OutputMode {
     Hdmi,
+    /// v1-spec-delta #11 (slice d) -- Mac dev preview path.
+    /// Slice (d) ships a clean reach gate: --output mock
+    /// emits a diagnostic identifying what's wired (snapshot
+    /// capture is the only real Mac-side primitive today, via
+    /// --capture-slide; per-frame paint requires GLES2 / EGL /
+    /// DRM which Mac doesn't have). Future phases can extend
+    /// Mock to a virtual-scanout PNG sequence.
     Mock,
+    /// v1-spec-delta #11 (slice e) -- 64x64 HUB75 RGB matrix
+    /// panel reach gate. Spec §5: keep reachable; panel-write
+    /// path stubbed for v1.
+    Hub75,
+    /// v1-spec-delta #11 (slice e) -- WS2812B serial-RGB strip
+    /// reach gate. Spec §5: keep reachable; panel-write path
+    /// stubbed for v1.
+    Ws2812b,
 }
 
 #[derive(Parser, Debug)]
@@ -1252,7 +1267,47 @@ fn main() -> Result<()> {
             }
         }
         OutputMode::Mock => {
-            eprintln!("mock output mode (placeholder); not yet implemented");
+            // v1-spec-delta #11 (slice d) -- Mac dev preview
+            // reach gate. Mock can dispatch to the snapshot-
+            // capture primitive when --capture-slide is set
+            // (since that path requires GLES2/EGL/DRM under
+            // the hood, it's still Linux-only at runtime --
+            // Mock just provides a separate CLI entrypoint
+            // with cleaner diagnostics for callers that want
+            // explicit "no scanout, capture only" semantics).
+            // Future phase: a virtual-scanout PNG sequence
+            // for full Mac dev preview.
+            eprintln!(
+                "mock output mode -- snapshot capture is the only Mac-side primitive today.\n\
+                 Use --output hdmi --capture-slide UUID --capture-path PATH on Linux for a PNG\n\
+                 snapshot. Per-frame paint preview on Mac is a future phase."
+            );
+        }
+        OutputMode::Hub75 => {
+            // v1-spec-delta #11 (slice e) -- HUB75 64x64 RGB
+            // matrix reach gate per spec §5. Panel-write path
+            // (rgb-matrix-rs / vc4-side bit-banging /
+            // dedicated controller subprocess) is post-v1.
+            eprintln!(
+                "hub75 output -- reach gate only; panel-write path stubbed for v1.\n\
+                 Spec §5: 64x64 RGB matrix at 30 fps over the GPIO HUB75 driver.\n\
+                 This binary build accepts --output hub75 and exits cleanly so the\n\
+                 backend can detect the renderer's reach without panicking on a\n\
+                 not-yet-implemented arm."
+            );
+        }
+        OutputMode::Ws2812b => {
+            // v1-spec-delta #11 (slice e) -- WS2812B serial-
+            // RGB strip reach gate per spec §5. Panel-write
+            // path (DMA-driven 800kHz serial protocol /
+            // dedicated subprocess) is post-v1.
+            eprintln!(
+                "ws2812b output -- reach gate only; panel-write path stubbed for v1.\n\
+                 Spec §5: WS2812B serial-RGB strip with DMA at 800 kHz.\n\
+                 This binary build accepts --output ws2812b and exits cleanly so the\n\
+                 backend can detect the renderer's reach without panicking on a\n\
+                 not-yet-implemented arm."
+            );
         }
     }
 
