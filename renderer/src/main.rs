@@ -205,6 +205,14 @@ struct Args {
     #[arg(long)]
     play_auto_mode_test: Option<String>,
 
+    /// v1-spec-delta #4 (slice b/d) — render a synthesized slide
+    /// with the layer's `outline` set. Validates that the
+    /// FS_GLYPH_OUTLINE shader path links + draws on real DRM
+    /// scanout. Visual diff vs --play-motion-test static is the
+    /// presence of a 1-px black ring around the glyphs.
+    #[arg(long, default_value_t = false)]
+    play_outline_test: bool,
+
     /// When `--play-reel` is set, loop the reel forever (wrapping
     /// from last slide back to first via the first slide's
     /// transition). Default: single pass.
@@ -284,6 +292,7 @@ fn build_motion_test_slide(kind: &str) -> content::TextSlide {
         motion_speed: 1.0,
         auto_mode: None,
         auto_format: None,
+        outline: false,
         r#box: content::TextBox {
             x: 0.05,
             y: 0.30,
@@ -332,6 +341,7 @@ fn build_auto_mode_test_slide(kind: &str) -> content::TextSlide {
         motion_speed: 1.0,
         auto_mode: Some(kind.to_string()),
         auto_format: Some(auto_format.to_string()),
+        outline: false,
         r#box: content::TextBox {
             x: 0.05,
             y: 0.30,
@@ -344,6 +354,50 @@ fn build_auto_mode_test_slide(kind: &str) -> content::TextSlide {
         name: format!("auto-mode-test-{kind}"),
         duration_ms: 5000,
         background_color: "#1A1A1A".to_string(),
+        background_pattern: None,
+        text_layers: vec![layer],
+    }
+}
+
+/// v1-spec-delta #4 (slice b/d) -- synthesize an in-memory
+/// TextSlide with outline=true. Used by --play-outline-test to
+/// exercise the FS_GLYPH_OUTLINE shader path on real DRM scanout.
+#[cfg(target_os = "linux")]
+fn build_outline_test_slide() -> content::TextSlide {
+    use uuid::Uuid;
+    let layer = content::TextLayer {
+        text: "OUTLINE TEST".to_string(),
+        name: String::new(),
+        font_family: None,
+        font_size_px: None,
+        font_size_pct: Some(50.0),
+        // Bright color so the outline ring is visually
+        // distinguishable from the body fill.
+        text_color: "#FFC700".to_string(),
+        text_align: "center".to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: "static".to_string(),
+        motion_intensity: 50,
+        motion_phase: 0.0,
+        motion_speed: 1.0,
+        auto_mode: None,
+        auto_format: None,
+        outline: true,
+        r#box: content::TextBox {
+            x: 0.05,
+            y: 0.30,
+            w: 0.90,
+            h: 0.40,
+        },
+    };
+    content::TextSlide {
+        id: Uuid::nil(),
+        // Mid-gray bg so the 1-px black outline is visible against
+        // both the body fill and the bg.
+        name: "outline-test".to_string(),
+        duration_ms: 2000,
+        background_color: "#666666".to_string(),
         background_pattern: None,
         text_layers: vec![layer],
     }
@@ -744,6 +798,29 @@ fn main() -> Result<()> {
                         args.transition_ms,
                         args.fps,
                     )?;
+                    return Ok(());
+                }
+                if args.play_outline_test {
+                    // v1-spec-delta #4 (slice b/d): synthesize a
+                    // slide with outline=true and render via the
+                    // standard render_slide path. Smoke gate for
+                    // FS_GLYPH_OUTLINE on real DRM hw.
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for outline smoke",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide = build_outline_test_slide();
+                    let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
+                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
                     return Ok(());
                 }
                 if let Some(kind) = args.play_auto_mode_test.as_deref() {

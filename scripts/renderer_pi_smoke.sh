@@ -735,6 +735,28 @@ if [ "${DISTINCT_TIMES:-0}" -lt 3 ]; then
 fi
 echo "    --play-auto-mode-test ok (3 kinds, time ticked $DISTINCT_TIMES distinct seconds across 4s)"
 
+# v1-spec-delta #4 (slice b/d) outline smoke. Synthesizes a slide
+# with layer.outline=true; asserts no panic + no GLSL link error
+# from FS_GLYPH_OUTLINE. Visual verification (1-px black ring) is
+# manual; smoke gates pipeline correctness.
+echo "==> Phase d-smoke -- --play-outline-test"
+OUTLINE_LOG="$LOG_DIR/outline-test.log"
+OUTLINE_EXIT=0
+ssh "$TARGET" "$BIN_PI --output hdmi --play-outline-test --hold-secs 2" \
+    > "$OUTLINE_LOG" 2>&1 || OUTLINE_EXIT=$?
+if [ "$OUTLINE_EXIT" -ne 0 ]; then
+    echo "FAIL: --play-outline-test exit $OUTLINE_EXIT"
+    cat "$OUTLINE_LOG"
+    exit 1
+fi
+grep -qE 'panicked at|RUST_BACKTRACE' "$OUTLINE_LOG" && \
+    { echo "FAIL: panic in --play-outline-test"; cat "$OUTLINE_LOG"; exit 1; }
+grep -q 'slide render complete' "$OUTLINE_LOG" || \
+    { echo "FAIL: --play-outline-test didn't reach slide render complete"; cat "$OUTLINE_LOG"; exit 1; }
+grep -q 'rasterized text "OUTLINE TEST"' "$OUTLINE_LOG" || \
+    { echo "FAIL: --play-outline-test didn't rasterize the test text"; cat "$OUTLINE_LOG"; exit 1; }
+echo "    --play-outline-test ok (FS_GLYPH_OUTLINE linked + drew on hw)"
+
 # Phase 6 reel assertion: completion + slide count + transition
 # count + no panics. The reel logs "reel: resolved N items" once
 # and "reel: transition into item I/N" for each transition.

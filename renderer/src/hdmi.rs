@@ -45,7 +45,7 @@ use crate::hdmi_logic::{
     gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
     parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, pick_largest_mode_index,
     prev_idx_for_reel, unix_to_calendar_utc, AlphaBitmap, FontCatalog, ModeSpec, MotionKind,
-    MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
+    MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE,
     FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -838,7 +838,11 @@ fn draw_text_layer(
             ndc_r, ndc_t, 1.0, 0.0,
         ];
 
-        let program = match link_program(gl, VS_TEXTURED_QUAD, FS_GLYPH) {
+        // v1-spec-delta #4 (b): outline=true picks the dilated-
+        // alpha shader; outline=false uses FS_GLYPH (cheap path).
+        // Both write premultiplied-alpha output.
+        let fs = if layer.outline { FS_GLYPH_OUTLINE } else { FS_GLYPH };
+        let program = match link_program(gl, VS_TEXTURED_QUAD, fs) {
             Ok(p) => p,
             Err(e) => {
                 gl.delete_texture(tex);
@@ -894,6 +898,22 @@ fn draw_text_layer(
         gl.uniform_3_f32(u_text_color.as_ref(), text_color[0], text_color[1], text_color[2]);
         let u_opacity = gl.get_uniform_location(program, "u_opacity");
         gl.uniform_1_f32(u_opacity.as_ref(), opacity);
+        if layer.outline {
+            // v1-spec-delta #4 (b): hardcoded 1px black outline,
+            // matching the Python convention at backend/openmarquee/
+            // motion.py:341 ('outline_color = #000000'). The schema
+            // is just `outline: bool`; future schema growth could
+            // expose color + width through these uniforms without
+            // a shader rewrite.
+            let u_outline_color = gl.get_uniform_location(program, "u_outline_color");
+            gl.uniform_3_f32(u_outline_color.as_ref(), 0.0, 0.0, 0.0);
+            let u_pixel_size = gl.get_uniform_location(program, "u_pixel_size");
+            gl.uniform_2_f32(
+                u_pixel_size.as_ref(),
+                1.0 / bm.width as f32,
+                1.0 / bm.height as f32,
+            );
+        }
 
         // BLEND state is set by the caller (render_slide) once
         // around the layer loop — same blend func for every layer,

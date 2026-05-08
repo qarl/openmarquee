@@ -172,28 +172,43 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
     }
     let baseline_y: i32 = max_ascent; // pixels from top of canvas to baseline (y-down)
 
-    // Second pass: blit each glyph at (cursor_x + glyph_xmin,
-    // baseline_y - (glyph_ymin + glyph_height)).
-    let mut data = vec![0u8; (line_w * line_h) as usize];
+    // v1-spec-delta #4 (slice b/d, QA review fix): pad the output
+    // bitmap by 1 pixel on all four sides. The padding rows stay
+    // alpha=0 -- invisible to FS_GLYPH (which only samples the
+    // center texel). FS_GLYPH_OUTLINE dilates the alpha mask by
+    // 1 pixel via 4-neighbor sampling; without padding, the
+    // boundary texels' neighbors clip via CLAMP_TO_EDGE which
+    // returns the edge inked texel and produces dilated == center
+    // at the bitmap edges (no visible exterior outline ring,
+    // outline only on INTERIOR shapes like the counter of an "O").
+    // Padding gives the dilation room to grow into transparent
+    // pixels and produce the visible exterior ring.
+    let pad: u32 = 1;
+    let bm_w = line_w + 2 * pad;
+    let bm_h = line_h + 2 * pad;
+
+    // Second pass: blit each glyph at (cursor_x + glyph_xmin + pad,
+    // baseline_y - (glyph_ymin + glyph_height) + pad).
+    let mut data = vec![0u8; (bm_w * bm_h) as usize];
     let mut cursor_x = 0.0_f32;
     for (m, alpha) in &glyphs {
-        let glyph_x = (cursor_x + m.xmin as f32).round() as i32;
-        let glyph_top = baseline_y - m.ymin - m.height as i32;
+        let glyph_x = (cursor_x + m.xmin as f32).round() as i32 + pad as i32;
+        let glyph_top = baseline_y - m.ymin - m.height as i32 + pad as i32;
         for gy in 0..m.height as i32 {
             let dst_y = glyph_top + gy;
-            if dst_y < 0 || dst_y as u32 >= line_h {
+            if dst_y < 0 || dst_y as u32 >= bm_h {
                 continue;
             }
             for gx in 0..m.width as i32 {
                 let dst_x = glyph_x + gx;
-                if dst_x < 0 || dst_x as u32 >= line_w {
+                if dst_x < 0 || dst_x as u32 >= bm_w {
                     continue;
                 }
                 let src = alpha[(gy as usize) * m.width + gx as usize];
                 if src == 0 {
                     continue;
                 }
-                let idx = (dst_y as u32 * line_w + dst_x as u32) as usize;
+                let idx = (dst_y as u32 * bm_w + dst_x as u32) as usize;
                 // Glyphs in a single line don't overlap (fontdue
                 // emits non-overlapping bboxes per glyph), so a
                 // direct write is safe — no max/saturate needed.
@@ -203,8 +218,8 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
         cursor_x += m.advance_width;
     }
     Some(AlphaBitmap {
-        width: line_w,
-        height: line_h,
+        width: bm_w,
+        height: bm_h,
         data,
     })
 }
@@ -275,6 +290,48 @@ void main() {
     float a = texture2D(u_atlas, v_uv).r;
     float alpha = a * u_opacity;
     gl_FragColor = vec4(u_text_color * alpha, alpha);
+}
+"#;
+
+/// Fragment shader: glyph atlas with a 1-pixel outline stroke
+/// around the body. Used when `layer.outline = true`. Samples the
+/// 4 cardinal neighbors of v_uv at 1-pixel offsets (via
+/// u_pixel_size) and dilates the glyph alpha mask by 1 pixel. The
+/// body stays in u_text_color where the center alpha is solid;
+/// the dilated ring (where the center is 0 but a neighbor has
+/// glyph) renders in u_outline_color. At anti-aliased edges the
+/// center alpha varies smoothly so the mix between body and
+/// outline is also smooth.
+///
+/// Python convention (backend/openmarquee/motion.py:341) is a 1-
+/// pixel BLACK stroke; the renderer hardcodes black via
+/// u_outline_color uniform set in draw_text_layer. The schema
+/// `outline: bool` is the on/off toggle; future schema growth
+/// could expose color + width as uniforms here without a shader
+/// rewrite.
+///
+/// Output is premultiplied-alpha (matches FS_GLYPH and the blend
+/// func GL_ONE / GL_ONE_MINUS_SRC_ALPHA).
+pub const FS_GLYPH_OUTLINE: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform vec3 u_text_color;
+uniform vec3 u_outline_color;
+uniform vec2 u_pixel_size;
+uniform float u_opacity;
+varying vec2 v_uv;
+void main() {
+    float center = texture2D(u_atlas, v_uv).r;
+    float n = texture2D(u_atlas, v_uv + vec2(0.0, -u_pixel_size.y)).r;
+    float s = texture2D(u_atlas, v_uv + vec2(0.0,  u_pixel_size.y)).r;
+    float w = texture2D(u_atlas, v_uv + vec2(-u_pixel_size.x, 0.0)).r;
+    float e = texture2D(u_atlas, v_uv + vec2( u_pixel_size.x, 0.0)).r;
+    float dilated = max(max(center, n), max(max(s, w), e));
+    // Color blend: center=1 -> body, center=0 but neighbor>0 ->
+    // outline ring. mix() handles the smooth AA edge naturally.
+    vec3 color = mix(u_outline_color, u_text_color, center);
+    float alpha = dilated * u_opacity;
+    gl_FragColor = vec4(color * alpha, alpha);
 }
 "#;
 
@@ -2202,6 +2259,44 @@ mod tests {
     }
 
     #[test]
+    fn fs_glyph_outline_targets_gles2_and_pins_uniforms() {
+        // v1-spec-delta #4 (b): outline shader compiles + uses the
+        // expected uniform set. dispatch in hdmi.rs picks this
+        // shader when layer.outline is true; uniform names must
+        // match.
+        assert!(FS_GLYPH_OUTLINE.starts_with("#version 100\n"));
+        assert!(FS_GLYPH_OUTLINE.contains("precision mediump float"));
+        for uniform in [
+            "u_atlas",
+            "u_text_color",
+            "u_outline_color",
+            "u_pixel_size",
+            "u_opacity",
+        ] {
+            assert!(
+                FS_GLYPH_OUTLINE.contains(uniform),
+                "FS_GLYPH_OUTLINE missing uniform {uniform:?}"
+            );
+        }
+        // Pin the 4-neighbor sampling math so a refactor that drops
+        // a direction lands as a host-test diff.
+        for offset in [
+            "vec2(0.0, -u_pixel_size.y)",
+            "vec2(0.0,  u_pixel_size.y)",
+            "vec2(-u_pixel_size.x, 0.0)",
+            "vec2( u_pixel_size.x, 0.0)",
+        ] {
+            assert!(
+                FS_GLYPH_OUTLINE.contains(offset),
+                "FS_GLYPH_OUTLINE missing neighbor offset {offset:?}"
+            );
+        }
+        // Output must be premultiplied like FS_GLYPH (matches the
+        // GL_ONE / GL_ONE_MINUS_SRC_ALPHA blend).
+        assert!(FS_GLYPH_OUTLINE.contains("color * alpha"));
+    }
+
+    #[test]
     fn fs_glyph_targets_gles2_and_pins_uniforms() {
         assert!(FS_GLYPH.starts_with("#version 100\n"));
         assert!(FS_GLYPH.contains("precision mediump float"));
@@ -2261,6 +2356,44 @@ mod tests {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .expect("parse Anton TTF")
+    }
+
+    #[test]
+    fn layout_has_one_pixel_transparent_margin() {
+        // v1-spec-delta #4 (slice b/d, QA review fix): layout
+        // pads the output bitmap by 1 pixel on all sides so the
+        // FS_GLYPH_OUTLINE shader's 4-neighbor dilation has room
+        // to grow beyond the inked extent. Verify the outermost
+        // row + col of pixels are all alpha=0.
+        let font = load_anton();
+        let bm = layout_text_to_alpha(&font, "F", 64.0).expect("F bitmap");
+        // Top + bottom rows
+        for x in 0..bm.width {
+            assert_eq!(
+                bm.data[x as usize], 0,
+                "top-row pixel ({x}, 0) must be padding (alpha=0)"
+            );
+            let bottom_idx = ((bm.height - 1) * bm.width + x) as usize;
+            assert_eq!(
+                bm.data[bottom_idx], 0,
+                "bottom-row pixel ({x}, {}) must be padding (alpha=0)",
+                bm.height - 1
+            );
+        }
+        // Left + right columns
+        for y in 0..bm.height {
+            let left = (y * bm.width) as usize;
+            assert_eq!(
+                bm.data[left], 0,
+                "left-col pixel (0, {y}) must be padding (alpha=0)"
+            );
+            let right = (y * bm.width + bm.width - 1) as usize;
+            assert_eq!(
+                bm.data[right], 0,
+                "right-col pixel ({}, {y}) must be padding (alpha=0)",
+                bm.width - 1
+            );
+        }
     }
 
     #[test]

@@ -167,6 +167,13 @@ pub struct TextLayer {
     /// if the field is somehow None despite auto_mode being set.
     #[serde(default)]
     pub auto_format: Option<String>,
+    /// v1-spec-delta #4 -- 1-pixel stroke outline around the
+    /// glyphs (Python convention: black). Default false. When
+    /// true, the renderer dispatches to FS_GLYPH_OUTLINE which
+    /// dilates the glyph alpha mask by 1 pixel and renders the
+    /// ring in u_outline_color (black).
+    #[serde(default)]
+    pub outline: bool,
     pub r#box: TextBox,
 }
 
