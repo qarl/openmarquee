@@ -131,6 +131,15 @@ pub struct GpuCounters {
 /// stable across slices. New fields go on the right; soak parsers
 /// regex by key (vm_rss=, cma_used=, etc) rather than positional-
 /// parse, so adding columns is non-breaking.
+///
+/// FORMAT CONTRACT — see scripts/renderer_soak_parse.py PAT regex.
+/// The parser anchors on `[mem]\s+<label>\s+vm_rss=NN.NMB...
+/// cma_used=NN.NMB` and ignores any trailing tokens. Reordering
+/// the four /proc keys WILL break the parser. Adding new keys
+/// after `cma_used=` is safe (parser regex is non-greedy through
+/// cma_used, then optional bo=N etc come after; new fields just
+/// extend the trailing tokens that the parser ignores). When in
+/// doubt: extend to the right, never reshuffle.
 pub fn log_mem_snapshot(label: &str, gpu: Option<GpuCounters>) {
     let s = MemSnapshot::read();
     let suffix = match gpu {
