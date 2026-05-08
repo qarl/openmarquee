@@ -27,7 +27,7 @@ use drm::control::{
     connector::{self, State as ConnectorState},
     crtc, framebuffer, plane,
     property::{self, Value as PropValue},
-    AtomicCommitFlags, Device as ControlDevice, Mode,
+    AtomicCommitFlags, Device as ControlDevice, Event, Mode, PageFlipFlags,
 };
 use gbm::{AsRaw, BufferObject, BufferObjectFlags, Format as GbmFormat};
 use khronos_egl as egl;
@@ -216,6 +216,20 @@ struct EglSession<'a> {
     mode: drm::control::Mode,
     mode_w: u16,
     mode_h: u16,
+    /// v1-spec-delta #5 (slice d): tracks whether SetCrtc has been
+    /// called on this session yet. The first commit modesets; all
+    /// subsequent commits use the cheaper page_flip path which
+    /// just swaps the FB on the existing CRTC at the next vblank
+    /// (closes spec-delta #8b's transition wall-clock perf gap).
+    modeset_done: bool,
+    /// v1-spec-delta #5 (slice d): tracks whether a page-flip is
+    /// currently in flight. The kernel allows at most one
+    /// outstanding flip per CRTC; the next commit must drain the
+    /// pending event before issuing another flip. Drain-before-
+    /// commit is the design (as opposed to drain-after-commit) so
+    /// the natural blocking point is when we WANT to advance, not
+    /// when we just told the kernel "go."
+    flip_pending: bool,
 }
 
 /// v1-spec-delta #5 (slice a) -- bring up GBM + EGL + GLES2,
@@ -331,6 +345,8 @@ where
             mode,
             mode_w,
             mode_h,
+            modeset_done: false,
+            flip_pending: false,
         };
         work(&mut session)
     };
@@ -352,6 +368,107 @@ where
     }
 
     work_result
+}
+
+/// v1-spec-delta #5 (slice d, 2026-05-08): commit a freshly-added
+/// FB to scanout. First call on a fresh EglSession does the
+/// SetCrtc modeset; subsequent calls use page_flip with EVENT
+/// completion. This closes spec-delta #8b's transition wall-clock
+/// perf gap (12.6 -> 30 fps target) by replacing the per-frame
+/// SetCrtc (~32 ms cost on vc4) with the cheaper page_flip path.
+///
+/// Drain-before-commit: at most one page-flip can be in flight
+/// per CRTC at the kernel boundary. If a flip is pending from a
+/// prior call, drain its completion event first. This naturally
+/// vsync-paces the per-frame loop -- the drain blocks until the
+/// kernel has scanned out the previous FB.
+///
+/// On the unhappy path the caller is responsible for fb/bo
+/// cleanup; this fn does NOT call destroy_framebuffer/drop on
+/// error so the existing per-call cleanup pattern stays
+/// consistent across both SetCrtc and page_flip dispatch.
+fn commit_fb(
+    session: &mut EglSession,
+    card: &Card,
+    fb: framebuffer::Handle,
+) -> Result<()> {
+    if session.flip_pending {
+        // Drain. Kernel sends a single PageFlipEvent per requested
+        // flip on this fd; loop in case multiple events arrive
+        // (defensive — we only ever request one at a time).
+        loop {
+            let events = card
+                .receive_events()
+                .context("drmHandleEvent (page-flip drain)")?;
+            let mut got_flip = false;
+            for ev in events {
+                if matches!(ev, Event::PageFlip(_)) {
+                    got_flip = true;
+                }
+            }
+            if got_flip {
+                break;
+            }
+        }
+        session.flip_pending = false;
+    }
+
+    if !session.modeset_done {
+        card.set_crtc(
+            session.crtc_handle,
+            Some(fb),
+            (0, 0),
+            &[session.connector_handle],
+            Some(session.mode),
+        )
+        .context("drmModeSetCrtc failed")?;
+        session.modeset_done = true;
+        return Ok(());
+    }
+
+    card.page_flip(session.crtc_handle, fb, PageFlipFlags::EVENT, None)
+        .context("drmModePageFlip failed")?;
+    session.flip_pending = true;
+    Ok(())
+}
+
+/// v1-spec-delta #5 (slice d, 2026-05-08): drain any pending
+/// page-flip event so the caller can safely release its last-
+/// frame BO/FB without racing the kernel scanout. Called at the
+/// end of per-frame loops in render_animated_slide_in_session
+/// and render_transition_animated_in_session.
+///
+/// Why drain at end-of-call (not just before next commit): the
+/// gbm_surface BO pool is shared across render calls in the same
+/// session. If we exit a call with a flip in flight, the kernel
+/// is still scanning the last BO. The next call's first
+/// swap_buffers may reuse that BO from the gbm pool -- racing
+/// the kernel mid-scanout. Draining here ensures the kernel has
+/// switched away before we drop the BufferObject (which marks
+/// it as free for gbm to reuse).
+fn drain_pending_flip(session: &mut EglSession, card: &Card) {
+    if !session.flip_pending {
+        return;
+    }
+    loop {
+        let events = match card.receive_events() {
+            Ok(events) => events,
+            Err(e) => {
+                eprintln!("warn: drmHandleEvent (end-of-call drain): {e}");
+                break;
+            }
+        };
+        let mut got_flip = false;
+        for ev in events {
+            if matches!(ev, Event::PageFlip(_)) {
+                got_flip = true;
+            }
+        }
+        if got_flip {
+            break;
+        }
+    }
+    session.flip_pending = false;
 }
 
 /// Bring up GBM + EGL + GLES2 against the HDMI display, run the
@@ -442,14 +559,13 @@ where
         bo_holder = Some(bo);
         fb_holder = Some(fb);
         eprintln!("registered fb {fb:?}");
-        card.set_crtc(
-            session.crtc_handle,
-            Some(fb),
-            (0, 0),
-            &[session.connector_handle],
-            Some(session.mode),
-        )
-        .context("drmModeSetCrtc failed")?;
+        // v1-spec-delta #5 (slice d): SetCrtc on first commit per
+        // session, page_flip thereafter. The static path benefits
+        // because slide N+1 inside a reel sees modeset_done=true
+        // from slide N -- so a held static slide between two
+        // animated slides commits via page_flip (no expensive
+        // modeset).
+        commit_fb(session, card, fb)?;
         eprintln!(
             "scanout active on {:?}; holding for {}ms",
             session.crtc_handle, hold_ms
@@ -457,6 +573,14 @@ where
         std::thread::sleep(std::time::Duration::from_millis(hold_ms));
         Ok(())
     })();
+
+    // v1-spec-delta #5 (slice d): drain pending page-flip event
+    // before BO/FB cleanup. For the FIRST call on a fresh session
+    // this is a no-op (commit_fb took the SetCrtc-synchronous
+    // branch). For subsequent calls under the same reel session
+    // it ensures the kernel has finished scanning out our BO
+    // before gbm reuses it.
+    drain_pending_flip(session, card);
 
     // BO/FB cleanup -- happens before with_egl_session's EGL
     // teardown so the FB-handle rmFB lands while DRM master is
@@ -584,27 +708,28 @@ fn render_animated_slide_in_session(
             let fb = card
                 .add_framebuffer(&fb_buf, 32, 32)
                 .map_err(|e| anyhow!("drmModeAddFB failed: {e}"))?;
-            // QA F2 (slice c carry-over): on SetCrtc fail, the
+            // QA F2 (slice c carry-over): on commit fail, the
             // just-added fb is a u32 with no Drop and would leak.
             // Explicitly rmFB on the unhappy path. The BO Drops
             // cleanly via gbm RAII either way.
-            if let Err(e) = card.set_crtc(
-                session.crtc_handle,
-                Some(fb),
-                (0, 0),
-                &[session.connector_handle],
-                Some(session.mode),
-            ) {
+            //
+            // v1-spec-delta #5 (slice d): commit_fb dispatches
+            // SetCrtc-on-first-call vs page_flip-thereafter, and
+            // drains any pending flip event before issuing the
+            // next one (natural vsync pacing).
+            if let Err(e) = commit_fb(session, card, fb) {
                 if let Err(de) = card.destroy_framebuffer(fb) {
                     eprintln!(
-                        "warn: cleanup destroy_framebuffer({fb:?}) on SetCrtc-fail: {de}"
+                        "warn: cleanup destroy_framebuffer({fb:?}) on commit-fail: {de}"
                     );
                 }
                 drop(bo);
-                return Err(anyhow!("drmModeSetCrtc failed: {e}"));
+                return Err(e);
             }
 
             // Previous frame is no longer scanout — safe to release.
+            // (commit_fb already drained the prior page-flip event,
+            // so the kernel is no longer reading from prev_fb's BO.)
             if let Some(old_fb) = prev_fb.take() {
                 if let Err(e) = card.destroy_framebuffer(old_fb) {
                     eprintln!("warn: destroy_framebuffer({old_fb:?}): {e}");
@@ -634,6 +759,13 @@ fn render_animated_slide_in_session(
         );
         Ok(())
     })();
+
+    // v1-spec-delta #5 (slice d): drain the last frame's pending
+    // page-flip event before per-call BO/FB cleanup. Otherwise
+    // the kernel may still be reading from the last frame's BO
+    // when we drop it, racing with the next render call's
+    // gbm_surface BO pool reuse.
+    drain_pending_flip(session, card);
 
     // Per-call BO/FB cleanup. Drops the last frame's holders so
     // the next render call (under the same session) starts with
@@ -1780,23 +1912,26 @@ fn render_transition_animated_in_session(
                 .add_framebuffer(&fb_buf, 32, 32)
                 .with_context(|| format!("drmModeAddFB (frame {frame})"))?;
             // QA F2 (slice c carry-over): rmFB the just-added fb
-            // on SetCrtc-fail unhappy path. Pre-existing leak in
+            // on commit-fail unhappy path. Pre-existing leak in
             // this transition harness mirrored across the slice
             // (c) render_animated_slide. Both fixed in this commit.
-            if let Err(e) = card.set_crtc(
-                session.crtc_handle,
-                Some(fb),
-                (0, 0),
-                &[session.connector_handle],
-                Some(session.mode),
-            ) {
+            //
+            // v1-spec-delta #5 (slice d): commit_fb dispatches
+            // SetCrtc-on-first-call vs page_flip-thereafter and
+            // drains the prior flip event so the kernel is no
+            // longer reading from the prev BO when we rotate.
+            // This is the critical change for #8b -- transitions
+            // were 12.6 fps with set_crtc-per-frame; page_flip
+            // moves them to vsync-paced (60Hz hw vsync, target
+            // 30 fps via the deadline sleep below).
+            if let Err(e) = commit_fb(session, card, fb) {
                 if let Err(de) = card.destroy_framebuffer(fb) {
                     eprintln!(
-                        "warn: cleanup destroy_framebuffer({fb:?}) on SetCrtc-fail (frame {frame}): {de}"
+                        "warn: cleanup destroy_framebuffer({fb:?}) on commit-fail (frame {frame}): {de}"
                     );
                 }
                 drop(bo);
-                return Err(anyhow!("drmModeSetCrtc (frame {frame}) failed: {e}"));
+                return Err(e.context(format!("commit_fb (frame {frame})")));
             }
 
             // -- Rotate frames: free the frame from TWO iterations
@@ -1830,6 +1965,13 @@ fn render_transition_animated_in_session(
         loop_result?;
         Ok(rendered)
     })();
+
+    // v1-spec-delta #5 (slice d): drain the last frame's pending
+    // page-flip event before per-call BO/FB cleanup. Otherwise
+    // the kernel may still be reading from the last frame's BO
+    // when we drop it, racing the next render call's gbm_surface
+    // BO pool reuse.
+    drain_pending_flip(session, card);
 
     // Per-call cleanup. Free any remaining BO/FB pairs from the
     // loop (current + prev). The session's gbm_surface is reused
