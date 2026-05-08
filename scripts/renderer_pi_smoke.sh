@@ -887,6 +887,98 @@ fi
 # no panic + the PNG exists + has the canonical PNG signature
 # (8-byte 89 50 4E 47 0D 0A 1A 0A header). Visual verification
 # (the PNG looks like the slide) is qarl-eyeball.
+# v1-spec-delta #9 (slice e pre-stamp gate) -- end-to-end IPC
+# sidecar smoke. Pipes a JSON-line script (open + begin_slide
+# + 3 advance ticks + capture + close) into --ipc-sidecar
+# over stdin, captures stdout, asserts each expected response
+# shape + verifies the captured PNG signature on disk.
+#
+# This exercises the full IPC stack on real hw:
+#   - run_open_and_inner_loop_linux opening DRM via with_egl_session
+#   - PlaybackState.begin_slide loading the text_slide
+#   - 3 paint_and_present_one_frame_for_slide calls (real GL paint)
+#   - capture_current_scene_to_png via slice 11 primitives
+#   - clean Close + EglSession teardown
+echo "==> Phase d-smoke -- --ipc-sidecar (open + 3 advance + capture + close)"
+IPC_UUID=$(ssh "$TARGET" '
+for d in /var/openmarquee/content/*/; do
+  if python3 -c "
+import json, sys
+d = json.load(open(\"$d/item.json\"))
+sys.exit(0 if d.get(\"item\", {}).get(\"type\") == \"text_slide\" else 1)
+" 2>/dev/null; then
+    basename "$d"
+    exit 0
+  fi
+done
+echo ""
+' || true)
+IPC_UUID=$(echo "$IPC_UUID" | tr -d '/' | head -1)
+if [ -z "$IPC_UUID" ]; then
+    echo "    --ipc-sidecar skipped (no text_slide on target)"
+else
+    IPC_LOG="$LOG_DIR/ipc-sidecar.log"
+    # macOS mktemp doesn't accept a suffix after the X's; use
+    # the default tempfile name and live with no `.json` suffix.
+    IPC_SCRIPT=$(mktemp -t openmarquee-ipc-script)
+    IPC_OUT="/tmp/openmarquee-ipc-capture.png"
+    cat > "$IPC_SCRIPT" <<EOF
+{"op":"open","params":{"output":"hdmi","content_root":"/var/openmarquee/content"}}
+{"op":"begin_slide","params":{"slide_id":"$IPC_UUID","t0_ms":0,"duration_ms":5000}}
+{"op":"advance","params":{"t_ms":100}}
+{"op":"advance","params":{"t_ms":500}}
+{"op":"advance","params":{"t_ms":1000}}
+{"op":"capture","params":{"path":"$IPC_OUT"}}
+{"op":"close"}
+EOF
+    IPC_EXIT=0
+    ssh "$TARGET" "$BIN_PI --ipc-sidecar" < "$IPC_SCRIPT" > "$IPC_LOG" 2>&1 || IPC_EXIT=$?
+    if [ "$IPC_EXIT" -ne 0 ]; then
+        echo "FAIL: --ipc-sidecar exit $IPC_EXIT"
+        cat "$IPC_LOG"
+        exit 1
+    fi
+    # The renderer also emits eprintln stderr during DRM
+    # bring-up + rasterization, which gets merged into the
+    # log via 2>&1. Filter only the JSON response lines (start
+    # with {"ok": or {"err":) for the count check.
+    JSON_COUNT=$(grep -cE '^\{"(ok|err)":' "$IPC_LOG" || true)
+    if [ "$JSON_COUNT" -ne 7 ]; then
+        echo "FAIL: --ipc-sidecar emitted $JSON_COUNT JSON responses, expected 7"
+        cat "$IPC_LOG"
+        exit 1
+    fi
+    grep -q '"command":"open_ok"' "$IPC_LOG" || \
+        { echo "FAIL: --ipc-sidecar missing open_ok"; cat "$IPC_LOG"; exit 1; }
+    PAINT_COUNT=$(grep -c '"command":"paint_slide"' "$IPC_LOG" || true)
+    if [ "$PAINT_COUNT" -ne 3 ]; then
+        echo "FAIL: --ipc-sidecar paint_slide count $PAINT_COUNT, expected 3"
+        cat "$IPC_LOG"
+        exit 1
+    fi
+    grep -q '"command":"capture_ok"' "$IPC_LOG" || \
+        { echo "FAIL: --ipc-sidecar missing capture_ok"; cat "$IPC_LOG"; exit 1; }
+    EMPTY_COUNT=$(grep -c '"command":"empty"' "$IPC_LOG" || true)
+    if [ "$EMPTY_COUNT" -lt 2 ]; then
+        echo "FAIL: --ipc-sidecar empty count $EMPTY_COUNT (expected >= 2: begin_slide + close)"
+        cat "$IPC_LOG"
+        exit 1
+    fi
+    if grep -qE '^\{"err":' "$IPC_LOG"; then
+        echo "FAIL: --ipc-sidecar emitted Err response"
+        cat "$IPC_LOG"
+        exit 1
+    fi
+    # Verify captured PNG sig on the Pi side.
+    IPC_PNG_OK=$(ssh "$TARGET" "head -c 8 $IPC_OUT | od -An -t x1 | tr -d ' \n'" || true)
+    if [ "$IPC_PNG_OK" != "89504e470d0a1a0a" ]; then
+        echo "FAIL: --ipc-sidecar capture output $IPC_OUT not a PNG (sig=$IPC_PNG_OK)"
+        exit 1
+    fi
+    rm -f "$IPC_SCRIPT"
+    echo "    --ipc-sidecar ok (open + 3 paint + capture + close, PNG sig verified)"
+fi
+
 echo "==> Phase d-smoke -- --capture-slide (text_slide PNG snapshot)"
 CAPTURE_UUID=$(ssh "$TARGET" '
 for d in /var/openmarquee/content/*/; do
