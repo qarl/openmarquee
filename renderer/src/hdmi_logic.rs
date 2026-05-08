@@ -965,6 +965,97 @@ void main() {
 }
 "#;
 
+/// v1-spec-delta #6 (slice d) -- conic ray pattern. atan2 gives
+/// per-pixel angle around the viewport center; bin to slice index;
+/// color = color_a / color_b based on slice parity. Slice count is
+/// always even so the seam at 0/-π wraps cleanly.
+pub const FS_PATTERN_RAYS: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_slices;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    vec2 d = pos - u_viewport * 0.5;
+    float angle = atan(d.y, d.x);
+    // angle range is -π..π. Map to [0, 1) then bin into slices.
+    float norm = mod(angle / 6.28318530 + 1.0, 1.0);
+    float slice_idx = floor(norm * u_slices);
+    float t = mod(slice_idx, 2.0);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
+/// v1-spec-delta #6 (slice d) -- brick wall. 2-pixel mortar lines
+/// between bricks; courses alternate offset by half-brick-width.
+/// Horizontal mortar at row mod bh < 2; vertical mortar depends
+/// on the row's course (0 or 1).
+pub const FS_PATTERN_BRICKS: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_bw;
+uniform float u_bh;
+uniform float u_half;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    float row = floor(pos.y);
+    float col = floor(pos.x);
+    // Horizontal mortar: y mod bh < 2 -> color_b.
+    float h_mortar = step(mod(row, u_bh), 1.5);
+    // Course 0 vs 1: alternates every bh rows.
+    float course = mod(floor(row / u_bh), 2.0);
+    // Vertical mortar offset by half on course-1 rows.
+    float c0 = mod(col, u_bw);
+    float c1 = mod(col - u_half, u_bw);
+    float vx = mix(c0, c1, step(0.5, course));
+    float v_mortar = step(vx, 1.5);
+    float on_mortar = max(h_mortar, v_mortar);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, on_mortar), 1.0);
+}
+"#;
+
+/// v1-spec-delta #6 (slice d) -- confetti scatter. Cell-based
+/// deterministic placement: each cell-size grid cell holds one
+/// hash-positioned color_b dot of variable radius on color_a.
+/// Hash uses fract(sin(dot(...))) -- low-quality but cheap and
+/// deterministic per (density, viewport).
+///
+/// Visual character matches Python's uniform-random scatter; the
+/// pixel-exact placement does NOT (different RNG families). Per
+/// Python docstring: "editor canvas and device backend use
+/// different RNG families with the same seed -- both deterministic
+/// per-surface but the scatters will not pixel-match."
+pub const FS_PATTERN_CONFETTI: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_cell;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+// Standard cheap GLSL hash. Returns [0, 1).
+float h11(float n) { return fract(sin(n * 91.4583) * 43758.5453); }
+vec2 h22(vec2 p) {
+    return fract(sin(vec2(
+        dot(p, vec2(127.1, 311.7)),
+        dot(p, vec2(269.5, 183.3))
+    )) * 43758.5453);
+}
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    vec2 cell = floor(pos / u_cell);
+    // Particle position within cell + radius from cell hash.
+    vec2 jitter = h22(cell);
+    vec2 particle = cell * u_cell + jitter * u_cell;
+    // Radius 2..6 px, mirrored from Python's rng.integers(2, 6).
+    float r = 2.0 + h11(cell.x * 13.7 + cell.y * 51.3) * 4.0;
+    vec2 d = pos - particle;
+    float t = step(dot(d, d), r * r);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
 /// v1-spec-delta #6 (slice a, 2026-05-08): typed enum of the 10
 /// procedural background patterns from Python's
 /// `auto_render._render_pattern_*`. `solid` and `gradient` aren't
@@ -1152,6 +1243,79 @@ pub fn rings_uniforms(density: f32) -> RingsUniforms {
     // this is "very dense rings" -- correct per Python.
     let threshold = (half - 2.0).max(0.0);
     RingsUniforms { tile, threshold }
+}
+
+/// v1-spec-delta #6 (slice d) -- rays pattern uniforms. Conic
+/// gradient with `slices` equal angular wedges alternating
+/// color_a / color_b. Mirrors Python's `_render_pattern_rays`:
+/// slices = max(2, 2 * round(lerp(2, 24, density))). Always
+/// even (an odd count would join two same-colored slices at the
+/// wrap seam).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RaysUniforms {
+    pub slices: f32,
+}
+
+pub fn rays_uniforms(density: f32) -> RaysUniforms {
+    let raw = pattern_lerp(2.0, 24.0, density).round();
+    // 2 * round(lerp(2, 24, density)), then floor at 2.
+    let slices = (2.0 * raw).max(2.0);
+    RaysUniforms { slices }
+}
+
+/// v1-spec-delta #6 (slice d) -- bricks pattern uniforms. Brick
+/// width shrinks with density (lerp(140, 16)); brick height is
+/// half the width. 2-pixel mortar between bricks. Courses
+/// alternate offset by half-brick-width. Mirrors Python's
+/// `_render_pattern_bricks`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BricksUniforms {
+    pub bw: f32,
+    pub bh: f32,
+    pub half: f32,
+}
+
+pub fn bricks_uniforms(density: f32) -> BricksUniforms {
+    let bw = pattern_lerp(140.0, 16.0, density).round().max(8.0);
+    // Python: bh = max(4, bw // 2). Mirror with floor.
+    let bh = (bw * 0.5).floor().max(4.0);
+    let half = (bw * 0.5).floor();
+    BricksUniforms { bw, bh, half }
+}
+
+/// v1-spec-delta #6 (slice d) -- confetti pattern uniforms.
+/// Cell-based deterministic scatter: viewport partitioned into
+/// `cell_size`-pixel cells, each cell holds one hash-positioned
+/// dot of color_b on color_a. Cell size derived from particle
+/// count so scatter density matches Python's intent without
+/// requiring per-particle CPU upload.
+///
+/// Python uses uniform-random scatter via numpy PRNG (count =
+/// max(40, round(lerp(80, 2000, density)))). The shader-side
+/// approach is structurally different (cell-based vs uniform-
+/// random) -- per Python's docstring, "editor canvas and device
+/// backend use different RNG families with the same seed --
+/// both deterministic per-surface but the scatters will not
+/// pixel-match. Visual character is the same."
+///
+/// cell_size derivation: assuming 1024x768 reference viewport
+/// (786 432 pixels), one particle per cell yields the equivalent
+/// Python count. cell_size = sqrt(area / count). Stored as a
+/// fraction of viewport so the shader can scale to any actual
+/// viewport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfettiUniforms {
+    pub count: f32,
+    /// Average cell size in pixels at the 1024x768 reference
+    /// viewport. The shader rescales by actual viewport area.
+    pub cell_ref: f32,
+}
+
+pub fn confetti_uniforms(density: f32) -> ConfettiUniforms {
+    let count = pattern_lerp(80.0, 2000.0, density).round().max(40.0);
+    // 1024 * 768 = 786432.
+    let cell_ref = (786432.0 / count).sqrt();
+    ConfettiUniforms { count, cell_ref }
 }
 
 /// Stable label for log output / smoke parsing. Matches the
@@ -2174,6 +2338,9 @@ mod tests {
             ("FS_PATTERN_SCANLINES", FS_PATTERN_SCANLINES),
             ("FS_PATTERN_GRID", FS_PATTERN_GRID),
             ("FS_PATTERN_RINGS", FS_PATTERN_RINGS),
+            ("FS_PATTERN_RAYS", FS_PATTERN_RAYS),
+            ("FS_PATTERN_BRICKS", FS_PATTERN_BRICKS),
+            ("FS_PATTERN_CONFETTI", FS_PATTERN_CONFETTI),
         ] {
             assert!(src.starts_with("#version 100\n"), "{name} missing #version 100");
             assert!(src.contains("precision mediump float"), "{name} missing precision");
@@ -2181,23 +2348,21 @@ mod tests {
             assert!(src.contains("u_color_b"), "{name} missing u_color_b");
             assert!(src.contains("u_viewport"), "{name} missing u_viewport");
         }
-        // tile uniform present where applicable (every pattern
-        // except scanlines... actually scanlines uses u_tile too).
-        for (name, src) in [
-            ("FS_PATTERN_STRIPES", FS_PATTERN_STRIPES),
-            ("FS_PATTERN_CHECKER", FS_PATTERN_CHECKER),
-            ("FS_PATTERN_DOTS", FS_PATTERN_DOTS),
-            ("FS_PATTERN_HALFTONE", FS_PATTERN_HALFTONE),
-            ("FS_PATTERN_SCANLINES", FS_PATTERN_SCANLINES),
-            ("FS_PATTERN_GRID", FS_PATTERN_GRID),
-            ("FS_PATTERN_RINGS", FS_PATTERN_RINGS),
-        ] {
-            assert!(src.contains("u_tile"), "{name} missing u_tile");
-        }
-        assert!(FS_PATTERN_DOTS.contains("u_radius"), "dots missing u_radius");
-        assert!(FS_PATTERN_HALFTONE.contains("u_radius"), "halftone missing u_radius");
-        assert!(FS_PATTERN_HALFTONE.contains("u_half"), "halftone missing u_half");
-        assert!(FS_PATTERN_RINGS.contains("u_threshold"), "rings missing u_threshold");
+        // Per-pattern uniform presence checks.
+        assert!(FS_PATTERN_STRIPES.contains("u_tile"));
+        assert!(FS_PATTERN_CHECKER.contains("u_tile"));
+        assert!(FS_PATTERN_DOTS.contains("u_tile") && FS_PATTERN_DOTS.contains("u_radius"));
+        assert!(FS_PATTERN_HALFTONE.contains("u_tile")
+            && FS_PATTERN_HALFTONE.contains("u_radius")
+            && FS_PATTERN_HALFTONE.contains("u_half"));
+        assert!(FS_PATTERN_SCANLINES.contains("u_tile"));
+        assert!(FS_PATTERN_GRID.contains("u_tile"));
+        assert!(FS_PATTERN_RINGS.contains("u_tile") && FS_PATTERN_RINGS.contains("u_threshold"));
+        assert!(FS_PATTERN_RAYS.contains("u_slices"));
+        assert!(FS_PATTERN_BRICKS.contains("u_bw")
+            && FS_PATTERN_BRICKS.contains("u_bh")
+            && FS_PATTERN_BRICKS.contains("u_half"));
+        assert!(FS_PATTERN_CONFETTI.contains("u_cell"));
     }
 
     // v1-spec-delta #6 (slice c) -- halftone / scanlines / grid /
@@ -2250,6 +2415,55 @@ mod tests {
         let u1 = rings_uniforms(1.0);
         assert_eq!(u1.tile, 6.0);
         assert_eq!(u1.threshold, 1.0);
+    }
+
+    // v1-spec-delta #6 (slice d) -- rays / bricks / confetti
+    // uniform helpers.
+    #[test]
+    fn rays_slice_count_is_always_even_and_floored_at_2() {
+        // density 0: slices = 2 * round(lerp(2, 24, 0)) = 2 * 2 = 4.
+        // (round(2.0) = 2.)
+        assert_eq!(rays_uniforms(0.0).slices, 4.0);
+        // density 1: slices = 2 * round(24) = 48.
+        assert_eq!(rays_uniforms(1.0).slices, 48.0);
+        // density 0.5: slices = 2 * round(13) = 26.
+        assert_eq!(rays_uniforms(0.5).slices, 26.0);
+        // Floor at 2.
+        let edge = rays_uniforms(0.0);
+        assert!(edge.slices >= 2.0);
+    }
+
+    #[test]
+    fn bricks_uniforms_match_python_anchors() {
+        // bw = max(8, round(lerp(140, 16, density))); bh = max(4,
+        // floor(bw/2)); half = floor(bw/2).
+        // density 0: bw=140, bh=70, half=70.
+        let u0 = bricks_uniforms(0.0);
+        assert_eq!(u0.bw, 140.0);
+        assert_eq!(u0.bh, 70.0);
+        assert_eq!(u0.half, 70.0);
+        // density 1: bw=16, bh=8, half=8.
+        let u1 = bricks_uniforms(1.0);
+        assert_eq!(u1.bw, 16.0);
+        assert_eq!(u1.bh, 8.0);
+        assert_eq!(u1.half, 8.0);
+    }
+
+    #[test]
+    fn confetti_uniforms_count_lerps_with_density() {
+        // count = max(40, round(lerp(80, 2000, density))).
+        // density 0: count=80; cell_ref=sqrt(786432/80) ~= 99.12.
+        let u0 = confetti_uniforms(0.0);
+        assert_eq!(u0.count, 80.0);
+        assert!((u0.cell_ref - 99.12).abs() < 0.5);
+        // density 1: count=2000; cell_ref=sqrt(786432/2000) ~= 19.83.
+        let u1 = confetti_uniforms(1.0);
+        assert_eq!(u1.count, 2000.0);
+        assert!((u1.cell_ref - 19.83).abs() < 0.5);
+        // Floor at 40 -- but density 0 already gives 80, so
+        // pure-floor case requires a count formula edit. Confirm
+        // the floor still kicks in if formula changes (defensive).
+        assert!(u0.count >= 40.0);
     }
 
     #[test]

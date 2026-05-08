@@ -40,17 +40,18 @@ use crate::content::{
     load_playlist, resolve_reel_items, solid_bg_hex, TextSlide,
 };
 use crate::hdmi_logic::{
-    box_to_ndc_quad, checker_uniforms, clamp_transition_ms, compute_motion_state,
-    dots_uniforms, effective_font_size_px, effective_hold_ms, format_auto_text,
-    fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, grid_uniforms,
-    halftone_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
-    parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, parse_pattern_kind,
-    pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel, rings_uniforms,
-    scanlines_uniforms, should_rerasterize, stripes_uniforms, unix_to_calendar_utc,
-    AlphaBitmap, FontCatalog, ModeSpec, MotionKind, MotionState, PatternKind, VAlign,
-    FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT,
-    FS_PATTERN_CHECKER, FS_PATTERN_DOTS, FS_PATTERN_GRID, FS_PATTERN_HALFTONE,
-    FS_PATTERN_RINGS, FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES,
+    box_to_ndc_quad, bricks_uniforms, checker_uniforms, clamp_transition_ms,
+    compute_motion_state, confetti_uniforms, dots_uniforms, effective_font_size_px,
+    effective_hold_ms, format_auto_text, fourcc_for_argb_family, fs_for_transition_kind,
+    gradient_uniforms, grid_uniforms, halftone_uniforms, hex_to_rgba, hsv_to_rgb,
+    layout_text_to_alpha, motion_offset_to_px, parse_crtc_list_filter_bits, parse_h_align,
+    parse_motion_kind, parse_pattern_kind, pattern_kind_label, pick_largest_mode_index,
+    prev_idx_for_reel, rays_uniforms, rings_uniforms, scanlines_uniforms,
+    should_rerasterize, stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, FontCatalog,
+    ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT, FS_CUT, FS_FADE,
+    FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_PATTERN_BRICKS, FS_PATTERN_CHECKER,
+    FS_PATTERN_CONFETTI, FS_PATTERN_DOTS, FS_PATTERN_GRID, FS_PATTERN_HALFTONE,
+    FS_PATTERN_RAYS, FS_PATTERN_RINGS, FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES,
     VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -992,17 +993,48 @@ fn draw_pattern(
                 },
             )
         }
-        // Patterns whose shaders haven't landed yet: warn-and-fall.
-        // Slice (d) lands rays / confetti / bricks.
-        PatternKind::Rays
-        | PatternKind::Confetti
-        | PatternKind::Bricks => {
-            eprintln!(
-                "warn: pattern={} shader not yet implemented; falling back to color_a clear",
-                pattern_kind_label(kind)
-            );
-            draw_solid_clear(gl, color_a);
-            Ok(())
+        PatternKind::Rays => {
+            let u = rays_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_RAYS, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_slices = gl.get_uniform_location(program, "u_slices");
+                    gl.uniform_1_f32(u_slices.as_ref(), u.slices);
+                },
+            )
+        }
+        PatternKind::Bricks => {
+            let u = bricks_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_BRICKS, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_bw = gl.get_uniform_location(program, "u_bw");
+                    let u_bh = gl.get_uniform_location(program, "u_bh");
+                    let u_half = gl.get_uniform_location(program, "u_half");
+                    gl.uniform_1_f32(u_bw.as_ref(), u.bw);
+                    gl.uniform_1_f32(u_bh.as_ref(), u.bh);
+                    gl.uniform_1_f32(u_half.as_ref(), u.half);
+                },
+            )
+        }
+        PatternKind::Confetti => {
+            let u = confetti_uniforms(density);
+            // Scale cell_ref (sized at 1024x768 reference) to the
+            // actual viewport: cell = cell_ref * sqrt(actual_area /
+            // ref_area). Equivalently: cell = sqrt(actual_area /
+            // count). Use the actual-area form to skip the ratio.
+            let actual_area = (mode_w as f32) * (mode_h as f32);
+            let cell = (actual_area / u.count).sqrt();
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_CONFETTI, color_a, color_b,
+                move |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_cell = gl.get_uniform_location(program, "u_cell");
+                    gl.uniform_1_f32(u_cell.as_ref(), cell);
+                },
+            )
         }
     }
 }
