@@ -269,10 +269,12 @@ pub const FS_GLYPH: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_atlas;
 uniform vec3 u_text_color;
+uniform float u_opacity;
 varying vec2 v_uv;
 void main() {
     float a = texture2D(u_atlas, v_uv).r;
-    gl_FragColor = vec4(u_text_color * a, a);
+    float alpha = a * u_opacity;
+    gl_FragColor = vec4(u_text_color * alpha, alpha);
 }
 "#;
 
@@ -2203,7 +2205,11 @@ mod tests {
     fn fs_glyph_targets_gles2_and_pins_uniforms() {
         assert!(FS_GLYPH.starts_with("#version 100\n"));
         assert!(FS_GLYPH.contains("precision mediump float"));
-        for uniform in ["u_atlas", "u_text_color"] {
+        // v1-spec-delta #4: u_opacity uniform multiplies BOTH RGB
+        // and the output alpha so opacity<1 over a non-black bg
+        // composites correctly (was pre-multiplied into text_color
+        // RGB only, leaving output alpha = unmultiplied a).
+        for uniform in ["u_atlas", "u_text_color", "u_opacity"] {
             assert!(
                 FS_GLYPH.contains(uniform),
                 "FS_GLYPH missing uniform {uniform:?}"
@@ -2212,6 +2218,13 @@ mod tests {
         // Must read the alpha out of the LUMINANCE-uploaded texture
         // via `.r` (GLES2 LUMINANCE puts the value in r, g, b, a).
         assert!(FS_GLYPH.contains(".r"));
+        // Pin the opacity multiplication into both RGB and alpha
+        // outputs -- pre-fix only RGB had it, leaving alpha
+        // un-attenuated and the bg invisible at low opacities.
+        assert!(
+            FS_GLYPH.contains("a * u_opacity"),
+            "FS_GLYPH must multiply alpha by u_opacity (v1-spec-delta #4)"
+        );
     }
 
     #[test]

@@ -884,11 +884,16 @@ fn draw_text_layer(
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         let u_atlas = gl.get_uniform_location(program, "u_atlas");
         gl.uniform_1_i32(u_atlas.as_ref(), 0);
-        let r = text_color[0] * opacity;
-        let g = text_color[1] * opacity;
-        let b = text_color[2] * opacity;
+        // v1-spec-delta #4: opacity goes through u_opacity uniform
+        // so the shader multiplies BOTH RGB and the output alpha
+        // by it. Pre-fix this code multiplied only the RGB
+        // channels into u_text_color, leaving the output alpha at
+        // `a` regardless of opacity -- which made an opacity=0.5
+        // glyph fully cover the bg instead of letting half through.
         let u_text_color = gl.get_uniform_location(program, "u_text_color");
-        gl.uniform_3_f32(u_text_color.as_ref(), r, g, b);
+        gl.uniform_3_f32(u_text_color.as_ref(), text_color[0], text_color[1], text_color[2]);
+        let u_opacity = gl.get_uniform_location(program, "u_opacity");
+        gl.uniform_1_f32(u_opacity.as_ref(), opacity);
 
         // BLEND state is set by the caller (render_slide) once
         // around the layer loop — same blend func for every layer,
