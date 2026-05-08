@@ -881,6 +881,90 @@ void main() {
 }
 "#;
 
+/// v1-spec-delta #6 (slice c) -- halftone (printer-style two-grid
+/// dot pattern). Same geometry as dots but with a second offset
+/// grid OR'd in (offset by `u_half` in both axes). Inside either
+/// grid's circle -> color_b; otherwise color_a.
+pub const FS_PATTERN_HALFTONE: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_tile;
+uniform float u_radius;
+uniform float u_half;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    vec2 cell1 = mod(pos, u_tile) - vec2(u_tile * 0.5);
+    vec2 cell2 = mod(pos + vec2(u_half), u_tile) - vec2(u_tile * 0.5);
+    float r2 = u_radius * u_radius;
+    float d_min2 = min(dot(cell1, cell1), dot(cell2, cell2));
+    float t = step(d_min2, r2);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
+/// v1-spec-delta #6 (slice c) -- horizontal 1-pixel scanlines
+/// every `u_tile` rows of color_b on a color_a base. Row index
+/// is integer floor(pos.y); rows where row mod tile == 0 get
+/// color_b, others stay color_a.
+pub const FS_PATTERN_SCANLINES: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_tile;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    float row = floor(pos.y);
+    // step(mod(row, tile), 0.5) is 1 when mod == 0, 0 otherwise.
+    float t = step(mod(row, u_tile), 0.5);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
+/// v1-spec-delta #6 (slice c) -- 1-pixel graph-paper grid:
+/// color_a lines on color_b paper, every `u_tile` rows + cols.
+/// Pixel sits on a line when (floor(x) % tile == 0) OR
+/// (floor(y) % tile == 0). On-line -> color_a; off-line ->
+/// color_b. Python convention reversed from dots/checker (the
+/// majority field is color_b, lines are color_a).
+pub const FS_PATTERN_GRID: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_tile;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    float on_x = step(mod(floor(pos.x), u_tile), 0.5);
+    float on_y = step(mod(floor(pos.y), u_tile), 0.5);
+    float on_line = max(on_x, on_y);
+    gl_FragColor = vec4(mix(u_color_b, u_color_a, on_line), 1.0);
+}
+"#;
+
+/// v1-spec-delta #6 (slice c) -- concentric rings around the
+/// slide center. Period-`u_tile` repetition: each period has a
+/// color_a band of (half-2) pixels followed by a 2-pixel
+/// color_b ring. Center at viewport midpoint.
+pub const FS_PATTERN_RINGS: &str = r#"#version 100
+precision mediump float;
+uniform vec2 u_viewport;
+uniform float u_tile;
+uniform float u_threshold;
+uniform vec3 u_color_a;
+uniform vec3 u_color_b;
+void main() {
+    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    vec2 d = pos - u_viewport * 0.5;
+    float dist = length(d);
+    float period = mod(dist, u_tile);
+    float t = step(u_threshold, period);
+    gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
+}
+"#;
+
 /// v1-spec-delta #6 (slice a, 2026-05-08): typed enum of the 10
 /// procedural background patterns from Python's
 /// `auto_render._render_pattern_*`. `solid` and `gradient` aren't
@@ -995,6 +1079,79 @@ pub fn dots_uniforms(density: f32) -> DotsUniforms {
     let tile = pattern_lerp(48.0, 4.0, density).round().max(2.0);
     let radius = (tile * 0.22).round().max(2.0);
     DotsUniforms { tile, radius }
+}
+
+/// v1-spec-delta #6 (slice c) -- halftone pattern uniforms. Two
+/// offset dot grids; second layer offset by half a tile. Mirrors
+/// Python's `_render_pattern_halftone`: tile = round(lerp(60, 6,
+/// density)); radius = round(tile * 0.34); half = tile // 2.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HalftoneUniforms {
+    pub tile: f32,
+    pub radius: f32,
+    pub half: f32,
+}
+
+pub fn halftone_uniforms(density: f32) -> HalftoneUniforms {
+    let tile = pattern_lerp(60.0, 6.0, density).round().max(2.0);
+    let radius = (tile * 0.34).round().max(2.0);
+    // Python uses `tile // 2` (integer floor divide). Mirror with
+    // floor(tile / 2) to match exactly even at odd tile sizes.
+    let half = (tile * 0.5).floor();
+    HalftoneUniforms { tile, radius, half }
+}
+
+/// v1-spec-delta #6 (slice c) -- scanlines pattern uniforms.
+/// Horizontal 1-pixel-tall lines of color_b on color_a, every
+/// `tile` rows. Mirrors Python's `_render_pattern_scanlines`:
+/// tile = max(2, round(lerp(16, 2, density))).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScanlinesUniforms {
+    pub tile: f32,
+}
+
+pub fn scanlines_uniforms(density: f32) -> ScanlinesUniforms {
+    let tile = pattern_lerp(16.0, 2.0, density).round().max(2.0);
+    ScanlinesUniforms { tile }
+}
+
+/// v1-spec-delta #6 (slice c) -- grid pattern uniforms. 1-pixel
+/// graph-paper grid: color_a lines on color_b paper, every tile
+/// rows + cols. Mirrors Python's `_render_pattern_grid`: tile =
+/// max(4, round(lerp(120, 4, density))).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridUniforms {
+    pub tile: f32,
+}
+
+pub fn grid_uniforms(density: f32) -> GridUniforms {
+    let tile = pattern_lerp(120.0, 4.0, density).round().max(4.0);
+    GridUniforms { tile }
+}
+
+/// v1-spec-delta #6 (slice c) -- rings pattern uniforms.
+/// Concentric rings around the slide center. Mirrors Python's
+/// `_render_pattern_rings`: tile = max(4, round(lerp(120, 6,
+/// density))); half = tile // 2; ring of `2` pixels at period
+/// boundary, color_a band of half-2 pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingsUniforms {
+    pub tile: f32,
+    /// Threshold within each period above which color_b shows.
+    /// Python: half - 2, where half = tile // 2.
+    pub threshold: f32,
+}
+
+pub fn rings_uniforms(density: f32) -> RingsUniforms {
+    let tile = pattern_lerp(120.0, 6.0, density).round().max(4.0);
+    let half = (tile * 0.5).floor();
+    // Python clamps the band so threshold could be 0 at tile=4
+    // (half=2, half-2=0). At threshold=0, every pixel inside the
+    // ring period >= 0 is color_b -- which means the whole tile
+    // is color_b except the exact period-boundary pixel. Visually
+    // this is "very dense rings" -- correct per Python.
+    let threshold = (half - 2.0).max(0.0);
+    RingsUniforms { tile, threshold }
 }
 
 /// Stable label for log output / smoke parsing. Matches the
@@ -2013,15 +2170,86 @@ mod tests {
             ("FS_PATTERN_STRIPES", FS_PATTERN_STRIPES),
             ("FS_PATTERN_CHECKER", FS_PATTERN_CHECKER),
             ("FS_PATTERN_DOTS", FS_PATTERN_DOTS),
+            ("FS_PATTERN_HALFTONE", FS_PATTERN_HALFTONE),
+            ("FS_PATTERN_SCANLINES", FS_PATTERN_SCANLINES),
+            ("FS_PATTERN_GRID", FS_PATTERN_GRID),
+            ("FS_PATTERN_RINGS", FS_PATTERN_RINGS),
         ] {
             assert!(src.starts_with("#version 100\n"), "{name} missing #version 100");
             assert!(src.contains("precision mediump float"), "{name} missing precision");
             assert!(src.contains("u_color_a"), "{name} missing u_color_a");
             assert!(src.contains("u_color_b"), "{name} missing u_color_b");
             assert!(src.contains("u_viewport"), "{name} missing u_viewport");
+        }
+        // tile uniform present where applicable (every pattern
+        // except scanlines... actually scanlines uses u_tile too).
+        for (name, src) in [
+            ("FS_PATTERN_STRIPES", FS_PATTERN_STRIPES),
+            ("FS_PATTERN_CHECKER", FS_PATTERN_CHECKER),
+            ("FS_PATTERN_DOTS", FS_PATTERN_DOTS),
+            ("FS_PATTERN_HALFTONE", FS_PATTERN_HALFTONE),
+            ("FS_PATTERN_SCANLINES", FS_PATTERN_SCANLINES),
+            ("FS_PATTERN_GRID", FS_PATTERN_GRID),
+            ("FS_PATTERN_RINGS", FS_PATTERN_RINGS),
+        ] {
             assert!(src.contains("u_tile"), "{name} missing u_tile");
         }
-        assert!(FS_PATTERN_DOTS.contains("u_radius"), "dots shader missing u_radius");
+        assert!(FS_PATTERN_DOTS.contains("u_radius"), "dots missing u_radius");
+        assert!(FS_PATTERN_HALFTONE.contains("u_radius"), "halftone missing u_radius");
+        assert!(FS_PATTERN_HALFTONE.contains("u_half"), "halftone missing u_half");
+        assert!(FS_PATTERN_RINGS.contains("u_threshold"), "rings missing u_threshold");
+    }
+
+    // v1-spec-delta #6 (slice c) -- halftone / scanlines / grid /
+    // rings uniform helpers. Math mirrors Python anchors at
+    // density 0/0.5/1.
+    #[test]
+    fn halftone_uniforms_match_python_anchors() {
+        // tile = round(lerp(60, 6, density)); radius = round(tile *
+        // 0.34); half = floor(tile / 2).
+        // density 0: tile=60, radius=round(20.4)=20, half=30.
+        let u0 = halftone_uniforms(0.0);
+        assert_eq!(u0.tile, 60.0);
+        assert_eq!(u0.radius, 20.0);
+        assert_eq!(u0.half, 30.0);
+        // density 1: tile=6, radius=round(2.04)=2, half=3.
+        let u1 = halftone_uniforms(1.0);
+        assert_eq!(u1.tile, 6.0);
+        assert_eq!(u1.radius, 2.0);
+        assert_eq!(u1.half, 3.0);
+    }
+
+    #[test]
+    fn scanlines_tile_size_matches_python_lerp() {
+        // tile = round(lerp(16, 2, density)). density 0 -> 16,
+        // density 1 -> 2 (floor=2). density 0.5 -> round(9) = 9.
+        assert_eq!(scanlines_uniforms(0.0).tile, 16.0);
+        assert_eq!(scanlines_uniforms(1.0).tile, 2.0);
+        assert_eq!(scanlines_uniforms(0.5).tile, 9.0);
+    }
+
+    #[test]
+    fn grid_tile_size_matches_python_lerp_with_floor4() {
+        // tile = max(4, round(lerp(120, 4, density))).
+        // density 0 -> 120, density 1 -> 4 (floor=4).
+        // density 0.5 -> round(62) = 62.
+        assert_eq!(grid_uniforms(0.0).tile, 120.0);
+        assert_eq!(grid_uniforms(1.0).tile, 4.0);
+        assert_eq!(grid_uniforms(0.5).tile, 62.0);
+    }
+
+    #[test]
+    fn rings_uniforms_match_python_anchors() {
+        // tile = max(4, round(lerp(120, 6, density))); half = floor
+        // (tile/2); threshold = max(0, half-2).
+        // density 0: tile=120, half=60, threshold=58.
+        let u0 = rings_uniforms(0.0);
+        assert_eq!(u0.tile, 120.0);
+        assert_eq!(u0.threshold, 58.0);
+        // density 1: tile=6, half=3, threshold=1.
+        let u1 = rings_uniforms(1.0);
+        assert_eq!(u1.tile, 6.0);
+        assert_eq!(u1.threshold, 1.0);
     }
 
     #[test]

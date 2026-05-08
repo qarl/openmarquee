@@ -42,13 +42,15 @@ use crate::content::{
 use crate::hdmi_logic::{
     box_to_ndc_quad, checker_uniforms, clamp_transition_ms, compute_motion_state,
     dots_uniforms, effective_font_size_px, effective_hold_ms, format_auto_text,
-    fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, hex_to_rgba,
-    hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px, parse_crtc_list_filter_bits,
-    parse_h_align, parse_motion_kind, parse_pattern_kind, pattern_kind_label,
-    pick_largest_mode_index, prev_idx_for_reel, should_rerasterize, stripes_uniforms,
-    unix_to_calendar_utc, AlphaBitmap, FontCatalog, ModeSpec, MotionKind, MotionState,
-    PatternKind, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE,
-    FS_GRADIENT, FS_PATTERN_CHECKER, FS_PATTERN_DOTS, FS_PATTERN_STRIPES,
+    fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms, grid_uniforms,
+    halftone_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
+    parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, parse_pattern_kind,
+    pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel, rings_uniforms,
+    scanlines_uniforms, should_rerasterize, stripes_uniforms, unix_to_calendar_utc,
+    AlphaBitmap, FontCatalog, ModeSpec, MotionKind, MotionState, PatternKind, VAlign,
+    FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT,
+    FS_PATTERN_CHECKER, FS_PATTERN_DOTS, FS_PATTERN_GRID, FS_PATTERN_HALFTONE,
+    FS_PATTERN_RINGS, FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES,
     VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -940,13 +942,59 @@ fn draw_pattern(
                 },
             )
         }
+        PatternKind::Halftone => {
+            let u = halftone_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_HALFTONE, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_tile = gl.get_uniform_location(program, "u_tile");
+                    let u_radius = gl.get_uniform_location(program, "u_radius");
+                    let u_half = gl.get_uniform_location(program, "u_half");
+                    gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                    gl.uniform_1_f32(u_radius.as_ref(), u.radius);
+                    gl.uniform_1_f32(u_half.as_ref(), u.half);
+                },
+            )
+        }
+        PatternKind::Scanlines => {
+            let u = scanlines_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_SCANLINES, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_tile = gl.get_uniform_location(program, "u_tile");
+                    gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                },
+            )
+        }
+        PatternKind::Grid => {
+            let u = grid_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_GRID, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_tile = gl.get_uniform_location(program, "u_tile");
+                    gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                },
+            )
+        }
+        PatternKind::Rings => {
+            let u = rings_uniforms(density);
+            draw_full_screen_pattern(
+                gl, mode_w, mode_h, FS_PATTERN_RINGS, color_a, color_b,
+                |gl, program| unsafe {
+                    use glow::HasContext;
+                    let u_tile = gl.get_uniform_location(program, "u_tile");
+                    let u_threshold = gl.get_uniform_location(program, "u_threshold");
+                    gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                    gl.uniform_1_f32(u_threshold.as_ref(), u.threshold);
+                },
+            )
+        }
         // Patterns whose shaders haven't landed yet: warn-and-fall.
-        // Subsequent slices replace each arm with its draw helper.
-        PatternKind::Halftone
-        | PatternKind::Scanlines
-        | PatternKind::Grid
-        | PatternKind::Rings
-        | PatternKind::Rays
+        // Slice (d) lands rays / confetti / bricks.
+        PatternKind::Rays
         | PatternKind::Confetti
         | PatternKind::Bricks => {
             eprintln!(

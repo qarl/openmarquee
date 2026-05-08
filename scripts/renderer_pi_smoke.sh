@@ -764,7 +764,7 @@ echo "    --play-outline-test ok (FS_GLYPH_OUTLINE linked + drew on hw)"
 # Patterns whose shader hasn't landed warn-and-fall to color_a;
 # they're left out of this list until they ship. The list grows
 # slice-by-slice (b: stripes/checker/dots; c: ...; d: ...).
-PATTERN_KINDS_IMPL="stripes checker dots"
+PATTERN_KINDS_IMPL="stripes checker dots halftone scanlines grid rings"
 for kind in $PATTERN_KINDS_IMPL; do
     echo "==> Phase d-smoke -- --play-pattern-test $kind"
     PT_LOG="$LOG_DIR/pattern-test-$kind.log"
