@@ -109,13 +109,39 @@ pub fn parse_meminfo(s: &str) -> (u64, u64) {
     (total, free)
 }
 
+/// v1-spec-delta #12 (slice b-2): GPU-side counters derived by
+/// inspecting EglSession state at emit-time (no allocation-path
+/// instrumentation needed). Caller fills these from the session;
+/// mem.rs stays decoupled from hdmi-internal types.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GpuCounters {
+    /// scanout buffer objects held in the N-2 rotation (gbm BOs)
+    pub bo: u32,
+    /// DRM framebuffer attachments (drmModeAddFB handles)
+    pub fb: u32,
+    /// GL framebuffer objects (scene FBO + transition FBOs when alive)
+    pub fbo: u32,
+    /// GL textures alive in the session (scene tex + image-bg cache + glyph atlas).
+    /// Soak parser should treat unknown columns as informational.
+    pub textures: u32,
+}
+
 /// Emit the canonical `[mem]` line. The soak gate (slice c) parses
 /// these out of stderr so the format is contract: keep the keys
-/// stable across slices. New fields go on the right.
-pub fn log_mem_snapshot(label: &str) {
+/// stable across slices. New fields go on the right; soak parsers
+/// regex by key (vm_rss=, cma_used=, etc) rather than positional-
+/// parse, so adding columns is non-breaking.
+pub fn log_mem_snapshot(label: &str, gpu: Option<GpuCounters>) {
     let s = MemSnapshot::read();
+    let suffix = match gpu {
+        Some(g) => format!(
+            " bo={} fb={} fbo={} textures={}",
+            g.bo, g.fb, g.fbo, g.textures,
+        ),
+        None => String::new(),
+    };
     eprintln!(
-        "[mem] {label} vm_rss={:.1}MB vm_data={:.1}MB swap={:.1}MB cma_used={:.1}MB",
+        "[mem] {label} vm_rss={:.1}MB vm_data={:.1}MB swap={:.1}MB cma_used={:.1}MB{suffix}",
         s.vm_rss_kb as f64 / 1024.0,
         s.vm_data_kb as f64 / 1024.0,
         s.vm_swap_kb as f64 / 1024.0,

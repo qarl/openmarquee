@@ -2318,6 +2318,26 @@ impl<'a> EglSession<'a> {
     pub fn current_settings(&self) -> &crate::content::Settings {
         &self.current_settings
     }
+
+    /// v1-spec-delta #12 (slice b-2): GPU counters derived from
+    /// session state. Cheap (no GL calls); inspects Option fields
+    /// + image_bg_cache.len. Transient FBOs allocated inside
+    /// render_transition_animated_in_session are NOT counted (they
+    /// only live across the transition function's stack); the
+    /// session-persistent scene FBO + scanout chain ARE. The
+    /// glyph atlas is also not counted -- FontCatalog is held by
+    /// callers (not the session) so the count would need a
+    /// separate plumbing axis. Tracked as a slice (c) followup.
+    pub fn gpu_counters(&self) -> crate::mem::GpuCounters {
+        let bo = (self.scanout_prev_bo.is_some() as u32)
+               + (self.scanout_current_bo.is_some() as u32);
+        let fb = (self.scanout_prev_fb.is_some() as u32)
+               + (self.scanout_current_fb.is_some() as u32);
+        let fbo = self.scene_fbo.is_some() as u32;
+        let textures = (self.scene_tex.is_some() as u32)
+                     + self.image_bg_cache.len() as u32;
+        crate::mem::GpuCounters { bo, fb, fbo, textures }
+    }
 }
 
 /// v1-spec-delta #10 (slice c) -- lazy-allocate the per-
@@ -4225,8 +4245,9 @@ pub fn render_playlist_reel(
         // v1-spec-delta #12 (slice b-1): baseline memory
         // snapshot at session open. The soak gate (slice c)
         // diffs per-pass values against this to compute the
-        // monotonic-growth slope per §8.2.
-        crate::mem::log_mem_snapshot("session=open");
+        // monotonic-growth slope per §8.2. Slice (b-2) adds
+        // the bo/fb/fbo/textures counters on the right.
+        crate::mem::log_mem_snapshot("session=open", Some(session.gpu_counters()));
         let mut pass = 0_u32;
         loop {
             let pass_start = std::time::Instant::now();
@@ -4381,7 +4402,7 @@ pub fn render_playlist_reel(
                 "reel: pass #{pass} complete pass_ms={pass_ms} slides_held={slides_held} \
                  transitions_run={transitions_run}",
             );
-            crate::mem::log_mem_snapshot(&format!("pass={pass}"));
+            crate::mem::log_mem_snapshot(&format!("pass={pass}"), Some(session.gpu_counters()));
 
             pass += 1;
             if !loop_forever {
@@ -4389,7 +4410,7 @@ pub fn render_playlist_reel(
             }
         }
 
-        crate::mem::log_mem_snapshot("session=close");
+        crate::mem::log_mem_snapshot("session=close", Some(session.gpu_counters()));
         eprintln!("reel: complete after {pass} pass(es)");
         Ok(())
     })
