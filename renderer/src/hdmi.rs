@@ -2353,6 +2353,8 @@ fn paint_slide(
             }
         }
         unsafe {
+            // BLEND once-per-paint; per-layer the blend FUNC is
+            // tweaked below based on layer.blend (slice 7b).
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
         }
@@ -2429,19 +2431,38 @@ fn paint_slide(
                     .map(|ms| ms[i])
                     .unwrap_or(MotionState::IDENTITY);
                 let motion_kind = parse_motion_kind(&layer.motion);
-                // v1-spec-delta #7 (slice a): typed blend dispatch.
-                // Slice (a) only parses + warns; the actual blend
-                // func selection lands in slice (b). Layers with
-                // blend != normal continue to render via the
-                // existing source-over path (functionally correct
-                // for solid bg slides; visually wrong for layered
-                // composites until slice (b)/(c)).
+                // v1-spec-delta #7 (slice b): per-layer blend func
+                // dispatch. The FS_GLYPH/FS_GLYPH_OUTLINE shaders
+                // emit premultiplied src (text_color * alpha,
+                // alpha); the blend func choice translates that
+                // emit into source-over normal / multiply / screen
+                // formulas without any shader change.
+                //   Normal:   src_factor = ONE,                   dst_factor = ONE_MINUS_SRC_ALPHA
+                //             dst' = src + (1-α) dst                       = source-over
+                //   Multiply: src_factor = DST_COLOR,             dst_factor = ONE_MINUS_SRC_ALPHA
+                //             dst' = (text·α) · dst + (1-α) dst   = source-over multiply
+                //   Screen:   src_factor = ONE_MINUS_DST_COLOR,   dst_factor = ONE
+                //             dst' = (text·α)·(1-dst) + dst        = source-over screen
+                //   Overlay:  needs FBO sample (slice c).
                 let blend_mode = parse_blend_mode(&layer.blend);
-                if !matches!(blend_mode, BlendMode::Normal) {
-                    eprintln!(
-                        "warn: blend={} on layer {i} not yet implemented; rendering as normal",
-                        blend_mode_label(blend_mode)
-                    );
+                unsafe {
+                    match blend_mode {
+                        BlendMode::Normal => {
+                            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                        }
+                        BlendMode::Multiply => {
+                            gl.blend_func(glow::DST_COLOR, glow::ONE_MINUS_SRC_ALPHA);
+                        }
+                        BlendMode::Screen => {
+                            gl.blend_func(glow::ONE_MINUS_DST_COLOR, glow::ONE);
+                        }
+                        BlendMode::Overlay => {
+                            eprintln!(
+                                "warn: blend=overlay on layer {i} not yet implemented (needs slice c FBO sample); rendering as normal"
+                            );
+                            gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                        }
+                    }
                 }
                 let cached = cache_ref[i]
                     .as_ref()

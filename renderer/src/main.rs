@@ -218,6 +218,15 @@ struct Args {
     #[arg(long)]
     play_pattern_test: Option<String>,
 
+    /// v1-spec-delta #7 (slice b+) -- render a synthesized slide
+    /// with one text layer using the named blend mode against a
+    /// solid bg. KIND is one of `normal` / `screen` / `multiply`
+    /// / `overlay`. Held for `--hold-secs` (default 2). Smoke
+    /// gate validates the per-layer blend func switch on real
+    /// DRM scanout.
+    #[arg(long)]
+    play_blend_test: Option<String>,
+
     /// v1-spec-delta #4 (slice b/d) — render a synthesized slide
     /// with the layer's `outline` set. Validates that the
     /// FS_GLYPH_OUTLINE shader path links + draws on real DRM
@@ -424,6 +433,52 @@ fn build_pattern_test_slide(pattern_name: &str) -> content::TextSlide {
             color_b: "#FF6B00".to_string(),  // orange
             density: 0.5,
         }),
+        text_layers: vec![layer],
+    }
+}
+
+/// v1-spec-delta #7 (slice b+) -- synthesize a slide with one
+/// text layer using the named blend mode. Layer text =
+/// uppercased blend name; cyan text on orange bg so the blend
+/// composite is visually distinct from "normal":
+///   normal:   cyan text on orange bg.
+///   multiply: dark color (cyan * orange).
+///   screen:   light color (1 - (1-cyan)*(1-orange)).
+///   overlay:  formula-dependent; slice (c) renders correctly,
+///             slice (b) falls back to normal + emits warn.
+fn build_blend_test_slide(blend_name: &str) -> content::TextSlide {
+    use uuid::Uuid;
+    let layer = content::TextLayer {
+        text: blend_name.to_uppercase(),
+        name: String::new(),
+        font_family: None,
+        font_size_px: None,
+        font_size_pct: Some(50.0),
+        text_color: "#00BFFF".to_string(),  // cyan
+        text_align: "center".to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: "static".to_string(),
+        motion_intensity: 50,
+        motion_phase: 0.0,
+        motion_speed: 1.0,
+        auto_mode: None,
+        auto_format: None,
+        outline: false,
+        blend: blend_name.to_string(),
+        r#box: content::TextBox {
+            x: 0.05,
+            y: 0.30,
+            w: 0.90,
+            h: 0.40,
+        },
+    };
+    content::TextSlide {
+        id: Uuid::nil(),
+        name: format!("blend-test-{blend_name}"),
+        duration_ms: 2000,
+        background_color: "#FF6B00".to_string(),  // orange
+        background_pattern: None,
         text_layers: vec![layer],
     }
 }
@@ -886,6 +941,25 @@ fn main() -> Result<()> {
                         );
                     };
                     let slide = build_pattern_test_slide(pattern_name);
+                    let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
+                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    return Ok(());
+                }
+                if let Some(blend_name) = args.play_blend_test.as_deref() {
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for blend smoke",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide = build_blend_test_slide(blend_name);
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
                     hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
                     return Ok(());

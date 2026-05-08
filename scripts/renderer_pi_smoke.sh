@@ -765,6 +765,10 @@ echo "    --play-outline-test ok (FS_GLYPH_OUTLINE linked + drew on hw)"
 # they're left out of this list until they ship. The list grows
 # slice-by-slice (b: stripes/checker/dots; c: ...; d: ...).
 PATTERN_KINDS_IMPL="stripes checker dots halftone scanlines grid rings rays bricks confetti"
+# v1-spec-delta #7 -- blend modes shipped by slice. (b) lands
+# screen + multiply via blend func tweaks; (c) lands overlay via
+# FBO sample. normal is shipped from day one.
+BLEND_KINDS_IMPL="normal screen multiply"
 for kind in $PATTERN_KINDS_IMPL; do
     echo "==> Phase d-smoke -- --play-pattern-test $kind"
     PT_LOG="$LOG_DIR/pattern-test-$kind.log"
@@ -792,6 +796,37 @@ for kind in $PATTERN_KINDS_IMPL; do
     fi
     KIND_UPPER=$(echo "$kind" | tr '[:lower:]' '[:upper:]')
     echo "    --play-pattern-test $kind ok (FS_PATTERN_${KIND_UPPER} linked + drew on hw)"
+done
+
+# v1-spec-delta #7 (slice b+) blend mode smoke. Renders a synth
+# slide for each shipped blend mode and asserts no panic + slide
+# render complete + the dispatch arm wasn't bypassed.
+for kind in $BLEND_KINDS_IMPL; do
+    echo "==> Phase d-smoke -- --play-blend-test $kind"
+    BL_LOG="$LOG_DIR/blend-test-$kind.log"
+    BL_EXIT=0
+    ssh "$TARGET" "$BIN_PI --output hdmi --play-blend-test $kind --hold-secs 2" \
+        > "$BL_LOG" 2>&1 || BL_EXIT=$?
+    if [ "$BL_EXIT" -ne 0 ]; then
+        echo "FAIL: --play-blend-test $kind exit $BL_EXIT"
+        cat "$BL_LOG"
+        exit 1
+    fi
+    grep -qE 'panicked at|RUST_BACKTRACE' "$BL_LOG" && \
+        { echo "FAIL: panic in --play-blend-test $kind"; cat "$BL_LOG"; exit 1; }
+    grep -q 'slide render complete' "$BL_LOG" || \
+        { echo "FAIL: --play-blend-test $kind didn't reach slide render complete"; cat "$BL_LOG"; exit 1; }
+    # Non-Normal modes must NOT have hit the warn-and-fall path
+    # (which would mean the dispatch arm regressed). The "Normal"
+    # mode is allowed to skip this check (it's the baseline).
+    if [ "$kind" != "normal" ]; then
+        if grep -q "warn: blend=$kind" "$BL_LOG"; then
+            echo "FAIL: --play-blend-test $kind hit warn-and-fall (dispatch arm regressed?)"
+            cat "$BL_LOG"
+            exit 1
+        fi
+    fi
+    echo "    --play-blend-test $kind ok (blend func dispatched correctly)"
 done
 
 # Phase 6 reel assertion: completion + slide count + transition
