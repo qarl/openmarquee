@@ -18,6 +18,7 @@
 // Mac dev box for the pure-logic surfaces.
 #[cfg(target_os = "linux")]
 mod hdmi;
+mod cea861;
 mod content;
 mod hdmi_logic;
 mod ipc_main;

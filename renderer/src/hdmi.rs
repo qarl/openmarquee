@@ -4602,6 +4602,54 @@ fn gbm_fourcc_bytes(fmt: GbmFormat) -> [u8; 4] {
     fourcc_for_argb_family(name).unwrap_or([0, 0, 0, 0])
 }
 
+/// v1-spec-delta #17 (slice b, 2026-05-08): synthesize a CEA-861
+/// drm::Mode from a `--force-mode` request. Used when the
+/// connector's EDID is missing/invalid and the safe-mode list
+/// doesn't include the operator's wanted resolution. The kernel
+/// still validates the mode against the driver's capabilities at
+/// SetCrtc time -- an unsupported timing surfaces as
+/// drmModeSetCrtc Err which the caller logs + bails.
+///
+/// Field-for-field copy from cea861::Cea861Timings into a
+/// drm_ffi::drm_mode_modeinfo, then .into() converts to drm-rs's
+/// Mode (the From impl just wraps the inner ffi struct).
+pub fn synthesize_drm_mode(forced: crate::ForcedMode) -> Result<Mode> {
+    use drm::control::{ModeFlags, ModeTypeFlags};
+    let t = crate::cea861::lookup(forced.width, forced.height, forced.vrefresh_hz)
+        .with_context(|| format!("synthesize_drm_mode({}x{}@{})",
+            forced.width, forced.height, forced.vrefresh_hz))?;
+    // drm_mode_modeinfo.name is c_char[32] (sign varies by arch).
+    // Build a NUL-terminated label that fits.
+    let label = format!("{}x{}", forced.width, forced.height);
+    let mut name: [core::ffi::c_char; 32] = [0; 32];
+    for (i, b) in label.bytes().take(31).enumerate() {
+        name[i] = b as core::ffi::c_char;
+    }
+    // PHSYNC | PVSYNC matches all four entries in the cea861 table.
+    // Mode type DRIVER + USERDEF tells the kernel "userspace-supplied,
+    // not from EDID parsing."
+    let flags = (ModeFlags::PHSYNC | ModeFlags::PVSYNC).bits();
+    let type_ = (ModeTypeFlags::DRIVER | ModeTypeFlags::USERDEF).bits();
+    let modeinfo = drm_ffi::drm_mode_modeinfo {
+        clock: t.clock,
+        hdisplay: t.hdisplay,
+        hsync_start: t.hsync_start,
+        hsync_end: t.hsync_end,
+        htotal: t.htotal,
+        hskew: 0,
+        vdisplay: t.vdisplay,
+        vsync_start: t.vsync_start,
+        vsync_end: t.vsync_end,
+        vtotal: t.vtotal,
+        vscan: 0,
+        vrefresh: t.vrefresh_hz,
+        flags,
+        type_,
+        name,
+    };
+    Ok(modeinfo.into())
+}
+
 /// Find the first connected connector and its largest mode. Mode
 /// selection delegates to `hdmi_logic::pick_largest_mode_index` so
 /// the tie-breaking + max-area logic is testable without a real DRM

@@ -56,6 +56,14 @@ glow = "0.14"
 # direct declaration just exposes the API. Linux-only since the
 # whole hdmi.rs module is.
 libc = "0.2"
+# v1-spec-delta #17 (slice b, 2026-05-08): drm-ffi exposes
+# drm_mode_modeinfo so we can synthesize a CEA-861 1920x1080 Mode
+# for --force-mode (project-memory: dev Pi EDID is 0 bytes; safe-
+# mode list tops out at 1024x768). drm-ffi is already in the dep
+# tree transitively via drm-rs; this declaration just exposes the
+# struct. Same major version drm-rs links against to avoid layout
+# drift.
+drm-ffi = "0.8"
 
 [dev-dependencies]
 # Integration tests for content.rs's file-IO wrappers.
