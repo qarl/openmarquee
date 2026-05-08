@@ -197,6 +197,14 @@ struct Args {
     #[arg(long)]
     play_motion_transition: Option<String>,
 
+    /// v1-spec-delta #3 (slice d) — render a synthesized auto_mode
+    /// slide (one of `time` / `date` / `day`) for `--hold-secs`
+    /// seconds. With `--hold-secs 5`, a `time` slide should tick
+    /// the seconds digit 4-5 times during the hold. Validates the
+    /// per-frame text re-rasterization on real DRM scanout.
+    #[arg(long)]
+    play_auto_mode_test: Option<String>,
+
     /// When `--play-reel` is set, loop the reel forever (wrapping
     /// from last slide back to first via the first slide's
     /// transition). Default: single pass.
@@ -274,6 +282,8 @@ fn build_motion_test_slide(kind: &str) -> content::TextSlide {
         motion_intensity: 50,
         motion_phase: 0.0,
         motion_speed: 1.0,
+        auto_mode: None,
+        auto_format: None,
         r#box: content::TextBox {
             x: 0.05,
             y: 0.30,
@@ -285,6 +295,54 @@ fn build_motion_test_slide(kind: &str) -> content::TextSlide {
         id: Uuid::nil(),
         name: format!("motion-test-{kind}"),
         duration_ms: 2000,
+        background_color: "#1A1A1A".to_string(),
+        background_pattern: None,
+        text_layers: vec![layer],
+    }
+}
+
+/// v1-spec-delta #3 (slice d) -- synthesize an in-memory TextSlide
+/// with one auto_mode-set layer. Used by `--play-auto-mode-test
+/// KIND` to exercise the per-frame clock/date substitution path
+/// on real scanout. Default formats picked for visual prominence:
+/// time -> time_hms (so seconds tick visibly), date -> date_long,
+/// day -> day_long.
+#[cfg(target_os = "linux")]
+fn build_auto_mode_test_slide(kind: &str) -> content::TextSlide {
+    use uuid::Uuid;
+    let auto_format = match kind {
+        "time" => "time_hms",
+        "date" => "date_long",
+        "day" => "day_long",
+        _ => "time_hms",
+    };
+    let layer = content::TextLayer {
+        text: format!("AUTO {}", kind.to_uppercase()),
+        name: String::new(),
+        font_family: None,
+        font_size_px: None,
+        font_size_pct: Some(50.0),
+        text_color: "#FFFFFF".to_string(),
+        text_align: "center".to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: "static".to_string(),
+        motion_intensity: 50,
+        motion_phase: 0.0,
+        motion_speed: 1.0,
+        auto_mode: Some(kind.to_string()),
+        auto_format: Some(auto_format.to_string()),
+        r#box: content::TextBox {
+            x: 0.05,
+            y: 0.30,
+            w: 0.90,
+            h: 0.40,
+        },
+    };
+    content::TextSlide {
+        id: Uuid::nil(),
+        name: format!("auto-mode-test-{kind}"),
+        duration_ms: 5000,
         background_color: "#1A1A1A".to_string(),
         background_pattern: None,
         text_layers: vec![layer],
@@ -686,6 +744,29 @@ fn main() -> Result<()> {
                         args.transition_ms,
                         args.fps,
                     )?;
+                    return Ok(());
+                }
+                if let Some(kind) = args.play_auto_mode_test.as_deref() {
+                    // v1-spec-delta #3 (slice d) -- synthesize an
+                    // auto_mode slide and render. `kind` = time /
+                    // date / day; format defaults to time_hms /
+                    // date_long / day_long for visual prominence.
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for auto-mode smoke",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide = build_auto_mode_test_slide(kind);
+                    let hold_ms = args.hold_secs.unwrap_or(5).saturating_mul(1000);
+                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
                     return Ok(());
                 }
                 if let (Some(from_id), Some(to_id)) = (args.fade_from, args.fade_to) {

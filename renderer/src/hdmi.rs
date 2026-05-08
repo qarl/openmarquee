@@ -41,10 +41,11 @@ use crate::content::{
 };
 use crate::hdmi_logic::{
     box_to_ndc_quad, clamp_transition_ms, compute_motion_state, effective_font_size_px,
-    effective_hold_ms, fourcc_for_argb_family, fs_for_transition_kind, gradient_uniforms,
-    hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px, parse_crtc_list_filter_bits,
-    parse_h_align, parse_motion_kind, pick_largest_mode_index, prev_idx_for_reel, FontCatalog,
-    ModeSpec, MotionKind, MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
+    effective_hold_ms, format_auto_text, fourcc_for_argb_family, fs_for_transition_kind,
+    gradient_uniforms, hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
+    parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, pick_largest_mode_index,
+    prev_idx_for_reel, unix_to_calendar_utc, AlphaBitmap, FontCatalog, ModeSpec, MotionKind,
+    MotionState, VAlign, FS_BLIT, FS_CUT, FS_FADE, FS_GLYPH,
     FS_GRADIENT, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
@@ -507,6 +508,14 @@ fn render_animated_slide(
     let frame_period_ns: u64 = 1_000_000_000_u64 / fps.max(1) as u64;
     let start = std::time::Instant::now();
     let mut frames: u32 = 0;
+    // v1-spec-delta #3 (slice b QA followup): glyph rasterization
+    // cache lives across the per-frame loop. layout_text_to_alpha
+    // fires only when resolved_text changes (motion-only paths
+    // never refresh; auto_mode=time refreshes 1x/sec instead of
+    // 30x/sec). Without this, the per-frame render at 1080p hits
+    // the fontdue ~50ms/layer bottleneck on every iteration.
+    let mut glyph_cache: GlyphCache = Vec::with_capacity(text_layers.len());
+    glyph_cache.resize_with(text_layers.len(), || None);
 
     let work: Result<()> = (|| {
         use glow::HasContext;
@@ -519,6 +528,7 @@ fn render_animated_slide(
             let tick_seconds = elapsed.as_secs_f64();
             let motion_states =
                 motion_states_for_layers(slide_id, text_layers, tick_seconds);
+            let wall_clock_unix = current_unix_seconds();
             paint_slide(
                 &gl,
                 mode_w as u32,
@@ -526,6 +536,8 @@ fn render_animated_slide(
                 bg_kind,
                 text_layers,
                 Some(&motion_states),
+                wall_clock_unix,
+                Some(&mut glyph_cache),
             )?;
             unsafe { gl.flush(); }
             egl_lib
@@ -699,10 +711,10 @@ fn draw_text_layer(
     mode_w: u32,
     mode_h: u32,
     layer: &crate::content::TextLayer,
-    font: &fontdue::Font,
     text_color: [f32; 4],
     motion_kind: MotionKind,
     motion_state: MotionState,
+    bm: &AlphaBitmap,
 ) -> Result<()> {
     use glow::HasContext;
 
@@ -716,17 +728,10 @@ fn draw_text_layer(
         mode_w,
     );
 
-    let bm = layout_text_to_alpha(font, &layer.text, size_px).ok_or_else(|| {
-        anyhow!(
-            "layout_text_to_alpha returned None for text={:?} size={}",
-            layer.text,
-            size_px
-        )
-    })?;
-    eprintln!(
-        "rasterized text {:?} @ {:.1}px → {}x{} alpha bitmap",
-        layer.text, size_px, bm.width, bm.height,
-    );
+    // v1-spec-delta #3 (slice b cache, QA followup): the alpha
+    // bitmap is pre-rasterized by paint_slide via the
+    // (resolved_text -> bitmap) cache. draw_text_layer is now
+    // GPU-only -- no fontdue calls per frame on cache hits.
 
     // v1-spec-delta #2 (slice c-1): apply per-layer motion.
     // alpha_mul folds in pulse / blink. A fully transparent layer
@@ -1000,14 +1005,21 @@ pub fn render_slide(
     // Animated slides take the per-frame loop with the same legacy
     // SetCrtc bring-up. 30 fps is the target, picked to match
     // spec §11's frame-rate ask.
+    // v1-spec-delta #3: auto_mode-set layers also force the
+    // animated dispatch (text changes every second, so the slide
+    // can't be one-shot). Layers with motion=static AND auto_mode
+    // unset stay in the cheap one-shot path. FYS today has neither
+    // motion nor auto_mode, so behavior is unchanged.
     let any_animated = text_layers.iter().any(|(layer, _, _)| {
         parse_motion_kind(&layer.motion) != MotionKind::Static
+            || layer.auto_mode.is_some()
     });
     if any_animated {
-        eprintln!("slide has animated layers — entering per-frame loop @ 30 fps");
+        eprintln!("slide has animated/auto_mode layers — entering per-frame loop @ 30 fps");
         render_animated_slide(card, &bg_kind, &text_layers, slide.id, hold_ms, 30)?;
     } else {
         let motion_states = motion_states_for_layers(slide.id, &text_layers, 0.0);
+        let wall_clock_unix = current_unix_seconds();
         render_one_frame_to_hdmi(card, hold_ms, |gl, mode_w, mode_h| {
             use glow::HasContext;
             paint_slide(
@@ -1017,6 +1029,8 @@ pub fn render_slide(
                 &bg_kind,
                 &text_layers,
                 Some(&motion_states),
+                wall_clock_unix,
+                None,
             )?;
             unsafe { gl.flush(); }
             Ok(())
@@ -1032,6 +1046,18 @@ pub fn render_slide(
 /// across reloads as long as the operator doesn't reorder layers
 /// (which would re-seed shake — acceptable; reorder is a
 /// deliberate edit, not an idle re-render).
+/// v1-spec-delta #3 -- current Unix timestamp in seconds, for
+/// auto_mode time/date/day substitution. Saturating cast on the
+/// pre-1970 / post-2262 edges (both fall outside the dev Pi's
+/// realistic operating range; the saturating behavior just avoids
+/// a panic if the system clock is wedged).
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn layer_id_seed(slide_id: Uuid, index: usize) -> u64 {
     let bytes = slide_id.as_bytes();
     let high = u64::from_le_bytes([
@@ -1137,10 +1163,22 @@ unsafe fn make_slide_fbo(
         return Err(anyhow!("framebuffer incomplete (slide_fbo): status=0x{status:x}"));
     }
     // v1-spec-delta #2 (slice c-1): FBO bake takes the static
-    // snapshot path. Slice (d) — motion through transitions — will
-    // pass per-frame motion states here so the bake re-runs each
-    // transition frame; for now this is the existing freeze.
-    let paint_result = paint_slide(gl, mode_w, mode_h, bg_kind, text_layers, None);
+    // snapshot path. Slice (d) — motion through transitions —
+    // passes per-frame motion states inside render_transition_
+    // animated; this make_slide_fbo path is the initial bake, so
+    // None is correct.
+    // v1-spec-delta #3: pass current wall-clock so any auto_mode
+    // layer in the FBO bake renders the right time-of-day.
+    let paint_result = paint_slide(
+        gl,
+        mode_w,
+        mode_h,
+        bg_kind,
+        text_layers,
+        None,
+        current_unix_seconds(),
+        None,
+    );
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
         gl.delete_framebuffer(fbo);
@@ -1614,6 +1652,23 @@ pub fn render_transition_animated(
         let any_animated_b = layers_b
             .iter()
             .any(|(l, _, _)| parse_motion_kind(&l.motion) != MotionKind::Static);
+        // v1-spec-delta #3: auto_mode-set layers also need
+        // re-rasterization through transitions so the clock
+        // doesn't freeze. Hoisted out of the per-frame loop --
+        // immutable across frames.
+        let any_auto_a = layers_a
+            .iter()
+            .any(|(l, _, _)| l.auto_mode.is_some());
+        let any_auto_b = layers_b
+            .iter()
+            .any(|(l, _, _)| l.auto_mode.is_some());
+        // v1-spec-delta #3 (slice b QA followup): per-slide glyph
+        // caches across the transition loop. fontdue rasterization
+        // skips when (resolved_text, font_size) is unchanged.
+        let mut glyph_cache_a: GlyphCache = Vec::with_capacity(layers_a.len());
+        glyph_cache_a.resize_with(layers_a.len(), || None);
+        let mut glyph_cache_b: GlyphCache = Vec::with_capacity(layers_b.len());
+        glyph_cache_b.resize_with(layers_b.len(), || None);
         let start = Instant::now();
         let mut rendered = 0_u32;
         let loop_result: Result<()> = (|| {
@@ -1627,8 +1682,9 @@ pub fn render_transition_animated(
             // The B-snap is sub-frame and below operator perception
             // — acceptable per spec line 277.
             let tick_seconds = start.elapsed().as_secs_f64();
+            let wall_clock_unix = current_unix_seconds();
             unsafe {
-                if any_animated_a {
+                if any_animated_a || any_auto_a {
                     let states_a = motion_states_for_layers(
                         slide_a.id,
                         &layers_a,
@@ -1642,9 +1698,11 @@ pub fn render_transition_animated(
                         &bg_a,
                         &layers_a,
                         Some(&states_a),
+                        wall_clock_unix,
+                        Some(&mut glyph_cache_a),
                     )?;
                 }
-                if any_animated_b {
+                if any_animated_b || any_auto_b {
                     let states_b = motion_states_for_layers(
                         slide_b.id,
                         &layers_b,
@@ -1658,6 +1716,8 @@ pub fn render_transition_animated(
                         &bg_b,
                         &layers_b,
                         Some(&states_b),
+                        wall_clock_unix,
+                        Some(&mut glyph_cache_b),
                     )?;
                 }
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -1807,6 +1867,24 @@ pub fn render_transition_animated(
 /// Caller is responsible for binding the target framebuffer BEFORE
 /// the call. Caller flushes/swaps AFTER. We do set the viewport so
 /// the caller doesn't have to re-derive size against the binding.
+/// v1-spec-delta #3 (slice b cache, QA followup): per-layer
+/// rasterized-bitmap cache. Each entry holds the
+/// (resolved_text, AlphaBitmap) for one layer. When the resolved
+/// text is unchanged across frames (motion-only animations or the
+/// 29 frames between auto_mode second-bucket boundaries), the
+/// expensive fontdue rasterization is skipped and the cached
+/// bitmap is reused. Cache miss = text changed = re-rasterize.
+///
+/// Vec parallel to text_layers; len matches. Initialized to None
+/// at slide-render entry; populated lazily on first paint.
+pub type GlyphCache = Vec<Option<CachedGlyph>>;
+
+#[derive(Debug)]
+pub struct CachedGlyph {
+    text: String,
+    bitmap: AlphaBitmap,
+}
+
 fn paint_slide(
     gl: &glow::Context,
     mode_w: u32,
@@ -1814,6 +1892,8 @@ fn paint_slide(
     bg_kind: &BgKind,
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     motion_states: Option<&[MotionState]>,
+    wall_clock_unix: i64,
+    glyph_cache: Option<&mut GlyphCache>,
 ) -> Result<()> {
     use glow::HasContext;
     unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
@@ -1850,21 +1930,94 @@ fn paint_slide(
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
         }
+        // v1-spec-delta #3: resolve layer text up front. auto_mode
+        // != None substitutes a formatted clock/date/day string; if
+        // the substitution returns None (mode unset/unknown) the
+        // layer's authored text falls through. Computed per frame
+        // because per-frame is when the wall-clock advances.
+        let cal = unix_to_calendar_utc(wall_clock_unix);
+        let resolved_texts: Vec<String> = text_layers
+            .iter()
+            .map(|(layer, _, _)| {
+                format_auto_text(
+                    layer.auto_mode.as_deref(),
+                    layer.auto_format.as_deref(),
+                    cal,
+                )
+                .unwrap_or_else(|| layer.text.clone())
+            })
+            .collect();
+        // v1-spec-delta #3 (slice b QA followup): rasterize through
+        // the per-layer cache. On cache hit (text unchanged), skip
+        // the fontdue call entirely -- this is what limits the
+        // motion=ticker / auto_mode=time / etc. paths to one rast
+        // per second-bucket instead of 30 per second. Without
+        // glyph_cache (one-shot static path), allocate a local
+        // throwaway cache so the layer loop has a uniform shape.
+        let mut local_cache_storage: GlyphCache;
+        let cache_ref: &mut GlyphCache = match glyph_cache {
+            Some(c) => {
+                if c.len() != text_layers.len() {
+                    c.clear();
+                    c.resize_with(text_layers.len(), || None);
+                }
+                c
+            }
+            None => {
+                local_cache_storage = Vec::with_capacity(text_layers.len());
+                local_cache_storage.resize_with(text_layers.len(), || None);
+                &mut local_cache_storage
+            }
+        };
+        // Stage 1: rasterize-or-reuse per layer. Bitmaps owned by
+        // cache_ref entries; we'll borrow them in stage 2's GL draw.
+        for (i, (layer, _, font)) in text_layers.iter().enumerate() {
+            let resolved_text = &resolved_texts[i];
+            let needs_raster = match &cache_ref[i] {
+                Some(cached) => cached.text != *resolved_text,
+                None => true,
+            };
+            if needs_raster {
+                let size_px = effective_font_size_px(
+                    layer.font_size_px,
+                    layer.font_size_pct,
+                    layer.r#box.w,
+                    mode_w,
+                );
+                let bm = layout_text_to_alpha(font.as_ref(), resolved_text, size_px)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "layout_text_to_alpha returned None for text={resolved_text:?} size={size_px}"
+                        )
+                    })?;
+                eprintln!(
+                    "rasterized text {resolved_text:?} @ {size_px:.1}px → {}x{} alpha bitmap",
+                    bm.width, bm.height,
+                );
+                cache_ref[i] = Some(CachedGlyph {
+                    text: resolved_text.clone(),
+                    bitmap: bm,
+                });
+            }
+        }
         let layer_loop_result: Result<()> = (|| {
-            for (i, (layer, tc, font)) in text_layers.iter().enumerate() {
+            for (i, (layer, tc, _)) in text_layers.iter().enumerate() {
                 let motion_state = motion_states
                     .map(|ms| ms[i])
                     .unwrap_or(MotionState::IDENTITY);
                 let motion_kind = parse_motion_kind(&layer.motion);
+                let cached = cache_ref[i]
+                    .as_ref()
+                    .expect("cache entry populated above");
                 draw_text_layer(
                     gl,
                     mode_w,
                     mode_h,
                     layer,
-                    font.as_ref(),
                     *tc,
                     motion_kind,
                     motion_state,
+                    &cached.bitmap,
                 )?;
             }
             Ok(())
@@ -1976,7 +2129,16 @@ pub fn render_slide_via_fbo(
             // motion through here when the test path needs it; for
             // now this is a deliberate freeze for visual diff
             // against render_slide.
-            let paint_result = paint_slide(gl, mode_w, mode_h, &bg_kind, &text_layers, None);
+            let paint_result = paint_slide(
+                gl,
+                mode_w,
+                mode_h,
+                &bg_kind,
+                &text_layers,
+                None,
+                current_unix_seconds(),
+                None,
+            );
             // Always rebind default FBO before propagating Err so
             // cleanup/teardown doesn't operate on the offscreen one.
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);

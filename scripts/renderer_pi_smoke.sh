@@ -691,6 +691,39 @@ if [ -z "${LOWEST_TRANS_FRAMES:-}" ] || [ "$LOWEST_TRANS_FRAMES" -lt 10 ]; then
 fi
 echo "    --play-motion-transition ok ($TRANS_LINES transitions, min $LOWEST_TRANS_FRAMES frames per transition)"
 
+# v1-spec-delta #3 (slice d) auto-mode smoke. Synthesized auto_mode
+# slides (time / date / day) over a 4s hold; the spec says auto-
+# mode text ticks every second, so a `time` slide must rasterize
+# AT LEAST 3 distinct values during a 4s hold. Catches: stalled
+# per-frame loop, format breakage, clock-source wedge.
+echo "==> Phase d-smoke -- --play-auto-mode-test (time / date / day)"
+AUTO_LOG="$LOG_DIR/auto-mode-test.log"
+AUTO_EXIT=0
+ssh "$TARGET" "for k in time date day; do echo \"=== auto-mode-test \$k ===\"; $BIN_PI --output hdmi --play-auto-mode-test \$k --hold-secs 4 2>&1 || echo \"FAIL: kind=\$k exit=\$?\"; done" \
+    > "$AUTO_LOG" 2>&1 || AUTO_EXIT=$?
+if [ "$AUTO_EXIT" -ne 0 ]; then
+    echo "FAIL: --play-auto-mode-test sweep exit $AUTO_EXIT"
+    cat "$AUTO_LOG"
+    exit 1
+fi
+grep -qE 'panicked at|RUST_BACKTRACE' "$AUTO_LOG" && \
+    { echo "FAIL: panic in --play-auto-mode-test"; cat "$AUTO_LOG"; exit 1; }
+for kind in time date day; do
+    grep -q "=== auto-mode-test $kind ===" "$AUTO_LOG" || \
+        { echo "FAIL: auto-mode-test $kind didn't run"; exit 1; }
+done
+# Time slide must show >=3 distinct text values across the hold
+# (the seconds digit ticks). awk extracts the rasterized text
+# value, sort -u counts uniques. Date and day are stable across a
+# 4s window so they show 1 each.
+DISTINCT_TIMES=$(awk '/=== auto-mode-test time ===/{capture=1;next} /=== auto-mode-test date ===/{capture=0} capture && /rasterized text "[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"/{print $0}' "$AUTO_LOG" | grep -oE '"[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"' | sort -u | wc -l | tr -d ' ')
+if [ "${DISTINCT_TIMES:-0}" -lt 3 ]; then
+    echo "FAIL: --play-auto-mode-test time showed only $DISTINCT_TIMES distinct values across 4s (clock not ticking)"
+    cat "$AUTO_LOG"
+    exit 1
+fi
+echo "    --play-auto-mode-test ok (3 kinds, time ticked $DISTINCT_TIMES distinct seconds across 4s)"
+
 # Phase 6 reel assertion: completion + slide count + transition
 # count + no panics. The reel logs "reel: resolved N items" once
 # and "reel: transition into item I/N" for each transition.
