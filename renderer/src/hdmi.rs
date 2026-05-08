@@ -386,67 +386,91 @@ fn render_one_frame_to_hdmi<F>(card: &Card, hold_ms: u64, draw: F) -> Result<()>
 where
     F: FnOnce(&glow::Context, u32, u32) -> Result<()>,
 {
-    with_egl_session(card, |session| {
-        // Resources the work block creates (BO + FB) need cleanup
-        // regardless of whether the work succeeds. Track via
-        // Options populated mid-closure; cleanup walks them after.
-        let mut bo_holder: Option<BufferObject<()>> = None;
-        let mut fb_holder: Option<framebuffer::Handle> = None;
+    with_egl_session(card, |session| render_one_frame_in_session(session, card, hold_ms, draw))
+}
 
-        let work: Result<()> = (|| {
-            draw(session.gl, session.mode_w as u32, session.mode_h as u32)?;
-            gl_error_sweep(session.gl, "user draw closure");
+/// v1-spec-delta #5 (slice b, 2026-05-08): per-frame work given an
+/// already-acquired EGL session. Runs the caller's `draw` closure,
+/// `eglSwapBuffers`, locks the front BO, addFB, drmModeSetCrtc,
+/// holds for `hold_ms` ms, then drops BO + destroy_framebuffer.
+/// Cleanup unconditional (errors warn but don't shadow the
+/// original cause via `work`).
+///
+/// Extracted from `render_one_frame_to_hdmi` so slice (c) can let
+/// the reel driver call this multiple times under one
+/// `with_egl_session` -- amortizing the ~500 ms bring-up cost
+/// across the whole reel pass instead of paying it per slide
+/// (closes spec-delta MAJOR #19's BLACK gaps). render_one_frame_to
+/// _hdmi remains as the wrapper for one-shot callers (CLI
+/// `--solid-color`, `--play-slide` static, `--fade-from/to`).
+fn render_one_frame_in_session<F>(
+    session: &mut EglSession,
+    card: &Card,
+    hold_ms: u64,
+    draw: F,
+) -> Result<()>
+where
+    F: FnOnce(&glow::Context, u32, u32) -> Result<()>,
+{
+    // Resources the work block creates (BO + FB) need cleanup
+    // regardless of whether the work succeeds. Track via Options
+    // populated mid-closure; cleanup walks them after.
+    let mut bo_holder: Option<BufferObject<()>> = None;
+    let mut fb_holder: Option<framebuffer::Handle> = None;
+
+    let work: Result<()> = (|| {
+        draw(session.gl, session.mode_w as u32, session.mode_h as u32)?;
+        gl_error_sweep(session.gl, "user draw closure");
+        session
+            .egl_lib
+            .swap_buffers(session.display, session.egl_surface)
+            .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+        let bo = unsafe {
             session
-                .egl_lib
-                .swap_buffers(session.display, session.egl_surface)
-                .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
-            let bo = unsafe {
-                session
-                    .gbm_surface
-                    .lock_front_buffer()
-                    .context("gbm_surface_lock_front_buffer failed")?
-            };
-            let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
-            let fb = match card.add_framebuffer(&fb_buf, 32, 32) {
-                Ok(fb) => fb,
-                Err(e) => {
-                    drop(bo);
-                    return Err(anyhow!("drmModeAddFB failed: {e}"));
-                }
-            };
-            bo_holder = Some(bo);
-            fb_holder = Some(fb);
-            eprintln!("registered fb {fb:?}");
-            card.set_crtc(
-                session.crtc_handle,
-                Some(fb),
-                (0, 0),
-                &[session.connector_handle],
-                Some(session.mode),
-            )
-            .context("drmModeSetCrtc failed")?;
-            eprintln!(
-                "scanout active on {:?}; holding for {}ms",
-                session.crtc_handle, hold_ms
-            );
-            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-            Ok(())
-        })();
-
-        // BO/FB cleanup -- happens before with_egl_session's EGL
-        // teardown so the FB-handle rmFB lands while DRM master
-        // is still held cleanly.
-        if let Some(bo) = bo_holder {
-            drop(bo);
-        }
-        if let Some(fb) = fb_holder {
-            if let Err(e) = card.destroy_framebuffer(fb) {
-                eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+                .gbm_surface
+                .lock_front_buffer()
+                .context("gbm_surface_lock_front_buffer failed")?
+        };
+        let fb_buf = GbmBufferAdapter::new(&bo).context("read GBM bo metadata")?;
+        let fb = match card.add_framebuffer(&fb_buf, 32, 32) {
+            Ok(fb) => fb,
+            Err(e) => {
+                drop(bo);
+                return Err(anyhow!("drmModeAddFB failed: {e}"));
             }
-        }
+        };
+        bo_holder = Some(bo);
+        fb_holder = Some(fb);
+        eprintln!("registered fb {fb:?}");
+        card.set_crtc(
+            session.crtc_handle,
+            Some(fb),
+            (0, 0),
+            &[session.connector_handle],
+            Some(session.mode),
+        )
+        .context("drmModeSetCrtc failed")?;
+        eprintln!(
+            "scanout active on {:?}; holding for {}ms",
+            session.crtc_handle, hold_ms
+        );
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+        Ok(())
+    })();
 
-        work
-    })
+    // BO/FB cleanup -- happens before with_egl_session's EGL
+    // teardown so the FB-handle rmFB lands while DRM master is
+    // still held cleanly.
+    if let Some(bo) = bo_holder {
+        drop(bo);
+    }
+    if let Some(fb) = fb_holder {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+        }
+    }
+
+    work
 }
 
 /// v1-spec-delta #2 (slice c-2) — per-frame animated render path
