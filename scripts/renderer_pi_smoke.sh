@@ -1111,6 +1111,42 @@ EOF
     # different. We want different (settings change took
     # effect).
     DIFFERS=$(ssh "$TARGET" "cmp -s $SR_OUT_A $SR_OUT_B && echo same || echo differ" || true)
+    # v1-spec-delta #10 (slice e1-extension, 2026-05-08): bright-
+    # pixel-count magnitude check. cmp differ catches "tonemapping
+    # fired" but is also triggered by ANY nondeterminism (PNG
+    # compression ordering etc). For text-on-black slide content,
+    # mean luma is dominated by AA-tail pixels and isn't a strong
+    # signal; bright-pixel count IS. Per QA 2026-05-08:
+    # brightness 80→20 should drop bright_count by ≥15%. This
+    # catches direction-reversed bugs and post-pass-not-firing
+    # bugs that the cmp gate would silently pass.
+    BRIGHT_DIFF=$(ssh "$TARGET" "python3 - <<'PYEOF'
+import struct, zlib, sys
+def count_bright(path, threshold=50):
+    data = open(path, 'rb').read()
+    p = 8; idat = b''; w=h=bd=ct=0
+    while p < len(data):
+        ln = struct.unpack('>I', data[p:p+4])[0]; t = data[p+4:p+8]
+        if t == b'IHDR':
+            w,h,bd,ct = struct.unpack('>IIBB', data[p+8:p+8+10])
+        elif t == b'IDAT':
+            idat += data[p+8:p+8+ln]
+        p += 8 + ln + 4
+    if ct != 6 or bd != 8: sys.exit(f'unsupported png ct={ct} bd={bd}')
+    raw = zlib.decompress(idat)
+    stride = w*4 + 1
+    bright = 0
+    for y in range(h):
+        line = raw[y*stride+1 : y*stride+1+w*4]
+        for x in range(w):
+            r,g,b = line[x*4], line[x*4+1], line[x*4+2]
+            if 0.2126*r + 0.7152*g + 0.0722*b > threshold:
+                bright += 1
+    return bright
+a = count_bright('$SR_OUT_A'); b = count_bright('$SR_OUT_B')
+print(f'{a} {b}')
+PYEOF
+" 2>&1 || true)
     # Restore settings BEFORE asserting so we don't leave a
     # mutated state if the assertion fails.
     ssh "$TARGET" "sudo cp $SR_BACKUP /var/openmarquee/settings.json && sudo systemctl restart openmarquee-backend" || true
@@ -1119,7 +1155,28 @@ EOF
         cat "$SR_LOG"
         exit 1
     fi
-    echo "    settings reactivity ok (brightness change reflected in capture)"
+    BRIGHT_A=$(echo "$BRIGHT_DIFF" | awk '{print $1}')
+    BRIGHT_B=$(echo "$BRIGHT_DIFF" | awk '{print $2}')
+    BRIGHT_OK=$(python3 -c "
+a_str, b_str = '$BRIGHT_A', '$BRIGHT_B'
+try:
+    a, b = int(a_str), int(b_str)
+except ValueError:
+    print(f'fail (parse error: a={a_str!r} b={b_str!r})')
+else:
+    if a < 100:
+        print(f'fail (a={a} too small for ratio test; capture bug?)')
+    elif b > a * 0.85:
+        print(f'fail (a={a} b={b} ratio={b/a:.2f}; expected b ≤ 0.85×a)')
+    else:
+        print('ok')
+" 2>&1)
+    if [ "$BRIGHT_OK" != "ok" ]; then
+        echo "FAIL: settings reactivity bright-pixel magnitude check: $BRIGHT_OK"
+        cat "$SR_LOG"
+        exit 1
+    fi
+    echo "    settings reactivity ok (cmp differ + bright A=$BRIGHT_A → B=$BRIGHT_B)"
 fi
 
 # v1-spec-delta #12 (slice c-2): live end-to-end soak gate. Runs
