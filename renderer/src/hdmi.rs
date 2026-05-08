@@ -2353,10 +2353,16 @@ unsafe fn run_bright_gamma_pass(
     Ok(())
 }
 
-/// v1-spec-delta #9 (slice e -- Capture) -- paint a slide
-/// into the EGL window surface for capture. No swap_buffers,
-/// no commit_fb, no scanout. Caller follows up with
-/// capture_fbo_to_rgba on the default framebuffer.
+/// v1-spec-delta #9 (slice e -- Capture) + #10 (slice d) --
+/// paint a slide into the EGL window surface for capture.
+/// No swap_buffers, no commit_fb, no scanout.
+///
+/// v1-spec-delta #10 (slice d): when settings have non-
+/// identity brightness/gamma, route paint through the
+/// session-cached scene FBO + FS_BRIGHT_GAMMA post-pass so
+/// the captured PNG reflects the same tonemapping as live
+/// scanout. Caller's subsequent capture_fbo_to_rgba on the
+/// default framebuffer reads the post-pass output.
 pub fn paint_one_for_capture(
     session: &mut EglSession,
     slide: &TextSlide,
@@ -2370,10 +2376,26 @@ pub fn paint_one_for_capture(
     let tick_seconds = t_in_slide_ms as f64 / 1000.0;
     let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
     let wall_clock_unix = current_unix_seconds();
+
+    let identity = session.current_settings.is_color_identity();
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    let scene_fbo_handle = if !identity {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        }
+    }
+
     paint_slide(
         session.gl,
-        session.mode_w as u32,
-        session.mode_h as u32,
+        mode_w,
+        mode_h,
         &bg_kind,
         &text_layers,
         Some(&motion_states),
@@ -2382,6 +2404,17 @@ pub fn paint_one_for_capture(
         Some(&mut session.image_bg_cache),
     )?;
     unsafe { session.gl.flush(); }
+
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = (session.current_settings.brightness as f32) / 100.0;
+        let gamma = session.current_settings.gamma;
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+            session.gl.flush();
+        }
+    }
     Ok(())
 }
 

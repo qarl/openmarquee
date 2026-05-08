@@ -1042,6 +1042,86 @@ else
     echo "    --play-image-slide ok (decoded + uploaded + drew on hw)"
 fi
 
+# v1-spec-delta #10 (slice d) -- settings reactivity end-to-end
+# smoke. Captures via IPC sidecar at current settings, mutates
+# settings.json (brightness 100 -> 20), captures again, asserts
+# the two PNGs differ on disk (settings change took effect on
+# the captured frame). Restores original settings before the
+# next phase.
+echo "==> Phase d-smoke -- settings reactivity (brightness change diff)"
+SETTINGS_UUID=$(ssh "$TARGET" '
+for d in /var/openmarquee/content/*/; do
+  if python3 -c "
+import json, sys
+d = json.load(open(\"$d/item.json\"))
+sys.exit(0 if d.get(\"item\", {}).get(\"type\") == \"text_slide\" else 1)
+" 2>/dev/null; then
+    basename "$d"
+    exit 0
+  fi
+done
+echo ""
+' || true)
+SETTINGS_UUID=$(echo "$SETTINGS_UUID" | tr -d '/' | head -1)
+if [ -z "$SETTINGS_UUID" ]; then
+    echo "    settings reactivity skipped (no text_slide on target)"
+else
+    SR_LOG="$LOG_DIR/settings-reactivity.log"
+    SR_OUT_A="/tmp/openmarquee-settings-A.png"
+    SR_OUT_B="/tmp/openmarquee-settings-B.png"
+    SR_BACKUP="/tmp/openmarquee-settings-backup.json"
+    # Backup current settings.
+    ssh "$TARGET" "sudo cp /var/openmarquee/settings.json $SR_BACKUP" || true
+    # Capture A: at whatever settings are live.
+    SR_SCRIPT_A=$(mktemp -t openmarquee-settings-A)
+    cat > "$SR_SCRIPT_A" <<EOF
+{"op":"open","params":{"output":"hdmi","content_root":"/var/openmarquee/content"}}
+{"op":"begin_slide","params":{"slide_id":"$SETTINGS_UUID","t0_ms":0,"duration_ms":5000}}
+{"op":"advance","params":{"t_ms":100}}
+{"op":"capture","params":{"path":"$SR_OUT_A"}}
+{"op":"close"}
+EOF
+    ssh "$TARGET" "$BIN_PI --ipc-sidecar" < "$SR_SCRIPT_A" >> "$SR_LOG" 2>&1 || \
+        { echo "FAIL: settings-reactivity capture A failed"; cat "$SR_LOG"; rm -f "$SR_SCRIPT_A"; exit 1; }
+    rm -f "$SR_SCRIPT_A"
+    # Mutate settings: brightness 100 -> 20 (drastic so the
+    # tonemapping diff is visually obvious).
+    ssh "$TARGET" '
+sudo python3 -c "
+import json
+d = json.load(open(\"/var/openmarquee/settings.json\"))
+d[\"brightness\"] = 20
+json.dump(d, open(\"/var/openmarquee/settings.json\", \"w\"), indent=2)
+"
+sudo touch /var/openmarquee/settings.json
+' || { echo "FAIL: settings mutate failed"; exit 1; }
+    # Capture B: at brightness=20.
+    SR_SCRIPT_B=$(mktemp -t openmarquee-settings-B)
+    cat > "$SR_SCRIPT_B" <<EOF
+{"op":"open","params":{"output":"hdmi","content_root":"/var/openmarquee/content"}}
+{"op":"begin_slide","params":{"slide_id":"$SETTINGS_UUID","t0_ms":0,"duration_ms":5000}}
+{"op":"advance","params":{"t_ms":100}}
+{"op":"capture","params":{"path":"$SR_OUT_B"}}
+{"op":"close"}
+EOF
+    ssh "$TARGET" "$BIN_PI --ipc-sidecar" < "$SR_SCRIPT_B" >> "$SR_LOG" 2>&1 || \
+        { echo "FAIL: settings-reactivity capture B failed"; cat "$SR_LOG"; rm -f "$SR_SCRIPT_B"; exit 1; }
+    rm -f "$SR_SCRIPT_B"
+    # Diff the two captures. cmp returns 0 on identical, 1 on
+    # different. We want different (settings change took
+    # effect).
+    DIFFERS=$(ssh "$TARGET" "cmp -s $SR_OUT_A $SR_OUT_B && echo same || echo differ" || true)
+    # Restore settings BEFORE asserting so we don't leave a
+    # mutated state if the assertion fails.
+    ssh "$TARGET" "sudo cp $SR_BACKUP /var/openmarquee/settings.json && sudo systemctl restart openmarquee-backend" || true
+    if [ "$DIFFERS" != "differ" ]; then
+        echo "FAIL: settings reactivity didn't change captured PNG (cmp=$DIFFERS)"
+        cat "$SR_LOG"
+        exit 1
+    fi
+    echo "    settings reactivity ok (brightness change reflected in capture)"
+fi
+
 # Phase 6 reel assertion: completion + slide count + transition
 # count + no panics. The reel logs "reel: resolved N items" once
 # and "reel: transition into item I/N" for each transition.
