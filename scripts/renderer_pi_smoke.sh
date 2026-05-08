@@ -791,7 +791,55 @@ if [ "$REEL_HOLDS" -ne "$REEL_RESOLVED" ]; then
     cat "$REEL_LOG"
     exit 1
 fi
-echo "    --play-reel ok ($REEL_RESOLVED items, $REEL_TRANSITIONS transitions, $REEL_HOLDS holds — single pass)"
+# v1-spec-delta #5 (slice e): cumulative wall-clock floor on the
+# pass. With --hold-secs 1, each hold is 1000ms; transitions are
+# variable-length (capped at clamp_transition_ms's bounds, 200-
+# 2000ms). Floor: per-item budget = 1000ms hold + 2000ms transition
+# upper bound + 500ms slack for slide setup; total = N items × 3500
+# - 2000 (no transition into the first item). On a healthy slice
+# (c)+(d) build with the FYS playlist (~19 items), ~64s. Pre-slice
+# (c) pass time was much higher (~500ms EGL bring-up × per-slide
+# accumulated). Pre-slice (d) had set_crtc per frame; perf delta
+# was visual (BLACK gaps) more than wall-clock. The floor catches
+# regressions that silently undo the architectural wins.
+REEL_PASS_MS=$(grep -oE 'reel: pass #0 complete pass_ms=[0-9]+' "$REEL_LOG" | grep -oE '[0-9]+$' | head -1)
+if [ -z "${REEL_PASS_MS:-}" ]; then
+    echo "FAIL: --play-reel didn't emit per-pass wall-clock (pass_ms=...)"
+    cat "$REEL_LOG"
+    exit 1
+fi
+# Lower bound: each item costs 1000ms hold + ~50ms commit min;
+# transitions add visible per-frame work. A reel that finishes
+# in << expected has skipped most of its rendering work via
+# error paths -- catches bugs where transitions or slides fail
+# silently in the warn-and-continue path. v1-spec-delta #5
+# slice e caught the slice d EBUSY regression this way.
+REEL_FLOOR_MIN_MS=$(( REEL_RESOLVED * 1000 ))
+if [ "$REEL_PASS_MS" -lt "$REEL_FLOOR_MIN_MS" ]; then
+    echo "FAIL: --play-reel pass suspiciously fast (got ${REEL_PASS_MS}ms, expected >= ${REEL_FLOOR_MIN_MS}ms for $REEL_RESOLVED items)"
+    echo "  -> probably warn-and-continue path swallowing real render errors; check 'reel: warn' lines"
+    cat "$REEL_LOG"
+    exit 1
+fi
+REEL_FLOOR_MS=$(( REEL_RESOLVED * 3500 - 2000 ))
+if [ "$REEL_PASS_MS" -gt "$REEL_FLOOR_MS" ]; then
+    echo "FAIL: --play-reel pass too slow (got ${REEL_PASS_MS}ms, floor ${REEL_FLOOR_MS}ms for $REEL_RESOLVED items)"
+    echo "  -> probable regression on slice (c) single-EGL-session or slice (d) page_flip"
+    cat "$REEL_LOG"
+    exit 1
+fi
+# Any 'reel: warn' line means a per-slide/transition path failed.
+# The reel driver intentionally warn-and-continues to avoid
+# wedging on a single bad slide, but the smoke must NOT go green
+# in that state. (slice d EBUSY across-call regression had this
+# exact silent-failure shape.)
+REEL_WARNS=$(grep -c 'reel: warn' "$REEL_LOG" || true)
+if [ "$REEL_WARNS" -ne 0 ]; then
+    echo "FAIL: --play-reel emitted $REEL_WARNS 'reel: warn' line(s)"
+    grep 'reel: warn' "$REEL_LOG" | head -10
+    exit 1
+fi
+echo "    --play-reel ok ($REEL_RESOLVED items, $REEL_TRANSITIONS transitions, $REEL_HOLDS holds — pass_ms=$REEL_PASS_MS, floor=$REEL_FLOOR_MS)"
 
 echo "==> backend recovery check (DRM master returned)"
 BACKEND_STATE=$(ssh "$TARGET" "systemctl is-active openmarquee-backend" || true)

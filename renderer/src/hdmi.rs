@@ -216,11 +216,20 @@ struct EglSession<'a> {
     mode: drm::control::Mode,
     mode_w: u16,
     mode_h: u16,
-    /// v1-spec-delta #5 (slice d): tracks whether SetCrtc has been
-    /// called on this session yet. The first commit modesets; all
-    /// subsequent commits use the cheaper page_flip path which
-    /// just swaps the FB on the existing CRTC at the next vblank
-    /// (closes spec-delta #8b's transition wall-clock perf gap).
+    /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
+    /// the kernel CRTC currently has an alive (set_crtc'd) FB
+    /// attached. The first commit per session OR the first commit
+    /// of a render call after a prior call destroyed its scanout
+    /// FB takes the SetCrtc branch (re-establishes the FB on the
+    /// CRTC); subsequent within-call commits use the cheaper
+    /// page_flip path. Set true on successful commit; reset to
+    /// false at end of each render call's per-call cleanup
+    /// (because we destroyed the FB the kernel was scanning out,
+    /// so the next call's page_flip would EBUSY if we lied about
+    /// readiness). Slice e's pass_ms gate caught this regression
+    /// when slice d was originally written as "set_crtc once per
+    /// session" -- the kernel rejected page_flip across render-
+    /// call boundaries because the prior FB had been rmFB'd.
     modeset_done: bool,
     /// v1-spec-delta #5 (slice d): tracks whether a page-flip is
     /// currently in flight. The kernel allows at most one
@@ -593,6 +602,12 @@ where
             eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
         }
     }
+    // v1-spec-delta #5 (slice e fix): the FB we just rmFB'd was
+    // the kernel's scanout source. Mark the CRTC as "needs a
+    // re-establishing SetCrtc on the next commit"; otherwise the
+    // next call's page_flip EBUSYs because the kernel sees a
+    // destroyed scanout FB. Caught by slice e's pass_ms gate.
+    session.modeset_done = false;
 
     work
 }
@@ -652,12 +667,20 @@ fn render_animated_slide_in_session(
     hold_ms: u64,
     fps: u32,
 ) -> Result<()> {
-    // Hold (BO, FB) of the previous frame across the loop body so
-    // the kernel is never asked to scan out a destroyed BO. After
-    // the next `drmModeSetCrtc` commits, the previous FB is
-    // detached and safe to destroy.
+    // v1-spec-delta #5 (slice e F1e fix): N-2 BO/FB rotation. Pre-
+    // slice-d under sync SetCrtc, N-1 was correct because the FB
+    // was guaranteed-released by the time SetCrtc returned. Post-
+    // slice-d the kernel scans fb_{K-1} until next vblank (async
+    // page_flip), so dropping bo_{K-1} immediately returns the
+    // BO to the gbm pool while still on scanout — kernel-level
+    // use-after-free under min-pool / back-pressure (typically
+    // hidden by libgbm's 3-4 BO rotation but not safe to rely
+    // on). Mirrors the N-2 rotation in
+    // render_transition_animated_in_session.
     let mut prev_bo: Option<BufferObject<()>> = None;
     let mut prev_fb: Option<framebuffer::Handle> = None;
+    let mut current_bo: Option<BufferObject<()>> = None;
+    let mut current_fb: Option<framebuffer::Handle> = None;
     // Frame deadline tracking.
     let frame_period_ns: u64 = 1_000_000_000_u64 / fps.max(1) as u64;
     let start = std::time::Instant::now();
@@ -727,9 +750,10 @@ fn render_animated_slide_in_session(
                 return Err(e);
             }
 
-            // Previous frame is no longer scanout — safe to release.
-            // (commit_fb already drained the prior page-flip event,
-            // so the kernel is no longer reading from prev_fb's BO.)
+            // v1-spec-delta #5 (slice e F1e fix): rotate N-2.
+            // After commit_fb returns, kernel still scans current
+            // (page_flip queued, fires next vblank). prev was
+            // scanned 2+ frames ago — safe to free.
             if let Some(old_fb) = prev_fb.take() {
                 if let Err(e) = card.destroy_framebuffer(old_fb) {
                     eprintln!("warn: destroy_framebuffer({old_fb:?}): {e}");
@@ -738,8 +762,10 @@ fn render_animated_slide_in_session(
             if let Some(old_bo) = prev_bo.take() {
                 drop(old_bo);
             }
-            prev_bo = Some(bo);
-            prev_fb = Some(fb);
+            prev_fb = current_fb.take();
+            prev_bo = current_bo.take();
+            current_fb = Some(fb);
+            current_bo = Some(bo);
             frames += 1;
 
             // Pace to fps. next-deadline math, not sleep-by-period
@@ -767,17 +793,32 @@ fn render_animated_slide_in_session(
     // gbm_surface BO pool reuse.
     drain_pending_flip(session, card);
 
-    // Per-call BO/FB cleanup. Drops the last frame's holders so
-    // the next render call (under the same session) starts with
-    // an empty rotation slot.
-    if let Some(bo) = prev_bo {
-        drop(bo);
-    }
-    if let Some(fb) = prev_fb {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+    // Per-call BO/FB cleanup. Drops the last two frames' holders
+    // (current = last frame just-committed; prev = frame before).
+    // Both are post-drain so the kernel is no longer reading from
+    // either. drain_pending_flip above guaranteed that the kernel
+    // switched away from current's predecessor, so prev is freeable.
+    // For current: kernel just switched to it; rmFB pulls our user-
+    // ref but kernel keeps internal ref until something replaces
+    // current as scanout (next call's set_crtc).
+    for (fb_opt, bo_opt) in [
+        (current_fb.take(), current_bo.take()),
+        (prev_fb.take(), prev_bo.take()),
+    ] {
+        if let Some(fb) = fb_opt {
+            if let Err(e) = card.destroy_framebuffer(fb) {
+                eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+            }
+        }
+        if let Some(bo) = bo_opt {
+            drop(bo);
         }
     }
+    // v1-spec-delta #5 (slice e fix): see render_one_frame_in_session.
+    // The last frame's FB was the kernel scanout source; rmFB
+    // means the next call's page_flip would EBUSY without a fresh
+    // SetCrtc to re-establish.
+    session.modeset_done = false;
 
     work
 }
@@ -1994,6 +2035,10 @@ fn render_transition_animated_in_session(
             drop(bo);
         }
     }
+    // v1-spec-delta #5 (slice e fix): see render_one_frame_in_session.
+    // Reset modeset_done after destroying scanout FB so next call
+    // re-establishes via SetCrtc instead of EBUSY-ing on page_flip.
+    session.modeset_done = false;
 
     let frame_count = work?;
     eprintln!(
@@ -2473,11 +2518,21 @@ pub fn render_playlist_reel(
     with_egl_session(card, |session| {
         let mut pass = 0_u32;
         loop {
+            let pass_start = std::time::Instant::now();
             eprintln!(
                 "reel: starting pass #{pass} ({} items, hold_override={:?}, fps={fps})",
                 resolved.len(),
                 hold_secs_override,
             );
+            // v1-spec-delta #5 (slice e, 2026-05-08): emit
+            // per-pass cumulative wall-clock so smoke can assert
+            // a perf floor. Catches regressions where slice (c)
+            // (single-EGL-session) or slice (d) (page_flip) are
+            // silently undone -- the BLACK-gap stutter doesn't
+            // re-appear on the visual side, but cumulative pass
+            // time would balloon.
+            let mut transitions_run = 0_u32;
+            let mut slides_held = 0_u32;
             for (i, (slide, _, _)) in resolved.iter().enumerate() {
                 // Entry transition (skip when no predecessor).
                 // wraparound math + first-pass semantics is in
@@ -2516,6 +2571,8 @@ pub fn render_playlist_reel(
                                 "reel: warn — transition into item {i} failed: {e:#}; \
                                  skipping to slide hold (acts as hard cut)"
                             );
+                        } else {
+                            transitions_run += 1;
                         }
                     }
                 }
@@ -2540,8 +2597,19 @@ pub fn render_playlist_reel(
                         "reel: warn — render_slide failed for item {i}: {e:#}; \
                          skipping"
                     );
+                } else {
+                    slides_held += 1;
                 }
             }
+
+            // v1-spec-delta #5 (slice e): emit per-pass wall-clock
+            // for smoke assertion. The line shape is stable so the
+            // smoke parser can grep+regex it ("pass=N" anchors).
+            let pass_ms = pass_start.elapsed().as_millis();
+            eprintln!(
+                "reel: pass #{pass} complete pass_ms={pass_ms} slides_held={slides_held} \
+                 transitions_run={transitions_run}",
+            );
 
             pass += 1;
             if !loop_forever {
@@ -2994,23 +3062,28 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
             }
 
             // Drain the page-flip event the atomic commit just queued.
-            // drm-rs's `receive_events` is *non-blocking* — it returns
-            // whatever's currently pending in the fd's event queue.
             //
-            // Probed 2026-05-06 (--animate 3s @ 30 fps target, vc4
-            // 1024×768@60): events=1 on 179/179 frames, 59.3 fps avg
-            // matching display vrefresh. Every event was already
-            // queued by the time we got here. The actual vsync gate
-            // is `eglSwapBuffers` — vc4's Mesa EGL is vsync-locked by
-            // default, so swap blocks ~16.7 ms. receive_events just
-            // drains the resulting page-flip event; it's not the
-            // gate.
+            // CORRECTION (slice e F1f, 2026-05-08): drm-rs's
+            // `receive_events` is NOT non-blocking. It calls
+            // rustix::io::read on the DRM fd, and main.rs opens the
+            // fd without O_NONBLOCK -- so the read blocks if no
+            // event is queued. The 2026-05-06 probe (events=1 on
+            // 179/179 frames, 59.3 fps matching vrefresh) measured
+            // empirical drain timing; events happened to be queued
+            // when we got here because eglSwapBuffers vsync-gated
+            // first. The read appeared non-blocking because the
+            // kernel had already written the event by the time we
+            // called receive_events.
             //
-            // Implication for Phase 4: if we ever render off-screen
-            // (no EGL swap to gate us), we have to block on the DRM
-            // fd ourselves via poll(2) — receive_events alone won't
-            // wait. Until then, EGL-swap + drain is correct and
-            // tear-free.
+            // Implication: this drain WILL block if a HW hang or
+            // missed-vblank scenario delays the page-flip event.
+            // No timeout on the read. F1d follow-up adds poll(2) +
+            // 500ms timeout to escape such hangs cleanly.
+            //
+            // The vsync gate is split: eglSwapBuffers blocks ~16.7
+            // ms on Mesa-vc4-vsync, then receive_events blocks
+            // until kernel writes the page-flip event (typically
+            // immediate after vblank lands).
             let _events = card
                 .receive_events()
                 .context("receive_events after atomic commit")?;
