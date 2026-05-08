@@ -3199,6 +3199,12 @@ fn render_transition_animated_in_session(
     let mut current_bo: Option<BufferObject<()>> = None;
     let mut current_fb: Option<framebuffer::Handle> = None;
 
+    // qarl-direct (2026-05-08): wall-clock around the work
+    // closure for the §8.3 fps log line below. Captures
+    // FBO bring-up + per-frame loop + cleanup; matches the
+    // "real elapsed" semantic of render_animated_slide's
+    // start.elapsed log.
+    let work_start_t = Instant::now();
     let work: Result<u32> = (|| {
         use glow::HasContext;
         let gl = session.gl;
@@ -3548,8 +3554,25 @@ fn render_transition_animated_in_session(
     session.modeset_done = false;
 
     let frame_count = work?;
+    // qarl-direct (2026-05-08): the {transition_ms} field above
+    // was previously a literal of the SCHEDULED parameter (e.g.
+    // 800ms target), not the actual wall-clock elapsed. That's
+    // useless for §8.3 fps verification because a 24-frame
+    // transition that ran 1.5x over budget would still log "in
+    // 800ms" — silently passing under spec. Now logs both the
+    // scheduled target AND the actual elapsed_ms so the soak
+    // gate can grep effective fps from any transition. Keep the
+    // existing token shape ("rendered N frames in Mms") at the
+    // start for backward-compat with parsers that already key on
+    // it; append "(target Tms)" so the new field is unambiguous.
+    let elapsed_ms = work_start_t.elapsed().as_millis();
+    let effective_fps = if elapsed_ms > 0 {
+        (frame_count as f64) * 1000.0 / (elapsed_ms as f64)
+    } else {
+        0.0
+    };
     eprintln!(
-        "animated transition complete: kind={kind:?} rendered {frame_count} frames in {transition_ms}ms"
+        "animated transition complete: kind={kind:?} rendered {frame_count} frames in {elapsed_ms}ms (target {transition_ms}ms; effective {effective_fps:.1} fps)"
     );
     Ok(frame_count)
 }
