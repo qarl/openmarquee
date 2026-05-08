@@ -502,92 +502,32 @@ fn render_animated_slide(
     hold_ms: u64,
     fps: u32,
 ) -> Result<()> {
-    let resources = card
-        .resource_handles()
-        .context("drmModeGetResources failed")?;
-    let (connector_info, mode) = pick_connector_and_mode(card, &resources)
-        .context("no connected HDMI connector with a usable mode")?;
-    let (mode_w, mode_h) = mode.size();
-    eprintln!(
-        "selected connector {:?} {:?} at {}x{}@{}",
-        connector_info.handle(),
-        connector_info.interface(),
-        mode_w,
-        mode_h,
-        mode.vrefresh(),
-    );
-
-    let encoder_handle = connector_info
-        .current_encoder()
-        .or_else(|| connector_info.encoders().first().copied())
-        .ok_or_else(|| anyhow!("connector advertises no encoders"))?;
-    let encoder_info = card
-        .get_encoder(encoder_handle)
-        .context("drmModeGetEncoder failed")?;
-    let crtc_handle = encoder_info
-        .crtc()
-        .or_else(|| resources.crtcs().first().copied())
-        .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
-
-    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
-        .context("gbm_create_device failed")?;
-    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
-    if gbm_dev_ptr.is_null() {
-        bail!("gbm_device raw pointer is null");
-    }
-    let gbm_surface = gbm_dev
-        .create_surface::<()>(
-            mode_w as u32,
-            mode_h as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+    with_egl_session(card, |session| {
+        render_animated_slide_in_session(
+            session, card, bg_kind, text_layers, slide_id, hold_ms, fps,
         )
-        .context("gbm_surface_create failed")?;
+    })
+}
 
-    let egl_lib = unsafe {
-        egl::DynamicInstance::<egl::EGL1_5>::load_required().map_err(|e| {
-            anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
-        })?
-    };
-    let display = unsafe {
-        egl_lib
-            .get_display(gbm_dev_ptr as egl::NativeDisplayType)
-            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
-    };
-    egl_lib
-        .initialize(display)
-        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
-    egl_lib
-        .bind_api(egl::OPENGL_ES_API)
-        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
-    let cfg_attribs = [
-        egl::SURFACE_TYPE, egl::WINDOW_BIT,
-        egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
-        egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE,
-    ];
-    let configs = egl_lib
-        .choose_first_config(display, &cfg_attribs)
-        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
-        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
-    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-    let context = egl_lib
-        .create_context(display, configs, None, &ctx_attribs)
-        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
-    let egl_surface = unsafe {
-        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
-        egl_lib
-            .create_window_surface(display, configs, raw_surface, None)
-            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
-    };
-    egl_lib
-        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
-        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
-    let gl = unsafe {
-        glow::Context::from_loader_function(|name| {
-            egl_lib.get_proc_address(name).map(|fp| fp as *const _).unwrap_or(ptr::null())
-        })
-    };
-
+/// v1-spec-delta #5 (slice c, 2026-05-08): per-frame animated
+/// slide work given an already-acquired EGL session. Extracted
+/// from render_animated_slide so the reel driver can call this
+/// under one shared with_egl_session, amortizing the ~500 ms
+/// bring-up across all reel slides (closes spec-delta MAJOR #19).
+///
+/// BO/FB rotation is per-call: each render holds prev_bo+prev_fb
+/// across its own frames, releases all of it on exit. The
+/// session's gbm_surface is reused across calls but no BOs leak
+/// between calls.
+fn render_animated_slide_in_session(
+    session: &mut EglSession,
+    card: &Card,
+    bg_kind: &BgKind,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    slide_id: Uuid,
+    hold_ms: u64,
+    fps: u32,
+) -> Result<()> {
     // Hold (BO, FB) of the previous frame across the loop body so
     // the kernel is never asked to scan out a destroyed BO. After
     // the next `drmModeSetCrtc` commits, the previous FB is
@@ -620,21 +560,23 @@ fn render_animated_slide(
                 motion_states_for_layers(slide_id, text_layers, tick_seconds);
             let wall_clock_unix = current_unix_seconds();
             paint_slide(
-                &gl,
-                mode_w as u32,
-                mode_h as u32,
+                session.gl,
+                session.mode_w as u32,
+                session.mode_h as u32,
                 bg_kind,
                 text_layers,
                 Some(&motion_states),
                 wall_clock_unix,
                 Some(&mut glyph_cache),
             )?;
-            unsafe { gl.flush(); }
-            egl_lib
-                .swap_buffers(display, egl_surface)
+            unsafe { session.gl.flush(); }
+            session
+                .egl_lib
+                .swap_buffers(session.display, session.egl_surface)
                 .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
             let bo = unsafe {
-                gbm_surface
+                session
+                    .gbm_surface
                     .lock_front_buffer()
                     .context("gbm_surface_lock_front_buffer failed")?
             };
@@ -647,11 +589,11 @@ fn render_animated_slide(
             // Explicitly rmFB on the unhappy path. The BO Drops
             // cleanly via gbm RAII either way.
             if let Err(e) = card.set_crtc(
-                crtc_handle,
+                session.crtc_handle,
                 Some(fb),
                 (0, 0),
-                &[connector_info.handle()],
-                Some(mode),
+                &[session.connector_handle],
+                Some(session.mode),
             ) {
                 if let Err(de) = card.destroy_framebuffer(fb) {
                     eprintln!(
@@ -693,18 +635,9 @@ fn render_animated_slide(
         Ok(())
     })();
 
-    if let Err(e) = egl_lib.make_current(display, None, None, None) {
-        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
-    }
-    if let Err(e) = egl_lib.destroy_context(display, context) {
-        eprintln!("warn: eglDestroyContext: {e:?}");
-    }
-    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
-        eprintln!("warn: eglDestroySurface: {e:?}");
-    }
-    if let Err(e) = egl_lib.terminate(display) {
-        eprintln!("warn: eglTerminate: {e:?}");
-    }
+    // Per-call BO/FB cleanup. Drops the last frame's holders so
+    // the next render call (under the same session) starts with
+    // an empty rotation slot.
     if let Some(bo) = prev_bo {
         drop(bo);
     }
@@ -714,8 +647,7 @@ fn render_animated_slide(
         }
     }
 
-    work?;
-    Ok(())
+    work
 }
 
 /// Draw a two-color linear gradient that fills the viewport. The
@@ -1097,6 +1029,25 @@ pub fn render_slide(
     fonts: Option<&FontCatalog>,
     hold_ms: u64,
 ) -> Result<()> {
+    with_egl_session(card, |session| {
+        render_slide_in_session(session, card, slide, fonts, hold_ms)
+    })
+}
+
+/// v1-spec-delta #5 (slice c, 2026-05-08): render a slide given
+/// an already-acquired EGL session. Static dispatch goes through
+/// render_one_frame_in_session; animated/auto_mode dispatch goes
+/// through render_animated_slide_in_session. Reused by
+/// render_playlist_reel which acquires one session for the entire
+/// reel pass instead of paying ~500 ms bring-up per slide
+/// (closes spec-delta MAJOR #19's BLACK gaps).
+fn render_slide_in_session(
+    session: &mut EglSession,
+    card: &Card,
+    slide: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    hold_ms: u64,
+) -> Result<()> {
     let (bg_kind, pattern_label, text_layers) = resolve_slide_layers(slide, fonts)?;
 
     let bg_log = match &bg_kind {
@@ -1116,9 +1067,9 @@ pub fn render_slide(
 
     // v1-spec-delta #2 (slice c-2): dispatch on whether ANY layer
     // is animated. Static-only slides keep the cheap one-shot
-    // bring-up + sleep path (no perf regression on FYS today).
+    // sleep path (no perf regression on FYS today).
     // Animated slides take the per-frame loop with the same legacy
-    // SetCrtc bring-up. 30 fps is the target, picked to match
+    // SetCrtc per-frame. 30 fps is the target, picked to match
     // spec §11's frame-rate ask.
     // v1-spec-delta #3: auto_mode-set layers also force the
     // animated dispatch (text changes every second, so the slide
@@ -1131,11 +1082,13 @@ pub fn render_slide(
     });
     if any_animated {
         eprintln!("slide has animated/auto_mode layers — entering per-frame loop @ 30 fps");
-        render_animated_slide(card, &bg_kind, &text_layers, slide.id, hold_ms, 30)?;
+        render_animated_slide_in_session(
+            session, card, &bg_kind, &text_layers, slide.id, hold_ms, 30,
+        )?;
     } else {
         let motion_states = motion_states_for_layers(slide.id, &text_layers, 0.0);
         let wall_clock_unix = current_unix_seconds();
-        render_one_frame_to_hdmi(card, hold_ms, |gl, mode_w, mode_h| {
+        render_one_frame_in_session(session, card, hold_ms, |gl, mode_w, mode_h| {
             use glow::HasContext;
             paint_slide(
                 gl,
@@ -1543,6 +1496,36 @@ pub fn render_transition_animated(
     transition_ms: u32,
     fps: u32,
 ) -> Result<u32> {
+    with_egl_session(card, |session| {
+        render_transition_animated_in_session(
+            session, card, slide_a, slide_b, fonts, kind, transition_ms, fps,
+        )
+    })
+}
+
+/// v1-spec-delta #5 (slice c, 2026-05-08): per-frame transition
+/// work given an already-acquired EGL session. Extracted from
+/// render_transition_animated so the reel driver can call this
+/// under one shared with_egl_session, amortizing the ~500 ms
+/// bring-up across all reel transitions (closes spec-delta
+/// MAJOR #19's BLACK gaps + #8b transition wall-clock perf gap).
+///
+/// FBO bake + transition program + VBO + per-frame BO/FB rotation
+/// are all per-call: each transition holds its own GL resources,
+/// releases all of them on exit. The session's gbm_surface is
+/// reused across calls but no GL state leaks between calls
+/// (cleanup_static at end of work + per-call BO/FB rotation
+/// cleanup).
+fn render_transition_animated_in_session(
+    session: &mut EglSession,
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    kind: &str,
+    transition_ms: u32,
+    fps: u32,
+) -> Result<u32> {
     if transition_ms == 0 {
         bail!("transition_ms must be > 0");
     }
@@ -1569,97 +1552,9 @@ pub fn render_transition_animated(
         slide_a.id, slide_b.id,
     );
 
-    // -- DRM + GBM + EGL bring-up (same as render_one_frame_to_hdmi).
-    let resources = card
-        .resource_handles()
-        .context("drmModeGetResources failed")?;
-    let (connector_info, mode) = pick_connector_and_mode(card, &resources)
-        .context("no connected HDMI connector with a usable mode")?;
-    let (mode_w, mode_h) = mode.size();
-    eprintln!(
-        "selected connector {:?} {:?} at {}x{}@{}",
-        connector_info.handle(),
-        connector_info.interface(),
-        mode_w,
-        mode_h,
-        mode.vrefresh(),
-    );
-
-    let encoder_handle = connector_info
-        .current_encoder()
-        .or_else(|| connector_info.encoders().first().copied())
-        .ok_or_else(|| anyhow!("connector advertises no encoders"))?;
-    let encoder_info = card
-        .get_encoder(encoder_handle)
-        .context("drmModeGetEncoder failed")?;
-    let crtc_handle = encoder_info
-        .crtc()
-        .or_else(|| resources.crtcs().first().copied())
-        .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
-
-    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
-        .context("gbm_create_device failed")?;
-    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
-    if gbm_dev_ptr.is_null() {
-        bail!("gbm_device raw pointer is null");
-    }
-    let gbm_surface = gbm_dev
-        .create_surface::<()>(
-            mode_w as u32,
-            mode_h as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
-        )
-        .context("gbm_surface_create failed")?;
-
-    let egl_lib = unsafe {
-        egl::DynamicInstance::<egl::EGL1_5>::load_required().map_err(|e| {
-            anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
-        })?
-    };
-    let display = unsafe {
-        egl_lib
-            .get_display(gbm_dev_ptr as egl::NativeDisplayType)
-            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
-    };
-    egl_lib
-        .initialize(display)
-        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
-    egl_lib
-        .bind_api(egl::OPENGL_ES_API)
-        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
-    let cfg_attribs = [
-        egl::SURFACE_TYPE, egl::WINDOW_BIT,
-        egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
-        egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE,
-    ];
-    let configs = egl_lib
-        .choose_first_config(display, &cfg_attribs)
-        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
-        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
-    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-    let context = egl_lib
-        .create_context(display, configs, None, &ctx_attribs)
-        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
-    let egl_surface = unsafe {
-        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
-        egl_lib
-            .create_window_surface(display, configs, raw_surface, None)
-            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
-    };
-    egl_lib
-        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
-        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
-
-    let gl = unsafe {
-        glow::Context::from_loader_function(|name| {
-            egl_lib.get_proc_address(name).map(|fp| fp as *const _).unwrap_or(ptr::null())
-        })
-    };
-
     // -- Animated render work + per-frame BO/FB tracking.
-    let mode_w_u32 = mode_w as u32;
-    let mode_h_u32 = mode_h as u32;
+    let mode_w_u32 = session.mode_w as u32;
+    let mode_h_u32 = session.mode_h as u32;
     let frame_budget = std::time::Duration::from_secs_f64(1.0 / fps as f64);
     let total_frames = ((transition_ms as f64) / 1000.0 * fps as f64).round().max(1.0) as u32;
 
@@ -1675,11 +1570,12 @@ pub fn render_transition_animated(
 
     let work: Result<u32> = (|| {
         use glow::HasContext;
+        let gl = session.gl;
 
         // -- Build slide_a and slide_b FBOs once.
-        let (fbo_a, tex_a) = unsafe { make_slide_fbo(&gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a)? };
+        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a)? };
         let (fbo_b, tex_b) = unsafe {
-            match make_slide_fbo(&gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b) {
+            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -1691,7 +1587,7 @@ pub fn render_transition_animated(
 
         // -- Compile transition program + build VBO once.
         let program = unsafe {
-            match link_program(&gl, VS_TEXTURED_QUAD, fs) {
+            match link_program(gl, VS_TEXTURED_QUAD, fs) {
                 Ok(p) => p,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -1714,7 +1610,7 @@ pub fn render_transition_animated(
             match gl.create_buffer() {
                 Ok(b) => b,
                 Err(e) => {
-                    cleanup_static(&gl, None);
+                    cleanup_static(gl, None);
                     return Err(anyhow!("glGenBuffers(animated fade): {e}"));
                 }
             }
@@ -1738,7 +1634,7 @@ pub fn render_transition_animated(
         let (a_pos, a_uv) = match (a_pos, a_uv) {
             (Some(p), Some(u)) => (p, u),
             _ => {
-                cleanup_static(&gl, Some(vbo));
+                cleanup_static(gl, Some(vbo));
                 return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos / a_uv (animated fade)"));
             }
         };
@@ -1836,7 +1732,7 @@ pub fn render_transition_animated(
                     )?;
                 }
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
                 gl.clear_color(0.0, 0.0, 0.0, 1.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
                 gl.use_program(Some(program));
@@ -1868,11 +1764,13 @@ pub fn render_transition_animated(
             }
 
             // -- Push to scanout.
-            egl_lib
-                .swap_buffers(display, egl_surface)
+            session
+                .egl_lib
+                .swap_buffers(session.display, session.egl_surface)
                 .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
             let bo = unsafe {
-                gbm_surface
+                session
+                    .gbm_surface
                     .lock_front_buffer()
                     .with_context(|| format!("lock_front_buffer (frame {frame})"))?
             };
@@ -1886,11 +1784,11 @@ pub fn render_transition_animated(
             // this transition harness mirrored across the slice
             // (c) render_animated_slide. Both fixed in this commit.
             if let Err(e) = card.set_crtc(
-                crtc_handle,
+                session.crtc_handle,
                 Some(fb),
                 (0, 0),
-                &[connector_info.handle()],
-                Some(mode),
+                &[session.connector_handle],
+                Some(session.mode),
             ) {
                 if let Err(de) = card.destroy_framebuffer(fb) {
                     eprintln!(
@@ -1928,13 +1826,15 @@ pub fn render_transition_animated(
         }
         Ok(())
         })();
-        cleanup_static(&gl, Some(vbo));
+        cleanup_static(gl, Some(vbo));
         loop_result?;
         Ok(rendered)
     })();
 
-    // Cleanup — unconditional. Free any remaining BO/FB pairs from
-    // the loop (current + prev), then EGL state.
+    // Per-call cleanup. Free any remaining BO/FB pairs from the
+    // loop (current + prev). The session's gbm_surface is reused
+    // across calls; only the render-call-scoped GL resources go
+    // here.
     for (fb_opt, bo_opt) in [
         (current_fb.take(), current_bo.take()),
         (prev_fb.take(), prev_bo.take()),
@@ -1951,18 +1851,6 @@ pub fn render_transition_animated(
         if let Some(bo) = bo_opt {
             drop(bo);
         }
-    }
-    if let Err(e) = egl_lib.make_current(display, None, None, None) {
-        eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
-    }
-    if let Err(e) = egl_lib.destroy_context(display, context) {
-        eprintln!("warn: eglDestroyContext: {e:?}");
-    }
-    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
-        eprintln!("warn: eglDestroySurface: {e:?}");
-    }
-    if let Err(e) = egl_lib.terminate(display) {
-        eprintln!("warn: eglTerminate: {e:?}");
     }
 
     let frame_count = work?;
@@ -2428,81 +2316,100 @@ pub fn render_playlist_reel(
     }
     eprintln!("reel: resolved {} playable text-slide items", resolved.len());
 
-    let mut pass = 0_u32;
-    loop {
-        eprintln!(
-            "reel: starting pass #{pass} ({} items, hold_override={:?}, fps={fps})",
-            resolved.len(),
-            hold_secs_override,
-        );
-        for (i, (slide, _, _)) in resolved.iter().enumerate() {
-            // Entry transition (skip when no predecessor). The
-            // wraparound math + first-pass semantics is in the
-            // host-tested `prev_idx_for_reel`.
-            //
-            // Defensive guard: if the predecessor IS the current
-            // item (1-item reel + --reel-loop), there's nothing
-            // visually meaningful to transition — slide_b ≡
-            // slide_a. Skip the per-frame loop entirely so we
-            // don't burn compute on a no-op.
-            if let Some(p) = prev_idx_for_reel(i, pass, resolved.len()) {
-                if p != i {
-                    let (prev_slide, _, _) = &resolved[p];
-                    let (_, kind, transition_ms) = &resolved[i];
-                    let transition_ms = clamp_transition_ms(*transition_ms);
-                    eprintln!(
-                        "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
-                        resolved.len() - 1,
-                    );
-                    if let Err(e) = render_transition_animated(
-                        card,
-                        prev_slide,
-                        slide,
-                        fonts,
-                        kind,
-                        transition_ms,
-                        fps,
-                    ) {
-                        // Skip-with-warn (no replay frame): the
-                        // next render_slide call below will paint
-                        // the new slide, which functions as a
-                        // hard cut.
+    // v1-spec-delta #5 (slice c, 2026-05-08): one with_egl_session
+    // wraps the entire reel pass. Per-slide and per-transition
+    // calls reuse the shared GBM/EGL/GLES2 context, eliminating
+    // the ~500 ms bring-up cost that previously sat between every
+    // slide and transition (closes spec-delta MAJOR #19's BLACK
+    // gaps + unblocks #8b transition wall-clock perf gap).
+    //
+    // Lifetime axis introduced here: EglSession outlives single
+    // render_*_in_session calls. The session's gbm_surface is
+    // reused across calls. Each render_*_in_session holds its own
+    // (BO, FB) rotation across its own frames and releases all of
+    // it on exit -- no BO/FB state leaks between calls.
+    with_egl_session(card, |session| {
+        let mut pass = 0_u32;
+        loop {
+            eprintln!(
+                "reel: starting pass #{pass} ({} items, hold_override={:?}, fps={fps})",
+                resolved.len(),
+                hold_secs_override,
+            );
+            for (i, (slide, _, _)) in resolved.iter().enumerate() {
+                // Entry transition (skip when no predecessor).
+                // wraparound math + first-pass semantics is in
+                // the host-tested `prev_idx_for_reel`.
+                //
+                // Defensive guard: if the predecessor IS the
+                // current item (1-item reel + --reel-loop),
+                // there's nothing visually meaningful to
+                // transition — slide_b ≡ slide_a. Skip the per-
+                // frame loop entirely so we don't burn compute
+                // on a no-op.
+                if let Some(p) = prev_idx_for_reel(i, pass, resolved.len()) {
+                    if p != i {
+                        let (prev_slide, _, _) = &resolved[p];
+                        let (_, kind, transition_ms) = &resolved[i];
+                        let transition_ms = clamp_transition_ms(*transition_ms);
                         eprintln!(
-                            "reel: warn — transition into item {i} failed: {e:#}; \
-                             skipping to slide hold (acts as hard cut)"
+                            "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
+                            resolved.len() - 1,
                         );
+                        if let Err(e) = render_transition_animated_in_session(
+                            session,
+                            card,
+                            prev_slide,
+                            slide,
+                            fonts,
+                            kind,
+                            transition_ms,
+                            fps,
+                        ) {
+                            // Skip-with-warn (no replay frame):
+                            // the next render_slide call below
+                            // will paint the new slide, which
+                            // functions as a hard cut.
+                            eprintln!(
+                                "reel: warn — transition into item {i} failed: {e:#}; \
+                                 skipping to slide hold (acts as hard cut)"
+                            );
+                        }
                     }
+                }
+
+                // v1-spec-delta #1: ms precision. slide.duration_ms
+                // is in ms verbatim; the override (operator's
+                // --hold-secs) is in seconds and gets ×1000'd
+                // inside effective_hold_ms. FYS Panic flash slides
+                // at 130/350/500/800 ms now hold for the actual
+                // specified duration instead of snapping to a 1-
+                // second floor.
+                let hold_ms = effective_hold_ms(slide.duration_ms, hold_secs_override);
+                eprintln!(
+                    "reel: holding item {i}/{} ({:?}) for {hold_ms}ms",
+                    resolved.len() - 1,
+                    slide.name,
+                );
+                if let Err(e) =
+                    render_slide_in_session(session, card, slide, fonts, hold_ms)
+                {
+                    eprintln!(
+                        "reel: warn — render_slide failed for item {i}: {e:#}; \
+                         skipping"
+                    );
                 }
             }
 
-            // v1-spec-delta #1: ms precision. slide.duration_ms is
-            // in ms verbatim; the override (operator's --hold-secs)
-            // is in seconds and gets ×1000'd inside effective_hold_ms.
-            // FYS Panic flash slides at 130/350/500/800 ms now hold
-            // for the actual specified duration instead of snapping
-            // to a 1-second floor.
-            let hold_ms = effective_hold_ms(slide.duration_ms, hold_secs_override);
-            eprintln!(
-                "reel: holding item {i}/{} ({:?}) for {hold_ms}ms",
-                resolved.len() - 1,
-                slide.name,
-            );
-            if let Err(e) = render_slide(card, slide, fonts, hold_ms) {
-                eprintln!(
-                    "reel: warn — render_slide failed for item {i}: {e:#}; \
-                     skipping"
-                );
+            pass += 1;
+            if !loop_forever {
+                break;
             }
         }
 
-        pass += 1;
-        if !loop_forever {
-            break;
-        }
-    }
-
-    eprintln!("reel: complete after {pass} pass(es)");
-    Ok(())
+        eprintln!("reel: complete after {pass} pass(es)");
+        Ok(())
+    })
 }
 
 /// Render a single solid-color frame, push it to the HDMI display via
