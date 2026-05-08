@@ -438,6 +438,147 @@ pub fn find_video_slide(content_root: &Path, item_id: Uuid) -> Result<Option<Vid
     Ok(Some(slide))
 }
 
+/// v1-spec-delta #10 (slice a, 2026-05-08) -- minimal mirror of
+/// Python's `Settings` model. Operator-controlled per spec §6.3.
+/// The renderer consumes display_rotation / brightness / gamma
+/// each frame; the rest (Wi-Fi / Tailscale / sign_name) is
+/// out of scope for the renderer (those are systemd / NM
+/// concerns).
+///
+/// Forward-compat: unknown fields are ignored (no
+/// deny_unknown_fields). Numeric fields use serde default so
+/// missing-field envelopes deserialize cleanly.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct Settings {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default = "default_display_width")]
+    pub display_width: u32,
+    #[serde(default = "default_display_height")]
+    pub display_height: u32,
+    /// Rotation in degrees applied to the rendered scanout.
+    /// One of 0 / 90 / 180 / 270 per spec §6.3. Other values
+    /// fall back to 0 with a warn at apply time.
+    #[serde(default)]
+    pub display_rotation: i32,
+    /// Brightness scalar in [0, 100]. The renderer multiplies
+    /// final RGB by brightness / 100. Spec §6.3.
+    #[serde(default = "default_brightness")]
+    pub brightness: u32,
+    /// Gamma in (0.0, 4.0]. Default 2.2 (sRGB-ish). Applied
+    /// in a per-pixel post-pass at scanout time (slice b).
+    #[serde(default = "default_gamma")]
+    pub gamma: f32,
+}
+
+fn default_display_width() -> u32 {
+    1920
+}
+fn default_display_height() -> u32 {
+    1080
+}
+fn default_brightness() -> u32 {
+    100
+}
+fn default_gamma() -> f32 {
+    2.2
+}
+
+/// v1-spec-delta #10 (slice a) -- read settings.json from disk
+/// and parse it. Returns the parsed Settings on success;
+/// errors surface filesystem or JSON-parse failures with
+/// context. Caller (CLI / IPC) decides whether missing
+/// settings is fatal or falls back to defaults.
+pub fn load_settings(path: &Path) -> Result<Settings> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read settings {}", path.display()))?;
+    let s: Settings = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse settings {}", path.display()))?;
+    Ok(s)
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            display_width: default_display_width(),
+            display_height: default_display_height(),
+            display_rotation: 0,
+            brightness: default_brightness(),
+            gamma: default_gamma(),
+        }
+    }
+}
+
+/// v1-spec-delta #10 (slice a) -- mtime-polling settings
+/// watcher. Cheaper than notify on Pi Zero 2 W (no inotify-
+/// rs deps; just stat each call) and well within spec §8.5's
+/// ≤2s-apply requirement at 500 ms polling cadence (which
+/// the caller drives -- this struct doesn't sleep).
+///
+/// Usage: caller constructs once with the settings.json
+/// path, then calls `check()` opportunistically (e.g.,
+/// between slides in --play-reel, or in the IPC sidecar's
+/// inner loop between Advance ticks). The first `check()`
+/// returns Some(initial) so the caller can apply on
+/// startup; subsequent calls return None when mtime is
+/// unchanged + Some(new_settings) when changed.
+pub struct SettingsWatcher {
+    path: PathBuf,
+    last_mtime: Option<std::time::SystemTime>,
+    /// True until the first successful check() so we always
+    /// emit the initial state on startup even if the file's
+    /// mtime is older than the renderer process start.
+    bootstrap: bool,
+}
+
+impl SettingsWatcher {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            last_mtime: None,
+            bootstrap: true,
+        }
+    }
+
+    /// Check if settings.json has changed since the last
+    /// successful call. Returns:
+    ///   * Some(settings) on first call, on mtime change, or
+    ///     when the file becomes readable after a transient
+    ///     error.
+    ///   * None when unchanged or when the file is unreadable
+    ///     (the caller continues with the last-known
+    ///     settings).
+    ///
+    /// Errors during stat / parse are absorbed silently --
+    /// settings reactivity is best-effort and the caller
+    /// shouldn't bail on a transient backend write that
+    /// momentarily renders the file invalid.
+    pub fn check(&mut self) -> Option<Settings> {
+        let metadata = std::fs::metadata(&self.path).ok()?;
+        let mtime = metadata.modified().ok()?;
+        let bootstrap = self.bootstrap;
+        let changed = bootstrap
+            || self.last_mtime.map(|prev| prev != mtime).unwrap_or(true);
+        if !changed {
+            return None;
+        }
+        let settings = match load_settings(&self.path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "warn: SettingsWatcher load failed for {}: {e:#}; keeping last-known",
+                    self.path.display(),
+                );
+                return None;
+            }
+        };
+        self.last_mtime = Some(mtime);
+        self.bootstrap = false;
+        Some(settings)
+    }
+}
+
 /// v1-spec-delta #8 (slice c) -- the asset MP4 path for a
 /// VideoSlide. H.264 video, browser-pre-transcoded to
 /// min(source, 1920×1080) per the Python schema docstring.
@@ -754,6 +895,164 @@ mod tests {
             p.to_str().unwrap(),
             "/var/openmarquee/content/3964c302-311f-44f2-a6c9-efd24a16cfc0/asset.mp4"
         );
+    }
+
+    // v1-spec-delta #10 (slice a) -- Settings schema + loader.
+    const SAMPLE_SETTINGS: &str = r##"{
+  "schema_version": 1,
+  "sign_name": "openMarqueeDev",
+  "flock_sync_enabled": true,
+  "ui_first_run_seen": true,
+  "output_mode": "hdmi",
+  "display_width": 1920,
+  "display_height": 1080,
+  "display_rotation": 0,
+  "brightness": 80,
+  "gamma": 2.2,
+  "ws281x_pixel_order": "row_major",
+  "wifi_ap_enabled": true,
+  "wifi_ssid": "openMarquee-SETUP",
+  "wifi_password": "openmarquee",
+  "wifi_station_enabled": false,
+  "wifi_station_ssid": null,
+  "wifi_station_password": null,
+  "timezone": null,
+  "tailscale_enabled": false,
+  "tailscale_auth_key": null,
+  "tailscale_hostname": null
+}"##;
+
+    #[test]
+    fn settings_round_trip_keeps_renderer_relevant_fields() {
+        // The Settings loader skips Wi-Fi / Tailscale / sign-
+        // name fields (out of renderer scope) and keeps just
+        // the per-frame-relevant subset.
+        let s: Settings = serde_json::from_str(SAMPLE_SETTINGS).unwrap();
+        assert_eq!(s.schema_version, 1);
+        assert_eq!(s.display_width, 1920);
+        assert_eq!(s.display_height, 1080);
+        assert_eq!(s.display_rotation, 0);
+        assert_eq!(s.brightness, 80);
+        assert!((s.gamma - 2.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn settings_loader_reads_from_disk() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        std::fs::write(&path, SAMPLE_SETTINGS).unwrap();
+        let s = load_settings(&path).unwrap();
+        assert_eq!(s.brightness, 80);
+        assert!((s.gamma - 2.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn settings_loader_errs_on_missing_file() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("nonexistent.json");
+        let err = load_settings(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("read settings"), "got: {msg}");
+    }
+
+    #[test]
+    fn settings_loader_errs_on_malformed_json() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        std::fs::write(&path, "{ broken").unwrap();
+        let err = load_settings(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parse settings"), "got: {msg}");
+    }
+
+    #[test]
+    fn settings_default_uses_spec_anchors() {
+        let s = Settings::default();
+        assert_eq!(s.display_width, 1920);
+        assert_eq!(s.display_height, 1080);
+        assert_eq!(s.display_rotation, 0);
+        assert_eq!(s.brightness, 100);
+        assert!((s.gamma - 2.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn settings_partial_envelope_uses_serde_defaults() {
+        // Partial envelope (only schema_version + brightness)
+        // should fill the rest from the serde defaults.
+        let json = r#"{"schema_version": 1, "brightness": 50}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.schema_version, 1);
+        assert_eq!(s.brightness, 50);
+        assert_eq!(s.display_width, 1920);  // default
+        assert!((s.gamma - 2.2).abs() < 0.001);  // default
+    }
+
+    #[test]
+    fn settings_watcher_emits_initial_state_on_first_check() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        std::fs::write(&path, SAMPLE_SETTINGS).unwrap();
+        let mut w = SettingsWatcher::new(path);
+        let initial = w.check().expect("first check should emit initial state");
+        assert_eq!(initial.brightness, 80);
+    }
+
+    #[test]
+    fn settings_watcher_returns_none_on_unchanged_mtime() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        std::fs::write(&path, SAMPLE_SETTINGS).unwrap();
+        let mut w = SettingsWatcher::new(path);
+        let _ = w.check().unwrap();  // bootstrap.
+        // Second check without mtime change: None.
+        assert!(w.check().is_none());
+        // Third call also None.
+        assert!(w.check().is_none());
+    }
+
+    #[test]
+    fn settings_watcher_emits_on_mtime_change() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        std::fs::write(&path, SAMPLE_SETTINGS).unwrap();
+        let mut w = SettingsWatcher::new(path.clone());
+        let _ = w.check().unwrap();  // bootstrap.
+        // Mutate the file. Sleep so the mtime tick is
+        // observable on platforms with second-precision mtime
+        // (some Linux fs configs go to whole seconds; APFS +
+        // ext4 with nanosec timestamps go finer).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let new_json = SAMPLE_SETTINGS.replace("\"brightness\": 80", "\"brightness\": 50");
+        std::fs::write(&path, &new_json).unwrap();
+        let after = w.check();
+        // On platforms where the mtime ticked (every reasonable
+        // FS at 1.1s sleep), after is Some.
+        let s = after.expect("post-mutation check should surface new mtime");
+        assert_eq!(s.brightness, 50);
+    }
+
+    #[test]
+    fn settings_watcher_silently_handles_missing_file() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("nonexistent.json");
+        let mut w = SettingsWatcher::new(path);
+        // First check on a missing file: None (no panic, no
+        // err -- watcher silently waits for the file to
+        // appear).
+        assert!(w.check().is_none());
+        // Subsequent checks also None.
+        assert!(w.check().is_none());
+    }
+
+    #[test]
+    fn settings_watcher_silently_handles_malformed_json() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("settings.json");
+        std::fs::write(&path, "{ broken").unwrap();
+        let mut w = SettingsWatcher::new(path);
+        // First check on malformed: None (warn + keep last-
+        // known).
+        assert!(w.check().is_none());
     }
 
     #[test]
