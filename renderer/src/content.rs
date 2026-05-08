@@ -153,6 +153,20 @@ pub struct TextLayer {
     /// per-effect Hz from the intensity table.
     #[serde(default = "default_motion_speed")]
     pub motion_speed: f32,
+    /// v1-spec-delta #3 -- auto-update mode. When set, the renderer
+    /// substitutes `text` with a formatted system-clock value (time
+    /// / date / day-of-week) every second. Spec §6.1 lines 114-118.
+    /// One of `time` / `date` / `day` or None.
+    #[serde(default)]
+    pub auto_mode: Option<String>,
+    /// v1-spec-delta #3 -- auto-update format string. Mode-scoped:
+    /// `time_*` for auto_mode=time, `date_*` for date, `day_*` for
+    /// day. The Python validator rejects mismatched combinations on
+    /// save, so the renderer trusts the saved envelope and falls
+    /// back to a sensible default (time_hm / date_medium / day_long)
+    /// if the field is somehow None despite auto_mode being set.
+    #[serde(default)]
+    pub auto_format: Option<String>,
     pub r#box: TextBox,
 }
 

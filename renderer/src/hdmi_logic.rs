@@ -993,6 +993,173 @@ pub fn effective_hold_ms(slide_duration_ms: u32, override_secs: Option<u64>) -> 
 }
 
 // ---------------------------------------------------------------
+// Auto-mode (v1-spec-delta #3) — system-clock text substitution.
+// Spec §6.1 lines 114-118: time / date / day layers tick every
+// second. The renderer rolls its own date math (Unix epoch ->
+// y/m/d/h/m/s/weekday) to avoid a new dep without QA sign-off.
+// All seven format strings the Python schema enumerates are
+// supported; pure helpers, host-testable.
+// ---------------------------------------------------------------
+
+/// Calendar fields decomposed from a Unix timestamp (seconds
+/// since 1970-01-01 UTC). Naive UTC math; future slices can layer
+/// timezone awareness on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalendarUtc {
+    pub year: i32,
+    pub month: u8,        // 1..=12
+    pub day: u8,          // 1..=31
+    pub hour: u8,         // 0..=23
+    pub minute: u8,       // 0..=59
+    pub second: u8,       // 0..=59
+    pub weekday: u8,      // 0=Sunday, 1=Monday, ..., 6=Saturday
+}
+
+/// Decompose a Unix timestamp into UTC calendar fields. Pure math,
+/// no system-clock side effects. Howard Hinnant's "civil from
+/// days" algorithm (CC0) for y/m/d; modular arithmetic for h/m/s
+/// and Sakamoto-style weekday from days.
+pub fn unix_to_calendar_utc(unix_seconds: i64) -> CalendarUtc {
+    // Split seconds-of-day from days-since-epoch. rem_euclid keeps
+    // sub-day fields well-defined for negative epochs (pre-1970).
+    let secs_in_day = 86_400_i64;
+    let days = unix_seconds.div_euclid(secs_in_day);
+    let secs = unix_seconds.rem_euclid(secs_in_day);
+    let hour = (secs / 3600) as u8;
+    let minute = ((secs % 3600) / 60) as u8;
+    let second = (secs % 60) as u8;
+    // 1970-01-01 was a Thursday (weekday=4 in Sun=0 convention).
+    // weekday = (4 + days) mod 7. div/rem_euclid for negative days.
+    let weekday = ((days.rem_euclid(7) + 4).rem_euclid(7)) as u8;
+    // "civil_from_days" — Howard Hinnant. Treats March as month 1
+    // internally to make leap-day handling branchless, then maps
+    // back to Jan-1 origin.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let year = (y + (m <= 2) as i64) as i32;
+    CalendarUtc {
+        year,
+        month: m,
+        day: d,
+        hour,
+        minute,
+        second,
+        weekday,
+    }
+}
+
+/// Format the auto-mode text per spec §6.1 + the Python
+/// auto_format Literal table. Returns None if auto_mode is unset
+/// or malformed; the caller's renderer falls back to the layer's
+/// `text` field on None.
+///
+/// `auto_format` is mode-scoped: time_hm/time_hms / date_iso/
+/// date_long/date_medium / day_long/day_short. When `auto_format`
+/// is None despite auto_mode being set (shouldn't happen post-
+/// validator but defensive against IPC edge cases), each mode
+/// has a sensible default: time_hm / date_medium / day_long.
+pub fn format_auto_text(
+    auto_mode: Option<&str>,
+    auto_format: Option<&str>,
+    cal: CalendarUtc,
+) -> Option<String> {
+    let mode = auto_mode?;
+    let fmt = match (mode, auto_format) {
+        ("time", Some(f)) if f.starts_with("time_") => f,
+        ("date", Some(f)) if f.starts_with("date_") => f,
+        ("day", Some(f)) if f.starts_with("day_") => f,
+        ("time", _) => "time_hm",
+        ("date", _) => "date_medium",
+        ("day", _) => "day_long",
+        _ => return None,
+    };
+    Some(match fmt {
+        "time_hm" => format!("{:02}:{:02}", cal.hour, cal.minute),
+        "time_hms" => format!("{:02}:{:02}:{:02}", cal.hour, cal.minute, cal.second),
+        "date_iso" => format!("{:04}-{:02}-{:02}", cal.year, cal.month, cal.day),
+        "date_long" => format!(
+            "{} {}, {:04}",
+            month_long(cal.month),
+            cal.day,
+            cal.year
+        ),
+        "date_medium" => format!("{} {}", month_short(cal.month), cal.day),
+        "day_long" => weekday_long(cal.weekday).to_string(),
+        "day_short" => weekday_short(cal.weekday).to_string(),
+        _ => format!("?{fmt}?"),
+    })
+}
+
+fn month_long(month: u8) -> &'static str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "?",
+    }
+}
+
+fn month_short(month: u8) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "?",
+    }
+}
+
+fn weekday_long(weekday: u8) -> &'static str {
+    match weekday {
+        0 => "Sunday",
+        1 => "Monday",
+        2 => "Tuesday",
+        3 => "Wednesday",
+        4 => "Thursday",
+        5 => "Friday",
+        6 => "Saturday",
+        _ => "?",
+    }
+}
+
+fn weekday_short(weekday: u8) -> &'static str {
+    match weekday {
+        0 => "Sun",
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        _ => "?",
+    }
+}
+
+// ---------------------------------------------------------------
 // Motion engine (v1-spec-delta #2) — pure host-testable math.
 // docs/text-layer-motion-spec.md is the source of truth for the
 // menu, semantics, and per-effect intensity ranges.
@@ -2572,6 +2739,183 @@ mod tests {
         // passes u64::MAX for the override (degenerate but
         // possible).
         assert_eq!(effective_hold_ms(0, Some(u64::MAX)), u64::MAX);
+    }
+
+    // -- auto-mode (v1-spec-delta #3) ---------------------------
+
+    #[test]
+    fn unix_to_calendar_at_epoch_zero() {
+        // 1970-01-01 00:00:00 UTC = Thursday (weekday=4).
+        let c = unix_to_calendar_utc(0);
+        assert_eq!(c.year, 1970);
+        assert_eq!(c.month, 1);
+        assert_eq!(c.day, 1);
+        assert_eq!(c.hour, 0);
+        assert_eq!(c.minute, 0);
+        assert_eq!(c.second, 0);
+        assert_eq!(c.weekday, 4);
+    }
+
+    #[test]
+    fn unix_to_calendar_known_y2k() {
+        // 2000-01-01 00:00:00 UTC = 946684800 seconds = Saturday (6).
+        let c = unix_to_calendar_utc(946_684_800);
+        assert_eq!(c.year, 2000);
+        assert_eq!(c.month, 1);
+        assert_eq!(c.day, 1);
+        assert_eq!(c.weekday, 6);
+    }
+
+    #[test]
+    fn unix_to_calendar_handles_leap_day() {
+        // 2024-02-29 12:34:56 UTC = 1709210096.
+        let c = unix_to_calendar_utc(1_709_210_096);
+        assert_eq!(c.year, 2024);
+        assert_eq!(c.month, 2);
+        assert_eq!(c.day, 29);
+        assert_eq!(c.hour, 12);
+        assert_eq!(c.minute, 34);
+        assert_eq!(c.second, 56);
+        // 2024-02-29 was a Thursday.
+        assert_eq!(c.weekday, 4);
+    }
+
+    #[test]
+    fn unix_to_calendar_handles_negative_seconds() {
+        // 1969-12-31 23:59:59 UTC = -1 = Wednesday (3).
+        let c = unix_to_calendar_utc(-1);
+        assert_eq!(c.year, 1969);
+        assert_eq!(c.month, 12);
+        assert_eq!(c.day, 31);
+        assert_eq!(c.hour, 23);
+        assert_eq!(c.minute, 59);
+        assert_eq!(c.second, 59);
+        assert_eq!(c.weekday, 3);
+    }
+
+    /// Pinned reference point for format tests: April 21, 2026 at
+    /// 14:35:09 UTC = Tuesday. unix = 1776_782_109
+    /// (= 20564 days * 86400 + 14*3600 + 35*60 + 9).
+    fn pinned_calendar() -> CalendarUtc {
+        let c = unix_to_calendar_utc(1_776_782_109);
+        assert_eq!(c.year, 2026);
+        assert_eq!(c.month, 4);
+        assert_eq!(c.day, 21);
+        assert_eq!(c.weekday, 2);
+        c
+    }
+
+    #[test]
+    fn format_auto_time_hm_two_digit_zero_padded() {
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("time"), Some("time_hm"), c).unwrap(),
+            "14:35"
+        );
+    }
+
+    #[test]
+    fn format_auto_time_hms_includes_seconds() {
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("time"), Some("time_hms"), c).unwrap(),
+            "14:35:09"
+        );
+    }
+
+    #[test]
+    fn format_auto_date_iso_yyyy_mm_dd() {
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("date"), Some("date_iso"), c).unwrap(),
+            "2026-04-21"
+        );
+    }
+
+    #[test]
+    fn format_auto_date_long_month_name() {
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("date"), Some("date_long"), c).unwrap(),
+            "April 21, 2026"
+        );
+    }
+
+    #[test]
+    fn format_auto_date_medium_short_month() {
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("date"), Some("date_medium"), c).unwrap(),
+            "Apr 21"
+        );
+    }
+
+    #[test]
+    fn format_auto_day_long_full_weekday() {
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("day"), Some("day_long"), c).unwrap(),
+            "Tuesday"
+        );
+    }
+
+    #[test]
+    fn format_auto_day_short_three_letter_weekday() {
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("day"), Some("day_short"), c).unwrap(),
+            "Tue"
+        );
+    }
+
+    #[test]
+    fn format_auto_returns_none_when_mode_unset() {
+        let c = pinned_calendar();
+        assert_eq!(format_auto_text(None, None, c), None);
+        assert_eq!(format_auto_text(None, Some("time_hm"), c), None);
+    }
+
+    #[test]
+    fn format_auto_falls_back_to_default_format_when_format_unset() {
+        // Spec validator rejects auto_format=None when auto_mode is
+        // set on save, but the renderer is the second line of
+        // defense for IPC edge cases.
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("time"), None, c).unwrap(),
+            "14:35"
+        );
+        assert_eq!(
+            format_auto_text(Some("date"), None, c).unwrap(),
+            "Apr 21"
+        );
+        assert_eq!(
+            format_auto_text(Some("day"), None, c).unwrap(),
+            "Tuesday"
+        );
+    }
+
+    #[test]
+    fn format_auto_falls_back_when_format_mismatches_mode() {
+        // Spec validator catches this on save (auto_format must
+        // start with the auto_mode prefix); renderer defensively
+        // falls through to the mode's default rather than render
+        // garbage.
+        let c = pinned_calendar();
+        assert_eq!(
+            format_auto_text(Some("time"), Some("date_iso"), c).unwrap(),
+            "14:35"
+        );
+        assert_eq!(
+            format_auto_text(Some("date"), Some("time_hm"), c).unwrap(),
+            "Apr 21"
+        );
+    }
+
+    #[test]
+    fn format_auto_unknown_mode_returns_none() {
+        let c = pinned_calendar();
+        assert_eq!(format_auto_text(Some("temperature"), None, c), None);
     }
 
     // -- motion engine (v1-spec-delta #2) -----------------------
