@@ -79,7 +79,25 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("log", help="path to soak run stderr capture")
     ap.add_argument("--max-slope-mb-per-hour", type=float, default=5.0,
-                    help="MB/hour ceiling for VmRSS / VmData / CmaUsed slope")
+                    help="default MB/hour ceiling applied to all signals "
+                         "unless overridden by --max-{rss,data,swap,cma}-"
+                         "slope-mbh")
+    # Slice 12(c) followup: per-signal slope ceilings. cma_used reads
+    # /proc/meminfo system-wide so peer-process churn (kms/v4l2/codec)
+    # makes its noise floor much higher than the renderer-process-only
+    # vm_rss / vm_data signals. Allowing per-signal overrides lets the
+    # production §8.2 6h gate stay tight on vm_rss while tolerating
+    # cma_used drift from elsewhere on the Pi.
+    ap.add_argument("--max-rss-slope-mbh", type=float, default=None,
+                    help="per-signal vm_rss slope ceiling (overrides default)")
+    ap.add_argument("--max-data-slope-mbh", type=float, default=None,
+                    help="per-signal vm_data slope ceiling (overrides default)")
+    ap.add_argument("--max-swap-slope-mbh", type=float, default=None,
+                    help="per-signal swap slope ceiling (overrides default; "
+                         "swap should genuinely be 0 in normal soak)")
+    ap.add_argument("--max-cma-slope-mbh", type=float, default=None,
+                    help="per-signal cma_used slope ceiling (overrides default; "
+                         "system-wide signal so noisier than process-local rss/data)")
     ap.add_argument("--max-cma-mb", type=float, default=200.0,
                     help="hard ceiling for end-of-soak CmaUsed (budget §4)")
     ap.add_argument("--max-rss-mb", type=float, default=100.0,
@@ -147,17 +165,21 @@ def main() -> int:
         f"cma={last['cma']:.1f}MB swap={last['swap']:.1f}MB"
     )
 
+    # Per-signal slope ceilings: explicit override beats the default.
     failures: List[str] = []
-    for name, val in (
-        ("vm_rss", rss_per_hour),
-        ("vm_data", data_per_hour),
-        ("swap", swap_per_hour),
-        ("cma_used", cma_per_hour),
-    ):
-        if val > args.max_slope_mb_per_hour:
+    per_signal = (
+        ("vm_rss", rss_per_hour, args.max_rss_slope_mbh),
+        ("vm_data", data_per_hour, args.max_data_slope_mbh),
+        ("swap", swap_per_hour, args.max_swap_slope_mbh),
+        ("cma_used", cma_per_hour, args.max_cma_slope_mbh),
+    )
+    for name, val, override in per_signal:
+        ceiling = override if override is not None else args.max_slope_mb_per_hour
+        if val > ceiling:
+            tag = "" if override is None else " (per-signal override)"
             failures.append(
                 f"{name} slope {val:+.1f} MB/hour > "
-                f"{args.max_slope_mb_per_hour} MB/hour ceiling"
+                f"{ceiling} MB/hour ceiling{tag}"
             )
 
     if last["cma"] > args.max_cma_mb:

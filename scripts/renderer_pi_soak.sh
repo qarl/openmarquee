@@ -108,11 +108,20 @@ esac
 
 echo "==> parsing [mem] lines + asserting slope"
 PARSER="$(dirname "$0")/renderer_soak_parse.py"
+# Slice 12(c) followup: per-signal slope ceiling env vars
+# (SOAK_MAX_RSS_SLOPE_MBH / DATA / SWAP / CMA). When unset,
+# the default --max-slope-mb-per-hour applies to all signals.
+PER_SIGNAL_ARGS=()
+[ -n "${SOAK_MAX_RSS_SLOPE_MBH:-}" ] && PER_SIGNAL_ARGS+=(--max-rss-slope-mbh "$SOAK_MAX_RSS_SLOPE_MBH")
+[ -n "${SOAK_MAX_DATA_SLOPE_MBH:-}" ] && PER_SIGNAL_ARGS+=(--max-data-slope-mbh "$SOAK_MAX_DATA_SLOPE_MBH")
+[ -n "${SOAK_MAX_SWAP_SLOPE_MBH:-}" ] && PER_SIGNAL_ARGS+=(--max-swap-slope-mbh "$SOAK_MAX_SWAP_SLOPE_MBH")
+[ -n "${SOAK_MAX_CMA_SLOPE_MBH:-}" ] && PER_SIGNAL_ARGS+=(--max-cma-slope-mbh "$SOAK_MAX_CMA_SLOPE_MBH")
 if ! python3 "$PARSER" "$SOAK_LOG" \
     --max-slope-mb-per-hour "$MAX_SLOPE" \
     --max-cma-mb "$MAX_CMA" \
     --max-rss-mb "$MAX_RSS" \
-    --warmup-passes "$WARMUP_PASSES"; then
+    --warmup-passes "$WARMUP_PASSES" \
+    "${PER_SIGNAL_ARGS[@]}"; then
     echo "FAIL: soak slope/budget gate"
     exit 1
 fi
