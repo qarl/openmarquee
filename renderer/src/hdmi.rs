@@ -2208,6 +2208,47 @@ pub fn egl_session_mode_size(session: &EglSession) -> (u32, u32) {
     (session.mode_w as u32, session.mode_h as u32)
 }
 
+impl<'a> EglSession<'a> {
+    /// Public accessor for the GL context. Used by the IPC
+    /// sidecar's Capture op which calls capture_fbo_to_rgba
+    /// directly (no paint_and_present round-trip).
+    pub fn gl(&self) -> &glow::Context {
+        self.gl
+    }
+}
+
+/// v1-spec-delta #9 (slice e -- Capture) -- paint a slide
+/// into the EGL window surface for capture. No swap_buffers,
+/// no commit_fb, no scanout. Caller follows up with
+/// capture_fbo_to_rgba on the default framebuffer.
+pub fn paint_one_for_capture(
+    session: &mut EglSession,
+    slide: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    t_in_slide_ms: u64,
+) -> Result<()> {
+    use glow::HasContext;
+    let (bg_kind, _label, text_layers) =
+        resolve_slide_layers(slide, fonts, content_root)?;
+    let tick_seconds = t_in_slide_ms as f64 / 1000.0;
+    let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
+    let wall_clock_unix = current_unix_seconds();
+    paint_slide(
+        session.gl,
+        session.mode_w as u32,
+        session.mode_h as u32,
+        &bg_kind,
+        &text_layers,
+        Some(&motion_states),
+        wall_clock_unix,
+        None,
+        Some(&mut session.image_bg_cache),
+    )?;
+    unsafe { session.gl.flush(); }
+    Ok(())
+}
+
 /// v1-spec-delta #5 (slice c, 2026-05-08): render a slide given
 /// an already-acquired EGL session. Static dispatch goes through
 /// render_one_frame_in_session; animated/auto_mode dispatch goes

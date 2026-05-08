@@ -303,6 +303,21 @@ where
                 }
             };
             let is_close = matches!(req, IpcRequest::Close);
+
+            // v1-spec-delta #9 (slice e -- Capture wired now;
+            // Reconfigure remains architectural-quality defer).
+            // Capture intercepts here BEFORE handle_inner_request
+            // because the standard dispatch returns "not yet
+            // implemented" and we need session+gl to capture.
+            if let IpcRequest::Capture(ref p) = req {
+                let path = std::path::PathBuf::from(&p.path);
+                let resp = capture_current_scene_to_png(
+                    session, &cache, &state, fonts, content_root, &path,
+                );
+                emit_response(stdout, &resp)?;
+                continue;
+            }
+
             let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
 
             // Linux paint hook: when the dispatcher returned a
@@ -326,6 +341,80 @@ where
         }
         Ok(())
     })
+}
+
+/// v1-spec-delta #9 (slice e -- Capture op) -- capture the
+/// current scene to a PNG using the slice 11 primitives. Re-
+/// paints the current slide into the EGL window surface (so
+/// the captured PNG matches the most-recent rendered state),
+/// reads back via capture_fbo_to_rgba, encodes via
+/// rgba_to_png_bytes, writes to disk.
+///
+/// This re-paint is deliberate: at the IPC tick, the EGL
+/// surface holds the LAST swap_buffers content, but we
+/// don't track which slide that corresponds to. Re-painting
+/// from current state guarantees the snapshot reflects what
+/// the caller's most recent Advance produced. Idle / no-
+/// current-slide returns Err.
+#[cfg(target_os = "linux")]
+fn capture_current_scene_to_png(
+    session: &mut crate::hdmi::EglSession,
+    cache: &SlideCache,
+    state: &PlaybackState,
+    fonts: Option<&FontCatalog>,
+    content_root: &Path,
+    png_path: &Path,
+) -> IpcResponse {
+    use crate::content::ContentItem;
+    use crate::hdmi;
+    use crate::hdmi_logic::rgba_to_png_bytes;
+
+    let slide = match &state.current {
+        Some(c) => c,
+        None => return err("Capture: no current slide (begin_slide first?)"),
+    };
+    let slide_id = slide.slide_id;
+    let item = match cache.items.get(&slide_id) {
+        Some(i) => i,
+        None => return err(format!("Capture: slide {slide_id} not in cache")),
+    };
+    let text_slide = match item {
+        ContentItem::Text(s) => s,
+        _ => return err("Capture: only text slides supported in slice (e); image/video TBD"),
+    };
+
+    // Re-paint into the EGL window surface (no commit_fb --
+    // this is offscreen for capture). Then read back.
+    let (mode_w, mode_h) = hdmi::egl_session_mode_size(session);
+    let t_in_slide_ms = 0_u64;
+    if let Err(e) = hdmi::paint_one_for_capture(
+        session,
+        text_slide,
+        fonts,
+        Some(content_root),
+        t_in_slide_ms,
+    ) {
+        return err(format!("Capture: paint failed: {e:#}"));
+    }
+
+    let rgba = match hdmi::capture_fbo_to_rgba(session.gl(), None, mode_w, mode_h) {
+        Ok(b) => b,
+        Err(e) => return err(format!("Capture: read_pixels failed: {e:#}")),
+    };
+    let png_bytes = match rgba_to_png_bytes(&rgba, mode_w, mode_h) {
+        Ok(b) => b,
+        Err(e) => return err(format!("Capture: png encode failed: {e:#}")),
+    };
+    let bytes = png_bytes.len() as u64;
+    if let Err(e) = std::fs::write(png_path, &png_bytes) {
+        return err(format!("Capture: write {} failed: {e:#}", png_path.display()));
+    }
+    IpcResponse::Ok {
+        result: OpResult::CaptureOk {
+            path: png_path.display().to_string(),
+            bytes,
+        },
+    }
 }
 
 /// Linux paint hook: translate PaintSlide / PaintTransition
