@@ -377,14 +377,86 @@ pub fn image_slide_asset_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
     item_dir(content_root, slide_id).join("asset.png")
 }
 
-/// v1-spec-delta #8 (slice a) -- typed reel item. The reel
+/// v1-spec-delta #8 (slice c, 2026-05-08) -- minimal mirror of
+/// Python's `VideoSlide`. Asset (H.264 in MP4 container, capped
+/// at 1080p per the backend docstring) lives at
+/// `<content_root>/<id>/asset.mp4`; thumbnail at `asset.png`.
+/// The schema fields the renderer needs are id + duration_ms +
+/// transition; name is kept for log lines. duration_ms is
+/// informational per the Python schema -- the playback engine
+/// reads actual runtime from the file -- but the renderer
+/// honors it for hold-time hints and the reel driver's pass_ms
+/// gate.
+///
+/// SLICE-C SCOPE NOTE: this slice ships the schema mirror +
+/// ContentItem::Video dispatch + warn-and-fall in the reel
+/// driver. Actual H.264 hardware-decode (V4L2 M2M via
+/// gstreamer / ffmpeg / direct linux-media-rs) is the
+/// architectural follow-up. The decode-approach selection has
+/// material spec-compliance + perf consequences and warrants
+/// qarl-direct review before implementation; this slice gets
+/// the dispatch shape in place so the renderer doesn't choke
+/// on video envelopes in playlists.
+#[derive(Debug, Deserialize, Clone)]
+pub struct VideoSlide {
+    #[serde(default = "Uuid::nil")]
+    pub id: Uuid,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_video_duration_ms")]
+    pub duration_ms: u32,
+    #[serde(default = "default_transition")]
+    pub transition: String,
+    #[serde(default = "default_transition_ms")]
+    pub transition_ms: u32,
+}
+
+fn default_video_duration_ms() -> u32 {
+    5000
+}
+
+/// v1-spec-delta #8 (slice c) -- locate the video-slide JSON for
+/// a given item_id. Mirrors find_text_slide / find_image_slide;
+/// returns Ok(None) when the item exists but isn't a video
+/// slide. Caller dispatches on type.
+pub fn find_video_slide(content_root: &Path, item_id: Uuid) -> Result<Option<VideoSlide>> {
+    let path = item_dir(content_root, item_id).join("item.json");
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read item {}", path.display()))?;
+    let envelope: ItemEnvelope = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse item envelope {}", path.display()))?;
+    let kind = envelope
+        .item
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if kind != "video" {
+        return Ok(None);
+    }
+    let slide: VideoSlide = serde_json::from_value(envelope.item)
+        .with_context(|| format!("parse video_slide {}", path.display()))?;
+    Ok(Some(slide))
+}
+
+/// v1-spec-delta #8 (slice c) -- the asset MP4 path for a
+/// VideoSlide. H.264 video, browser-pre-transcoded to
+/// min(source, 1920×1080) per the Python schema docstring.
+/// Path: `<content_root>/<id>/asset.mp4`.
+pub fn video_slide_asset_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
+    item_dir(content_root, slide_id).join("asset.mp4")
+}
+
+/// v1-spec-delta #8 (slice a/c) -- typed reel item. The reel
 /// driver dispatches on this enum; each variant has its own
-/// render path (Text via render_slide_in_session, Image via
-/// render_image_slide_in_session). Slice (c) will add Video.
+/// render path. Text via render_slide_in_session, Image via
+/// render_image_slide_in_session. Video lands in slice (c)+
+/// pending the decode-approach selection (warn-and-fall to
+/// hard cut today).
 #[derive(Debug, Clone)]
 pub enum ContentItem {
     Text(TextSlide),
     Image(ImageSlide),
+    Video(VideoSlide),
 }
 
 impl ContentItem {
@@ -392,24 +464,28 @@ impl ContentItem {
         match self {
             ContentItem::Text(s) => s.id,
             ContentItem::Image(s) => s.id,
+            ContentItem::Video(s) => s.id,
         }
     }
     pub fn name(&self) -> &str {
         match self {
             ContentItem::Text(s) => &s.name,
             ContentItem::Image(s) => &s.name,
+            ContentItem::Video(s) => &s.name,
         }
     }
     pub fn duration_ms(&self) -> u32 {
         match self {
             ContentItem::Text(s) => s.duration_ms,
             ContentItem::Image(s) => s.duration_ms,
+            ContentItem::Video(s) => s.duration_ms,
         }
     }
     pub fn type_label(&self) -> &'static str {
         match self {
             ContentItem::Text(_) => "text_slide",
             ContentItem::Image(_) => "image",
+            ContentItem::Video(_) => "video",
         }
     }
 }
@@ -466,15 +542,33 @@ pub fn resolve_reel_items(
                 ));
                 continue;
             }
+            Ok(None) => {} // not text or image; try video.
+            Err(e) => {
+                eprintln!(
+                    "reel: skipping item {} -- find_image_slide failed: {e:#}",
+                    item.item_id,
+                );
+                continue;
+            }
+        }
+        match find_video_slide(content_root, item.item_id) {
+            Ok(Some(slide)) => {
+                out.push((
+                    ContentItem::Video(slide),
+                    item.transition.clone(),
+                    item.transition_ms,
+                ));
+                continue;
+            }
             Ok(None) => {
                 eprintln!(
-                    "reel: skipping item {} -- type not text_slide or image (video out of scope until slice c)",
+                    "reel: skipping item {} -- type not text_slide / image / video",
                     item.item_id,
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "reel: skipping item {} -- find_image_slide failed: {e:#}",
+                    "reel: skipping item {} -- find_video_slide failed: {e:#}",
                     item.item_id,
                 );
             }

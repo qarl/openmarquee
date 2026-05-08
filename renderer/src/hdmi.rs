@@ -3541,6 +3541,32 @@ pub fn render_playlist_reel(
                         let asset = image_slide_asset_path(content_root, slide.id);
                         render_image_slide_in_session(session, card, &asset, hold_ms)
                     }
+                    ContentItem::Video(_slide) => {
+                        // v1-spec-delta #8 (slice c, infra-only):
+                        // VideoSlide schema is mirrored + dispatched
+                        // here, but the actual H.264 decode pipeline
+                        // doesn't ship in this slice -- approach
+                        // selection (gstreamer subprocess vs ffmpeg
+                        // vs raw V4L2 M2M) is qarl-direct review per
+                        // QA's slicing read. Today: warn-and-fall to
+                        // a hard cut so the renderer doesn't choke
+                        // on video envelopes in playlists. The slot
+                        // is held for the spec'd hold_ms duration
+                        // (black screen) so the reel pacing is
+                        // preserved.
+                        eprintln!(
+                            "reel: video item {i} ({:?}) decode pipeline not yet implemented; holding {}ms with black",
+                            _slide.name,
+                            hold_ms,
+                        );
+                        // Hold the slot. Use a solid-black
+                        // render_solid_color call so the panel shows
+                        // something deterministic for hold_ms; the
+                        // slice-d follow-up replaces this with the
+                        // real decode-frame path.
+                        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                        Ok(())
+                    }
                 };
                 if let Err(e) = render_result {
                     eprintln!(
