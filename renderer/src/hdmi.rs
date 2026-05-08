@@ -280,6 +280,24 @@ pub struct EglSession<'a> {
     /// updates. paint_and_present_one_frame uses
     /// is_identity() to decide route.
     current_settings: crate::content::Settings,
+    /// qarl-direct perf-profile (2026-05-08, post-cache): per-
+    /// slide CachedGlyph + TextureCache hoisted from per-call
+    /// scope to session level. Closes the per-transition first-
+    /// frame text-rasterization tax (~180 ms × 2 sides per
+    /// transition setup) by sharing rasterized bitmaps and GL
+    /// textures across all renders of the same slide_id within
+    /// a session. With the FYS reel cycling 19 slides and each
+    /// reel pass touching every slide, the second pass + onward
+    /// hit cache for ALL bake operations.
+    ///
+    /// Keyed by slide_id (Uuid). HashMap (no LRU) — FYS reel is
+    /// 19 slides × ~1 MB cached state per slide (small text
+    /// bitmaps); 19 MB total fits trivially in CMA budget. If
+    /// future workloads need eviction, swap to LruMap.
+    ///
+    /// Cleanup at with_egl_session teardown drains all entries
+    /// + delete_textures while gl context is still bound.
+    slide_caches: std::collections::HashMap<uuid::Uuid, SlideRenderCache>,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -427,6 +445,7 @@ where
         scene_fbo: None,
         scene_tex: None,
         current_settings: crate::content::Settings::default(),
+        slide_caches: std::collections::HashMap::new(),
     };
     let work_result = work(&mut session);
 
@@ -442,6 +461,18 @@ where
             // Trace-level diagnostic: cached image freed.
             // Comment-only -- production logs stay quiet.
             let _ = path;
+        }
+        // qarl-direct perf-profile (2026-05-08, post-cache hoist):
+        // free per-slide cached GL textures from the session-
+        // level slide_caches. Glyph alpha bitmaps are CPU heap
+        // (drop on drain). Texture handles are kernel-side; need
+        // explicit gl.delete_texture while context is bound.
+        for (_slide_id, mut entry) in session.slide_caches.drain() {
+            for slot in entry.tex.iter_mut() {
+                if let Some(t) = slot.take() {
+                    unsafe { gl.delete_texture(t); }
+                }
+            }
         }
     }
     // qarl-direct perf-profile (2026-05-08): free thread-local
@@ -882,13 +913,29 @@ fn render_animated_slide_in_session(
     // never refresh; auto_mode=time refreshes 1x/sec instead of
     // 30x/sec). Without this, the per-frame render at 1080p hits
     // the fontdue ~50ms/layer bottleneck on every iteration.
-    let mut glyph_cache: GlyphCache = Vec::with_capacity(text_layers.len());
-    glyph_cache.resize_with(text_layers.len(), || None);
-    // v1-spec-delta perf-profile: parallel GL texture cache. Saves
-    // ~3.5 MB / layer / frame of glTexImage2D upload at 1080p.
-    // Cleanup at end of loop deletes any cached textures.
-    let mut tex_cache: TextureCache = Vec::with_capacity(text_layers.len());
-    tex_cache.resize_with(text_layers.len(), || None);
+    // qarl-direct perf-profile (2026-05-08, post-cache hoist):
+    // session-level slide cache replaces the per-call locals.
+    // Re-renders of the same slide_id (e.g. across a reel pass)
+    // hit the cache; no per-call setup tax.
+    {
+        let needs_new = match session.slide_caches.get(&slide_id) {
+            Some(c) => c.glyph.len() != text_layers.len(),
+            None => true,
+        };
+        if needs_new {
+            if let Some(old) = session.slide_caches.remove(&slide_id) {
+                unsafe {
+                    use glow::HasContext;
+                    for slot in old.tex {
+                        if let Some(t) = slot {
+                            session.gl.delete_texture(t);
+                        }
+                    }
+                }
+            }
+            session.slide_caches.insert(slide_id, SlideRenderCache::new(text_layers.len()));
+        }
+    }
 
     let work: Result<()> = (|| {
         use glow::HasContext;
@@ -910,6 +957,12 @@ fn render_animated_slide_in_session(
                 motion_states_for_layers(slide_id, text_layers, tick_seconds);
             let wall_clock_unix = current_unix_seconds();
             let t_paint = std::time::Instant::now();
+            // Borrow each disjoint EglSession field for paint_slide.
+            // Compiler verifies they don't overlap (gl=&immut,
+            // image_bg_cache=&mut, slide_caches[slide_id].glyph=&mut,
+            // slide_caches[slide_id].tex=&mut).
+            let cache = session.slide_caches.get_mut(&slide_id)
+                .expect("slide_caches entry initialized above");
             paint_slide(
                 session.gl,
                 session.mode_w as u32,
@@ -918,13 +971,13 @@ fn render_animated_slide_in_session(
                 text_layers,
                 Some(&motion_states),
                 wall_clock_unix,
-                Some(&mut glyph_cache),
+                Some(&mut cache.glyph),
                 // v1-spec-delta #8 F-image-bg-cache: reuse the
                 // session-wide cache so animated slides with
                 // image bg upload exactly once. Closes the per-
                 // frame re-decode regression QA flagged.
                 Some(&mut session.image_bg_cache),
-                Some(&mut tex_cache),
+                Some(&mut cache.tex),
             )?;
             unsafe { session.gl.flush(); }
             crate::profile::record_phase("paint", t_paint.elapsed().as_nanos() as u64);
@@ -1013,18 +1066,11 @@ fn render_animated_slide_in_session(
         Ok(())
     })();
 
-    // v1-spec-delta perf-profile: free any GL textures the loop
-    // cached. paint_slide owns invalidation on bitmap regen; this
-    // is just end-of-call cleanup for the live entries. GL context
-    // is still bound here; safe to delete.
-    {
-        use glow::HasContext;
-        for slot in tex_cache.iter_mut() {
-            if let Some(t) = slot.take() {
-                unsafe { session.gl.delete_texture(t); }
-            }
-        }
-    }
+    // qarl-direct perf-profile (2026-05-08, post-cache hoist):
+    // tex_cache is now session-owned via session.slide_caches;
+    // cleanup deferred to with_egl_session teardown. The
+    // previous per-call free is gone -- intentional, that's the
+    // whole point of the hoist.
 
     // v1-spec-delta #5 (slice d): drain the last frame's pending
     // page-flip event before per-call BO/FB cleanup. Otherwise
@@ -3317,21 +3363,36 @@ fn render_transition_animated_in_session(
         let any_auto_b = layers_b
             .iter()
             .any(|(l, _, _)| l.auto_mode.is_some());
-        // v1-spec-delta #3 (slice b QA followup): per-slide glyph
-        // caches across the transition loop. fontdue rasterization
-        // skips when (resolved_text, font_size) is unchanged.
-        let mut glyph_cache_a: GlyphCache = Vec::with_capacity(layers_a.len());
-        glyph_cache_a.resize_with(layers_a.len(), || None);
-        let mut glyph_cache_b: GlyphCache = Vec::with_capacity(layers_b.len());
-        glyph_cache_b.resize_with(layers_b.len(), || None);
-        // v1-spec-delta perf-profile: parallel GL texture caches
-        // for both bake passes. Saves ~3.5 MB / layer / frame /
-        // SIDE of texture re-upload in the motion-through-
-        // transition hot path.
-        let mut tex_cache_a: TextureCache = Vec::with_capacity(layers_a.len());
-        tex_cache_a.resize_with(layers_a.len(), || None);
-        let mut tex_cache_b: TextureCache = Vec::with_capacity(layers_b.len());
-        tex_cache_b.resize_with(layers_b.len(), || None);
+        // qarl-direct perf-profile (2026-05-08, post-cache hoist):
+        // session-level slide cache by slide_id. Both slide_a and
+        // slide_b's caches live in session.slide_caches and
+        // persist across transition calls. Re-render of same slide
+        // (e.g. slide N becomes slide_a in transition N→N+1, and
+        // slide_b in transition N-1→N) hits cache.
+        let slide_a_id = slide_a.id;
+        let slide_b_id = slide_b.id;
+        let layers_a_len = layers_a.len();
+        let layers_b_len = layers_b.len();
+        // Ensure both entries exist + are correctly sized. Free
+        // any stale textures if layer count changed.
+        for (sid, n) in [(slide_a_id, layers_a_len), (slide_b_id, layers_b_len)] {
+            let needs_new = match session.slide_caches.get(&sid) {
+                Some(c) => c.glyph.len() != n,
+                None => true,
+            };
+            if needs_new {
+                if let Some(old) = session.slide_caches.remove(&sid) {
+                    unsafe {
+                        for slot in old.tex {
+                            if let Some(t) = slot {
+                                gl.delete_texture(t);
+                            }
+                        }
+                    }
+                }
+                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+            }
+        }
         let start = Instant::now();
         let mut rendered = 0_u32;
         let profile_active_t = crate::profile::is_enabled();
@@ -3360,6 +3421,8 @@ fn render_transition_animated_in_session(
                         tick_seconds,
                     );
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+                    let cache_a = session.slide_caches.get_mut(&slide_a_id)
+                        .expect("slide_caches[slide_a] initialized above");
                     paint_slide(
                         &gl,
                         mode_w_u32,
@@ -3368,9 +3431,9 @@ fn render_transition_animated_in_session(
                         &layers_a,
                         Some(&states_a),
                         wall_clock_unix,
-                        Some(&mut glyph_cache_a),
+                        Some(&mut cache_a.glyph),
                         Some(&mut session.image_bg_cache),
-                        Some(&mut tex_cache_a),
+                        Some(&mut cache_a.tex),
                     )?;
                 }
                 crate::profile::record_phase("bake_a", t_bake_a.elapsed().as_nanos() as u64);
@@ -3382,6 +3445,8 @@ fn render_transition_animated_in_session(
                         tick_seconds,
                     );
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b));
+                    let cache_b = session.slide_caches.get_mut(&slide_b_id)
+                        .expect("slide_caches[slide_b] initialized above");
                     paint_slide(
                         &gl,
                         mode_w_u32,
@@ -3390,9 +3455,9 @@ fn render_transition_animated_in_session(
                         &layers_b,
                         Some(&states_b),
                         wall_clock_unix,
-                        Some(&mut glyph_cache_b),
+                        Some(&mut cache_b.glyph),
                         Some(&mut session.image_bg_cache),
-                        Some(&mut tex_cache_b),
+                        Some(&mut cache_b.tex),
                     )?;
                 }
                 crate::profile::record_phase("bake_b", t_bake_b.elapsed().as_nanos() as u64);
@@ -3509,20 +3574,12 @@ fn render_transition_animated_in_session(
         Ok(())
         })();
         cleanup_static(gl, Some(vbo));
-        // v1-spec-delta perf-profile: free per-side cached
-        // textures while the GL context is still bound.
-        unsafe {
-            for slot in tex_cache_a.iter_mut() {
-                if let Some(t) = slot.take() {
-                    gl.delete_texture(t);
-                }
-            }
-            for slot in tex_cache_b.iter_mut() {
-                if let Some(t) = slot.take() {
-                    gl.delete_texture(t);
-                }
-            }
-        }
+        // qarl-direct perf-profile (2026-05-08, post-cache hoist):
+        // tex_cache_a / tex_cache_b are now session-owned via
+        // session.slide_caches; cleanup deferred to with_egl_
+        // session teardown. No per-call texture free here -- the
+        // whole point of the hoist is that subsequent transition
+        // calls reuse these textures.
         loop_result?;
         Ok(rendered)
     })();
@@ -3676,6 +3733,27 @@ fn clear_transition_program_cache(gl: &glow::Context) {
             unsafe { gl.delete_program(p); }
         }
     });
+}
+
+/// qarl-direct perf-profile (2026-05-08, post-cache hoist):
+/// per-slide cache state stored at session level. Bundles
+/// GlyphCache (alpha-bitmap rasterization) + TextureCache (GL
+/// luminance texture upload) for one slide's text layers.
+/// Caller (paint_slide) borrows the inner Vecs to feed the
+/// existing per-call API.
+pub struct SlideRenderCache {
+    pub glyph: GlyphCache,
+    pub tex: TextureCache,
+}
+
+impl SlideRenderCache {
+    pub fn new(layer_count: usize) -> Self {
+        let mut glyph: GlyphCache = Vec::with_capacity(layer_count);
+        glyph.resize_with(layer_count, || None);
+        let mut tex: TextureCache = Vec::with_capacity(layer_count);
+        tex.resize_with(layer_count, || None);
+        Self { glyph, tex }
+    }
 }
 
 /// v1-spec-delta perf-profile (qarl-direct 2026-05-08): per-layer
