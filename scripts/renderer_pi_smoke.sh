@@ -62,6 +62,38 @@ COLOR_EXIT=0
 ssh "$TARGET" "$BIN_PI --output hdmi --solid-color 0,1,1 --hold-secs 3" \
     > "$COLOR_LOG" 2>&1 || COLOR_EXIT=$?
 
+# v1-spec-delta #17 (slice d): --force-mode 1920x1080@30 sanity
+# gate. Asserts the synthesized mode survives kernel SetCrtc
+# validation on the dev Pi's vc4 + connected HDMI, and the
+# expected log line ("--force-mode: synthesized ...") fires.
+# This is the V1 spec §11 1080p reachability gate -- if the gate
+# stops passing, 1080p measurement is blocked again. Operators
+# can OPT OUT of this gate via SMOKE_SKIP_FORCE_MODE=1 (e.g. when
+# running against a panel that genuinely doesn't support 1080p).
+if [ "${SMOKE_SKIP_FORCE_MODE:-0}" = "1" ]; then
+    echo "==> Phase 2.0a -- --force-mode 1920x1080@30 SKIPPED (SMOKE_SKIP_FORCE_MODE=1)"
+else
+    echo "==> Phase 2.0a -- --force-mode 1920x1080@30 (--solid-color 0,0,1 --hold-secs 2)"
+    FM_LOG="$LOG_DIR/force-mode.log"
+    FM_EXIT=0
+    ssh "$TARGET" "$BIN_PI --output hdmi --solid-color 0,0,1 --hold-secs 2 --force-mode 1920x1080@30" \
+        > "$FM_LOG" 2>&1 || FM_EXIT=$?
+    if [ "$FM_EXIT" -ne 0 ]; then
+        echo "FAIL: --force-mode exit $FM_EXIT"
+        cat "$FM_LOG"
+        exit 1
+    fi
+    grep -q -- '--force-mode: synthesized 1920x1080@30' "$FM_LOG" || \
+        { echo "FAIL: --force-mode override log line missing"; cat "$FM_LOG"; exit 1; }
+    grep -q 'HDMIA at 1920x1080@30' "$FM_LOG" || \
+        { echo "FAIL: --force-mode chosen mode line wrong"; cat "$FM_LOG"; exit 1; }
+    grep -q 'solid-color render complete' "$FM_LOG" || \
+        { echo "FAIL: --force-mode didn't reach completion"; cat "$FM_LOG"; exit 1; }
+    grep -qE 'panicked at|RUST_BACKTRACE' "$FM_LOG" && \
+        { echo "FAIL: panic in --force-mode output"; exit 1; }
+    echo "    --force-mode 1920x1080@30 ok (vc4 accepted CEA-861 synthesized mode)"
+fi
+
 echo "==> Phase 2.1 -- --animate --hold-secs 3 --fps 30"
 ANIM_LOG="$LOG_DIR/animate.log"
 ANIM_EXIT=0
