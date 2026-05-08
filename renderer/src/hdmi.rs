@@ -1591,12 +1591,64 @@ pub fn render_transition_animated(
         // that's invisible (teardown happens immediately on Err);
         // 5-c may persistize the context across calls, where the
         // leak would compound.
+        // v1-spec-delta #2 (slice d): motion through transitions.
+        // If either slide has any animated layer, its FBO is
+        // re-painted each frame so the motion math advances during
+        // the transition. Static-only slides keep the one-shot bake
+        // — no per-frame paint cost. Spec §11: motion advances
+        // through transitions is a first-class render requirement.
+        let any_animated_a = layers_a
+            .iter()
+            .any(|(l, _, _)| parse_motion_kind(&l.motion) != MotionKind::Static);
+        let any_animated_b = layers_b
+            .iter()
+            .any(|(l, _, _)| parse_motion_kind(&l.motion) != MotionKind::Static);
         let start = Instant::now();
         let mut rendered = 0_u32;
         let loop_result: Result<()> = (|| {
         for frame in 0..total_frames {
             let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
+            // Each transition frame's tick_seconds is the elapsed
+            // time inside the transition loop. Slide A "continues"
+            // its motion across the transition; slide B starts
+            // ticking from 0 (snaps to its render_slide tick=0 at
+            // transition end, where render_slide(B) takes over).
+            // The B-snap is sub-frame and below operator perception
+            // — acceptable per spec line 277.
+            let tick_seconds = start.elapsed().as_secs_f64();
             unsafe {
+                if any_animated_a {
+                    let states_a = motion_states_for_layers(
+                        slide_a.id,
+                        &layers_a,
+                        tick_seconds,
+                    );
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+                    paint_slide(
+                        &gl,
+                        mode_w_u32,
+                        mode_h_u32,
+                        &bg_a,
+                        &layers_a,
+                        Some(&states_a),
+                    )?;
+                }
+                if any_animated_b {
+                    let states_b = motion_states_for_layers(
+                        slide_b.id,
+                        &layers_b,
+                        tick_seconds,
+                    );
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b));
+                    paint_slide(
+                        &gl,
+                        mode_w_u32,
+                        mode_h_u32,
+                        &bg_b,
+                        &layers_b,
+                        Some(&states_b),
+                    )?;
+                }
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.viewport(0, 0, mode_w as i32, mode_h as i32);
                 gl.clear_color(0.0, 0.0, 0.0, 1.0);
