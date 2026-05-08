@@ -259,6 +259,18 @@ pub struct EglSession<'a> {
     scanout_prev_fb: Option<framebuffer::Handle>,
     scanout_current_bo: Option<BufferObject<()>>,
     scanout_current_fb: Option<framebuffer::Handle>,
+    /// v1-spec-delta #10 (slice c): persistent scene FBO for
+    /// the brightness/gamma post-pass. Lazy-allocated on first
+    /// non-identity settings frame, freed on session teardown.
+    /// When settings are identity, scene_fbo stays None and
+    /// paint targets default fb directly (zero overhead).
+    scene_fbo: Option<glow::NativeFramebuffer>,
+    scene_tex: Option<glow::NativeTexture>,
+    /// v1-spec-delta #10 (slice c): caller-applied settings.
+    /// Default = identity (Settings::default); apply_settings
+    /// updates. paint_and_present_one_frame uses
+    /// is_identity() to decide route.
+    current_settings: crate::content::Settings,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -403,6 +415,9 @@ where
         scanout_prev_fb: None,
         scanout_current_bo: None,
         scanout_current_fb: None,
+        scene_fbo: None,
+        scene_tex: None,
+        current_settings: crate::content::Settings::default(),
     };
     let work_result = work(&mut session);
 
@@ -444,6 +459,19 @@ where
     }
     if let Some(bo) = session.scanout_prev_bo.take() {
         drop(bo);
+    }
+    // v1-spec-delta #10 (slice c): free scene FBO + texture
+    // (lazy-allocated by paint_*_one_frame when settings are
+    // non-identity). Safe to call delete_framebuffer/texture
+    // while GL context is still current.
+    unsafe {
+        use glow::HasContext;
+        if let Some(fbo) = session.scene_fbo.take() {
+            gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.scene_tex.take() {
+            gl.delete_texture(tex);
+        }
     }
     drop(session);
 
@@ -1849,11 +1877,30 @@ pub fn paint_and_present_one_frame_for_slide(
     let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
     let wall_clock_unix = current_unix_seconds();
 
-    // GL paint into the bound default framebuffer.
+    // v1-spec-delta #10 (slice c): when settings have non-
+    // identity brightness/gamma, route paint_slide through a
+    // session-cached scene FBO + post-pass blit. Identity
+    // settings (brightness=100 + gamma=1.0) take the direct-
+    // to-default-fb path with zero post-pass cost.
+    let identity = session.current_settings.is_color_identity();
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    let scene_fbo_handle = if !identity {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        }
+    }
+
     paint_slide(
         session.gl,
-        session.mode_w as u32,
-        session.mode_h as u32,
+        mode_w,
+        mode_h,
         &bg_kind,
         &text_layers,
         Some(&motion_states),
@@ -1862,6 +1909,21 @@ pub fn paint_and_present_one_frame_for_slide(
         Some(&mut session.image_bg_cache),
     )?;
     unsafe { session.gl.flush(); }
+
+    // v1-spec-delta #10 (slice c): if non-identity, the scene
+    // is in scene_fbo. Bind default fb + run FS_BRIGHT_GAMMA
+    // from scene_tex. Brightness divides by 100 to turn
+    // schema [0, 100] into shader [0, 1].
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = (session.current_settings.brightness as f32) / 100.0;
+        let gamma = session.current_settings.gamma;
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+            session.gl.flush();
+        }
+    }
 
     // swap_buffers → lock → addFB → commit_fb. Same primitive
     // sequence as render_animated_slide_in_session's per-frame
@@ -2215,6 +2277,80 @@ impl<'a> EglSession<'a> {
     pub fn gl(&self) -> &glow::Context {
         self.gl
     }
+
+    /// v1-spec-delta #10 (slice c) -- update cached settings.
+    /// paint_and_present_one_frame_for_slide consults
+    /// current_settings.is_color_identity() to decide whether
+    /// to route through the FBO post-pass.
+    pub fn apply_settings(&mut self, settings: crate::content::Settings) {
+        self.current_settings = settings;
+    }
+
+    /// v1-spec-delta #10 (slice c) accessor for the cached
+    /// settings. Used by tests + the IPC dispatcher's
+    /// Reconfigure op (slice d) to read the active state.
+    pub fn current_settings(&self) -> &crate::content::Settings {
+        &self.current_settings
+    }
+}
+
+/// v1-spec-delta #10 (slice c) -- lazy-allocate the per-
+/// session scene FBO + texture used as the brightness/gamma
+/// post-pass source. Idempotent on success: calls after the
+/// first return Ok without allocating. On framebuffer-
+/// incomplete, frees both before propagating Err.
+unsafe fn ensure_scene_fbo(session: &mut EglSession, w: u32, h: u32) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    if let (Some(fbo), Some(tex)) = (session.scene_fbo, session.scene_tex) {
+        return Ok((fbo, tex));
+    }
+    let (fbo, tex) = create_color_fbo(session.gl, w, h)?;
+    session.scene_fbo = Some(fbo);
+    session.scene_tex = Some(tex);
+    Ok((fbo, tex))
+}
+
+/// v1-spec-delta #10 (slice c) -- final blit from scene FBO
+/// to the EGL window surface (default fb) via FS_BRIGHT_GAMMA
+/// using the session's current_settings. Caller is responsible
+/// for binding the default framebuffer + setting viewport
+/// before this call.
+unsafe fn run_bright_gamma_pass(
+    gl: &glow::Context,
+    src_tex: glow::NativeTexture,
+    brightness: f32,
+    gamma: f32,
+) -> Result<()> {
+    use glow::HasContext;
+    let program = link_program(gl, VS_TEXTURED_QUAD, crate::hdmi_logic::FS_BRIGHT_GAMMA)?;
+    let (vbo, a_pos, a_uv) = match create_textured_quad(gl, program) {
+        Ok(t) => t,
+        Err(e) => {
+            gl.delete_program(program);
+            return Err(e);
+        }
+    };
+    gl.use_program(Some(program));
+    let u_src = gl.get_uniform_location(program, "u_src");
+    let u_brightness = gl.get_uniform_location(program, "u_brightness");
+    let u_gamma = gl.get_uniform_location(program, "u_gamma");
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
+    gl.uniform_1_i32(u_src.as_ref(), 0);
+    gl.uniform_1_f32(u_brightness.as_ref(), brightness);
+    gl.uniform_1_f32(u_gamma.as_ref(), gamma);
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.enable_vertex_attrib_array(a_pos);
+    gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(a_uv);
+    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    gl.disable_vertex_attrib_array(a_pos);
+    gl.disable_vertex_attrib_array(a_uv);
+    gl.delete_buffer(vbo);
+    gl.delete_program(program);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    Ok(())
 }
 
 /// v1-spec-delta #9 (slice e -- Capture) -- paint a slide

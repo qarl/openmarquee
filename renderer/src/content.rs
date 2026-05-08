@@ -510,6 +510,19 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// v1-spec-delta #10 (slice c) -- whether brightness +
+    /// gamma are color-identity (skip the post-pass). Spec
+    /// schema brightness is in [0, 100] (so 100 = full); the
+    /// renderer's shader takes brightness/100 in [0, 1]. Gamma
+    /// near 1.0 with brightness near 100 means the post-pass
+    /// is a no-op blit; the caller can route paint directly to
+    /// the default framebuffer and skip the FBO ping-pong.
+    pub fn is_color_identity(&self) -> bool {
+        self.brightness == 100 && (self.gamma - 1.0).abs() < 0.001
+    }
+}
+
 /// v1-spec-delta #10 (slice a) -- mtime-polling settings
 /// watcher. Cheaper than notify on Pi Zero 2 W (no inotify-
 /// rs deps; just stat each call) and well within spec §8.5's
@@ -973,6 +986,33 @@ mod tests {
         assert_eq!(s.display_rotation, 0);
         assert_eq!(s.brightness, 100);
         assert!((s.gamma - 2.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn settings_is_color_identity_at_default_anchors_is_false() {
+        // The schema default is brightness=100 + gamma=2.2,
+        // which is NOT identity (gamma=2.2 applies sRGB-like
+        // correction). The renderer's post-pass fires at the
+        // schema defaults; operators get identity by setting
+        // gamma=1.0 explicitly.
+        let s = Settings::default();
+        assert!(!s.is_color_identity(), "default is not identity (gamma=2.2)");
+    }
+
+    #[test]
+    fn settings_is_color_identity_at_b100_g1() {
+        // Explicit identity: brightness=100, gamma=1.0.
+        let mut s = Settings::default();
+        s.gamma = 1.0;
+        assert!(s.is_color_identity());
+    }
+
+    #[test]
+    fn settings_not_color_identity_when_brightness_dimmed() {
+        let mut s = Settings::default();
+        s.gamma = 1.0;
+        s.brightness = 50;
+        assert!(!s.is_color_identity());
     }
 
     #[test]

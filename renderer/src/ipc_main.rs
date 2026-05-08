@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
-use crate::content::{find_image_slide, find_text_slide, find_video_slide, ContentItem};
+use crate::content::{
+    find_image_slide, find_text_slide, find_video_slide, ContentItem, SettingsWatcher,
+};
 use crate::playback::{
     advance_command_to_op_result, AdvanceCommand, IpcRequest, IpcResponse, OpResult,
     OpenParams, PlaybackState,
@@ -293,7 +295,29 @@ where
         )?;
         let mut state = PlaybackState::new();
         let mut cache = SlideCache::new();
+        // v1-spec-delta #10 (slice c): SettingsWatcher polls
+        // /var/openmarquee/settings.json (canonical path on
+        // dev Pi) for changes between IPC ticks. First check
+        // emits the initial state which session.apply_settings
+        // wires to the post-pass.
+        let mut settings_watcher = SettingsWatcher::new(
+            std::path::PathBuf::from("/var/openmarquee/settings.json"),
+        );
+        if let Some(initial) = settings_watcher.check() {
+            session.apply_settings(initial);
+        }
         while let Some(line) = lines.next() {
+            // Opportunistic settings poll. Cheap stat() call
+            // per iteration; the watcher returns None when
+            // mtime is unchanged.
+            if let Some(updated) = settings_watcher.check() {
+                eprintln!(
+                    "ipc_sidecar: settings.json changed (brightness={} gamma={:.2}); applying",
+                    updated.brightness,
+                    updated.gamma,
+                );
+                session.apply_settings(updated);
+            }
             let line = line?;
             let req: IpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
