@@ -881,6 +881,54 @@ fi
 # via --play-image-slide. Asserts no panic + slide-render-complete
 # + the PNG decode + texture-upload + FS_BLIT path linked. Visual
 # verification (the PNG actually shows on screen) is qarl-eyeball.
+# v1-spec-delta #11 (slice c) -- snapshot capture smoke. Picks
+# the first text_slide UUID from the live FYS playlist and
+# captures it to /tmp/openmarquee-capture-test.png. Asserts
+# no panic + the PNG exists + has the canonical PNG signature
+# (8-byte 89 50 4E 47 0D 0A 1A 0A header). Visual verification
+# (the PNG looks like the slide) is qarl-eyeball.
+echo "==> Phase d-smoke -- --capture-slide (text_slide PNG snapshot)"
+CAPTURE_UUID=$(ssh "$TARGET" '
+for d in /var/openmarquee/content/*/; do
+  if python3 -c "
+import json, sys
+d = json.load(open(\"$d/item.json\"))
+sys.exit(0 if d.get(\"item\", {}).get(\"type\") == \"text_slide\" else 1)
+" 2>/dev/null; then
+    basename "$d"
+    exit 0
+  fi
+done
+echo ""
+' || true)
+CAPTURE_UUID=$(echo "$CAPTURE_UUID" | tr -d '/' | head -1)
+if [ -z "$CAPTURE_UUID" ]; then
+    echo "    --capture-slide skipped (no text_slide on target)"
+else
+    CAP_LOG="$LOG_DIR/capture-slide.log"
+    CAP_OUT="/tmp/openmarquee-capture-test.png"
+    CAP_EXIT=0
+    ssh "$TARGET" "$BIN_PI --output hdmi --capture-slide $CAPTURE_UUID --content-root /var/openmarquee/content --capture-path $CAP_OUT" \
+        > "$CAP_LOG" 2>&1 || CAP_EXIT=$?
+    if [ "$CAP_EXIT" -ne 0 ]; then
+        echo "FAIL: --capture-slide exit $CAP_EXIT (uuid=$CAPTURE_UUID)"
+        cat "$CAP_LOG"
+        exit 1
+    fi
+    grep -qE 'panicked at|RUST_BACKTRACE' "$CAP_LOG" && \
+        { echo "FAIL: panic in --capture-slide"; cat "$CAP_LOG"; exit 1; }
+    grep -q "captured slide" "$CAP_LOG" || \
+        { echo "FAIL: --capture-slide didn't reach 'captured slide' log line"; cat "$CAP_LOG"; exit 1; }
+    # PNG signature check on the Pi side. xxd isn't on the
+    # canonical raspbian image; od is. Hex-strip via tr.
+    PNG_OK=$(ssh "$TARGET" "head -c 8 $CAP_OUT | od -An -t x1 | tr -d ' \n'" || true)
+    if [ "$PNG_OK" != "89504e470d0a1a0a" ]; then
+        echo "FAIL: --capture-slide output $CAP_OUT not a PNG (sig=$PNG_OK)"
+        exit 1
+    fi
+    echo "    --capture-slide ok (PNG signature verified on hw)"
+fi
+
 echo "==> Phase d-smoke -- --play-image-slide (first content/<uuid>/asset.png)"
 IMAGE_ASSET=$(ssh "$TARGET" 'ls -1 /var/openmarquee/content/*/asset.png 2>/dev/null | head -1' || true)
 if [ -z "$IMAGE_ASSET" ]; then

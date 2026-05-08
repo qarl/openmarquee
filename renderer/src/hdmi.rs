@@ -2085,6 +2085,123 @@ where
     with_egl_session(card, work)
 }
 
+/// v1-spec-delta #11 (slice a, 2026-05-08) -- read back the
+/// pixels of a bound framebuffer as an RGBA8 buffer in image-
+/// coord convention (y=0 at top). When `fbo` is None, reads
+/// the default framebuffer (the EGL window surface). When
+/// `fbo` is Some(handle), reads that FBO -- caller is
+/// responsible for its lifecycle.
+///
+/// glReadPixels returns rows bottom-to-top in OpenGL
+/// convention; this helper flips Y so the result matches
+/// image-coord convention (the convention rgba_to_png_bytes +
+/// the Python PIL reference both expect).
+///
+/// Buffer size: 4 * w * h bytes. Caller passes that buffer
+/// pre-allocated to avoid a second alloc inside the hot
+/// path.
+pub fn capture_fbo_to_rgba(
+    gl: &glow::Context,
+    fbo: Option<glow::NativeFramebuffer>,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    use glow::HasContext;
+    let stride = (w as usize) * 4;
+    let total = stride * (h as usize);
+    let mut gl_pixels = vec![0u8; total];
+    unsafe {
+        // Bind the requested FBO before glReadPixels. None ->
+        // default framebuffer (FBO 0).
+        gl.bind_framebuffer(glow::FRAMEBUFFER, fbo);
+        gl.read_pixels(
+            0,
+            0,
+            w as i32,
+            h as i32,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(&mut gl_pixels),
+        );
+        let err = gl.get_error();
+        if err != glow::NO_ERROR {
+            return Err(anyhow!("glReadPixels: GL error 0x{err:x}"));
+        }
+    }
+    // Flip Y. glReadPixels returns row 0 at the bottom; image-
+    // coord convention (and PNG, and PIL) wants row 0 at the
+    // top. In-place would need a swap-pair; allocating a new
+    // buffer is simpler and the cost is one memcpy for the
+    // capture path (not a hot loop).
+    let mut flipped = vec![0u8; total];
+    for y in 0..h as usize {
+        let src_row = (h as usize - 1 - y) * stride;
+        let dst_row = y * stride;
+        flipped[dst_row..dst_row + stride]
+            .copy_from_slice(&gl_pixels[src_row..src_row + stride]);
+    }
+    Ok(flipped)
+}
+
+/// v1-spec-delta #11 (slice c, 2026-05-08) -- snapshot capture
+/// of a TextSlide to a PNG file. Composition over the slice-a
+/// + slice-b primitives:
+///   1. with_egl_session bring-up.
+///   2. paint_slide into the EGL default framebuffer (no
+///      scanout commit -- this is offscreen-only; the caller
+///      doesn't see the slide on screen).
+///   3. capture_fbo_to_rgba reads back as image-coord RGBA.
+///   4. rgba_to_png_bytes encodes.
+///   5. write to png_path.
+///
+/// Per spec §7.3 the snapshot PNG dimensions match the
+/// negotiated CRTC mode (the operator's panel resolution).
+pub fn capture_slide_to_png(
+    card: &Card,
+    slide: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    png_path: &Path,
+) -> Result<()> {
+    use crate::hdmi_logic::rgba_to_png_bytes;
+    let (bg_kind, _label, text_layers) =
+        resolve_slide_layers(slide, fonts, content_root)?;
+    let motion_states = motion_states_for_layers(slide.id, &text_layers, 0.0);
+    let wall_clock_unix = current_unix_seconds();
+    with_egl_session(card, |session| {
+        let mode_w = session.mode_w as u32;
+        let mode_h = session.mode_h as u32;
+        paint_slide(
+            session.gl,
+            mode_w,
+            mode_h,
+            &bg_kind,
+            &text_layers,
+            Some(&motion_states),
+            wall_clock_unix,
+            None,
+            Some(&mut session.image_bg_cache),
+        )?;
+        unsafe {
+            use glow::HasContext;
+            session.gl.flush();
+        }
+        let rgba = capture_fbo_to_rgba(session.gl, None, mode_w, mode_h)?;
+        let png_bytes = rgba_to_png_bytes(&rgba, mode_w, mode_h)?;
+        std::fs::write(png_path, &png_bytes)
+            .with_context(|| format!("write png {}", png_path.display()))?;
+        eprintln!(
+            "captured slide {} to {} ({}x{} RGBA, {} bytes)",
+            slide.id,
+            png_path.display(),
+            mode_w,
+            mode_h,
+            png_bytes.len()
+        );
+        Ok(())
+    })
+}
+
 /// Public accessor for IPC sidecar Open op: the negotiated
 /// mode (w, h) of the EglSession's CRTC.
 pub fn egl_session_mode_size(session: &EglSession) -> (u32, u32) {

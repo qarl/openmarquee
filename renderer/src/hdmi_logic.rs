@@ -795,6 +795,43 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
 /// onto this pattern with a `t` uniform + a second texture.
 ///
 /// Pairs with `VS_TEXTURED_QUAD` (interleaved [x, y, u, v] verts).
+/// v1-spec-delta #11 (slice b, 2026-05-08) -- encode an RGBA8
+/// pixel buffer to PNG bytes. Pure-CPU helper; no GL deps so
+/// it lives in hdmi_logic.rs (cross-platform; runs on Mac in
+/// cargo test).
+///
+/// Caller is responsible for the buffer being row-major
+/// top-to-bottom (image-coord convention, y=0 top). The GL
+/// glReadPixels output is bottom-to-top; capture_fbo_to_rgba
+/// (slice 11a) flips it before passing here.
+///
+/// `bytes_buf.len()` must equal `(w * h * 4) as usize`; the
+/// function bails with a clear error if not.
+pub fn rgba_to_png_bytes(rgba: &[u8], w: u32, h: u32) -> anyhow::Result<Vec<u8>> {
+    use anyhow::{anyhow, Context};
+    let expected = (w as usize) * (h as usize) * 4;
+    if rgba.len() != expected {
+        return Err(anyhow!(
+            "rgba_to_png_bytes: buffer len {} != expected {} ({}x{}x4)",
+            rgba.len(),
+            expected,
+            w,
+            h,
+        ));
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(expected / 2);
+    {
+        let mut encoder = png::Encoder::new(&mut out, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .context("png write_header")?;
+        writer.write_image_data(rgba).context("png write_image_data")?;
+    }
+    Ok(out)
+}
+
 pub const FS_BLIT: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src;
@@ -2487,6 +2524,54 @@ mod tests {
         assert!(FS_OVERLAY_BLEND.contains("mix(dst, ovl, a)"));
         // Premultiplied recovery short-circuit at α<0.001:
         assert!(FS_OVERLAY_BLEND.contains("a < 0.001"));
+    }
+
+    // v1-spec-delta #11 (slice b) -- rgba_to_png_bytes round-trips.
+    #[test]
+    fn rgba_to_png_bytes_encodes_known_buffer() {
+        // 2x2 RGBA: red, green, blue, opaque-white.
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255,    // (0,0) red
+            0, 255, 0, 255,    // (1,0) green
+            0, 0, 255, 255,    // (0,1) blue
+            255, 255, 255, 255, // (1,1) white
+        ];
+        let png = rgba_to_png_bytes(&rgba, 2, 2).unwrap();
+        // PNG sanity: starts with the canonical 8-byte signature
+        // 89 50 4E 47 0D 0A 1A 0A.
+        assert_eq!(&png[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        // Decode round-trip: png crate read + reconstruct.
+        let dec = png::Decoder::new(&png[..]);
+        let mut reader = dec.read_info().unwrap();
+        let mut decoded = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!(info.width, 2);
+        assert_eq!(info.height, 2);
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(&decoded[..16], &rgba[..16]);
+    }
+
+    #[test]
+    fn rgba_to_png_bytes_rejects_size_mismatch() {
+        // Buffer too short for declared dims.
+        let rgba: Vec<u8> = vec![255, 0, 0, 255];  // only 1 pixel
+        let err = rgba_to_png_bytes(&rgba, 2, 2).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("buffer len"), "got: {msg}");
+    }
+
+    #[test]
+    fn rgba_to_png_bytes_rejects_zero_dims() {
+        // PNG forbids 0-width / 0-height; the encode path
+        // surfaces that as an error from png write_header.
+        // Caller-side guard: snapshot path validates dims
+        // upstream before calling here, but the helper is
+        // robust to bad input.
+        let rgba: Vec<u8> = vec![];
+        let err = rgba_to_png_bytes(&rgba, 0, 0).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("png write_header") || msg.contains("zero"),
+            "got: {msg}");
     }
 
     // v1-spec-delta #6 (slice c) -- halftone / scanlines / grid /

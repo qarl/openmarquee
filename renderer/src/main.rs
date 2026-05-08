@@ -178,6 +178,20 @@ struct Args {
     #[arg(long, default_value_t = false)]
     play_reel: bool,
 
+    /// v1-spec-delta #11 (slice a) -- snapshot capture: render a
+    /// TextSlide once into the EGL window surface, read back via
+    /// glReadPixels, flip-Y, and encode to a PNG at the given
+    /// path. No scanout commit -- this is an offscreen capture
+    /// for spec §7.3 /capture/<id>.png endpoints (and the IPC
+    /// sidecar Capture op).
+    #[arg(long)]
+    capture_slide: Option<uuid::Uuid>,
+
+    /// v1-spec-delta #11 (slice a) -- output path for
+    /// `--capture-slide`. Required when --capture-slide is set.
+    #[arg(long)]
+    capture_path: Option<PathBuf>,
+
     /// v1-spec-delta #9 (slice c+) -- enter IPC sidecar mode.
     /// The renderer reads JSON-line IpcRequest messages from
     /// stdin, dispatches via the playback state machine, and
@@ -1036,6 +1050,46 @@ fn main() -> Result<()> {
                     let slide = build_pattern_test_slide(pattern_name);
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
                     hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)?;
+                    return Ok(());
+                }
+                if let Some(slide_id) = args.capture_slide {
+                    let png_path = args
+                        .capture_path
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "--capture-slide requires --capture-path"
+                        ))?;
+                    let content_root = args
+                        .content_root
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "--capture-slide requires --content-root"
+                        ))?;
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for capture",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide = content::find_text_slide(content_root, slide_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide for {slide_id} under {}",
+                            content_root.display()
+                        ))?;
+                    hdmi::capture_slide_to_png(
+                        &card,
+                        &slide,
+                        catalog_opt,
+                        Some(content_root),
+                        png_path,
+                    )?;
                     return Ok(());
                 }
                 if let Some(image_id) = args.play_bg_image_test {
