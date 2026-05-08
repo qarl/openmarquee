@@ -21,6 +21,7 @@ mod hdmi;
 mod content;
 mod hdmi_logic;
 mod ipc_main;
+mod mem;
 mod playback;
 
 use std::path::PathBuf;

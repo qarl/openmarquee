@@ -4222,6 +4222,11 @@ pub fn render_playlist_reel(
                 session.apply_settings(initial);
             }
         }
+        // v1-spec-delta #12 (slice b-1): baseline memory
+        // snapshot at session open. The soak gate (slice c)
+        // diffs per-pass values against this to compute the
+        // monotonic-growth slope per §8.2.
+        crate::mem::log_mem_snapshot("session=open");
         let mut pass = 0_u32;
         loop {
             let pass_start = std::time::Instant::now();
@@ -4376,6 +4381,7 @@ pub fn render_playlist_reel(
                 "reel: pass #{pass} complete pass_ms={pass_ms} slides_held={slides_held} \
                  transitions_run={transitions_run}",
             );
+            crate::mem::log_mem_snapshot(&format!("pass={pass}"));
 
             pass += 1;
             if !loop_forever {
@@ -4383,6 +4389,7 @@ pub fn render_playlist_reel(
             }
         }
 
+        crate::mem::log_mem_snapshot("session=close");
         eprintln!("reel: complete after {pass} pass(es)");
         Ok(())
     })

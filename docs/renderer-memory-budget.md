@@ -142,12 +142,18 @@ but the budget tolerates it.
 
 ## 5. Verification methodology
 
-Slice 12(b) lands runtime instrumentation that emits at slide
-boundaries and at `Close`:
+Slice 12(b) lands runtime instrumentation that emits at session
+boundaries (open / per-pass / close):
 
 ```
-[mem] slide=N rss=AA.A vmdata=BB.B cma_used=CC.C bo=N fb=M textures=K fbos=J
+[mem] <label> vm_rss=AA.AMB vm_data=BB.BMB swap=CC.CMB cma_used=DD.DMB
 ```
+
+Slice (b-1) covers the /proc-derived subset (above). The GPU-side
+counters (BO/FB/texture/FBO) are slice (b-2) and append to the same
+line shape — soak parsers should regex-extract the keys they need
+rather than positional-parse, so unknown fields don't break older
+parsers.
 
 Sources:
 
