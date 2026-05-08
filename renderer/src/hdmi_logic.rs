@@ -1318,6 +1318,45 @@ pub fn confetti_uniforms(density: f32) -> ConfettiUniforms {
     ConfettiUniforms { count, cell_ref }
 }
 
+/// v1-spec-delta #7 (slice a, 2026-05-08) -- typed enum for the
+/// 4 schema-allowed text-layer compositing modes. `Normal` is
+/// today's shipped behavior (source-over premultiplied alpha).
+/// `Multiply` and `Screen` ship in slice (b) via GL blend func
+/// tweaks (no shader changes needed; the math falls out of the
+/// existing FS_GLYPH premultiplied-alpha emit). `Overlay` ships
+/// in slice (c) via FBO ping-pong because the formula needs a
+/// per-pixel destination sample that fixed-function blend can't
+/// express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    Normal,
+    Screen,
+    Multiply,
+    Overlay,
+}
+
+/// Parse the schema string into a typed BlendMode. Unknown values
+/// fall back to Normal -- forward-compat for future blend modes
+/// added to the schema before the renderer ships them.
+pub fn parse_blend_mode(s: &str) -> BlendMode {
+    match s {
+        "screen" => BlendMode::Screen,
+        "multiply" => BlendMode::Multiply,
+        "overlay" => BlendMode::Overlay,
+        _ => BlendMode::Normal,
+    }
+}
+
+/// Stable label for log output / smoke parsing.
+pub fn blend_mode_label(b: BlendMode) -> &'static str {
+    match b {
+        BlendMode::Normal => "normal",
+        BlendMode::Screen => "screen",
+        BlendMode::Multiply => "multiply",
+        BlendMode::Overlay => "overlay",
+    }
+}
+
 /// Stable label for log output / smoke parsing. Matches the
 /// Python pattern name (lowercase, no spaces) so a single grep
 /// covers both renderer-side log lines and Python-baked PNGs.
@@ -2223,6 +2262,34 @@ mod tests {
     }
 
     // v1-spec-delta #6 (slice a) -- pattern dispatch parsing.
+    // v1-spec-delta #7 (slice a) -- blend mode parsing + label
+    // round-trip + unknown fallback.
+    #[test]
+    fn parse_blend_mode_handles_all_four_schema_names() {
+        assert_eq!(parse_blend_mode("normal"), BlendMode::Normal);
+        assert_eq!(parse_blend_mode("screen"), BlendMode::Screen);
+        assert_eq!(parse_blend_mode("multiply"), BlendMode::Multiply);
+        assert_eq!(parse_blend_mode("overlay"), BlendMode::Overlay);
+    }
+
+    #[test]
+    fn parse_blend_mode_falls_back_to_normal_on_unknown() {
+        // Unknown / empty / typo / case-sensitive: all fall back
+        // to Normal so the renderer doesn't bail on an envelope
+        // saved by a future schema version.
+        assert_eq!(parse_blend_mode(""), BlendMode::Normal);
+        assert_eq!(parse_blend_mode("SCREEN"), BlendMode::Normal);
+        assert_eq!(parse_blend_mode("normaL"), BlendMode::Normal);
+        assert_eq!(parse_blend_mode("nope"), BlendMode::Normal);
+    }
+
+    #[test]
+    fn blend_mode_label_round_trips() {
+        for b in [BlendMode::Normal, BlendMode::Screen, BlendMode::Multiply, BlendMode::Overlay] {
+            assert_eq!(parse_blend_mode(blend_mode_label(b)), b);
+        }
+    }
+
     #[test]
     fn parse_pattern_kind_handles_all_ten_python_names() {
         assert_eq!(parse_pattern_kind("dots"), Some(PatternKind::Dots));

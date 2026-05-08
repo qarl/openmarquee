@@ -174,6 +174,17 @@ pub struct TextLayer {
     /// ring in u_outline_color (black).
     #[serde(default)]
     pub outline: bool,
+    /// v1-spec-delta #7 -- per-layer compositing mode against
+    /// what's already been drawn. Schema literal:
+    /// `normal` / `screen` / `multiply` / `overlay`. Default
+    /// `normal` = source-over premultiplied alpha (today's
+    /// shipped behavior). The other 3 land in subsequent
+    /// slices: slice (b) wires multiply + screen via GL blend
+    /// func tweaks; slice (c) implements overlay via an FBO
+    /// ping-pong shader (overlay needs a per-pixel dst sample
+    /// that fixed-function blend can't express).
+    #[serde(default = "default_blend")]
+    pub blend: String,
     pub r#box: TextBox,
 }
 
@@ -210,6 +221,9 @@ fn default_motion_phase() -> f32 {
 }
 fn default_motion_speed() -> f32 {
     1.0
+}
+fn default_blend() -> String {
+    "normal".to_string()
 }
 
 /// Mirror of `TextLayer._migrate_legacy_motion` -- rename "scroll"

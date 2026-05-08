@@ -306,6 +306,7 @@ fn build_motion_test_slide(kind: &str) -> content::TextSlide {
         auto_mode: None,
         auto_format: None,
         outline: false,
+        blend: "normal".to_string(),
         r#box: content::TextBox {
             x: 0.05,
             y: 0.30,
@@ -355,6 +356,7 @@ fn build_auto_mode_test_slide(kind: &str) -> content::TextSlide {
         auto_mode: Some(kind.to_string()),
         auto_format: Some(auto_format.to_string()),
         outline: false,
+        blend: "normal".to_string(),
         r#box: content::TextBox {
             x: 0.05,
             y: 0.30,
@@ -403,6 +405,7 @@ fn build_pattern_test_slide(pattern_name: &str) -> content::TextSlide {
         auto_mode: None,
         auto_format: None,
         outline: true,
+        blend: "normal".to_string(),
         r#box: content::TextBox {
             x: 0.05,
             y: 0.40,
@@ -446,6 +449,7 @@ fn build_outline_test_slide() -> content::TextSlide {
         auto_mode: None,
         auto_format: None,
         outline: true,
+        blend: "normal".to_string(),
         r#box: content::TextBox {
             x: 0.05,
             y: 0.30,

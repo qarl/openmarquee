@@ -40,14 +40,15 @@ use crate::content::{
     load_playlist, resolve_reel_items, solid_bg_hex, TextSlide,
 };
 use crate::hdmi_logic::{
-    box_to_ndc_quad, bricks_uniforms, checker_uniforms, clamp_transition_ms,
-    compute_motion_state, confetti_uniforms, dots_uniforms, effective_font_size_px,
-    effective_hold_ms, format_auto_text, fourcc_for_argb_family, fs_for_transition_kind,
-    gradient_uniforms, grid_uniforms, halftone_uniforms, hex_to_rgba, hsv_to_rgb,
-    layout_text_to_alpha, motion_offset_to_px, parse_crtc_list_filter_bits, parse_h_align,
-    parse_motion_kind, parse_pattern_kind, pattern_kind_label, pick_largest_mode_index,
-    prev_idx_for_reel, rays_uniforms, rings_uniforms, scanlines_uniforms,
-    should_rerasterize, stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, FontCatalog,
+    blend_mode_label, box_to_ndc_quad, bricks_uniforms, checker_uniforms,
+    clamp_transition_ms, compute_motion_state, confetti_uniforms, dots_uniforms,
+    effective_font_size_px, effective_hold_ms, format_auto_text, fourcc_for_argb_family,
+    fs_for_transition_kind, gradient_uniforms, grid_uniforms, halftone_uniforms,
+    hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
+    parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
+    parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
+    rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
+    stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT, FS_CUT, FS_FADE,
     FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_PATTERN_BRICKS, FS_PATTERN_CHECKER,
     FS_PATTERN_CONFETTI, FS_PATTERN_DOTS, FS_PATTERN_GRID, FS_PATTERN_HALFTONE,
@@ -2428,6 +2429,20 @@ fn paint_slide(
                     .map(|ms| ms[i])
                     .unwrap_or(MotionState::IDENTITY);
                 let motion_kind = parse_motion_kind(&layer.motion);
+                // v1-spec-delta #7 (slice a): typed blend dispatch.
+                // Slice (a) only parses + warns; the actual blend
+                // func selection lands in slice (b). Layers with
+                // blend != normal continue to render via the
+                // existing source-over path (functionally correct
+                // for solid bg slides; visually wrong for layered
+                // composites until slice (b)/(c)).
+                let blend_mode = parse_blend_mode(&layer.blend);
+                if !matches!(blend_mode, BlendMode::Normal) {
+                    eprintln!(
+                        "warn: blend={} on layer {i} not yet implemented; rendering as normal",
+                        blend_mode_label(blend_mode)
+                    );
+                }
                 let cached = cache_ref[i]
                     .as_ref()
                     .expect("cache entry populated above");
