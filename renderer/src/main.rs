@@ -926,6 +926,22 @@ mod tests {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // v1-spec-delta #17 (slice c): wire --force-mode CLI flag
+    // through to hdmi.rs's process-wide OnceLock. Parse failures
+    // surface here so the operator gets immediate feedback rather
+    // than a deferred surprise inside DRM bring-up. set_forced_
+    // mode is a no-op on non-Linux builds.
+    let forced_mode = match args.force_mode.as_deref() {
+        Some(s) => Some(ForcedMode::parse(s)?),
+        None => None,
+    };
+    #[cfg(target_os = "linux")]
+    hdmi::set_forced_mode(forced_mode);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = forced_mode;
+    }
+
     // v1-spec-delta #9 (slice c): IPC sidecar mode short-circuits
     // the standalone CLI dispatch. The dispatcher loop opens DRM
     // lazily via the Open op (slice (d)); slice (c) only handles

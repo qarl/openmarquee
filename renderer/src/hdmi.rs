@@ -4602,6 +4602,22 @@ fn gbm_fourcc_bytes(fmt: GbmFormat) -> [u8; 4] {
     fourcc_for_argb_family(name).unwrap_or([0, 0, 0, 0])
 }
 
+/// v1-spec-delta #17 (slice c, 2026-05-08): process-wide
+/// `--force-mode` setting. main.rs calls set_forced_mode at
+/// startup; pick_connector_and_mode reads it. OnceLock first-call-
+/// wins semantics: re-calls are silently ignored, which matches
+/// the CLI-flag-set-once contract. Tests don't hit hdmi so the
+/// OnceLock global doesn't leak across host test runs.
+static FORCED_MODE: std::sync::OnceLock<Option<crate::ForcedMode>> = std::sync::OnceLock::new();
+
+pub fn set_forced_mode(forced: Option<crate::ForcedMode>) {
+    let _ = FORCED_MODE.set(forced);
+}
+
+fn forced_mode() -> Option<crate::ForcedMode> {
+    FORCED_MODE.get().copied().flatten()
+}
+
 /// v1-spec-delta #17 (slice b, 2026-05-08): synthesize a CEA-861
 /// drm::Mode from a `--force-mode` request. Used when the
 /// connector's EDID is missing/invalid and the safe-mode list
@@ -4658,6 +4674,31 @@ fn pick_connector_and_mode(
     card: &Card,
     resources: &drm::control::ResourceHandles,
 ) -> Result<(connector::Info, Mode)> {
+    // v1-spec-delta #17 (slice c): when --force-mode is set, find
+    // the first connected connector but synthesize the mode from
+    // the CEA-861 table instead of picking from info.modes(). The
+    // kernel still validates at SetCrtc time -- an unsupported
+    // timing surfaces as an error which the caller (with_egl_
+    // session bring-up) propagates.
+    if let Some(forced) = forced_mode() {
+        for &handle in resources.connectors() {
+            let info = card
+                .get_connector(handle, false)
+                .with_context(|| format!("get_connector({handle:?})"))?;
+            if info.state() != ConnectorState::Connected {
+                continue;
+            }
+            let mode = synthesize_drm_mode(forced)
+                .context("--force-mode synthesize_drm_mode")?;
+            eprintln!(
+                "--force-mode: synthesized {}x{}@{} bypassing connector's {} reported modes",
+                forced.width, forced.height, forced.vrefresh_hz,
+                info.modes().len(),
+            );
+            return Ok((info, mode));
+        }
+        bail!("--force-mode: no connected connector found");
+    }
     for &handle in resources.connectors() {
         let info = card
             .get_connector(handle, false)
