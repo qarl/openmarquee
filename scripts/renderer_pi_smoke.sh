@@ -1122,6 +1122,27 @@ EOF
     echo "    settings reactivity ok (brightness change reflected in capture)"
 fi
 
+# v1-spec-delta #12 (slice c-2): live end-to-end soak gate. Runs
+# the canonical FYS reel via --reel-loop for SMOKE_SOAK_DURATION_
+# SECS (default 180s ≈ 5 passes at 34s/pass) and asserts the
+# slope test + budget gates green. Defaults laxer than the
+# production §8.2 6h gate: short runs are noisy, the smoke just
+# proves the slope-test machinery works end-to-end. Operators
+# bump SMOKE_SOAK_DURATION_SECS or call scripts/renderer_pi_soak.
+# sh directly for the long-form §8.2 acceptance test.
+echo "==> Phase d-smoke -- soak gate (short ~3min slope test)"
+SMOKE_SOAK_DURATION_SECS="${SMOKE_SOAK_DURATION_SECS:-180}"
+SOAK_SMOKE_LOG="$LOG_DIR/soak-smoke.log"
+SOAK_DURATION_SECS="$SMOKE_SOAK_DURATION_SECS" \
+SOAK_MAX_RSS_MB=120.0 \
+SOAK_MAX_CMA_MB=220.0 \
+SOAK_MAX_SLOPE_MBH=20.0 \
+SOAK_HOLD_SECS=1 \
+bash "$(dirname "$0")/renderer_pi_soak.sh" "$TARGET" > "$SOAK_SMOKE_LOG" 2>&1 || \
+    { echo "FAIL: soak gate"; tail -30 "$SOAK_SMOKE_LOG"; exit 1; }
+SOAK_SAMPLES=$(grep -oE 'samples=[0-9]+ passes=[0-9]+\.\.[0-9]+' "$SOAK_SMOKE_LOG" | head -1)
+echo "    soak gate ok ($SOAK_SAMPLES)"
+
 # Phase 6 reel assertion: completion + slide count + transition
 # count + no panics. The reel logs "reel: resolved N items" once
 # and "reel: transition into item I/N" for each transition.

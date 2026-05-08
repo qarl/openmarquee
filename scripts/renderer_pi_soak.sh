@@ -27,6 +27,11 @@ DURATION="${SOAK_DURATION_SECS:-3600}"
 MAX_SLOPE="${SOAK_MAX_SLOPE_MBH:-5.0}"
 MAX_CMA="${SOAK_MAX_CMA_MB:-200.0}"
 MAX_RSS="${SOAK_MAX_RSS_MB:-100.0}"
+# Operator-tunable hold compression for noise/sample-count tradeoff:
+# default leaves canonical FYS timings (per slide.duration_ms) for
+# §8.2 acceptance runs; smoke embedding overrides to 1s for more
+# passes per minute on short runs.
+SOAK_HOLD_OVERRIDE="${SOAK_HOLD_SECS:-}"
 BIN_HOST="renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-render"
 BIN_PI="/tmp/openmarquee-render"
 LOG_DIR="/tmp/renderer-soak"
@@ -60,9 +65,13 @@ sleep 2
 # canonical FYS reel ≈ 30s/pass on dev Pi (hold + transitions). 1h
 # default = ~120 passes, well above the slope-test 3-sample floor.
 # §8.2 "≥6h overnight" uses SOAK_DURATION_SECS=21600.
-echo "==> running soak: ${DURATION}s @ canonical FYS reel --reel-loop"
+HOLD_FLAG=""
+if [ -n "$SOAK_HOLD_OVERRIDE" ]; then
+    HOLD_FLAG="--hold-secs $SOAK_HOLD_OVERRIDE"
+fi
+echo "==> running soak: ${DURATION}s @ canonical FYS reel --reel-loop ${HOLD_FLAG:-(canonical timings)}"
 set +e
-ssh "$TARGET" "timeout ${DURATION} $BIN_PI --output hdmi --play-reel /var/openmarquee/playlist.json --content-root /var/openmarquee/content --reel-loop --fps 30 2>&1" \
+ssh "$TARGET" "timeout ${DURATION} $BIN_PI --output hdmi --play-reel --reel-loop --fps 30 $HOLD_FLAG 2>&1" \
     > "$SOAK_LOG" 2>&1
 SOAK_EXIT=$?
 set -e
