@@ -540,14 +540,25 @@ fn render_animated_slide(
             let fb = card
                 .add_framebuffer(&fb_buf, 32, 32)
                 .map_err(|e| anyhow!("drmModeAddFB failed: {e}"))?;
-            card.set_crtc(
+            // QA F2 (slice c carry-over): on SetCrtc fail, the
+            // just-added fb is a u32 with no Drop and would leak.
+            // Explicitly rmFB on the unhappy path. The BO Drops
+            // cleanly via gbm RAII either way.
+            if let Err(e) = card.set_crtc(
                 crtc_handle,
                 Some(fb),
                 (0, 0),
                 &[connector_info.handle()],
                 Some(mode),
-            )
-            .context("drmModeSetCrtc failed")?;
+            ) {
+                if let Err(de) = card.destroy_framebuffer(fb) {
+                    eprintln!(
+                        "warn: cleanup destroy_framebuffer({fb:?}) on SetCrtc-fail: {de}"
+                    );
+                }
+                drop(bo);
+                return Err(anyhow!("drmModeSetCrtc failed: {e}"));
+            }
 
             // Previous frame is no longer scanout — safe to release.
             if let Some(old_fb) = prev_fb.take() {
@@ -1695,14 +1706,25 @@ pub fn render_transition_animated(
             let fb = card
                 .add_framebuffer(&fb_buf, 32, 32)
                 .with_context(|| format!("drmModeAddFB (frame {frame})"))?;
-            card.set_crtc(
+            // QA F2 (slice c carry-over): rmFB the just-added fb
+            // on SetCrtc-fail unhappy path. Pre-existing leak in
+            // this transition harness mirrored across the slice
+            // (c) render_animated_slide. Both fixed in this commit.
+            if let Err(e) = card.set_crtc(
                 crtc_handle,
                 Some(fb),
                 (0, 0),
                 &[connector_info.handle()],
                 Some(mode),
-            )
-            .with_context(|| format!("drmModeSetCrtc (frame {frame})"))?;
+            ) {
+                if let Err(de) = card.destroy_framebuffer(fb) {
+                    eprintln!(
+                        "warn: cleanup destroy_framebuffer({fb:?}) on SetCrtc-fail (frame {frame}): {de}"
+                    );
+                }
+                drop(bo);
+                return Err(anyhow!("drmModeSetCrtc (frame {frame}) failed: {e}"));
+            }
 
             // -- Rotate frames: free the frame from TWO iterations
             // ago — `prev` is no longer in scanout because

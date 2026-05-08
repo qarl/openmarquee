@@ -176,6 +176,27 @@ struct Args {
     #[arg(long, default_value_t = false)]
     play_reel: bool,
 
+    /// v1-spec-delta #2 — render a synthesized text slide whose
+    /// single layer has the given motion kind, exercising the
+    /// per-frame animated render path on real scanout. One of
+    /// `static` / `ticker` / `breathe` / `pulse` / `bounce` /
+    /// `shake` / `blink`. Each kind held for `--hold-secs`
+    /// (default 2 s); intensity / phase / speed default to spec
+    /// midpoints (50 / 0.0 / 1.0). Smoke validates that
+    /// render_animated_slide doesn't panic on real DRM hardware.
+    #[arg(long)]
+    play_motion_test: Option<String>,
+
+    /// v1-spec-delta #2 (slice d) — animate a transition between
+    /// two synthesized text slides, each with the given motion
+    /// kind. Format: `--play-motion-transition KIND_A,KIND_B`.
+    /// Drives the render_transition_animated per-frame FBO rebake
+    /// path with both slides animated, validating that motion
+    /// advances through transitions on real DRM scanout. Reuses
+    /// `--transition` and `--transition-ms`.
+    #[arg(long)]
+    play_motion_transition: Option<String>,
+
     /// When `--play-reel` is set, loop the reel forever (wrapping
     /// from last slide back to first via the first slide's
     /// transition). Default: single pass.
@@ -227,6 +248,47 @@ struct Args {
     /// Path to settings.json (placeholder; not used in Phase 1).
     #[arg(long)]
     settings: Option<PathBuf>,
+}
+
+/// v1-spec-delta #2 (slice d-smoke) -- synthesize an in-memory
+/// TextSlide with one motion layer of the given kind. Used by
+/// `--play-motion-test KIND` to exercise the per-frame animated
+/// render path on real scanout. Slide is plain (solid bg, single
+/// centered text layer); only the `motion` field varies. Spec
+/// midpoints (intensity=50, phase=0, speed=1.0) keep the curve
+/// at canonical amplitude for visual inspection.
+#[cfg(target_os = "linux")]
+fn build_motion_test_slide(kind: &str) -> content::TextSlide {
+    use uuid::Uuid;
+    let layer = content::TextLayer {
+        text: format!("MOTION {}", kind.to_uppercase()),
+        name: String::new(),
+        font_family: None,
+        font_size_px: None,
+        font_size_pct: Some(50.0),
+        text_color: "#FFFFFF".to_string(),
+        text_align: "center".to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: kind.to_string(),
+        motion_intensity: 50,
+        motion_phase: 0.0,
+        motion_speed: 1.0,
+        r#box: content::TextBox {
+            x: 0.05,
+            y: 0.30,
+            w: 0.90,
+            h: 0.40,
+        },
+    };
+    content::TextSlide {
+        id: Uuid::nil(),
+        name: format!("motion-test-{kind}"),
+        duration_ms: 2000,
+        background_color: "#1A1A1A".to_string(),
+        background_pattern: None,
+        text_layers: vec![layer],
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -560,6 +622,70 @@ fn main() -> Result<()> {
                 }
                 if let Some(slide_id) = args.play_slide_via_fbo {
                     dispatch_slide(slide_id, false, true)?;
+                    return Ok(());
+                }
+                if let Some(kind) = args.play_motion_test.as_deref() {
+                    // v1-spec-delta #2 -- synthesize an in-memory
+                    // text slide with one layer of `kind` motion
+                    // and render it through the standard
+                    // render_slide path. Smoke gate for the
+                    // per-frame animated render loop on real DRM
+                    // hardware; FYS has no animated layers so this
+                    // is the only on-Pi exercise of motion.
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for motion smoke",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide = build_motion_test_slide(kind);
+                    let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
+                    hdmi::render_slide(&card, &slide, catalog_opt, hold_ms)?;
+                    return Ok(());
+                }
+                if let Some(spec) = args.play_motion_transition.as_deref() {
+                    // v1-spec-delta #2 (slice d) -- exercise the
+                    // per-frame transition rebake path. Synthesize
+                    // two slides with each one's animated kind,
+                    // run them through render_transition_animated
+                    // with the operator-set --transition kind.
+                    let parts: Vec<&str> = spec.split(',').collect();
+                    if parts.len() != 2 {
+                        bail!(
+                            "--play-motion-transition expects KIND_A,KIND_B (got {spec:?})"
+                        );
+                    }
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for motion-transition smoke",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide_a = build_motion_test_slide(parts[0]);
+                    let slide_b = build_motion_test_slide(parts[1]);
+                    hdmi::render_transition_animated(
+                        &card,
+                        &slide_a,
+                        &slide_b,
+                        catalog_opt,
+                        &args.transition,
+                        args.transition_ms,
+                        args.fps,
+                    )?;
                     return Ok(());
                 }
                 if let (Some(from_id), Some(to_id)) = (args.fade_from, args.fade_to) {
