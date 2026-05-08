@@ -730,6 +730,46 @@ mod tests {
         );
     }
 
+    // v1-spec-delta #8 (F-image-bg-tests + F-video-asset-tests)
+    // -- pure path-derivation helpers for ImageSlide and
+    // VideoSlide assets. Mirrors the item_dir_uses_uuid_dir_
+    // layout test to lock the canonical storage convention.
+    #[test]
+    fn image_slide_asset_path_appends_asset_png() {
+        let root = Path::new("/var/openmarquee/content");
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let p = image_slide_asset_path(root, id);
+        assert_eq!(
+            p.to_str().unwrap(),
+            "/var/openmarquee/content/3964c302-311f-44f2-a6c9-efd24a16cfc0/asset.png"
+        );
+    }
+
+    #[test]
+    fn video_slide_asset_path_appends_asset_mp4() {
+        let root = Path::new("/var/openmarquee/content");
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let p = video_slide_asset_path(root, id);
+        assert_eq!(
+            p.to_str().unwrap(),
+            "/var/openmarquee/content/3964c302-311f-44f2-a6c9-efd24a16cfc0/asset.mp4"
+        );
+    }
+
+    #[test]
+    fn image_and_video_asset_paths_diverge_at_extension() {
+        // Sanity: asset.png vs asset.mp4 disambiguates the
+        // type-based dispatch -- the renderer never has to grep
+        // both extensions for one slide_id.
+        let root = Path::new("/tmp/x");
+        let id = Uuid::nil();
+        let img = image_slide_asset_path(root, id);
+        let vid = video_slide_asset_path(root, id);
+        assert_ne!(img, vid);
+        assert!(img.to_str().unwrap().ends_with("asset.png"));
+        assert!(vid.to_str().unwrap().ends_with("asset.mp4"));
+    }
+
     fn slide_with_pattern(pattern: &str, color_a: &str) -> TextSlide {
         TextSlide {
             id: Uuid::nil(),
@@ -1009,6 +1049,109 @@ mod tests {
             msg.contains("parse item envelope"),
             "expected 'parse item envelope' in error chain, got: {msg}"
         );
+    }
+
+    // v1-spec-delta #8 (F-image-bg-tests + slice c) -- type-
+    // narrow loaders for ImageSlide and VideoSlide. Mirror the
+    // find_text_slide test suite.
+    const SAMPLE_VIDEO_ITEM: &str = r##"{
+  "schema_version": 3,
+  "item": {
+    "type": "video",
+    "id": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+    "name": "intro",
+    "duration_ms": 8000,
+    "transition": "fade",
+    "transition_ms": 600
+  }
+}"##;
+
+    #[test]
+    fn find_image_slide_returns_some_for_image_item() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "item.json", SAMPLE_IMAGE_ITEM);
+        let slide = find_image_slide(td.path(), id).unwrap().unwrap();
+        assert_eq!(slide.id, id);
+        assert_eq!(slide.duration_ms, 3000);
+        assert_eq!(slide.transition, "fade");
+    }
+
+    #[test]
+    fn find_image_slide_returns_none_for_text_item() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "item.json", SAMPLE_TEXT_ITEM);
+        assert!(find_image_slide(td.path(), id).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_image_slide_returns_none_for_video_item() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "item.json", SAMPLE_VIDEO_ITEM);
+        assert!(find_image_slide(td.path(), id).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_video_slide_returns_some_for_video_item() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "item.json", SAMPLE_VIDEO_ITEM);
+        let slide = find_video_slide(td.path(), id).unwrap().unwrap();
+        assert_eq!(slide.id, id);
+        assert_eq!(slide.duration_ms, 8000);
+        assert_eq!(slide.transition, "fade");
+    }
+
+    #[test]
+    fn find_video_slide_returns_none_for_image_item() {
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "item.json", SAMPLE_IMAGE_ITEM);
+        assert!(find_video_slide(td.path(), id).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_reel_items_dispatches_text_image_video_in_order() {
+        // Mixed-type playlist exercises all three find_* paths
+        // through resolve_reel_items's dispatch chain.
+        let td = TempDir::new().unwrap();
+        let id_t = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let id_i = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cff0").unwrap();
+        let id_v = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cffd").unwrap();
+        for (id, body) in [
+            (id_t, SAMPLE_TEXT_ITEM),
+            (id_i, SAMPLE_IMAGE_ITEM),
+            (id_v, SAMPLE_VIDEO_ITEM),
+        ] {
+            let dir = td.path().join(id.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            write_file(&dir, "item.json", body);
+        }
+        let playlist = build_playlist_with_items(vec![
+            item_ref(id_t, "cut", 500),
+            item_ref(id_i, "fade", 600),
+            item_ref(id_v, "wipe", 700),
+        ]);
+        let resolved = resolve_reel_items(td.path(), &playlist);
+        assert_eq!(resolved.len(), 3);
+        assert!(matches!(resolved[0].0, ContentItem::Text(_)));
+        assert!(matches!(resolved[1].0, ContentItem::Image(_)));
+        assert!(matches!(resolved[2].0, ContentItem::Video(_)));
+        assert_eq!(resolved[0].0.type_label(), "text_slide");
+        assert_eq!(resolved[1].0.type_label(), "image");
+        assert_eq!(resolved[2].0.type_label(), "video");
     }
 
     // -- resolve_reel_items -------------------------------------
