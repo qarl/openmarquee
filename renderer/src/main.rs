@@ -237,6 +237,17 @@ struct Args {
     #[arg(long)]
     play_image_slide: Option<String>,
 
+    /// v1-spec-delta #8 (F-image-bg-smoke) -- render a synthesized
+    /// TextSlide whose `background_image_slide_id` references the
+    /// given UUID, with a centered text layer composited on top.
+    /// Requires `--content-root` to resolve `<root>/<UUID>/asset
+    /// .png`. Validates the BgKind::Image path through paint_slide
+    /// (decode + texture upload + FS_BLIT before glyph composite)
+    /// on real DRM scanout, including the F-image-bg-cache
+    /// session-wide reuse path.
+    #[arg(long)]
+    play_bg_image_test: Option<uuid::Uuid>,
+
     /// v1-spec-delta #4 (slice b/d) — render a synthesized slide
     /// with the layer's `outline` set. Validates that the
     /// FS_GLYPH_OUTLINE shader path links + draws on real DRM
@@ -446,6 +457,49 @@ fn build_pattern_test_slide(pattern_name: &str) -> content::TextSlide {
             density: 0.5,
         }),
         background_image_slide_id: None,
+        text_layers: vec![layer],
+    }
+}
+
+/// v1-spec-delta #8 (F-image-bg-smoke) -- synthesize a slide
+/// whose background_image_slide_id references the given UUID.
+/// One centered text layer composited on top so the smoke can
+/// also assert text composites correctly over an image bg. The
+/// asset is loaded from <content_root>/<UUID>/asset.png.
+fn build_bg_image_test_slide(image_id: uuid::Uuid) -> content::TextSlide {
+    use uuid::Uuid;
+    let layer = content::TextLayer {
+        text: "BG IMAGE".to_string(),
+        name: String::new(),
+        font_family: None,
+        font_size_px: None,
+        font_size_pct: Some(40.0),
+        text_color: "#FFFFFF".to_string(),
+        text_align: "center".to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: "static".to_string(),
+        motion_intensity: 50,
+        motion_phase: 0.0,
+        motion_speed: 1.0,
+        auto_mode: None,
+        auto_format: None,
+        outline: true,
+        blend: "normal".to_string(),
+        r#box: content::TextBox {
+            x: 0.05,
+            y: 0.40,
+            w: 0.90,
+            h: 0.20,
+        },
+    };
+    content::TextSlide {
+        id: Uuid::nil(),
+        name: format!("bg-image-test-{image_id}"),
+        duration_ms: 2000,
+        background_color: "#222222".to_string(),
+        background_pattern: None,
+        background_image_slide_id: Some(image_id),
         text_layers: vec![layer],
     }
 }
@@ -959,6 +1013,31 @@ fn main() -> Result<()> {
                     let slide = build_pattern_test_slide(pattern_name);
                     let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
                     hdmi::render_slide(&card, &slide, catalog_opt, args.content_root.as_deref(), hold_ms)?;
+                    return Ok(());
+                }
+                if let Some(image_id) = args.play_bg_image_test {
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for bg-image smoke",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide = build_bg_image_test_slide(image_id);
+                    let hold_ms = args.hold_secs.unwrap_or(2).saturating_mul(1000);
+                    hdmi::render_slide(
+                        &card,
+                        &slide,
+                        catalog_opt,
+                        args.content_root.as_deref(),
+                        hold_ms,
+                    )?;
                     return Ok(());
                 }
                 if let Some(asset_path) = args.play_image_slide.as_deref() {

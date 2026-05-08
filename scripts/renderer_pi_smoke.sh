@@ -829,6 +829,53 @@ for kind in $BLEND_KINDS_IMPL; do
     echo "    --play-blend-test $kind ok (blend func dispatched correctly)"
 done
 
+# v1-spec-delta #8 (F-image-bg-smoke) image-bg-on-text smoke.
+# Picks the first ImageSlide UUID from the content store and
+# synthesizes a TextSlide whose background_image_slide_id
+# points to it. Validates the BgKind::Image path through
+# paint_slide -- decode + texture upload + FS_BLIT before glyph
+# composite -- and exercises the F-image-bg-cache reuse path
+# under render_slide_in_session. Visual verification (text
+# layer composites correctly over the image bg) is qarl-
+# eyeball; smoke gates pipeline correctness.
+echo "==> Phase d-smoke -- --play-bg-image-test (TextSlide w/ image bg)"
+BGI_UUID=$(ssh "$TARGET" '
+for d in /var/openmarquee/content/*/; do
+  if [ -f "$d/asset.png" ]; then
+    if python3 -c "
+import json, sys
+d = json.load(open(\"$d/item.json\"))
+sys.exit(0 if d.get(\"item\", {}).get(\"type\") == \"image\" else 1)
+" 2>/dev/null; then
+      basename "$d"
+      exit 0
+    fi
+  fi
+done
+echo ""
+' || true)
+BGI_UUID=$(echo "$BGI_UUID" | tr -d '/' | head -1)
+if [ -z "$BGI_UUID" ]; then
+    echo "    --play-bg-image-test skipped (no ImageSlide on target)"
+else
+    BGI_LOG="$LOG_DIR/play-bg-image-test.log"
+    BGI_EXIT=0
+    ssh "$TARGET" "$BIN_PI --output hdmi --play-bg-image-test $BGI_UUID --content-root /var/openmarquee/content --hold-secs 2" \
+        > "$BGI_LOG" 2>&1 || BGI_EXIT=$?
+    if [ "$BGI_EXIT" -ne 0 ]; then
+        echo "FAIL: --play-bg-image-test exit $BGI_EXIT (uuid=$BGI_UUID)"
+        cat "$BGI_LOG"
+        exit 1
+    fi
+    grep -qE 'panicked at|RUST_BACKTRACE' "$BGI_LOG" && \
+        { echo "FAIL: panic in --play-bg-image-test"; cat "$BGI_LOG"; exit 1; }
+    grep -q 'pattern=image asset=' "$BGI_LOG" || \
+        { echo "FAIL: --play-bg-image-test didn't take the BgKind::Image path"; cat "$BGI_LOG"; exit 1; }
+    grep -q 'slide render complete' "$BGI_LOG" || \
+        { echo "FAIL: --play-bg-image-test didn't reach slide render complete"; cat "$BGI_LOG"; exit 1; }
+    echo "    --play-bg-image-test ok (image-bg + text composite drew on hw)"
+fi
+
 # v1-spec-delta #8 (slice a) ImageSlide smoke. Picks the first
 # asset.png from the live content store on the Pi and renders it
 # via --play-image-slide. Asserts no panic + slide-render-complete
