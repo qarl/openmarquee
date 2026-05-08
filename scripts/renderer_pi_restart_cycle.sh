@@ -91,33 +91,50 @@ read_cma() {
     ssh "$TARGET" "awk '/CmaTotal/ {t=\$2} /CmaFree/ {f=\$2} END {print (t-f)/1024}' /proc/meminfo"
 }
 
-# Baseline (before any renderer cycle).
+# Baseline before any renderer cycle (cold kernel state).
 sleep 1
 BASELINE_CMA=$(read_cma)
-echo "==> baseline cma_used: ${BASELINE_CMA} MB"
+echo "==> baseline cma_used (cold): ${BASELINE_CMA} MB"
 echo "cycle,phase,cma_mb" > /tmp/restart-cycles.csv
-echo "0,baseline,$BASELINE_CMA" >> /tmp/restart-cycles.csv
+echo "0,baseline_cold,$BASELINE_CMA" >> /tmp/restart-cycles.csv
 
-echo "==> running $CYCLES renderer cycles"
+# Warmup cycle. The first renderer launch establishes ~50-60 MB
+# of persistent kernel state (vc4 driver buffer pools, possibly
+# Mesa shader cache pages). That allocation is one-time, not
+# per-cycle; the §8.6 "no compound leak across restart" test
+# should compare WARM baseline to subsequent cycles, not cold
+# baseline.
+echo "==> warmup cycle (one-time persistent kernel state alloc)"
+ssh "$TARGET" "$BIN_PI --ipc-sidecar < /tmp/openmarquee-restart-script.json >> $LOG 2>&1" || \
+    { echo "FAIL: warmup cycle exit non-zero"; tail -20 "$LOG"; exit 1; }
+sleep 2
+WARM_CMA=$(read_cma)
+WARM_DELTA=$(python3 -c "print(f'{$WARM_CMA - $BASELINE_CMA:.1f}')")
+echo "==> post-warmup cma_used: ${WARM_CMA} MB (Δ ${WARM_DELTA} MB from cold)"
+echo "0,baseline_warm,$WARM_CMA" >> /tmp/restart-cycles.csv
+
+echo "==> running $CYCLES renderer cycles (compound-leak detection)"
 for i in $(seq 1 "$CYCLES"); do
     ssh "$TARGET" "$BIN_PI --ipc-sidecar < /tmp/openmarquee-restart-script.json >> $LOG 2>&1" || \
         { echo "FAIL: cycle $i exit non-zero"; tail -20 "$LOG"; exit 1; }
     sleep 1
     CYCLE_CMA=$(read_cma)
-    DELTA_MB=$(python3 -c "print(f'{$CYCLE_CMA - $BASELINE_CMA:.1f}')")
-    echo "    cycle $i: cma=${CYCLE_CMA} MB (Δ=${DELTA_MB} MB from baseline)"
+    DELTA_MB=$(python3 -c "print(f'{$CYCLE_CMA - $WARM_CMA:.1f}')")
+    echo "    cycle $i: cma=${CYCLE_CMA} MB (Δ=${DELTA_MB} MB from warm baseline)"
     echo "$i,post_close,$CYCLE_CMA" >> /tmp/restart-cycles.csv
 done
 
-# Final cma + assertion.
+# Final cma + assertion against WARM baseline (not cold).
 FINAL_CMA=$(read_cma)
-DELTA_MB=$(python3 -c "print(f'{$FINAL_CMA - $BASELINE_CMA:.1f}')")
+DELTA_MB=$(python3 -c "print(f'{$FINAL_CMA - $WARM_CMA:.1f}')")
 echo
-echo "==> final: baseline=${BASELINE_CMA} MB; final=${FINAL_CMA} MB; Δ=${DELTA_MB} MB across $CYCLES cycles"
+echo "==> final: cold=${BASELINE_CMA} MB; warm=${WARM_CMA} MB; final=${FINAL_CMA} MB"
+echo "    cold→warm Δ (one-time persistent): $WARM_DELTA MB"
+echo "    warm→final Δ (compound across $CYCLES cycles): $DELTA_MB MB"
 
 OK=$(python3 -c "
-delta = $FINAL_CMA - $BASELINE_CMA
-print('ok' if delta <= $MAX_DELTA_MB else f'fail (delta {delta:.1f} MB > {$MAX_DELTA_MB} MB ceiling)')
+delta = $FINAL_CMA - $WARM_CMA
+print('ok' if delta <= $MAX_DELTA_MB else f'fail (compound delta {delta:.1f} MB > {$MAX_DELTA_MB} MB ceiling)')
 ")
 
 if [ "$OK" != "ok" ]; then
