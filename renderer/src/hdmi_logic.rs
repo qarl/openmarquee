@@ -185,10 +185,122 @@ pub fn should_rerasterize(
 ///
 /// Phase 4.2a: simple single-line layout. Phase 4.2c will pull in
 /// multiline + alignment when the FYS slides that need them land.
+/// Maximum rasterized text bitmap dimension (per side). vc4 V3D 2.1
+/// has GL_MAX_TEXTURE_SIZE=2048; oversize bitmaps fail texture upload
+/// with GL_INVALID_VALUE (0x501) AND have unbounded fragment-fill
+/// cost via the per-layer texture sampler. Per the 2026-05-09 synth
+/// bench (Option E in qa-synth-motion-bench.md): clamping `size_px`
+/// down at the rasterize stage closes both classes of issue
+/// deterministically. Author-side text gets slightly smaller than
+/// requested; the warn line surfaces the clamp to operators.
+pub const MAX_RASTERIZED_BITMAP_DIM: u32 = 2048;
+
+/// Predict the rasterized bitmap's pixel dimensions for `(font, text,
+/// size_px)` WITHOUT performing the full rasterization. fontdue's
+/// `metrics(ch, size_px)` returns glyph bbox + advance from a cached
+/// outline lookup; orders of magnitude cheaper than a full rasterize.
+///
+/// Mirrors layout_text_to_alpha's bbox math: line width is the sum of
+/// per-glyph advance widths; line height is `max(ymin+height) -
+/// min(ymin)` across glyphs (ascent above + descent below baseline).
+/// Padding (1px each side) added to match the rasterized output.
+///
+/// Returns `(width, height)` as the rasterized bitmap WOULD be at
+/// `size_px`. Empty text returns `(0, 0)`.
+pub fn predict_alpha_bitmap_dims(font: &fontdue::Font, text: &str, size_px: f32) -> (u32, u32) {
+    if text.is_empty() {
+        return (0, 0);
+    }
+    let mut total_advance = 0.0_f32;
+    let mut max_ascent = 0_i32;
+    let mut min_descent = 0_i32;
+    for ch in text.chars() {
+        let m = font.metrics(ch, size_px);
+        let ascent = m.ymin + m.height as i32;
+        max_ascent = max_ascent.max(ascent);
+        min_descent = min_descent.min(m.ymin);
+        total_advance += m.advance_width;
+    }
+    let pad: u32 = 1;
+    let line_w = total_advance.ceil() as u32;
+    let line_h = (max_ascent - min_descent).max(0) as u32;
+    let bm_w = line_w + 2 * pad;
+    let bm_h = line_h + 2 * pad;
+    (bm_w, bm_h)
+}
+
+/// Compute the largest `size_px` whose rasterized bitmap fits within
+/// `MAX_RASTERIZED_BITMAP_DIM` in both dims. Returns `Some(clamped)`
+/// when the input `size_px` would exceed the cap, `None` otherwise.
+/// Bitmap dims scale linearly with `size_px` (per-glyph advance and
+/// ascent/descent are both proportional), so the clamp is one
+/// multiply against the binding-dim ratio.
+///
+/// Floors at `8.0` (matches `effective_font_size_px`) so clamped text
+/// never disappears entirely.
+pub fn clamp_size_px_to_bitmap_cap(
+    font: &fontdue::Font,
+    text: &str,
+    size_px: f32,
+) -> Option<f32> {
+    if text.is_empty() || size_px <= 0.0 {
+        return None;
+    }
+    let (pred_w, pred_h) = predict_alpha_bitmap_dims(font, text, size_px);
+    let cap = MAX_RASTERIZED_BITMAP_DIM;
+    if pred_w <= cap && pred_h <= cap {
+        return None;
+    }
+    // Initial scale: linear extrapolation. Bitmap dims scale
+    // linearly with size_px, but advance.ceil() + 2*pad can each
+    // round one pixel up after the rescale, so the linear-
+    // extrapolation answer overshoots by 1-2px in practice.
+    let scale_w = cap as f32 / pred_w as f32;
+    let scale_h = cap as f32 / pred_h as f32;
+    let mut clamped = (size_px * scale_w.min(scale_h)).max(8.0);
+
+    // Tighten in one or two 1px steps until both predicted dims
+    // are at-or-under cap. Bounded by the 8.0 floor; iteration
+    // count is < 5 in practice (the rounding overshoot is O(1)px
+    // regardless of input scale).
+    while clamped > 8.0 {
+        let (w, h) = predict_alpha_bitmap_dims(font, text, clamped);
+        if w <= cap && h <= cap {
+            break;
+        }
+        clamped = (clamped - 1.0).max(8.0);
+    }
+    Some(clamped)
+}
+
 pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> Option<AlphaBitmap> {
     if text.is_empty() {
         return None;
     }
+
+    // Option E (rasterize-side cap, 2026-05-09): pre-measure the
+    // bitmap dims via cheap font.metrics() lookups and clamp size_px
+    // down if the rasterized output would exceed
+    // MAX_RASTERIZED_BITMAP_DIM. Closes the multi-line >2048px
+    // capture-side 0x501 bug AND deterministically caps per-layer
+    // texture upload size on vc4 (GL_MAX_TEXTURE_SIZE=2048). Single-
+    // line text at typical authored sizes (<= 500px) is unaffected;
+    // very large authored sizes get clamped with a warn surface.
+    let effective_size_px = match clamp_size_px_to_bitmap_cap(font, text, size_px) {
+        Some(clamped) => {
+            // Best-effort log surface for the editor / smoke runs.
+            // Single line per clamp event (text is the natural key
+            // for de-dup once the editor wires this up via IPC).
+            eprintln!(
+                "warn: rasterize bitmap cap engaged -- requested size_px={size_px:.1} \
+                 exceeded {MAX_RASTERIZED_BITMAP_DIM}px max bitmap dim, clamping to \
+                 size_px={clamped:.1} (text len={})",
+                text.chars().count(),
+            );
+            clamped
+        }
+        None => size_px,
+    };
 
     // First pass: rasterize each glyph + measure the line's bbox.
     // We measure ascent/descent in the font's own units to size the
@@ -208,7 +320,7 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
     let mut max_ascent = 0_i32;  // pixels above baseline
     let mut min_descent = 0_i32; // pixels below baseline (m.ymin is ≤ 0 typically)
     for ch in text.chars() {
-        let (m, alpha) = font.rasterize(ch, size_px);
+        let (m, alpha) = font.rasterize(ch, effective_size_px);
         // ascent_above_baseline = ymin + height (top of bitmap
         // relative to baseline, y-up).
         let ascent = m.ymin + m.height as i32;
@@ -5036,6 +5148,154 @@ mod tests {
     fn layout_empty_text_returns_none() {
         let font = load_anton();
         assert!(layout_text_to_alpha(&font, "", 64.0).is_none());
+    }
+
+    // E (rasterize-side bitmap cap, 2026-05-09): predict +
+    // clamp helpers for keeping rasterized bitmap dims within
+    // MAX_RASTERIZED_BITMAP_DIM. Closes the multi-line >2048px
+    // capture-side 0x501 bug AND deterministically caps per-
+    // layer texture upload size on vc4.
+
+    #[test]
+    fn predict_alpha_bitmap_dims_matches_rasterize_at_64px() {
+        // Pin: predict_alpha_bitmap_dims agrees with the actual
+        // rasterized output of layout_text_to_alpha at the same
+        // size_px (when below the cap). If the prediction drifts
+        // from the rasterizer, the cap math becomes non-load-
+        // bearing.
+        let font = load_anton();
+        for text in ["F", "FREE", "Tile Chaos 08", "abcdefghij"] {
+            let (pred_w, pred_h) = predict_alpha_bitmap_dims(&font, text, 64.0);
+            let bm = layout_text_to_alpha(&font, text, 64.0)
+                .unwrap_or_else(|| panic!("rasterize {text:?}"));
+            assert_eq!(
+                (pred_w, pred_h),
+                (bm.width, bm.height),
+                "{text:?}: predict vs rasterize disagree",
+            );
+        }
+    }
+
+    #[test]
+    fn predict_alpha_bitmap_dims_empty_returns_zero() {
+        let font = load_anton();
+        assert_eq!(predict_alpha_bitmap_dims(&font, "", 64.0), (0, 0));
+    }
+
+    #[test]
+    fn predict_alpha_bitmap_dims_scales_linearly_with_size() {
+        // size_px doubles -> predicted dims roughly double (within
+        // rounding from the per-glyph integer pixel snap). Pins
+        // the linearity assumption that clamp_size_px_to_bitmap_
+        // cap relies on for its single-multiply scale factor.
+        let font = load_anton();
+        let (w_64, h_64) = predict_alpha_bitmap_dims(&font, "FYS Tile Chaos", 64.0);
+        let (w_128, h_128) = predict_alpha_bitmap_dims(&font, "FYS Tile Chaos", 128.0);
+        // Allow ±1px rounding tolerance per side per glyph; 14
+        // chars + 2 padding = up to 16px slack on width. Height
+        // tolerance is ±max_ascent_diff + ±min_descent_diff +
+        // 2*pad rounding ≈ up to 5px in practice.
+        assert!((w_128 as i32 - 2 * w_64 as i32).abs() < 16,
+            "doubling size: w_64={w_64} w_128={w_128}");
+        assert!((h_128 as i32 - 2 * h_64 as i32).abs() <= 6,
+            "doubling size: h_64={h_64} h_128={h_128}");
+    }
+
+    #[test]
+    fn clamp_returns_none_when_under_cap() {
+        // Typical authored sizes fall well under the 2048-pixel
+        // cap. clamp returns None to signal no clamp needed.
+        let font = load_anton();
+        assert!(clamp_size_px_to_bitmap_cap(&font, "F", 64.0).is_none());
+        assert!(clamp_size_px_to_bitmap_cap(&font, "Tile Chaos 08", 128.0).is_none());
+        assert!(clamp_size_px_to_bitmap_cap(&font, "Hello world", 200.0).is_none());
+    }
+
+    #[test]
+    fn clamp_returns_none_for_empty_text() {
+        // Empty text has no rasterizable content; cap math is
+        // undefined. Return None (no clamp) and let the rasterize
+        // path handle the empty case via its own short-circuit.
+        let font = load_anton();
+        assert!(clamp_size_px_to_bitmap_cap(&font, "", 64.0).is_none());
+    }
+
+    #[test]
+    fn clamp_engages_when_size_exceeds_cap() {
+        // A 2000-px font on a longer string blows past the 2048
+        // dim cap. clamp returns Some(scaled) where scaled keeps
+        // the rasterized output within bounds.
+        let font = load_anton();
+        let text = "OPEN MARQUEE";
+        let clamped = clamp_size_px_to_bitmap_cap(&font, text, 2000.0)
+            .expect("expected clamp engagement at size_px=2000 for 12-char text");
+        assert!(clamped < 2000.0, "clamped {clamped} should be < 2000");
+        assert!(clamped >= 8.0, "clamped {clamped} should be >= 8 (size floor)");
+        // Verify the clamped size_px actually keeps both dims
+        // within the cap.
+        let (w, h) = predict_alpha_bitmap_dims(&font, text, clamped);
+        assert!(
+            w <= MAX_RASTERIZED_BITMAP_DIM,
+            "clamped width {w} > cap {MAX_RASTERIZED_BITMAP_DIM}",
+        );
+        assert!(
+            h <= MAX_RASTERIZED_BITMAP_DIM,
+            "clamped height {h} > cap {MAX_RASTERIZED_BITMAP_DIM}",
+        );
+    }
+
+    #[test]
+    fn clamp_floors_at_8_px() {
+        // Pathological inputs (extremely long text at huge sizes)
+        // could otherwise scale below the 8-px floor. clamp must
+        // never return Some(x) with x < 8.0.
+        let font = load_anton();
+        // 300-char string at 5000-px font would scale to ~tiny.
+        let text = "A".repeat(500);
+        if let Some(clamped) = clamp_size_px_to_bitmap_cap(&font, &text, 5000.0) {
+            assert!(clamped >= 8.0, "clamped {clamped} below 8-px floor");
+        }
+    }
+
+    #[test]
+    fn layout_text_to_alpha_caps_oversize_bitmap() {
+        // End-to-end: a request that would overflow the cap is
+        // clamped INSIDE layout_text_to_alpha; the returned
+        // AlphaBitmap is within the cap in both dims. Reaching
+        // the rasterize path uncapped would either crash on
+        // GL_INVALID_VALUE at upload time or burn fragment-fill
+        // cost unboundedly.
+        let font = load_anton();
+        let bm = layout_text_to_alpha(&font, "OPEN MARQUEE", 2000.0)
+            .expect("expected clamped rasterize result");
+        assert!(
+            bm.width <= MAX_RASTERIZED_BITMAP_DIM,
+            "clamped bm width {} > cap {}",
+            bm.width, MAX_RASTERIZED_BITMAP_DIM,
+        );
+        assert!(
+            bm.height <= MAX_RASTERIZED_BITMAP_DIM,
+            "clamped bm height {} > cap {}",
+            bm.height, MAX_RASTERIZED_BITMAP_DIM,
+        );
+        // Bitmap should still have ink in it (clamp doesn't
+        // reduce to zero).
+        assert!(bm.data.iter().any(|&p| p > 0));
+    }
+
+    #[test]
+    fn layout_text_to_alpha_passes_through_when_under_cap() {
+        // Sanity: the cap is engaged ONLY when needed. A typical
+        // authored size produces the same bitmap with or without
+        // the cap pre-check.
+        let font = load_anton();
+        let bm = layout_text_to_alpha(&font, "FYS Tile Chaos 08", 96.0).unwrap();
+        assert!(bm.width < MAX_RASTERIZED_BITMAP_DIM);
+        assert!(bm.height < MAX_RASTERIZED_BITMAP_DIM);
+        // Output dims match the un-clamped prediction at this
+        // size_px (no clamp applied).
+        let (pred_w, pred_h) = predict_alpha_bitmap_dims(&font, "FYS Tile Chaos 08", 96.0);
+        assert_eq!((bm.width, bm.height), (pred_w, pred_h));
     }
 
     #[test]
