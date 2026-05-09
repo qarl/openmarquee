@@ -2718,10 +2718,6 @@ pub fn capture_sb_transition_mid_to_png(
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
-    let bg_a_4 = effective_solid_bg(&bg_a_kind)
-        .ok_or_else(|| anyhow!("capture_sb_mid: bg_a not solid"))?;
-    let bg_b_4 = effective_solid_bg(&bg_b_kind)
-        .ok_or_else(|| anyhow!("capture_sb_mid: bg_b not solid"))?;
     if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
         || layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
     {
@@ -2752,8 +2748,6 @@ pub fn capture_sb_transition_mid_to_png(
         let ccp = cached_composite_program(session.gl, kind)?;
         let (atlas_fbo, atlas_tex) = unsafe { ensure_bake_atlas(session)? };
         let vbo = ensure_transition_sp_quad_vbo(session)?;
-        let _ = bg_a_4;
-        let _ = bg_b_4;
         let region_h = crate::hdmi_logic::ATLAS_REGION_H;
         let atlas_w_f = crate::hdmi_logic::ATLAS_FBO_W as f32;
         let atlas_h_f = crate::hdmi_logic::ATLAS_FBO_H as f32;
@@ -2806,6 +2800,14 @@ pub fn capture_sb_transition_mid_to_png(
         let states_b = motion_states_for_layers(slide_b.id, &layers_b, 0.0);
         let wall_clock_unix = current_unix_seconds();
 
+        // IIFE so cap_fbo / cap_tex (and SCISSOR_TEST state) get
+        // unconditional cleanup even when an inner ? aborts mid-
+        // bake (e.g. cached_blit_program?, blit_bg_to_region?,
+        // paint_slide_with_viewport?). The pre-IIFE allocation
+        // already used a manual delete on the create_framebuffer
+        // failure path; the IIFE extends that discipline across
+        // every fallible call inside the capture body.
+        let work_result: Result<()> = (|| {
         // Atlas bake phase: one FBO bind, scissor + viewport
         // switch between regions. Mirrors the runtime SB path.
         let bcp = cached_blit_program(session.gl)?;
@@ -2931,13 +2933,19 @@ pub fn capture_sb_transition_mid_to_png(
             "captured SB transition kind={kind:?} slide_a={} slide_b={} t={t:.3} -> {} ({} bytes)",
             slide_a.id, slide_b.id, png_path.display(), png_bytes.len(),
         );
+        Ok(())
+        })();
 
+        // Unconditional cleanup. Runs on both Ok and Err paths so
+        // a mid-bake error doesn't leak cap_fbo / cap_tex / SCISSOR
+        // state into the surrounding session.
         unsafe {
+            gl.disable(glow::SCISSOR_TEST);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.delete_framebuffer(cap_fbo);
             gl.delete_texture(cap_tex);
         }
-        Ok(())
+        work_result
     })
 }
 
@@ -4767,6 +4775,16 @@ fn render_transition_single_pass_in_session(
             drop(bo);
         }
     }
+    // Restore scissor state. Atlas SB enables SCISSOR_TEST mid-frame
+    // for region-clipped bg fill; the per-frame composite branch
+    // disables it before scanout, but a `?` mid-bake skips that.
+    // Without this, an error bail leaks SCISSOR_TEST into the next
+    // render call's GL state. SP path doesn't enable scissor; this
+    // disable is a no-op there.
+    unsafe {
+        use glow::HasContext;
+        session.gl.disable(glow::SCISSOR_TEST);
+    }
     session.modeset_done = false;
 
     let frame_count = work?;
@@ -4833,12 +4851,17 @@ fn render_transition_scissored_bake_in_session(
     }
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
-    let bg_a_4 = effective_solid_bg(&bg_a_kind)
+    // Eligibility-validation: SB tier currently requires solid (or
+    // density-0 gradient) bg on both sides. The bg-cache machinery
+    // can render any BgKind, so this gate is over-restrictive --
+    // widening is queued as a follow-up commit. For now, retain
+    // the validation; bind to _ since downstream doesn't need the
+    // resolved color (the bake calls paint_slide_with_viewport
+    // which carries its own bg routing).
+    let _ = effective_solid_bg(&bg_a_kind)
         .ok_or_else(|| anyhow!("scissored_bake: bg_a not solid"))?;
-    let bg_b_4 = effective_solid_bg(&bg_b_kind)
+    let _ = effective_solid_bg(&bg_b_kind)
         .ok_or_else(|| anyhow!("scissored_bake: bg_b not solid"))?;
-    let bg_a_color: [f32; 3] = [bg_a_4[0], bg_a_4[1], bg_a_4[2]];
-    let bg_b_color: [f32; 3] = [bg_b_4[0], bg_b_4[1], bg_b_4[2]];
     if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
         || layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
     {
@@ -4904,7 +4927,14 @@ fn render_transition_scissored_bake_in_session(
     // count. Other kinds need both sides + use the combined
     // FS_<KIND> via cached_composite_program.
     let kind_is_cut = kind == "cut";
-    let ccp = cached_composite_program(session.gl, kind)?;
+    // Cut path uses side-specialized FS_CUT_A / FS_CUT_B exclusively;
+    // skip the combined-FS_CUT compile to avoid burning a redundant
+    // GL program slot. Other kinds compile + use the standard ccp.
+    let ccp = if kind_is_cut {
+        None
+    } else {
+        Some(cached_composite_program(session.gl, kind)?)
+    };
     let cut_ccp_a = if kind_is_cut {
         Some(cached_cut_composite_program(session.gl, false)?)
     } else {
@@ -4918,8 +4948,6 @@ fn render_transition_scissored_bake_in_session(
     let bcp = cached_blit_program(session.gl)?;
     let (atlas_fbo, atlas_tex) = unsafe { ensure_bake_atlas(session)? };
     let vbo = ensure_transition_sp_quad_vbo(session)?;
-    let _ = bg_a_4;
-    let _ = bg_b_4;
     // bg-cache (2026-05-09 Phase 2.5): pre-populate cached non-
     // solid bgs at atlas region size. Idempotent across calls
     // -- pays the gradient/pattern fill cost ONCE per slide
@@ -5083,7 +5111,7 @@ fn render_transition_scissored_bake_in_session(
                         cut_ccp_b.as_ref().expect("cut_ccp_b init for cut")
                     }
                 } else {
-                    &ccp
+                    ccp.as_ref().expect("ccp init for non-cut kinds")
                 };
                 unsafe {
                     gl.disable(glow::SCISSOR_TEST);
@@ -5202,6 +5230,16 @@ fn render_transition_scissored_bake_in_session(
         if let Some(bo) = bo_opt {
             drop(bo);
         }
+    }
+    // Restore scissor state. Atlas SB enables SCISSOR_TEST mid-frame
+    // for region-clipped bg fill; the per-frame composite branch
+    // disables it before scanout, but a `?` mid-bake skips that.
+    // Without this, an error bail leaks SCISSOR_TEST into the next
+    // render call's GL state. SP path doesn't enable scissor; this
+    // disable is a no-op there.
+    unsafe {
+        use glow::HasContext;
+        session.gl.disable(glow::SCISSOR_TEST);
     }
     session.modeset_done = false;
 
@@ -7175,17 +7213,13 @@ fn prewarm_sp_session(
             // pre-compile here.
             if !composite_compiled.contains(kind) {
                 composite_compiled.insert(kind.to_string());
-                if let Err(e) = cached_composite_program(session.gl, kind) {
-                    eprintln!(
-                        "reel: prewarm composite({kind:?}) failed: {e:#}; skipping"
-                    );
-                    return;
-                }
-                *composite_count += 1;
-                // Phase 2.6: cut transition uses side-specialized
-                // composite shaders. Pre-compile both sides so the
-                // first cut transition doesn't pay link cost.
                 if kind == "cut" {
+                    // Cut path uses ONLY the side-specialized
+                    // FS_CUT_A / FS_CUT_B composite shaders at
+                    // runtime; combined FS_CUT is unused so skip
+                    // the compile. Matches the runtime SB cut
+                    // path that no longer compiles `ccp` for
+                    // kind=="cut".
                     for side_b in [false, true] {
                         if let Err(e) = cached_cut_composite_program(session.gl, side_b) {
                             eprintln!(
@@ -7193,7 +7227,13 @@ fn prewarm_sp_session(
                             );
                         }
                     }
+                } else if let Err(e) = cached_composite_program(session.gl, kind) {
+                    eprintln!(
+                        "reel: prewarm composite({kind:?}) failed: {e:#}; skipping"
+                    );
+                    return;
                 }
+                *composite_count += 1;
             }
         }
     };
