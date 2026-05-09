@@ -5574,8 +5574,22 @@ unsafe fn ensure_slide_bg_cache(
         return Ok(());
     }
     let gl = session.gl;
+    // Cache texture is sized to the atlas region (2048x1024). The
+    // blit copies the texture 1:1 into the atlas region, so the
+    // texture and region must match dims.
     let cache_w = crate::hdmi_logic::ATLAS_REGION_W as i32;
     let cache_h = crate::hdmi_logic::ATLAS_REGION_H as i32;
+    // BG-render PROJECTION uses mode_w (1920) so gradient/pattern
+    // math matches the non-cached direct-bake path. But the gl
+    // viewport stays at the full atlas-region size (2048x1024) so
+    // the blit-into-atlas-region remains a 1:1 copy. gl_FragCoord
+    // pixels at x > mode_w land outside the gradient projection
+    // span; they clamp to color_b for FS_GRADIENT and tile naturally
+    // for FS_PATTERN_*. Composite never samples the [mode_w,
+    // atlas_w) gutter (xform_a/b u-scale = mode_w/atlas_w), so the
+    // gutter content doesn't reach the panel either way.
+    let proj_w = session.mode_w as u32;
+    let proj_h = crate::hdmi_logic::ATLAS_REGION_H;
     let bg_tex = gl
         .create_texture()
         .map_err(|e| anyhow!("bg_cache glGenTextures: {e}"))?;
@@ -5606,26 +5620,33 @@ unsafe fn ensure_slide_bg_cache(
         gl.delete_texture(bg_tex);
         bail!("bg_cache FBO incomplete: status=0x{status:x}");
     }
-    gl.viewport(0, 0, cache_w, cache_h);
     gl.disable(glow::SCISSOR_TEST);
+    gl.viewport(0, 0, cache_w, cache_h);
 
-    // Render the bg into the cache texture. Same code path as
-    // paint_slide_with_viewport's BgKind branch but at a fixed
-    // size (atlas region) and into our temp FBO.
+    // Render the bg into the cache texture. PROJECTION dims are
+    // (mode_w, region_h) so gl_FragCoord-based shaders (FS_GRADIENT,
+    // FS_PATTERN_*) compute the same projection bounds the non-cached
+    // direct-bake path does. The gl viewport stays full 2048-wide so
+    // the blit-into-atlas-region is 1:1 -- gutter pixels x in
+    // [mode_w, atlas_w) get color_b (gradient clamp) or tiled
+    // continuation (pattern); composite never samples them.
     let render_result: Result<()> = (|| {
         match bg_kind {
             BgKind::Solid(_) => unreachable!("filtered above"),
             BgKind::Gradient { color_a, color_b, density } => {
                 draw_gradient_pattern(
-                    gl, 0, 0, cache_w as u32, cache_h as u32,
+                    gl, 0, 0, proj_w, proj_h,
                     *color_a, *color_b, *density,
                 )?;
             }
             BgKind::Pattern { kind, color_a, color_b, density } => {
-                // Pattern bgs are NOT SB-eligible upstream
-                // (effective_solid_bg returns None). Defensive
-                // path here in case eligibility expands later.
-                draw_pattern(gl, cache_w as u32, cache_h as u32, *kind, *color_a, *color_b, *density)?;
+                // Pattern bgs aren't SB-eligible at the time of
+                // writing (effective_solid_bg returns None). When
+                // eligibility widens, this path activates. The
+                // gl_FragCoord-based pattern shaders need the same
+                // u_vp_offset extension FS_GRADIENT got if direct-
+                // bake ever calls draw_pattern with non-zero offset.
+                draw_pattern(gl, proj_w, proj_h, *kind, *color_a, *color_b, *density)?;
             }
             BgKind::Image { asset_path, solid_fallback } => {
                 draw_image_bg(gl, asset_path, *solid_fallback, Some(&mut session.image_bg_cache));
