@@ -5548,29 +5548,37 @@ fn paint_slide_with_viewport(
     mut tex_cache: Option<&mut TextureCache>,
 ) -> Result<()> {
     use glow::HasContext;
-    // vp_w/h for the GL viewport; mode_w/h for all box/layer math.
-    // For the default paint_slide call vp == mode (full-res). For
-    // the scissored-bake path the bake FBO is half-res, so vp is
-    // half mode and we let the same NDC corners cover the smaller
-    // pixel region; composite LINEAR-upsamples to full output.
+    // vp_w/h for the GL viewport; mode_w/h for layer NDC math
+    // (box ratios -> pixel coords -> NDC). Pattern + gradient bg
+    // shaders use gl_FragCoord (viewport-pixel coords) + uniforms
+    // for tile/span size: those need to operate in vp-pixel space
+    // so the bg fills vp-relative coords correctly. Passing
+    // (vp_w, vp_h) to draw_gradient_pattern + draw_pattern gives
+    // the right scale -- tile sizes auto-scale by 1/divisor and
+    // gradient spans auto-fit the viewport, matching how the
+    // composite-pass LINEAR upsamples to full output.
+    //
+    // Caught by QA visual review (2026-05-09): half-res bake of
+    // slide 70f9d701's density=0 vertical gradient bg showed
+    // grey-top instead of pink-top because the prior code passed
+    // mode_h for u_viewport while gl_FragCoord was in vp space.
     unsafe { gl.viewport(0, 0, vp_w as i32, vp_h as i32); }
-    // Pattern shaders accept a (mode_w, mode_h) "image space" --
-    // they need the SCREEN dimensions for tile-size math, not the
-    // viewport size. Pass mode_w/h so patterns look identical to
-    // full-res (just rendered into fewer pixels). Layers ditto.
     match bg_kind {
         BgKind::Gradient { color_a, color_b, density } => {
-            draw_gradient_pattern(gl, mode_w, mode_h, *color_a, *color_b, *density)?;
+            draw_gradient_pattern(gl, vp_w, vp_h, *color_a, *color_b, *density)?;
         }
         BgKind::Pattern { kind, color_a, color_b, density } => {
-            draw_pattern(gl, mode_w, mode_h, *kind, *color_a, *color_b, *density)?;
+            draw_pattern(gl, vp_w, vp_h, *kind, *color_a, *color_b, *density)?;
         }
         BgKind::Image { asset_path, solid_fallback } => {
+            // Image bg path uses FS_BLIT which is uv-driven (not
+            // gl_FragCoord) -- viewport-resolution-independent.
             // Reborrow so we can hand the cache to the overlay-
             // route below if any_overlay fires for a later layer.
             draw_image_bg(gl, asset_path, *solid_fallback, image_bg_cache.as_deref_mut());
         }
         BgKind::Solid(color) => {
+            // glClear; trivially resolution-independent.
             draw_solid_clear(gl, *color);
         }
     }
