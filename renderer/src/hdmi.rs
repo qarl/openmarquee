@@ -49,14 +49,14 @@ use crate::hdmi_logic::{
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
-    fs_transition_sp_source, is_transition_kind_single_pass, stripes_uniforms,
-    unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog, ModeSpec, MotionKind,
-    MotionState, PatternKind, VAlign, FS_BLIT,
+    fs_transition_sp_source, is_transition_kind_single_pass,
+    stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog,
+    ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
     FS_PATTERN_GRID, FS_PATTERN_HALFTONE, FS_PATTERN_RAYS, FS_PATTERN_RINGS,
-    FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES, SINGLE_PASS_MAX_LAYERS_PER_SLIDE,
-    VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
+    FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES, SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE,
+    SINGLE_PASS_MAX_LAYERS_PER_SLIDE, VS_FULLSCREEN_QUAD, VS_TEXTURED_QUAD,
 };
 use crate::Card;
 
@@ -308,6 +308,15 @@ pub struct EglSession<'a> {
     /// (~1 ms per transition * 18 reel transitions). Lazy-init on
     /// first SP transition; freed at with_egl_session teardown.
     transition_sp_quad_vbo: Option<glow::NativeBuffer>,
+    /// QA-mandated scissored-bake (Step 4, 2026-05-08): two
+    /// session-cached offscreen FBO+texture pairs sized at the
+    /// current mode's dimensions. Reused across every scissored-
+    /// bake transition; the bake-pass renders one slide into
+    /// each, the composite-pass samples both. 2 × 1080p ×
+    /// 4 bytes = 16 MB CMA total. Lazy-allocated on first
+    /// scissored-bake call; freed at with_egl_session teardown.
+    scissored_bake_fbo_a: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
+    scissored_bake_fbo_b: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -457,6 +466,8 @@ where
         current_settings: crate::content::Settings::default(),
         slide_caches: std::collections::HashMap::new(),
         transition_sp_quad_vbo: None,
+        scissored_bake_fbo_a: None,
+        scissored_bake_fbo_b: None,
     };
     let work_result = work(&mut session);
 
@@ -494,6 +505,7 @@ where
     clear_glyph_program_cache(&gl);
     clear_transition_program_cache(&gl);
     clear_transition_sp_program_cache(&gl);
+    clear_composite_program_cache(&gl);
     // v1-spec-delta #9 (slice d): drain pending flip + free
     // session-level scanout BO/FB rotation. Mirrors the
     // animated_slide end-of-call cleanup but at session
@@ -532,6 +544,14 @@ where
         }
         if let Some(vbo) = session.transition_sp_quad_vbo.take() {
             gl.delete_buffer(vbo);
+        }
+        if let Some((fbo, tex)) = session.scissored_bake_fbo_a.take() {
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(tex);
+        }
+        if let Some((fbo, tex)) = session.scissored_bake_fbo_b.take() {
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(tex);
         }
     }
     drop(session);
@@ -3359,8 +3379,24 @@ fn render_transition_animated_in_session(
     // budget at 30Hz). The eligibility check is conservative -- any
     // slide that doesn't fit (image bg, pattern bg, >4 layers,
     // outline, non-normal blend) falls through to the legacy path.
-    if transition_eligible_for_single_pass(kind, &bg_a, &bg_b, &layers_a, &layers_b) {
+    // Tiered SP dispatch:
+    //   1. single-pass for low-fragment-cost cases (n_a + n_b <= 4
+    //      AND each <= 4): cheapest path; no FBO bounce.
+    //   2. scissored-bake for higher-cost cases that still fit
+    //      solid-bg + ≤6 layers per side: 3 simpler passes that
+    //      stay under the per-frame budget where SP would overrun.
+    //   3. legacy 3-pass: pattern bg / outline / non-normal blend.
+    let n_a = layers_a.len();
+    let n_b = layers_b.len();
+    if !prefer_scissored_bake(n_a, n_b)
+        && transition_eligible_for_single_pass(kind, &bg_a, &bg_b, &layers_a, &layers_b)
+    {
         return render_transition_single_pass_in_session(
+            session, card, slide_a, slide_b, fonts, content_root, kind, transition_ms, fps,
+        );
+    }
+    if transition_eligible_for_scissored_bake(kind, &bg_a, &bg_b, &layers_a, &layers_b) {
+        return render_transition_scissored_bake_in_session(
             session, card, slide_a, slide_b, fonts, content_root, kind, transition_ms, fps,
         );
     }
@@ -4444,6 +4480,312 @@ fn render_transition_single_pass_in_session(
     Ok(frame_count)
 }
 
+/// QA-mandated scissored-bake (Step 4, 2026-05-08): three-pass
+/// transition path for cases where single-pass exceeds the per-
+/// fragment budget (n_a + n_b > 4 OR per-side > 4 layers).
+///
+/// Per frame:
+///   1. Bake slide A: bg + N_a layers → fbo_a/tex_a (1× 1080p
+///      fragment fill, single draw).
+///   2. Bake slide B: same → fbo_b/tex_b.
+///   3. Composite: kind-specific FS samples 2 baked textures
+///      with warp + mix → default framebuffer.
+///
+/// Splits the high-fragment-cost SP shader (5+ apply_layer per
+/// fragment) into 3 simpler passes that fit per-frame budget. The
+/// bake-pass programs are cached per `n_layers` (BAKE_SP_PROGRAMS);
+/// the composite-pass programs are cached per kind
+/// (COMPOSITE_PROGRAMS) and reuse the EXISTING legacy FS_<KIND>
+/// shaders -- those already take 2 sampler2D + u_t and apply the
+/// kind-specific warp.
+///
+/// Note: this is the WITHOUT-scissor variant of scissored-bake.
+/// The bake-pass is full-screen (1× 1080p fragment fill per slide
+/// regardless of layer-rect coverage). Adding sparse glScissor
+/// based on layer-union-rect is a Phase-2 optimization.
+fn render_transition_scissored_bake_in_session(
+    session: &mut EglSession,
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    kind: &str,
+    transition_ms: u32,
+    fps: u32,
+) -> Result<u32> {
+    if transition_ms == 0 {
+        bail!("transition_ms must be > 0");
+    }
+    if fps == 0 {
+        bail!("fps must be > 0");
+    }
+    if !is_transition_kind_single_pass(kind) {
+        bail!("scissored_bake: kind {kind:?} has no SP generator");
+    }
+    let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
+    let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    let bg_a_4 = effective_solid_bg(&bg_a_kind)
+        .ok_or_else(|| anyhow!("scissored_bake: bg_a not solid"))?;
+    let bg_b_4 = effective_solid_bg(&bg_b_kind)
+        .ok_or_else(|| anyhow!("scissored_bake: bg_b not solid"))?;
+    let bg_a_color: [f32; 3] = [bg_a_4[0], bg_a_4[1], bg_a_4[2]];
+    let bg_b_color: [f32; 3] = [bg_b_4[0], bg_b_4[1], bg_b_4[2]];
+    if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+        || layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+    {
+        bail!(
+            "scissored_bake: layer count exceeds {} per slide",
+            SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+        );
+    }
+
+    eprintln!(
+        "rendering scissored-bake {kind} transition slide_a={} slide_b={} \
+         transition_ms={transition_ms} fps={fps} layers_a={} layers_b={}",
+        slide_a.id,
+        slide_b.id,
+        layers_a.len(),
+        layers_b.len(),
+    );
+
+    let mode_w_u32 = session.mode_w as u32;
+    let mode_h_u32 = session.mode_h as u32;
+    let total_frames =
+        ((transition_ms as f64) / 1000.0 * fps as f64).round().max(1.0) as u32;
+    let frame_period_ns: u64 = 1_000_000_000_u64 / fps.max(1) as u64;
+
+    let slide_a_id = slide_a.id;
+    let slide_b_id = slide_b.id;
+    let layers_a_len = layers_a.len();
+    let layers_b_len = layers_b.len();
+    {
+        use glow::HasContext;
+        for (sid, n) in [(slide_a_id, layers_a_len), (slide_b_id, layers_b_len)] {
+            let needs_new = match session.slide_caches.get(&sid) {
+                Some(c) => c.glyph.len() != n,
+                None => true,
+            };
+            if needs_new {
+                if let Some(old) = session.slide_caches.remove(&sid) {
+                    unsafe {
+                        for slot in old.tex {
+                            if let Some(t) = slot {
+                                session.gl.delete_texture(t);
+                            }
+                        }
+                    }
+                }
+                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+            }
+        }
+    }
+
+    // Pre-resolve cached programs + ensure FBOs/VBO.
+    // Bake-pass is via paint_slide (per-layer draws into the layer
+    // rect, not full-screen) -- the SP-style bake program with
+    // full-screen apply_layer chain ran 70+ ms/frame on vc4
+    // because each fragment paid N texture samples regardless of
+    // layer-rect coverage. paint_slide's clear + per-layer-quad
+    // pattern is sparse and fits per-frame budget.
+    let ccp = cached_composite_program(session.gl, kind)?;
+    let (fbo_a, tex_a) = unsafe { ensure_bake_fbo_pair(session, 0)? };
+    let (fbo_b, tex_b) = unsafe { ensure_bake_fbo_pair(session, 1)? };
+    let vbo = ensure_transition_sp_quad_vbo(session)?;
+
+    let mut prev_bo: Option<BufferObject<()>> = None;
+    let mut prev_fb: Option<framebuffer::Handle> = None;
+    let mut current_bo: Option<BufferObject<()>> = None;
+    let mut current_fb: Option<framebuffer::Handle> = None;
+
+    let work_start_t = Instant::now();
+    let loop_elapsed_cell: std::cell::Cell<std::time::Duration> =
+        std::cell::Cell::new(std::time::Duration::ZERO);
+    let work: Result<u32> = (|| {
+        use glow::HasContext;
+        let gl = session.gl;
+        let start = Instant::now();
+        let start_mono_ns = monotonic_now_ns();
+        let mut rendered = 0_u32;
+        let profile_active_t = crate::profile::is_enabled();
+        let loop_result: Result<()> = (|| {
+            for frame in 0..total_frames {
+                if profile_active_t && crate::profile::frames_remaining() == Some(0) {
+                    break;
+                }
+                let frame_start_t = Instant::now();
+                let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
+                let tick_seconds = start.elapsed().as_secs_f64();
+                let wall_clock_unix = current_unix_seconds();
+
+                let states_a =
+                    motion_states_for_layers(slide_a.id, &layers_a, tick_seconds);
+                let states_b =
+                    motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
+
+                // Bake slide A via paint_slide → fbo_a/tex_a.
+                let t_bake_a = Instant::now();
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+                }
+                {
+                    let cache_a = session
+                        .slide_caches
+                        .get_mut(&slide_a_id)
+                        .expect("slide_caches[slide_a] init above");
+                    paint_slide(
+                        gl, mode_w_u32, mode_h_u32, &bg_a_kind, &layers_a,
+                        Some(&states_a), wall_clock_unix,
+                        Some(&mut cache_a.glyph),
+                        Some(&mut session.image_bg_cache),
+                        Some(&mut cache_a.tex),
+                    )?;
+                }
+                crate::profile::record_phase("sb_bake_a", t_bake_a.elapsed().as_nanos() as u64);
+
+                let t_bake_b = Instant::now();
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b));
+                }
+                {
+                    let cache_b = session
+                        .slide_caches
+                        .get_mut(&slide_b_id)
+                        .expect("slide_caches[slide_b] init above");
+                    paint_slide(
+                        gl, mode_w_u32, mode_h_u32, &bg_b_kind, &layers_b,
+                        Some(&states_b), wall_clock_unix,
+                        Some(&mut cache_b.glyph),
+                        Some(&mut session.image_bg_cache),
+                        Some(&mut cache_b.tex),
+                    )?;
+                }
+                crate::profile::record_phase("sb_bake_b", t_bake_b.elapsed().as_nanos() as u64);
+
+                // Composite: 2 baked textures + kind-specific warp + mix → default FB.
+                let t_comp = Instant::now();
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+                    gl.disable(glow::BLEND);
+                    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                    gl.use_program(Some(ccp.program));
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+                    gl.uniform_1_i32(ccp.u_src_a.as_ref(), 0);
+                    gl.active_texture(glow::TEXTURE1);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+                    gl.uniform_1_i32(ccp.u_src_b.as_ref(), 1);
+                    gl.uniform_1_f32(ccp.u_t.as_ref(), t);
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                    let stride = (4 * std::mem::size_of::<f32>()) as i32;
+                    gl.enable_vertex_attrib_array(ccp.a_pos);
+                    gl.vertex_attrib_pointer_f32(ccp.a_pos, 2, glow::FLOAT, false, stride, 0);
+                    gl.enable_vertex_attrib_array(ccp.a_uv);
+                    gl.vertex_attrib_pointer_f32(
+                        ccp.a_uv, 2, glow::FLOAT, false, stride,
+                        (2 * std::mem::size_of::<f32>()) as i32,
+                    );
+                    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    gl.flush();
+                }
+                crate::profile::record_phase("sb_composite", t_comp.elapsed().as_nanos() as u64);
+
+                // Swap + commit + N-2 BO/FB rotation (mirrors SP path).
+                let t_swap = Instant::now();
+                session
+                    .egl_lib
+                    .swap_buffers(session.display, session.egl_surface)
+                    .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
+                crate::profile::record_phase("swap", t_swap.elapsed().as_nanos() as u64);
+                let t_lockfb = Instant::now();
+                let bo = unsafe {
+                    session
+                        .gbm_surface
+                        .lock_front_buffer()
+                        .with_context(|| format!("lock_front_buffer (frame {frame})"))?
+                };
+                let fb_buf = GbmBufferAdapter::new(&bo)
+                    .with_context(|| format!("read GBM bo metadata (frame {frame})"))?;
+                let fb = card
+                    .add_framebuffer(&fb_buf, 32, 32)
+                    .with_context(|| format!("drmModeAddFB (frame {frame})"))?;
+                crate::profile::record_phase("lockfb", t_lockfb.elapsed().as_nanos() as u64);
+                let t_commit = Instant::now();
+                if let Err(e) = commit_fb(session, card, fb) {
+                    if let Err(de) = card.destroy_framebuffer(fb) {
+                        eprintln!(
+                            "warn: cleanup destroy_framebuffer({fb:?}) on commit-fail (frame {frame}): {de}"
+                        );
+                    }
+                    drop(bo);
+                    return Err(e.context(format!("commit_fb (frame {frame})")));
+                }
+                crate::profile::record_phase("commit", t_commit.elapsed().as_nanos() as u64);
+
+                let t_rotate = Instant::now();
+                if let Some(old_fb) = prev_fb.take() {
+                    if let Err(e) = card.destroy_framebuffer(old_fb) {
+                        eprintln!("warn: destroy_framebuffer({old_fb:?}): {e}");
+                    }
+                }
+                if let Some(old_bo) = prev_bo.take() {
+                    drop(old_bo);
+                }
+                prev_fb = current_fb.take();
+                prev_bo = current_bo.take();
+                current_fb = Some(fb);
+                current_bo = Some(bo);
+                rendered += 1;
+                crate::profile::record_phase("rotate", t_rotate.elapsed().as_nanos() as u64);
+                crate::profile::record_phase(
+                    "frame_total",
+                    frame_start_t.elapsed().as_nanos() as u64,
+                );
+                crate::profile::frame_complete();
+
+                if !profile_active_t {
+                    pace_to_frame_deadline(start_mono_ns, rendered as u64, frame_period_ns);
+                }
+            }
+            Ok(())
+        })();
+        loop_elapsed_cell.set(start.elapsed());
+        loop_result?;
+        Ok(rendered)
+    })();
+
+    drain_pending_flip(session, card);
+    for (fb_opt, bo_opt) in [
+        (current_fb.take(), current_bo.take()),
+        (prev_fb.take(), prev_bo.take()),
+    ] {
+        if let Some(fb) = fb_opt {
+            if let Err(e) = card.destroy_framebuffer(fb) {
+                eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
+            }
+        }
+        if let Some(bo) = bo_opt {
+            drop(bo);
+        }
+    }
+    session.modeset_done = false;
+
+    let frame_count = work?;
+    let total_elapsed_ms = work_start_t.elapsed().as_millis();
+    let loop_elapsed_ms = loop_elapsed_cell.get().as_millis();
+    let effective_fps = if loop_elapsed_ms > 0 {
+        (frame_count as f64) * 1000.0 / (loop_elapsed_ms as f64)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "animated transition complete: kind={kind:?} rendered {frame_count} frames in {loop_elapsed_ms}ms (target {transition_ms}ms; effective {effective_fps:.1} fps; total {total_elapsed_ms}ms incl setup) [scissored-bake]"
+    );
+    Ok(frame_count)
+}
+
 /// Paint a slide (bg pass + text-layer passes) into the currently-
 /// bound framebuffer. Phase 5-a — extracted from `render_slide`'s
 /// closure so the same painting logic can target either the default
@@ -4654,6 +4996,111 @@ fn cached_transition_sp_program(
     })
 }
 
+/// QA-mandated scissored-bake (Step 4): create + cache an
+/// offscreen FBO + RGBA color-texture pair sized at the session's
+/// current mode. Returns (fbo, color_tex). Lazy-init from
+/// (None, None) -> populated; subsequent calls return the
+/// cached pair. Freed at with_egl_session teardown.
+unsafe fn ensure_bake_fbo_pair(
+    session: &mut EglSession,
+    slot: u8,
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    let cached = match slot {
+        0 => session.scissored_bake_fbo_a,
+        _ => session.scissored_bake_fbo_b,
+    };
+    if let Some(pair) = cached {
+        return Ok(pair);
+    }
+    let gl = session.gl;
+    let mode_w = session.mode_w as i32;
+    let mode_h = session.mode_h as i32;
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("bake_fbo glGenTextures: {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_image_2d(
+        glow::TEXTURE_2D, 0, glow::RGBA as i32, mode_w, mode_h, 0,
+        glow::RGBA, glow::UNSIGNED_BYTE, None,
+    );
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    let fbo = gl
+        .create_framebuffer()
+        .map_err(|e| {
+            gl.delete_texture(tex);
+            anyhow!("bake_fbo glGenFramebuffers: {e}")
+        })?;
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+    gl.framebuffer_texture_2d(
+        glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0,
+    );
+    let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    if status != glow::FRAMEBUFFER_COMPLETE {
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        bail!("bake_fbo incomplete: status=0x{status:x}");
+    }
+    let pair = (fbo, tex);
+    match slot {
+        0 => session.scissored_bake_fbo_a = Some(pair),
+        _ => session.scissored_bake_fbo_b = Some(pair),
+    }
+    Ok(pair)
+}
+
+/// QA-mandated scissored-bake (Step 4): eligibility for the
+/// scissored-bake path. Same shape as single-pass eligibility
+/// but with a higher per-slide layer cap. Used after single-
+/// pass eligibility fails (e.g. n_a + n_b > 4) to determine
+/// whether to take scissored-bake or fall through to legacy
+/// 3-pass.
+fn transition_eligible_for_scissored_bake(
+    kind: &str,
+    bg_a: &BgKind,
+    bg_b: &BgKind,
+    layers_a: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    layers_b: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+) -> bool {
+    if !is_transition_kind_single_pass(kind) {
+        return false;
+    }
+    if effective_solid_bg(bg_a).is_none() {
+        return false;
+    }
+    if effective_solid_bg(bg_b).is_none() {
+        return false;
+    }
+    if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
+        return false;
+    }
+    if layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
+        return false;
+    }
+    for (l, _, _) in layers_a.iter().chain(layers_b.iter()) {
+        if l.outline {
+            return false;
+        }
+        if !matches!(parse_blend_mode(&l.blend), BlendMode::Normal) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Decide whether scissored-bake should be PREFERRED over single-
+/// pass for given layer counts. SP wins on cheap-fragment cases;
+/// scissored-bake wins on per-fragment-budget overruns.
+fn prefer_scissored_bake(n_a: usize, n_b: usize) -> bool {
+    n_a > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+        || n_b > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+        || n_a + n_b > 4
+}
+
 /// QA-direct (2026-05-08): session-level fullscreen-quad VBO for
 /// the SP transition path. Lazy-allocated on first SP transition;
 /// freed at with_egl_session teardown. The geometry is identical
@@ -4689,6 +5136,73 @@ fn ensure_transition_sp_quad_vbo(session: &mut EglSession) -> Result<glow::Nativ
     }
     session.transition_sp_quad_vbo = Some(vbo);
     Ok(vbo)
+}
+
+/// QA-mandated scissored-bake (Step 4): composite-pass program
+/// cached per kind. The composite pass samples 2 baked slide
+/// textures with kind-specific warp + mix. Uses the EXISTING
+/// FS_<KIND> shaders (FS_FADE / FS_CUT / etc.) -- they already
+/// take 2 sampler2D + u_t and produce the final output. Just
+/// caches the program + uniform locations once per kind.
+#[derive(Clone)]
+struct CachedCompositeProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_src_a: Option<glow::NativeUniformLocation>,
+    u_src_b: Option<glow::NativeUniformLocation>,
+    u_t: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static COMPOSITE_PROGRAMS: std::cell::RefCell<
+        std::collections::HashMap<&'static str, CachedCompositeProgram>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedCompositeProgram> {
+    use glow::HasContext;
+    let kind_static =
+        sp_kind_static(kind).ok_or_else(|| anyhow!("kind {kind:?} has no SP generator"))?;
+    COMPOSITE_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(ccp) = cache.get(kind_static) {
+            return Ok(ccp.clone());
+        }
+        let fs = match fs_for_transition_kind(kind) {
+            Some(s) => s,
+            None => bail!("kind {kind:?} has no legacy FS"),
+        };
+        let program = link_program(gl, VS_TEXTURED_QUAD, fs)
+            .with_context(|| format!("link FS_<KIND={kind}> composite"))?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("composite VS missing a_pos"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("composite VS missing a_uv"))?;
+        let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
+        let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
+        let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        let ccp = CachedCompositeProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_src_a,
+            u_src_b,
+            u_t,
+        };
+        cache.insert(kind_static, ccp.clone());
+        Ok(ccp)
+    })
+}
+
+fn clear_composite_program_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    COMPOSITE_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        for (_, ccp) in cache.drain() {
+            unsafe { gl.delete_program(ccp.program); }
+        }
+    });
 }
 
 fn clear_transition_sp_program_cache(gl: &glow::Context) {
@@ -5703,10 +6217,26 @@ fn prewarm_sp_session(
     // -- the runtime uses prev_idx_for_reel which wraps at pass
     // boundaries, so without the wrap entry pass #1's first
     // transition would still pay a cold compile.
-    let mut compiled: std::collections::HashSet<(String, usize, usize)> =
+    //
+    // Per-tier dispatch matches render_transition_animated_in_
+    // session: low-cost combinations compile a single-pass
+    // program; higher-cost combinations compile bake + composite
+    // programs for the scissored-bake path. Tracks which tier
+    // each (kind, n_a, n_b) takes so prewarm and runtime agree.
+    let mut sp_compiled: std::collections::HashSet<(String, usize, usize)> =
         std::collections::HashSet::new();
-    let mut compile_count = 0_u32;
-    let mut consider_pair = |a_idx: usize, b_idx: usize, compiled: &mut std::collections::HashSet<(String, usize, usize)>, count: &mut u32| {
+    let mut composite_compiled: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut sp_count = 0_u32;
+    let mut composite_count = 0_u32;
+    let mut consider_pair = |
+        a_idx: usize,
+        b_idx: usize,
+        sp_compiled: &mut std::collections::HashSet<(String, usize, usize)>,
+        composite_compiled: &mut std::collections::HashSet<String>,
+        sp_count: &mut u32,
+        composite_count: &mut u32,
+    | {
         let kind = resolved[b_idx].1.as_str();
         if !is_transition_kind_single_pass(kind) {
             return;
@@ -5715,44 +6245,71 @@ fn prewarm_sp_session(
         let id_b = resolved[b_idx].0.id();
         let n_a = match layer_counts.get(&id_a) {
             Some(n) => *n,
-            None => return, // slide not in layer_counts: non-text OR resolve-failed
+            None => return,
         };
         let n_b = match layer_counts.get(&id_b) {
             Some(n) => *n,
             None => return,
         };
-        if n_a > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-            || n_b > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+        if n_a > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+            || n_b > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
         {
-            return; // exceeds cap; falls through to legacy
+            return; // exceeds bake cap; legacy
         }
-        let key = (kind.to_string(), n_a, n_b);
-        if compiled.contains(&key) {
-            return;
+        if !prefer_scissored_bake(n_a, n_b)
+            && n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+            && n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+        {
+            let key = (kind.to_string(), n_a, n_b);
+            if sp_compiled.contains(&key) {
+                return;
+            }
+            sp_compiled.insert(key);
+            if let Err(e) = cached_transition_sp_program(session.gl, kind, n_a, n_b) {
+                eprintln!(
+                    "reel: prewarm SP compile {kind:?}({n_a},{n_b}) failed: {e:#}; skipping"
+                );
+                return;
+            }
+            *sp_count += 1;
+        } else {
+            // Scissored-bake tier: bake passes use paint_slide (its
+            // own per-outline glyph program cache is primed by the
+            // slide-text raster pre-pass above). Only the kind-
+            // specific composite-pass program needs explicit
+            // pre-compile here.
+            if !composite_compiled.contains(kind) {
+                composite_compiled.insert(kind.to_string());
+                if let Err(e) = cached_composite_program(session.gl, kind) {
+                    eprintln!(
+                        "reel: prewarm composite({kind:?}) failed: {e:#}; skipping"
+                    );
+                    return;
+                }
+                *composite_count += 1;
+            }
         }
-        compiled.insert(key);
-        if let Err(e) = cached_transition_sp_program(session.gl, kind, n_a, n_b) {
-            eprintln!(
-                "reel: prewarm compile {kind:?}({n_a},{n_b}) failed: {e:#}; skipping"
-            );
-            return;
-        }
-        *count += 1;
     };
     for i in 1..resolved.len() {
-        consider_pair(i - 1, i, &mut compiled, &mut compile_count);
+        consider_pair(
+            i - 1, i,
+            &mut sp_compiled, &mut composite_compiled,
+            &mut sp_count, &mut composite_count,
+        );
     }
-    // Wrap pair: between passes, runtime transitions from
-    // last item back to first.
     if resolved.len() >= 2 {
-        consider_pair(resolved.len() - 1, 0, &mut compiled, &mut compile_count);
+        consider_pair(
+            resolved.len() - 1, 0,
+            &mut sp_compiled, &mut composite_compiled,
+            &mut sp_count, &mut composite_count,
+        );
     }
+    let compile_count = sp_count + composite_count;
 
     let elapsed_ms = t_prewarm.elapsed().as_millis();
     eprintln!(
-        "reel: prewarm complete -- {} slide texts rasterized, {} programs compiled, {elapsed_ms} ms",
+        "reel: prewarm complete -- {} slide texts rasterized, {compile_count} programs compiled (sp={sp_count} composite={composite_count}), {elapsed_ms} ms",
         text_slides.len(),
-        compile_count,
     );
     Ok(())
 }

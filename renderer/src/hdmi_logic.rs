@@ -777,6 +777,21 @@ void main() {
 /// 2×N must fit. N=4 is the cap.
 pub const SINGLE_PASS_MAX_LAYERS_PER_SLIDE: usize = 4;
 
+/// Maximum text layers per slide for the scissored-bake path.
+/// Bake-pass FS takes one slide's bg + N layer samplers; vc4
+/// 8-sampler cap with bg-as-uniform gives N ≤ 8 in principle.
+/// 6 keeps headroom and covers every FYS slide (max observed:
+/// 5 layers on Tile Chaos #08 / Chant Wall #09).
+pub const SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE: usize = 6;
+
+// fs_bake_sp_source removed 2026-05-08: the first attempt at
+// scissored-bake used a full-screen apply_layer chain in this
+// shader, but at 1080p with N apply_layer per fragment it was
+// fragment-bound at ~70 ms/frame. paint_slide (per-layer-rect
+// draws via cached_glyph_program + draw_text_layer) is the bake
+// path now. Const removed; see git history if a future scissor
+// optimization wants to revisit a generated-shader approach.
+
 /// QA-mandated single-pass transitions (2026-05-08 step 3):
 /// returns the set of transition kinds that have a single-pass
 /// shader generator implemented today. Kinds outside this set
