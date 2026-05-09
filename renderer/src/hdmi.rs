@@ -1968,13 +1968,18 @@ fn draw_text_layer(
             let to_fb_y = |ndc: f32| {
                 vp_y_off as f32 + (ndc + 1.0) * 0.5 * vp_h as f32
             };
-            let fb_l = to_fb_x(ndc_l).floor().max(0.0) as i32;
-            let fb_r = to_fb_x(ndc_r).ceil() as i32;
-            let fb_b = to_fb_y(ndc_b).floor().max(0.0) as i32;
-            let fb_t = to_fb_y(ndc_t).ceil() as i32;
-            // GL scissor takes (x, y, w, h) where y is from
-            // bottom of framebuffer, w/h must be >=0. Skip if
-            // empty (degenerate quad).
+            // Clamp to viewport bounds: motion translation can
+            // push the rect past the layer's box, and GL will
+            // clamp anyway, but reporting a tighter box up front
+            // makes the intent legible (sw / sh tests below now
+            // mean what they say). Also skip the scissor entirely
+            // when the rect collapses to empty.
+            let vp_x_max = (vp_x_off + vp_w) as f32;
+            let vp_y_max = (vp_y_off + vp_h) as f32;
+            let fb_l = to_fb_x(ndc_l).floor().clamp(vp_x_off as f32, vp_x_max) as i32;
+            let fb_r = to_fb_x(ndc_r).ceil().clamp(vp_x_off as f32, vp_x_max) as i32;
+            let fb_b = to_fb_y(ndc_b).floor().clamp(vp_y_off as f32, vp_y_max) as i32;
+            let fb_t = to_fb_y(ndc_t).ceil().clamp(vp_y_off as f32, vp_y_max) as i32;
             let sw = (fb_r - fb_l).max(0);
             let sh = (fb_t - fb_b).max(0);
             if sw > 0 && sh > 0 {
@@ -3269,6 +3274,30 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Per-layer resolved text (cold-scout #13). For layers without
+/// auto_mode set, returns a `Cow::Borrowed` of `layer.text` -- no
+/// allocation per frame. For auto_mode layers, calls
+/// `format_auto_text` and wraps the resulting String in
+/// `Cow::Owned`. The pre-fix code unconditionally cloned
+/// `layer.text` into a String per frame even when nothing
+/// changed; for static slides with long layer text the clones
+/// were a measurable per-frame allocation tax.
+fn resolve_layer_text<'a>(
+    layer: &'a crate::content::TextLayer,
+    cal: crate::hdmi_logic::CalendarUtc,
+) -> std::borrow::Cow<'a, str> {
+    match layer.auto_mode.as_deref() {
+        None => std::borrow::Cow::Borrowed(layer.text.as_str()),
+        Some(_) => format_auto_text(
+            layer.auto_mode.as_deref(),
+            layer.auto_format.as_deref(),
+            cal,
+        )
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(layer.text.as_str())),
+    }
+}
+
 fn layer_id_seed(slide_id: Uuid, index: usize) -> u64 {
     let bytes = slide_id.as_bytes();
     let high = u64::from_le_bytes([
@@ -4289,13 +4318,6 @@ fn prepare_layers_for_single_pass(
         );
     }
     let cal = unix_to_calendar_utc(wall_clock_unix);
-    let resolved_texts: Vec<String> = text_layers
-        .iter()
-        .map(|(layer, _, _)| {
-            format_auto_text(layer.auto_mode.as_deref(), layer.auto_format.as_deref(), cal)
-                .unwrap_or_else(|| layer.text.clone())
-        })
-        .collect();
     if glyph_cache.len() != text_layers.len() {
         glyph_cache.clear();
         glyph_cache.resize_with(text_layers.len(), || None);
@@ -4312,7 +4334,8 @@ fn prepare_layers_for_single_pass(
     }
     // Stage 1: rasterize-or-reuse.
     for (i, (layer, _, font)) in text_layers.iter().enumerate() {
-        let resolved_text = &resolved_texts[i];
+        let resolved_cow = resolve_layer_text(layer, cal);
+        let resolved_text: &str = &resolved_cow;
         let size_px = effective_font_size_px(
             layer.font_size_px,
             layer.font_size_pct,
@@ -4330,7 +4353,7 @@ fn prepare_layers_for_single_pass(
                     )
                 })?;
             glyph_cache[i] = Some(CachedGlyph {
-                text: resolved_text.clone(),
+                text: resolved_cow.into_owned(),
                 size_px,
                 bitmap: bm,
             });
@@ -4948,9 +4971,8 @@ fn render_transition_scissored_bake_in_session(
             eprintln!("warn: ensure_slide_bg_cache slide_b={slide_b_id}: {e:#}; falling back to per-frame bg render");
         }
     }
-    let region_w = crate::hdmi_logic::ATLAS_REGION_W;
     let region_h = crate::hdmi_logic::ATLAS_REGION_H;
-    // mode_w (1920) ≤ region_w (2048) and mode_h (1080) ≥
+    // mode_w (1920) ≤ atlas_region_w (2048) and mode_h (1080) ≥
     // region_h (1024). Used range for slide content: x in
     // [0, mode_w], y in [0, region_h] (per region). Atlas-uv
     // scale = mode_w/atlas_w on x, region_h/atlas_h on y.
@@ -6264,23 +6286,7 @@ fn paint_slide_with_viewport(
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
         }
-        // v1-spec-delta #3: resolve layer text up front. auto_mode
-        // != None substitutes a formatted clock/date/day string; if
-        // the substitution returns None (mode unset/unknown) the
-        // layer's authored text falls through. Computed per frame
-        // because per-frame is when the wall-clock advances.
         let cal = unix_to_calendar_utc(wall_clock_unix);
-        let resolved_texts: Vec<String> = text_layers
-            .iter()
-            .map(|(layer, _, _)| {
-                format_auto_text(
-                    layer.auto_mode.as_deref(),
-                    layer.auto_format.as_deref(),
-                    cal,
-                )
-                .unwrap_or_else(|| layer.text.clone())
-            })
-            .collect();
         // v1-spec-delta #3 (slice b QA followup): rasterize through
         // the per-layer cache. On cache hit (text unchanged), skip
         // the fontdue call entirely -- this is what limits the
@@ -6310,7 +6316,8 @@ fn paint_slide_with_viewport(
         // needs a fresh GL texture upload. Cache hit = bitmap
         // unchanged = tex stays.
         for (i, (layer, _, font)) in text_layers.iter().enumerate() {
-            let resolved_text = &resolved_texts[i];
+            let resolved_cow = resolve_layer_text(layer, cal);
+            let resolved_text: &str = &resolved_cow;
             // Compute size_px first so should_rerasterize can key
             // on (text, size_px). Pre-fix the cache keyed only on
             // text — a layout-changing edit (box.w / mode_w shrink)
@@ -6341,7 +6348,7 @@ fn paint_slide_with_viewport(
                     bm.width, bm.height,
                 );
                 cache_ref[i] = Some(CachedGlyph {
-                    text: resolved_text.clone(),
+                    text: resolved_cow.into_owned(),
                     size_px,
                     bitmap: bm,
                 });
