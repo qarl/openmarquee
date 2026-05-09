@@ -1020,6 +1020,65 @@ pub fn gradient_density_is_degenerate(density: f32) -> bool {
     density.abs() < 1e-4
 }
 
+/// Reel-prewarm tier classification for a single (kind, n_a, n_b)
+/// transition pair. The runtime in `prewarm_sp_session` walks every
+/// (i-1, i) plus the wrap-around (last, first) pair across the
+/// resolved reel, and asks `classify_prewarm_pair` which compile
+/// path each takes so the GPU programs are already linked when the
+/// first frame of that transition reaches `render_transition_
+/// animated_in_session`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrewarmTier {
+    /// Kind isn't in the SP-portable set (e.g. `glitch`, unknown).
+    /// Runtime falls through to legacy 3-pass; nothing for prewarm
+    /// to compile.
+    NotSinglePass,
+    /// Either side's layer count exceeds the SB cap (6). Runtime
+    /// also falls through to legacy 3-pass for these; prewarm
+    /// has nothing to compile.
+    ExceedsBakeCap,
+    /// SP tier: compile a `cached_transition_sp_program(kind,
+    /// n_a, n_b)`. Runtime takes the single-pass path.
+    SinglePass,
+    /// Scissored-bake tier: compile the per-kind composite
+    /// program (or the side-specialized cut programs for
+    /// `kind == "cut"`). Runtime takes the atlas-SB path.
+    ScissoredBake,
+}
+
+/// Classify a (kind, n_a, n_b) transition pair into the prewarm
+/// tier the reel will use. Pure-logic mirror of the decision tree
+/// in `prewarm_sp_session::consider_pair`. Tier dispatch:
+///   1. kind in SP-portable set? if no -> `NotSinglePass`.
+///   2. either side > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE (6)?
+///      if yes -> `ExceedsBakeCap`.
+///   3. SP-cheaper-by-bench (`!prefer_scissored_bake(n_a, n_b)
+///      && both sides within SP cap`)? if yes -> `SinglePass`,
+///      else -> `ScissoredBake`.
+///
+/// The third arm's per-side <= SP cap check is defensive: when
+/// `prefer_scissored_bake` returns false it already implies both
+/// sides <= 4 (since the predicate is OR-of-{>4 OR sum>4}). Kept
+/// for parity with the runtime call site.
+pub fn classify_prewarm_pair(kind: &str, n_a: usize, n_b: usize) -> PrewarmTier {
+    if !is_transition_kind_single_pass(kind) {
+        return PrewarmTier::NotSinglePass;
+    }
+    if n_a > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+        || n_b > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+    {
+        return PrewarmTier::ExceedsBakeCap;
+    }
+    if !prefer_scissored_bake(n_a, n_b)
+        && n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+        && n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+    {
+        PrewarmTier::SinglePass
+    } else {
+        PrewarmTier::ScissoredBake
+    }
+}
+
 /// Per-layer property summary used by the atlas-SB / single-pass
 /// eligibility gates. Sufficient for the gate logic without
 /// dragging in `crate::content::TextLayer` or `Rc<fontdue::Font>`;
@@ -6664,5 +6723,138 @@ mod tests {
         // to UV bottom 0.25.
         assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
         assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
+    }
+
+    // P2-I (continued): classify_prewarm_pair. The function is the
+    // pure-logic mirror of the decision tree in
+    // prewarm_sp_session::consider_pair (hdmi.rs); these tests pin
+    // every PrewarmTier outcome.
+
+    #[test]
+    fn classify_prewarm_pair_non_sp_kind_returns_not_single_pass() {
+        // Glitch is qarl-deferred from SP path. Unknown / empty
+        // kinds also fall through to legacy 3-pass.
+        assert_eq!(
+            classify_prewarm_pair("glitch", 1, 1),
+            PrewarmTier::NotSinglePass,
+        );
+        assert_eq!(
+            classify_prewarm_pair("", 1, 1),
+            PrewarmTier::NotSinglePass,
+        );
+        assert_eq!(
+            classify_prewarm_pair("unknown_kind", 4, 4),
+            PrewarmTier::NotSinglePass,
+        );
+    }
+
+    #[test]
+    fn classify_prewarm_pair_above_bake_cap_returns_exceeds_bake_cap() {
+        // SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE = 6. 7 on either
+        // side means SB can't host the slide; runtime falls
+        // through to legacy 3-pass.
+        assert_eq!(SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE, 6);
+        assert_eq!(
+            classify_prewarm_pair("fade", 7, 1),
+            PrewarmTier::ExceedsBakeCap,
+        );
+        assert_eq!(
+            classify_prewarm_pair("fade", 1, 7),
+            PrewarmTier::ExceedsBakeCap,
+        );
+        assert_eq!(
+            classify_prewarm_pair("fade", 100, 100),
+            PrewarmTier::ExceedsBakeCap,
+        );
+    }
+
+    #[test]
+    fn classify_prewarm_pair_low_count_returns_single_pass() {
+        // Combined <= 4 AND each side <= SP cap -> SP tier.
+        for (na, nb) in [(0, 0), (1, 1), (2, 2), (4, 0), (3, 1)] {
+            assert_eq!(
+                classify_prewarm_pair("fade", na, nb),
+                PrewarmTier::SinglePass,
+                "({na}, {nb}) should be SP-eligible",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_prewarm_pair_above_combined_returns_scissored_bake() {
+        // Combined > 4 with both sides within SP cap STILL goes
+        // SB (the prefer_scissored_bake heuristic). 5L+5L all-
+        // motion is the documented FYS heavy case here.
+        for (na, nb) in [(3, 2), (4, 1), (1, 4), (4, 4), (5, 0)] {
+            assert_eq!(
+                classify_prewarm_pair("fade", na, nb),
+                PrewarmTier::ScissoredBake,
+                "({na}, {nb}) should route SB",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_prewarm_pair_above_sp_cap_within_sb_cap_returns_scissored_bake() {
+        // Per-side > SINGLE_PASS_MAX_LAYERS_PER_SLIDE (4) but <=
+        // SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE (6) -> SB tier.
+        for (na, nb) in [(5, 0), (5, 5), (6, 0), (6, 6), (5, 6)] {
+            assert_eq!(
+                classify_prewarm_pair("fade", na, nb),
+                PrewarmTier::ScissoredBake,
+                "({na}, {nb}) within SB cap should route SB",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_prewarm_pair_skip_tiers_dominate_kind_check() {
+        // ExceedsBakeCap takes priority over kind check IF the
+        // kind passes -- but if the kind fails, NotSinglePass
+        // dominates regardless of layer count. Pin the priority
+        // ordering since it's load-bearing for prewarm correctness.
+        assert_eq!(
+            classify_prewarm_pair("glitch", 100, 100),
+            PrewarmTier::NotSinglePass,
+            "kind-failure dominates layer-cap-failure",
+        );
+        assert_eq!(
+            classify_prewarm_pair("fade", 100, 100),
+            PrewarmTier::ExceedsBakeCap,
+            "kind-pass + layer-cap-fail = ExceedsBakeCap",
+        );
+    }
+
+    #[test]
+    fn classify_prewarm_pair_alignment_with_runtime_dispatch() {
+        // The runtime dispatcher uses prefer_scissored_bake +
+        // SINGLE_PASS / SCISSORED_BAKE caps. classify_prewarm_pair
+        // MUST agree on every (kind, n_a, n_b) combo so prewarm
+        // and runtime never disagree on which program to compile
+        // vs which program to call. Spot-check across the per-
+        // side cap and combined cap.
+        for kind in ["fade", "wipe", "marquee"] {
+            for n_a in 0..=8 {
+                for n_b in 0..=8 {
+                    let tier = classify_prewarm_pair(kind, n_a, n_b);
+                    let exceeds_bake = n_a > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+                        || n_b > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE;
+                    let prefer_sb = prefer_scissored_bake(n_a, n_b);
+                    let within_sp = n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+                        && n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE;
+                    let expected = if exceeds_bake {
+                        PrewarmTier::ExceedsBakeCap
+                    } else if !prefer_sb && within_sp {
+                        PrewarmTier::SinglePass
+                    } else {
+                        PrewarmTier::ScissoredBake
+                    };
+                    assert_eq!(
+                        tier, expected,
+                        "{kind} ({n_a}, {n_b}) classifier disagrees with runtime",
+                    );
+                }
+            }
+        }
     }
 }

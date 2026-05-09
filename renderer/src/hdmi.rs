@@ -49,12 +49,12 @@ use crate::hdmi_logic::{
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
-    compute_layer_uv_rect_logic, fs_transition_sp_source,
-    gradient_density_is_degenerate, is_transition_kind_single_pass,
-    prefer_scissored_bake, sp_kind_static,
+    classify_prewarm_pair, compute_layer_uv_rect_logic,
+    fs_transition_sp_source, gradient_density_is_degenerate,
+    is_transition_kind_single_pass, prefer_scissored_bake, sp_kind_static,
     stripes_uniforms, transition_eligible_for_scissored_bake_logic,
     transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
-    AlphaBitmap, BlendMode, FontCatalog,
+    AlphaBitmap, BlendMode, FontCatalog, PrewarmTier,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
@@ -7174,9 +7174,6 @@ fn prewarm_sp_session(
         composite_count: &mut u32,
     | {
         let kind = resolved[b_idx].1.as_str();
-        if !is_transition_kind_single_pass(kind) {
-            return;
-        }
         let id_a = resolved[a_idx].0.id();
         let id_b = resolved[b_idx].0.id();
         let n_a = match layer_counts.get(&id_a) {
@@ -7187,56 +7184,55 @@ fn prewarm_sp_session(
             Some(n) => *n,
             None => return,
         };
-        if n_a > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
-            || n_b > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
-        {
-            return; // exceeds bake cap; legacy
-        }
-        if !prefer_scissored_bake(n_a, n_b)
-            && n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-            && n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-        {
-            let key = (kind.to_string(), n_a, n_b);
-            if sp_compiled.contains(&key) {
-                return;
+        match classify_prewarm_pair(kind, n_a, n_b) {
+            PrewarmTier::NotSinglePass | PrewarmTier::ExceedsBakeCap => {
+                // Both fall through to legacy 3-pass at runtime;
+                // prewarm has nothing to compile here.
             }
-            sp_compiled.insert(key);
-            if let Err(e) = cached_transition_sp_program(session.gl, kind, n_a, n_b) {
-                eprintln!(
-                    "reel: prewarm SP compile {kind:?}({n_a},{n_b}) failed: {e:#}; skipping"
-                );
-                return;
-            }
-            *sp_count += 1;
-        } else {
-            // Scissored-bake tier: bake passes use paint_slide (its
-            // own per-outline glyph program cache is primed by the
-            // slide-text raster pre-pass above). Only the kind-
-            // specific composite-pass program needs explicit
-            // pre-compile here.
-            if !composite_compiled.contains(kind) {
-                composite_compiled.insert(kind.to_string());
-                if kind == "cut" {
-                    // Cut path uses ONLY the side-specialized
-                    // FS_CUT_A / FS_CUT_B composite shaders at
-                    // runtime; combined FS_CUT is unused so skip
-                    // the compile. Matches the runtime SB cut
-                    // path that no longer compiles `ccp` for
-                    // kind=="cut".
-                    for side_b in [false, true] {
-                        if let Err(e) = cached_cut_composite_program(session.gl, side_b) {
-                            eprintln!(
-                                "reel: prewarm cut composite (side_b={side_b}) failed: {e:#}; skipping"
-                            );
-                        }
-                    }
-                } else if let Err(e) = cached_composite_program(session.gl, kind) {
+            PrewarmTier::SinglePass => {
+                let key = (kind.to_string(), n_a, n_b);
+                if sp_compiled.contains(&key) {
+                    return;
+                }
+                sp_compiled.insert(key);
+                if let Err(e) = cached_transition_sp_program(session.gl, kind, n_a, n_b) {
                     eprintln!(
-                        "reel: prewarm composite({kind:?}) failed: {e:#}; skipping"
+                        "reel: prewarm SP compile {kind:?}({n_a},{n_b}) failed: {e:#}; skipping"
                     );
                     return;
                 }
-                *composite_count += 1;
+                *sp_count += 1;
+            }
+            PrewarmTier::ScissoredBake => {
+                // Scissored-bake tier: bake passes use paint_slide
+                // (its own per-outline glyph program cache is
+                // primed by the slide-text raster pre-pass above).
+                // Only the kind-specific composite-pass program
+                // needs explicit pre-compile here.
+                if !composite_compiled.contains(kind) {
+                    composite_compiled.insert(kind.to_string());
+                    if kind == "cut" {
+                        // Cut path uses ONLY the side-specialized
+                        // FS_CUT_A / FS_CUT_B composite shaders at
+                        // runtime; combined FS_CUT is unused so skip
+                        // the compile. Matches the runtime SB cut
+                        // path that no longer compiles `ccp` for
+                        // kind=="cut".
+                        for side_b in [false, true] {
+                            if let Err(e) = cached_cut_composite_program(session.gl, side_b) {
+                                eprintln!(
+                                    "reel: prewarm cut composite (side_b={side_b}) failed: {e:#}; skipping"
+                                );
+                            }
+                        }
+                    } else if let Err(e) = cached_composite_program(session.gl, kind) {
+                        eprintln!(
+                            "reel: prewarm composite({kind:?}) failed: {e:#}; skipping"
+                        );
+                        return;
+                    }
+                    *composite_count += 1;
+                }
             }
         }
     };
