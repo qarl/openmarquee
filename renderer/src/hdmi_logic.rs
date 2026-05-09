@@ -784,8 +784,8 @@ pub const SINGLE_PASS_MAX_LAYERS_PER_SLIDE: usize = 4;
 /// per batch as kinds are ported.
 ///
 /// Batch A: cut, fade, wipe, iris, dissolve.
-/// Batch B (this commit): scanline, halftone, blinds, shutter.
-/// Batch C (planned): slide, push, scroll.
+/// Batch B: scanline, halftone, blinds, shutter.
+/// Batch C (this commit): slide, push, scroll.
 /// Batch D (planned): flip, marquee, pixelate.
 /// Glitch: qarl-deferred -- stays on legacy.
 pub fn is_transition_kind_single_pass(kind: &str) -> bool {
@@ -800,6 +800,9 @@ pub fn is_transition_kind_single_pass(kind: &str) -> bool {
             | "halftone"
             | "blinds"
             | "shutter"
+            | "slide"
+            | "push"
+            | "scroll"
     )
 }
 
@@ -1050,6 +1053,58 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             s.push_str("    float inscribed = 1.5 * u_t;\n");
             s.push_str("    float mask = step(hex_d, inscribed);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
+        }
+        "slide" => {
+            // Horizontal slide: B enters from right, A exits left.
+            // sample_uv_a = (v_uv.x + t, y); sample_uv_b =
+            // (v_uv.x - (1-t), y). When the warped coord exits
+            // [0,1] no layer rect-test will match, so the bg
+            // uniform alone shows through -- matching legacy
+            // CLAMP_TO_EDGE behavior on the FBO bake.
+            s.push_str("    float t = u_t;\n");
+            s.push_str("    float seam = 1.0 - t;\n");
+            s.push_str("    vec2 sample_uv_a = vec2(v_uv.x + t, v_uv.y);\n");
+            s.push_str("    vec2 sample_uv_b = vec2(v_uv.x - seam, v_uv.y);\n");
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "sample_uv_a");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "sample_uv_b");
+            s.push_str("    float on_to = step(seam, v_uv.x);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, on_to), 1.0);\n");
+        }
+        "push" => {
+            // Horizontal push: B enters from LEFT, pushes A off
+            // the right. Bright projector-blade separator at the
+            // seam (smoothstep'd 0.001 wide × 0.8 brightness).
+            s.push_str("    float t = u_t;\n");
+            s.push_str("    vec2 sample_uv_a = vec2(v_uv.x - t, v_uv.y);\n");
+            s.push_str("    vec2 sample_uv_b = vec2(v_uv.x + (1.0 - t), v_uv.y);\n");
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "sample_uv_a");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "sample_uv_b");
+            s.push_str("    float on_to = step(v_uv.x, t);\n");
+            s.push_str("    vec3 col = mix(ca, cb, on_to);\n");
+            s.push_str("    float blade = 1.0 - smoothstep(0.0, 0.001, abs(v_uv.x - t));\n");
+            s.push_str("    col = mix(col, vec3(1.0), blade * 0.8);\n");
+            s.push_str("    gl_FragColor = vec4(col, 1.0);\n");
+        }
+        "scroll" => {
+            // Vertical analog of slide: B enters from bottom as
+            // A rolls up off the top. Note v_uv.y is bottom-up
+            // (NDC convention from VS_TEXTURED_QUAD); the legacy
+            // FS_SCROLL used the same convention so the math
+            // ports verbatim.
+            s.push_str("    float t = u_t;\n");
+            s.push_str("    float seam = 1.0 - t;\n");
+            s.push_str("    vec2 sample_uv_a = vec2(v_uv.x, v_uv.y + t);\n");
+            s.push_str("    vec2 sample_uv_b = vec2(v_uv.x, v_uv.y - seam);\n");
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "sample_uv_a");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "sample_uv_b");
+            s.push_str("    float on_to = step(seam, v_uv.y);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, on_to), 1.0);\n");
         }
         _ => unreachable!(
             "push_main_body called for unsupported kind {kind:?}; \
@@ -3799,10 +3854,10 @@ mod tests {
 
     #[test]
     fn is_transition_kind_single_pass_classifies_correctly() {
-        // Batch A + Batch B ported set (9 kinds).
+        // Batch A + Batch B + Batch C ported set (12 kinds).
         for kind in [
             "cut", "fade", "wipe", "iris", "dissolve", "scanline", "halftone",
-            "blinds", "shutter",
+            "blinds", "shutter", "slide", "push", "scroll",
         ] {
             assert!(
                 is_transition_kind_single_pass(kind),
@@ -3810,7 +3865,7 @@ mod tests {
             );
         }
         // Not yet ported (still on legacy 3-pass; will fall through).
-        for kind in ["slide", "push", "scroll", "flip", "marquee", "pixelate"] {
+        for kind in ["flip", "marquee", "pixelate"] {
             assert!(
                 !is_transition_kind_single_pass(kind),
                 "{kind} not yet ported -- should not be SP-eligible"
@@ -3819,6 +3874,38 @@ mod tests {
         // Glitch is qarl-deferred.
         assert!(!is_transition_kind_single_pass("glitch"));
         assert!(!is_transition_kind_single_pass("unknown"));
+    }
+
+    #[test]
+    fn fs_transition_sp_source_batch_c_warped_sample() {
+        // QA Step 3 Batch C: slide, push, scroll. These are
+        // Group-B warped-sample transitions; sample_uv differs
+        // per slide. Pin the warp expressions + the "slide A
+        // composes at sample_uv_a, slide B at sample_uv_b"
+        // shape.
+        for kind in ["slide", "push", "scroll"] {
+            let s = fs_transition_sp_source(kind, 1, 1)
+                .unwrap_or_else(|| panic!("expected SP source for {kind}"));
+            assert!(s.contains("sample_uv_a"), "{kind}: missing sample_uv_a");
+            assert!(s.contains("sample_uv_b"), "{kind}: missing sample_uv_b");
+            assert!(
+                s.contains("apply_layer(ca, u_a_tex0, u_a_rect0, u_a_rgba0, sample_uv_a)"),
+                "{kind}: slide A apply_layer should pass sample_uv_a"
+            );
+            assert!(
+                s.contains("apply_layer(cb, u_b_tex0, u_b_rect0, u_b_rgba0, sample_uv_b)"),
+                "{kind}: slide B apply_layer should pass sample_uv_b"
+            );
+        }
+        // Per-kind shape pins.
+        let slide = fs_transition_sp_source("slide", 0, 0).unwrap();
+        assert!(slide.contains("vec2(v_uv.x + t, v_uv.y)"));
+        assert!(slide.contains("vec2(v_uv.x - seam, v_uv.y)"));
+        let push = fs_transition_sp_source("push", 0, 0).unwrap();
+        assert!(push.contains("vec2(v_uv.x - t, v_uv.y)"));
+        assert!(push.contains("blade"));
+        let scroll = fs_transition_sp_source("scroll", 0, 0).unwrap();
+        assert!(scroll.contains("vec2(v_uv.x, v_uv.y + t)"));
     }
 
     #[test]

@@ -4457,6 +4457,9 @@ fn sp_kind_static(kind: &str) -> Option<&'static str> {
         "halftone" => "halftone",
         "blinds" => "blinds",
         "shutter" => "shutter",
+        "slide" => "slide",
+        "push" => "push",
+        "scroll" => "scroll",
         _ => return None,
     })
 }
