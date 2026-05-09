@@ -49,8 +49,9 @@ use crate::hdmi_logic::{
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
-    fs_fade_sp_source, stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode,
-    FontCatalog, ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
+    fs_transition_sp_source, is_transition_kind_single_pass, stripes_uniforms,
+    unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog, ModeSpec, MotionKind,
+    MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
     FS_PATTERN_GRID, FS_PATTERN_HALFTONE, FS_PATTERN_RAYS, FS_PATTERN_RINGS,
@@ -483,7 +484,7 @@ where
     // the GL context lifecycle.
     clear_glyph_program_cache(&gl);
     clear_transition_program_cache(&gl);
-    clear_fade_sp_program_cache(&gl);
+    clear_transition_sp_program_cache(&gl);
     // v1-spec-delta #9 (slice d): drain pending flip + free
     // session-level scanout BO/FB rotation. Mirrors the
     // animated_slide end-of-call cleanup but at session
@@ -3235,8 +3236,8 @@ fn render_transition_animated_in_session(
     // slide that doesn't fit (image bg, pattern bg, >4 layers,
     // outline, non-normal blend) falls through to the legacy path.
     if transition_eligible_for_single_pass(kind, &bg_a, &bg_b, &layers_a, &layers_b) {
-        return render_fade_single_pass_in_session(
-            session, card, slide_a, slide_b, fonts, content_root, transition_ms, fps,
+        return render_transition_single_pass_in_session(
+            session, card, slide_a, slide_b, fonts, content_root, kind, transition_ms, fps,
         );
     }
 
@@ -3657,15 +3658,14 @@ fn render_transition_animated_in_session(
     Ok(frame_count)
 }
 
-/// QA-mandated single-pass transition (2026-05-08): eligibility
-/// gate for FS_FADE_SP. The single-pass shader can express:
-///   - kind = "fade" (more kinds added by step 3 of the QA plan)
+/// QA-mandated single-pass transition (2026-05-08, step 3): per-
+/// transition eligibility gate. The single-pass shader can express
+/// any kind for which `is_transition_kind_single_pass` returns
+/// true PLUS the slide composition fits the FS layout:
 ///   - solid bg on both sides (no pattern/image)
 ///   - <= 4 visible text layers per slide (texture-unit budget)
-///   - all layers blend=normal, outline=false (FS path doesn't
-///     have multiply/screen branches yet, no neighbor-tap dilation)
-/// Anything else falls through to the legacy bake+composite path
-/// so behavior is preserved.
+///   - all layers blend=normal, outline=false
+/// Anything else falls through to the legacy 3-pass bake+composite.
 fn transition_eligible_for_single_pass(
     kind: &str,
     bg_a: &BgKind,
@@ -3673,7 +3673,7 @@ fn transition_eligible_for_single_pass(
     layers_a: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     layers_b: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
 ) -> bool {
-    if kind != "fade" {
+    if !is_transition_kind_single_pass(kind) {
         return false;
     }
     if !matches!(bg_a, BgKind::Solid(_)) {
@@ -3902,28 +3902,32 @@ fn prepare_layers_for_single_pass(
     Ok((rects, rgbas, texs))
 }
 
-/// QA-mandated single-pass transition (2026-05-08): per-frame
-/// fade transition that composites both slides + the fade mix in
-/// ONE fragment shader pass to the default framebuffer. Replaces
-/// the legacy bake_a + bake_b + composite three-pass structure
-/// for transitions that satisfy transition_eligible_for_single_pass.
+/// QA-mandated single-pass transition (2026-05-08, step 3): per-
+/// frame transition that composites both slides + the per-kind
+/// transition mix in ONE fragment shader pass to the default
+/// framebuffer. Replaces the legacy bake_a + bake_b + composite
+/// three-pass structure for transitions that satisfy
+/// transition_eligible_for_single_pass.
+///
+/// `kind` selects the FS via fs_transition_sp_source. The slice-1
+/// implementation supported only "fade"; step 3 expands to all
+/// non-glitch kinds.
 ///
 /// The fragment-fill cost drops from 3× 1080p (bake_a + bake_b +
 /// composite) to 1× 1080p, matching the slide-render path's per-
-/// frame budget so transitions hit the same 30 fps wall-clock
-/// gate.
+/// frame budget.
 ///
 /// Resource lifecycle mirrors render_transition_animated_in_session:
-/// VBO + page-flip pacing + N-2 BO/FB rotation. The 8 layer
-/// alpha-bitmap textures are session-cached via slide_caches; the
-/// dummy 1×1 fill-in is session-cached via dummy_alpha_tex.
-fn render_fade_single_pass_in_session(
+/// VBO + page-flip pacing + N-2 BO/FB rotation. Per-layer alpha-
+/// bitmap textures are session-cached via slide_caches.
+fn render_transition_single_pass_in_session(
     session: &mut EglSession,
     card: &Card,
     slide_a: &TextSlide,
     slide_b: &TextSlide,
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
+    kind: &str,
     transition_ms: u32,
     fps: u32,
 ) -> Result<u32> {
@@ -3933,27 +3937,30 @@ fn render_fade_single_pass_in_session(
     if fps == 0 {
         bail!("fps must be > 0");
     }
+    if !is_transition_kind_single_pass(kind) {
+        bail!("single-pass transition: kind {kind:?} has no SP generator");
+    }
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
     let bg_a_color: [f32; 3] = match &bg_a_kind {
         BgKind::Solid(c) => [c[0], c[1], c[2]],
-        _ => bail!("single-pass fade: bg_a must be solid"),
+        _ => bail!("single-pass transition: bg_a must be solid"),
     };
     let bg_b_color: [f32; 3] = match &bg_b_kind {
         BgKind::Solid(c) => [c[0], c[1], c[2]],
-        _ => bail!("single-pass fade: bg_b must be solid"),
+        _ => bail!("single-pass transition: bg_b must be solid"),
     };
     if layers_a.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
         || layers_b.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
     {
         bail!(
-            "single-pass fade: layer count exceeds {} per slide",
+            "single-pass transition: layer count exceeds {} per slide",
             SINGLE_PASS_MAX_LAYERS_PER_SLIDE
         );
     }
 
     eprintln!(
-        "rendering single-pass fade transition slide_a={} slide_b={} \
+        "rendering single-pass {kind} transition slide_a={} slide_b={} \
          transition_ms={transition_ms} fps={fps} layers_a={} layers_b={}",
         slide_a.id,
         slide_b.id,
@@ -4004,7 +4011,7 @@ fn render_fade_single_pass_in_session(
     let work: Result<u32> = (|| {
         use glow::HasContext;
         let gl = session.gl;
-        let program = cached_fade_sp_program(gl, layers_a_len, layers_b_len)?;
+        let program = cached_transition_sp_program(gl, kind, layers_a_len, layers_b_len)?;
 
         let vbo = unsafe {
             gl.create_buffer()
@@ -4302,8 +4309,7 @@ fn render_fade_single_pass_in_session(
         0.0
     };
     eprintln!(
-        "animated transition complete: kind={:?} rendered {frame_count} frames in {elapsed_ms}ms (target {transition_ms}ms; effective {effective_fps:.1} fps) [single-pass]",
-        "fade",
+        "animated transition complete: kind={kind:?} rendered {frame_count} frames in {elapsed_ms}ms (target {transition_ms}ms; effective {effective_fps:.1} fps) [single-pass]"
     );
     Ok(frame_count)
 }
@@ -4402,42 +4408,60 @@ fn clear_transition_program_cache(gl: &glow::Context) {
     });
 }
 
-/// QA-mandated single-pass transition (2026-05-08): per-(n_a, n_b)
-/// shader cache for FS_FADE_SP. The first cut used a fixed 8-slot
-/// shader with rgba.a=0 early-outs for unused slots; on vc4 that
-/// branchy SIMD ALU stalled at 8.4 fps@1080p. Specialization
-/// generates the FS with EXACTLY n_a + n_b apply_layer calls (no
-/// unused branches), one program per pair, cached so the FYS
-/// reel's repeated (1,1)/(1,2)/(2,2) transitions share compile
-/// cost across the session. Keyed by (n_a, n_b) tuple. Cleared
-/// at with_egl_session teardown via clear_fade_sp_program_cache.
+/// QA-mandated single-pass transition (2026-05-08, step 3
+/// generalization): per-(kind, n_a, n_b) shader cache. The slice-2
+/// fade-only cache became inadequate once additional transition
+/// kinds gained their own specialized shaders. Keyed by
+/// (kind: &'static str, n_a, n_b) tuple. The kind string is a
+/// kind literal (e.g. "fade", "wipe") so the HashMap key is cheap.
+/// FYS reel cycles through ~5-15 unique (kind, n_a, n_b) pairs;
+/// each compiles ONCE per session.
 std::thread_local! {
-    static FADE_SP_PROGRAMS: std::cell::RefCell<
-        std::collections::HashMap<(usize, usize), glow::NativeProgram>,
+    static TRANSITION_SP_PROGRAMS: std::cell::RefCell<
+        std::collections::HashMap<(&'static str, usize, usize), glow::NativeProgram>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-fn cached_fade_sp_program(
+/// Resolve `kind` to a 'static string slice if and only if it has a
+/// single-pass generator. Required because HashMap keys borrow
+/// 'static; a runtime `&str` would need ownership. Mirrors the
+/// match in is_transition_kind_single_pass; grows as batches port.
+fn sp_kind_static(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "cut" => "cut",
+        "fade" => "fade",
+        "wipe" => "wipe",
+        "iris" => "iris",
+        "dissolve" => "dissolve",
+        _ => return None,
+    })
+}
+
+fn cached_transition_sp_program(
     gl: &glow::Context,
+    kind: &str,
     n_a: usize,
     n_b: usize,
 ) -> Result<glow::NativeProgram> {
-    FADE_SP_PROGRAMS.with(|c| {
+    let kind_static =
+        sp_kind_static(kind).ok_or_else(|| anyhow!("kind {kind:?} has no SP generator"))?;
+    TRANSITION_SP_PROGRAMS.with(|c| {
         let mut cache = c.borrow_mut();
-        if let Some(&p) = cache.get(&(n_a, n_b)) {
+        if let Some(&p) = cache.get(&(kind_static, n_a, n_b)) {
             return Ok(p);
         }
-        let fs = fs_fade_sp_source(n_a, n_b);
+        let fs = fs_transition_sp_source(kind, n_a, n_b)
+            .ok_or_else(|| anyhow!("fs_transition_sp_source returned None for {kind:?}"))?;
         let p = link_program(gl, VS_TEXTURED_QUAD, &fs)
-            .with_context(|| format!("link FS_FADE_SP({n_a}, {n_b})"))?;
-        cache.insert((n_a, n_b), p);
+            .with_context(|| format!("link FS_{}_SP({n_a}, {n_b})", kind.to_uppercase()))?;
+        cache.insert((kind_static, n_a, n_b), p);
         Ok(p)
     })
 }
 
-fn clear_fade_sp_program_cache(gl: &glow::Context) {
+fn clear_transition_sp_program_cache(gl: &glow::Context) {
     use glow::HasContext;
-    FADE_SP_PROGRAMS.with(|c| {
+    TRANSITION_SP_PROGRAMS.with(|c| {
         let mut cache = c.borrow_mut();
         for (_, p) in cache.drain() {
             unsafe { gl.delete_program(p); }

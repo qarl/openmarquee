@@ -777,34 +777,59 @@ void main() {
 /// 2×N must fit. N=4 is the cap.
 pub const SINGLE_PASS_MAX_LAYERS_PER_SLIDE: usize = 4;
 
-/// Single-pass fade: composes both slides' bg + N_a + N_b text
-/// layers + fade mix in ONE fragment shader. Eliminates the
-/// bake_a + bake_b + composite three-pass structure.
+/// QA-mandated single-pass transitions (2026-05-08 step 3):
+/// returns the set of transition kinds that have a single-pass
+/// shader generator implemented today. Kinds outside this set
+/// fall through to the legacy 3-pass bake+composite path. Grows
+/// per batch as kinds are ported.
 ///
-/// SPECIALIZED PER (n_a, n_b) -- the shader is generated with
-/// EXACTLY n_a apply_layer calls for slide A and n_b for slide B.
-/// First-cut FS_FADE_SP used a fixed 8-slot shader with rgba.a=0
-/// early-outs for unused slots; on vc4 (and other branchy SIMD
-/// fragment ALUs) this serialized inactive ALU work and ran 8.4
-/// fps at 1080p (worse than the 22 fps legacy 3-pass baseline).
-/// Specialization removes the unused branches → fragment fill
-/// scales with actual layer count, not the cap.
+/// Batch A (this commit): cut, fade, wipe, iris, dissolve.
+/// Batch B (planned): scanline, halftone, blinds, shutter.
+/// Batch C (planned): slide, push, scroll.
+/// Batch D (planned): flip, marquee, pixelate.
+/// Glitch: qarl-deferred -- stays on legacy.
+pub fn is_transition_kind_single_pass(kind: &str) -> bool {
+    matches!(
+        kind,
+        "cut" | "fade" | "wipe" | "iris" | "dissolve"
+    )
+}
+
+/// Single-pass transition shader generator. Composes both slides'
+/// bg + N_a + N_b text layers + the per-kind transition mix in ONE
+/// fragment shader. Eliminates the bake_a + bake_b + composite
+/// three-pass structure (legacy 22 fps@1080p) by specializing the
+/// FS to the exact (kind, n_a, n_b) combination.
 ///
-/// Eligibility (caller checks):
-///   - bg_a and bg_b are both BgKind::Solid (no patterns/images)
-///   - n_a and n_b each <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-///   - All layers blend=normal, outline=false
+/// Returns None for kinds not yet ported (caller falls through to
+/// legacy 3-pass) or for layer counts beyond
+/// SINGLE_PASS_MAX_LAYERS_PER_SLIDE (caller falls through too).
 ///
-/// Layer rect convention: rect = (left, bottom, right, top) in
-/// v_uv space ([0,1] bottom-up, matching VS_TEXTURED_QUAD).
-/// The CPU pre-bakes halign/valign + scale + motion translate
-/// into the rect; the FS does a per-fragment in-rect test +
-/// alpha sample + over-blend.
-pub fn fs_fade_sp_source(n_a: usize, n_b: usize) -> String {
-    debug_assert!(n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE);
-    debug_assert!(n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE);
+/// The shader is structured as:
+///   - GLES2 preamble + precision (mediump for most; highp for
+///     dissolve/glitch which need 24-bit hash math)
+///   - Common uniforms (u_t, u_a_bg, u_b_bg) + per-slot uniforms
+///     (sampler2D u_*_texN, vec4 u_*_rectN, vec4 u_*_rgbaN) for
+///     0..n_a / 0..n_b
+///   - apply_layer helper (takes explicit sample_uv parameter so
+///     warped-sample transitions can pass a transformed coord)
+///   - per-kind main(): compute sample_uv_a + sample_uv_b + mix
+///     factor; compose slide A at sample_uv_a, slide B at
+///     sample_uv_b; emit mix(ca, cb, factor).
+pub fn fs_transition_sp_source(kind: &str, n_a: usize, n_b: usize) -> Option<String> {
+    if !is_transition_kind_single_pass(kind) {
+        return None;
+    }
+    if n_a > SINGLE_PASS_MAX_LAYERS_PER_SLIDE || n_b > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
+        return None;
+    }
     let mut s = String::with_capacity(2048);
-    s.push_str("#version 100\nprecision mediump float;\n");
+    s.push_str("#version 100\n");
+    s.push_str(if kind_needs_highp(kind) {
+        "precision highp float;\n"
+    } else {
+        "precision mediump float;\n"
+    });
     s.push_str("uniform vec3 u_a_bg;\nuniform vec3 u_b_bg;\nuniform float u_t;\n");
     for i in 0..n_a {
         s.push_str(&format!(
@@ -817,35 +842,139 @@ pub fn fs_fade_sp_source(n_a: usize, n_b: usize) -> String {
         ));
     }
     s.push_str("varying vec2 v_uv;\n");
-    s.push_str(
-        r#"
-vec3 apply_layer(vec3 c, sampler2D tex, vec4 rect, vec4 rgba) {
+    if kind_needs_hash(kind) {
+        s.push_str(SP_HASH_HELPER);
+    }
+    s.push_str(SP_APPLY_LAYER);
+    s.push_str("void main() {\n");
+    push_main_body(&mut s, kind, n_a, n_b);
+    s.push_str("}\n");
+    Some(s)
+}
+
+/// Backwards-compat alias kept for the slice-1 / slice-2 fade path
+/// + tests. Delegates to fs_transition_sp_source("fade", ...).
+/// Panics if n_a or n_b exceeds SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+/// (matching the original debug_assert! semantics); fade itself is
+/// always supported.
+pub fn fs_fade_sp_source(n_a: usize, n_b: usize) -> String {
+    debug_assert!(n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE);
+    debug_assert!(n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE);
+    fs_transition_sp_source("fade", n_a, n_b)
+        .expect("fade + valid layer counts always supported")
+}
+
+fn kind_needs_highp(kind: &str) -> bool {
+    // dissolve + glitch hash math collapses on vc4's mediump
+    // (~10-bit mantissa). Glitch isn't ported yet (qarl-deferred);
+    // keep the gate for forward compat.
+    matches!(kind, "dissolve" | "glitch")
+}
+
+fn kind_needs_hash(kind: &str) -> bool {
+    matches!(kind, "dissolve" | "glitch")
+}
+
+const SP_HASH_HELPER: &str = r#"
+float _hash(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+"#;
+
+/// apply_layer(c, tex, rect, rgba, sample_uv): composite a single
+/// text layer onto color `c`. `sample_uv` is the screen-space UV
+/// at which to test the layer rect + sample the alpha bitmap; for
+/// in-place transitions it equals v_uv, for warped transitions it's
+/// the per-slide transformed coord.
+const SP_APPLY_LAYER: &str = r#"
+vec3 apply_layer(vec3 c, sampler2D tex, vec4 rect, vec4 rgba, vec2 sample_uv) {
     if (rgba.a < 0.004) return c;
-    if (v_uv.x < rect.x || v_uv.x > rect.z) return c;
-    if (v_uv.y < rect.y || v_uv.y > rect.w) return c;
+    if (sample_uv.x < rect.x || sample_uv.x > rect.z) return c;
+    if (sample_uv.y < rect.y || sample_uv.y > rect.w) return c;
     float w = max(rect.z - rect.x, 1e-6);
     float h = max(rect.w - rect.y, 1e-6);
-    vec2 luv = vec2((v_uv.x - rect.x) / w, 1.0 - (v_uv.y - rect.y) / h);
+    vec2 luv = vec2((sample_uv.x - rect.x) / w, 1.0 - (sample_uv.y - rect.y) / h);
     float a = texture2D(tex, luv).r * rgba.a;
     return mix(c, rgba.rgb, a);
 }
-void main() {
-    vec3 ca = u_a_bg;
-"#,
-    );
-    for i in 0..n_a {
+"#;
+
+/// Emit the apply_layer chain that composes slide A's full color
+/// at the given `sample_uv` GLSL expression. The `prefix` is "u_a"
+/// or "u_b"; `n` is the layer count.
+fn push_compose_chain(s: &mut String, prefix: &str, var: &str, n: usize, sample_uv: &str) {
+    for i in 0..n {
         s.push_str(&format!(
-            "    ca = apply_layer(ca, u_a_tex{i}, u_a_rect{i}, u_a_rgba{i});\n"
+            "    {var} = apply_layer({var}, {prefix}_tex{i}, {prefix}_rect{i}, {prefix}_rgba{i}, {sample_uv});\n"
         ));
     }
-    s.push_str("    vec3 cb = u_b_bg;\n");
-    for i in 0..n_b {
-        s.push_str(&format!(
-            "    cb = apply_layer(cb, u_b_tex{i}, u_b_rect{i}, u_b_rgba{i});\n"
-        ));
+}
+
+/// Per-kind main body. Each kind:
+///   1. Computes per-slide sample_uv (often v_uv; sometimes warped)
+///   2. Composes slide A's color via apply_layer chain at sample_uv_a
+///   3. Composes slide B's color via apply_layer chain at sample_uv_b
+///   4. Computes the mix factor (often u_t-derived; sometimes per-pixel)
+///   5. Emits gl_FragColor = vec4(mix(ca, cb, mix_factor), 1.0)
+///
+/// Kinds not yet ported panic via unreachable!() -- the caller has
+/// already filtered them via is_transition_kind_single_pass.
+fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
+    match kind {
+        "cut" => {
+            // Hard switch at t=0.5. Both slides sample at v_uv.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str(
+                "    gl_FragColor = vec4(mix(ca, cb, step(0.5, u_t)), 1.0);\n",
+            );
+        }
+        "fade" => {
+            // Linear cross-fade. Both slides sample at v_uv.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str(
+                "    gl_FragColor = vec4(mix(ca, cb, clamp(u_t, 0.0, 1.0)), 1.0);\n",
+            );
+        }
+        "wipe" => {
+            // Horizontal wipe: B reveals from left, hard line at x=t.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str("    float mask = step(v_uv.x, u_t);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
+        }
+        "iris" => {
+            // Radial expansion: B reveals through a circle.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str("    float r = distance(v_uv, vec2(0.5));\n");
+            s.push_str("    float mask = step(r, u_t * 0.71);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
+        }
+        "dissolve" => {
+            // Per-pixel hash threshold reveal.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str("    float threshold = _hash(v_uv);\n");
+            s.push_str("    float mask = step(threshold, u_t);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
+        }
+        _ => unreachable!(
+            "push_main_body called for unsupported kind {kind:?}; \
+             is_transition_kind_single_pass should have filtered"
+        ),
     }
-    s.push_str("    gl_FragColor = vec4(mix(ca, cb, clamp(u_t, 0.0, 1.0)), 1.0);\n}\n");
-    s
 }
 
 /// Map a transition `kind` string (as the Python content model
@@ -3481,6 +3610,9 @@ mod tests {
         // 8-layer shader was 8.4 fps (vs 22 fps 3-pass baseline);
         // unused branches stalled the vc4 SIMD fragment ALU.
         let s = fs_fade_sp_source(2, 1);
+        // Step 3: fs_fade_sp_source delegates to
+        // fs_transition_sp_source("fade", ...). The pinned
+        // uniforms should still be present.
         assert!(s.starts_with("#version 100\n"));
         assert!(s.contains("precision mediump float"));
         for uniform in ["u_a_bg", "u_b_bg", "u_t"] {
@@ -3546,6 +3678,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fs_transition_sp_source_kind_dispatch() {
+        // QA step 3 (2026-05-08): per-kind generator dispatch.
+        // Pin a few of the kinds added in batch A.
+        for kind in ["cut", "fade", "wipe", "iris", "dissolve"] {
+            let s = fs_transition_sp_source(kind, 1, 1)
+                .unwrap_or_else(|| panic!("expected SP source for {kind}"));
+            assert!(s.starts_with("#version 100\n"));
+            assert!(s.contains("u_a_tex0"));
+            assert!(s.contains("u_b_tex0"));
+            assert!(s.contains("apply_layer"));
+            // The sample_uv arg should be in the apply_layer
+            // signature and at every call site.
+            assert!(
+                s.contains("sample_uv"),
+                "{kind}: missing sample_uv in apply_layer body"
+            );
+        }
+        // Mix-factor heuristic per kind.
+        let cut = fs_transition_sp_source("cut", 0, 0).unwrap();
+        assert!(cut.contains("step(0.5, u_t)"));
+        let wipe = fs_transition_sp_source("wipe", 0, 0).unwrap();
+        assert!(wipe.contains("step(v_uv.x, u_t)"));
+        let iris = fs_transition_sp_source("iris", 0, 0).unwrap();
+        assert!(iris.contains("distance(v_uv, vec2(0.5))"));
+        let dissolve = fs_transition_sp_source("dissolve", 0, 0).unwrap();
+        assert!(dissolve.contains("precision highp float"));
+        assert!(dissolve.contains("_hash"));
+    }
+
+    #[test]
+    fn fs_transition_sp_source_unsupported_kind_returns_none() {
+        assert!(fs_transition_sp_source("glitch", 1, 1).is_none());
+        assert!(fs_transition_sp_source("unknown_kind", 1, 1).is_none());
+    }
+
+    #[test]
+    fn is_transition_kind_single_pass_classifies_correctly() {
+        // Batch A ported set (5 kinds). Grows per batch.
+        for kind in ["cut", "fade", "wipe", "iris", "dissolve"] {
+            assert!(
+                is_transition_kind_single_pass(kind),
+                "{kind} should be SP-portable"
+            );
+        }
+        // Not yet ported (still on legacy 3-pass; will fall through).
+        for kind in [
+            "scanline", "halftone", "blinds", "shutter", "slide", "push",
+            "scroll", "flip", "marquee", "pixelate",
+        ] {
+            assert!(
+                !is_transition_kind_single_pass(kind),
+                "{kind} not yet ported -- should not be SP-eligible"
+            );
+        }
+        // Glitch is qarl-deferred (visual jitter glitches in
+        // current legacy implementation are accepted spec
+        // deviation; SP port not blocking v1).
+        assert!(!is_transition_kind_single_pass("glitch"));
+        assert!(!is_transition_kind_single_pass("unknown"));
     }
 
     #[test]
