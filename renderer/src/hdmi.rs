@@ -5855,11 +5855,19 @@ fn transition_eligible_for_scissored_bake(
     if layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
         return false;
     }
+    // Outline + non-Overlay blends OK (cold-scout #10):
+    // paint_slide_with_viewport's layer loop already dispatches
+    // blend_func per layer for Normal/Multiply/Screen and the
+    // outline glyph shader (FS_GLYPH_OUTLINE). The atlas SB bake
+    // calls paint_slide_with_viewport so all this is supported
+    // out of the box.
+    //
+    // Overlay alone needs the ping-pong FBO route in
+    // paint_layers_via_overlay_route (mode-res FBO_a + FBO_b
+    // alternating); incompatible with atlas region rendering.
+    // Reject any pair containing an Overlay layer.
     for (l, _, _) in layers_a.iter().chain(layers_b.iter()) {
-        if l.outline {
-            return false;
-        }
-        if !matches!(parse_blend_mode(&l.blend), BlendMode::Normal) {
+        if matches!(parse_blend_mode(&l.blend), BlendMode::Overlay) {
             return false;
         }
     }
