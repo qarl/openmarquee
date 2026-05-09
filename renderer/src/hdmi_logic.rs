@@ -771,6 +771,89 @@ void main() {
 }
 "#;
 
+/// Single-pass fade: composes both slides' bg + up to 4 text layers
+/// each + fade mix, all in ONE fragment shader. Eliminates the
+/// bake_a + bake_b + composite three-pass structure of FS_FADE so
+/// transitions on animated slides hit the same fragment fill budget
+/// as the slide-render path (1 pass per frame at 1080p).
+///
+/// Eligibility (caller checks):
+///   - bg_a and bg_b are both BgKind::Solid (no patterns/images here)
+///   - Each side has ≤ 4 visible text layers
+///   - All layers blend=normal, outline=false
+///
+/// Texture unit budget: 4 layers × 2 slides = 8 samplers (the vc4
+/// GL_MAX_TEXTURE_IMAGE_UNITS limit). Unused slots get a 1×1 dummy
+/// texture bound and rgba.a=0 so the early-out path skips the sample.
+///
+/// Layer rect convention: rect = (left, bottom, right, top) in v_uv
+/// space ([0,1] bottom-up, matching VS_TEXTURED_QUAD's varying).
+/// The CPU pre-bakes halign/valign, scale, and motion translate into
+/// the rect so the shader is just a per-fragment in-rect test +
+/// alpha sample + over-blend.
+pub const FS_FADE_SP: &str = r#"#version 100
+precision mediump float;
+uniform vec3 u_a_bg;
+uniform vec3 u_b_bg;
+uniform float u_t;
+uniform sampler2D u_a_tex0;
+uniform sampler2D u_a_tex1;
+uniform sampler2D u_a_tex2;
+uniform sampler2D u_a_tex3;
+uniform vec4 u_a_rect0;
+uniform vec4 u_a_rect1;
+uniform vec4 u_a_rect2;
+uniform vec4 u_a_rect3;
+uniform vec4 u_a_rgba0;
+uniform vec4 u_a_rgba1;
+uniform vec4 u_a_rgba2;
+uniform vec4 u_a_rgba3;
+uniform sampler2D u_b_tex0;
+uniform sampler2D u_b_tex1;
+uniform sampler2D u_b_tex2;
+uniform sampler2D u_b_tex3;
+uniform vec4 u_b_rect0;
+uniform vec4 u_b_rect1;
+uniform vec4 u_b_rect2;
+uniform vec4 u_b_rect3;
+uniform vec4 u_b_rgba0;
+uniform vec4 u_b_rgba1;
+uniform vec4 u_b_rgba2;
+uniform vec4 u_b_rgba3;
+varying vec2 v_uv;
+
+vec3 apply_layer(vec3 c, sampler2D tex, vec4 rect, vec4 rgba) {
+    if (rgba.a < 0.004) return c;
+    if (v_uv.x < rect.x || v_uv.x > rect.z) return c;
+    if (v_uv.y < rect.y || v_uv.y > rect.w) return c;
+    float w = max(rect.z - rect.x, 1e-6);
+    float h = max(rect.w - rect.y, 1e-6);
+    vec2 luv = vec2((v_uv.x - rect.x) / w, 1.0 - (v_uv.y - rect.y) / h);
+    float a = texture2D(tex, luv).r * rgba.a;
+    return mix(c, rgba.rgb, a);
+}
+
+void main() {
+    vec3 ca = u_a_bg;
+    ca = apply_layer(ca, u_a_tex0, u_a_rect0, u_a_rgba0);
+    ca = apply_layer(ca, u_a_tex1, u_a_rect1, u_a_rgba1);
+    ca = apply_layer(ca, u_a_tex2, u_a_rect2, u_a_rgba2);
+    ca = apply_layer(ca, u_a_tex3, u_a_rect3, u_a_rgba3);
+    vec3 cb = u_b_bg;
+    cb = apply_layer(cb, u_b_tex0, u_b_rect0, u_b_rgba0);
+    cb = apply_layer(cb, u_b_tex1, u_b_rect1, u_b_rgba1);
+    cb = apply_layer(cb, u_b_tex2, u_b_rect2, u_b_rgba2);
+    cb = apply_layer(cb, u_b_tex3, u_b_rect3, u_b_rgba3);
+    gl_FragColor = vec4(mix(ca, cb, clamp(u_t, 0.0, 1.0)), 1.0);
+}
+"#;
+
+/// Maximum text layers per slide that single-pass transitions
+/// support. The vc4 GLES2 GL_MAX_TEXTURE_IMAGE_UNITS is 8; a
+/// 2-slide single-pass shader binds N samplers per side, so
+/// 2×N must fit. N=4 is the cap.
+pub const SINGLE_PASS_MAX_LAYERS_PER_SLIDE: usize = 4;
+
 /// Map a transition `kind` string (as the Python content model
 /// stores it in `PlaylistItemRef.transition`) to the fragment
 /// shader source the renderer should run.
@@ -3391,6 +3474,46 @@ mod tests {
         // to e.g. (1-t)*a + t*b stays equivalent or trips the test.
         assert!(FS_FADE.contains("mix("));
         assert!(FS_FADE.contains("clamp"));
+    }
+
+    #[test]
+    fn fs_fade_sp_targets_gles2_and_pins_uniforms() {
+        // QA-mandated single-pass transition (2026-05-08): pin every
+        // uniform name FS_FADE_SP exposes so a rename doesn't
+        // silently break render_fade_single_pass_in_session's bind
+        // sites. The shader must:
+        //   - Target GLES2 (#version 100, mediump float)
+        //   - Have separate u_a_*N / u_b_*N for slides A and B
+        //   - Provide tex/rect/rgba uniforms for slots 0..N where
+        //     N = SINGLE_PASS_MAX_LAYERS_PER_SLIDE (4)
+        //   - Mix slides with `mix(a, b, clamp(u_t, 0, 1))`
+        assert!(FS_FADE_SP.starts_with("#version 100\n"));
+        assert!(FS_FADE_SP.contains("precision mediump float"));
+        for uniform in ["u_a_bg", "u_b_bg", "u_t"] {
+            assert!(
+                FS_FADE_SP.contains(uniform),
+                "FS_FADE_SP missing top-level uniform {uniform:?}"
+            );
+        }
+        for slot in 0..SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
+            for prefix in ["u_a", "u_b"] {
+                for kind in ["tex", "rect", "rgba"] {
+                    let name = format!("{prefix}_{kind}{slot}");
+                    assert!(
+                        FS_FADE_SP.contains(&name),
+                        "FS_FADE_SP missing per-layer uniform {name:?}"
+                    );
+                }
+            }
+        }
+        // SINGLE_PASS_MAX_LAYERS_PER_SLIDE pins to 4 (vc4 8-unit
+        // budget = 4 layers × 2 slides). Test guards against an
+        // accidental cap bump that the FS layer-binding loop in
+        // hdmi.rs hasn't been updated for.
+        assert_eq!(SINGLE_PASS_MAX_LAYERS_PER_SLIDE, 4);
+        assert!(FS_FADE_SP.contains("mix("));
+        assert!(FS_FADE_SP.contains("clamp"));
+        assert!(FS_FADE_SP.contains("apply_layer"));
     }
 
     #[test]
