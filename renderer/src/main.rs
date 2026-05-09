@@ -211,6 +211,28 @@ struct Args {
     #[arg(long)]
     capture_path: Option<PathBuf>,
 
+    /// QA-direct (2026-05-09) -- visual-verdict path for the
+    /// scissored-bake half-res FBO. Captures one frame at t=0.5
+    /// of a transition between `--fade-from` and `--fade-to` via
+    /// the SB pipeline, writes PNG at `--capture-path`. Reads
+    /// `OPENMARQUEE_SB_DIVISOR` env var (default 2 = half-res;
+    /// set 1 for full-res reference). Combine with --transition
+    /// to pick the kind.
+    ///
+    /// Example:
+    ///   OPENMARQUEE_SB_DIVISOR=2 \\
+    ///   /tmp/openmarquee-render --output hdmi \\
+    ///     --capture-sb-mid \\
+    ///     --fade-from <a> --fade-to <b> --transition cut \\
+    ///     --capture-path /tmp/sb-mid_div2.png
+    #[arg(long, default_value_t = false)]
+    capture_sb_mid: bool,
+
+    /// QA-direct (2026-05-09) -- override the t value the
+    /// capture-sb-mid samples at. Default 0.5 (mid-transition).
+    #[arg(long, default_value_t = 0.5)]
+    capture_sb_t: f32,
+
     /// v1-spec-delta #9 (slice c+) -- enter IPC sidecar mode.
     /// The renderer reads JSON-line IpcRequest messages from
     /// stdin, dispatches via the playback state machine, and
@@ -1249,6 +1271,63 @@ fn main() -> Result<()> {
                         &slide,
                         catalog_opt,
                         Some(content_root),
+                        png_path,
+                    )?;
+                    return Ok(());
+                }
+                if args.capture_sb_mid {
+                    // QA-direct (2026-05-09) visual-verdict capture
+                    // path. Requires --fade-from, --fade-to,
+                    // --transition, --capture-path, --content-root.
+                    let png_path = args
+                        .capture_path
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "--capture-sb-mid requires --capture-path"
+                        ))?;
+                    let content_root = args
+                        .content_root
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "--capture-sb-mid requires --content-root"
+                        ))?;
+                    let from_id = args.fade_from.ok_or_else(|| anyhow::anyhow!(
+                        "--capture-sb-mid requires --fade-from"
+                    ))?;
+                    let to_id = args.fade_to.ok_or_else(|| anyhow::anyhow!(
+                        "--capture-sb-mid requires --fade-to"
+                    ))?;
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for capture",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide_a = content::find_text_slide(content_root, from_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide for --fade-from {from_id} under {}",
+                            content_root.display()
+                        ))?;
+                    let slide_b = content::find_text_slide(content_root, to_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide for --fade-to {to_id} under {}",
+                            content_root.display()
+                        ))?;
+                    hdmi::capture_sb_transition_mid_to_png(
+                        &card,
+                        &slide_a,
+                        &slide_b,
+                        catalog_opt,
+                        Some(content_root),
+                        &args.transition,
+                        args.capture_sb_t,
                         png_path,
                     )?;
                     return Ok(());

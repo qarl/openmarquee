@@ -317,6 +317,10 @@ pub struct EglSession<'a> {
     /// scissored-bake call; freed at with_egl_session teardown.
     scissored_bake_fbo_a: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
     scissored_bake_fbo_b: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
+    /// QA-approved env override for scissored-bake FBO size
+    /// divisor. Read once at session bring-up via
+    /// read_sb_divisor_env. See OPENMARQUEE_SB_DIVISOR docs.
+    scissored_bake_divisor: u32,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -468,6 +472,7 @@ where
         transition_sp_quad_vbo: None,
         scissored_bake_fbo_a: None,
         scissored_bake_fbo_b: None,
+        scissored_bake_divisor: read_sb_divisor_env(),
     };
     let work_result = work(&mut session);
 
@@ -2620,6 +2625,202 @@ pub fn capture_fbo_to_rgba(
 ///
 /// Per spec §7.3 the snapshot PNG dimensions match the
 /// negotiated CRTC mode (the operator's panel resolution).
+/// QA-direct (2026-05-09): capture one frame mid-transition
+/// (default t=0.5) from the scissored-bake path, write to PNG.
+/// Used by the visual-verdict path for §8.2 soak readiness --
+/// half-res bake (vc4 GLES2 FBO-switch sync workaround) might
+/// soften text on Anton 5-layer SB transitions; QA reviews the
+/// PNG before approving soak start.
+///
+/// Renders into a temp full-res FBO so the readback is a clean
+/// RGBA grab without GBM / EGL surface state. Reuses the same
+/// bake → composite pipeline as render_transition_scissored_
+/// bake_in_session; the only difference is one-shot (no per-
+/// frame loop) and writes to PNG instead of swapping.
+pub fn capture_sb_transition_mid_to_png(
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    kind: &str,
+    t: f32,
+    png_path: &Path,
+) -> Result<()> {
+    use crate::hdmi_logic::rgba_to_png_bytes;
+    use glow::HasContext;
+    if !is_transition_kind_single_pass(kind) {
+        bail!("capture_sb_mid: kind {kind:?} not in SP-portable set");
+    }
+    let t = t.clamp(0.0, 1.0);
+    let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
+    let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    if effective_solid_bg(&bg_a_kind).is_none() || effective_solid_bg(&bg_b_kind).is_none() {
+        bail!("capture_sb_mid: both slides must have solid bg");
+    }
+    if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+        || layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
+    {
+        bail!("capture_sb_mid: layer count exceeds cap");
+    }
+    with_egl_session(card, |session| {
+        let mode_w = session.mode_w as u32;
+        let mode_h = session.mode_h as u32;
+        let slide_a_id = slide_a.id;
+        let slide_b_id = slide_b.id;
+        let layers_a_len = layers_a.len();
+        let layers_b_len = layers_b.len();
+
+        // Ensure session caches.
+        for (sid, n) in [(slide_a_id, layers_a_len), (slide_b_id, layers_b_len)] {
+            let needs_new = match session.slide_caches.get(&sid) {
+                Some(c) => c.glyph.len() != n,
+                None => true,
+            };
+            if needs_new {
+                if let Some(old) = session.slide_caches.remove(&sid) {
+                    unsafe {
+                        for slot in old.tex {
+                            if let Some(tx) = slot {
+                                session.gl.delete_texture(tx);
+                            }
+                        }
+                    }
+                }
+                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+            }
+        }
+
+        let ccp = cached_composite_program(session.gl, kind)?;
+        let (fbo_a, tex_a) = unsafe { ensure_bake_fbo_pair(session, 0)? };
+        let (fbo_b, tex_b) = unsafe { ensure_bake_fbo_pair(session, 1)? };
+        let vbo = ensure_transition_sp_quad_vbo(session)?;
+
+        // Allocate a full-res capture FBO. Free at function exit.
+        let gl = session.gl;
+        let cap_tex = unsafe {
+            let t_ = gl
+                .create_texture()
+                .map_err(|e| anyhow!("capture tex: {e}"))?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t_));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA as i32, mode_w as i32, mode_h as i32, 0,
+                glow::RGBA, glow::UNSIGNED_BYTE, None,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+            );
+            t_
+        };
+        let cap_fbo = unsafe {
+            let f = gl.create_framebuffer().map_err(|e| {
+                gl.delete_texture(cap_tex);
+                anyhow!("capture fbo: {e}")
+            })?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(cap_tex), 0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                gl.delete_framebuffer(f);
+                gl.delete_texture(cap_tex);
+                bail!("capture fbo incomplete: status=0x{status:x}");
+            }
+            f
+        };
+
+        let states_a = motion_states_for_layers(slide_a.id, &layers_a, 0.0);
+        let states_b = motion_states_for_layers(slide_b.id, &layers_b, 0.0);
+        let wall_clock_unix = current_unix_seconds();
+
+        let divisor = session.scissored_bake_divisor;
+        let bake_vp_w = (mode_w / divisor).max(1);
+        let bake_vp_h = (mode_h / divisor).max(1);
+
+        // Bake A
+        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a)); }
+        {
+            let cache_a = session
+                .slide_caches
+                .get_mut(&slide_a_id)
+                .expect("slide_caches[a] init above");
+            paint_slide_with_viewport(
+                gl, mode_w, mode_h, bake_vp_w, bake_vp_h,
+                &bg_a_kind, &layers_a,
+                Some(&states_a), wall_clock_unix,
+                Some(&mut cache_a.glyph),
+                Some(&mut session.image_bg_cache),
+                Some(&mut cache_a.tex),
+            )?;
+        }
+        // Bake B
+        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b)); }
+        {
+            let cache_b = session
+                .slide_caches
+                .get_mut(&slide_b_id)
+                .expect("slide_caches[b] init above");
+            paint_slide_with_viewport(
+                gl, mode_w, mode_h, bake_vp_w, bake_vp_h,
+                &bg_b_kind, &layers_b,
+                Some(&states_b), wall_clock_unix,
+                Some(&mut cache_b.glyph),
+                Some(&mut session.image_bg_cache),
+                Some(&mut cache_b.tex),
+            )?;
+        }
+
+        // Composite at t into cap_fbo.
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(cap_fbo));
+            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            gl.disable(glow::BLEND);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.use_program(Some(ccp.program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+            gl.uniform_1_i32(ccp.u_src_a.as_ref(), 0);
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+            gl.uniform_1_i32(ccp.u_src_b.as_ref(), 1);
+            gl.uniform_1_f32(ccp.u_t.as_ref(), t);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let stride = (4 * std::mem::size_of::<f32>()) as i32;
+            gl.enable_vertex_attrib_array(ccp.a_pos);
+            gl.vertex_attrib_pointer_f32(ccp.a_pos, 2, glow::FLOAT, false, stride, 0);
+            gl.enable_vertex_attrib_array(ccp.a_uv);
+            gl.vertex_attrib_pointer_f32(
+                ccp.a_uv, 2, glow::FLOAT, false, stride,
+                (2 * std::mem::size_of::<f32>()) as i32,
+            );
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.flush();
+        }
+
+        let rgba = capture_fbo_to_rgba(gl, Some(cap_fbo), mode_w, mode_h)?;
+        let png_bytes = rgba_to_png_bytes(&rgba, mode_w, mode_h)?;
+        std::fs::write(png_path, &png_bytes)
+            .with_context(|| format!("write png {}", png_path.display()))?;
+        eprintln!(
+            "captured SB transition kind={kind:?} slide_a={} slide_b={} t={t:.3} divisor={divisor} -> {} ({} bytes)",
+            slide_a.id, slide_b.id, png_path.display(), png_bytes.len(),
+        );
+
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(cap_fbo);
+            gl.delete_texture(cap_tex);
+        }
+        Ok(())
+    })
+}
+
 pub fn capture_slide_to_png(
     card: &Card,
     slide: &TextSlide,
@@ -4624,13 +4825,14 @@ fn render_transition_scissored_bake_in_session(
                     motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
 
                 // Bake slides via paint_slide_with_viewport at
-                // half-res (mode / SCISSORED_BAKE_FBO_DIVISOR).
+                // mode / session.scissored_bake_divisor.
                 // mode_w/h drive layer math (full-res NDC); vp_w/h
                 // drive the GL viewport so the bake fragment fill
-                // hits the half-res FBO. Composite LINEAR-upsamples
+                // hits the smaller FBO. Composite LINEAR-upsamples
                 // to full output.
-                let bake_vp_w = (mode_w_u32 / SCISSORED_BAKE_FBO_DIVISOR).max(1);
-                let bake_vp_h = (mode_h_u32 / SCISSORED_BAKE_FBO_DIVISOR).max(1);
+                let divisor = session.scissored_bake_divisor;
+                let bake_vp_w = (mode_w_u32 / divisor).max(1);
+                let bake_vp_h = (mode_h_u32 / divisor).max(1);
 
                 let t_bake_a = Instant::now();
                 unsafe {
@@ -5007,20 +5209,54 @@ fn cached_transition_sp_program(
 }
 
 /// QA-direct (2026-05-08, post-Step-4): scissored-bake FBO size
-/// divisor. Bake target is mode_w / DIVISOR × mode_h / DIVISOR;
-/// composite samples with LINEAR filter and upscales to full
-/// output via the kind-shader's UV math.
+/// divisor default. Bake target is mode_w / DIVISOR × mode_h /
+/// DIVISOR; composite samples with LINEAR filter and upscales to
+/// full output via the kind-shader's UV math.
 ///
-/// Why half-res: cut-SB on heavy slide pair (giant ticker bitmap +
-/// 5-layer slide) hit 33.9 ms p50 frame_total at full-res bake
-/// (the second sb_bake's CPU time = ~13 ms = wait for previous
-/// bake's GPU work to flush at FBO-switch on vc4 GLES2). vc4 has
-/// no glMemoryBarrier (GLES3+); cutting the bake fragment fill
-/// 4× drops the wait below the per-frame budget.
+/// Why half-res: cut-SB on heavy slide pair hit 33.9 ms p50
+/// frame_total at full-res bake (vc4 GLES2 FBO-switch implicit
+/// GPU sync = ~13 ms wait). No glMemoryBarrier in GLES2; cutting
+/// bake fragment fill 4× drops the wait below per-frame budget.
 ///
-/// Tradeoff: text crispness on small font sizes. LINEAR upscale
-/// of 540p text holds up at TV viewing distance.
-const SCISSORED_BAKE_FBO_DIVISOR: u32 = 2;
+/// QA-approved env override `OPENMARQUEE_SB_DIVISOR`:
+///   1 = full-res (identical to pre-abf057d behavior; for A/B)
+///   2 = half-res (default; ships strict 30 fps)
+///   4 = quarter-res (only useful for visual A/B comparison)
+const SCISSORED_BAKE_FBO_DIVISOR_DEFAULT: u32 = 2;
+
+/// Read OPENMARQUEE_SB_DIVISOR env var, validate, return divisor.
+/// Defaults to SCISSORED_BAKE_FBO_DIVISOR_DEFAULT. Invalid values
+/// (zero, non-numeric, > 16) fall back to default with a warn.
+fn read_sb_divisor_env() -> u32 {
+    match std::env::var("OPENMARQUEE_SB_DIVISOR") {
+        Ok(s) => match s.parse::<u32>() {
+            Ok(n) if (1..=16).contains(&n) => {
+                if n != SCISSORED_BAKE_FBO_DIVISOR_DEFAULT {
+                    eprintln!(
+                        "OPENMARQUEE_SB_DIVISOR override = {n} (default {})",
+                        SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
+                    );
+                }
+                n
+            }
+            Ok(n) => {
+                eprintln!(
+                    "warn: OPENMARQUEE_SB_DIVISOR={n} out of range [1, 16]; using default {}",
+                    SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
+                );
+                SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
+            }
+            Err(_) => {
+                eprintln!(
+                    "warn: OPENMARQUEE_SB_DIVISOR={s:?} unparseable; using default {}",
+                    SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
+                );
+                SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
+            }
+        },
+        Err(_) => SCISSORED_BAKE_FBO_DIVISOR_DEFAULT,
+    }
+}
 
 /// QA-mandated scissored-bake (Step 4): create + cache an
 /// offscreen FBO + RGBA color-texture pair sized at mode /
@@ -5039,10 +5275,9 @@ unsafe fn ensure_bake_fbo_pair(
         return Ok(pair);
     }
     let gl = session.gl;
-    let bake_w =
-        ((session.mode_w as u32) / SCISSORED_BAKE_FBO_DIVISOR).max(1) as i32;
-    let bake_h =
-        ((session.mode_h as u32) / SCISSORED_BAKE_FBO_DIVISOR).max(1) as i32;
+    let divisor = session.scissored_bake_divisor;
+    let bake_w = ((session.mode_w as u32) / divisor).max(1) as i32;
+    let bake_h = ((session.mode_h as u32) / divisor).max(1) as i32;
     let tex = gl
         .create_texture()
         .map_err(|e| anyhow!("bake_fbo glGenTextures: {e}"))?;
