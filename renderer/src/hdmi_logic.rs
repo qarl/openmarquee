@@ -1020,6 +1020,110 @@ pub fn gradient_density_is_degenerate(density: f32) -> bool {
     density.abs() < 1e-4
 }
 
+/// Per-layer property summary used by the atlas-SB / single-pass
+/// eligibility gates. Sufficient for the gate logic without
+/// dragging in `crate::content::TextLayer` or `Rc<fontdue::Font>`;
+/// constructed by hdmi.rs from each `(TextLayer, color, font)`
+/// tuple at decision time, then passed into the pure-logic
+/// predicates below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerCompositeProps {
+    pub outline: bool,
+    pub blend: BlendMode,
+}
+
+/// Pure-logic eligibility gate for the single-pass (SP) tier. SP
+/// composes both slides' bg + every text layer + the per-kind
+/// transition mix in ONE fragment shader; the gate excludes any
+/// shape the SP shader can't express:
+///   - kind outside the SP-portable set
+///   - bg that isn't equivalent to a solid uniform fill on either
+///     side (caller resolves this via `effective_solid_bg` and
+///     passes the boolean here)
+///   - more than SINGLE_PASS_MAX_LAYERS_PER_SLIDE on either side
+///   - any layer with outline=true (FS_GLYPH_OUTLINE not in the
+///     SP shader)
+///   - any layer with blend != Normal (Multiply/Screen/Overlay
+///     need separate blend-state passes)
+///
+/// Anything else is admitted; the caller picks SP vs scissored-
+/// bake via `prefer_scissored_bake`. Inputs are already-resolved
+/// per-layer property summaries to keep this function pure.
+pub fn transition_eligible_for_single_pass_logic(
+    kind: &str,
+    bg_a_solid: bool,
+    bg_b_solid: bool,
+    layer_props_a: &[LayerCompositeProps],
+    layer_props_b: &[LayerCompositeProps],
+) -> bool {
+    if !is_transition_kind_single_pass(kind) {
+        return false;
+    }
+    if !bg_a_solid || !bg_b_solid {
+        return false;
+    }
+    if layer_props_a.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
+        return false;
+    }
+    if layer_props_b.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
+        return false;
+    }
+    for p in layer_props_a.iter().chain(layer_props_b.iter()) {
+        if p.outline {
+            return false;
+        }
+        if !matches!(p.blend, BlendMode::Normal) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pure-logic eligibility gate for the scissored-bake (atlas SB)
+/// tier. SB renders both slides into a 2048x2048 atlas (split
+/// vertically into two 2048x1024 regions) via paint_slide_with_
+/// viewport, then composites at runtime. The gate is wider than
+/// SP because:
+///   - bg type doesn't matter (bg-cache machinery handles every
+///     BgKind variant: gradient/pattern/image/solid).
+///   - Per-side cap is SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE (6),
+///     not SP's 4 (the bake pass uses paint_slide which has its
+///     own per-layer-glyph-program pipeline; samplers are not the
+///     binding constraint).
+///   - Outline + Multiply + Screen blends are supported because
+///     paint_slide_with_viewport dispatches blend_func per layer.
+///
+/// What SB CAN'T do:
+///   - kind outside the SP-portable set (the composite shader
+///     dispatch table is shared with SP).
+///   - Overlay blend on any layer (needs a ping-pong FBO route
+///     in paint_layers_via_overlay_route, incompatible with atlas
+///     region rendering).
+///
+/// Anything else is admitted. Caller falls through to legacy
+/// 3-pass for the kinds and shapes this rejects.
+pub fn transition_eligible_for_scissored_bake_logic(
+    kind: &str,
+    layer_props_a: &[LayerCompositeProps],
+    layer_props_b: &[LayerCompositeProps],
+) -> bool {
+    if !is_transition_kind_single_pass(kind) {
+        return false;
+    }
+    if layer_props_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
+        return false;
+    }
+    if layer_props_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
+        return false;
+    }
+    for p in layer_props_a.iter().chain(layer_props_b.iter()) {
+        if matches!(p.blend, BlendMode::Overlay) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Single-pass transition shader generator. Composes both slides'
 /// bg + N_a + N_b text layers + the per-kind transition mix in ONE
 /// fragment shader. Eliminates the bake_a + bake_b + composite
@@ -4304,6 +4408,198 @@ mod tests {
         assert!(!gradient_density_is_degenerate(f32::NAN));
         assert!(!gradient_density_is_degenerate(f32::INFINITY));
         assert!(!gradient_density_is_degenerate(f32::NEG_INFINITY));
+    }
+
+    // P2-I (continued): eligibility-gate pure-logic helpers.
+    // LayerCompositeProps lets the gates take a small POD slice
+    // instead of the (TextLayer, color, font) tuple shape that
+    // the call site has, so these tests don't need the full
+    // content stack.
+
+    fn lp_normal() -> LayerCompositeProps {
+        LayerCompositeProps { outline: false, blend: BlendMode::Normal }
+    }
+
+    #[test]
+    fn sp_eligibility_admits_minimal_solid_bg_normal_layers() {
+        // Smallest case that should pass: SP-portable kind + solid
+        // bg both sides + 1 normal layer per side.
+        let layers = [lp_normal()];
+        for kind in ["fade", "wipe", "cut", "marquee", "pixelate"] {
+            assert!(
+                transition_eligible_for_single_pass_logic(
+                    kind, true, true, &layers, &layers,
+                ),
+                "{kind} 1L+1L solid normal should be SP-eligible",
+            );
+        }
+    }
+
+    #[test]
+    fn sp_eligibility_admits_zero_layers_per_side() {
+        // Bg-only slides (no text) are valid input. Zero layers
+        // is within the SP per-side cap and the loop body just
+        // doesn't execute.
+        assert!(transition_eligible_for_single_pass_logic(
+            "fade", true, true, &[], &[],
+        ));
+    }
+
+    #[test]
+    fn sp_eligibility_rejects_non_sp_kind() {
+        let layers = [lp_normal()];
+        assert!(!transition_eligible_for_single_pass_logic(
+            "glitch", true, true, &layers, &layers,
+        ));
+        assert!(!transition_eligible_for_single_pass_logic(
+            "unknown", true, true, &layers, &layers,
+        ));
+    }
+
+    #[test]
+    fn sp_eligibility_rejects_non_solid_bg() {
+        let layers = [lp_normal()];
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", false, true, &layers, &layers,
+        ));
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, false, &layers, &layers,
+        ));
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", false, false, &layers, &layers,
+        ));
+    }
+
+    #[test]
+    fn sp_eligibility_rejects_above_per_side_cap() {
+        // SP per-side cap is SINGLE_PASS_MAX_LAYERS_PER_SLIDE = 4.
+        // 5 layers on either side rejects the pair.
+        let five = vec![lp_normal(); 5];
+        let four = vec![lp_normal(); 4];
+        assert_eq!(SINGLE_PASS_MAX_LAYERS_PER_SLIDE, 4);
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, true, &five, &four,
+        ));
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, true, &four, &five,
+        ));
+        // 4+4 still admits (the tier-routing decision between SP
+        // and SB happens via prefer_scissored_bake, not here).
+        assert!(transition_eligible_for_single_pass_logic(
+            "fade", true, true, &four, &four,
+        ));
+    }
+
+    #[test]
+    fn sp_eligibility_rejects_outline_layer() {
+        let normal = lp_normal();
+        let outlined = LayerCompositeProps { outline: true, blend: BlendMode::Normal };
+        // Outline on side A.
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, true, &[normal, outlined], &[normal],
+        ));
+        // Outline on side B.
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, true, &[normal], &[normal, outlined],
+        ));
+    }
+
+    #[test]
+    fn sp_eligibility_rejects_non_normal_blend() {
+        let normal = lp_normal();
+        for blend in [BlendMode::Multiply, BlendMode::Screen, BlendMode::Overlay] {
+            let l = LayerCompositeProps { outline: false, blend };
+            assert!(
+                !transition_eligible_for_single_pass_logic(
+                    "fade", true, true, &[normal, l], &[normal],
+                ),
+                "blend {blend:?} on side A must reject SP",
+            );
+            assert!(
+                !transition_eligible_for_single_pass_logic(
+                    "fade", true, true, &[normal], &[normal, l],
+                ),
+                "blend {blend:?} on side B must reject SP",
+            );
+        }
+    }
+
+    #[test]
+    fn sb_eligibility_admits_wider_inputs_than_sp() {
+        // SB is wider than SP: it doesn't care about bg type, it
+        // accepts up to 6 layers per side, AND it accepts outline
+        // and non-Overlay blends. Spot-check the cases SP rejects
+        // that SB still admits.
+        let outlined = LayerCompositeProps { outline: true, blend: BlendMode::Normal };
+        let multiply = LayerCompositeProps { outline: false, blend: BlendMode::Multiply };
+        let screen = LayerCompositeProps { outline: false, blend: BlendMode::Screen };
+        // Outline OK for SB.
+        assert!(transition_eligible_for_scissored_bake_logic(
+            "fade", &[outlined], &[lp_normal()],
+        ));
+        // Multiply + Screen OK for SB.
+        assert!(transition_eligible_for_scissored_bake_logic(
+            "fade", &[multiply, screen], &[lp_normal()],
+        ));
+        // 6+6 OK for SB (was rejected by SP at >4).
+        let six = vec![lp_normal(); 6];
+        assert!(transition_eligible_for_scissored_bake_logic(
+            "fade", &six, &six,
+        ));
+        assert_eq!(SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE, 6);
+    }
+
+    #[test]
+    fn sb_eligibility_rejects_non_sp_kind() {
+        // SB shares the SP-portable kind list (the composite
+        // shader dispatch table is shared).
+        let layers = [lp_normal()];
+        assert!(!transition_eligible_for_scissored_bake_logic(
+            "glitch", &layers, &layers,
+        ));
+        assert!(!transition_eligible_for_scissored_bake_logic(
+            "unknown", &layers, &layers,
+        ));
+    }
+
+    #[test]
+    fn sb_eligibility_rejects_above_per_side_cap() {
+        let seven = vec![lp_normal(); 7];
+        let six = vec![lp_normal(); 6];
+        // 7 layers on either side exceeds SB cap.
+        assert!(!transition_eligible_for_scissored_bake_logic(
+            "fade", &seven, &six,
+        ));
+        assert!(!transition_eligible_for_scissored_bake_logic(
+            "fade", &six, &seven,
+        ));
+    }
+
+    #[test]
+    fn sb_eligibility_rejects_overlay_blend() {
+        let overlay = LayerCompositeProps { outline: false, blend: BlendMode::Overlay };
+        // Overlay on either side rejects (paint_layers_via_overlay_
+        // route is incompatible with atlas regions).
+        assert!(!transition_eligible_for_scissored_bake_logic(
+            "fade", &[lp_normal(), overlay], &[lp_normal()],
+        ));
+        assert!(!transition_eligible_for_scissored_bake_logic(
+            "fade", &[lp_normal()], &[lp_normal(), overlay],
+        ));
+    }
+
+    #[test]
+    fn sb_eligibility_admits_zero_layer_slides() {
+        // Bg-only slides on either or both sides are valid SB
+        // input -- zero layers always satisfies the cap and the
+        // Overlay-rejection loop is empty.
+        assert!(transition_eligible_for_scissored_bake_logic("fade", &[], &[]));
+        assert!(transition_eligible_for_scissored_bake_logic(
+            "fade", &[lp_normal()], &[],
+        ));
+        assert!(transition_eligible_for_scissored_bake_logic(
+            "fade", &[], &[lp_normal()],
+        ));
     }
 
     #[test]

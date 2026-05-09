@@ -51,7 +51,9 @@ use crate::hdmi_logic::{
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
     fs_transition_sp_source, gradient_density_is_degenerate,
     is_transition_kind_single_pass, prefer_scissored_bake, sp_kind_static,
-    stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog,
+    stripes_uniforms, transition_eligible_for_scissored_bake_logic,
+    transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
+    AlphaBitmap, BlendMode, FontCatalog,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
@@ -4192,30 +4194,32 @@ fn transition_eligible_for_single_pass(
     layers_a: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     layers_b: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
 ) -> bool {
-    if !is_transition_kind_single_pass(kind) {
-        return false;
-    }
-    if effective_solid_bg(bg_a).is_none() {
-        return false;
-    }
-    if effective_solid_bg(bg_b).is_none() {
-        return false;
-    }
-    if layers_a.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
-        return false;
-    }
-    if layers_b.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
-        return false;
-    }
-    for (l, _, _) in layers_a.iter().chain(layers_b.iter()) {
-        if l.outline {
-            return false;
-        }
-        if !matches!(parse_blend_mode(&l.blend), BlendMode::Normal) {
-            return false;
-        }
-    }
-    true
+    let props_a = layer_composite_props_from_tuples(layers_a);
+    let props_b = layer_composite_props_from_tuples(layers_b);
+    transition_eligible_for_single_pass_logic(
+        kind,
+        effective_solid_bg(bg_a).is_some(),
+        effective_solid_bg(bg_b).is_some(),
+        &props_a,
+        &props_b,
+    )
+}
+
+/// Adapter: lift a single slide's `(TextLayer, color, font)`
+/// tuples into the pure-logic `LayerCompositeProps` summary the
+/// eligibility gates take. Allocates one small Vec per call;
+/// only on the eligibility-decision path (once per transition
+/// onset, not per frame).
+fn layer_composite_props_from_tuples(
+    layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+) -> Vec<crate::hdmi_logic::LayerCompositeProps> {
+    layers
+        .iter()
+        .map(|(l, _, _)| crate::hdmi_logic::LayerCompositeProps {
+            outline: l.outline,
+            blend: parse_blend_mode(&l.blend),
+        })
+        .collect()
 }
 
 /// QA-mandated single-pass transition (2026-05-08, batch B fix):
@@ -5838,9 +5842,6 @@ fn transition_eligible_for_scissored_bake(
     layers_a: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     layers_b: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
 ) -> bool {
-    if !is_transition_kind_single_pass(kind) {
-        return false;
-    }
     // bg type widening (cold-scout #1, 2026-05-09): atlas SB used to
     // require solid-or-density-0-gradient on both sides via
     // effective_solid_bg. The bg-cache machinery
@@ -5852,7 +5853,9 @@ fn transition_eligible_for_scissored_bake(
     // tier's predicate (which legitimately needs solid because the
     // SP shader takes bg as a uniform color); SB does not. Drop
     // the gate. Image bgs now route through SB instead of legacy
-    // 3-pass; gradient bgs at any density too.
+    // 3-pass; gradient bgs at any density too. The pure-logic
+    // gate (transition_eligible_for_scissored_bake_logic) does
+    // not take bg props as a result.
     //
     // Pattern bgs (FS_PATTERN_*) still use gl_FragCoord without a
     // u_vp_offset uniform. They render correctly through the
@@ -5863,29 +5866,9 @@ fn transition_eligible_for_scissored_bake(
     // (cache-Err is a memory-pressure signal); the pattern shaders
     // can grow u_vp_offset in a follow-up if the fallback becomes
     // load-bearing.
-    if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
-        return false;
-    }
-    if layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
-        return false;
-    }
-    // Outline + non-Overlay blends OK (cold-scout #10):
-    // paint_slide_with_viewport's layer loop already dispatches
-    // blend_func per layer for Normal/Multiply/Screen and the
-    // outline glyph shader (FS_GLYPH_OUTLINE). The atlas SB bake
-    // calls paint_slide_with_viewport so all this is supported
-    // out of the box.
-    //
-    // Overlay alone needs the ping-pong FBO route in
-    // paint_layers_via_overlay_route (mode-res FBO_a + FBO_b
-    // alternating); incompatible with atlas region rendering.
-    // Reject any pair containing an Overlay layer.
-    for (l, _, _) in layers_a.iter().chain(layers_b.iter()) {
-        if matches!(parse_blend_mode(&l.blend), BlendMode::Overlay) {
-            return false;
-        }
-    }
-    true
+    let props_a = layer_composite_props_from_tuples(layers_a);
+    let props_b = layer_composite_props_from_tuples(layers_b);
+    transition_eligible_for_scissored_bake_logic(kind, &props_a, &props_b)
 }
 
 
