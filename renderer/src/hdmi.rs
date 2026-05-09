@@ -4846,17 +4846,10 @@ fn render_transition_scissored_bake_in_session(
     }
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
-    // Eligibility-validation: SB tier currently requires solid (or
-    // density-0 gradient) bg on both sides. The bg-cache machinery
-    // can render any BgKind, so this gate is over-restrictive --
-    // widening is queued as a follow-up commit. For now, retain
-    // the validation; bind to _ since downstream doesn't need the
-    // resolved color (the bake calls paint_slide_with_viewport
-    // which carries its own bg routing).
-    let _ = effective_solid_bg(&bg_a_kind)
-        .ok_or_else(|| anyhow!("scissored_bake: bg_a not solid"))?;
-    let _ = effective_solid_bg(&bg_b_kind)
-        .ok_or_else(|| anyhow!("scissored_bake: bg_b not solid"))?;
+    // No bg validation: transition_eligible_for_scissored_bake
+    // (cold-scout #1 widening) admits all BgKind variants. The
+    // bg-cache machinery handles gradient/pattern/image; solid
+    // uses scissor-clear in the bake.
     if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
         || layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
     {
@@ -5695,12 +5688,18 @@ unsafe fn ensure_slide_bg_cache(
                 )?;
             }
             BgKind::Pattern { kind, color_a, color_b, density } => {
-                // Pattern bgs aren't SB-eligible at the time of
-                // writing (effective_solid_bg returns None). When
-                // eligibility widens, this path activates. The
-                // gl_FragCoord-based pattern shaders need the same
-                // u_vp_offset extension FS_GRADIENT got if direct-
-                // bake ever calls draw_pattern with non-zero offset.
+                // Cache path renders at viewport offset (0, 0), so
+                // FS_PATTERN_*'s gl_FragCoord-based tile math is
+                // correct here regardless of where the cache is
+                // later blit into the atlas. The pattern shaders
+                // still lack u_vp_offset, so the lazy-fallback
+                // direct-bake path in render_transition_scissored_
+                // _bake_in_session (which fires only on cache-Err,
+                // a memory-pressure signal) renders pattern tiles
+                // at the wrong absolute position when slide B's
+                // bake hits viewport y_off=region_h. Best-effort
+                // fallback; rare in practice. Add u_vp_offset to
+                // FS_PATTERN_* if the fallback becomes load-bearing.
                 draw_pattern(gl, proj_w, proj_h, *kind, *color_a, *color_b, *density)?;
             }
             BgKind::Image { asset_path, solid_fallback } => {
@@ -5820,20 +5819,36 @@ unsafe fn ensure_bake_atlas(
 /// 3-pass.
 fn transition_eligible_for_scissored_bake(
     kind: &str,
-    bg_a: &BgKind,
-    bg_b: &BgKind,
+    _bg_a: &BgKind,
+    _bg_b: &BgKind,
     layers_a: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     layers_b: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
 ) -> bool {
     if !is_transition_kind_single_pass(kind) {
         return false;
     }
-    if effective_solid_bg(bg_a).is_none() {
-        return false;
-    }
-    if effective_solid_bg(bg_b).is_none() {
-        return false;
-    }
+    // bg type widening (cold-scout #1, 2026-05-09): atlas SB used to
+    // require solid-or-density-0-gradient on both sides via
+    // effective_solid_bg. The bg-cache machinery
+    // (ensure_slide_bg_cache + blit_bg_to_region) handles every
+    // BgKind variant -- gradient, pattern, image, solid -- by
+    // pre-rendering into a 2048x1024 cache texture and per-frame
+    // blitting via FS_BLIT (uv-driven, viewport-offset agnostic).
+    // The pre-eligibility-widening predicate was a copy of the SP
+    // tier's predicate (which legitimately needs solid because the
+    // SP shader takes bg as a uniform color); SB does not. Drop
+    // the gate. Image bgs now route through SB instead of legacy
+    // 3-pass; gradient bgs at any density too.
+    //
+    // Pattern bgs (FS_PATTERN_*) still use gl_FragCoord without a
+    // u_vp_offset uniform. They render correctly through the
+    // bg-cache path (cache renders at offset 0 then blits) but
+    // the rare cache-Err fallback in render_transition_scissored_
+    // bake_in_session would hit the direct-bake-at-non-zero-offset
+    // path with wrong tile positions. Fallback is best-effort
+    // (cache-Err is a memory-pressure signal); the pattern shaders
+    // can grow u_vp_offset in a follow-up if the fallback becomes
+    // load-bearing.
     if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE {
         return false;
     }
@@ -6189,10 +6204,16 @@ fn paint_slide_with_viewport(
                 draw_gradient_pattern(gl, vp_x_off, vp_y_off, vp_w, vp_h, *color_a, *color_b, *density)?;
             }
             BgKind::Pattern { kind, color_a, color_b, density } => {
-                // Pattern bgs aren't SB-eligible (effective_solid_bg
-                // returns None), so vp_x_off/vp_y_off won't be nonzero
-                // here in production. If they do become eligible later,
-                // FS_PATTERN_* shaders need the same u_vp_offset shift.
+                // FS_PATTERN_* shaders use absolute gl_FragCoord
+                // without a u_vp_offset uniform. When called from
+                // the atlas SB lazy-fallback path with a non-zero
+                // vp_y_off (slide B region offset), tile positions
+                // are wrong. The atlas SB normal path renders bg
+                // through ensure_slide_bg_cache (offset=0) and blits
+                // into the region, so this lazy-fallback only fires
+                // on cache-Err. Best-effort; rare. Add u_vp_offset
+                // to FS_PATTERN_* if the fallback becomes load-
+                // bearing (mirror the FS_GRADIENT u_vp_offset fix).
                 draw_pattern(gl, vp_w, vp_h, *kind, *color_a, *color_b, *density)?;
             }
             BgKind::Image { asset_path, solid_fallback } => {
@@ -7151,6 +7172,24 @@ fn prewarm_sp_session(
                 "reel: prewarm skipping slide {} text raster: {e:#}",
                 slide.id,
             );
+        }
+        // Pre-populate the bg-cache for non-solid bgs (cold-scout
+        // #12). Pays the gradient/pattern/image bg fragment-fill
+        // cost once at session bring-up rather than on the first
+        // SB transition involving this slide. Lazy-fallback path
+        // in render_transition_scissored_bake_in_session still
+        // populates if an error skips this. Idempotent across
+        // calls. Skip-on-Err so prewarm doesn't fail-fast on a
+        // single slide; runtime falls back to direct-bake.
+        if !matches!(_bg, BgKind::Solid(_)) {
+            unsafe {
+                if let Err(e) = ensure_slide_bg_cache(session, slide.id, &_bg) {
+                    eprintln!(
+                        "reel: prewarm bg_cache for slide {} failed: {e:#}; lazy on first SB call",
+                        slide.id,
+                    );
+                }
+            }
         }
     }
 
