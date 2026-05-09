@@ -930,38 +930,58 @@ fn render_animated_slide(
 /// across its own frames, releases all of it on exit. The
 /// session's gbm_surface is reused across calls but no BOs leak
 /// between calls.
-/// QA-direct (2026-05-08, post-Step-3): pace to a per-frame
-/// deadline with a hybrid sleep + spin-wait tail. std::thread::
-/// sleep on Linux at the default kernel HZ has 1-5 ms overshoot;
-/// at 30 fps target (33.3 ms cadence), that overshoot pushes
-/// per-frame to ~37 ms = ~27-28 fps aggregate (matches the §8.3
-/// gap measured post-Step-3). Sleeping most of the way and
-/// busy-spinning the last few ms lets us hit the deadline within
-/// a single spin iteration (~10 us). Cost: <2% CPU at 30 fps.
-fn pace_to_frame_deadline(start: Instant, frame_idx: u64, frame_period_ns: u64) {
-    // 10 ms spin budget. Linux thread::sleep on this Pi at the
-    // default kernel HZ has typical overshoot of 1-3 ms but tail
-    // hits 5-8 ms; a 10 ms spin window guarantees the spin (not
-    // the sleep) is what hits the deadline. CPU cost: ~30% of
-    // one core during the spin window per paced frame, which at
-    // 30 fps with a 33 ms cadence works out to ~9% of a core per
-    // second of render. That's the price for closing the §8.3
-    // gap from 28→30 fps STRICT instead of 29.6.
-    const SPIN_BUDGET_NS: u64 = 10_000_000;
-    let deadline_ns = frame_idx.wrapping_mul(frame_period_ns);
-    let now = start.elapsed().as_nanos() as u64;
-    if deadline_ns <= now {
-        return;
-    }
-    let remaining = deadline_ns - now;
-    if remaining > SPIN_BUDGET_NS {
-        std::thread::sleep(std::time::Duration::from_nanos(
-            remaining - SPIN_BUDGET_NS,
-        ));
-    }
-    while (start.elapsed().as_nanos() as u64) < deadline_ns {
-        std::hint::spin_loop();
-    }
+/// QA-direct (2026-05-08, post-Step-3): capture an absolute
+/// CLOCK_MONOTONIC timestamp at loop entry. Used as the base for
+/// pace_to_frame_deadline's clock_nanosleep TIMER_ABSTIME deadline
+/// math. Returns the timestamp in nanoseconds.
+#[cfg(target_os = "linux")]
+fn monotonic_now_ns() -> u64 {
+    let mut tp: libc::timespec = unsafe { std::mem::zeroed() };
+    let _ = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut tp) };
+    (tp.tv_sec as u64) * 1_000_000_000 + (tp.tv_nsec as u64)
+}
+
+/// QA-direct (2026-05-08, post-commit_fb): pace to a per-frame
+/// deadline using clock_nanosleep TIMER_ABSTIME, the highest-
+/// precision sleep primitive Linux exposes. Sub-millisecond on
+/// modern kernels, which closes the residual ~0.85 ms drift the
+/// hybrid sleep+spin couldn't absorb (kernel HZ overshoot leaks
+/// past spin budget on tail). No spin loop needed, no CPU spent
+/// busy-waiting.
+///
+/// `start_mono_ns` must be the CLOCK_MONOTONIC timestamp captured
+/// at loop init (via monotonic_now_ns). Deadline = start_mono_ns +
+/// frame_idx * frame_period_ns. clock_nanosleep returns when the
+/// kernel wakes us, typically <100 µs after the absolute deadline
+/// on a dev Pi (Linux 6.x).
+#[cfg(target_os = "linux")]
+fn pace_to_frame_deadline(start_mono_ns: u64, frame_idx: u64, frame_period_ns: u64) {
+    let deadline_ns = start_mono_ns.wrapping_add(frame_idx.wrapping_mul(frame_period_ns));
+    let target = libc::timespec {
+        tv_sec: (deadline_ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (deadline_ns % 1_000_000_000) as libc::c_long,
+    };
+    let _ = unsafe {
+        libc::clock_nanosleep(
+            libc::CLOCK_MONOTONIC,
+            libc::TIMER_ABSTIME,
+            &target,
+            std::ptr::null_mut(),
+        )
+    };
+}
+
+/// Non-Linux fallback: std::thread::sleep relative to deadline.
+/// Renderer is Linux-only in production but the function must
+/// compile on host (macOS) for tests.
+#[cfg(not(target_os = "linux"))]
+fn monotonic_now_ns() -> u64 {
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pace_to_frame_deadline(_start_mono_ns: u64, _frame_idx: u64, _frame_period_ns: u64) {
+    // No-op on non-Linux; renderer doesn't run on macOS.
 }
 
 fn render_animated_slide_in_session(
@@ -990,6 +1010,7 @@ fn render_animated_slide_in_session(
     // Frame deadline tracking.
     let frame_period_ns: u64 = 1_000_000_000_u64 / fps.max(1) as u64;
     let start = std::time::Instant::now();
+    let start_mono_ns = monotonic_now_ns();
     let mut frames: u32 = 0;
     // v1-spec-delta #3 (slice b QA followup): glyph rasterization
     // cache lives across the per-frame loop. layout_text_to_alpha
@@ -1133,12 +1154,10 @@ fn render_animated_slide_in_session(
             // — accumulated drift would walk us off cadence after a
             // few seconds. SKIP when profiling so the histogram
             // captures real shader-bound cadence, not vsync-padded.
-            // QA-direct (2026-05-08): pace_to_frame_deadline does a
-            // hybrid sleep+spin to absorb the 1-5 ms kernel sleep
-            // overshoot that was dragging per-frame to 37 ms (~27
-            // fps aggregate) at 30 fps target.
+            // QA-direct (2026-05-08): pace_to_frame_deadline uses
+            // clock_nanosleep TIMER_ABSTIME for sub-ms precision.
             if !profile_active {
-                pace_to_frame_deadline(start, frames as u64, frame_period_ns);
+                pace_to_frame_deadline(start_mono_ns, frames as u64, frame_period_ns);
             }
         }
         eprintln!(
@@ -3490,6 +3509,7 @@ fn render_transition_animated_in_session(
             }
         }
         let start = Instant::now();
+        let start_mono_ns = monotonic_now_ns();
         let mut rendered = 0_u32;
         let profile_active_t = crate::profile::is_enabled();
         let loop_result: Result<()> = (|| {
@@ -3659,11 +3679,11 @@ fn render_transition_animated_in_session(
             crate::profile::frame_complete();
             // Skip pace-sleep when profiling so the histogram
             // captures real shader-bound cadence.
-            // QA-direct (2026-05-08): pace_to_frame_deadline
-            // hybrid-sleeps to absorb kernel overshoot.
+            // QA-direct (2026-05-08): clock_nanosleep TIMER_ABSTIME
+            // for sub-ms precision.
             if !profile_active_t {
                 pace_to_frame_deadline(
-                    start,
+                    start_mono_ns,
                     (frame + 1) as u64,
                     frame_budget.as_nanos() as u64,
                 );
@@ -4168,6 +4188,7 @@ fn render_transition_single_pass_in_session(
         let u_b_rgba_locs = resolve_slot_locs("u_b_rgba", layers_b_len);
 
         let start = Instant::now();
+        let start_mono_ns = monotonic_now_ns();
         let mut rendered = 0_u32;
         let profile_active_t = crate::profile::is_enabled();
         let loop_result: Result<()> = (|| {
@@ -4370,7 +4391,7 @@ fn render_transition_single_pass_in_session(
                 crate::profile::frame_complete();
 
                 if !profile_active_t {
-                    pace_to_frame_deadline(start, rendered as u64, frame_period_ns);
+                    pace_to_frame_deadline(start_mono_ns, rendered as u64, frame_period_ns);
                 }
             }
             Ok(())
