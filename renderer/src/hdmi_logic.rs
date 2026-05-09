@@ -718,17 +718,24 @@ void main() {
     float t = u_t;
     float scaleX = abs(2.0 * t - 1.0);
     float useTo = step(0.5, t);
-    vec4 col = vec4(0.0, 0.0, 0.0, 1.0);
-    if (scaleX > 0.001) {
-        float src_x = (v_uv.x - 0.5) / scaleX + 0.5;
-        if (src_x >= 0.0 && src_x <= 1.0) {
-            vec2 uv = vec2(src_x, v_uv.y);
-            vec4 a = texture2D(u_src_a, uv);
-            vec4 b = texture2D(u_src_b, uv);
-            col = mix(a, b, useTo);
-        }
-    }
-    gl_FragColor = col;
+    // Branchless (P5, 2026-05-09): the legacy shader gated the
+    // texture sample with two nested conditionals on scaleX and
+    // src_x extent. On vc4 SIMD the inner src_x test diverges
+    // per-fragment whenever the card is mid-flip. Match the
+    // SP-tier idiom: compute src_x unconditionally with
+    // max(scaleX, 1e-3) to avoid divide-by-zero at t=0.5
+    // exactly, sample both slides, then multiply the final RGB
+    // by inside = step(0.001, scaleX) * step(0.0, src_x) *
+    // step(src_x, 1.0). Out-of-card pixels still emit black
+    // (matches legacy behavior); inside-card pixels mix(a, b,
+    // useTo) like the legacy guard.
+    float src_x = (v_uv.x - 0.5) / max(scaleX, 1e-3) + 0.5;
+    vec2 uv = vec2(src_x, v_uv.y);
+    vec4 a = texture2D(u_src_a, uv);
+    vec4 b = texture2D(u_src_b, uv);
+    vec3 col = mix(a, b, useTo).rgb;
+    float inside = step(0.001, scaleX) * step(0.0, src_x) * step(src_x, 1.0);
+    gl_FragColor = vec4(col * inside, 1.0);
 }
 "#;
 
@@ -4180,6 +4187,37 @@ mod tests {
         // switches at midpoint via step(0.5, t).
         assert!(FS_FLIP.contains("abs(2.0 * t - 1.0)"));
         assert!(FS_FLIP.contains("step(0.5, t)"));
+    }
+
+    #[test]
+    fn fs_flip_is_branchless() {
+        // P5 (2026-05-09): the standalone composite FS_FLIP was
+        // backported to match the SP-tier FS_FLIP_SP idiom --
+        // sample both slides unconditionally, mask the final
+        // color via step() products. No per-fragment `if`
+        // branching in the body; on vc4 SIMD this avoids
+        // divergence cost when the card is mid-flip.
+        assert!(
+            !FS_FLIP.contains("if ("),
+            "FS_FLIP should be branchless (no `if (` in body)",
+        );
+        // Specific markers of the branchless idiom.
+        assert!(
+            FS_FLIP.contains("max(scaleX, 1e-3)"),
+            "FS_FLIP should use max-guard to avoid div-by-zero",
+        );
+        assert!(
+            FS_FLIP.contains("step(0.001, scaleX)"),
+            "FS_FLIP should use scaleX step-mask for inside test",
+        );
+        assert!(
+            FS_FLIP.contains("step(0.0, src_x)"),
+            "FS_FLIP should use src_x lower-bound step-mask",
+        );
+        assert!(
+            FS_FLIP.contains("step(src_x, 1.0)"),
+            "FS_FLIP should use src_x upper-bound step-mask",
+        );
     }
 
     #[test]
