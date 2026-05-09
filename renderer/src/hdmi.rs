@@ -4974,6 +4974,30 @@ fn render_transition_scissored_bake_in_session(
     // [0.5, 1.0].
     let xform_b: [f32; 4] = [0.0, uv_scale_y, uv_scale_x, uv_scale_y];
 
+    // Static-pair single-bake (cold-scout 2026-05-09 #3): when
+    // both slides have no per-frame-changing layers (no motion,
+    // no auto_mode), the atlas bake output is identical every
+    // frame in the transition. Bake once on frame 0; subsequent
+    // frames composite-only. Saves ~bake_a+bake_b time per frame
+    // (sub-ms p50, multi-ms p99 -- the GPU work IS the savings)
+    // and naturally extends to the dominant operator-content
+    // shape (most authored slides are static text on solid bgs).
+    //
+    // Eligibility check matches render_slide_in_session's
+    // any_animated/any_auto pattern. auto_mode-set layers refresh
+    // text on second boundaries; treat as motion for transition-
+    // window purposes (a 600 ms transition could straddle a
+    // boundary -- conservatively re-bake every frame).
+    let any_animated_a = layers_a
+        .iter()
+        .any(|(l, _, _)| parse_motion_kind(&l.motion) != MotionKind::Static);
+    let any_animated_b = layers_b
+        .iter()
+        .any(|(l, _, _)| parse_motion_kind(&l.motion) != MotionKind::Static);
+    let any_auto_a = layers_a.iter().any(|(l, _, _)| l.auto_mode.is_some());
+    let any_auto_b = layers_b.iter().any(|(l, _, _)| l.auto_mode.is_some());
+    let static_pair = !any_animated_a && !any_animated_b && !any_auto_a && !any_auto_b;
+
     let mut prev_bo: Option<BufferObject<()>> = None;
     let mut prev_fb: Option<framebuffer::Handle> = None;
     let mut current_bo: Option<BufferObject<()>> = None;
@@ -4988,6 +5012,10 @@ fn render_transition_scissored_bake_in_session(
         let start = Instant::now();
         let start_mono_ns = monotonic_now_ns();
         let mut rendered = 0_u32;
+        // Static-pair single-bake gate: flips true after the first
+        // frame's bake when static_pair = true. Subsequent frames
+        // skip bake_a + bake_b and go straight to composite.
+        let mut static_baked = false;
         let profile_active_t = crate::profile::is_enabled();
         let loop_result: Result<()> = (|| {
             for frame in 0..total_frames {
@@ -4999,10 +5027,19 @@ fn render_transition_scissored_bake_in_session(
                 let tick_seconds = start.elapsed().as_secs_f64();
                 let wall_clock_unix = current_unix_seconds();
 
-                let states_a =
-                    motion_states_for_layers(slide_a.id, &layers_a, tick_seconds);
-                let states_b =
-                    motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
+                // Skip motion_states_for_layers + bake when the
+                // pair is static and atlas already baked.
+                let bake_needed = !static_pair || !static_baked;
+                let states_a = if bake_needed {
+                    motion_states_for_layers(slide_a.id, &layers_a, tick_seconds)
+                } else {
+                    Vec::new()
+                };
+                let states_b = if bake_needed {
+                    motion_states_for_layers(slide_b.id, &layers_b, tick_seconds)
+                } else {
+                    Vec::new()
+                };
 
                 // Atlas bake phase: bind atlas FBO ONCE, paint A
                 // into bottom region (y=[0,1024)) under scissor,
@@ -5013,6 +5050,7 @@ fn render_transition_scissored_bake_in_session(
                 // composite). Region height = 1024 (1080 → 1024
                 // = 5.5% vertical compression upsampled at
                 // composite).
+                if bake_needed {
                 let t_bake_a = Instant::now();
                 unsafe {
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(atlas_fbo));
@@ -5089,6 +5127,10 @@ fn render_transition_scissored_bake_in_session(
                     )?;
                 }
                 crate::profile::record_phase("sb_bake_b", t_bake_b.elapsed().as_nanos() as u64);
+                if static_pair {
+                    static_baked = true;
+                }
+                } // end if bake_needed
 
                 // Composite: sample atlas with two UV xforms +
                 // kind-specific warp + mix → default FB. Disable
