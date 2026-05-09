@@ -308,15 +308,19 @@ pub struct EglSession<'a> {
     /// (~1 ms per transition * 18 reel transitions). Lazy-init on
     /// first SP transition; freed at with_egl_session teardown.
     transition_sp_quad_vbo: Option<glow::NativeBuffer>,
-    /// QA-mandated scissored-bake (Step 4, 2026-05-08): two
-    /// session-cached offscreen FBO+texture pairs sized at the
-    /// current mode's dimensions. Reused across every scissored-
-    /// bake transition; the bake-pass renders one slide into
-    /// each, the composite-pass samples both. 2 × 1080p ×
-    /// 4 bytes = 16 MB CMA total. Lazy-allocated on first
+    /// Single 2048x2048 atlas FBO for the scissored-bake path
+    /// (2026-05-09 redirect). Replaces the prior fbo_a / fbo_b
+    /// pair: with vc4 V3D 2.1 tiled-deferred sequencing, every
+    /// FBO bind-switch forces a tile-store flush of the outgoing
+    /// FBO (~13ms p50). Baking BOTH slides into ONE FBO, with
+    /// scissor switching between regions, eliminates one of the
+    /// three per-frame bind-switches. Lazy-allocated on first
     /// scissored-bake call; freed at with_egl_session teardown.
-    scissored_bake_fbo_a: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
-    scissored_bake_fbo_b: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
+    /// Memory: 2048*2048*4 = 16 MB. Same total as the prior pair
+    /// at 1920*1080*4*2 = 16.6 MB; no net memory increase.
+    /// See ATLAS_FBO_W / ATLAS_FBO_H / ATLAS_REGION_W /
+    /// ATLAS_REGION_H in hdmi_logic.rs for the geometry.
+    scissored_bake_atlas: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
     /// QA-approved env override for scissored-bake FBO size
     /// divisor. Read once at session bring-up via
     /// read_sb_divisor_env. See OPENMARQUEE_SB_DIVISOR docs.
@@ -441,6 +445,20 @@ where
         .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
         .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
 
+    // eglSwapInterval(0) (2026-05-09 QA Phase 2): pair with
+    // DRM_MODE_PAGE_FLIP_ASYNC so eglSwapBuffers does NOT wait
+    // for vsync to release a back buffer. Default EGL behaviour
+    // is interval=1 (vsync-lock), which on vc4 + GBM means
+    // 16.67ms quantization on swap returns even though the
+    // kernel page-flip is async. Setting interval=0 hands buffer
+    // management to the kernel/driver and lets us pace at
+    // arbitrary 33.3ms (or finer) intervals via clock_nanosleep.
+    // Tearing is still bounded -- the ASYNC page-flip already
+    // accepts the (sub-vblank) tear window.
+    if let Err(e) = egl_lib.swap_interval(display, 0) {
+        eprintln!("warn: eglSwapInterval(0) failed: {e:?}; defaulting to vsync-locked swap");
+    }
+
     let gl = unsafe {
         glow::Context::from_loader_function(|name| {
             egl_lib.get_proc_address(name).map(|fp| fp as *const _).unwrap_or(ptr::null())
@@ -470,8 +488,7 @@ where
         current_settings: crate::content::Settings::default(),
         slide_caches: std::collections::HashMap::new(),
         transition_sp_quad_vbo: None,
-        scissored_bake_fbo_a: None,
-        scissored_bake_fbo_b: None,
+        scissored_bake_atlas: None,
         scissored_bake_divisor: read_sb_divisor_env(),
     };
     let work_result = work(&mut session);
@@ -500,6 +517,12 @@ where
                     unsafe { gl.delete_texture(t); }
                 }
             }
+            // Atlas SB bg-cache (2026-05-09): free the cached bg
+            // texture for this slide. Lives at slide-cache lifetime;
+            // GL_DELETE_TEXTURE while context still bound.
+            if let Some(t) = entry.bg_tex.take() {
+                unsafe { gl.delete_texture(t); }
+            }
         }
     }
     // qarl-direct perf-profile (2026-05-08): free thread-local
@@ -511,6 +534,7 @@ where
     clear_transition_program_cache(&gl);
     clear_transition_sp_program_cache(&gl);
     clear_composite_program_cache(&gl);
+    clear_blit_program_cache(&gl);
     // v1-spec-delta #9 (slice d): drain pending flip + free
     // session-level scanout BO/FB rotation. Mirrors the
     // animated_slide end-of-call cleanup but at session
@@ -550,11 +574,7 @@ where
         if let Some(vbo) = session.transition_sp_quad_vbo.take() {
             gl.delete_buffer(vbo);
         }
-        if let Some((fbo, tex)) = session.scissored_bake_fbo_a.take() {
-            gl.delete_framebuffer(fbo);
-            gl.delete_texture(tex);
-        }
-        if let Some((fbo, tex)) = session.scissored_bake_fbo_b.take() {
+        if let Some((fbo, tex)) = session.scissored_bake_atlas.take() {
             gl.delete_framebuffer(fbo);
             gl.delete_texture(tex);
         }
@@ -1080,14 +1100,7 @@ fn render_animated_slide_in_session(
         };
         if needs_new {
             if let Some(old) = session.slide_caches.remove(&slide_id) {
-                unsafe {
-                    use glow::HasContext;
-                    for slot in old.tex {
-                        if let Some(t) = slot {
-                            session.gl.delete_texture(t);
-                        }
-                    }
-                }
+                free_slide_render_cache(session.gl, old);
             }
             session.slide_caches.insert(slide_id, SlideRenderCache::new(text_layers.len()));
         }
@@ -1268,14 +1281,16 @@ fn render_animated_slide_in_session(
 /// closure.
 fn draw_gradient_pattern(
     gl: &glow::Context,
-    mode_w: u32,
-    mode_h: u32,
+    vp_x_off: u32,
+    vp_y_off: u32,
+    vp_w: u32,
+    vp_h: u32,
     color_a: [f32; 4],
     color_b: [f32; 4],
     density: f32,
 ) -> Result<()> {
     use glow::HasContext;
-    let g = gradient_uniforms(mode_w, mode_h, density);
+    let g = gradient_uniforms(vp_w, vp_h, density);
     unsafe {
         if let Some(g) = g {
             let program = link_program(gl, VS_FULLSCREEN_QUAD, FS_GRADIENT)?;
@@ -1288,11 +1303,13 @@ fn draw_gradient_pattern(
             };
             gl.use_program(Some(program));
             let u_viewport = gl.get_uniform_location(program, "u_viewport");
+            let u_vp_offset = gl.get_uniform_location(program, "u_vp_offset");
             let u_dir = gl.get_uniform_location(program, "u_dir");
             let u_proj_bounds = gl.get_uniform_location(program, "u_proj_bounds");
             let u_color_a = gl.get_uniform_location(program, "u_color_a");
             let u_color_b = gl.get_uniform_location(program, "u_color_b");
-            gl.uniform_2_f32(u_viewport.as_ref(), mode_w as f32, mode_h as f32);
+            gl.uniform_2_f32(u_viewport.as_ref(), vp_w as f32, vp_h as f32);
+            gl.uniform_2_f32(u_vp_offset.as_ref(), vp_x_off as f32, vp_y_off as f32);
             gl.uniform_2_f32(u_dir.as_ref(), g.dx, g.dy);
             gl.uniform_2_f32(u_proj_bounds.as_ref(), g.proj_min, g.span);
             gl.uniform_3_f32(u_color_a.as_ref(), color_a[0], color_a[1], color_a[2]);
@@ -1671,6 +1688,13 @@ fn draw_text_layer(
     motion_state: MotionState,
     bm: &AlphaBitmap,
     tex_slot: Option<&mut Option<glow::NativeTexture>>,
+    // Atlas SB Phase 2.7 (E): when Some, set glScissor to the
+    // layer's framebuffer-pixel rect (NDC-final quad mapped via
+    // the supplied viewport) before draw_arrays. Restricts the
+    // rasterizer's tile-coverage to the layer's destination area,
+    // dropping fragment work on tiles outside the layer rect.
+    // (vp_x_off, vp_y_off, vp_w, vp_h) is the current GL viewport.
+    tighten_scissor: Option<(u32, u32, u32, u32)>,
 ) -> Result<()> {
     use glow::HasContext;
 
@@ -1923,6 +1947,45 @@ fn draw_text_layer(
             stride,
             (2 * std::mem::size_of::<f32>()) as i32,
         );
+
+        // Atlas SB Phase 2.7 (E): tighten scissor to this layer's
+        // framebuffer-pixel rect. vc4 is a tile-based renderer
+        // (tile=64x64); without scissor, the rasterizer covers
+        // every tile that intersects the quad's bbox even though
+        // the fragment shader will only emit coverage inside
+        // visible glyph areas. Tightening scissor to the quad's
+        // rect drops uncovered tiles entirely, removing the per-
+        // tile load/store overhead on tiles the layer doesn't
+        // actually fill.
+        //
+        // Caller already has GL_SCISSOR_TEST enabled (atlas SB
+        // sets region scissor before bake) and is responsible
+        // for re-establishing scissor after the layer batch.
+        if let Some((vp_x_off, vp_y_off, vp_w, vp_h)) = tighten_scissor {
+            // NDC -> framebuffer pixel coords via current
+            // viewport. NDC y=+1 (top) maps to fb_y_top =
+            // vp_y_off + vp_h; NDC y=-1 (bottom) maps to
+            // vp_y_off. Quad's NDC top is ndc_t (the larger y),
+            // bottom is ndc_b (smaller).
+            let to_fb_x = |ndc: f32| {
+                vp_x_off as f32 + (ndc + 1.0) * 0.5 * vp_w as f32
+            };
+            let to_fb_y = |ndc: f32| {
+                vp_y_off as f32 + (ndc + 1.0) * 0.5 * vp_h as f32
+            };
+            let fb_l = to_fb_x(ndc_l).floor().max(0.0) as i32;
+            let fb_r = to_fb_x(ndc_r).ceil() as i32;
+            let fb_b = to_fb_y(ndc_b).floor().max(0.0) as i32;
+            let fb_t = to_fb_y(ndc_t).ceil() as i32;
+            // GL scissor takes (x, y, w, h) where y is from
+            // bottom of framebuffer, w/h must be >=0. Skip if
+            // empty (degenerate quad).
+            let sw = (fb_r - fb_l).max(0);
+            let sh = (fb_t - fb_b).max(0);
+            if sw > 0 && sh > 0 {
+                gl.scissor(fb_l, fb_b, sw, sh);
+            }
+        }
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         gl.disable_vertex_attrib_array(a_pos);
         gl.disable_vertex_attrib_array(a_uv);
@@ -2655,9 +2718,10 @@ pub fn capture_sb_transition_mid_to_png(
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
-    if effective_solid_bg(&bg_a_kind).is_none() || effective_solid_bg(&bg_b_kind).is_none() {
-        bail!("capture_sb_mid: both slides must have solid bg");
-    }
+    let bg_a_4 = effective_solid_bg(&bg_a_kind)
+        .ok_or_else(|| anyhow!("capture_sb_mid: bg_a not solid"))?;
+    let bg_b_4 = effective_solid_bg(&bg_b_kind)
+        .ok_or_else(|| anyhow!("capture_sb_mid: bg_b not solid"))?;
     if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
         || layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
     {
@@ -2679,22 +2743,26 @@ pub fn capture_sb_transition_mid_to_png(
             };
             if needs_new {
                 if let Some(old) = session.slide_caches.remove(&sid) {
-                    unsafe {
-                        for slot in old.tex {
-                            if let Some(tx) = slot {
-                                session.gl.delete_texture(tx);
-                            }
-                        }
-                    }
+                    free_slide_render_cache(session.gl, old);
                 }
                 session.slide_caches.insert(sid, SlideRenderCache::new(n));
             }
         }
 
         let ccp = cached_composite_program(session.gl, kind)?;
-        let (fbo_a, tex_a) = unsafe { ensure_bake_fbo_pair(session, 0)? };
-        let (fbo_b, tex_b) = unsafe { ensure_bake_fbo_pair(session, 1)? };
+        let (atlas_fbo, atlas_tex) = unsafe { ensure_bake_atlas(session)? };
         let vbo = ensure_transition_sp_quad_vbo(session)?;
+        let _ = bg_a_4;
+        let _ = bg_b_4;
+        let region_h = crate::hdmi_logic::ATLAS_REGION_H;
+        let atlas_w_f = crate::hdmi_logic::ATLAS_FBO_W as f32;
+        let atlas_h_f = crate::hdmi_logic::ATLAS_FBO_H as f32;
+        let used_w_f = mode_w as f32;
+        let used_h_f = region_h as f32;
+        let uv_scale_x = used_w_f / atlas_w_f;
+        let uv_scale_y = used_h_f / atlas_h_f;
+        let xform_a: [f32; 4] = [0.0, 0.0, uv_scale_x, uv_scale_y];
+        let xform_b: [f32; 4] = [0.0, uv_scale_y, uv_scale_x, uv_scale_y];
 
         // Allocate a full-res capture FBO. Free at function exit.
         let gl = session.gl;
@@ -2738,36 +2806,79 @@ pub fn capture_sb_transition_mid_to_png(
         let states_b = motion_states_for_layers(slide_b.id, &layers_b, 0.0);
         let wall_clock_unix = current_unix_seconds();
 
-        let divisor = session.scissored_bake_divisor;
-        let bake_vp_w = (mode_w / divisor).max(1);
-        let bake_vp_h = (mode_h / divisor).max(1);
-
-        // Bake A
-        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a)); }
+        // Atlas bake phase: one FBO bind, scissor + viewport
+        // switch between regions. Mirrors the runtime SB path.
+        let bcp = cached_blit_program(session.gl)?;
+        unsafe {
+            if let Err(e) = ensure_slide_bg_cache(session, slide_a_id, &bg_a_kind) {
+                eprintln!("warn: capture ensure_slide_bg_cache slide_a: {e:#}");
+            }
+            if let Err(e) = ensure_slide_bg_cache(session, slide_b_id, &bg_b_kind) {
+                eprintln!("warn: capture ensure_slide_bg_cache slide_b: {e:#}");
+            }
+        }
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(atlas_fbo));
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(0, 0, mode_w as i32, region_h as i32);
+        }
         {
+            let bg_tex_a = session
+                .slide_caches
+                .get(&slide_a_id)
+                .and_then(|c| c.bg_tex);
+            if let Some(bg_tex) = bg_tex_a {
+                unsafe {
+                    gl.viewport(0, 0, mode_w as i32, region_h as i32);
+                }
+                blit_bg_to_region(gl, &bcp, vbo, bg_tex)?;
+            }
             let cache_a = session
                 .slide_caches
                 .get_mut(&slide_a_id)
                 .expect("slide_caches[a] init above");
+            let bg_arg = if bg_tex_a.is_some() {
+                None
+            } else {
+                Some(&bg_a_kind)
+            };
             paint_slide_with_viewport(
-                gl, mode_w, mode_h, bake_vp_w, bake_vp_h,
-                &bg_a_kind, &layers_a,
+                gl, mode_w, mode_h,
+                0, 0, mode_w, region_h,
+                bg_arg, &layers_a,
                 Some(&states_a), wall_clock_unix,
                 Some(&mut cache_a.glyph),
                 Some(&mut session.image_bg_cache),
                 Some(&mut cache_a.tex),
             )?;
         }
-        // Bake B
-        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b)); }
+        unsafe {
+            gl.scissor(0, region_h as i32, mode_w as i32, region_h as i32);
+        }
         {
+            let bg_tex_b = session
+                .slide_caches
+                .get(&slide_b_id)
+                .and_then(|c| c.bg_tex);
+            if let Some(bg_tex) = bg_tex_b {
+                unsafe {
+                    gl.viewport(0, region_h as i32, mode_w as i32, region_h as i32);
+                }
+                blit_bg_to_region(gl, &bcp, vbo, bg_tex)?;
+            }
             let cache_b = session
                 .slide_caches
                 .get_mut(&slide_b_id)
                 .expect("slide_caches[b] init above");
+            let bg_arg = if bg_tex_b.is_some() {
+                None
+            } else {
+                Some(&bg_b_kind)
+            };
             paint_slide_with_viewport(
-                gl, mode_w, mode_h, bake_vp_w, bake_vp_h,
-                &bg_b_kind, &layers_b,
+                gl, mode_w, mode_h,
+                0, region_h, mode_w, region_h,
+                bg_arg, &layers_b,
                 Some(&states_b), wall_clock_unix,
                 Some(&mut cache_b.glyph),
                 Some(&mut session.image_bg_cache),
@@ -2777,6 +2888,7 @@ pub fn capture_sb_transition_mid_to_png(
 
         // Composite at t into cap_fbo.
         unsafe {
+            gl.disable(glow::SCISSOR_TEST);
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(cap_fbo));
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             gl.disable(glow::BLEND);
@@ -2784,11 +2896,19 @@ pub fn capture_sb_transition_mid_to_png(
             gl.clear(glow::COLOR_BUFFER_BIT);
             gl.use_program(Some(ccp.program));
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+            gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
             gl.uniform_1_i32(ccp.u_src_a.as_ref(), 0);
             gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+            gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
             gl.uniform_1_i32(ccp.u_src_b.as_ref(), 1);
+            gl.uniform_4_f32(
+                ccp.u_a_xform.as_ref(),
+                xform_a[0], xform_a[1], xform_a[2], xform_a[3],
+            );
+            gl.uniform_4_f32(
+                ccp.u_b_xform.as_ref(),
+                xform_b[0], xform_b[1], xform_b[2], xform_b[3],
+            );
             gl.uniform_1_f32(ccp.u_t.as_ref(), t);
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -2808,7 +2928,7 @@ pub fn capture_sb_transition_mid_to_png(
         std::fs::write(png_path, &png_bytes)
             .with_context(|| format!("write png {}", png_path.display()))?;
         eprintln!(
-            "captured SB transition kind={kind:?} slide_a={} slide_b={} t={t:.3} divisor={divisor} -> {} ({} bytes)",
+            "captured SB transition kind={kind:?} slide_a={} slide_b={} t={t:.3} -> {} ({} bytes)",
             slide_a.id, slide_b.id, png_path.display(), png_bytes.len(),
         );
 
@@ -3760,13 +3880,7 @@ fn render_transition_animated_in_session(
             };
             if needs_new {
                 if let Some(old) = session.slide_caches.remove(&sid) {
-                    unsafe {
-                        for slot in old.tex {
-                            if let Some(t) = slot {
-                                gl.delete_texture(t);
-                            }
-                        }
-                    }
+                    free_slide_render_cache(gl, old);
                 }
                 session.slide_caches.insert(sid, SlideRenderCache::new(n));
             }
@@ -4366,7 +4480,6 @@ fn render_transition_single_pass_in_session(
     let layers_a_len = layers_a.len();
     let layers_b_len = layers_b.len();
     {
-        use glow::HasContext;
         for (sid, n) in [(slide_a_id, layers_a_len), (slide_b_id, layers_b_len)] {
             let needs_new = match session.slide_caches.get(&sid) {
                 Some(c) => c.glyph.len() != n,
@@ -4374,13 +4487,7 @@ fn render_transition_single_pass_in_session(
             };
             if needs_new {
                 if let Some(old) = session.slide_caches.remove(&sid) {
-                    unsafe {
-                        for slot in old.tex {
-                            if let Some(t) = slot {
-                                session.gl.delete_texture(t);
-                            }
-                        }
-                    }
+                    free_slide_render_cache(session.gl, old);
                 }
                 session.slide_caches.insert(sid, SlideRenderCache::new(n));
             }
@@ -4761,7 +4868,6 @@ fn render_transition_scissored_bake_in_session(
     let layers_a_len = layers_a.len();
     let layers_b_len = layers_b.len();
     {
-        use glow::HasContext;
         for (sid, n) in [(slide_a_id, layers_a_len), (slide_b_id, layers_b_len)] {
             let needs_new = match session.slide_caches.get(&sid) {
                 Some(c) => c.glyph.len() != n,
@@ -4769,30 +4875,81 @@ fn render_transition_scissored_bake_in_session(
             };
             if needs_new {
                 if let Some(old) = session.slide_caches.remove(&sid) {
-                    unsafe {
-                        for slot in old.tex {
-                            if let Some(t) = slot {
-                                session.gl.delete_texture(t);
-                            }
-                        }
-                    }
+                    free_slide_render_cache(session.gl, old);
                 }
                 session.slide_caches.insert(sid, SlideRenderCache::new(n));
             }
         }
     }
 
-    // Pre-resolve cached programs + ensure FBOs/VBO.
-    // Bake-pass is via paint_slide (per-layer draws into the layer
-    // rect, not full-screen) -- the SP-style bake program with
-    // full-screen apply_layer chain ran 70+ ms/frame on vc4
-    // because each fragment paid N texture samples regardless of
-    // layer-rect coverage. paint_slide's clear + per-layer-quad
-    // pattern is sparse and fits per-frame budget.
+    // Pre-resolve cached programs + ensure atlas FBO/VBO.
+    // Bake-pass is via paint_slide_with_viewport (per-layer draws
+    // into the layer rect, not full-screen) -- the SP-style bake
+    // program with full-screen apply_layer chain ran 70+ ms/frame
+    // on vc4 because each fragment paid N texture samples
+    // regardless of layer-rect coverage.
+    //
+    // Both slides bake into the same atlas FBO at distinct
+    // viewport regions (slide A at y=[0,1024), slide B at
+    // y=[1024,2048)) -- one FBO bind across the bake phase
+    // eliminates one of the prior implementation's three
+    // per-frame bind-switches (each ~13ms vc4 tile-store
+    // sync). bg_kind passes through; gradient bg uses
+    // u_vp_offset to shift gl_FragCoord into the region-local
+    // frame (FS_GRADIENT, 2026-05-09). Solid bg uses glClear
+    // which respects scissor. Pattern bg isn't SB-eligible.
+    // Cut transition uses side-specialized composite shaders
+    // (Phase 2.6 QA-direct): FS_CUT_A / FS_CUT_B sample only the
+    // visible side per frame, halving composite texture-fetch
+    // count. Other kinds need both sides + use the combined
+    // FS_<KIND> via cached_composite_program.
+    let kind_is_cut = kind == "cut";
     let ccp = cached_composite_program(session.gl, kind)?;
-    let (fbo_a, tex_a) = unsafe { ensure_bake_fbo_pair(session, 0)? };
-    let (fbo_b, tex_b) = unsafe { ensure_bake_fbo_pair(session, 1)? };
+    let cut_ccp_a = if kind_is_cut {
+        Some(cached_cut_composite_program(session.gl, false)?)
+    } else {
+        None
+    };
+    let cut_ccp_b = if kind_is_cut {
+        Some(cached_cut_composite_program(session.gl, true)?)
+    } else {
+        None
+    };
+    let bcp = cached_blit_program(session.gl)?;
+    let (atlas_fbo, atlas_tex) = unsafe { ensure_bake_atlas(session)? };
     let vbo = ensure_transition_sp_quad_vbo(session)?;
+    let _ = bg_a_4;
+    let _ = bg_b_4;
+    // bg-cache (2026-05-09 Phase 2.5): pre-populate cached non-
+    // solid bgs at atlas region size. Idempotent across calls
+    // -- pays the gradient/pattern fill cost ONCE per slide
+    // lifetime, not 18× per transition.
+    unsafe {
+        if let Err(e) = ensure_slide_bg_cache(session, slide_a_id, &bg_a_kind) {
+            eprintln!("warn: ensure_slide_bg_cache slide_a={slide_a_id}: {e:#}; falling back to per-frame bg render");
+        }
+        if let Err(e) = ensure_slide_bg_cache(session, slide_b_id, &bg_b_kind) {
+            eprintln!("warn: ensure_slide_bg_cache slide_b={slide_b_id}: {e:#}; falling back to per-frame bg render");
+        }
+    }
+    let region_w = crate::hdmi_logic::ATLAS_REGION_W;
+    let region_h = crate::hdmi_logic::ATLAS_REGION_H;
+    // mode_w (1920) ≤ region_w (2048) and mode_h (1080) ≥
+    // region_h (1024). Used range for slide content: x in
+    // [0, mode_w], y in [0, region_h] (per region). Atlas-uv
+    // scale = mode_w/atlas_w on x, region_h/atlas_h on y.
+    let atlas_w_f = crate::hdmi_logic::ATLAS_FBO_W as f32;
+    let atlas_h_f = crate::hdmi_logic::ATLAS_FBO_H as f32;
+    let used_w_f = mode_w_u32 as f32;
+    let used_h_f = region_h as f32;
+    let uv_scale_x = used_w_f / atlas_w_f;
+    let uv_scale_y = used_h_f / atlas_h_f;
+    // Region A: bottom half of atlas (atlas y=[0,1024)). UV-y
+    // [0, 0.5] in atlas coords.
+    let xform_a: [f32; 4] = [0.0, 0.0, uv_scale_x, uv_scale_y];
+    // Region B: top half of atlas (atlas y=[1024,2048)). UV-y
+    // [0.5, 1.0].
+    let xform_b: [f32; 4] = [0.0, uv_scale_y, uv_scale_x, uv_scale_y];
 
     let mut prev_bo: Option<BufferObject<()>> = None;
     let mut prev_fb: Option<framebuffer::Handle> = None;
@@ -4824,28 +4981,48 @@ fn render_transition_scissored_bake_in_session(
                 let states_b =
                     motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
 
-                // Bake slides via paint_slide_with_viewport at
-                // mode / session.scissored_bake_divisor.
-                // mode_w/h drive layer math (full-res NDC); vp_w/h
-                // drive the GL viewport so the bake fragment fill
-                // hits the smaller FBO. Composite LINEAR-upsamples
-                // to full output.
-                let divisor = session.scissored_bake_divisor;
-                let bake_vp_w = (mode_w_u32 / divisor).max(1);
-                let bake_vp_h = (mode_h_u32 / divisor).max(1);
-
+                // Atlas bake phase: bind atlas FBO ONCE, paint A
+                // into bottom region (y=[0,1024)) under scissor,
+                // paint B into top region (y=[1024,2048)) under
+                // scissor. Region width = mode_w (slides used
+                // 1920 of the 2048-wide atlas; 128px right gutter
+                // is unwritten and clipped via UV-scale at
+                // composite). Region height = 1024 (1080 → 1024
+                // = 5.5% vertical compression upsampled at
+                // composite).
                 let t_bake_a = Instant::now();
                 unsafe {
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(atlas_fbo));
+                    gl.enable(glow::SCISSOR_TEST);
+                    gl.scissor(0, 0, mode_w_u32 as i32, region_h as i32);
                 }
                 {
+                    // Snapshot bg_tex BEFORE the mut-borrow on cache_a
+                    // so we don't double-borrow session.slide_caches.
+                    let bg_tex_a = session
+                        .slide_caches
+                        .get(&slide_a_id)
+                        .and_then(|c| c.bg_tex);
+                    if let Some(bg_tex) = bg_tex_a {
+                        // Blit cached bg into region first (uses scissor).
+                        unsafe {
+                            gl.viewport(0, 0, mode_w_u32 as i32, region_h as i32);
+                        }
+                        blit_bg_to_region(gl, &bcp, vbo, bg_tex)?;
+                    }
                     let cache_a = session
                         .slide_caches
                         .get_mut(&slide_a_id)
                         .expect("slide_caches[slide_a] init above");
+                    let bg_arg = if bg_tex_a.is_some() {
+                        None  // bg already filled by blit above
+                    } else {
+                        Some(&bg_a_kind)
+                    };
                     paint_slide_with_viewport(
-                        gl, mode_w_u32, mode_h_u32, bake_vp_w, bake_vp_h,
-                        &bg_a_kind, &layers_a,
+                        gl, mode_w_u32, mode_h_u32,
+                        0, 0, mode_w_u32, region_h,
+                        bg_arg, &layers_a,
                         Some(&states_a), wall_clock_unix,
                         Some(&mut cache_a.glyph),
                         Some(&mut session.image_bg_cache),
@@ -4856,16 +5033,32 @@ fn render_transition_scissored_bake_in_session(
 
                 let t_bake_b = Instant::now();
                 unsafe {
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_b));
+                    gl.scissor(0, region_h as i32, mode_w_u32 as i32, region_h as i32);
                 }
                 {
+                    let bg_tex_b = session
+                        .slide_caches
+                        .get(&slide_b_id)
+                        .and_then(|c| c.bg_tex);
+                    if let Some(bg_tex) = bg_tex_b {
+                        unsafe {
+                            gl.viewport(0, region_h as i32, mode_w_u32 as i32, region_h as i32);
+                        }
+                        blit_bg_to_region(gl, &bcp, vbo, bg_tex)?;
+                    }
                     let cache_b = session
                         .slide_caches
                         .get_mut(&slide_b_id)
                         .expect("slide_caches[slide_b] init above");
+                    let bg_arg = if bg_tex_b.is_some() {
+                        None
+                    } else {
+                        Some(&bg_b_kind)
+                    };
                     paint_slide_with_viewport(
-                        gl, mode_w_u32, mode_h_u32, bake_vp_w, bake_vp_h,
-                        &bg_b_kind, &layers_b,
+                        gl, mode_w_u32, mode_h_u32,
+                        0, region_h, mode_w_u32, region_h,
+                        bg_arg, &layers_b,
                         Some(&states_b), wall_clock_unix,
                         Some(&mut cache_b.glyph),
                         Some(&mut session.image_bg_cache),
@@ -4874,29 +5067,57 @@ fn render_transition_scissored_bake_in_session(
                 }
                 crate::profile::record_phase("sb_bake_b", t_bake_b.elapsed().as_nanos() as u64);
 
-                // Composite: 2 baked textures + kind-specific warp + mix → default FB.
+                // Composite: sample atlas with two UV xforms +
+                // kind-specific warp + mix → default FB. Disable
+                // scissor before composite so the full mode-res
+                // output isn't clipped to one of the bake regions.
                 let t_comp = Instant::now();
+                // Cut transition: pick FS_CUT_A (slide A only) or
+                // FS_CUT_B (slide B only) based on t. Halves the
+                // texture-sample count vs the combined FS_CUT.
+                // Other kinds use the standard ccp.
+                let active_ccp = if kind_is_cut {
+                    if t < 0.5 {
+                        cut_ccp_a.as_ref().expect("cut_ccp_a init for cut")
+                    } else {
+                        cut_ccp_b.as_ref().expect("cut_ccp_b init for cut")
+                    }
+                } else {
+                    &ccp
+                };
                 unsafe {
+                    gl.disable(glow::SCISSOR_TEST);
                     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                     gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
                     gl.disable(glow::BLEND);
                     gl.clear_color(0.0, 0.0, 0.0, 1.0);
                     gl.clear(glow::COLOR_BUFFER_BIT);
-                    gl.use_program(Some(ccp.program));
+                    gl.use_program(Some(active_ccp.program));
+                    // Both samplers point at the SAME atlas; the
+                    // u_a_xform / u_b_xform uniforms remap v_uv
+                    // into the region for slide A vs slide B.
                     gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
-                    gl.uniform_1_i32(ccp.u_src_a.as_ref(), 0);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
+                    gl.uniform_1_i32(active_ccp.u_src_a.as_ref(), 0);
                     gl.active_texture(glow::TEXTURE1);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
-                    gl.uniform_1_i32(ccp.u_src_b.as_ref(), 1);
-                    gl.uniform_1_f32(ccp.u_t.as_ref(), t);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
+                    gl.uniform_1_i32(active_ccp.u_src_b.as_ref(), 1);
+                    gl.uniform_4_f32(
+                        active_ccp.u_a_xform.as_ref(),
+                        xform_a[0], xform_a[1], xform_a[2], xform_a[3],
+                    );
+                    gl.uniform_4_f32(
+                        active_ccp.u_b_xform.as_ref(),
+                        xform_b[0], xform_b[1], xform_b[2], xform_b[3],
+                    );
+                    gl.uniform_1_f32(active_ccp.u_t.as_ref(), t);
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     let stride = (4 * std::mem::size_of::<f32>()) as i32;
-                    gl.enable_vertex_attrib_array(ccp.a_pos);
-                    gl.vertex_attrib_pointer_f32(ccp.a_pos, 2, glow::FLOAT, false, stride, 0);
-                    gl.enable_vertex_attrib_array(ccp.a_uv);
+                    gl.enable_vertex_attrib_array(active_ccp.a_pos);
+                    gl.vertex_attrib_pointer_f32(active_ccp.a_pos, 2, glow::FLOAT, false, stride, 0);
+                    gl.enable_vertex_attrib_array(active_ccp.a_uv);
                     gl.vertex_attrib_pointer_f32(
-                        ccp.a_uv, 2, glow::FLOAT, false, stride,
+                        active_ccp.a_uv, 2, glow::FLOAT, false, stride,
                         (2 * std::mem::size_of::<f32>()) as i32,
                     );
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
@@ -5258,32 +5479,243 @@ fn read_sb_divisor_env() -> u32 {
     }
 }
 
-/// QA-mandated scissored-bake (Step 4): create + cache an
-/// offscreen FBO + RGBA color-texture pair sized at mode /
-/// SCISSORED_BAKE_FBO_DIVISOR. Lazy-init; freed at
-/// with_egl_session teardown.
-unsafe fn ensure_bake_fbo_pair(
+/// Cached FS_BLIT program for the atlas SB bg-cache path
+/// (2026-05-09): when a slide has a non-solid bg cached as a
+/// pre-rendered texture, we blit it into the atlas region via
+/// a single full-screen-quad draw. This is ~2-3x faster than
+/// re-running FS_GRADIENT every frame (vc4 TMU dedicated
+/// hardware vs SIMD ALU). Cached per session; freed via
+/// clear_blit_program_cache at teardown.
+#[derive(Clone)]
+struct CachedBlitProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_src: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static BLIT_PROGRAM: std::cell::RefCell<Option<CachedBlitProgram>> =
+        std::cell::RefCell::new(None);
+}
+
+fn cached_blit_program(gl: &glow::Context) -> Result<CachedBlitProgram> {
+    use glow::HasContext;
+    BLIT_PROGRAM.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(p) = cache.as_ref() {
+            return Ok(p.clone());
+        }
+        let program = link_program(gl, VS_TEXTURED_QUAD, crate::hdmi_logic::FS_BLIT)
+            .context("link FS_BLIT (atlas bg-cache blit)")?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("FS_BLIT VS missing a_pos"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("FS_BLIT VS missing a_uv"))?;
+        let u_src = unsafe { gl.get_uniform_location(program, "u_src") };
+        let cbp = CachedBlitProgram { program, a_pos, a_uv, u_src };
+        *cache = Some(cbp.clone());
+        Ok(cbp)
+    })
+}
+
+fn clear_blit_program_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    BLIT_PROGRAM.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(p) = cache.take() {
+            unsafe { gl.delete_program(p.program); }
+        }
+    });
+}
+
+/// Populate `slide_caches[slide_id].bg_tex` for non-solid bgs
+/// at atlas region size (2048x1024). Idempotent: returns early
+/// if already cached. Returns `Ok(())` for solid bgs (no cache
+/// needed; glClear in the bake path is already free) WITHOUT
+/// populating; caller checks `bg_tex.is_some()` to decide
+/// blit-vs-clear.
+///
+/// On first call for a non-solid bg this:
+///   1. Allocates a 2048x1024 RGBA texture + temporary FBO.
+///   2. Binds the temp FBO + viewport (0, 0, 2048, 1024).
+///   3. Renders bg via the existing draw_gradient_pattern /
+///      draw_pattern / draw_image_bg helpers (one full-frag-fill).
+///   4. Frees the temp FBO. Stores the texture in
+///      slide_caches[slide_id].bg_tex.
+///
+/// Memory: 8 MB per cached bg. Cap by slide count -- the FYS
+/// reel has 1 non-solid bg slide (Scream). Arbitrary content
+/// could push higher but the slide_caches HashMap is naturally
+/// bounded by playlist length.
+unsafe fn ensure_slide_bg_cache(
     session: &mut EglSession,
-    slot: u8,
+    slide_id: uuid::Uuid,
+    bg_kind: &BgKind,
+) -> Result<()> {
+    use glow::HasContext;
+    // Solid bgs use scissor-clear in the bake; no cache benefit.
+    if matches!(bg_kind, BgKind::Solid(_)) {
+        return Ok(());
+    }
+    // Already populated?
+    let already_cached = match session.slide_caches.get(&slide_id) {
+        Some(c) => c.bg_tex.is_some(),
+        None => false,
+    };
+    if already_cached {
+        return Ok(());
+    }
+    // Slide cache slot must exist before we add bg_tex.
+    if !session.slide_caches.contains_key(&slide_id) {
+        // Caller hasn't initialized the slide cache. Skip --
+        // the lazy fall-through path will still render bg
+        // correctly (just per-frame instead of once).
+        return Ok(());
+    }
+    let gl = session.gl;
+    let cache_w = crate::hdmi_logic::ATLAS_REGION_W as i32;
+    let cache_h = crate::hdmi_logic::ATLAS_REGION_H as i32;
+    let bg_tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("bg_cache glGenTextures: {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(bg_tex));
+    gl.tex_image_2d(
+        glow::TEXTURE_2D, 0, glow::RGBA as i32, cache_w, cache_h, 0,
+        glow::RGBA, glow::UNSIGNED_BYTE, None,
+    );
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+
+    let temp_fbo = gl
+        .create_framebuffer()
+        .map_err(|e| {
+            gl.delete_texture(bg_tex);
+            anyhow!("bg_cache glGenFramebuffers: {e}")
+        })?;
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(temp_fbo));
+    gl.framebuffer_texture_2d(
+        glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(bg_tex), 0,
+    );
+    let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+    if status != glow::FRAMEBUFFER_COMPLETE {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.delete_framebuffer(temp_fbo);
+        gl.delete_texture(bg_tex);
+        bail!("bg_cache FBO incomplete: status=0x{status:x}");
+    }
+    gl.viewport(0, 0, cache_w, cache_h);
+    gl.disable(glow::SCISSOR_TEST);
+
+    // Render the bg into the cache texture. Same code path as
+    // paint_slide_with_viewport's BgKind branch but at a fixed
+    // size (atlas region) and into our temp FBO.
+    let render_result: Result<()> = (|| {
+        match bg_kind {
+            BgKind::Solid(_) => unreachable!("filtered above"),
+            BgKind::Gradient { color_a, color_b, density } => {
+                draw_gradient_pattern(
+                    gl, 0, 0, cache_w as u32, cache_h as u32,
+                    *color_a, *color_b, *density,
+                )?;
+            }
+            BgKind::Pattern { kind, color_a, color_b, density } => {
+                // Pattern bgs are NOT SB-eligible upstream
+                // (effective_solid_bg returns None). Defensive
+                // path here in case eligibility expands later.
+                draw_pattern(gl, cache_w as u32, cache_h as u32, *kind, *color_a, *color_b, *density)?;
+            }
+            BgKind::Image { asset_path, solid_fallback } => {
+                draw_image_bg(gl, asset_path, *solid_fallback, Some(&mut session.image_bg_cache));
+            }
+        }
+        Ok(())
+    })();
+
+    // Cleanup temp FBO regardless of render outcome. The
+    // texture stays allocated and gets stored on success;
+    // freed on error.
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    gl.delete_framebuffer(temp_fbo);
+    if let Err(e) = render_result {
+        gl.delete_texture(bg_tex);
+        return Err(e).context("bg_cache render");
+    }
+    if let Some(cache) = session.slide_caches.get_mut(&slide_id) {
+        cache.bg_tex = Some(bg_tex);
+    } else {
+        // Slide cache disappeared between our check + write
+        // (shouldn't happen single-threaded); avoid leak.
+        gl.delete_texture(bg_tex);
+        bail!("bg_cache: slide_caches[{slide_id}] removed during populate");
+    }
+    Ok(())
+}
+
+/// Blit a cached bg texture into the currently-bound FBO at
+/// the given region. Caller is responsible for binding the
+/// FBO + setting viewport / scissor as needed BEFORE calling.
+/// Uses cached_blit_program (FS_BLIT) and the existing
+/// transition_sp_quad VBO for the full-screen draw.
+fn blit_bg_to_region(
+    gl: &glow::Context,
+    blit_program: &CachedBlitProgram,
+    vbo: glow::NativeBuffer,
+    bg_tex: glow::NativeTexture,
+) -> Result<()> {
+    use glow::HasContext;
+    unsafe {
+        gl.use_program(Some(blit_program.program));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(bg_tex));
+        gl.uniform_1_i32(blit_program.u_src.as_ref(), 0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let stride = (4 * std::mem::size_of::<f32>()) as i32;
+        gl.enable_vertex_attrib_array(blit_program.a_pos);
+        gl.vertex_attrib_pointer_f32(blit_program.a_pos, 2, glow::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(blit_program.a_uv);
+        gl.vertex_attrib_pointer_f32(
+            blit_program.a_uv, 2, glow::FLOAT, false, stride,
+            (2 * std::mem::size_of::<f32>()) as i32,
+        );
+        gl.disable(glow::BLEND);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    }
+    Ok(())
+}
+
+/// Scissored-bake atlas FBO (2026-05-09 redirect): one
+/// 2048x2048 FBO+texture for the dual-slide bake. Slide A region
+/// at y in [0, 1024); slide B region at y in [1024, 2048). Each
+/// region is 2048 wide (1920 used, 128 gutter) and 1024 tall
+/// (1080 → 1024 = 5.5% vertical compression upsampled at
+/// composite). Lazy-init; freed at with_egl_session teardown.
+///
+/// Note: the legacy SCISSORED_BAKE_FBO_DIVISOR env override no
+/// longer affects bake size — the atlas is fixed at 2048x2048
+/// because we need both regions to fit. The env is still read
+/// (other call paths may use it for capture-fbo sizing); just
+/// not load-bearing here. The ATLAS path supersedes the half-res
+/// FBO that qarl rejected as failing the production-correct
+/// full-res bar (2026-05-09 qarl-direct).
+unsafe fn ensure_bake_atlas(
+    session: &mut EglSession,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
-    let cached = match slot {
-        0 => session.scissored_bake_fbo_a,
-        _ => session.scissored_bake_fbo_b,
-    };
-    if let Some(pair) = cached {
+    if let Some(pair) = session.scissored_bake_atlas {
         return Ok(pair);
     }
     let gl = session.gl;
-    let divisor = session.scissored_bake_divisor;
-    let bake_w = ((session.mode_w as u32) / divisor).max(1) as i32;
-    let bake_h = ((session.mode_h as u32) / divisor).max(1) as i32;
+    let atlas_w = crate::hdmi_logic::ATLAS_FBO_W as i32;
+    let atlas_h = crate::hdmi_logic::ATLAS_FBO_H as i32;
     let tex = gl
         .create_texture()
-        .map_err(|e| anyhow!("bake_fbo glGenTextures: {e}"))?;
+        .map_err(|e| anyhow!("atlas glGenTextures: {e}"))?;
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
     gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, glow::RGBA as i32, bake_w, bake_h, 0,
+        glow::TEXTURE_2D, 0, glow::RGBA as i32, atlas_w, atlas_h, 0,
         glow::RGBA, glow::UNSIGNED_BYTE, None,
     );
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
@@ -5294,7 +5726,7 @@ unsafe fn ensure_bake_fbo_pair(
         .create_framebuffer()
         .map_err(|e| {
             gl.delete_texture(tex);
-            anyhow!("bake_fbo glGenFramebuffers: {e}")
+            anyhow!("atlas glGenFramebuffers: {e}")
         })?;
     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
     gl.framebuffer_texture_2d(
@@ -5305,13 +5737,10 @@ unsafe fn ensure_bake_fbo_pair(
     if status != glow::FRAMEBUFFER_COMPLETE {
         gl.delete_framebuffer(fbo);
         gl.delete_texture(tex);
-        bail!("bake_fbo incomplete: status=0x{status:x}");
+        bail!("atlas FBO incomplete: status=0x{status:x}");
     }
     let pair = (fbo, tex);
-    match slot {
-        0 => session.scissored_bake_fbo_a = Some(pair),
-        _ => session.scissored_bake_fbo_b = Some(pair),
-    }
+    session.scissored_bake_atlas = Some(pair);
     Ok(pair)
 }
 
@@ -5400,12 +5829,16 @@ fn ensure_transition_sp_quad_vbo(session: &mut EglSession) -> Result<glow::Nativ
     Ok(vbo)
 }
 
-/// QA-mandated scissored-bake (Step 4): composite-pass program
-/// cached per kind. The composite pass samples 2 baked slide
-/// textures with kind-specific warp + mix. Uses the EXISTING
-/// FS_<KIND> shaders (FS_FADE / FS_CUT / etc.) -- they already
-/// take 2 sampler2D + u_t and produce the final output. Just
-/// caches the program + uniform locations once per kind.
+/// Composite-pass program cached per kind. Wraps the FS_<KIND>
+/// composite shader via wrap_composite_for_atlas (2026-05-09):
+/// the shader gains `u_a_xform` / `u_b_xform` vec4 uniforms that
+/// remap a per-fragment uv into the atlas region for slide A vs
+/// slide B. With atlas-FBO compositing, both samplers (u_src_a,
+/// u_src_b) point at the SAME atlas texture; the xforms select
+/// the region. For non-atlas callers (e.g. capture path with two
+/// separate full-res textures), set both xforms to identity
+/// (offset=0, scale=1) and the wrapped shader behaves
+/// identically to the unwrapped FS_<KIND>.
 #[derive(Clone)]
 struct CachedCompositeProgram {
     program: glow::NativeProgram,
@@ -5414,6 +5847,8 @@ struct CachedCompositeProgram {
     u_src_a: Option<glow::NativeUniformLocation>,
     u_src_b: Option<glow::NativeUniformLocation>,
     u_t: Option<glow::NativeUniformLocation>,
+    u_a_xform: Option<glow::NativeUniformLocation>,
+    u_b_xform: Option<glow::NativeUniformLocation>,
 }
 
 std::thread_local! {
@@ -5435,8 +5870,9 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
             Some(s) => s,
             None => bail!("kind {kind:?} has no legacy FS"),
         };
-        let program = link_program(gl, VS_TEXTURED_QUAD, fs)
-            .with_context(|| format!("link FS_<KIND={kind}> composite"))?;
+        let wrapped = crate::hdmi_logic::wrap_composite_for_atlas(fs);
+        let program = link_program(gl, VS_TEXTURED_QUAD, &wrapped)
+            .with_context(|| format!("link FS_<KIND={kind}> composite (atlas-wrapped)"))?;
         let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
             .ok_or_else(|| anyhow!("composite VS missing a_pos"))?;
         let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
@@ -5444,6 +5880,8 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
         let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
         let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
         let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
+        let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
         let ccp = CachedCompositeProgram {
             program,
             a_pos,
@@ -5451,6 +5889,8 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
             u_src_a,
             u_src_b,
             u_t,
+            u_a_xform,
+            u_b_xform,
         };
         cache.insert(kind_static, ccp.clone());
         Ok(ccp)
@@ -5465,6 +5905,69 @@ fn clear_composite_program_cache(gl: &glow::Context) {
             unsafe { gl.delete_program(ccp.program); }
         }
     });
+    CUT_COMPOSITE_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        for (_, ccp) in cache.drain() {
+            unsafe { gl.delete_program(ccp.program); }
+        }
+    });
+}
+
+/// QA-direct (2026-05-09 Phase 2.6) -- per-side cached composite
+/// for the cut transition. CUT_COMPOSITE_PROGRAMS[true] = the
+/// FS_CUT_B variant (slide B side, t>=0.5);
+/// CUT_COMPOSITE_PROGRAMS[false] = FS_CUT_A (slide A side, t<0.5).
+/// Halves the fragment-shader texture-sample count vs the
+/// combined FS_CUT — only one side is visible per frame.
+///
+/// Other transition kinds need both sides simultaneously and use
+/// COMPOSITE_PROGRAMS via cached_composite_program.
+std::thread_local! {
+    static CUT_COMPOSITE_PROGRAMS: std::cell::RefCell<
+        std::collections::HashMap<bool, CachedCompositeProgram>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn cached_cut_composite_program(
+    gl: &glow::Context,
+    side_b: bool,
+) -> Result<CachedCompositeProgram> {
+    use glow::HasContext;
+    CUT_COMPOSITE_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(ccp) = cache.get(&side_b) {
+            return Ok(ccp.clone());
+        }
+        let fs = if side_b {
+            crate::hdmi_logic::FS_CUT_B
+        } else {
+            crate::hdmi_logic::FS_CUT_A
+        };
+        let wrapped = crate::hdmi_logic::wrap_composite_for_atlas(fs);
+        let program = link_program(gl, VS_TEXTURED_QUAD, &wrapped)
+            .with_context(|| format!("link FS_CUT_{} (atlas-wrapped)", if side_b { "B" } else { "A" }))?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("cut composite VS missing a_pos"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("cut composite VS missing a_uv"))?;
+        let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
+        let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
+        let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
+        let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
+        let ccp = CachedCompositeProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_src_a,
+            u_src_b,
+            u_t,
+            u_a_xform,
+            u_b_xform,
+        };
+        cache.insert(side_b, ccp.clone());
+        Ok(ccp)
+    })
 }
 
 fn clear_transition_sp_program_cache(gl: &glow::Context) {
@@ -5486,6 +5989,18 @@ fn clear_transition_sp_program_cache(gl: &glow::Context) {
 pub struct SlideRenderCache {
     pub glyph: GlyphCache,
     pub tex: TextureCache,
+    /// QA-direct (2026-05-09 atlas SB Phase 2.5): cached non-solid
+    /// bg as a 2048x1024 RGBA texture sized to the atlas region.
+    /// Populated lazily on first SB use (or eagerly at prewarm)
+    /// for slides whose bg is gradient / pattern / image (anything
+    /// the BgKind branch resolves via a fragment shader, not glClear).
+    /// Subsequent atlas SB bakes blit this cache via FS_BLIT into
+    /// the atlas region instead of re-running the bg shader -- vc4
+    /// TMU dedicated hardware makes the blit ~2-3x cheaper than
+    /// FS_GRADIENT compute on a 2M-fragment fill.
+    /// `None` for solid-bg slides (glClear is already free; no
+    /// cache benefit).
+    pub bg_tex: Option<glow::NativeTexture>,
 }
 
 impl SlideRenderCache {
@@ -5494,7 +6009,27 @@ impl SlideRenderCache {
         glyph.resize_with(layer_count, || None);
         let mut tex: TextureCache = Vec::with_capacity(layer_count);
         tex.resize_with(layer_count, || None);
-        Self { glyph, tex }
+        Self { glyph, tex, bg_tex: None }
+    }
+}
+
+/// Free GL textures owned by a SlideRenderCache being removed
+/// from session.slide_caches (2026-05-09 atlas SB bg-cache).
+/// Must be called while the GL context is still bound. Used by
+/// the multiple slide_caches.remove call sites that previously
+/// inlined `for slot in old.tex { delete_texture(t) }` and now
+/// also need to free `bg_tex`.
+fn free_slide_render_cache(gl: &glow::Context, mut cache: SlideRenderCache) {
+    use glow::HasContext;
+    unsafe {
+        for slot in cache.tex.iter_mut() {
+            if let Some(t) = slot.take() {
+                gl.delete_texture(t);
+            }
+        }
+        if let Some(t) = cache.bg_tex.take() {
+            gl.delete_texture(t);
+        }
     }
 }
 
@@ -5520,7 +6055,7 @@ fn paint_slide(
     mut tex_cache: Option<&mut TextureCache>,
 ) -> Result<()> {
     paint_slide_with_viewport(
-        gl, mode_w, mode_h, mode_w, mode_h, bg_kind, text_layers,
+        gl, mode_w, mode_h, 0, 0, mode_w, mode_h, Some(bg_kind), text_layers,
         motion_states, wall_clock_unix, glyph_cache, image_bg_cache, tex_cache,
     )
 }
@@ -5537,9 +6072,11 @@ fn paint_slide_with_viewport(
     gl: &glow::Context,
     mode_w: u32,
     mode_h: u32,
+    vp_x_off: u32,
+    vp_y_off: u32,
     vp_w: u32,
     vp_h: u32,
-    bg_kind: &BgKind,
+    bg_kind: Option<&BgKind>,
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     motion_states: Option<&[MotionState]>,
     wall_clock_unix: i64,
@@ -5547,6 +6084,10 @@ fn paint_slide_with_viewport(
     mut image_bg_cache: Option<&mut ImageBgCache>,
     mut tex_cache: Option<&mut TextureCache>,
 ) -> Result<()> {
+    // bg_kind = None signals the caller has ALREADY filled the
+    // bg (e.g. atlas SB blit-from-bg-cache or pre-baked region).
+    // Skip the BgKind branch entirely; just set viewport + paint
+    // layers. (2026-05-09 atlas SB Phase 2.5 bg-cache.)
     use glow::HasContext;
     // vp_w/h for the GL viewport; mode_w/h for layer NDC math
     // (box ratios -> pixel coords -> NDC). Pattern + gradient bg
@@ -5558,28 +6099,45 @@ fn paint_slide_with_viewport(
     // gradient spans auto-fit the viewport, matching how the
     // composite-pass LINEAR upsamples to full output.
     //
+    // (vp_x_off, vp_y_off) lets the bake into a SUB-region of the
+    // bound framebuffer (atlas FBO use case, 2026-05-09): caller
+    // sets a matching glScissor + GL_SCISSOR_TEST so glClear and
+    // any pattern/gradient bg fill stays in-region. Atlas SB
+    // eligibility filters out non-solid bgs upstream
+    // (effective_solid_bg() != None), so within the SB path
+    // bg_kind is BgKind::Solid (or a degenerate gradient already
+    // collapsed to solid by the caller); gl_FragCoord-based
+    // pattern shaders aren't reached and don't need offset
+    // awareness.
+    //
     // Caught by QA visual review (2026-05-09): half-res bake of
     // slide 70f9d701's density=0 vertical gradient bg showed
     // grey-top instead of pink-top because the prior code passed
     // mode_h for u_viewport while gl_FragCoord was in vp space.
-    unsafe { gl.viewport(0, 0, vp_w as i32, vp_h as i32); }
-    match bg_kind {
-        BgKind::Gradient { color_a, color_b, density } => {
-            draw_gradient_pattern(gl, vp_w, vp_h, *color_a, *color_b, *density)?;
-        }
-        BgKind::Pattern { kind, color_a, color_b, density } => {
-            draw_pattern(gl, vp_w, vp_h, *kind, *color_a, *color_b, *density)?;
-        }
-        BgKind::Image { asset_path, solid_fallback } => {
-            // Image bg path uses FS_BLIT which is uv-driven (not
-            // gl_FragCoord) -- viewport-resolution-independent.
-            // Reborrow so we can hand the cache to the overlay-
-            // route below if any_overlay fires for a later layer.
-            draw_image_bg(gl, asset_path, *solid_fallback, image_bg_cache.as_deref_mut());
-        }
-        BgKind::Solid(color) => {
-            // glClear; trivially resolution-independent.
-            draw_solid_clear(gl, *color);
+    unsafe { gl.viewport(vp_x_off as i32, vp_y_off as i32, vp_w as i32, vp_h as i32); }
+    if let Some(bg_kind) = bg_kind {
+        match bg_kind {
+            BgKind::Gradient { color_a, color_b, density } => {
+                draw_gradient_pattern(gl, vp_x_off, vp_y_off, vp_w, vp_h, *color_a, *color_b, *density)?;
+            }
+            BgKind::Pattern { kind, color_a, color_b, density } => {
+                // Pattern bgs aren't SB-eligible (effective_solid_bg
+                // returns None), so vp_x_off/vp_y_off won't be nonzero
+                // here in production. If they do become eligible later,
+                // FS_PATTERN_* shaders need the same u_vp_offset shift.
+                draw_pattern(gl, vp_w, vp_h, *kind, *color_a, *color_b, *density)?;
+            }
+            BgKind::Image { asset_path, solid_fallback } => {
+                // Image bg path uses FS_BLIT which is uv-driven (not
+                // gl_FragCoord) -- viewport-resolution-independent.
+                // Reborrow so we can hand the cache to the overlay-
+                // route below if any_overlay fires for a later layer.
+                draw_image_bg(gl, asset_path, *solid_fallback, image_bg_cache.as_deref_mut());
+            }
+            BgKind::Solid(color) => {
+                // glClear; trivially resolution-independent.
+                draw_solid_clear(gl, *color);
+            }
         }
     }
     // BLEND toggle once around the layer loop (Phase 4.2c
@@ -5706,6 +6264,19 @@ fn paint_slide_with_viewport(
             .iter()
             .any(|(l, _, _)| matches!(parse_blend_mode(&l.blend), BlendMode::Overlay));
         if any_overlay {
+            // Overlay layers go through a ping-pong FBO route that
+            // re-renders bg internally; bg_kind = None (atlas SB
+            // bg-cache path) is incompatible with that. Atlas SB
+            // eligibility filters out overlay-mode layers upstream
+            // (transition_eligible_for_scissored_bake), so this
+            // branch should never be taken when bg_kind = None.
+            // Defensive bail keeps the type-system honest.
+            let bg_kind = bg_kind.ok_or_else(|| {
+                anyhow!(
+                    "paint_slide_with_viewport: overlay-route layers require Some(bg_kind); \
+                     atlas-SB bg-cache path bypasses bg_kind which is incompatible"
+                )
+            })?;
             paint_layers_via_overlay_route(
                 gl,
                 mode_w,
@@ -5774,6 +6345,7 @@ fn paint_slide_with_viewport(
                     motion_state,
                     &cached.bitmap,
                     tex_slot,
+                    Some((vp_x_off, vp_y_off, vp_w, vp_h)),
                 )?;
             }
             Ok(())
@@ -5847,7 +6419,7 @@ fn paint_layers_via_overlay_route(
         gl.viewport(0, 0, mode_w as i32, mode_h as i32);
         match bg_kind {
             BgKind::Gradient { color_a, color_b, density } => {
-                draw_gradient_pattern(gl, mode_w, mode_h, *color_a, *color_b, *density)?;
+                draw_gradient_pattern(gl, 0, 0, mode_w, mode_h, *color_a, *color_b, *density)?;
             }
             BgKind::Pattern { kind, color_a, color_b, density } => {
                 draw_pattern(gl, mode_w, mode_h, *kind, *color_a, *color_b, *density)?;
@@ -5900,6 +6472,7 @@ fn paint_layers_via_overlay_route(
                     motion_state,
                     &cached.bitmap,
                     None,  // tex_slot: overlay route is not hot path
+                    None,  // tighten_scissor: overlay route uses ping-pong FBOs at full mode-res
                 )?;
             } else {
                 // Overlay: render text to layer_fbo (premultiplied
@@ -5921,6 +6494,7 @@ fn paint_layers_via_overlay_route(
                     motion_state,
                     &cached.bitmap,
                     None,  // tex_slot: overlay route is not hot path
+                    None,  // tighten_scissor: overlay route writes full mode-res FBOs
                 )?;
 
                 // Composite layer_tex over current_scene_tex into
@@ -6476,14 +7050,7 @@ fn prewarm_sp_session(
         };
         if needs_new {
             if let Some(old) = session.slide_caches.remove(&slide_id) {
-                use glow::HasContext;
-                unsafe {
-                    for slot in old.tex {
-                        if let Some(t) = slot {
-                            session.gl.delete_texture(t);
-                        }
-                    }
-                }
+                free_slide_render_cache(session.gl, old);
             }
             session
                 .slide_caches
@@ -6594,6 +7161,18 @@ fn prewarm_sp_session(
                     return;
                 }
                 *composite_count += 1;
+                // Phase 2.6: cut transition uses side-specialized
+                // composite shaders. Pre-compile both sides so the
+                // first cut transition doesn't pay link cost.
+                if kind == "cut" {
+                    for side_b in [false, true] {
+                        if let Err(e) = cached_cut_composite_program(session.gl, side_b) {
+                            eprintln!(
+                                "reel: prewarm cut composite (side_b={side_b}) failed: {e:#}; skipping"
+                            );
+                        }
+                    }
+                }
             }
         }
     };
@@ -6613,9 +7192,49 @@ fn prewarm_sp_session(
     }
     let compile_count = sp_count + composite_count;
 
+    // Atlas SB pre-warm (2026-05-09 QA Phase 2): allocate the
+    // atlas FBO + texture + clear once at session bring-up so the
+    // first SB transition doesn't pay the lazy-allocation +
+    // first-bind cold cost in its hot loop. Bench data showed
+    // sb_bake_a p99 = 15.6ms (one frame in the first SB
+    // transition) vs p50 = 1.16ms; allocating + warming here
+    // moves that 14ms cost off the per-frame critical path.
+    //
+    // Skipped if no SB-portable transitions are in the reel
+    // (composite_count == 0). The eligibility-check loops above
+    // already produce composite_count, so this gates cleanly.
+    let mut atlas_warmed = false;
+    if composite_count > 0 {
+        match unsafe { ensure_bake_atlas(session) } {
+            Ok((fbo, _tex)) => {
+                use glow::HasContext;
+                unsafe {
+                    session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                    session.gl.viewport(
+                        0, 0,
+                        crate::hdmi_logic::ATLAS_FBO_W as i32,
+                        crate::hdmi_logic::ATLAS_FBO_H as i32,
+                    );
+                    session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                    session.gl.clear(glow::COLOR_BUFFER_BIT);
+                    // Force the GPU to actually do the clear --
+                    // without flush, the pre-warm becomes a no-op
+                    // command queue and the first frame still pays
+                    // the cold allocation + tile-store cost.
+                    session.gl.flush();
+                    session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                }
+                atlas_warmed = true;
+            }
+            Err(e) => {
+                eprintln!("reel: prewarm atlas FBO alloc failed: {e:#}; lazy on first SB call");
+            }
+        }
+    }
+
     let elapsed_ms = t_prewarm.elapsed().as_millis();
     eprintln!(
-        "reel: prewarm complete -- {} slide texts rasterized, {compile_count} programs compiled (sp={sp_count} composite={composite_count}), {elapsed_ms} ms",
+        "reel: prewarm complete -- {} slide texts rasterized, {compile_count} programs compiled (sp={sp_count} composite={composite_count}), atlas_warmed={atlas_warmed}, {elapsed_ms} ms",
         text_slides.len(),
     );
     Ok(())
@@ -6843,6 +7462,21 @@ pub fn render_playlist_reel(
                     );
                 } else {
                     slides_held += 1;
+                }
+                // Profile-mode short-circuit (2026-05-09 atlas SB
+                // bench harness): when --profile-frames N exhausts
+                // its budget, exit the reel cleanly so the Drop
+                // guard in main() runs profile::summarize() and
+                // dumps the histogram. Without this, the reel
+                // would loop forever; SIGTERM/SIGKILL would skip
+                // the histogram dump.
+                if crate::profile::is_enabled()
+                    && crate::profile::frames_remaining() == Some(0)
+                {
+                    eprintln!(
+                        "reel: profile-frames budget exhausted mid-pass {pass} (item {i}); exiting cleanly"
+                    );
+                    return Ok(());
                 }
             }
 

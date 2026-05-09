@@ -406,6 +406,49 @@ void main() {
 }
 "#;
 
+/// QA-direct (2026-05-09 Phase 2.6) -- atlas SB cut-composite
+/// specialization. Cut is unique among the 16 transitions: its
+/// mix function is binary at t=0.5 (step()), so any given frame
+/// in the cut transition reads from EXACTLY ONE side. The
+/// general FS_CUT samples both sides + mixes; on vc4 that's 2
+/// fullscreen texture fetches per fragment when only 1 is
+/// visually used. Halving the composite-pass texture sample
+/// count = halving fragment fetch bandwidth on the composite
+/// pass.
+///
+/// The atlas SB cut path picks FS_CUT_A at t<0.5 and FS_CUT_B
+/// at t>=0.5. Both are wrap_composite_for_atlas-compatible:
+/// wrap injects u_a_xform/u_b_xform + _sa/_sb helpers, and the
+/// `texture2D(u_src_X, ...)` call site gets rewritten to
+/// `_sX(...)`. The unused uniform/sampler is harmless
+/// (GLES2 link-time eliminates unused varyings + unused
+/// uniforms can be set or unset; see CachedCompositeProgram).
+///
+/// Other transition kinds (fade / wipe / iris / dissolve / etc.)
+/// need both sides simultaneously and stay on the combined
+/// FS_<KIND>.
+pub const FS_CUT_A: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_src_a, v_uv);
+}
+"#;
+
+pub const FS_CUT_B: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_src_a;
+uniform sampler2D u_src_b;
+uniform float u_t;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_src_b, v_uv);
+}
+"#;
+
 /// Fragment shader: horizontal wipe — slide_b reveals from the left
 /// edge with a hard line at x=t. Mirrors backend.openmarquee
 /// .rendering.shader_compositor's `_FRAGMENT_WIPE` minus the motion-
@@ -783,6 +826,102 @@ pub const SINGLE_PASS_MAX_LAYERS_PER_SLIDE: usize = 4;
 /// 6 keeps headroom and covers every FYS slide (max observed:
 /// 5 layers on Tile Chaos #08 / Chant Wall #09).
 pub const SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE: usize = 6;
+
+/// Atlas-FBO geometry for the single-FBO scissored-bake path
+/// (2026-05-09 QA architectural redirect).
+///
+/// The 13ms FBO-switch penalty observed in the prior 2-FBO bake
+/// scheme is rooted in vc4 V3D 2.1's tiled-deferred single-core
+/// sequencing: every render-target switch forces a tile-store
+/// flush of the outgoing FBO before the new pass can begin. No
+/// GLES2 mechanism (DiscardFramebufferEXT, renderbuffer-vs-tex,
+/// triple-FBO rotation, glClear, vc4-specific extensions) breaks
+/// that. The architectural answer is to bake BOTH slides into ONE
+/// FBO without re-binding between them.
+///
+/// vc4 GL_MAX_TEXTURE_SIZE = 2048. The atlas is 2048x2048 with
+/// two 2048x1024 regions stacked vertically:
+///   - Slide A region: y in [0, 1024)
+///   - Slide B region: y in [1024, 2048)
+/// Each region is wider (2048) than 1080p output (1920), so a
+/// 128-pixel right-side gutter is unused. Vertical compression is
+/// 1080 → 1024 = 5.5%; the composite pass LINEAR-upsamples to
+/// 1080. Empirically this is well below the threshold of
+/// perceptible vertical-stem softening on Anton / Playfair italic
+/// (~ sub-pixel at 1080p viewing distance).
+///
+/// Within bake phase: FBO bound once, viewport + scissor switch
+/// between regions to confine writes. Composite phase: FBO bound
+/// to default, atlas sampled with two UV transforms (one per
+/// region). Bind-switch count drops from 3 to 2 per frame.
+pub const ATLAS_FBO_W: u32 = 2048;
+pub const ATLAS_FBO_H: u32 = 2048;
+pub const ATLAS_REGION_W: u32 = 2048;
+pub const ATLAS_REGION_H: u32 = 1024;
+
+/// Wrap a composite-pass FS source for atlas-mode sampling. The
+/// source must declare `uniform sampler2D u_src_a;` and
+/// `uniform sampler2D u_src_b;` (every FS_<KIND> shader does)
+/// and reference them via `texture2D(u_src_a, X)` / `(u_src_b, X)`.
+///
+/// The wrap injects:
+///   - `uniform vec4 u_a_xform;` and `uniform vec4 u_b_xform;`
+///     after the `u_src_b` line. Each is `(off_x, off_y, scale_x,
+///     scale_y)` mapping a per-fragment uv (in [0,1] across the
+///     scanout) to the atlas region for that slide.
+///   - GLSL helpers `_sa(uv)` / `_sb(uv)` that apply the xform
+///     before sampling the atlas.
+///
+/// Replaces every `texture2D(u_src_a, X)` with `_sa(X)` and the
+/// matching b form with `_sb(X)`. The argument count change
+/// (texture2D takes 2, _sa/_sb take 1) is balanced because the
+/// existing `, ` after `u_src_a/u_src_b` is consumed by the
+/// substitution; the closing parenthesis matches automatically.
+///
+/// Identity transform `(0, 0, 1, 1)` makes the wrapped shader
+/// behave identically to the unwrapped FS_<KIND>, so callers that
+/// don't use the atlas (e.g. capture path with a single full-res
+/// source texture) can use the wrapped program by setting both
+/// xforms to identity.
+pub fn wrap_composite_for_atlas(src: &str) -> String {
+    // Order matters: rewrite the call sites in `src` FIRST, then
+    // inject the helpers. If we injected first, the helper bodies'
+    // own `texture2D(u_src_a, ...)` would self-substitute into
+    // `_sa(...)` and produce infinite recursion at link time.
+    //
+    // Bail out for shaders that don't reference both samplers (e.g.
+    // FS_GLYPH); the wrap is a no-op then. The injection point is
+    // anchored on `uniform sampler2D u_src_b;\n`, which every FS_
+    // <KIND> composite shader has on its own line.
+    let needle = "uniform sampler2D u_src_b;\n";
+    let i = match src.find(needle) {
+        Some(i) => i,
+        None => return src.to_string(),
+    };
+    let split = i + needle.len();
+    let rewritten = src
+        .replace("texture2D(u_src_a, ", "_sa(")
+        .replace("texture2D(u_src_b, ", "_sb(");
+    // The call-site replacement also shifts byte offsets, so the
+    // injection has to happen on the rewritten string. Find the
+    // injection point again (still anchored on the same line).
+    let split_re = match rewritten.find(needle) {
+        Some(i) => i + needle.len(),
+        None => {
+            // Defensive: if the anchor moved despite no edits to it,
+            // fall back to the prefix-len from `src` (substitution
+            // operates on the body of main, never on the uniform
+            // line).
+            split
+        }
+    };
+    let inject = "uniform vec4 u_a_xform;\nuniform vec4 u_b_xform;\nvec4 _sa(vec2 uv) { return texture2D(u_src_a, u_a_xform.xy + uv * u_a_xform.zw); }\nvec4 _sb(vec2 uv) { return texture2D(u_src_b, u_b_xform.xy + uv * u_b_xform.zw); }\n";
+    let mut out = String::with_capacity(rewritten.len() + inject.len());
+    out.push_str(&rewritten[..split_re]);
+    out.push_str(inject);
+    out.push_str(&rewritten[split_re..]);
+    out
+}
 
 // fs_bake_sp_source removed 2026-05-08: the first attempt at
 // scissored-bake used a full-screen apply_layer chain in this
@@ -1401,12 +1540,19 @@ void main() {
 pub const FS_GRADIENT: &str = r#"#version 100
 precision mediump float;
 uniform vec2 u_viewport;
+uniform vec2 u_vp_offset;
 uniform vec2 u_dir;
 uniform vec2 u_proj_bounds;
 uniform vec3 u_color_a;
 uniform vec3 u_color_b;
 void main() {
-    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
+    // u_vp_offset (atlas SB, 2026-05-09): shifts gl_FragCoord
+    // into the viewport-local (0..vp_w, 0..vp_h) frame so the
+    // gradient projection math uses pixel coords relative to
+    // the bake region, not the absolute atlas. Identity = (0,0)
+    // for full-screen renders.
+    vec2 frag_local = gl_FragCoord.xy - u_vp_offset;
+    vec2 pos = vec2(frag_local.x, u_viewport.y - frag_local.y);
     float proj = dot(pos, u_dir);
     float t = clamp((proj - u_proj_bounds.x) / u_proj_bounds.y, 0.0, 1.0);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
@@ -5686,5 +5832,88 @@ mod tests {
         // catch it, rather than silently coerce.
         assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter ( 8 )"), None);
         assert_eq!(parse_crtc_list_filter_bits("CrtcListFilter( 8)"), None);
+    }
+
+    // -- composite-shader atlas wrapper -------------------------
+
+    #[test]
+    fn atlas_wrap_injects_uniforms_and_helpers() {
+        let wrapped = wrap_composite_for_atlas(FS_FADE);
+        assert!(wrapped.contains("uniform vec4 u_a_xform;"));
+        assert!(wrapped.contains("uniform vec4 u_b_xform;"));
+        assert!(wrapped.contains("vec4 _sa(vec2 uv)"));
+        assert!(wrapped.contains("vec4 _sb(vec2 uv)"));
+    }
+
+    #[test]
+    fn atlas_wrap_replaces_texture2D_calls() {
+        let wrapped = wrap_composite_for_atlas(FS_FADE);
+        // Original FS_FADE has `texture2D(u_src_a, v_uv)` and
+        // `texture2D(u_src_b, v_uv)`. Wrapper replaces them with
+        // _sa(...) / _sb(...). The helper bodies still contain
+        // texture2D(u_src_a, ...) / (u_src_b, ...) -- so we just
+        // confirm the call-site replacement happened.
+        assert!(wrapped.contains("_sa(v_uv)"));
+        assert!(wrapped.contains("_sb(v_uv)"));
+    }
+
+    #[test]
+    fn atlas_wrap_handles_complex_uv_expression() {
+        // FS_MARQUEE samples with `vec2(cx, v_uv.y)` and
+        // `vec2(cx - 1.0 - gap_uv, v_uv.y)`. The substitution must
+        // preserve the inner expressions as a single argument.
+        let wrapped = wrap_composite_for_atlas(FS_MARQUEE);
+        assert!(wrapped.contains("_sa(vec2(cx, v_uv.y))"));
+        assert!(wrapped.contains("_sb(vec2(cx - 1.0 - gap_uv, v_uv.y))"));
+    }
+
+    #[test]
+    fn atlas_wrap_idempotent_for_shader_without_samplers() {
+        // FS_GLYPH doesn't have u_src_a/u_src_b -- wrap should
+        // pass through unchanged. (Defense against accidental
+        // wrapping of non-composite shaders.)
+        let original = FS_GLYPH;
+        let wrapped = wrap_composite_for_atlas(original);
+        assert_eq!(original, wrapped);
+    }
+
+    #[test]
+    fn atlas_wrap_all_composite_shaders_have_no_orphan_call_sites() {
+        // Each composite-pass FS_<KIND> wraps cleanly: every
+        // call to texture2D(u_src_a, ...) becomes _sa(...), and
+        // every call to texture2D(u_src_b, ...) becomes _sb(...).
+        // Helpers contain ONE texture2D(u_src_a, ...) and ONE
+        // texture2D(u_src_b, ...) -- so every wrapped shader
+        // should have EXACTLY 1 occurrence of each form.
+        let kinds = [
+            ("FS_CUT", FS_CUT),
+            ("FS_FADE", FS_FADE),
+            ("FS_WIPE", FS_WIPE),
+            ("FS_IRIS", FS_IRIS),
+            ("FS_DISSOLVE", FS_DISSOLVE),
+            ("FS_PIXELATE", FS_PIXELATE),
+            ("FS_SCANLINE", FS_SCANLINE),
+            ("FS_HALFTONE", FS_HALFTONE),
+            ("FS_GLITCH", FS_GLITCH),
+            ("FS_SLIDE", FS_SLIDE),
+            ("FS_PUSH", FS_PUSH),
+            ("FS_SCROLL", FS_SCROLL),
+            ("FS_BLINDS", FS_BLINDS),
+            ("FS_FLIP", FS_FLIP),
+            ("FS_MARQUEE", FS_MARQUEE),
+            ("FS_SHUTTER", FS_SHUTTER),
+        ];
+        for (name, src) in kinds {
+            let wrapped = wrap_composite_for_atlas(src);
+            let n_a = wrapped.matches("texture2D(u_src_a, ").count();
+            let n_b = wrapped.matches("texture2D(u_src_b, ").count();
+            // Exactly 1 = the call inside the _sa / _sb helper.
+            // Original main()'s call sites all became _sa(...) /
+            // _sb(...). Recursion is impossible because the
+            // helper definition itself was injected AFTER the
+            // call-site rewrite (see wrap_composite_for_atlas).
+            assert_eq!(n_a, 1, "{name}: expected 1 leftover texture2D(u_src_a (in _sa helper); got {n_a}");
+            assert_eq!(n_b, 1, "{name}: expected 1 leftover texture2D(u_src_b (in _sb helper); got {n_b}");
+        }
     }
 }
