@@ -3676,10 +3676,10 @@ fn transition_eligible_for_single_pass(
     if !is_transition_kind_single_pass(kind) {
         return false;
     }
-    if !matches!(bg_a, BgKind::Solid(_)) {
+    if effective_solid_bg(bg_a).is_none() {
         return false;
     }
-    if !matches!(bg_b, BgKind::Solid(_)) {
+    if effective_solid_bg(bg_b).is_none() {
         return false;
     }
     if layers_a.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
@@ -3697,6 +3697,26 @@ fn transition_eligible_for_single_pass(
         }
     }
     true
+}
+
+/// QA-mandated single-pass transition (2026-05-08, batch B fix):
+/// returns the effective uniform-fill color for this BgKind if it's
+/// equivalent to a solid color. Resolves:
+///   - BgKind::Solid(c)                              -> Some(c)
+///   - BgKind::Gradient with density ≈ 0             -> Some(color_a)
+///     (FS_GRADIENT at density=0 outputs color_a uniformly; the
+///     authored "gradient" is visually solid. Several FYS slides
+///     ride this shape -- without the relaxation 2/19 slides fall
+///     through to legacy.)
+/// Returns None for genuine gradients (density > 0), patterns, and
+/// images -- those need a non-uniform bg the SP shader doesn't
+/// model and stay on the legacy 3-pass path.
+fn effective_solid_bg(bg: &BgKind) -> Option<[f32; 4]> {
+    match bg {
+        BgKind::Solid(c) => Some(*c),
+        BgKind::Gradient { color_a, density, .. } if density.abs() < 1e-4 => Some(*color_a),
+        _ => None,
+    }
 }
 
 /// QA-mandated single-pass transition (2026-05-08): compute a
@@ -3942,13 +3962,13 @@ fn render_transition_single_pass_in_session(
     }
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
-    let bg_a_color: [f32; 3] = match &bg_a_kind {
-        BgKind::Solid(c) => [c[0], c[1], c[2]],
-        _ => bail!("single-pass transition: bg_a must be solid"),
+    let bg_a_color: [f32; 3] = match effective_solid_bg(&bg_a_kind) {
+        Some(c) => [c[0], c[1], c[2]],
+        None => bail!("single-pass transition: bg_a not equivalent to a solid color"),
     };
-    let bg_b_color: [f32; 3] = match &bg_b_kind {
-        BgKind::Solid(c) => [c[0], c[1], c[2]],
-        _ => bail!("single-pass transition: bg_b must be solid"),
+    let bg_b_color: [f32; 3] = match effective_solid_bg(&bg_b_kind) {
+        Some(c) => [c[0], c[1], c[2]],
+        None => bail!("single-pass transition: bg_b not equivalent to a solid color"),
     };
     if layers_a.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
         || layers_b.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
@@ -4433,6 +4453,10 @@ fn sp_kind_static(kind: &str) -> Option<&'static str> {
         "wipe" => "wipe",
         "iris" => "iris",
         "dissolve" => "dissolve",
+        "scanline" => "scanline",
+        "halftone" => "halftone",
+        "blinds" => "blinds",
+        "shutter" => "shutter",
         _ => return None,
     })
 }

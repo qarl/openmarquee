@@ -783,15 +783,23 @@ pub const SINGLE_PASS_MAX_LAYERS_PER_SLIDE: usize = 4;
 /// fall through to the legacy 3-pass bake+composite path. Grows
 /// per batch as kinds are ported.
 ///
-/// Batch A (this commit): cut, fade, wipe, iris, dissolve.
-/// Batch B (planned): scanline, halftone, blinds, shutter.
+/// Batch A: cut, fade, wipe, iris, dissolve.
+/// Batch B (this commit): scanline, halftone, blinds, shutter.
 /// Batch C (planned): slide, push, scroll.
 /// Batch D (planned): flip, marquee, pixelate.
 /// Glitch: qarl-deferred -- stays on legacy.
 pub fn is_transition_kind_single_pass(kind: &str) -> bool {
     matches!(
         kind,
-        "cut" | "fade" | "wipe" | "iris" | "dissolve"
+        "cut"
+            | "fade"
+            | "wipe"
+            | "iris"
+            | "dissolve"
+            | "scanline"
+            | "halftone"
+            | "blinds"
+            | "shutter"
     )
 }
 
@@ -886,15 +894,24 @@ float _hash(vec2 p) {
 /// at which to test the layer rect + sample the alpha bitmap; for
 /// in-place transitions it equals v_uv, for warped transitions it's
 /// the per-slide transformed coord.
+///
+/// BRANCHLESS by design: vc4's QPU executes both branches of `if`
+/// in SIMD groups and masks the inactive lane, so conditional
+/// returns don't actually skip work -- they just diverge the
+/// pipeline. Computing `in_rect` via `step()` keeps every fragment
+/// on the same code path. The texture sample fires regardless;
+/// CLAMP_TO_EDGE handles out-of-bounds UV by returning the edge
+/// alpha (0 for the row-major top-down bitmap's borders), which
+/// would land at zero alpha anyway and be masked out by `in_rect`.
 const SP_APPLY_LAYER: &str = r#"
 vec3 apply_layer(vec3 c, sampler2D tex, vec4 rect, vec4 rgba, vec2 sample_uv) {
-    if (rgba.a < 0.004) return c;
-    if (sample_uv.x < rect.x || sample_uv.x > rect.z) return c;
-    if (sample_uv.y < rect.y || sample_uv.y > rect.w) return c;
     float w = max(rect.z - rect.x, 1e-6);
     float h = max(rect.w - rect.y, 1e-6);
     vec2 luv = vec2((sample_uv.x - rect.x) / w, 1.0 - (sample_uv.y - rect.y) / h);
-    float a = texture2D(tex, luv).r * rgba.a;
+    float in_x = step(rect.x, sample_uv.x) * step(sample_uv.x, rect.z);
+    float in_y = step(rect.y, sample_uv.y) * step(sample_uv.y, rect.w);
+    float in_rect = in_x * in_y;
+    float a = texture2D(tex, luv).r * rgba.a * in_rect;
     return mix(c, rgba.rgb, a);
 }
 "#;
@@ -968,6 +985,70 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
             s.push_str("    float threshold = _hash(v_uv);\n");
             s.push_str("    float mask = step(threshold, u_t);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
+        }
+        "scanline" => {
+            // Top-to-bottom sweep + bright band at the sweep
+            // line. v_uv.y bottom-up: NDC y=+1 (top) maps to
+            // v_uv.y=1, NDC y=-1 (bottom) maps to v_uv.y=0. The
+            // legacy FS_SCANLINE used `step(v_uv.y, sweep)` which
+            // expects screen-y-down semantics; on this VS_TEXTURED_
+            // QUAD layout, v_uv is bottom-up. Replicate the same
+            // visual by sweeping from top-to-bottom: mask =
+            // step(1.0 - v_uv.y, sweep).
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str("    float screen_y = 1.0 - v_uv.y;\n");
+            s.push_str("    float sweep = u_t;\n");
+            s.push_str("    float band_half = 0.015;\n");
+            s.push_str("    float mask = step(screen_y, sweep);\n");
+            s.push_str("    vec3 col = mix(ca, cb, mask);\n");
+            s.push_str("    float band = 1.0 - smoothstep(0.0, band_half, abs(screen_y - sweep));\n");
+            s.push_str("    col = mix(col, vec3(1.0), band * 0.7);\n");
+            s.push_str("    gl_FragColor = vec4(col, 1.0);\n");
+        }
+        "halftone" => {
+            // 16:9 grid of growing circular dots.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str("    float grid_y = 8.0;\n");
+            s.push_str("    float aspect = 16.0 / 9.0;\n");
+            s.push_str("    vec2 cell_uv = fract(vec2(v_uv.x * grid_y * aspect, v_uv.y * grid_y));\n");
+            s.push_str("    float d = distance(cell_uv, vec2(0.5));\n");
+            s.push_str("    float mask = step(d, u_t * 0.71);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
+        }
+        "blinds" => {
+            // 16 horizontal slats opening from each midline.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str("    float n_slats = 16.0;\n");
+            s.push_str("    float slat_uv = fract(v_uv.y * n_slats);\n");
+            s.push_str("    float dist_to_mid = abs(slat_uv - 0.5);\n");
+            s.push_str("    float mask = step(dist_to_mid, u_t * 0.5);\n");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
+        }
+        "shutter" => {
+            // Hexagonal aperture inscribed-radius test.
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
+            s.push_str("    vec2 d = v_uv - vec2(0.5);\n");
+            s.push_str("    d.x *= 16.0 / 9.0;\n");
+            s.push_str("    float k = 0.866025;\n");
+            s.push_str("    float c1 = abs(d.x * k + d.y * 0.5);\n");
+            s.push_str("    float c2 = abs(d.y);\n");
+            s.push_str("    float c3 = abs(d.x * k - d.y * 0.5);\n");
+            s.push_str("    float hex_d = max(max(c1, c2), c3);\n");
+            s.push_str("    float inscribed = 1.5 * u_t;\n");
+            s.push_str("    float mask = step(hex_d, inscribed);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
         _ => unreachable!(
@@ -3718,28 +3799,53 @@ mod tests {
 
     #[test]
     fn is_transition_kind_single_pass_classifies_correctly() {
-        // Batch A ported set (5 kinds). Grows per batch.
-        for kind in ["cut", "fade", "wipe", "iris", "dissolve"] {
+        // Batch A + Batch B ported set (9 kinds).
+        for kind in [
+            "cut", "fade", "wipe", "iris", "dissolve", "scanline", "halftone",
+            "blinds", "shutter",
+        ] {
             assert!(
                 is_transition_kind_single_pass(kind),
                 "{kind} should be SP-portable"
             );
         }
         // Not yet ported (still on legacy 3-pass; will fall through).
-        for kind in [
-            "scanline", "halftone", "blinds", "shutter", "slide", "push",
-            "scroll", "flip", "marquee", "pixelate",
-        ] {
+        for kind in ["slide", "push", "scroll", "flip", "marquee", "pixelate"] {
             assert!(
                 !is_transition_kind_single_pass(kind),
                 "{kind} not yet ported -- should not be SP-eligible"
             );
         }
-        // Glitch is qarl-deferred (visual jitter glitches in
-        // current legacy implementation are accepted spec
-        // deviation; SP port not blocking v1).
+        // Glitch is qarl-deferred.
         assert!(!is_transition_kind_single_pass("glitch"));
         assert!(!is_transition_kind_single_pass("unknown"));
+    }
+
+    #[test]
+    fn fs_transition_sp_source_batch_b_dispatch() {
+        // QA Step 3 Batch B: scanline, halftone, blinds, shutter.
+        for kind in ["scanline", "halftone", "blinds", "shutter"] {
+            let s = fs_transition_sp_source(kind, 1, 1)
+                .unwrap_or_else(|| panic!("expected SP source for {kind}"));
+            assert!(s.starts_with("#version 100\n"));
+            assert!(s.contains("u_a_tex0"));
+            assert!(s.contains("u_b_tex0"));
+            assert!(s.contains("apply_layer"));
+            assert!(s.contains("sample_uv"));
+        }
+        // Per-kind shape pins.
+        let scanline = fs_transition_sp_source("scanline", 0, 0).unwrap();
+        assert!(scanline.contains("smoothstep"));
+        assert!(scanline.contains("vec3(1.0)"));
+        let halftone = fs_transition_sp_source("halftone", 0, 0).unwrap();
+        assert!(halftone.contains("16.0 / 9.0"));
+        assert!(halftone.contains("0.71"));
+        let blinds = fs_transition_sp_source("blinds", 0, 0).unwrap();
+        assert!(blinds.contains("16.0"));
+        assert!(blinds.contains("fract"));
+        let shutter = fs_transition_sp_source("shutter", 0, 0).unwrap();
+        assert!(shutter.contains("0.866025"));
+        assert!(shutter.contains("max(max(c1, c2), c3)"));
     }
 
     #[test]
