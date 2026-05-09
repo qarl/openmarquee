@@ -1143,7 +1143,9 @@ fn render_animated_slide_in_session(
                 Some(&mut session.image_bg_cache),
                 Some(&mut cache.tex),
             )?;
-            unsafe { session.gl.flush(); }
+            // eglSwapBuffers implicitly flushes; the explicit gl.flush()
+            // that used to be here forced an extra tile-store on vc4
+            // (cold-scout #2 P6, 2026-05-09).
             crate::profile::record_phase("paint", t_paint.elapsed().as_nanos() as u64);
             let t_swap = std::time::Instant::now();
             session
@@ -2365,7 +2367,6 @@ pub fn paint_and_present_one_frame_for_slide(
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
-            session.gl.flush();
         }
     }
 
@@ -2373,6 +2374,9 @@ pub fn paint_and_present_one_frame_for_slide(
     // sequence as render_animated_slide_in_session's per-frame
     // loop body, with the (BO, FB) holders coming off session
     // instead of loop locals.
+    // (cold-scout #2 P6, 2026-05-09): eglSwapBuffers implicitly
+    // flushes; the explicit gl.flush() that used to be here
+    // forced an extra tile-store on vc4.
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -2563,14 +2567,15 @@ pub fn paint_and_present_one_transition_frame(
             session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
             run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
         }
-
-        session.gl.flush();
         Ok(())
     })();
     work?;
 
     // swap → lock → addFB → commit_fb same as paint_and_
     // present_one_frame_for_slide.
+    // (cold-scout #2 P6, 2026-05-09): eglSwapBuffers implicitly
+    // flushes; the explicit gl.flush() forced an extra tile-store
+    // on vc4.
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -3235,7 +3240,6 @@ fn render_slide_in_session(
         let motion_states = motion_states_for_layers(slide.id, &text_layers, 0.0);
         let wall_clock_unix = current_unix_seconds();
         render_one_frame_in_session(session, card, hold_ms, |gl, mode_w, mode_h| {
-            use glow::HasContext;
             paint_slide(
                 gl,
                 mode_w,
@@ -3248,7 +3252,9 @@ fn render_slide_in_session(
                 None,  // image_bg_cache: closure-captured, no session access
                 None,  // tex_cache: one-shot path, no caching needed
             )?;
-            unsafe { gl.flush(); }
+            // eglSwapBuffers (called in render_one_frame_in_session)
+            // implicitly flushes; the explicit gl.flush() forced an
+            // extra tile-store on vc4 (cold-scout #2 P6, 2026-05-09).
             Ok(())
         })?;
     }
@@ -4016,7 +4022,9 @@ fn render_transition_animated_in_session(
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 gl.disable_vertex_attrib_array(a_pos);
                 gl.disable_vertex_attrib_array(a_uv);
-                gl.flush();
+                // eglSwapBuffers implicitly flushes; the explicit
+                // gl.flush() forced an extra tile-store on vc4
+                // (cold-scout #2 P6, 2026-05-09).
                 crate::profile::record_phase("composite", t_composite.elapsed().as_nanos() as u64);
             }
 
@@ -4697,7 +4705,9 @@ fn render_transition_single_pass_in_session(
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                     gl.disable_vertex_attrib_array(a_pos);
                     gl.disable_vertex_attrib_array(a_uv);
-                    gl.flush();
+                    // eglSwapBuffers implicitly flushes; explicit
+                    // gl.flush() forced an extra tile-store on vc4
+                    // (cold-scout #2 P6, 2026-05-09).
                 }
                 crate::profile::record_phase(
                     "sp_draw",
@@ -5231,11 +5241,13 @@ fn render_transition_scissored_bake_in_session(
                         (2 * std::mem::size_of::<f32>()) as i32,
                     );
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-                    gl.flush();
                 }
                 crate::profile::record_phase("sb_composite", t_comp.elapsed().as_nanos() as u64);
 
                 // Swap + commit + N-2 BO/FB rotation (mirrors SP path).
+                // eglSwapBuffers implicitly flushes; the explicit gl.flush()
+                // that used to be here forced an extra tile-store on vc4
+                // (cold-scout #2 P6, 2026-05-09).
                 let t_swap = Instant::now();
                 session
                     .egl_lib
@@ -7054,7 +7066,10 @@ pub fn render_slide_via_fbo(
             gl.delete_program(program);
             gl.delete_framebuffer(fbo);
             gl.delete_texture(color_tex);
-            gl.flush();
+            // eglSwapBuffers (called by render_one_frame_in_session
+            // immediately after this closure returns) implicitly
+            // flushes; the explicit gl.flush() forced an extra
+            // tile-store on vc4 (cold-scout #2 P6, 2026-05-09).
         }
         Ok(())
     })?;
@@ -7644,7 +7659,10 @@ pub fn render_solid_color(card: &Card, color: [f32; 4], duration_ms: u64) -> Res
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             gl.clear_color(color[0], color[1], color[2], color[3]);
             gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.flush();
+            // eglSwapBuffers (called immediately after this closure
+            // returns) implicitly flushes; the explicit gl.flush()
+            // forced an extra tile-store on vc4 (cold-scout #2 P6,
+            // 2026-05-09).
         }
         Ok(())
     })?;
@@ -8059,7 +8077,9 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             gl.clear_color(r, g, b, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.flush();
+            // eglSwapBuffers (called immediately after) implicitly
+            // flushes; the explicit gl.flush() forced an extra
+            // tile-store on vc4 (cold-scout #2 P6, 2026-05-09).
         }
     };
 
