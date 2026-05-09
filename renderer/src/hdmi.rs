@@ -4460,6 +4460,9 @@ fn sp_kind_static(kind: &str) -> Option<&'static str> {
         "slide" => "slide",
         "push" => "push",
         "scroll" => "scroll",
+        "flip" => "flip",
+        "marquee" => "marquee",
+        "pixelate" => "pixelate",
         _ => return None,
     })
 }

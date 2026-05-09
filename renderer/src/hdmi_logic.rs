@@ -785,8 +785,8 @@ pub const SINGLE_PASS_MAX_LAYERS_PER_SLIDE: usize = 4;
 ///
 /// Batch A: cut, fade, wipe, iris, dissolve.
 /// Batch B: scanline, halftone, blinds, shutter.
-/// Batch C (this commit): slide, push, scroll.
-/// Batch D (planned): flip, marquee, pixelate.
+/// Batch C: slide, push, scroll.
+/// Batch D (this commit): flip, marquee, pixelate.
 /// Glitch: qarl-deferred -- stays on legacy.
 pub fn is_transition_kind_single_pass(kind: &str) -> bool {
     matches!(
@@ -803,6 +803,9 @@ pub fn is_transition_kind_single_pass(kind: &str) -> bool {
             | "slide"
             | "push"
             | "scroll"
+            | "flip"
+            | "marquee"
+            | "pixelate"
     )
 }
 
@@ -1105,6 +1108,80 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             push_compose_chain(s, "u_b", "cb", n_b, "sample_uv_b");
             s.push_str("    float on_to = step(seam, v_uv.y);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, on_to), 1.0);\n");
+        }
+        "flip" => {
+            // 2D card-flip: A scaleX-shrinks 1.0 -> 0.0 in the
+            // first half (t in [0, 0.5]), B scaleX-grows 0.0 ->
+            // 1.0 in the second half (t in [0.5, 1]). Both slides
+            // sample at the SAME warped uv (the inverse of the
+            // scaleX transform). Outside the card extent, the
+            // pixel is black.
+            //
+            // Branchless port of legacy FS_FLIP: the legacy
+            // shader had nested `if` blocks that gate the texture
+            // sample; on vc4 SIMD those branches diverge. Here:
+            // compute sample_uv unconditionally with max(scaleX,
+            // 1e-3) to avoid divide-by-zero at t=0.5 exactly,
+            // then mask the final color by `inside = step(0.001,
+            // scaleX) * step(0, src_x) * step(src_x, 1)`.
+            s.push_str("    float t = u_t;\n");
+            s.push_str("    float scaleX = abs(2.0 * t - 1.0);\n");
+            s.push_str("    float useTo = step(0.5, t);\n");
+            s.push_str("    float src_x = (v_uv.x - 0.5) / max(scaleX, 1e-3) + 0.5;\n");
+            s.push_str("    vec2 sample_uv = vec2(src_x, v_uv.y);\n");
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "sample_uv");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "sample_uv");
+            s.push_str("    vec3 col = mix(ca, cb, useTo);\n");
+            s.push_str("    float inside = step(0.001, scaleX) * step(0.0, src_x) * step(src_x, 1.0);\n");
+            s.push_str("    gl_FragColor = vec4(col * inside, 1.0);\n");
+        }
+        "marquee" => {
+            // Tickertape wraparound: A scrolls off to the left, a
+            // gap zone with a centered white dot passes through,
+            // B enters from the right. Three region masks
+            // (in_from, in_gap, in_to) partition the screen and
+            // sum to 1 by construction.
+            s.push_str("    float gap_uv = 0.125;\n");
+            s.push_str("    float scroll_t = u_t * (1.0 + gap_uv);\n");
+            s.push_str("    float cx = scroll_t + v_uv.x;\n");
+            s.push_str("    vec2 sample_uv_a = vec2(cx, v_uv.y);\n");
+            s.push_str("    vec2 sample_uv_b = vec2(cx - 1.0 - gap_uv, v_uv.y);\n");
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "sample_uv_a");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "sample_uv_b");
+            s.push_str("    float gap_local_x = (cx - 1.0) / gap_uv;\n");
+            s.push_str("    float dx_uv = (gap_local_x - 0.5) * gap_uv;\n");
+            s.push_str("    float dy = v_uv.y - 0.5;\n");
+            s.push_str("    float dist = length(vec2(dx_uv, dy));\n");
+            s.push_str("    float dot_r = 0.074;\n");
+            s.push_str("    float in_dot = step(dist, dot_r);\n");
+            s.push_str("    vec3 gap_col = mix(vec3(0.0), vec3(1.0), in_dot);\n");
+            s.push_str("    float in_from = step(cx, 1.0);\n");
+            s.push_str("    float in_to = step(1.0 + gap_uv, cx);\n");
+            s.push_str("    float in_gap = 1.0 - in_from - in_to;\n");
+            s.push_str("    vec3 col = ca * in_from + gap_col * in_gap + cb * in_to;\n");
+            s.push_str("    gl_FragColor = vec4(col, 1.0);\n");
+        }
+        "pixelate" => {
+            // Both slides sample at a coarsened grid whose block
+            // size grows to a peak at midpoint then shrinks back.
+            // Wave envelope `1 - 4(t-0.5)^2` is 0 at t=0/1, 1 at
+            // t=0.5; block size 0.0025 (~5px at 1080p, native) at
+            // endpoints, 0.0425 (~46px at 1080p) at midpoint.
+            // Both A and B sample at the SAME quantized cell --
+            // the visual mixing is the linear u_t cross-fade
+            // between two pixelated views.
+            s.push_str("    float wave = 1.0 - 4.0 * (u_t - 0.5) * (u_t - 0.5);\n");
+            s.push_str("    float blockSize = 0.0025 + 0.04 * wave;\n");
+            s.push_str("    vec2 cell = floor(v_uv / blockSize) * blockSize + 0.5 * blockSize;\n");
+            s.push_str("    vec3 ca = u_a_bg;\n");
+            push_compose_chain(s, "u_a", "ca", n_a, "cell");
+            s.push_str("    vec3 cb = u_b_bg;\n");
+            push_compose_chain(s, "u_b", "cb", n_b, "cell");
+            s.push_str("    gl_FragColor = vec4(mix(ca, cb, u_t), 1.0);\n");
         }
         _ => unreachable!(
             "push_main_body called for unsupported kind {kind:?}; \
@@ -3854,26 +3931,48 @@ mod tests {
 
     #[test]
     fn is_transition_kind_single_pass_classifies_correctly() {
-        // Batch A + Batch B + Batch C ported set (12 kinds).
+        // Step 3 complete: 15/16 ported. Glitch deferred per qarl.
         for kind in [
             "cut", "fade", "wipe", "iris", "dissolve", "scanline", "halftone",
-            "blinds", "shutter", "slide", "push", "scroll",
+            "blinds", "shutter", "slide", "push", "scroll", "flip", "marquee",
+            "pixelate",
         ] {
             assert!(
                 is_transition_kind_single_pass(kind),
                 "{kind} should be SP-portable"
             );
         }
-        // Not yet ported (still on legacy 3-pass; will fall through).
-        for kind in ["flip", "marquee", "pixelate"] {
-            assert!(
-                !is_transition_kind_single_pass(kind),
-                "{kind} not yet ported -- should not be SP-eligible"
-            );
-        }
         // Glitch is qarl-deferred.
         assert!(!is_transition_kind_single_pass("glitch"));
         assert!(!is_transition_kind_single_pass("unknown"));
+    }
+
+    #[test]
+    fn fs_transition_sp_source_batch_d_warps() {
+        // QA Step 3 Batch D: flip, marquee, pixelate (Group-B
+        // non-trivial warps).
+        for kind in ["flip", "marquee", "pixelate"] {
+            let s = fs_transition_sp_source(kind, 1, 1)
+                .unwrap_or_else(|| panic!("expected SP source for {kind}"));
+            assert!(s.starts_with("#version 100\n"));
+            assert!(s.contains("apply_layer"));
+        }
+        // Per-kind shape pins.
+        let flip = fs_transition_sp_source("flip", 0, 0).unwrap();
+        assert!(flip.contains("scaleX = abs(2.0 * t - 1.0)"));
+        assert!(flip.contains("max(scaleX, 1e-3)"));
+        assert!(flip.contains("col * inside"));
+        let marquee = fs_transition_sp_source("marquee", 0, 0).unwrap();
+        assert!(marquee.contains("gap_uv = 0.125"));
+        assert!(marquee.contains("dot_r = 0.074"));
+        assert!(marquee.contains("in_from + gap_col * in_gap + cb * in_to"));
+        let pixelate = fs_transition_sp_source("pixelate", 0, 0).unwrap();
+        assert!(pixelate.contains("blockSize = 0.0025"));
+        assert!(pixelate.contains("floor(v_uv / blockSize)"));
+        // pixelate: both A and B compose at the SAME quantized
+        // `cell` coord (both sample the pixelated view).
+        assert!(pixelate.contains("vec3 ca = u_a_bg"));
+        assert!(pixelate.contains("vec3 cb = u_b_bg"));
     }
 
     #[test]
