@@ -49,7 +49,8 @@ use crate::hdmi_logic::{
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
-    fs_transition_sp_source, is_transition_kind_single_pass,
+    fs_transition_sp_source, gradient_density_is_degenerate,
+    is_transition_kind_single_pass, prefer_scissored_bake, sp_kind_static,
     stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
@@ -4232,7 +4233,11 @@ fn transition_eligible_for_single_pass(
 fn effective_solid_bg(bg: &BgKind) -> Option<[f32; 4]> {
     match bg {
         BgKind::Solid(c) => Some(*c),
-        BgKind::Gradient { color_a, density, .. } if density.abs() < 1e-4 => Some(*color_a),
+        BgKind::Gradient { color_a, density, .. }
+            if gradient_density_is_degenerate(*density) =>
+        {
+            Some(*color_a)
+        }
         _ => None,
     }
 }
@@ -5481,31 +5486,6 @@ std::thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Resolve `kind` to a 'static string slice if and only if it has a
-/// single-pass generator. Required because HashMap keys borrow
-/// 'static; a runtime `&str` would need ownership. Mirrors the
-/// match in is_transition_kind_single_pass; grows as batches port.
-fn sp_kind_static(kind: &str) -> Option<&'static str> {
-    Some(match kind {
-        "cut" => "cut",
-        "fade" => "fade",
-        "wipe" => "wipe",
-        "iris" => "iris",
-        "dissolve" => "dissolve",
-        "scanline" => "scanline",
-        "halftone" => "halftone",
-        "blinds" => "blinds",
-        "shutter" => "shutter",
-        "slide" => "slide",
-        "push" => "push",
-        "scroll" => "scroll",
-        "flip" => "flip",
-        "marquee" => "marquee",
-        "pixelate" => "pixelate",
-        _ => return None,
-    })
-}
-
 fn cached_transition_sp_program(
     gl: &glow::Context,
     kind: &str,
@@ -5908,14 +5888,6 @@ fn transition_eligible_for_scissored_bake(
     true
 }
 
-/// Decide whether scissored-bake should be PREFERRED over single-
-/// pass for given layer counts. SP wins on cheap-fragment cases;
-/// scissored-bake wins on per-fragment-budget overruns.
-fn prefer_scissored_bake(n_a: usize, n_b: usize) -> bool {
-    n_a > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-        || n_b > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-        || n_a + n_b > 4
-}
 
 /// QA-direct (2026-05-08): session-level fullscreen-quad VBO for
 /// the SP transition path. Lazy-allocated on first SP transition;

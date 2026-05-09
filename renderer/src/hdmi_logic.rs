@@ -963,6 +963,63 @@ pub fn is_transition_kind_single_pass(kind: &str) -> bool {
     )
 }
 
+/// Resolve `kind` to a `'static` string slice if and only if it has a
+/// single-pass generator. Required because the per-session program-
+/// cache HashMap keys are `&'static str`; a runtime borrowed `&str`
+/// would need ownership to fit. Mirrors the match in
+/// `is_transition_kind_single_pass`; grows in lock-step as batches
+/// port. Returns `None` for kinds outside the SP-portable set.
+pub fn sp_kind_static(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "cut" => "cut",
+        "fade" => "fade",
+        "wipe" => "wipe",
+        "iris" => "iris",
+        "dissolve" => "dissolve",
+        "scanline" => "scanline",
+        "halftone" => "halftone",
+        "blinds" => "blinds",
+        "shutter" => "shutter",
+        "slide" => "slide",
+        "push" => "push",
+        "scroll" => "scroll",
+        "flip" => "flip",
+        "marquee" => "marquee",
+        "pixelate" => "pixelate",
+        _ => return None,
+    })
+}
+
+/// Decide whether the scissored-bake (atlas SB) tier should be
+/// PREFERRED over the single-pass tier for a given pair of per-slide
+/// layer counts. SP wins on cheap-fragment cases (low total layers);
+/// scissored-bake wins when the per-fragment shader cost would push
+/// SP over the vc4 fragment ceiling (more layers => more per-fragment
+/// blends in one pass).
+///
+/// Returns `true` when EITHER side individually exceeds the SP
+/// per-side cap, OR the combined layer count exceeds 4 (the empirical
+/// SP-tier-still-cheaper threshold from FYS bench data). Combined-cap
+/// of 4 is intentional, NOT 2*SINGLE_PASS_MAX_LAYERS_PER_SLIDE: at 5+
+/// total layers the SP per-fragment fetch dominates the bind-switch
+/// savings, even when each side is within its individual cap.
+pub fn prefer_scissored_bake(n_a: usize, n_b: usize) -> bool {
+    n_a > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+        || n_b > SINGLE_PASS_MAX_LAYERS_PER_SLIDE
+        || n_a + n_b > 4
+}
+
+/// Returns true if a gradient with this density is visually
+/// indistinguishable from a solid `color_a` fill. Used by
+/// `effective_solid_bg` (in hdmi.rs) to admit density-≈-0 gradients
+/// to the single-pass tier as if they were solid bgs. The threshold
+/// (1e-4) matches FS_GRADIENT's compute output: at density=0 the
+/// shader produces color_a uniformly; values below 1e-4 are within
+/// per-fragment quantization noise of that.
+pub fn gradient_density_is_degenerate(density: f32) -> bool {
+    density.abs() < 1e-4
+}
+
 /// Single-pass transition shader generator. Composes both slides'
 /// bg + N_a + N_b text layers + the per-kind transition mix in ONE
 /// fragment shader. Eliminates the bake_a + bake_b + composite
@@ -4106,6 +4163,147 @@ mod tests {
         // Glitch is qarl-deferred.
         assert!(!is_transition_kind_single_pass("glitch"));
         assert!(!is_transition_kind_single_pass("unknown"));
+    }
+
+    // P2-I: pure-logic helpers extracted from hdmi.rs (qarl-direct
+    // 2026-05-09). The trio below clusters with
+    // is_transition_kind_single_pass since they share the
+    // SP-portable kind list / SP layer cap / scissored-bake layer
+    // cap as their only inputs.
+
+    #[test]
+    fn sp_kind_static_returns_static_for_every_sp_portable_kind() {
+        // The kind list MUST stay 1:1 with
+        // is_transition_kind_single_pass; if it diverges the SP
+        // program-cache HashMap key shape no longer matches the
+        // gate that admits a kind into the cache. The 'static
+        // bound on the returned slice is enforced by the function
+        // signature -- annotated below to make the compile-time
+        // check explicit at the call site too.
+        for kind in [
+            "cut", "fade", "wipe", "iris", "dissolve", "scanline", "halftone",
+            "blinds", "shutter", "slide", "push", "scroll", "flip", "marquee",
+            "pixelate",
+        ] {
+            let resolved: &'static str = sp_kind_static(kind)
+                .unwrap_or_else(|| panic!("{kind} should resolve to a 'static slice"));
+            assert_eq!(resolved, kind);
+        }
+    }
+
+    #[test]
+    fn sp_kind_static_returns_none_for_non_sp_kinds() {
+        // Glitch is qarl-deferred from SP path. Unknown / empty /
+        // wrong-case all fall through to legacy 3-pass, NOT to a
+        // panic.
+        assert_eq!(sp_kind_static("glitch"), None);
+        assert_eq!(sp_kind_static(""), None);
+        assert_eq!(sp_kind_static("unknown_kind"), None);
+        assert_eq!(sp_kind_static("FADE"), None);   // case-sensitive
+        assert_eq!(sp_kind_static("Fade"), None);
+        assert_eq!(sp_kind_static("fade "), None);  // trailing space
+    }
+
+    #[test]
+    fn sp_kind_static_aligns_with_is_transition_kind_single_pass() {
+        // Every kind that is_transition_kind_single_pass admits
+        // MUST resolve via sp_kind_static, and vice versa. Drift
+        // between these two predicates would let a kind reach the
+        // SP code path without a HashMap key, or take an SP key
+        // for a kind the runtime tier-dispatch doesn't accept.
+        let candidate_kinds = [
+            "cut", "fade", "wipe", "iris", "dissolve", "scanline", "halftone",
+            "blinds", "shutter", "slide", "push", "scroll", "flip", "marquee",
+            "pixelate", "glitch", "unknown_kind", "", "FADE",
+        ];
+        for k in candidate_kinds {
+            assert_eq!(
+                is_transition_kind_single_pass(k),
+                sp_kind_static(k).is_some(),
+                "{k} disagrees between is_transition_kind_single_pass / sp_kind_static",
+            );
+        }
+    }
+
+    #[test]
+    fn prefer_scissored_bake_below_single_pass_combined_cap() {
+        // Combined <= 4 AND each side <= SP cap (4) routes to SP.
+        // 0+0, 1+1, 2+2, 4+0 all stay on SP.
+        assert!(!prefer_scissored_bake(0, 0));
+        assert!(!prefer_scissored_bake(1, 1));
+        assert!(!prefer_scissored_bake(2, 2));
+        assert!(!prefer_scissored_bake(4, 0));
+        assert!(!prefer_scissored_bake(0, 4));
+        assert!(!prefer_scissored_bake(3, 1));
+    }
+
+    #[test]
+    fn prefer_scissored_bake_above_combined_cap() {
+        // Combined > 4 with both sides within SP per-side cap
+        // STILL prefers SB. This is the 5L+5L all-motion case
+        // documented in /tmp/qa-synth-motion-bench.md.
+        assert!(prefer_scissored_bake(3, 2));   // 5 total
+        assert!(prefer_scissored_bake(4, 1));   // 5 total
+        assert!(prefer_scissored_bake(4, 4));   // 8 total, both at cap
+    }
+
+    #[test]
+    fn prefer_scissored_bake_per_side_cap_overrides() {
+        // Either side > SINGLE_PASS_MAX_LAYERS_PER_SLIDE forces SB
+        // even if the combined count would otherwise fit.
+        assert_eq!(SINGLE_PASS_MAX_LAYERS_PER_SLIDE, 4);
+        assert!(prefer_scissored_bake(5, 0));
+        assert!(prefer_scissored_bake(0, 5));
+        assert!(prefer_scissored_bake(6, 0));   // up to SB cap
+    }
+
+    #[test]
+    fn prefer_scissored_bake_threshold_is_strict_greater_than_4() {
+        // The combined boundary is `> 4`, NOT `>= 4`. 4 total is
+        // the SP-cheaper-by-bench band; 5 is the flip point.
+        // Locks the constant against accidental drift.
+        assert!(!prefer_scissored_bake(2, 2));   // 4 total -> SP
+        assert!(prefer_scissored_bake(2, 3));    // 5 total -> SB
+        assert!(prefer_scissored_bake(3, 2));    // 5 total -> SB
+    }
+
+    #[test]
+    fn gradient_density_is_degenerate_zero_and_below_threshold() {
+        // FS_GRADIENT at density=0 emits color_a uniformly.
+        // Threshold (1e-4) is the per-fragment quantization-noise
+        // cutoff; values within ±1e-4 of zero render visually
+        // identical to a solid color_a fill.
+        assert!(gradient_density_is_degenerate(0.0));
+        assert!(gradient_density_is_degenerate(-0.0));
+        assert!(gradient_density_is_degenerate(5e-5));
+        assert!(gradient_density_is_degenerate(-5e-5));
+        assert!(gradient_density_is_degenerate(9e-5));
+    }
+
+    #[test]
+    fn gradient_density_is_degenerate_above_threshold() {
+        // 1e-4 itself is the strict-less-than threshold; values
+        // AT or above it produce a visible gradient and should
+        // NOT be admitted to the SP solid-bg path.
+        assert!(!gradient_density_is_degenerate(1e-4));
+        assert!(!gradient_density_is_degenerate(2e-4));
+        assert!(!gradient_density_is_degenerate(0.01));
+        assert!(!gradient_density_is_degenerate(0.5));
+        assert!(!gradient_density_is_degenerate(1.0));
+        // Negative side mirrors the positive side via .abs().
+        assert!(!gradient_density_is_degenerate(-1e-4));
+        assert!(!gradient_density_is_degenerate(-0.5));
+    }
+
+    #[test]
+    fn gradient_density_is_degenerate_handles_pathological_inputs() {
+        // NaN .abs() is NaN; NaN < 1e-4 is false; pathological
+        // gradient envelopes shouldn't crash AND shouldn't take
+        // the solid-bg fast path. Inf likewise stays on the
+        // gradient render path.
+        assert!(!gradient_density_is_degenerate(f32::NAN));
+        assert!(!gradient_density_is_degenerate(f32::INFINITY));
+        assert!(!gradient_density_is_degenerate(f32::NEG_INFINITY));
     }
 
     #[test]
