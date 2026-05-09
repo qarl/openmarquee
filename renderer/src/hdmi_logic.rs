@@ -6725,6 +6725,145 @@ mod tests {
         assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
     }
 
+    // P2-I.3.fix (QA-relayed qarl-direct 2026-05-09): three coverage
+    // gaps QA flagged on the original P2-I.3 (commit 3dc2bdf). The
+    // mechanical extraction was line-by-line GREEN; these tests pin
+    // additional invariants the extraction preserves but the
+    // original test set didn't exercise.
+
+    #[test]
+    fn compute_layer_uv_rect_halign_right_flushes_right() {
+        // QA gap #1: HAlign::Right was not exercised by the
+        // initial test set (only Center and Left). Smaller bitmap
+        // in a wider box with HAlign::Right should land flush
+        // against the right edge of the box.
+        let inputs = LayerGeomInputs {
+            box_x: 0.0,
+            box_y: 0.0,
+            box_w: 1.0,
+            box_h: 1.0,
+            halign: HAlign::Right,
+            font_size_px: Some(64.0),
+            font_size_pct: None,
+        };
+        // 960x540 bitmap (half mode dims); right-aligned in full
+        // mode box. Right edge of placed bitmap = right edge of
+        // box -> uv_r = 1.0, uv_l = 1.0 - 0.5 = 0.5.
+        let rect = compute_layer_uv_rect_logic(
+            &inputs,
+            MotionKind::Static,
+            MotionState::IDENTITY,
+            960, 540, 1920, 1080,
+        );
+        assert!((rect[2] - 1.0).abs() < 1e-4, "uv_r should be flush right, got {}", rect[2]);
+        assert!((rect[0] - 0.5).abs() < 1e-4, "uv_l should match right-flush bitmap width, got {}", rect[0]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_bitmap_larger_than_box_scales_down_to_fit() {
+        // QA gap #2: bitmap-larger-than-box scale-down-fit branch
+        // of box_to_ndc_quad was not exercised. The placed rect
+        // must NOT exceed the box bounds even when bm dimensions
+        // are larger than box * mode dimensions.
+        let inputs = LayerGeomInputs {
+            box_x: 0.25,
+            box_y: 0.25,
+            box_w: 0.5,
+            box_h: 0.5,
+            halign: HAlign::Center,
+            font_size_px: Some(64.0),
+            font_size_pct: None,
+        };
+        // Box pixel size = 0.5 * 1920 = 960 wide, 0.5 * 1080 =
+        // 540 tall. Bitmap 1920x1080 is larger in both dims; the
+        // scale-down-to-fit branch applies. With bm 1920x1080 in
+        // 960x540 box, the binding dim is the smaller s_w=0.5 vs
+        // s_h=0.5 (equal) -> placed_w = 1920 * 0.5 = 960 = box
+        // width, placed_h = 1080 * 0.5 = 540 = box height.
+        // Identity motion: rect == box.
+        let rect = compute_layer_uv_rect_logic(
+            &inputs,
+            MotionKind::Static,
+            MotionState::IDENTITY,
+            1920, 1080, 1920, 1080,
+        );
+        // Placed rect must NOT exceed box bounds in UV: box_x =
+        // 0.25 -> uv_l = 0.25; box_x+box_w = 0.75 -> uv_r = 0.75.
+        // box_y = 0.25 (top-down) -> uv_t = 0.75 (UV is bottom-
+        // up); box_y+box_h = 0.75 -> uv_b = 0.25.
+        assert!(rect[0] >= 0.25 - 1e-4, "uv_l outside box: {}", rect[0]);
+        assert!(rect[2] <= 0.75 + 1e-4, "uv_r outside box: {}", rect[2]);
+        assert!(rect[1] >= 0.25 - 1e-4, "uv_b outside box: {}", rect[1]);
+        assert!(rect[3] <= 0.75 + 1e-4, "uv_t outside box: {}", rect[3]);
+        // Equal-aspect-ratio scale-down -> placed rect IS the box.
+        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
+        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
+        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
+        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_y_translate_negates_dy_ndc() {
+        // QA gap #3 (highest-risk): the dy_ndc sign-inversion at
+        //   `let dy_ndc = -(dy_px / mode_h as f32) * 2.0;`
+        // If a future refactor drops the negation, the rect would
+        // shift UP in UV instead of DOWN for positive
+        // offset_y_norm; this test must fail loudly in that case.
+        //
+        // Bounce motion + offset_y_norm = 0.25 + box_h = 1.0
+        // (full mode) -> dy_px = 0.25 * 1080 = 270 -> dy_ndc =
+        // -270/1080 * 2 = -0.5 -> dy_uv (the affine output is
+        // halved during NDC->UV) = -0.25. Both uv_b and uv_t
+        // shift by -0.25.
+        let mut state = MotionState::IDENTITY;
+        state.offset_y_norm = 0.25;
+        let rect = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Bounce,
+            state,
+            1920, 1080, 1920, 1080,
+        );
+        // Identity-motion baseline: uv_b = 0.0, uv_t = 1.0.
+        // Y-translated: uv_b = -0.25, uv_t = 0.75. Sign-inverted
+        // path would produce uv_b = 0.25, uv_t = 1.25 instead --
+        // very different observed values.
+        assert!((rect[1] - (-0.25)).abs() < 1e-4, "uv_b = {} (expected -0.25 with negated dy_ndc)", rect[1]);
+        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {} (expected 0.75 with negated dy_ndc)", rect[3]);
+        // X must stay pinned (Bounce only translates in y).
+        assert!((rect[0] - 0.0).abs() < 1e-4, "uv_l should be unchanged, got {}", rect[0]);
+        assert!((rect[2] - 1.0).abs() < 1e-4, "uv_r should be unchanged, got {}", rect[2]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_static_motion_does_not_translate() {
+        // QA bonus: Static layers do NOT translate, regardless of
+        // motion_state.offset_x_norm / offset_y_norm. The skip-
+        // when-zero check `if dx_px.abs() > 1e-4 || dy_px.abs() >
+        // 1e-4` should short-circuit because motion_offset_to_px
+        // returns (0, 0) for kind=Static. Pins the SP-path
+        // "Static layers don't translate" contract: even if a
+        // future MotionState carries non-zero offsets from a stale
+        // previous frame, the kind=Static path must remain
+        // translation-free.
+        let mut state = MotionState::IDENTITY;
+        state.offset_x_norm = 0.5;
+        state.offset_y_norm = 0.5;
+        let rect_static = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Static,
+            state,
+            1920, 1080, 1920, 1080,
+        );
+        let rect_identity = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Static,
+            MotionState::IDENTITY,
+            1920, 1080, 1920, 1080,
+        );
+        assert_eq!(rect_static, rect_identity,
+            "Static motion must produce same rect regardless of state offsets");
+    }
+
     // P2-I (continued): classify_prewarm_pair. The function is the
     // pure-logic mirror of the decision tree in
     // prewarm_sp_session::consider_pair (hdmi.rs); these tests pin
