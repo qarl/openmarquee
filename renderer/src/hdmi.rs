@@ -4623,7 +4623,15 @@ fn render_transition_scissored_bake_in_session(
                 let states_b =
                     motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
 
-                // Bake slide A via paint_slide → fbo_a/tex_a.
+                // Bake slides via paint_slide_with_viewport at
+                // half-res (mode / SCISSORED_BAKE_FBO_DIVISOR).
+                // mode_w/h drive layer math (full-res NDC); vp_w/h
+                // drive the GL viewport so the bake fragment fill
+                // hits the half-res FBO. Composite LINEAR-upsamples
+                // to full output.
+                let bake_vp_w = (mode_w_u32 / SCISSORED_BAKE_FBO_DIVISOR).max(1);
+                let bake_vp_h = (mode_h_u32 / SCISSORED_BAKE_FBO_DIVISOR).max(1);
+
                 let t_bake_a = Instant::now();
                 unsafe {
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
@@ -4633,8 +4641,9 @@ fn render_transition_scissored_bake_in_session(
                         .slide_caches
                         .get_mut(&slide_a_id)
                         .expect("slide_caches[slide_a] init above");
-                    paint_slide(
-                        gl, mode_w_u32, mode_h_u32, &bg_a_kind, &layers_a,
+                    paint_slide_with_viewport(
+                        gl, mode_w_u32, mode_h_u32, bake_vp_w, bake_vp_h,
+                        &bg_a_kind, &layers_a,
                         Some(&states_a), wall_clock_unix,
                         Some(&mut cache_a.glyph),
                         Some(&mut session.image_bg_cache),
@@ -4652,8 +4661,9 @@ fn render_transition_scissored_bake_in_session(
                         .slide_caches
                         .get_mut(&slide_b_id)
                         .expect("slide_caches[slide_b] init above");
-                    paint_slide(
-                        gl, mode_w_u32, mode_h_u32, &bg_b_kind, &layers_b,
+                    paint_slide_with_viewport(
+                        gl, mode_w_u32, mode_h_u32, bake_vp_w, bake_vp_h,
+                        &bg_b_kind, &layers_b,
                         Some(&states_b), wall_clock_unix,
                         Some(&mut cache_b.glyph),
                         Some(&mut session.image_bg_cache),
@@ -4996,11 +5006,26 @@ fn cached_transition_sp_program(
     })
 }
 
+/// QA-direct (2026-05-08, post-Step-4): scissored-bake FBO size
+/// divisor. Bake target is mode_w / DIVISOR × mode_h / DIVISOR;
+/// composite samples with LINEAR filter and upscales to full
+/// output via the kind-shader's UV math.
+///
+/// Why half-res: cut-SB on heavy slide pair (giant ticker bitmap +
+/// 5-layer slide) hit 33.9 ms p50 frame_total at full-res bake
+/// (the second sb_bake's CPU time = ~13 ms = wait for previous
+/// bake's GPU work to flush at FBO-switch on vc4 GLES2). vc4 has
+/// no glMemoryBarrier (GLES3+); cutting the bake fragment fill
+/// 4× drops the wait below the per-frame budget.
+///
+/// Tradeoff: text crispness on small font sizes. LINEAR upscale
+/// of 540p text holds up at TV viewing distance.
+const SCISSORED_BAKE_FBO_DIVISOR: u32 = 2;
+
 /// QA-mandated scissored-bake (Step 4): create + cache an
-/// offscreen FBO + RGBA color-texture pair sized at the session's
-/// current mode. Returns (fbo, color_tex). Lazy-init from
-/// (None, None) -> populated; subsequent calls return the
-/// cached pair. Freed at with_egl_session teardown.
+/// offscreen FBO + RGBA color-texture pair sized at mode /
+/// SCISSORED_BAKE_FBO_DIVISOR. Lazy-init; freed at
+/// with_egl_session teardown.
 unsafe fn ensure_bake_fbo_pair(
     session: &mut EglSession,
     slot: u8,
@@ -5014,14 +5039,16 @@ unsafe fn ensure_bake_fbo_pair(
         return Ok(pair);
     }
     let gl = session.gl;
-    let mode_w = session.mode_w as i32;
-    let mode_h = session.mode_h as i32;
+    let bake_w =
+        ((session.mode_w as u32) / SCISSORED_BAKE_FBO_DIVISOR).max(1) as i32;
+    let bake_h =
+        ((session.mode_h as u32) / SCISSORED_BAKE_FBO_DIVISOR).max(1) as i32;
     let tex = gl
         .create_texture()
         .map_err(|e| anyhow!("bake_fbo glGenTextures: {e}"))?;
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
     gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, glow::RGBA as i32, mode_w, mode_h, 0,
+        glow::TEXTURE_2D, 0, glow::RGBA as i32, bake_w, bake_h, 0,
         glow::RGBA, glow::UNSIGNED_BYTE, None,
     );
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
@@ -5257,8 +5284,45 @@ fn paint_slide(
     mut image_bg_cache: Option<&mut ImageBgCache>,
     mut tex_cache: Option<&mut TextureCache>,
 ) -> Result<()> {
+    paint_slide_with_viewport(
+        gl, mode_w, mode_h, mode_w, mode_h, bg_kind, text_layers,
+        motion_states, wall_clock_unix, glyph_cache, image_bg_cache, tex_cache,
+    )
+}
+
+/// QA-mandated scissored-bake (Step 4): paint_slide variant with
+/// an explicit viewport size separate from mode_w/h. mode_w/h
+/// drive layer NDC math (box ratios → screen-space pixel coords →
+/// NDC), so passing full-res mode keeps the layer placement +
+/// bitmap-to-box scaling intact. vp_w/h drive the GL viewport so
+/// the bake can target a smaller (e.g. half-res) FBO. NDC [-1,1]
+/// maps to [0, vp_w] regardless of mode -- the same content is
+/// rendered into fewer pixels, then LINEAR-upsampled by composite.
+fn paint_slide_with_viewport(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    vp_w: u32,
+    vp_h: u32,
+    bg_kind: &BgKind,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    motion_states: Option<&[MotionState]>,
+    wall_clock_unix: i64,
+    glyph_cache: Option<&mut GlyphCache>,
+    mut image_bg_cache: Option<&mut ImageBgCache>,
+    mut tex_cache: Option<&mut TextureCache>,
+) -> Result<()> {
     use glow::HasContext;
-    unsafe { gl.viewport(0, 0, mode_w as i32, mode_h as i32); }
+    // vp_w/h for the GL viewport; mode_w/h for all box/layer math.
+    // For the default paint_slide call vp == mode (full-res). For
+    // the scissored-bake path the bake FBO is half-res, so vp is
+    // half mode and we let the same NDC corners cover the smaller
+    // pixel region; composite LINEAR-upsamples to full output.
+    unsafe { gl.viewport(0, 0, vp_w as i32, vp_h as i32); }
+    // Pattern shaders accept a (mode_w, mode_h) "image space" --
+    // they need the SCREEN dimensions for tile-size math, not the
+    // viewport size. Pass mode_w/h so patterns look identical to
+    // full-res (just rendered into fewer pixels). Layers ditto.
     match bg_kind {
         BgKind::Gradient { color_a, color_b, density } => {
             draw_gradient_pattern(gl, mode_w, mode_h, *color_a, *color_b, *density)?;
