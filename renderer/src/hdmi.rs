@@ -49,8 +49,9 @@ use crate::hdmi_logic::{
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
-    fs_transition_sp_source, gradient_density_is_degenerate,
-    is_transition_kind_single_pass, prefer_scissored_bake, sp_kind_static,
+    compute_layer_uv_rect_logic, fs_transition_sp_source,
+    gradient_density_is_degenerate, is_transition_kind_single_pass,
+    prefer_scissored_bake, sp_kind_static,
     stripes_uniforms, transition_eligible_for_scissored_bake_logic,
     transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
     AlphaBitmap, BlendMode, FontCatalog,
@@ -4261,49 +4262,18 @@ fn compute_layer_uv_rect(
     mode_w: u32,
     mode_h: u32,
 ) -> [f32; 4] {
-    let halign = parse_h_align(&layer.text_align);
-    let valign = VAlign::Middle;
-    let (mut ndc_l, mut ndc_r, mut ndc_t, mut ndc_b) = box_to_ndc_quad(
-        layer.r#box.x,
-        layer.r#box.y,
-        layer.r#box.w,
-        layer.r#box.h,
-        bm.width,
-        bm.height,
-        mode_w,
-        mode_h,
-        halign,
-        valign,
-    );
-    let scale = motion_state.scale.max(0.05);
-    if (scale - 1.0).abs() > 1e-4 {
-        let box_cx_ndc = (layer.r#box.x + layer.r#box.w * 0.5) * 2.0 - 1.0;
-        let box_cy_ndc = 1.0 - (layer.r#box.y + layer.r#box.h * 0.5) * 2.0;
-        ndc_l = box_cx_ndc + scale * (ndc_l - box_cx_ndc);
-        ndc_r = box_cx_ndc + scale * (ndc_r - box_cx_ndc);
-        ndc_t = box_cy_ndc + scale * (ndc_t - box_cy_ndc);
-        ndc_b = box_cy_ndc + scale * (ndc_b - box_cy_ndc);
-    }
-    let box_w_px = (layer.r#box.w * mode_w as f32).max(1.0);
-    let box_h_px = (layer.r#box.h * mode_h as f32).max(1.0);
-    let size_px = effective_font_size_px(
-        layer.font_size_px,
-        layer.font_size_pct,
-        layer.r#box.w,
-        mode_w,
-    );
-    let (dx_px, dy_px) =
-        motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px);
-    if dx_px.abs() > 1e-4 || dy_px.abs() > 1e-4 {
-        let dx_ndc = (dx_px / mode_w as f32) * 2.0;
-        let dy_ndc = -(dy_px / mode_h as f32) * 2.0;
-        ndc_l += dx_ndc;
-        ndc_r += dx_ndc;
-        ndc_t += dy_ndc;
-        ndc_b += dy_ndc;
-    }
-    let to_uv = |c: f32| (c + 1.0) * 0.5;
-    [to_uv(ndc_l), to_uv(ndc_b), to_uv(ndc_r), to_uv(ndc_t)]
+    let inputs = crate::hdmi_logic::LayerGeomInputs {
+        box_x: layer.r#box.x,
+        box_y: layer.r#box.y,
+        box_w: layer.r#box.w,
+        box_h: layer.r#box.h,
+        halign: parse_h_align(&layer.text_align),
+        font_size_px: layer.font_size_px,
+        font_size_pct: layer.font_size_pct,
+    };
+    compute_layer_uv_rect_logic(
+        &inputs, motion_kind, motion_state, bm.width, bm.height, mode_w, mode_h,
+    )
 }
 
 /// QA-mandated single-pass transition (2026-05-08): rasterize +

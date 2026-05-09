@@ -3130,6 +3130,102 @@ pub fn box_to_ndc_quad(
     )
 }
 
+/// Per-layer geometry inputs the single-pass layer-uv-rect math
+/// needs. Resolved from `crate::content::TextLayer` at the call
+/// site; matches the fields `compute_layer_uv_rect_logic`
+/// touches. Lets the pure-logic function stay independent of the
+/// envelope schema.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerGeomInputs {
+    pub box_x: f32,
+    pub box_y: f32,
+    pub box_w: f32,
+    pub box_h: f32,
+    pub halign: HAlign,
+    /// Mirrors TextLayer.font_size_px (None means defer to pct).
+    pub font_size_px: Option<f32>,
+    /// Mirrors TextLayer.font_size_pct (None means use the
+    /// schema fallback inside effective_font_size_px).
+    pub font_size_pct: Option<f32>,
+}
+
+/// Compute a layer's destination rect in v_uv space ([0,1]
+/// bottom-up) after applying halign/valign + scale-around-box-
+/// center + motion-translate. CPU-side; the FS just does a
+/// per-fragment in-rect test + alpha sample. Mirrors the
+/// geometry math in `draw_text_layer` so the visual result is
+/// identical to the legacy bake path.
+///
+/// Stages (all in NDC = clip space [-1, 1]):
+///   1. box_to_ndc_quad: aligned-bitmap rect (handles
+///      scale-down-only fit + halign/valign placement).
+///   2. Per-frame `motion_state.scale` applied around the BOX
+///      CENTER (not the bitmap center) -- keeps the layer's
+///      origin stable while pulse/breathe scale the visible
+///      glyphs around their authored anchor.
+///   3. Per-frame `motion_offset_to_px` translation, converted
+///      from pixels back to NDC (Y inverted because NDC is
+///      bottom-up while the rest of the pipeline thinks top-
+///      down).
+///   4. NDC -> UV affine (c -> (c+1)/2). Output ordering is
+///      `[uv_left, uv_bottom, uv_right, uv_top]` matching the
+///      single-pass shader's per-layer rect uniform.
+///
+/// Output shape matches FS_FADE_SP / FS_<KIND>_SP `u_*_rectN`:
+/// vec4(uv_l, uv_b, uv_r, uv_t).
+pub fn compute_layer_uv_rect_logic(
+    inputs: &LayerGeomInputs,
+    motion_kind: MotionKind,
+    motion_state: MotionState,
+    bm_w: u32,
+    bm_h: u32,
+    mode_w: u32,
+    mode_h: u32,
+) -> [f32; 4] {
+    let valign = VAlign::Middle;
+    let (mut ndc_l, mut ndc_r, mut ndc_t, mut ndc_b) = box_to_ndc_quad(
+        inputs.box_x,
+        inputs.box_y,
+        inputs.box_w,
+        inputs.box_h,
+        bm_w,
+        bm_h,
+        mode_w,
+        mode_h,
+        inputs.halign,
+        valign,
+    );
+    let scale = motion_state.scale.max(0.05);
+    if (scale - 1.0).abs() > 1e-4 {
+        let box_cx_ndc = (inputs.box_x + inputs.box_w * 0.5) * 2.0 - 1.0;
+        let box_cy_ndc = 1.0 - (inputs.box_y + inputs.box_h * 0.5) * 2.0;
+        ndc_l = box_cx_ndc + scale * (ndc_l - box_cx_ndc);
+        ndc_r = box_cx_ndc + scale * (ndc_r - box_cx_ndc);
+        ndc_t = box_cy_ndc + scale * (ndc_t - box_cy_ndc);
+        ndc_b = box_cy_ndc + scale * (ndc_b - box_cy_ndc);
+    }
+    let box_w_px = (inputs.box_w * mode_w as f32).max(1.0);
+    let box_h_px = (inputs.box_h * mode_h as f32).max(1.0);
+    let size_px = effective_font_size_px(
+        inputs.font_size_px,
+        inputs.font_size_pct,
+        inputs.box_w,
+        mode_w,
+    );
+    let (dx_px, dy_px) =
+        motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px);
+    if dx_px.abs() > 1e-4 || dy_px.abs() > 1e-4 {
+        let dx_ndc = (dx_px / mode_w as f32) * 2.0;
+        let dy_ndc = -(dy_px / mode_h as f32) * 2.0;
+        ndc_l += dx_ndc;
+        ndc_r += dx_ndc;
+        ndc_t += dy_ndc;
+        ndc_b += dy_ndc;
+    }
+    let to_uv = |c: f32| (c + 1.0) * 0.5;
+    [to_uv(ndc_l), to_uv(ndc_b), to_uv(ndc_r), to_uv(ndc_t)]
+}
+
 /// Map a fourcc code (the four-byte ASCII encoding the DRM/GBM specs
 /// share for buffer formats) to its ARGB-family fourcc bytes.
 ///
@@ -6409,5 +6505,164 @@ mod tests {
             assert_eq!(n_a, 1, "{name}: expected 1 leftover texture2D(u_src_a (in _sa helper); got {n_a}");
             assert_eq!(n_b, 1, "{name}: expected 1 leftover texture2D(u_src_b (in _sb helper); got {n_b}");
         }
+    }
+
+    // P2-I (continued): compute_layer_uv_rect_logic. The function
+    // composes box_to_ndc_quad + scale-around-box-center + motion
+    // translate, then converts NDC -> UV. Tests cover the four
+    // stages independently against pinned numeric outputs.
+
+    fn centered_full_box() -> LayerGeomInputs {
+        // Layer fills the entire mode rect, anchored top-left at
+        // (0, 0). Halign center makes the rect symmetric so
+        // identity-motion outputs centered around UV=(0.5, 0.5).
+        LayerGeomInputs {
+            box_x: 0.0,
+            box_y: 0.0,
+            box_w: 1.0,
+            box_h: 1.0,
+            halign: HAlign::Center,
+            font_size_px: Some(64.0),
+            font_size_pct: None,
+        }
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_identity_motion_full_box_full_bitmap() {
+        // 1920x1080 mode, bitmap exactly 1920x1080, box covers
+        // the whole mode -> the placed rect IS the full mode.
+        // NDC -> UV: full mode maps to UV [0, 1] x [0, 1].
+        let rect = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Static,
+            MotionState::IDENTITY,
+            1920, 1080, 1920, 1080,
+        );
+        // Output ordering: [uv_l, uv_b, uv_r, uv_t].
+        assert!((rect[0] - 0.0).abs() < 1e-5, "uv_l = {}", rect[0]);
+        assert!((rect[1] - 0.0).abs() < 1e-5, "uv_b = {}", rect[1]);
+        assert!((rect[2] - 1.0).abs() < 1e-5, "uv_r = {}", rect[2]);
+        assert!((rect[3] - 1.0).abs() < 1e-5, "uv_t = {}", rect[3]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_smaller_bitmap_centers_in_box() {
+        // Box is the full mode; bitmap is half-width and half-
+        // height of the mode. Center halign + middle valign
+        // place the bitmap at the mode center.
+        let rect = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Static,
+            MotionState::IDENTITY,
+            960, 540, 1920, 1080,
+        );
+        // 960x540 bitmap centered in 1920x1080 box -> uv
+        // [0.25, 0.25] to [0.75, 0.75].
+        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
+        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
+        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
+        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_scale_around_box_center() {
+        // motion_state.scale = 0.5 around box-center (= mode
+        // center for centered_full_box). The placed rect
+        // [0, 1]x[0, 1] in UV should shrink to [0.25, 0.75] in
+        // both dims. Box-center NDC = (0, 0); UV center = (0.5,
+        // 0.5).
+        let mut state = MotionState::IDENTITY;
+        state.scale = 0.5;
+        let rect = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Static,
+            state,
+            1920, 1080, 1920, 1080,
+        );
+        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
+        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
+        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
+        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_scale_floor_at_005() {
+        // Pathological scale=0 must clamp to 0.05 (the floor in
+        // compute_layer_uv_rect_logic). Without the floor, scale=0
+        // collapses the rect to a point at box-center; with the
+        // floor it stays a small but non-degenerate rect.
+        let mut state = MotionState::IDENTITY;
+        state.scale = 0.0;
+        let rect = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Static,
+            state,
+            1920, 1080, 1920, 1080,
+        );
+        // Width of placed rect: 0.05 in both UV dims, centered
+        // at 0.5 -> [0.475, 0.525].
+        assert!((rect[0] - 0.475).abs() < 1e-4, "uv_l = {}", rect[0]);
+        assert!((rect[2] - 0.525).abs() < 1e-4, "uv_r = {}", rect[2]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_motion_translate_y_inverted() {
+        // Ticker motion at offset_x_norm = 0.25, offset_y_norm =
+        // 0 produces dx_px > 0 (rightward). Box width is full
+        // mode, so dx_px = 0.25 * mode_w = 480; dx_ndc = 0.5;
+        // dx_uv = 0.25. The placed rect [0, 1] -> [0.25, 1.25]
+        // (clipping into >1 is fine, the FS does an in-rect
+        // test). Y stays at [0, 1] because offset_y_norm = 0.
+        //
+        // The Y-invert step (`dy_ndc = -...`) only applies when
+        // offset_y_norm != 0; this test pins the X-translate
+        // path AND that y-rect is unchanged when only x moves.
+        let mut state = MotionState::IDENTITY;
+        state.offset_x_norm = 0.25;
+        let rect = compute_layer_uv_rect_logic(
+            &centered_full_box(),
+            MotionKind::Ticker,
+            state,
+            1920, 1080, 1920, 1080,
+        );
+        assert!(rect[0] > 0.0, "uv_l should have moved right; got {}", rect[0]);
+        assert!(rect[2] > 1.0, "uv_r should overflow right; got {}", rect[2]);
+        assert!((rect[1] - 0.0).abs() < 1e-4, "uv_b unchanged; got {}", rect[1]);
+        assert!((rect[3] - 1.0).abs() < 1e-4, "uv_t unchanged; got {}", rect[3]);
+    }
+
+    #[test]
+    fn compute_layer_uv_rect_offset_box_within_mode() {
+        // Authored box at (0.25, 0.25) sized 0.5x0.5 of the mode,
+        // bitmap exactly fills the box. With identity motion the
+        // placed rect = the authored box. UV space is bottom-up
+        // so uv_b corresponds to the LARGER y-pixel, uv_t to the
+        // smaller.
+        let inputs = LayerGeomInputs {
+            box_x: 0.25,
+            box_y: 0.25,
+            box_w: 0.5,
+            box_h: 0.5,
+            halign: HAlign::Left,
+            font_size_px: Some(64.0),
+            font_size_pct: None,
+        };
+        let rect = compute_layer_uv_rect_logic(
+            &inputs,
+            MotionKind::Static,
+            MotionState::IDENTITY,
+            960, 540, 1920, 1080,
+        );
+        // Box = [0.25, 0.25] -> [0.75, 0.75] in normalized
+        // top-down, bitmap exactly fills it. Placed rect in NDC
+        // = box * 2 - 1 = [-0.5, 0.5]. UV = (NDC + 1)/2 =
+        // [0.25, 0.75].
+        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
+        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
+        // Y INVERTS: top of box (top-down y=0.25) maps to UV top
+        // 0.75 (large UV y). Bottom of box (top-down y=0.75) maps
+        // to UV bottom 0.25.
+        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
+        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
     }
 }
