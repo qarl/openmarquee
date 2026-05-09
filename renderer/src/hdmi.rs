@@ -49,9 +49,9 @@ use crate::hdmi_logic::{
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
-    stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode, FontCatalog,
-    ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT, FS_CUT, FS_FADE,
-    FS_FADE_SP, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
+    fs_fade_sp_source, stripes_uniforms, unix_to_calendar_utc, AlphaBitmap, BlendMode,
+    FontCatalog, ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
+    FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
     FS_PATTERN_GRID, FS_PATTERN_HALFTONE, FS_PATTERN_RAYS, FS_PATTERN_RINGS,
     FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES, SINGLE_PASS_MAX_LAYERS_PER_SLIDE,
@@ -299,15 +299,6 @@ pub struct EglSession<'a> {
     /// Cleanup at with_egl_session teardown drains all entries
     /// + delete_textures while gl context is still bound.
     slide_caches: std::collections::HashMap<uuid::Uuid, SlideRenderCache>,
-    /// QA-mandated single-pass transition (2026-05-08): 1×1 LUMINANCE
-    /// dummy texture bound to unused layer-sampler slots in
-    /// FS_FADE_SP. The shader's per-layer early-out on rgba.a < 1/255
-    /// already skips the sample, but GLES2 requires every used
-    /// sampler unit to have a valid texture bound -- otherwise some
-    /// drivers (vc4 historically OK, but not guaranteed) mark the
-    /// program as unrenderable. Lazy-init on first single-pass call;
-    /// freed at with_egl_session teardown.
-    dummy_alpha_tex: Option<glow::NativeTexture>,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -456,7 +447,6 @@ where
         scene_tex: None,
         current_settings: crate::content::Settings::default(),
         slide_caches: std::collections::HashMap::new(),
-        dummy_alpha_tex: None,
     };
     let work_result = work(&mut session);
 
@@ -493,6 +483,7 @@ where
     // the GL context lifecycle.
     clear_glyph_program_cache(&gl);
     clear_transition_program_cache(&gl);
+    clear_fade_sp_program_cache(&gl);
     // v1-spec-delta #9 (slice d): drain pending flip + free
     // session-level scanout BO/FB rotation. Mirrors the
     // animated_slide end-of-call cleanup but at session
@@ -528,12 +519,6 @@ where
         }
         if let Some(tex) = session.scene_tex.take() {
             gl.delete_texture(tex);
-        }
-        // QA-mandated single-pass transition (2026-05-08): free
-        // the lazy-allocated 1×1 dummy texture used as a fill-in
-        // for unused FS_FADE_SP layer-sampler slots.
-        if let Some(t) = session.dummy_alpha_tex.take() {
-            gl.delete_texture(t);
         }
     }
     drop(session);
@@ -3714,64 +3699,6 @@ fn transition_eligible_for_single_pass(
     true
 }
 
-/// QA-mandated single-pass transition (2026-05-08): lazy-allocate
-/// a 1×1 LUMINANCE alpha=0 texture used as a fill-in for unused
-/// FS_FADE_SP layer-sampler slots. Some GLES2 drivers consider a
-/// shader unrenderable when a referenced sampler unit has nothing
-/// bound; this dummy keeps every unit valid even though the
-/// shader's per-layer rgba.a < 1/255 early-out skips the actual
-/// sample. Stored on EglSession; freed at with_egl_session
-/// teardown.
-fn ensure_dummy_alpha_tex(session: &mut EglSession) -> Result<glow::NativeTexture> {
-    use glow::HasContext;
-    if let Some(t) = session.dummy_alpha_tex {
-        return Ok(t);
-    }
-    unsafe {
-        let t = session
-            .gl
-            .create_texture()
-            .map_err(|e| anyhow!("dummy_alpha_tex glGenTextures: {e}"))?;
-        session.gl.bind_texture(glow::TEXTURE_2D, Some(t));
-        session.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        let pixel: [u8; 1] = [0];
-        session.gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::LUMINANCE as i32,
-            1,
-            1,
-            0,
-            glow::LUMINANCE,
-            glow::UNSIGNED_BYTE,
-            Some(&pixel),
-        );
-        session.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-        session.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::NEAREST as i32,
-        );
-        session.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::NEAREST as i32,
-        );
-        session.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        session.gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        session.dummy_alpha_tex = Some(t);
-        Ok(t)
-    }
-}
-
 /// QA-mandated single-pass transition (2026-05-08): compute a
 /// layer's destination rect in v_uv space ([0,1] bottom-up) after
 /// applying halign/valign + scale-around-box-center + motion-
@@ -4068,8 +3995,6 @@ fn render_fade_single_pass_in_session(
             }
         }
     }
-    let dummy_tex = ensure_dummy_alpha_tex(session)?;
-
     let mut prev_bo: Option<BufferObject<()>> = None;
     let mut prev_fb: Option<framebuffer::Handle> = None;
     let mut current_bo: Option<BufferObject<()>> = None;
@@ -4079,7 +4004,7 @@ fn render_fade_single_pass_in_session(
     let work: Result<u32> = (|| {
         use glow::HasContext;
         let gl = session.gl;
-        let program = cached_transition_program(gl, FS_FADE_SP)?;
+        let program = cached_fade_sp_program(gl, layers_a_len, layers_b_len)?;
 
         let vbo = unsafe {
             gl.create_buffer()
@@ -4116,42 +4041,23 @@ fn render_fade_single_pass_in_session(
         let u_t_loc = unsafe { gl.get_uniform_location(program, "u_t") };
         let u_a_bg_loc = unsafe { gl.get_uniform_location(program, "u_a_bg") };
         let u_b_bg_loc = unsafe { gl.get_uniform_location(program, "u_b_bg") };
-        let u_a_tex_locs: [Option<glow::UniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] = [
-            unsafe { gl.get_uniform_location(program, "u_a_tex0") },
-            unsafe { gl.get_uniform_location(program, "u_a_tex1") },
-            unsafe { gl.get_uniform_location(program, "u_a_tex2") },
-            unsafe { gl.get_uniform_location(program, "u_a_tex3") },
-        ];
-        let u_b_tex_locs: [Option<glow::UniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] = [
-            unsafe { gl.get_uniform_location(program, "u_b_tex0") },
-            unsafe { gl.get_uniform_location(program, "u_b_tex1") },
-            unsafe { gl.get_uniform_location(program, "u_b_tex2") },
-            unsafe { gl.get_uniform_location(program, "u_b_tex3") },
-        ];
-        let u_a_rect_locs: [Option<glow::UniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] = [
-            unsafe { gl.get_uniform_location(program, "u_a_rect0") },
-            unsafe { gl.get_uniform_location(program, "u_a_rect1") },
-            unsafe { gl.get_uniform_location(program, "u_a_rect2") },
-            unsafe { gl.get_uniform_location(program, "u_a_rect3") },
-        ];
-        let u_b_rect_locs: [Option<glow::UniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] = [
-            unsafe { gl.get_uniform_location(program, "u_b_rect0") },
-            unsafe { gl.get_uniform_location(program, "u_b_rect1") },
-            unsafe { gl.get_uniform_location(program, "u_b_rect2") },
-            unsafe { gl.get_uniform_location(program, "u_b_rect3") },
-        ];
-        let u_a_rgba_locs: [Option<glow::UniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] = [
-            unsafe { gl.get_uniform_location(program, "u_a_rgba0") },
-            unsafe { gl.get_uniform_location(program, "u_a_rgba1") },
-            unsafe { gl.get_uniform_location(program, "u_a_rgba2") },
-            unsafe { gl.get_uniform_location(program, "u_a_rgba3") },
-        ];
-        let u_b_rgba_locs: [Option<glow::UniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] = [
-            unsafe { gl.get_uniform_location(program, "u_b_rgba0") },
-            unsafe { gl.get_uniform_location(program, "u_b_rgba1") },
-            unsafe { gl.get_uniform_location(program, "u_b_rgba2") },
-            unsafe { gl.get_uniform_location(program, "u_b_rgba3") },
-        ];
+        // Specialized shader: only resolve uniforms for the slots
+        // the shader actually emits (0..n). Returns None for slots
+        // beyond the count -- those are never bound.
+        let resolve_slot_locs = |prefix: &str, n: usize| -> [Option<glow::UniformLocation>; 4] {
+            let mut out: [Option<glow::UniformLocation>; 4] = [None, None, None, None];
+            for slot in 0..n {
+                let name = format!("{prefix}{slot}");
+                out[slot] = unsafe { gl.get_uniform_location(program, &name) };
+            }
+            out
+        };
+        let u_a_tex_locs = resolve_slot_locs("u_a_tex", layers_a_len);
+        let u_b_tex_locs = resolve_slot_locs("u_b_tex", layers_b_len);
+        let u_a_rect_locs = resolve_slot_locs("u_a_rect", layers_a_len);
+        let u_b_rect_locs = resolve_slot_locs("u_b_rect", layers_b_len);
+        let u_a_rgba_locs = resolve_slot_locs("u_a_rgba", layers_a_len);
+        let u_b_rgba_locs = resolve_slot_locs("u_b_rgba", layers_b_len);
 
         let start = Instant::now();
         let mut rendered = 0_u32;
@@ -4235,54 +4141,40 @@ fn render_fade_single_pass_in_session(
                         bg_b_color[1],
                         bg_b_color[2],
                     );
-                    for slot in 0..SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
+                    // Specialized shader: bind ONLY the slots the
+                    // FS uses (0..layers_a_len for slide A, then
+                    // 0..layers_b_len for slide B). No dummy
+                    // textures, no unused branches in shader.
+                    for slot in 0..layers_a_len {
                         let unit = slot as u32;
                         gl.active_texture(glow::TEXTURE0 + unit);
-                        let (tex, rect, rgba) = if slot < texs_a.len() {
-                            (texs_a[slot], rects_a[slot], rgbas_a[slot])
-                        } else {
-                            (dummy_tex, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
-                        };
-                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        gl.bind_texture(glow::TEXTURE_2D, Some(texs_a[slot]));
                         gl.uniform_1_i32(u_a_tex_locs[slot].as_ref(), unit as i32);
+                        let rect = rects_a[slot];
+                        let rgba = rgbas_a[slot];
                         gl.uniform_4_f32(
                             u_a_rect_locs[slot].as_ref(),
-                            rect[0],
-                            rect[1],
-                            rect[2],
-                            rect[3],
+                            rect[0], rect[1], rect[2], rect[3],
                         );
                         gl.uniform_4_f32(
                             u_a_rgba_locs[slot].as_ref(),
-                            rgba[0],
-                            rgba[1],
-                            rgba[2],
-                            rgba[3],
+                            rgba[0], rgba[1], rgba[2], rgba[3],
                         );
                     }
-                    for slot in 0..SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
-                        let unit = (SINGLE_PASS_MAX_LAYERS_PER_SLIDE + slot) as u32;
+                    for slot in 0..layers_b_len {
+                        let unit = (layers_a_len + slot) as u32;
                         gl.active_texture(glow::TEXTURE0 + unit);
-                        let (tex, rect, rgba) = if slot < texs_b.len() {
-                            (texs_b[slot], rects_b[slot], rgbas_b[slot])
-                        } else {
-                            (dummy_tex, [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
-                        };
-                        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        gl.bind_texture(glow::TEXTURE_2D, Some(texs_b[slot]));
                         gl.uniform_1_i32(u_b_tex_locs[slot].as_ref(), unit as i32);
+                        let rect = rects_b[slot];
+                        let rgba = rgbas_b[slot];
                         gl.uniform_4_f32(
                             u_b_rect_locs[slot].as_ref(),
-                            rect[0],
-                            rect[1],
-                            rect[2],
-                            rect[3],
+                            rect[0], rect[1], rect[2], rect[3],
                         );
                         gl.uniform_4_f32(
                             u_b_rgba_locs[slot].as_ref(),
-                            rgba[0],
-                            rgba[1],
-                            rgba[2],
-                            rgba[3],
+                            rgba[0], rgba[1], rgba[2], rgba[3],
                         );
                     }
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
@@ -4503,6 +4395,49 @@ fn cached_transition_program(gl: &glow::Context, fs: &'static str) -> Result<glo
 fn clear_transition_program_cache(gl: &glow::Context) {
     use glow::HasContext;
     TRANSITION_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        for (_, p) in cache.drain() {
+            unsafe { gl.delete_program(p); }
+        }
+    });
+}
+
+/// QA-mandated single-pass transition (2026-05-08): per-(n_a, n_b)
+/// shader cache for FS_FADE_SP. The first cut used a fixed 8-slot
+/// shader with rgba.a=0 early-outs for unused slots; on vc4 that
+/// branchy SIMD ALU stalled at 8.4 fps@1080p. Specialization
+/// generates the FS with EXACTLY n_a + n_b apply_layer calls (no
+/// unused branches), one program per pair, cached so the FYS
+/// reel's repeated (1,1)/(1,2)/(2,2) transitions share compile
+/// cost across the session. Keyed by (n_a, n_b) tuple. Cleared
+/// at with_egl_session teardown via clear_fade_sp_program_cache.
+std::thread_local! {
+    static FADE_SP_PROGRAMS: std::cell::RefCell<
+        std::collections::HashMap<(usize, usize), glow::NativeProgram>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn cached_fade_sp_program(
+    gl: &glow::Context,
+    n_a: usize,
+    n_b: usize,
+) -> Result<glow::NativeProgram> {
+    FADE_SP_PROGRAMS.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(&p) = cache.get(&(n_a, n_b)) {
+            return Ok(p);
+        }
+        let fs = fs_fade_sp_source(n_a, n_b);
+        let p = link_program(gl, VS_TEXTURED_QUAD, &fs)
+            .with_context(|| format!("link FS_FADE_SP({n_a}, {n_b})"))?;
+        cache.insert((n_a, n_b), p);
+        Ok(p)
+    })
+}
+
+fn clear_fade_sp_program_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    FADE_SP_PROGRAMS.with(|c| {
         let mut cache = c.borrow_mut();
         for (_, p) in cache.drain() {
             unsafe { gl.delete_program(p); }
