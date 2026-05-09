@@ -5012,10 +5012,19 @@ fn render_transition_scissored_bake_in_session(
         let start = Instant::now();
         let start_mono_ns = monotonic_now_ns();
         let mut rendered = 0_u32;
-        // Static-pair single-bake gate: flips true after the first
-        // frame's bake when static_pair = true. Subsequent frames
-        // skip bake_a + bake_b and go straight to composite.
-        let mut static_baked = false;
+        // Per-side bake gate (cold-scout #3 + #2). Two flags so
+        // cut transitions can bake A and B at DIFFERENT frames
+        // (each side first becomes visible when t crosses 0.5).
+        // For non-cut static_pair the legacy single-bake behaviour
+        // collapses to: both flags flip true on frame 0; remaining
+        // frames composite-only. For non-static cut, the cut-only
+        // half is gated by `cut_a_visible / cut_b_visible` so the
+        // invisible side's bake is skipped every frame even on
+        // motion content -- ~50% bake work removed for cut.
+        let mut a_baked = false;
+        let mut b_baked = false;
+        // kind_is_cut already in scope from the caller-scope decl
+        // around line 4924; rely on capture rather than re-binding.
         let profile_active_t = crate::profile::is_enabled();
         let loop_result: Result<()> = (|| {
             for frame in 0..total_frames {
@@ -5027,15 +5036,27 @@ fn render_transition_scissored_bake_in_session(
                 let tick_seconds = start.elapsed().as_secs_f64();
                 let wall_clock_unix = current_unix_seconds();
 
-                // Skip motion_states_for_layers + bake when the
-                // pair is static and atlas already baked.
-                let bake_needed = !static_pair || !static_baked;
-                let states_a = if bake_needed {
+                // Cut composite specialization (Phase 2.6) reads
+                // ONLY the visible side per frame: A at t<0.5, B
+                // at t>=0.5. The other side's atlas content goes
+                // un-sampled, so we can skip baking it. For
+                // non-cut transitions both sides are sampled
+                // (mix/wipe/iris/etc. all read both); always
+                // bake both unless static_pair lets us skip.
+                let cut_a_visible = !kind_is_cut || t < 0.5;
+                let cut_b_visible = !kind_is_cut || t >= 0.5;
+                // Static-pair gate: skip the bake on subsequent
+                // visible-frame visits once the side is baked.
+                // For non-static_pair, bake every visible-frame.
+                let bake_a_needed = cut_a_visible && (!static_pair || !a_baked);
+                let bake_b_needed = cut_b_visible && (!static_pair || !b_baked);
+                let bake_needed = bake_a_needed || bake_b_needed;
+                let states_a = if bake_a_needed {
                     motion_states_for_layers(slide_a.id, &layers_a, tick_seconds)
                 } else {
                     Vec::new()
                 };
-                let states_b = if bake_needed {
+                let states_b = if bake_b_needed {
                     motion_states_for_layers(slide_b.id, &layers_b, tick_seconds)
                 } else {
                     Vec::new()
@@ -5051,10 +5072,13 @@ fn render_transition_scissored_bake_in_session(
                 // = 5.5% vertical compression upsampled at
                 // composite).
                 if bake_needed {
-                let t_bake_a = Instant::now();
                 unsafe {
                     gl.bind_framebuffer(glow::FRAMEBUFFER, Some(atlas_fbo));
                     gl.enable(glow::SCISSOR_TEST);
+                }
+                if bake_a_needed {
+                let t_bake_a = Instant::now();
+                unsafe {
                     gl.scissor(0, 0, mode_w_u32 as i32, region_h as i32);
                 }
                 {
@@ -5091,7 +5115,12 @@ fn render_transition_scissored_bake_in_session(
                     )?;
                 }
                 crate::profile::record_phase("sb_bake_a", t_bake_a.elapsed().as_nanos() as u64);
+                if static_pair {
+                    a_baked = true;
+                }
+                } // end if bake_a_needed
 
+                if bake_b_needed {
                 let t_bake_b = Instant::now();
                 unsafe {
                     gl.scissor(0, region_h as i32, mode_w_u32 as i32, region_h as i32);
@@ -5128,8 +5157,9 @@ fn render_transition_scissored_bake_in_session(
                 }
                 crate::profile::record_phase("sb_bake_b", t_bake_b.elapsed().as_nanos() as u64);
                 if static_pair {
-                    static_baked = true;
+                    b_baked = true;
                 }
+                } // end if bake_b_needed
                 } // end if bake_needed
 
                 // Composite: sample atlas with two UV xforms +
