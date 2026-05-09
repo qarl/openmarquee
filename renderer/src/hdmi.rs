@@ -300,6 +300,14 @@ pub struct EglSession<'a> {
     /// Cleanup at with_egl_session teardown drains all entries
     /// + delete_textures while gl context is still bound.
     slide_caches: std::collections::HashMap<uuid::Uuid, SlideRenderCache>,
+    /// QA-direct (2026-05-08, post-clock_nanosleep): session-cached
+    /// fullscreen-quad VBO for the SP transition path. The same
+    /// 4-vert TRIANGLE_STRIP geometry is used by every transition
+    /// kind; lifting it out of the per-call setup saves the
+    /// gl.create_buffer + buffer_data ioctl pair on every call
+    /// (~1 ms per transition * 18 reel transitions). Lazy-init on
+    /// first SP transition; freed at with_egl_session teardown.
+    transition_sp_quad_vbo: Option<glow::NativeBuffer>,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -448,6 +456,7 @@ where
         scene_tex: None,
         current_settings: crate::content::Settings::default(),
         slide_caches: std::collections::HashMap::new(),
+        transition_sp_quad_vbo: None,
     };
     let work_result = work(&mut session);
 
@@ -520,6 +529,9 @@ where
         }
         if let Some(tex) = session.scene_tex.take() {
             gl.delete_texture(tex);
+        }
+        if let Some(vbo) = session.transition_sp_quad_vbo.take() {
+            gl.delete_buffer(vbo);
         }
     }
     drop(session);
@@ -4128,64 +4140,37 @@ fn render_transition_single_pass_in_session(
     let mut current_bo: Option<BufferObject<()>> = None;
     let mut current_fb: Option<framebuffer::Handle> = None;
 
+    // QA-direct (2026-05-08, post-clock_nanosleep): hoist program
+    // lookup + uniform location resolution + VBO creation OUT of
+    // work_start_t. cached_transition_sp_program returns a struct
+    // with all locations pre-resolved (one-time per (kind, n_a,
+    // n_b)); transition_sp_quad_vbo is session-cached. Closes the
+    // ~15 ms / transition setup-overhead drag that was capping
+    // reel-context warm-state aggregate fps at 29.2.
+    let csp = cached_transition_sp_program(
+        session.gl,
+        kind,
+        layers_a_len,
+        layers_b_len,
+    )?;
+    let vbo = ensure_transition_sp_quad_vbo(session)?;
+
     let work_start_t = Instant::now();
     let work: Result<u32> = (|| {
         use glow::HasContext;
         let gl = session.gl;
-        let program = cached_transition_sp_program(gl, kind, layers_a_len, layers_b_len)?;
-
-        let vbo = unsafe {
-            gl.create_buffer()
-                .map_err(|e| anyhow!("glGenBuffers(single_pass_fade): {e}"))?
-        };
-        let cleanup_static = |gl: &glow::Context, vbo: glow::NativeBuffer| unsafe {
-            gl.delete_buffer(vbo);
-        };
-        let verts: [f32; 16] = [
-            -1.0, -1.0, 0.0, 0.0,
-             1.0, -1.0, 1.0, 0.0,
-            -1.0,  1.0, 0.0, 1.0,
-             1.0,  1.0, 1.0, 1.0,
-        ];
-        unsafe {
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            let bytes = std::slice::from_raw_parts(
-                verts.as_ptr() as *const u8,
-                std::mem::size_of_val(&verts),
-            );
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-        }
-        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") };
-        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") };
-        let (a_pos, a_uv) = match (a_pos, a_uv) {
-            (Some(p), Some(u)) => (p, u),
-            _ => {
-                cleanup_static(gl, vbo);
-                return Err(anyhow!(
-                    "VS_TEXTURED_QUAD missing a_pos / a_uv (single_pass_fade)"
-                ));
-            }
-        };
-        let u_t_loc = unsafe { gl.get_uniform_location(program, "u_t") };
-        let u_a_bg_loc = unsafe { gl.get_uniform_location(program, "u_a_bg") };
-        let u_b_bg_loc = unsafe { gl.get_uniform_location(program, "u_b_bg") };
-        // Specialized shader: only resolve uniforms for the slots
-        // the shader actually emits (0..n). Returns None for slots
-        // beyond the count -- those are never bound.
-        let resolve_slot_locs = |prefix: &str, n: usize| -> [Option<glow::UniformLocation>; 4] {
-            let mut out: [Option<glow::UniformLocation>; 4] = [None, None, None, None];
-            for slot in 0..n {
-                let name = format!("{prefix}{slot}");
-                out[slot] = unsafe { gl.get_uniform_location(program, &name) };
-            }
-            out
-        };
-        let u_a_tex_locs = resolve_slot_locs("u_a_tex", layers_a_len);
-        let u_b_tex_locs = resolve_slot_locs("u_b_tex", layers_b_len);
-        let u_a_rect_locs = resolve_slot_locs("u_a_rect", layers_a_len);
-        let u_b_rect_locs = resolve_slot_locs("u_b_rect", layers_b_len);
-        let u_a_rgba_locs = resolve_slot_locs("u_a_rgba", layers_a_len);
-        let u_b_rgba_locs = resolve_slot_locs("u_b_rgba", layers_b_len);
+        let program = csp.program;
+        let a_pos = csp.a_pos;
+        let a_uv = csp.a_uv;
+        let u_t_loc = csp.u_t.clone();
+        let u_a_bg_loc = csp.u_a_bg.clone();
+        let u_b_bg_loc = csp.u_b_bg.clone();
+        let u_a_tex_locs = &csp.u_a_tex_locs;
+        let u_b_tex_locs = &csp.u_b_tex_locs;
+        let u_a_rect_locs = &csp.u_a_rect_locs;
+        let u_b_rect_locs = &csp.u_b_rect_locs;
+        let u_a_rgba_locs = &csp.u_a_rgba_locs;
+        let u_b_rgba_locs = &csp.u_b_rgba_locs;
 
         let start = Instant::now();
         let start_mono_ns = monotonic_now_ns();
@@ -4396,7 +4381,9 @@ fn render_transition_single_pass_in_session(
             }
             Ok(())
         })();
-        cleanup_static(gl, vbo);
+        // VBO is session-cached now -- no per-call free needed.
+        // Program is owned by TRANSITION_SP_PROGRAMS and freed at
+        // session teardown.
         loop_result?;
         Ok(rendered)
     })();
@@ -4524,17 +4511,39 @@ fn clear_transition_program_cache(gl: &glow::Context) {
     });
 }
 
+/// QA-direct (2026-05-08, post-clock_nanosleep): cached per-program
+/// state so that the per-call uniform-location lookups (~14 string
+/// hash queries through the GLES2 driver) and attribute-location
+/// lookups don't fire on every transition. First encounter of a
+/// (kind, n_a, n_b) compiles + resolves; subsequent calls fetch
+/// the resolved struct. Closes the §8.3 reel-context warm-state
+/// gap where setup-overhead amortized over short transitions
+/// dragged the aggregate fps 0.5-1 fps below the per-frame cadence.
+#[derive(Clone)]
+struct CachedSpProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_t: Option<glow::NativeUniformLocation>,
+    u_a_bg: Option<glow::NativeUniformLocation>,
+    u_b_bg: Option<glow::NativeUniformLocation>,
+    u_a_tex_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
+    u_b_tex_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
+    u_a_rect_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
+    u_b_rect_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
+    u_a_rgba_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
+    u_b_rgba_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
+}
+
 /// QA-mandated single-pass transition (2026-05-08, step 3
-/// generalization): per-(kind, n_a, n_b) shader cache. The slice-2
-/// fade-only cache became inadequate once additional transition
-/// kinds gained their own specialized shaders. Keyed by
-/// (kind: &'static str, n_a, n_b) tuple. The kind string is a
-/// kind literal (e.g. "fade", "wipe") so the HashMap key is cheap.
-/// FYS reel cycles through ~5-15 unique (kind, n_a, n_b) pairs;
-/// each compiles ONCE per session.
+/// generalization): per-(kind, n_a, n_b) shader cache. Keyed by
+/// (kind: &'static str, n_a, n_b) tuple. FYS reel cycles through
+/// ~5-15 unique (kind, n_a, n_b) pairs; each compiles + resolves
+/// ONCE per session, then every subsequent commit_fb path fetches
+/// the cached struct.
 std::thread_local! {
     static TRANSITION_SP_PROGRAMS: std::cell::RefCell<
-        std::collections::HashMap<(&'static str, usize, usize), glow::NativeProgram>,
+        std::collections::HashMap<(&'static str, usize, usize), CachedSpProgram>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -4568,29 +4577,99 @@ fn cached_transition_sp_program(
     kind: &str,
     n_a: usize,
     n_b: usize,
-) -> Result<glow::NativeProgram> {
+) -> Result<CachedSpProgram> {
+    use glow::HasContext;
     let kind_static =
         sp_kind_static(kind).ok_or_else(|| anyhow!("kind {kind:?} has no SP generator"))?;
     TRANSITION_SP_PROGRAMS.with(|c| {
         let mut cache = c.borrow_mut();
-        if let Some(&p) = cache.get(&(kind_static, n_a, n_b)) {
-            return Ok(p);
+        if let Some(csp) = cache.get(&(kind_static, n_a, n_b)) {
+            return Ok(csp.clone());
         }
         let fs = fs_transition_sp_source(kind, n_a, n_b)
             .ok_or_else(|| anyhow!("fs_transition_sp_source returned None for {kind:?}"))?;
-        let p = link_program(gl, VS_TEXTURED_QUAD, &fs)
+        let program = link_program(gl, VS_TEXTURED_QUAD, &fs)
             .with_context(|| format!("link FS_{}_SP({n_a}, {n_b})", kind.to_uppercase()))?;
-        cache.insert((kind_static, n_a, n_b), p);
-        Ok(p)
+        // Resolve all attribute + uniform locations ONCE so the
+        // per-frame loop just reads from the cached struct.
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (sp {kind})"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (sp {kind})"))?;
+        let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        let u_a_bg = unsafe { gl.get_uniform_location(program, "u_a_bg") };
+        let u_b_bg = unsafe { gl.get_uniform_location(program, "u_b_bg") };
+        let resolve_slots = |prefix: &str, n: usize| -> [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] {
+            let mut out: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] =
+                [None, None, None, None];
+            for slot in 0..n {
+                let name = format!("{prefix}{slot}");
+                out[slot] = unsafe { gl.get_uniform_location(program, &name) };
+            }
+            out
+        };
+        let csp = CachedSpProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_t,
+            u_a_bg,
+            u_b_bg,
+            u_a_tex_locs: resolve_slots("u_a_tex", n_a),
+            u_b_tex_locs: resolve_slots("u_b_tex", n_b),
+            u_a_rect_locs: resolve_slots("u_a_rect", n_a),
+            u_b_rect_locs: resolve_slots("u_b_rect", n_b),
+            u_a_rgba_locs: resolve_slots("u_a_rgba", n_a),
+            u_b_rgba_locs: resolve_slots("u_b_rgba", n_b),
+        };
+        cache.insert((kind_static, n_a, n_b), csp.clone());
+        Ok(csp)
     })
+}
+
+/// QA-direct (2026-05-08): session-level fullscreen-quad VBO for
+/// the SP transition path. Lazy-allocated on first SP transition;
+/// freed at with_egl_session teardown. The geometry is identical
+/// across every transition kind (4-vert TRIANGLE_STRIP covering
+/// NDC [-1, 1] with UV [0, 1]); session caching saves
+/// gl.create_buffer + buffer_data per transition call.
+fn ensure_transition_sp_quad_vbo(session: &mut EglSession) -> Result<glow::NativeBuffer> {
+    use glow::HasContext;
+    if let Some(vbo) = session.transition_sp_quad_vbo {
+        return Ok(vbo);
+    }
+    let vbo = unsafe {
+        session
+            .gl
+            .create_buffer()
+            .map_err(|e| anyhow!("glGenBuffers(transition_sp_quad): {e}"))?
+    };
+    let verts: [f32; 16] = [
+        -1.0, -1.0, 0.0, 0.0,
+         1.0, -1.0, 1.0, 0.0,
+        -1.0,  1.0, 0.0, 1.0,
+         1.0,  1.0, 1.0, 1.0,
+    ];
+    unsafe {
+        session.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            std::mem::size_of_val(&verts),
+        );
+        session
+            .gl
+            .buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+    }
+    session.transition_sp_quad_vbo = Some(vbo);
+    Ok(vbo)
 }
 
 fn clear_transition_sp_program_cache(gl: &glow::Context) {
     use glow::HasContext;
     TRANSITION_SP_PROGRAMS.with(|c| {
         let mut cache = c.borrow_mut();
-        for (_, p) in cache.drain() {
-            unsafe { gl.delete_program(p); }
+        for (_, csp) in cache.drain() {
+            unsafe { gl.delete_program(csp.program); }
         }
     });
 }
