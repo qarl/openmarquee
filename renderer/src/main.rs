@@ -211,20 +211,16 @@ struct Args {
     #[arg(long)]
     capture_path: Option<PathBuf>,
 
-    /// QA-direct (2026-05-09) -- visual-verdict path for the
-    /// scissored-bake half-res FBO. Captures one frame at t=0.5
-    /// of a transition between `--fade-from` and `--fade-to` via
-    /// the SB pipeline, writes PNG at `--capture-path`. Reads
-    /// `OPENMARQUEE_SB_DIVISOR` env var (default 2 = half-res;
-    /// set 1 for full-res reference). Combine with --transition
-    /// to pick the kind.
+    /// Visual-verdict capture: render one frame at t=0.5 (or
+    /// --capture-sb-t) of a transition between --fade-from and
+    /// --fade-to through the atlas SB pipeline, write PNG at
+    /// --capture-path. Combine with --transition to pick the kind.
     ///
     /// Example:
-    ///   OPENMARQUEE_SB_DIVISOR=2 \\
     ///   /tmp/openmarquee-render --output hdmi \\
     ///     --capture-sb-mid \\
     ///     --fade-from <a> --fade-to <b> --transition cut \\
-    ///     --capture-path /tmp/sb-mid_div2.png
+    ///     --capture-path /tmp/sb-mid.png
     #[arg(long, default_value_t = false)]
     capture_sb_mid: bool,
 

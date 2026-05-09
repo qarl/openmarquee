@@ -321,10 +321,6 @@ pub struct EglSession<'a> {
     /// See ATLAS_FBO_W / ATLAS_FBO_H / ATLAS_REGION_W /
     /// ATLAS_REGION_H in hdmi_logic.rs for the geometry.
     scissored_bake_atlas: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
-    /// QA-approved env override for scissored-bake FBO size
-    /// divisor. Read once at session bring-up via
-    /// read_sb_divisor_env. See OPENMARQUEE_SB_DIVISOR docs.
-    scissored_bake_divisor: u32,
     /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
     /// the kernel CRTC currently has an alive (set_crtc'd) FB
     /// attached. The first commit per session OR the first commit
@@ -489,7 +485,6 @@ where
         slide_caches: std::collections::HashMap::new(),
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
-        scissored_bake_divisor: read_sb_divisor_env(),
     };
     let work_result = work(&mut session);
 
@@ -5467,56 +5462,6 @@ fn cached_transition_sp_program(
     })
 }
 
-/// QA-direct (2026-05-08, post-Step-4): scissored-bake FBO size
-/// divisor default. Bake target is mode_w / DIVISOR × mode_h /
-/// DIVISOR; composite samples with LINEAR filter and upscales to
-/// full output via the kind-shader's UV math.
-///
-/// Why half-res: cut-SB on heavy slide pair hit 33.9 ms p50
-/// frame_total at full-res bake (vc4 GLES2 FBO-switch implicit
-/// GPU sync = ~13 ms wait). No glMemoryBarrier in GLES2; cutting
-/// bake fragment fill 4× drops the wait below per-frame budget.
-///
-/// QA-approved env override `OPENMARQUEE_SB_DIVISOR`:
-///   1 = full-res (identical to pre-abf057d behavior; for A/B)
-///   2 = half-res (default; ships strict 30 fps)
-///   4 = quarter-res (only useful for visual A/B comparison)
-const SCISSORED_BAKE_FBO_DIVISOR_DEFAULT: u32 = 2;
-
-/// Read OPENMARQUEE_SB_DIVISOR env var, validate, return divisor.
-/// Defaults to SCISSORED_BAKE_FBO_DIVISOR_DEFAULT. Invalid values
-/// (zero, non-numeric, > 16) fall back to default with a warn.
-fn read_sb_divisor_env() -> u32 {
-    match std::env::var("OPENMARQUEE_SB_DIVISOR") {
-        Ok(s) => match s.parse::<u32>() {
-            Ok(n) if (1..=16).contains(&n) => {
-                if n != SCISSORED_BAKE_FBO_DIVISOR_DEFAULT {
-                    eprintln!(
-                        "OPENMARQUEE_SB_DIVISOR override = {n} (default {})",
-                        SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
-                    );
-                }
-                n
-            }
-            Ok(n) => {
-                eprintln!(
-                    "warn: OPENMARQUEE_SB_DIVISOR={n} out of range [1, 16]; using default {}",
-                    SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
-                );
-                SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
-            }
-            Err(_) => {
-                eprintln!(
-                    "warn: OPENMARQUEE_SB_DIVISOR={s:?} unparseable; using default {}",
-                    SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
-                );
-                SCISSORED_BAKE_FBO_DIVISOR_DEFAULT
-            }
-        },
-        Err(_) => SCISSORED_BAKE_FBO_DIVISOR_DEFAULT,
-    }
-}
-
 /// Cached FS_BLIT program for the atlas SB bg-cache path
 /// (2026-05-09): when a slide has a non-solid bg cached as a
 /// pre-rendered texture, we blit it into the atlas region via
@@ -5751,14 +5696,6 @@ fn blit_bg_to_region(
 /// region is 2048 wide (1920 used, 128 gutter) and 1024 tall
 /// (1080 → 1024 = 5.5% vertical compression upsampled at
 /// composite). Lazy-init; freed at with_egl_session teardown.
-///
-/// Note: the legacy SCISSORED_BAKE_FBO_DIVISOR env override no
-/// longer affects bake size — the atlas is fixed at 2048x2048
-/// because we need both regions to fit. The env is still read
-/// (other call paths may use it for capture-fbo sizing); just
-/// not load-bearing here. The ATLAS path supersedes the half-res
-/// FBO that qarl rejected as failing the production-correct
-/// full-res bar (2026-05-09 qarl-direct).
 unsafe fn ensure_bake_atlas(
     session: &mut EglSession,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
