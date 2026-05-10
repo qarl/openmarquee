@@ -200,33 +200,91 @@ pub const MAX_RASTERIZED_BITMAP_DIM: u32 = 2048;
 /// `metrics(ch, size_px)` returns glyph bbox + advance from a cached
 /// outline lookup; orders of magnitude cheaper than a full rasterize.
 ///
-/// Mirrors layout_text_to_alpha's bbox math: line width is the sum of
-/// per-glyph advance widths; line height is `max(ymin+height) -
-/// min(ymin)` across glyphs (ascent above + descent below baseline).
-/// Padding (1px each side) added to match the rasterized output.
+/// Mirrors layout_text_to_alpha's bbox math: per-line width is the sum
+/// of per-glyph advance widths; output width is the MAX line width;
+/// line height is `max(ymin+height) - min(ymin)` across ALL glyphs in
+/// ALL lines (ascent above + descent below baseline) so all lines
+/// share a uniform vertical advance. Padding (1px each side) added to
+/// match the rasterized output.
+///
+/// Newline handling (qarl-flag 2026-05-10): `\r\n` is normalized to
+/// `\n`; bare `\r` is also treated as a line break. Each `\n` starts
+/// a new line; empty lines contribute one line-height of vertical
+/// space. Pre-fix the rasterizer fed `\n` to `font.rasterize` like
+/// any other char, getting fontdue's missing-glyph tofu and
+/// concatenating "Liberate\nyour sign." onto one line with a tofu
+/// in the middle.
 ///
 /// Returns `(width, height)` as the rasterized bitmap WOULD be at
-/// `size_px`. Empty text returns `(0, 0)`.
+/// `size_px`. Empty text or text yielding zero-width content returns
+/// `(0, 0)`.
 pub fn predict_alpha_bitmap_dims(font: &fontdue::Font, text: &str, size_px: f32) -> (u32, u32) {
     if text.is_empty() {
         return (0, 0);
     }
-    let mut total_advance = 0.0_f32;
+    let lines = split_text_into_lines(text);
+    let mut max_line_w = 0.0_f32;
     let mut max_ascent = 0_i32;
     let mut min_descent = 0_i32;
-    for ch in text.chars() {
-        let m = font.metrics(ch, size_px);
-        let ascent = m.ymin + m.height as i32;
-        max_ascent = max_ascent.max(ascent);
-        min_descent = min_descent.min(m.ymin);
-        total_advance += m.advance_width;
+    let mut any_glyph = false;
+    for line in &lines {
+        let mut line_advance = 0.0_f32;
+        for ch in line.chars() {
+            let m = font.metrics(ch, size_px);
+            let ascent = m.ymin + m.height as i32;
+            max_ascent = max_ascent.max(ascent);
+            min_descent = min_descent.min(m.ymin);
+            line_advance += m.advance_width;
+            any_glyph = true;
+        }
+        if line_advance > max_line_w {
+            max_line_w = line_advance;
+        }
+    }
+    if !any_glyph {
+        // All-whitespace / all-newlines input has no measurable
+        // glyph content; return (0, 0) so layout_text_to_alpha's
+        // None contract holds.
+        return (0, 0);
     }
     let pad: u32 = 1;
-    let line_w = total_advance.ceil() as u32;
-    let line_h = (max_ascent - min_descent).max(0) as u32;
-    let bm_w = line_w + 2 * pad;
-    let bm_h = line_h + 2 * pad;
+    let line_h_px = (max_ascent - min_descent).max(0) as u32;
+    let bm_w = max_line_w.ceil() as u32 + 2 * pad;
+    let bm_h = (lines.len() as u32) * line_h_px + 2 * pad;
     (bm_w, bm_h)
+}
+
+/// Split text on newline boundaries. `\r\n` (Windows) is treated as
+/// one break; bare `\r` (legacy Mac) also as one break. Split is
+/// inclusive of trailing empty lines: `"abc\n"` -> `["abc", ""]`,
+/// matching text-editor convention. Empty input -> `[""]`.
+pub fn split_text_into_lines(text: &str) -> Vec<&str> {
+    // Normalize \r\n and bare \r without allocating: walk the bytes
+    // and emit slices at each break. Cheaper than text.replace().
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            out.push(&text[start..i]);
+            i += 1;
+            start = i;
+        } else if b == b'\r' {
+            out.push(&text[start..i]);
+            // \r\n: skip the \n too.
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'\n' {
+                i += 1;
+            }
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(&text[start..bytes.len()]);
+    out
 }
 
 /// Compute the largest `size_px` whose rasterized bitmap fits within
@@ -302,10 +360,17 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
         None => size_px,
     };
 
-    // First pass: rasterize each glyph + measure the line's bbox.
-    // We measure ascent/descent in the font's own units to size the
-    // canvas. fontdue exposes BOTH a float OutlineBounds (`m.bounds`)
-    // and integer pixel offsets (`m.xmin`, `m.ymin`); the latter are
+    // Newline handling (qarl-flag 2026-05-10): split into lines on
+    // \n / \r / \r\n. Pre-fix the rasterizer fed \n to font.rasterize
+    // like any other char, getting fontdue's missing-glyph tofu;
+    // multi-line text (e.g. "Liberate\nyour sign.") was getting
+    // squashed onto one line with a tofu in the middle.
+    let lines = split_text_into_lines(text);
+
+    // First pass: rasterize each glyph in each line + measure global
+    // bbox. We measure ascent/descent in the font's own units.
+    // fontdue exposes BOTH a float OutlineBounds (`m.bounds`) and
+    // integer pixel offsets (`m.xmin`, `m.ymin`); the latter are
     // pre-snapped to the bitmap rows the rasterizer actually wrote,
     // so using bounds + .round() introduces an off-by-one between
     // the placement and the bitmap (descender hairline gaps,
@@ -315,26 +380,44 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
     // the glyph bitmap, in pixels, with y-up. Negative for
     // descenders (g, j, p, q, y) — the bottom of the bitmap sits
     // below the baseline.
-    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::with_capacity(text.chars().count());
-    let mut total_advance = 0.0_f32;
-    let mut max_ascent = 0_i32;  // pixels above baseline
-    let mut min_descent = 0_i32; // pixels below baseline (m.ymin is ≤ 0 typically)
-    for ch in text.chars() {
-        let (m, alpha) = font.rasterize(ch, effective_size_px);
-        // ascent_above_baseline = ymin + height (top of bitmap
-        // relative to baseline, y-up).
-        let ascent = m.ymin + m.height as i32;
-        max_ascent = max_ascent.max(ascent);
-        min_descent = min_descent.min(m.ymin);
-        total_advance += m.advance_width;
-        glyphs.push((m, alpha));
+    //
+    // ALL lines share the same line-height = max_ascent - min_descent
+    // computed across every glyph in every line so vertical advance
+    // is uniform.
+    let mut all_lines: Vec<(Vec<(fontdue::Metrics, Vec<u8>)>, f32)> =
+        Vec::with_capacity(lines.len());
+    let mut max_line_w = 0.0_f32;
+    let mut max_ascent = 0_i32;
+    let mut min_descent = 0_i32;
+    let mut any_glyph = false;
+    for line in &lines {
+        let mut line_glyphs: Vec<(fontdue::Metrics, Vec<u8>)> =
+            Vec::with_capacity(line.chars().count());
+        let mut line_advance = 0.0_f32;
+        for ch in line.chars() {
+            let (m, alpha) = font.rasterize(ch, effective_size_px);
+            let ascent = m.ymin + m.height as i32;
+            max_ascent = max_ascent.max(ascent);
+            min_descent = min_descent.min(m.ymin);
+            line_advance += m.advance_width;
+            line_glyphs.push((m, alpha));
+            any_glyph = true;
+        }
+        if line_advance > max_line_w {
+            max_line_w = line_advance;
+        }
+        all_lines.push((line_glyphs, line_advance));
     }
-    let line_w = total_advance.ceil() as u32;
+    if !any_glyph {
+        // All-whitespace / all-newlines input -- no measurable
+        // glyph content. Preserve the legacy empty-text contract.
+        return None;
+    }
+    let line_w = max_line_w.ceil() as u32;
     let line_h = (max_ascent - min_descent).max(0) as u32;
     if line_w == 0 || line_h == 0 {
         return None;
     }
-    let baseline_y: i32 = max_ascent; // pixels from top of canvas to baseline (y-down)
 
     // v1-spec-delta #4 (slice b/d, QA review fix): pad the output
     // bitmap by 1 pixel on all four sides. The padding rows stay
@@ -349,37 +432,45 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
     // pixels and produce the visible exterior ring.
     let pad: u32 = 1;
     let bm_w = line_w + 2 * pad;
-    let bm_h = line_h + 2 * pad;
+    let bm_h = (lines.len() as u32) * line_h + 2 * pad;
 
-    // Second pass: blit each glyph at (cursor_x + glyph_xmin + pad,
-    // baseline_y - (glyph_ymin + glyph_height) + pad).
+    // Second pass: blit each line's glyphs at the correct baseline.
+    // Line N's baseline = pad + max_ascent + N * line_h. cursor_x
+    // resets to pad at the start of each line; per-line layout is
+    // left-aligned within the bitmap (caller's halign in
+    // box_to_ndc_quad places the WHOLE bitmap within the layer box).
     let mut data = vec![0u8; (bm_w * bm_h) as usize];
-    let mut cursor_x = 0.0_f32;
-    for (m, alpha) in &glyphs {
-        let glyph_x = (cursor_x + m.xmin as f32).round() as i32 + pad as i32;
-        let glyph_top = baseline_y - m.ymin - m.height as i32 + pad as i32;
-        for gy in 0..m.height as i32 {
-            let dst_y = glyph_top + gy;
-            if dst_y < 0 || dst_y as u32 >= bm_h {
-                continue;
-            }
-            for gx in 0..m.width as i32 {
-                let dst_x = glyph_x + gx;
-                if dst_x < 0 || dst_x as u32 >= bm_w {
+    for (line_idx, (line_glyphs, _)) in all_lines.iter().enumerate() {
+        let baseline_y = pad as i32 + max_ascent + (line_idx as i32) * line_h as i32;
+        let mut cursor_x = 0.0_f32;
+        for (m, alpha) in line_glyphs {
+            let glyph_x = (cursor_x + m.xmin as f32).round() as i32 + pad as i32;
+            let glyph_top = baseline_y - m.ymin - m.height as i32;
+            for gy in 0..m.height as i32 {
+                let dst_y = glyph_top + gy;
+                if dst_y < 0 || dst_y as u32 >= bm_h {
                     continue;
                 }
-                let src = alpha[(gy as usize) * m.width + gx as usize];
-                if src == 0 {
-                    continue;
+                for gx in 0..m.width as i32 {
+                    let dst_x = glyph_x + gx;
+                    if dst_x < 0 || dst_x as u32 >= bm_w {
+                        continue;
+                    }
+                    let src = alpha[(gy as usize) * m.width + gx as usize];
+                    if src == 0 {
+                        continue;
+                    }
+                    let idx = (dst_y as u32 * bm_w + dst_x as u32) as usize;
+                    // Glyphs in a single line don't overlap (fontdue
+                    // emits non-overlapping bboxes per glyph) and
+                    // separate lines don't share rows (uniform line
+                    // height advances baseline by exactly line_h),
+                    // so a direct write is safe -- no max/saturate.
+                    data[idx] = src;
                 }
-                let idx = (dst_y as u32 * bm_w + dst_x as u32) as usize;
-                // Glyphs in a single line don't overlap (fontdue
-                // emits non-overlapping bboxes per glyph), so a
-                // direct write is safe — no max/saturate needed.
-                data[idx] = src;
             }
+            cursor_x += m.advance_width;
         }
-        cursor_x += m.advance_width;
     }
     Some(AlphaBitmap {
         width: bm_w,
@@ -5470,6 +5561,161 @@ mod tests {
     fn layout_empty_text_returns_none() {
         let font = load_anton();
         assert!(layout_text_to_alpha(&font, "", 64.0).is_none());
+    }
+
+    // Newline handling (qarl-flag 2026-05-10): pre-fix, the
+    // rasterizer fed \n to font.rasterize like any other char,
+    // getting fontdue's missing-glyph tofu. Multi-line text was
+    // squashed onto one line with a tofu in the middle. These
+    // tests pin the multi-line behavior + newline normalization.
+
+    #[test]
+    fn split_text_into_lines_lf() {
+        assert_eq!(split_text_into_lines(""), vec![""]);
+        assert_eq!(split_text_into_lines("abc"), vec!["abc"]);
+        assert_eq!(split_text_into_lines("a\nb"), vec!["a", "b"]);
+        assert_eq!(split_text_into_lines("a\nb\nc"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_text_into_lines_crlf_normalized() {
+        // \r\n (Windows) is one break.
+        assert_eq!(split_text_into_lines("a\r\nb"), vec!["a", "b"]);
+        // Bare \r (legacy Mac) is also one break.
+        assert_eq!(split_text_into_lines("a\rb"), vec!["a", "b"]);
+        // Mixed: \r\n and \n in one string.
+        assert_eq!(
+            split_text_into_lines("a\r\nb\nc"),
+            vec!["a", "b", "c"],
+        );
+    }
+
+    #[test]
+    fn split_text_into_lines_empty_lines_preserved() {
+        // Trailing newline -> trailing empty line (text-editor
+        // convention).
+        assert_eq!(split_text_into_lines("abc\n"), vec!["abc", ""]);
+        // Empty middle line.
+        assert_eq!(split_text_into_lines("a\n\nb"), vec!["a", "", "b"]);
+        // Just newlines.
+        assert_eq!(split_text_into_lines("\n\n"), vec!["", "", ""]);
+    }
+
+    #[test]
+    fn layout_two_lines_taller_than_one_line() {
+        // Per the bug: pre-fix, "Liberate\nyour sign." came out
+        // ~229 px tall (single line height) with a tofu glyph
+        // at the \n position. Post-fix it must be substantially
+        // taller (two lines stacked vertically).
+        //
+        // "your sign." alone has descenders ('y', 'g') so its
+        // line height ≈ the global line height of the two-line
+        // version; "Liberate" alone has no descenders so its
+        // height is shorter. Compare against the descender-
+        // bearing line for the 2x check.
+        let font = load_anton();
+        let your_sign = layout_text_to_alpha(&font, "your sign.", 64.0).unwrap();
+        let two_lines = layout_text_to_alpha(&font, "Liberate\nyour sign.", 64.0).unwrap();
+        // Two lines should be ~2x as tall as the descender-bearing
+        // single line. Allow ±4 px for padding.
+        let expected_h = your_sign.height * 2;
+        assert!(
+            (two_lines.height as i32 - expected_h as i32).abs() <= 4,
+            "two-line h={} should be ~2x your_sign h={} (expected ~{})",
+            two_lines.height, your_sign.height, expected_h,
+        );
+        // Sanity: two-line is materially taller than the
+        // single-line "Liberate" baseline (which would be the
+        // pre-fix tofu-on-one-line height).
+        let liberate = layout_text_to_alpha(&font, "Liberate", 64.0).unwrap();
+        assert!(
+            two_lines.height > liberate.height + 50,
+            "two-line h={} should dwarf liberate h={} (pre-fix would have matched)",
+            two_lines.height, liberate.height,
+        );
+    }
+
+    #[test]
+    fn layout_two_lines_width_is_max_of_lines() {
+        // Bitmap width should be the LONGER line's width, not
+        // the SUM. "your sign." is wider than "Liberate" at
+        // Anton 64px (more chars including descenders).
+        let font = load_anton();
+        let liberate = layout_text_to_alpha(&font, "Liberate", 64.0).unwrap();
+        let your_sign = layout_text_to_alpha(&font, "your sign.", 64.0).unwrap();
+        let two_lines = layout_text_to_alpha(&font, "Liberate\nyour sign.", 64.0).unwrap();
+        let expected_w = liberate.width.max(your_sign.width);
+        assert!(
+            (two_lines.width as i32 - expected_w as i32).abs() <= 2,
+            "two-line w={} should match max(liberate {}, your_sign {}) = {}",
+            two_lines.width, liberate.width, your_sign.width, expected_w,
+        );
+        // And NOT the sum.
+        let summed = liberate.width + your_sign.width;
+        assert!(
+            two_lines.width < summed,
+            "two-line w={} should be less than summed-line w={} \
+             (would be the pre-fix tofu-on-one-line behavior)",
+            two_lines.width, summed,
+        );
+    }
+
+    #[test]
+    fn layout_crlf_treated_as_single_break() {
+        // CRLF (Windows) and LF should produce identical output
+        // shape -- both are one line break.
+        let font = load_anton();
+        let lf = layout_text_to_alpha(&font, "a\nb", 64.0).unwrap();
+        let crlf = layout_text_to_alpha(&font, "a\r\nb", 64.0).unwrap();
+        assert_eq!((lf.width, lf.height), (crlf.width, crlf.height));
+    }
+
+    #[test]
+    fn layout_no_tofu_glyph_for_newline() {
+        // Smoke check: rasterize "a\nb" and "ab" at the same
+        // size. Two-line "a\nb" has the SAME width as "a" alone
+        // (longest line is 1 char), NOT the width of "ab" or
+        // "ab + tofu". Pre-fix the \n produced a tofu glyph
+        // wider than nothing, making "a\nb" wider than "a" by
+        // ~tofu_width.
+        let font = load_anton();
+        let single_a = layout_text_to_alpha(&font, "a", 64.0).unwrap();
+        let two_lines_ab = layout_text_to_alpha(&font, "a\nb", 64.0).unwrap();
+        // "a" and "b" are similar widths in Anton at 64px;
+        // treat them as effectively equal +/- 4px.
+        assert!(
+            (two_lines_ab.width as i32 - single_a.width as i32).abs() <= 6,
+            "two-line 'a\\nb' w={} should match single-line 'a' w={} (no tofu)",
+            two_lines_ab.width, single_a.width,
+        );
+    }
+
+    #[test]
+    fn layout_only_newlines_returns_none() {
+        // No glyph content -> None (matches empty-text contract).
+        let font = load_anton();
+        assert!(layout_text_to_alpha(&font, "\n", 64.0).is_none());
+        assert!(layout_text_to_alpha(&font, "\n\n\n", 64.0).is_none());
+        assert!(layout_text_to_alpha(&font, "\r\n\r\n", 64.0).is_none());
+    }
+
+    #[test]
+    fn predict_dims_match_rasterize_for_multi_line() {
+        // The cap math (clamp_size_px_to_bitmap_cap) relies on
+        // predict_alpha_bitmap_dims being byte-equal to the
+        // actual rasterized output dims. Pin parity for multi-
+        // line input.
+        let font = load_anton();
+        for text in ["a\nb", "Liberate\nyour sign.", "Hello\nWorld\n!"] {
+            let (pred_w, pred_h) = predict_alpha_bitmap_dims(&font, text, 64.0);
+            let bm = layout_text_to_alpha(&font, text, 64.0)
+                .unwrap_or_else(|| panic!("rasterize {text:?}"));
+            assert_eq!(
+                (pred_w, pred_h),
+                (bm.width, bm.height),
+                "{text:?}: predict vs rasterize disagree",
+            );
+        }
     }
 
     // E (rasterize-side bitmap cap, 2026-05-09): predict +
