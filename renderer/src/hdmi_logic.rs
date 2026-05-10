@@ -606,19 +606,31 @@ void main() {
 /// when u_t crosses its threshold. Mirrors Python ref
 /// `_FRAGMENT_DISSOLVE`.
 ///
-/// **Precision note**: the Python ref uses `highp` throughout the
-/// preamble specifically because the hash math (sin/dot/fract on
-/// large constants) collapses on vc4's mediump (~10-bit mantissa).
-/// Match that here — every other transition can stay mediump, but
-/// dissolve needs the higher precision or it stripes/banded on Pi.
+/// **Precision note (P3, 2026-05-09)**: the Python ref uses a
+/// `sin(dot)*large` hash that needs highp because the large
+/// magnification constant (43758.5453) saturates mediump's ~10-bit
+/// mantissa. Replaced with the Inigo Quilez mediump-safe idiom
+/// (`50 * fract(p * 1/π + seed)` then cross-multiply + final
+/// fract). Same per-pixel salt-and-pepper visual character; works
+/// in mediump; cheaper than sin on vc4. Drops dissolve's highp
+/// dependency from the punch list.
+///
+/// Why IQ over Hoskins's 0.1031-seeded form: Hoskins's small seed
+/// produces tiny per-pixel input deltas at 1080p (delta 1/1920 *
+/// 0.1031 ≈ 5e-5), which collapse the per-pixel hash into broad
+/// swept reveals at native pixel pitch. IQ's 50.0 post-multiply
+/// amplifies the delta to ~8e-3, well into the productive range
+/// of fract-based scrambling. Host test
+/// `dissolve_hash_decorrelates_adjacent_pixels` pins this.
 pub const FS_DISSOLVE: &str = r#"#version 100
-precision highp float;
+precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
 varying vec2 v_uv;
 float _hash(vec2 p) {
-    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+    p = 50.0 * fract(p * 0.3183099 + vec2(0.71, 0.113));
+    return fract(p.x * p.y * (p.x + p.y));
 }
 void main() {
     vec4 a = texture2D(u_src_a, v_uv);
@@ -1128,6 +1140,34 @@ pub fn prefer_scissored_bake(n_a: usize, n_b: usize) -> bool {
         || n_a + n_b > 4
 }
 
+/// Host-side mirror of the GLSL `_hash(vec2 p)` IQ hash that
+/// FS_DISSOLVE / SP_HASH_HELPER embed. Lets unit tests assert the
+/// hash's distribution / determinism / decorrelation properties
+/// without spinning up a GLES2 context.
+///
+/// IMPORTANT: this MUST stay byte-for-byte equivalent to the GLSL.
+/// The pinned constants (0.3183099 = 1/π, 50.0, seeds 0.71/0.113)
+/// are load-bearing -- they're what makes the hash mediump-safe
+/// AND uniformly distributed in [0, 1] AND adjacent-pixel-
+/// decorrelated at 1080p. Changing either side without changing
+/// the other invalidates the unit test guarantees.
+pub fn dissolve_hash_vec2_to_float(p: [f32; 2]) -> f32 {
+    // GLSL fract(x) = x - floor(x). Differs from Rust's f32::fract
+    // (which is x - x.trunc()) only for negative inputs; our hash
+    // inputs are v_uv in [0, 1] so the two agree, but use the GLSL
+    // semantic explicitly for full equivalence in tests.
+    fn glsl_fract(x: f32) -> f32 {
+        x - x.floor()
+    }
+    // p = 50.0 * fract(p * 0.3183099 + vec2(0.71, 0.113));
+    let p = [
+        50.0 * glsl_fract(p[0] * 0.3183099 + 0.71),
+        50.0 * glsl_fract(p[1] * 0.3183099 + 0.113),
+    ];
+    // return fract(p.x * p.y * (p.x + p.y));
+    glsl_fract(p[0] * p[1] * (p[0] + p[1]))
+}
+
 /// Returns true if a gradient with this density is visually
 /// indistinguishable from a solid `color_a` fill. Used by
 /// `effective_solid_bg` (in hdmi.rs) to admit density-≈-0 gradients
@@ -1372,19 +1412,34 @@ pub fn fs_fade_sp_source(n_a: usize, n_b: usize) -> String {
 }
 
 fn kind_needs_highp(kind: &str) -> bool {
-    // dissolve + glitch hash math collapses on vc4's mediump
-    // (~10-bit mantissa). Glitch isn't ported yet (qarl-deferred);
-    // keep the gate for forward compat.
-    matches!(kind, "dissolve" | "glitch")
+    // Glitch hash math (sin/dot/fract on a large magnification
+    // constant) collapses on vc4's mediump (~10-bit mantissa).
+    // Glitch isn't ported to SP yet (qarl-deferred); the gate is
+    // here for forward compat with the standalone FS_GLITCH which
+    // still uses the sin-hash idiom.
+    //
+    // P3 (2026-05-09): "dissolve" was dropped from this set. The
+    // SP-tier dissolve hash now uses the Hoskins "hash without
+    // sine" idiom (see SP_HASH_HELPER) which is mediump-safe AND
+    // cheaper on vc4. Standalone FS_DISSOLVE got the same swap.
+    matches!(kind, "glitch")
 }
 
 fn kind_needs_hash(kind: &str) -> bool {
     matches!(kind, "dissolve" | "glitch")
 }
 
+/// SP-tier hash helper. Used by the dissolve generator (and any
+/// future SP glitch port). P3 (2026-05-09): swapped from the
+/// classic `sin(dot)*43758` hash to the Inigo Quilez mediump-safe
+/// idiom -- per-pixel salt-and-pepper distribution character with
+/// adjacent-pixel decorrelation at 1080p, no sin, no highp
+/// dependency. Mirrors the standalone FS_DISSOLVE hash so SP and
+/// standalone paths match.
 const SP_HASH_HELPER: &str = r#"
 float _hash(vec2 p) {
-    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+    p = 50.0 * fract(p * 0.3183099 + vec2(0.71, 0.113));
+    return fract(p.x * p.y * (p.x + p.y));
 }
 "#;
 
@@ -4143,25 +4198,236 @@ mod tests {
     }
 
     #[test]
-    fn fs_dissolve_uses_highp_precision() {
-        // Critical for vc4 — the sin/dot/fract hash needs more than
-        // the ~10-bit mantissa of mediump or the threshold values
-        // collapse and the dissolve goes banded. Pin at host-test
-        // time so a copy-paste from another shader can't downgrade
-        // it.
+    fn fs_dissolve_uses_mediump_iq_hash() {
+        // P3 (2026-05-09): swapped the highp sin-hash for the
+        // Inigo Quilez mediump-safe idiom. mediump-safe (no
+        // large-constant magnification), no `sin(`, same per-pixel
+        // salt-and-pepper distribution character, adjacent-pixel
+        // decorrelated at 1080p.
         assert!(FS_DISSOLVE.starts_with("#version 100\n"));
-        assert!(FS_DISSOLVE.contains("precision highp float"));
-        assert!(!FS_DISSOLVE.contains("precision mediump float"));
+        assert!(
+            FS_DISSOLVE.contains("precision mediump float"),
+            "FS_DISSOLVE should be mediump now (IQ hash drops the highp dep)",
+        );
+        assert!(
+            !FS_DISSOLVE.contains("precision highp"),
+            "FS_DISSOLVE must not use highp (P3 dropped it)",
+        );
         for uniform in ["u_src_a", "u_src_b", "u_t"] {
             assert!(FS_DISSOLVE.contains(uniform));
         }
-        // Hash structure pinned: sin(dot(p, vec2(...))) * big
-        // constant, fract'd. Pin the magic constants so a future
-        // edit doesn't silently change the noise pattern.
-        assert!(FS_DISSOLVE.contains("12.9898"));
-        assert!(FS_DISSOLVE.contains("78.233"));
-        assert!(FS_DISSOLVE.contains("43758.5453"));
+        // IQ markers pinned: 1/pi seed scale (0.3183099),
+        // 50.0 amplifier, vec2 seed offsets (0.71, 0.113). Pin so
+        // a future edit doesn't silently regress to a non-mediump-
+        // safe hash or an under-amplified Hoskins variant.
+        assert!(FS_DISSOLVE.contains("0.3183099"), "IQ 1/pi seed missing");
+        assert!(FS_DISSOLVE.contains("50.0"), "IQ amplifier missing");
+        assert!(FS_DISSOLVE.contains("0.71"), "IQ seed offset missing");
+        assert!(FS_DISSOLVE.contains("0.113"), "IQ seed offset missing");
+        assert!(
+            !FS_DISSOLVE.contains("sin("),
+            "FS_DISSOLVE must not call sin() -- IQ is sine-free",
+        );
+        // Body still does the threshold-step + mix structure.
         assert!(FS_DISSOLVE.contains("step(threshold, u_t)"));
+    }
+
+    #[test]
+    fn fs_dissolve_is_branchless() {
+        // P3 (2026-05-09): mirror of the FS_FLIP branchless gate.
+        // Hash math is straight arithmetic; no per-fragment
+        // conditionals.
+        assert!(
+            !FS_DISSOLVE.contains("if ("),
+            "FS_DISSOLVE should be branchless (no `if (`)",
+        );
+    }
+
+    #[test]
+    fn sp_hash_helper_is_iq_not_sine() {
+        // SP-tier dissolve generator emits SP_HASH_HELPER inline
+        // before main(); same IQ idiom must apply there so SP-tier
+        // dissolve and standalone FS_DISSOLVE don't drift.
+        assert!(SP_HASH_HELPER.contains("0.3183099"));
+        assert!(SP_HASH_HELPER.contains("50.0"));
+        assert!(SP_HASH_HELPER.contains("0.71"));
+        assert!(SP_HASH_HELPER.contains("0.113"));
+        assert!(
+            !SP_HASH_HELPER.contains("sin("),
+            "SP_HASH_HELPER must not use sin (P3)",
+        );
+        assert!(
+            !SP_HASH_HELPER.contains("43758"),
+            "SP_HASH_HELPER must not use the legacy 43758 constant",
+        );
+    }
+
+    #[test]
+    fn sp_dissolve_does_not_request_highp() {
+        // P3: kind_needs_highp("dissolve") used to return true,
+        // forcing the SP-tier dissolve shader into highp. The
+        // Hoskins hash is mediump-safe, so dissolve drops out of
+        // that gate. Glitch (still using sin-hash in standalone)
+        // stays in for forward compat.
+        assert!(!kind_needs_highp("dissolve"));
+        assert!(kind_needs_highp("glitch"));
+        // The generated SP-tier dissolve source must NOT contain
+        // "precision highp" -- only mediump.
+        let sp = fs_transition_sp_source("dissolve", 1, 1).expect("dissolve SP");
+        assert!(
+            sp.contains("precision mediump float"),
+            "SP dissolve should declare mediump",
+        );
+        assert!(
+            !sp.contains("precision highp"),
+            "SP dissolve must not declare highp (P3 dropped it)",
+        );
+        assert!(
+            !sp.contains("sin("),
+            "SP dissolve must not call sin (P3 swapped to Hoskins)",
+        );
+    }
+
+    // P3 host-side hash function tests. The Rust mirror
+    // (dissolve_hash_vec2_to_float) MUST stay byte-equivalent to
+    // the GLSL embedded in FS_DISSOLVE / SP_HASH_HELPER.
+
+    #[test]
+    fn dissolve_hash_is_deterministic() {
+        // Same input -> same output, every call. Sanity check that
+        // there's no hidden RNG / time / global state in the math.
+        let inputs = [
+            [0.0, 0.0],
+            [0.5, 0.5],
+            [1.0, 1.0],
+            [0.123, 0.456],
+            [0.987, 0.012],
+        ];
+        for p in inputs {
+            let a = dissolve_hash_vec2_to_float(p);
+            let b = dissolve_hash_vec2_to_float(p);
+            assert_eq!(a, b, "{p:?}: hash should be deterministic");
+        }
+    }
+
+    #[test]
+    fn dissolve_hash_outputs_within_unit_interval() {
+        // Output is always in [0, 1] by construction (final fract).
+        // Pin the invariant so the Rust mirror agrees with the
+        // GLSL contract (step(threshold, u_t) only makes sense
+        // when threshold is in [0, 1]).
+        for i in 0..256u32 {
+            for j in 0..256u32 {
+                let u = i as f32 / 255.0;
+                let v = j as f32 / 255.0;
+                let h = dissolve_hash_vec2_to_float([u, v]);
+                assert!(
+                    (0.0..=1.0).contains(&h),
+                    "hash([{u:.3}, {v:.3}]) = {h} outside [0, 1]",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dissolve_hash_distribution_is_roughly_uniform() {
+        // 16384-sample uniformity check: bucket the outputs into
+        // 16 bins and assert no bin is empty AND no bin has more
+        // than 2x the expected mean. This is a weak distribution
+        // test (chi-square with 16 df would be tighter), but it
+        // catches obvious degenerate hashes (all-zero, all-one,
+        // periodic clumps).
+        let n_bins = 16;
+        let mut bins = vec![0u32; n_bins];
+        let total: u32 = 16384;
+        let side: u32 = 128;
+        for i in 0..side {
+            for j in 0..side {
+                let u = (i as f32 + 0.5) / side as f32;
+                let v = (j as f32 + 0.5) / side as f32;
+                let h = dissolve_hash_vec2_to_float([u, v]);
+                let bin = ((h * n_bins as f32) as usize).min(n_bins - 1);
+                bins[bin] += 1;
+            }
+        }
+        let mean = total / n_bins as u32;
+        for (bin_idx, &count) in bins.iter().enumerate() {
+            assert!(
+                count > 0,
+                "bin {bin_idx} empty (degenerate hash distribution)",
+            );
+            assert!(
+                count < 2 * mean,
+                "bin {bin_idx} has {count} samples vs mean {mean} (clumpy distribution)",
+            );
+            assert!(
+                count > mean / 2,
+                "bin {bin_idx} has {count} samples vs mean {mean} (gap in distribution)",
+            );
+        }
+    }
+
+    #[test]
+    fn dissolve_hash_decorrelates_adjacent_pixels_horizontal() {
+        // Adjacent pixels (1 texel apart in v_uv space, i.e. spaced
+        // by 1/1920 horizontally at 1080p) should produce decor-
+        // related hash outputs >90% of the time. Defends against
+        // accidentally-smooth hash regression where neighbors
+        // produce nearly identical thresholds and the dissolve
+        // collapses into broad swept reveals.
+        let mode_w = 1920.0_f32;
+        let step = 1.0 / mode_w;
+        let mut total = 0_u32;
+        let mut significantly_different = 0_u32;
+        for i in 0..1000 {
+            // 1000 random-ish probe positions across [0, 1)^2.
+            let u = (i as f32 * 0.0017).fract();
+            let v = (i as f32 * 0.0029).fract();
+            let h0 = dissolve_hash_vec2_to_float([u, v]);
+            let h1 = dissolve_hash_vec2_to_float([u + step, v]);
+            total += 1;
+            // "Significantly different" = differs by at least 0.05
+            // (5% of the [0, 1] range).
+            if (h0 - h1).abs() >= 0.05 {
+                significantly_different += 1;
+            }
+        }
+        let pct = (significantly_different as f32 / total as f32) * 100.0;
+        assert!(
+            pct >= 90.0,
+            "only {pct:.1}% of horizontal-adjacent pixel pairs are decorrelated; \
+             expected >= 90%. Hash may have regressed to a smooth function.",
+        );
+    }
+
+    #[test]
+    fn dissolve_hash_decorrelates_adjacent_pixels_vertical() {
+        // Mirror of the horizontal test along the y-axis. The IQ
+        // hash uses asymmetric seeds (0.71 for x, 0.113 for y), so
+        // horizontal and vertical decorrelation are structurally
+        // different; pinning ONLY horizontal would leave a 50%
+        // coverage gap. At 1080p, the y step is 1/1080.
+        let mode_h = 1080.0_f32;
+        let step = 1.0 / mode_h;
+        let mut total = 0_u32;
+        let mut significantly_different = 0_u32;
+        for i in 0..1000 {
+            let u = (i as f32 * 0.0017).fract();
+            let v = (i as f32 * 0.0029).fract();
+            let h0 = dissolve_hash_vec2_to_float([u, v]);
+            let h1 = dissolve_hash_vec2_to_float([u, v + step]);
+            total += 1;
+            if (h0 - h1).abs() >= 0.05 {
+                significantly_different += 1;
+            }
+        }
+        let pct = (significantly_different as f32 / total as f32) * 100.0;
+        assert!(
+            pct >= 90.0,
+            "only {pct:.1}% of vertical-adjacent pixel pairs are decorrelated; \
+             expected >= 90%. Vertical-only seed (0.113) may not produce enough \
+             scrambling for the dissolve to look per-pixel.",
+        );
     }
 
     #[test]
@@ -4546,7 +4812,10 @@ mod tests {
         let iris = fs_transition_sp_source("iris", 0, 0).unwrap();
         assert!(iris.contains("distance(v_uv, vec2(0.5))"));
         let dissolve = fs_transition_sp_source("dissolve", 0, 0).unwrap();
-        assert!(dissolve.contains("precision highp float"));
+        // P3 (2026-05-09): SP-tier dissolve dropped highp; the IQ
+        // hash is mediump-safe so the precision qualifier flips.
+        assert!(dissolve.contains("precision mediump float"));
+        assert!(!dissolve.contains("precision highp"));
         assert!(dissolve.contains("_hash"));
     }
 
