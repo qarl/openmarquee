@@ -274,6 +274,28 @@ pub struct EglSession<'a> {
     scanout_prev_fb: Option<framebuffer::Handle>,
     scanout_current_bo: Option<BufferObject<()>>,
     scanout_current_fb: Option<framebuffer::Handle>,
+    /// Bug 2 (qarl-flag 2026-05-09): the in-session render paths
+    /// (render_one_frame_in_session, render_animated_slide_in_
+    /// session, render_transition_*_in_session) used to destroy
+    /// their last scanout FB at end-of-call AND reset modeset_
+    /// done = false. The next call's first commit then took the
+    /// SetCrtc branch -- a panel re-sync that scans out one
+    /// black frame at boundary. qarl saw "screen blinks black for
+    /// a frame when transitions start/stop" on glass.
+    ///
+    /// Fix: at end-of-call, instead of destroying current's
+    /// (fb, bo), STASH them here. The kernel keeps scanning out
+    /// this FB until the next call's first page_flip retargets.
+    /// modeset_done stays TRUE -> page_flip path on next call's
+    /// first commit -> no re-modeset -> no black flash.
+    ///
+    /// Lifecycle: at the END of each in-session render call the
+    /// helper destroys whatever was previously held (now off-
+    /// scanout because THIS call already issued page_flips
+    /// against it), then stashes THIS call's last (fb, bo). At
+    /// session teardown, drain pending flip + destroy held.
+    held_scanout_fb: Option<framebuffer::Handle>,
+    held_scanout_bo: Option<BufferObject<()>>,
     /// v1-spec-delta #10 (slice c): persistent scene FBO for
     /// the brightness/gamma post-pass. Lazy-allocated on first
     /// non-identity settings frame, freed on session teardown.
@@ -325,20 +347,25 @@ pub struct EglSession<'a> {
     /// See ATLAS_FBO_W / ATLAS_FBO_H / ATLAS_REGION_W /
     /// ATLAS_REGION_H in hdmi_logic.rs for the geometry.
     scissored_bake_atlas: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
-    /// v1-spec-delta #5 (slice d, refined slice e): tracks whether
-    /// the kernel CRTC currently has an alive (set_crtc'd) FB
-    /// attached. The first commit per session OR the first commit
-    /// of a render call after a prior call destroyed its scanout
-    /// FB takes the SetCrtc branch (re-establishes the FB on the
-    /// CRTC); subsequent within-call commits use the cheaper
-    /// page_flip path. Set true on successful commit; reset to
-    /// false at end of each render call's per-call cleanup
-    /// (because we destroyed the FB the kernel was scanning out,
-    /// so the next call's page_flip would EBUSY if we lied about
-    /// readiness). Slice e's pass_ms gate caught this regression
-    /// when slice d was originally written as "set_crtc once per
-    /// session" -- the kernel rejected page_flip across render-
-    /// call boundaries because the prior FB had been rmFB'd.
+    /// v1-spec-delta #5 (slice d, refined slice e + Bug 2 fix
+    /// 2026-05-09): tracks whether the kernel CRTC currently has
+    /// an alive (set_crtc'd) FB attached. The first commit per
+    /// session takes the SetCrtc branch (establishes the FB on
+    /// the CRTC); ALL subsequent commits -- including across
+    /// render-call boundaries -- use the cheaper page_flip path.
+    /// Set true on the very first successful commit; STAYS true
+    /// thereafter for the session's lifetime.
+    ///
+    /// Pre-Bug-2: this used to reset to false at end of every
+    /// render call because the call destroyed its scanout FB,
+    /// forcing the next call to SetCrtc to re-establish. Each
+    /// SetCrtc forced a panel re-sync = visible black frame at
+    /// the call boundary. The fix (held_scanout_fb / _bo +
+    /// end_of_in_session_render_call) hands the last scanout FB
+    /// across the call boundary instead of destroying it, so
+    /// the kernel never loses its scanout source -- modeset_done
+    /// stays true and the next call's first commit page_flips
+    /// cleanly.
     modeset_done: bool,
     /// v1-spec-delta #5 (slice d): tracks whether a page-flip is
     /// currently in flight. The kernel allows at most one
@@ -483,6 +510,8 @@ where
         scanout_prev_fb: None,
         scanout_current_bo: None,
         scanout_current_fb: None,
+        held_scanout_fb: None,
+        held_scanout_bo: None,
         scene_fbo: None,
         scene_tex: None,
         current_settings: crate::content::Settings::default(),
@@ -556,6 +585,21 @@ where
         }
     }
     if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    // Bug 2 (2026-05-09): drain in-session held scanout. The
+    // standalone render paths (animated slide + transition + one-
+    // frame) stash their last scanout (fb, bo) here at end-of-
+    // call to avoid an end-of-call rmFB that would force a
+    // re-modeset on the NEXT call's first commit (visible black
+    // flash). At session teardown the kernel is about to lose
+    // the GBM/EGL context anyway; drain pending flip + destroy.
+    if let Some(fb) = session.held_scanout_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(held_scanout): {e}");
+        }
+    }
+    if let Some(bo) = session.held_scanout_bo.take() {
         drop(bo);
     }
     // v1-spec-delta #10 (slice c): free scene FBO + texture
@@ -808,6 +852,71 @@ fn drain_pending_flip(session: &mut EglSession, card: &Card) {
     session.flip_pending = false;
 }
 
+/// Bug 2 (qarl-flag 2026-05-09): cleanup at end of an in-session
+/// render call -- animated slide / transition / one-shot frame.
+/// Replaces the prior pattern of destroying current_fb +
+/// resetting modeset_done = false (which forced the NEXT call's
+/// first commit through SetCrtc, scanning out a black frame at
+/// the boundary).
+///
+/// New pattern:
+///   1. drain pending flip (kernel switches to current_fb)
+///   2. destroy local prev_fb (older within-call FB; safe)
+///   3. destroy session.held_scanout_fb from PRIOR call (the
+///      kernel switched away from it during this call's commits)
+///   4. stash local current_fb -> session.held_scanout_fb so
+///      kernel keeps a valid scanout source across the call
+///      boundary. modeset_done STAYS true. Next call's first
+///      commit page_flips against held_scanout cleanly. No
+///      modeset, no black frame.
+///
+/// Edge case: this call did zero successful commits (current_fb
+/// is None). Then the kernel may still be on whatever held_
+/// scanout was active at call start. Don't touch held_scanout;
+/// don't change modeset_done. (No boundary swap to worry about.)
+fn end_of_in_session_render_call(
+    session: &mut EglSession,
+    card: &Card,
+    current_fb: Option<framebuffer::Handle>,
+    current_bo: Option<BufferObject<()>>,
+    prev_fb: Option<framebuffer::Handle>,
+    prev_bo: Option<BufferObject<()>>,
+) {
+    drain_pending_flip(session, card);
+    // prev (older within-call FB) is off-scanout if the loop
+    // already drained at least one page_flip away from it.
+    // Safe to destroy regardless.
+    if let Some(fb) = prev_fb {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(prev): {e}");
+        }
+    }
+    drop(prev_bo);
+
+    if current_fb.is_some() {
+        // We committed at least once this call; kernel is on
+        // current_fb after the drain. The held_scanout from the
+        // PRIOR call is now off-scanout (kernel moved through
+        // current/prev FBs during this call). Destroy it; stash
+        // THIS call's current as the new held.
+        if let Some(prior_fb) = session.held_scanout_fb.take() {
+            if let Err(e) = card.destroy_framebuffer(prior_fb) {
+                eprintln!("warn: destroy_framebuffer(held): {e}");
+            }
+        }
+        let _ = session.held_scanout_bo.take();
+        session.held_scanout_fb = current_fb;
+        session.held_scanout_bo = current_bo;
+        // modeset_done stays whatever it was (typically true
+        // post-first-commit). NO reset to false.
+    } else {
+        // Zero-commit call -- nothing to stash. Don't touch
+        // held_scanout (still on-scanout from prior call, if any).
+        // Don't touch modeset_done.
+        drop(current_bo);
+    }
+}
+
 /// Bring up GBM + EGL + GLES2 against the HDMI display, run the
 /// caller's `draw` closure once with a live `glow::Context`, then
 /// `eglSwapBuffers` + lock the front BO + register the DRM
@@ -911,31 +1020,12 @@ where
         Ok(())
     })();
 
-    // v1-spec-delta #5 (slice d): drain pending page-flip event
-    // before BO/FB cleanup. For the FIRST call on a fresh session
-    // this is a no-op (commit_fb took the SetCrtc-synchronous
-    // branch). For subsequent calls under the same reel session
-    // it ensures the kernel has finished scanning out our BO
-    // before gbm reuses it.
-    drain_pending_flip(session, card);
-
-    // BO/FB cleanup -- happens before with_egl_session's EGL
-    // teardown so the FB-handle rmFB lands while DRM master is
-    // still held cleanly.
-    if let Some(bo) = bo_holder {
-        drop(bo);
-    }
-    if let Some(fb) = fb_holder {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
-        }
-    }
-    // v1-spec-delta #5 (slice e fix): the FB we just rmFB'd was
-    // the kernel's scanout source. Mark the CRTC as "needs a
-    // re-establishing SetCrtc on the next commit"; otherwise the
-    // next call's page_flip EBUSYs because the kernel sees a
-    // destroyed scanout FB. Caught by slice e's pass_ms gate.
-    session.modeset_done = false;
+    // Bug 2 fix (2026-05-09): hand fb_holder to held_scanout so
+    // the kernel keeps a valid scanout source across the call
+    // boundary -- avoids the prior end-of-call destroy + modeset_
+    // done = false that caused a SetCrtc on the next call's
+    // first commit (visible black flash on glass).
+    end_of_in_session_render_call(session, card, fb_holder, bo_holder, None, None);
 
     work
 }
@@ -1238,39 +1328,17 @@ fn render_animated_slide_in_session(
     // previous per-call free is gone -- intentional, that's the
     // whole point of the hoist.
 
-    // v1-spec-delta #5 (slice d): drain the last frame's pending
-    // page-flip event before per-call BO/FB cleanup. Otherwise
-    // the kernel may still be reading from the last frame's BO
-    // when we drop it, racing with the next render call's
-    // gbm_surface BO pool reuse.
-    drain_pending_flip(session, card);
-
-    // Per-call BO/FB cleanup. Drops the last two frames' holders
-    // (current = last frame just-committed; prev = frame before).
-    // Both are post-drain so the kernel is no longer reading from
-    // either. drain_pending_flip above guaranteed that the kernel
-    // switched away from current's predecessor, so prev is freeable.
-    // For current: kernel just switched to it; rmFB pulls our user-
-    // ref but kernel keeps internal ref until something replaces
-    // current as scanout (next call's set_crtc).
-    for (fb_opt, bo_opt) in [
-        (current_fb.take(), current_bo.take()),
-        (prev_fb.take(), prev_bo.take()),
-    ] {
-        if let Some(fb) = fb_opt {
-            if let Err(e) = card.destroy_framebuffer(fb) {
-                eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
-            }
-        }
-        if let Some(bo) = bo_opt {
-            drop(bo);
-        }
-    }
-    // v1-spec-delta #5 (slice e fix): see render_one_frame_in_session.
-    // The last frame's FB was the kernel scanout source; rmFB
-    // means the next call's page_flip would EBUSY without a fresh
-    // SetCrtc to re-establish.
-    session.modeset_done = false;
+    // Bug 2 fix (2026-05-09): hand current to held_scanout so the
+    // kernel keeps scanning out a valid FB across the call
+    // boundary; destroy prev (off-scanout) and the prior call's
+    // held (now also off-scanout); modeset_done stays true so
+    // next call's first commit takes the page_flip path -- no
+    // SetCrtc, no black flash.
+    end_of_in_session_render_call(
+        session, card,
+        current_fb.take(), current_bo.take(),
+        prev_fb.take(), prev_bo.take(),
+    );
 
     work
 }
@@ -4123,38 +4191,14 @@ fn render_transition_animated_in_session(
         Ok(rendered)
     })();
 
-    // v1-spec-delta #5 (slice d): drain the last frame's pending
-    // page-flip event before per-call BO/FB cleanup. Otherwise
-    // the kernel may still be reading from the last frame's BO
-    // when we drop it, racing the next render call's gbm_surface
-    // BO pool reuse.
-    drain_pending_flip(session, card);
-
-    // Per-call cleanup. Free any remaining BO/FB pairs from the
-    // loop (current + prev). The session's gbm_surface is reused
-    // across calls; only the render-call-scoped GL resources go
-    // here.
-    for (fb_opt, bo_opt) in [
-        (current_fb.take(), current_bo.take()),
-        (prev_fb.take(), prev_bo.take()),
-    ] {
-        // Match the in-loop rotation order: destroy_framebuffer
-        // first, then drop the BO. The kernel refcounts the
-        // underlying buffer either way, but consistency aids
-        // future readers.
-        if let Some(fb) = fb_opt {
-            if let Err(e) = card.destroy_framebuffer(fb) {
-                eprintln!("warn: destroy_framebuffer(cleanup): {e}");
-            }
-        }
-        if let Some(bo) = bo_opt {
-            drop(bo);
-        }
-    }
-    // v1-spec-delta #5 (slice e fix): see render_one_frame_in_session.
-    // Reset modeset_done after destroying scanout FB so next call
-    // re-establishes via SetCrtc instead of EBUSY-ing on page_flip.
-    session.modeset_done = false;
+    // Bug 2 fix (2026-05-09): hand current to held_scanout to keep
+    // kernel scanout valid across the call boundary. See
+    // end_of_in_session_render_call.
+    end_of_in_session_render_call(
+        session, card,
+        current_fb.take(), current_bo.take(),
+        prev_fb.take(), prev_bo.take(),
+    );
 
     let frame_count = work?;
     // qarl-direct (2026-05-08): the {transition_ms} field above
@@ -4768,20 +4812,13 @@ fn render_transition_single_pass_in_session(
         Ok(rendered)
     })();
 
-    drain_pending_flip(session, card);
-    for (fb_opt, bo_opt) in [
-        (current_fb.take(), current_bo.take()),
-        (prev_fb.take(), prev_bo.take()),
-    ] {
-        if let Some(fb) = fb_opt {
-            if let Err(e) = card.destroy_framebuffer(fb) {
-                eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
-            }
-        }
-        if let Some(bo) = bo_opt {
-            drop(bo);
-        }
-    }
+    // Bug 2 fix (2026-05-09): held_scanout hand-off across the
+    // call boundary -- see end_of_in_session_render_call.
+    end_of_in_session_render_call(
+        session, card,
+        current_fb.take(), current_bo.take(),
+        prev_fb.take(), prev_bo.take(),
+    );
     // Restore scissor state. Atlas SB enables SCISSOR_TEST mid-frame
     // for region-clipped bg fill; the per-frame composite branch
     // disables it before scanout, but a `?` mid-bake skips that.
@@ -4792,7 +4829,6 @@ fn render_transition_single_pass_in_session(
         use glow::HasContext;
         session.gl.disable(glow::SCISSOR_TEST);
     }
-    session.modeset_done = false;
 
     let frame_count = work?;
     let total_elapsed_ms = work_start_t.elapsed().as_millis();
@@ -5290,20 +5326,13 @@ fn render_transition_scissored_bake_in_session(
         Ok(rendered)
     })();
 
-    drain_pending_flip(session, card);
-    for (fb_opt, bo_opt) in [
-        (current_fb.take(), current_bo.take()),
-        (prev_fb.take(), prev_bo.take()),
-    ] {
-        if let Some(fb) = fb_opt {
-            if let Err(e) = card.destroy_framebuffer(fb) {
-                eprintln!("warn: destroy_framebuffer({fb:?}): {e}");
-            }
-        }
-        if let Some(bo) = bo_opt {
-            drop(bo);
-        }
-    }
+    // Bug 2 fix (2026-05-09): held_scanout hand-off across the
+    // call boundary -- see end_of_in_session_render_call.
+    end_of_in_session_render_call(
+        session, card,
+        current_fb.take(), current_bo.take(),
+        prev_fb.take(), prev_bo.take(),
+    );
     // Restore scissor state. Atlas SB enables SCISSOR_TEST mid-frame
     // for region-clipped bg fill; the per-frame composite branch
     // disables it before scanout, but a `?` mid-bake skips that.
@@ -5314,7 +5343,6 @@ fn render_transition_scissored_bake_in_session(
         use glow::HasContext;
         session.gl.disable(glow::SCISSOR_TEST);
     }
-    session.modeset_done = false;
 
     let frame_count = work?;
     let total_elapsed_ms = work_start_t.elapsed().as_millis();
