@@ -1419,9 +1419,14 @@ fn kind_needs_highp(kind: &str) -> bool {
     // still uses the sin-hash idiom.
     //
     // P3 (2026-05-09): "dissolve" was dropped from this set. The
-    // SP-tier dissolve hash now uses the Hoskins "hash without
-    // sine" idiom (see SP_HASH_HELPER) which is mediump-safe AND
-    // cheaper on vc4. Standalone FS_DISSOLVE got the same swap.
+    // SP-tier dissolve hash now uses the Inigo Quilez (IQ)
+    // mediump-safe idiom (see SP_HASH_HELPER) -- no sin, no
+    // 43758-magnification, works in mediump. Standalone
+    // FS_DISSOLVE got the same swap. Hoskins's "hash without
+    // sine" form was tried first but failed the host adjacent-
+    // pixel decorrelation test at 1080p (71% vs 90% target);
+    // IQ's 50.0 amplifier on asymmetric seeds (0.71 / 0.113)
+    // passes 90%+ on both axes.
     matches!(kind, "glitch")
 }
 
@@ -4266,9 +4271,9 @@ mod tests {
     fn sp_dissolve_does_not_request_highp() {
         // P3: kind_needs_highp("dissolve") used to return true,
         // forcing the SP-tier dissolve shader into highp. The
-        // Hoskins hash is mediump-safe, so dissolve drops out of
-        // that gate. Glitch (still using sin-hash in standalone)
-        // stays in for forward compat.
+        // IQ hash is mediump-safe, so dissolve drops out of that
+        // gate. Glitch (still using sin-hash in standalone) stays
+        // in for forward compat.
         assert!(!kind_needs_highp("dissolve"));
         assert!(kind_needs_highp("glitch"));
         // The generated SP-tier dissolve source must NOT contain
@@ -4284,13 +4289,61 @@ mod tests {
         );
         assert!(
             !sp.contains("sin("),
-            "SP dissolve must not call sin (P3 swapped to Hoskins)",
+            "SP dissolve must not call sin (P3 swapped to IQ)",
         );
     }
 
     // P3 host-side hash function tests. The Rust mirror
     // (dissolve_hash_vec2_to_float) MUST stay byte-equivalent to
     // the GLSL embedded in FS_DISSOLVE / SP_HASH_HELPER.
+
+    #[test]
+    fn dissolve_hash_does_not_match_legacy_sin_hash() {
+        // P3.fix (QA-relayed 2026-05-09): pin that the IQ hash
+        // produces semantically different output from the legacy
+        // `fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453)`
+        // form it replaced. Defends against a drive-by edit that
+        // re-introduces sin-hash semantics under different syntax
+        // (e.g. someone copy-pastes from a stack-overflow answer
+        // that re-derives Mittring's sin-hash with same constants):
+        // all 8 distribution / decorrelation / branchless tests
+        // would still pass, but the highp dependency would creep
+        // back AND vc4's mediump would silently band again.
+        //
+        // Compute legacy sin-hash inline so the assertion stays
+        // self-contained -- the legacy form is canonical (used in
+        // FS_GLITCH today and pre-P3 FS_DISSOLVE).
+        fn legacy_sin_hash(p: [f32; 2]) -> f32 {
+            // GLSL fract: x - floor(x).
+            let g_fract = |x: f32| x - x.floor();
+            let dot = p[0] * 12.9898 + p[1] * 78.233;
+            g_fract(dot.sin() * 43758.5453)
+        }
+        // Probe a few representative UVs across the unit square.
+        // For each, the IQ output must differ from sin-hash by at
+        // least 0.05 (5% of the [0, 1] range) -- well above f32
+        // round-trip noise but stricter than coincidental near-
+        // matches (which would be vanishingly rare for unrelated
+        // hash families anyway).
+        let probes = [
+            [0.123, 0.456],
+            [0.789, 0.012],
+            [0.5, 0.5],
+            [0.0, 0.0],
+            [0.937, 0.681],
+        ];
+        for p in probes {
+            let iq = dissolve_hash_vec2_to_float(p);
+            let sin_hash = legacy_sin_hash(p);
+            let delta = (iq - sin_hash).abs();
+            assert!(
+                delta >= 0.05,
+                "IQ hash {iq:.4} vs legacy sin-hash {sin_hash:.4} at {p:?} differ \
+                 by {delta:.4}; expected >= 0.05. Did the dissolve hash regress \
+                 to sin-based semantics?",
+            );
+        }
+    }
 
     #[test]
     fn dissolve_hash_is_deterministic() {
