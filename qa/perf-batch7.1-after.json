@@ -1,0 +1,37 @@
+{
+  "content_storage": {
+    "list_all_calls": 60,
+    "load_calls": 1260,
+    "save_calls": 0,
+    "envelope_validates": 21
+  },
+  "playlist_storage": {
+    "load_all_calls": 120,
+    "save_all_calls": 0
+  },
+  "flock_storage": {
+    "load_calls": 20,
+    "save_calls": 0
+  },
+  "settings_storage": {
+    "load_calls": 21,
+    "save_calls": 0
+  },
+  "schedule_storage": {
+    "load_calls": 60,
+    "save_calls": 0
+  },
+  "font_cache": {
+    "hits": 0,
+    "misses": 0,
+    "maxsize": 128,
+    "currsize": 0
+  },
+  "_meta": {
+    "captured_at": "2026-05-10",
+    "session_kind": "synthetic-testclient (20 text slides seeded)",
+    "cycle_count": 60,
+    "commit": "Batch 7.1 -- ContentStorage mtime cache",
+    "baseline_reference": "qa/perf-baseline-2026-05-10.json (empty fixture, not directly comparable on content_storage; expected 60*20=1200 validates pre-cache for 20 slides; post-cache: 20 (cold) + 0 (warm) = 20)"
+  }
+}

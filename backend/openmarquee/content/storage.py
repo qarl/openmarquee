@@ -71,6 +71,24 @@ class ContentStorage:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        # mtime-keyed in-memory cache (Batch 7.1). Skip the expensive
+        # path -- json.loads + Pydantic discriminated-union validate --
+        # when the envelope file's stat().st_mtime_ns matches what we
+        # last cached. save()/delete() invalidate in lockstep so a
+        # writer's change is visible on the next list_all().
+        #
+        # Instance-level (not class-level like `_stats`) because tests
+        # use per-tmp_path ContentStorage and a class-level cache would
+        # bleed across them. Relies on `Depends(get_content_storage)`
+        # returning a singleton at runtime -- if that ever changes,
+        # key on `(self.root, item_id)` instead.
+        #
+        # Cached items MUST be treated as read-only by callers --
+        # mutation propagates to the next cache hit. (Verified clean
+        # at write time -- grep for `\.text_layers =` / `\.name =` on
+        # loaded items returns no mutation sites; document this here
+        # so a future contributor adding one gets caught in review.)
+        self._cache: dict[UUID, tuple[int, ContentItem]] = {}
 
     @classmethod
     def stats_snapshot(cls) -> dict[str, int]:
@@ -111,6 +129,10 @@ class ContentStorage:
         }
         self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
         self._atomic_write_bytes(item_dir / _ASSET_FILENAME, png)
+        # Drop the stale cache entry -- next load() repopulates with the
+        # canonical re-decoded shape (avoids drift between what we just
+        # serialized and what TypeAdapter would re-validate).
+        self._cache.pop(item.id, None)
 
     def save_text_slide(self, slide: TextSlide, png: bytes) -> None:
         """Persist a text slide — convenience wrapper for save()."""
@@ -179,6 +201,15 @@ class ContentStorage:
         if not envelope_path.exists():
             raise FileNotFoundError(f"no content item at {envelope_path}")
 
+        # Batch 7.1: mtime-keyed cache. A `stat()` is ~microseconds
+        # vs json.loads + discriminated-union validate at ~milliseconds
+        # on a populated device. List-then-show-on-UI flows hit this
+        # path 60-200x per playback session per the baseline data.
+        mtime_ns = envelope_path.stat().st_mtime_ns
+        cached = self._cache.get(item_id)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
         data = json.loads(envelope_path.read_text())
         version = data.get("schema_version")
         if version != SCHEMA_VERSION:
@@ -206,6 +237,7 @@ class ContentStorage:
                 # Malformed envelope stamp — leave the mirror null rather
                 # than crash the load; the next save() rewrites the field.
                 pass
+        self._cache[item_id] = (mtime_ns, item)
         return item
 
     def read_asset(self, item_id: UUID) -> bytes:
@@ -283,6 +315,7 @@ class ContentStorage:
         if not item_dir.exists():
             raise FileNotFoundError(f"no content item at {item_dir}")
         shutil.rmtree(item_dir)
+        self._cache.pop(item_id, None)
 
     # --- internals ---
 

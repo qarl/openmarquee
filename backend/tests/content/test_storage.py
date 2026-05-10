@@ -417,3 +417,65 @@ def test_read_updated_at_falls_back_to_mtime_for_pre_flock_envelopes(tmp_path: P
     os.utime(envelope_path, (epoch, epoch))
     stamp = storage.read_updated_at(slide.id)
     assert stamp == datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+
+# --- Batch 7.1: mtime cache tests ---
+
+
+def test_list_all_reuses_cache_for_unchanged_envelopes(tmp_path: Path):
+    """First list_all parses all 3 envelopes; second list_all is a
+    pure stat-and-reuse path -- envelope_validates counter must not
+    move on the cache-hit pass."""
+    storage = ContentStorage(tmp_path / "content")
+    storage.save(_make_slide(text="One"), b"\x89PNG-1")
+    storage.save(_make_slide(text="Two"), b"\x89PNG-2")
+    storage.save(_make_slide(text="Three"), b"\x89PNG-3")
+    # Reset the class-level counter so the assertion delta is clean.
+    ContentStorage._stats["envelope_validates"] = 0
+    storage.list_all()  # cold path -> 3 validates
+    assert ContentStorage._stats["envelope_validates"] == 3
+    storage.list_all()  # warm path -> 0 validates
+    assert ContentStorage._stats["envelope_validates"] == 3
+
+
+def test_list_all_revalidates_only_changed_envelopes(tmp_path: Path):
+    """Edit one item; next list_all should re-validate exactly that
+    one (the other two are still cached by unchanged mtime)."""
+    storage = ContentStorage(tmp_path / "content")
+    a = _make_slide(text="Alpha")
+    b = _make_slide(text="Bravo")
+    c = _make_slide(text="Charlie")
+    storage.save(a, b"PNG-A")
+    storage.save(b, b"PNG-B")
+    storage.save(c, b"PNG-C")
+    storage.list_all()  # warm the cache
+    ContentStorage._stats["envelope_validates"] = 0
+    # Edit just `b` -- save() invalidates only its cache entry.
+    storage.save(_make_slide(id=b.id, text="Bravo-edited"), b"PNG-B2")
+    storage.list_all()
+    assert ContentStorage._stats["envelope_validates"] == 1
+
+
+def test_save_invalidates_cache_entry(tmp_path: Path):
+    """After save() with same id + different content, the next load
+    must return the new content -- not the stale cached value."""
+    storage = ContentStorage(tmp_path / "content")
+    original = _make_slide(text="Original")
+    storage.save(original, b"PNG-1")
+    storage.list_all()  # populate cache
+    storage.save(_make_slide(id=original.id, text="Rewritten"), b"PNG-2")
+    # Re-load via list_all path; the cached "Original" must be gone.
+    fresh = storage.load(original.id)
+    assert fresh.text_layers[0].text == "Rewritten"
+
+
+def test_delete_invalidates_cache_entry(tmp_path: Path):
+    """After delete(), a subsequent load() of the same id must raise
+    FileNotFoundError -- not return the stale cached value."""
+    storage = ContentStorage(tmp_path / "content")
+    slide = _make_slide(text="Doomed")
+    storage.save(slide, b"PNG")
+    storage.list_all()  # populate cache
+    storage.delete(slide.id)
+    with pytest.raises(FileNotFoundError):
+        storage.load(slide.id)
