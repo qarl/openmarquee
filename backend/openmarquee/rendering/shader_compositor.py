@@ -763,7 +763,7 @@ class ShaderRenderer:
         # commit_frame drains it before issuing a new flip.
         self._pageflip_pending: bool = False
 
-    def __enter__(self) -> "ShaderRenderer":
+    def __enter__(self) -> ShaderRenderer:
         _load_libs()
         try:
             self._open_drm()
@@ -1235,7 +1235,6 @@ class ShaderRenderer:
         """Render one frame (sample bg texture across the fullscreen
         quad), present via SwapBuffers, AddFB2 the new front bo, and
         either SetCrtc (first commit) or PageFlip (subsequent)."""
-        from OpenGL import EGL as _e
         from OpenGL import GLES2 as _g
         assert _gbm is not None and _libegl is not None and _libdrm is not None
 

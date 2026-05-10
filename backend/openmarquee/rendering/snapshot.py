@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _slide_has_auto_layer(slide: "TextSlide") -> bool:
+def _slide_has_auto_layer(slide: TextSlide) -> bool:
     """True iff any visible layer carries auto_mode (clock/date/day).
     Auto-mode layers re-render text from the current time on every
     call, so their snapshots are NOT stable across calls -- caching
@@ -58,7 +58,7 @@ def _slide_has_auto_layer(slide: "TextSlide") -> bool:
 
 
 def compose_slide_rgba(
-    slide: "TextSlide",
+    slide: TextSlide,
     width: int,
     height: int,
     *,
@@ -118,7 +118,7 @@ def compose_slide_rgba(
 
 
 def compose_slide_bg_statics_rgba(
-    slide: "TextSlide",
+    slide: TextSlide,
     width: int,
     height: int,
     *,
@@ -172,12 +172,12 @@ def compose_slide_bg_statics_rgba(
 
 
 def extract_first_animated_layer(
-    slide: "TextSlide",
+    slide: TextSlide,
     width: int,
     height: int,
     *,
     now: datetime | None = None,
-) -> tuple[int, "TextLayer", bytes, tuple[int, int, int, int], tuple[int, int, int, int]] | None:
+) -> tuple[int, TextLayer, bytes, tuple[int, int, int, int], tuple[int, int, int, int]] | None:
     """Find the first visible animated layer with rasterized ink in
     `slide`, return (layer_idx, layer, glyph_bbox_rgba_bytes,
     glyph_bbox_px=(gx,gy,gw,gh), box_px=(bx,by,bw,bh)) for the
@@ -254,7 +254,7 @@ class _CachedSnapshot:
     bg_statics_rgba: bytes | None = None
     # Tri-state: None = uncomputed; _ANIM_NONE = computed-but-no-anim;
     # tuple = computed-and-found.
-    anim_layer: "_AnimLayerData | object | None" = None
+    anim_layer: _AnimLayerData | object | None = None
 
 
 # Sentinel for "we ran extract_first_animated_layer and got None" so
@@ -294,7 +294,7 @@ class SlideSnapshotCache:
 
     def _maybe_get(
         self,
-        slide: "TextSlide",
+        slide: TextSlide,
         width: int,
         height: int,
     ) -> _CachedSnapshot | None:
@@ -318,7 +318,7 @@ class SlideSnapshotCache:
 
     def get_full(
         self,
-        slide: "TextSlide",
+        slide: TextSlide,
         width: int,
         height: int,
         *,
@@ -338,7 +338,7 @@ class SlideSnapshotCache:
 
     def get_bg_statics(
         self,
-        slide: "TextSlide",
+        slide: TextSlide,
         width: int,
         height: int,
         *,
@@ -359,7 +359,7 @@ class SlideSnapshotCache:
 
     def get_anim_layer(
         self,
-        slide: "TextSlide",
+        slide: TextSlide,
         width: int,
         height: int,
         *,
@@ -383,7 +383,7 @@ class SlideSnapshotCache:
 
     def prerender_for_transition(
         self,
-        slide: "TextSlide",
+        slide: TextSlide,
         width: int,
         height: int,
         *,
@@ -423,7 +423,7 @@ class SlideSnapshotCache:
         entries against a content store that may have changed."""
         self._entries.clear()
 
-    def evict_except(self, keep_ids: "set[UUID]") -> int:
+    def evict_except(self, keep_ids: set[UUID]) -> int:
         """Drop every cached entry whose slide_id is NOT in `keep_ids`.
 
         The cycle-aware bound for the OOM fix (2026-05-06): a circular

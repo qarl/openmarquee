@@ -83,7 +83,7 @@ class SlideAssetCache:
     def __init__(self) -> None:
         self._entries: dict[UUID, _CachedSlideAssets] = {}
 
-    def lookup(self, slide: "TextSlide") -> _CachedSlideAssets | None:
+    def lookup(self, slide: TextSlide) -> _CachedSlideAssets | None:
         """Return the cached entry IFF it matches slide.updated_at;
         otherwise return None (caller does the slow path + stores)."""
         slide_id = getattr(slide, "id", None)
@@ -97,7 +97,7 @@ class SlideAssetCache:
             return None
         return entry
 
-    def ensure(self, slide: "TextSlide") -> _CachedSlideAssets:
+    def ensure(self, slide: TextSlide) -> _CachedSlideAssets:
         """Return or freshly create an entry for `slide` at its current
         updated_at. Replaces any stale entry."""
         slide_id = getattr(slide, "id", None)
@@ -117,7 +117,7 @@ class SlideAssetCache:
 
     def evict_except(
         self,
-        keep_ids: "set[UUID]",
+        keep_ids: set[UUID],
         *,
         renderer: object | None = None,
     ) -> int:
@@ -190,7 +190,7 @@ class MultiPlaneRenderer(Protocol):
     def commit(self) -> None: ...
 
 
-def classify_layer(layer: "TextLayer") -> str:
+def classify_layer(layer: TextLayer) -> str:
     """Bucket a layer for the GPU compositor: "hidden" / "static" /
     "animated". Static = renders into the primary plane once at attach.
     Animated = gets its own overlay plane (motion or auto_mode triggers
@@ -225,12 +225,12 @@ class GPUSlideCompositor:
 
     def __init__(
         self,
-        slide: "TextSlide",
+        slide: TextSlide,
         renderer: MultiPlaneRenderer,
         *,
         width: int,
         height: int,
-        read_asset: Callable[["UUID"], bytes] | None = None,
+        read_asset: Callable[[UUID], bytes] | None = None,
         cache: SlideAssetCache | None = None,
         snapshot_cache: object | None = None,
     ) -> None:
@@ -315,7 +315,7 @@ class GPUSlideCompositor:
             raise RuntimeError("GPUSlideCompositor already attached — call detach() first")
 
         layers = list(getattr(self.slide, "text_layers", []))
-        animated: list[tuple[int, "TextLayer"]] = []
+        animated: list[tuple[int, TextLayer]] = []
         n_static = 0
 
         # 1. Background + static layers → primary plane (one-time CPU
@@ -664,7 +664,7 @@ class GPUSlideCompositor:
         self,
         slot_idx: int,
         layer_idx: int,
-        layer: "TextLayer",
+        layer: TextLayer,
         *,
         now: datetime | None,
     ) -> tuple[bytes, int, int, int, int] | None:
@@ -754,7 +754,7 @@ class GPUSlideCompositor:
         self,
         slot_idx: int,
         layer_idx: int,
-        layer: "TextLayer",
+        layer: TextLayer,
         cached: tuple[bytes, int, int, int, int],
     ) -> None:
         """Fast-path animated-layer attach using a previously-rasterized
@@ -777,7 +777,7 @@ class GPUSlideCompositor:
         self,
         slot_idx: int,
         layer_idx: int,
-        layer: "TextLayer",
+        layer: TextLayer,
         motion: str,
         elapsed_s: float,
     ) -> None:

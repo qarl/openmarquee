@@ -196,7 +196,7 @@ class PlaybackLoop:
         # EGL/GL init is ~5 s on a cold mesa cache. None until either
         # _get_or_create_shader_renderer() succeeds or the feature is
         # disabled (env var unset, renderer lacks drm_fd, init failed).
-        self._shader_renderer: "ShaderRenderer | None" = None
+        self._shader_renderer: ShaderRenderer | None = None
         # Lazily-flipped sentinel so we don't repeatedly attempt
         # ShaderRenderer construction after a failure (e.g. on dev hosts
         # without libdrm/libegl).
@@ -215,8 +215,8 @@ class PlaybackLoop:
         # drains -- they'd collide on slot indices. Either drain first
         # (sacrifice continuous incoming-side motion) or split the
         # plane budget statically (incoming gets [N/2..N-1]).
-        self._outgoing_compositor: "GPUSlideCompositor | None" = None
-        self._outgoing_slide: "TextSlide | None" = None
+        self._outgoing_compositor: GPUSlideCompositor | None = None
+        self._outgoing_slide: TextSlide | None = None
         # Incoming slide reference set by the dispatcher BEFORE the
         # transition method fires; consumed by _run_shader_transition
         # to compose u_to as bg+statics-only (excluding animated
@@ -225,7 +225,7 @@ class PlaybackLoop:
         # iris-revealed area of the shader output -- overlapping with
         # slide A's live-moving ticker on the overlay plane until the
         # incoming compositor attaches after the transition.
-        self._incoming_slide: "TextSlide | None" = None
+        self._incoming_slide: TextSlide | None = None
         # Last steady-tick elapsed for the outgoing slide (#218).
         # Stashed in _play_dynamic_slide_gpu's finally as the elapsed
         # at slide-end. _run_shader_transition uses this as the

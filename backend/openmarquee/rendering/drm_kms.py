@@ -39,7 +39,6 @@ import fcntl
 import logging
 import mmap
 import os
-import struct
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +65,7 @@ class _PlaneSlot:
     dumb_handle: int = 0
     dumb_size: int = 0
     dumb_pitch: int = 0
-    mmap: "mmap.mmap | None" = None
+    mmap: mmap.mmap | None = None
     width: int = 0
     height: int = 0
     attached: bool = False
@@ -476,7 +475,7 @@ class DRMRenderer:
         # without it, an operator editing a slide mid-loop would see
         # the old pixels until LRU eviction.
         self._primary_buffer_pool: OrderedDict[
-            object, tuple[int, int, "mmap.mmap", object],
+            object, tuple[int, int, mmap.mmap, object],
         ] = OrderedDict()
         if max_pool_buffers < 0:
             raise ValueError("max_pool_buffers must be >= 0")
@@ -537,7 +536,7 @@ class DRMRenderer:
         # — SRC_W/H = bbox dims, CRTC_W/H = display-pixel dest rect.
         # Smaller bbox = less LBM = more simultaneous animated layers.
         self.max_animated_planes = max(0, int(max_animated_planes))
-        self._animated_planes: list["_PlaneSlot"] = []
+        self._animated_planes: list[_PlaneSlot] = []
         # Pending atomic-property changes staged between commits. Maps
         # (plane_id, prop_id) → value. commit() drains it into one
         # DRM_IOCTL_MODE_ATOMIC and clears.
@@ -1221,7 +1220,7 @@ class DRMRenderer:
 
     def _alloc_dumb_primary_fb(
         self,
-    ) -> tuple[int, int, "mmap.mmap", int, int]:
+    ) -> tuple[int, int, mmap.mmap, int, int]:
         """Allocate a sign-native dumb buffer + register as DRM fb +
         mmap. Used both for the default primary buffer and per-slide
         cached buffers in the pool (#218 part 2). Returns (fb_id,
@@ -1268,7 +1267,7 @@ class DRMRenderer:
         return fb_id, dumb_handle, buf_mmap, dumb_size, dumb_pitch
 
     def _destroy_dumb_primary_fb(
-        self, fb_id: int, dumb_handle: int, buf_mmap: "mmap.mmap | None",
+        self, fb_id: int, dumb_handle: int, buf_mmap: mmap.mmap | None,
     ) -> None:
         """Tear down a dumb-buffer-backed primary fb: mmap.close ->
         RmFB -> DESTROY_DUMB. Each leg guarded -- a partially-

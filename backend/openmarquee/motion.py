@@ -313,7 +313,7 @@ def apply_motion(
 
 
 def render_layer_to_rgba(
-    layer: "TextLayer",
+    layer: TextLayer,
     width: int,
     height: int,
     now: datetime | None = None,
@@ -356,7 +356,7 @@ def render_layer_to_rgba(
     return img
 
 
-def _box_px(layer: "TextLayer", width: int, height: int) -> tuple[int, int, int, int]:
+def _box_px(layer: TextLayer, width: int, height: int) -> tuple[int, int, int, int]:
     """Convert a layer's normalized box (x/y/w/h ∈ [0, 1]) to integer
     slide-pixel coords."""
     box = getattr(layer, "box", None)
@@ -370,7 +370,7 @@ def _box_px(layer: "TextLayer", width: int, height: int) -> tuple[int, int, int,
 
 
 def prerender_layer_bitmaps(
-    slide: "TextSlide", width: int, height: int
+    slide: TextSlide, width: int, height: int
 ) -> list[Image.Image | None]:
     """Rasterize each visible layer's text once into a slide-sized RGBA
     bitmap, parallel to `slide.text_layers`. Hidden layers get `None`
@@ -407,10 +407,10 @@ def prerender_layer_bitmaps(
 
 
 def load_motion_background(
-    slide: "TextSlide",
+    slide: TextSlide,
     width: int,
     height: int,
-    read_asset: Callable[["UUID"], bytes] | None = None,
+    read_asset: Callable[[UUID], bytes] | None = None,
 ) -> Image.Image:
     """Load this slide's background once. Hoisted out so the playback
     loop can pre-load at slide entry and pass the result into every
@@ -420,7 +420,7 @@ def load_motion_background(
     return _load_background(slide, width, height, read_asset)
 
 
-def slide_has_motion(slide: "TextSlide") -> bool:
+def slide_has_motion(slide: TextSlide) -> bool:
     """True if any visible layer's `motion` is non-static — used by the
     playback loop to decide between the static/auto path and the per-
     tick re-composition path. Hidden layers don't count: an operator
@@ -433,7 +433,7 @@ def slide_has_motion(slide: "TextSlide") -> bool:
     return False
 
 
-def slide_has_auto(slide: "TextSlide") -> bool:
+def slide_has_auto(slide: TextSlide) -> bool:
     """True if any visible layer has `auto_mode` set. Used together
     with `slide_has_motion` to decide whether to go through the
     unified per-tick composer or the static (one-render) path."""
@@ -445,18 +445,18 @@ def slide_has_auto(slide: "TextSlide") -> bool:
     return False
 
 
-def slide_has_dynamic_content(slide: "TextSlide") -> bool:
+def slide_has_dynamic_content(slide: TextSlide) -> bool:
     """True if the slide needs per-tick re-rendering (motion or auto
     or both). False = static slide, one render is enough."""
     return slide_has_motion(slide) or slide_has_auto(slide)
 
 
 def compose_motion_frame(
-    slide: "TextSlide",
+    slide: TextSlide,
     elapsed_s: float,
     width: int,
     height: int,
-    read_asset: Callable[["UUID"], bytes] | None = None,
+    read_asset: Callable[[UUID], bytes] | None = None,
     background_cache: Image.Image | None = None,
     layer_bitmap_cache: list[Image.Image | None] | None = None,
     now: datetime | None = None,

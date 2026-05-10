@@ -1253,7 +1253,7 @@ def _wrap_text_to_width(
 
 
 def _draw_text_into(
-    img: "Image.Image",
+    img: Image.Image,
     *,
     text: str,
     fg: str,

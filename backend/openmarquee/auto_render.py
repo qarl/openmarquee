@@ -254,7 +254,7 @@ def _lerp(a: float, b: float, t: float) -> float:
 
 
 def render_pattern(
-    pattern: "BackgroundPattern", width: int, height: int,
+    pattern: BackgroundPattern, width: int, height: int,
 ) -> Image.Image:
     """Dispatch to the matching pattern renderer. Falls back to a
     solid color_a fill on an unrecognized pattern name (forward-compat
