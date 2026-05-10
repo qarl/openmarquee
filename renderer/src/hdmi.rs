@@ -296,6 +296,21 @@ pub struct EglSession<'a> {
     /// session teardown, drain pending flip + destroy held.
     held_scanout_fb: Option<framebuffer::Handle>,
     held_scanout_bo: Option<BufferObject<()>>,
+    /// Bug 1 (qarl-flag 2026-05-09): session-global monotonic
+    /// tick basis for compute_motion_state. Pre-fix, each in-
+    /// session render call (hold / SP transition / SB transition
+    /// / legacy 3-pass) set its OWN `start = Instant::now()` and
+    /// computed tick_seconds from THAT, resetting tick to 0 at
+    /// every call boundary. compute_motion_state's per-effect
+    /// frequency math then snapped motion phase at every call
+    /// boundary -- visible "phase confusion" on glass at every
+    /// hold->transition or transition->hold edge.
+    ///
+    /// Fix: tick_seconds is `session.session_start.elapsed().
+    /// as_secs_f64()` everywhere. Motion phase is continuous
+    /// across the entire session lifetime; render calls are
+    /// transparent timing checkpoints, not phase resets.
+    session_start: std::time::Instant,
     /// v1-spec-delta #10 (slice c): persistent scene FBO for
     /// the brightness/gamma post-pass. Lazy-allocated on first
     /// non-identity settings frame, freed on session teardown.
@@ -512,6 +527,7 @@ where
         scanout_current_fb: None,
         held_scanout_fb: None,
         held_scanout_bo: None,
+        session_start: std::time::Instant::now(),
         scene_fbo: None,
         scene_tex: None,
         current_settings: crate::content::Settings::default(),
@@ -1210,7 +1226,11 @@ fn render_animated_slide_in_session(
                 break;
             }
             let frame_start = std::time::Instant::now();
-            let tick_seconds = elapsed.as_secs_f64();
+            // Bug 1 fix (2026-05-09): tick_seconds is session-
+            // global, NOT call-local. Motion phase stays continuous
+            // across hold/transition boundaries. `elapsed` (call-
+            // local) still drives the hold-loop exit at hold_ms.
+            let tick_seconds = session.session_start.elapsed().as_secs_f64();
             let motion_states =
                 motion_states_for_layers(slide_id, text_layers, tick_seconds);
             let wall_clock_unix = current_unix_seconds();
@@ -4006,14 +4026,12 @@ fn render_transition_animated_in_session(
             }
             let frame_start_t = std::time::Instant::now();
             let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
-            // Each transition frame's tick_seconds is the elapsed
-            // time inside the transition loop. Slide A "continues"
-            // its motion across the transition; slide B starts
-            // ticking from 0 (snaps to its render_slide tick=0 at
-            // transition end, where render_slide(B) takes over).
-            // The B-snap is sub-frame and below operator perception
-            // — acceptable per spec line 277.
-            let tick_seconds = start.elapsed().as_secs_f64();
+            // Bug 1 fix (2026-05-09): tick_seconds is session-
+            // global, NOT call-local. Both slides A and B compute
+            // motion against the same continuous monotonic basis
+            // as the surrounding hold loops -- no phase snap at
+            // transition entry / exit (qarl-flagged on glass).
+            let tick_seconds = session.session_start.elapsed().as_secs_f64();
             let wall_clock_unix = current_unix_seconds();
             unsafe {
                 let t_bake_a = std::time::Instant::now();
@@ -4604,7 +4622,8 @@ fn render_transition_single_pass_in_session(
                 }
                 let frame_start_t = Instant::now();
                 let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
-                let tick_seconds = start.elapsed().as_secs_f64();
+                // Bug 1 fix: session-global tick (see Bug 1 doc).
+                let tick_seconds = session.session_start.elapsed().as_secs_f64();
                 let wall_clock_unix = current_unix_seconds();
 
                 let states_a =
@@ -5073,7 +5092,8 @@ fn render_transition_scissored_bake_in_session(
                 }
                 let frame_start_t = Instant::now();
                 let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
-                let tick_seconds = start.elapsed().as_secs_f64();
+                // Bug 1 fix: session-global tick (see Bug 1 doc).
+                let tick_seconds = session.session_start.elapsed().as_secs_f64();
                 let wall_clock_unix = current_unix_seconds();
 
                 // Cut composite specialization (Phase 2.6) reads
