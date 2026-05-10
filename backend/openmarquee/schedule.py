@@ -167,7 +167,12 @@ class ScheduleStorage:
     """
 
     # Perf counters (Batch 6.1). See ContentStorage._stats comment.
-    _stats: dict[str, int] = {"load_calls": 0, "save_calls": 0}
+    # json_parses (Batch 7.2) separates true re-parses from cache hits.
+    _stats: dict[str, int] = {
+        "load_calls": 0,
+        "save_calls": 0,
+        "json_parses": 0,
+    }
 
     def __init__(
         self,
@@ -176,6 +181,8 @@ class ScheduleStorage:
     ):
         self.path = Path(path)
         self._playlist_storage = playlist_storage
+        # mtime-keyed cache (Batch 7.2). See PlaylistStorage._cache.
+        self._cache: tuple[int, Schedule] | None = None
 
     @classmethod
     def stats_snapshot(cls) -> dict[str, int]:
@@ -185,15 +192,25 @@ class ScheduleStorage:
         type(self)._stats["load_calls"] += 1
         if not self.path.exists():
             return Schedule()
+        mtime_ns = self.path.stat().st_mtime_ns
+        if self._cache is not None and self._cache[0] == mtime_ns:
+            return self._cache[1]
+        type(self)._stats["json_parses"] += 1
         data = json.loads(self.path.read_text())
         schedule, was_migrated = _coerce_to_schedule(data, self._playlist_storage)
         if was_migrated:
             self.save(schedule)
+            mtime_ns = self.path.stat().st_mtime_ns
+        self._cache = (mtime_ns, schedule)
         return schedule
 
     def save(self, schedule: Schedule) -> None:
         type(self)._stats["save_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # See PlaylistStorage.save_all comment -- clear cache BEFORE
+        # the write so a failed atomic replace doesn't leave stale
+        # state in the cache.
+        self._cache = None
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(schedule.model_dump_json(indent=2))
         tmp.replace(self.path)

@@ -160,3 +160,24 @@ def test_font_cache_info_surfaces_through_endpoint(client: TestClient):
     body = client.get("/api/system/perf-stats").json()
     assert body["font_cache"]["hits"] >= 1
     assert body["font_cache"]["misses"] >= 1
+
+
+# --- Batch 7.2: json_parses counter tests ---
+
+
+def test_playlist_storage_cache_skips_json_parse(client: TestClient):
+    """Two GET /api/playlists in a row -- load_all_calls bumps both
+    times, but json_parses bumps only on the cold-cache first call.
+    This is the cache working: repeated reads return the cached
+    PlaylistCollection without re-parsing the json file."""
+    client.get("/api/playlists")
+    before = client.get("/api/system/perf-stats").json()["playlist_storage"]
+    cold_parses = before["json_parses"]
+    cold_load_alls = before["load_all_calls"]
+    for _ in range(10):
+        client.get("/api/playlists")
+    after = client.get("/api/system/perf-stats").json()["playlist_storage"]
+    # load_all_calls bumps every time (no cache short-circuit).
+    assert after["load_all_calls"] - cold_load_alls == 10
+    # json_parses doesn't move -- the cache hit returns without parse.
+    assert after["json_parses"] == cold_parses

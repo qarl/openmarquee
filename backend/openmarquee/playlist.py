@@ -222,13 +222,22 @@ class PlaylistStorage:
     """
 
     # Perf counters (Batch 6.1). See ContentStorage._stats comment.
+    # json_parses (Batch 7.2) separates true on-disk re-parses from
+    # cache-hit returns so the sweep diff can show the cache working.
     _stats: dict[str, int] = {
         "load_all_calls": 0,
         "save_all_calls": 0,
+        "json_parses": 0,
     }
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        # mtime-keyed cache (Batch 7.2). See ContentStorage._cache
+        # rationale; same instance-level / singleton-at-runtime
+        # design + read-only-by-contract caveat. Skip json.loads +
+        # _coerce_to_collection (Pydantic validate over every
+        # Playlist + every PlaylistItem) when the file hasn't moved.
+        self._cache: tuple[int, PlaylistCollection] | None = None
 
     @classmethod
     def stats_snapshot(cls) -> dict[str, int]:
@@ -243,16 +252,29 @@ class PlaylistStorage:
         type(self)._stats["load_all_calls"] += 1
         if not self.path.exists():
             return _bootstrap_default_collection()
+        mtime_ns = self.path.stat().st_mtime_ns
+        if self._cache is not None and self._cache[0] == mtime_ns:
+            return self._cache[1]
+        type(self)._stats["json_parses"] += 1
         data = json.loads(self.path.read_text())
         collection, was_migrated = _coerce_to_collection(data)
         if was_migrated:
             self.save_all(collection)
+            mtime_ns = self.path.stat().st_mtime_ns
+        self._cache = (mtime_ns, collection)
         return collection
 
     def save_all(self, collection: PlaylistCollection) -> None:
         """Atomically write the full collection to disk."""
         type(self)._stats["save_all_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Drop the cache BEFORE the write so an IO error (disk full,
+        # permission) doesn't leave the cache holding a mutated-but-
+        # unpersisted object. Some callers (set_by_id, delete_by_id)
+        # mutate the load_all() return in-place before calling save_all
+        # -- without this, a failed write would let next load_all()
+        # return the mutated cached value that doesn't match disk.
+        self._cache = None
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(collection.model_dump_json(indent=2))
         tmp.replace(self.path)

@@ -127,12 +127,13 @@ class ContentStorage:
             # drift the moment someone hand-edits item.json.
             "item": item.model_dump(mode="json", exclude={"updated_at"}),
         }
+        # Drop the cache entry BEFORE the disk write so an IO error
+        # (atomic-rename failure on full disk) doesn't leave the cache
+        # holding pre-save state that diverges from disk on retry.
+        # Next load() repopulates with the canonical re-decoded shape.
+        self._cache.pop(item.id, None)
         self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
         self._atomic_write_bytes(item_dir / _ASSET_FILENAME, png)
-        # Drop the stale cache entry -- next load() repopulates with the
-        # canonical re-decoded shape (avoids drift between what we just
-        # serialized and what TypeAdapter would re-validate).
-        self._cache.pop(item.id, None)
 
     def save_text_slide(self, slide: TextSlide, png: bytes) -> None:
         """Persist a text slide — convenience wrapper for save()."""

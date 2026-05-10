@@ -201,10 +201,17 @@ class FlockStorage:
     """Atomic file-backed persistence for the flock."""
 
     # Perf counters (Batch 6.1). See ContentStorage._stats comment.
-    _stats: dict[str, int] = {"load_calls": 0, "save_calls": 0}
+    # json_parses (Batch 7.2) separates true re-parses from cache hits.
+    _stats: dict[str, int] = {
+        "load_calls": 0,
+        "save_calls": 0,
+        "json_parses": 0,
+    }
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        # mtime-keyed cache (Batch 7.2). See PlaylistStorage._cache.
+        self._cache: tuple[int, Flock] | None = None
 
     @classmethod
     def stats_snapshot(cls) -> dict[str, int]:
@@ -214,12 +221,24 @@ class FlockStorage:
         type(self)._stats["load_calls"] += 1
         if not self.path.exists():
             return Flock()
+        mtime_ns = self.path.stat().st_mtime_ns
+        if self._cache is not None and self._cache[0] == mtime_ns:
+            return self._cache[1]
+        type(self)._stats["json_parses"] += 1
         data = json.loads(self.path.read_text())
-        return Flock.model_validate(data)
+        flock = Flock.model_validate(data)
+        self._cache = (mtime_ns, flock)
+        return flock
 
     def save(self, flock: Flock) -> None:
         type(self)._stats["save_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # See PlaylistStorage.save_all comment -- clear cache BEFORE
+        # the write so a failed atomic replace doesn't leave the
+        # cache holding a caller-mutated object that doesn't match
+        # disk. add()/remove()/update() mutate the load() return
+        # in-place before calling save.
+        self._cache = None
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(flock.model_dump_json(indent=2))
         tmp.replace(self.path)

@@ -1,0 +1,39 @@
+{
+  "content_storage": {
+    "list_all_calls": 60,
+    "load_calls": 2460,
+    "save_calls": 0,
+    "envelope_validates": 41
+  },
+  "playlist_storage": {
+    "load_all_calls": 120,
+    "save_all_calls": 0,
+    "json_parses": 1
+  },
+  "flock_storage": {
+    "load_calls": 60,
+    "save_calls": 0,
+    "json_parses": 0
+  },
+  "settings_storage": {
+    "load_calls": 21,
+    "save_calls": 0
+  },
+  "schedule_storage": {
+    "load_calls": 60,
+    "save_calls": 0,
+    "json_parses": 0
+  },
+  "font_cache": {
+    "hits": 0,
+    "misses": 0,
+    "maxsize": 128,
+    "currsize": 0
+  },
+  "_meta": {
+    "captured_at": "2026-05-10",
+    "session_kind": "synthetic-testclient (20 text slides seeded)",
+    "cycle_count": 60,
+    "commit": "Batch 7.2 -- Playlist/Flock/Schedule mtime cache"
+  }
+}
