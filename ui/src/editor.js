@@ -21,73 +21,47 @@
 import Sortable from "sortablejs";
 
 import { attachAutoSave } from "./auto-save.js";
-import { formatAutoText } from "./auto-format.js";
 import {
     PATTERN_NAMES,
     PATTERN_LABELS,
     buildBg as buildPatternBg,
-    paintPatternOnCanvas,
     patternUsesColorB,
     patternUsesDensity,
     densityLabelFor,
 } from "./bg-system.js";
+import { populateBgSlideOptions, populateBgVideoOptions } from "./bg-picker.js";
 import { mountColorPicker } from "./color-picker.js";
-import { canvasToBase64 } from "./image-upload.js";
 import {
     anyLayerAnimated,
-    paintLayerWithMotion,
 } from "./canvas-motion.js";
+import {
+    FONT_FAMILIES,
+    FONT_WEIGHT_BY_VALUE,
+    cssFontFamily,
+    setupFontPicker,
+} from "./font-picker.js";
+import { makeAutoNamedLayer, nextLayerName } from "./layer-defaults.js";
+import {
+    drawCanvas,
+    drawTextOnly,
+    pickFontSize,
+    pickFontSizePct,
+    rasterizeAtTarget,
+} from "./rasterize.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
-const RASTERIZE_W = 3840;
-const RASTERIZE_H = 2160;
-
-
-// `weight` = numeric CSS font-weight to request in `ctx.font`. Using
-// each face's *native* weight avoids browser-synthesized fake bold on
-// single-weight display fonts (Pacifico, Bebas Neue, etc.).
-export const FONT_FAMILIES = [
-    { value: "sans-serif",            label: "Sans-serif",            category: "System",     weight: 700 },
-    { value: "serif",                 label: "Serif",                 category: "System",     weight: 700 },
-    { value: "monospace",             label: "Monospace",             category: "System",     weight: 700 },
-    { value: "Inter",                 label: "Inter",                 category: "Block",      weight: 700 },
-    { value: "Oswald",                label: "Oswald",                category: "Block",      weight: 700 },
-    { value: "Bebas Neue",            label: "Bebas Neue",            category: "Block",      weight: 400 },
-    { value: "Bowlby One SC",         label: "Bowlby One SC",         category: "Block",      weight: 400 },
-    { value: "Anton",                 label: "Anton",                 category: "Block",      weight: 400 },
-    { value: "Archivo Black",         label: "Archivo Black",         category: "Block",      weight: 400 },
-    { value: "Alfa Slab One",         label: "Alfa Slab One",         category: "Block",      weight: 400 },
-    { value: "Roboto Slab",           label: "Roboto Slab",           category: "Serif",      weight: 700 },
-    { value: "Cinzel",                label: "Cinzel",                category: "Serif",      weight: 700 },
-    { value: "Playfair Display",      label: "Playfair Display",      category: "Serif",      weight: 700 },
-    { value: "DM Serif Display",      label: "DM Serif Display",      category: "Serif",      weight: 400 },
-    { value: "UnifrakturCook",        label: "UnifrakturCook",        category: "Serif",      weight: 700 },
-    { value: "VT323",                 label: "VT323",                 category: "Mono",       weight: 400 },
-    { value: "JetBrains Mono",        label: "JetBrains Mono",        category: "Mono",       weight: 700 },
-    { value: "Space Mono",            label: "Space Mono",            category: "Mono",       weight: 700 },
-    { value: "Pacifico",              label: "Pacifico",              category: "Script",     weight: 400 },
-    { value: "Rye",                   label: "Rye",                   category: "Script",     weight: 400 },
-    { value: "Sedgwick Ave Display",  label: "Sedgwick Ave Display",  category: "Script",     weight: 400 },
-    { value: "Caveat Brush",          label: "Caveat Brush",          category: "Script",     weight: 400 },
-    { value: "Permanent Marker",      label: "Permanent Marker",      category: "Script",     weight: 400 },
-    { value: "Caveat",                label: "Caveat",                category: "Script",     weight: 700 },
-    { value: "Reenie Beanie",         label: "Reenie Beanie",         category: "Script",     weight: 400 },
-    { value: "Shadows Into Light",    label: "Shadows Into Light",    category: "Script",     weight: 400 },
-];
-
-const FONT_WEIGHT_BY_VALUE = new Map(FONT_FAMILIES.map((f) => [f.value, f.weight]));
-
-// Map TextLayer.blend -> Canvas2D globalCompositeOperation so the
-// editor preview matches the backend's PIL composite_with_blend math
-// (W3C compositing spec: multiply/screen/overlay are first-class
-// canvas modes, parity with backend modulo anti-aliasing). Keys MUST
-// stay in sync with TextLayer.blend's Literal in content/__init__.py
-// and _BLEND_MODES in rendering/blend.py.
-const BLEND_TO_CANVAS = {
-    normal: "source-over",
-    multiply: "multiply",
-    screen: "screen",
-    overlay: "overlay",
+// Re-export the public surface so existing importers
+// (main.js, editor.test.js, bg-picker.test.js, inline-preview.js)
+// don't churn on the split.
+export {
+    FONT_FAMILIES,
+    populateBgSlideOptions,
+    populateBgVideoOptions,
+    drawCanvas,
+    drawTextOnly,
+    pickFontSize,
+    pickFontSizePct,
+    rasterizeAtTarget,
 };
 
 const AUTO_FORMAT_OPTIONS = {
@@ -105,123 +79,6 @@ const AUTO_FORMAT_OPTIONS = {
         ["day_short", "Short — Mon"],
     ],
 };
-
-/**
- * Wire up the visual font picker around a layer's hidden <select> +
- * trigger button + popover. Idempotent per `layerEl`: each layer gets
- * its own popover wired once at insert time.
- */
-function setupFontPicker(layerEl) {
-    const selectEl = layerEl.querySelector(".field-font-family");
-    const trigger = layerEl.querySelector(".font-picker-trigger");
-    const triggerLabel = layerEl.querySelector(".font-picker-trigger-label");
-    const popover = layerEl.querySelector(".font-picker-popover");
-    if (!selectEl || !trigger || !popover) return;
-
-    const byCategory = new Map();
-    for (const f of FONT_FAMILIES) {
-        if (!byCategory.has(f.category)) byCategory.set(f.category, []);
-        byCategory.get(f.category).push(f);
-    }
-    for (const [cat, fonts] of byCategory) {
-        const section = document.createElement("div");
-        section.className = "font-picker-section";
-        section.innerHTML = `<div class="font-picker-section-head">${cat}</div>`;
-        const grid = document.createElement("div");
-        grid.className = "font-picker-grid";
-        for (const f of fonts) {
-            const tile = document.createElement("button");
-            tile.type = "button";
-            tile.className = "font-picker-tile";
-            tile.dataset.value = f.value;
-            tile.textContent = f.label;
-            tile.style.fontFamily = cssFontFamily(f.value);
-            tile.style.fontWeight = String(f.weight);
-            tile.setAttribute("role", "option");
-            grid.appendChild(tile);
-        }
-        section.appendChild(grid);
-        popover.appendChild(section);
-    }
-
-    function syncTrigger() {
-        const value = selectEl.value || FONT_FAMILIES[0].value;
-        const meta = FONT_FAMILIES.find((f) => f.value === value) || FONT_FAMILIES[0];
-        triggerLabel.textContent = meta.label;
-        triggerLabel.style.fontFamily = cssFontFamily(meta.value);
-        triggerLabel.style.fontWeight = String(meta.weight);
-        for (const tile of popover.querySelectorAll(".font-picker-tile")) {
-            tile.classList.toggle("selected", tile.dataset.value === value);
-            tile.setAttribute("aria-selected", tile.dataset.value === value ? "true" : "false");
-        }
-    }
-
-    function setOpen(open) {
-        popover.hidden = !open;
-        trigger.setAttribute("aria-expanded", open ? "true" : "false");
-        if (open) {
-            const sel = popover.querySelector(".font-picker-tile.selected");
-            sel?.scrollIntoView?.({ block: "nearest" });
-        }
-    }
-
-    trigger.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        setOpen(popover.hidden);
-    });
-
-    popover.addEventListener("click", (ev) => {
-        const tile = ev.target.closest(".font-picker-tile");
-        if (!tile) return;
-        const value = tile.dataset.value;
-        if (selectEl.value === value) {
-            setOpen(false);
-            return;
-        }
-        selectEl.value = value;
-        // Native <select> fires both `input` and `change` on user pick;
-        // syncAndRender wires `input`, font-load-then-redraw wires
-        // `change`. Dispatching only `change` leaves the live preview
-        // stale until the next input on any field.
-        selectEl.dispatchEvent(new Event("input", { bubbles: true }));
-        selectEl.dispatchEvent(new Event("change", { bubbles: true }));
-        syncTrigger();
-        setOpen(false);
-    });
-
-    document.addEventListener("click", (ev) => {
-        if (popover.hidden) return;
-        if (popover.contains(ev.target) || trigger.contains(ev.target)) return;
-        setOpen(false);
-    });
-
-    selectEl.addEventListener("change", syncTrigger);
-    selectEl.addEventListener("font-picker-sync", syncTrigger);
-    syncTrigger();
-}
-
-/**
- * Return a CSS font-family string safe for use in `ctx.font` / `style.font`.
- * Generic keywords (sans-serif, serif, monospace) must NOT be quoted; named
- * families with spaces must be. Canvas will silently drop an unquoted
- * "Bebas Neue" otherwise.
- *
- * Appends "Noto Color Emoji" as the canvas-side fallback so the browser
- * picks emoji glyphs from the bundled color-emoji TTF (loaded via
- * @font-face in styles.css, populated at build time by
- * scripts/download-emoji-font.sh) rather than the system's default
- * emoji font. Pairs with the device-side codepoint segmentation in
- * backend/openmarquee/seed.py:_draw_text_runs so editor preview and
- * device output use the same color glyphs.
- */
-function cssFontFamily(value) {
-    const GENERICS = new Set([
-        "sans-serif", "serif", "monospace", "cursive", "fantasy",
-        "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
-    ]);
-    const primary = GENERICS.has(value) ? value : `"${value}"`;
-    return `${primary}, "Noto Color Emoji"`;
-}
 
 const EDITOR_TEMPLATE = `
     <div class="editor">
@@ -462,62 +319,6 @@ const LAYER_GROUP_TEMPLATE = `
         </div>
     </div>
 `;
-
-/**
- * Construct an empty layer (default values matching backend TextLayer).
- * §5.10a v3.1: includes the new editor-driven fields (name / motion /
- * visible / etc.) that landed in commit 20cb506.
- */
-function defaultLayer() {
-    return {
-        text: "",
-        name: "",
-        textColor: "#FFFFFF",
-        fontFamily: FONT_FAMILIES[0].value,
-        fontSizePct: pickFontSizePct(),
-        autoMode: null,
-        autoFormat: null,
-        textAlign: "center",
-        motion: "static",
-        motionIntensity: 50,
-        motionPhase: 0,
-        motionSpeed: 1.0,
-        blend: "normal",
-        opacity: 1.0,
-        visible: true,
-        box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
-    };
-}
-
-/**
- * Smallest unused "Layer N" given the slide's current layer names.
- * Custom-named layers ("Headline", "Hours") don't reserve a slot —
- * deleting "Layer 2" and adding fills back as "Layer 2". Mirrors
- * slide-browser's nextAutoName for the slide-title field. qarl
- * 2026-05-01.
- */
-function nextLayerName(layers) {
-    const pattern = /^Layer (\d+)$/;
-    const used = new Set();
-    for (const layer of layers || []) {
-        const m = (layer?.name || "").match(pattern);
-        if (m) used.add(Number(m[1]));
-    }
-    let n = 1;
-    while (used.has(n)) n += 1;
-    return `Layer ${n}`;
-}
-
-/**
- * defaultLayer() pre-populated with the next-unused "Layer N" name —
- * used at editor mount, resetToBlank, and the +New affordance so a
- * fresh layer always has a real label.
- */
-function makeAutoNamedLayer(existingLayers) {
-    const layer = defaultLayer();
-    layer.name = nextLayerName(existingLayers);
-    return layer;
-}
 
 /**
  * Mount the text-slide editor.
@@ -1977,37 +1778,6 @@ export function mountEditor(
     };
 }
 
-export async function populateBgSlideOptions(selectEl, fetchItems, statusEl) {
-    try {
-        const items = await fetchItems();
-        selectEl.innerHTML = '<option value="">(pick a slide)</option>';
-        for (const item of items) {
-            if (item.type !== "image") continue;
-            const opt = document.createElement("option");
-            opt.value = String(item.id);
-            opt.textContent = item.name || item.text || "Untitled";
-            selectEl.appendChild(opt);
-        }
-    } catch (err) {
-        statusEl.textContent = `Could not load slides: ${err.message}`;
-    }
-}
-
-export async function populateBgVideoOptions(selectEl, fetchItems, statusEl) {
-    try {
-        const items = await fetchItems();
-        selectEl.innerHTML = '<option value="">(pick a video)</option>';
-        for (const item of items) {
-            if (item.type !== "video") continue;
-            const opt = document.createElement("option");
-            opt.value = String(item.id);
-            opt.textContent = item.name || "Untitled";
-            selectEl.appendChild(opt);
-        }
-    } catch (err) {
-        statusEl.textContent = `Could not load videos: ${err.message}`;
-    }
-}
 
 function loadImageForSlide(slideId) {
     return new Promise((resolve, reject) => {
@@ -2017,333 +1787,4 @@ function loadImageForSlide(slideId) {
         img.onerror = () => reject(new Error("could not load slide image"));
         img.src = `/api/content/${slideId}/asset`;
     });
-}
-
-/**
- * Render only the text layers of a TextSlide onto `canvas`, leaving the
- * canvas's background transparent. Used by the inline-preview to overlay
- * text on top of a live video frame for Text-over-Video slides
- * (Phase 5b — SYSTEM_SPEC §5.10). Iterates `text_layers` in array order
- * (later entries composite over earlier).
- *
- * Accepts the on-the-wire ContentItem shape — not the editor's internal
- * `state` — because the inline-preview consumes ContentItem directly.
- */
-export function drawTextOnly(canvas, item, opts) {
-    const ctx = canvas.getContext("2d");
-    ctx.save();
-    try {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const layers = Array.isArray(item.text_layers) ? item.text_layers : [];
-        const elapsed = opts && opts.elapsed_s;
-        const slideKey = (item && (item.id || "?")) + "";
-        for (let i = 0; i < layers.length; i++) {
-            const layer = layers[i];
-            const paint = () => paintLayer(ctx, canvas, layer, /* fillBox */ null);
-            if (elapsed === undefined || elapsed === null) {
-                // Static path — current behavior, no motion.
-                paint();
-            } else {
-                paintLayerWithMotion(ctx, canvas, layer, paint, {
-                    elapsed_s: elapsed,
-                    layerKey: `${slideKey}:${i}`,
-                });
-            }
-        }
-    } finally {
-        ctx.restore();
-    }
-}
-
-/**
- * Paint a single layer's text onto an already-cleared / pre-filled
- * context. `box` defaults to {0.1, 0.1, 0.8, 0.8} when absent. Mirrors
- * `_draw_text_into` on the backend (seed.py).
- */
-function paintLayer(ctx, canvas, layer) {
-    const text = layer?.text || "";
-    if (!text) return;
-    const textColor = layer.text_color || layer.textColor || "#FFFFFF";
-    const fontFamily = layer.font_family || layer.fontFamily || "sans-serif";
-    const box = layer.box || { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
-
-    const boxX = box.x * canvas.width;
-    const boxY = box.y * canvas.height;
-    const boxW = Math.max(1, box.w * canvas.width);
-    const boxH = Math.max(1, box.h * canvas.height);
-
-    let fontSizePx;
-    const pct = layer.font_size_pct ?? layer.fontSizePct;
-    const px = layer.font_size_px ?? layer.fontSize;
-    if (Number.isFinite(pct) && pct > 0) {
-        // §5.10a v3.1.2 (qarl 2026-05-01 review #3): font_size_pct is
-        // a percentage of BOX WIDTH (not slide width). Resizing the
-        // box visibly resizes the text — operators expected that math
-        // and asked for it explicitly. Math: pct% × box.w × canvas.width
-        // = pct% × boxW (already in pixels).
-        fontSizePx = Math.max(4, Math.round((boxW * pct) / 100));
-    } else if (Number.isFinite(px) && px > 0) {
-        fontSizePx = px;
-    } else {
-        fontSizePx = pickFontSize(boxW);
-    }
-    ctx.fillStyle = textColor;
-    const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
-    ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
-    const textAlign = layer.text_align || layer.textAlign || "center";
-    ctx.textAlign = textAlign === "left"
-        ? "left"
-        : textAlign === "right"
-            ? "right"
-            : "center";
-    ctx.textBaseline = "middle";
-
-    // Word-wrap (B4, 2026-05-05): any paragraph longer than the box
-    // width gets broken at word boundaries onto multiple lines. Pre-
-    // existing literal newlines are preserved.
-    const wrapped = wrapTextToWidth(ctx, text, boxW);
-    const lines = wrapped.split(/\r?\n/);
-    const lineHeight = fontSizePx * 1.1;
-    const totalHeight = lineHeight * lines.length;
-    const boxCenterY = boxY + boxH / 2;
-    // Anchor x depends on textAlign: left = box left, right = box right,
-    // center = box center. Canvas's textAlign+x interplay handles the
-    // per-line offset.
-    let anchorX;
-    if (textAlign === "left") anchorX = boxX;
-    else if (textAlign === "right") anchorX = boxX + boxW;
-    else anchorX = boxX + boxW / 2;
-    const maxWidth = Math.max(1, boxW);
-    // Vertical squish (qarl 2026-05-01 ask #1): when total rendered
-    // text height exceeds box height, scale-y around the box center
-    // so lines stay inside. fillText's maxWidth handles horizontal
-    // overflow as before — both axes squish independently.
-    const yScale = totalHeight > boxH ? boxH / totalHeight : 1;
-    if (yScale === 1) {
-        const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
-        for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], anchorX, startY + i * lineHeight, maxWidth);
-        }
-    } else {
-        ctx.save();
-        ctx.translate(anchorX, boxCenterY);
-        ctx.scale(1, yScale);
-        // Draw aligned around (0,0) under the local transform; each
-        // line's y-offset is from the centered origin. fillText's
-        // maxWidth is in untransformed coords, so it still clamps
-        // horizontal width correctly.
-        const lineY0 = -totalHeight / 2 + lineHeight / 2;
-        for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], 0, lineY0 + i * lineHeight, maxWidth);
-        }
-        ctx.restore();
-    }
-}
-
-/**
- * Insert \n at word boundaries so each line measures within `maxWidth`
- * via the current ctx.font. Preserves existing literal newlines.
- * Mirrors the backend's _wrap_text_to_width helper (B4, 2026-05-05).
- * Single words wider than maxWidth are left intact -- the existing
- * fillText maxWidth + horizontal squish handles overflow.
- */
-function wrapTextToWidth(ctx, text, maxWidth) {
-    if (!text || maxWidth <= 0) return text;
-    const out = [];
-    for (const paragraph of text.split(/\r?\n/)) {
-        if (!paragraph) {
-            out.push("");
-            continue;
-        }
-        const words = paragraph.split(" ");
-        let line = [];
-        for (const word of words) {
-            if (line.length === 0) {
-                line.push(word);
-                continue;
-            }
-            const candidate = line.concat(word).join(" ");
-            if (ctx.measureText(candidate).width > maxWidth) {
-                out.push(line.join(" "));
-                line = [word];
-            } else {
-                line.push(word);
-            }
-        }
-        if (line.length > 0) out.push(line.join(" "));
-    }
-    return out.join("\n");
-}
-
-/**
- * Draw the slide onto `canvas`. Pure: only reads `state` and writes
- * pixels — no DOM wiring, no event handlers.
- *
- * Accepts BOTH editor-state shape (`state.layers` with internal field
- * names) AND a flat single-layer back-compat shape (`state.text`,
- * `state.textColor`, …) for callers that haven't migrated. The two
- * shapes are distinguished by presence of `.layers`.
- */
-export function drawCanvas(canvas, state, opts) {
-    const ctx = canvas.getContext("2d");
-    const {
-        backgroundColor = "#000000",
-        bgSource = "color",
-        bgImage = null,
-        bgPattern = null,
-    } = state;
-
-    ctx.save();
-    try {
-        if (bgSource === "slide" && bgImage) {
-            const scale = Math.max(
-                canvas.width / bgImage.width,
-                canvas.height / bgImage.height,
-            );
-            const drawW = bgImage.width * scale;
-            const drawH = bgImage.height * scale;
-            ctx.drawImage(
-                bgImage,
-                (canvas.width - drawW) / 2,
-                (canvas.height - drawH) / 2,
-                drawW,
-                drawH,
-            );
-        } else if (bgSource === "pattern" && bgPattern) {
-            // The bg-system.js canvas painter mirrors the backend's
-            // numpy render_pattern() so editor preview = device
-            // render. Tile sizes / dot radii / band spacing match.
-            paintPatternOnCanvas(
-                ctx, canvas.width, canvas.height,
-                bgPattern.pattern, bgPattern.color_a, bgPattern.color_b,
-                bgPattern.density,
-            );
-        } else {
-            ctx.fillStyle = backgroundColor;
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-        }
-
-        const layers = layersForDraw(state);
-        const elapsed = opts && opts.elapsed_s;
-        for (let i = 0; i < layers.length; i++) {
-            const layer = layers[i];
-            // §5.10a v3.1: editor's eye toggle sets visible=false; skip
-            // hidden layers entirely so the rasterized PNG matches what
-            // the operator sees in preview.
-            if (layer?.visible === false) continue;
-            const resolved = resolveLayerForDraw(layer);
-            const paint = () => paintLayer(ctx, canvas, resolved);
-            // Per-layer Photoshop blend mode. Canvas natively supports
-            // multiply / screen / overlay (W3C compositing). Map to
-            // 'source-over' for normal so the editor preview matches
-            // the backend's PIL composite_with_blend math (modulo
-            // small anti-aliasing differences -- same WYSIWYG parity
-            // rule we hold for gradient/pattern). Only save/restore
-            // when we're actually flipping the compositor away from
-            // the default; the common normal case skips the wrapper
-            // so drawCanvas's "exactly one save/restore" invariant
-            // (relied on by tests + the outer try/finally) holds.
-            const blendKey = layer?.blend || "normal";
-            const opacityVal = typeof layer?.opacity === "number" ? layer.opacity : 1;
-            const needsBlendWrap = blendKey !== "normal";
-            const needsAlphaWrap = opacityVal < 1;
-            const drawOnce = () => {
-                if (elapsed === undefined || elapsed === null) {
-                    paint();
-                } else {
-                    // The motion wrapper takes the unresolved layer so
-                    // it reads .motion / .motion_intensity /
-                    // .motion_phase off the editor-state shape;
-                    // paintLayer is called via the closure with the
-                    // auto-resolved layer.
-                    paintLayerWithMotion(ctx, canvas, layer, paint, {
-                        elapsed_s: elapsed,
-                        layerKey: `editor:${i}`,
-                    });
-                }
-            };
-            if (needsBlendWrap || needsAlphaWrap) {
-                ctx.save();
-                if (needsBlendWrap) {
-                    ctx.globalCompositeOperation = BLEND_TO_CANVAS[blendKey];
-                }
-                if (needsAlphaWrap) {
-                    ctx.globalAlpha = Math.max(0, Math.min(1, opacityVal));
-                }
-                try {
-                    drawOnce();
-                } finally {
-                    ctx.restore();
-                }
-            } else {
-                drawOnce();
-            }
-        }
-    } finally {
-        ctx.restore();
-    }
-}
-
-function layersForDraw(state) {
-    if (Array.isArray(state.layers) && state.layers.length > 0) {
-        return state.layers;
-    }
-    // Back-compat single-layer shape: pull a synthetic layer off the
-    // top-level state fields. This keeps drawCanvas usable from older
-    // unit tests that pass `{text, textColor, …}` directly.
-    return [
-        {
-            text: state.text || "",
-            textColor: state.textColor,
-            fontFamily: state.fontFamily,
-            fontSizePct: state.fontSizePct,
-            fontSize: state.fontSize,
-            autoMode: state.autoMode,
-            autoFormat: state.autoFormat,
-            box: state.box,
-        },
-    ];
-}
-
-function resolveLayerForDraw(layer) {
-    // Auto-mode tokens (time / date / day): the canvas shows the current
-    // formatted value so the preview matches what the device renders at
-    // playout. Operator's typed text is the fallback.
-    const rawText = layer.text || "";
-    const mode = layer.auto_mode ?? layer.autoMode ?? null;
-    const fmt = layer.auto_format ?? layer.autoFormat ?? null;
-    const text = mode
-        ? formatAutoText(mode, fmt, new Date()) || rawText
-        : rawText;
-    return { ...layer, text };
-}
-
-/**
- * Heuristic fallback when neither `font_size_pct` nor `font_size_px`
- * is set on a layer. Width-relative per §5.10a v3.1.1 (qarl
- * 2026-05-01 ask #1) — matches the new pct semantic so a slide
- * without explicit sizing reads the same way the editor's "% of
- * width" field would suggest.
- */
-export function pickFontSize(panelWidth) {
-    return Math.max(12, Math.floor(panelWidth * 0.3));
-}
-
-// Default percent-of-width for a brand-new auto-mode-less text slide.
-// 30% reads cleanly as a single-word slogan on common 4:3 / 16:9 panels;
-// the operator can dial in something more specific from the field.
-export function pickFontSizePct() {
-    return 30;
-}
-
-/**
- * Render the editor scene onto a fresh offscreen 4K canvas and return
- * its base64 PNG body.
- */
-export function rasterizeAtTarget(state) {
-    const off = document.createElement("canvas");
-    off.width = RASTERIZE_W;
-    off.height = RASTERIZE_H;
-    drawCanvas(off, state);
-    return canvasToBase64(off);
 }
