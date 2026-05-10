@@ -1,10 +1,12 @@
 // Shared ffmpeg.wasm plumbing + the H.264 transcode helper.
 //
-// Consumers:
-//   - /spike.html (ui/src/spike.js) — maintainer-facing page that
-//     exercises the pipeline end-to-end with a downloadable output.
+// Consumer:
 //   - Production video uploader (ui/src/video-upload.js) — transcodes
 //     operator uploads to H.264 MP4 at the Pi's 1080p decoder cap.
+//
+// (The maintainer-facing /spike.html dev probe was retired alongside
+// simulator.js; if you need to exercise the pipeline end-to-end again,
+// resurrect from git history rather than keeping it in the bundle.)
 //
 // COI / SAB note: `@ffmpeg/ffmpeg` v0.12+ supports single-threaded mode
 // without Cross-Origin-Isolation headers, so this runs on the captive-
