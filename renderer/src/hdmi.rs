@@ -3185,10 +3185,12 @@ std::thread_local! {
     /// run_overlay_blend_pass). Geometry is STATIC_DRAW (NDC
     /// [-1,1] x UV [0,1]) so reuse across calls is safe (no
     /// driver-sync hazard like P2-F's reverted STREAM_DRAW). Single
-    /// allocation across all three call paths; replaces CRIT-A's
-    /// BRIGHT_GAMMA_QUAD_VBO + the per-call create_textured_quad
-    /// helper that run_blit_pass / run_overlay_blend_pass were
-    /// using.
+    /// allocation across all three call paths; access via
+    /// `cached_textured_quad_vbo(gl)`. (P2-G hoist 2026-05-10
+    /// consolidated three pre-existing per-call paths -- CRIT-A's
+    /// BRIGHT_GAMMA_QUAD_VBO + a now-removed create_textured_quad
+    /// helper that run_blit_pass / run_overlay_blend_pass used --
+    /// into this single shared cell.)
     static TEXTURED_QUAD_VBO: std::cell::Cell<Option<glow::NativeBuffer>> =
         const { std::cell::Cell::new(None) };
 }
@@ -5764,7 +5766,7 @@ fn cached_transition_sp_program(
 /// re-running FS_GRADIENT every frame (vc4 TMU dedicated
 /// hardware vs SIMD ALU). Cached per session; freed via
 /// clear_blit_program_cache at teardown.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct CachedBlitProgram {
     program: glow::NativeProgram,
     a_pos: u32,
@@ -5773,16 +5775,19 @@ struct CachedBlitProgram {
 }
 
 std::thread_local! {
-    static BLIT_PROGRAM: std::cell::RefCell<Option<CachedBlitProgram>> =
-        std::cell::RefCell::new(None);
+    // P2-G.fix (2026-05-10): Cell+Copy for pattern uniformity with
+    // FS_BRIGHT_GAMMA / FS_OVERLAY_BLEND program caches. RefCell+
+    // Clone was a vestige of an earlier shape; behavior identical
+    // since CachedBlitProgram fields are all Copy.
+    static BLIT_PROGRAM: std::cell::Cell<Option<CachedBlitProgram>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn cached_blit_program(gl: &glow::Context) -> Result<CachedBlitProgram> {
     use glow::HasContext;
     BLIT_PROGRAM.with(|c| {
-        let mut cache = c.borrow_mut();
-        if let Some(p) = cache.as_ref() {
-            return Ok(p.clone());
+        if let Some(p) = c.get() {
+            return Ok(p);
         }
         let program = link_program(gl, VS_TEXTURED_QUAD, crate::hdmi_logic::FS_BLIT)
             .context("link FS_BLIT (atlas bg-cache blit)")?;
@@ -5792,7 +5797,7 @@ fn cached_blit_program(gl: &glow::Context) -> Result<CachedBlitProgram> {
             .ok_or_else(|| anyhow!("FS_BLIT VS missing a_uv"))?;
         let u_src = unsafe { gl.get_uniform_location(program, "u_src") };
         let cbp = CachedBlitProgram { program, a_pos, a_uv, u_src };
-        *cache = Some(cbp.clone());
+        c.set(Some(cbp));
         Ok(cbp)
     })
 }
@@ -5800,8 +5805,7 @@ fn cached_blit_program(gl: &glow::Context) -> Result<CachedBlitProgram> {
 fn clear_blit_program_cache(gl: &glow::Context) {
     use glow::HasContext;
     BLIT_PROGRAM.with(|c| {
-        let mut cache = c.borrow_mut();
-        if let Some(p) = cache.take() {
+        if let Some(p) = c.replace(None) {
             unsafe { gl.delete_program(p.program); }
         }
     });
@@ -7480,6 +7484,25 @@ fn prewarm_sp_session(
                 eprintln!("reel: prewarm atlas FBO alloc failed: {e:#}; lazy on first SB call");
             }
         }
+    }
+
+    // P2-G.fix (2026-05-10): pre-link the post-pass programs that
+    // CRIT-A and P2-G cached. Skips the first-paint link cost
+    // when the FYS reel hits a non-identity-color frame
+    // (run_bright_gamma_pass) or the overlay-route (run_blit_pass
+    // / run_overlay_blend_pass). Lazy first-call would otherwise
+    // pay ~5 ms on the first overlay-route slide. cached_blit_
+    // program is also pre-warmed via the bg-cache prewarm path
+    // above for non-solid bgs; this call is idempotent (cache
+    // hit on second invocation).
+    if let Err(e) = unsafe { cached_bright_gamma_program(session.gl) } {
+        eprintln!("reel: prewarm cached_bright_gamma_program failed: {e:#}; lazy on first call");
+    }
+    if let Err(e) = unsafe { cached_overlay_blend_program(session.gl) } {
+        eprintln!("reel: prewarm cached_overlay_blend_program failed: {e:#}; lazy on first call");
+    }
+    if let Err(e) = cached_blit_program(session.gl) {
+        eprintln!("reel: prewarm cached_blit_program failed: {e:#}; lazy on first call");
     }
 
     let elapsed_ms = t_prewarm.elapsed().as_millis();

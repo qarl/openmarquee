@@ -36,6 +36,11 @@ BIN_HOST="$REPO/renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-re
 BIN_PI="/tmp/openmarquee-render-rendertests"
 GOLDEN_DIR="$REPO/renderer/tests/golden"
 CAPTURE_DIR="$REPO/renderer/tests/captures"
+FIXTURE_DIR="$REPO/renderer/tests/fixtures"
+# Synth-content-root on Pi: hosts the synthesized fixture slides
+# that don't live in /var/openmarquee/content (overlay-route, etc.).
+# Populated each run via scp of the fixtures/ subtree.
+PI_FIXTURE_ROOT="/tmp/render-test-content"
 DIFF_PY="$REPO/scripts/render_diff.py"
 
 BLESS=0
@@ -57,26 +62,39 @@ if [ ! -x "$BIN_HOST" ]; then
     exit 1
 fi
 
-# Fixture spec: NAME|TYPE|UUID(s)
-# TYPE=slide  -> --capture-slide UUID
+# Fixture spec: NAME|TYPE|UUID|CONTENT_ROOT
+# TYPE=slide       -> --capture-slide UUID --content-root CONTENT_ROOT
 # Add more shapes (transition_mid etc) in follow-up commits.
 FIXTURES=(
     # 01 · FREE: solid bg, single-line single-layer text. Simplest
     # smoke fixture. Catches regressions in glyph rasterizer +
-    # layout + bg fill + atlas geometry.
-    "fys_01_free|slide|3964c302-311f-44f2-a6c9-efd24a16cfc0"
+    # layout + bg fill + atlas geometry. Lives in the production
+    # content root.
+    "fys_01_free|slide|3964c302-311f-44f2-a6c9-efd24a16cfc0|/var/openmarquee/content"
     # 08 · Tile Chaos: heavy 5L pattern slide. Catches multi-layer
     # composite + per-layer color binding + multi-slide bg cache
     # invalidation. The slide that the FYS heavy bench used.
-    "fys_08_tile_chaos|slide|99c11690-415b-40f6-8e3c-6491f3bdf60e"
+    "fys_08_tile_chaos|slide|99c11690-415b-40f6-8e3c-6491f3bdf60e|/var/openmarquee/content"
     # 09 · Chant Wall: 5L ticker-heavy slide. Pairs with #08 for
     # transition midpoint fixtures in a follow-up.
-    "fys_09_chant_wall|slide|2c858968-ae0a-4592-8083-85257de50bcd"
+    "fys_09_chant_wall|slide|2c858968-ae0a-4592-8083-85257de50bcd|/var/openmarquee/content"
+    # P2-G.fix overlay-route fixture: 2-layer slide where layer 2
+    # has blend=overlay, forcing paint_layers_via_overlay_route
+    # (legacy 3-pass with run_blit_pass + run_overlay_blend_pass
+    # on the hot path). Catches regressions in P2-G's caches that
+    # the Normal-blend FYS fixtures wouldn't surface. Synth slide
+    # checked in at renderer/tests/fixtures/<UUID>/item.json;
+    # pushed to Pi at $PI_FIXTURE_ROOT each run.
+    "p2g_overlay_route|slide|f0000000-0000-4000-8000-000000000001|$PI_FIXTURE_ROOT"
 )
 
 echo "==> deploying binary to $TARGET:$BIN_PI"
 scp -q "$BIN_HOST" "$TARGET:$BIN_PI"
 ssh -q "$TARGET" "test -x $BIN_PI" || { echo "FAIL: binary not exec on Pi"; exit 1; }
+
+echo "==> deploying synth fixtures to $TARGET:$PI_FIXTURE_ROOT"
+ssh -q "$TARGET" "mkdir -p $PI_FIXTURE_ROOT"
+scp -qr "$FIXTURE_DIR/." "$TARGET:$PI_FIXTURE_ROOT/"
 
 echo "==> stopping openmarquee-backend (DRM master grab)"
 ssh -q "$TARGET" "sudo systemctl stop openmarquee-backend"
@@ -84,16 +102,16 @@ ssh -q "$TARGET" "sudo systemctl stop openmarquee-backend"
 PASS_COUNT=0
 FAIL_COUNT=0
 for fixture in "${FIXTURES[@]}"; do
-    IFS='|' read -r NAME TYPE UUID <<<"$fixture"
+    IFS='|' read -r NAME TYPE UUID CONTENT_ROOT <<<"$fixture"
     PI_PATH="/tmp/render-test-$NAME.png"
     LOCAL_PATH="$CAPTURE_DIR/$NAME.png"
     GOLDEN_PATH="$GOLDEN_DIR/$NAME.png"
     case "$TYPE" in
         slide)
             echo
-            echo "==> $NAME (capture-slide $UUID)"
+            echo "==> $NAME (capture-slide $UUID, content-root=$CONTENT_ROOT)"
             CAP_LOG="$CAPTURE_DIR/$NAME.log"
-            if ! ssh -q "$TARGET" "$BIN_PI --output hdmi --capture-slide $UUID --content-root /var/openmarquee/content --capture-path $PI_PATH --force-mode $FORCE_MODE" > "$CAP_LOG" 2>&1; then
+            if ! ssh -q "$TARGET" "$BIN_PI --output hdmi --capture-slide $UUID --content-root $CONTENT_ROOT --capture-path $PI_PATH --force-mode $FORCE_MODE" > "$CAP_LOG" 2>&1; then
                 echo "    FAIL: capture exited non-zero (see $CAP_LOG)"
                 FAIL_COUNT=$((FAIL_COUNT + 1))
                 continue
