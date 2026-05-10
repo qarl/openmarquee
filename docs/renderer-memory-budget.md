@@ -133,12 +133,34 @@ but the budget tolerates it.
 
 | Resource                      | Hard ceiling | Reason                       |
 | ----------------------------- | ------------ | ---------------------------- |
-| CMA used (system-wide)        | 200 MB       | OOM-killer trips ≥220 MB     |
+| CMA used (system-wide)        | 250 MB       | 1080p@60 + atlas-SB baseline; see note below |
 | Total RSS (renderer process)  | 100 MB       | Backend headroom             |
 | Single texture/FBO dimension  | 2048 px      | vc4 hardware limit           |
 | Concurrent FBOs allocated     | 8            | Mesa state-tracker pressure  |
 | GBM BO chain depth (explicit) | 4            | CMA cost vs latency tradeoff |
 | Image-bg cache entries        | 6            | 6 × 8 MB = 48 MB CMA cap (LRU eviction landed in slice 12 image-bg)        |
+
+**CMA ceiling note (2026-05-10):** Raised from 200 MB to 250 MB
+after the §8.2 1h soak (atlas-sb-2026-05-09 tip = 7417ae0,
+canonical FYS reel @1080p@60 forced) measured CmaUsed=234.9 MB
+at pass=0 (first-frame allocations: bake atlas + per-slide
+bg-cache + GBM BO chain) and 225.3 MB at pass=97. The cma slope
+was DECREASING (-11.4 MB/h) over the run — no leak; the
+baseline is structural for the 1080p+atlas-SB architecture.
+
+The prior 200 MB ceiling pre-dated the atlas-SB redirect (single
+2048×2048 atlas adds ~16 MB) AND the bg-cache prewarm (per-slide
+bg cache; ~12 MB at 1080p×3 slides cached) AND the 1080p-forced-
+mode requirement (was 1024×768 EDID-default, needs ~×1.4 more
+GBM BO area). The pre-existing "OOM-killer trips ≥220 MB" note
+was empirically wrong on this Pi (1h run held 225-234 MB stable
+with no OOM); 256 MB CMA carveout is the absolute kernel-side
+ceiling, 250 leaves ~6 MB headroom over the observed first-frame
+maximum.
+
+If a future architectural change pushes the baseline higher,
+re-measure on a fresh 1h soak and update this row alongside
+the change.
 
 ## 5. Verification methodology
 

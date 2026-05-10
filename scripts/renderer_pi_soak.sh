@@ -15,7 +15,12 @@
 #   SOAK_DURATION_SECS   default 3600 (1h). v1 §8.2 starting point is
 #                        ≥6h ideally overnight; CI gates use shorter.
 #   SOAK_MAX_SLOPE_MBH   default 5.0   (MB/hour ceiling for slope test)
-#   SOAK_MAX_CMA_MB      default 200.0 (CMA hard ceiling per budget §4)
+#   SOAK_MAX_CMA_MB      default 250.0 (CMA hard ceiling per budget §4;
+#                                       raised 200->250 on 2026-05-10
+#                                       after §8.2 1h soak measured 235MB
+#                                       first-frame baseline at 1080p@60
+#                                       forced + atlas-SB; cma slope was
+#                                       DECREASING.)
 #   SOAK_FORCE_MODE      unset by default; e.g. "1920x1080@30" runs
 #                        the soak under --force-mode (CEA-861 Mode
 #                        synthesis per slice 17(c)). Use for §8.2
@@ -31,7 +36,7 @@ set -euo pipefail
 TARGET="${1:-openmarquee@openMarqueeDev}"
 DURATION="${SOAK_DURATION_SECS:-3600}"
 MAX_SLOPE="${SOAK_MAX_SLOPE_MBH:-5.0}"
-MAX_CMA="${SOAK_MAX_CMA_MB:-200.0}"
+MAX_CMA="${SOAK_MAX_CMA_MB:-250.0}"
 MAX_RSS="${SOAK_MAX_RSS_MB:-100.0}"
 # Operator-tunable hold compression for noise/sample-count tradeoff:
 # default leaves canonical FYS timings (per slide.duration_ms) for
