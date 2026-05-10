@@ -15,6 +15,7 @@ flock.js.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shutil
@@ -73,7 +74,12 @@ async def detect_display_dims() -> DisplayDims:
     """
     if shutil.which("fbset"):
         try:
-            out = subprocess.run(
+            # Batch 6.2: subprocess.run is sync and blocks the event
+            # loop for the duration of fbset (up to 2s on a slow Pi).
+            # Run on a worker thread so concurrent /api/playback/state
+            # polls stay responsive while this is in flight.
+            out = await asyncio.to_thread(
+                subprocess.run,
                 ["fbset", "-i"],
                 capture_output=True,
                 text=True,
@@ -118,7 +124,10 @@ async def scan_wifi() -> WifiScanResult:
     # Linux / Pi path.
     if shutil.which("iw"):
         try:
-            out = subprocess.run(
+            # Batch 6.2: iw scan blocks up to 8s; offload so the
+            # event loop keeps serving other requests.
+            out = await asyncio.to_thread(
+                subprocess.run,
                 ["iw", "dev", "wlan0", "scan"],
                 capture_output=True,
                 text=True,
@@ -138,7 +147,9 @@ async def scan_wifi() -> WifiScanResult:
     )
     if airport.exists():
         try:
-            out = subprocess.run(
+            # Batch 6.2: airport blocks up to 5s; offload.
+            out = await asyncio.to_thread(
+                subprocess.run,
                 [str(airport), "-s"],
                 capture_output=True,
                 text=True,

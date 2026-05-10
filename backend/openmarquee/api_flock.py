@@ -14,6 +14,7 @@ I need to fetch / delete?". Push notifications + periodic pull arrive
 in follow-up modules on top of this data.
 """
 
+import asyncio
 import json
 import logging
 import shutil
@@ -295,7 +296,7 @@ async def discover_tailnet_peers(storage: FlockDep) -> DiscoverResult:
     risk) but needs Unix-socket plumbing through httpx. Flip if the
     shell-out's reliability ever bites us in production.
     """
-    candidates, source = _discover_tailnet_candidates()
+    candidates, source = await _discover_tailnet_candidates()
     # Cross-reference with the operator's existing flock so the UI
     # can disable already-added entries rather than offering the
     # operator the chance to "add" a peer who's already there.
@@ -312,7 +313,7 @@ async def discover_tailnet_peers(storage: FlockDep) -> DiscoverResult:
     return DiscoverResult(candidates=out, source=source)
 
 
-def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
+async def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
     """Shell out to `tailscale status --json` and parse the Peer
     table. Returns (list_of_(hostname, address), source). Source is
     "tailscale" on a successful parse, "none" otherwise.
@@ -334,7 +335,11 @@ def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
     if not shutil.which("tailscale"):
         return ([], "none")
     try:
-        out = subprocess.run(
+        # Batch 6.2: tailscale status can block up to 4s when the
+        # daemon is slow to reply. Offload so concurrent /api/flock
+        # reads + /api/playback/state polls stay snappy.
+        out = await asyncio.to_thread(
+            subprocess.run,
             ["tailscale", "status", "--json"],
             capture_output=True,
             text=True,

@@ -21,6 +21,7 @@ GET /api/content before the rerender bumped updated_at on disk
 for a guaranteed-coherent post-save state.
 """
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -64,7 +65,11 @@ async def get_settings(storage: SettingsDep) -> SystemSettings:
         not settings.ui_first_run_seen
         and not (settings.wifi_station_ssid or "").strip()
     ):
-        creds = read_system_wifi()
+        # Batch 6.2: read_system_wifi spawns iwgetid (up to 2s) and
+        # reads /etc/wpa_supplicant -- both blocking. Offload to a
+        # worker thread so the first-run GET doesn't stall the loop
+        # for any concurrent /api/playback/state poll.
+        creds = await asyncio.to_thread(read_system_wifi)
         if creds is not None:
             ssid, psk = creds
             try:
