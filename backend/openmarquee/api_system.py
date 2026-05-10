@@ -25,8 +25,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 
+from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_settings_storage
+from openmarquee.flock import FlockStorage
+from openmarquee.perf_middleware import recent_requests
+from openmarquee.playlist import PlaylistStorage
+from openmarquee.schedule import ScheduleStorage
 from openmarquee.settings import SettingsStorage
+from openmarquee.text_raster import font_cache_info
 
 log = logging.getLogger(__name__)
 
@@ -442,4 +448,46 @@ def _parse_airport_scan(output: str) -> list[WifiNetwork]:
     return sorted(
         networks.values(),
         key=lambda n: (-(n.signal_dbm or -999), n.ssid),
+    )
+
+
+# --- perf instrumentation (Batch 6.1) ---
+
+
+class PerfStats(BaseModel):
+    """Snapshot of per-storage counters + font cache stats.
+
+    Counters are class-level, so the snapshot is the cumulative call
+    count since the process started. Sweep #2 baseline capture: GET
+    this once at startup, run a canonical playback session, GET again,
+    diff the values. The intent is to verify which list_all / load_all
+    paths are actually hot in production before optimizing them.
+    """
+
+    content_storage: dict[str, int]
+    playlist_storage: dict[str, int]
+    flock_storage: dict[str, int]
+    settings_storage: dict[str, int]
+    schedule_storage: dict[str, int]
+    font_cache: dict[str, int]
+    request_log: list[dict[str, object]] | None = None
+
+
+@router.get("/perf-stats", response_model=PerfStats)
+async def perf_stats() -> PerfStats:
+    """Aggregate the per-storage class counters + font cache info."""
+    cache = font_cache_info()
+    return PerfStats(
+        content_storage=ContentStorage.stats_snapshot(),
+        playlist_storage=PlaylistStorage.stats_snapshot(),
+        flock_storage=FlockStorage.stats_snapshot(),
+        settings_storage=SettingsStorage.stats_snapshot(),
+        schedule_storage=ScheduleStorage.stats_snapshot(),
+        font_cache={
+            "hits": cache.hits,
+            "misses": cache.misses,
+            "maxsize": cache.maxsize,
+            "currsize": cache.currsize,
+        },
+        request_log=recent_requests(),
     )

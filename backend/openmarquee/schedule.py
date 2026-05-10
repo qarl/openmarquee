@@ -166,6 +166,9 @@ class ScheduleStorage:
     by resolving the names against the playlist collection.
     """
 
+    # Perf counters (Batch 6.1). See ContentStorage._stats comment.
+    _stats: dict[str, int] = {"load_calls": 0, "save_calls": 0}
+
     def __init__(
         self,
         path: Path,
@@ -174,7 +177,12 @@ class ScheduleStorage:
         self.path = Path(path)
         self._playlist_storage = playlist_storage
 
+    @classmethod
+    def stats_snapshot(cls) -> dict[str, int]:
+        return dict(cls._stats)
+
     def load(self) -> Schedule:
+        type(self)._stats["load_calls"] += 1
         if not self.path.exists():
             return Schedule()
         data = json.loads(self.path.read_text())
@@ -184,6 +192,7 @@ class ScheduleStorage:
         return schedule
 
     def save(self, schedule: Schedule) -> None:
+        type(self)._stats["save_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(schedule.model_dump_json(indent=2))

@@ -1,0 +1,36 @@
+{
+  "content_storage": {
+    "list_all_calls": 60,
+    "load_calls": 0,
+    "save_calls": 0,
+    "envelope_validates": 0
+  },
+  "playlist_storage": {
+    "load_all_calls": 120,
+    "save_all_calls": 0
+  },
+  "flock_storage": {
+    "load_calls": 0,
+    "save_calls": 0
+  },
+  "settings_storage": {
+    "load_calls": 1,
+    "save_calls": 0
+  },
+  "schedule_storage": {
+    "load_calls": 60,
+    "save_calls": 0
+  },
+  "font_cache": {
+    "hits": 0,
+    "misses": 0,
+    "maxsize": 128,
+    "currsize": 0
+  },
+  "_meta": {
+    "captured_at": "2026-05-10",
+    "session_kind": "synthetic-testclient",
+    "cycle_count": 60,
+    "notes": "Pre-Batch-7 baseline. Sweep #1 hypothesized ContentStorage.list_all + PlaylistStorage.load_all as 2-3x amplified per request. These numbers prove the multiplier on a clean testclient session."
+  }
+}

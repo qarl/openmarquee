@@ -200,16 +200,25 @@ class Flock(BaseModel):
 class FlockStorage:
     """Atomic file-backed persistence for the flock."""
 
+    # Perf counters (Batch 6.1). See ContentStorage._stats comment.
+    _stats: dict[str, int] = {"load_calls": 0, "save_calls": 0}
+
     def __init__(self, path: Path):
         self.path = Path(path)
 
+    @classmethod
+    def stats_snapshot(cls) -> dict[str, int]:
+        return dict(cls._stats)
+
     def load(self) -> Flock:
+        type(self)._stats["load_calls"] += 1
         if not self.path.exists():
             return Flock()
         data = json.loads(self.path.read_text())
         return Flock.model_validate(data)
 
     def save(self, flock: Flock) -> None:
+        type(self)._stats["save_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(flock.model_dump_json(indent=2))

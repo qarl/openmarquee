@@ -58,9 +58,23 @@ _CONTENT_ADAPTER: TypeAdapter[ContentItem] = TypeAdapter(ContentItem)
 class ContentStorage:
     """Persists content items as files on disk — one subdirectory per item."""
 
+    # Perf counters (Batch 6.1). Class-level so the singleton's stats
+    # survive across `Depends()` resolutions and any future per-test
+    # instance creation. Snapshot via `GET /api/system/perf-stats`.
+    _stats: dict[str, int] = {
+        "list_all_calls": 0,
+        "load_calls": 0,
+        "save_calls": 0,
+        "envelope_validates": 0,
+    }
+
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def stats_snapshot(cls) -> dict[str, int]:
+        return dict(cls._stats)
 
     # --- writes ---
 
@@ -82,6 +96,7 @@ class ContentStorage:
         Pass an explicit value when ingesting from a peer so the
         original stamp travels with the content.
         """
+        type(self)._stats["save_calls"] += 1
         item_dir = self.root / str(item.id)
         item_dir.mkdir(parents=True, exist_ok=True)
 
@@ -159,6 +174,7 @@ class ContentStorage:
 
     def load(self, item_id: UUID) -> ContentItem:
         """Load a content item by id. Raises FileNotFoundError if missing."""
+        type(self)._stats["load_calls"] += 1
         envelope_path = self.root / str(item_id) / _ENVELOPE_FILENAME
         if not envelope_path.exists():
             raise FileNotFoundError(f"no content item at {envelope_path}")
@@ -173,6 +189,7 @@ class ContentStorage:
 
         # TypeAdapter dispatches to the right ContentItem variant based on
         # the `type` literal. Unknown types surface as validation errors.
+        type(self)._stats["envelope_validates"] += 1
         item = _CONTENT_ADAPTER.validate_python(data["item"])
         # Populate the output-only updated_at mirror so API consumers can
         # cachebust asset URLs (`?v=${updated_at}`) and pick up new bytes
@@ -240,6 +257,7 @@ class ContentStorage:
         Resilient to the root being deleted at runtime (e.g. SD card swap,
         manual cleanup) — returns an empty list rather than raising.
         """
+        type(self)._stats["list_all_calls"] += 1
         if not self.root.exists():
             return []
         items: list[ContentItem] = []

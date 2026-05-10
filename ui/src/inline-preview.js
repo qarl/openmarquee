@@ -26,6 +26,7 @@
 import { formatAutoText } from "./auto-format.js";
 import { anyLayerAnimated } from "./canvas-motion.js";
 import { drawTextOnly } from "./editor.js";
+import { markEnd, markStart } from "./perf.js";
 
 const TEMPLATE = `
     <section class="inline-preview" aria-label="playlist preview">
@@ -1017,6 +1018,7 @@ export function mountInlinePreview(container, options) {
 
     function tick(now) {
         if (!playing) return;
+        markStart("inline-preview.tick");
         if (lastTick == null) lastTick = now;
         const dt = (now - lastTick) / 1000;
         lastTick = now;
@@ -1026,6 +1028,7 @@ export function mountInlinePreview(container, options) {
         slider.value = String(position.toFixed(2));
         timeEl.textContent = formatRange(position, totalSec);
         renderOnce();
+        markEnd("inline-preview.tick");
         rafId = requestAnimationFrame(tick);
     }
 

@@ -34,6 +34,7 @@ from openmarquee.dependencies import (
     get_stream_manager,
 )
 from openmarquee.dev import router as dev_router
+from openmarquee.perf_middleware import PerfMiddleware
 from openmarquee.seed import seed_if_needed
 
 
@@ -155,6 +156,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
+
+# Perf middleware -- timestamps each HTTP request, logs slow ones,
+# and pushes records into the in-memory ring exposed at
+# /api/system/perf-stats. Mount BEFORE routers so it wraps them.
+app.add_middleware(PerfMiddleware)
 
 
 @app.exception_handler(RequestValidationError)

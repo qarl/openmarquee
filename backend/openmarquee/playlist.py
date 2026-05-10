@@ -221,8 +221,18 @@ class PlaylistStorage:
     auto-append/remove plumbing.
     """
 
+    # Perf counters (Batch 6.1). See ContentStorage._stats comment.
+    _stats: dict[str, int] = {
+        "load_all_calls": 0,
+        "save_all_calls": 0,
+    }
+
     def __init__(self, path: Path):
         self.path = Path(path)
+
+    @classmethod
+    def stats_snapshot(cls) -> dict[str, int]:
+        return dict(cls._stats)
 
     # --- collection primitives ---
 
@@ -230,6 +240,7 @@ class PlaylistStorage:
         """Return the full collection. Migrates legacy formats on the fly
         (v1/v2/v3 → v4) AND rewrites the file on a successful migration
         so subsequent loads skip the conversion."""
+        type(self)._stats["load_all_calls"] += 1
         if not self.path.exists():
             return _bootstrap_default_collection()
         data = json.loads(self.path.read_text())
@@ -240,6 +251,7 @@ class PlaylistStorage:
 
     def save_all(self, collection: PlaylistCollection) -> None:
         """Atomically write the full collection to disk."""
+        type(self)._stats["save_all_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(collection.model_dump_json(indent=2))

@@ -348,10 +348,18 @@ class SettingsStorage:
     semantics baked in via Pydantic validation.
     """
 
+    # Perf counters (Batch 6.1). See ContentStorage._stats comment.
+    _stats: dict[str, int] = {"load_calls": 0, "save_calls": 0}
+
     def __init__(self, path: Path):
         self.path = Path(path)
 
+    @classmethod
+    def stats_snapshot(cls) -> dict[str, int]:
+        return dict(cls._stats)
+
     def load(self) -> SystemSettings:
+        type(self)._stats["load_calls"] += 1
         """Load settings from disk. On first access (no file yet) we mint
         fresh defaults AND persist them — otherwise sign_name's random
         factory would hand out a different name on every reload and the
@@ -381,6 +389,7 @@ class SettingsStorage:
 
     def save(self, settings: SystemSettings) -> None:
         """Replace the on-disk settings with `settings`. Atomic via rename."""
+        type(self)._stats["save_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(settings.model_dump_json(indent=2))

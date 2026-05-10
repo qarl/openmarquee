@@ -17,6 +17,7 @@ import Sortable from "sortablejs";
 import { attachAutoSave } from "./auto-save.js";
 import { attachAutoTextOverlay } from "./auto-text-overlay.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
+import { markEnd, markStart } from "./perf.js";
 
 // Per-block transition selector options. The pulldown UX replaced the
 // prior cycle-button per the 2026-04-28 design batch; this list is the
@@ -248,6 +249,7 @@ export function mountPlaylistTrack(container, options) {
     }
 
     async function refresh() {
+        markStart("playlist-track.refresh");
         statusEl.textContent = "";
         refreshVersion += 1;
         // Destroy existing Sortables BEFORE re-rendering tiles. Sortable.js
@@ -343,6 +345,8 @@ export function mountPlaylistTrack(container, options) {
             }
         } catch (err) {
             statusEl.textContent = `Could not load playlist: ${err.message}`;
+        } finally {
+            markEnd("playlist-track.refresh");
         }
     }
 
