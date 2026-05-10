@@ -46,15 +46,18 @@ if TYPE_CHECKING:
     from openmarquee.content import TextLayer, TextSlide
 
 
-# Perf counters (Batch 8.1). Module-level (motion is not a class).
-# image_new_calls covers every RGBA scratch buffer Image.new(...)
-# call made by the _apply_* effects + compose_motion_frame --
-# Batch 8.4 will introduce a scratch pool to drive this toward zero
-# on the warm path. compose_motion_frame_calls bumps once per slide
-# frame so we can compute the per-frame Image.new ratio.
+# Perf counters (Batch 8.1 / 8.4).
+# * image_new_calls: every true PIL Image.new("RGBA", ...) allocation
+#   in this module -- bumps on pool miss + on truly-persistent
+#   buffer creation (render_layer_to_rgba's output).
+# * scratch_pool_hits (Batch 8.4): pool reuse on _apply_* paths --
+#   delta vs image_new_calls is the cache-effectiveness signal.
+# * compose_motion_frame_calls: once per slide frame so per-frame
+#   ratios can be derived.
 _stats: dict[str, int] = {
     "compose_motion_frame_calls": 0,
     "image_new_calls": 0,
+    "scratch_pool_hits": 0,
 }
 
 
@@ -63,11 +66,68 @@ def stats_snapshot() -> dict[str, int]:
 
 
 def _new_rgba(size: tuple[int, int]) -> Image.Image:
-    """Allocate a transparent RGBA buffer. Counted in `_stats` so the
-    perf baseline can see how many fresh allocations a single
-    compose_motion_frame triggers."""
+    """Allocate a fresh transparent RGBA buffer. Use when the caller
+    needs a persistent buffer (e.g. layer_bitmap_cache entries in
+    render_layer_to_rgba); use _scratch_rgba for transient _apply_*
+    output that lives only until the next alpha_composite into base."""
     _stats["image_new_calls"] += 1
     return Image.new("RGBA", size, (0, 0, 0, 0))
+
+
+# Scratch buffer pool (Batch 8.4). Keyed by (width, height) -- one
+# slot per size. The _apply_* effects allocate transient RGBA
+# buffers that live only until compose_motion_frame's
+# `base.alpha_composite(layer_rgba)` consumes them and moves on to
+# the next layer. Reusing the same backing buffer across frames
+# avoids the per-frame malloc + zero-fill at 1080 p (~8 MB / RGBA
+# buffer; allocating one fresh per frame measured ~3 ms on Pi Zero
+# 2 W in sweep #1 traces).
+#
+# Single-slot-per-size is safe because no _apply_* allocates two
+# buffers of the same size within one call (audited at Batch 8.4
+# write time: ticker/breathe/pulse/bounce/shake/blink each have at
+# most one (bw,bh) and one layer_rgba.size buffer, distinct).
+# Multi-layer flows are sequential: layer N's scratch is consumed
+# by alpha_composite before layer N+1 calls _scratch_rgba.
+#
+# NOT used by render_layer_to_rgba (its output goes into
+# layer_bitmap_cache across frames -- must stay fresh per cache
+# entry). Only _apply_* effects pull from the pool.
+_scratch_pool: dict[tuple[int, int], Image.Image] = {}
+
+
+def _scratch_rgba(size: tuple[int, int]) -> Image.Image:
+    """Return a cleared RGBA buffer of `size`. Hits the pool when a
+    buffer of that size already exists; otherwise allocates a fresh
+    one and caches it for next time. The caller may mutate the
+    returned buffer freely; the next _scratch_rgba(same_size) call
+    will clear and return the same instance.
+
+    CAVEAT: callers must NOT request two same-size buffers within
+    one call -- the second clears the first. Today the _apply_*
+    effects allocate at most one (bw,bh) + one layer_rgba.size
+    buffer, and the TextBox schema clamps box.w/h to [0.1, 0.9] so
+    (bw,bh) != layer_rgba.size by construction. A future degenerate
+    full-box test fixture would re-introduce the collision."""
+    buf = _scratch_pool.get(size)
+    if buf is not None:
+        _stats["scratch_pool_hits"] += 1
+        # paste() with a tuple fill paints the whole image. The
+        # default no-box paste covers (0, 0, w, h), so this fully
+        # resets to transparent.
+        buf.paste((0, 0, 0, 0), (0, 0, size[0], size[1]))
+        return buf
+    _stats["image_new_calls"] += 1
+    buf = Image.new("RGBA", size, (0, 0, 0, 0))
+    _scratch_pool[size] = buf
+    return buf
+
+
+def clear_scratch_pool() -> None:
+    """Drop pooled buffers. Test hook + safety valve if pool memory
+    grows beyond expected (e.g. operator drives the renderer through
+    many different sizes in succession)."""
+    _scratch_pool.clear()
 
 log = logging.getLogger(__name__)
 
@@ -134,7 +194,7 @@ def _apply_ticker(
     arr = np.array(box_region)
     arr = np.roll(arr, shift_px, axis=1)
     rolled = Image.fromarray(arr, mode="RGBA")
-    out = _new_rgba(layer_rgba.size)
+    out = _scratch_rgba(layer_rgba.size)
     out.paste(rolled, (bx, by))
     return out
 
@@ -184,9 +244,9 @@ def _apply_breathe(
     new_cy = box_cy + s * dy
     paste_x = int(round(new_cx - new_w / 2))
     paste_y = int(round(new_cy - new_h / 2))
-    out_box = _new_rgba((bw, bh))
+    out_box = _scratch_rgba((bw, bh))
     out_box.paste(scaled, (paste_x, paste_y), scaled)
-    out = _new_rgba(layer_rgba.size)
+    out = _scratch_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -210,7 +270,7 @@ def _apply_pulse(
     arr = np.array(box_region)
     arr[:, :, 3] = (arr[:, :, 3].astype(np.float32) * a).astype(np.uint8)
     out_box = Image.fromarray(arr, mode="RGBA")
-    out = _new_rgba(layer_rgba.size)
+    out = _scratch_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -239,9 +299,9 @@ def _apply_bounce(
     amplitude = (intensity / 100.0) * 0.10  # 0..10 % box height at 100
     offset_px = -int(round(amplitude * bh * abs(math.sin(2 * math.pi * phase))))
     box_region = layer_rgba.crop((bx, by, bx + bw, by + bh))
-    out_box = _new_rgba((bw, bh))
+    out_box = _scratch_rgba((bw, bh))
     out_box.paste(box_region, (0, offset_px))
-    out = _new_rgba(layer_rgba.size)
+    out = _scratch_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -283,9 +343,9 @@ def _apply_shake(
     rng = np.random.default_rng(_shake_seed(layer_id, motion_phase, step))
     dx = int(round(rng.normal(0, amplitude_px / 2)))
     dy = int(round(rng.normal(0, amplitude_px / 2)))
-    out_box = _new_rgba((bw, bh))
+    out_box = _scratch_rgba((bw, bh))
     out_box.paste(box_region, (dx, dy))
-    out = _new_rgba(layer_rgba.size)
+    out = _scratch_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -301,7 +361,7 @@ def _apply_blink(
     comes from _effect_freq → _blink_freq."""
     if phase < 0.5:
         return layer_rgba
-    return _new_rgba(layer_rgba.size)
+    return _scratch_rgba(layer_rgba.size)
 
 
 def apply_motion(
