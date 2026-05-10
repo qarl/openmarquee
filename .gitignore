@@ -70,6 +70,7 @@ ui/fonts/noto-color-emoji.ttf
 *.swp
 *.swo
 *~
+*.bak
 
 # Env / secrets
 .env

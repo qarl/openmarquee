@@ -36,6 +36,7 @@ sync_to_build_dir() {
         --exclude='.Jimmy' \
         --exclude='.DS_Store' \
         --exclude='._*' \
+        --exclude='*.bak' \
         --exclude='.fuse_hidden*' \
         --exclude='*.partial' \
         --exclude='openmarquee-content' \
