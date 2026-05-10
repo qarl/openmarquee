@@ -3144,12 +3144,11 @@ unsafe fn ensure_scene_fbo(session: &mut EglSession, w: u32, h: u32) -> Result<(
 }
 
 /// CRIT-A (2026-05-10): cached FS_BRIGHT_GAMMA program + resolved
-/// attribute / uniform locations + reused fullscreen-quad VBO.
-/// Mirrors CachedSpProgram / CachedGlyphProgram. Pre-fix
-/// run_bright_gamma_pass did link_program + 3x get_uniform_location
-/// + create_buffer + buffer_data + delete_buffer + delete_program
-/// PER FRAME on every non-identity-color frame -- ~5 ms/frame on
-/// vc4 with the link being the dominant cost.
+/// attribute / uniform locations. P2-G (2026-05-10) extracted the
+/// fullscreen-quad VBO into a shared `cached_textured_quad_vbo`
+/// (also used by run_blit_pass + run_overlay_blend_pass; identical
+/// geometry, single allocation). Mirrors CachedSpProgram /
+/// CachedGlyphProgram.
 #[derive(Clone, Copy)]
 struct CachedBrightGammaProgram {
     program: glow::NativeProgram,
@@ -3160,14 +3159,37 @@ struct CachedBrightGammaProgram {
     u_gamma: Option<glow::NativeUniformLocation>,
 }
 
+/// P2-G (2026-05-10): cached FS_OVERLAY_BLEND program + locations.
+/// Pre-fix run_overlay_blend_pass did link_program + create_buffer
+/// + 2x get_attrib_location + 2x get_uniform_location + draw +
+/// delete_buffer + delete_program EVERY frame the slide had a
+/// non-Normal-blend layer (overlay-route hot path). Same shape as
+/// CachedBrightGammaProgram.
+#[derive(Clone, Copy)]
+struct CachedOverlayBlendProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_layer_tex: Option<glow::NativeUniformLocation>,
+    u_slide_tex: Option<glow::NativeUniformLocation>,
+}
+
 std::thread_local! {
     static BRIGHT_GAMMA_PROGRAM: std::cell::Cell<Option<CachedBrightGammaProgram>> =
         const { std::cell::Cell::new(None) };
-    /// Cached fullscreen-quad VBO for the bright/gamma post-pass.
-    /// Geometry is STATIC_DRAW (NDC [-1,1] x UV [0,1]) so reuse
-    /// across frames is safe (no driver-sync concern that bit P2-F's
-    /// STREAM_DRAW VBO reuse).
-    static BRIGHT_GAMMA_QUAD_VBO: std::cell::Cell<Option<glow::NativeBuffer>> =
+    static OVERLAY_BLEND_PROGRAM: std::cell::Cell<Option<CachedOverlayBlendProgram>> =
+        const { std::cell::Cell::new(None) };
+    /// P2-G (2026-05-10): shared fullscreen-quad VBO for every
+    /// post-pass that draws a textured fullscreen quad
+    /// (run_bright_gamma_pass + run_blit_pass +
+    /// run_overlay_blend_pass). Geometry is STATIC_DRAW (NDC
+    /// [-1,1] x UV [0,1]) so reuse across calls is safe (no
+    /// driver-sync hazard like P2-F's reverted STREAM_DRAW). Single
+    /// allocation across all three call paths; replaces CRIT-A's
+    /// BRIGHT_GAMMA_QUAD_VBO + the per-call create_textured_quad
+    /// helper that run_blit_pass / run_overlay_blend_pass were
+    /// using.
+    static TEXTURED_QUAD_VBO: std::cell::Cell<Option<glow::NativeBuffer>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -3203,18 +3225,51 @@ unsafe fn cached_bright_gamma_program(
     })
 }
 
-unsafe fn cached_bright_gamma_vbo(gl: &glow::Context) -> Result<glow::NativeBuffer> {
+unsafe fn cached_overlay_blend_program(
+    gl: &glow::Context,
+) -> Result<CachedOverlayBlendProgram> {
     use glow::HasContext;
-    BRIGHT_GAMMA_QUAD_VBO.with(|c| {
+    OVERLAY_BLEND_PROGRAM.with(|c| {
+        if let Some(cop) = c.get() {
+            return Ok(cop);
+        }
+        let program = link_program(gl, VS_TEXTURED_QUAD, FS_OVERLAY_BLEND)
+            .context("link FS_OVERLAY_BLEND")?;
+        let a_pos = gl
+            .get_attrib_location(program, "a_pos")
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (overlay_blend)"))?;
+        let a_uv = gl
+            .get_attrib_location(program, "a_uv")
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (overlay_blend)"))?;
+        let u_layer_tex = gl.get_uniform_location(program, "u_layer_tex");
+        let u_slide_tex = gl.get_uniform_location(program, "u_slide_tex");
+        let cop = CachedOverlayBlendProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_layer_tex,
+            u_slide_tex,
+        };
+        c.set(Some(cop));
+        Ok(cop)
+    })
+}
+
+/// Shared fullscreen-quad VBO for textured-quad post-passes.
+/// Lazy-allocated on first call; STATIC_DRAW (geometry never
+/// changes between calls). Used by run_bright_gamma_pass +
+/// run_blit_pass + run_overlay_blend_pass.
+unsafe fn cached_textured_quad_vbo(gl: &glow::Context) -> Result<glow::NativeBuffer> {
+    use glow::HasContext;
+    TEXTURED_QUAD_VBO.with(|c| {
         if let Some(vbo) = c.get() {
             return Ok(vbo);
         }
         let vbo = gl
             .create_buffer()
-            .map_err(|e| anyhow!("glGenBuffers(bright_gamma_quad): {e}"))?;
+            .map_err(|e| anyhow!("glGenBuffers(textured_quad): {e}"))?;
         // Fullscreen quad with UV (0,0) at top-left -> bottom in
-        // NDC because gl_FragCoord origin is bottom-left. Mirrors
-        // create_textured_quad's geometry exactly.
+        // NDC because gl_FragCoord origin is bottom-left.
         let verts: [f32; 16] = [
             -1.0, -1.0, 0.0, 0.0,
              1.0, -1.0, 1.0, 0.0,
@@ -3232,9 +3287,8 @@ unsafe fn cached_bright_gamma_vbo(gl: &glow::Context) -> Result<glow::NativeBuff
     })
 }
 
-/// Delete cached bright/gamma program + VBO while the GL context
-/// is still bound. Called from with_egl_session teardown
-/// (alongside clear_glyph_program_cache).
+/// Delete cached post-pass programs + shared VBO while the GL
+/// context is still bound. Called from with_egl_session teardown.
 fn clear_bright_gamma_cache(gl: &glow::Context) {
     use glow::HasContext;
     BRIGHT_GAMMA_PROGRAM.with(|c| {
@@ -3242,7 +3296,12 @@ fn clear_bright_gamma_cache(gl: &glow::Context) {
             unsafe { gl.delete_program(cgp.program); }
         }
     });
-    BRIGHT_GAMMA_QUAD_VBO.with(|c| {
+    OVERLAY_BLEND_PROGRAM.with(|c| {
+        if let Some(cop) = c.replace(None) {
+            unsafe { gl.delete_program(cop.program); }
+        }
+    });
+    TEXTURED_QUAD_VBO.with(|c| {
         if let Some(vbo) = c.replace(None) {
             unsafe { gl.delete_buffer(vbo); }
         }
@@ -3262,7 +3321,7 @@ unsafe fn run_bright_gamma_pass(
 ) -> Result<()> {
     use glow::HasContext;
     let cgp = cached_bright_gamma_program(gl)?;
-    let vbo = cached_bright_gamma_vbo(gl)?;
+    let vbo = cached_textured_quad_vbo(gl)?;
     gl.use_program(Some(cgp.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
@@ -3278,8 +3337,8 @@ unsafe fn run_bright_gamma_pass(
     gl.disable_vertex_attrib_array(cgp.a_pos);
     gl.disable_vertex_attrib_array(cgp.a_uv);
     gl.bind_texture(glow::TEXTURE_2D, None);
-    // CRIT-A: program + vbo come from session-lived thread_local
-    // caches; never freed here. Cleanup happens in
+    // CRIT-A + P2-G: program + shared VBO come from session-lived
+    // thread_local caches; never freed here. Cleanup happens in
     // clear_bright_gamma_cache at session teardown.
     Ok(())
 }
@@ -6757,52 +6816,6 @@ fn paint_layers_via_overlay_route(
     work.map(|_| ())
 }
 
-/// v1-spec-delta #7 (slice c) helper -- build a fullscreen
-/// textured quad (NDC -1..1 × -1..1, UV 0..1 × 0..1) for a shader
-/// that takes `a_pos: vec2` + `a_uv: vec2`. Returns the (VBO,
-/// a_pos location, a_uv location) tuple. On any setup error,
-/// frees the program before propagating.
-unsafe fn create_textured_quad(
-    gl: &glow::Context,
-    program: glow::Program,
-) -> Result<(glow::Buffer, u32, u32)> {
-    use glow::HasContext;
-    // Fullscreen quad with UV (0,0) at top-left -> bottom in NDC
-    // because gl_FragCoord origin is bottom-left. We sample
-    // textures that were rendered in the same convention so the
-    // composite is identity-aligned.
-    let verts: [f32; 16] = [
-        -1.0, -1.0, 0.0, 0.0,
-         1.0, -1.0, 1.0, 0.0,
-        -1.0,  1.0, 0.0, 1.0,
-         1.0,  1.0, 1.0, 1.0,
-    ];
-    let vbo = gl
-        .create_buffer()
-        .map_err(|e| anyhow!("glGenBuffers(textured-quad): {e}"))?;
-    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    let bytes = std::slice::from_raw_parts(
-        verts.as_ptr() as *const u8,
-        std::mem::size_of_val(&verts),
-    );
-    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-    let a_pos = match gl.get_attrib_location(program, "a_pos") {
-        Some(loc) => loc,
-        None => {
-            gl.delete_buffer(vbo);
-            return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos"));
-        }
-    };
-    let a_uv = match gl.get_attrib_location(program, "a_uv") {
-        Some(loc) => loc,
-        None => {
-            gl.delete_buffer(vbo);
-            return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv"));
-        }
-    };
-    Ok((vbo, a_pos, a_uv))
-}
-
 /// v1-spec-delta #7 (slice c) helper -- create an RGBA8 color FBO
 /// + bound texture sized to (w, h). Returns the (FBO, texture)
 /// pair. On framebuffer-incomplete, frees both before propagating.
@@ -6866,38 +6879,31 @@ unsafe fn run_overlay_blend_pass(
     layer_tex: glow::NativeTexture,
 ) -> Result<()> {
     use glow::HasContext;
-    let program = link_program(gl, VS_TEXTURED_QUAD, FS_OVERLAY_BLEND)?;
-    let (vbo, a_pos, a_uv) = match create_textured_quad(gl, program) {
-        Ok(t) => t,
-        Err(e) => {
-            gl.delete_program(program);
-            return Err(e);
-        }
-    };
-    gl.use_program(Some(program));
-    let u_layer_tex = gl.get_uniform_location(program, "u_layer_tex");
-    let u_slide_tex = gl.get_uniform_location(program, "u_slide_tex");
+    let cop = cached_overlay_blend_program(gl)?;
+    let vbo = cached_textured_quad_vbo(gl)?;
+    gl.use_program(Some(cop.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(layer_tex));
-    gl.uniform_1_i32(u_layer_tex.as_ref(), 0);
+    gl.uniform_1_i32(cop.u_layer_tex.as_ref(), 0);
     gl.active_texture(glow::TEXTURE1);
     gl.bind_texture(glow::TEXTURE_2D, Some(scene_tex));
-    gl.uniform_1_i32(u_slide_tex.as_ref(), 1);
+    gl.uniform_1_i32(cop.u_slide_tex.as_ref(), 1);
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    gl.enable_vertex_attrib_array(a_pos);
-    gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
-    gl.enable_vertex_attrib_array(a_uv);
-    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.enable_vertex_attrib_array(cop.a_pos);
+    gl.vertex_attrib_pointer_f32(cop.a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(cop.a_uv);
+    gl.vertex_attrib_pointer_f32(cop.a_uv, 2, glow::FLOAT, false, 16, 8);
     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-    gl.disable_vertex_attrib_array(a_pos);
-    gl.disable_vertex_attrib_array(a_uv);
-    gl.delete_buffer(vbo);
-    gl.delete_program(program);
+    gl.disable_vertex_attrib_array(cop.a_pos);
+    gl.disable_vertex_attrib_array(cop.a_uv);
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, None);
     gl.active_texture(glow::TEXTURE1);
     gl.bind_texture(glow::TEXTURE_2D, None);
     gl.active_texture(glow::TEXTURE0);
+    // P2-G: program + shared VBO come from session-lived thread_
+    // local caches; never freed here. Cleanup in
+    // clear_bright_gamma_cache at session teardown.
     Ok(())
 }
 
@@ -6911,30 +6917,31 @@ unsafe fn run_blit_pass(
     src_tex: glow::NativeTexture,
 ) -> Result<()> {
     use glow::HasContext;
-    let program = link_program(gl, VS_TEXTURED_QUAD, FS_BLIT)?;
-    let (vbo, a_pos, a_uv) = match create_textured_quad(gl, program) {
-        Ok(t) => t,
-        Err(e) => {
-            gl.delete_program(program);
-            return Err(e);
-        }
-    };
-    gl.use_program(Some(program));
-    let u_src = gl.get_uniform_location(program, "u_src");
+    // P2-G (2026-05-10): use the existing session-cached
+    // CachedBlitProgram (was already cached for the atlas SB
+    // bg-cache path; just plug it in here too) + the shared
+    // cached_textured_quad_vbo. Pre-fix this path was per-call
+    // link_program + create_buffer + 2x get_attrib_location +
+    // 1x get_uniform_location + draw + delete_buffer +
+    // delete_program -- on the overlay-route final blit, that's
+    // every frame the slide has a non-Normal-blend layer.
+    let cbp = cached_blit_program(gl)?;
+    let vbo = cached_textured_quad_vbo(gl)?;
+    gl.use_program(Some(cbp.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
-    gl.uniform_1_i32(u_src.as_ref(), 0);
+    gl.uniform_1_i32(cbp.u_src.as_ref(), 0);
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    gl.enable_vertex_attrib_array(a_pos);
-    gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
-    gl.enable_vertex_attrib_array(a_uv);
-    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.enable_vertex_attrib_array(cbp.a_pos);
+    gl.vertex_attrib_pointer_f32(cbp.a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(cbp.a_uv);
+    gl.vertex_attrib_pointer_f32(cbp.a_uv, 2, glow::FLOAT, false, 16, 8);
     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-    gl.disable_vertex_attrib_array(a_pos);
-    gl.disable_vertex_attrib_array(a_uv);
-    gl.delete_buffer(vbo);
-    gl.delete_program(program);
+    gl.disable_vertex_attrib_array(cbp.a_pos);
+    gl.disable_vertex_attrib_array(cbp.a_uv);
     gl.bind_texture(glow::TEXTURE_2D, None);
+    // Program + shared VBO come from session-lived caches; never
+    // freed here.
     Ok(())
 }
 
