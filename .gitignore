@@ -49,6 +49,12 @@ backend/openmarquee/seed_assets/*
 !backend/openmarquee/seed_assets/backgrounds/**
 !backend/openmarquee/seed_assets/videos/
 !backend/openmarquee/seed_assets/videos/**
+# Re-ignore AppleDouble + .DS_Store inside the un-ignored seed_assets
+# subtree -- the `**` negations above un-ignore EVERYTHING under those
+# paths, which would silently leak macOS metadata (`._brick-wall.png`
+# etc.) into `git add -A`. Negation-then-re-ignore closes the hole.
+backend/openmarquee/seed_assets/**/._*
+backend/openmarquee/seed_assets/**/.DS_Store
 
 # Playwright
 playwright-report/
