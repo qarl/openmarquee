@@ -32,6 +32,7 @@ import {
     densityLabelFor,
 } from "./bg-system.js";
 import { mountColorPicker } from "./color-picker.js";
+import { canvasToBase64 } from "./image-upload.js";
 import {
     anyLayerAnimated,
     paintLayerWithMotion,
@@ -2333,11 +2334,6 @@ export function pickFontSize(panelWidth) {
 // the operator can dial in something more specific from the field.
 export function pickFontSizePct() {
     return 30;
-}
-
-export function canvasToBase64(canvas) {
-    const dataUrl = canvas.toDataURL("image/png");
-    return dataUrl.split(",")[1];
 }
 
 /**

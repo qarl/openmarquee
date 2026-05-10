@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
 import {
-    canvasToBase64,
     drawCanvas,
     drawTextOnly,
     mountEditor,
@@ -254,13 +253,6 @@ describe("drawTextOnly (Phase 5b — Text-over-Video overlay)", () => {
         expect(canvas._ctx.fillText).toHaveBeenCalledTimes(2);
         expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("BOTTOM");
         expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("TOP");
-    });
-});
-
-describe("canvasToBase64", () => {
-    it("strips the data URL prefix, returning just the base64 body", () => {
-        const canvas = mockCanvas(2, 2);
-        expect(canvasToBase64(canvas)).toBe("FAKEDATA");
     });
 });
 

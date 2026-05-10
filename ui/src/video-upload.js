@@ -45,7 +45,7 @@ const TEMPLATE = `
 `;
 
 import { attachAutoSave } from "./auto-save.js";
-import { drawPlaceholderToCanvas } from "./image-upload.js";
+import { canvasToBase64, drawPlaceholderToCanvas } from "./image-upload.js";
 import {
     describeFfmpegError,
     transcodeToH264,
@@ -555,11 +555,6 @@ export function fileToBase64(file) {
         reader.onerror = () => reject(new Error("file read failed"));
         reader.readAsDataURL(file);
     });
-}
-
-function canvasToBase64(canvas) {
-    const dataUrl = canvas.toDataURL("image/png");
-    return dataUrl.split(",")[1];
 }
 
 /**
