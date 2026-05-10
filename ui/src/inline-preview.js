@@ -50,6 +50,15 @@ const TEMPLATE = `
 
 const PANEL_OUTPUT_MODES = new Set(["hub75", "ws281x", "composite"]);
 
+// Transitions that animate over their transition_ms window. Hoisted to
+// module scope (Batch 8.2) -- renderOnce() runs at rAF cadence (60 Hz)
+// so reallocating this set every tick was ~60 Set instances/sec.
+const ANIMATED_TRANSITIONS = new Set([
+    "fade", "wipe", "slide", "iris", "scroll", "flip",
+    "marquee", "dissolve", "pixelate", "halftone", "scanline",
+    "glitch", "push", "blinds", "shutter",
+]);
+
 function pickSkin(outputMode) {
     if (outputMode === "hub75") return "hub75";
     if (outputMode === "ws281x") return "ws281x";
@@ -75,6 +84,12 @@ export function mountInlinePreview(container, options) {
 
     const stage = container.querySelector(".inline-preview-stage");
     const canvas = container.querySelector(".inline-preview-canvas");
+    // Cache the canvas 2D context once at mount (Batch 8.2). The
+    // transition branches inside renderOnce + the drawSlot variants
+    // grabbed it inline 6 times per frame; getContext is cheap but
+    // not free, and the cached reference also makes the hot paths
+    // shorter to read.
+    const canvasCtx = canvas.getContext("2d");
     const autoText = container.querySelector(".inline-preview-auto-text");
     const idle = container.querySelector(".inline-preview-idle");
     const playBtn = container.querySelector(".inline-preview-play");
@@ -200,30 +215,13 @@ export function mountInlinePreview(container, options) {
         // it here keeps preview and device in sync.
         const timeInto = position - slot.startSec;
         const timeLeft = slot.endSec - position;
-        const ANIMATED = new Set([
-            "fade",
-            "wipe",
-            "slide",
-            "iris",
-            "scroll",
-            "flip",
-            "marquee",
-            "dissolve",
-            "pixelate",
-            "halftone",
-            "scanline",
-            "glitch",
-            "push",
-            "blinds",
-            "shutter",
-        ]);
-        const fadeSec = ANIMATED.has(slot.transition)
+        const fadeSec = ANIMATED_TRANSITIONS.has(slot.transition)
             ? slot.transition_ms / 1000
             : 0;
         if (fadeSec > 0 && timeLeft < fadeSec && timeline.length > 1) {
             const nextIdx = (idx + 1) % timeline.length;
             const progress = 1 - timeLeft / fadeSec; // 0 → 1 through window
-            const ctx = canvas.getContext("2d");
+            const ctx = canvasCtx;
             if (slot.transition === "fade") {
                 ctx.globalAlpha = progress;
                 drawSlot(timeline[nextIdx]);
@@ -755,7 +753,7 @@ export function mountInlinePreview(container, options) {
             // Not ready yet; leave whatever was drawn last.
             return;
         }
-        const ctx = canvas.getContext("2d");
+        const ctx = canvasCtx;
         const srcW = img.naturalWidth;
         const srcH = img.naturalHeight;
         if (sampler.width !== srcW) sampler.width = srcW;
@@ -775,7 +773,7 @@ export function mountInlinePreview(container, options) {
         // shared-clock semantics as the editor preview's rAF loop —
         // motion_phase still offsets the cycle per layer.
         const elapsed_s = position - slot.startSec;
-        const ctx = canvas.getContext("2d");
+        const ctx = canvasCtx;
         const srcW = width;
         const srcH = height;
         if (sampler.width !== srcW) sampler.width = srcW;
@@ -849,7 +847,7 @@ export function mountInlinePreview(container, options) {
     function drawVideo(item) {
         const video = getCachedVideo(item.id, item);
         if (video.readyState < 2 || !video.videoWidth) return;
-        const ctx = canvas.getContext("2d");
+        const ctx = canvasCtx;
         const srcW = video.videoWidth;
         const srcH = video.videoHeight;
         if (sampler.width !== srcW) sampler.width = srcW;
@@ -871,7 +869,7 @@ export function mountInlinePreview(container, options) {
     function drawTextOverVideo(item, videoId) {
         const video = getCachedVideo(videoId, item);
         if (video.readyState < 2 || !video.videoWidth) return;
-        const ctx = canvas.getContext("2d");
+        const ctx = canvasCtx;
         const srcW = video.videoWidth;
         const srcH = video.videoHeight;
         if (sampler.width !== srcW) sampler.width = srcW;
@@ -992,7 +990,7 @@ export function mountInlinePreview(container, options) {
     }
 
     function clearCanvas() {
-        const ctx = canvas.getContext("2d");
+        const ctx = canvasCtx;
         ctx.fillStyle = "#000";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
@@ -1019,16 +1017,21 @@ export function mountInlinePreview(container, options) {
     function tick(now) {
         if (!playing) return;
         markStart("inline-preview.tick");
-        if (lastTick == null) lastTick = now;
-        const dt = (now - lastTick) / 1000;
-        lastTick = now;
-        if (totalSec > 0) {
-            position = (position + dt) % totalSec;
+        try {
+            if (lastTick == null) lastTick = now;
+            const dt = (now - lastTick) / 1000;
+            lastTick = now;
+            if (totalSec > 0) {
+                position = (position + dt) % totalSec;
+            }
+            slider.value = String(position.toFixed(2));
+            timeEl.textContent = formatRange(position, totalSec);
+            renderOnce();
+        } finally {
+            // Always close the perf measure even if renderOnce throws,
+            // so window.__perf doesn't accumulate an unclosed mark.
+            markEnd("inline-preview.tick");
         }
-        slider.value = String(position.toFixed(2));
-        timeEl.textContent = formatRange(position, totalSec);
-        renderOnce();
-        markEnd("inline-preview.tick");
         rafId = requestAnimationFrame(tick);
     }
 
