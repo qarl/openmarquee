@@ -1,0 +1,28 @@
+{
+  "motion": {
+    "compose_motion_frame_calls": 120,
+    "image_new_calls": 150
+  },
+  "blend": {
+    "composite_with_blend_calls": 30,
+    "non_normal_calls": 30,
+    "float32_array_creates": 90
+  },
+  "auto_render": {
+    "load_background_calls": 120,
+    "png_decodes": 30
+  },
+  "font_cache": {
+    "hits": 118,
+    "misses": 122,
+    "maxsize": 128,
+    "currsize": 2
+  },
+  "_meta": {
+    "captured_at": "2026-05-10",
+    "session_kind": "autorender-direct (30 frames each of auto+motion+blend+imgbg slides)",
+    "frame_count_per_slide": 30,
+    "commit": "Batch 8.1 -- autorender baseline pre-8.4/8.5/8.6",
+    "notes": "Per-frame allocation counts visible here. Batch 8.4/8.5/8.6 will drive these toward zero on warm-pool path."
+  }
+}

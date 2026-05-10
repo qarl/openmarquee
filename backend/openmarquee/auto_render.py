@@ -120,6 +120,21 @@ def resolve_timezone(tz_name: str | None) -> ZoneInfo:
 # --- internals ---
 
 
+# Perf counters (Batch 8.1). load_background_calls bumps per
+# entry; png_decodes counts the actual Image.open + convert in the
+# image-bg branch (skipped for solid / gradient / pattern). Batch
+# 8.6 will introduce an LRU cache keyed on (slide_id, width,
+# height) to drive png_decodes toward 1 per slide entry.
+_stats: dict[str, int] = {
+    "load_background_calls": 0,
+    "png_decodes": 0,
+}
+
+
+def stats_snapshot() -> dict[str, int]:
+    return dict(_stats)
+
+
 def _load_background(
     slide: TextSlide,
     width: int,
@@ -127,9 +142,11 @@ def _load_background(
     read_asset: Callable[[UUID], bytes] | None,
 ) -> Image.Image:
     """Build the background layer: image slide ref, gradient, or solid fill."""
+    _stats["load_background_calls"] += 1
     if slide.background_image_slide_id is not None and read_asset is not None:
         try:
             png = read_asset(slide.background_image_slide_id)
+            _stats["png_decodes"] += 1
             img = Image.open(io.BytesIO(png)).convert("RGB")
             if img.size != (width, height):
                 img = img.resize((width, height), resample=Image.Resampling.NEAREST)

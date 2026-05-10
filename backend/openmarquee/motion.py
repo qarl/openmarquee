@@ -45,6 +45,30 @@ if TYPE_CHECKING:
 
     from openmarquee.content import TextLayer, TextSlide
 
+
+# Perf counters (Batch 8.1). Module-level (motion is not a class).
+# image_new_calls covers every RGBA scratch buffer Image.new(...)
+# call made by the _apply_* effects + compose_motion_frame --
+# Batch 8.4 will introduce a scratch pool to drive this toward zero
+# on the warm path. compose_motion_frame_calls bumps once per slide
+# frame so we can compute the per-frame Image.new ratio.
+_stats: dict[str, int] = {
+    "compose_motion_frame_calls": 0,
+    "image_new_calls": 0,
+}
+
+
+def stats_snapshot() -> dict[str, int]:
+    return dict(_stats)
+
+
+def _new_rgba(size: tuple[int, int]) -> Image.Image:
+    """Allocate a transparent RGBA buffer. Counted in `_stats` so the
+    perf baseline can see how many fresh allocations a single
+    compose_motion_frame triggers."""
+    _stats["image_new_calls"] += 1
+    return Image.new("RGBA", size, (0, 0, 0, 0))
+
 log = logging.getLogger(__name__)
 
 
@@ -110,7 +134,7 @@ def _apply_ticker(
     arr = np.array(box_region)
     arr = np.roll(arr, shift_px, axis=1)
     rolled = Image.fromarray(arr, mode="RGBA")
-    out = Image.new("RGBA", layer_rgba.size, (0, 0, 0, 0))
+    out = _new_rgba(layer_rgba.size)
     out.paste(rolled, (bx, by))
     return out
 
@@ -160,9 +184,9 @@ def _apply_breathe(
     new_cy = box_cy + s * dy
     paste_x = int(round(new_cx - new_w / 2))
     paste_y = int(round(new_cy - new_h / 2))
-    out_box = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+    out_box = _new_rgba((bw, bh))
     out_box.paste(scaled, (paste_x, paste_y), scaled)
-    out = Image.new("RGBA", layer_rgba.size, (0, 0, 0, 0))
+    out = _new_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -186,7 +210,7 @@ def _apply_pulse(
     arr = np.array(box_region)
     arr[:, :, 3] = (arr[:, :, 3].astype(np.float32) * a).astype(np.uint8)
     out_box = Image.fromarray(arr, mode="RGBA")
-    out = Image.new("RGBA", layer_rgba.size, (0, 0, 0, 0))
+    out = _new_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -215,9 +239,9 @@ def _apply_bounce(
     amplitude = (intensity / 100.0) * 0.10  # 0..10 % box height at 100
     offset_px = -int(round(amplitude * bh * abs(math.sin(2 * math.pi * phase))))
     box_region = layer_rgba.crop((bx, by, bx + bw, by + bh))
-    out_box = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+    out_box = _new_rgba((bw, bh))
     out_box.paste(box_region, (0, offset_px))
-    out = Image.new("RGBA", layer_rgba.size, (0, 0, 0, 0))
+    out = _new_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -259,9 +283,9 @@ def _apply_shake(
     rng = np.random.default_rng(_shake_seed(layer_id, motion_phase, step))
     dx = int(round(rng.normal(0, amplitude_px / 2)))
     dy = int(round(rng.normal(0, amplitude_px / 2)))
-    out_box = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+    out_box = _new_rgba((bw, bh))
     out_box.paste(box_region, (dx, dy))
-    out = Image.new("RGBA", layer_rgba.size, (0, 0, 0, 0))
+    out = _new_rgba(layer_rgba.size)
     out.paste(out_box, (bx, by))
     return out
 
@@ -277,7 +301,7 @@ def _apply_blink(
     comes from _effect_freq → _blink_freq."""
     if phase < 0.5:
         return layer_rgba
-    return Image.new("RGBA", layer_rgba.size, (0, 0, 0, 0))
+    return _new_rgba(layer_rgba.size)
 
 
 def apply_motion(
@@ -339,7 +363,7 @@ def render_layer_to_rgba(
     # Without this, clocks on mid-tone backgrounds (the comment-cited
     # rationale in the prior auto_render code) lose contrast.
     outline_color = "#000000" if is_auto else None
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    img = _new_rgba((width, height))
     _draw_text_into(
         img,
         text=text,
@@ -477,6 +501,7 @@ def compose_motion_frame(
     1080 p). That cold-call shape is fine for tests + ad-hoc renders;
     the playback loop's hot path always passes the cache.
     """
+    _stats["compose_motion_frame_calls"] += 1
     if background_cache is not None and background_cache.size == (width, height):
         base = background_cache.copy()
     else:

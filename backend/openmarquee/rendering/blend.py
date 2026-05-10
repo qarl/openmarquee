@@ -40,6 +40,21 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
+# Perf counters (Batch 8.1). float32_array_creates covers every
+# `np.asarray(..., dtype=np.float32)` + `np.empty_like` allocation
+# inside composite_with_blend on a non-normal mode. Batch 8.5 will
+# pool these per (width, height) keyed scratch buffer.
+_stats: dict[str, int] = {
+    "composite_with_blend_calls": 0,
+    "non_normal_calls": 0,
+    "float32_array_creates": 0,
+}
+
+
+def stats_snapshot() -> dict[str, int]:
+    return dict(_stats)
+
+
 # Modes the TextLayer schema currently accepts. Keep in sync with the
 # Literal[...] in TextLayer.blend; adding a new mode is (a) extend the
 # schema, (b) extend this dispatch + tests.
@@ -68,6 +83,7 @@ def composite_with_blend(
     Unknown modes degrade gracefully to "normal" -- callers can
     propagate any future schema mode without breaking renders.
     """
+    _stats["composite_with_blend_calls"] += 1
     if mode == "normal" or mode not in _BLEND_MODES:
         out = base.copy()
         out.alpha_composite(top)
@@ -84,6 +100,8 @@ def composite_with_blend(
             f"got base={base.size}, top={top.size}"
         )
 
+    _stats["non_normal_calls"] += 1
+    _stats["float32_array_creates"] += 2  # base + top
     base_arr = np.asarray(base, dtype=np.float32) / 255.0
     top_arr = np.asarray(top, dtype=np.float32) / 255.0
 
@@ -120,6 +138,7 @@ def composite_with_blend(
     ) / safe_a
     result_rgb = np.clip(result_rgb, 0.0, 1.0)
 
+    _stats["float32_array_creates"] += 1
     out_arr = np.empty_like(base_arr)
     out_arr[..., :3] = result_rgb
     out_arr[..., 3:4] = result_a

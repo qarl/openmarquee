@@ -26,11 +26,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 
+from openmarquee import auto_render, motion
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_settings_storage
 from openmarquee.flock import FlockStorage
 from openmarquee.perf_middleware import recent_requests
 from openmarquee.playlist import PlaylistStorage
+from openmarquee.rendering import blend
 from openmarquee.schedule import ScheduleStorage
 from openmarquee.settings import SettingsStorage
 from openmarquee.text_raster import font_cache_info
@@ -481,6 +483,14 @@ class PerfStats(BaseModel):
     settings_storage: dict[str, int]
     schedule_storage: dict[str, int]
     font_cache: dict[str, int]
+    # Render-path counters (Batch 8.1) -- exercised when auto-mode,
+    # motion, blend, or image-bg slides actually fire through the
+    # playback loop. The synthetic-testclient baseline doesn't hit
+    # these; the autorender baseline (qa/perf-baseline-autorender-
+    # 2026-05-10.json) does.
+    motion: dict[str, int] = {}
+    blend: dict[str, int] = {}
+    auto_render: dict[str, int] = {}
     request_log: list[dict[str, object]] | None = None
 
 
@@ -500,5 +510,8 @@ async def perf_stats() -> PerfStats:
             "maxsize": cache.maxsize,
             "currsize": cache.currsize,
         },
+        motion=motion.stats_snapshot(),
+        blend=blend.stats_snapshot(),
+        auto_render=auto_render.stats_snapshot(),
         request_log=recent_requests(),
     )
