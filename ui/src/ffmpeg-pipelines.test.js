@@ -175,9 +175,12 @@ describe("transcodeToH264", () => {
             { onProgress },
         );
 
-        // Drain microtasks: load + writeFile + listener-attach
-        // + exec entry, then we're parked inside exec.
-        await new Promise(r => setTimeout(r, 0));
+        // Drain microtasks until the listener attaches. Batch 7.4
+        // made the FFmpeg + util imports dynamic, adding ~2 extra
+        // microtask hops before instance.on() runs.
+        for (let i = 0; i < 20 && !ffmpegState.progressListener; i++) {
+            await new Promise(r => setTimeout(r, 0));
+        }
         expect(ffmpegState.progressListener).toBeTypeOf("function");
 
         ffmpegState.progressListener({ progress: 0.5 });
@@ -229,7 +232,9 @@ describe("transcodeToH264", () => {
             { file: new Blob([]), width: 320, height: 240 },
             { onProgress },
         );
-        await new Promise(r => setTimeout(r, 0));
+        for (let i = 0; i < 20 && !ffmpegState.progressListener; i++) {
+            await new Promise(r => setTimeout(r, 0));
+        }
         ffmpegState.progressListener({ progress: 0.3 });  // throws, swallowed
         releaseExec();
 

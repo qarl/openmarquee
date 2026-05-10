@@ -12,13 +12,26 @@
 // without Cross-Origin-Isolation headers, so this runs on the captive-
 // portal's bare HTTP surface without needing COOP/COEP.
 
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
+// Batch 7.4: @ffmpeg/ffmpeg + @ffmpeg/util are large (~30 KB
+// minified between them) and only needed for video uploads. Load
+// lazily inside getFfmpeg + transcodeToH264 so the cold path that
+// never uploads a video doesn't pay for the parse.
 
 const FFMPEG_CORE_BASE = "/dist/vendor/ffmpeg-core";
 
 let _instance = null;
 let _loadPromise = null;
+// Cached @ffmpeg/util namespace -- fetchFile is needed at transcode
+// time. Same import resolves to the same module via the dynamic-
+// import dedupe, so this just avoids the extra await on warm calls.
+let _ffmpegUtil = null;
+
+async function _getFfmpegUtil() {
+    if (!_ffmpegUtil) {
+        _ffmpegUtil = await import("@ffmpeg/util");
+    }
+    return _ffmpegUtil;
+}
 
 /**
  * Lazy-init the ffmpeg.wasm runtime and return the singleton instance.
@@ -35,6 +48,11 @@ export async function getFfmpeg() {
     if (_loadPromise) return _loadPromise;
 
     _loadPromise = (async () => {
+        // Lazy-import both packages -- they're only reachable from
+        // this singleton constructor, which only fires when a
+        // video upload starts.
+        const { FFmpeg } = await import("@ffmpeg/ffmpeg");
+        const { toBlobURL } = await _getFfmpegUtil();
         const instance = new FFmpeg();
         // Keep verbose log out of the UI — operators don't want a wall
         // of "frame=  42 fps=12 q=23.0 ..." text. Console only.
@@ -97,6 +115,7 @@ export async function transcodeToH264(
     { onStatus, onProgress } = {},
 ) {
     const ff = await getFfmpeg();
+    const { fetchFile } = await _getFfmpegUtil();
     const inName = `input-${Date.now()}`;
     const outName = `output-${Date.now()}.mp4`;
     await ff.writeFile(inName, await fetchFile(file));
