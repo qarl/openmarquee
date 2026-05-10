@@ -22,7 +22,6 @@ import logging
 import math
 from collections.abc import Callable
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -32,7 +31,7 @@ if TYPE_CHECKING:
     from openmarquee.content import BackgroundPattern
 from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from openmarquee.content import TextSlide
 
@@ -588,80 +587,13 @@ def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
 
 
-# Map the UI font-family strings to the bundled TTF filenames under
-# ui/fonts/. The browser editor uses these names via @font-face; server-
-# side auto-render (clock/date/day slides) has to resolve them to actual
-# file paths so Pillow picks the same face the operator picked in the UI.
-_BUNDLED_FONT_FILES = {
-    "Inter": "inter.ttf",
-    "Oswald": "oswald.ttf",
-    "Bebas Neue": "bebas-neue.ttf",
-    "Roboto Slab": "roboto-slab.ttf",
-    "Caveat Brush": "caveat-brush.ttf",
-    "Permanent Marker": "permanent-marker.ttf",
-    "Cinzel": "cinzel.ttf",
-    "UnifrakturCook": "unifrakturcook.ttf",
-    "Rye": "rye.ttf",
-    "Pacifico": "pacifico.ttf",
-    "Sedgwick Ave Display": "sedgwick-ave-display.ttf",
-    "Bowlby One SC": "bowlby-one-sc.ttf",
-    "Anton": "anton.ttf",
-    "Archivo Black": "archivo-black.ttf",
-    "Alfa Slab One": "alfa-slab-one.ttf",
-    "Playfair Display": "playfair-display.ttf",
-    "DM Serif Display": "dm-serif-display.ttf",
-    "VT323": "vt323.ttf",
-    "JetBrains Mono": "jetbrains-mono.ttf",
-    "Space Mono": "space-mono.ttf",
-    "Caveat": "caveat.ttf",
-    "Reenie Beanie": "reenie-beanie.ttf",
-    "Shadows Into Light": "shadows-into-light.ttf",
-}
-
-
-def _bundled_fonts_dir() -> Path:
-    """`ui/fonts/` alongside `backend/` in the repo layout."""
-    return Path(__file__).resolve().parent.parent.parent / "ui" / "fonts"
-
-
-def _load_font(family: str | None, size_px: int | None, canvas_height: int) -> ImageFont.ImageFont:
-    """Pick a best-effort font. Size defaults to ~40% of canvas height
-    so the auto value reads across a HUB75 panel without the operator
-    having to pick a size explicitly for every auto slide."""
-    size = size_px if size_px else max(8, int(canvas_height * 0.4))
-    if family:
-        # 1. Bundled @font-face family — load the matching TTF by path.
-        bundled = _BUNDLED_FONT_FILES.get(family)
-        if bundled:
-            path = _bundled_fonts_dir() / bundled
-            try:
-                return ImageFont.truetype(str(path), size=size)
-            except OSError:
-                pass
-        # 2. Raw path or system-registered name — let Pillow try.
-        try:
-            return ImageFont.truetype(family, size=size)
-        except OSError:
-            pass
-    # Last resort: PIL's bundled bitmap font ignores size but always loads.
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size=size)
-    except OSError:
-        return ImageFont.load_default()
-
-
-def _measure_centered(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font: ImageFont.ImageFont,
-    width: int,
-    height: int,
-) -> tuple[int, int, int, int]:
-    """Return (text_w, text_h, top_left_x, top_left_y) for centered text."""
-    # Pillow 10+: textbbox is the canonical sizing API.
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    x = (width - text_w) // 2 - bbox[0]
-    y = (height - text_h) // 2 - bbox[1]
-    return text_w, text_h, x, y
+# Font loading + measurement moved to text_raster.py so the
+# server-side renderers + seed pipeline share a cached truetype
+# loader. Underscore aliases preserved here because seed.py (and
+# possibly external callers) import them by their original names.
+from openmarquee.text_raster import (
+    BUNDLED_FONT_FILES as _BUNDLED_FONT_FILES,
+    bundled_fonts_dir as _bundled_fonts_dir,
+    load_font as _load_font,
+    measure_centered as _measure_centered,
+)
