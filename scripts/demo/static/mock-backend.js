@@ -213,6 +213,21 @@
     }
 
     // --- route table -------------------------------------------------------
+    //
+    // FastAPI paths handled by this mock (literal forms below so
+    // scripts/demo/check-mock-drift.py's substring search recognizes
+    // them; the actual handlers are regex-driven below):
+    //
+    //   GET    /api/content/{item_id}/asset      (line ~245)
+    //   GET    /api/content/{item_id}/video      (line ~247)
+    //   PATCH  /api/content/{item_id}/duration   (line ~250)
+    //   GET    /api/flock/manifest               (added 5.2)
+    //   POST   /api/flock/notify                 (added 5.2 -- no-op)
+    //   POST   /api/flock/sync-announce          (added 5.2 -- no-op)
+    //   GET    /api/playback/current-frame       (added 5.2)
+    //
+    // When adding new FastAPI routes, list them in this block too so
+    // the drift checker stays accurate.
 
     async function route(url, request) {
         const { pathname, searchParams } = url;
@@ -345,6 +360,15 @@
             });
         }
         if (pathname === "/api/playback/current-thumbnail" && method === "GET") {
+            const first = firstDefaultPlaylistItem();
+            if (!first) return noContent(204);
+            return assetResponse(first.id, "png", { "Cache-Control": "no-store" });
+        }
+        // /api/playback/current-frame -- HUB75 / WS2812B fleet UIs poll
+        // for a raw current-frame buffer. The demo doesn't run a real
+        // playback loop, so share the current-thumbnail asset; it's
+        // the same visual fidelity the inline preview already shows.
+        if (pathname === "/api/playback/current-frame" && method === "GET") {
             const first = firstDefaultPlaylistItem();
             if (!first) return noContent(204);
             return assetResponse(first.id, "png", { "Cache-Control": "no-store" });
@@ -705,6 +729,31 @@
                 return noContent();
             }
         }
+        // --- flock no-op endpoints ---
+        // /api/flock/sync-announce + /api/flock/notify: production
+        // chatter for cross-peer coordination. The demo runs in
+        // isolation (no real peers), so these are 204 no-ops -- the
+        // UI's fire-and-forget POSTs succeed and no state changes.
+        if (pathname === "/api/flock/sync-announce" && method === "POST") {
+            return noContent(204);
+        }
+        if (pathname === "/api/flock/notify" && method === "POST") {
+            return noContent(204);
+        }
+        // /api/flock/manifest: the production endpoint returns a
+        // manifest of the device's content for peer-sync. The demo's
+        // mock peers don't sync, so an empty manifest with the
+        // production shape (entries + tombstones, per
+        // backend/openmarquee/api_flock.py) satisfies any UI surface
+        // that polls it.
+        if (pathname === "/api/flock/manifest" && method === "GET") {
+            return jsonResponse({
+                schema_version: 1,
+                entries: [],
+                tombstones: [],
+            });
+        }
+
         // Fake-peer current-thumbnail: the Flock tile polls
         // http://<peer-address>/api/playback/current-thumbnail. In the
         // demo those URLs would fail (cross-origin, unreachable), so
