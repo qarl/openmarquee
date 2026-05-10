@@ -1,5 +1,5 @@
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -31,60 +31,52 @@ def client(storage: PlaylistStorage) -> TestClient:
         _playlist_storage_singleton.cache_clear()
 
 
-# --- Legacy single-playlist endpoint (operates on the default by id) ---
+# --- Multi-playlist (id-keyed) endpoints ---
 
 
-def test_get_empty_playlist_returns_empty_default(client: TestClient):
-    response = client.get("/api/playlist")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["item_ids"] == []
-    assert body["items"] == []
-    assert body["id"] == str(DEFAULT_PLAYLIST_ID)
-
-
-def test_put_then_get_round_trips_order(client: TestClient):
-    a, b, c = str(uuid4()), str(uuid4()), str(uuid4())
-    response = client.put("/api/playlist", json={"item_ids": [c, a, b]})
-    assert response.status_code == 200
-    assert response.json()["item_ids"] == [c, a, b]
-
-    response = client.get("/api/playlist")
-    assert response.json()["item_ids"] == [c, a, b]
+def test_put_rejects_non_uuid_strings(client: TestClient):
+    """Pydantic validation on the wire format -- legacy coverage
+    preserved against the new endpoint."""
+    created = client.post("/api/playlists", json={"name": "x"}).json()
+    pid = created["id"]
+    response = client.put(
+        f"/api/playlists/{pid}", json={"item_ids": ["not-a-uuid"]},
+    )
+    assert response.status_code == 422
 
 
 def test_put_with_empty_list_clears_the_playlist(client: TestClient):
     a = str(uuid4())
-    client.put("/api/playlist", json={"item_ids": [a]})
-    response = client.put("/api/playlist", json={"item_ids": []})
+    created = client.post(
+        "/api/playlists", json={"name": "x", "item_ids": [a]},
+    ).json()
+    pid = created["id"]
+    response = client.put(f"/api/playlists/{pid}", json={"item_ids": []})
     assert response.status_code == 200
     assert response.json()["item_ids"] == []
 
 
-def test_put_rejects_non_uuid_strings(client: TestClient):
-    response = client.put("/api/playlist", json={"item_ids": ["not-a-uuid"]})
-    assert response.status_code == 422
-
-
 def test_put_with_duplicate_ids_preserves_them_verbatim(client: TestClient):
-    """The constructor doesn't dedup — round-trip should preserve whatever
-    the UI sent, even if it's silly. (Playlist.append dedups, but PUT replaces
-    the whole list and trusts the caller.)"""
+    """PUT replaces the whole list verbatim -- no server-side dedup."""
+    created = client.post("/api/playlists", json={"name": "x"}).json()
+    pid = created["id"]
     a = str(uuid4())
-    response = client.put("/api/playlist", json={"item_ids": [a, a, a]})
+    response = client.put(
+        f"/api/playlists/{pid}", json={"item_ids": [a, a, a]},
+    )
     assert response.status_code == 200
     assert response.json()["item_ids"] == [a, a, a]
 
 
 def test_put_persists_across_requests(client: TestClient, storage: PlaylistStorage):
+    """Direct disk read proves PUT actually wrote, not just round-tripped."""
+    created = client.post("/api/playlists", json={"name": "x"}).json()
+    pid = created["id"]
     a = str(uuid4())
-    client.put("/api/playlist", json={"item_ids": [a]})
-    # Direct read from storage proves the PUT actually wrote to disk.
-    persisted = storage.load()
-    assert [str(item_id) for item_id in persisted.item_ids] == [a]
-
-
-# --- Multi-playlist (id-keyed) endpoints ---
+    client.put(f"/api/playlists/{pid}", json={"item_ids": [a]})
+    persisted = storage.get_by_id(UUID(pid))
+    assert persisted is not None
+    assert [str(item.item_id) for item in persisted.items] == [a]
 
 
 def test_get_playlists_returns_default_playlist_initially(client: TestClient):
@@ -157,25 +149,6 @@ def test_delete_playlist_by_id_removes_it(client: TestClient):
 def test_delete_playlist_by_id_404_when_missing(client: TestClient):
     response = client.delete(f"/api/playlists/{uuid4()}")
     assert response.status_code == 404
-
-
-def test_legacy_and_id_endpoints_see_the_same_default_playlist(
-    client: TestClient,
-):
-    """Setting via /api/playlist (legacy) should be readable via
-    /api/playlists/{DEFAULT_PLAYLIST_ID}, and vice versa."""
-    a, b = str(uuid4()), str(uuid4())
-    client.put("/api/playlist", json={"item_ids": [a, b]})
-
-    via_new = client.get(f"/api/playlists/{DEFAULT_PLAYLIST_ID}").json()
-    assert via_new["item_ids"] == [a, b]
-
-    c = str(uuid4())
-    client.put(
-        f"/api/playlists/{DEFAULT_PLAYLIST_ID}", json={"item_ids": [c]}
-    )
-    via_legacy = client.get("/api/playlist").json()
-    assert via_legacy["item_ids"] == [c]
 
 
 def test_rename_does_not_change_id(client: TestClient):

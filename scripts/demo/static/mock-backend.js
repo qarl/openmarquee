@@ -382,30 +382,6 @@
             saveState();
             return jsonResponse(playlist, { status: 201 });
         }
-        // Legacy single-playlist shortcut — operates on the default by id.
-        if (pathname === "/api/playlist" && method === "GET") {
-            const pl = findPlaylistById(DEFAULT_PLAYLIST_ID);
-            return jsonResponse(pl || {
-                id: DEFAULT_PLAYLIST_ID,
-                name: "default",
-                items: [],
-                item_ids: [],
-            });
-        }
-        if (pathname === "/api/playlist" && method === "PUT") {
-            const body = await request.json();
-            const items = normalizePlaylistItems(body);
-            const existing = findPlaylistById(DEFAULT_PLAYLIST_ID);
-            const playlist = {
-                id: DEFAULT_PLAYLIST_ID,
-                name: existing?.name || "default",
-                items,
-                item_ids: items.map((e) => e.item_id),
-            };
-            upsertPlaylist(playlist);
-            saveState();
-            return jsonResponse(playlist);
-        }
         const playlistMatch = pathname.match(/^\/api\/playlists\/([^/]+)$/);
         if (playlistMatch) {
             const playlistId = decodeURIComponent(playlistMatch[1]);

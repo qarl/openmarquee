@@ -110,7 +110,7 @@ const TEMPLATE = `
  * @param {() => Promise<Array>} options.fetchItems — all content items
  * @param {() => Promise<object>} options.fetchPlaylists — { playlists: { default: {items, item_ids}, ... } }
  * @param {(items: Array<{item_id, transition, transition_ms}>) => Promise<any>} options.onReorder
- *     — PUT /api/playlist with the canonical items shape
+ *     — PUT /api/playlists/{id} with the canonical items shape
  * @param {object} [options.inlinePreview] — optional injection:
  *     `{ width, height, outputMode, mount(slot, dims) }`. When set, the
  *     mount is called once right under the header and is expected to
@@ -425,7 +425,7 @@ function collectTrackIds(trackEl) {
 
 // The canonical-shape reader for save calls: returns the full
 // `{item_id, transition, transition_ms}` tuple per track block in DOM
-// order, so PUT /api/playlist can round-trip transitions too.
+// order, so PUT /api/playlists/{id} can round-trip transitions too.
 function collectTrackEntries(trackEl) {
     return Array.from(trackEl.querySelectorAll(".track-block[data-id]")).map(
         (li) => ({

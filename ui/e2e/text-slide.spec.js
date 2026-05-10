@@ -68,10 +68,11 @@ test("rejected save (text too long) surfaces the error", async ({ page }) => {
 test("playlist PUT reorders content via the API (what drag-reorder invokes)", async ({
     page,
 }) => {
-    // The UI drag-reorder flow ends in a PUT /api/playlist with the new id
-    // order. Driving Sortable's pointer-event internals from Playwright is
-    // flaky, so we verify the contract the drag handler depends on: PUT
-    // the new order via the exact same client path, and GET reflects it.
+    // The UI drag-reorder flow ends in a PUT /api/playlists/{id} with the
+    // new id order. Driving Sortable's pointer-event internals from
+    // Playwright is flaky, so we verify the contract the drag handler
+    // depends on: PUT the new order via the exact same client path, and
+    // GET reflects it.
     await saveTextSlide(page, "First");
     await clickNewSlide(page);
     await saveTextSlide(page, "Second");
@@ -82,9 +83,10 @@ test("playlist PUT reorders content via the API (what drag-reorder invokes)", as
     expect(content.map((item) => item.name)).toEqual(["First", "Second", "Third"]);
     const [first, second, third] = content.map((item) => item.id);
 
-    const putResponse = await page.request.put("/api/playlist", {
-        data: { item_ids: [third, second, first] },
-    });
+    const putResponse = await page.request.put(
+        "/api/playlists/00000000-0000-4000-8000-000000000001",
+        { data: { item_ids: [third, second, first] } },
+    );
     expect(putResponse.status()).toBe(200);
 
     const reordered = await (await page.request.get("/api/content")).json();
@@ -95,9 +97,10 @@ test("inline preview renders the playlist on the Playlists subpage", async ({ pa
     await saveTextSlide(page, "Loop", { text: "LOOP" });
 
     const content = await (await page.request.get("/api/content")).json();
-    await page.request.put("/api/playlist", {
-        data: { item_ids: [content[0].id] },
-    });
+    await page.request.put(
+        "/api/playlists/00000000-0000-4000-8000-000000000001",
+        { data: { item_ids: [content[0].id] } },
+    );
 
     // The Playlists subpage hosts the inline preview (client-side
     // simulator). The transport controls render unconditionally; the

@@ -145,9 +145,10 @@ test.fixme("inline preview mounts a <video> for a Text-over-Video slide's bg (Ph
     const textSlide = await saveResponse.json();
 
     // Put it in the default playlist so the inline preview picks it up.
-    const putResponse = await page.request.put("/api/playlist", {
-        data: { item_ids: [textSlide.id] },
-    });
+    const putResponse = await page.request.put(
+        "/api/playlists/00000000-0000-4000-8000-000000000001",
+        { data: { item_ids: [textSlide.id] } },
+    );
     expect(putResponse.status()).toBe(200);
 
     // Land on the playlists panel. The inline preview mounts the bg

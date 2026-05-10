@@ -35,11 +35,14 @@ test("auto-mode time slide ticks in the live preview overlay", async ({ page }) 
     // 2) Put the slide in the default playlist.
     const content = await (await page.request.get("/api/content")).json();
     const clockId = content[0].id;
-    await page.request.put("/api/playlist", {
-        data: {
-            items: [{ item_id: clockId, transition: "cut", transition_ms: 0 }],
+    await page.request.put(
+        "/api/playlists/00000000-0000-4000-8000-000000000001",
+        {
+            data: {
+                items: [{ item_id: clockId, transition: "cut", transition_ms: 0 }],
+            },
         },
-    });
+    );
 
     // 3) Playlists panel: the inline preview is the client-side simulator.
     //    Click the inline play button to start its own playback engine.

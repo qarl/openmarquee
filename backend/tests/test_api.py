@@ -10,7 +10,7 @@ from PIL import Image
 from openmarquee.app import app
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_content_storage, get_playlist_storage
-from openmarquee.playlist import PlaylistStorage
+from openmarquee.playlist import DEFAULT_PLAYLIST_ID, PlaylistStorage
 
 
 def _real_png_bytes() -> bytes:
@@ -499,7 +499,10 @@ def test_list_content_returns_items_in_playlist_order(
     c = UUID(client.post("/api/content/text-slides", json=_upload_payload(name="C")).json()["id"])
 
     # Reverse the playlist order.
-    client.put("/api/playlist", json={"item_ids": [str(c), str(b), str(a)]})
+    client.put(
+        f"/api/playlists/{DEFAULT_PLAYLIST_ID}",
+        json={"item_ids": [str(c), str(b), str(a)]},
+    )
 
     response = client.get("/api/content").json()
     assert [item["name"] for item in response] == ["C", "B", "A"]

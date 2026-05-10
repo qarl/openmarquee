@@ -1,9 +1,5 @@
 """REST API for playlists — UUID-keyed.
 
-Singular (legacy) endpoints — operate on the default playlist:
-    GET /api/playlist          — { id, name, items, item_ids }
-    PUT /api/playlist          — replace the default playlist's order
-
 Collection endpoints — manage any playlist by id:
     GET    /api/playlists           — { schema_version, playlists: [...] }
     POST   /api/playlists           — create a new playlist (server assigns id)
@@ -20,8 +16,6 @@ from pydantic import BaseModel, Field
 
 from openmarquee.dependencies import get_playlist_storage
 from openmarquee.playlist import (
-    DEFAULT_PLAYLIST_ID,
-    DEFAULT_PLAYLIST_NAME,
     Playlist,
     PlaylistCollection,
     PlaylistItem,
@@ -66,26 +60,6 @@ class PlaylistCreate(BaseModel):
         if self.item_ids is not None:
             return [PlaylistItem(item_id=i) for i in self.item_ids]
         return []
-
-
-# --- legacy single-playlist endpoints ---
-
-
-@router.get("/api/playlist", response_model=Playlist)
-async def get_default_playlist(storage: PlaylistDep) -> Playlist:
-    return storage.load()
-
-
-@router.put("/api/playlist", response_model=Playlist)
-async def set_default_playlist(payload: PlaylistUpdate, storage: PlaylistDep) -> Playlist:
-    items = payload.to_items()
-    name = payload.name if payload.name is not None else DEFAULT_PLAYLIST_NAME
-    playlist = Playlist(id=DEFAULT_PLAYLIST_ID, name=name, items=items)
-    storage.set_by_id(playlist)
-    return playlist
-
-
-# --- multi-playlist endpoints ---
 
 
 @router.get("/api/playlists", response_model=PlaylistCollection)
