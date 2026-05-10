@@ -1,9 +1,9 @@
 // Auto-slide end-to-end: create a time slide via the editor, start
 // playback, assert the live preview shows a ticking HH:MM:SS overlay
 // (first value → wait ≥1s → second value differs). Exercises the full
-// stack: editor save → auto_format wire shape → backend compose_auto_frame
-// on the playback loop → /api/playback/state surfacing current_item_auto_*
-// → live-preview overlay in DOM.
+// stack: editor save → auto_format wire shape → backend
+// compose_motion_frame on the playback loop → /api/playback/state
+// surfacing current_item_auto_* → live-preview overlay in DOM.
 
 import { expect, test } from "@playwright/test";
 import { resetServerState } from "./_helpers.js";

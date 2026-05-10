@@ -93,10 +93,11 @@ def render_auto_text_for_layer(layer, now: datetime) -> str:
 def render_auto_text(slide: TextSlide, now: datetime) -> str:
     """Slide-level compat wrapper for `render_auto_text_for_layer`.
 
-    Reads text_layers[0] only — single-layer behavior is preserved
-    for older callers (compose_auto_frame and the test surface that
-    imports this name). Multi-layer auto-mode rendering goes through
-    `render_auto_text_for_layer` directly via the unified composer.
+    Reads text_layers[0] only — single-layer behavior preserved for
+    test_auto_render.py + any ad-hoc string-only callers. Multi-
+    layer auto-mode rendering goes through
+    `render_auto_text_for_layer` directly via the unified composer
+    (motion.compose_motion_frame).
     """
     return render_auto_text_for_layer(slide.text_layers[0], now)
 
@@ -114,76 +115,6 @@ def resolve_timezone(tz_name: str | None) -> ZoneInfo:
     except Exception:
         log.warning("auto_render: unknown timezone %r, falling back to UTC", tz_name)
         return ZoneInfo("UTC")
-
-
-def compose_auto_frame(
-    slide: TextSlide,
-    width: int,
-    height: int,
-    now: datetime,
-    read_asset: Callable[[UUID], bytes] | None = None,
-) -> Image.Image:
-    """Render a fresh RGB frame for an auto-mode slide at `now`.
-
-    NOTE (2026-05-02): the playback loop no longer calls this — the
-    unified per-tick composer in `motion.compose_motion_frame` handles
-    auto AND motion in one pass (with proper multi-layer support and
-    auto+motion combination). This function is kept as a single-layer
-    compat shim for `test_auto_render.py` and any ad-hoc callers; it
-    is NOT the production render path. New work should target
-    `compose_motion_frame` instead.
-
-    Background resolution order:
-      1. If slide.background_image_slide_id is set AND read_asset is
-         provided, load that slide's PNG and resize-fit to (width, height).
-      2. Else fill with slide.background_color.
-
-    Text drawing:
-      - render_auto_text → current string
-      - Slide's font_family (if available system-side) + font_size_pct
-        of box width (or font_size_px as fallback)
-      - text_color; centered within the frame
-    """
-    # Base canvas.
-    base = _load_background(slide, width, height, read_asset)
-
-    # Current string.
-    value = render_auto_text(slide, now)
-
-    # Font: try slide.font_family first (as a TTF file path / PIL-loadable
-    # name), fall back to the platform default font. We bias toward the
-    # fallback so tests + first-boot devices never crash on a missing
-    # font — the rendered text might be blockier than the editor preview
-    # but that's a visible-quality issue, not a correctness one.
-    # Prefer the relative metric so the auto-render keeps proportional
-    # sizing across resolution changes. Fall back to absolute px on old
-    # slides that haven't been re-saved with the new field.
-    layer = slide.text_layers[0]
-    if layer.font_size_pct is not None:
-        # Spec 5.10a v3.1.2: pct is of BOX WIDTH, not slide height.
-        # Resizing the box visibly resizes the text -- operators
-        # expected that math (B3, 2026-05-05). Mirrors the
-        # _draw_text_into convention in seed.py and the editor canvas
-        # preview in ui/src/editor.js.
-        box_w_frac = float(getattr(getattr(layer, "box", None), "w", 1.0))
-        px_box_w = max(1, int(box_w_frac * width))
-        size_px = max(4, int(round(px_box_w * layer.font_size_pct / 100)))
-    else:
-        size_px = layer.font_size_px
-    font = _load_font(layer.font_family, size_px, height)
-
-    draw = ImageDraw.Draw(base)
-    text_w, text_h, text_x, text_y = _measure_centered(draw, value, font, width, height)
-    # Drop-shadow-ish: a 1-pixel black outline so the text reads on
-    # mid-tone backgrounds without relying on a matched shadow color.
-    color = layer.text_color
-    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-        draw.text((text_x + dx, text_y + dy), value, fill="#000000", font=font)
-    draw.text((text_x, text_y), value, fill=color, font=font)
-
-    # Silence unused return so future callers can read the bbox if needed.
-    _ = (text_w, text_h)
-    return base
 
 
 # --- internals ---

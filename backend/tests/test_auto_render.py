@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from openmarquee.auto_render import (
-    compose_auto_frame,
     render_auto_text,
     resolve_timezone,
 )
@@ -126,35 +125,7 @@ class TestResolveTimezone:
         assert resolve_timezone("Mars/Olympus_Mons") == ZoneInfo("UTC")
 
 
-# --- compose_auto_frame: smoke test the Pillow composition ---
-
-
-class TestComposeAutoFrame:
-    def test_produces_an_image_of_the_requested_dims(self):
-        slide = _auto_slide(auto_mode="time", auto_format="time_hm")
-        now = datetime(2026, 4, 21, 14, 30, tzinfo=ZoneInfo("UTC"))
-        img = compose_auto_frame(slide, 128, 96, now)
-        assert img.size == (128, 96)
-        assert img.mode == "RGB"
-
-    def test_uses_background_color_when_no_bg_slide(self):
-        slide = _auto_slide(
-            auto_mode="day",
-            auto_format="day_short",
-            background_color="#112233",
-        )
-        now = datetime(2026, 4, 21, tzinfo=ZoneInfo("UTC"))
-        img = compose_auto_frame(slide, 32, 32, now)
-        # The corner pixel (away from the text glyphs at center) should be
-        # the background color.
-        assert img.getpixel((0, 0)) == (0x11, 0x22, 0x33)
-
-    def test_different_times_produce_different_frames(self):
-        """Sanity: 14:30 and 14:31 aren't the same pixel bytes — catches a
-        wiring bug where the 'current time' string gets cached."""
-        slide = _auto_slide(auto_mode="time", auto_format="time_hm")
-        t1 = datetime(2026, 4, 21, 14, 30, tzinfo=ZoneInfo("UTC"))
-        t2 = datetime(2026, 4, 21, 14, 31, tzinfo=ZoneInfo("UTC"))
-        img1 = compose_auto_frame(slide, 128, 32, t1)
-        img2 = compose_auto_frame(slide, 128, 32, t2)
-        assert img1.tobytes() != img2.tobytes()
+# compose_auto_frame was deleted in Batch 5.3 -- the unified
+# motion.compose_motion_frame is the only render path; equivalent
+# coverage lives in test_motion.py (auto-layer outline test at line
+# 602, dim/bg/timing tests in TestComposeMotionFrame).
