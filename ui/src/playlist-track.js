@@ -12,7 +12,9 @@
 // playlists can come back via a later commit if the schedule UX needs
 // them visible.
 
-import Sortable from "sortablejs";
+// Batch 7.3: sortablejs is the largest dep in the playlist bundle
+// (~36 KB minified). Loaded lazily inside refresh() so the cold
+// path that doesn't open the Playlists panel doesn't pay for it.
 
 import { attachAutoSave } from "./auto-save.js";
 import { attachAutoTextOverlay } from "./auto-text-overlay.js";
@@ -322,14 +324,18 @@ export function mountPlaylistTrack(container, options) {
                 );
             }
 
-            trackSortable = bindTrackSortable(
-                trackEl,
-                markContentDirty,
-                itemByIdRef,
-                bindAddedBlockButtons,
-                () => refreshVersion,
-            );
-            palletSortable = bindPalletSortable(palletEl);
+            // Lazy-import sortablejs; the two binders await it. Parallel
+            // since they're independent.
+            [trackSortable, palletSortable] = await Promise.all([
+                bindTrackSortable(
+                    trackEl,
+                    markContentDirty,
+                    itemByIdRef,
+                    bindAddedBlockButtons,
+                    () => refreshVersion,
+                ),
+                bindPalletSortable(palletEl),
+            ]);
 
             // Eyebrow stats: total playlists, then this loop's block count + duration.
             const statsEl = container.querySelector("[data-playlist-stats]");
@@ -357,7 +363,8 @@ export function mountPlaylistTrack(container, options) {
     };
 }
 
-function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons, getCacheBust) {
+async function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons, getCacheBust) {
+    const { default: Sortable } = await import("sortablejs");
     return Sortable.create(trackEl, {
         group: { name: "playlist-track", pull: true, put: ["playlist-pallet"] },
         animation: 150,
@@ -402,7 +409,8 @@ function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons, getCa
     });
 }
 
-function bindPalletSortable(palletEl) {
+async function bindPalletSortable(palletEl) {
+    const { default: Sortable } = await import("sortablejs");
     return Sortable.create(palletEl, {
         // Dragging out of the pallet creates a clone (pallet tile stays put)
         // so the same slide can be added to the track multiple times.
