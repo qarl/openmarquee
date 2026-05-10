@@ -19,7 +19,7 @@ notes. No /dev/dri write; no DRM master grab needed beyond the
 read-only ioctls. Run as the openmarquee user on the Pi:
 
     cd /home/openmarquee/openmarquee
-    PYTHONPATH=backend python3 scripts/phase6_vc4_probe.py
+    PYTHONPATH=backend python3 scripts/probes/phase6_vc4_probe.py
 """
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent / "backend"
+# scripts/probes/<this file> -> ../../backend (parent.parent.parent).
+ROOT = Path(__file__).resolve().parent.parent.parent / "backend"
 sys.path.insert(0, str(ROOT))
 
 # Reuse the ctypes structs + ioctl numbers we already validated in

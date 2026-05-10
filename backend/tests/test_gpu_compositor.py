@@ -9,8 +9,9 @@ verbatim, so we only need to verify the math lands in the RIGHT
 plane property.
 
 Live-fire visual verification of the property math (ticker sweeps,
-pulse fades, no flicker) is covered by scripts/phase6_drm_compositor_
-smoke.py on the dev Pi, not here.
+pulse fades, no flicker) was historically covered by phase6 DRM
+compositor smoke scripts on the dev Pi (archived in git tag
+pre-rust-phase-scripts-2026-05-10 since the Rust renderer rewrite).
 """
 
 from __future__ import annotations

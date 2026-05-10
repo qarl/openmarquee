@@ -28,8 +28,9 @@ scaffolding (see commit a4347d2 / 9b2ea0c). The hot rewrite is the
 fragment shader + the layer-slot API → 2-input + transition_t.
 
 This is a Linux/vc4-specific module; tests on the Mac side mock the
-renderer. The Pi-side live-fire (scripts/phase7_shader_renderer_smoke.py)
-is the canonical correctness check.
+renderer. Pi-side live-fire historically used phase7_shader_renderer_-
+smoke.py (archived in git tag pre-rust-phase-scripts-2026-05-10
+since the Rust renderer rewrite supersedes the Python shader path).
 """
 
 from __future__ import annotations
