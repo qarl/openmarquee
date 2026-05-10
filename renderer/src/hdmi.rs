@@ -1930,13 +1930,23 @@ fn draw_text_layer(
         //
         // qarl-direct perf-profile (2026-05-08): glyph programs
         // are cached in thread-local Cells across paint_slide
-        // calls within the same EGL session. Cuts ~5 ms / frame
-        // / layer of GLSL compile cost — was the dominant per-
-        // frame cost in motion-shake at 1080p (paint p50 7.4 ms,
-        // of which link_program p50 was 5 ms).
+        // calls within the same EGL session.
+        //
+        // P2-F (2026-05-10): the cache now also holds resolved
+        // attribute + uniform locations (cgp.a_pos / .u_atlas /
+        // etc.), eliminating ~5 driver string lookups per layer
+        // per frame (~1500/sec at 5L+30fps).
+        //
+        // (P2-F also TRIED reusing the VBO across layers via
+        // STREAM_DRAW + buffer_data_u8_slice, but Pi bench at
+        // @60 showed a ~1 fps regression on flip transitions --
+        // suspected vc4 driver sync stall on rebinding a
+        // recently-streamed buffer. Reverted: per-call create_
+        // buffer + destroy_buffer remains. The driver-string
+        // lookup elimination is the bulk of the win regardless.)
         let t_link = std::time::Instant::now();
-        let program = match cached_glyph_program(gl, layer.outline) {
-            Ok(p) => p,
+        let cgp = match cached_glyph_program(gl, layer.outline) {
+            Ok(c) => c,
             Err(e) => {
                 if owns_tex {
                     gl.delete_texture(tex);
@@ -1945,10 +1955,6 @@ fn draw_text_layer(
             }
         };
         crate::profile::record_phase("link_program", t_link.elapsed().as_nanos() as u64);
-        // Programs come from the thread-local cache; never freed
-        // here even on error. clear_glyph_program_cache handles
-        // session-teardown cleanup.
-        let owns_program = false;
         let t_vbo = std::time::Instant::now();
         let vbo = match gl.create_buffer() {
             Ok(b) => b,
@@ -1967,42 +1973,18 @@ fn draw_text_layer(
         );
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
 
-        let a_pos = match gl.get_attrib_location(program, "a_pos") {
-            Some(loc) => loc,
-            None => {
-                gl.delete_buffer(vbo);
-                if owns_tex {
-                    gl.delete_texture(tex);
-                }
-                return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos attribute"));
-            }
-        };
-        let a_uv = match gl.get_attrib_location(program, "a_uv") {
-            Some(loc) => loc,
-            None => {
-                gl.delete_buffer(vbo);
-                if owns_tex {
-                    gl.delete_texture(tex);
-                }
-                return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv attribute"));
-            }
-        };
-
-        gl.use_program(Some(program));
+        gl.use_program(Some(cgp.program));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        let u_atlas = gl.get_uniform_location(program, "u_atlas");
-        gl.uniform_1_i32(u_atlas.as_ref(), 0);
+        gl.uniform_1_i32(cgp.u_atlas.as_ref(), 0);
         // v1-spec-delta #4: opacity goes through u_opacity uniform
         // so the shader multiplies BOTH RGB and the output alpha
         // by it. Pre-fix this code multiplied only the RGB
         // channels into u_text_color, leaving the output alpha at
         // `a` regardless of opacity -- which made an opacity=0.5
         // glyph fully cover the bg instead of letting half through.
-        let u_text_color = gl.get_uniform_location(program, "u_text_color");
-        gl.uniform_3_f32(u_text_color.as_ref(), text_color[0], text_color[1], text_color[2]);
-        let u_opacity = gl.get_uniform_location(program, "u_opacity");
-        gl.uniform_1_f32(u_opacity.as_ref(), opacity);
+        gl.uniform_3_f32(cgp.u_text_color.as_ref(), text_color[0], text_color[1], text_color[2]);
+        gl.uniform_1_f32(cgp.u_opacity.as_ref(), opacity);
         if layer.outline {
             // v1-spec-delta #4 (b): hardcoded 1px black outline,
             // matching the Python convention at backend/openmarquee/
@@ -2010,15 +1992,15 @@ fn draw_text_layer(
             // is just `outline: bool`; future schema growth could
             // expose color + width through these uniforms without
             // a shader rewrite.
-            let u_outline_color = gl.get_uniform_location(program, "u_outline_color");
-            gl.uniform_3_f32(u_outline_color.as_ref(), 0.0, 0.0, 0.0);
-            let u_pixel_size = gl.get_uniform_location(program, "u_pixel_size");
+            gl.uniform_3_f32(cgp.u_outline_color.as_ref(), 0.0, 0.0, 0.0);
             gl.uniform_2_f32(
-                u_pixel_size.as_ref(),
+                cgp.u_pixel_size.as_ref(),
                 1.0 / bm.width as f32,
                 1.0 / bm.height as f32,
             );
         }
+        let a_pos = cgp.a_pos;
+        let a_uv = cgp.a_uv;
 
         // BLEND state is set by the caller (render_slide) once
         // around the layer loop — same blend func for every layer,
@@ -2084,9 +2066,10 @@ fn draw_text_layer(
         gl.disable_vertex_attrib_array(a_pos);
         gl.disable_vertex_attrib_array(a_uv);
         gl.delete_buffer(vbo);
-        if owns_program {
-            gl.delete_program(program);
-        }
+        // P2-F (2026-05-10): program comes from session-lived
+        // FS_GLYPH(_OUTLINE)_PROGRAM thread_local; never freed
+        // here. Cleanup happens in clear_glyph_program_cache at
+        // session teardown.
         // Texture lifecycle: if caller passed a slot AND we created
         // the texture this call, store it back so the next draw
         // reuses it. If caller didn't pass a slot, the texture is
@@ -5394,44 +5377,97 @@ fn render_transition_scissored_bake_in_session(
 // `Option<&mut GlyphCache>`.
 pub use crate::hdmi_logic::{CachedGlyph, GlyphCache};
 
-/// qarl-direct perf-profile (2026-05-08): thread-local cache of
-/// compiled glyph programs. Renderer is single-threaded, so
+/// P2-F (2026-05-10): cached glyph program + all attribute /
+/// uniform locations, mirroring CachedSpProgram. Pre-fix
+/// draw_text_layer called gl.get_attrib_location + 3-5 calls to
+/// gl.get_uniform_location PER LAYER PER FRAME -- driver string
+/// lookups that show up as ~1500/sec at 5L slides @ 30 fps. With
+/// the locations resolved ONCE per program at first link, per-
+/// layer cost drops to one uniform_*_f32 per uniform.
+#[derive(Clone, Copy)]
+struct CachedGlyphProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_atlas: Option<glow::NativeUniformLocation>,
+    u_text_color: Option<glow::NativeUniformLocation>,
+    u_opacity: Option<glow::NativeUniformLocation>,
+    /// outline only; None for the non-outline program.
+    u_outline_color: Option<glow::NativeUniformLocation>,
+    /// outline only; None for the non-outline program.
+    u_pixel_size: Option<glow::NativeUniformLocation>,
+}
+
+/// qarl-direct perf-profile (2026-05-08, extended P2-F 2026-05-10):
+/// thread-local cache of compiled glyph programs PLUS resolved
+/// attribute / uniform locations. Renderer is single-threaded, so
 /// thread_local + Cell is mutex-free. EglSession teardown calls
 /// clear_glyph_program_cache to delete the programs while the GL
 /// context is still bound; without that they'd outlive the
 /// context as dangling driver handles.
 std::thread_local! {
-    static FS_GLYPH_PROGRAM: std::cell::Cell<Option<glow::NativeProgram>> =
+    static FS_GLYPH_PROGRAM: std::cell::Cell<Option<CachedGlyphProgram>> =
         const { std::cell::Cell::new(None) };
-    static FS_GLYPH_OUTLINE_PROGRAM: std::cell::Cell<Option<glow::NativeProgram>> =
+    static FS_GLYPH_OUTLINE_PROGRAM: std::cell::Cell<Option<CachedGlyphProgram>> =
         const { std::cell::Cell::new(None) };
 }
 
-fn cached_glyph_program(gl: &glow::Context, outline: bool) -> Result<glow::NativeProgram> {
+fn cached_glyph_program(gl: &glow::Context, outline: bool) -> Result<CachedGlyphProgram> {
+    use glow::HasContext;
     let cell = if outline { &FS_GLYPH_OUTLINE_PROGRAM } else { &FS_GLYPH_PROGRAM };
     cell.with(|c| {
-        if let Some(p) = c.get() {
-            return Ok(p);
+        if let Some(cgp) = c.get() {
+            return Ok(cgp);
         }
         let fs = if outline { FS_GLYPH_OUTLINE } else { FS_GLYPH };
-        let p = link_program(gl, VS_TEXTURED_QUAD, fs)?;
-        c.set(Some(p));
-        Ok(p)
+        let program = link_program(gl, VS_TEXTURED_QUAD, fs)
+            .with_context(|| format!("link {}", if outline { "FS_GLYPH_OUTLINE" } else { "FS_GLYPH" }))?;
+        // Resolve all attribute + uniform locations ONCE so the
+        // per-layer hot loop just reads from the cached struct.
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (glyph)"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (glyph)"))?;
+        let u_atlas = unsafe { gl.get_uniform_location(program, "u_atlas") };
+        let u_text_color = unsafe { gl.get_uniform_location(program, "u_text_color") };
+        let u_opacity = unsafe { gl.get_uniform_location(program, "u_opacity") };
+        let (u_outline_color, u_pixel_size) = if outline {
+            unsafe {
+                (
+                    gl.get_uniform_location(program, "u_outline_color"),
+                    gl.get_uniform_location(program, "u_pixel_size"),
+                )
+            }
+        } else {
+            (None, None)
+        };
+        let cgp = CachedGlyphProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_atlas,
+            u_text_color,
+            u_opacity,
+            u_outline_color,
+            u_pixel_size,
+        };
+        c.set(Some(cgp));
+        Ok(cgp)
     })
 }
 
-/// Delete the cached programs while the GL context is still bound.
-/// Called from with_egl_session teardown.
+/// Delete the cached programs while the GL context is still
+/// bound. Called from with_egl_session teardown.
 fn clear_glyph_program_cache(gl: &glow::Context) {
     use glow::HasContext;
     FS_GLYPH_PROGRAM.with(|c| {
-        if let Some(p) = c.replace(None) {
-            unsafe { gl.delete_program(p); }
+        if let Some(cgp) = c.replace(None) {
+            unsafe { gl.delete_program(cgp.program); }
         }
     });
     FS_GLYPH_OUTLINE_PROGRAM.with(|c| {
-        if let Some(p) = c.replace(None) {
-            unsafe { gl.delete_program(p); }
+        if let Some(cgp) = c.replace(None) {
+            unsafe { gl.delete_program(cgp.program); }
         }
     });
 }
