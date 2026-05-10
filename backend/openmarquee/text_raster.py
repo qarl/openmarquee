@@ -63,7 +63,7 @@ def bundled_fonts_dir() -> Path:
 
 
 @functools.lru_cache(maxsize=128)
-def _truetype_cached(path_or_name: str, size: int) -> ImageFont.ImageFont:
+def cached_truetype(path_or_name: str, size: int) -> ImageFont.ImageFont:
     """LRU-cached ImageFont.truetype(). Raises OSError on miss --
     callers must handle it. The unwrapped truetype is the dominant
     cost on cold auto-render slides; caching it means after the
@@ -86,18 +86,18 @@ def load_font(
         if bundled:
             path = bundled_fonts_dir() / bundled
             try:
-                return _truetype_cached(str(path), size)
+                return cached_truetype(str(path), size)
             except OSError:
                 pass
         # 2. Raw path or system-registered name — let Pillow try.
         try:
-            return _truetype_cached(family, size)
+            return cached_truetype(family, size)
         except OSError:
             pass
     # Last resort: PIL's bundled bitmap font ignores size but
     # always loads.
     try:
-        return _truetype_cached("DejaVuSans.ttf", size)
+        return cached_truetype("DejaVuSans.ttf", size)
     except OSError:
         return ImageFont.load_default()
 
@@ -123,9 +123,9 @@ def measure_centered(
 def clear_font_cache() -> None:
     """Drop the LRU cache. Useful for tests that mock filesystem
     state or want to count cold-load calls."""
-    _truetype_cached.cache_clear()
+    cached_truetype.cache_clear()
 
 
 def font_cache_info() -> functools._CacheInfo:
     """Expose the cache stats for tests + perf instrumentation."""
-    return _truetype_cached.cache_info()
+    return cached_truetype.cache_info()

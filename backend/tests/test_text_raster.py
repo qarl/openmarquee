@@ -28,14 +28,14 @@ def _isolate_font_cache():
 
 
 def test_bundled_font_files_has_expected_entries():
-    """Sanity: the 24 bundled @font-face families we ship to the
+    """Sanity: the 23 bundled @font-face families we ship to the
     browser editor are also resolvable server-side. If a new family
     is added to ui/fonts/ the operator picker exposes it but the
     backend will fall through to DejaVuSans -- visible quality
     regression."""
     assert "Inter" in BUNDLED_FONT_FILES
     assert "Bebas Neue" in BUNDLED_FONT_FILES
-    assert len(BUNDLED_FONT_FILES) >= 20
+    assert len(BUNDLED_FONT_FILES) == 23
 
 
 def test_bundled_fonts_dir_resolves_inside_repo():

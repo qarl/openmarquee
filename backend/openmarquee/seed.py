@@ -1551,13 +1551,13 @@ def _load_emoji_font(size_px: int):
     script (scripts/install/download-emoji-font.sh, TBD).
     """
     try:
-        from openmarquee.auto_render import _bundled_fonts_dir
-        path = _bundled_fonts_dir() / "noto-color-emoji.ttf"
+        from openmarquee.text_raster import bundled_fonts_dir, cached_truetype
+        path = bundled_fonts_dir() / "noto-color-emoji.ttf"
         if not path.exists():
             return None
         # Noto Color Emoji is a CBDT bitmap font; PIL picks the closest
         # bitmap strike. Pass any size the layer wants — Pillow scales.
-        return ImageFont.truetype(str(path), size_px)
+        return cached_truetype(str(path), size_px)
     except (OSError, Exception):
         return None
 
@@ -1649,30 +1649,27 @@ def _draw_text_runs(
 
 def _load_text_font(family: str | None, size_px: int):
     """Load a bundled @font-face TTF when `family` matches an entry in
-    `auto_render._BUNDLED_FONT_FILES`; otherwise the historical bold
+    `text_raster.BUNDLED_FONT_FILES`; otherwise the historical bold
     fallback (DejaVuSans-Bold → Arial Bold → bitmap)."""
+    from openmarquee.text_raster import (
+        BUNDLED_FONT_FILES,
+        bundled_fonts_dir,
+        cached_truetype,
+    )
     if family:
-        try:
-            from openmarquee.auto_render import (
-                _BUNDLED_FONT_FILES,
-                _bundled_fonts_dir,
-            )
-
-            bundled_name = _BUNDLED_FONT_FILES.get(family)
-            if bundled_name:
-                path = _bundled_fonts_dir() / bundled_name
-                if path.exists():
-                    try:
-                        return ImageFont.truetype(str(path), size_px)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
+        bundled_name = BUNDLED_FONT_FILES.get(family)
+        if bundled_name:
+            path = bundled_fonts_dir() / bundled_name
+            if path.exists():
+                try:
+                    return cached_truetype(str(path), size_px)
+                except OSError:
+                    pass
     try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", size_px)
+        return cached_truetype("DejaVuSans-Bold.ttf", size_px)
     except OSError:
         try:
-            return ImageFont.truetype("Arial Bold.ttf", size_px)
+            return cached_truetype("Arial Bold.ttf", size_px)
         except OSError:
             return ImageFont.load_default()
 
