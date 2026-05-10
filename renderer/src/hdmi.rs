@@ -579,6 +579,7 @@ where
     clear_transition_sp_program_cache(&gl);
     clear_composite_program_cache(&gl);
     clear_blit_program_cache(&gl);
+    clear_bright_gamma_cache(&gl);
     // v1-spec-delta #9 (slice d): drain pending flip + free
     // session-level scanout BO/FB rotation. Mirrors the
     // animated_slide end-of-call cleanup but at session
@@ -3142,6 +3143,112 @@ unsafe fn ensure_scene_fbo(session: &mut EglSession, w: u32, h: u32) -> Result<(
     Ok((fbo, tex))
 }
 
+/// CRIT-A (2026-05-10): cached FS_BRIGHT_GAMMA program + resolved
+/// attribute / uniform locations + reused fullscreen-quad VBO.
+/// Mirrors CachedSpProgram / CachedGlyphProgram. Pre-fix
+/// run_bright_gamma_pass did link_program + 3x get_uniform_location
+/// + create_buffer + buffer_data + delete_buffer + delete_program
+/// PER FRAME on every non-identity-color frame -- ~5 ms/frame on
+/// vc4 with the link being the dominant cost.
+#[derive(Clone, Copy)]
+struct CachedBrightGammaProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_src: Option<glow::NativeUniformLocation>,
+    u_brightness: Option<glow::NativeUniformLocation>,
+    u_gamma: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static BRIGHT_GAMMA_PROGRAM: std::cell::Cell<Option<CachedBrightGammaProgram>> =
+        const { std::cell::Cell::new(None) };
+    /// Cached fullscreen-quad VBO for the bright/gamma post-pass.
+    /// Geometry is STATIC_DRAW (NDC [-1,1] x UV [0,1]) so reuse
+    /// across frames is safe (no driver-sync concern that bit P2-F's
+    /// STREAM_DRAW VBO reuse).
+    static BRIGHT_GAMMA_QUAD_VBO: std::cell::Cell<Option<glow::NativeBuffer>> =
+        const { std::cell::Cell::new(None) };
+}
+
+unsafe fn cached_bright_gamma_program(
+    gl: &glow::Context,
+) -> Result<CachedBrightGammaProgram> {
+    use glow::HasContext;
+    BRIGHT_GAMMA_PROGRAM.with(|c| {
+        if let Some(cgp) = c.get() {
+            return Ok(cgp);
+        }
+        let program = link_program(gl, VS_TEXTURED_QUAD, crate::hdmi_logic::FS_BRIGHT_GAMMA)
+            .context("link FS_BRIGHT_GAMMA")?;
+        let a_pos = gl
+            .get_attrib_location(program, "a_pos")
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (bright_gamma)"))?;
+        let a_uv = gl
+            .get_attrib_location(program, "a_uv")
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (bright_gamma)"))?;
+        let u_src = gl.get_uniform_location(program, "u_src");
+        let u_brightness = gl.get_uniform_location(program, "u_brightness");
+        let u_gamma = gl.get_uniform_location(program, "u_gamma");
+        let cgp = CachedBrightGammaProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_src,
+            u_brightness,
+            u_gamma,
+        };
+        c.set(Some(cgp));
+        Ok(cgp)
+    })
+}
+
+unsafe fn cached_bright_gamma_vbo(gl: &glow::Context) -> Result<glow::NativeBuffer> {
+    use glow::HasContext;
+    BRIGHT_GAMMA_QUAD_VBO.with(|c| {
+        if let Some(vbo) = c.get() {
+            return Ok(vbo);
+        }
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("glGenBuffers(bright_gamma_quad): {e}"))?;
+        // Fullscreen quad with UV (0,0) at top-left -> bottom in
+        // NDC because gl_FragCoord origin is bottom-left. Mirrors
+        // create_textured_quad's geometry exactly.
+        let verts: [f32; 16] = [
+            -1.0, -1.0, 0.0, 0.0,
+             1.0, -1.0, 1.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+        ];
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            std::mem::size_of_val(&verts),
+        );
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+        c.set(Some(vbo));
+        Ok(vbo)
+    })
+}
+
+/// Delete cached bright/gamma program + VBO while the GL context
+/// is still bound. Called from with_egl_session teardown
+/// (alongside clear_glyph_program_cache).
+fn clear_bright_gamma_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    BRIGHT_GAMMA_PROGRAM.with(|c| {
+        if let Some(cgp) = c.replace(None) {
+            unsafe { gl.delete_program(cgp.program); }
+        }
+    });
+    BRIGHT_GAMMA_QUAD_VBO.with(|c| {
+        if let Some(vbo) = c.replace(None) {
+            unsafe { gl.delete_buffer(vbo); }
+        }
+    });
+}
+
 /// v1-spec-delta #10 (slice c) -- final blit from scene FBO
 /// to the EGL window surface (default fb) via FS_BRIGHT_GAMMA
 /// using the session's current_settings. Caller is responsible
@@ -3154,34 +3261,26 @@ unsafe fn run_bright_gamma_pass(
     gamma: f32,
 ) -> Result<()> {
     use glow::HasContext;
-    let program = link_program(gl, VS_TEXTURED_QUAD, crate::hdmi_logic::FS_BRIGHT_GAMMA)?;
-    let (vbo, a_pos, a_uv) = match create_textured_quad(gl, program) {
-        Ok(t) => t,
-        Err(e) => {
-            gl.delete_program(program);
-            return Err(e);
-        }
-    };
-    gl.use_program(Some(program));
-    let u_src = gl.get_uniform_location(program, "u_src");
-    let u_brightness = gl.get_uniform_location(program, "u_brightness");
-    let u_gamma = gl.get_uniform_location(program, "u_gamma");
+    let cgp = cached_bright_gamma_program(gl)?;
+    let vbo = cached_bright_gamma_vbo(gl)?;
+    gl.use_program(Some(cgp.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
-    gl.uniform_1_i32(u_src.as_ref(), 0);
-    gl.uniform_1_f32(u_brightness.as_ref(), brightness);
-    gl.uniform_1_f32(u_gamma.as_ref(), gamma);
+    gl.uniform_1_i32(cgp.u_src.as_ref(), 0);
+    gl.uniform_1_f32(cgp.u_brightness.as_ref(), brightness);
+    gl.uniform_1_f32(cgp.u_gamma.as_ref(), gamma);
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    gl.enable_vertex_attrib_array(a_pos);
-    gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
-    gl.enable_vertex_attrib_array(a_uv);
-    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.enable_vertex_attrib_array(cgp.a_pos);
+    gl.vertex_attrib_pointer_f32(cgp.a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(cgp.a_uv);
+    gl.vertex_attrib_pointer_f32(cgp.a_uv, 2, glow::FLOAT, false, 16, 8);
     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-    gl.disable_vertex_attrib_array(a_pos);
-    gl.disable_vertex_attrib_array(a_uv);
-    gl.delete_buffer(vbo);
-    gl.delete_program(program);
+    gl.disable_vertex_attrib_array(cgp.a_pos);
+    gl.disable_vertex_attrib_array(cgp.a_uv);
     gl.bind_texture(glow::TEXTURE_2D, None);
+    // CRIT-A: program + vbo come from session-lived thread_local
+    // caches; never freed here. Cleanup happens in
+    // clear_bright_gamma_cache at session teardown.
     Ok(())
 }
 
