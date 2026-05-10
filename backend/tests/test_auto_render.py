@@ -129,3 +129,75 @@ class TestResolveTimezone:
 # motion.compose_motion_frame is the only render path; equivalent
 # coverage lives in test_motion.py (auto-layer outline test at line
 # 602, dim/bg/timing tests in TestComposeMotionFrame).
+
+
+# --- Batch 8.6: image-bg LRU ---
+
+
+def test_load_background_lru_skips_png_decode_on_cache_hit():
+    """First _load_background for a (slide_id, w, h) decodes; second
+    returns the cached Image without a fresh decode. Sweep #2 #15."""
+    from io import BytesIO
+    from uuid import uuid4
+    from PIL import Image as _Image
+    from openmarquee.auto_render import (
+        _load_background, _stats, clear_image_bg_cache,
+    )
+
+    clear_image_bg_cache()
+    for k in _stats:
+        _stats[k] = 0
+
+    buf = BytesIO()
+    _Image.new("RGB", (16, 16), (10, 20, 30)).save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+    bg_id = uuid4()
+
+    def fake_read(_id):
+        return png_bytes
+
+    slide = _auto_slide(
+        auto_mode="time", auto_format="time_hm",
+        background_image_slide_id=bg_id,
+    )
+    _load_background(slide, 16, 16, fake_read)
+    assert _stats["png_decodes"] == 1
+    assert _stats["image_bg_cache_hits"] == 0
+
+    _load_background(slide, 16, 16, fake_read)
+    _load_background(slide, 16, 16, fake_read)
+    assert _stats["png_decodes"] == 1  # no new decodes
+    assert _stats["image_bg_cache_hits"] == 2
+
+
+def test_load_background_lru_evicts_at_8_entries():
+    """The LRU caps at 8 entries; the 9th add evicts the oldest."""
+    from io import BytesIO
+    from uuid import uuid4
+    from PIL import Image as _Image
+    from openmarquee.auto_render import (
+        _load_background, _image_bg_cache, _stats, clear_image_bg_cache,
+    )
+
+    clear_image_bg_cache()
+    for k in _stats:
+        _stats[k] = 0
+
+    buf = BytesIO()
+    _Image.new("RGB", (8, 8), (0, 0, 0)).save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    def fake_read(_id):
+        return png_bytes
+
+    ids = [uuid4() for _ in range(9)]
+    for i in ids:
+        slide = _auto_slide(
+            auto_mode="time", auto_format="time_hm",
+            background_image_slide_id=i,
+        )
+        _load_background(slide, 8, 8, fake_read)
+
+    assert len(_image_bg_cache) == 8
+    assert (ids[0], 8, 8) not in _image_bg_cache
+    assert (ids[8], 8, 8) in _image_bg_cache

@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import logging
 import math
+from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -120,19 +121,40 @@ def resolve_timezone(tz_name: str | None) -> ZoneInfo:
 # --- internals ---
 
 
-# Perf counters (Batch 8.1). load_background_calls bumps per
-# entry; png_decodes counts the actual Image.open + convert in the
-# image-bg branch (skipped for solid / gradient / pattern). Batch
-# 8.6 will introduce an LRU cache keyed on (slide_id, width,
-# height) to drive png_decodes toward 1 per slide entry.
+# Perf counters (Batch 8.1 + 8.6).
+# load_background_calls: per-entry; bumps even on solid / gradient /
+#   pattern branches.
+# png_decodes: actual Image.open + convert in the image-bg branch.
+# image_bg_cache_hits (Batch 8.6): LRU hits on the (slide_id, w, h)
+#   path -- delta vs png_decodes is the cache-effectiveness signal.
 _stats: dict[str, int] = {
     "load_background_calls": 0,
     "png_decodes": 0,
+    "image_bg_cache_hits": 0,
 }
 
 
 def stats_snapshot() -> dict[str, int]:
     return dict(_stats)
+
+
+# Image-bg LRU (Batch 8.6). Keyed by (slide_id, width, height).
+# Compose_motion_frame ALREADY has a per-slide background_cache
+# parameter that caches the loaded bg across the frames of one
+# slide; the LRU here covers the seam BETWEEN slides -- when the
+# playback loop swaps between two slides that both reference the
+# same image-bg (e.g. all clock slides share a brick-wall bg), each
+# slide entry hits this cache instead of re-decoding the PNG.
+# 8 entries is generous: typical demo reels have 2-5 distinct
+# image-bg references; an operator showing off 8+ is well-served
+# by the LRU's natural eviction.
+_IMAGE_BG_LRU_MAX = 8
+_image_bg_cache: "OrderedDict[tuple[UUID, int, int], Image.Image]" = OrderedDict()
+
+
+def clear_image_bg_cache() -> None:
+    """Drop the LRU. Test hook + safety valve."""
+    _image_bg_cache.clear()
 
 
 def _load_background(
@@ -144,12 +166,23 @@ def _load_background(
     """Build the background layer: image slide ref, gradient, or solid fill."""
     _stats["load_background_calls"] += 1
     if slide.background_image_slide_id is not None and read_asset is not None:
+        cache_key = (slide.background_image_slide_id, width, height)
+        cached = _image_bg_cache.get(cache_key)
+        if cached is not None:
+            _stats["image_bg_cache_hits"] += 1
+            # Move to most-recently-used end so the OrderedDict
+            # naturally evicts the LRU entry on overflow.
+            _image_bg_cache.move_to_end(cache_key)
+            return cached
         try:
             png = read_asset(slide.background_image_slide_id)
             _stats["png_decodes"] += 1
             img = Image.open(io.BytesIO(png)).convert("RGB")
             if img.size != (width, height):
                 img = img.resize((width, height), resample=Image.Resampling.NEAREST)
+            _image_bg_cache[cache_key] = img
+            if len(_image_bg_cache) > _IMAGE_BG_LRU_MAX:
+                _image_bg_cache.popitem(last=False)
             return img
         except FileNotFoundError:
             log.warning(
