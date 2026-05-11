@@ -70,12 +70,18 @@ def _decode_image_payload(b64: str) -> bytes:
             status_code=400, detail=f"image_base64 is not valid base64: {exc}"
         ) from exc
     try:
+        # 11.1 / sweep #5 #5: use .load() not .verify() at the upload
+        # boundary. verify() only walks structural metadata; load()
+        # actually runs the codec, so a malicious image that uses a
+        # known-bad-decoder path (e.g. Pillow CVE-2026-25990 et al.)
+        # surfaces here at upload time, not later at playback when
+        # the device is composing slides.
         with Image.open(io.BytesIO(data)) as img:
-            img.verify()
+            img.load()
     except (UnidentifiedImageError, Exception) as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"image_base64 decoded but isn't a valid image: {exc}",
+            detail="image_base64 decoded but isn't a valid image",
         ) from exc
     return data
 
@@ -117,12 +123,14 @@ def _decode_png_payload(b64: str) -> bytes:
         ) from exc
 
     try:
+        # 11.1 / sweep #5 #5: .load() not .verify() -- runs the
+        # codec so a Pillow CVE path surfaces at upload time.
         with Image.open(io.BytesIO(png)) as img:
-            img.verify()  # confirms PNG/JPEG/etc structure without full decode
+            img.load()
     except (UnidentifiedImageError, Exception) as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"png_base64 decoded but isn't a valid image: {exc}",
+            detail="png_base64 decoded but isn't a valid image",
         ) from exc
 
     return png

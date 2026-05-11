@@ -74,10 +74,13 @@ rsync -avz --delete --delete-excluded \
     "$OPENMARQUEE_BUILD_DIR/ui/" "$TARGET:$REMOTE_ROOT/ui/"
 
 echo "==> installing / updating backend deps in remote venv"
-# -e install picks up any new pyproject.toml deps without reinstalling the
-# world. If this fails the first time, run system/README.md § first-time
-# install on the target.
-ssh "$TARGET" "$REMOTE_ROOT/venv/bin/pip install --quiet --upgrade -e $REMOTE_ROOT/backend"
+# Install from requirements.lock first (Batch 11.1 / sweep #5 #7)
+# so the device runs the exact CVE-audited dep tree. Then -e
+# install of the backend package itself for the openmarquee
+# module + its entry points. If either fails on first deploy,
+# run system/README.md § first-time install on the target.
+ssh "$TARGET" "$REMOTE_ROOT/venv/bin/pip install --quiet -r $REMOTE_ROOT/backend/requirements.lock"
+ssh "$TARGET" "$REMOTE_ROOT/venv/bin/pip install --quiet --upgrade --no-deps -e $REMOTE_ROOT/backend"
 
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl restart openmarquee-backend"

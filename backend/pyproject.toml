@@ -14,8 +14,13 @@ authors = [
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "pillow>=10.0",
-    "aiortc>=1.9",
+    # Pillow + aiortc pinned exactly (sweep #5 #7). Both have had
+    # CVE drumbeat 2024-25 (Pillow image-decoder bugs, aiortc/
+    # WebRTC stack). Lock to a known-good version; bump
+    # intentionally through pip-audit + a fresh lockfile generation
+    # rather than letting `>=` drift silently.
+    "pillow==12.2.0",
+    "aiortc==1.14.0",
     # numpy is a hard dep of stream.py's `frame.to_ndarray(format='rgb24')`.
     # PyAV declares numpy as optional, so without this entry a fresh
     # setup.sh fails test collection at tests/test_stream.py with
@@ -41,6 +46,12 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.3",
+    # Lockfile + CVE-audit tooling. pip-compile (from pip-tools)
+    # regenerates requirements.lock from pyproject.toml; pip-audit
+    # gates pre-deploy on CVE findings against the lockfile. Both
+    # are dev-only -- the device runs from the generated lockfile.
+    "pip-tools>=7.0",
+    "pip-audit>=2.7",
 ]
 
 [tool.setuptools.packages.find]

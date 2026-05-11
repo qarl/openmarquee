@@ -26,4 +26,22 @@ echo "==> UI tests (vitest)"
 (cd ui && npm test --silent)
 
 echo
+echo "==> backend CVE audit (pip-audit vs requirements.lock)"
+# Batch 11.1 / sweep #5: fail the suite on known CVEs in the
+# locked deps. Lock is committed; regen via
+# `pip-compile --strip-extras pyproject.toml -o - > requirements.lock`
+# after intentional dep bumps. Skip if pip-audit isn't installed
+# locally (devs running test.sh on a barebones env still get
+# pytest + vitest; CI / pre-deploy hits the gate).
+PIP_AUDIT="$VENV/bin/pip-audit"
+if [ ! -x "$PIP_AUDIT" ] && ! command -v pip-audit > /dev/null; then
+    echo "    (skipped: pip-audit not installed; run \`pip install -e backend[dev]\`)"
+else
+    if [ ! -x "$PIP_AUDIT" ]; then
+        PIP_AUDIT="pip-audit"
+    fi
+    (cd backend && "$PIP_AUDIT" -r requirements.lock)
+fi
+
+echo
 echo "all tests passed."
