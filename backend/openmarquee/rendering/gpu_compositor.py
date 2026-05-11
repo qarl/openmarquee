@@ -32,7 +32,7 @@ from uuid import UUID
 
 import numpy as np
 
-from openmarquee.auto_render import _load_background, render_auto_text_for_layer
+from openmarquee.auto_render import load_background, render_auto_text_for_layer
 from openmarquee.motion import (
     _box_px,
     _effect_freq,
@@ -393,7 +393,7 @@ class GPUSlideCompositor:
             # Cold path: full bg load + alpha_composite. ~600ms first
             # time on a 1080p Pi Zero 2 W. Pool path skips this; pool
             # has the rendered bytes already in the slide's mmap.
-            bg = _load_background(self.slide, self.width, self.height, self.read_asset)
+            bg = load_background(self.slide, self.width, self.height, self.read_asset)
             if bg.mode != "RGBA":
                 bg = bg.convert("RGBA")
             for idx, layer in enumerate(layers):

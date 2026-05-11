@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from openmarquee.auto_render import _load_background
+from openmarquee.auto_render import load_background
 from openmarquee.motion import _box_px, render_layer_to_rgba
 from openmarquee.rendering.blend import composite_with_blend
 
@@ -102,7 +102,7 @@ def compose_slide_rgba(
             getattr(slide, "id", "<no-id>"),
         )
 
-    bg = _load_background(slide, width, height, read_asset)
+    bg = load_background(slide, width, height, read_asset)
     if bg.mode != "RGBA":
         bg = bg.convert("RGBA")
     for layer in getattr(slide, "text_layers", []):
@@ -152,7 +152,7 @@ def compose_slide_bg_statics_rgba(
             getattr(slide, "id", "<no-id>"),
         )
 
-    bg = _load_background(slide, width, height, read_asset)
+    bg = load_background(slide, width, height, read_asset)
     if bg.mode != "RGBA":
         bg = bg.convert("RGBA")
     for layer in getattr(slide, "text_layers", []):

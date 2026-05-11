@@ -135,13 +135,13 @@ class TestResolveTimezone:
 
 
 def test_load_background_lru_skips_png_decode_on_cache_hit():
-    """First _load_background for a (slide_id, w, h) decodes; second
+    """First load_background for a (slide_id, w, h) decodes; second
     returns the cached Image without a fresh decode. Sweep #2 #15."""
     from io import BytesIO
     from uuid import uuid4
     from PIL import Image as _Image
     from openmarquee.auto_render import (
-        _load_background, _stats, clear_image_bg_cache,
+        load_background, _stats, clear_image_bg_cache,
     )
 
     clear_image_bg_cache()
@@ -160,12 +160,12 @@ def test_load_background_lru_skips_png_decode_on_cache_hit():
         auto_mode="time", auto_format="time_hm",
         background_image_slide_id=bg_id,
     )
-    _load_background(slide, 16, 16, fake_read)
+    load_background(slide, 16, 16, fake_read)
     assert _stats["png_decodes"] == 1
     assert _stats["image_bg_cache_hits"] == 0
 
-    _load_background(slide, 16, 16, fake_read)
-    _load_background(slide, 16, 16, fake_read)
+    load_background(slide, 16, 16, fake_read)
+    load_background(slide, 16, 16, fake_read)
     assert _stats["png_decodes"] == 1  # no new decodes
     assert _stats["image_bg_cache_hits"] == 2
 
@@ -177,7 +177,7 @@ def test_load_background_lru_evicts_at_cap():
     from uuid import uuid4
     from PIL import Image as _Image
     from openmarquee.auto_render import (
-        _IMAGE_BG_LRU_MAX, _image_bg_cache, _load_background, _stats,
+        _IMAGE_BG_LRU_MAX, _image_bg_cache, load_background, _stats,
         clear_image_bg_cache,
     )
 
@@ -198,7 +198,7 @@ def test_load_background_lru_evicts_at_cap():
             auto_mode="time", auto_format="time_hm",
             background_image_slide_id=i,
         )
-        _load_background(slide, 8, 8, fake_read)
+        load_background(slide, 8, 8, fake_read)
 
     assert len(_image_bg_cache) == _IMAGE_BG_LRU_MAX
     # Oldest evicted; newest present.

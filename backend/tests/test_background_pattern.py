@@ -7,7 +7,7 @@ Covers:
   - Migration: legacy `background_gradient` JSON deserializes into
     `background_pattern` via the model_validator(mode="before")
   - 11 PIL renderers (visual sanity, not pixel-perfect)
-  - _load_background dispatch
+  - load_background dispatch
   - TextSlideUpload wire-mirror round-trip (the recurring bite)
 """
 
@@ -26,7 +26,7 @@ from pydantic import ValidationError
 from openmarquee.app import app
 from openmarquee.auto_render import (
     _hex_to_rgb,
-    _load_background,
+    load_background,
     render_pattern,
 )
 from openmarquee.content import (
@@ -394,7 +394,7 @@ def test_render_halftone_two_offset_grids():
     assert (255, 255, 255) in pixels
 
 
-# --- _load_background dispatch ---
+# --- load_background dispatch ---
 
 
 def test_load_background_uses_pattern_when_set():
@@ -402,14 +402,14 @@ def test_load_background_uses_pattern_when_set():
         pattern="solid", color_a="#FF0000", color_b="#00FF00",
     )
     slide = TextSlide(**_slide_with(background_pattern=p))
-    img = _load_background(slide, 50, 50, read_asset=None)
+    img = load_background(slide, 50, 50, read_asset=None)
     pixels = set(img.getdata())
     assert pixels == {(255, 0, 0)}
 
 
 def test_load_background_falls_back_to_solid_when_no_pattern():
     slide = TextSlide(**_slide_with(background_color="#112233"))
-    img = _load_background(slide, 50, 50, read_asset=None)
+    img = load_background(slide, 50, 50, read_asset=None)
     assert img.getpixel((0, 0)) == (0x11, 0x22, 0x33)
 
 

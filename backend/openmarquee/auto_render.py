@@ -161,7 +161,7 @@ def clear_image_bg_cache() -> None:
     _image_bg_cache.clear()
 
 
-def _load_background(
+def load_background(
     slide: TextSlide,
     width: int,
     height: int,

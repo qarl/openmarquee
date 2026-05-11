@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PIL import Image
 
-from openmarquee.auto_render import _load_background, render_auto_text_for_layer
+from openmarquee.auto_render import load_background, render_auto_text_for_layer
 from openmarquee.seed import _draw_text_into
 
 if TYPE_CHECKING:
@@ -501,7 +501,7 @@ def load_motion_background(
     `compose_motion_frame` tick via `background_cache=` — avoids
     re-reading the background PNG (or re-allocating the solid-color
     canvas) 30× per second."""
-    return _load_background(slide, width, height, read_asset)
+    return load_background(slide, width, height, read_asset)
 
 
 def slide_has_motion(slide: TextSlide) -> bool:
@@ -565,7 +565,7 @@ def compose_motion_frame(
     if background_cache is not None and background_cache.size == (width, height):
         base = background_cache.copy()
     else:
-        base = _load_background(slide, width, height, read_asset)
+        base = load_background(slide, width, height, read_asset)
     if base.mode != "RGBA":
         base = base.convert("RGBA")
 
