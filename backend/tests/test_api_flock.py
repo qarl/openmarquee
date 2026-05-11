@@ -221,6 +221,23 @@ def test_post_rejects_duplicate_address_as_409(client: TestClient):
     assert "already" in response.json()["detail"]
 
 
+def test_post_duplicate_response_does_not_leak_exception_string(
+    client: TestClient,
+):
+    """Batch 11.2 / sweep #5 #8: the 409 detail must NOT carry the
+    raw ValueError message (which currently includes the address +
+    quoting from f-string interpolation). Generic operator-helpful
+    message only; internal detail goes to the WARNING log."""
+    client.post("/api/flock", json={"address": "lobby.ts.net"})
+    response = client.post("/api/flock", json={"address": "lobby.ts.net"})
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    # Specifically NOT containing the address value (quoted-form leak)
+    # nor the ValueError keyword "peer with address".
+    assert "lobby.ts.net" not in detail
+    assert "peer with address" not in detail.lower()
+
+
 def test_post_validates_empty_address(client: TestClient):
     response = client.post("/api/flock", json={"address": ""})
     assert response.status_code == 422

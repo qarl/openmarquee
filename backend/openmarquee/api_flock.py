@@ -139,8 +139,15 @@ async def add_peer(
     try:
         peer = storage.add(address=body.address)
     except ValueError as exc:
-        # Duplicate address — 409 Conflict reads better than 400 here.
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # 11.2 / sweep #5 #8: don't reflect the exception string -- the
+        # ValueError could carry internal detail in the future. Generic
+        # operator-helpful message ("already" preserved so the UI's
+        # duplicate-detection branch keeps working); full reason in log.
+        log.warning("flock add rejected (address=%r): %s", body.address, exc)
+        raise HTTPException(
+            status_code=409,
+            detail="peer with that address is already known to this device",
+        ) from exc
     # Fire-and-forget probe of the new peer's /api/settings so the tile's
     # display name switches from the raw address to the configured
     # sign_name within a second or two of the add.

@@ -144,6 +144,28 @@ def test_put_rejects_garbage_timezone(client: TestClient):
     assert response.status_code == 422
 
 
+def test_put_validation_response_does_not_leak_pydantic_internals(
+    client: TestClient,
+):
+    """Batch 11.2 / sweep #5 #8: 422 detail must NOT carry Pydantic's
+    raw error string (which quotes the failing payload value verbatim
+    and includes internal error-type codes). Operator gets a generic
+    message; full detail goes to log.warning."""
+    # A passphrase value WOULD have leaked into the response body
+    # under the prior detail=str(exc) implementation.
+    payload = {"wifi_password": "short"}  # 5 chars; below 8-char min
+    response = client.put("/api/settings", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    # The literal payload value must not appear.
+    assert "short" not in detail
+    # Pydantic-specific markers must not appear.
+    for marker in ("value_error", "string_too_short", "validation error"):
+        assert marker not in detail.lower(), (
+            f"Pydantic internal marker {marker!r} leaked into response"
+        )
+
+
 # --- Display-dim change side-effect (qarl 2026-04-30 ask 1) -----------
 
 
@@ -545,6 +567,30 @@ def test_patch_wifi_ap_password_rejects_too_short(auth_client: TestClient):
         json={"current_password": "hunter2hunter", "new_value": "shorty1"},
     )
     assert response.status_code == 422
+
+
+def test_patch_validation_response_does_not_leak_secret_or_pydantic_text(
+    auth_client: TestClient,
+):
+    """Batch 11.2 / sweep #5 #8: the PATCH 422 detail must NOT contain
+    the rejected secret value (which Pydantic's error string quotes
+    verbatim) nor any internal validator marker. Log captures the field
+    name + reason for the operator audit trail."""
+    token = _configure_auth_for_patch_tests(auth_client)
+    # 7 chars -- below the WPA2 8-char floor; rejection guaranteed.
+    forbidden_value = "leak7ch"
+    response = auth_client.patch(
+        "/api/settings/wifi-ap-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter", "new_value": forbidden_value},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    # The rejected secret must NOT appear in the response body.
+    assert forbidden_value not in detail
+    # Pydantic-specific markers must not appear.
+    for marker in ("value_error", "string_pattern_mismatch", "validation error"):
+        assert marker not in detail.lower()
 
 
 def test_patch_wifi_station_password_set_then_clear(auth_client: TestClient):

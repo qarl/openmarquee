@@ -209,7 +209,15 @@ async def set_settings(
         # dict (FastAPI's auto-422 only fires on typed bodies); a
         # plain HTTPException at this layer keeps the wire shape
         # consistent with what existing tests assert.
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        #
+        # 11.2 / sweep #5 #8: don't reflect Pydantic's raw exception
+        # text -- the message includes the failing payload value which
+        # can include secrets-passed-through-by-UI. Generic detail; log
+        # carries the field-level reason for the operator's audit trail.
+        log.warning("settings PUT validation failed: %s", exc)
+        raise HTTPException(
+            status_code=422, detail="settings validation failed"
+        ) from exc
     # Compare the dim-affecting fields BEFORE the save so we know whether
     # to fire the text-slide rerender.
     dims_changed = (
@@ -303,7 +311,17 @@ def _patch_secret_field(
         # handler.
         SystemSettings.model_validate(updated.model_dump())
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # 11.2 / sweep #5 #8: scrub exception text from the response.
+        # new_value is a secret rotation candidate (AP password / station
+        # password / Tailscale auth key) and Pydantic's error message
+        # quotes the failing input verbatim. Generic detail; log captures
+        # the field name + reason (NOT the value).
+        log.warning(
+            "settings PATCH validation failed (field=%s): %s", field, exc
+        )
+        raise HTTPException(
+            status_code=422, detail="secret field validation failed"
+        ) from exc
     storage.save(updated)
     return _redact_secrets(updated.model_dump())
 
