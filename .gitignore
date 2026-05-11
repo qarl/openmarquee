@@ -34,6 +34,8 @@ openmarquee-playlist.json
 openmarquee-schedules.json
 openmarquee-settings.json
 openmarquee-seeded.json
+openmarquee-tombstones.json
+openmarquee-flock.json
 
 # rclone-fuse mount sometimes leaves these stub files behind — they
 # aren't ours.

@@ -186,13 +186,12 @@ async def test_motion_slide_routes_through_gpu_path(tmp_path):
 
 
 @pytest.mark.skip(
-    reason="cross-suite hang: passes alone, hangs 160s+ when run after "
-    "test_auto_render or similar. Tracked as 9.fix item 2 (option B). "
-    "Hypothesis: asyncio fixture state leak in the MockRenderer "
-    "fallback path (compose_motion_frame software route under "
-    "PlaybackLoop.start/stop). Time-boxed investigation -- needs a "
-    "dedicated debug session to diagnose; the test itself runs clean "
-    "in isolation so the assertion coverage is preserved."
+    reason="Hangs in isolation; PlaybackLoop + software-fallback or "
+    "auto-tick path + asyncio test scaffold interacting with loop.stop() "
+    "cleanup. Real discriminator is the software-fallback/auto-tick "
+    "path, NOT renderer flavor (FakeMultiPlaneRendererWithPNG works fine "
+    "in passing tests). See qa-log 2026-05-11 (9.fix item 2 + 10.fix "
+    "wording correction)."
 )
 @pytest.mark.asyncio
 async def test_motion_slide_falls_back_to_software_when_renderer_lacks_gpu(tmp_path):
@@ -215,7 +214,7 @@ async def test_motion_slide_falls_back_to_software_when_renderer_lacks_gpu(tmp_p
     assert len(renderer.last_frame) == 64 * 48 * 3
 
 
-@pytest.mark.skip(reason="9.fix: PlaybackLoop teardown hang (see line 188)")
+@pytest.mark.skip(reason="Hangs in isolation; PlaybackLoop+software-fallback or auto-tick + asyncio scaffold loop.stop() cleanup (see line 188 + qa-log 2026-05-11)")
 @pytest.mark.asyncio
 async def test_motion_slide_falls_back_when_budget_exceeded(tmp_path):
     """A slide with more animated layers than the renderer's plane
@@ -234,7 +233,7 @@ async def test_motion_slide_falls_back_when_budget_exceeded(tmp_path):
     assert renderer.last_frame is not None
 
 
-@pytest.mark.skip(reason="9.fix: PlaybackLoop teardown hang (see line 188)")
+@pytest.mark.skip(reason="Hangs in isolation; PlaybackLoop+software-fallback or auto-tick + asyncio scaffold loop.stop() cleanup (see line 188 + qa-log 2026-05-11)")
 @pytest.mark.asyncio
 async def test_zero_budget_renderer_routes_to_software(tmp_path):
     """A multi-plane-capable renderer constructed with budget=0 (the
@@ -253,7 +252,7 @@ async def test_zero_budget_renderer_routes_to_software(tmp_path):
     assert renderer.last_frame is not None
 
 
-@pytest.mark.skip(reason="9.fix: PlaybackLoop teardown hang (see line 188)")
+@pytest.mark.skip(reason="Hangs in isolation; PlaybackLoop+software-fallback or auto-tick + asyncio scaffold loop.stop() cleanup (see line 188 + qa-log 2026-05-11)")
 @pytest.mark.asyncio
 async def test_gpu_attach_partial_failure_cleans_up_then_falls_back(tmp_path):
     """If GPUSlideCompositor.attach raises mid-way (after some planes
@@ -338,7 +337,7 @@ async def test_fade_falls_back_to_software_when_shader_unavailable(tmp_path):
         await loop.stop()
 
 
-@pytest.mark.skip(reason="9.fix: PlaybackLoop teardown hang (see line 188)")
+@pytest.mark.skip(reason="Hangs in isolation; PlaybackLoop+software-fallback or auto-tick + asyncio scaffold loop.stop() cleanup (see line 188 + qa-log 2026-05-11)")
 @pytest.mark.asyncio
 async def test_auto_layer_routes_through_gpu_path(tmp_path):
     """An auto-mode layer (clock/date/day) classifies as animated even
