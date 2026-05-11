@@ -298,24 +298,29 @@
             } catch {
                 return forbidden("invalid JSON body");
             }
-            // Merge slide-level fields + replace text_layers wholesale.
-            // png_base64 + the wire-side validators are skipped — the
-            // mock trusts whatever the editor sends, which is fine
-            // because the editor IS the only writer.
-            for (const key of [
-                "name",
-                "duration_ms",
-                "background_color",
-                "background_image_slide_id",
-                "background_video_slide_id",
-                "transition",
-                "transition_ms",
-            ]) {
-                if (key in body) item[key] = body[key];
-            }
-            if (Array.isArray(body.text_layers)) {
-                item.text_layers = body.text_layers;
-            }
+            // Merge slide-level fields. Mirror Pydantic's "all declared
+            // fields round-trip" semantic via Object.assign so any field
+            // the editor sends lands in the mock's state without needing
+            // a per-field allow-list to be maintained in lockstep.
+            //
+            // Previous hardcoded allow-list silently dropped new fields
+            // (caught 2026-05-11: background_pattern from the 2026-05-03
+            // procedural-pattern picker was being dropped, so demo
+            // visitors saw "save" succeed but the pattern edit didn't
+            // persist on reload). The drop-no-error shape is the worst
+            // kind of bug -- it looks like a working save. Object.assign
+            // makes the mock behave like the backend, and the new
+            // field-level drift check (see check-mock-drift.py) will
+            // catch any future TextSlideUpload field that lands in a
+            // handler that DOESN'T do this merge.
+            //
+            // png_base64 is intentionally skipped (the mock doesn't
+            // persist binary assets) and id can't be reassigned (we
+            // looked the item up by it). Strip them explicitly to keep
+            // the state shape clean.
+            delete body.png_base64;
+            delete body.id;
+            Object.assign(item, body);
             item.updated_at = new Date().toISOString();
             saveState();
             return jsonResponse(item);

@@ -73,6 +73,138 @@ def mock_handles(routes: list[tuple[str, str]], mock_text: str) -> set[tuple[str
     return handled
 
 
+def parse_upload_class_fields(code_root: Path) -> dict[str, list[str]]:
+    """Best-effort: scan backend api*.py for `class FooUpload(BaseModel):`
+    blocks and pull out top-level field-name identifiers from them.
+
+    Heuristic — Pydantic's model declaration syntax is regular enough
+    that a regex pass catches the common shape (`name: type = ...` lines
+    in the class body) without needing to actually import the modules.
+    Misses inheritance + dynamically-built fields; that's fine for the
+    drift-detection use case where we want false positives, not false
+    negatives.
+
+    Returns {class_name: [field_name, ...]} for each *Upload class found.
+    """
+    backend = code_root / "backend" / "openmarquee"
+    out: dict[str, list[str]] = {}
+    for path in sorted(backend.glob("api*.py")):
+        text = path.read_text()
+        # Match `class <Name>Upload(<Base>):` and capture name + the rest
+        # of the file (we'll trim to the class body below).
+        for class_match in re.finditer(
+            r"^class (\w+Upload)\([^)]+\):\n((?: {4}.*\n|\n)+)",
+            text,
+            re.MULTILINE,
+        ):
+            cls_name, body = class_match.group(1), class_match.group(2)
+            fields: list[str] = []
+            for fm in re.finditer(
+                r"^    ([a-z_][a-z_0-9]*)\s*:\s*",
+                body,
+                re.MULTILINE,
+            ):
+                fname = fm.group(1)
+                # Skip Pydantic config / model-private identifiers.
+                if fname.startswith("_") or fname == "model_config":
+                    continue
+                fields.append(fname)
+            if fields:
+                out[cls_name] = fields
+    return out
+
+
+def find_handler_blocks(mock_text: str) -> list[tuple[str, str]]:
+    """Yield (handler_label, handler_text_chunk) blocks from the mock.
+
+    The mock's route handlers are framed by `if (...method/path...)` /
+    `// --- comment ---` boundaries. A robust block-extractor is more
+    work than the drift signal is worth -- the heuristic just slices on
+    blank lines + comment-separator lines and tags each chunk with the
+    first method/path-string it contains.
+    """
+    blocks: list[tuple[str, str]] = []
+    chunks = re.split(r"\n\s*//\s*---", mock_text)
+    for chunk in chunks:
+        # Tag each chunk with the first /api/... path it mentions so a
+        # missing-field warning can name a route.
+        path_match = re.search(r'["\'`](/api/[^"\'`]+)', chunk)
+        label = path_match.group(1) if path_match else "(unlabeled)"
+        blocks.append((label, chunk))
+    return blocks
+
+
+# Map a *Upload class to the route-path substring(s) where its fields
+# should reach the mock state. Add entries here as new *Upload models
+# land in the backend.
+_UPLOAD_CLASS_TO_PATH = {
+    "TextSlideUpload": "/api/content/text-slides",
+    # ImageUpload / VideoUpload aren't merge-relevant in the mock
+    # because /api/content/{images,videos} POSTs are forbidden in the
+    # demo (the bg-picker only serves pre-seeded media). Still surface
+    # them so a future "image edit metadata" handler would catch up.
+    "ImageUploadRequest": "/api/content/images",
+    "VideoUploadRequest": "/api/content/videos",
+}
+
+
+def check_upload_field_drift(
+    upload_fields: dict[str, list[str]],
+    mock_text: str,
+) -> list[str]:
+    """Return human-readable warnings for fields declared in an Upload
+    class but never mentioned in the mock route handler that serves
+    that class's path.
+
+    False-positive risk: a handler that uses Object.assign(item, body)
+    legitimately handles every body field without naming any. We treat
+    `Object.assign(item, body)` (or a `...body` spread) anywhere in a
+    chunk as "handles all fields" and short-circuit the per-field check.
+    """
+    warnings: list[str] = []
+    blocks = find_handler_blocks(mock_text)
+    for cls_name, fields in upload_fields.items():
+        target_path = _UPLOAD_CLASS_TO_PATH.get(cls_name)
+        if not target_path:
+            continue
+        # Find blocks that mention this path. A path can show up in
+        # multiple blocks (e.g. a "read path" block AND a "write path:
+        # blocked" block both reference /api/content/text-slides). The
+        # field check needs ONE block to satisfy the merge -- if any
+        # block uses Object.assign(item, body) OR names every field,
+        # the contract is honored.
+        matching = [
+            (label, body) for (label, body) in blocks if target_path in body
+        ]
+        if not matching:
+            continue
+        # Trust the handler if ANY matching block does a wildcard
+        # merge (Object.assign(item, body) OR a `...body` spread).
+        if any(
+            re.search(r"Object\.assign\s*\(\s*\w+\s*,\s*body\b", body)
+            or re.search(r"\.\.\.\s*body\b", body)
+            for _, body in matching
+        ):
+            continue
+        # No wildcard merge -- need to find each field somewhere in the
+        # matching blocks (union of mentions across all chunks).
+        merged_body = "\n".join(body for _, body in matching)
+        first_label = matching[0][0]
+        for field in fields:
+            # png_base64 / video_base64 are wire-only inputs; the
+            # mock doesn't persist binary assets.
+            if field.endswith("_base64"):
+                continue
+            # Word-boundary match so `name` doesn't false-match
+            # `filename`.
+            if not re.search(rf"\b{re.escape(field)}\b", merged_body):
+                warnings.append(
+                    f"{cls_name}.{field} not mentioned in mock "
+                    f"handler near {first_label}"
+                )
+    return warnings
+
+
 def main() -> int:
     here = Path(__file__).resolve().parent
     code_root = here.parent.parent  # scripts/demo/ → scripts/ → code/
@@ -90,15 +222,27 @@ def main() -> int:
     handled = mock_handles(real, mock_text)
     missing = sorted(set(real) - handled)
 
-    if not missing:
+    upload_fields = parse_upload_class_fields(code_root)
+    field_warnings = check_upload_field_drift(upload_fields, mock_text)
+
+    if not missing and not field_warnings:
         print(f"  ok — {len(real)} backend routes accounted for in mock")
         return 0
 
-    print(f"  drift: {len(missing)} backend route(s) not handled by demo mock:")
-    for method, path in missing:
-        print(f"    {method:6s} {path}")
-    print("  → edit scripts/demo/static/mock-backend.js to handle them,")
-    print("    or rest assured if the demo doesn't exercise them.")
+    if missing:
+        print(f"  drift: {len(missing)} backend route(s) not handled by demo mock:")
+        for method, path in missing:
+            print(f"    {method:6s} {path}")
+        print("  → edit scripts/demo/static/mock-backend.js to handle them,")
+        print("    or rest assured if the demo doesn't exercise them.")
+
+    if field_warnings:
+        print(f"  field-drift: {len(field_warnings)} Upload field(s) "
+              "look unhandled in the mock:")
+        for w in field_warnings:
+            print(f"    {w}")
+        print("  → merge handler should reach the field, OR use "
+              "Object.assign(item, body) to mirror Pydantic round-trip.")
     return 0
 
 
