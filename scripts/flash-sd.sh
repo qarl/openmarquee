@@ -76,6 +76,21 @@ case "$IMAGE" in
     *) fatal "unsupported image extension: $IMAGE (expected .img or .img.xz)" ;;
 esac
 
+# --- Guard 2a: refuse pseudo / mapped devices by NAME first -----------------
+# B.6 follow-up: do this BEFORE the device-exists check so a typo like
+# `/dev/loop99` returns a clear "loopback refused" error instead of the
+# generic "not found" -- the operator is trying to do the wrong thing and
+# needs to know. Loopback devices (file-backed mounts) and device-mapper
+# targets (LUKS/LVM) would corrupt the underlying file/volume on dd.
+case "$DEVICE" in
+    /dev/loop*|/dev/rloop*)
+        fatal "REFUSED: $DEVICE is a loopback device (file-backed mount)"
+        ;;
+    /dev/dm-*|/dev/mapper/*)
+        fatal "REFUSED: $DEVICE is a device-mapper target (LUKS/LVM/etc.)"
+        ;;
+esac
+
 # --- Guard 2: device exists + is a block device -----------------------------
 
 # On macOS /dev/diskN are character devices but appear as block to BSD
@@ -119,6 +134,46 @@ case "$UNAME" in
         if [ "$DEVICE" = "/dev/disk0" ] || [ "$DEVICE" = "/dev/rdisk0" ]; then
             fatal "REFUSED: $DEVICE is the Mac system disk"
         fi
+        ;;
+esac
+
+# --- Guard 3b: refuse if the device or its partitions are currently mounted --
+# Even non-root mounts (a /home or /boot on a separate disk; an SD card the
+# operator is using for working files) MUST be safe from accidental
+# overwrites. findmnt walks /proc/self/mountinfo (Linux) and returns the
+# mount sources; if ANY of them sit on this device, refuse.
+#
+# On macOS the equivalent is diskutil info showing "Mounted: Yes" against
+# the disk OR any of its slice children. The simpler heuristic: refuse if
+# diskutil reports the device as currently mounted.
+case "$UNAME" in
+    Linux)
+        # `findmnt -no SOURCE` lists currently-mounted sources, one per line.
+        # Match prefix because partitions show as ${DEVICE}1 / ${DEVICE}p1.
+        while read -r source; do
+            [ -z "$source" ] && continue
+            case "$source" in
+                "$DEVICE"|"$DEVICE"[0-9]*|"$DEVICE"p[0-9]*)
+                    fatal "REFUSED: $DEVICE (or a partition of it) is currently mounted at a non-root path"
+                    ;;
+            esac
+        done < <(findmnt -no SOURCE 2>/dev/null || true)
+        ;;
+    Darwin)
+        # diskutil info reports "Mounted: Yes" or "Mounted: No" against
+        # a disk; for the parent disk it's typically "Not applicable
+        # (no file system)" while slice children carry the real state.
+        # Use `diskutil list` to enumerate slices, then check each.
+        SLICE_DEV="${DEVICE/\/dev\/rdisk//dev/disk}"  # de-raw for diskutil
+        while read -r slice; do
+            [ -z "$slice" ] && continue
+            mounted=$(diskutil info "$slice" 2>/dev/null | \
+                      awk -F: '/^[[:space:]]*Mounted:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+            if [ "$mounted" = "Yes" ]; then
+                fatal "REFUSED: $DEVICE has a currently-mounted slice ($slice)"
+            fi
+        done < <(diskutil list "$SLICE_DEV" 2>/dev/null | \
+                 awk '/^[[:space:]]+[0-9]+:/ {print "/dev/" $NF}' | grep -E "^/dev/disk[0-9]+s[0-9]+")
         ;;
 esac
 

@@ -183,6 +183,40 @@ def test_flash_rejects_unknown_flag(tmp_path: Path) -> None:
     assert r.returncode == 2
 
 
+def test_flash_refuses_loopback_devices(tmp_path: Path) -> None:
+    """B.6-followup Guard 2a: /dev/loop* is a file-backed mount;
+    dd'ing to it would corrupt the underlying file in ways that are
+    non-obvious to recover from. Refuse by NAME before the device-
+    exists check so the operator sees a clear "loopback refused"
+    error, not a generic "not found"."""
+    img = tmp_path / "fake.img"
+    img.write_bytes(b"x" * 64)
+    r = subprocess.run(
+        ["bash", str(_FLASH), "--dry-run", "--yes", str(img), "/dev/loop42"],
+        check=False, capture_output=True, text=True
+    )
+    assert r.returncode != 0
+    assert "loopback" in r.stderr.lower()
+
+
+def test_flash_refuses_device_mapper_devices(tmp_path: Path) -> None:
+    """B.6-followup Guard 2a: /dev/dm-* + /dev/mapper/* are device-
+    mapper targets (LUKS-encrypted volumes, LVM logical volumes).
+    dd'ing to one would silently corrupt the mapped backing -- LUKS
+    headers gone, LVM metadata gone."""
+    img = tmp_path / "fake.img"
+    img.write_bytes(b"x" * 64)
+    for dev in ("/dev/dm-0", "/dev/mapper/cryptroot"):
+        r = subprocess.run(
+            ["bash", str(_FLASH), "--dry-run", "--yes", str(img), dev],
+            check=False, capture_output=True, text=True
+        )
+        assert r.returncode != 0, f"should refuse {dev}"
+        assert "device-mapper" in r.stderr.lower(), (
+            f"missing device-mapper message for {dev}: {r.stderr!r}"
+        )
+
+
 def test_flash_supports_yes_to_skip_prompt(tmp_path: Path) -> None:
     """--yes skips the typed-confirmation prompt. Useful in CI but the
     spirit of the safety guards still holds (size + system-disk checks
