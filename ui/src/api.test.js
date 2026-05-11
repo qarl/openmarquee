@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     deleteContent,
     effectiveDisplayDims,
+    extractDetailMessage,
     generateBackground,
     getPlaybackState,
     getSchedule,
@@ -498,5 +499,52 @@ describe("effectiveDisplayDims", () => {
                 display_height: 32,
             }),
         ).toBe(null);
+    });
+});
+
+describe("extractDetailMessage (15.3)", () => {
+    it("returns body.detail when it's a string (HTTPException(detail=...))", async () => {
+        const response = {
+            status: 409,
+            statusText: "Conflict",
+            json: async () => ({ detail: "peer already exists" }),
+        };
+        expect(await extractDetailMessage(response)).toBe("peer already exists");
+    });
+
+    it("returns the first msg from a 422 ValidationError array", async () => {
+        const response = {
+            status: 422,
+            statusText: "Unprocessable Entity",
+            json: async () => ({
+                detail: [
+                    { msg: "string too long", loc: ["body", "name"] },
+                    { msg: "additional later error", loc: ["body", "color"] },
+                ],
+            }),
+        };
+        expect(await extractDetailMessage(response)).toBe("string too long");
+    });
+
+    it("falls back to '<status> <statusText>' when body isn't JSON", async () => {
+        const response = {
+            status: 500,
+            statusText: "Internal Server Error",
+            json: async () => {
+                throw new Error("not json");
+            },
+        };
+        expect(await extractDetailMessage(response)).toBe(
+            "500 Internal Server Error",
+        );
+    });
+
+    it("falls back when body is JSON but lacks a detail field", async () => {
+        const response = {
+            status: 503,
+            statusText: "Service Unavailable",
+            json: async () => ({ error: "down" }),
+        };
+        expect(await extractDetailMessage(response)).toBe("503 Service Unavailable");
     });
 });

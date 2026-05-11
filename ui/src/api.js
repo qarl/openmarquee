@@ -1,6 +1,30 @@
 // Thin client over the openMarquee REST API. Same-origin, no CORS, no auth.
 
 /**
+ * 15.3: Best-effort "pull a one-line operator-friendly message out of a
+ * non-OK response." Handles three shapes FastAPI emits:
+ *   - 422 ValidationError -> `{detail: [{msg, loc, ...}, ...]}` (array)
+ *   - 4xx with `raise HTTPException(detail="...")` -> `{detail: "..."}` (string)
+ *   - 5xx with no JSON body or bytes -> falls back to `status statusText`
+ *
+ * Used at every non-OK throw site so the operator gets a useful message
+ * instead of a raw JSON dump. addFlockPeer used to be the only caller
+ * with this pattern; sweep #7 #4 hoisted it for uniformity.
+ */
+export async function extractDetailMessage(response) {
+    try {
+        const body = await response.json();
+        if (typeof body.detail === "string") return body.detail;
+        if (Array.isArray(body.detail) && body.detail[0]?.msg) {
+            return body.detail[0].msg;
+        }
+    } catch {
+        /* not JSON -- fall through to the status-only fallback */
+    }
+    return `${response.status} ${response.statusText}`.trim();
+}
+
+/**
  * Upload a text slide. `payload` matches the backend `TextSlideUpload`
  * schema (api.py) — see that class for the full field list (it grew
  * past anything worth enumerating here when Phase 5b added
@@ -14,7 +38,7 @@ export async function saveTextSlide(payload) {
         body: JSON.stringify(payload),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Save failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -33,7 +57,7 @@ export async function saveImage(payload) {
         body: JSON.stringify(payload),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Save failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -51,7 +75,7 @@ export async function saveVideo(payload) {
         body: JSON.stringify(payload),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Save video failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -87,7 +111,7 @@ export async function updateTextSlide(id, payload) {
         body: JSON.stringify(payload),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Update failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -104,7 +128,7 @@ export async function updateImage(id, payload) {
         body: JSON.stringify(payload),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Update image failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -122,7 +146,7 @@ export async function updateVideo(id, payload) {
         body: JSON.stringify(payload),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Update video failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -140,7 +164,7 @@ export async function patchSlideDuration(id, durationMs) {
         body: JSON.stringify({ duration_ms: Math.round(durationMs) }),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Update duration failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -230,7 +254,7 @@ export async function createPlaylist({ name, entries }) {
         body: JSON.stringify(_encodePlaylistBody(entries, name)),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Create playlist failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -253,7 +277,7 @@ export async function savePlaylistById(id, { name, entries }) {
         },
     );
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Save playlist failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -285,13 +309,7 @@ export async function generateBackground({ prompt, name }) {
         body: JSON.stringify({ prompt, name }),
     });
     if (!response.ok) {
-        let detail = "";
-        try {
-            const body = await response.json();
-            detail = body?.detail || "";
-        } catch {
-            detail = await response.text();
-        }
+        const detail = await extractDetailMessage(response);
         const err = new Error(
             `Background generation failed (${response.status}): ${detail}`,
         );
@@ -379,7 +397,7 @@ export async function saveSettings(settings) {
         body: JSON.stringify(settings),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Save settings failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -393,7 +411,7 @@ export async function saveSchedule(schedule) {
         body: JSON.stringify(schedule),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Save schedule failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -418,19 +436,11 @@ export async function addFlockPeer(address) {
     });
     if (!response.ok) {
         // 422 bodies are FastAPI validation envelopes ({detail: [...]}); 409
-        // bodies are {detail: "..."}. Pull out a one-line reason so the
-        // modal doesn't dump a regex at the operator.
-        let message = `HTTP ${response.status}`;
-        try {
-            const body = await response.json();
-            if (typeof body.detail === "string") {
-                message = body.detail;
-            } else if (Array.isArray(body.detail) && body.detail[0]?.msg) {
-                message = body.detail[0].msg;
-            }
-        } catch {
-            /* not JSON — keep the status code */
-        }
+        // bodies are {detail: "..."}. The shared helper handles both shapes.
+        // 422 specifically gets a friendlier hand-written message because the
+        // raw "expected ASCII / max length" pydantic noise is meaningless to
+        // the operator who just typed a bad hostname.
+        let message = await extractDetailMessage(response);
         if (response.status === 422) {
             message = `Invalid address — expected a hostname or IP (optionally host:port).`;
         }
@@ -512,7 +522,7 @@ export async function startStream(sdpOffer) {
         throw err;
     }
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Stream start failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -530,7 +540,7 @@ export async function takeoverStream(sdpOffer) {
         signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Stream takeover failed (${response.status}): ${detail}`);
     }
     return await response.json();
@@ -547,7 +557,7 @@ export async function stopStream(sessionId) {
         body: JSON.stringify({ session_id: sessionId }),
     });
     if (!response.ok && response.status !== 404) {
-        const detail = await response.text();
+        const detail = await extractDetailMessage(response);
         throw new Error(`Stream stop failed (${response.status}): ${detail}`);
     }
 }
