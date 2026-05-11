@@ -152,7 +152,8 @@ async function boot() {
     const isDemoMode =
         typeof document !== "undefined" &&
         document.body &&
-        document.body.hasAttribute("data-demo-mode");
+        (document.body.hasAttribute("data-demo-mode") ||
+            window.location.pathname.startsWith("/demo/"));
 
     // Batch 20.2 / phase A.2 — auth gate. Probe /api/auth/status to
     // figure out which boot route applies:
@@ -545,9 +546,9 @@ async function boot() {
     // pathname check is belt-and-suspenders: if someone ever strips
     // data-demo-mode from the demo template, the panel still simulates
     // (instead of silently breaking with a setRemoteDescription throw).
-    const isDemoMode =
-        document.body.hasAttribute("data-demo-mode") ||
-        window.location.pathname.startsWith("/demo/");
+    // 20.2 hotfix lifted the same check earlier in boot() to gate the
+    // auth redirect; this is the SAME `isDemoMode` const, hoisted up
+    // to that earlier declaration.
     mountStreamPanel(root.querySelector(".stream-panel-slot"), {
         simulateOnly: isDemoMode,
     });
