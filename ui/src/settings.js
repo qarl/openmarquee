@@ -244,6 +244,39 @@ const SECTION_TEMPLATE = `
                 </label>
             </div>
 
+            <div class="om-card settings-operator-password">
+                <div ${CARD_EYEBROW}>Operator login</div>
+                <p class="settings-hint" style="margin: 0 0 12px;">
+                    The password gates this editor. Changing it invalidates
+                    every existing session on every device.
+                </p>
+                <div class="change-pw-display"
+                     style="display: flex; gap: 8px; align-items: center;">
+                    <span class="change-pw-status"
+                          style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;">
+                        Set
+                    </span>
+                    <button type="button" class="om-btn sm change-pw-btn">Change…</button>
+                </div>
+                <div class="change-pw-form" hidden
+                     style="display: grid; gap: 6px; margin-top: 10px;">
+                    <input type="password" class="om-input change-pw-current"
+                           placeholder="Current password" autocomplete="current-password">
+                    <input type="password" class="om-input change-pw-new"
+                           placeholder="New password (8+ chars)" minlength="8"
+                           autocomplete="new-password">
+                    <input type="password" class="om-input change-pw-confirm"
+                           placeholder="Confirm new password" minlength="8"
+                           autocomplete="new-password">
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" class="om-btn primary sm change-pw-save">Save</button>
+                        <button type="button" class="om-btn sm change-pw-cancel">Cancel</button>
+                    </div>
+                    <p class="change-pw-error" role="alert" aria-live="polite"
+                       style="min-height: 1.2em; color: #ff6b6b; font-size: 12px; margin: 0;"></p>
+                </div>
+            </div>
+
             <button type="submit" class="om-btn primary settings-save" style="width: 100%; height: 46px; font-size: 14.5px;">Save settings</button>
             <p class="settings-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
         </form>
@@ -519,6 +552,106 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         }
     }
     wireSecretFields();
+
+    // Batch 20.5: operator-password Change… card. Mirrors the secret-
+    // field pattern but POSTs /api/auth/change-password (3-field
+    // body: current_password + new_password + new_password_confirm)
+    // and stashes the rotated token in localStorage so subsequent
+    // apiFetch calls don't 401-then-redirect on the now-bumped
+    // token_version.
+    function wireChangePasswordCard() {
+        const card = container.querySelector(".settings-operator-password");
+        if (!card) return;
+        const display = card.querySelector(".change-pw-display");
+        const formEl = card.querySelector(".change-pw-form");
+        const changeBtn = card.querySelector(".change-pw-btn");
+        const cancelBtn = card.querySelector(".change-pw-cancel");
+        const saveBtn = card.querySelector(".change-pw-save");
+        const currentEl = card.querySelector(".change-pw-current");
+        const newEl = card.querySelector(".change-pw-new");
+        const confirmEl = card.querySelector(".change-pw-confirm");
+        const errorEl = card.querySelector(".change-pw-error");
+
+        function open() {
+            display.hidden = true;
+            formEl.hidden = false;
+            currentEl.value = "";
+            newEl.value = "";
+            confirmEl.value = "";
+            errorEl.textContent = "";
+            saveBtn.disabled = false;
+            currentEl.focus();
+        }
+        function close() {
+            formEl.hidden = true;
+            display.hidden = false;
+            currentEl.value = "";
+            newEl.value = "";
+            confirmEl.value = "";
+            errorEl.textContent = "";
+            saveBtn.disabled = false;
+        }
+
+        changeBtn.addEventListener("click", open);
+        cancelBtn.addEventListener("click", close);
+
+        saveBtn.addEventListener("click", async () => {
+            errorEl.textContent = "";
+            if (newEl.value !== confirmEl.value) {
+                errorEl.textContent = "New passwords don't match.";
+                return;
+            }
+            if (newEl.value.length < 8) {
+                errorEl.textContent = "New password must be at least 8 characters.";
+                return;
+            }
+            saveBtn.disabled = true;
+            try {
+                const response = await apiFetch("/api/auth/change-password", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        current_password: currentEl.value,
+                        new_password: newEl.value,
+                        new_password_confirm: confirmEl.value,
+                    }),
+                    // 20.5: 401 here means "current_password wrong" --
+                    // surface inline rather than bouncing to /login.
+                    skipAuth401Redirect: true,
+                });
+                if (response.status === 401) {
+                    errorEl.textContent = "Incorrect current password.";
+                    saveBtn.disabled = false;
+                    return;
+                }
+                if (!response.ok) {
+                    let detail = `HTTP ${response.status}`;
+                    try {
+                        const body = await response.json();
+                        if (typeof body.detail === "string") detail = body.detail;
+                    } catch { /* ignore */ }
+                    errorEl.textContent = detail;
+                    saveBtn.disabled = false;
+                    return;
+                }
+                // 200: backend bumped token_version + returned a new
+                // token. Stash it so the next apiFetch carries it
+                // instead of the now-invalidated old one.
+                const body = await response.json();
+                if (body.token) {
+                    try {
+                        localStorage.setItem("openmarquee_auth_token", body.token);
+                    } catch { /* private-browsing */ }
+                }
+                close();
+                statusEl.textContent = "Password changed.";
+            } catch (err) {
+                errorEl.textContent = err?.message || "Network error.";
+                saveBtn.disabled = false;
+            }
+        });
+    }
+    wireChangePasswordCard();
 
     async function refresh() {
         statusEl.textContent = "";

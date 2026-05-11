@@ -17,12 +17,12 @@ const PRESET_PASSWORD = "hunter2hunter";
 test.beforeEach(async ({ page }) => {
     resetServerState();
     await page.context().clearCookies();
-    await page.addInitScript(() => {
-        try { localStorage.removeItem("openmarquee_auth_token"); } catch {}
-    });
     // Stamp a password directly into the backend so /login.html has
     // something to authenticate against. resetServerState() cleared
     // E2E_AUTH_PATH; /api/auth/set-password lands it fresh.
+    // No addInitScript localStorage.removeItem -- Playwright auto-
+    // isolates contexts, and a per-load removeItem would wipe the
+    // token between /login.html success + the redirect to /.
     const resp = await page.request.post("/api/auth/set-password", {
         data: { password: PRESET_PASSWORD, password_confirm: PRESET_PASSWORD },
     });

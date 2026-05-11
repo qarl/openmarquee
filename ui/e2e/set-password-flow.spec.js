@@ -14,14 +14,12 @@ test.beforeEach(async ({ page }) => {
     resetServerState();
     resetFirstRun();
     await page.context().clearCookies();
-    // Clear localStorage in the page context so a previous test's
-    // token doesn't survive into this one. The first-run-welcome path
-    // doesn't read localStorage, but the post-set-password redirect
-    // does, and a stale token would short-circuit subsequent /login
-    // checks.
-    await page.addInitScript(() => {
-        try { localStorage.removeItem("openmarquee_auth_token"); } catch {}
-    });
+    // No localStorage.removeItem init-script here -- Playwright
+    // contexts auto-isolate localStorage between tests, and a
+    // removeItem init-script fires on EVERY page load (including the
+    // post-set-password navigation to /), wiping the freshly-stored
+    // token before main.js's auth gate reads it (caught 2026-05-11
+    // during 20.5 playwright run).
 });
 
 test("first-boot welcome → set-password → editor", async ({ page }) => {
