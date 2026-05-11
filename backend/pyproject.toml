@@ -50,7 +50,14 @@ dev = [
     # regenerates requirements.lock from pyproject.toml; pip-audit
     # gates pre-deploy on CVE findings against the lockfile. Both
     # are dev-only -- the device runs from the generated lockfile.
-    "pip-tools>=7.0",
+    #
+    # pip-tools is EXACT-pinned (==) -- the lock-drift check in
+    # test.sh / CI runs `pip-compile ... | diff requirements.lock`,
+    # and pip-tools version differences across dev/CI produce
+    # spurious diffs in the header comment block. Pinning eliminates
+    # that. Bump in lockstep with a re-run of pip-compile + commit
+    # of the updated requirements.lock.
+    "pip-tools==7.4.1",
     "pip-audit>=2.7",
 ]
 

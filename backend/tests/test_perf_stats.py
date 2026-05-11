@@ -32,6 +32,7 @@ from openmarquee.dependencies import (
 from openmarquee.flock import FlockStorage
 from openmarquee.perf_middleware import (
     _REQUEST_LOG_MAX,
+    _coerce_request_id,
     clear_request_log,
     recent_requests,
 )
@@ -186,6 +187,54 @@ def test_middleware_rejects_malformed_request_id(client: TestClient):
     rid = response.headers.get("x-request-id")
     assert rid is not None
     assert len(rid) == 12  # minted, not echoed
+
+
+def test_coerce_request_id_rejects_crlf_injection():
+    """Header-injection attempt with embedded \\r\\n must NOT reflect
+    back -- httpx strips CRLF at send-time so the TestClient-level
+    tests don't reach the predicate. Hit it directly with raw bytes
+    here so the no-reflection guarantee is locked in."""
+    headers = [(b"x-request-id", b"abc\r\nInjected: header")]
+    result = _coerce_request_id(headers)
+    assert "\r" not in result
+    assert "\n" not in result
+    assert "Injected" not in result
+    assert len(result) == 12  # minted, hex
+
+
+def test_coerce_request_id_rejects_non_ascii():
+    """Bytes that can't decode to ASCII (Latin-1 \\xff, multi-byte
+    UTF-8 starts) get a minted id rather than crashing or being
+    reflected back."""
+    headers = [(b"x-request-id", b"\xff\xfe garbage")]
+    result = _coerce_request_id(headers)
+    assert len(result) == 12  # minted, hex
+
+
+def test_coerce_request_id_rejects_oversized():
+    """65+ char values exceed the predicate cap and get minted
+    instead -- prevents log-line bloat / response-header bloat from
+    a misbehaving client."""
+    headers = [(b"x-request-id", b"a" * 100)]
+    result = _coerce_request_id(headers)
+    assert len(result) == 12
+    assert result != "a" * 12  # truly minted, not truncated input
+
+
+def test_coerce_request_id_rejects_null_bytes():
+    """Null bytes are non-printable -- they shouldn't sneak past the
+    alnum-or-dash predicate. Mint instead."""
+    headers = [(b"x-request-id", b"abc\x00def")]
+    result = _coerce_request_id(headers)
+    assert "\x00" not in result
+    assert len(result) == 12
+
+
+def test_coerce_request_id_accepts_valid_dash_alnum():
+    """Sanity: a legitimate `phone-trace-42` shape round-trips."""
+    headers = [(b"x-request-id", b"phone-trace-42")]
+    result = _coerce_request_id(headers)
+    assert result == "phone-trace-42"
 
 
 def test_request_id_log_filter_stamps_record():

@@ -49,10 +49,12 @@ request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 class RequestIdLogFilter(logging.Filter):
     """Stamp every LogRecord with `record.request_id` from the
-    ContextVar. Attach to handlers whose formatter uses %(request_id)s
-    -- the configured logging format in app.py doesn't reference it
-    yet (sweep #8 A4 is the foundation; structured logging in A3 will
-    pull it into the format)."""
+    ContextVar. Attached to root-logger handlers by app.py's
+    _configure_logging; the configured format
+    `%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s`
+    consumes that attribute. Outside a request scope the ContextVar's
+    default of "-" renders, so log calls during startup / shutdown
+    don't KeyError."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.request_id = request_id_var.get()

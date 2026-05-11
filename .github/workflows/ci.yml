@@ -67,6 +67,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: cargo test
         working-directory: renderer
+        # Plain `cargo test` (no --no-default-features) is correct on
+        # macos-latest: Cargo.toml has zero [features] declarations;
+        # the Linux-only deps gate purely via [target.'cfg(target_os
+        # = "linux")'.dependencies] which cfg-out automatically on
+        # macOS. See qa/ci-tradeoffs.md for the runner-choice
+        # rationale.
         run: cargo test
 
   e2e:
