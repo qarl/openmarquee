@@ -137,7 +137,7 @@ def find_handler_blocks(mock_text: str) -> list[tuple[str, str]]:
 # Map a *Upload class to the route-path substring(s) where its fields
 # should reach the mock state. Add entries here as new *Upload models
 # land in the backend.
-_UPLOAD_CLASS_TO_PATH = {
+_UPLOAD_CLASS_TO_PATH: dict[str, str | None] = {
     "TextSlideUpload": "/api/content/text-slides",
     # ImageUpload / VideoUpload POSTs are currently forbidden in the
     # mock (the demo's bg-picker only serves pre-seeded media), so the
@@ -147,6 +147,14 @@ _UPLOAD_CLASS_TO_PATH = {
     # automatically and surfaces any missing fields.
     "ImageUpload": "/api/content/images",
     "VideoUpload": "/api/content/videos",
+    # 18.5: known non-route Upload classes. None marker means "we know
+    # this class exists, it has no standalone route, skip field-drift
+    # check + suppress unmapped-class warning". TextLayerUpload is a
+    # nested sub-model inside TextSlideUpload (one TextSlideUpload
+    # contains a list[TextLayerUpload]); its fields are covered by
+    # the TextSlideUpload merge handler scanning the wider request
+    # body.
+    "TextLayerUpload": None,
 }
 
 
@@ -166,8 +174,12 @@ def check_upload_field_drift(
     warnings: list[str] = []
     blocks = find_handler_blocks(mock_text)
     for cls_name, fields in upload_fields.items():
-        target_path = _UPLOAD_CLASS_TO_PATH.get(cls_name)
-        if not target_path:
+        # Skip if not mapped (caught by unmapped-classes check in
+        # main) OR if explicitly mapped to None (known non-route).
+        if cls_name not in _UPLOAD_CLASS_TO_PATH:
+            continue
+        target_path = _UPLOAD_CLASS_TO_PATH[cls_name]
+        if target_path is None:
             continue
         # Find blocks that mention this path. A path can show up in
         # multiple blocks (e.g. a "read path" block AND a "write path:
@@ -239,7 +251,17 @@ def main() -> int:
     upload_fields = parse_upload_class_fields(code_root)
     field_warnings = check_upload_field_drift(upload_fields, mock_text)
 
-    if not missing and not field_warnings:
+    # 18.5 / sweep #9 N5: closes the "new *Upload class with no map
+    # entry" silent-skip class. The field-level drift checker uses
+    # _UPLOAD_CLASS_TO_PATH to know which mock-handler chunk to scan
+    # for each Upload class. A new class added in api.py without a
+    # corresponding map entry would never get its fields checked --
+    # this surfaces the gap so a future contributor can wire it up.
+    unmapped = [
+        cls for cls in upload_fields if cls not in _UPLOAD_CLASS_TO_PATH
+    ]
+
+    if not missing and not field_warnings and not unmapped:
         print(f"  ok — {len(real)} backend routes accounted for in mock")
         return 0
 
@@ -257,6 +279,15 @@ def main() -> int:
             print(f"    {w}")
         print("  → merge handler should reach the field, OR use "
               "Object.assign(item, body) to mirror Pydantic round-trip.")
+
+    if unmapped:
+        print(f"  unmapped-classes: {len(unmapped)} *Upload class(es) "
+              "without _UPLOAD_CLASS_TO_PATH entry -- field-drift check "
+              "skipped silently:")
+        for cls in unmapped:
+            print(f"    {cls}")
+        print("  → add to _UPLOAD_CLASS_TO_PATH in this script so the "
+              "field-level drift check covers them.")
     return 0
 
 
