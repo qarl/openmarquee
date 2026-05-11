@@ -346,3 +346,73 @@ async def test_auto_layer_routes_through_gpu_path(tmp_path):
     assert all(s == 0 for s in renderer.attach_calls)
     assert renderer.detach_calls
     assert all(s == 0 for s in renderer.detach_calls)
+
+
+# --- Sweep #3 #5: _slide_has_animated_blend_mode_layer gate ---
+
+
+def test_slide_has_animated_blend_mode_layer_static_only():
+    """Static layers (no motion + no auto) never trigger the
+    software-path fallback regardless of blend mode."""
+    from openmarquee.content import TextLayer, TextSlide
+    from openmarquee.playback import _slide_has_animated_blend_mode_layer
+
+    slide = TextSlide(
+        name="static", duration_ms=5000,
+        text_layers=[TextLayer(text="hi", blend="overlay")],
+    )
+    assert _slide_has_animated_blend_mode_layer(slide) is False
+
+
+def test_slide_has_animated_blend_mode_layer_motion_normal():
+    """Animated layer + normal blend = stays on GPU path."""
+    from openmarquee.content import TextLayer, TextSlide
+    from openmarquee.playback import _slide_has_animated_blend_mode_layer
+
+    slide = TextSlide(
+        name="m", duration_ms=5000,
+        text_layers=[TextLayer(text="hi", motion="ticker", blend="normal")],
+    )
+    assert _slide_has_animated_blend_mode_layer(slide) is False
+
+
+def test_slide_has_animated_blend_mode_layer_motion_multiply():
+    """Animated layer + non-normal blend = drops to software path.
+    This is the trigger case the function gates."""
+    from openmarquee.content import TextLayer, TextSlide
+    from openmarquee.playback import _slide_has_animated_blend_mode_layer
+
+    slide = TextSlide(
+        name="m", duration_ms=5000,
+        text_layers=[TextLayer(text="hi", motion="ticker", blend="multiply")],
+    )
+    assert _slide_has_animated_blend_mode_layer(slide) is True
+
+
+def test_slide_has_animated_blend_mode_layer_hidden_animated_blend():
+    """An invisible animated-blend layer doesn't count -- it won't
+    render. The classify_layer / visible chain skips it."""
+    from openmarquee.content import TextLayer, TextSlide
+    from openmarquee.playback import _slide_has_animated_blend_mode_layer
+
+    slide = TextSlide(
+        name="m", duration_ms=5000,
+        text_layers=[TextLayer(
+            text="hi", motion="ticker", blend="multiply", visible=False,
+        )],
+    )
+    assert _slide_has_animated_blend_mode_layer(slide) is False
+
+
+def test_slide_has_animated_blend_mode_layer_non_text_slide():
+    """Image / video slides return False -- the gate is text-slide
+    only since other types don't run blend math anyway."""
+    from datetime import datetime, timezone
+    from openmarquee.content import ImageSlide
+    from openmarquee.playback import _slide_has_animated_blend_mode_layer
+
+    img = ImageSlide(
+        name="i", duration_ms=5000,
+        created_at=datetime.now(timezone.utc),
+    )
+    assert _slide_has_animated_blend_mode_layer(img) is False

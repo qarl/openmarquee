@@ -814,3 +814,24 @@ def test_scratch_pool_hits_on_repeated_motion_compose():
         f"second frame allocated {second_frame_creates} fresh buffers; "
         f"expected <= cold-frame count {cold_creates}"
     )
+
+
+# --- Sweep #3 #13: compute_phase wraps cleanly at the cycle boundary ---
+
+
+def test_compute_phase_returns_zero_at_cycle_boundary_not_one():
+    """`compute_phase` should always return a value in [0, 1).
+    At exactly one full cycle (elapsed * freq + motion_phase = 1.0),
+    the modulo wraps to 0.0. A float-precision regression that
+    returns 1.0 would break ticker's wrap-around logic (a 1.0
+    phase would shift_px past the box edge by one full width)."""
+    from openmarquee.motion import compute_phase
+
+    # 1Hz, motion_phase=0, elapsed=1.0 -> exactly one cycle.
+    assert compute_phase(1.0, 1.0, 0.0) == 0.0
+    # Half cycle.
+    assert compute_phase(0.5, 1.0, 0.0) == 0.5
+    # Cycle + half.
+    assert compute_phase(1.5, 1.0, 0.0) == 0.5
+    # motion_phase pushes into next cycle exactly.
+    assert compute_phase(0.5, 1.0, 0.5) == 0.0

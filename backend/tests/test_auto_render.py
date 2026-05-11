@@ -204,3 +204,79 @@ def test_load_background_lru_evicts_at_cap():
     # Oldest evicted; newest present.
     assert (ids[0], 8, 8) not in _image_bg_cache
     assert (ids[-1], 8, 8) in _image_bg_cache
+
+
+# --- Sweep #3 #4: render_auto_text_for_layer unknown-mode fall-through ---
+
+
+def test_render_auto_text_for_layer_unknown_mode_returns_typed_text():
+    """If a future schema mode lands ahead of the helper (e.g. a new
+    auto_mode="weather" appears in saved slides before the renderer
+    is updated), the fall-through should return the layer's typed
+    `text` rather than crash. model_construct bypasses schema
+    validation so we can test the defensive shape."""
+    from openmarquee.auto_render import render_auto_text_for_layer
+    from openmarquee.content import TextLayer
+
+    layer = TextLayer.model_construct(
+        text="fallback text",
+        auto_mode="future_weather_mode",
+        auto_format=None,
+    )
+    now = datetime(2026, 5, 10, 14, 30, tzinfo=ZoneInfo("UTC"))
+    assert render_auto_text_for_layer(layer, now) == "fallback text"
+
+
+# --- Sweep #3 #6: render_pattern unknown-pattern fall-through ---
+
+
+def test_render_pattern_unknown_falls_back_to_solid_color_a(caplog):
+    """Unknown pattern returns a solid color_a fill + log.warning.
+    Forward-compat for schema versions adding patterns ahead of
+    clients. model_construct bypasses the enum validator."""
+    import logging as _logging
+    from openmarquee.auto_render import render_pattern
+    from openmarquee.content import BackgroundPattern
+
+    pattern = BackgroundPattern.model_construct(
+        pattern="future_holographic",
+        color_a="#FF0000",
+        color_b="#00FF00",
+        density=0.5,
+    )
+    with caplog.at_level(_logging.WARNING, logger="openmarquee.auto_render"):
+        img = render_pattern(pattern, 16, 16)
+
+    # Solid color_a fill: every pixel matches.
+    assert img.size == (16, 16)
+    assert img.getpixel((0, 0)) == (0xFF, 0x00, 0x00)
+    assert img.getpixel((15, 15)) == (0xFF, 0x00, 0x00)
+    # Warning logged so operators see the fallback.
+    assert any(
+        "unknown pattern" in r.message
+        for r in caplog.records
+    )
+
+
+# --- Sweep #3 #9: _dot_grid_mask defensive against bad inputs ---
+
+
+def test_dot_grid_mask_zero_tile_returns_all_false():
+    """A degenerate tile=0 input would div-by-zero in the modulo
+    arithmetic. The guard returns an all-False mask of the right
+    shape so the caller's _apply_mask is a no-op."""
+    from openmarquee.auto_render import _dot_grid_mask
+
+    mask = _dot_grid_mask(width=10, height=10, tile=0, radius=5)
+    assert mask.shape == (10, 10)
+    assert not mask.any()
+
+
+def test_dot_grid_mask_negative_tile_returns_all_false():
+    """Same defensive shape for negative tile (the spec doesn't
+    accept it but a Pydantic bypass via model_construct could)."""
+    from openmarquee.auto_render import _dot_grid_mask
+
+    mask = _dot_grid_mask(width=10, height=10, tile=-3, radius=5)
+    assert mask.shape == (10, 10)
+    assert not mask.any()

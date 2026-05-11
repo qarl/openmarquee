@@ -204,3 +204,50 @@ def test_generate_no_longer_requires_api_key_env(
     _stub_provider_generate(monkeypatch)
     response = client.post("/api/backgrounds/generate", json={"prompt": "x"})
     assert response.status_code == 200
+
+
+# --- Sweep #3 #10: _name_from_prompt edge cases ---
+
+
+def test_name_from_prompt_whitespace_only_falls_back_to_generic():
+    """A prompt that's just whitespace/newlines after .strip() ends
+    up empty; the ternary uses the generic placeholder."""
+    from openmarquee.api_backgrounds import _name_from_prompt
+
+    assert _name_from_prompt("   \n  ") == "Generated — Background"
+    assert _name_from_prompt("") == "Generated — Background"
+    assert _name_from_prompt("\t\t") == "Generated — Background"
+
+
+def test_name_from_prompt_long_emoji_no_decode_error():
+    """A long all-emoji prompt should slice + format without raising
+    a UnicodeDecodeError or splitting a codepoint mid-byte."""
+    from openmarquee.api_backgrounds import _name_from_prompt
+
+    name = _name_from_prompt("🎉" * 100)
+    # Result is well-formed UTF-8 (no surrogate halves).
+    assert isinstance(name, str)
+    name.encode("utf-8")  # no crash
+    assert name.endswith(" — Background")
+
+
+def test_name_from_prompt_truncates_at_60_chars_no_codepoint_split():
+    """Python str slicing is character-based, not byte-based, so
+    [:60] of an emoji string takes 60 codepoints -- no half-byte
+    surrogate split. The output should still decode cleanly."""
+    from openmarquee.api_backgrounds import _name_from_prompt
+
+    name = _name_from_prompt("🚀" * 100)
+    name.encode("utf-8")  # round-trip
+    # First line, 60 codepoints + " — Background" suffix.
+    prefix, _, _ = name.partition(" — Background")
+    assert len(prefix) == 60
+
+
+def test_name_from_prompt_first_line_only():
+    """Multi-line prompts: the name is the first stripped line
+    (operators paste long prompts; the name should stay short)."""
+    from openmarquee.api_backgrounds import _name_from_prompt
+
+    name = _name_from_prompt("first line\nsecond line longer\nmore")
+    assert name == "first line — Background"

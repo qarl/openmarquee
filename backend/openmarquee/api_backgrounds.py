@@ -110,5 +110,9 @@ def _name_from_prompt(prompt: str) -> str:
     """Turn a prompt into a reasonable slide name. Truncate hard because
     the name column in the saved-slides list is narrow; operators rename
     anyway."""
-    trimmed = prompt.strip().splitlines()[0][:60].strip()
+    # 9.3: empty/whitespace-only prompt -> splitlines() returns []
+    # and [0] would IndexError. Guard with `or [""]` so the truthy
+    # tail falls through to the generic placeholder.
+    first_line = (prompt.strip().splitlines() or [""])[0]
+    trimmed = first_line[:60].strip()
     return f"{trimmed} — Background" if trimmed else "Generated — Background"
