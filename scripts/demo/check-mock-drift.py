@@ -139,12 +139,14 @@ def find_handler_blocks(mock_text: str) -> list[tuple[str, str]]:
 # land in the backend.
 _UPLOAD_CLASS_TO_PATH = {
     "TextSlideUpload": "/api/content/text-slides",
-    # ImageUpload / VideoUpload aren't merge-relevant in the mock
-    # because /api/content/{images,videos} POSTs are forbidden in the
-    # demo (the bg-picker only serves pre-seeded media). Still surface
-    # them so a future "image edit metadata" handler would catch up.
-    "ImageUploadRequest": "/api/content/images",
-    "VideoUploadRequest": "/api/content/videos",
+    # ImageUpload / VideoUpload POSTs are currently forbidden in the
+    # mock (the demo's bg-picker only serves pre-seeded media), so the
+    # checker has no merge handler to scan -- it falls through cleanly.
+    # When those routes do get implemented in mock-backend.js, the
+    # class-name-driven parse_upload_class_fields() pass picks them up
+    # automatically and surfaces any missing fields.
+    "ImageUpload": "/api/content/images",
+    "VideoUpload": "/api/content/videos",
 }
 
 
@@ -183,6 +185,18 @@ def check_upload_field_drift(
         if any(
             re.search(r"Object\.assign\s*\(\s*\w+\s*,\s*body\b", body)
             or re.search(r"\.\.\.\s*body\b", body)
+            for _, body in matching
+        ):
+            continue
+        # If NO matching block even reads body / request.json(), the
+        # path isn't a write-merge handler at all -- e.g. ImageUpload /
+        # VideoUpload POSTs are forbidden in the demo (no state to
+        # merge). When those routes get a real handler later, that
+        # block WILL parse body and the wildcard-merge or per-field
+        # check below applies.
+        if not any(
+            re.search(r"\bbody\.\w", body)
+            or re.search(r"request\.json\s*\(", body)
             for _, body in matching
         ):
             continue
