@@ -85,6 +85,26 @@ ssh "$TARGET" "$REMOTE_ROOT/venv/bin/pip install --quiet --upgrade --no-deps -e 
 echo "==> restarting openmarquee-backend"
 ssh "$TARGET" "sudo systemctl restart openmarquee-backend"
 
+# 19.3 / sweep #10 #5: gate the deploy on /healthz returning 200.
+# Mandatory (not advisory) -- a backend that crashes during startup
+# (config error / asset missing / migration failure) silently
+# remained "deployed" before. Now the deploy fails fast.
+#
+# --max-time 30 budget covers startup of: lifespan (seed, prune,
+# renderer __enter__, playback start, pull worker), uvicorn bind.
+# --retry 5 + --retry-delay 2 spans 10-30s; matches the StartLimit
+# in backend.service (5 failures in 5 min).
+echo "==> verifying backend health (/healthz must 200 within 30s)"
+# Use Tailscale hostname (or whatever TARGET resolves to); deploy
+# typically targets openmarquee@<host> so we strip the user@.
+HEALTH_HOST="${TARGET#*@}"
+if ! curl --max-time 30 --retry 5 --retry-delay 2 --fail -sS "http://$HEALTH_HOST/healthz" > /dev/null; then
+    echo "ERROR: backend did not return 200 within budget"
+    echo "       inspect: ssh $TARGET sudo journalctl -u openmarquee-backend -n 50"
+    exit 1
+fi
+echo "==> /healthz OK"
+
 cat <<EOF
 
 deployed to $TARGET.

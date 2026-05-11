@@ -27,6 +27,12 @@ Environment="OPENMARQUEE_SCHEDULE_PATH=/var/openmarquee/schedules.json"
 Environment="OPENMARQUEE_SETTINGS_PATH=/var/openmarquee/settings.json"
 Environment="OPENMARQUEE_SEED_MARKER_PATH=/var/openmarquee/seeded.json"
 Environment="OPENMARQUEE_DEV_PREVIEW_PATH=/var/openmarquee/preview.png"
+# 19.3 / sweep #10 #6: flock + tombstone paths weren't explicit
+# here; they fell back to dependencies.py's project-root-relative
+# default. Make /var canonical so a future cwd change doesn't
+# silently relocate flock.json / tombstones.json.
+Environment="OPENMARQUEE_FLOCK_PATH=/var/openmarquee/flock.json"
+Environment="OPENMARQUEE_TOMBSTONE_PATH=/var/openmarquee/tombstones.json"
 
 # Production: strip the /dev tooling (preview page, manual play endpoint)
 # from the HTTP surface. The gate is read by app.py at startup.

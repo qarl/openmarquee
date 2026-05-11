@@ -24,6 +24,25 @@ The backend service is wrapped with `ProtectSystem=strict`, a dedicated
 service user, and `CAP_NET_BIND_SERVICE` so uvicorn can bind port 80
 without running as root.
 
+## On-disk state layout (`/var/openmarquee/`)
+
+The backend writes all mutable state under `/var/openmarquee/`. Paths are
+pinned via `Environment="OPENMARQUEE_*_PATH=..."` in
+`openmarquee-backend.service` so dev / cwd / refactor can't relocate
+them silently.
+
+| Path | Carries |
+| --- | --- |
+| `content/` | All ContentItem dirs (`<UUID>/item.json` + `<UUID>/asset.png` or `<UUID>/asset.mp4`) |
+| `playlist.json` | PlaylistCollection (v4 UUID-keyed) |
+| `schedules.json` | Schedule rules + default_playlist_id |
+| `settings.json` | SystemSettings (AP password, station password, Tailscale auth key — 0600 only) |
+| `flock.json` | FlockStorage peer list + sync flags |
+| `tombstones.json` | TombstoneLog for delete-replication across the flock |
+| `seeded.json` | Marker stamping that first-boot seed already ran |
+| `preview.png` | Latest dev-preview snapshot from the playback loop |
+| `wifi.json` | Captive-portal AP password as currently broadcast (written by first-boot rotation) |
+
 ## Concurrent AP + station mode on a single radio
 
 The Pi Zero 2 W's BCM43438 supports hosting a WiFi access point AND
