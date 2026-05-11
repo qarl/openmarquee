@@ -444,3 +444,67 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
         }).not.toThrow();
     });
 });
+
+
+describe("mountPlaylistTrack — Batch 8.3 memoized refresh", () => {
+    it("preserves track-block DOM node identity when nothing changed", async () => {
+        const container = document.createElement("div");
+        const handle = mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a", "b"]),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        // Wait for the lazy sortablejs import to land.
+        await tick();
+        const firstBlocks = Array.from(container.querySelectorAll(".track-block"));
+        expect(firstBlocks).toHaveLength(2);
+
+        // Refresh with identical fetchItems + fetchPlaylists -- the
+        // memoized refresh should short-circuit and leave the same
+        // DOM nodes in place.
+        await handle.refresh();
+        await tick();
+        const secondBlocks = Array.from(container.querySelectorAll(".track-block"));
+        expect(secondBlocks).toHaveLength(2);
+        // Same Node references = no rebuild.
+        expect(secondBlocks[0]).toBe(firstBlocks[0]);
+        expect(secondBlocks[1]).toBe(firstBlocks[1]);
+    });
+
+    it("rebuilds when the playlist contents change", async () => {
+        const container = document.createElement("div");
+        let order = ["a", "b"];
+        const handle = mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            // fetchPlaylists is re-invoked each refresh, so we can
+            // mutate the outer `order` to drive a real change.
+            fetchPlaylists: async () => ({
+                schema_version: 4,
+                playlists: [
+                    {
+                        id: DEFAULT_PLAYLIST_ID,
+                        name: "default",
+                        items: order.map((id) => ({ item_id: id })),
+                    },
+                ],
+            }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        await tick();
+        const firstBlocks = Array.from(container.querySelectorAll(".track-block"));
+
+        order = ["b", "a", "c"];
+        await handle.refresh();
+        await tick();
+        const secondBlocks = Array.from(container.querySelectorAll(".track-block"));
+        // Different content -> different node count + at least one
+        // identity break.
+        expect(secondBlocks).toHaveLength(3);
+        // Cannot assert all identities differ (the underlying DOM
+        // wipe is unconditional on rebuild), but the node count
+        // change is sufficient to confirm the rebuild fired.
+        expect(secondBlocks.length).not.toBe(firstBlocks.length);
+    });
+});

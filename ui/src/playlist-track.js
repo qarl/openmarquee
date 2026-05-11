@@ -186,6 +186,15 @@ export function mountPlaylistTrack(container, options) {
     // (edits don't change created_at, so the HTTP cache would otherwise
     // serve stale bytes after an in-place save).
     let refreshVersion = 0;
+    // Memoization key for diff-based refresh (Batch 8.3). When the
+    // playlist + content snapshot hasn't changed since the last
+    // refresh, the entire wipe + rebuild + Sortable-recreate cycle
+    // is a no-op. The key encodes everything that affects rendered
+    // chrome: playlist entries (id+transition+transition_ms order),
+    // content items (id+duration_ms+updated_at), and the active
+    // playlist name. Auto-save fires refresh() every 600ms in some
+    // edit flows; this lets unchanged-state polls short-circuit.
+    let lastRefreshKey = null;
     // Closure-scoped lookup so the track Sortable's `onEnd` can re-skin a
     // cross-list drop (pallet → track) from the Sortable-clone's default
     // `.pallet-tile` shape into a proper `.track-block` *before* waiting
@@ -253,13 +262,6 @@ export function mountPlaylistTrack(container, options) {
     async function refresh() {
         markStart("playlist-track.refresh");
         statusEl.textContent = "";
-        refreshVersion += 1;
-        // Destroy existing Sortables BEFORE re-rendering tiles. Sortable.js
-        // `destroy()` strips the `draggable` attribute from every child it
-        // managed — doing this AFTER rendering the new tiles would wipe
-        // their draggable="false" and let native <img> drag preempt Sortable.
-        if (trackSortable) { trackSortable.destroy(); trackSortable = null; }
-        if (palletSortable) { palletSortable.destroy(); palletSortable = null; }
         try {
             const [items, collection] = await Promise.all([
                 fetchItems(),
@@ -273,10 +275,6 @@ export function mountPlaylistTrack(container, options) {
                 (p) => String(p.id) === String(activeId),
             );
             const activeName = active?.name || "default";
-            if (headingEl) {
-                headingEl.textContent =
-                    activeName === "default" ? "Default playlist" : activeName;
-            }
             const playlistRaw = active?.items;
             const defaultEntries = Array.isArray(playlistRaw)
                 ? playlistRaw.map((e) => ({
@@ -289,6 +287,54 @@ export function mountPlaylistTrack(container, options) {
                       transition: "cut",
                       transition_ms: 500,
                   }));
+
+            // Batch 8.3 memoization: compute a fingerprint covering
+            // everything that affects rendered chrome. If unchanged
+            // since last refresh AND the track has content, skip the
+            // wipe-and-rebuild. Auto-save can fire refresh() rapidly
+            // while the operator types in an unrelated field; this
+            // short-circuits those redundant ticks.
+            const entriesKey = defaultEntries
+                .map((e) => `${e.item_id}/${e.transition}/${e.transition_ms}`)
+                .join(",");
+            const itemsKey = items
+                .map((i) => `${i.id}/${i.duration_ms}/${i.updated_at || ""}`)
+                .join(",");
+            // Sibling-playlist count goes into the eyebrow stats
+            // line; key on the full playlists list so a non-active
+            // playlist add/delete invalidates the memo.
+            const playlistsKey = (collection.playlists || [])
+                .map((p) => String(p.id))
+                .join(",");
+            const refreshKey = `${activeName}|${entriesKey}|${itemsKey}|${playlistsKey}`;
+            if (
+                refreshKey === lastRefreshKey
+                && trackSortable !== null
+                && palletSortable !== null
+            ) {
+                // Nothing observable changed; keep the existing DOM +
+                // Sortable instances intact. autoSave + statusEl reset
+                // still need to happen (refresh is a "loaded fresh from
+                // server" reset signal, not just a render trigger).
+                nameEl.value = activeName;
+                nameEl.disabled = activeName === "default";
+                autoSave.cancel();
+                statusEl.dataset.state = "idle";
+                return;
+            }
+            lastRefreshKey = refreshKey;
+            refreshVersion += 1;
+            if (headingEl) {
+                headingEl.textContent =
+                    activeName === "default" ? "Default playlist" : activeName;
+            }
+            // Destroy existing Sortables BEFORE re-rendering tiles.
+            // Sortable.js `destroy()` strips the `draggable` attribute
+            // from every child it managed — doing this AFTER rendering
+            // the new tiles would wipe their draggable=false and let
+            // native <img> drag preempt Sortable.
+            if (trackSortable) { trackSortable.destroy(); trackSortable = null; }
+            if (palletSortable) { palletSortable.destroy(); palletSortable = null; }
 
             trackEl.innerHTML = "";
             for (const entry of defaultEntries) {
