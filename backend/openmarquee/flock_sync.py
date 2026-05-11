@@ -260,7 +260,10 @@ class FlockSync:
                         r.status_code,
                     )
         except Exception:
-            logger.info("sync-announce to %s failed", peer_address)
+            # 16.5 / sweep #8 A5: keep INFO level for volume control
+            # but include the stack so on-call has the cause without
+            # re-running with DEBUG.
+            logger.info("sync-announce to %s failed", peer_address, exc_info=True)
 
     async def gossip_add(self, new_peer_address: str) -> None:
         """SYSTEM_SPEC §13 introduction protocol: when peer B is added to
@@ -333,10 +336,12 @@ class FlockSync:
                     r.status_code,
                 )
         except Exception:
+            # 16.5 / sweep #8 A5: see sync-announce note above.
             logger.info(
                 "hello → %s (introducing %s) failed",
                 peer_address,
                 introduced_address,
+                exc_info=True,
             )
 
     def apply_hello(self, address: str) -> bool:
@@ -389,7 +394,8 @@ class FlockSync:
                 r.raise_for_status()
                 remote_name = (r.json() or {}).get("sign_name")
         except Exception:
-            logger.info("probe %s: settings fetch failed", address)
+            # 16.5 / sweep #8 A5: see sync-announce note above.
+            logger.info("probe %s: settings fetch failed", address, exc_info=True)
             return
         if not remote_name or peer.name == remote_name:
             return

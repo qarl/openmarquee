@@ -1637,7 +1637,11 @@ class DRMRenderer:
                     ex_fb_id, ex_dumb, ex_mmap, content_version,
                 )
                 self._primary_buffer_pool.move_to_end(key)
-                log.info(
+                # 16.5 / sweep #8 A6: per-slide pool ops are useful at
+                # DEBUG for debugging a specific repaint, but spam
+                # journalctl at INFO during normal playback (one entry
+                # per slide change). Init-time DRM INFO lines stay.
+                log.debug(
                     "DRM: pool repainted slide %s fb_id=%d "
                     "(updated_at changed)",
                     key, ex_fb_id,
@@ -1685,7 +1689,8 @@ class DRMRenderer:
         self._primary_buffer_pool[key] = (
             fb_id, dumb_handle, buf_mmap, content_version,
         )
-        log.info(
+        # 16.5 / sweep #8 A6: see pool-repaint note above; same demote.
+        log.debug(
             "DRM: pool added slide %s fb_id=%d (pool size=%d/%d)",
             key, fb_id,
             len(self._primary_buffer_pool), self._max_pool_buffers,

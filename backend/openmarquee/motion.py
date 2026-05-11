@@ -364,6 +364,22 @@ def _apply_blink(
     return _scratch_rgba(layer_rgba.size)
 
 
+# 16.5 / sweep #8 A8: motion.py imports the module logger at line 132
+# but had no callsites. The dispatch (apply_motion) handles unknown
+# motion modes by falling through to "return unchanged" -- correct
+# behavior for forward-compat, but operationally invisible: a typo in
+# a TextLayer.motion value silently disables motion + leaves no trace.
+# Warn once per unknown mode (across the process) so a future loud
+# debugging session catches the typo without spamming on every frame.
+_warned_motion_modes: set[str] = set()
+
+# Known motion modes -- update alongside the dispatch table in
+# apply_motion. "static" is the empty / forward-compat sentinel.
+_KNOWN_MOTION_MODES = frozenset(
+    {"static", "", "ticker", "breathe", "pulse", "bounce", "shake", "blink"}
+)
+
+
 def apply_motion(
     layer_rgba: Image.Image,
     box_px: tuple[int, int, int, int],
@@ -390,6 +406,17 @@ def apply_motion(
         )
     if motion == "blink":
         return _apply_blink(layer_rgba, box_px, intensity, phase)
+    # Forward-compat fallthrough: an unknown / future motion mode
+    # should render as static (the renderer can't simulate something
+    # it doesn't recognize). Warn ONCE per unknown mode -- a typo in
+    # an operator-edited slide otherwise disappears silently.
+    if motion not in _KNOWN_MOTION_MODES and motion not in _warned_motion_modes:
+        log.warning(
+            "motion: unknown mode %r (layer %s) -- rendering as static; "
+            "valid modes: %s",
+            motion, layer_id, sorted(_KNOWN_MOTION_MODES - {""}),
+        )
+        _warned_motion_modes.add(motion)
     return layer_rgba
 
 
