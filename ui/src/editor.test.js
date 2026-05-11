@@ -1349,6 +1349,28 @@ describe("mountEditor — submit flow", () => {
         expect(list.children[0].classList.contains("editor-layer-expanded")).toBe(false);
         expect(list.children[1].classList.contains("editor-layer-expanded")).toBe(true);
 
+        // 14.3: aria-expanded mirrors the expanded class.
+        expect(list.children[0].querySelector(".editor-layer-head").getAttribute("aria-expanded")).toBe("false");
+        expect(list.children[1].querySelector(".editor-layer-head").getAttribute("aria-expanded")).toBe("true");
+
+        // 14.3: Enter on a collapsed head expands it (keyboard reach).
+        const head0 = list.children[0].querySelector(".editor-layer-head");
+        head0.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+        expect(list.children[0].classList.contains("editor-layer-expanded")).toBe(true);
+        expect(head0.getAttribute("aria-expanded")).toBe("true");
+
+        // 14.3: Space on an expanded head collapses it.
+        head0.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true }));
+        expect(list.children[0].classList.contains("editor-layer-expanded")).toBe(false);
+        expect(head0.getAttribute("aria-expanded")).toBe("false");
+
+        // 14.3: keyboard reach attributes are present on every head.
+        for (const child of list.children) {
+            const head = child.querySelector(".editor-layer-head");
+            expect(head.getAttribute("tabindex")).toBe("0");
+            expect(head.getAttribute("role")).toBe("button");
+        }
+
         // Cleanup the autosave that the +New layer kicked.
         await handle.flushAutoSave();
     });

@@ -133,19 +133,19 @@ const EDITOR_TEMPLATE = `
                         <div class="editor-bg-pattern-grid" role="radiogroup"
                              aria-label="Pattern picker"></div>
                         <div class="editor-bg-pattern-tweaks">
-                            <div class="om-row editor-bg-pattern-tweak" style="gap: 10px; align-items: center;">
+                            <label class="om-row editor-bg-pattern-tweak" style="gap: 10px; align-items: center;">
                                 <span class="editor-bg-pattern-label">Color A</span>
                                 <input type="color" class="field-bg-pat-color-a" value="#000000" style="flex: 1; height: 36px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-                            </div>
-                            <div class="om-row editor-bg-pattern-tweak editor-bg-pattern-tweak-b" style="gap: 10px; align-items: center;">
+                            </label>
+                            <label class="om-row editor-bg-pattern-tweak editor-bg-pattern-tweak-b" style="gap: 10px; align-items: center;">
                                 <span class="editor-bg-pattern-label">Color B</span>
                                 <input type="color" class="field-bg-pat-color-b" value="#FFB43C" style="flex: 1; height: 36px; border-radius: 9px; border: 1px solid var(--om-line); background: var(--om-surface-2);">
-                            </div>
-                            <div class="om-row editor-bg-pattern-tweak editor-bg-pattern-tweak-d" style="gap: 10px; align-items: center;">
+                            </label>
+                            <label class="om-row editor-bg-pattern-tweak editor-bg-pattern-tweak-d" style="gap: 10px; align-items: center;">
                                 <span class="editor-bg-pattern-label field-bg-pat-density-label">Density</span>
                                 <input type="range" class="field-bg-pat-density" min="0" max="100" step="1" value="50" style="flex: 1;">
-                                <span class="field-bg-pat-density-val" style="font-family: var(--om-mono); font-size: 11px; color: var(--om-text-fade); min-width: 28px; text-align: right;">50</span>
-                            </div>
+                                <span class="field-bg-pat-density-val" aria-hidden="true" style="font-family: var(--om-mono); font-size: 11px; color: var(--om-text-fade); min-width: 28px; text-align: right;">50</span>
+                            </label>
                         </div>
                     </div>
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
@@ -198,7 +198,7 @@ const EDITOR_TEMPLATE = `
 // .field-name (TOP of the editor) — the per-layer name field below is
 // .field-layer-name to avoid the collision.
 const LAYER_GROUP_TEMPLATE = `
-    <header class="editor-layer-head">
+    <header class="editor-layer-head" tabindex="0" role="button" aria-expanded="false">
         <span class="editor-layer-handle" aria-label="drag to reorder" title="drag to reorder">⋮⋮</span>
         <div class="editor-layer-thumb" aria-hidden="true"></div>
         <div class="editor-layer-titleblock">
@@ -849,10 +849,7 @@ export function mountEditor(
         // expands+selects this layer; collapses the previously expanded
         // one (one-open-at-a-time accordion, per design handoff).
         const headEl = groupEl.querySelector(".editor-layer-head");
-        headEl.addEventListener("click", (ev) => {
-            if (ev.target.closest(".editor-layer-handle, .editor-layer-eye, button, input, textarea, select")) {
-                return;
-            }
+        const toggleExpansion = () => {
             const idx = layerIndexOfGroup(groupEl);
             if (idx < 0) return;
             // Toggle: clicking the already-expanded layer's header
@@ -865,6 +862,25 @@ export function mountEditor(
             }
             updateActiveLayerStyling();
             positionBoxOverlay();
+        };
+        headEl.addEventListener("click", (ev) => {
+            if (ev.target.closest(".editor-layer-handle, .editor-layer-eye, button, input, textarea, select")) {
+                return;
+            }
+            toggleExpansion();
+        });
+        // 14.3: keyboard reach. The head is tabindex=0 + role=button so
+        // a screen-reader/keyboard-only user can land on it; Enter or
+        // Space then triggers the same toggle. Space must preventDefault
+        // to suppress the page scroll the browser otherwise fires.
+        headEl.addEventListener("keydown", (ev) => {
+            if (ev.target.closest(".editor-layer-handle, .editor-layer-eye, button, input, textarea, select")) {
+                return;
+            }
+            if (ev.key === "Enter" || ev.key === " ") {
+                ev.preventDefault();
+                toggleExpansion();
+            }
         });
 
         // Eye toggle — stop-prop so the head's click handler doesn't fire.
@@ -1123,6 +1139,10 @@ export function mountEditor(
             const isExpanded = arrayIdx === state.expandedLayerIndex;
             groupEl.classList.toggle("editor-layer-active", isActive);
             groupEl.classList.toggle("editor-layer-expanded", isExpanded);
+            // 14.3: keep aria-expanded on the head in sync with the
+            // expanded class so screen readers announce open/closed.
+            const headEl = groupEl.querySelector(".editor-layer-head");
+            if (headEl) headEl.setAttribute("aria-expanded", isExpanded ? "true" : "false");
         }
     }
 
