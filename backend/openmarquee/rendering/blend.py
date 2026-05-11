@@ -40,19 +40,64 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-# Perf counters (Batch 8.1). float32_array_creates covers every
-# `np.asarray(..., dtype=np.float32)` + `np.empty_like` allocation
-# inside composite_with_blend on a non-normal mode. Batch 8.5 will
-# pool these per (width, height) keyed scratch buffer.
+# Perf counters (Batch 8.1 / 8.5).
+# float32_array_creates: every `np.asarray(..., dtype=float32)` +
+#   `np.empty_like` allocation -- on pool hit this stays flat.
+# float32_pool_hits (Batch 8.5): the 3 named scratch buffers
+#   (base / top / out) reused from the pool instead of allocated
+#   fresh. Each non-normal call hits 3 buffers, so hit rate is
+#   3 * (calls - cold_calls).
 _stats: dict[str, int] = {
     "composite_with_blend_calls": 0,
     "non_normal_calls": 0,
     "float32_array_creates": 0,
+    "float32_pool_hits": 0,
 }
 
 
 def stats_snapshot() -> dict[str, int]:
     return dict(_stats)
+
+
+# Scratch buffer pool (Batch 8.5). One slot per (width, height,
+# channels) holds three preallocated float32 arrays for the non-
+# normal blend path:
+#   * base_buf -- uint8->float32 cast of `base` Image
+#   * top_buf  -- uint8->float32 cast of `top` Image
+#   * out_buf  -- the float32 accumulator written via slice
+#                 assignment before the final uint8 conversion
+# Single-slot-per-size is safe by the same argument as motion 8.4:
+# composite_with_blend runs sequentially across layers; one layer's
+# buffers are fully consumed by the returned Image.fromarray before
+# the next layer's call. Intermediate arrays (blend_rgb, result_a,
+# safe_a, result_rgb, out_u8) still allocate fresh -- they're
+# smaller (single-channel slices, element-wise temporaries) and the
+# code stays readable.
+_blend_pool: dict[tuple[int, int], dict[str, np.ndarray]] = {}
+
+
+def clear_blend_pool() -> None:
+    """Drop pooled buffers. Test hook + safety valve."""
+    _blend_pool.clear()
+
+
+def _get_pool(size: tuple[int, int]) -> dict[str, np.ndarray]:
+    """Return the (base, top, out) buffer trio for `size`. Allocates
+    on miss + caches; bumps `float32_array_creates` += 3 only on the
+    cold path. Warm path bumps `float32_pool_hits` += 3."""
+    pool = _blend_pool.get(size)
+    if pool is not None:
+        _stats["float32_pool_hits"] += 3
+        return pool
+    _stats["float32_array_creates"] += 3
+    w, h = size
+    pool = {
+        "base": np.empty((h, w, 4), dtype=np.float32),
+        "top": np.empty((h, w, 4), dtype=np.float32),
+        "out": np.empty((h, w, 4), dtype=np.float32),
+    }
+    _blend_pool[size] = pool
+    return pool
 
 
 # Modes the TextLayer schema currently accepts. Keep in sync with the
@@ -101,9 +146,17 @@ def composite_with_blend(
         )
 
     _stats["non_normal_calls"] += 1
-    _stats["float32_array_creates"] += 2  # base + top
-    base_arr = np.asarray(base, dtype=np.float32) / 255.0
-    top_arr = np.asarray(top, dtype=np.float32) / 255.0
+    # Pull the three scratch buffers from the pool (or allocate cold).
+    pool = _get_pool(base.size)
+    base_arr = pool["base"]
+    top_arr = pool["top"]
+    # Cast PIL uint8 inputs INTO the pooled float32 buffers in
+    # place (out= keyword on np.copyto avoids the intermediate
+    # array that `np.asarray(...) / 255.0` would produce).
+    np.copyto(base_arr, np.asarray(base), casting="unsafe")
+    base_arr /= 255.0
+    np.copyto(top_arr, np.asarray(top), casting="unsafe")
+    top_arr /= 255.0
 
     base_rgb = base_arr[..., :3]
     top_rgb = top_arr[..., :3]
@@ -138,8 +191,7 @@ def composite_with_blend(
     ) / safe_a
     result_rgb = np.clip(result_rgb, 0.0, 1.0)
 
-    _stats["float32_array_creates"] += 1
-    out_arr = np.empty_like(base_arr)
+    out_arr = pool["out"]
     out_arr[..., :3] = result_rgb
     out_arr[..., 3:4] = result_a
     out_u8 = np.clip(out_arr * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
