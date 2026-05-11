@@ -140,6 +140,20 @@ async function fetchResolvedPlaylist(playlistId) {
 async function boot() {
     const root = document.getElementById("app");
 
+    // 20.2 demo gap (caught by www-Jimmy on the 5e5dd97 deploy): the
+    // demo bundle mounts the UI at /demo/, so a redirect to
+    // "/login.html" lands on https://openmarquee.com/login.html
+    // (root) which 404s. The demo never actually has a real backend
+    // anyway -- its mock-backend.js stubs every /api/* response,
+    // including /api/auth/* -- so the auth gate has nothing to enforce.
+    // Skip the whole gate when the body carries data-demo-mode, the
+    // same flag stream-panel uses for an analogous "skip the live-
+    // backend round trip" carve-out.
+    const isDemoMode =
+        typeof document !== "undefined" &&
+        document.body &&
+        document.body.hasAttribute("data-demo-mode");
+
     // Batch 20.2 / phase A.2 — auth gate. Probe /api/auth/status to
     // figure out which boot route applies:
     //   - configured + valid token in localStorage → continue boot
@@ -156,22 +170,24 @@ async function boot() {
     // The auth probe is itself whitelisted by AuthMiddleware so it
     // works pre-set-password.
     let authStatus = null;
-    try {
-        const r = await fetch("/api/auth/status");
-        if (r.ok) authStatus = await r.json();
-    } catch (err) {
-        // /api/auth/status unreachable — degrade gracefully rather
-        // than locking the operator out. The first-run + boot logic
-        // below still runs against settings; the auth gate just
-        // can't enforce here.
-        console.warn("[boot] auth-status probe failed", err);
-    }
-    const hasToken =
-        typeof localStorage !== "undefined" &&
-        !!localStorage.getItem("openmarquee_auth_token");
-    if (authStatus && authStatus.configured && !hasToken) {
-        window.location.replace("/login.html");
-        return;
+    if (!isDemoMode) {
+        try {
+            const r = await fetch("/api/auth/status");
+            if (r.ok) authStatus = await r.json();
+        } catch (err) {
+            // /api/auth/status unreachable — degrade gracefully rather
+            // than locking the operator out. The first-run + boot logic
+            // below still runs against settings; the auth gate just
+            // can't enforce here.
+            console.warn("[boot] auth-status probe failed", err);
+        }
+        const hasToken =
+            typeof localStorage !== "undefined" &&
+            !!localStorage.getItem("openmarquee_auth_token");
+        if (authStatus && authStatus.configured && !hasToken) {
+            window.location.replace("/login.html");
+            return;
+        }
     }
 
     // First-run gate: a freshly-flashed device shows the welcome screen
