@@ -200,6 +200,40 @@ describe("mountSchedule", () => {
         expect(onSave.mock.calls[0][0].tz).toBe("America/New_York");
     });
 
+    it("round-trips unknown forward-compat fields (backend extra='allow')", async () => {
+        // 15.2: backend Schedule has model_config = ConfigDict(extra="allow")
+        // so a future zoned-evaluator field or downstream consumer add-on
+        // round-trips through this UI. collectSchedule must preserve any
+        // field on the loaded envelope that the UI doesn't explicitly
+        // overwrite.
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const handle = mountSchedule(container, {
+            fetchSchedule: async () => ({
+                rules: [],
+                default_playlist_id: DEFAULT_PLAYLIST_ID,
+                tz: null,
+                experimental_zoned_evaluator: true,
+                downstream_consumer_hint: { v: 1, source: "future-plugin" },
+            }),
+            onSave,
+            fetchPlaylistChoices: defaultChoices(),
+        });
+        await tick();
+
+        await handle.flushAutoSave();
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.experimental_zoned_evaluator).toBe(true);
+        expect(payload.downstream_consumer_hint).toEqual({
+            v: 1,
+            source: "future-plugin",
+        });
+        // And the explicitly-edited fields still come from the form, not
+        // the loaded snapshot.
+        expect(payload.rules).toEqual([]);
+        expect(payload.default_playlist_id).toBe(DEFAULT_PLAYLIST_ID);
+    });
+
     it("shows a ticking device-time display when fetchSettings is provided", async () => {
         const container = document.createElement("div");
         mountSchedule(container, {

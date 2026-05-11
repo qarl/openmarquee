@@ -88,6 +88,11 @@ export function mountSchedule(
     let availableChoices = [];
     let persistedTz = null;
     let deviceTz = null;
+    // 15.2: keep the full loaded schedule envelope so collectSchedule
+    // can round-trip unknown fields (backend Schedule has extra="allow"
+    // -- a future zoned-evaluator field or downstream consumer add-on
+    // would otherwise be silently dropped on the next save).
+    let loadedSchedule = null;
 
     async function refresh() {
         statusEl.textContent = "";
@@ -115,6 +120,7 @@ export function mountSchedule(
             );
             persistedTz = schedule.tz || null;
             deviceTz = settings?.timezone || null;
+            loadedSchedule = schedule;
             rulesEl.innerHTML = "";
             for (const rule of schedule.rules || []) {
                 rulesEl.appendChild(renderRule(rule, availableChoices));
@@ -196,7 +202,7 @@ export function mountSchedule(
     });
 
     async function performSave() {
-        const payload = collectSchedule(defaultEl, rulesEl, persistedTz);
+        const payload = collectSchedule(defaultEl, rulesEl, persistedTz, loadedSchedule);
         await onSave(payload);
     }
 
@@ -349,7 +355,8 @@ function fillPlaylistOptions(selectEl, choices, currentValue) {
     selectEl.value = currentValue || "";
 }
 
-function collectSchedule(defaultEl, rulesEl, persistedTz) {
+// Exported for unit tests; not part of the public mountSchedule API.
+export function collectSchedule(defaultEl, rulesEl, persistedTz, loadedSchedule) {
     const rules = Array.from(rulesEl.querySelectorAll(".schedule-rule")).map((li) => ({
         name: li.querySelector(".rule-name").value,
         days: Array.from(li.querySelectorAll(".rule-day-input"))
@@ -360,7 +367,12 @@ function collectSchedule(defaultEl, rulesEl, persistedTz) {
         playlist_id: li.querySelector(".rule-playlist").value,
         enabled: li.querySelector(".rule-enabled").checked,
     }));
+    // 15.2: start from the loaded schedule envelope so unknown forward-
+    // compat fields round-trip (backend Schedule has extra="allow").
+    // Spread BEFORE the explicit overrides so operator-edited values
+    // win over the loaded snapshot's stale rules / default / tz.
     return {
+        ...(loadedSchedule || {}),
         rules,
         default_playlist_id: defaultEl.value || DEFAULT_PLAYLIST_ID,
         tz: persistedTz,
