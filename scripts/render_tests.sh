@@ -137,6 +137,24 @@ FIXTURES=(
     # reel rebuild adds them).
     "animated_ticker_chant|animated_slide|2c858968-ae0a-4592-8083-85257de50bcd,1.75|$PI_FIXTURE_ROOT"
     "animated_multi_chaos|animated_slide|99c11690-415b-40f6-8e3c-6491f3bdf60e,0.5|$PI_FIXTURE_ROOT"
+    # --- 18.2 / sweep #9 N3: word-wrap golden ---
+    # Long-form text in a narrow box forces 3+ line breaks. Catches
+    # glyph rasterizer + wrap algorithm regressions that would
+    # silently break the b4 word-wrap feature (landed 2026-05-05).
+    "multiline_wrap|slide|f0000000-0000-4000-8000-000000000002|$PI_FIXTURE_ROOT"
+    # --- 18.3 / sweep #9 N4: background_pattern 4-up sampler ---
+    # 4 synthetic single-pattern fixtures (one slide per pattern,
+    # since background_pattern is slide-level not per-layer). Each
+    # uses the same color pair + density=0.5 so the only variable
+    # is the pattern kind. Covers the 4 most-distinct patterns from
+    # the 12-pattern set (dots = grid of disks, stripes = diagonal
+    # bands, rings = concentric, confetti = scatter). The 8 remaining
+    # patterns (solid/gradient/halftone/scanlines/checker/grid/rays/
+    # bricks) defer until/if needed.
+    "bg_pattern_dots|slide|f0000000-0000-4000-8000-000000000003|$PI_FIXTURE_ROOT"
+    "bg_pattern_stripes|slide|f0000000-0000-4000-8000-000000000004|$PI_FIXTURE_ROOT"
+    "bg_pattern_rings|slide|f0000000-0000-4000-8000-000000000005|$PI_FIXTURE_ROOT"
+    "bg_pattern_confetti|slide|f0000000-0000-4000-8000-000000000006|$PI_FIXTURE_ROOT"
 )
 
 echo "==> deploying binary to $TARGET:$BIN_PI"
