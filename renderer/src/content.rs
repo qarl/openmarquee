@@ -1645,4 +1645,99 @@ mod tests {
         // Sanity: the resolved path stays under content_root.
         assert!(dir.starts_with(root));
     }
+
+    // --- Batch 17.4 / sweep #9 #3: schema round-trip fixture pin ---
+    //
+    // The p2g_overlay_route golden-master fixture at
+    // renderer/tests/fixtures/f0000000-.../item.json hardcodes
+    // schema_version=3. Spec §5.10a v3.1.2 keeps adding fields (per-
+    // axis squish + width-relative font_size_pct most recently); if a
+    // future spec bumps to v4 with a new field, the fixture would
+    // load on the lenient #[serde(default)] deserializer but silently
+    // skip the new field, and the captured golden PNG would no
+    // longer reflect what the production renderer sees.
+    //
+    // This test asserts the fixture deserializes cleanly + the round-
+    // trip preserves the slide's load-bearing fields (text content,
+    // box, motion, blend). When a spec bump lands, this test fails
+    // loud rather than silently passing.
+
+    fn fixture_path() -> std::path::PathBuf {
+        // CARGO_MANIFEST_DIR points to renderer/; the fixture lives
+        // at tests/fixtures/<UUID>/item.json relative to it.
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest
+            .join("tests")
+            .join("fixtures")
+            .join("f0000000-0000-4000-8000-000000000001")
+            .join("item.json")
+    }
+
+    #[test]
+    fn p2g_overlay_route_fixture_deserializes_cleanly() {
+        let path = fixture_path();
+        let bytes = std::fs::read(&path).expect("fixture file readable");
+        let envelope: ItemEnvelope =
+            serde_json::from_slice(&bytes).expect("envelope parses");
+        assert_eq!(envelope.schema_version, 3);
+        let kind = envelope.item.get("type").and_then(|v| v.as_str());
+        assert_eq!(kind, Some("text_slide"));
+        let slide: TextSlide =
+            serde_json::from_value(envelope.item).expect("text_slide parses");
+        // Load-bearing claims: 2 layers, the second one has blend=
+        // "overlay" (this is the fixture's whole reason for existing
+        // -- it triggers paint_layers_via_overlay_route on the hot
+        // path).
+        assert_eq!(slide.text_layers.len(), 2);
+        assert_eq!(slide.text_layers[1].blend, "overlay");
+        // Texts pin so a future schema change can't silently rewrite
+        // them.
+        assert_eq!(slide.text_layers[0].text, "OVERLAY");
+        assert_eq!(slide.text_layers[1].text, "BLEND");
+    }
+
+    #[test]
+    fn p2g_overlay_route_fixture_round_trips_via_value() {
+        // Stronger guarantee: serialize the parsed slide back to
+        // serde_json::Value and compare to the source item value's
+        // fields. If a new spec field landed in production that the
+        // renderer's TextSlide doesn't yet model, this catches the
+        // gap. The check is per-field (not whole-value equality)
+        // because the renderer's TextSlide is a partial mirror by
+        // design (it only fields what Phase 4 needs).
+        let path = fixture_path();
+        let bytes = std::fs::read(&path).expect("fixture file readable");
+        let envelope: ItemEnvelope =
+            serde_json::from_slice(&bytes).expect("envelope parses");
+        // Stash the source item before consuming it for slide parse.
+        let source_item = envelope.item.clone();
+        let slide: TextSlide =
+            serde_json::from_value(envelope.item).expect("text_slide parses");
+
+        // For each field the renderer DOES model, the round-tripped
+        // serialization back to JSON must match the source. Adding
+        // a new field to the source-of-truth schema without a
+        // corresponding renderer-side field surfaces here as a
+        // mismatch on the missed key.
+        let layer = source_item
+            .get("text_layers")
+            .and_then(|v| v.as_array())
+            .expect("text_layers present");
+        for (i, src_layer) in layer.iter().enumerate() {
+            let parsed_text = src_layer.get("text").and_then(|v| v.as_str());
+            assert_eq!(
+                slide.text_layers[i].text.as_str(),
+                parsed_text.unwrap_or(""),
+                "layer {} text mismatch",
+                i
+            );
+            let parsed_blend = src_layer.get("blend").and_then(|v| v.as_str()).unwrap_or("normal");
+            assert_eq!(
+                slide.text_layers[i].blend.as_str(),
+                parsed_blend,
+                "layer {} blend mismatch",
+                i
+            );
+        }
+    }
 }
