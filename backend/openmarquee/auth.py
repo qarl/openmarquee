@@ -47,12 +47,30 @@ log = logging.getLogger(__name__)
 # Bump when AuthState fields gain non-backward-compat changes.
 AUTH_SCHEMA_VERSION = 1
 
-# Argon2id-defaults via argon2-cffi's PasswordHasher (time_cost=3,
-# memory_cost=64 MiB, parallelism=4). Verifies in ~50ms on Pi Zero 2 W
-# from a cold cache -- the per-request overhead is fine because login
-# is rare relative to authed API calls (those just compare a token
-# prefix, no argon2 work).
-_HASHER = PasswordHasher()
+# Argon2id parameters tuned to the OWASP "Password Storage Cheat Sheet"
+# floor for argon2id (m=19456 KiB = 19 MiB, t=2, p=1). This is the modern
+# security minimum -- anything stronger is over-spec relative to what
+# Pi Zero 2 W can serve in real time, anything weaker drops below the
+# OWASP recommendation.
+#
+# Measured on the dev Pi Zero 2 W (Cortex-A53 4x @ 1GHz, 512MB RAM,
+# Bookworm trixie, Python 3.13, argon2-cffi 25.1.0) -- 2026-05-11:
+#   library defaults (t=3 m=64MiB p=4):  median 779ms, max 2055ms
+#   OWASP min (t=2 m=19MiB p=1):         median 249ms, max 253ms
+# The defaults miss the <500ms login-latency target the operator
+# experience needs; more importantly, parallelism=4 thrashes the Pi's
+# weak cores and produces 2s worst-case logins that read as broken to
+# the operator. parallelism=1 stabilises variance (10x tighter range)
+# alongside hitting the latency target.
+#
+# Do NOT "improve" these params back to library defaults without
+# re-measuring on hardware -- the floor is set by OWASP, not by
+# what the library happens to ship as defaults.
+_HASHER = PasswordHasher(
+    time_cost=2,
+    memory_cost=19456,
+    parallelism=1,
+)
 
 # Minimum password length the operator can set. 8 is the conventional
 # floor; no max length (argon2 truncates internally if needed).
