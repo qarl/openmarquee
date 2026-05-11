@@ -170,13 +170,15 @@ def test_load_background_lru_skips_png_decode_on_cache_hit():
     assert _stats["image_bg_cache_hits"] == 2
 
 
-def test_load_background_lru_evicts_at_8_entries():
-    """The LRU caps at 8 entries; the 9th add evicts the oldest."""
+def test_load_background_lru_evicts_at_cap():
+    """The LRU caps at _IMAGE_BG_LRU_MAX entries (Batch 8.fix: 4);
+    the (cap+1)th add evicts the oldest."""
     from io import BytesIO
     from uuid import uuid4
     from PIL import Image as _Image
     from openmarquee.auto_render import (
-        _load_background, _image_bg_cache, _stats, clear_image_bg_cache,
+        _IMAGE_BG_LRU_MAX, _image_bg_cache, _load_background, _stats,
+        clear_image_bg_cache,
     )
 
     clear_image_bg_cache()
@@ -190,7 +192,7 @@ def test_load_background_lru_evicts_at_8_entries():
     def fake_read(_id):
         return png_bytes
 
-    ids = [uuid4() for _ in range(9)]
+    ids = [uuid4() for _ in range(_IMAGE_BG_LRU_MAX + 1)]
     for i in ids:
         slide = _auto_slide(
             auto_mode="time", auto_format="time_hm",
@@ -198,6 +200,7 @@ def test_load_background_lru_evicts_at_8_entries():
         )
         _load_background(slide, 8, 8, fake_read)
 
-    assert len(_image_bg_cache) == 8
+    assert len(_image_bg_cache) == _IMAGE_BG_LRU_MAX
+    # Oldest evicted; newest present.
     assert (ids[0], 8, 8) not in _image_bg_cache
-    assert (ids[8], 8, 8) in _image_bg_cache
+    assert (ids[-1], 8, 8) in _image_bg_cache

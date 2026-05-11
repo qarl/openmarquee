@@ -508,3 +508,64 @@ describe("mountPlaylistTrack — Batch 8.3 memoized refresh", () => {
         expect(secondBlocks.length).not.toBe(firstBlocks.length);
     });
 });
+
+
+describe("mountPlaylistTrack — Batch 8.fix sibling-playlist memo invalidation", () => {
+    it("invalidates the memo when a sibling playlist is added", async () => {
+        const container = document.createElement("div");
+        let playlists = [
+            { id: DEFAULT_PLAYLIST_ID, name: "default", items: [{ item_id: "a" }] },
+            { id: "11111111-1111-4111-8111-111111111111", name: "lunch", items: [] },
+        ];
+        const handle = mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({ schema_version: 4, playlists }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        await tick();
+        const statsBefore = container.querySelector("[data-playlist-stats]").textContent;
+        // 2 playlists.
+        expect(statsBefore).toContain("2 playlist");
+
+        // Add a 3rd sibling playlist (non-active). Without the
+        // playlistsKey in the memo, refresh would skip the rebuild
+        // and the stats line would stay stale.
+        playlists = [
+            ...playlists,
+            { id: "22222222-2222-4222-8222-222222222222", name: "promo", items: [] },
+        ];
+        await handle.refresh();
+        await tick();
+
+        const statsAfter = container.querySelector("[data-playlist-stats]").textContent;
+        expect(statsAfter).toContain("3 playlist");
+    });
+
+    it("invalidates the memo when a sibling playlist is deleted", async () => {
+        const container = document.createElement("div");
+        let playlists = [
+            { id: DEFAULT_PLAYLIST_ID, name: "default", items: [{ item_id: "a" }] },
+            { id: "11111111-1111-4111-8111-111111111111", name: "lunch", items: [] },
+        ];
+        const handle = mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({ schema_version: 4, playlists }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        await tick();
+        expect(
+            container.querySelector("[data-playlist-stats]").textContent,
+        ).toContain("2 playlist");
+
+        // Delete the non-active 'lunch' playlist; only `default` remains.
+        playlists = playlists.filter((p) => p.name !== "lunch");
+        await handle.refresh();
+        await tick();
+
+        expect(
+            container.querySelector("[data-playlist-stats]").textContent,
+        ).toContain("1 playlist");
+    });
+});

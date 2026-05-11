@@ -767,3 +767,50 @@ def test_load_motion_background_returns_solid_when_no_image():
     assert bg.mode in ("RGB", "RGBA")
     # Sample a corner — should be the configured color.
     assert bg.getpixel((0, 0))[:3] == (0x12, 0x34, 0x56)
+
+
+# --- Batch 8.fix: pool-hit assertion (validates 8.4) ---
+
+
+def test_scratch_pool_hits_on_repeated_motion_compose():
+    """Two compose_motion_frame calls on a motion-active slide at
+    the same dims: first cold-allocates the scratch buffers; second
+    hits the pool. Sweep #2 #8 / Batch 8.4 validation gate."""
+    from openmarquee.content import TextBox, TextLayer, TextSlide
+    from openmarquee.motion import (
+        _stats, clear_scratch_pool, compose_motion_frame,
+    )
+
+    clear_scratch_pool()
+    for k in _stats:
+        _stats[k] = 0
+
+    slide = TextSlide(
+        name="motion-test", duration_ms=5000,
+        text_layers=[TextLayer(
+            text="HELLO", motion="ticker", motion_intensity=50,
+            font_family="Inter", font_size_pct=30,
+            box=TextBox(x=0.1, y=0.4, w=0.8, h=0.2),
+        )],
+        background_color="#102030",
+    )
+
+    compose_motion_frame(slide, elapsed_s=0.0, width=128, height=128)
+    cold_pool_hits = _stats["scratch_pool_hits"]
+    cold_creates = _stats["image_new_calls"]
+
+    compose_motion_frame(slide, elapsed_s=0.033, width=128, height=128)
+    # Second frame: at least one _scratch_rgba call (ticker's
+    # `out = _scratch_rgba(layer_rgba.size)`) hit the pool. The
+    # exact count varies by motion effect but must be > 0.
+    assert _stats["scratch_pool_hits"] > cold_pool_hits, (
+        "expected scratch_pool_hits to grow on the second frame"
+    )
+    # And no fresh scratch allocation at that key (image_new_calls
+    # may still grow from render_layer_to_rgba's persistent buffer,
+    # so just check the delta isn't BIGGER than the cold side).
+    second_frame_creates = _stats["image_new_calls"] - cold_creates
+    assert second_frame_creates <= cold_creates, (
+        f"second frame allocated {second_frame_creates} fresh buffers; "
+        f"expected <= cold-frame count {cold_creates}"
+    )

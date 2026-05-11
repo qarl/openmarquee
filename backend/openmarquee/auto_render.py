@@ -145,10 +145,14 @@ def stats_snapshot() -> dict[str, int]:
 # playback loop swaps between two slides that both reference the
 # same image-bg (e.g. all clock slides share a brick-wall bg), each
 # slide entry hits this cache instead of re-decoding the PNG.
-# 8 entries is generous: typical demo reels have 2-5 distinct
-# image-bg references; an operator showing off 8+ is well-served
-# by the LRU's natural eviction.
-_IMAGE_BG_LRU_MAX = 8
+#
+# 4 entries (Batch 8.fix). Sweep review note: typical reels carry
+# 2-5 distinct image-bg references. 4 covers the median + leaves a
+# little headroom; the 8-entry default would have parked ~50 MB at
+# 1080p (4×8.4 MB × 1.5 for RGB+resize), which is meaningful on
+# Pi Zero 2 W. clear_image_bg_cache() is the safety valve if a
+# future operator-driven scenario blows past 4.
+_IMAGE_BG_LRU_MAX = 4
 _image_bg_cache: "OrderedDict[tuple[UUID, int, int], Image.Image]" = OrderedDict()
 
 

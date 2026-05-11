@@ -138,3 +138,31 @@ def test_non_rgba_input_raises():
     top = _solid((0, 0, 255, 255))
     with pytest.raises(ValueError, match="RGBA"):
         composite_with_blend(base, top, mode="multiply")
+
+
+# --- Batch 8.fix: pool-hit assertion (validates 8.5) ---
+
+
+def test_float32_pool_hits_on_repeated_blend():
+    """Two composite_with_blend calls at the same size: first cold-
+    populates the (base/top/out) trio; second hits all 3 from the
+    pool. Sweep #2 #9 / Batch 8.5 validation gate."""
+    from PIL import Image as _Image
+    from openmarquee.rendering.blend import (
+        _stats, clear_blend_pool, composite_with_blend,
+    )
+
+    clear_blend_pool()
+    for k in _stats:
+        _stats[k] = 0
+
+    base = _Image.new("RGBA", (64, 64), (100, 100, 100, 255))
+    top = _Image.new("RGBA", (64, 64), (200, 50, 50, 128))
+
+    composite_with_blend(base, top, mode="overlay")
+    assert _stats["float32_array_creates"] == 3  # cold: base+top+out
+    assert _stats["float32_pool_hits"] == 0
+
+    composite_with_blend(base, top, mode="overlay")
+    assert _stats["float32_array_creates"] == 3  # no new allocations
+    assert _stats["float32_pool_hits"] == 3  # warm: all 3 reused
