@@ -327,14 +327,18 @@
                 <dl class="creds" aria-label="WiFi credentials">
                     <div class="creds-row">
                         <dt class="creds-label">Network</dt>
-                        <dd class="creds-value" data-field="ssid">openMarquee-A3F7</dd>
+                        <!-- Templated by system/openmarquee-firstboot.sh
+                             on first boot (B.4). Off-device / pre-template
+                             the literal "{{AP_SSID}}" renders, signalling
+                             the templating step didn't run. -->
+                        <dd class="creds-value" data-field="ssid">{{AP_SSID}}</dd>
                         <button type="button" class="copy-btn"
                                 data-copy-for="ssid"
                                 aria-label="Copy WiFi network name">Copy</button>
                     </div>
                     <div class="creds-row">
                         <dt class="creds-label">Password</dt>
-                        <dd class="creds-value" data-field="password">xxxx-xxxx-xxxx</dd>
+                        <dd class="creds-value" data-field="password">{{AP_PASSWORD}}</dd>
                         <button type="button" class="copy-btn"
                                 data-copy-for="password"
                                 aria-label="Copy WiFi password">Copy</button>
@@ -353,22 +357,14 @@
                 failed-load fallback (the .qr-placeholder class triggers
                 the "PLACEHOLDER" watermark).
             -->
+            <!-- B.4: first-boot oneshot replaces {{AP_PASSWORD_QR}} with
+                 a real qrencode-generated SVG and strips the qr-placeholder
+                 class so the watermark stops rendering. Pre-template, the
+                 placeholder marker is just a comment so the visual
+                 fallback (welcome.js dynamic generation) still works in
+                 dev / demo. -->
             <div class="welcome-qr qr qr-placeholder" aria-label="WiFi QR code">
-                <svg viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg" role="img" aria-hidden="true">
-                    <rect width="21" height="21" fill="white"/>
-                    <g fill="black">
-                        <rect x="0" y="0" width="7" height="7"/>
-                        <rect x="1" y="1" width="5" height="5" fill="white"/>
-                        <rect x="2" y="2" width="3" height="3"/>
-                        <rect x="14" y="0" width="7" height="7"/>
-                        <rect x="15" y="1" width="5" height="5" fill="white"/>
-                        <rect x="16" y="2" width="3" height="3"/>
-                        <rect x="0" y="14" width="7" height="7"/>
-                        <rect x="1" y="15" width="5" height="5" fill="white"/>
-                        <rect x="2" y="16" width="3" height="3"/>
-                        <rect x="9" y="9" width="3" height="3"/>
-                    </g>
-                </svg>
+                {{AP_PASSWORD_QR}}
                 <p class="welcome-qr-caption">Scan to join</p>
             </div>
         </section>

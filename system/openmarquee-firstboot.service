@@ -1,0 +1,50 @@
+[Unit]
+Description=openMarquee first-boot config (AP password rotation + welcome.html templating)
+Documentation=https://github.com/qarl/openmarquee
+
+# Run after the local filesystem is up but BEFORE the backend / AP
+# services try to use the files we generate. wifi.json is read by
+# the backend (settings.py reflects it into the UI). hostapd.conf
+# is read by hostapd.service.
+After=local-fs.target
+Before=openmarquee-backend.service hostapd.service openmarquee-ap0.service
+
+# Don't run if we've already bootstrapped. The script ALSO has its
+# own idempotency check (wifi.json existence), but the systemd-level
+# ConditionPathExists keeps the unit from even firing on subsequent
+# boots -- cleaner journal log + faster boot.
+ConditionPathExists=!/var/openmarquee/.bootstrapped
+
+[Service]
+Type=oneshot
+# RemainAfterExit=no: this is a fire-and-forget oneshot. Once it
+# touches .bootstrapped and disables itself, it's done forever.
+RemainAfterExit=no
+ExecStart=/opt/openmarquee/system/openmarquee-firstboot.sh
+# After successful run, disable so future boots skip the unit even
+# without the ConditionPathExists guard (defense in depth).
+ExecStartPost=/bin/systemctl disable openmarquee-firstboot.service
+
+# Run as root: we mutate /etc/hostapd, /var/openmarquee, and
+# /opt/openmarquee/ui. Tight FS access via the directives below
+# restricts the blast radius; openmarquee-backend.service has a
+# similar shape.
+User=root
+Group=root
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# We DO need to write to /etc/hostapd, /opt/openmarquee/ui, and
+# /var/openmarquee -- ProtectSystem=full makes /usr + /boot
+# read-only but leaves /etc + /var + /opt writable.
+ReadWritePaths=/etc/hostapd /opt/openmarquee/ui /var/openmarquee
+# Restart only on failure -- a clean exit means we're done.
+Restart=on-failure
+# But cap retries: if the script keeps crashing, stop trying so
+# journalctl shows the cycle clearly.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target
