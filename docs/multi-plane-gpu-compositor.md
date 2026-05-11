@@ -1,6 +1,8 @@
 # Multi-Plane GPU Compositor — Design
 
-Status: **proposed, awaiting qarl review**. Drafted 2026-05-02 after
+**Status:** shipped — see [`gpu_compositor.py`](../backend/openmarquee/rendering/gpu_compositor.py) (2026-05-02 → 2026-05-03 multi-plane DRM atomic compositor 7127f73 + fade+wipe GPU transitions 0ee0f85).
+
+Drafted 2026-05-02 after
 the office-network return + the 1080p motion bench (4ec363c) + the
 vc4 plane probe (4ec363c) confirmed that the canonical render path
 needs to be GPU-side at 1080p, not CPU-side.

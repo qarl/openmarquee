@@ -1,6 +1,8 @@
 # Text-Layer Motion Spec
 
-Status: **proposed, awaiting QA review**. Drafted 2026-05-02 after the
+**Status:** shipped — see [`motion.py`](../backend/openmarquee/motion.py) (motion effects + compose_motion_frame; sweep #2 perf work in Batch 8.4 added the scratch buffer pool).
+
+Drafted 2026-05-02 after the
 DRM/KMS rewrite (commit chain fc433dc → a55a215) collapsed the
 per-frame render cost to ~0.5 ms on Pi Zero 2 W, making per-tick
 animation of text layers cheap enough to design in.

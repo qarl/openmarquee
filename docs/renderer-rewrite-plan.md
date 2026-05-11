@@ -1,6 +1,6 @@
 # Renderer Rewrite — Implementation Plan
 
-**Status:** draft, awaiting qarl review.
+**Status:** SUPERSEDED by [`renderer-rewrite-plan-rust.md`](renderer-rewrite-plan-rust.md) (2026-05-06 pivot to Rust binary). Kept as historical record.
 **Companion to:** [`renderer-rewrite-requirements.md`](renderer-rewrite-requirements.md).
 **Author:** Plan subagent, 2026-05-06.
 **Audience:** the agent that will write the code. The plan describes
