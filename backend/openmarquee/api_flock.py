@@ -54,7 +54,7 @@ class ManifestEntry(BaseModel):
 
     content_id: UUID
     content_type: str = Field(
-        description="Matches ContentItem.type — 'text', 'image', or 'video'."
+        description="Matches ContentItem.type -- 'text_slide', 'image', or 'video'."
     )
     updated_at: datetime
 

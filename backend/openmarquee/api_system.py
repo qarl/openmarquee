@@ -233,6 +233,13 @@ class SystemInfo(BaseModel):
     mixed result (model from /proc/device-tree but signal falling
     back to sentinel because no wireless adapter) is debuggable
     without re-probing.
+
+    Contract note (15.4): all fields are NON-NULLABLE by design.
+    When a /proc reader returns None, the handler substitutes the
+    matching `_FALLBACK_*` sentinel so the wire payload always
+    carries a renderable value. Don't relax nullability here -- the
+    UI's defensive null-guards mirror this contract; if you flip a
+    field to Optional, the UI has to grow real null branching.
     """
 
     model: str
