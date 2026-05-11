@@ -68,5 +68,17 @@ rsync -a --delete --delete-excluded \
     --exclude='.*' \
     "$SRC_UI/fonts/" "$DEST/fonts/"
 
+# 14.1: regression guard against stale main.js shipping eager-loaded
+# dependencies that Batch 7 moved behind dynamic imports. The cold-load
+# bundle MUST NOT contain "Sortable" (sortablejs is now lazy-loaded on
+# track interaction; if it shows up here, the wrong main.js was copied
+# in -- 219KB pre-Batch-7 build vs 178KB post). Sweep #6 caught a
+# 41KB stale bundle on the live demo this way (2026-05-11).
+if grep -q "Sortable" "$DEST/dist/main.js"; then
+    echo "error: $DEST/dist/main.js contains 'Sortable' -- stale pre-Batch-7 bundle?" >&2
+    echo "       (sortablejs is lazy-loaded; main.js should not reference it)" >&2
+    exit 3
+fi
+
 echo "demo bundle ready at $DEST/"
 du -sh "$DEST" | awk '{print "total size:", $1}'
