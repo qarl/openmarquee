@@ -39,7 +39,14 @@ export const AUTH_TOKEN_KEY = "openmarquee_auth_token";
  *     cross-tab BroadcastChannel needed.
  */
 export async function apiFetch(input, init = {}) {
-    const headers = new Headers(init.headers || {});
+    // 20.4: callers that own a 401 inline (e.g. the Change-secret form
+    // where 401 means "wrong current_password", not "stale token")
+    // pass `skipAuth401Redirect: true` so apiFetch leaves the response
+    // alone -- no localStorage clear, no /login.html redirect, no
+    // throw. Non-init key; we strip it before passing to fetch.
+    const skip401 = init.skipAuth401Redirect === true;
+    const { skipAuth401Redirect: _skip, ...fetchInit } = init;
+    const headers = new Headers(fetchInit.headers || {});
     if (typeof localStorage !== "undefined") {
         try {
             const token = localStorage.getItem(AUTH_TOKEN_KEY);
@@ -51,8 +58,8 @@ export async function apiFetch(input, init = {}) {
             // request still goes out, it just won't carry the token.
         }
     }
-    const response = await fetch(input, { ...init, headers });
-    if (response.status === 401) {
+    const response = await fetch(input, { ...fetchInit, headers });
+    if (response.status === 401 && !skip401) {
         try {
             localStorage?.removeItem?.(AUTH_TOKEN_KEY);
         } catch { /* ignore */ }

@@ -10,6 +10,9 @@ function tick() {
     return new Promise((r) => setTimeout(r, 0));
 }
 
+// Batch 20.4: GET /api/settings now returns the secret fields redacted
+// (sentinel "<set>" when populated, null when unset). The fixture
+// reflects the wire shape post-20.4.
 const SAMPLE = {
     schema_version: 1,
     sign_name: "Lobby",
@@ -21,7 +24,7 @@ const SAMPLE = {
     gamma: 2.4,
     wifi_ap_enabled: true,
     wifi_ssid: "openMarquee-A3F7",
-    wifi_password: "correct-horse-battery",
+    wifi_password: "<set>",
     wifi_station_enabled: false,
     wifi_station_ssid: null,
     wifi_station_password: null,
@@ -49,9 +52,15 @@ describe("mountSettings", () => {
         expect(container.querySelector(".field-wifi-ssid").value).toBe(
             "openMarquee-A3F7",
         );
-        expect(container.querySelector(".field-wifi-password").value).toBe(
-            "correct-horse-battery",
+        // Batch 20.4: field-wifi-password is now a hidden input carrying
+        // the redacted wire value; the displayed indicator is in
+        // .secret-status. The hidden value is what gets echoed back on
+        // PUT so the backend can substitute the stored value.
+        expect(container.querySelector(".field-wifi-password").value).toBe("<set>");
+        const apSecretStatus = container.querySelector(
+            '.secret-field[data-secret="wifi-ap-password"] .secret-status',
         );
+        expect(apSecretStatus.textContent).toMatch(/Set/i);
         expect(container.querySelector(".field-timezone").value).toBe(
             "America/New_York",
         );
@@ -136,7 +145,9 @@ describe("mountSettings", () => {
         expect(payload.brightness).toBe(42);
         expect(payload.gamma).toBeCloseTo(2.4);
         expect(payload.display_width).toBe(1920);
-        expect(payload.wifi_password).toBe("correct-horse-battery");
+        // Batch 20.4: PUT body echoes the redacted sentinel; the
+        // backend substitutes the stored value before persisting.
+        expect(payload.wifi_password).toBe("<set>");
         expect(payload.timezone).toBe("America/New_York");
     });
 
@@ -203,7 +214,8 @@ describe("mountSettings", () => {
                 ...SAMPLE,
                 wifi_station_enabled: true,
                 wifi_station_ssid: "home-net",
-                wifi_station_password: "correct-horse-battery",
+                // Batch 20.4: redacted wire value.
+                wifi_station_password: "<set>",
             }),
             onSave,
         });
@@ -214,7 +226,9 @@ describe("mountSettings", () => {
         expect(p.wifi_ap_enabled).toBe(true);
         expect(p.wifi_station_enabled).toBe(true);
         expect(p.wifi_station_ssid).toBe("home-net");
-        expect(p.wifi_station_password).toBe("correct-horse-battery");
+        // Batch 20.4: PUT body echoes the sentinel; the backend
+        // substitutes the stored value.
+        expect(p.wifi_station_password).toBe("<set>");
     });
 
     it("rotation dropdown exposes the four cardinal angles + hydrates from settings", async () => {
@@ -297,7 +311,8 @@ describe("mountSettings", () => {
                 ...SAMPLE,
                 tailscale_enabled: true,
                 tailscale_hostname: "lobby-sign-01",
-                tailscale_auth_key: "tskey-auth-existing-12345",
+                // Batch 20.4: redacted wire value.
+                tailscale_auth_key: "<set>",
             }),
             onSave,
         });
@@ -307,16 +322,20 @@ describe("mountSettings", () => {
         expect(container.querySelector(".field-tailscale-hostname").value).toBe(
             "lobby-sign-01",
         );
-        expect(container.querySelector(".field-tailscale-auth-key").value).toBe(
-            "tskey-auth-existing-12345",
+        // Batch 20.4: hidden input carries the redacted wire value.
+        expect(container.querySelector(".field-tailscale-auth-key").value).toBe("<set>");
+        const tsSecretStatus = container.querySelector(
+            '.secret-field[data-secret="tailscale-auth-key"] .secret-status',
         );
+        expect(tsSecretStatus.textContent).toMatch(/Set/i);
 
         container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
         await tick();
         const payload = onSave.mock.calls[0][0];
         expect(payload.tailscale_enabled).toBe(true);
         expect(payload.tailscale_hostname).toBe("lobby-sign-01");
-        expect(payload.tailscale_auth_key).toBe("tskey-auth-existing-12345");
+        // Batch 20.4: PUT body echoes the sentinel.
+        expect(payload.tailscale_auth_key).toBe("<set>");
     });
 
     it("sends Tailscale hostname + key as null when cleared", async () => {
@@ -336,6 +355,139 @@ describe("mountSettings", () => {
         const payload = onSave.mock.calls[0][0];
         expect(payload.tailscale_hostname).toBeNull();
         expect(payload.tailscale_auth_key).toBeNull();
+    });
+
+    // --- Batch 20.4: secret-field UI (Change… inline form) ---
+
+    it("renders 'Set' indicator when GET returns the <set> sentinel", async () => {
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const apStatus = container.querySelector(
+            '.secret-field[data-secret="wifi-ap-password"] .secret-status',
+        );
+        expect(apStatus.textContent).toMatch(/Set/i);
+        // station + tailscale start null (per SAMPLE) -> "Not set"
+        const stationStatus = container.querySelector(
+            '.secret-field[data-secret="wifi-station-password"] .secret-status',
+        );
+        expect(stationStatus.textContent).toMatch(/Not set/i);
+        const tsStatus = container.querySelector(
+            '.secret-field[data-secret="tailscale-auth-key"] .secret-status',
+        );
+        expect(tsStatus.textContent).toMatch(/Not set/i);
+    });
+
+    it("Change… reveals the inline current_password + new_value form", async () => {
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const row = container.querySelector(
+            '.secret-field[data-secret="wifi-ap-password"]',
+        );
+        expect(row.querySelector(".secret-form").hidden).toBe(true);
+        row.querySelector(".secret-change-btn").click();
+        expect(row.querySelector(".secret-form").hidden).toBe(false);
+        expect(row.querySelector(".secret-display").hidden).toBe(true);
+    });
+
+    it("Cancel collapses the form back to the display row", async () => {
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const row = container.querySelector(
+            '.secret-field[data-secret="wifi-ap-password"]',
+        );
+        row.querySelector(".secret-change-btn").click();
+        row.querySelector(".secret-current-password").value = "typed-something";
+        row.querySelector(".secret-cancel-btn").click();
+        expect(row.querySelector(".secret-form").hidden).toBe(true);
+        expect(row.querySelector(".secret-display").hidden).toBe(false);
+        // Cancel clears the inputs so the next open() doesn't reveal
+        // what the operator typed before.
+        expect(row.querySelector(".secret-current-password").value).toBe("");
+    });
+
+    it("Save Secret PATCHes the right endpoint with current_password + new_value", async () => {
+        const container = document.createElement("div");
+        const fetchMock = vi.fn().mockResolvedValue(
+            new Response(JSON.stringify({ wifi_password: "<set>" }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const row = container.querySelector(
+            '.secret-field[data-secret="wifi-ap-password"]',
+        );
+        row.querySelector(".secret-change-btn").click();
+        row.querySelector(".secret-current-password").value = "hunter2hunter";
+        row.querySelector(".secret-new-value").value = "new-ap-pass-12";
+        row.querySelector(".secret-save-btn").click();
+        await tick();
+        await tick();
+        // First fetch call: PATCH /api/settings/wifi-ap-password.
+        const patchCall = fetchMock.mock.calls.find(([url]) =>
+            String(url).endsWith("/api/settings/wifi-ap-password"),
+        );
+        expect(patchCall).toBeDefined();
+        const init = patchCall[1];
+        expect(init.method).toBe("PATCH");
+        expect(JSON.parse(init.body)).toEqual({
+            current_password: "hunter2hunter",
+            new_value: "new-ap-pass-12",
+        });
+    });
+
+    it("Save Secret shows 'Incorrect current password' on 401", async () => {
+        const container = document.createElement("div");
+        const fetchMock = vi.fn().mockImplementation(async (url) => {
+            const u = String(url);
+            if (u.endsWith("/api/settings/wifi-ap-password")) {
+                return new Response(JSON.stringify({ detail: "wrong" }), {
+                    status: 401,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+            // GET /api/settings + display-dims/wifi-scan stubs.
+            return new Response(JSON.stringify(SAMPLE), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        });
+        vi.stubGlobal("fetch", fetchMock);
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const row = container.querySelector(
+            '.secret-field[data-secret="wifi-ap-password"]',
+        );
+        row.querySelector(".secret-change-btn").click();
+        row.querySelector(".secret-current-password").value = "wrong";
+        row.querySelector(".secret-new-value").value = "doesnt-matter";
+        row.querySelector(".secret-save-btn").click();
+        await tick();
+        await tick();
+        const err = row.querySelector(".secret-error");
+        expect(err.textContent).toMatch(/Incorrect current password/i);
+        // Form stays open so the operator can retry.
+        expect(row.querySelector(".secret-form").hidden).toBe(false);
     });
 
     it("surfaces backend failures into the status line without throwing", async () => {

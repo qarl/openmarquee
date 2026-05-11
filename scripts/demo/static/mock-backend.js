@@ -19,6 +19,32 @@
     const SEED_URL = "./seed.json";
     const ASSET_BASE = "./assets/";
 
+    // Batch 20.4: mirror backend api_settings.py's redaction constants.
+    // Three fields get the "<set>" sentinel on GET / PUT responses;
+    // sentinel-on-PUT-input is treated as "no change" so the UI's
+    // GET-mutate-PUT round-trip doesn't overwrite real values.
+    const SECRET_SENTINEL = "<set>";
+    const SECRET_FIELDS = [
+        "wifi_password",
+        "wifi_station_password",
+        "tailscale_auth_key",
+    ];
+
+    function redactSettingsSecrets(settings) {
+        const out = { ...settings };
+        for (const key of SECRET_FIELDS) {
+            const v = out[key];
+            if (v && v !== SECRET_SENTINEL) {
+                out[key] = SECRET_SENTINEL;
+            } else if (!v) {
+                out[key] = null;
+            }
+            // v === SECRET_SENTINEL stays as-is (rare; would only happen
+            // if the mock re-redacts a value that was already redacted).
+        }
+        return out;
+    }
+
     // In-memory copies; populated from localStorage (or seed) during init.
     let state = null;
     let seed = null;
@@ -501,13 +527,55 @@
 
         // --- settings ---
         if (pathname === "/api/settings" && method === "GET") {
-            return jsonResponse(state.settings);
+            // 20.4: redact secrets on the wire the same way the real
+            // backend does. The demo doesn't have an AuthMiddleware in
+            // play so the secret values themselves are uninteresting,
+            // but the UI tests for the "<set>" sentinel to decide
+            // whether to render the "•••• Set" + Change... affordance.
+            return jsonResponse(redactSettingsSecrets(state.settings));
         }
         if (pathname === "/api/settings" && method === "PUT") {
             const body = await request.json();
+            // 20.4: PUT substitutes the sentinel for the stored value
+            // so a UI Save-after-GET doesn't overwrite the real secret
+            // with the literal "<set>" string. Matches the real
+            // backend's substitution logic.
+            for (const key of SECRET_FIELDS) {
+                if (body[key] === SECRET_SENTINEL) {
+                    body[key] = state.settings[key];
+                }
+            }
             state.settings = { ...state.settings, ...body };
             saveState();
-            return jsonResponse(state.settings);
+            return jsonResponse(redactSettingsSecrets(state.settings));
+        }
+        // 20.4: PATCH endpoints for the 3 secret fields. The demo
+        // doesn't enforce current_password (no AuthState) so we just
+        // update the field; this lets the demo's Change... UI show
+        // an end-to-end flow without a real password-rotation mechanism.
+        //
+        // Literal paths handled (also enumerated here so check-mock-
+        // drift.py recognizes the routes via substring search):
+        //   PATCH /api/settings/wifi-ap-password
+        //   PATCH /api/settings/wifi-station-password
+        //   PATCH /api/settings/tailscale-auth-key
+        const patchSecretMatch = pathname.match(
+            /^\/api\/settings\/(wifi-ap-password|wifi-station-password|tailscale-auth-key)$/,
+        );
+        if (patchSecretMatch && method === "PATCH") {
+            const fieldByPath = {
+                "wifi-ap-password": "wifi_password",
+                "wifi-station-password": "wifi_station_password",
+                "tailscale-auth-key": "tailscale_auth_key",
+            };
+            const field = fieldByPath[patchSecretMatch[1]];
+            const body = await request.json();
+            // Set or clear (empty/null clears, nullable fields only).
+            state.settings[field] = body.new_value || (
+                field === "wifi_password" ? state.settings[field] : null
+            );
+            saveState();
+            return jsonResponse(redactSettingsSecrets(state.settings));
         }
         if (pathname === "/api/system/display-dims" && method === "GET") {
             return jsonResponse({ width: 1920, height: 1080, source: "demo" });

@@ -597,34 +597,19 @@ describe("apiFetch (20.3 wrapper)", () => {
     // observe the redirect intention AND avoid the "Not implemented:
     // navigation" jsdom warning.
     function stubLocation(pathname = "/") {
+        // jsdom's window.location is non-configurable + its methods are
+        // non-configurable too, which blocks both Object.defineProperty
+        // and vi.spyOn. Workaround: swap window.location wholesale via
+        // `delete window.location` + reassign. Node/jsdom allows this
+        // on window despite the standard restriction. The replaced
+        // shape is the minimal set apiFetch reads.
+        const original = window.location;
         const replace = vi.fn();
-        // Window.location can't be reassigned wholesale in jsdom; mock
-        // only the methods we need.
-        const original = {
-            replace: window.location.replace,
-            pathname: window.location.pathname,
-        };
-        Object.defineProperty(window.location, "replace", {
-            configurable: true,
-            writable: true,
-            value: replace,
-        });
-        Object.defineProperty(window.location, "pathname", {
-            configurable: true,
-            writable: true,
-            value: pathname,
-        });
+        delete window.location;
+        window.location = { pathname, replace };
         return { replace, restore: () => {
-            Object.defineProperty(window.location, "replace", {
-                configurable: true,
-                writable: true,
-                value: original.replace,
-            });
-            Object.defineProperty(window.location, "pathname", {
-                configurable: true,
-                writable: true,
-                value: original.pathname,
-            });
+            delete window.location;
+            window.location = original;
         }};
     }
 

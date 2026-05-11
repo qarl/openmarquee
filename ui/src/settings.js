@@ -123,9 +123,25 @@ const SECTION_TEMPLATE = `
                                 <span>AP SSID</span>
                                 <input type="text" class="om-input field-wifi-ssid" maxlength="32">
                             </label>
-                            <label class="field om-field" style="flex: 1;">
+                            <label class="field om-field secret-field" style="flex: 1;" data-secret="wifi-ap-password">
                                 <span>AP password (8-63 chars)</span>
-                                <input type="password" class="om-input field-wifi-password" minlength="8" maxlength="63">
+                                <div class="secret-display"
+                                     style="display: flex; gap: 8px; align-items: center; padding: 6px 0;">
+                                    <span class="secret-status" style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
+                                    <button type="button" class="om-btn sm secret-change-btn">Change…</button>
+                                </div>
+                                <div class="secret-form" hidden style="display: grid; gap: 6px; margin-top: 4px;">
+                                    <input type="password" class="om-input secret-current-password"
+                                           placeholder="Current login password" autocomplete="current-password">
+                                    <input type="password" class="om-input secret-new-value"
+                                           placeholder="New AP password (8-63 chars)" minlength="8" maxlength="63">
+                                    <div style="display: flex; gap: 6px;">
+                                        <button type="button" class="om-btn primary sm secret-save-btn">Save</button>
+                                        <button type="button" class="om-btn sm secret-cancel-btn">Cancel</button>
+                                    </div>
+                                    <p class="secret-error" role="alert" aria-live="polite" style="min-height: 1.2em; color: #ff6b6b; font-size: 12px; margin: 0;"></p>
+                                </div>
+                                <input type="hidden" class="field-wifi-password">
                             </label>
                         </div>
                     </fieldset>
@@ -145,9 +161,25 @@ const SECTION_TEMPLATE = `
                                 </select>
                                 <input type="text" class="om-input field-wifi-station-ssid" maxlength="32" placeholder="SSID">
                             </label>
-                            <label class="field om-field" style="flex: 1;">
+                            <label class="field om-field secret-field" style="flex: 1;" data-secret="wifi-station-password">
                                 <span>WiFi password (8-63 chars)</span>
-                                <input type="password" class="om-input field-wifi-station-password" minlength="8" maxlength="63">
+                                <div class="secret-display"
+                                     style="display: flex; gap: 8px; align-items: center; padding: 6px 0;">
+                                    <span class="secret-status" style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
+                                    <button type="button" class="om-btn sm secret-change-btn">Change…</button>
+                                </div>
+                                <div class="secret-form" hidden style="display: grid; gap: 6px; margin-top: 4px;">
+                                    <input type="password" class="om-input secret-current-password"
+                                           placeholder="Current login password" autocomplete="current-password">
+                                    <input type="password" class="om-input secret-new-value"
+                                           placeholder="New WiFi password (blank = clear)" maxlength="63">
+                                    <div style="display: flex; gap: 6px;">
+                                        <button type="button" class="om-btn primary sm secret-save-btn">Save</button>
+                                        <button type="button" class="om-btn sm secret-cancel-btn">Cancel</button>
+                                    </div>
+                                    <p class="secret-error" role="alert" aria-live="polite" style="min-height: 1.2em; color: #ff6b6b; font-size: 12px; margin: 0;"></p>
+                                </div>
+                                <input type="hidden" class="field-wifi-station-password">
                             </label>
                         </div>
                         <button type="button" class="om-btn sm settings-wifi-rescan field-hint-btn">
@@ -176,9 +208,25 @@ const SECTION_TEMPLATE = `
                                     <span>Hostname on tailnet (optional)</span>
                                     <input type="text" class="om-input field-tailscale-hostname" maxlength="63" placeholder="e.g. lobby-sign-01">
                                 </label>
-                                <label class="field om-field" style="flex: 1;">
+                                <label class="field om-field secret-field" style="flex: 1;" data-secret="tailscale-auth-key">
                                     <span>Auth key (tskey-auth-… or tskey-client-…)</span>
-                                    <input type="password" class="om-input field-tailscale-auth-key" placeholder="paste from Tailscale admin">
+                                    <div class="secret-display"
+                                         style="display: flex; gap: 8px; align-items: center; padding: 6px 0;">
+                                        <span class="secret-status" style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
+                                        <button type="button" class="om-btn sm secret-change-btn">Change…</button>
+                                    </div>
+                                    <div class="secret-form" hidden style="display: grid; gap: 6px; margin-top: 4px;">
+                                        <input type="password" class="om-input secret-current-password"
+                                               placeholder="Current login password" autocomplete="current-password">
+                                        <input type="password" class="om-input secret-new-value"
+                                               placeholder="tskey-auth-… (blank = clear)">
+                                        <div style="display: flex; gap: 6px;">
+                                            <button type="button" class="om-btn primary sm secret-save-btn">Save</button>
+                                            <button type="button" class="om-btn sm secret-cancel-btn">Cancel</button>
+                                        </div>
+                                        <p class="secret-error" role="alert" aria-live="polite" style="min-height: 1.2em; color: #ff6b6b; font-size: 12px; margin: 0;"></p>
+                                    </div>
+                                    <input type="hidden" class="field-tailscale-auth-key">
                                 </label>
                             </div>
                         </fieldset>
@@ -353,6 +401,125 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         }
     });
 
+    // Batch 20.4: secret-field UI -- redacted display + Change… inline
+    // form per field. The hidden inputs (field-wifi-password etc.)
+    // still carry whatever GET returned ("<set>" or null) so the main
+    // PUT round-trip echoes it back unchanged; rotations land via the
+    // PATCH /api/settings/{...} endpoints called directly from this
+    // helper. Each .secret-field row is self-contained: it picks up
+    // its target endpoint from `data-secret`.
+    const PATCH_PATH_BY_SECRET = {
+        "wifi-ap-password": "/api/settings/wifi-ap-password",
+        "wifi-station-password": "/api/settings/wifi-station-password",
+        "tailscale-auth-key": "/api/settings/tailscale-auth-key",
+    };
+
+    function updateSecretIndicator(secretId, wireValue) {
+        const row = container.querySelector(
+            `.secret-field[data-secret="${secretId}"]`,
+        );
+        if (!row) return;
+        const status = row.querySelector(".secret-status");
+        // wireValue == "<set>": secret is configured; wireValue == null
+        // or "": secret is unset.
+        if (wireValue && wireValue === "<set>") {
+            status.textContent = "•••• Set";
+        } else if (wireValue) {
+            // Defensive: a real value somehow leaked into the wire shape
+            // (shouldn't happen post-20.4 redaction). Show the same
+            // "Set" indicator -- the operator can rotate via Change…
+            // and the new value flows through the redacted path.
+            status.textContent = "•••• Set";
+        } else {
+            status.textContent = "Not set";
+        }
+    }
+
+    function wireSecretFields() {
+        for (const row of container.querySelectorAll(".secret-field")) {
+            const secretId = row.dataset.secret;
+            const display = row.querySelector(".secret-display");
+            const formEl = row.querySelector(".secret-form");
+            const changeBtn = row.querySelector(".secret-change-btn");
+            const cancelBtn = row.querySelector(".secret-cancel-btn");
+            const saveBtn = row.querySelector(".secret-save-btn");
+            const currentPwEl = row.querySelector(".secret-current-password");
+            const newValueEl = row.querySelector(".secret-new-value");
+            const errorEl = row.querySelector(".secret-error");
+
+            function open() {
+                display.hidden = true;
+                formEl.hidden = false;
+                currentPwEl.value = "";
+                newValueEl.value = "";
+                errorEl.textContent = "";
+                currentPwEl.focus();
+            }
+            function close() {
+                formEl.hidden = true;
+                display.hidden = false;
+                currentPwEl.value = "";
+                newValueEl.value = "";
+                errorEl.textContent = "";
+                // 20.4 subagent: saveBtn gets .disabled=true on submit
+                // entry; the error paths re-enable but the success path
+                // calls close() before resetting it. Reset here so a
+                // second rotation in the same session isn't dead.
+                saveBtn.disabled = false;
+            }
+
+            changeBtn.addEventListener("click", open);
+            cancelBtn.addEventListener("click", close);
+
+            saveBtn.addEventListener("click", async () => {
+                errorEl.textContent = "";
+                saveBtn.disabled = true;
+                try {
+                    const response = await apiFetch(PATCH_PATH_BY_SECRET[secretId], {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            current_password: currentPwEl.value,
+                            new_value: newValueEl.value,
+                        }),
+                        // 20.4: 401 from this endpoint means "wrong
+                        // current_password" -- a re-auth gate signal,
+                        // not "your bearer token expired". Surface
+                        // inline rather than redirecting to /login.html.
+                        skipAuth401Redirect: true,
+                    });
+                    if (response.status === 401) {
+                        errorEl.textContent = "Incorrect current password.";
+                        saveBtn.disabled = false;
+                        return;
+                    }
+                    if (!response.ok) {
+                        let detail = `HTTP ${response.status}`;
+                        try {
+                            const body = await response.json();
+                            if (typeof body.detail === "string") detail = body.detail;
+                        } catch { /* ignore */ }
+                        errorEl.textContent = detail;
+                        saveBtn.disabled = false;
+                        return;
+                    }
+                    // 200: refresh the settings panel so the indicator
+                    // updates to reflect the new redacted state.
+                    close();
+                    await refresh();
+                } catch (err) {
+                    // apiFetch throws "authentication required" on 401
+                    // AND triggers a /login.html redirect -- if we got
+                    // here from a 401 the page is already navigating.
+                    // Otherwise surface the message inline.
+                    errorEl.textContent = err?.message || "Network error.";
+                    saveBtn.disabled = false;
+                }
+            });
+        }
+    }
+    wireSecretFields();
+
     async function refresh() {
         statusEl.textContent = "";
         try {
@@ -370,13 +537,17 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             gammaEl.value = String(settings.gamma ?? 2.2);
             apEnabledEl.checked = settings.wifi_ap_enabled !== false; // default on
             ssidEl.value = settings.wifi_ssid ?? "";
-            // Round-trip the real password so the operator can resubmit
-            // without retyping it. The captive-portal API already returns
-            // it in plaintext on GET — this is just hydrating the form.
+            // Batch 20.4: GET returns "<set>" / null for the 3 secret
+            // fields. The hidden inputs hold the wire value verbatim so
+            // PUT can echo them back (the backend substitutes the
+            // sentinel for the stored value, so a Save without a
+            // Change-form rotation is a no-op for these fields).
             passwordEl.value = settings.wifi_password ?? "";
+            updateSecretIndicator("wifi-ap-password", settings.wifi_password);
             stationEnabledEl.checked = Boolean(settings.wifi_station_enabled);
             stationSsidEl.value = settings.wifi_station_ssid ?? "";
             stationPasswordEl.value = settings.wifi_station_password ?? "";
+            updateSecretIndicator("wifi-station-password", settings.wifi_station_password);
             ws281xOrderEl.value = settings.ws281x_pixel_order || "row_major";
             // Hydrate tailscale state BEFORE the sync calls — syncTailscale*
             // reads tsEnabledEl.checked to decide dim / disabled state, so
@@ -384,6 +555,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
             tsHostnameEl.value = settings.tailscale_hostname ?? "";
             tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
+            updateSecretIndicator("tailscale-auth-key", settings.tailscale_auth_key);
             syncWifiGrayOut();
             syncTailscaleStationGating();
             syncWs281xOrderVisibility();
