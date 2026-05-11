@@ -73,17 +73,13 @@ rsync -avz --delete --delete-excluded \
     --exclude '._*' \
     "$OPENMARQUEE_BUILD_DIR/ui/" "$TARGET:$REMOTE_ROOT/ui/"
 
-echo "==> installing / updating backend deps in remote venv"
-# Install from requirements.lock first (Batch 11.1 / sweep #5 #7)
-# so the device runs the exact CVE-audited dep tree. Then -e
-# install of the backend package itself for the openmarquee
-# module + its entry points. If either fails on first deploy,
-# run system/README.md § first-time install on the target.
-ssh "$TARGET" "$REMOTE_ROOT/venv/bin/pip install --quiet -r $REMOTE_ROOT/backend/requirements.lock"
-ssh "$TARGET" "$REMOTE_ROOT/venv/bin/pip install --quiet --upgrade --no-deps -e $REMOTE_ROOT/backend"
-
-echo "==> restarting openmarquee-backend"
-ssh "$TARGET" "sudo systemctl restart openmarquee-backend"
+echo "==> running install.sh on remote (idempotent provisioning)"
+# install.sh handles venv (Batch 11.1 / sweep #5 #7 requirements.lock
+# pin), systemd unit install, hostapd/dnsmasq/iptables wiring, and
+# kicks the backend restart. It's idempotent -- safe to re-run on
+# every redeploy. Per Phase B.3 dispatch: this is the single
+# entry point for both first-boot config and developer redeploy.
+ssh "$TARGET" "sudo bash $REMOTE_ROOT/scripts/install.sh"
 
 # 19.3 / sweep #10 #5: gate the deploy on /healthz returning 200.
 # Mandatory (not advisory) -- a backend that crashes during startup

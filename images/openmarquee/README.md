@@ -16,8 +16,6 @@ openMarquee captive-portal-first-boot device flow.
 | `stage-openmarquee/prerun.sh` | Boilerplate: copy previous stage's rootfs into this stage. |
 
 What's NOT here (yet):
-- **B.3 install.sh** — the real provisioning. Drops the systemd unit,
-  builds the venv, lays down hostapd/dnsmasq configs from `wifi.json`.
 - **B.4 first-boot oneshot** — generates the AP password + QR code on
   first boot, templates into welcome.html, closes sweep #5 #2.
 - **B.5 welcome.html flow integration** — AP password + QR code shown
