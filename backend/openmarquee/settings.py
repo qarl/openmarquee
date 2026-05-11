@@ -27,9 +27,10 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from openmarquee._atomic import atomic_write_text
+from openmarquee._storage_recovery import quarantine_corrupt_file
 
 # Bump when the on-disk format changes in a non-backward-compatible way.
 # Same migration discipline as `openmarquee.schedule` and
@@ -386,8 +387,20 @@ class SettingsStorage:
                 fresh = fresh.model_copy(update=updates)
             self.save(fresh)
             return fresh
-        data = json.loads(self.path.read_text())
-        return SystemSettings.model_validate(data)
+        # 19.2 / sweep #10 #4: on parse / schema failure quarantine
+        # the bad file + return defaults; the next save() rewrites
+        # the original path. settings.json carries the AP password
+        # and Tailscale auth key -- the quarantine .corrupt-<ISO>
+        # file inherits the 0600 mode (preserved by rename) so the
+        # secrets don't leak through the recovery path.
+        try:
+            data = json.loads(self.path.read_text())
+            return SystemSettings.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            quarantine_corrupt_file(self.path, exc)
+            fresh = SystemSettings()
+            self.save(fresh)
+            return fresh
 
     def save(self, settings: SystemSettings) -> None:
         """Replace the on-disk settings with `settings`. Atomic via rename."""

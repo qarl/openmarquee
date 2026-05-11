@@ -29,9 +29,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from openmarquee._atomic import atomic_write_text
+from openmarquee._storage_recovery import quarantine_corrupt_file
 
 TOMBSTONE_SCHEMA_VERSION = 1
 # All peers must agree on this value — a peer with a shorter TTL stops
@@ -69,8 +70,13 @@ class TombstoneStorage:
     def load(self) -> TombstoneLog:
         if not self.path.exists():
             return TombstoneLog()
-        data = json.loads(self.path.read_text())
-        return TombstoneLog.model_validate(data)
+        # 19.2 / sweep #10 #4: see PlaylistStorage.load_all note.
+        try:
+            data = json.loads(self.path.read_text())
+            return TombstoneLog.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            quarantine_corrupt_file(self.path, exc)
+            return TombstoneLog()
 
     def save(self, log: TombstoneLog) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

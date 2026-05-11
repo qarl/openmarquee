@@ -42,9 +42,10 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from openmarquee._atomic import atomic_write_text
+from openmarquee._storage_recovery import quarantine_corrupt_file
 from openmarquee.playlist import (
     DEFAULT_PLAYLIST_ID,
     PlaylistStorage,
@@ -197,8 +198,13 @@ class ScheduleStorage:
         if self._cache is not None and self._cache[0] == mtime_ns:
             return self._cache[1]
         type(self)._stats["json_parses"] += 1
-        data = json.loads(self.path.read_text())
-        schedule, was_migrated = _coerce_to_schedule(data, self._playlist_storage)
+        # 19.2 / sweep #10 #4: see PlaylistStorage.load_all note.
+        try:
+            data = json.loads(self.path.read_text())
+            schedule, was_migrated = _coerce_to_schedule(data, self._playlist_storage)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            quarantine_corrupt_file(self.path, exc)
+            return Schedule()
         if was_migrated:
             self.save(schedule)
             mtime_ns = self.path.stat().st_mtime_ns

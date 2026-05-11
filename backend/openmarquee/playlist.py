@@ -58,9 +58,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, computed_field, model_validator
 
 from openmarquee._atomic import atomic_write_text
+from openmarquee._storage_recovery import quarantine_corrupt_file
 
 if TYPE_CHECKING:
     from openmarquee.content import ContentItem
@@ -258,8 +259,17 @@ class PlaylistStorage:
         if self._cache is not None and self._cache[0] == mtime_ns:
             return self._cache[1]
         type(self)._stats["json_parses"] += 1
-        data = json.loads(self.path.read_text())
-        collection, was_migrated = _coerce_to_collection(data)
+        # 19.2 / sweep #10 #4: on JSON corruption or schema mismatch,
+        # quarantine the bad file + start fresh with defaults. The
+        # next save_all() overwrites the original path. Without this,
+        # a power-loss-during-write or a hand-edit gone wrong leaves
+        # the backend hard-crashing on every restart.
+        try:
+            data = json.loads(self.path.read_text())
+            collection, was_migrated = _coerce_to_collection(data)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            quarantine_corrupt_file(self.path, exc)
+            return _bootstrap_default_collection()
         if was_migrated:
             self.save_all(collection)
             mtime_ns = self.path.stat().st_mtime_ns
