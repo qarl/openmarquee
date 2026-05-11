@@ -74,6 +74,51 @@ AuthDep = Annotated[AuthStorage, Depends(get_auth_storage)]
 
 log = logging.getLogger(__name__)
 
+
+def _scrubbed_error_summary(exc: Exception) -> str:
+    """Return a log-safe summary of a validation exception that does NOT
+    contain the rejected input value.
+
+    Pydantic's `str(ValidationError)` and the default `.errors()` both
+    include the failing input verbatim. On the PATCH-secret path the
+    input IS a secret -- if a `log.warning("...: %s", exc)` line
+    serialises that string into journald/syslog, anyone with shell on
+    the Pi reads the password via `journalctl -u openmarquee`. The
+    `include_input=False` knob (pydantic >=2.4) suppresses the `input`
+    key, BUT a `field_validator` that does
+    `raise ValueError(f"..., got {value!r}")` will land its ValueError
+    instance in `ctx['error']` -- and `repr()`ing that dict re-prints
+    the value via the ValueError's __repr__. So we ALSO strip `ctx`
+    here and serialise only loc/type/msg, which can never carry the
+    raw input as long as field_validator raise-messages don't embed
+    `{value!r}`.
+
+    Important convention for future contributors: field_validator
+    raise messages on SECRET fields (wifi_password,
+    wifi_station_password, tailscale_auth_key) MUST stay free of
+    `{value!r}` -- otherwise that string lands here via msg even
+    without ctx. The non-secret validators in settings.py (wifi_ssid,
+    timezone) do use {value!r}; safe for them, dangerous to copy
+    onto a secret.
+
+    For non-Pydantic exceptions we fall back to `type(exc).__name__`;
+    the message body could contain arbitrary text and isn't worth
+    trusting for log-safety.
+    """
+    try:
+        # Pydantic v2 ValidationError. Strip both `input` (the raw
+        # rejected value) AND `ctx` (which may carry a ValueError whose
+        # message re-includes it). Keep loc + type + msg + url for the
+        # operator's audit trail.
+        keep = ("loc", "type", "msg", "url")
+        sanitised = [
+            {k: err[k] for k in keep if k in err}
+            for err in exc.errors(include_input=False)
+        ]
+        return repr(sanitised)
+    except (AttributeError, TypeError):
+        return type(exc).__name__
+
 # 20.4: sentinel returned by GET in place of each of the three secret
 # fields. Picked for readability + the leading `<` so a careless eye-
 # ball matcher doesn't mistake it for a real password. The UI tests
@@ -214,7 +259,9 @@ async def set_settings(
         # text -- the message includes the failing payload value which
         # can include secrets-passed-through-by-UI. Generic detail; log
         # carries the field-level reason for the operator's audit trail.
-        log.warning("settings PUT validation failed: %s", exc)
+        # #379 follow-up: log via _scrubbed_error_summary so the rejected
+        # value never lands in journald either.
+        log.warning("settings PUT validation failed: %s", _scrubbed_error_summary(exc))
         raise HTTPException(
             status_code=422, detail="settings validation failed"
         ) from exc
@@ -316,8 +363,12 @@ def _patch_secret_field(
         # password / Tailscale auth key) and Pydantic's error message
         # quotes the failing input verbatim. Generic detail; log captures
         # the field name + reason (NOT the value).
+        # #379 follow-up: _scrubbed_error_summary uses
+        # exc.errors(include_input=False) so the journald sink is also
+        # safe -- anyone with shell on the Pi can `journalctl` otherwise.
         log.warning(
-            "settings PATCH validation failed (field=%s): %s", field, exc
+            "settings PATCH validation failed (field=%s): %s",
+            field, _scrubbed_error_summary(exc),
         )
         raise HTTPException(
             status_code=422, detail="secret field validation failed"

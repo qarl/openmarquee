@@ -569,6 +569,101 @@ def test_patch_wifi_ap_password_rejects_too_short(auth_client: TestClient):
     assert response.status_code == 422
 
 
+def test_scrubbed_error_summary_strips_ctx_key():
+    """Belt-and-braces: when a field_validator stores a ValueError in
+    errors()[i]['ctx']['error'], the value's __repr__ would leak via
+    `repr(list[dict])`. The helper strips `ctx` from each error dict
+    so this path is closed.
+
+    Note: if a validator's raise message ITSELF includes `{value!r}`,
+    the msg field still carries the leak -- and msg can't be stripped
+    without losing the operator audit trail. The codebase convention
+    documented in _scrubbed_error_summary's docstring is that
+    field_validator raise messages on SECRET fields must NOT embed
+    {value!r}. The three current secret validators (wifi_password,
+    wifi_station_password, tailscale_auth_key) honor this -- they
+    raise the literal `wifi_password: expected empty or 8-63 printable
+    ASCII chars` form. This test is the regression guard for the
+    helper's `ctx` strip; the validator-message convention is a
+    separate upstream constraint."""
+    from pydantic import BaseModel, ValidationError, field_validator
+    from openmarquee.api_settings import _scrubbed_error_summary
+
+    class _Probe(BaseModel):
+        secret: str
+
+        @field_validator("secret")
+        @classmethod
+        def _no_short_secret(cls, value: str) -> str:
+            if len(value) < 8:
+                # SAFE validator: message does NOT embed the value.
+                # Matches the convention used by the three current
+                # secret validators in settings.py.
+                raise ValueError("secret: must be at least 8 chars")
+            return value
+
+    forbidden = "leaky-1"
+    try:
+        _Probe.model_validate({"secret": forbidden})
+    except ValidationError as exc:
+        summary = _scrubbed_error_summary(exc)
+        # ctx is gone (defense in depth against future bad validators).
+        assert "ctx" not in summary, (
+            f"helper kept the ctx key (the ValueError leak vector): "
+            f"{summary!r}"
+        )
+        # Rejected value is absent (because both `input` and `ctx`
+        # were stripped, AND this safe validator didn't embed it in msg).
+        assert forbidden not in summary, (
+            f"rejected value leaked: {summary!r}"
+        )
+        # Audit trail intact: field name + error type still visible.
+        assert "secret" in summary
+        assert "value_error" in summary
+    else:
+        pytest.fail("validator should have raised")
+
+
+def test_patch_validation_log_does_not_leak_secret_to_journal(
+    auth_client: TestClient, caplog: "pytest.LogCaptureFixture"
+):
+    """Task #379 (sweep #5 #8 full closure): the PATCH validation
+    log.warning call MUST NOT contain the rejected secret value.
+    Anyone with shell on the Pi can `journalctl -u openmarquee` and
+    grep for the new_value -- if it leaks here we've shifted the
+    sweep #5 #8 vulnerability from HTTP response body to syslog.
+    Helper _scrubbed_error_summary uses exc.errors(include_input=False)
+    to omit the value."""
+    token = _configure_auth_for_patch_tests(auth_client)
+    forbidden_value = "leak7ch"  # too short -> WPA2 8-char floor
+
+    with caplog.at_level("WARNING", logger="openmarquee.api_settings"):
+        response = auth_client.patch(
+            "/api/settings/wifi-ap-password",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "current_password": "hunter2hunter",
+                "new_value": forbidden_value,
+            },
+        )
+    assert response.status_code == 422
+    # The WARNING line must mention the field name (audit trail) but
+    # NOT the rejected value.
+    warning_lines = [
+        rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
+    ]
+    # The model's internal field name is wifi_password (the URL path
+    # `wifi-ap-password` is the API alias). Audit trail is the field
+    # name, not the URL path.
+    assert any("wifi_password" in line for line in warning_lines), (
+        f"expected field=wifi_password in log, got: {warning_lines}"
+    )
+    for line in warning_lines:
+        assert forbidden_value not in line, (
+            f"REJECTED SECRET LEAKED TO LOG: {line!r}"
+        )
+
+
 def test_patch_validation_response_does_not_leak_secret_or_pydantic_text(
     auth_client: TestClient,
 ):
