@@ -392,5 +392,13 @@ class SettingsStorage:
         type(self)._stats["save_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(settings.model_dump_json(indent=2))
-        tmp.replace(self.path)
+        try:
+            tmp.write_text(settings.model_dump_json(indent=2))
+            tmp.replace(self.path)
+        except Exception:
+            # 9.2: clean up orphan .tmp on rollback.
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise

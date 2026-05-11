@@ -73,8 +73,16 @@ class TombstoneStorage:
     def save(self, log: TombstoneLog) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(log.model_dump_json(indent=2))
-        tmp.replace(self.path)
+        try:
+            tmp.write_text(log.model_dump_json(indent=2))
+            tmp.replace(self.path)
+        except Exception:
+            # 9.2: clean up orphan .tmp on rollback.
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     def add(self, content_id: UUID, *, now: datetime | None = None) -> Tombstone:
         """Record a deletion. If a tombstone for this id already exists the

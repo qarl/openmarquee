@@ -325,11 +325,29 @@ class ContentStorage:
         # Append ".tmp" to the full name (so "item.json" → "item.json.tmp"),
         # not with_suffix which would replace the last suffix.
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(content)
-        tmp.replace(path)
+        try:
+            tmp.write_text(content)
+            tmp.replace(path)
+        except Exception:
+            # 9.2: clean up the orphan .tmp on rollback so the next
+            # save doesn't fight a stale file. unlink errors are
+            # ignored -- if cleanup itself fails, the original
+            # exception is the load-bearing one.
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     @staticmethod
     def _atomic_write_bytes(path: Path, content: bytes) -> None:
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_bytes(content)
-        tmp.replace(path)
+        try:
+            tmp.write_bytes(content)
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise

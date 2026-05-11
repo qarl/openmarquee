@@ -240,8 +240,16 @@ class FlockStorage:
         # in-place before calling save.
         self._cache = None
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(flock.model_dump_json(indent=2))
-        tmp.replace(self.path)
+        try:
+            tmp.write_text(flock.model_dump_json(indent=2))
+            tmp.replace(self.path)
+        except Exception:
+            # 9.2: clean up orphan .tmp on rollback.
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     # --- convenience CRUD on top of load/save ---
 

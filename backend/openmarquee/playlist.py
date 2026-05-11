@@ -276,8 +276,16 @@ class PlaylistStorage:
         # return the mutated cached value that doesn't match disk.
         self._cache = None
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(collection.model_dump_json(indent=2))
-        tmp.replace(self.path)
+        try:
+            tmp.write_text(collection.model_dump_json(indent=2))
+            tmp.replace(self.path)
+        except Exception:
+            # 9.2: clean up orphan .tmp on rollback.
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     def get_by_id(self, playlist_id: UUID) -> Playlist | None:
         """Return the playlist with the given id, or None."""
