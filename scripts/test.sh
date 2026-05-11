@@ -18,6 +18,22 @@ if [ ! -x "$PYTEST" ]; then
     PYTEST="pytest"
 fi
 
+echo "==> backend lint (ruff)"
+# 16.1 / sweep #8 B1: keep test.sh and CI in lockstep -- CI runs
+# `ruff check` + `ruff format --check`, so devs running test.sh hit
+# the same gate before push. Skip if ruff isn't installed locally
+# (CI always has it via the [dev] extras install).
+RUFF="$VENV/bin/ruff"
+if [ ! -x "$RUFF" ] && ! command -v ruff > /dev/null; then
+    echo "    (skipped: ruff not installed; run \`pip install -e backend[dev]\`)"
+else
+    if [ ! -x "$RUFF" ]; then
+        RUFF="ruff"
+    fi
+    (cd backend && "$RUFF" check . && "$RUFF" format --check .)
+fi
+
+echo
 echo "==> backend tests (pytest)"
 (cd backend && "$PYTEST")
 
@@ -41,6 +57,29 @@ else
         PIP_AUDIT="pip-audit"
     fi
     (cd backend && "$PIP_AUDIT" -r requirements.lock)
+fi
+
+echo
+echo "==> backend lock drift (pyproject.toml vs requirements.lock)"
+# 16.1 / sweep #8 B8: ensure the committed lock matches what
+# pip-compile would produce from the current pyproject.toml. Catches
+# the "edited pyproject but forgot to re-lock" footgun before it
+# ships -- a stale lock is what bit us in Batch 11.1's first attempt
+# (Pillow CVEs unlocked because the dep bump never reached the lock).
+# Skip if pip-compile isn't installed locally.
+PIP_COMPILE="$VENV/bin/pip-compile"
+if [ ! -x "$PIP_COMPILE" ] && ! command -v pip-compile > /dev/null; then
+    echo "    (skipped: pip-tools not installed; run \`pip install -e backend[dev]\`)"
+else
+    if [ ! -x "$PIP_COMPILE" ]; then
+        PIP_COMPILE="pip-compile"
+    fi
+    (cd backend && \
+        "$PIP_COMPILE" --quiet --strip-extras pyproject.toml -o - 2>/dev/null \
+        | diff -u requirements.lock - \
+        || { echo "    lock drift -- regen with:"; \
+             echo "    cd backend && pip-compile --strip-extras pyproject.toml -o - > requirements.lock"; \
+             exit 1; })
 fi
 
 echo

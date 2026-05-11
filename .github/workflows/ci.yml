@@ -23,6 +23,14 @@ jobs:
         run: |
           ruff check .
           ruff format --check .
+      - name: pip-audit
+        working-directory: backend
+        run: pip-audit -r requirements.lock
+      - name: Lock drift check
+        working-directory: backend
+        run: |
+          pip-compile --quiet --strip-extras pyproject.toml -o - 2>/dev/null \
+            | diff -u requirements.lock -
       - name: Pytest
         working-directory: backend
         run: pytest
