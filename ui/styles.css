@@ -2579,7 +2579,10 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   --om-line-2:    rgba(255,255,255,.14);
   --om-text:      #e7eaee;
   --om-text-dim:  rgba(231,234,238,.62);
-  --om-text-fade: rgba(231,234,238,.38);
+  /* WCAG AA: .50 on #14181d => ~3.4:1 (passes 3:1 large-text bar
+     where most --om-text-fade uses qualify -- eyebrow labels, meta
+     chips, version footer, count badges). Was .38 (~2.5:1). */
+  --om-text-fade: rgba(231,234,238,.50);
   --om-shadow:    0 1px 0 rgba(255,255,255,.04) inset, 0 8px 24px rgba(0,0,0,.4);
   --om-led-bg:    #050608;
   --om-led-off:   rgba(255,255,255,.025);
@@ -2607,7 +2610,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   --om-line-2:    rgba(255,255,255,.14);
   --om-text:      #e7eaee;
   --om-text-dim:  rgba(231,234,238,.62);
-  --om-text-fade: rgba(231,234,238,.38);
+  --om-text-fade: rgba(231,234,238,.50);  /* 14.2: WCAG AA 3:1 large */
 }
 [data-theme="oled"] {
   --om-bg:        #000000;
