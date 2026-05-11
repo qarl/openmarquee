@@ -240,6 +240,34 @@ def get_settings_storage() -> SettingsStorage:
     return _settings_storage_singleton()
 
 
+# --- Batch 20.1 / phase A.1: auth storage (password hash + token version) ---
+
+
+def _resolve_auth_path() -> Path:
+    """Where `auth.json` lives. Production (systemd unit) sets
+    OPENMARQUEE_AUTH_PATH explicitly to /var/openmarquee/auth.json."""
+    override = os.environ.get("OPENMARQUEE_AUTH_PATH")
+    if override:
+        return Path(override)
+    return _resolve_content_root().parent / "openmarquee-auth.json"
+
+
+@lru_cache
+def _auth_storage_singleton():
+    # Import here to avoid a circular dep at module-import time
+    # (auth.py imports _atomic and _storage_recovery; both are
+    # leaves, but keeping the lazy resolution clean avoids future
+    # ordering surprises).
+    from openmarquee.auth import AuthStorage
+    return AuthStorage(_resolve_auth_path())
+
+
+def get_auth_storage():
+    """Dependency provider for the AuthStorage (password hash +
+    token version)."""
+    return _auth_storage_singleton()
+
+
 def _resolve_flock_path() -> Path:
     """Where `flock.json` lives (peer list + per-peer sync flag). Sibling
     of the playlist/schedule/settings by default."""

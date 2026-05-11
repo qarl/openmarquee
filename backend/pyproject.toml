@@ -39,6 +39,13 @@ dependencies = [
     # shader_compositor module-level only references it through the
     # `from OpenGL import EGL` / `GLES2` *inside* methods.
     "pyopengl>=3.1",
+    # Batch 20.1 / phase A.1 -- argon2id password hashing for the
+    # operator-set captive-portal password. argon2-cffi is the
+    # standard binding; default PasswordHasher() params (time_cost=
+    # 3, memory_cost=64MiB, parallelism=4) verify in ~50ms on Pi
+    # Zero 2 W and write a self-describing $argon2id$ string the
+    # PHC format gives us forward-compat across param tweaks.
+    "argon2-cffi>=23",
 ]
 
 [project.optional-dependencies]

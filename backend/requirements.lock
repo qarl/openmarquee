@@ -17,6 +17,10 @@ anyio==4.13.0
     #   httpx
     #   starlette
     #   watchfiles
+argon2-cffi==25.1.0
+    # via openmarquee (pyproject.toml)
+argon2-cffi-bindings==25.1.0
+    # via argon2-cffi
 av==16.1.0
     # via aiortc
 certifi==2026.4.22
@@ -25,6 +29,7 @@ certifi==2026.4.22
     #   httpx
 cffi==2.0.0
     # via
+    #   argon2-cffi-bindings
     #   cryptography
     #   pylibsrtp
 click==8.3.3

@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from openmarquee import __version__
 from openmarquee.api import router as content_router
+from openmarquee.api_auth import router as auth_router
 from openmarquee.api_backgrounds import router as backgrounds_router
 from openmarquee.api_flock import router as flock_router
 from openmarquee.api_playback import router as playback_router
@@ -23,6 +24,7 @@ from openmarquee.api_settings import router as settings_router
 from openmarquee.api_stream import router as stream_router
 from openmarquee.api_system import router as system_router
 from openmarquee.dependencies import (
+    get_auth_storage,
     get_content_storage,
     get_demo_video_path,
     get_playback_loop,
@@ -188,6 +190,17 @@ app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
 # /api/system/perf-stats. Mount BEFORE routers so it wraps them.
 app.add_middleware(PerfMiddleware)
 
+# Batch 20.1 / phase A.1: bearer-token gate. add_middleware stacks
+# outer-most-first, so PerfMiddleware (added first) wraps
+# AuthMiddleware -- perf records still cover auth-rejected 401s
+# (useful for "are we 401-ing a lot?" observability). AuthMiddleware
+# fails closed: requests not on the whitelist need a valid token.
+from openmarquee.auth_middleware import AuthMiddleware
+# Pass a callable resolver -- the middleware looks up the storage
+# per-request so the singleton's lru_cache can be cleared between
+# tests (tests point OPENMARQUEE_AUTH_PATH at a tmp dir).
+app.add_middleware(AuthMiddleware, auth_storage_resolver=get_auth_storage)
+
 
 @app.exception_handler(RequestValidationError)
 async def _request_validation_handler(
@@ -225,6 +238,7 @@ async def healthz() -> dict[str, str]:
     return {"status": "alive", "version": __version__}
 
 
+app.include_router(auth_router)
 app.include_router(content_router)
 app.include_router(playlist_router)
 app.include_router(schedule_router)

@@ -32,3 +32,11 @@ os.environ.setdefault("OPENMARQUEE_DISABLE_PULL_WORKER", "1")
 # fallback path is exercised by an explicit test, not every fixture
 # setup.
 os.environ.setdefault("OPENMARQUEE_RENDERER", "mock")
+
+# Batch 20.1 / phase A.1: bypass the bearer-token gate so the pre-
+# existing 100+ TestClient suites don't need to mint tokens. Auth
+# behavior itself is covered explicitly by test_auth.py (which
+# clears this env var locally where needed). Production systemd
+# unit never sets DISABLE_AUTH; the captive-portal threat model
+# assumes the gate is always on.
+os.environ.setdefault("OPENMARQUEE_DISABLE_AUTH", "1")

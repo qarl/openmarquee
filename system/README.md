@@ -37,6 +37,7 @@ them silently.
 | `playlist.json` | PlaylistCollection (v4 UUID-keyed) |
 | `schedules.json` | Schedule rules + default_playlist_id |
 | `settings.json` | SystemSettings (AP password, station password, Tailscale auth key — 0600 only) |
+| `auth.json` | argon2id password hash + token_version for the operator-set captive-portal password (0600 only). Forgot-password recovery: physical SD access, `sudo rm /var/openmarquee/auth.json`, restart backend — first-boot welcome flow re-prompts. |
 | `flock.json` | FlockStorage peer list + sync flags |
 | `tombstones.json` | TombstoneLog for delete-replication across the flock |
 | `seeded.json` | Marker stamping that first-boot seed already ran |

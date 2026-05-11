@@ -42,6 +42,11 @@ Environment="OPENMARQUEE_DEV_PREVIEW_PATH=/var/openmarquee/preview.png"
 # silently relocate flock.json / tombstones.json.
 Environment="OPENMARQUEE_FLOCK_PATH=/var/openmarquee/flock.json"
 Environment="OPENMARQUEE_TOMBSTONE_PATH=/var/openmarquee/tombstones.json"
+# 20.1 / phase A.1: auth.json carries the argon2id password hash +
+# token_version. 0600 owner-only by atomic_write_text. Recovery via
+# physical SD access (delete the file + redo welcome flow per
+# system/README.md).
+Environment="OPENMARQUEE_AUTH_PATH=/var/openmarquee/auth.json"
 
 # Production: strip the /dev tooling (preview page, manual play endpoint)
 # from the HTTP surface. The gate is read by app.py at startup.
