@@ -229,6 +229,22 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     capture_sb_t: f32,
 
+    /// Batch 17.2 / sweep #9 #2 -- pin tick_seconds for
+    /// --capture-slide so motion compositor evaluates at a fixed
+    /// phase. Without this flag, capture renders the slide at
+    /// tick=0 + real wall-clock-time, which produces a different
+    /// PNG every run for any layer with motion=ticker/breathe/
+    /// pulse/bounce/blink/shake. With this flag, the same tick
+    /// reproduces bit-identical for golden-master diffs.
+    ///
+    /// Example:
+    ///   /tmp/openmarquee-render --output hdmi \\
+    ///     --capture-slide <UUID> --content-root <ROOT> \\
+    ///     --capture-slide-at-tick 1.75 \\
+    ///     --capture-path /tmp/animated.png
+    #[arg(long)]
+    capture_slide_at_tick: Option<f64>,
+
     /// v1-spec-delta #9 (slice c+) -- enter IPC sidecar mode.
     /// The renderer reads JSON-line IpcRequest messages from
     /// stdin, dispatches via the playback state machine, and
@@ -1268,6 +1284,7 @@ fn main() -> Result<()> {
                         catalog_opt,
                         Some(content_root),
                         png_path,
+                        args.capture_slide_at_tick,
                     )?;
                     return Ok(());
                 }

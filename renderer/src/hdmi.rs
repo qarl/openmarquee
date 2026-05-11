@@ -3036,12 +3036,26 @@ pub fn capture_slide_to_png(
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
     png_path: &Path,
+    // 17.2 / sweep #9 #2: pin tick_seconds + wall_clock_unix to a
+    // deterministic value so a golden-master capture of an animated
+    // slide reproduces bit-identically across runs. None preserves
+    // the legacy behavior (tick=0, wall_clock=real-time).
+    tick_override: Option<f64>,
 ) -> Result<()> {
     use crate::hdmi_logic::rgba_to_png_bytes;
     let (bg_kind, _label, text_layers) =
         resolve_slide_layers(slide, fonts, content_root)?;
-    let motion_states = motion_states_for_layers(slide.id, &text_layers, 0.0);
-    let wall_clock_unix = current_unix_seconds();
+    let tick_seconds = tick_override.unwrap_or(0.0);
+    let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
+    // When pinned, also pin wall_clock_unix to a deterministic value
+    // (0) so any wall-clock-based effect (auto_mode time slides)
+    // reproduces. Without the override, real time keeps the legacy
+    // behavior for non-capture callers.
+    let wall_clock_unix = if tick_override.is_some() {
+        0
+    } else {
+        current_unix_seconds()
+    };
     with_egl_session(card, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;

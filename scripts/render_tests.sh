@@ -68,6 +68,10 @@ fi
 #                        --transition + --capture-sb-t; "UUID" field is
 #                        encoded as "FROM_UUID,TO_UUID,KIND,T" (no spaces).
 #                        CONTENT_ROOT must contain both UUIDs' item.json.
+# TYPE=animated_slide -> --capture-slide UUID --capture-slide-at-tick T;
+#                        "UUID" field is encoded as "UUID,T" so motion
+#                        is sampled at a deterministic phase. Requires
+#                        renderer with the 17.2 flag.
 # Add more shapes in follow-up commits.
 FIXTURES=(
     # 01 · FREE: solid bg, single-line single-layer text. Simplest
@@ -114,6 +118,25 @@ FIXTURES=(
     "transition_mid_wipe|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,wipe,0.5|$PI_FIXTURE_ROOT"
     "transition_mid_slide|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,slide,0.5|$PI_FIXTURE_ROOT"
     "transition_mid_pixelate|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,pixelate,0.5|$PI_FIXTURE_ROOT"
+    # --- 17.2 / sweep #9 #2: animated-slide tick-pin goldens ---
+    # Pin tick_seconds so the per-frame motion compositor evaluates
+    # at a deterministic phase. Goldens reproduce bit-identically
+    # across runs. Requires --capture-slide-at-tick (Batch 17.2).
+    #
+    # Coverage chosen from existing snapshot fixtures:
+    #   - Chant Wall (09): single-motion ticker. Tick 1.75 picks
+    #     mid-cycle (the ticker freq table puts intensity=50 at
+    #     ~3s/cycle, so t=1.75 lands ~60% through the first cycle
+    #     -- well off the wrap-around edge).
+    #   - Tile Chaos (08): 4-layer slide with blink + shake + pulse
+    #     + bounce on different layers. ONE capture exercises four
+    #     motions at once. Tick 0.5 puts each motion mid-phase.
+    #
+    # Future motion-coverage additions land here as synthetic
+    # single-motion fixtures (or as additional FYS slides if the
+    # reel rebuild adds them).
+    "animated_ticker_chant|animated_slide|2c858968-ae0a-4592-8083-85257de50bcd,1.75|$PI_FIXTURE_ROOT"
+    "animated_multi_chaos|animated_slide|99c11690-415b-40f6-8e3c-6491f3bdf60e,0.5|$PI_FIXTURE_ROOT"
 )
 
 echo "==> deploying binary to $TARGET:$BIN_PI"
@@ -169,6 +192,21 @@ for fixture in "${FIXTURES[@]}"; do
             echo "==> $NAME (transition-mid $T_KIND@t=$T_T from $T_FROM -> $T_TO)"
             CAP_LOG="$CAPTURE_DIR/$NAME.log"
             if ! ssh -q "$TARGET" "$BIN_PI --output hdmi --capture-sb-mid --fade-from $T_FROM --fade-to $T_TO --transition $T_KIND --capture-sb-t $T_T --content-root $CONTENT_ROOT --capture-path $PI_PATH --force-mode $FORCE_MODE" > "$CAP_LOG" 2>&1; then
+                echo "    FAIL: capture exited non-zero (see $CAP_LOG)"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                continue
+            fi
+            scp -q "$TARGET:$PI_PATH" "$LOCAL_PATH"
+            ;;
+        animated_slide)
+            # UUID field encodes "UUID,TICK" -- split.
+            # 17.2: tick pins motion phase so the per-frame
+            # animated compositor reproduces bit-identically.
+            IFS=',' read -r A_UUID A_TICK <<<"$UUID"
+            echo
+            echo "==> $NAME (animated-slide $A_UUID @ tick=$A_TICK)"
+            CAP_LOG="$CAPTURE_DIR/$NAME.log"
+            if ! ssh -q "$TARGET" "$BIN_PI --output hdmi --capture-slide $A_UUID --capture-slide-at-tick $A_TICK --content-root $CONTENT_ROOT --capture-path $PI_PATH --force-mode $FORCE_MODE" > "$CAP_LOG" 2>&1; then
                 echo "    FAIL: capture exited non-zero (see $CAP_LOG)"
                 FAIL_COUNT=$((FAIL_COUNT + 1))
                 continue
