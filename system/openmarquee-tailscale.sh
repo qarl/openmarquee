@@ -61,14 +61,21 @@ tailscale up "${ARGS[@]}"
 # Best-effort: once the node is authenticated, clear the auth key from
 # settings.json so a later leak of the file can't re-auth. The backend
 # API's PUT validator accepts an empty string → None.
+#
+# 19.1 / sweep #10 #2: delegate to openmarquee._atomic.atomic_write_
+# text instead of the inline tmp.write_text+replace dance. The shared
+# helper sets 0600 + cleans up orphan .tmp on failure (Batch 11.2's
+# discipline applied here too -- settings.json carries the AP
+# password, station password, and the auth key we're about to
+# clear).
 if [ "$AUTH_KEY" != "-" ]; then
     python3 - <<PY || true
-import json, pathlib
+import json, pathlib, sys
+sys.path.insert(0, "/opt/openmarquee/backend")
+from openmarquee._atomic import atomic_write_text
 p = pathlib.Path("$SETTINGS_PATH")
 s = json.loads(p.read_text())
 s["tailscale_auth_key"] = None
-tmp = p.with_name(p.name + ".tmp")
-tmp.write_text(json.dumps(s, indent=2))
-tmp.replace(p)
+atomic_write_text(p, json.dumps(s, indent=2))
 PY
 fi

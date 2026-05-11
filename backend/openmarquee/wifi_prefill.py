@@ -60,8 +60,18 @@ def _default_iwgetid() -> str | None:
 
 # Locations checked in order. The /var copy is the recommended path
 # for stock Pi OS installs without chmod'ing /etc.
+#
+# 19.1 / sweep #10 #1 (CRITICAL): Bookworm's `wpa_supplicant@wlan0.
+# service` shape puts the conf at the per-interface path
+# `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf`, not the bare
+# `wpa_supplicant.conf`. system/README.md install instructions
+# write the file at that per-interface path. Without this entry,
+# wifi_prefill never finds the conf on a real Pi -- the captive-
+# portal first-run flow keeps reading "no SSID configured" while
+# the device IS in fact joined to a home network.
 DEFAULT_WPA_CONF_PATHS: tuple[Path, ...] = (
     Path("/var/openmarquee/wpa_supplicant.conf"),
+    Path("/etc/wpa_supplicant/wpa_supplicant-wlan0.conf"),
     Path("/etc/wpa_supplicant/wpa_supplicant.conf"),
 )
 

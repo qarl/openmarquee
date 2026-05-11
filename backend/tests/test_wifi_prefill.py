@@ -208,3 +208,31 @@ network={
         get_active_ssid=lambda: "MyNet",
     )
     assert result == ("MyNet", "mypass12")
+
+
+# --- Batch 19.1 / sweep #10 #1: DEFAULT_WPA_CONF_PATHS ordering ---
+
+
+def test_default_paths_include_per_interface_wlan0_path():
+    """Bookworm's `wpa_supplicant@wlan0.service` reads its conf from
+    `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf` -- the per-
+    interface form. system/README.md install instructions write the
+    file at that path. Pre-19.1, the per-interface path wasn't in
+    DEFAULT_WPA_CONF_PATHS, so wifi_prefill never found the conf on
+    a real Pi (the captive-portal first-run flow read "no SSID" while
+    the device WAS joined to a home network)."""
+    from openmarquee.wifi_prefill import DEFAULT_WPA_CONF_PATHS
+
+    paths = [str(p) for p in DEFAULT_WPA_CONF_PATHS]
+    # All 3 candidate paths present.
+    assert "/var/openmarquee/wpa_supplicant.conf" in paths
+    assert "/etc/wpa_supplicant/wpa_supplicant-wlan0.conf" in paths
+    assert "/etc/wpa_supplicant/wpa_supplicant.conf" in paths
+    # /var copy first, per-interface path second, bare path last --
+    # the operator's /var override wins, then the per-interface
+    # Bookworm path, then the legacy bare path for older Pi OS
+    # images.
+    var_idx = paths.index("/var/openmarquee/wpa_supplicant.conf")
+    wlan0_idx = paths.index("/etc/wpa_supplicant/wpa_supplicant-wlan0.conf")
+    bare_idx = paths.index("/etc/wpa_supplicant/wpa_supplicant.conf")
+    assert var_idx < wlan0_idx < bare_idx

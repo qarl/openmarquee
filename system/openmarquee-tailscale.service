@@ -8,6 +8,13 @@ Wants=network-online.target tailscaled.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# 19.1 / sweep #10 #2: run as openmarquee, not root. The tailscale
+# CLI talks to tailscaled via /var/run/tailscale/tailscaled.sock --
+# no CAP_NET_ADMIN needed for the bring-up. The script writes back
+# to settings.json (clearing the auth key); running as openmarquee
+# preserves the 0600 owner-only mode set by atomic_write_text.
+User=openmarquee
+Group=openmarquee
 Environment="OPENMARQUEE_SETTINGS_PATH=/var/openmarquee/settings.json"
 ExecStart=/opt/openmarquee/system/openmarquee-tailscale.sh
 

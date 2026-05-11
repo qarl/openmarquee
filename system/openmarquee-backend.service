@@ -11,6 +11,15 @@ Documentation=https://github.com/qarl/openmarquee
 After=network-online.target openmarquee-ap0.service hostapd.service dnsmasq.service
 Wants=network-online.target
 
+# 19.1 / sweep #10 #3: cap the restart-on-failure loop so a wedged
+# startup (config error, missing asset, lifespan exception) doesn't
+# burn the SD card with a constant respawn. After 5 failures in 5
+# minutes, systemd stops trying -- operator must intervene
+# (journalctl -u openmarquee-backend + a manual `systemctl reset-
+# failed && systemctl start openmarquee-backend` to retry).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=openmarquee
