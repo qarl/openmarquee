@@ -1844,5 +1844,16 @@ def _write_marker(path: Path, *, created: int, reason: str) -> None:
         "reason": reason,
     }
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(path)
+    try:
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(path)
+    except Exception:
+        # 9.fix: complete the "all atomic-write sites" guarantee
+        # from Batch 9.2 (the storage-class sweep missed this one).
+        # Clean up the orphan .tmp on rollback so a retry doesn't
+        # fight a stale file.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise

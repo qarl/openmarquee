@@ -669,3 +669,40 @@ def test_seed_bundled_videos_derives_title_from_filename(
     names = sorted(s.name for s in video_slides)
     assert names == ["Sale"]
     assert "Up To 70 Off" not in names
+
+
+# --- Batch 9.fix: _write_marker atomic-write rollback ---
+
+
+def test_write_marker_rollback_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """_write_marker uses the same tmp.write_text + tmp.replace
+    atomic pattern as the 6 storage classes covered in Batch 9.2.
+    When replace() raises, the orphan .tmp must be cleaned up so a
+    retry doesn't fight a stale file. Same shape as
+    test_storage_atomic_writes."""
+    from openmarquee.seed import _write_marker
+
+    marker_path = tmp_path / "seed-marker.json"
+    # First write succeeds; baseline.
+    _write_marker(marker_path, created=2, reason="initial")
+    assert marker_path.exists()
+
+    # Monkeypatch Path.replace to raise OSError on .tmp paths.
+    original_replace = Path.replace
+
+    def _raise_if_tmp(self: Path, target):
+        if self.name.endswith(".tmp"):
+            raise OSError(28, "simulated disk full")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", _raise_if_tmp)
+
+    with pytest.raises(OSError):
+        _write_marker(marker_path, created=5, reason="retry")
+
+    # Original marker intact (replace never landed).
+    assert marker_path.exists()
+    # No orphan .tmp left behind.
+    assert not any(p.name.endswith(".tmp") for p in tmp_path.rglob("*"))
