@@ -163,11 +163,30 @@ def test_dry_run_sets_up_iptables_redirect(dry_output: str) -> None:
     assert "/etc/iptables/rules.v4" in dry_output
 
 
-def test_dry_run_triggers_firstboot_oneshot_check(dry_output: str) -> None:
-    """Step 7 -- check for /var/openmarquee/.bootstrapped and (when
-    B.4 lands) trigger the oneshot. The check itself must appear in
-    dry-run even though the oneshot service file doesn't yet exist."""
-    assert "Trigger first-boot oneshot" in dry_output
+def test_dry_run_stages_firstboot_service(dry_output: str) -> None:
+    """Step 7 -- unconditionally copy openmarquee-firstboot.service into
+    /etc/systemd/system. Unconditional so deploy.sh-rsync'd updates to
+    the unit body take effect."""
+    assert "Stage openmarquee-firstboot service file" in dry_output
+    assert "openmarquee-firstboot.service" in dry_output
+
+
+def test_dry_run_enables_firstboot_on_first_boot(dry_output: str) -> None:
+    """First-boot path: `systemctl enable --now` is synchronous for
+    Type=oneshot units, so hostapd.conf + welcome.html are templated
+    before install.sh's `systemctl restart backend` line runs."""
+    assert "systemctl enable --now openmarquee-firstboot.service" in dry_output
+
+
+def test_dry_run_invokes_firstboot_for_redeploy_templating(dry_output: str) -> None:
+    """B.5: deploy.sh rsyncs welcome.html back to its placeholders on
+    every redeploy. The systemd unit won't re-fire (.bootstrapped
+    guards it), so install.sh runs firstboot.sh DIRECTLY for the
+    redeploy re-templating path. firstboot.sh's idempotency reuses
+    the existing wifi.json credentials."""
+    assert "Re-running firstboot.sh for redeploy templating" in dry_output
+    assert "bash" in dry_output
+    assert "openmarquee-firstboot.sh" in dry_output
 
 
 def test_dry_run_reloads_systemd_and_enables_units(dry_output: str) -> None:

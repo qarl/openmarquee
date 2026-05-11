@@ -203,23 +203,45 @@ else
     iptables-save > "$IPT_RULES_FILE"
 fi
 
-# --- 7. First-boot oneshot trigger ------------------------------------------
+# --- 7. First-boot oneshot service + redeploy re-templating -----------------
 
-say "Trigger first-boot oneshot if not yet bootstrapped"
-if already_done -f "$BOOTSTRAP_MARKER"; then
-    say "  device already bootstrapped; skip first-boot oneshot"
-else
-    # B.4 will land openmarquee-firstboot.service; until then this is a
-    # no-op placeholder. Once B.4 lands the next line enables + starts
-    # the oneshot which generates the AP password + QR + welcome.html
-    # template AND touches BOOTSTRAP_MARKER on success.
-    if already_done -f "${OPT_DIR}/system/openmarquee-firstboot.service"; then
-        run cp "${OPT_DIR}/system/openmarquee-firstboot.service" \
-               "${SYSTEMD_DIR}/openmarquee-firstboot.service"
-        run systemctl enable openmarquee-firstboot.service
-        run systemctl start openmarquee-firstboot.service
-    else
-        say "  openmarquee-firstboot.service not present yet (B.4 pending)"
+# Install the .service file unconditionally so deploy.sh-rsync'd updates
+# to the unit body (e.g. tightened hardening directives) take effect.
+# In dry-run mode the source file isn't present in the tmpdir, so we
+# unconditionally print the cp action.
+say "Stage openmarquee-firstboot service file"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-firstboot.service" ]; then
+    run cp "${OPT_DIR}/system/openmarquee-firstboot.service" \
+           "${SYSTEMD_DIR}/openmarquee-firstboot.service"
+fi
+
+if [ ! -f "$BOOTSTRAP_MARKER" ] && [ "$DRY_RUN" -eq 0 ]; then
+    # First boot. `enable --now` is synchronous for Type=oneshot units --
+    # blocks until firstboot.sh exits, so hostapd.conf + welcome.html
+    # are templated by the time we move on to backend restart.
+    say "First boot detected; running openmarquee-firstboot.service"
+    run systemctl enable --now openmarquee-firstboot.service
+elif [ "$DRY_RUN" -eq 1 ]; then
+    # In real mode this block fires ONLY when marker is absent. Dry-run
+    # prints unconditionally for test-coverage visibility -- the redeploy
+    # block below is similarly always printed in dry-run.
+    say "DRYRUN first-boot path (real mode: only when marker absent)"
+    printf 'DRYRUN: systemctl enable --now openmarquee-firstboot.service\n'
+fi
+
+# Redeploy path (B.5): if .bootstrapped is present, the systemd unit
+# won't re-fire (ConditionPathExists guard + ExecStartPost disabled
+# the unit on first run). But scripts/deploy.sh rsyncs welcome.html
+# back to its placeholders on every redeploy. Re-run firstboot.sh
+# DIRECTLY to re-template welcome.html + hostapd.conf from the
+# existing wifi.json. firstboot.sh's idempotency means this re-uses
+# the same SSID + passphrase -- no churn.
+if [ "$DRY_RUN" -eq 1 ] || [ -f "$BOOTSTRAP_MARKER" ]; then
+    if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-firstboot.sh" ]; then
+        # In real mode this fires ONLY when marker is present (i.e. it's
+        # a redeploy). Dry-run prints unconditionally for test coverage.
+        say "Re-running firstboot.sh for redeploy templating (real mode: only when marker present; idempotent)"
+        run bash "${OPT_DIR}/system/openmarquee-firstboot.sh"
     fi
 fi
 
