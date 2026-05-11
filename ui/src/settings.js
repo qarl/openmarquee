@@ -12,6 +12,7 @@
 //   - brightness / gamma feed the active renderer at playback time
 // See backend/openmarquee/settings.py for the authoritative scope notes.
 
+import { apiFetch } from "./api.js";
 import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
 
 const OUTPUT_MODES = [
@@ -445,7 +446,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     detectBtn.addEventListener("click", async () => {
         detectStatusEl.textContent = "Probing display…";
         try {
-            const res = await fetch("/api/system/display-dims");
+            const res = await apiFetch("/api/system/display-dims");
             const data = await res.json();
             if (data.width && data.height) {
                 widthEl.value = String(data.width);
@@ -465,7 +466,7 @@ export function mountSettings(container, { fetchSettings, onSave }) {
 
     async function populateWifiScan() {
         try {
-            const res = await fetch("/api/system/wifi-scan");
+            const res = await apiFetch("/api/system/wifi-scan");
             if (!res.ok) return;
             const data = await res.json();
             const networks = Array.isArray(data?.networks) ? data.networks : [];

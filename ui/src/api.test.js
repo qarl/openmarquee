@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+// @vitest-environment jsdom
+//
+// 20.3: needs jsdom for window.location + localStorage (apiFetch reads
+// both). The rest of the existing tests in this file are environment-
+// neutral; jsdom is a superset.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+    apiFetch,
+    AUTH_TOKEN_KEY,
     deleteContent,
     effectiveDisplayDims,
     extractDetailMessage,
@@ -19,6 +26,13 @@ import {
     takeoverStream,
 } from "./api.js";
 
+// 20.3: apiFetch reads localStorage on every call. The tests below pre-
+// clear it so each test starts in the "no token" state; tests that need
+// a token call localStorage.setItem(AUTH_TOKEN_KEY, ...) explicitly.
+beforeEach(() => {
+    try { localStorage.removeItem(AUTH_TOKEN_KEY); } catch { /* no localStorage in setup */ }
+});
+
 afterEach(() => {
     vi.unstubAllGlobals();
 });
@@ -27,6 +41,18 @@ function mockFetch(response) {
     const fetchMock = vi.fn().mockResolvedValue(response);
     vi.stubGlobal("fetch", fetchMock);
     return fetchMock;
+}
+
+// 20.3: helper for tests that don't care about the Authorization header
+// arg; just unwrap the URL of the first fetch call.
+function calledUrl(fetchMock) {
+    return fetchMock.mock.calls[0][0];
+}
+
+// 20.3: helper for tests that need to assert method/body without
+// caring about the Authorization header injected by apiFetch.
+function calledInit(fetchMock) {
+    return fetchMock.mock.calls[0][1] || {};
 }
 
 describe("saveTextSlide", () => {
@@ -49,7 +75,11 @@ describe("saveTextSlide", () => {
         const [url, init] = fetchMock.mock.calls[0];
         expect(url).toBe("/api/content/text-slides");
         expect(init.method).toBe("POST");
-        expect(init.headers).toEqual({ "Content-Type": "application/json" });
+        // 20.3: apiFetch wraps init.headers in a Headers instance to
+        // attach Authorization, so the strict-equal {Content-Type:...}
+        // check used to pass against a plain object but doesn't now.
+        // Assert Content-Type via the Headers API instead.
+        expect(init.headers.get("Content-Type")).toBe("application/json");
         expect(JSON.parse(init.body).name).toBe("Hi");
     });
 
@@ -65,7 +95,9 @@ describe("listContent", () => {
         const fetchMock = mockFetch({ ok: true, json: async () => items });
         const result = await listContent();
         expect(result).toEqual(items);
-        expect(fetchMock).toHaveBeenCalledWith("/api/content");
+        // 20.3: apiFetch always passes a 2nd arg (the wrapped init); use
+        // calledUrl() to ignore it.
+        expect(calledUrl(fetchMock)).toBe("/api/content");
     });
 
     it("throws on non-ok response", async () => {
@@ -78,7 +110,8 @@ describe("deleteContent", () => {
     it("DELETEs /api/content/{id}", async () => {
         const fetchMock = mockFetch({ ok: true });
         await deleteContent("abc");
-        expect(fetchMock).toHaveBeenCalledWith("/api/content/abc", { method: "DELETE" });
+        expect(calledUrl(fetchMock)).toBe("/api/content/abc");
+        expect(calledInit(fetchMock).method).toBe("DELETE");
     });
 
     it("throws on non-ok response", async () => {
@@ -181,7 +214,7 @@ describe("playlists API (id-based)", () => {
         });
         const result = await (await import("./api.js")).listPlaylists();
         expect(result.schema_version).toBe(4);
-        expect(fetchMock).toHaveBeenCalledWith("/api/playlists");
+        expect(calledUrl(fetchMock)).toBe("/api/playlists");
     });
 
     it("createPlaylist POSTs name + items to /api/playlists", async () => {
@@ -225,9 +258,8 @@ describe("playlists API (id-based)", () => {
         const fetchMock = mockFetch({ ok: true });
         const { deletePlaylistById } = await import("./api.js");
         await deletePlaylistById("the-uuid");
-        expect(fetchMock).toHaveBeenCalledWith("/api/playlists/the-uuid", {
-            method: "DELETE",
-        });
+        expect(calledUrl(fetchMock)).toBe("/api/playlists/the-uuid");
+        expect(calledInit(fetchMock).method).toBe("DELETE");
     });
 
     it("savePlaylistById routes v3 entry objects to the `items` key, not `item_ids`", async () => {
@@ -274,7 +306,7 @@ describe("schedule API", () => {
         });
         const result = await getSchedule();
         expect(result.default_playlist_name).toBe("default");
-        expect(fetchMock).toHaveBeenCalledWith("/api/schedules");
+        expect(calledUrl(fetchMock)).toBe("/api/schedules");
     });
 
     it("saveSchedule PUTs to /api/schedules", async () => {
@@ -302,7 +334,7 @@ describe("settings API", () => {
         });
         const result = await getSettings();
         expect(result.output_mode).toBe("hdmi");
-        expect(fetchMock).toHaveBeenCalledWith("/api/settings");
+        expect(calledUrl(fetchMock)).toBe("/api/settings");
     });
 
     it("getSettings throws on non-ok", async () => {
@@ -333,7 +365,7 @@ describe("playback control API", () => {
         const fetchMock = mockFetch({ ok: true, json: async () => state });
         const result = await getPlaybackState();
         expect(result).toEqual(state);
-        expect(fetchMock).toHaveBeenCalledWith("/api/playback/state");
+        expect(calledUrl(fetchMock)).toBe("/api/playback/state");
     });
 
     it("getPlaybackState response uses is_running + current_playlist_id (regression: QA 2026-04-26 #08)", async () => {
@@ -364,13 +396,15 @@ describe("playback control API", () => {
     it("startPlayback POSTs /api/playback/start", async () => {
         const fetchMock = mockFetch({ ok: true });
         await startPlayback();
-        expect(fetchMock).toHaveBeenCalledWith("/api/playback/start", { method: "POST" });
+        expect(calledUrl(fetchMock)).toBe("/api/playback/start");
+        expect(calledInit(fetchMock).method).toBe("POST");
     });
 
     it("stopPlayback POSTs /api/playback/stop", async () => {
         const fetchMock = mockFetch({ ok: true });
         await stopPlayback();
-        expect(fetchMock).toHaveBeenCalledWith("/api/playback/stop", { method: "POST" });
+        expect(calledUrl(fetchMock)).toBe("/api/playback/stop");
+        expect(calledInit(fetchMock).method).toBe("POST");
     });
 
     it("throws on non-ok responses", async () => {
@@ -546,5 +580,116 @@ describe("extractDetailMessage (15.3)", () => {
             json: async () => ({ error: "down" }),
         };
         expect(await extractDetailMessage(response)).toBe("503 Service Unavailable");
+    });
+});
+
+// --- 20.3 / phase A.3: apiFetch wrapper ---
+//
+// These tests pin the bearer-injection + 401-redirect contract. The
+// rest of api.test.js exercises the wrapper indirectly (every existing
+// suite goes through apiFetch now), but the contract pieces themselves
+// -- header set, token cleared, redirect fired, throw raised -- deserve
+// explicit assertions.
+
+describe("apiFetch (20.3 wrapper)", () => {
+    // jsdom's window.location.replace is a noop+throws in some setups.
+    // Each test stubs it independently with a spy so we can both
+    // observe the redirect intention AND avoid the "Not implemented:
+    // navigation" jsdom warning.
+    function stubLocation(pathname = "/") {
+        const replace = vi.fn();
+        // Window.location can't be reassigned wholesale in jsdom; mock
+        // only the methods we need.
+        const original = {
+            replace: window.location.replace,
+            pathname: window.location.pathname,
+        };
+        Object.defineProperty(window.location, "replace", {
+            configurable: true,
+            writable: true,
+            value: replace,
+        });
+        Object.defineProperty(window.location, "pathname", {
+            configurable: true,
+            writable: true,
+            value: pathname,
+        });
+        return { replace, restore: () => {
+            Object.defineProperty(window.location, "replace", {
+                configurable: true,
+                writable: true,
+                value: original.replace,
+            });
+            Object.defineProperty(window.location, "pathname", {
+                configurable: true,
+                writable: true,
+                value: original.pathname,
+            });
+        }};
+    }
+
+    it("attaches Authorization: Bearer <token> when localStorage has a token", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.fake-token-aaaaaaaaaaaaaaaaaaaaaaaa");
+        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
+        await apiFetch("/api/content");
+        const init = calledInit(fetchMock);
+        expect(init.headers.get("Authorization")).toBe(
+            "Bearer 1.fake-token-aaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+    });
+
+    it("sends no Authorization header when localStorage has no token", async () => {
+        // beforeEach already cleared the token; just verify.
+        const fetchMock = mockFetch({ ok: true, json: async () => ({}) });
+        await apiFetch("/api/content");
+        const init = calledInit(fetchMock);
+        expect(init.headers.has("Authorization")).toBe(false);
+    });
+
+    it("clears the localStorage token on a 401 response", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.stale-token");
+        mockFetch({ ok: false, status: 401 });
+        const { restore } = stubLocation("/");
+        try {
+            await apiFetch("/api/content").catch(() => {});
+        } finally {
+            restore();
+        }
+        expect(localStorage.getItem(AUTH_TOKEN_KEY)).toBeNull();
+    });
+
+    it("redirects to /login.html on 401", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.stale");
+        mockFetch({ ok: false, status: 401 });
+        const { replace, restore } = stubLocation("/");
+        try {
+            await apiFetch("/api/content").catch(() => {});
+        } finally {
+            restore();
+        }
+        expect(replace).toHaveBeenCalledWith("/login.html");
+    });
+
+    it("does NOT redirect when already on /login.html (no loop)", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.stale");
+        mockFetch({ ok: false, status: 401 });
+        const { replace, restore } = stubLocation("/login.html");
+        try {
+            await apiFetch("/api/auth/login", { method: "POST" }).catch(() => {});
+        } finally {
+            restore();
+        }
+        expect(replace).not.toHaveBeenCalled();
+    });
+
+    it("throws on 401 so the caller's then-chain doesn't proceed against a stale Response", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.stale");
+        mockFetch({ ok: false, status: 401 });
+        const { restore } = stubLocation("/login.html");
+        try {
+            await expect(apiFetch("/api/auth/login")).rejects.toThrow(/authentication required/);
+        } finally {
+            restore();
+        }
     });
 });
