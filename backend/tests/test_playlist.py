@@ -53,12 +53,36 @@ def test_save_overwrites_previous_default_playlist(tmp_path: Path):
     assert storage.load().item_ids == new_ids
 
 
-def test_invalid_json_raises_on_load(tmp_path: Path):
+def test_invalid_json_is_quarantined_and_starts_fresh(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """Corrupt-JSON recovery contract (Batch 19.2 / sweep #10 #4):
+    load() must NOT raise on garbage input -- a single bad on-disk
+    file would otherwise lock the backend into a crash loop. Instead,
+    the bad file gets renamed to `<name>.corrupt-<UTC>` and the
+    storage starts fresh from defaults. Operator sees the WARNING
+    in the log; next save() overwrites the original path with a
+    valid file."""
     path = tmp_path / "playlist.json"
     path.write_text("this is not JSON")
     storage = PlaylistStorage(path)
-    with pytest.raises(json.JSONDecodeError):
-        storage.load()
+
+    with caplog.at_level("WARNING", logger="openmarquee._storage_recovery"):
+        playlist = storage.load()
+
+    # No exception. Returned playlist is the bootstrap default (empty).
+    assert playlist.item_ids == []
+
+    # The bad file was renamed to a timestamped quarantine sibling.
+    quarantined = list(tmp_path.glob("playlist.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text() == "this is not JSON"
+
+    # WARNING log emitted citing the path + parse error.
+    assert any("failed to parse" in rec.message for rec in caplog.records), (
+        f"expected a WARNING about parse failure, got: "
+        f"{[r.message for r in caplog.records]}"
+    )
 
 
 def test_append_skips_duplicates():
