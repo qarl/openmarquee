@@ -1,0 +1,9 @@
+# EXPORT_IMAGE — presence at the stage root tells pi-gen to emit a
+# .img at the END of this stage. We also assign IMG_SUFFIX here;
+# pi-gen sources this file as shell so any KEY=value sticks. Without
+# this marker pi-gen would only emit images at stages that have it
+# (the upstream default: stage2 = "lite" image), and we'd get a
+# generic lite image plus our overlay rather than a single named
+# "openMarquee Pi OS" artifact.
+
+IMG_SUFFIX="-openmarquee"

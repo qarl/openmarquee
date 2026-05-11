@@ -1,0 +1,16 @@
+hostapd
+dnsmasq
+iptables
+python3
+python3-pip
+python3-venv
+ffmpeg
+fonts-dejavu
+qrencode
+git
+rsync
+ca-certificates
+cloud-init
+wireless-regdb
+iw
+wpasupplicant
