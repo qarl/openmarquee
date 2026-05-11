@@ -155,6 +155,20 @@ FIXTURES=(
     "bg_pattern_stripes|slide|f0000000-0000-4000-8000-000000000004|$PI_FIXTURE_ROOT"
     "bg_pattern_rings|slide|f0000000-0000-4000-8000-000000000005|$PI_FIXTURE_ROOT"
     "bg_pattern_confetti|slide|f0000000-0000-4000-8000-000000000006|$PI_FIXTURE_ROOT"
+    # --- 18.1 / sweep #9 N2: ImageSlide + VideoSlide goldens ---
+    # ImageSlide blit path (full-res RGBA tex upload + FS_BLIT) had
+    # zero pixel coverage. 1920x1080 synth asset.png: diagonal
+    # gradient + 3 color squares + centered white label so a
+    # sampling-filter or texture-format regression surfaces visibly.
+    "image_slide|slide|f0000000-0000-4000-8000-000000000008|$PI_FIXTURE_ROOT"
+    # VideoSlide first-frame == thumbnail per the storage spec
+    # (<id>/asset.png is the saved-slides thumb AND the renderer
+    # paints the same on slide entry pre-decode-warmup). main.rs's
+    # capture dispatch routes video_slide through capture_image_slide
+    # _to_png against the .png sibling. Decode-path coverage is a
+    # separate follow-up if needed (would need ffmpeg + a frame-pin
+    # mechanism in the decoder loop).
+    "video_slide|slide|f0000000-0000-4000-8000-000000000009|$PI_FIXTURE_ROOT"
     # --- 18.6 / sweep #9 N7: auto_mode dynamic-layer golden ---
     # auto_mode=time/date/day layers regenerate text per-tick from
     # the renderer's wall_clock_unix. The animated_slide TYPE

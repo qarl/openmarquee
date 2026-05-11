@@ -3104,6 +3104,71 @@ pub fn capture_slide_to_png(
     })
 }
 
+/// Batch 18.1 / sweep #9 N2: capture an ImageSlide to PNG. Mirrors
+/// capture_slide_to_png for the image case -- load asset, blit via
+/// FS_BLIT, read back FBO, write PNG. The render side reuses
+/// run_blit_pass (slice 7c helper) so the captured pixels match
+/// what render_image_slide_in_session would scan out.
+pub fn capture_image_slide_to_png(
+    card: &Card,
+    asset_path: &Path,
+    png_path: &Path,
+) -> Result<()> {
+    use crate::hdmi_logic::rgba_to_png_bytes;
+    let (rgba, img_w, img_h) = load_png_rgba(asset_path)?;
+    with_egl_session(card, |session| {
+        let mode_w = session.mode_w as u32;
+        let mode_h = session.mode_h as u32;
+        unsafe {
+            use glow::HasContext;
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            let tex = session
+                .gl
+                .create_texture()
+                .map_err(|e| anyhow!("glGenTextures(image_slide capture): {e}"))?;
+            session.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            session.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                img_w as i32,
+                img_h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                Some(&rgba),
+            );
+            let blit_result = run_blit_pass(session.gl, tex);
+            session.gl.delete_texture(tex);
+            blit_result?;
+            session.gl.flush();
+        }
+        let rgba_out = capture_fbo_to_rgba(session.gl, None, mode_w, mode_h)?;
+        let png_bytes = rgba_to_png_bytes(&rgba_out, mode_w, mode_h)?;
+        std::fs::write(png_path, &png_bytes)
+            .with_context(|| format!("write png {}", png_path.display()))?;
+        eprintln!(
+            "captured image_slide from {} to {} ({}x{} RGBA, {} bytes)",
+            asset_path.display(),
+            png_path.display(),
+            mode_w,
+            mode_h,
+            png_bytes.len()
+        );
+        Ok(())
+    })
+}
+
 /// Public accessor for IPC sidecar Open op: the negotiated
 /// mode (w, h) of the EglSession's CRTC.
 pub fn egl_session_mode_size(session: &EglSession) -> (u32, u32) {

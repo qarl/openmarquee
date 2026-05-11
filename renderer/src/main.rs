@@ -1273,19 +1273,52 @@ fn main() -> Result<()> {
                             args.fallback_font_family,
                         );
                     };
-                    let slide = content::find_text_slide(content_root, slide_id)?
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no text_slide for {slide_id} under {}",
+                    // Batch 18.1 / sweep #9 N2: dispatch on slide type.
+                    // text_slide -> capture_slide_to_png (existing layered
+                    // motion composite). image_slide -> capture_image_slide
+                    // _to_png (asset.png blit, no text layers). video_slide
+                    // -> capture against the asset.png THUMBNAIL (the
+                    // VideoSlide storage spec puts the first frame at
+                    // asset.png; renderer paints the same on slide entry
+                    // before decode warm-up, so the thumbnail blit is the
+                    // correct "first-frame" pixel signal for golden tests).
+                    if let Some(slide) = content::find_text_slide(content_root, slide_id)? {
+                        hdmi::capture_slide_to_png(
+                            &card,
+                            &slide,
+                            catalog_opt,
+                            Some(content_root),
+                            png_path,
+                            args.capture_slide_at_tick,
+                        )?;
+                    } else if content::find_image_slide(content_root, slide_id)?.is_some() {
+                        let asset_path = content::image_slide_asset_path(
+                            content_root, slide_id,
+                        );
+                        hdmi::capture_image_slide_to_png(
+                            &card, &asset_path, png_path,
+                        )?;
+                    } else if content::find_video_slide(content_root, slide_id)?.is_some() {
+                        // VideoSlide thumbnail lives at <id>/asset.png
+                        // (the storage spec: "asset.png -- thumbnail
+                        // (first frame, for saved-slides list)").
+                        // video_slide_asset_path returns the .mp4; the
+                        // thumbnail sibling is asset.png in the same
+                        // dir. Construct inline.
+                        let asset_path = content::video_slide_asset_path(
+                            content_root, slide_id,
+                        )
+                        .with_file_name("asset.png");
+                        hdmi::capture_image_slide_to_png(
+                            &card, &asset_path, png_path,
+                        )?;
+                    } else {
+                        bail!(
+                            "no text_slide / image_slide / video_slide for \
+                             {slide_id} under {}",
                             content_root.display()
-                        ))?;
-                    hdmi::capture_slide_to_png(
-                        &card,
-                        &slide,
-                        catalog_opt,
-                        Some(content_root),
-                        png_path,
-                        args.capture_slide_at_tick,
-                    )?;
+                        );
+                    }
                     return Ok(());
                 }
                 if args.capture_sb_mid {

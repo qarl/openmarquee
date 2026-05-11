@@ -1,0 +1,13 @@
+{
+  "schema_version": 3,
+  "updated_at": "2026-05-11T00:00:00.000000+00:00",
+  "item": {
+    "type": "image",
+    "id": "f0000000-0000-4000-8000-000000000008",
+    "name": "image_slide fixture (B.18.1)",
+    "duration_ms": 5000,
+    "transition": "cut",
+    "transition_ms": 500,
+    "created_at": "2026-05-11T00:00:00.000000+00:00"
+  }
+}
