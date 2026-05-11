@@ -63,8 +63,12 @@ if [ ! -x "$BIN_HOST" ]; then
 fi
 
 # Fixture spec: NAME|TYPE|UUID|CONTENT_ROOT
-# TYPE=slide       -> --capture-slide UUID --content-root CONTENT_ROOT
-# Add more shapes (transition_mid etc) in follow-up commits.
+# TYPE=slide          -> --capture-slide UUID --content-root CONTENT_ROOT
+# TYPE=transition_mid -> --capture-sb-mid + --fade-from + --fade-to +
+#                        --transition + --capture-sb-t; "UUID" field is
+#                        encoded as "FROM_UUID,TO_UUID,KIND,T" (no spaces).
+#                        CONTENT_ROOT must contain both UUIDs' item.json.
+# Add more shapes in follow-up commits.
 FIXTURES=(
     # 01 · FREE: solid bg, single-line single-layer text. Simplest
     # smoke fixture. Catches regressions in glyph rasterizer +
@@ -95,6 +99,21 @@ FIXTURES=(
     # checked in at renderer/tests/fixtures/<UUID>/item.json;
     # pushed to Pi at $PI_FIXTURE_ROOT each run.
     "p2g_overlay_route|slide|f0000000-0000-4000-8000-000000000001|$PI_FIXTURE_ROOT"
+    # --- 17.1 / sweep #9 #1: transition-midpoint goldens ---
+    # Capture one frame at t=0.5 of a transition between two FYS
+    # slides through the atlas-SB pipeline. Covers all 5 SP-portable
+    # transitions (one per migration batch + the cut baseline) so
+    # shader / blend regressions surface at bit-identical resolution
+    # instead of via post-soak eyeball.
+    #
+    # FROM = fys_01_free (3964c302-...), TO = fys_09_chant_wall
+    # (2c858968-...). Same FROM/TO pair across all 5 so the only
+    # variable is the transition kind itself.
+    "transition_mid_cut|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,cut,0.5|$PI_FIXTURE_ROOT"
+    "transition_mid_fade|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,fade,0.5|$PI_FIXTURE_ROOT"
+    "transition_mid_wipe|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,wipe,0.5|$PI_FIXTURE_ROOT"
+    "transition_mid_slide|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,slide,0.5|$PI_FIXTURE_ROOT"
+    "transition_mid_pixelate|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,pixelate,0.5|$PI_FIXTURE_ROOT"
 )
 
 echo "==> deploying binary to $TARGET:$BIN_PI"
@@ -137,6 +156,19 @@ for fixture in "${FIXTURES[@]}"; do
             echo "==> $NAME (capture-slide $UUID, content-root=$CONTENT_ROOT)"
             CAP_LOG="$CAPTURE_DIR/$NAME.log"
             if ! ssh -q "$TARGET" "$BIN_PI --output hdmi --capture-slide $UUID --content-root $CONTENT_ROOT --capture-path $PI_PATH --force-mode $FORCE_MODE" > "$CAP_LOG" 2>&1; then
+                echo "    FAIL: capture exited non-zero (see $CAP_LOG)"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                continue
+            fi
+            scp -q "$TARGET:$PI_PATH" "$LOCAL_PATH"
+            ;;
+        transition_mid)
+            # UUID field encodes "FROM_UUID,TO_UUID,KIND,T" -- split.
+            IFS=',' read -r T_FROM T_TO T_KIND T_T <<<"$UUID"
+            echo
+            echo "==> $NAME (transition-mid $T_KIND@t=$T_T from $T_FROM -> $T_TO)"
+            CAP_LOG="$CAPTURE_DIR/$NAME.log"
+            if ! ssh -q "$TARGET" "$BIN_PI --output hdmi --capture-sb-mid --fade-from $T_FROM --fade-to $T_TO --transition $T_KIND --capture-sb-t $T_T --content-root $CONTENT_ROOT --capture-path $PI_PATH --force-mode $FORCE_MODE" > "$CAP_LOG" 2>&1; then
                 echo "    FAIL: capture exited non-zero (see $CAP_LOG)"
                 FAIL_COUNT=$((FAIL_COUNT + 1))
                 continue
