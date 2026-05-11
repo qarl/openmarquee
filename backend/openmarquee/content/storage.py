@@ -32,6 +32,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter
 
+from openmarquee._atomic import atomic_write_bytes, atomic_write_text
 from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
@@ -320,34 +321,12 @@ class ContentStorage:
 
     # --- internals ---
 
-    @staticmethod
-    def _atomic_write_text(path: Path, content: str) -> None:
-        # Append ".tmp" to the full name (so "item.json" → "item.json.tmp"),
-        # not with_suffix which would replace the last suffix.
-        tmp = path.with_name(path.name + ".tmp")
-        try:
-            tmp.write_text(content)
-            tmp.replace(path)
-        except Exception:
-            # 9.2: clean up the orphan .tmp on rollback so the next
-            # save doesn't fight a stale file. unlink errors are
-            # ignored -- if cleanup itself fails, the original
-            # exception is the load-bearing one.
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
-
-    @staticmethod
-    def _atomic_write_bytes(path: Path, content: bytes) -> None:
-        tmp = path.with_name(path.name + ".tmp")
-        try:
-            tmp.write_bytes(content)
-            tmp.replace(path)
-        except Exception:
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+    # 11.2: atomic-write text + bytes helpers moved to
+    # openmarquee._atomic. The staticmethods are kept as thin
+    # delegators so existing call sites + future subclasses keep
+    # working unchanged; the helpers themselves now also set 0600
+    # mode (sweep #5 #6: AP password / station password live in
+    # adjacent files; consistent owner-only mode keeps the on-
+    # disk surface narrow).
+    _atomic_write_text = staticmethod(atomic_write_text)
+    _atomic_write_bytes = staticmethod(atomic_write_bytes)

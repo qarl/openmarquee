@@ -7,6 +7,7 @@ The shipped provider set is free-tier services; nothing here depends on
 a paid API key. See `openmarquee.backgrounds` for the provider registry.
 """
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -28,6 +29,8 @@ from openmarquee.dependencies import (
 )
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.settings import SettingsStorage
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/backgrounds", tags=["backgrounds"])
 
@@ -84,14 +87,25 @@ async def generate_background(
     except BackgroundProviderUnknown as exc:
         # 400 = the caller's request was malformed (named provider that
         # isn't in our registry).
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 11.2: don't reflect exception string -- log + opaque 400.
+        log.warning("unknown background provider: %s", exc)
+        raise HTTPException(
+            status_code=400, detail="unknown background provider"
+        ) from exc
 
     try:
         raw = provider.generate(payload.prompt)
     except BackgroundGenError as exc:
-        # 502 = upstream-bad-gateway. The detail surfaces the provider's
-        # own message (rate-limit, timeout, etc.) so the operator can act.
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # 502 = upstream-bad-gateway.
+        # 11.2: previous detail reflected the provider's response body
+        # (which could include upstream HTML / error metadata). The
+        # operator-facing message stays generic; the full provider
+        # response goes to the server log so an on-device journalctl
+        # tail still surfaces rate-limit / timeout / etc.
+        log.exception("background provider failed")
+        raise HTTPException(
+            status_code=502, detail="background provider failed"
+        ) from exc
 
     # Store the provider's bytes verbatim — no device-side resample.
     # Playback cover-fits down to panel dims on slide entry, so keeping

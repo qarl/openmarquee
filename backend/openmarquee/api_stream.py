@@ -14,6 +14,7 @@ so /start does the full SDP round trip in a single response. The phone
 hands the answer to its RTCPeerConnection and frames flow.
 """
 
+import logging
 from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
@@ -23,6 +24,8 @@ from pydantic import BaseModel
 
 from openmarquee.dependencies import get_stream_manager
 from openmarquee.stream import StreamAlreadyActive, StreamManager, StreamNotActive
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/stream", tags=["stream"])
 
@@ -116,9 +119,12 @@ async def start_stream(
     except Exception as exc:
         # SDP parse failure / aiortc raised. 400 since the phone's
         # request is the most likely source of badness.
+        # 11.2: don't reflect the exception string into the response --
+        # aiortc/SDP-parse messages can carry internals. Log + opaque 400.
+        log.exception("stream negotiation failed")
         raise HTTPException(
             status_code=400,
-            detail=f"stream negotiation failed: {exc}",
+            detail="stream negotiation failed",
         ) from exc
     started_at = streams.active_session_started_at
     assert started_at is not None  # session was just created above
@@ -152,9 +158,11 @@ async def takeover_stream(
     try:
         session_id, answer = await streams.takeover(payload.sdp_offer)
     except Exception as exc:
+        # 11.2: don't reflect the exception string. Log + opaque 400.
+        log.exception("stream takeover failed")
         raise HTTPException(
             status_code=400,
-            detail=f"stream takeover failed: {exc}",
+            detail="stream takeover failed",
         ) from exc
     started_at = streams.active_session_started_at
     assert started_at is not None  # session was just created above

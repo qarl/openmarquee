@@ -31,6 +31,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from openmarquee._atomic import atomic_write_text
+
 TOMBSTONE_SCHEMA_VERSION = 1
 # All peers must agree on this value — a peer with a shorter TTL stops
 # advertising a deletion before a longer-TTL peer has caught up, which
@@ -72,17 +74,8 @@ class TombstoneStorage:
 
     def save(self, log: TombstoneLog) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        try:
-            tmp.write_text(log.model_dump_json(indent=2))
-            tmp.replace(self.path)
-        except Exception:
-            # 9.2: clean up orphan .tmp on rollback.
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        # 11.2: atomic_write_text sets 0600 + cleans up orphan .tmp.
+        atomic_write_text(self.path, log.model_dump_json(indent=2))
 
     def add(self, content_id: UUID, *, now: datetime | None = None) -> Tombstone:
         """Record a deletion. If a tombstone for this id already exists the

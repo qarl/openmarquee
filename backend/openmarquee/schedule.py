@@ -44,6 +44,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from openmarquee._atomic import atomic_write_text
 from openmarquee.playlist import (
     DEFAULT_PLAYLIST_ID,
     PlaylistStorage,
@@ -211,17 +212,8 @@ class ScheduleStorage:
         # the write so a failed atomic replace doesn't leave stale
         # state in the cache.
         self._cache = None
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        try:
-            tmp.write_text(schedule.model_dump_json(indent=2))
-            tmp.replace(self.path)
-        except Exception:
-            # 9.2: clean up orphan .tmp on rollback.
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        # 11.2: atomic_write_text sets 0600 + cleans up orphan .tmp.
+        atomic_write_text(self.path, schedule.model_dump_json(indent=2))
 
 
 def _coerce_to_schedule(

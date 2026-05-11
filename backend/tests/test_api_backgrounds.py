@@ -183,7 +183,9 @@ def test_generate_maps_provider_error_to_502(client: TestClient, monkeypatch):
 
     response = client.post("/api/backgrounds/generate", json={"prompt": "x"})
     assert response.status_code == 502
-    assert "rate limited" in response.json()["detail"]
+    # 11.2: detail is opaque now (the provider's response body could leak
+    # upstream HTML / tokens). Full message goes to the server log.
+    assert response.json()["detail"] == "background provider failed"
 
 
 def test_generate_rejects_unknown_provider(client: TestClient):
@@ -192,7 +194,8 @@ def test_generate_rejects_unknown_provider(client: TestClient):
         json={"prompt": "x", "provider": "dall-e"},
     )
     assert response.status_code == 400
-    assert "dall-e" in response.json()["detail"]
+    # 11.2: detail no longer echoes the unknown provider name.
+    assert response.json()["detail"] == "unknown background provider"
 
 
 def test_generate_no_longer_requires_api_key_env(

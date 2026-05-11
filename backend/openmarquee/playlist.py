@@ -60,6 +60,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
+from openmarquee._atomic import atomic_write_text
+
 if TYPE_CHECKING:
     from openmarquee.content import ContentItem
     from openmarquee.content.storage import ContentStorage
@@ -275,17 +277,9 @@ class PlaylistStorage:
         # -- without this, a failed write would let next load_all()
         # return the mutated cached value that doesn't match disk.
         self._cache = None
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        try:
-            tmp.write_text(collection.model_dump_json(indent=2))
-            tmp.replace(self.path)
-        except Exception:
-            # 9.2: clean up orphan .tmp on rollback.
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        # 11.2: atomic_write_text sets 0600 + cleans up orphan
+        # .tmp on rollback. Centralized in openmarquee._atomic.
+        atomic_write_text(self.path, collection.model_dump_json(indent=2))
 
     def get_by_id(self, playlist_id: UUID) -> Playlist | None:
         """Return the playlist with the given id, or None."""

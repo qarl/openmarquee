@@ -230,3 +230,67 @@ def test_tombstone_storage_save_rollback_on_replace_failure(
     assert any(t.content_id == id_a for t in after.tombstones)
     assert not any(t.content_id == id_b for t in after.tombstones)
     assert _no_leftover_tmp_files(tmp_path)
+
+
+# --- Batch 11.2 / sweep #5 #6: every storage class saves at 0600 ---
+#
+# settings.json is the one that actually motivates 0600 (AP password,
+# station password, future Tailscale auth key), but the helper applies
+# uniformly so every storage class inherits the discipline. A
+# parameterized sweep keeps a future contributor from leaking a new
+# storage class with a different umask-default mode.
+
+
+def _save_baseline(storage, tmp_path: Path):
+    """Save a fresh baseline through each storage's save API."""
+    cls = type(storage).__name__
+    if cls == "ContentStorage":
+        slide = ImageSlide(name="m", duration_ms=1000)
+        storage.save_image(slide, _fake_png())
+        return tmp_path / str(slide.id) / "item.json"
+    if cls == "PlaylistStorage":
+        coll = PlaylistCollection(
+            playlists=[Playlist(id=DEFAULT_PLAYLIST_ID, name=DEFAULT_PLAYLIST_NAME, items=[])]
+        )
+        storage.save_all(coll)
+        return storage.path
+    if cls == "FlockStorage":
+        storage.save(storage.load())
+        return storage.path
+    if cls == "ScheduleStorage":
+        storage.save(Schedule())
+        return storage.path
+    if cls == "SettingsStorage":
+        storage.save(SystemSettings())
+        return storage.path
+    if cls == "TombstoneStorage":
+        storage.add(uuid4())
+        return storage.path
+    raise AssertionError(f"unknown storage class: {cls}")
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda p: ContentStorage(p),
+        lambda p: PlaylistStorage(p / "playlist.json"),
+        lambda p: FlockStorage(p / "flock.json"),
+        lambda p: ScheduleStorage(p / "schedule.json"),
+        lambda p: SettingsStorage(p / "settings.json"),
+        lambda p: TombstoneStorage(p / "tombstones.json"),
+    ],
+    ids=[
+        "ContentStorage",
+        "PlaylistStorage",
+        "FlockStorage",
+        "ScheduleStorage",
+        "SettingsStorage",
+        "TombstoneStorage",
+    ],
+)
+def test_storage_save_lands_at_0600(factory, tmp_path: Path):
+    storage = factory(tmp_path)
+    written = _save_baseline(storage, tmp_path)
+    assert written.exists()
+    mode = written.stat().st_mode & 0o777
+    assert mode == 0o600, f"{written.name} mode is {oct(mode)}, want 0o600"

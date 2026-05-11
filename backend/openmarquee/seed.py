@@ -50,6 +50,7 @@ from openmarquee.content import (
     TextSlide,
     VideoSlide,
 )
+from openmarquee._atomic import atomic_write_text
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playlist import PlaylistStorage
 
@@ -1843,17 +1844,5 @@ def _write_marker(path: Path, *, created: int, reason: str) -> None:
         "created": created,
         "reason": reason,
     }
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        tmp.write_text(json.dumps(payload, indent=2))
-        tmp.replace(path)
-    except Exception:
-        # 9.fix: complete the "all atomic-write sites" guarantee
-        # from Batch 9.2 (the storage-class sweep missed this one).
-        # Clean up the orphan .tmp on rollback so a retry doesn't
-        # fight a stale file.
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    # 11.2: atomic_write_text sets 0600 + cleans up orphan .tmp.
+    atomic_write_text(path, json.dumps(payload, indent=2))

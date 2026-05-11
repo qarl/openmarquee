@@ -34,6 +34,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+from openmarquee._atomic import atomic_write_text
+
 FLOCK_SCHEMA_VERSION = 1
 
 # A peer address must look like a DNS hostname or a bare IPv4 literal,
@@ -239,17 +241,8 @@ class FlockStorage:
         # disk. add()/remove()/update() mutate the load() return
         # in-place before calling save.
         self._cache = None
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        try:
-            tmp.write_text(flock.model_dump_json(indent=2))
-            tmp.replace(self.path)
-        except Exception:
-            # 9.2: clean up orphan .tmp on rollback.
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        # 11.2: atomic_write_text sets 0600 + cleans up orphan .tmp.
+        atomic_write_text(self.path, flock.model_dump_json(indent=2))
 
     # --- convenience CRUD on top of load/save ---
 

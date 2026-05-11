@@ -66,8 +66,9 @@ def _decode_image_payload(b64: str) -> bytes:
     try:
         data = base64.b64decode(b64, validate=True)
     except ValueError as exc:
+        # 11.2: don't reflect exception string into response.
         raise HTTPException(
-            status_code=400, detail=f"image_base64 is not valid base64: {exc}"
+            status_code=400, detail="image_base64 is not valid base64"
         ) from exc
     try:
         # 11.1 / sweep #5 #5: use .load() not .verify() at the upload
@@ -118,8 +119,9 @@ def _decode_png_payload(b64: str) -> bytes:
     try:
         png = base64.b64decode(b64, validate=True)
     except ValueError as exc:  # binascii.Error subclasses ValueError
+        # 11.2: don't reflect exception string into response.
         raise HTTPException(
-            status_code=400, detail=f"png_base64 is not valid base64: {exc}"
+            status_code=400, detail="png_base64 is not valid base64"
         ) from exc
 
     try:
@@ -288,8 +290,9 @@ def _decode_mp4_payload(b64: str) -> bytes:
     try:
         mp4 = base64.b64decode(b64, validate=True)
     except ValueError as exc:
+        # 11.2: don't reflect exception string into response.
         raise HTTPException(
-            status_code=400, detail=f"mp4_base64 is not valid base64: {exc}"
+            status_code=400, detail="mp4_base64 is not valid base64"
         ) from exc
 
     # MP4 files start with a box: 4 bytes big-endian size, then 4 bytes type.

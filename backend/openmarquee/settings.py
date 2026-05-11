@@ -29,6 +29,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from openmarquee._atomic import atomic_write_text
+
 # Bump when the on-disk format changes in a non-backward-compatible way.
 # Same migration discipline as `openmarquee.schedule` and
 # `openmarquee.content.storage`.
@@ -391,14 +393,8 @@ class SettingsStorage:
         """Replace the on-disk settings with `settings`. Atomic via rename."""
         type(self)._stats["save_calls"] += 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        try:
-            tmp.write_text(settings.model_dump_json(indent=2))
-            tmp.replace(self.path)
-        except Exception:
-            # 9.2: clean up orphan .tmp on rollback.
-            try:
-                tmp.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        # 11.2: atomic_write_text sets 0600 + cleans up orphan .tmp.
+        # settings.json carries the AP password, station password,
+        # and (future) Tailscale auth key -- the 0600 mode is
+        # specifically why this helper exists.
+        atomic_write_text(self.path, settings.model_dump_json(indent=2))
