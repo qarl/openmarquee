@@ -99,6 +99,22 @@ scp -qr "$FIXTURE_DIR/." "$TARGET:$PI_FIXTURE_ROOT/"
 echo "==> stopping openmarquee-backend (DRM master grab)"
 ssh -q "$TARGET" "sudo systemctl stop openmarquee-backend"
 
+# 17.5 / sweep #9 #5: capture provenance for bless / diff. When a
+# future diff fails, the operator needs to know whether the GOLDEN
+# was blessed under a different driver build (vc4) or a different
+# Pi (model bump can produce subtly-different rendering).
+#
+# Gathered once per run so all per-fixture writes share the same
+# values. Format mirrors the SystemInfo wire shape: git_sha is the
+# code state, blessed_at is run-time UTC, pi_model + vc4_version
+# come from the Pi.
+GIT_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "unknown")
+PI_MODEL=$(ssh -q "$TARGET" "tr -d '\0' < /proc/device-tree/model 2>/dev/null" 2>/dev/null || echo "unknown")
+# vc4 driver version comes from `modinfo vc4` -- field "version" if
+# present, else fall back to the kernel version (vc4 ships in-tree).
+VC4_VERSION=$(ssh -q "$TARGET" "modinfo vc4 2>/dev/null | awk '/^version:/{print \$2; exit}' || uname -r" 2>/dev/null || echo "unknown")
+BLESSED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
 PASS_COUNT=0
 FAIL_COUNT=0
 for fixture in "${FIXTURES[@]}"; do
@@ -124,11 +140,38 @@ for fixture in "${FIXTURES[@]}"; do
             continue
             ;;
     esac
+    PROVENANCE_PATH="$GOLDEN_DIR/$NAME.golden.json"
     if [ "$BLESS" = "1" ]; then
         cp "$LOCAL_PATH" "$GOLDEN_PATH"
+        # 17.5: record provenance so a future diff failure can be
+        # disambiguated (renderer regression vs. different driver
+        # build vs. different Pi).
+        cat > "$PROVENANCE_PATH" <<EOF
+{
+  "git_sha": "$GIT_SHA",
+  "pi_model": "$PI_MODEL",
+  "vc4_version": "$VC4_VERSION",
+  "blessed_at": "$BLESSED_AT"
+}
+EOF
         echo "    BLESSED: $LOCAL_PATH -> $GOLDEN_PATH"
         PASS_COUNT=$((PASS_COUNT + 1))
     else
+        # 17.5: warn (don't gate) on driver/model mismatch in diff
+        # mode. The diff still runs -- a real renderer regression
+        # should fail on bit-equality regardless -- but operator
+        # gets a heads-up that the failure might be a driver bump
+        # rather than a renderer bug.
+        if [ -f "$PROVENANCE_PATH" ]; then
+            G_VC4=$(awk -F'"' '/vc4_version/{print $4}' "$PROVENANCE_PATH" 2>/dev/null || echo "")
+            G_MODEL=$(awk -F'"' '/pi_model/{print $4}' "$PROVENANCE_PATH" 2>/dev/null || echo "")
+            if [ -n "$G_VC4" ] && [ "$G_VC4" != "$VC4_VERSION" ]; then
+                echo "    WARN: vc4 mismatch -- golden=$G_VC4 vs current=$VC4_VERSION"
+            fi
+            if [ -n "$G_MODEL" ] && [ "$G_MODEL" != "$PI_MODEL" ]; then
+                echo "    WARN: pi_model mismatch -- golden=$G_MODEL vs current=$PI_MODEL"
+            fi
+        fi
         if python3 "$DIFF_PY" "$LOCAL_PATH" "$GOLDEN_PATH"; then
             PASS_COUNT=$((PASS_COUNT + 1))
         else
