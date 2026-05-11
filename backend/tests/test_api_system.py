@@ -180,14 +180,14 @@ def test_info_exposes_rotation_applied_display_dims(client: TestClient):
     assert info["display_rotation"] == 90
 
 
-def test_info_sets_cors_header_so_peers_can_read_it(client: TestClient):
-    """Peer flock UIs fetch each other's /api/system/info to render
-    per-peer thumbs at the correct rotation. That's a cross-origin GET,
-    so the response must carry Access-Control-Allow-Origin: * (matching
-    the thumbnail endpoint's pattern)."""
+def test_info_no_cors_header_for_same_origin(client: TestClient):
+    """Batch 11.3 / sweep #5 #4: same-origin request (no Origin header)
+    gets NO access-control-allow-origin header -- browser doesn't need
+    one for same-origin reads. The wildcard ACAO that used to be set
+    here was the sweep #5 #4 vulnerability."""
     response = client.get("/api/system/info")
     assert response.status_code == 200
-    assert response.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in response.headers
 
 
 def test_info_passes_unrotated_dims_through_when_rotation_is_zero(client: TestClient):
@@ -211,3 +211,41 @@ def test_info_signal_in_range_when_present(client: TestClient):
     on the response side; this catches a parser regression."""
     info = client.get("/api/system/info").json()
     assert 0 <= info["signal"] <= 100
+
+
+# --- Batch 11.3 / sweep #5 #4: CORS allowlist tests ---
+
+
+def test_info_no_cors_for_unknown_origin(client: TestClient):
+    """Cross-origin GET from a non-allowlisted origin gets no ACAO."""
+    response = client.get(
+        "/api/system/info",
+        headers={"Origin": "https://attacker.example.com"},
+    )
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_info_cors_for_localhost_origin(client: TestClient):
+    response = client.get(
+        "/api/system/info",
+        headers={"Origin": "http://localhost:9000"},
+    )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == (
+        "http://localhost:9000"
+    )
+    assert response.headers.get("vary") == "Origin"
+
+
+def test_info_cors_for_captive_portal_ap_origin(client: TestClient):
+    """192.168.4.1 is the captive-portal AP gateway (SYSTEM_SPEC §4.1) --
+    the operator's phone hits it directly during setup. Builtin allow."""
+    response = client.get(
+        "/api/system/info",
+        headers={"Origin": "http://192.168.4.1"},
+    )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == (
+        "http://192.168.4.1"
+    )

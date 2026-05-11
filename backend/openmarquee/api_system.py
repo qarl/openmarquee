@@ -23,12 +23,13 @@ import subprocess
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
 from openmarquee import auto_render, motion
+from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
-from openmarquee.dependencies import get_settings_storage
+from openmarquee.dependencies import get_flock_storage, get_settings_storage
 from openmarquee.flock import FlockStorage
 from openmarquee.perf_middleware import recent_requests
 from openmarquee.playlist import PlaylistStorage
@@ -42,6 +43,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/system", tags=["system"])
 
 SettingsDep = Annotated[SettingsStorage, Depends(get_settings_storage)]
+FlockDep = Annotated[FlockStorage, Depends(get_flock_storage)]
 
 
 class DisplayDims(BaseModel):
@@ -259,18 +261,25 @@ class SystemInfo(BaseModel):
 
 @router.get("/info", response_model=SystemInfo)
 async def system_info(
+    request: Request,
     response: Response,
     settings_storage: SettingsDep,
+    flock_storage: FlockDep,
 ) -> SystemInfo:
     """Read /proc/* + the configured display mode and return a flock
     self-card payload. Each /proc reader is best-effort; failure
     falls back to the matching SELF_PLACEHOLDER constant.
     """
-    # Permit cross-origin GETs so a peer's flock UI can read this device's
-    # rotation when rendering its thumb. Mirrors the thumbnail endpoint's
-    # wildcard ACAO; the payload is non-sensitive (model / mode / signal /
-    # uptime / display dims).
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    # Batch 11.3 / sweep #5 #4: CORS allowlist-reflective. Peers in the
+    # operator's flock can read this device's display dims for rendering
+    # peer-card thumbnails; arbitrary cross-origin pages cannot (the
+    # payload is metadata, not secret, but a wildcard ACAO is still the
+    # wrong shape -- failing closed). See cors_headers_for_origin in
+    # api.py for the full rationale.
+    for key, value in cors_headers_for_origin(
+        request.headers.get("origin", ""), flock_storage
+    ).items():
+        response.headers[key] = value
 
     settings = settings_storage.load()
 

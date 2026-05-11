@@ -31,6 +31,7 @@ from openmarquee.dependencies import (
     get_playlist_storage,
     get_tombstone_storage,
 )
+from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync
 from openmarquee.playlist import PlaylistStorage, list_in_playlist_order
 from openmarquee.tombstone import TombstoneStorage
@@ -41,6 +42,107 @@ StorageDep = Annotated[ContentStorage, Depends(get_content_storage)]
 PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
 TombstoneDep = Annotated[TombstoneStorage, Depends(get_tombstone_storage)]
 FlockSyncDep = Annotated[FlockSync, Depends(get_flock_sync)]
+
+
+# --- Batch 11.3 / sweep #5 #4: CORS allowlist helper ---
+#
+# The pre-Phase-A code stamped `Access-Control-Allow-Origin: *` on the
+# 3 cross-flock-readable endpoints (/api/playback/current-{thumbnail,
+# frame} and /api/system/info). A wildcard ACAO lets ANY origin in the
+# operator's browser cache read those bytes; an attacker-controlled
+# page could pull the current playing frame off the captive-portal AP.
+# Replace with allowlist-reflective echoing: only set ACAO when the
+# Origin matches the operator's flock-peer allowlist (or the built-in
+# local origins -- localhost/AP IP/loopback). Failing closed means the
+# browser blocks the cross-origin read; flock peers continue to work
+# because they're explicitly allow-listed via the operator's flock
+# config.
+
+# Built-in same-network origins that always pass without flock-peer
+# enumeration. captive-portal AP IP is the operator's phone hitting
+# the device directly during setup; loopback covers dev + the device
+# talking to itself.
+_BUILTIN_ALLOWLIST_HOSTS: frozenset[str] = frozenset({
+    "localhost",
+    "127.0.0.1",
+    "192.168.4.1",  # captive-portal AP gateway (SYSTEM_SPEC §4.1)
+})
+
+
+def _parse_origin_host(origin: str) -> str | None:
+    """Extract the bare host from an `Origin` header value.
+
+    `Origin` per RFC 6454 is `<scheme>://<host>[:<port>]` (no path, no
+    query, no fragment). Defensive against malformed values: bare host
+    without scheme is accepted (some embedded clients omit it); empty
+    or unparseable returns None.
+    """
+    if not origin:
+        return None
+    # Strip scheme.
+    if "://" in origin:
+        origin = origin.split("://", 1)[1]
+    # Strip path (defensive; shouldn't appear in Origin).
+    if "/" in origin:
+        origin = origin.split("/", 1)[0]
+    # Strip port.
+    if ":" in origin:
+        origin = origin.split(":", 1)[0]
+    host = origin.strip().lower()
+    return host or None
+
+
+def origin_in_flock_allowlist(
+    origin: str, flock_storage: FlockStorage
+) -> bool:
+    """Decide whether a request's `Origin` should receive a reflective
+    `Access-Control-Allow-Origin` header.
+
+    Allowed:
+      - localhost / 127.0.0.1 / 192.168.4.1 (built-in same-network)
+      - Any peer.address from the operator's flock (port stripped,
+        case-insensitive)
+
+    All other origins return False; caller should omit the ACAO header
+    entirely (browser blocks cross-origin read). Failing closed.
+
+    Same-origin requests don't reach this helper -- the browser doesn't
+    send an `Origin` header for same-origin GETs, so the caller's
+    `origin = ""` branch falls through cleanly.
+    """
+    host = _parse_origin_host(origin)
+    if host is None:
+        return False
+    if host in _BUILTIN_ALLOWLIST_HOSTS:
+        return True
+    flock = flock_storage.load()
+    for peer in flock.peers:
+        # peer.address is already normalised to lowercase; may include
+        # ":<port>". Strip the port for host-level comparison so a
+        # peer registered as `lobby.ts.net:8000` matches an Origin of
+        # `https://lobby.ts.net` (default ports).
+        peer_host = peer.address.split(":", 1)[0]
+        if peer_host == host:
+            return True
+    return False
+
+
+def cors_headers_for_origin(
+    origin: str, flock_storage: FlockStorage
+) -> dict[str, str]:
+    """Build the response-header dict for a flock-readable endpoint.
+
+    Returns `{ACAO: <origin>, Vary: "Origin"}` when allow-listed, or
+    `{}` when not. Vary tells caches the response depends on Origin so
+    a peer's allowed response doesn't get served to an unallowed
+    origin from a shared cache.
+    """
+    if origin_in_flock_allowlist(origin, flock_storage):
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Vary": "Origin",
+        }
+    return {}
 
 
 def _append_to_playlist(playlist_storage: PlaylistStorage, item_id) -> None:

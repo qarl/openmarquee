@@ -15,16 +15,19 @@ on the device once those land). Replaced the Phase 2 manual
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
+from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_content_storage,
+    get_flock_storage,
     get_playback_loop,
     get_playlist_storage,
 )
+from openmarquee.flock import FlockStorage
 from openmarquee.playback import PlaybackLoop
 from openmarquee.playlist import PlaylistStorage
 
@@ -33,6 +36,7 @@ router = APIRouter(prefix="/api/playback", tags=["playback"])
 LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
 ContentDep = Annotated[ContentStorage, Depends(get_content_storage)]
 PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
+FlockDep = Annotated[FlockStorage, Depends(get_flock_storage)]
 
 
 class PlaybackState(BaseModel):
@@ -80,7 +84,11 @@ async def get_state(loop: LoopDep) -> PlaybackState:
     },
 )
 async def get_current_thumbnail(
-    loop: LoopDep, content: ContentDep, playlists: PlaylistDep
+    request: Request,
+    loop: LoopDep,
+    content: ContentDep,
+    playlists: PlaylistDep,
+    flock_storage: FlockDep,
 ) -> Response:
     """Cover art for the playlist this device is currently playing —
     the first item of that playlist's asset, matching the playlist
@@ -113,15 +121,21 @@ async def get_current_thumbnail(
     path = content.asset_path(first_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no asset for {first_id}")
-    # No-store so the browser's <img> with ?t=<ms> cachebust works; CORS
-    # wildcard so one device's UI can pull this from a peer's backend.
+    # Batch 11.3 / sweep #5 #4: CORS allowlist-reflective. Echo back the
+    # Origin only when it's in the operator's flock allowlist (or a
+    # builtin local origin). Same-origin requests don't carry Origin so
+    # they fall through cleanly without any ACAO header (browser doesn't
+    # need one).
+    headers = {"Cache-Control": "no-store"}
+    headers.update(
+        cors_headers_for_origin(
+            request.headers.get("origin", ""), flock_storage
+        )
+    )
     return FileResponse(
         path,
         media_type="image/png",
-        headers={
-            "Cache-Control": "no-store",
-            "Access-Control-Allow-Origin": "*",
-        },
+        headers=headers,
     )
 
 
@@ -132,7 +146,11 @@ async def get_current_thumbnail(
         503: {"description": "Capture not available (nothing playing or non-text/non-image slide)."},
     },
 )
-async def get_current_frame(loop: LoopDep) -> Response:
+async def get_current_frame(
+    request: Request,
+    loop: LoopDep,
+    flock_storage: FlockDep,
+) -> Response:
     """PNG of what's actually rendering right now -- the slide's live
     composite at current elapsed_s, NOT the playlist cover art that
     /current-thumbnail returns. Distinct from /current-thumbnail in
@@ -158,13 +176,18 @@ async def get_current_frame(loop: LoopDep) -> Response:
             content="capture not available",
             media_type="text/plain",
         )
+    # Batch 11.3 / sweep #5 #4: same allowlist-reflective ACAO as
+    # /current-thumbnail above. See cors_headers_for_origin in api.py.
+    headers = {"Cache-Control": "no-store"}
+    headers.update(
+        cors_headers_for_origin(
+            request.headers.get("origin", ""), flock_storage
+        )
+    )
     return Response(
         content=png,
         media_type="image/png",
-        headers={
-            "Cache-Control": "no-store",
-            "Access-Control-Allow-Origin": "*",
-        },
+        headers=headers,
     )
 
 

@@ -165,8 +165,12 @@ def test_current_thumbnail_serves_current_item_asset(
     response = client.get("/api/playback/current-thumbnail")
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
-    # CORS wildcard so peers' UIs can <img src=...> us cross-origin.
-    assert response.headers.get("access-control-allow-origin") == "*"
+    # Batch 11.3 / sweep #5 #4: CORS is no longer a wildcard. Without an
+    # Origin header (same-origin request), the response carries NO
+    # access-control-allow-origin header at all -- browser doesn't need
+    # one for same-origin reads. Flock-allowlisted cross-origin coverage
+    # lives in test_current_thumbnail_cors_allowlist_*.
+    assert "access-control-allow-origin" not in response.headers
     assert response.headers.get("cache-control") == "no-store"
     assert response.content == png
     client.post("/api/playback/stop")
@@ -257,3 +261,83 @@ def test_current_thumbnail_returns_first_item_of_current_playlist(tmp_path: Path
         _content_storage_singleton.cache_clear()
         _playback_loop_singleton.cache_clear()
         _playlist_storage_singleton.cache_clear()
+
+
+# --- Batch 11.3 / sweep #5 #4: CORS allowlist tests ---
+
+
+def _playing_text_slide(client: TestClient, storage: ContentStorage) -> None:
+    """Helper: seed + start playback so /current-thumbnail returns 200."""
+    slide = TextSlide(name="cors-test", text="t", duration_ms=1000)
+    png = _png_bytes(8, 8, (0, 200, 100))
+    storage.save_text_slide(slide, png)
+    client.post("/api/playback/start")
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if client.get("/api/playback/state").json().get("current_item_id"):
+            return
+        time.sleep(0.05)
+
+
+def test_current_thumbnail_no_cors_for_unknown_origin(
+    client: TestClient, storage: ContentStorage
+):
+    """A cross-origin GET from a domain NOT on the flock allowlist
+    gets no Access-Control-Allow-Origin -- browser blocks the read."""
+    _playing_text_slide(client, storage)
+    response = client.get(
+        "/api/playback/current-thumbnail",
+        headers={"Origin": "https://attacker.example.com"},
+    )
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+    client.post("/api/playback/stop")
+
+
+def test_current_thumbnail_cors_for_localhost_origin(
+    client: TestClient, storage: ContentStorage
+):
+    """localhost is in the builtin allowlist (dev convenience)."""
+    _playing_text_slide(client, storage)
+    response = client.get(
+        "/api/playback/current-thumbnail",
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == (
+        "http://localhost:8000"
+    )
+    assert response.headers.get("vary") == "Origin"
+    client.post("/api/playback/stop")
+
+
+def test_current_thumbnail_cors_for_flock_peer_origin(
+    client: TestClient, storage: ContentStorage, tmp_path: Path
+):
+    """A peer in the operator's flock gets reflective allow. Set up a
+    FlockStorage override with one peer, then probe with that origin."""
+    from openmarquee.dependencies import (
+        _flock_storage_singleton,
+        get_flock_storage,
+    )
+    from openmarquee.flock import Flock, FlockPeer, FlockStorage
+
+    flock_path = tmp_path / "flock.json"
+    flock_storage = FlockStorage(flock_path)
+    flock_storage.save(Flock(peers=[FlockPeer(address="peer-lobby.ts.net")]))
+    app.dependency_overrides[get_flock_storage] = lambda: flock_storage
+    _flock_storage_singleton.cache_clear()
+    try:
+        _playing_text_slide(client, storage)
+        response = client.get(
+            "/api/playback/current-thumbnail",
+            headers={"Origin": "https://peer-lobby.ts.net"},
+        )
+        assert response.status_code == 200
+        assert response.headers.get("access-control-allow-origin") == (
+            "https://peer-lobby.ts.net"
+        )
+        assert response.headers.get("vary") == "Origin"
+    finally:
+        client.post("/api/playback/stop")
+        _flock_storage_singleton.cache_clear()
