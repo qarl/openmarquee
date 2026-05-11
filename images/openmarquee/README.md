@@ -11,11 +11,11 @@ openMarquee captive-portal-first-boot device flow.
 | `stage-openmarquee/` | Custom pi-gen stage that runs after the standard `lite` stages. |
 | `stage-openmarquee/00-install-packages/00-packages` | apt packages needed by the openMarquee runtime. |
 | `stage-openmarquee/EXPORT_IMAGE` | Marker file (pi-gen sources as shell) — tells pi-gen to emit the .img at the end of this stage; also sets `IMG_SUFFIX`. |
+| `cloud-init/user-data` | NoCloud first-boot config (B.2). Contains `{{SSH_AUTHORIZED_KEYS}}` placeholder to substitute. |
+| `cloud-init/meta-data` | Minimal cloud-init metadata (instance-id + seed hostname). |
 | `stage-openmarquee/prerun.sh` | Boilerplate: copy previous stage's rootfs into this stage. |
 
 What's NOT here (yet):
-- **B.2 cloud-init user-data template** — lands separately; configures
-  hostname, SSH keys, user, and runs `install.sh` on first boot.
 - **B.3 install.sh** — the real provisioning. Drops the systemd unit,
   builds the venv, lays down hostapd/dnsmasq configs from `wifi.json`.
 - **B.4 first-boot oneshot** — generates the AP password + QR code on

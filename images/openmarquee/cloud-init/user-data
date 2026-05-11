@@ -1,0 +1,80 @@
+#cloud-config
+# user-data — cloud-init first-boot config for an openMarquee Pi.
+#
+# Cloud-init's NoCloud datasource picks this up from
+# /boot/firmware/user-data on the SD card. The flash tooling (B.6)
+# substitutes the {{SSH_AUTHORIZED_KEYS}} placeholder with the
+# operator's public key before flashing; leave it in source as a
+# literal placeholder so unsubstituted files fail loudly.
+#
+# What this does on first boot:
+#   1. Assigns a unique hostname (openmarquee-<4-hex>) so multiple
+#      devices on the same LAN don't collide on mDNS.
+#   2. Adds the operator's SSH public key to the openmarquee user.
+#   3. Enables + starts the SSH service (Pi OS Lite trixie does NOT
+#      enable SSH by default with cloud-init -- this is the gotcha
+#      from project_dev_pi_provisioned).
+#   4. Runs install.sh which wires the systemd unit, builds the
+#      venv, lays down hostapd/dnsmasq configs, and triggers the
+#      first-boot oneshot.
+
+# Don't auto-run apt-update / apt-upgrade on first boot. Adds 30-90s
+# without delivering anything; the image was built against the same
+# trixie snapshot pi-gen used.
+package_update: false
+package_upgrade: false
+
+# pi-gen already created the openmarquee user with passwordless sudo
+# in B.1 via FIRST_USER_NAME. We re-declare here only to attach SSH
+# keys -- cloud-init merges by username.
+users:
+  - name: openmarquee
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      # Quoted: an unsubstituted "{{...}}" placeholder is a flow-mapping
+      # to YAML and would discard the WHOLE user-data file. Quoted, it's
+      # a literal string -- cloud-init rejects it as a non-key on the
+      # ssh validator but still runs the rest (SSH enable, install.sh,
+      # hostname randomization), so the operator can recover via console.
+      - "{{SSH_AUTHORIZED_KEYS}}"
+
+# Lock down SSH: key-only, no password auth, no root login. This
+# closes the brief console-only window where pi-gen's literal
+# FIRST_USER_PASS is the device password (see pi-gen.config note).
+ssh_pwauth: false
+disable_root: true
+
+# Without this, cloud-init's set_hostname module runs in cloud_init
+# stage (after bootcmd, before runcmd) and would overwrite the random
+# suffix back to meta-data's `local-hostname: openmarquee`. Setting
+# this true tells set_hostname to leave /etc/hostname alone.
+preserve_hostname: true
+
+# bootcmd runs VERY early in the boot sequence -- before networking,
+# before SSH, before systemd targets a user can reach. The right
+# place to set the hostname so by the time SSH listens, mDNS
+# advertises the correct name.
+bootcmd:
+  - |
+    if [ ! -f /var/lib/openmarquee/.hostname-randomized ]; then
+      # `od` (coreutils) -- always present. `xxd` got split out of
+      # vim-common on trixie and is NOT in our 00-packages, so this
+      # MUST stay od-based.
+      SUFFIX=$(od -An -tx1 -N2 /dev/urandom | tr -d ' \n')
+      NEW_HOSTNAME="openmarquee-${SUFFIX}"
+      echo "${NEW_HOSTNAME}" > /etc/hostname
+      sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${NEW_HOSTNAME}/" /etc/hosts || \
+        echo "127.0.1.1	${NEW_HOSTNAME}" >> /etc/hosts
+      hostnamectl set-hostname "${NEW_HOSTNAME}" || true
+      mkdir -p /var/lib/openmarquee
+      touch /var/lib/openmarquee/.hostname-randomized
+    fi
+
+# runcmd runs after networking + system services come up. SSH enable
+# + install.sh land here so the device is operator-reachable after
+# this completes.
+runcmd:
+  - systemctl enable ssh
+  - systemctl start ssh
+  - bash /opt/openmarquee/scripts/install.sh
