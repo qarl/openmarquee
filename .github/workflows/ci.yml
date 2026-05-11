@@ -46,9 +46,28 @@ jobs:
       - name: Install UI dependencies
         working-directory: ui
         run: npm ci
+      - name: esbuild bundle
+        working-directory: ui
+        run: npm run build
       - name: Vitest
         working-directory: ui
         run: npm test --silent
+
+  renderer:
+    # 16.4 / sweep #8 B6: cargo test for the host-portable surfaces
+    # (parse_color, hdmi_logic, content.rs, etc.). Use macos-latest so
+    # the Linux-only drm/gbm/khronos-egl deps stay cfg-gated off --
+    # ubuntu-latest would need apt-get install libdrm-dev libgbm-dev
+    # libegl1-mesa-dev to even compile. macOS host-test was the design
+    # point per Cargo.toml's comment block at the Linux-only target.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        working-directory: renderer
+        run: cargo test
 
   e2e:
     runs-on: ubuntu-latest
