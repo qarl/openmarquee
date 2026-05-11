@@ -68,16 +68,25 @@ fi
 FIXTURES=(
     # 01 · FREE: solid bg, single-line single-layer text. Simplest
     # smoke fixture. Catches regressions in glyph rasterizer +
-    # layout + bg fill + atlas geometry. Lives in the production
-    # content root.
-    "fys_01_free|slide|3964c302-311f-44f2-a6c9-efd24a16cfc0|/var/openmarquee/content"
+    # layout + bg fill + atlas geometry.
+    #
+    # 17.3 / sweep #9 #4: pinned via renderer/tests/fixtures/<UUID>/
+    # item.json (snapshot of the on-Pi production seed). The FYS
+    # reel is queued for re-authoring per
+    # `project_demo_reel_rebuild_changes`; the previous /var/...
+    # pointer would have silently invalidated this golden when the
+    # rebuild lands. Now the harness scp's the checked-in snapshot
+    # to $PI_FIXTURE_ROOT each run and points the fixture there.
+    "fys_01_free|slide|3964c302-311f-44f2-a6c9-efd24a16cfc0|$PI_FIXTURE_ROOT"
     # 08 · Tile Chaos: heavy 5L pattern slide. Catches multi-layer
     # composite + per-layer color binding + multi-slide bg cache
     # invalidation. The slide that the FYS heavy bench used.
-    "fys_08_tile_chaos|slide|99c11690-415b-40f6-8e3c-6491f3bdf60e|/var/openmarquee/content"
+    # 17.3 snapshot-pinned -- see #01 note.
+    "fys_08_tile_chaos|slide|99c11690-415b-40f6-8e3c-6491f3bdf60e|$PI_FIXTURE_ROOT"
     # 09 · Chant Wall: 5L ticker-heavy slide. Pairs with #08 for
-    # transition midpoint fixtures in a follow-up.
-    "fys_09_chant_wall|slide|2c858968-ae0a-4592-8083-85257de50bcd|/var/openmarquee/content"
+    # transition midpoint fixtures.
+    # 17.3 snapshot-pinned -- see #01 note.
+    "fys_09_chant_wall|slide|2c858968-ae0a-4592-8083-85257de50bcd|$PI_FIXTURE_ROOT"
     # P2-G.fix overlay-route fixture: 2-layer slide where layer 2
     # has blend=overlay, forcing paint_layers_via_overlay_route
     # (legacy 3-pass with run_blit_pass + run_overlay_blend_pass
