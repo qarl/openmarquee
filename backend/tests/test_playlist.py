@@ -209,9 +209,13 @@ def test_v3_dict_keyed_migrates_to_v4_list_with_uuids(tmp_path: Path):
     default_pl = coll.by_id(DEFAULT_PLAYLIST_ID)
     assert default_pl is not None
     # Migration-rename: a v3 "default" key the operator never touched
-    # gets renamed to "Welcome" on upgrade so the fleet's display
-    # names stay uniform across fresh-installs and upgrades.
-    assert default_pl.name == "Welcome"
+    # gets renamed to DEFAULT_PLAYLIST_NAME on upgrade so the fleet's
+    # display names stay uniform across fresh-installs and upgrades.
+    # (2026-05-04: that name is "Demo" -- post-Welcome+Freedom collapse
+    # into the FREE YOUR SIGN demo reel.)
+    from openmarquee.playlist import DEFAULT_PLAYLIST_NAME
+
+    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Demo"
     assert default_pl.item_ids == [a]
     # Lunch playlist preserved with its name and a fresh UUID.
     lunch = coll.by_name("lunch")

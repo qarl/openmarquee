@@ -171,102 +171,107 @@ def test_seed_creates_starter_slides_when_fresh(
 ):
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
-    # At least the 4 fallback backgrounds + 3 welcome text slides + 3
-    # Freedom text slides (FREE / YOUR / SIGN).
+    # At least the 4 fallback backgrounds + the 19-slide demo reel
+    # (FREE/YOUR/SIGN as slots 01-03 + the rest of the escalation arc).
     assert len(created) >= 10
 
     # They round-trip through storage.
     loaded = storage.list_all()
     assert len(loaded) == len(created)
 
-    # Mix of TextSlide (welcome + freedom slides) + ImageSlide (backgrounds).
+    # Mix of TextSlide (demo reel slides) + ImageSlide (backgrounds).
     types = sorted({s.type for s in created})
     assert "image" in types
     assert "text_slide" in types
 
 
-def test_seed_default_playlist_contains_the_three_welcome_text_slides(
+def test_seed_default_playlist_contains_the_demo_reel(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
-    """qarl's requirement: fresh boot → default (Welcome) playlist holds
-    the three intro text slides ('Welcome' / 'to' / 'openMarquee') in
-    order. Backgrounds + videos are available content but aren't in the
-    playlist — the operator drags what they want onto the track."""
+    """Post-2026-05-04 reel shape: fresh boot → default Demo playlist
+    holds the full FREE-YOUR-SIGN demo reel, in spec order. The Welcome
+    trio + separate Freedom playlist have collapsed into reel slots
+    01/02/03 + the rest of the reel. Backgrounds + videos are available
+    content but aren't in the playlist."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
-    # Welcome text slides come first in the seed flow; Freedom slides
-    # (FREE / YOUR / SIGN) come after, on a separate playlist.
     text_slides = [s for s in created if s.type == "text_slide"]
-    welcome_slides = text_slides[:3]
-    assert [s.text_layers[0].text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
-
-    # Default playlist holds exactly those three, in the same order.
+    reel_slides = [s for s in text_slides if " · " in s.name]
+    # Reel slot names are "NN · Label" where the order in seed.py matches
+    # the order they're appended to the default playlist.
     ids = playlist.load().item_ids
-    assert ids == [s.id for s in welcome_slides]
+    assert ids == [s.id for s in reel_slides]
+    # And the first three slots are the FREE / YOUR / SIGN intro beat.
+    assert [s.text_layers[0].text for s in reel_slides[:3]] == ["FREE", "YOUR", "SIGN"]
 
 
-def test_welcome_slides_render_with_qarl_specified_fonts(
+def test_reel_intro_slides_use_qarl_specified_fonts(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
-    """qarl batch 2026-04-29 (B8/B9/B10): Welcome → Reenie Beanie,
-    to → Permanent Marker, openMarquee → Shadows Into Light. Locks the
-    pairing so a refactor of the spec list doesn't silently revert the
-    chosen pairings."""
+    """qarl 2026-05-04 reel handoff: FREE → Anton, YOUR → Alfa Slab One,
+    SIGN → Bowlby One SC. Locks the pairing so a refactor of the
+    _DEMO_REEL spec list doesn't silently revert the intro typography."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
     text_slides = [s for s in created if s.type == "text_slide"]
-    welcome = {s.text_layers[0].text: s for s in text_slides[:3]}
-    assert welcome["Welcome"].text_layers[0].font_family == "Reenie Beanie"
-    assert welcome["to"].text_layers[0].font_family == "Permanent Marker"
-    assert welcome["openMarquee"].text_layers[0].font_family == "Shadows Into Light"
+    intro = {s.text_layers[0].text: s for s in text_slides if s.text_layers[0].text in {"FREE", "YOUR", "SIGN"}}
+    assert intro["FREE"].text_layers[0].font_family == "Anton"
+    assert intro["YOUR"].text_layers[0].font_family == "Alfa Slab One"
+    assert intro["SIGN"].text_layers[0].font_family == "Bowlby One SC"
 
 
-def test_seed_default_playlist_is_named_welcome(
+def test_seed_default_playlist_is_named_demo(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
-    """qarl's 2026-04-28 ask: the default playlist's display name is
-    'Welcome' (matching its solo seeded content), not the legacy
-    'default'. Identity is still the stable DEFAULT_PLAYLIST_ID UUID,
-    so schedule rules + API references survive the rename."""
+    """qarl 2026-05-04: after the Welcome+Freedom 2-playlist collapse,
+    the default playlist's display name is 'Demo' (matching its content
+    -- the FREE YOUR SIGN demo reel). Identity is still the stable
+    DEFAULT_PLAYLIST_ID UUID, so schedule rules + API references
+    survive the rename."""
     seed_if_needed(storage, playlist, marker, width=32, height=32)
 
-    from openmarquee.playlist import DEFAULT_PLAYLIST_ID
+    from openmarquee.playlist import DEFAULT_PLAYLIST_ID, DEFAULT_PLAYLIST_NAME
 
     default_pl = playlist.get_by_id(DEFAULT_PLAYLIST_ID)
     assert default_pl is not None
-    assert default_pl.name == "Welcome"
+    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Demo"
 
 
-def test_seed_creates_freedom_playlist_with_three_slides(
+def test_seed_reel_contains_free_your_sign_in_default_playlist(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
-    """qarl's 2026-04-28 ask: fresh boot also creates a 'Freedom'
-    playlist with three protest-poster slides reading FREE / YOUR /
-    SIGN. Played by the Friday-night schedule rule."""
+    """qarl 2026-05-04 reel collapse: FREE / YOUR / SIGN live as reel
+    slots 01 / 02 / 03 inside the single default Demo playlist. The
+    earlier separate 'Freedom' playlist + Friday-night schedule rule
+    are gone -- the protest-poster beat is now the opening of the reel
+    rather than a scheduled side-show."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
 
     text_slides = [s for s in created if s.type == "text_slide"]
-    freedom_slides = text_slides[3:6]
-    assert [s.text_layers[0].text for s in freedom_slides] == ["FREE", "YOUR", "SIGN"]
+    fys = [s for s in text_slides if s.text_layers[0].text in {"FREE", "YOUR", "SIGN"}]
+    assert {s.text_layers[0].text for s in fys} == {"FREE", "YOUR", "SIGN"}
 
-    # Freedom playlist exists alongside the default (Welcome) playlist.
+    # No separate Freedom playlist -- only the default Demo playlist exists.
     collection = playlist.load_all()
-    by_name = {p.name: p for p in collection.playlists}
-    assert "Freedom" in by_name
-    freedom_pl = by_name["Freedom"]
-    assert [item.item_id for item in freedom_pl.items] == [
-        s.id for s in freedom_slides
-    ]
+    names = {p.name for p in collection.playlists}
+    assert names == {"Demo"}
+
+    # FREE/YOUR/SIGN appear inside the default Demo playlist.
+    default_ids = playlist.load().item_ids
+    for s in fys:
+        assert s.id in default_ids
 
 
-def test_seed_writes_friday_2000_freedom_rule_into_schedule(
+def test_seed_leaves_schedule_unrouted_with_default_pointing_at_demo(
     storage: ContentStorage,
     playlist: PlaylistStorage,
     marker: Path,
     tmp_path: Path,
 ):
-    """qarl's 2026-04-28 ask: schedule has a Friday 20:00-20:10 rule
-    pointing at the Freedom playlist; default fallback stays on the
-    Welcome (default) playlist for all other times."""
+    """qarl 2026-05-04 reel collapse: the old Friday-20:00-Freedom rule
+    is gone -- the protest-poster beat is now slots 01/02/03 of the
+    reel, so there's no scheduled side-show to route to. Seed writes
+    no rules; default_playlist_id stays on DEFAULT_PLAYLIST_ID (the
+    Demo playlist), which the evaluator falls back to at all times."""
     from openmarquee.playlist import DEFAULT_PLAYLIST_ID
     from openmarquee.schedule import ScheduleStorage
 
@@ -285,28 +290,24 @@ def test_seed_writes_friday_2000_freedom_rule_into_schedule(
 
     schedule = schedule_storage.load()
     assert schedule.default_playlist_id == DEFAULT_PLAYLIST_ID
-    assert len(schedule.rules) == 1
-    rule = schedule.rules[0]
-    assert rule.days == ["fri"]
-    assert rule.start_time == "20:00"
-    assert rule.end_time == "20:10"
-    assert rule.enabled
-
-    # Rule's playlist_id resolves to the Freedom playlist by name.
-    collection = playlist.load_all()
-    freedom = next(p for p in collection.playlists if p.name == "Freedom")
-    assert rule.playlist_id == freedom.id
+    assert schedule.rules == []
 
 
 def test_seed_skips_schedule_rule_when_no_schedule_storage_provided(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
-    """schedule_storage is optional — tests that don't care about the
-    schedule rule should still see Freedom + Welcome land cleanly."""
+    """schedule_storage is optional -- the seed completes cleanly
+    without one, with the default Demo playlist holding the reel."""
+    from openmarquee.playlist import DEFAULT_PLAYLIST_ID, DEFAULT_PLAYLIST_NAME
+
     seed_if_needed(storage, playlist, marker, width=32, height=32)
-    # No exception raised. Freedom playlist still landed.
+    # No exception raised. Only the default Demo playlist exists.
     collection = playlist.load_all()
-    assert any(p.name == "Freedom" for p in collection.playlists)
+    assert [p.name for p in collection.playlists] == [DEFAULT_PLAYLIST_NAME]
+    default_pl = playlist.get_by_id(DEFAULT_PLAYLIST_ID)
+    assert default_pl is not None
+    # And the default has the reel -- non-empty post-seed.
+    assert len(default_pl.items) > 0
 
 
 def test_seed_writes_marker_file_recording_what_it_did(
@@ -439,12 +440,10 @@ def test_seed_registers_bundled_backgrounds_over_pillow_fallback(
         s.name for s in created if s.name.endswith("— Background")
     )
     assert bg_names == ["Midnight — Background", "Parchment — Background"]
-    # The default playlist holds exactly the three Welcome text slides;
-    # Freedom slides land on a separate playlist (covered elsewhere).
-    text_slides = [s for s in created if s.type == "text_slide"]
-    welcome_slides = text_slides[:3]
-    assert [s.text_layers[0].text for s in welcome_slides] == ["Welcome", "to", "openMarquee"]
-    assert playlist.load().item_ids == [s.id for s in welcome_slides]
+    # The default Demo playlist holds the full demo reel (reel slot
+    # names are "NN · Label"); backgrounds are NOT auto-appended.
+    reel_slides = [s for s in created if s.type == "text_slide" and " · " in s.name]
+    assert playlist.load().item_ids == [s.id for s in reel_slides]
 
 
 def test_seed_falls_back_to_gradients_when_bundled_dir_is_empty(
@@ -489,18 +488,17 @@ def test_seed_bundled_skips_unreadable_files_but_still_seeds_good_ones(
         height=32,
         bundled_backgrounds_dir=bundled,
     )
-    # Good bundled + 3 welcome + 3 freedom slides = 7 items; broken file
-    # logged + skipped.
-    names = sorted(s.name for s in created)
-    assert names == [
-        "FREE",
-        "Good — Background",
-        "SIGN",
-        "Welcome",
-        "YOUR",
-        "openMarquee",
-        "to",
-    ]
+    # Good bundled + the full demo reel; broken file logged + skipped.
+    # The reel evolves over time so we check set-membership of the
+    # load-bearing names rather than full equality. The "broken" file
+    # must not leak through.
+    names = {s.name for s in created}
+    assert "Good — Background" in names
+    assert "Broken — Background" not in names
+    # FREE/YOUR/SIGN open the reel; assert by reel-spec name prefix.
+    assert "01 · FREE" in names
+    assert "02 · YOUR" in names
+    assert "03 · SIGN" in names
 
 
 def test_seed_bundled_is_deterministic_across_runs(
@@ -510,8 +508,10 @@ def test_seed_bundled_is_deterministic_across_runs(
     tmp_path: Path,
 ):
     """Order should be filename-sorted so two fresh devices ship the same
-    set of bundled backgrounds in the same order — welcome slides always
-    last, in playlist order."""
+    set of bundled backgrounds in the same order -- backgrounds first
+    (alphabetical), then reel slides in _DEMO_REEL spec order."""
+    from openmarquee.seed import _DEMO_REEL
+
     bundled = tmp_path / "backgrounds"
     bundled.mkdir()
     for stem in ["zebra", "alpha", "mango"]:
@@ -525,17 +525,13 @@ def test_seed_bundled_is_deterministic_across_runs(
         height=16,
         bundled_backgrounds_dir=bundled,
     )
-    assert [s.name for s in created] == [
+    expected = [
         "Alpha — Background",
         "Mango — Background",
         "Zebra — Background",
-        "Welcome",
-        "to",
-        "openMarquee",
-        "FREE",
-        "YOUR",
-        "SIGN",
+        *[spec.name for spec in _DEMO_REEL],
     ]
+    assert [s.name for s in created] == expected
 
 
 # --- demo video ---
@@ -564,13 +560,12 @@ def test_seed_registers_demo_video_when_mp4_is_present(
     assert "Demo" in videos[0].name
     # And it round-trips through storage.read_video() — the bytes match.
     assert storage.read_video(videos[0].id) == _FAKE_MP4
-    # Demo video is NOT auto-appended to the default (Welcome) playlist
-    # — only the three welcome text slides are. Operator drags the demo
-    # into the playlist themselves when they want to show it.
+    # Demo video is NOT auto-appended to the default Demo playlist --
+    # only the reel slides are. Operator drags the demo into the
+    # playlist themselves when they want to show it.
     assert videos[0].id not in playlist.load().item_ids
-    text_slides = [s for s in created if s.type == "text_slide"]
-    welcome_slides = text_slides[:3]
-    assert playlist.load().item_ids == [s.id for s in welcome_slides]
+    reel_slides = [s for s in created if s.type == "text_slide" and " · " in s.name]
+    assert playlist.load().item_ids == [s.id for s in reel_slides]
 
 
 def test_seed_skips_demo_video_when_path_is_missing(
