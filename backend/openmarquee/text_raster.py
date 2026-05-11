@@ -13,7 +13,7 @@ Extracted from auto_render.py so:
 The cache assumes ImageFont instances are safe to share across
 draw calls. They are: Pillow's drawing API treats them as
 read-only metadata + glyph atlas. We size the cache at 128 entries
-which covers (24 bundled fonts) * (handful of common sizes) with
+which covers (23 bundled fonts) * (handful of common sizes) with
 slack to spare.
 """
 
