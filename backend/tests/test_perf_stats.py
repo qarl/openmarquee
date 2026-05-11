@@ -134,9 +134,84 @@ def test_middleware_logs_each_request(client: TestClient):
     assert "/api/content" in paths
     # Required fields.
     for entry in log:
-        assert {"method", "path", "status", "duration_ms"} <= entry.keys()
+        assert {"method", "path", "status", "duration_ms", "request_id"} <= entry.keys()
         assert isinstance(entry["duration_ms"], float)
         assert entry["duration_ms"] >= 0
+
+
+# --- Batch 16.3 / sweep #8 A4: correlation-id round-trip ---
+
+
+def test_middleware_echoes_inbound_request_id(client: TestClient):
+    """X-Request-ID header on the request round-trips back on the
+    response so a caller's trace can join across the wire."""
+    response = client.get(
+        "/healthz", headers={"X-Request-ID": "phone-trace-42"}
+    )
+    assert response.headers.get("x-request-id") == "phone-trace-42"
+    # And the perf ring records it.
+    assert any(
+        e.get("request_id") == "phone-trace-42" for e in recent_requests()
+    )
+
+
+def test_middleware_mints_request_id_when_absent(client: TestClient):
+    """No inbound X-Request-ID -> middleware mints a 12-char hex id."""
+    response = client.get("/healthz")
+    rid = response.headers.get("x-request-id")
+    assert rid is not None
+    # uuid4().hex[:12] is 12 lowercase hex chars.
+    assert len(rid) == 12
+    assert all(c in "0123456789abcdef" for c in rid)
+
+
+def test_middleware_rejects_malformed_request_id(client: TestClient):
+    """Junk input (control chars, header-injection attempt, too long)
+    is dropped in favor of a minted id rather than reflected back
+    into logs and response headers."""
+    # Header value with a CRLF injection attempt -- httpx strips the
+    # CRLF at send so the actual value the middleware sees is the
+    # safe leading slice. Cover the long-input + special-char paths
+    # with values httpx will actually pass through.
+    response = client.get(
+        "/healthz", headers={"X-Request-ID": "a" * 100}  # over 64
+    )
+    rid = response.headers.get("x-request-id")
+    assert rid is not None
+    assert len(rid) == 12  # minted, not echoed
+
+    response = client.get(
+        "/healthz", headers={"X-Request-ID": "has spaces!"}  # not alnum/-
+    )
+    rid = response.headers.get("x-request-id")
+    assert rid is not None
+    assert len(rid) == 12  # minted, not echoed
+
+
+def test_request_id_log_filter_stamps_record():
+    """The Filter pulls the current ContextVar value onto the
+    LogRecord so a Formatter with %(request_id)s renders correctly."""
+    import logging
+
+    from openmarquee.perf_middleware import RequestIdLogFilter, request_id_var
+
+    token = request_id_var.set("test-id-abc")
+    try:
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="", args=(), exc_info=None,
+        )
+        RequestIdLogFilter().filter(record)
+        assert record.request_id == "test-id-abc"
+    finally:
+        request_id_var.reset(token)
+    # Outside a request scope, default is "-".
+    record = logging.LogRecord(
+        name="test", level=logging.INFO, pathname="", lineno=0,
+        msg="", args=(), exc_info=None,
+    )
+    RequestIdLogFilter().filter(record)
+    assert record.request_id == "-"
 
 
 def test_middleware_request_log_is_bounded(client: TestClient):

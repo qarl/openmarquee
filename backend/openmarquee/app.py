@@ -56,12 +56,22 @@ def _configure_logging() -> None:
     level_name = os.environ.get("OPENMARQUEE_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s",
         level=level,
         # If a previous uvicorn entry installed handlers (it does),
         # force=True replaces them so our format wins.
         force=True,
     )
+    # 16.3 / sweep #8 A4: tag every log record with the per-request
+    # correlation id (or "-" when emitted outside a request, set by
+    # the ContextVar's default). Attach the filter to the root
+    # logger's handlers so all subloggers inherit it. Order matters:
+    # the filter has to be installed BEFORE any log call runs against
+    # the new format, otherwise the formatter would raise KeyError
+    # on the missing request_id attribute.
+    from openmarquee.perf_middleware import RequestIdLogFilter
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RequestIdLogFilter())
     # Silence chatty deps at INFO; their WARNING+ still surfaces.
     for noisy in ("aiortc", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

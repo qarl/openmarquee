@@ -19,8 +19,10 @@ when the in-memory ring has rolled over.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import time
+import uuid
 from collections import deque
 from typing import Any
 
@@ -33,6 +35,30 @@ _REQUEST_LOG_MAX = 256
 _request_log: deque[dict[str, Any]] = deque(maxlen=_REQUEST_LOG_MAX)
 
 
+# 16.3 / sweep #8 A4: per-request correlation id. The middleware
+# pushes the incoming X-Request-ID (or a generated 12-char hex) into
+# this ContextVar before calling the downstream app; the
+# RequestIdLogFilter (below) reads it on every LogRecord so every
+# log line emitted while handling a request gets a request_id tag.
+# Echoed back to the client as X-Request-ID so phone / UI traces can
+# join across the wire.
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="-"
+)
+
+
+class RequestIdLogFilter(logging.Filter):
+    """Stamp every LogRecord with `record.request_id` from the
+    ContextVar. Attach to handlers whose formatter uses %(request_id)s
+    -- the configured logging format in app.py doesn't reference it
+    yet (sweep #8 A4 is the foundation; structured logging in A3 will
+    pull it into the format)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
 def recent_requests() -> list[dict[str, Any]]:
     """Snapshot of the request ring, oldest-first."""
     return list(_request_log)
@@ -41,6 +67,27 @@ def recent_requests() -> list[dict[str, Any]]:
 def clear_request_log() -> None:
     """Drop the ring. Test hook only."""
     _request_log.clear()
+
+
+def _coerce_request_id(headers: list[tuple[bytes, bytes]]) -> str:
+    """Pull an inbound X-Request-ID from the ASGI scope's header list,
+    OR mint a fresh 12-char hex id. ASCII-clean range only -- ignore
+    weird inputs rather than reflect them back into logs / responses.
+    """
+    for name, value in headers:
+        if name.lower() == b"x-request-id":
+            try:
+                candidate = value.decode("ascii").strip()
+            except UnicodeDecodeError:
+                continue
+            # Keep it tight: alnum + dash, up to 64 chars. Reject
+            # anything that smells like an injection vector before it
+            # reaches a log handler.
+            if 1 <= len(candidate) <= 64 and all(
+                c.isalnum() or c == "-" for c in candidate
+            ):
+                return candidate
+    return uuid.uuid4().hex[:12]
 
 
 class PerfMiddleware:
@@ -63,9 +110,23 @@ class PerfMiddleware:
         start = time.perf_counter()
         status_holder: dict[str, int] = {"code": 0}
 
+        # 16.3: per-request correlation id. Pull from inbound
+        # X-Request-ID header or mint a new one; pushed into the
+        # ContextVar so any log emitted during this request gets
+        # tagged (via RequestIdLogFilter), and echoed back in the
+        # response so the caller can correlate.
+        request_id = _coerce_request_id(scope.get("headers") or [])
+        token = request_id_var.set(request_id)
+
         async def send_wrapper(message: dict) -> None:
             if message.get("type") == "http.response.start":
                 status_holder["code"] = message.get("status", 0)
+                # Inject X-Request-ID into the outbound headers.
+                # Headers list is a mutable list of (bytes, bytes)
+                # tuples in ASGI; safe to append.
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-request-id", request_id.encode("ascii")))
+                message = {**message, "headers": headers}
             await send(message)
 
         try:
@@ -77,12 +138,14 @@ class PerfMiddleware:
                 "path": path,
                 "status": status_holder["code"],
                 "duration_ms": round(duration_ms, 3),
+                "request_id": request_id,
             }
             _request_log.append(entry)
             # Only emit INFO for requests over 50ms so the typical
             # sub-ms /api/playback/state poll doesn't drown the log.
             if duration_ms >= 50.0:
                 log.info(
-                    "perf: %s %s -> %d in %.1fms",
-                    method, path, status_holder["code"], duration_ms,
+                    "perf: %s %s -> %d in %.1fms [%s]",
+                    method, path, status_holder["code"], duration_ms, request_id,
                 )
+            request_id_var.reset(token)
