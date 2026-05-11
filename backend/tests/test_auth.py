@@ -321,6 +321,39 @@ def test_whitelisted_paths_no_auth_required(client: TestClient):
     assert client.get("/api/auth/status").status_code == 200
 
 
+def test_ui_html_pages_whitelisted(client: TestClient):
+    """20.2: the captive-portal HTML pages must be reachable without
+    a token. main.js redirects to /login.html / /set-password.html
+    before any token exists -- if the middleware gated those URLs the
+    operator would 401 on the page itself."""
+    # Pre-configure auth so we're testing the "with auth state" branch
+    # of the middleware (i.e. the whitelist actually has to short-
+    # circuit; without it the middleware would 401 these as
+    # "authentication required" since no Bearer is sent).
+    client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    # The TestClient doesn't actually mount the StaticFiles UI dir
+    # (UI root path isn't there in the test backend), so the response
+    # may 404. The load-bearing assertion is that the middleware does
+    # NOT 401 -- whether the static handler 404s is fine.
+    for path in (
+        "/login.html",
+        "/set-password.html",
+        "/welcome.html",
+        "/index.html",
+        "/dist/main.js",
+        "/dist/login.js",
+        "/dist/set-password.js",
+        "/styles.css",
+    ):
+        response = client.get(path)
+        assert response.status_code != 401, (
+            f"middleware 401'd a whitelisted path: {path}"
+        )
+
+
 def test_protected_path_returns_401_without_token(client: TestClient):
     """Auth not configured + no token + non-whitelist path -> 401."""
     response = client.get("/api/content")

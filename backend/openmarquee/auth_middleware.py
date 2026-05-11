@@ -50,8 +50,21 @@ log = logging.getLogger(__name__)
 _WHITELIST_EXACT: frozenset[str] = frozenset({
     "/healthz",
     "/",
-    "/welcome",
+    # UI shells served by the StaticFiles mount. These are inert HTML
+    # pages -- the actual editor only opens after main.js fetches the
+    # token-gated /api endpoints, which still require auth. (20.2: the
+    # captive-portal phone flow needs to reach welcome / login / set-
+    # password BEFORE the operator has a token; the StaticFiles mount
+    # exposes them with the literal .html paths.)
+    "/welcome",          # 20.1: kept for /welcome (no .html) form
+    "/welcome.html",     # 20.2: actual served path
     "/login",
+    "/login.html",
+    "/set-password.html",
+    "/index.html",
+    "/spike.html",       # ffmpeg-wasm spike page, exercised by smoke.spec.js
+    "/styles.css",       # main stylesheet referenced by index.html
+    "/favicon.ico",
     "/api/auth/status",
     "/api/auth/set-password",
     "/api/auth/login",
@@ -69,6 +82,12 @@ _WHITELIST_EXACT: frozenset[str] = frozenset({
 _WHITELIST_PREFIX: tuple[str, ...] = (
     "/static/",
     "/fonts/",
+    # 20.2: esbuild's output dir, mounted under the StaticFiles UI
+    # root. Contains main.js + welcome.js + login.js + set-password.js +
+    # ffmpeg-worker.js + chunk-*.js. The browser fetches these BEFORE
+    # main.js can attach an Authorization header; gating them would
+    # 401 the editor itself on every load.
+    "/dist/",
     # Peer-fetch route: /api/flock/asset/<UUID>/<filename>. Same
     # tailnet-ACL rationale as the flock list above.
     "/api/flock/asset/",

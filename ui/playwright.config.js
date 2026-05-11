@@ -23,6 +23,7 @@ export const E2E_PLAYLIST_PATH = "/tmp/openmarquee-e2e-playlist.json";
 export const E2E_SCHEDULE_PATH = "/tmp/openmarquee-e2e-schedules.json";
 export const E2E_SETTINGS_PATH = "/tmp/openmarquee-e2e-settings.json";
 export const E2E_SEED_MARKER_PATH = "/tmp/openmarquee-e2e-seeded.json";
+export const E2E_AUTH_PATH = "/tmp/openmarquee-e2e-auth.json";
 
 export default defineConfig({
     testDir: "./e2e",
@@ -52,6 +53,7 @@ export default defineConfig({
             OPENMARQUEE_SCHEDULE_PATH: E2E_SCHEDULE_PATH,
             OPENMARQUEE_SETTINGS_PATH: E2E_SETTINGS_PATH,
             OPENMARQUEE_SEED_MARKER_PATH: E2E_SEED_MARKER_PATH,
+            OPENMARQUEE_AUTH_PATH: E2E_AUTH_PATH,
             // e2e specs assume empty state and reset between tests; the
             // startup seed would pre-populate four slides and break the
             // smoke tests. Seeding is unit-tested in test_seed.py.
@@ -59,6 +61,14 @@ export default defineConfig({
             // e2e specs that want playback running call start() themselves;
             // leaving the lifespan auto-start off keeps test runs predictable.
             OPENMARQUEE_DISABLE_AUTOSTART: "1",
+            // Batch 20.2 / phase A.2: bypass the bearer-token gate so
+            // the existing 17 e2e specs (which all assume open /api
+            // access) keep passing. The auth-flow specs themselves
+            // exercise the UI side of /api/auth/* endpoints, which
+            // remain functional regardless of this bypass -- the env
+            // var only short-circuits AuthMiddleware, not the auth
+            // endpoints. The Pi systemd unit never sets DISABLE_AUTH.
+            OPENMARQUEE_DISABLE_AUTH: "1",
             // Resolve the UI dir relative to THIS file, not cwd, so e2e works
             // regardless of where Playwright is launched from.
             OPENMARQUEE_UI_DIR: __dirname,

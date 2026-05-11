@@ -225,6 +225,10 @@
     //   POST   /api/flock/notify                 (added 5.2 -- no-op)
     //   POST   /api/flock/sync-announce          (added 5.2 -- no-op)
     //   GET    /api/playback/current-frame       (added 5.2)
+    //   GET    /api/auth/status                  (added 20.2 -- stub)
+    //   POST   /api/auth/set-password            (added 20.2 -- 409)
+    //   POST   /api/auth/login                   (added 20.2 -- stub)
+    //   POST   /api/auth/change-password         (added 20.2 -- stub)
     //
     // When adding new FastAPI routes, list them in this block too so
     // the drift checker stays accurate.
@@ -240,6 +244,44 @@
         // Health check.
         if (pathname === "/healthz") {
             return jsonResponse({ status: "alive", version: "demo" });
+        }
+
+        // --- auth (Batch 20.2 / phase A.2) ---
+        // The demo's auth bootstrap is intentionally lightweight: every
+        // visitor's instance is "already configured" so /set-password.html
+        // 409s and routes to /login.html, and /login.html always succeeds
+        // with a stub bearer token so a visitor who lands on the login
+        // page can click through and reach the editor. The token itself
+        // never gets validated because the demo doesn't run the backend
+        // AuthMiddleware -- it's just a localStorage placeholder that the
+        // 20.3 fetch wrapper will tack onto Authorization headers (which
+        // the mock ignores).
+        if (pathname === "/api/auth/status" && method === "GET") {
+            return jsonResponse({ configured: true });
+        }
+        if (pathname === "/api/auth/login" && method === "POST") {
+            return jsonResponse({ token: "demo.demo-stub-bearer-token-aaaaaaaaaaaaaaaaaaaaaaaa" });
+        }
+        if (pathname === "/api/auth/set-password" && method === "POST") {
+            // 409 means "already configured" -- the set-password page
+            // handles it by bouncing to /login.html, which is the
+            // visitor experience we want for the demo. A real device
+            // returns 200 + token on first-time success; we don't
+            // simulate that here because the demo is always "already
+            // configured."
+            return jsonResponse(
+                { detail: "auth already configured" },
+                { status: 409 },
+            );
+        }
+        if (pathname === "/api/auth/change-password" && method === "POST") {
+            // Surface to a future change-password UI: in the demo we
+            // can't actually rotate the placeholder token without
+            // hand-rolling more state, so we mint a fresh stub each
+            // call. Real backend bumps token_version and invalidates
+            // every previously-issued token; the demo skips that
+            // detail since nothing's enforcing the token anyway.
+            return jsonResponse({ token: "demo.demo-stub-bearer-token-bbbbbbbbbbbbbbbbbbbbbbbb" });
         }
 
         // --- content read path ---

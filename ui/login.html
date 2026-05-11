@@ -1,0 +1,235 @@
+<!doctype html>
+<!--
+    Login screen — Batch 20.2 / phase A.2. Shown when the editor's
+    boot-time auth gate notices we don't have a valid bearer token in
+    localStorage. One field, one button. Successful POST to
+    /api/auth/login stashes the token under `openmarquee_auth_token`
+    and bounces to /. 404 means the device isn't actually configured
+    yet -- bounce to /set-password.html instead.
+
+    Standalone (no api.js import) -- same rationale as
+    set-password.html.
+-->
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>openMarquee — log in</title>
+    <style>
+        :root {
+            --bg: #0e0e10;
+            --text: #f2f2f4;
+            --muted: #9c9ca3;
+            --accent: #ffb84d;
+            --error: #ff6b6b;
+            --card: #191a1d;
+            --card-border: #2a2a2f;
+            --field-bg: #0b0b0d;
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+            min-height: 100vh;
+        }
+
+        .auth-page {
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: clamp(1rem, 4vw, 3rem);
+        }
+
+        .auth-card {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 0.8rem;
+            padding: clamp(1.5rem, 3vw, 2.5rem);
+            width: min(420px, 100%);
+            display: grid;
+            gap: 1.25rem;
+        }
+
+        .auth-brand {
+            display: flex;
+            align-items: center;
+            gap: 0.7rem;
+            margin: 0 0 0.25rem;
+        }
+
+        .brand-mark {
+            width: 2.4rem;
+            height: 2.4rem;
+            border-radius: 0.45rem;
+            background: var(--accent);
+            color: #1a0f00;
+            display: grid;
+            place-items: center;
+            font-weight: 800;
+            font-size: 1.15rem;
+            letter-spacing: -0.03em;
+        }
+
+        .brand-word {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin: 0;
+        }
+
+        .brand-word span { color: var(--accent); }
+
+        .auth-title {
+            font-size: clamp(1.4rem, 2.4vw, 1.7rem);
+            font-weight: 700;
+            margin: 0;
+            line-height: 1.2;
+        }
+
+        .auth-subhead {
+            color: var(--muted);
+            font-size: 0.95rem;
+            line-height: 1.45;
+            margin: 0;
+        }
+
+        form { display: grid; gap: 1rem; }
+
+        .field-row { display: grid; gap: 0.35rem; }
+
+        label {
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--muted);
+        }
+
+        .input-wrap {
+            position: relative;
+            display: flex;
+        }
+
+        input[type="password"], input[type="text"] {
+            width: 100%;
+            background: var(--field-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 0.5rem;
+            padding: 0.85rem 4.5rem 0.85rem 0.95rem;
+            color: var(--text);
+            font: inherit;
+            font-size: 1.05rem;
+            min-height: 2.8rem;
+            outline: none;
+            transition: border-color 120ms ease;
+        }
+
+        input[type="password"]:focus,
+        input[type="text"]:focus {
+            border-color: var(--accent);
+        }
+
+        .reveal-btn {
+            position: absolute;
+            right: 0.4rem;
+            top: 50%;
+            transform: translateY(-50%);
+            background: transparent;
+            border: 0;
+            color: var(--muted);
+            font: inherit;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            padding: 0.35rem 0.6rem;
+            cursor: pointer;
+            border-radius: 0.3rem;
+        }
+
+        .reveal-btn:hover { color: var(--text); }
+
+        button.submit {
+            width: 100%;
+            min-height: 3rem;
+            background: var(--accent);
+            color: #1a0f00;
+            border: 0;
+            border-radius: 0.5rem;
+            font-weight: 700;
+            font-size: 1rem;
+            letter-spacing: 0.02em;
+            cursor: pointer;
+            transition: filter 120ms ease, opacity 120ms ease;
+        }
+
+        button.submit:hover:not(:disabled) { filter: brightness(1.06); }
+
+        button.submit:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        .form-error {
+            color: var(--error);
+            font-size: 0.9rem;
+            min-height: 1.1em;
+            text-align: center;
+        }
+
+        .form-help {
+            color: var(--muted);
+            font-size: 0.8rem;
+            line-height: 1.45;
+            margin: 0;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <main class="auth-page">
+        <section class="auth-card" aria-labelledby="title">
+            <div class="auth-brand">
+                <div class="brand-mark" aria-hidden="true">oM</div>
+                <h1 class="brand-word">open<span>Marquee</span></h1>
+            </div>
+
+            <h2 id="title" class="auth-title">Sign in</h2>
+            <p class="auth-subhead">
+                Enter the password you set when this sign was first
+                configured.
+            </p>
+
+            <form data-form="login" novalidate>
+                <div class="field-row">
+                    <label for="password">Password</label>
+                    <div class="input-wrap">
+                        <input id="password"
+                               name="password"
+                               type="password"
+                               autocomplete="current-password"
+                               autocapitalize="off"
+                               autocorrect="off"
+                               spellcheck="false"
+                               required>
+                        <button type="button" class="reveal-btn"
+                                data-reveal-for="password"
+                                aria-label="Show password">Show</button>
+                    </div>
+                </div>
+
+                <button type="submit" class="submit" disabled>Sign in</button>
+                <p class="form-error" data-form-error role="alert" aria-live="polite"></p>
+                <p class="form-help">
+                    Forgot it? An operator with physical access can delete
+                    <code>auth.json</code> from the SD card and run the
+                    welcome flow again to set a new password.
+                </p>
+            </form>
+        </section>
+    </main>
+    <script type="module" src="/dist/login.js"></script>
+</body>
+</html>

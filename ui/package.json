@@ -6,8 +6,8 @@
   "license": "GPL-3.0-or-later",
   "type": "module",
   "scripts": {
-    "dev": "esbuild src/main.js src/welcome.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --splitting --outdir=dist --servedir=. --watch=forever",
-    "build": "esbuild src/main.js src/welcome.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --splitting --minify --outdir=dist && node scripts/copy-ffmpeg-core.mjs",
+    "dev": "esbuild src/main.js src/welcome.js src/set-password.js src/login.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --splitting --outdir=dist --servedir=. --watch=forever",
+    "build": "esbuild src/main.js src/welcome.js src/set-password.js src/login.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js --format=esm --bundle --splitting --minify --outdir=dist && node scripts/copy-ffmpeg-core.mjs",
     "test": "vitest run",
     "e2e": "playwright test",
     "e2e:install": "playwright install chromium"

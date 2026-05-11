@@ -7,6 +7,7 @@ import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { expect } from "@playwright/test";
 import {
+    E2E_AUTH_PATH,
     E2E_CONTENT_ROOT,
     E2E_PLAYLIST_PATH,
     E2E_PREVIEW_PATH,
@@ -32,6 +33,10 @@ export function resetServerState() {
     // dev-only "reseed" endpoint is future work; for now the seed landing
     // is verified by test_seed.py + the smoke e2e below.
     rmSync(E2E_SEED_MARKER_PATH, { force: true });
+    // Batch 20.2: clear the per-run auth.json so each spec starts in
+    // the "auth not configured" state by default. Specs that need a
+    // configured device call `configureAuthInline()` before navigating.
+    rmSync(E2E_AUTH_PATH, { force: true });
     // Pre-seed the captive-portal first-run gate as already-dismissed so
     // the SPA boots straight to the editor instead of the welcome CTA.
     // SystemSettings backfills every other field from its model defaults

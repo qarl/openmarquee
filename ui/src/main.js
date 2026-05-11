@@ -140,6 +140,40 @@ async function fetchResolvedPlaylist(playlistId) {
 async function boot() {
     const root = document.getElementById("app");
 
+    // Batch 20.2 / phase A.2 — auth gate. Probe /api/auth/status to
+    // figure out which boot route applies:
+    //   - configured + valid token in localStorage → continue boot
+    //   - configured + no token → redirect to /login.html
+    //   - not configured → fall through. The first-run welcome card's
+    //     onContinue handler kicks the operator to /set-password.html
+    //     on first boot. If the operator already dismissed the welcome
+    //     card AND their auth.json was wiped, they fall through into
+    //     a broken editor; recovery is to manually visit
+    //     /set-password.html. The intentionally simple semantics here
+    //     keep every existing e2e spec working under
+    //     OPENMARQUEE_DISABLE_AUTH=1 — auto-redirecting to set-password
+    //     on every "auth not configured" load would break them all.
+    // The auth probe is itself whitelisted by AuthMiddleware so it
+    // works pre-set-password.
+    let authStatus = null;
+    try {
+        const r = await fetch("/api/auth/status");
+        if (r.ok) authStatus = await r.json();
+    } catch (err) {
+        // /api/auth/status unreachable — degrade gracefully rather
+        // than locking the operator out. The first-run + boot logic
+        // below still runs against settings; the auth gate just
+        // can't enforce here.
+        console.warn("[boot] auth-status probe failed", err);
+    }
+    const hasToken =
+        typeof localStorage !== "undefined" &&
+        !!localStorage.getItem("openmarquee_auth_token");
+    if (authStatus && authStatus.configured && !hasToken) {
+        window.location.replace("/login.html");
+        return;
+    }
+
     // First-run gate: a freshly-flashed device shows the welcome screen
     // until the operator dismisses it. The flag lives on
     // SystemSettings.ui_first_run_seen so it survives a power cycle.
@@ -156,6 +190,18 @@ async function boot() {
                         ...settings,
                         ui_first_run_seen: true,
                     });
+                    // 20.2: route to set-password if auth isn't
+                    // configured yet (first-boot path). If it IS
+                    // configured by the time we get here, the
+                    // auth-gate check above (which runs BEFORE this
+                    // block) already kicked the operator to /login
+                    // when they had no token. So a configured-status
+                    // here implies the token is present too — fall
+                    // through to the editor reload.
+                    if (authStatus && !authStatus.configured) {
+                        window.location.replace("/set-password.html");
+                        return;
+                    }
                     location.reload();
                 },
             });
