@@ -1,6 +1,6 @@
 {
-  "git_sha": "8090c1973e46d2ca356c3aa3012adb5a0742c3c3",
+  "git_sha": "13a7e09a4c0b3c88c2dcc236d103540d6e6b62bc",
   "pi_model": "Raspberry Pi Zero 2 W Rev 1.0",
-  "vc4_version": "",
-  "blessed_at": "2026-05-11T10:25:20Z"
+  "vc4_version": "6.12.75+rpt-rpi-v8",
+  "blessed_at": "2026-05-11T10:49:07Z"
 }

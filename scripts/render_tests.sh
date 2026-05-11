@@ -163,7 +163,17 @@ GIT_SHA=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "unknown")
 PI_MODEL=$(ssh -q "$TARGET" "tr -d '\0' < /proc/device-tree/model 2>/dev/null" 2>/dev/null || echo "unknown")
 # vc4 driver version comes from `modinfo vc4` -- field "version" if
 # present, else fall back to the kernel version (vc4 ships in-tree).
-VC4_VERSION=$(ssh -q "$TARGET" "modinfo vc4 2>/dev/null | awk '/^version:/{print \$2; exit}' || uname -r" 2>/dev/null || echo "unknown")
+#
+# 17.fix-B: the previous `awk ... || uname -r` didn't fire the
+# fallback when awk's pattern didn't match because awk exits 0 even
+# with no output. Test for empty explicitly. Single-quoted heredoc
+# bypasses local shell interpolation -- $v / awk's $2 stay literal
+# until the remote shell evaluates.
+VC4_VERSION=$(ssh -q "$TARGET" 'bash -s' <<'REMOTE' 2>/dev/null || echo "unknown"
+v=$(modinfo vc4 2>/dev/null | awk '/^version:/{print $2; exit}')
+if [ -n "$v" ]; then echo "$v"; else uname -r; fi
+REMOTE
+)
 BLESSED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 PASS_COUNT=0

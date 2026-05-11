@@ -2879,7 +2879,20 @@ pub fn capture_sb_transition_mid_to_png(
 
         let states_a = motion_states_for_layers(slide_a.id, &layers_a, 0.0);
         let states_b = motion_states_for_layers(slide_b.id, &layers_b, 0.0);
-        let wall_clock_unix = current_unix_seconds();
+        // 17.fix-A: same wall_clock pin as 17.2 applied to
+        // capture_slide_to_png. Motion states pin to tick=0 above,
+        // but wall_clock_unix flows into paint_slide_with_viewport
+        // at lines ~2932/2965 and the motion compositor uses it to
+        // derive phase for time-based effects (ticker horizontal
+        // wrap, blink, etc.). Without pinning wall_clock, a re-run
+        // of `--capture-sb-mid` produces a slightly different PNG
+        // because real-time-since-epoch changes between bless and
+        // diff -- the slide transition at t=0.5 maximally exposes
+        // the drift (TO slide has 5 ticker-motion layers); other
+        // transition kinds accidentally damp it below the 10/255
+        // diff tolerance but the bug is structural. Pin to 0 so
+        // golden captures reproduce bit-identically.
+        let wall_clock_unix: i64 = 0;
 
         // IIFE so cap_fbo / cap_tex (and SCISSOR_TEST state) get
         // unconditional cleanup even when an inner ? aborts mid-
