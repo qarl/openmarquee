@@ -15,6 +15,52 @@ openMarquee captive-portal-first-boot device flow.
 | `cloud-init/meta-data` | Minimal cloud-init metadata (instance-id + seed hostname). |
 | `stage-openmarquee/prerun.sh` | Boilerplate: copy previous stage's rootfs into this stage. |
 
+## Two operator onboarding flows
+
+The Phase B image supports two onboarding paths. Phase C closure ensures
+both actually work on a freshly-flashed device.
+
+### Captive-portal flow (no pre-flash wifi creds)
+
+Operator powers on a Pi without setting wifi at flash time:
+
+1. `system/openmarquee-firstboot.service` fires on first boot. Generates
+   a per-device WPA2 passphrase + MAC-derived SSID
+   (`openMarquee-<HEX>`), writes `/var/openmarquee/wifi.json` (0600),
+   templates `/etc/hostapd/hostapd.conf`, templates SSID/password into
+   `/opt/openmarquee/ui/welcome.html` (with QR code if `qrencode` is
+   installed).
+2. AP comes up; phone joins via the QR scan or by typing the displayed
+   passphrase.
+3. Phone hits `http://192.168.4.1/` → welcome.html → `set-password.html`
+   (Phase A) → operator types admin password.
+4. Operator types their home wifi creds via the UI; backend writes
+   them into `settings.json`.
+
+### Pre-flash flow (operator has wifi creds at build time)
+
+Operator either uses Pi Imager's "set wifi" interface, or sets
+`WPA_ESSID` + `WPA_PASSWORD` in `pi-gen.config` before running
+`scripts/build-image.sh`:
+
+1. Pi-gen bakes `/etc/wpa_supplicant/wpa_supplicant.conf` into the
+   image (with operator-chosen SSID + PSK).
+2. On first boot, `openmarquee-firstboot.service` runs `chmod 644
+   /etc/wpa_supplicant/wpa_supplicant.conf` so the openmarquee service
+   user can read it (Phase C closure -- pi-gen ships the file 600
+   root:root by default).
+3. The device joins the operator's wifi via wpa_supplicant.
+4. On first GET `/api/settings`, `backend/openmarquee/wifi_prefill.py`
+   shells out to `iwgetid -r` (from `wireless-tools`, also Phase C in
+   pi-gen's 00-packages) to confirm the active SSID, then parses the
+   wpa_supplicant.conf to extract the PSK, and folds both into
+   `settings.json`. UI shows them pre-filled -- operator just
+   confirms instead of re-typing.
+
+Both flows converge on the same end-state: wifi creds in settings.json,
+admin password set, device on operator's home wifi + AP up for
+re-onboarding if needed.
+
 ## How to build an image
 
 ```bash
