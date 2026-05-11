@@ -155,6 +155,16 @@ FIXTURES=(
     "bg_pattern_stripes|slide|f0000000-0000-4000-8000-000000000004|$PI_FIXTURE_ROOT"
     "bg_pattern_rings|slide|f0000000-0000-4000-8000-000000000005|$PI_FIXTURE_ROOT"
     "bg_pattern_confetti|slide|f0000000-0000-4000-8000-000000000006|$PI_FIXTURE_ROOT"
+    # --- 18.6 / sweep #9 N7: auto_mode dynamic-layer golden ---
+    # auto_mode=time/date/day layers regenerate text per-tick from
+    # the renderer's wall_clock_unix. The animated_slide TYPE
+    # (17.2's --capture-slide-at-tick) already pins wall_clock to 0
+    # when tick override is set, so this fixture captures at
+    # wall_clock=epoch (Thu Jan 1 1970 UTC) and the auto_mode=date
+    # layer renders that. Deterministic + reproducible.
+    # No new renderer flag needed -- 17.2's plumbing already
+    # forces auto_mode evaluation through a pinned wall_clock.
+    "auto_mode_date|animated_slide|f0000000-0000-4000-8000-000000000007,0.0|$PI_FIXTURE_ROOT"
 )
 
 echo "==> deploying binary to $TARGET:$BIN_PI"
