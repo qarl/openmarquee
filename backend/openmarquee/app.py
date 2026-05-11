@@ -1,5 +1,6 @@
 """FastAPI application that runs on the device."""
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -38,6 +39,37 @@ from openmarquee.perf_middleware import PerfMiddleware
 from openmarquee.seed import seed_if_needed
 
 
+log = logging.getLogger(__name__)
+
+
+def _configure_logging() -> None:
+    """Set the root logger format + level for the device process.
+
+    16.2 / sweep #8 A1: replace the bare uvicorn default (no
+    timestamp, no module name, opaque "INFO:") with a timestamped
+    structured-ish line that survives journalctl tailing. Level
+    comes from OPENMARQUEE_LOG_LEVEL env (default INFO) so an
+    operator can flip to DEBUG without code edit. Noisy third-party
+    libs get explicitly silenced -- aiortc + httpx are chattiest
+    at INFO and aren't useful for openMarquee-side debugging.
+    """
+    level_name = os.environ.get("OPENMARQUEE_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        level=level,
+        # If a previous uvicorn entry installed handlers (it does),
+        # force=True replaces them so our format wins.
+        force=True,
+    )
+    # Silence chatty deps at INFO; their WARNING+ still surfaces.
+    for noisy in ("aiortc", "httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_configure_logging()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Startup: first-boot seed + auto-start playback. Shutdown: stop."""
@@ -61,9 +93,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             )
         except Exception:
             # Seeding is nice-to-have; never block startup on it.
-            import logging
-
-            logging.getLogger(__name__).exception("startup seed failed")
+            log.exception("startup seed failed")
 
     # Prune playlist refs that no longer resolve to stored content. Catches
     # the "dev-wiped content/ but left playlist.json intact" class of bug
@@ -73,15 +103,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         valid_ids = {item.id for item in get_content_storage().list_all()}
         pruned = get_playlist_storage().prune_dangling_refs(valid_ids)
         if pruned:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "startup: pruned %d dangling playlist item_id(s)", pruned
-            )
+            log.warning("startup: pruned %d dangling playlist item_id(s)", pruned)
     except Exception:
-        import logging
-
-        logging.getLogger(__name__).exception("startup playlist prune failed")
+        log.exception("startup playlist prune failed")
 
     # Open the production renderer if it's a context manager (DRMRenderer
     # acquires the DRM master fd, allocates the dumb buffer, and mode-sets
@@ -94,11 +118,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             renderer.__enter__()
         except Exception:
-            import logging
-
-            logging.getLogger(__name__).exception(
-                "startup: renderer __enter__ failed; degrading to mock"
-            )
+            log.exception("startup: renderer __enter__ failed; degrading to mock")
             # Force the singleton to swap to mock for the rest of the
             # process lifetime so the playback loop has a working target.
             # The next get_playback_loop() resolution will go through
@@ -121,9 +141,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             await get_playback_loop().start()
         except Exception:
-            import logging
-
-            logging.getLogger(__name__).exception("startup playback autostart failed")
+            log.exception("startup playback autostart failed")
 
     # Flock pull worker — periodic reliability backstop that reconciles
     # against sync=True peers even when pushes get dropped. Tests can
@@ -133,9 +151,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             await get_pull_worker().start()
         except Exception:
-            import logging
-
-            logging.getLogger(__name__).exception("startup pull worker autostart failed")
+            log.exception("startup pull worker autostart failed")
     yield
     # Tear down any active stream session BEFORE the playback loop stops
     # so the session's close() can resume() the loop cleanly even though

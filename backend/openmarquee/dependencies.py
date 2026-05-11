@@ -4,6 +4,7 @@ Centralizes how API routes get their collaborators so tests can override them
 via app.dependency_overrides and the production wiring stays in one place.
 """
 
+import logging
 import os
 import socket
 import tempfile
@@ -19,6 +20,8 @@ from openmarquee.rendering.mock import MockRenderer
 from openmarquee.schedule import ScheduleStorage
 from openmarquee.settings import SettingsStorage
 from openmarquee.tombstone import TombstoneStorage
+
+log = logging.getLogger(__name__)
 
 
 def _resolve_content_root() -> Path:
@@ -69,9 +72,6 @@ def _real_renderer_singleton():
     frame. lru_cache lifts construction out of the hot path; the
     singleton holds for the process lifetime.
     """
-    import logging
-    log = logging.getLogger(__name__)
-
     override = os.environ.get("OPENMARQUEE_RENDERER", "auto").lower()
     if override == "mock":
         return _mock_renderer_singleton()
