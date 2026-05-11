@@ -27,15 +27,23 @@ if ! ip link show "$AP_IFACE" >/dev/null 2>&1; then
 fi
 
 # 2. Give ap0 a locally-administered MAC distinct from wlan0's. Two
-#    virtual interfaces on the same radio can't share a MAC; flipping the
-#    locally-administered bit on wlan0's MAC is the canonical choice.
+#    virtual interfaces on the same radio can't share a MAC; flipping
+#    the locally-administered bit on wlan0's MAC is the canonical
+#    choice (RFC: bit 0x02 of the first octet signals "this MAC was
+#    not assigned by the IEEE OUI registry"). 19.4 / sweep #10 #9:
+#    the previous code did `m[0] |= 0x02; m[0] ^= 0x02` which is a
+#    no-op when the bit was already 0. Wlan0's onboard MAC has bit
+#    0x02 clear (it IS IEEE-assigned), so the previous code left
+#    bit 0x02 clear too -- the new MAC was still "globally unique"
+#    in the IEEE sense, and most kernels accept it anyway since
+#    only the bit-1 multicast flag is rejected, but the intent of
+#    the script was always "set the LA bit" and the code didn't.
 WLAN0_MAC=$(cat /sys/class/net/"$PHY_IFACE"/address)
 AP0_MAC=$(python3 -c "
 import sys
 m = [int(o, 16) for o in sys.argv[1].split(':')]
-m[0] |= 0x02   # locally administered
-m[0] ^= 0x02   # … then flip back, then differ in a lower octet
-m[5] ^= 0x01
+m[0] |= 0x02   # set locally-administered bit (RFC 802; was a no-op before 19.4)
+m[5] ^= 0x01   # differ from wlan0 in last octet so the two MACs aren't identical
 print(':'.join(f'{o:02x}' for o in m))
 " "$WLAN0_MAC")
 ip link set dev "$AP_IFACE" address "$AP0_MAC"

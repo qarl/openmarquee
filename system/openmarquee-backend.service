@@ -72,6 +72,18 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# 19.4 / sweep #10 #8 -- systemd hardening defaults. Safe to enable;
+# none of these conflict with the FastAPI + DRM + Tailscale flow.
+# MemoryDenyWriteExecute deliberately excluded: it would block the
+# renderer's mmap+GL surfaces (CMA-backed dumb buffers + GLES2
+# shader-program upload). Revisit after the renderer Rust rewrite
+# settles.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
 # /var/openmarquee is not a StateDirectory= target (that would create
 # /var/lib/openmarquee); the install docs + Phase 9 image builder
 # pre-create /var/openmarquee so `ReadWritePaths` has an existing dir
