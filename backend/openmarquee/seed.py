@@ -346,97 +346,13 @@ def _seed_bundled_videos(storage: ContentStorage, directory: Path) -> list[Video
     return created
 
 
-# --- Welcome playlist ---
-
-# Legacy two-color fallback (used when bundled backgrounds aren't present
-# and we can't composite a real image). High contrast + warm feel.
+# Fallback colors for the text-slide raster path when no bundled
+# background is present and we can't composite a real image. High
+# contrast + warm feel. (Pre-2026-05-04 these doubled as the Welcome
+# trio's bg + fg defaults; post-reel-collapse they're used by
+# render_text_slide_png / _draw_text_into as the no-image fallback.)
 WELCOME_TEXT_COLOR = "#FFFFFF"
 WELCOME_BG_COLOR = "#0A3D4A"
-
-
-# Three-slide intro: each slide pairs a bundled background with a
-# distinct font + transition so the demo shows off the editor's range
-# the moment the device boots. Background lookups are by *base name*
-# of the bundled file (chalkboard.png → "Chalkboard"); the seed only
-# wires a slide if the matching background was successfully seeded.
-@dataclass
-class _WelcomeSlideSpec:
-    text: str
-    font_family: str  # matches editor.js FONT_FAMILIES
-    text_color: str
-    background_filename_stem: str  # e.g. "chalkboard"
-    transition_out: str  # transition to play after this slide
-
-
-_WELCOME_SPECS: tuple[_WelcomeSlideSpec, ...] = (
-    _WelcomeSlideSpec(
-        text="Welcome",
-        # qarl 2026-04-29 (B8): hand-lettered, schoolyard-chalk vibe.
-        font_family="Reenie Beanie",
-        text_color="#FFFFFF",
-        background_filename_stem="chalkboard",
-        transition_out="fade",
-    ),
-    _WelcomeSlideSpec(
-        text="to",
-        # qarl 2026-04-29 (B9): heavy marker stroke that reads against brick.
-        font_family="Permanent Marker",
-        text_color="#000000",
-        background_filename_stem="brick-wall",
-        transition_out="wipe",
-    ),
-    _WelcomeSlideSpec(
-        text="openMarquee",
-        # qarl 2026-04-29 (B10): wispy hand-drawn glow against midnight.
-        font_family="Shadows Into Light",
-        # Amber from the marketing site — reads as "neon at night" on midnight bg.
-        text_color="#F5A524",
-        background_filename_stem="midnight",
-        transition_out="iris",
-    ),
-)
-
-
-_WELCOME_PLAYLIST_TEXTS: tuple[str, ...] = tuple(s.text for s in _WELCOME_SPECS)
-
-
-# Three protest-poster-style slides that play on Friday nights via the
-# scheduled rule (see _seed_friday_freedom_rule). Reuse _WelcomeSlideSpec
-# since the shape is identical — text, font, color, bg stem, transition
-# out. Bold display fonts on punchy backgrounds; short duration for a
-# chant-like cadence. "FREE / YOUR / SIGN" — the openMarquee
-# project's free-your-sign ethos in three hits.
-_FREEDOM_SPECS: tuple[_WelcomeSlideSpec, ...] = (
-    _WelcomeSlideSpec(
-        text="FREE",
-        font_family="Bowlby One SC",
-        text_color="#FFFFFF",
-        background_filename_stem="stained-glass",
-        transition_out="cut",
-    ),
-    _WelcomeSlideSpec(
-        text="YOUR",
-        font_family="Archivo Black",
-        text_color="#FFFFFF",
-        background_filename_stem="sunset-gradient",
-        transition_out="wipe",
-    ),
-    _WelcomeSlideSpec(
-        text="SIGN",
-        font_family="Alfa Slab One",
-        text_color="#F5A524",
-        background_filename_stem="midnight",
-        transition_out="iris",
-    ),
-)
-# Shorter than the Welcome cadence — short declarative words read better
-# at chant speed than slow contemplation. 10-minute Friday window plays
-# this loop ~130 times.
-_FREEDOM_DURATION_MS = 1500
-# Display name for the Freedom playlist. Schedule rule references the
-# playlist by UUID (assigned at seed time), so this name is purely for
-# the operator's UI — they can rename without breaking the rule.
-FREEDOM_PLAYLIST_NAME = "Freedom"
 
 
 # ─── FREE YOUR SIGN demo reel ────────────────────────────────
@@ -1451,9 +1367,9 @@ def render_text_slide_png(
 ) -> bytes:
     """Flatten a single text+box onto a PNG.
 
-    Single-layer rendering — used by the seed path's _seed_text_slide_set
-    + the test_rerender single-text fixtures. The new layered compositor
-    is `render_layered_text_slide_png` (§5.10a v3); both share the
+    Single-layer rendering -- used by the test_rerender single-text
+    fixtures + render_welcome_png. The layered compositor is
+    `render_layered_text_slide_png` (§5.10a v3); both share the
     `_draw_text_into` helper so squish + box-centering stay consistent.
     """
     if background_image_path is not None and background_image_path.exists():
@@ -1675,91 +1591,6 @@ def _load_text_font(family: str | None, size_px: int):
             return ImageFont.load_default()
 
 
-def _seed_text_slide_set(
-    storage: ContentStorage,
-    specs: tuple[_WelcomeSlideSpec, ...],
-    width: int,
-    height: int,
-    duration_ms: int,
-    bundled_backgrounds_dir: Path | None = None,
-    bundled_bg_slides: list[ImageSlide] | None = None,
-) -> list[TextSlide]:
-    """Render + save a batch of TextSlides matching the given specs.
-
-    Each spec pairs a font, color, and bundled-background filename stem.
-    When the matching background is present we composite it into the
-    rasterized PNG AND wire the TextSlide's `background_image_slide_id`
-    to the seeded ImageSlide so the operator can re-edit without losing
-    the background. Falls back to a solid color when the bundled asset
-    is missing.
-
-    Used to seed both the Welcome and Freedom playlists' text slides
-    from their respective spec tuples.
-    """
-    bg_dir = bundled_backgrounds_dir or _default_bundled_backgrounds_dir()
-    # Bundled image slides are named "<Title> — Background" — index by
-    # the same filename stem each spec references for an O(1) lookup.
-    bg_slides_by_stem: dict[str, ImageSlide] = {}
-    for slide in bundled_bg_slides or ():
-        for cand in bg_dir.iterdir() if bg_dir.is_dir() else ():
-            if _name_from_filename(cand.stem) == slide.name:
-                bg_slides_by_stem[cand.stem] = slide
-                break
-
-    slides: list[TextSlide] = []
-    font_size_px = max(12, int(height * 0.4))
-    for spec in specs:
-        bg_path = bg_dir / f"{spec.background_filename_stem}.png"
-        bg_image_slide = bg_slides_by_stem.get(spec.background_filename_stem)
-        png = render_text_slide_png(
-            spec.text,
-            width,
-            height,
-            fg=spec.text_color,
-            bg=WELCOME_BG_COLOR,
-            background_image_path=bg_path if bg_path.exists() else None,
-            font_family=spec.font_family,
-        )
-        slide = TextSlide(
-            name=spec.text,
-            background_color=WELCOME_BG_COLOR,
-            duration_ms=duration_ms,
-            background_image_slide_id=bg_image_slide.id if bg_image_slide else None,
-            text_layers=[
-                TextLayer(
-                    text=spec.text,
-                    text_color=spec.text_color,
-                    font_family=spec.font_family,
-                    font_size_px=font_size_px,
-                ),
-            ],
-        )
-        storage.save_text_slide(slide, png)
-        slides.append(slide)
-    return slides
-
-
-def _seed_welcome_playlist_slides(
-    storage: ContentStorage,
-    width: int,
-    height: int,
-    bundled_backgrounds_dir: Path | None = None,
-    bundled_bg_slides: list[ImageSlide] | None = None,
-) -> list[TextSlide]:
-    """Render the three intro text slides for the default playlist.
-    Thin wrapper over _seed_text_slide_set for backwards-compat with
-    older callers (tests). 3000ms cadence for contemplative reading."""
-    return _seed_text_slide_set(
-        storage,
-        _WELCOME_SPECS,
-        width,
-        height,
-        duration_ms=3000,
-        bundled_backgrounds_dir=bundled_backgrounds_dir,
-        bundled_bg_slides=bundled_bg_slides,
-    )
-
-
 def _seed_demo_video_if_available(
     storage: ContentStorage,
     demo_video_path: Path | None,
@@ -1799,42 +1630,6 @@ def _seed_demo_video_if_available(
     except Exception:
         logger.exception("seed: failed to seed demo video from %s", path)
         return None
-
-
-def _seed_friday_freedom_rule(schedule_storage, freedom_playlist_id) -> None:
-    """Write the Friday 20:00-20:10 → Freedom rule into a fresh schedule.
-
-    Only runs on a fresh-install seed (alongside the rest of the seed
-    flow), so the operator's existing schedule rules are never touched.
-    The default fallback stays at DEFAULT_PLAYLIST_ID (Welcome) — a
-    Schedule with no rules also falls back there, so the default
-    behavior at every other time is "play Welcome."
-
-    Re-running seed (after the marker is deleted AND content is wiped)
-    creates a new Freedom playlist with a fresh uuid4 and writes a
-    matching new rule. Any stale schedule from a prior seed run that
-    happens to remain on disk would point at the OLD Freedom UUID and
-    route to a missing playlist — the playback engine treats that as
-    empty and falls through to the default. Not a correctness bug,
-    just a curiosity of the marker-deletion escape hatch.
-    """
-    from openmarquee.playlist import DEFAULT_PLAYLIST_ID
-    from openmarquee.schedule import Schedule, ScheduleRule
-
-    schedule = Schedule(
-        rules=[
-            ScheduleRule(
-                name="Freedom Friday",
-                days=["fri"],
-                start_time="20:00",
-                end_time="20:10",
-                playlist_id=freedom_playlist_id,
-                enabled=True,
-            ),
-        ],
-        default_playlist_id=DEFAULT_PLAYLIST_ID,
-    )
-    schedule_storage.save(schedule)
 
 
 def _write_marker(path: Path, *, created: int, reason: str) -> None:
