@@ -442,7 +442,11 @@ def _parse_airport_scan(output: str) -> list[WifiNetwork]:
         m = bssid.search(line)
         if not m:
             continue
-        ssid = line[: m.start()].rstrip()
+        # strip() (not rstrip): airport pads SSID column with
+        # leading whitespace for alignment. Sweep #3 / 9.1: tests
+        # caught that the original rstrip-only preserved leading
+        # spaces, producing UI-visible SSIDs like "       HomeNet".
+        ssid = line[: m.start()].strip()
         if not ssid:
             continue
         rest = line[m.end():].split()
