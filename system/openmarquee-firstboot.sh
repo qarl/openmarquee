@@ -181,6 +181,25 @@ else
 fi
 rm -f "${WELCOME_HTML}.bak"
 
+# --- 5b. Widen wpa_supplicant.conf read access for wifi-prefill --------------
+
+# Phase C closure: backend/openmarquee/wifi_prefill.py reads
+# /etc/wpa_supplicant/wpa_supplicant.conf to fold pre-flash SSID/PSK
+# into settings.json on first GET /api/settings. pi-gen lays the file
+# down 600 root:root; the openmarquee service user can't read it. Widen
+# to 644 here so the prefill works without operator intervention.
+#
+# Safe: file contents are pi-gen-baked at build time (operator chose
+# WPA_ESSID + WPA_PASSWORD when generating the image). The passphrase
+# is already in /etc/hostapd/hostapd.conf (also 644-readable by design)
+# and in /var/openmarquee/wifi.json (0600). 644 on wpa_supplicant.conf
+# matches the symmetry of the AP creds path.
+WPA_CONF="${ROOT_PREFIX}/etc/wpa_supplicant/wpa_supplicant.conf"
+if [ -f "$WPA_CONF" ]; then
+    say "Widening $WPA_CONF to 644 for wifi-prefill read access"
+    chmod 644 "$WPA_CONF" || true
+fi
+
 # --- 6. Touch bootstrap marker ----------------------------------------------
 
 say "Marking device as bootstrapped"

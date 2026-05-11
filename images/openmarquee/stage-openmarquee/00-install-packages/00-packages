@@ -13,4 +13,5 @@ ca-certificates
 cloud-init
 wireless-regdb
 iw
+wireless-tools
 wpasupplicant

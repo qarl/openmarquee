@@ -124,6 +124,11 @@ def test_config_locale_is_utf8(config: dict[str, str]) -> None:
         ("wpasupplicant", "station-mode wlan0 WiFi join"),
         ("iw", "ap0 virtual-interface creation"),
         ("cloud-init", "B.2 first-boot config; not in Pi OS Lite default"),
+        (
+            "wireless-tools",
+            "Phase C: wifi_prefill.py shells out to iwgetid which lives "
+            "in wireless-tools (NOT iw -- different package, modern vs legacy)",
+        ),
     ],
 )
 def test_packages_includes_runtime_essential(

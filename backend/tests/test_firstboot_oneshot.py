@@ -227,6 +227,46 @@ def test_bootstrap_marker_touched(fakefs: Path) -> None:
     assert (fakefs / "var" / "openmarquee" / ".bootstrapped").exists()
 
 
+def test_widens_wpa_supplicant_conf_for_wifi_prefill(fakefs: Path) -> None:
+    """Phase C closure: pi-gen lays /etc/wpa_supplicant/wpa_supplicant.conf
+    as 600 root:root by default. The openmarquee service user can't read
+    it, so wifi_prefill.py's pre-fill of settings.json fails silently.
+    Oneshot widens the file to 644 so the prefill works without operator
+    chmod. Safe: contents are pi-gen-baked at image build, AP-side hostapd
+    + wifi.json are already on the same trust tier."""
+    wpa_dir = fakefs / "etc" / "wpa_supplicant"
+    wpa_dir.mkdir(parents=True, exist_ok=True)
+    wpa_conf = wpa_dir / "wpa_supplicant.conf"
+    # Match the pi-gen default: 600 root:root with operator's pre-flash creds.
+    wpa_conf.write_text(
+        "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n"
+        "country=US\n"
+        "update_config=1\n"
+        'network={\n  ssid="pikazo"\n  psk="Picasso!"\n}\n'
+    )
+    wpa_conf.chmod(0o600)
+
+    _run_oneshot(fakefs)
+
+    mode = wpa_conf.stat().st_mode & 0o777
+    assert mode == 0o644, f"expected 0644 after oneshot, got 0{mode:o}"
+    # Content preserved -- chmod doesn't corrupt. wifi_prefill.py:129-140
+    # documents the operator hint that closes the loop on the read-side.
+    content = wpa_conf.read_text()
+    assert "pikazo" in content
+    assert "Picasso!" in content
+
+
+def test_skips_wpa_widen_when_file_absent(fakefs: Path) -> None:
+    """If pi-gen didn't lay wpa_supplicant.conf (operator built the image
+    without WPA_ESSID), the chmod step must NOT fail the oneshot. wifi-
+    prefill returns None silently; that's the absent-creds path."""
+    wpa_conf = fakefs / "etc" / "wpa_supplicant" / "wpa_supplicant.conf"
+    assert not wpa_conf.exists()
+    _run_oneshot(fakefs)
+    assert not wpa_conf.exists()
+
+
 def test_second_run_reuses_wifi_json(fakefs: Path) -> None:
     """Idempotency: if wifi.json exists, re-use the SSID + passphrase
     rather than regenerating. Protects against interrupted runs and
