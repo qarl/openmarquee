@@ -15,24 +15,24 @@ openMarquee captive-portal-first-boot device flow.
 | `cloud-init/meta-data` | Minimal cloud-init metadata (instance-id + seed hostname). |
 | `stage-openmarquee/prerun.sh` | Boilerplate: copy previous stage's rootfs into this stage. |
 
-What's NOT here (yet):
-- **B.4 first-boot oneshot** — generates the AP password + QR code on
-  first boot, templates into welcome.html, closes sweep #5 #2.
-- **B.5 welcome.html flow integration** — AP password + QR code shown
-  on the captive-portal landing screen.
-- **B.6 build artifact + flash script** — `scripts/build-image.sh` and
-  `scripts/flash-sd.sh` wrappers.
-
-## How to build an image (when B.6 lands)
+## How to build an image
 
 ```bash
-bash scripts/build-image.sh
-# → drops /tmp/openmarquee-pi-image-<date>.img
+bash scripts/build-image.sh --ssh-key ~/.ssh/id_ed25519.pub
+# → drops /tmp/openmarquee-pi-image-<date>.img.xz
 ```
 
-## How to build an image manually (until B.6 lands)
+Phase B legs landed:
+- B.1: pi-gen config (this directory)
+- B.2: cloud-init user-data (cloud-init/)
+- B.3: scripts/install.sh on-device provisioning
+- B.4: system/openmarquee-firstboot.{service,sh} per-device AP password
+- B.5: install.sh re-runs firstboot.sh on redeploy (welcome.html re-template)
+- B.6: scripts/build-image.sh + scripts/flash-sd.sh wrappers (this leg)
 
-Until B.6 is in place, you can drive pi-gen directly:
+## How to build an image manually (without scripts/build-image.sh)
+
+You can drive pi-gen directly if needed:
 
 ```bash
 # 1. Clone pi-gen alongside the openMarquee repo
