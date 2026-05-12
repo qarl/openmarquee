@@ -217,6 +217,39 @@ def test_flash_refuses_device_mapper_devices(tmp_path: Path) -> None:
         )
 
 
+def test_flash_partition_to_parent_disk_regex_handles_nvme_and_mmcblk() -> None:
+    """Task #382: Guard 3's partition-to-parent-disk regex must handle
+    the NVMe (`nvme0n1p2`) and mmcblk (`mmcblk0p2`) naming conventions,
+    not just SATA-style (`sda2`). The prior regex `s/[0-9]+$//` stripped
+    only digits, so a partition path like `/dev/nvme0n1p2` derived a
+    bogus parent `/dev/nvme0n1p` -- not matching the operator's `$DEVICE`
+    of `/dev/nvme0n1` -- so the system-disk refusal silently missed on
+    NVMe hosts. Guard 3b's mounted-fs check caught the actual exploit
+    surface, but Guard 3 itself was lying. Fix: `s/p?[0-9]+$//`."""
+    cases = [
+        ("/dev/sda2", "/dev/sda"),
+        ("/dev/sda10", "/dev/sda"),
+        ("/dev/nvme0n1p2", "/dev/nvme0n1"),
+        ("/dev/nvme1n2p15", "/dev/nvme1n2"),
+        ("/dev/mmcblk0p2", "/dev/mmcblk0"),
+        ("/dev/mmcblk1p1", "/dev/mmcblk1"),
+        # Passthrough: a bare device path with no partition suffix
+        # stays unchanged. findmnt always returns a partition path for
+        # `/` on a partitioned root, so this isn't load-bearing in
+        # practice -- but verifies the regex doesn't overreach.
+        ("/dev/sda", "/dev/sda"),
+    ]
+    for partition, expected_parent in cases:
+        result = subprocess.run(
+            ["sed", "-E", "s/p?[0-9]+$//"],
+            input=partition, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert result == expected_parent, (
+            f"regex misderived parent for {partition!r}: "
+            f"got {result!r}, expected {expected_parent!r}"
+        )
+
+
 def test_flash_supports_yes_to_skip_prompt(tmp_path: Path) -> None:
     """--yes skips the typed-confirmation prompt. Useful in CI but the
     spirit of the safety guards still holds (size + system-disk checks

@@ -122,9 +122,18 @@ esac
 
 case "$UNAME" in
     Linux)
-        # Find the disk holding /. Sample: /dev/sda2 -> /dev/sda.
+        # Find the disk holding /. Examples (the regex must handle all):
+        #   /dev/sda2       -> /dev/sda       (SATA/SAS/SCSI/USB)
+        #   /dev/nvme0n1p2  -> /dev/nvme0n1   (NVMe)
+        #   /dev/mmcblk0p2  -> /dev/mmcblk0   (eMMC / SD card)
+        # The 'p?' optional prefix handles the NVMe/mmcblk convention
+        # where partition N is suffixed `pN` (vs SATA's bare `N`).
+        # Task #382 fix: the prior regex `s/[0-9]+$//` stripped only
+        # digits, leaving `/dev/nvme0n1p` (with trailing `p`) instead
+        # of `/dev/nvme0n1`. Guard 3b's mounted-fs check caught the
+        # actual hazard, but Guard 3 itself was lying to operators.
         ROOT_SRC=$(findmnt -no SOURCE /)
-        ROOT_DISK=$(echo "$ROOT_SRC" | sed -E 's/[0-9]+$//')
+        ROOT_DISK=$(echo "$ROOT_SRC" | sed -E 's/p?[0-9]+$//')
         if [ "$DEVICE" = "$ROOT_DISK" ]; then
             fatal "REFUSED: $DEVICE is the system disk (holds /)"
         fi
