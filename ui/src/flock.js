@@ -60,9 +60,9 @@ const SECTION_TEMPLATE = `
         <p class="flock-status" role="status" aria-live="polite"></p>
     </section>
 
-    <dialog class="flock-modal">
+    <dialog class="flock-modal" aria-labelledby="flock-modal-title">
         <form method="dialog" class="flock-modal-form">
-            <h3>Add device</h3>
+            <h3 id="flock-modal-title">Add device</h3>
             <div class="flock-discover-section" hidden>
                 <p class="flock-discover-label">On your Tailnet:</p>
                 <ul class="flock-discover-list"></ul>

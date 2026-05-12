@@ -18,7 +18,11 @@
 // panel), drag-reorderable; the box overlay attaches to the focused
 // (selected) layer.
 
-import Sortable from "sortablejs";
+// Batch 12.x: sortablejs is lazy-imported in bindLayerSortable() below,
+// matching the pattern in playlist-track.js. Two static imports + a
+// dynamic import would have prevented esbuild from deduping the chunk
+// across the editor + playlist bundles; lazy here lets esbuild collapse
+// the dep into a single shared chunk.
 
 import { attachAutoSave } from "./auto-save.js";
 import {
@@ -1114,7 +1118,10 @@ export function mountEditor(
         updateDeleteButtonAvailability();
         updateLayersCountEyebrow();
         positionBoxOverlay();
-        bindLayerSortable();
+        // Fire-and-forget; .catch swallows any dynamic-chunk-fetch
+        // failure (network blip) instead of surfacing as an unhandled
+        // promise rejection in the operator's console.
+        bindLayerSortable().catch(() => {});
         // After a wholesale rebuild (loadForEdit / addLayer / delete /
         // reorder), the layer set may have changed — re-evaluate
         // whether the motion rAF loop should be running.
@@ -1157,7 +1164,27 @@ export function mountEditor(
         }
     }
 
-    function bindLayerSortable() {
+    let sortableBindGeneration = 0;
+    async function bindLayerSortable() {
+        // Batch 12.x: lazy-import to share the sortablejs chunk with
+        // playlist-track.js. Renderer renderLayers() doesn't await this
+        // -- the binder is fire-and-forget; if the user grabs a layer
+        // handle before the chunk resolves, the drag is a no-op for
+        // that one attempt (~30ms cold path on slow networks).
+        //
+        // Generation guard: if renderLayers re-runs (delete/reorder/
+        // addLayer) while a prior bindLayerSortable() await is in
+        // flight, we'd otherwise create a stale Sortable instance that
+        // leaks (the second destroy() ran against null). Compare
+        // generation before assigning; bail if stale.
+        //
+        // Note: layersListEl is mount-stable (captured once at
+        // mountEditor; renderLayers uses innerHTML="" rather than
+        // replacing the node), so the create-after-resolve targets the
+        // same DOM element across rebuilds.
+        const myGeneration = ++sortableBindGeneration;
+        const { default: Sortable } = await import("sortablejs");
+        if (myGeneration !== sortableBindGeneration) return;
         layerSortable = Sortable.create(layersListEl, {
             handle: ".editor-layer-handle",
             animation: 150,
