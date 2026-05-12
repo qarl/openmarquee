@@ -154,11 +154,12 @@ async def _capture_with_server(playwright, fixtures, capture_dir: Path, port: in
         if fx["kind"] == "single":
             item = load_item(fx["uuid"])
             params = {"kind": "single", "item": item, "tick": fx["tick"]}
-        elif fx["kind"] == "transition_fade_mid":
+        elif fx["kind"] == "transition_mid":
             from_item = load_item(fx["from_uuid"])
             to_item = load_item(fx["to_uuid"])
             params = {
-                "kind": "transition_fade_mid",
+                "kind": "transition_mid",
+                "transition": fx["transition"],
                 "fromItem": from_item,
                 "toItem": to_item,
                 "transitionT": fx["transition_t"],

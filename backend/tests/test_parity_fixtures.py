@@ -26,7 +26,8 @@ REQUIRED_TOP_KEYS = {"schema_version", "defaults", "fixtures"}
 REQUIRED_DEFAULTS = {"ssim_min", "max_delta_max"}
 REQUIRED_FIXTURE_KEYS = {"name", "kind", "golden", "purpose"}
 SINGLE_KEYS = {"uuid", "tick"}
-TRANSITION_FADE_MID_KEYS = {"from_uuid", "to_uuid", "transition_t"}
+TRANSITION_MID_KEYS = {"transition", "from_uuid", "to_uuid", "transition_t"}
+TRANSITION_NAMES = {"cut", "fade", "wipe", "slide", "scroll", "pixelate"}
 
 
 @pytest.fixture(scope="module")
@@ -65,14 +66,18 @@ def test_kind_specific_fields(spec):
             assert not missing, (
                 f"single fixture {fx['name']!r} missing: {missing}"
             )
-        elif fx["kind"] == "transition_fade_mid":
-            missing = TRANSITION_FADE_MID_KEYS - set(fx)
+        elif fx["kind"] == "transition_mid":
+            missing = TRANSITION_MID_KEYS - set(fx)
             assert not missing, (
                 f"transition fixture {fx['name']!r} missing: {missing}"
             )
             t = fx["transition_t"]
             assert 0.0 <= t <= 1.0, (
                 f"{fx['name']}: transition_t {t} not in [0,1]"
+            )
+            assert fx["transition"] in TRANSITION_NAMES, (
+                f"{fx['name']}: transition {fx['transition']!r} "
+                f"not in {sorted(TRANSITION_NAMES)}"
             )
         else:
             pytest.fail(f"{fx['name']}: unknown kind {fx['kind']!r}")
@@ -86,7 +91,7 @@ def test_fixture_uuids_reference_existing_item_json(spec):
         uuids = []
         if fx["kind"] == "single":
             uuids.append(fx["uuid"])
-        elif fx["kind"] == "transition_fade_mid":
+        elif fx["kind"] == "transition_mid":
             uuids.extend([fx["from_uuid"], fx["to_uuid"]])
         for u in uuids:
             item_path = FIXTURE_DIR / u / "item.json"

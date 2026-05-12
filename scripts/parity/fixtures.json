@@ -39,13 +39,72 @@
             "purpose": "Multi-layer with overlay blend. Canvas globalCompositeOperation vs GLES2 blend math."
         },
         {
-            "name": "parity_transition_mid",
-            "kind": "transition_fade_mid",
+            "name": "parity_motion_compound",
+            "kind": "single",
+            "uuid": "99c11690-415b-40f6-8e3c-6491f3bdf60e",
+            "tick": 0.5,
+            "golden": "animated_multi_chaos",
+            "purpose": "4-layer compound motion (blink+shake+pulse+bounce) at tick 0.5. Different motion mix than parity_motion_ticker; surfaces multi-motion-phase drift."
+        },
+        {
+            "name": "parity_transition_fade",
+            "kind": "transition_mid",
+            "transition": "fade",
             "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
             "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "transition_t": 0.5,
             "golden": "transition_mid_fade",
-            "purpose": "Cross-fade midpoint. Per-pixel (1-t)·from + t·to in browser vs Rust FS_FADE. Other transitions land in commit 3."
+            "purpose": "Cross-fade midpoint. JS per-pixel (1-t)·A + t·B vs Rust FS_FADE."
+        },
+        {
+            "name": "parity_transition_cut",
+            "kind": "transition_mid",
+            "transition": "cut",
+            "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+            "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+            "transition_t": 0.5,
+            "golden": "transition_mid_cut",
+            "purpose": "Cut midpoint (t=0.5 picks B). Single-side-sample vs Rust FS_CUT_B."
+        },
+        {
+            "name": "parity_transition_wipe",
+            "kind": "transition_mid",
+            "transition": "wipe",
+            "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+            "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+            "transition_t": 0.5,
+            "golden": "transition_mid_wipe",
+            "purpose": "Horizontal wipe midpoint. mask = step(uv.x, t) per-pixel vs Rust FS_WIPE."
+        },
+        {
+            "name": "parity_transition_slide",
+            "kind": "transition_mid",
+            "transition": "slide",
+            "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+            "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+            "transition_t": 0.5,
+            "golden": "transition_mid_slide",
+            "purpose": "Slide midpoint. seam-based UV translation vs Rust FS_SLIDE. Tests bilinear clamp-to-edge sampling math."
+        },
+        {
+            "name": "parity_transition_scroll",
+            "kind": "transition_mid",
+            "transition": "scroll",
+            "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+            "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+            "transition_t": 0.5,
+            "golden": "transition_mid_scroll",
+            "purpose": "Scroll midpoint (vertical). qarl-bug 2026-05-12: direction flipped + tested. Should pin the fix from c8f22d5/732897b."
+        },
+        {
+            "name": "parity_transition_pixelate",
+            "kind": "transition_mid",
+            "transition": "pixelate",
+            "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+            "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+            "transition_t": 0.5,
+            "golden": "transition_mid_pixelate",
+            "purpose": "Pixelate midpoint. wave/blockSize math + mix vs Rust FS_PIXELATE."
         }
     ]
 }

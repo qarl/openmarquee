@@ -56,46 +56,193 @@
             return c.toDataURL("image/png").split(",")[1];
         }
 
-        // For transition midpoints we composite two slides via
-        // ctx.globalAlpha — matches the renderer's FS_FADE
-        // (1-t)·from + t·to at t=0.5. Other transitions (wipe /
-        // slide / scroll / pixelate) need per-pixel masks; commit
-        // 3 wires those. Commit-2 transitions are fade-only.
         // Synchronous. The outer __parityCapture is async only because
-        // captureFadeMid wants to be -- keep the same call shape for
-        // both kinds so the caller doesn't branch.
+        // transition captures want to be -- keep the same call shape
+        // so the caller doesn't branch.
         function captureSingle(item, tick) {
             const state = stateFromItem(item);
             drawCanvas(canvas, state, { elapsed_s: tick });
         }
 
-        async function captureFadeMid(fromItem, toItem, t) {
+        // Render `item` into a fresh ImageData. Helper for transition
+        // midpoints: we paint each side onto the shared canvas, snapshot
+        // via getImageData, then composite into a third ImageData.
+        function renderSlideImageData(item) {
             const ctx = canvas.getContext("2d");
-            // FROM at full alpha
-            const fromState = stateFromItem(fromItem);
-            drawCanvas(canvas, fromState, { elapsed_s: 0 });
-            const fromImg = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            // TO on a fresh canvas; we paint via the same canvas and
-            // re-snapshot.
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            const toState = stateFromItem(toItem);
-            drawCanvas(canvas, toState, { elapsed_s: 0 });
-            const toImg = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            // Blend per-pixel: out = (1-t)·from + t·to.
-            const outImg = ctx.createImageData(canvas.width, canvas.height);
-            const f = fromImg.data, td = toImg.data, o = outImg.data;
-            const inv = 1 - t;
-            // Math.round (not |0 truncate) to match GLES2 float→byte
-            // rounding semantics in Rust's FS_FADE; truncation would
-            // introduce a 1-LSB bias that bumps max_delta without
-            // reflecting real renderer drift.
-            for (let i = 0; i < o.length; i += 4) {
-                o[i + 0] = Math.round(f[i + 0] * inv + td[i + 0] * t);
-                o[i + 1] = Math.round(f[i + 1] * inv + td[i + 1] * t);
-                o[i + 2] = Math.round(f[i + 2] * inv + td[i + 2] * t);
-                o[i + 3] = 255;
+            drawCanvas(canvas, stateFromItem(item), { elapsed_s: 0 });
+            return ctx.getImageData(0, 0, canvas.width, canvas.height);
+        }
+
+        // Bilinear sample of an ImageData at fractional uv (0..1).
+        // GL_LINEAR semantics with clamp-to-edge: the Rust transition
+        // shaders sample texture2D against u_src_a / u_src_b which use
+        // GL_LINEAR + GL_CLAMP_TO_EDGE. Off-image uv values clamp to
+        // border pixels (NOT wrap), so transitions that sample beyond
+        // the unit square (slide, scroll) read the edge color.
+        function sampleBilinear(data, w, h, u, v, out, outOff) {
+            // Clamp uv to [0,1] then convert to pixel space with the
+            // GL center-of-pixel convention (uv 0 = pixel 0 center
+            // minus 0.5, etc.).
+            const cu = Math.max(0, Math.min(1, u));
+            const cv = Math.max(0, Math.min(1, v));
+            const fx = cu * w - 0.5;
+            const fy = cv * h - 0.5;
+            const x0 = Math.max(0, Math.min(w - 1, Math.floor(fx)));
+            const y0 = Math.max(0, Math.min(h - 1, Math.floor(fy)));
+            const x1 = Math.max(0, Math.min(w - 1, x0 + 1));
+            const y1 = Math.max(0, Math.min(h - 1, y0 + 1));
+            const wx = Math.max(0, Math.min(1, fx - x0));
+            const wy = Math.max(0, Math.min(1, fy - y0));
+            const i00 = (y0 * w + x0) * 4;
+            const i10 = (y0 * w + x1) * 4;
+            const i01 = (y1 * w + x0) * 4;
+            const i11 = (y1 * w + x1) * 4;
+            for (let c = 0; c < 3; c++) {
+                const top = data[i00 + c] * (1 - wx) + data[i10 + c] * wx;
+                const bot = data[i01 + c] * (1 - wx) + data[i11 + c] * wx;
+                out[outOff + c] = top * (1 - wy) + bot * wy;
             }
-            ctx.putImageData(outImg, 0, 0);
+        }
+
+        // Generic transition-midpoint compositor. Picks the per-pixel
+        // sample-and-mix function for the named transition and runs it
+        // over the 1920×1080 canvas. UV convention: v_uv.x = pixel x /
+        // width, v_uv.y = pixel y / height (matches the Rust transition
+        // SP-tier vertex's v_uv.y = y / 1.0 mapping where y=0 is TOP --
+        // confirmed by the qarl-bug-2026-05-12 scroll fix).
+        //
+        // Each transition function takes (uv_x, uv_y, t) and produces
+        // either (a) a 2-element pair of [u, v, source] sampling
+        // coordinates per side, plus a mix factor (m: 0=A, 1=B), or
+        // (b) a per-pixel mix factor with both sides sampled at the
+        // same uv. We use a simple inline-switch dispatch for clarity
+        // -- transition count is small (6) and per-pixel cost dominates.
+        const TRANSITION_FNS = {
+            cut(pixels, w, h, A, B, t) {
+                // FS_CUT picks A side at t<0.5, B side at t>=0.5.
+                const src = t < 0.5 ? A : B;
+                pixels.set(src.data);
+                pixels[3] = 255;
+            },
+            fade(pixels, w, h, A, B, t) {
+                const inv = 1 - t;
+                const a = A.data, b = B.data;
+                for (let i = 0; i < pixels.length; i += 4) {
+                    pixels[i + 0] = Math.round(a[i + 0] * inv + b[i + 0] * t);
+                    pixels[i + 1] = Math.round(a[i + 1] * inv + b[i + 1] * t);
+                    pixels[i + 2] = Math.round(a[i + 2] * inv + b[i + 2] * t);
+                    pixels[i + 3] = 255;
+                }
+            },
+            wipe(pixels, w, h, A, B, t) {
+                // mask = step(uv.x, t). x<t -> B, else A.
+                const a = A.data, b = B.data;
+                for (let y = 0; y < h; y++) {
+                    const tCol = Math.floor(t * w);
+                    for (let x = 0; x < w; x++) {
+                        const i = (y * w + x) * 4;
+                        const src = x < tCol ? b : a;
+                        pixels[i + 0] = src[i + 0];
+                        pixels[i + 1] = src[i + 1];
+                        pixels[i + 2] = src[i + 2];
+                        pixels[i + 3] = 255;
+                    }
+                }
+            },
+            slide(pixels, w, h, A, B, t) {
+                // FS_SLIDE: seam=1-t; onTo=step(seam, uv.x); A.uv=(x+t,y);
+                // B.uv=(x-seam, y). At t=0.5 the seam is at uv.x=0.5,
+                // A's image has scrolled right by t, B's by -seam.
+                const seam = 1 - t;
+                const tmp = [0, 0, 0];
+                for (let y = 0; y < h; y++) {
+                    const v = (y + 0.5) / h;
+                    for (let x = 0; x < w; x++) {
+                        const u = (x + 0.5) / w;
+                        const i = (y * w + x) * 4;
+                        const useB = u >= seam;
+                        const srcUVx = useB ? u - seam : u + t;
+                        sampleBilinear(useB ? B.data : A.data, w, h, srcUVx, v, tmp, 0);
+                        pixels[i + 0] = Math.round(tmp[0]);
+                        pixels[i + 1] = Math.round(tmp[1]);
+                        pixels[i + 2] = Math.round(tmp[2]);
+                        pixels[i + 3] = 255;
+                    }
+                }
+            },
+            scroll(pixels, w, h, A, B, t) {
+                // FS_SCROLL has a Y-axis convention twist relative to
+                // single-slide / horizontal transitions: the Rust path
+                // runs in GL coords where v_uv.y=0 is the visual
+                // BOTTOM of the screen (NDC y=-1 maps to uv.y=0). Our
+                // JS canvas + drawCanvas use y=0 = TOP. Same shader
+                // math gives mirrored output if you don't convert.
+                //
+                // Visual semantics (matching the qarl-bug-2026-05-12
+                // fix in the Rust shader at hdmi_logic.rs:896): B
+                // rises from below, A scrolls off the top. At t=0.5
+                // the bottom half of the screen shows the top half of
+                // B; the top half shows the bottom half of A. The
+                // formulas below are derived in canvas-y-down terms
+                // directly, not by post-flipping v_uv.y, so they're
+                // easier to verify against on-screen behavior.
+                //   B fills v >= 1 - t (the lower-y, bottom region)
+                //   A fills v <  1 - t (the upper-y, top region)
+                //   A samples at v + t          (A scrolled UP by t)
+                //   B samples at v + t - 1      (B risen by 1 - t)
+                const tmp = [0, 0, 0];
+                const seam = 1 - t;
+                for (let y = 0; y < h; y++) {
+                    const v = (y + 0.5) / h;
+                    const useB = v >= seam;
+                    for (let x = 0; x < w; x++) {
+                        const u = (x + 0.5) / w;
+                        const i = (y * w + x) * 4;
+                        const srcUVy = useB ? v - seam : v + t;
+                        sampleBilinear(useB ? B.data : A.data, w, h, u, srcUVy, tmp, 0);
+                        pixels[i + 0] = Math.round(tmp[0]);
+                        pixels[i + 1] = Math.round(tmp[1]);
+                        pixels[i + 2] = Math.round(tmp[2]);
+                        pixels[i + 3] = 255;
+                    }
+                }
+            },
+            pixelate(pixels, w, h, A, B, t) {
+                // FS_PIXELATE: wave = 1 - 4·(t-0.5)². At t=0.5 wave=1,
+                // blockSize = 0.0425. cell = floor(uv/bs)*bs + 0.5*bs.
+                // Both A and B sampled at cell-center then mixed with t.
+                const wave = 1 - 4 * (t - 0.5) * (t - 0.5);
+                const blockSize = 0.0025 + 0.04 * wave;
+                const inv = 1 - t;
+                const tmpA = [0, 0, 0], tmpB = [0, 0, 0];
+                for (let y = 0; y < h; y++) {
+                    const v = (y + 0.5) / h;
+                    const cellV = Math.floor(v / blockSize) * blockSize + 0.5 * blockSize;
+                    for (let x = 0; x < w; x++) {
+                        const u = (x + 0.5) / w;
+                        const cellU = Math.floor(u / blockSize) * blockSize + 0.5 * blockSize;
+                        const i = (y * w + x) * 4;
+                        sampleBilinear(A.data, w, h, cellU, cellV, tmpA, 0);
+                        sampleBilinear(B.data, w, h, cellU, cellV, tmpB, 0);
+                        pixels[i + 0] = Math.round(tmpA[0] * inv + tmpB[0] * t);
+                        pixels[i + 1] = Math.round(tmpA[1] * inv + tmpB[1] * t);
+                        pixels[i + 2] = Math.round(tmpA[2] * inv + tmpB[2] * t);
+                        pixels[i + 3] = 255;
+                    }
+                }
+            },
+        };
+
+        async function captureTransitionMid(fromItem, toItem, transitionName, t) {
+            const ctx = canvas.getContext("2d");
+            const A = renderSlideImageData(fromItem);
+            const B = renderSlideImageData(toItem);
+            const out = ctx.createImageData(canvas.width, canvas.height);
+            const fn = TRANSITION_FNS[transitionName];
+            if (!fn) throw new Error(`unknown transition: ${transitionName}`);
+            fn(out.data, canvas.width, canvas.height, A, B, t);
+            ctx.putImageData(out, 0, 0);
         }
 
         // Promise resolves when all @font-face fonts referenced by
@@ -120,11 +267,16 @@
 
         window.__parityCapture = async function (params) {
             await window.__parityFontsReady;
-            const { kind, item, fromItem, toItem, tick, transitionT } = params;
+            const { kind } = params;
             if (kind === "single") {
-                await captureSingle(item, tick || 0);
-            } else if (kind === "transition_fade_mid") {
-                await captureFadeMid(fromItem, toItem, transitionT || 0.5);
+                captureSingle(params.item, params.tick || 0);
+            } else if (kind === "transition_mid") {
+                await captureTransitionMid(
+                    params.fromItem,
+                    params.toItem,
+                    params.transition,
+                    params.transitionT == null ? 0.5 : params.transitionT,
+                );
             } else {
                 throw new Error(`unknown parity kind: ${kind}`);
             }
