@@ -221,10 +221,12 @@ header h1 {
 }
 
 /* Same preview-on-left, form-on-right pattern as the slide editor.
-   Below 720 px the wrapper falls back to vertical flex so phones get
+   Below 760 px the wrapper falls back to vertical flex so phones get
    the original stacked behavior (preview on top, name+timeline+
    pallet below). Above the breakpoint, preview sticks at top-left
-   while the operator scrolls the right column. */
+   while the operator scrolls the right column. qarl-bug 2026-05-12:
+   breakpoint dropped 720 -> 760 in lockstep with .editor-cols when
+   the form column narrowed to 420px. */
 .playlist-cols {
     display: flex;
     flex-direction: column;
@@ -235,17 +237,22 @@ header h1 {
     flex-direction: column;
     gap: 0.75rem;
     min-width: 0;  /* timeline + pallet must shrink, not overflow */
-    /* Same 720px cap as the slide editor -- B13, 2026-05-05. */
-    max-width: 720px;
+    /* qarl-bug 2026-05-12 (companion to ca08edd): match the slide
+       editor's phone-width-on-desktop cap. See `project_editor_
+       layout_phone_width_on_desktop` memory for the rationale --
+       operator's "what fits on a phone" mental model stays consistent
+       across mobile + desktop; preview takes the leftover width. */
+    max-width: 420px;
 }
-/* B21: 1080 breakpoint matches .editor-cols -- see comment there. */
-@media (min-width: 1080px) {
+/* qarl-bug 2026-05-12: 760 breakpoint matches .editor-cols. */
+@media (min-width: 760px) {
     .playlist-cols {
         display: grid;
-        /* preview = 1fr, form = stable 720px track. Same B21 fix as
-           .editor-cols: auto-sized track caused the column to jump
-           when its inner controls changed visibility. */
-        grid-template-columns: minmax(0, 1fr) 720px;
+        /* preview = 1fr, form = stable 420px track. Same shape as
+           .editor-cols. The fixed track keeps the column from jumping
+           when inner controls (timeline rows, pallet tiles) change
+           visibility. */
+        grid-template-columns: minmax(0, 1fr) 420px;
         gap: 1.25rem;
         align-items: start;
     }
@@ -253,7 +260,7 @@ header h1 {
         position: sticky;
         top: 1rem;
         /* Allow the playlist preview to grow into the leftover space
-           when form caps at 720px. B13, 2026-05-05. */
+           when form caps at 420px. */
         max-width: none;
     }
     /* Override the .inline-preview-stage 26rem cap when it lives

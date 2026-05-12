@@ -58,3 +58,40 @@ describe("editor column phone-width-on-desktop (qarl-bug 2026-05-12)", () => {
         expect(bp).toBeLessThanOrEqual(820);
     });
 });
+
+describe("playlist column matches slide editor (qarl 2026-05-12 symmetry)", () => {
+    // Companion to the editor-width tests above. qarl confirmed the
+    // playlist editor needs the same phone-width-on-desktop shape
+    // (was a flagged open question in the original Bug 1 memory).
+    // The two views' form columns must stay in lockstep: one fix
+    // for both = one design point.
+    it("caps .playlist-form-stack at 420px", () => {
+        const m = CSS.match(
+            /\.playlist-form-stack\s*\{[^}]*?max-width:\s*(\d+)px[^}]*\}/m,
+        );
+        expect(m, ".playlist-form-stack rule missing or no max-width").toBeTruthy();
+        const px = Number(m[1]);
+        expect(px).toBeGreaterThanOrEqual(380);
+        expect(px).toBeLessThanOrEqual(440);
+    });
+
+    it("desktop two-column grid pins the form track to 420px", () => {
+        const m = CSS.match(
+            /\.playlist-cols\s*\{[^}]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+(\d+)px/m,
+        );
+        expect(m, ".playlist-cols grid-template-columns missing").toBeTruthy();
+        const px = Number(m[1]);
+        expect(px).toBeGreaterThanOrEqual(380);
+        expect(px).toBeLessThanOrEqual(440);
+    });
+
+    it("two-column breakpoint matches the editor (~760px)", () => {
+        const m = CSS.match(
+            /@media\s*\(min-width:\s*(\d+)px\)\s*\{\s*\.playlist-cols/m,
+        );
+        expect(m, "playlist-cols media-query breakpoint not found").toBeTruthy();
+        const bp = Number(m[1]);
+        expect(bp).toBeGreaterThanOrEqual(700);
+        expect(bp).toBeLessThanOrEqual(820);
+    });
+});
