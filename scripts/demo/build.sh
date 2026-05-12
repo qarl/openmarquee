@@ -64,6 +64,25 @@ find "$DEST/dist" -maxdepth 1 -type f -name '.*' -delete 2>/dev/null || true
 # non-hashed entry file (main.js / login.js / set-password.js / etc.).
 bash "$(dirname "$0")/sweep_orphan_chunks.sh" "$DEST/dist"
 
+# .htaccess for the live demo on DreamHost (www-Jimmy 2026-05-05;
+# restored 2026-05-11 after a refactor dropped it). Sets the response
+# Cache-Control on dist/* to 5 minutes (was 30 days by host default,
+# so a sortable/main.js update wouldn't reach operators' browsers for
+# a month). Must be written AFTER both the dotfile sweep (find
+# -delete '.*') and the orphan-chunk sweep -- either would wipe it
+# if it landed earlier. deploy.sh's rsync --delete only excludes
+# .DS_Store + ._*, so the .htaccess MUST exist in BUILD_DIR before
+# each deploy or the server copy gets wiped.
+cat > "$DEST/dist/.htaccess" <<'HTACCESS'
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresDefault "access plus 5 minutes"
+</IfModule>
+<IfModule mod_headers.c>
+  Header set Cache-Control "max-age=300, must-revalidate"
+</IfModule>
+HTACCESS
+
 # Same stylesheet path (./styles.css) as the device UI so demo's
 # index.html doesn't need URL rewrites.
 cp "$SRC_UI/styles.css" "$DEST/styles.css"
