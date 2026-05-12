@@ -181,6 +181,21 @@ FIXTURES=(
     "blend_multiply|slide|f0000000-0000-4000-8000-000000000012|$PI_FIXTURE_ROOT"
     "blend_screen|slide|f0000000-0000-4000-8000-000000000013|$PI_FIXTURE_ROOT"
     "blend_normal|slide|f0000000-0000-4000-8000-000000000014|$PI_FIXTURE_ROOT"
+    # c3d parity font coverage: the 11 display fonts from commit
+    # 63b4869 (qarl curated bundle 2026-04-23). One single-line text
+    # slide per family so the per-glyph rasterizer drift surfaces
+    # independently from layout / pattern / blend drift.
+    "font_inter|slide|f0000000-0000-4000-8000-000000000015|$PI_FIXTURE_ROOT"
+    "font_oswald|slide|f0000000-0000-4000-8000-000000000016|$PI_FIXTURE_ROOT"
+    "font_bebas_neue|slide|f0000000-0000-4000-8000-000000000017|$PI_FIXTURE_ROOT"
+    "font_roboto_slab|slide|f0000000-0000-4000-8000-000000000018|$PI_FIXTURE_ROOT"
+    "font_caveat_brush|slide|f0000000-0000-4000-8000-000000000019|$PI_FIXTURE_ROOT"
+    "font_permanent_marker|slide|f0000000-0000-4000-8000-00000000001a|$PI_FIXTURE_ROOT"
+    "font_cinzel|slide|f0000000-0000-4000-8000-00000000001b|$PI_FIXTURE_ROOT"
+    "font_unifrakturcook|slide|f0000000-0000-4000-8000-00000000001c|$PI_FIXTURE_ROOT"
+    "font_rye|slide|f0000000-0000-4000-8000-00000000001d|$PI_FIXTURE_ROOT"
+    "font_pacifico|slide|f0000000-0000-4000-8000-00000000001e|$PI_FIXTURE_ROOT"
+    "font_sedgwick_ave|slide|f0000000-0000-4000-8000-00000000001f|$PI_FIXTURE_ROOT"
     # --- 18.1 / sweep #9 N2: ImageSlide + VideoSlide goldens ---
     # ImageSlide blit path (full-res RGBA tex upload + FS_BLIT) had
     # zero pixel coverage. 1920x1080 synth asset.png: diagonal

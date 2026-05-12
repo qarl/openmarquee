@@ -151,6 +151,94 @@
             "purpose": "Multi-layer with normal blend (source-over) baseline. Pins the default-blend path."
         },
         {
+            "name": "parity_font_inter",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000015",
+            "tick": 0.0,
+            "golden": "font_inter",
+            "purpose": "Inter -- variable-axis sans, the 'default' display face for openMarquee."
+        },
+        {
+            "name": "parity_font_oswald",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000016",
+            "tick": 0.0,
+            "golden": "font_oswald",
+            "purpose": "Oswald -- condensed sans."
+        },
+        {
+            "name": "parity_font_bebas_neue",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000017",
+            "tick": 0.0,
+            "golden": "font_bebas_neue",
+            "purpose": "Bebas Neue -- tall narrow display."
+        },
+        {
+            "name": "parity_font_roboto_slab",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000018",
+            "tick": 0.0,
+            "golden": "font_roboto_slab",
+            "purpose": "Roboto Slab -- slab serif."
+        },
+        {
+            "name": "parity_font_caveat_brush",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000019",
+            "tick": 0.0,
+            "golden": "font_caveat_brush",
+            "purpose": "Caveat Brush -- hand-drawn script."
+        },
+        {
+            "name": "parity_font_permanent_marker",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000001a",
+            "tick": 0.0,
+            "golden": "font_permanent_marker",
+            "purpose": "Permanent Marker -- chunky hand-letter."
+        },
+        {
+            "name": "parity_font_cinzel",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000001b",
+            "tick": 0.0,
+            "golden": "font_cinzel",
+            "purpose": "Cinzel -- Roman-inscription serif."
+        },
+        {
+            "name": "parity_font_unifrakturcook",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000001c",
+            "tick": 0.0,
+            "golden": "font_unifrakturcook",
+            "purpose": "UnifrakturCook -- blackletter."
+        },
+        {
+            "name": "parity_font_rye",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000001d",
+            "tick": 0.0,
+            "golden": "font_rye",
+            "purpose": "Rye -- western-style display."
+        },
+        {
+            "name": "parity_font_pacifico",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000001e",
+            "tick": 0.0,
+            "golden": "font_pacifico",
+            "purpose": "Pacifico -- 50s-script display."
+        },
+        {
+            "name": "parity_font_sedgwick_ave",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000001f",
+            "tick": 0.0,
+            "golden": "font_sedgwick_ave",
+            "purpose": "Sedgwick Ave Display -- urban-graffiti hand letter."
+        },
+        {
             "name": "parity_motion_compound",
             "kind": "single",
             "uuid": "99c11690-415b-40f6-8e3c-6491f3bdf60e",

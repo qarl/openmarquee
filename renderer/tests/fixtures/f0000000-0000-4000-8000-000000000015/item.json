@@ -1,0 +1,43 @@
+{
+  "schema_version": 3,
+  "updated_at": "2026-05-12T00:00:00.000000+00:00",
+  "item": {
+    "type": "text_slide",
+    "id": "f0000000-0000-4000-8000-000000000015",
+    "name": "Font sampler -- Inter",
+    "duration_ms": 1500,
+    "text_layers": [
+      {
+        "text": "INTER",
+        "name": "label",
+        "font_family": "Inter",
+        "font_size_px": null,
+        "font_size_pct": 60.0,
+        "weight": null,
+        "text_color": "#FFFFFF",
+        "text_align": "center",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.05,
+          "y": 0.4,
+          "w": 0.9,
+          "h": 0.2
+        }
+      }
+    ],
+    "background_color": "#181818",
+    "transition": "fade",
+    "transition_ms": 500
+  }
+}
