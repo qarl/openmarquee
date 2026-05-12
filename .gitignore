@@ -63,6 +63,12 @@ playwright-report/
 test-results/
 .playwright/
 
+# Cross-renderer parity harness — fresh captures + run-metrics
+# re-created every invocation. Goldens it diffs against live in
+# renderer/tests/golden/ (tracked).
+renderer/tests/parity/captures/
+renderer/tests/parity/baseline/
+
 # vitest cache
 .vite/
 

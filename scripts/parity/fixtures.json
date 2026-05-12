@@ -1,0 +1,51 @@
+{
+    "schema_version": 1,
+    "comment": "Cross-renderer parity fixtures. See qa/cross-renderer-parity-design.md for the design. Each fixture references an item.json under renderer/tests/fixtures/<uuid>/ + a checked-in Rust golden under renderer/tests/golden/<golden>.png. The harness captures the browser side fresh via Playwright + diffs against the golden (which render_tests.sh's GREEN gate keeps in sync with the Rust path). Thresholds start lax; tighten as drift is fixed. Note: image_slide fixture (planned in design doc) deferred to commit 3 -- parity-harness.html's drawCanvas path only renders text_slide shape; image-asset rendering needs a separate browser-side hydrator. Commit-2 first wave is 5 fixtures, not 6.",
+    "defaults": {
+        "ssim_min": 0.95,
+        "max_delta_max": 50
+    },
+    "fixtures": [
+        {
+            "name": "parity_text_static",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000002",
+            "tick": 0.0,
+            "golden": "multiline_wrap",
+            "purpose": "Text-only static slide. Canvas2D vs fontdue text AA + word-wrap parity."
+        },
+        {
+            "name": "parity_bg_pattern",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000003",
+            "tick": 0.0,
+            "golden": "bg_pattern_dots",
+            "purpose": "bg-system.js Canvas2D dots vs Rust pattern shader. First of the 11; commit 3 expands to all."
+        },
+        {
+            "name": "parity_motion_ticker",
+            "kind": "single",
+            "uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+            "tick": 1.75,
+            "golden": "animated_ticker_chant",
+            "purpose": "Ticker motion @ tick=1.75. Motion-phase math + per-tick frequency tables."
+        },
+        {
+            "name": "parity_blend_overlay",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000001",
+            "tick": 0.0,
+            "golden": "p2g_overlay_route",
+            "purpose": "Multi-layer with overlay blend. Canvas globalCompositeOperation vs GLES2 blend math."
+        },
+        {
+            "name": "parity_transition_mid",
+            "kind": "transition_fade_mid",
+            "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+            "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+            "transition_t": 0.5,
+            "golden": "transition_mid_fade",
+            "purpose": "Cross-fade midpoint. Per-pixel (1-t)·from + t·to in browser vs Rust FS_FADE. Other transitions land in commit 3."
+        }
+    ]
+}

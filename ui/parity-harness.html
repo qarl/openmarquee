@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>openMarquee parity harness</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        html, body { margin: 0; padding: 0; background: #222; }
+        #parity-canvas { display: block; width: 1920px; height: 1080px; }
+        #parity-status { position: fixed; top: 4px; left: 4px;
+            background: rgba(0,0,0,0.7); color: #fff; padding: 4px 8px;
+            font-family: monospace; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div id="parity-status">parity-harness: loading…</div>
+    <canvas id="parity-canvas" width="1920" height="1080"></canvas>
+    <script type="module">
+        // Cross-renderer parity harness (commit 2 / qa/cross-renderer-parity-design.md).
+        // Exposes window.__parityCapture(itemJson, tickSeconds, transition?)
+        // → Promise<base64-png>. Playwright (scripts/parity/run.py)
+        // drives the page, evaluates the helper per fixture, and
+        // diffs the result against renderer/tests/golden/<name>.png.
+        import { drawCanvas } from "./src/rasterize.js";
+
+        const canvas = document.getElementById("parity-canvas");
+        const status = document.getElementById("parity-status");
+
+        // Wire-shape → drawCanvas state shape. drawCanvas accepts
+        // BOTH wire-snake-case (font_family, text_color) and editor-
+        // camelCase via paintLayer's fallback reads, so we mostly
+        // just pass layers through verbatim. We DO normalize the bg
+        // fields because drawCanvas only checks `bgSource` + the
+        // matching state holder.
+        function stateFromItem(item) {
+            const state = {
+                backgroundColor: item.background_color || "#000000",
+                bgSource: "color",
+                bgPattern: null,
+                bgImage: null,
+                layers: Array.isArray(item.text_layers) ? item.text_layers : [],
+            };
+            if (item.background_pattern) {
+                state.bgSource = "pattern";
+                state.bgPattern = {
+                    pattern: item.background_pattern.pattern,
+                    color_a: item.background_pattern.color_a,
+                    color_b: item.background_pattern.color_b,
+                    density: item.background_pattern.density,
+                };
+            }
+            return state;
+        }
+
+        function canvasToBase64(c) {
+            return c.toDataURL("image/png").split(",")[1];
+        }
+
+        // For transition midpoints we composite two slides via
+        // ctx.globalAlpha — matches the renderer's FS_FADE
+        // (1-t)·from + t·to at t=0.5. Other transitions (wipe /
+        // slide / scroll / pixelate) need per-pixel masks; commit
+        // 3 wires those. Commit-2 transitions are fade-only.
+        // Synchronous. The outer __parityCapture is async only because
+        // captureFadeMid wants to be -- keep the same call shape for
+        // both kinds so the caller doesn't branch.
+        function captureSingle(item, tick) {
+            const state = stateFromItem(item);
+            drawCanvas(canvas, state, { elapsed_s: tick });
+        }
+
+        async function captureFadeMid(fromItem, toItem, t) {
+            const ctx = canvas.getContext("2d");
+            // FROM at full alpha
+            const fromState = stateFromItem(fromItem);
+            drawCanvas(canvas, fromState, { elapsed_s: 0 });
+            const fromImg = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            // TO on a fresh canvas; we paint via the same canvas and
+            // re-snapshot.
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const toState = stateFromItem(toItem);
+            drawCanvas(canvas, toState, { elapsed_s: 0 });
+            const toImg = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            // Blend per-pixel: out = (1-t)·from + t·to.
+            const outImg = ctx.createImageData(canvas.width, canvas.height);
+            const f = fromImg.data, td = toImg.data, o = outImg.data;
+            const inv = 1 - t;
+            // Math.round (not |0 truncate) to match GLES2 float→byte
+            // rounding semantics in Rust's FS_FADE; truncation would
+            // introduce a 1-LSB bias that bumps max_delta without
+            // reflecting real renderer drift.
+            for (let i = 0; i < o.length; i += 4) {
+                o[i + 0] = Math.round(f[i + 0] * inv + td[i + 0] * t);
+                o[i + 1] = Math.round(f[i + 1] * inv + td[i + 1] * t);
+                o[i + 2] = Math.round(f[i + 2] * inv + td[i + 2] * t);
+                o[i + 3] = 255;
+            }
+            ctx.putImageData(outImg, 0, 0);
+        }
+
+        // Promise resolves when all @font-face fonts referenced by
+        // any fixture are ready. Without this the first capture
+        // races font loading and produces a system-sans fallback
+        // render that doesn't match the Rust path.
+        window.__parityFontsReady = (async () => {
+            // Force every bundled @font-face to actually load by
+            // measuring a glyph in each family. document.fonts.load
+            // is per-family + size; pick a representative size.
+            const families = [
+                "Anton", "Oswald", "Bebas Neue", "Bowlby One SC",
+                "Archivo Black", "Alfa Slab One", "Cinzel",
+                "DM Serif Display", "Caveat", "Pacifico",
+                "JetBrains Mono", "Inter",
+            ];
+            await Promise.all(
+                families.map((fam) => document.fonts.load(`700 100px "${fam}"`)),
+            );
+            await document.fonts.ready;
+        })();
+
+        window.__parityCapture = async function (params) {
+            await window.__parityFontsReady;
+            const { kind, item, fromItem, toItem, tick, transitionT } = params;
+            if (kind === "single") {
+                await captureSingle(item, tick || 0);
+            } else if (kind === "transition_fade_mid") {
+                await captureFadeMid(fromItem, toItem, transitionT || 0.5);
+            } else {
+                throw new Error(`unknown parity kind: ${kind}`);
+            }
+            return canvasToBase64(canvas);
+        };
+
+        status.textContent = "parity-harness: ready";
+    </script>
+</body>
+</html>
