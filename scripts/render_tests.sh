@@ -118,6 +118,13 @@ FIXTURES=(
     "transition_mid_wipe|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,wipe,0.5|$PI_FIXTURE_ROOT"
     "transition_mid_slide|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,slide,0.5|$PI_FIXTURE_ROOT"
     "transition_mid_pixelate|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,pixelate,0.5|$PI_FIXTURE_ROOT"
+    # qarl-bug 2026-05-12: scroll direction was inverted. Pin a
+    # mid-transition capture so the fix doesn't regress silently. At
+    # t=0.5, B's top half should occupy the BOTTOM of the frame
+    # (B entering from below); A's bottom half stays at the top.
+    # Different from "fade" (per-pixel blend, no split) and "slide"
+    # (horizontal split, not vertical).
+    "transition_mid_scroll|transition_mid|3964c302-311f-44f2-a6c9-efd24a16cfc0,2c858968-ae0a-4592-8083-85257de50bcd,scroll,0.5|$PI_FIXTURE_ROOT"
     # --- 17.2 / sweep #9 #2: animated-slide tick-pin goldens ---
     # Pin tick_seconds so the per-frame motion compositor evaluates
     # at a deterministic phase. Goldens reproduce bit-identically

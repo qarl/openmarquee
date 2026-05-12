@@ -880,8 +880,19 @@ void main() {
 "#;
 
 /// Fragment shader: scroll — vertical analog of slide. slide_b
-/// enters from the bottom as slide_a rolls up off the top. Mirrors
-/// Python ref `_FRAGMENT_SCROLL`.
+/// enters from the bottom as slide_a rolls up off the top.
+///
+/// qarl-bug 2026-05-12: direction was reversed (B entered from the
+/// TOP, A scrolled down off the BOTTOM) despite the comment. Root
+/// cause: the Python ref `_FRAGMENT_SCROLL` was authored assuming
+/// image-y-down (PIL/numpy) UV convention, but the Rust renderer's
+/// transition_sp_quad_vbo binds v_uv.y=0 at NDC y=-1 (GL standard,
+/// y-up). Same shader code, opposite visual result. Inverted the
+/// step direction (`step(v_uv.y, t)` selects the bottom region as
+/// the to-region) and the sampling offsets (A samples y-t to slide
+/// its content upward as t grows; B samples y+(1-t) so its content
+/// appears to rise from below). Python ref has the same latent bug;
+/// not in scope for this commit but flagged as a follow-up.
 pub const FS_SCROLL: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src_a;
@@ -890,10 +901,9 @@ uniform float u_t;
 varying vec2 v_uv;
 void main() {
     float t = u_t;
-    float seam = 1.0 - t;
-    float onTo = step(seam, v_uv.y);
-    vec2 fromUV = vec2(v_uv.x, v_uv.y + t);
-    vec2 toUV = vec2(v_uv.x, v_uv.y - seam);
+    float onTo = step(v_uv.y, t);
+    vec2 fromUV = vec2(v_uv.x, v_uv.y - t);
+    vec2 toUV = vec2(v_uv.x, v_uv.y + (1.0 - t));
     vec4 a = texture2D(u_src_a, fromUV);
     vec4 b = texture2D(u_src_b, toUV);
     gl_FragColor = mix(a, b, onTo);
@@ -1738,19 +1748,22 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
         }
         "scroll" => {
             // Vertical analog of slide: B enters from bottom as
-            // A rolls up off the top. Note v_uv.y is bottom-up
-            // (NDC convention from VS_TEXTURED_QUAD); the legacy
-            // FS_SCROLL used the same convention so the math
-            // ports verbatim.
+            // A rolls up off the top. v_uv.y is bottom-up (NDC
+            // convention from VS_TEXTURED_QUAD).
+            //
+            // qarl-bug 2026-05-12: pre-fix shape was `step(seam,
+            // v_uv.y)` + `vec2(v_uv.x, v_uv.y + t)` for A which
+            // (under the y-up VBO UV convention) put B in the TOP
+            // region -- visually scroll-DOWN. Mirrors the same fix
+            // applied to the standalone FS_SCROLL.
             s.push_str("    float t = u_t;\n");
-            s.push_str("    float seam = 1.0 - t;\n");
-            s.push_str("    vec2 sample_uv_a = vec2(v_uv.x, v_uv.y + t);\n");
-            s.push_str("    vec2 sample_uv_b = vec2(v_uv.x, v_uv.y - seam);\n");
+            s.push_str("    vec2 sample_uv_a = vec2(v_uv.x, v_uv.y - t);\n");
+            s.push_str("    vec2 sample_uv_b = vec2(v_uv.x, v_uv.y + (1.0 - t));\n");
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "sample_uv_a");
             s.push_str("    vec3 cb = u_b_bg;\n");
             push_compose_chain(s, "u_b", "cb", n_b, "sample_uv_b");
-            s.push_str("    float on_to = step(seam, v_uv.y);\n");
+            s.push_str("    float on_to = step(v_uv.y, t);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, on_to), 1.0);\n");
         }
         "flip" => {
@@ -4683,7 +4696,10 @@ mod tests {
             assert!(FS_SCROLL.contains(uniform));
         }
         // Vertical analog of slide — step on v_uv.y not .x.
-        assert!(FS_SCROLL.contains("step(seam, v_uv.y)"));
+        // qarl-bug 2026-05-12: pin the corrected scroll-UP direction.
+        // Was `step(seam, v_uv.y)` which gave scroll-DOWN under the
+        // VBO's NDC-y-up UV convention.
+        assert!(FS_SCROLL.contains("step(v_uv.y, t)"));
     }
 
     #[test]
@@ -5377,7 +5393,13 @@ mod tests {
         assert!(push.contains("vec2(v_uv.x - t, v_uv.y)"));
         assert!(push.contains("blade"));
         let scroll = fs_transition_sp_source("scroll", 0, 0).unwrap();
-        assert!(scroll.contains("vec2(v_uv.x, v_uv.y + t)"));
+        // qarl-bug 2026-05-12: scroll must scroll UP (B enters from
+        // bottom). Pin the corrected step direction + A-sampling
+        // offset so a re-introduction of the old "scroll down" path
+        // fails loudly. Old: `vec2(v_uv.x, v_uv.y + t)` + `step(seam,
+        // v_uv.y)`. New: `vec2(v_uv.x, v_uv.y - t)` + `step(v_uv.y, t)`.
+        assert!(scroll.contains("vec2(v_uv.x, v_uv.y - t)"));
+        assert!(scroll.contains("step(v_uv.y, t)"));
     }
 
     #[test]
