@@ -14,6 +14,27 @@
 const lerp = (a, b, t) =>
     a + (b - a) * Math.max(0, Math.min(1, t));
 
+// Stretch the low end of the density slider so low-intensity values
+// yield REALLY large features. qarl 2026-05-12: the linear mapping
+// felt too compressed at the left of the slider -- intensity=0.1
+// looked almost identical to intensity=0.5. A quadratic (^2) curve
+// shifts the noticeable shrink to the right half of the slider so
+// "slider 10%" reads as "huge stripes / huge bricks / big dots,"
+// which is what operators expected from "low intensity."
+//
+// Applied to all patterns whose density controls feature SIZE / COUNT
+// (dots/halftone/stripes/scanlines/checker/grid/rings/rays/confetti
+// /bricks). NOT applied to gradient (density = rotation angle there;
+// curving rotation makes no semantic sense).
+//
+// Backend mirror: backend/openmarquee/auto_render.py _density_curve.
+// Both sides must stay in lockstep for WYSIWYG parity.
+export const DENSITY_CURVE_EXPONENT = 2;
+function densityCurve(d) {
+    const dd = Math.max(0, Math.min(1, d));
+    return Math.pow(dd, DENSITY_CURVE_EXPONENT);
+}
+
 // Numerical Recipes LCG -- deterministic 0..1 stream from a seed.
 // Used by patterns that need stable per-render randomness (e.g.
 // confetti scatter, B5). Not cryptographic; just needs to be
@@ -171,11 +192,19 @@ const BUILDERS = {
     },
 };
 
+// Apply the curve only to size-/count-bearing patterns. Gradient
+// uses density as a rotation angle (0..270deg); curving that would
+// re-map the angle to no operator-comprehensible visual axis.
+function effectiveDensity(pattern, rawD) {
+    if (pattern === "gradient") return rawD;
+    return densityCurve(rawD);
+}
+
 // Build a CSS background value for the given pattern + colors.
 // Falls back to a solid color_a fill on an unknown pattern name.
 export function buildBg(pattern, color_a, color_b, density) {
     const fn = BUILDERS[pattern] || BUILDERS.solid;
-    return fn(color_a, color_b, density);
+    return fn(color_a, color_b, effectiveDensity(pattern, density));
 }
 
 // Whether the pattern uses color_b. Used by the editor UI to grey
@@ -209,8 +238,9 @@ export function densityLabelFor(pattern) {
 // pattern picker — that's where CSS gradient stacks are cheap and
 // canvas painting would be wasteful.
 export function paintPatternOnCanvas(
-    ctx, width, height, pattern, a, b, density,
+    ctx, width, height, pattern, a, b, rawDensity,
 ) {
+    const density = effectiveDensity(pattern, rawDensity);
     ctx.save();
     try {
         // Solid color_a base — every pattern (except solid itself,

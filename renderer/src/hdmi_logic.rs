@@ -2364,6 +2364,21 @@ fn pattern_lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// qarl 2026-05-12: stretch the low end of the density slider so
+/// low-intensity values yield REALLY large features. Quadratic
+/// curve (d^2). Applied at the call sites of every size-/count-
+/// bearing pattern_lerp; gradient/solid (no lerp) are exempt.
+///
+/// JS mirror: `ui/src/bg-system.js` densityCurve().
+/// Python mirror: `backend/openmarquee/auto_render.py` _density_curve.
+/// All three must stay in lockstep for WYSIWYG parity.
+pub const PATTERN_DENSITY_CURVE_EXPONENT: f32 = 2.0;
+
+pub fn pattern_density_curve(density: f32) -> f32 {
+    let d = density.clamp(0.0, 1.0);
+    d.powf(PATTERN_DENSITY_CURVE_EXPONENT)
+}
+
 /// v1-spec-delta #6 (slice b) -- stripes pattern uniforms. Tile
 /// size is the perpendicular-pixel spacing of the diagonal 45°
 /// bands. Each tile is split half-color_a / half-color_b along
@@ -3677,10 +3692,32 @@ mod tests {
     #[test]
     fn stripes_tile_size_matches_python_lerp() {
         // density 0 -> tile 80 (max), density 1 -> tile 4 (min).
+        // (stripes_uniforms takes raw density; the qarl-curve is
+        // applied at the draw_pattern dispatch site in hdmi.rs, not
+        // inside the uniform fn -- so these direct calls still use
+        // a linear-lerp model.)
         assert_eq!(stripes_uniforms(0.0).tile, 80.0);
         assert_eq!(stripes_uniforms(1.0).tile, 4.0);
         // density 0.5 -> round(80 + (4-80)*0.5) = round(42) = 42.
         assert_eq!(stripes_uniforms(0.5).tile, 42.0);
+    }
+
+    #[test]
+    fn pattern_density_curve_matches_js_and_python_mirrors() {
+        // The curve must agree at boundaries + the standard 0.5
+        // anchor with the JS bg-system.js densityCurve() and
+        // Python auto_render._density_curve. All three are
+        // d^2 with [0,1] clamp.
+        assert_eq!(pattern_density_curve(0.0), 0.0);
+        assert_eq!(pattern_density_curve(1.0), 1.0);
+        assert_eq!(pattern_density_curve(0.5), 0.25);
+        // Clamp: out-of-range inputs collapse to the bounds.
+        assert_eq!(pattern_density_curve(-0.5), 0.0);
+        assert_eq!(pattern_density_curve(1.5), 1.0);
+        // Curve stretches the low end: at intensity=0.1 the curved
+        // d is 0.01, well below the linear-mapping 0.1, so features
+        // stay near MAX for longer. qarl 2026-05-12 product spec.
+        assert!((pattern_density_curve(0.1) - 0.01).abs() < 1e-6);
     }
 
     #[test]

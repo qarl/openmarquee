@@ -127,11 +127,15 @@ describe("buildBg -- CSS string output", () => {
             .toBe("linear-gradient(135deg, #000000, #FFFFFF)");
     });
 
-    it("dots at d=0.5 — backend-parity tile size = round(lerp(48,4,0.5))=26", () => {
-        // backend: _render_pattern_dots tile = round(lerp(48,4,0.5)).
-        // JS+Python both round(0.5*4 + 0.5*48) = round(26) = 26.
+    it("dots at d=0.5 — curved-d=0.25; tile = round(lerp(48,4,0.25))=37", () => {
+        // qarl-curve 2026-05-12: density slider passes through
+        // densityCurve(d)=d^2 BEFORE the lerp for size-bearing
+        // patterns. At d=0.5 the effective density is 0.25, so
+        // dots tile = round(0.75*48 + 0.25*4) = round(37) = 37.
+        // Backend (_render_pattern_dots) applies _density_curve too,
+        // so JS + Python land on the same 37.
         const css = buildBg("dots", "#000000", "#FFFFFF", 0.5);
-        expect(css).toContain("26px 26px");
+        expect(css).toContain("37px 37px");
     });
 
     it("dots references both color_a and color_b", () => {
@@ -152,18 +156,17 @@ describe("buildBg -- CSS string output", () => {
 
     it("rays slice count is always even (B15)", () => {
         // Verify by extracting the conic-gradient stops.
-        // d=0: 2*round(lerp(2,24,0)) = 2*2 = 4 stops.
-        // d=1: 2*round(lerp(2,24,1)) = 2*24 = 48 stops.
-        // d=0.5: 2*round(13) = 26.
+        // d=0: 2*round(lerp(2,24,0^2=0)) = 2*2 = 4 stops.
+        // d=1: 2*round(lerp(2,24,1^2=1)) = 2*24 = 48 stops.
+        // d=0.5 (curved->0.25): 2*round(lerp(2,24,0.25))
+        //                     = 2*round(7.5) = 2*8 = 16 stops.
         const at0 = buildBg("rays", "#000000", "#FFFFFF", 0);
         const at1 = buildBg("rays", "#000000", "#FFFFFF", 1);
         const at5 = buildBg("rays", "#000000", "#FFFFFF", 0.5);
-        // Count stops by counting "%, " separators inside the stops
-        // list. Each stop has one "%, " separator except the last.
         const stopCount = css => css.match(/0deg at 50% 50%, (.+)\)$/)?.[1].split(", ").length;
         expect(stopCount(at0)).toBe(4);
         expect(stopCount(at1)).toBe(48);
-        expect(stopCount(at5)).toBe(26);
+        expect(stopCount(at5)).toBe(16);
         // All counts even.
         for (const n of [stopCount(at0), stopCount(at1), stopCount(at5)]) {
             expect(n % 2).toBe(0);
@@ -182,30 +185,35 @@ describe("buildBg -- CSS string output", () => {
 });
 
 describe("buildBg -- per-pattern tile-size parity smoke", () => {
-    // Each subtest pins ONE concrete tile/radius value computed
-    // from the lerp(...) constants so a regression that changes
-    // the lerp constants (e.g. accidentally re-narrowing them)
-    // fails loudly. These are the post-B12 (2026-05-05) widened
-    // values that backend mirrors.
+    // Each subtest pins ONE concrete tile value computed from the
+    // lerp(...) constants AFTER the qarl-curve 2026-05-12 transform
+    // (densityCurve(d) = d^2 before lerp for size-bearing patterns).
+    // At d=0.5 the effective density is 0.25.
 
-    it("halftone d=0.5 tile = round(lerp(60,6))=33", () => {
+    it("halftone d=0.5 (curved 0.25) tile = round(lerp(60,6,0.25))=47", () => {
+        // lerp(60,6,0.25) = 46.5 exactly. JS Math.round is half-up
+        // (-> 47); Python round() is banker's half-to-even (-> 46).
+        // 1-pixel JS/Python disagreement at this specific d; not a
+        // regression vs the pre-curve world (the old d=0.5 tile was
+        // 33, no half-tie). Documented for future parity-harness
+        // sanity passes.
         expect(buildBg("halftone", "#000000", "#FFFFFF", 0.5))
-            .toContain("33px 33px");
+            .toContain("47px 47px");
     });
 
-    it("stripes d=0.5 tile = round(lerp(80,4))=42", () => {
+    it("stripes d=0.5 (curved 0.25) tile = round(lerp(80,4,0.25))=61", () => {
         expect(buildBg("stripes", "#000000", "#FFFFFF", 0.5))
-            .toContain("42px");  // half = 21
+            .toContain("61px");  // half = 30.5
     });
 
-    it("checker d=0.5 tile = round(lerp(60,4))=32", () => {
+    it("checker d=0.5 (curved 0.25) tile = round(lerp(60,4,0.25))=46", () => {
         expect(buildBg("checker", "#000000", "#FFFFFF", 0.5))
-            .toContain("32px 32px");
+            .toContain("46px 46px");
     });
 
-    it("bricks d=0.5 w = round(lerp(140,16))=78", () => {
+    it("bricks d=0.5 (curved 0.25) w = round(lerp(140,16,0.25))=109", () => {
         expect(buildBg("bricks", "#000000", "#FFFFFF", 0.5))
-            .toContain("78px");
+            .toContain("109px");
     });
 });
 
@@ -268,12 +276,12 @@ describe("paintPatternOnCanvas", () => {
     });
 
     it("dots path: arc() called for every dot in the grid", () => {
-        // d=0.5 -> tile=26. Canvas 100x100, dots stride starts at
-        // tile/2=13 -> grid positions 13, 39, 65, 91 (x 4). Same in
-        // y. So 4*4 = 16 arcs.
+        // d=0.5 (curved 0.25) -> tile=37. Canvas 100x100, dots
+        // stride starts at tile/2=18 -> grid positions 18, 55, 92
+        // (x 3). Same in y. So 3*3 = 9 arcs.
         const ctx = makeCtx();
         paintPatternOnCanvas(ctx, 100, 100, "dots", "#000000", "#FFFFFF", 0.5);
-        expect(ctx.arc).toHaveBeenCalledTimes(16);
+        expect(ctx.arc).toHaveBeenCalledTimes(9);
         // Last fillStyle assigned is color_b (the dot color).
         expect(ctx._fillStyleHistory).toContain("#FFFFFF");
     });
@@ -281,21 +289,21 @@ describe("paintPatternOnCanvas", () => {
     it("confetti is deterministic: same density -> same arc count", () => {
         // PRNG seed is fixed (0xC0FFE71), so two paints at the
         // same density produce identical arc-call counts.
-        // d=0.5 -> count = round(lerp(80, 2000, 0.5)) = 1040.
+        // d=0.5 (curved 0.25) -> count = round(lerp(80,2000,0.25)) = 560.
         const ctx1 = makeCtx();
         const ctx2 = makeCtx();
         paintPatternOnCanvas(ctx1, 400, 400, "confetti", "#000000", "#FFFFFF", 0.5);
         paintPatternOnCanvas(ctx2, 400, 400, "confetti", "#000000", "#FFFFFF", 0.5);
-        expect(ctx1.arc).toHaveBeenCalledTimes(1040);
-        expect(ctx2.arc).toHaveBeenCalledTimes(1040);
+        expect(ctx1.arc).toHaveBeenCalledTimes(560);
+        expect(ctx2.arc).toHaveBeenCalledTimes(560);
     });
 
-    it("rays path: even slice count at d=0.5 (26 fills, all color_b)", () => {
-        // 2*round(lerp(2,24,0.5)) = 26 total slices, half are
-        // color_b filled (the odd-indexed ones), so 13 fills.
+    it("rays path: even slice count at d=0.5 (curved 0.25 -> 16 slices, 8 fills)", () => {
+        // 2*round(lerp(2,24,0.25)) = 16 total slices, half are
+        // color_b filled (the odd-indexed ones), so 8 fills.
         const ctx = makeCtx();
         paintPatternOnCanvas(ctx, 200, 200, "rays", "#000000", "#FFFFFF", 0.5);
-        expect(ctx.fill).toHaveBeenCalledTimes(13);
+        expect(ctx.fill).toHaveBeenCalledTimes(8);
     });
 
     it("grid path: repaints base to color_b, then draws color_a lines", () => {

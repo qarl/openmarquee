@@ -1562,8 +1562,13 @@ fn draw_pattern(
     kind: PatternKind,
     color_a: [f32; 4],
     color_b: [f32; 4],
-    density: f32,
+    raw_density: f32,
 ) -> Result<()> {
+    // qarl 2026-05-12: stretch the low end of the density slider so
+    // low-intensity values yield REALLY large features. Quadratic
+    // curve in hdmi_logic::pattern_density_curve. Mirrors
+    // ui/src/bg-system.js + backend/openmarquee/auto_render.py.
+    let density = crate::hdmi_logic::pattern_density_curve(raw_density);
     match kind {
         PatternKind::Stripes => {
             let u = stripes_uniforms(density);

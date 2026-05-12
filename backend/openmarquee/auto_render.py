@@ -237,6 +237,27 @@ def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
+# qarl 2026-05-12: stretch the low end of the density slider so
+# low-intensity values yield REALLY large features. Quadratic curve
+# applied to size-/count-bearing patterns; gradient (whose density
+# encodes rotation angle 0..270deg) is exempt.
+#
+# JS mirror: ui/src/bg-system.js DENSITY_CURVE_EXPONENT + densityCurve().
+# Both sides must stay in lockstep for WYSIWYG parity.
+_DENSITY_CURVE_EXPONENT = 2
+
+
+def _density_curve(d: float) -> float:
+    dd = max(0.0, min(1.0, d))
+    return dd ** _DENSITY_CURVE_EXPONENT
+
+
+def _effective_density(pattern_name: str, raw_d: float) -> float:
+    if pattern_name == "gradient":
+        return raw_d
+    return _density_curve(raw_d)
+
+
 def render_pattern(
     pattern: BackgroundPattern, width: int, height: int,
 ) -> Image.Image:
@@ -247,7 +268,7 @@ def render_pattern(
     p = pattern.pattern
     a = pattern.color_a
     b = pattern.color_b
-    d = pattern.density
+    d = _effective_density(p, pattern.density)
     if p == "solid":
         return Image.new("RGB", (width, height), a)
     if p == "gradient":
