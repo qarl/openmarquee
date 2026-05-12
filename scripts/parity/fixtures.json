@@ -15,12 +15,100 @@
             "purpose": "Text-only static slide. Canvas2D vs fontdue text AA + word-wrap parity."
         },
         {
-            "name": "parity_bg_pattern",
+            "name": "parity_bg_pattern_dots",
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-000000000003",
             "tick": 0.0,
             "golden": "bg_pattern_dots",
-            "purpose": "bg-system.js Canvas2D dots vs Rust pattern shader. First of the 11; commit 3 expands to all."
+            "purpose": "bg-system.js Canvas2D dots vs Rust pattern shader."
+        },
+        {
+            "name": "parity_bg_pattern_solid",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000000a",
+            "tick": 0.0,
+            "golden": "bg_pattern_solid",
+            "purpose": "Solid color fill -- the simplest pattern. Baseline for color exactness."
+        },
+        {
+            "name": "parity_bg_pattern_gradient",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000000b",
+            "tick": 0.0,
+            "golden": "bg_pattern_gradient",
+            "purpose": "Linear gradient. Canvas createLinearGradient vs Rust shader gradient math."
+        },
+        {
+            "name": "parity_bg_pattern_halftone",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000000c",
+            "tick": 0.0,
+            "golden": "bg_pattern_halftone",
+            "purpose": "Halftone offset-grid dots. Pattern tile alignment + density-to-radius mapping."
+        },
+        {
+            "name": "parity_bg_pattern_stripes",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000004",
+            "tick": 0.0,
+            "golden": "bg_pattern_stripes",
+            "purpose": "Diagonal stripes."
+        },
+        {
+            "name": "parity_bg_pattern_scanlines",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000000d",
+            "tick": 0.0,
+            "golden": "bg_pattern_scanlines",
+            "purpose": "Horizontal scanlines. Density-to-line-width mapping."
+        },
+        {
+            "name": "parity_bg_pattern_checker",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000000e",
+            "tick": 0.0,
+            "golden": "bg_pattern_checker",
+            "purpose": "Checkerboard. Tile size + parity alignment."
+        },
+        {
+            "name": "parity_bg_pattern_grid",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-00000000000f",
+            "tick": 0.0,
+            "golden": "bg_pattern_grid",
+            "purpose": "Grid lines. Line spacing + thickness from density."
+        },
+        {
+            "name": "parity_bg_pattern_rings",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000005",
+            "tick": 0.0,
+            "golden": "bg_pattern_rings",
+            "purpose": "Concentric rings. Radial gradient/repeating-pattern math."
+        },
+        {
+            "name": "parity_bg_pattern_rays",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000010",
+            "tick": 0.0,
+            "golden": "bg_pattern_rays",
+            "purpose": "Sun rays. Radial sweep with angular density."
+        },
+        {
+            "name": "parity_bg_pattern_confetti",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000006",
+            "tick": 0.0,
+            "golden": "bg_pattern_confetti",
+            "purpose": "Confetti scatter. Deterministic per-seed RNG; tests numerical reproducibility of the LCG."
+        },
+        {
+            "name": "parity_bg_pattern_bricks",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000011",
+            "tick": 0.0,
+            "golden": "bg_pattern_bricks",
+            "purpose": "Brick pattern. Per-row offset + tile size from density."
         },
         {
             "name": "parity_motion_ticker",

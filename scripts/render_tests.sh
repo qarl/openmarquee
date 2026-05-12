@@ -162,6 +162,18 @@ FIXTURES=(
     "bg_pattern_stripes|slide|f0000000-0000-4000-8000-000000000004|$PI_FIXTURE_ROOT"
     "bg_pattern_rings|slide|f0000000-0000-4000-8000-000000000005|$PI_FIXTURE_ROOT"
     "bg_pattern_confetti|slide|f0000000-0000-4000-8000-000000000006|$PI_FIXTURE_ROOT"
+    # c3b parity pattern expansion: 8 more patterns to close the
+    # 12-pattern set (the 4 above + these 8 = all of PATTERN_NAMES
+    # from ui/src/bg-system.js). Drives cross-renderer parity
+    # coverage; goldens live alongside the existing 4-up sampler.
+    "bg_pattern_solid|slide|f0000000-0000-4000-8000-00000000000a|$PI_FIXTURE_ROOT"
+    "bg_pattern_gradient|slide|f0000000-0000-4000-8000-00000000000b|$PI_FIXTURE_ROOT"
+    "bg_pattern_halftone|slide|f0000000-0000-4000-8000-00000000000c|$PI_FIXTURE_ROOT"
+    "bg_pattern_scanlines|slide|f0000000-0000-4000-8000-00000000000d|$PI_FIXTURE_ROOT"
+    "bg_pattern_checker|slide|f0000000-0000-4000-8000-00000000000e|$PI_FIXTURE_ROOT"
+    "bg_pattern_grid|slide|f0000000-0000-4000-8000-00000000000f|$PI_FIXTURE_ROOT"
+    "bg_pattern_rays|slide|f0000000-0000-4000-8000-000000000010|$PI_FIXTURE_ROOT"
+    "bg_pattern_bricks|slide|f0000000-0000-4000-8000-000000000011|$PI_FIXTURE_ROOT"
     # --- 18.1 / sweep #9 N2: ImageSlide + VideoSlide goldens ---
     # ImageSlide blit path (full-res RGBA tex upload + FS_BLIT) had
     # zero pixel coverage. 1920x1080 synth asset.png: diagonal
