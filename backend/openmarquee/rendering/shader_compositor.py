@@ -460,6 +460,21 @@ void main() {
 
 # Scroll: vertical analog of slide. u_to enters from the bottom edge
 # as u_from rolls up off the top.
+#
+# Convention pin (task #388, 2026-05-12 verify): this Python path's
+# _VERTEX_SHADER (line ~248) Y-FLIPS the UV at vertex stage
+#   v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+# so v_uv.y=0 is the screen TOP and v_uv.y=1 is the screen BOTTOM
+# (image-y-down convention, matching PIL). Under that convention,
+# `step(seam, v_uv.y)` selects the v_uv.y >= seam region, which is
+# the BOTTOM of the screen -- where B correctly enters.
+#
+# The Rust renderer's transition_sp_quad_vbo binds NDC-y-up UVs
+# (v_uv.y=0 at screen BOTTOM); same shader code there scrolls the
+# WRONG direction. Fixed in qarl-bug 2026-05-12 commit 3d6f43e
+# by inverting the step + sampling offsets ON THE RUST SIDE. This
+# Python path is correct AS-IS; do not symmetric-port the Rust
+# math here without verifying the UV convention first.
 _FRAGMENT_SCROLL = _FRAGMENT_PREAMBLE + """
 void main() {
   float t = u_transition_t;

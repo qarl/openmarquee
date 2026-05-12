@@ -497,6 +497,41 @@ async def test_scroll_transition_emits_split_frames(renderer):
         "expected at least one split frame with both pure-red and pure-blue rows"
     )
 
+    # Task #388 directional verification: at a mid-transition frame,
+    # the NEW slide (B = blue) should appear at the BOTTOM of the
+    # frame while the OLD slide (A = red) sits on top -- scroll UP,
+    # not scroll DOWN. Inspect every split frame; the bottom rows
+    # must be blue, top rows must be red. PIL fallback path is what
+    # runs in this test (no EGL on the runner); same direction
+    # contract as the shader path's _FRAGMENT_SCROLL.
+    red_row = bytes((255, 0, 0)) * width
+    blue_row = bytes((0, 0, 255)) * width
+    split_frames = [
+        f for f in rendered
+        if red_row in [f[y * width * 3:(y + 1) * width * 3] for y in range(height)]
+        and blue_row in [f[y * width * 3:(y + 1) * width * 3] for y in range(height)]
+    ]
+    assert split_frames, "no split frames found (precondition for direction check)"
+    for f in split_frames:
+        rows = [f[y * width * 3:(y + 1) * width * 3] for y in range(height)]
+        # Find the boundary between red and blue. Walk top-down (PIL
+        # convention): first row that's NOT red marks the seam; from
+        # there down must be blue.
+        first_blue_y = next(
+            (y for y, r in enumerate(rows) if r == blue_row),
+            None,
+        )
+        last_red_y = max(
+            (y for y, r in enumerate(rows) if r == red_row),
+            default=-1,
+        )
+        assert first_blue_y is not None and last_red_y >= 0
+        assert last_red_y < first_blue_y, (
+            f"scroll direction reversed: red row at y={last_red_y} below "
+            f"blue row at y={first_blue_y}. Expected A (red) on top, "
+            f"B (blue) on bottom for 'scroll up'."
+        )
+
 
 @pytest.mark.asyncio
 async def test_flip_transition_emits_squished_frames(renderer):
