@@ -990,38 +990,35 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     flex-direction: column;
     gap: 0.75rem;
     min-width: 0;  /* let cards shrink rather than overflow the column */
-    /* Cap the parameter group at 720px on wide viewports -- without
-       this the form stretches into wasted horizontal space and the
-       preview stays at its 26rem cap. With the cap, leftover space
-       flows to the preview column instead (B13, 2026-05-05). */
-    max-width: 720px;
+    /* qarl-bug 2026-05-12: the 720px cap (B13, 2026-05-05) was a
+       mistake. The editor column should be approximately phone-width
+       so the operator's mental model of "this is what fits on a
+       phone" stays consistent across mobile + desktop. iPhone 14
+       Pro Max is the wide end at 430px; iPhone 14/15 is 390px;
+       iPhone SE is 375px. 420px caps just above the common-phone
+       widths, gives the preview column the rest. */
+    max-width: 420px;
 }
-/* Breakpoint bumped from 720 to 1080 (B21, 2026-05-05): with the
-   form column pinned to a stable 720px (not auto-sized), splitting
-   into two cols at the previous 720px breakpoint left the preview
-   track at near-zero width on viewports between 720 and 1080. The
-   single-column stacked layout reads better at those widths anyway
-   -- preview-above-form, both full-width. Above 1080 the preview
-   gets at least ~340px of meaningful space. */
-@media (min-width: 1080px) {
+/* qarl-bug 2026-05-12: 1080 breakpoint dropped to 760, matching the
+   narrower 420px form + ~340px preview budget at the breakpoint. The
+   original 1080 was tuned to 720+340 = 1060; with form now 420, the
+   two-column layout becomes viable much sooner. */
+@media (min-width: 760px) {
     .editor-cols {
         display: grid;
-        /* preview = 1fr (grows to fill leftover), form = stable 720px
-           track. Was minmax(0, auto) (B13) which sized to intrinsic
-           content width -- so showing/hiding motion controls (3 flex:1
-           sliders) made the form column jump wider/narrower and the
-           preview column resize with it (B21, 2026-05-05). The track is
-           now a fixed 720px to match .editor-form-stack's max-width
-           cap; column width stays constant regardless of which controls
-           are visible. */
-        grid-template-columns: minmax(0, 1fr) 720px;
+        /* preview = 1fr (grows to fill leftover), form = stable 420px
+           track. Phone-width-on-desktop design point: the form column
+           stays at its mobile size; the preview column inherits all
+           remaining horizontal space (and gets bigger on larger
+           displays, which is the operator's primary feedback surface). */
+        grid-template-columns: minmax(0, 1fr) 420px;
         gap: 1.25rem;
         align-items: start;
     }
     /* preview-wrap inside editor-cols sticks to the top so it stays
        visible while the operator scrolls the form-stack on the right.
        Override the global 26rem max-width so the preview can grow into
-       the leftover space when the viewport is wider than 720px form +
+       the leftover space when the viewport is wider than 420px form +
        preview-natural. */
     .editor-cols > .preview-wrap {
         position: sticky;
