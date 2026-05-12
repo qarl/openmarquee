@@ -30,7 +30,7 @@ def _stand_up_fake_src_ui(src_ui: Path) -> None:
     (src_ui / "fonts" / "Stub.ttf").write_text("not really a ttf\n")
 
 
-def test_build_emits_htaccess_with_short_cache(tmp_path: Path) -> None:
+def test_build_emits_dist_htaccess_with_short_cache(tmp_path: Path) -> None:
     """End-to-end: run build.sh against fake SRC_UI + tmp BUILD_DIR;
     assert .htaccess lands in $DEST/dist/ with `max-age=300`. www-Jimmy
     flagged this as the silent regression that re-bit on 2026-05-11."""
@@ -49,14 +49,48 @@ def test_build_emits_htaccess_with_short_cache(tmp_path: Path) -> None:
 
     htaccess = build_dir / "demo" / "dist" / ".htaccess"
     assert htaccess.exists(), (
-        ".htaccess missing from build output -- live demo will revert to "
-        "DreamHost's 30-day default Cache-Control. Re-land the cat block "
-        "in scripts/demo/build.sh after the dotfile + orphan sweeps."
+        "/demo/dist/.htaccess missing -- live demo's bundle will "
+        "revert to DreamHost's 30-day default Cache-Control. Re-land "
+        "the dist cat block in scripts/demo/build.sh after the "
+        "dotfile + orphan sweeps."
     )
     body = htaccess.read_text()
     assert "max-age=300" in body, (
         f"Cache-Control max-age regressed; body was:\n{body!r}"
     )
+    assert "must-revalidate" in body
+
+
+def test_build_emits_root_htaccess_with_short_cache(tmp_path: Path) -> None:
+    """Companion to the dist test: Apache .htaccess rules are
+    directory-local, so /demo/dist/.htaccess does NOT cover /demo/
+    root files (styles.css, index.html, welcome.html, mock-backend.js,
+    seed.json). www-Jimmy 2026-05-12 incident: qarl saw a stale
+    styles.css even AFTER deploy because /demo/.htaccess was missing
+    and the root inherited DreamHost's 30-day default. Both files
+    must exist."""
+    src_ui = tmp_path / "src-ui"
+    build_dir = tmp_path / "build"
+    _stand_up_fake_src_ui(src_ui)
+
+    env = {
+        **os.environ,
+        "OPENMARQUEE_BUILD_DIR": str(build_dir),
+    }
+    subprocess.run(
+        ["bash", str(_BUILD), str(src_ui)],
+        check=True, capture_output=True, text=True, env=env,
+    )
+
+    htaccess = build_dir / "demo" / ".htaccess"
+    assert htaccess.exists(), (
+        "/demo/.htaccess missing -- styles.css/index.html/welcome.html/"
+        "mock-backend.js will revert to DreamHost's 30-day default. "
+        "The /demo/dist/.htaccess does NOT cover these (directory-"
+        "local rules). Re-land the root cat block in build.sh."
+    )
+    body = htaccess.read_text()
+    assert "max-age=300" in body
     assert "must-revalidate" in body
 
 
@@ -83,6 +117,13 @@ def test_build_htaccess_survives_dotfile_and_orphan_sweeps(tmp_path: Path) -> No
     # Orphan sweep should have fired.
     assert "removed=1" in result.stdout or "removed orphan" in result.stdout
 
-    htaccess = build_dir / "demo" / "dist" / ".htaccess"
-    assert htaccess.exists()
-    assert "max-age=300" in htaccess.read_text()
+    htaccess_dist = build_dir / "demo" / "dist" / ".htaccess"
+    htaccess_root = build_dir / "demo" / ".htaccess"
+    assert htaccess_dist.exists()
+    assert "max-age=300" in htaccess_dist.read_text()
+    # Root .htaccess also survives the sweeps (it lives at $DEST/, not
+    # $DEST/dist/, so the dist-scoped sweeps don't touch it -- but pin
+    # it here in case a future refactor introduces a parallel
+    # root-level sweep).
+    assert htaccess_root.exists()
+    assert "max-age=300" in htaccess_root.read_text()

@@ -64,15 +64,37 @@ find "$DEST/dist" -maxdepth 1 -type f -name '.*' -delete 2>/dev/null || true
 # non-hashed entry file (main.js / login.js / set-password.js / etc.).
 bash "$(dirname "$0")/sweep_orphan_chunks.sh" "$DEST/dist"
 
-# .htaccess for the live demo on DreamHost (www-Jimmy 2026-05-05;
-# restored 2026-05-11 after a refactor dropped it). Sets the response
-# Cache-Control on dist/* to 5 minutes (was 30 days by host default,
-# so a sortable/main.js update wouldn't reach operators' browsers for
-# a month). Must be written AFTER both the dotfile sweep (find
-# -delete '.*') and the orphan-chunk sweep -- either would wipe it
-# if it landed earlier. deploy.sh's rsync --delete only excludes
-# .DS_Store + ._*, so the .htaccess MUST exist in BUILD_DIR before
-# each deploy or the server copy gets wiped.
+# .htaccess for the live demo on DreamHost. TWO files at two scopes
+# because Apache .htaccess rules are directory-local:
+#   $DEST/.htaccess        covers /demo/ root  -> styles.css,
+#                          index.html, welcome.html, mock-backend.js,
+#                          seed.json. (www-Jimmy 2026-05-12: this is
+#                          the file qarl's stale-styles.css bug
+#                          uncovered today.)
+#   $DEST/dist/.htaccess   covers /demo/dist/* -> the esbuild bundle
+#                          (main.js + content-hashed chunks). (www-
+#                          Jimmy 2026-05-05; restored 2026-05-11 after
+#                          a refactor dropped it.)
+#
+# Same body in both. Caps Cache-Control to 5 minutes (DreamHost's
+# default is 30 days; an updated main.js or styles.css wouldn't reach
+# operators' browsers for a month otherwise).
+#
+# Must be written AFTER both the dotfile sweep (find -delete '.*')
+# and the orphan-chunk sweep -- either would wipe the dist/ file
+# (and the root-level one too, if a future refactor widens the
+# dotfile sweep to $DEST root). deploy.sh's rsync --delete only
+# excludes .DS_Store + ._*, so BOTH files MUST exist in BUILD_DIR
+# before each deploy or the server copies get wiped.
+cat > "$DEST/.htaccess" <<'HTACCESS'
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresDefault "access plus 5 minutes"
+</IfModule>
+<IfModule mod_headers.c>
+  Header set Cache-Control "max-age=300, must-revalidate"
+</IfModule>
+HTACCESS
 cat > "$DEST/dist/.htaccess" <<'HTACCESS'
 <IfModule mod_expires.c>
   ExpiresActive On
