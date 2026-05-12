@@ -54,6 +54,16 @@ rsync -a --delete --delete-excluded \
 # change loses --delete-excluded — same shape sweep used in refresh.sh.
 find "$DEST/dist" -maxdepth 1 -type f -name '.*' -delete 2>/dev/null || true
 
+# Batch 12.x followup (www-Jimmy 2026-05-11): drop orphan hashed chunks
+# that npm run build left behind after a content-hash flip. Same shape
+# as the dotfile leak above: rsync mirrors what's there; if a prior
+# build wrote `sortable.esm-RLL2D47F.js` and the current build wrote
+# `sortable.esm-PUWFMERW.js`, BOTH end up in dist/ and both deploy.
+# main.js only loads the current one; the old one is dead weight on
+# the live demo. Sweep removes hashed files not referenced by any
+# non-hashed entry file (main.js / login.js / set-password.js / etc.).
+bash "$(dirname "$0")/sweep_orphan_chunks.sh" "$DEST/dist"
+
 # Same stylesheet path (./styles.css) as the device UI so demo's
 # index.html doesn't need URL rewrites.
 cp "$SRC_UI/styles.css" "$DEST/styles.css"
