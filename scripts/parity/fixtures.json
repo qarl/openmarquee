@@ -127,6 +127,30 @@
             "purpose": "Multi-layer with overlay blend. Canvas globalCompositeOperation vs GLES2 blend math."
         },
         {
+            "name": "parity_blend_multiply",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000012",
+            "tick": 0.0,
+            "golden": "blend_multiply",
+            "purpose": "Multi-layer with multiply blend on layer 2. Canvas 'multiply' (W3C compositing) vs GLES2 multiply math."
+        },
+        {
+            "name": "parity_blend_screen",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000013",
+            "tick": 0.0,
+            "golden": "blend_screen",
+            "purpose": "Multi-layer with screen blend on layer 2. Canvas 'screen' vs GLES2 screen math."
+        },
+        {
+            "name": "parity_blend_normal",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000014",
+            "tick": 0.0,
+            "golden": "blend_normal",
+            "purpose": "Multi-layer with normal blend (source-over) baseline. Pins the default-blend path."
+        },
+        {
             "name": "parity_motion_compound",
             "kind": "single",
             "uuid": "99c11690-415b-40f6-8e3c-6491f3bdf60e",

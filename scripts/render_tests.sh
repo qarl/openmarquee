@@ -174,6 +174,13 @@ FIXTURES=(
     "bg_pattern_grid|slide|f0000000-0000-4000-8000-00000000000f|$PI_FIXTURE_ROOT"
     "bg_pattern_rays|slide|f0000000-0000-4000-8000-000000000010|$PI_FIXTURE_ROOT"
     "bg_pattern_bricks|slide|f0000000-0000-4000-8000-000000000011|$PI_FIXTURE_ROOT"
+    # c3c parity blend-mode coverage: 2-layer slides with the test
+    # blend kind on layer 2. p2g_overlay_route already covers
+    # "overlay"; these add the remaining 3 modes from BLEND_TO_CANVAS
+    # in ui/src/rasterize.js.
+    "blend_multiply|slide|f0000000-0000-4000-8000-000000000012|$PI_FIXTURE_ROOT"
+    "blend_screen|slide|f0000000-0000-4000-8000-000000000013|$PI_FIXTURE_ROOT"
+    "blend_normal|slide|f0000000-0000-4000-8000-000000000014|$PI_FIXTURE_ROOT"
     # --- 18.1 / sweep #9 N2: ImageSlide + VideoSlide goldens ---
     # ImageSlide blit path (full-res RGBA tex upload + FS_BLIT) had
     # zero pixel coverage. 1920x1080 synth asset.png: diagonal
