@@ -665,6 +665,25 @@
             });
         }
 
+        // qarl 2026-05-12 (arc 4): Tailscale URL-auth stubs. Demo
+        // doesn't have a real `tailscale` binary; surface a static
+        // "disabled" status + a stub auth URL so the UI flow renders.
+        if (pathname === "/api/system/tailscale/up" && method === "POST") {
+            return jsonResponse({
+                state: "pending",
+                auth_url: "https://login.tailscale.com/a/demo-fake-key",
+                message: "demo: tailscale up stub",
+            });
+        }
+        if (pathname === "/api/system/tailscale/status" && method === "GET") {
+            return jsonResponse({
+                state: "disabled",
+                hostname: null,
+                ipv4: null,
+                message: "demo: tailscale status stub",
+            });
+        }
+
         // --- stream (live phone-camera takeover, SYSTEM_SPEC §5.11) ---
         // simulateOnly mode in the panel skips the /start /stop
         // /takeover round trips entirely — they're never called from

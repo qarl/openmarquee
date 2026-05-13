@@ -385,6 +385,14 @@ describe("mountSettings", () => {
     });
 
     it("hydrates Tailscale fields + round-trips them to onSave", async () => {
+        // qarl 2026-05-12 arc 4: the auth-key secret-field UI was
+        // replaced by a URL-auth flow (Enable button + status pill +
+        // auth-URL inline display). The wire-shape tailscale_auth_key
+        // field is preserved as a hidden input for back-compat — it
+        // round-trips the redacted sentinel through PUT so the
+        // backend's secret-substitution doesn't clobber an existing
+        // key. Hostname is now readonly (pinned to device_id per a2
+        // semantics).
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
         mount(container, {
@@ -403,19 +411,21 @@ describe("mountSettings", () => {
         expect(container.querySelector(".field-tailscale-hostname").value).toBe(
             "lobby-sign-01",
         );
-        // Batch 20.4: hidden input carries the redacted wire value.
+        // Hidden input carries the redacted wire value.
         expect(container.querySelector(".field-tailscale-auth-key").value).toBe("<set>");
-        const tsSecretStatus = container.querySelector(
-            '.secret-field[data-secret="tailscale-auth-key"] .secret-status',
-        );
-        expect(tsSecretStatus.textContent).toMatch(/Set/i);
+        // arc 4: Enable button + state pill + auth box wired into DOM.
+        expect(container.querySelector(".field-tailscale-enable-btn")).not.toBeNull();
+        expect(container.querySelector(".field-tailscale-state")).not.toBeNull();
+        const authBox = container.querySelector(".field-tailscale-auth");
+        // Auth-URL box is hidden until the operator clicks Enable.
+        expect(authBox.hidden).toBe(true);
 
         container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
         const payload = onSave.mock.calls[0][0];
         expect(payload.tailscale_enabled).toBe(true);
         expect(payload.tailscale_hostname).toBe("lobby-sign-01");
-        // Batch 20.4: PUT body echoes the sentinel.
+        // PUT body echoes the sentinel intact.
         expect(payload.tailscale_auth_key).toBe("<set>");
     });
 
@@ -441,6 +451,9 @@ describe("mountSettings", () => {
     // --- Batch 20.4: secret-field UI (Change… inline form) ---
 
     it("renders 'Set' indicator when GET returns the <set> sentinel", async () => {
+        // arc 4 (qarl 2026-05-12): Tailscale auth-key secret-field
+        // UI removed. Only wifi-ap + wifi-station retain the
+        // secret-field Change… affordance.
         const container = document.createElement("div");
         mount(container, {
             fetchSettings: async () => SAMPLE,
@@ -451,15 +464,11 @@ describe("mountSettings", () => {
             '.secret-field[data-secret="wifi-ap-password"] .secret-status',
         );
         expect(apStatus.textContent).toMatch(/Set/i);
-        // station + tailscale start null (per SAMPLE) -> "Not set"
+        // station starts null (per SAMPLE) -> "Not set"
         const stationStatus = container.querySelector(
             '.secret-field[data-secret="wifi-station-password"] .secret-status',
         );
         expect(stationStatus.textContent).toMatch(/Not set/i);
-        const tsStatus = container.querySelector(
-            '.secret-field[data-secret="tailscale-auth-key"] .secret-status',
-        );
-        expect(tsStatus.textContent).toMatch(/Not set/i);
     });
 
     it("Change… reveals the inline current_password + new_value form", async () => {

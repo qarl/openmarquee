@@ -215,32 +215,42 @@ const SECTION_TEMPLATE = `
                                 this UI from anywhere. Requires internet at
                                 install-time (secondary WiFi or Ethernet).
                             </p>
-                            <div class="row" style="gap: 10px;">
+                            <!-- qarl 2026-05-12 (arc 4): URL-auth flow.
+                                 No more pasting tskey-auth-... from the
+                                 admin console. Click Enable → backend
+                                 spawns 'tailscale up', captures the auth
+                                 URL → operator opens it on their phone /
+                                 signs in → poll detects authenticated. -->
+                            <div class="row" style="gap: 10px; align-items: flex-end;">
                                 <label class="field om-field" style="flex: 1;">
-                                    <span>Hostname on tailnet (optional)</span>
-                                    <input type="text" class="om-input field-tailscale-hostname" maxlength="63" placeholder="e.g. lobby-sign-01">
+                                    <span>Hostname on tailnet</span>
+                                    <input type="text" class="om-input field-tailscale-hostname"
+                                           maxlength="63" readonly aria-readonly="true"
+                                           title="Pinned to the device ID. Renaming the display label doesn't churn magic-DNS.">
                                 </label>
-                                <label class="field om-field secret-field" style="flex: 1;" data-secret="tailscale-auth-key">
-                                    <span>Auth key (tskey-auth-… or tskey-client-…)</span>
-                                    <div class="secret-display"
-                                         style="display: flex; gap: 8px; align-items: center; padding: 6px 0;">
-                                        <span class="secret-status" style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
-                                        <button type="button" class="om-btn sm secret-change-btn">Change…</button>
+                                <div class="field om-field" style="flex: 1;">
+                                    <span class="field-tailscale-state-label">Status</span>
+                                    <div style="display: flex; gap: 8px; align-items: center;">
+                                        <span class="field-tailscale-state om-mono" style="color: var(--om-text-dim); font-size: 13px;">Disabled</span>
+                                        <button type="button" class="om-btn primary sm field-tailscale-enable-btn">
+                                            Enable Tailscale
+                                        </button>
                                     </div>
-                                    <div class="secret-form" hidden style="display: grid; gap: 6px; margin-top: 4px;">
-                                        <input type="password" class="om-input secret-current-password"
-                                               placeholder="Current login password" autocomplete="current-password">
-                                        <input type="password" class="om-input secret-new-value"
-                                               placeholder="tskey-auth-… (blank = clear)">
-                                        <div style="display: flex; gap: 6px;">
-                                            <button type="button" class="om-btn primary sm secret-save-btn">Save</button>
-                                            <button type="button" class="om-btn sm secret-cancel-btn">Cancel</button>
-                                        </div>
-                                        <p class="secret-error" role="alert" aria-live="polite" style="min-height: 1.2em; color: #ff6b6b; font-size: 12px; margin: 0;"></p>
-                                    </div>
-                                    <input type="hidden" class="field-tailscale-auth-key">
-                                </label>
+                                </div>
                             </div>
+                            <div class="field-tailscale-auth" hidden style="margin-top: 10px; padding: 12px; background: var(--om-card-bg-2); border-radius: 8px;">
+                                <p style="margin: 0 0 6px;">Open this URL on any device with a browser to finish sign-in:</p>
+                                <a class="field-tailscale-auth-url" target="_blank" rel="noopener"
+                                   style="font-family: var(--om-mono); font-size: 13px; word-break: break-all;"></a>
+                                <p class="field-tailscale-auth-poll" style="margin: 8px 0 0; color: var(--om-text-dim); font-size: 12px;">Waiting for sign-in…</p>
+                            </div>
+                            <!-- Hidden field carrying the (deprecated) tskey
+                                 auth-key for back-compat: the wire schema still
+                                 has tailscale_auth_key; the new flow leaves it
+                                 empty. Keep the hidden input so collectPayload
+                                 echoes the redacted sentinel intact and the
+                                 backend's secret-substitution doesn't clobber. -->
+                            <input type="hidden" class="field-tailscale-auth-key">
                         </fieldset>
                     </fieldset>
                 </div>
@@ -349,6 +359,11 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
     const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
     const tsAuthKeyEl = container.querySelector(".field-tailscale-auth-key");
+    const tsStateEl = container.querySelector(".field-tailscale-state");
+    const tsEnableBtn = container.querySelector(".field-tailscale-enable-btn");
+    const tsAuthBox = container.querySelector(".field-tailscale-auth");
+    const tsAuthUrlEl = container.querySelector(".field-tailscale-auth-url");
+    const tsAuthPollEl = container.querySelector(".field-tailscale-auth-poll");
     const nowValueEl = container.querySelector('[data-field="device-now-value"]');
 
     // One-time population of non-data-driven selects.
@@ -474,7 +489,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const PATCH_PATH_BY_SECRET = {
         "wifi-ap-password": "/api/settings/wifi-ap-password",
         "wifi-station-password": "/api/settings/wifi-station-password",
-        "tailscale-auth-key": "/api/settings/tailscale-auth-key",
     };
 
     function updateSecretIndicator(secretId, wireValue) {
@@ -736,7 +750,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
             tsHostnameEl.value = settings.tailscale_hostname ?? "";
             tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
-            updateSecretIndicator("tailscale-auth-key", settings.tailscale_auth_key);
             syncWifiGrayOut();
             syncTailscaleStationGating();
             syncWs281xOrderVisibility();
@@ -748,6 +761,88 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             statusEl.textContent = `Could not load settings: ${err.message}`;
         }
     }
+
+    // qarl 2026-05-12 (arc 4): Tailscale URL-auth flow. Click Enable
+    // -> POST /api/system/tailscale/up -> backend spawns `tailscale up`,
+    // captures auth URL, returns it. We surface the URL inline +
+    // start polling /api/system/tailscale/status until backend
+    // reports BackendState=="Running" (authenticated). State pill
+    // updates throughout.
+    let tsPollTimer = null;
+    function setTsState(label, color) {
+        if (!tsStateEl) return;
+        tsStateEl.textContent = label;
+        tsStateEl.style.color = color || "var(--om-text-dim)";
+    }
+    async function pollTailscaleStatus() {
+        try {
+            const res = await apiFetch("/api/system/tailscale/status");
+            const data = await res.json();
+            if (data.state === "authenticated") {
+                const label = data.hostname
+                    ? `Authenticated as ${data.hostname}`
+                    : "Authenticated";
+                setTsState(label, "#7dd87a");
+                tsAuthBox.hidden = true;
+                if (tsPollTimer) clearInterval(tsPollTimer);
+                tsPollTimer = null;
+            } else if (data.state === "error") {
+                setTsState("Error", "#ff6b6b");
+                tsAuthPollEl.textContent =
+                    data.message || "Couldn't read Tailscale status.";
+                // Stop polling — the error is unlikely to clear
+                // without operator action; let them click Enable
+                // again to restart.
+                if (tsPollTimer) clearInterval(tsPollTimer);
+                tsPollTimer = null;
+            } else if (data.state === "disabled") {
+                setTsState("Disabled");
+                // Operator declined or `tailscale up` exited before
+                // sign-in. Stop polling; the auth URL is stale anyway.
+                if (tsPollTimer) clearInterval(tsPollTimer);
+                tsPollTimer = null;
+            } else {
+                setTsState("Waiting for sign-in…");
+            }
+        } catch (err) {
+            tsAuthPollEl.textContent = `Status check failed: ${err.message}`;
+        }
+    }
+    tsEnableBtn?.addEventListener("click", async () => {
+        tsEnableBtn.disabled = true;
+        setTsState("Starting…");
+        tsAuthBox.hidden = true;
+        try {
+            const res = await apiFetch("/api/system/tailscale/up", {
+                method: "POST",
+            });
+            const data = await res.json();
+            if (data.state === "pending" && data.auth_url) {
+                tsAuthUrlEl.textContent = data.auth_url;
+                tsAuthUrlEl.href = data.auth_url;
+                tsAuthBox.hidden = false;
+                setTsState("Waiting for sign-in…");
+                if (tsPollTimer) clearInterval(tsPollTimer);
+                tsPollTimer = setInterval(pollTailscaleStatus, 3000);
+            } else if (data.state === "authenticated") {
+                setTsState("Authenticated", "#7dd87a");
+            } else {
+                setTsState("Error", "#ff6b6b");
+                tsAuthPollEl.textContent = data.message || "tailscale up failed.";
+                tsAuthBox.hidden = false;
+            }
+        } catch (err) {
+            setTsState("Error", "#ff6b6b");
+            tsAuthPollEl.textContent = `Couldn't reach backend: ${err.message}`;
+            tsAuthBox.hidden = false;
+        } finally {
+            tsEnableBtn.disabled = false;
+        }
+    });
+    // On mount, read existing status so an already-authenticated
+    // device shows the green pill without the operator clicking
+    // Enable.
+    pollTailscaleStatus();
 
     function collectPayload() {
         return {

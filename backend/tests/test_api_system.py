@@ -123,6 +123,48 @@ def test_info_exposes_device_id_when_identity_present(
     assert body["device_id"] == "MySign7K2"
 
 
+def test_tailscale_up_returns_auth_url_from_stub(
+    client: TestClient, tmp_path, monkeypatch
+):
+    """qarl 2026-05-12 (arc 4): POST /api/system/tailscale/up spawns
+    `tailscale up`, parses the auth URL, returns it. Use a bash stub
+    so the test doesn't need a real Tailscale install."""
+    import stat as _stat
+    stub = tmp_path / "tailscale"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'visit https://login.tailscale.com/a/teststub42' >&2\n"
+        "sleep 30\n"
+    )
+    stub.chmod(stub.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+    monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", str(stub))
+    response = client.post("/api/system/tailscale/up")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "pending"
+    assert body["auth_url"] == "https://login.tailscale.com/a/teststub42"
+
+
+def test_tailscale_status_authenticated_from_stub(
+    client: TestClient, tmp_path, monkeypatch
+):
+    import stat as _stat
+    stub = tmp_path / "tailscale"
+    blob = (
+        '{"BackendState":"Running",'
+        '"Self":{"HostName":"mysign7k2","TailscaleIPs":["100.64.1.2"]}}'
+    )
+    stub.write_text(f"#!/usr/bin/env bash\ncat <<'EOF'\n{blob}\nEOF\n")
+    stub.chmod(stub.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+    monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", str(stub))
+    response = client.get("/api/system/tailscale/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "authenticated"
+    assert body["hostname"] == "mysign7k2"
+    assert body["ipv4"] == "100.64.1.2"
+
+
 def test_info_device_id_null_when_identity_absent(client: TestClient, tmp_path, monkeypatch):
     """Off-device dev path: identity.json doesn't exist; the field
     is null. UI falls back to OS hostname there."""

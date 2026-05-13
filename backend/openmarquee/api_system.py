@@ -26,7 +26,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
-from openmarquee import auto_render, identity, motion
+from openmarquee import auto_render, identity, motion, tailscale
 from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_flock_storage, get_settings_storage
@@ -339,6 +339,59 @@ async def system_info(
         display_rotation=rotation,
         device_id=identity.read_device_id(),
     )
+
+
+# --- qarl 2026-05-12 (arc 4): Tailscale URL-auth flow ---
+
+
+class TailscaleUpResponse(BaseModel):
+    """Response from POST /api/system/tailscale/up.
+
+    state:
+      - "pending": auth_url populated; operator should open it
+      - "authenticated": already up, no action needed
+      - "error": something went wrong; see message
+    """
+
+    state: str
+    auth_url: str | None
+    message: str | None
+
+
+class TailscaleStatusResponse(BaseModel):
+    state: str
+    hostname: str | None
+    ipv4: str | None
+    message: str | None
+
+
+@router.post("/tailscale/up", response_model=TailscaleUpResponse)
+async def tailscale_up() -> TailscaleUpResponse:
+    """Start `tailscale up --hostname=<device_id>` without an auth-key
+    and return the auth URL Tailscale prints. Operator opens the URL
+    in a browser, signs in to Tailscale, and the daemon finishes
+    auth. Caller polls /tailscale/status to detect the transition."""
+    device_id = identity.read_device_id()
+    result = await tailscale.start_up(device_id)
+    return TailscaleUpResponse(**{
+        "state": result["state"],
+        "auth_url": result.get("auth_url"),
+        "message": result.get("message"),
+    })
+
+
+@router.get("/tailscale/status", response_model=TailscaleStatusResponse)
+async def tailscale_status() -> TailscaleStatusResponse:
+    """Read `tailscale status --json` and return a thin summary.
+    UI polls this while in the URL-auth modal to detect when the
+    operator's browser sign-in completes."""
+    result = await tailscale.read_status()
+    return TailscaleStatusResponse(**{
+        "state": result["state"],
+        "hostname": result.get("hostname"),
+        "ipv4": result.get("ipv4"),
+        "message": result.get("message"),
+    })
 
 
 def _read_model() -> str | None:
