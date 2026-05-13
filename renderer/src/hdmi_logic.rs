@@ -234,23 +234,50 @@ pub fn predict_alpha_bitmap_dims(font: &fontdue::Font, text: &str, size_px: f32)
             let ascent = m.ymin + m.height as i32;
             max_ascent = max_ascent.max(ascent);
             min_descent = min_descent.min(m.ymin);
-            line_advance += m.advance_width;
+            // qarl-direct 2026-05-13 (Bug A): round per-glyph advance
+            // so monospace fonts (VT323) produce integer-aligned
+            // column stride. fontdue can report fractional advances
+            // (e.g. 9.5px at request size 86.4px) which compound
+            // with cursor_x rounding into a visible 9/10 alternation
+            // pattern. Round-per-step keeps stride uniform; bounded
+            // 0.5px-per-glyph error for proportional fonts is
+            // visually invisible.
+            line_advance += m.advance_width.round();
             any_glyph = true;
         }
         if line_advance > max_line_w {
             max_line_w = line_advance;
         }
     }
-    if !any_glyph {
-        // All-whitespace / all-newlines input has no measurable
-        // glyph content; return (0, 0) so layout_text_to_alpha's
-        // None contract holds.
+    // qarl-direct 2026-05-13 (Bug B): an ink-bearing glyph has both
+    // a non-zero ascent and a non-zero glyph height — if neither
+    // happens (e.g. " ", "   ", "\n"), the bitmap is empty. Detect
+    // here via max_ascent (which only goes positive when a glyph
+    // contributes ink) so the None-on-whitespace contract holds
+    // even after we pinned line_h to round(size*1.1) (which would
+    // otherwise leave line_h non-zero for any non-empty input).
+    let has_ink = max_ascent > 0 || min_descent < 0;
+    if !any_glyph || !has_ink {
         return (0, 0);
     }
     let pad: u32 = 1;
-    let line_h_px = (max_ascent - min_descent).max(0) as u32;
-    let bm_w = max_line_w.ceil() as u32 + 2 * pad;
-    let bm_h = (lines.len() as u32) * line_h_px + 2 * pad;
+    // qarl-direct 2026-05-13 (Bug B): line stride pinned to
+    // round(size_px * 1.1) to match Canvas2D rasterize.js (the
+    // canonical reference). Was: max_ascent - min_descent (font's
+    // intrinsic ascent+descent), which produced different line
+    // packing than JS at the same nominal font size.
+    let line_h_px = (size_px * 1.1).round() as u32;
+    let bm_w = max_line_w as u32 + 2 * pad;
+    // bm_h: stride between baselines is line_h_px (Canvas2D parity).
+    // The LAST line's glyphs still extend up by max_ascent and down
+    // by -min_descent from its baseline — pad bm_h to capture that
+    // ink rather than clipping descenders. For single-line text
+    // this reduces to (max_ascent - min_descent) + 2*pad which
+    // matches the pre-2026-05-13 contract exactly. For N>1, lines
+    // are spaced at line_h_px but the bitmap grows by the last
+    // line's full extent at the bottom.
+    let last_line_extent = (max_ascent - min_descent).max(0) as u32;
+    let bm_h = 2 * pad + last_line_extent + (lines.len() as u32 - 1) * line_h_px;
     (bm_w, bm_h)
 }
 
@@ -399,7 +426,8 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
             let ascent = m.ymin + m.height as i32;
             max_ascent = max_ascent.max(ascent);
             min_descent = min_descent.min(m.ymin);
-            line_advance += m.advance_width;
+            // Bug A fix: round per-step (see predict_alpha_bitmap_dims).
+            line_advance += m.advance_width.round();
             line_glyphs.push((m, alpha));
             any_glyph = true;
         }
@@ -408,13 +436,16 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
         }
         all_lines.push((line_glyphs, line_advance));
     }
-    if !any_glyph {
-        // All-whitespace / all-newlines input -- no measurable
-        // glyph content. Preserve the legacy empty-text contract.
+    // Bug B fix: an ink-bearing glyph has either positive ascent or
+    // negative descent (see predict_alpha_bitmap_dims for the
+    // matching whitespace check).
+    let has_ink = max_ascent > 0 || min_descent < 0;
+    if !any_glyph || !has_ink {
         return None;
     }
-    let line_w = max_line_w.ceil() as u32;
-    let line_h = (max_ascent - min_descent).max(0) as u32;
+    let line_w = max_line_w as u32;
+    // Bug B fix: pin to fontSize * 1.1 (see predict_alpha_bitmap_dims).
+    let line_h = (effective_size_px * 1.1).round() as u32;
     if line_w == 0 || line_h == 0 {
         return None;
     }
@@ -432,7 +463,13 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
     // pixels and produce the visible exterior ring.
     let pad: u32 = 1;
     let bm_w = line_w + 2 * pad;
-    let bm_h = (lines.len() as u32) * line_h + 2 * pad;
+    // Bug B fix: bm_h grows by line_h per additional line (stride
+    // matches Canvas2D) but the last line's full vertical extent
+    // (max_ascent - min_descent) is captured in the bitmap so
+    // descenders on the last line aren't clipped. Mirrors
+    // predict_alpha_bitmap_dims.
+    let last_line_extent = (max_ascent - min_descent).max(0) as u32;
+    let bm_h = 2 * pad + last_line_extent + (lines.len() as u32 - 1) * line_h;
 
     // Second pass: blit each line's glyphs at the correct baseline.
     // Line N's baseline = pad + max_ascent + N * line_h. cursor_x
@@ -469,7 +506,8 @@ pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> O
                     data[idx] = src;
                 }
             }
-            cursor_x += m.advance_width;
+            // Bug A fix: round per-step.
+            cursor_x += m.advance_width.round();
         }
     }
     Some(AlphaBitmap {
@@ -5576,6 +5614,95 @@ mod tests {
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .expect("parse Anton TTF")
+    }
+
+    /// Load VT323 (the Boot-slide canonical monospace font). Used by
+    /// the qarl-direct 2026-05-13 Bug A regression tests that pin
+    /// monospace column alignment.
+    fn load_vt323() -> fontdue::Font {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("ui/fonts/vt323.ttf");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+            .expect("parse VT323 TTF")
+    }
+
+    #[test]
+    fn line_height_pinned_to_size_times_1_1() {
+        // qarl-direct 2026-05-13 Bug B: Rust line STRIDE between
+        // baselines MUST match Canvas2D's `lineHeight = fontSize *
+        // 1.1` (rasterize.js:119). The bm_h formula keeps the last
+        // line's full vertical extent intact (descenders don't
+        // clip) but successive lines stack at exactly line_h
+        // pixels. So h_N - h_1 must equal (N-1) * round(size * 1.1).
+        let font = load_anton();
+        for size_px in [24.0_f32, 48.0, 96.0, 200.0] {
+            let expected_line_h = (size_px * 1.1).round() as u32;
+            let (_, h1) = predict_alpha_bitmap_dims(&font, "HELLO", size_px);
+            let (_, h3) = predict_alpha_bitmap_dims(&font, "A\nB\nC", size_px);
+            // Stride between lines is exactly line_h: h3 - h1 = 2 * line_h.
+            assert_eq!(
+                h3 - h1,
+                2 * expected_line_h,
+                "stride @ size={size_px}: got h3-h1={} (h1={h1}, h3={h3}), want 2 * {expected_line_h}",
+                h3 - h1,
+            );
+        }
+    }
+
+    #[test]
+    fn predict_descender_bm_h_exceeds_caps_only() {
+        // Companion to layout_descender_with_caps_extends_below:
+        // pin the predictor's bm_h to match the rasterizer's
+        // last-line-descender-aware formula. "Pgy" must yield a
+        // taller bm_h than "PPP" even though both are single-line.
+        let font = load_anton();
+        let (_, caps_h) = predict_alpha_bitmap_dims(&font, "PPP", 64.0);
+        let (_, mixed_h) = predict_alpha_bitmap_dims(&font, "Pgy", 64.0);
+        assert!(
+            mixed_h > caps_h,
+            "mixed h={mixed_h} should be > all-caps h={caps_h} (descender padding)",
+        );
+    }
+
+    #[test]
+    fn monospace_advance_is_uniform_after_rounding() {
+        // qarl-direct 2026-05-13 Bug A: VT323 (monospace) reports
+        // fractional advance_width from fontdue at non-integer sizes
+        // (e.g. 86.4px → ~9.5 px/glyph). Without per-step rounding,
+        // cursor_x drifts and rounded glyph_x positions alternate
+        // 9 / 10 / 9 / 10 — a visible non-uniform column stride.
+        //
+        // The fix: round per-step. With the fix, predicting a line
+        // of N identical glyphs produces a line width that's an
+        // exact multiple of round(advance_width). This test pins
+        // that invariant for VT323 at the Boot-slide-y size 86.4px.
+        let font = load_vt323();
+        let size = 86.4_f32;
+        let (w1, _) = predict_alpha_bitmap_dims(&font, ".", size);
+        let (w5, _) = predict_alpha_bitmap_dims(&font, ".....", size);
+        let (w10, _) = predict_alpha_bitmap_dims(&font, "..........", size);
+        // Strip the 2*pad from each width to isolate the per-line
+        // advance accumulator.
+        let pad: u32 = 1;
+        let inner1 = w1 - 2 * pad;
+        let inner5 = w5 - 2 * pad;
+        let inner10 = w10 - 2 * pad;
+        // 5 dots' width should be exactly 5 * single-dot stride.
+        assert_eq!(
+            inner5,
+            5 * inner1,
+            "5 dots @ {size}px should be 5x single-dot stride (single={inner1}, 5dots={inner5})",
+        );
+        // 10 dots: 10x. Bounds the cumulative drift to zero.
+        assert_eq!(
+            inner10,
+            10 * inner1,
+            "10 dots @ {size}px should be 10x single-dot stride (single={inner1}, 10dots={inner10})",
+        );
     }
 
     #[test]

@@ -275,6 +275,10 @@ async def main_async(args) -> int:
     metrics_path.write_text(json.dumps(metrics_per_fixture, indent=2))
     print(f"\nmetrics written to {metrics_path}")
 
+    if args.report_only:
+        # Soft mode: report drift to stdout + write metrics.json but
+        # always exit 0 so the surrounding pipeline doesn't fail.
+        return 0
     return 0 if all_pass else 1
 
 
@@ -284,6 +288,18 @@ def main() -> int:
         "--bless",
         action="store_true",
         help="Save browser captures as the new baseline (skip diff).",
+    )
+    # qarl-direct 2026-05-13: hard-gate is the default mode -- the
+    # script exits non-zero when ANY fixture fails its threshold so
+    # CI / deploy pipelines actually block on parity drift. --report-only
+    # flips to soft mode (always exit 0) for the rare "I'm working
+    # the diff down, don't fail my dev box yet" workflow. Keep the
+    # default hard; reports without consequences breed entropy.
+    ap.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Report drift but always exit 0 (soft mode). Default is "
+        "hard-gate: exit non-zero on any per-fixture threshold miss.",
     )
     args = ap.parse_args()
     return asyncio.run(main_async(args))
