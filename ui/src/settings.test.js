@@ -35,6 +35,78 @@ const SAMPLE = {
 };
 
 describe("mountSettings", () => {
+    it("device_id row is read-only and populated from /api/system/info when present", async () => {
+        // qarl 2026-05-12 (a2): MySignXXX device_id is exposed by
+        // /api/system/info, surfaced as a read-only row above the
+        // (editable) display name. Mock fetch so we don't hit the
+        // real network from jsdom.
+        // URL-routed mock: only respond to /api/system/info; let any
+        // other fetch call (rescan, etc.) return an empty-ok stub so
+        // the rest of the page doesn't crash.
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+            (url) => Promise.resolve({
+                ok: true,
+                json: async () => String(url).includes("/api/system/info")
+                    ? { device_id: "MySign7K2" }
+                    : { networks: [] },
+            }),
+        );
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const row = container.querySelector(".field-device-id-row");
+        const input = container.querySelector(".field-device-id");
+        expect(row).not.toBeNull();
+        expect(row.hidden).toBe(false);
+        expect(input.value).toBe("MySign7K2");
+        expect(input.readOnly).toBe(true);
+        // The Sign-name field is the editable display label; device_id
+        // row is its IMMUTABLE companion, not a replacement.
+        expect(container.querySelector(".field-sign-name").value).toBe("Lobby");
+        fetchSpy.mockRestore();
+    });
+
+    it("device_id row is hidden when /api/system/info returns null device_id", async () => {
+        // Off-device dev / pre-firstboot: identity.json absent ->
+        // device_id is null. Row must hide so the operator doesn't see
+        // a blank "Device ID:" label.
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+            ok: true,
+            json: async () => ({ device_id: null }),
+        });
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const row = container.querySelector(".field-device-id-row");
+        expect(row.hidden).toBe(true);
+        fetchSpy.mockRestore();
+    });
+
+    it("device_id row stays hidden when /api/system/info fetch errors", async () => {
+        // Network glitch / 401 from the auth middleware / etc -- the
+        // settings page must still render. Row default-hides.
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(
+            new Error("network glitch"),
+        );
+        const container = document.createElement("div");
+        mountSettings(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const row = container.querySelector(".field-device-id-row");
+        expect(row.hidden).toBe(true);
+        // And the rest of the form still hydrated.
+        expect(container.querySelector(".field-sign-name").value).toBe("Lobby");
+        fetchSpy.mockRestore();
+    });
+
     it("hydrates every field from the fetched settings", async () => {
         const container = document.createElement("div");
         mountSettings(container, {

@@ -26,7 +26,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
-from openmarquee import auto_render, motion
+from openmarquee import auto_render, identity, motion
 from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_flock_storage, get_settings_storage
@@ -257,6 +257,11 @@ class SystemInfo(BaseModel):
     display_width: int
     display_height: int
     display_rotation: int
+    # qarl 2026-05-12: MySignXXX device identifier from
+    # /var/openmarquee/identity.json (set at first boot). NULL on
+    # off-device dev hosts where identity.json doesn't exist (the
+    # operator-facing UI falls back to the OS hostname there).
+    device_id: str | None
 
 
 @router.get("/info", response_model=SystemInfo)
@@ -332,6 +337,7 @@ async def system_info(
         display_width=eff_w,
         display_height=eff_h,
         display_rotation=rotation,
+        device_id=identity.read_device_id(),
     )
 
 

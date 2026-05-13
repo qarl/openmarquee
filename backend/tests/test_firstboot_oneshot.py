@@ -42,6 +42,12 @@ def fakefs(tmp_path: Path) -> Path:
     (tmp_path / "opt" / "openmarquee" / "ui").mkdir(parents=True)
     shutil.copy(_SRC_HOSTAPD, tmp_path / "etc" / "hostapd" / "hostapd.conf")
     shutil.copy(_SRC_WELCOME, tmp_path / "opt" / "openmarquee" / "ui" / "welcome.html")
+    # Pre-seed /etc/hostname + /etc/hosts so the firstboot hostname
+    # rewrite has something to overwrite + update.
+    (tmp_path / "etc" / "hostname").write_text("openmarquee-bootstrap\n")
+    (tmp_path / "etc" / "hosts").write_text(
+        "127.0.0.1\tlocalhost\n127.0.1.1\topenmarquee-bootstrap\n"
+    )
     return tmp_path
 
 
@@ -122,16 +128,90 @@ def test_passphrase_uses_safe_charset(fakefs: Path) -> None:
     )
 
 
-def test_ssid_uses_openmarquee_prefix(fakefs: Path) -> None:
-    """sign name + AP SSID stays in sync principle (feedback memo).
-    SSID must start with `openMarquee-`."""
+def test_ssid_is_mysign_device_id(fakefs: Path) -> None:
+    """qarl 2026-05-12: SSID is now the MySignXXX device_id verbatim.
+    Replaces the prior openMarquee-<MAC-suffix> form. The same
+    identifier appears as /etc/hostname + identity.json device_id."""
     _run_oneshot(fakefs)
     payload = json.loads(
         (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
     )
-    assert payload["ssid"].startswith("openMarquee-"), (
-        f"SSID lost prefix: {payload['ssid']!r}"
+    assert re.match(r"^MySign[A-Z0-9]{3}$", payload["ssid"]), (
+        f"SSID {payload['ssid']!r} doesn't match MySign[A-Z0-9]{{3}}"
     )
+
+
+def test_identity_json_written_with_device_id(fakefs: Path) -> None:
+    """qarl 2026-05-12: identity.json is the single source of truth
+    for MySignXXX. Written 0644 (public ID, not a secret)."""
+    _run_oneshot(fakefs)
+    identity_path = fakefs / "var" / "openmarquee" / "identity.json"
+    assert identity_path.exists(), "identity.json not written"
+    payload = json.loads(identity_path.read_text())
+    assert "device_id" in payload
+    assert re.match(r"^MySign[A-Z0-9]{3}$", payload["device_id"])
+
+
+def test_identity_json_is_0644(fakefs: Path) -> None:
+    """Public ID, not a secret. 0644 lets the openmarquee service
+    user read it for /api/system/info; 0600 would force a sudo path."""
+    _run_oneshot(fakefs)
+    identity_path = fakefs / "var" / "openmarquee" / "identity.json"
+    mode = identity_path.stat().st_mode & 0o777
+    assert mode == 0o644, f"identity.json mode {oct(mode)} != 0644"
+
+
+def test_identity_ssid_hostname_all_match(fakefs: Path) -> None:
+    """Cross-source consistency: identity.json device_id, wifi.json
+    ssid, /etc/hostname, and hostapd.conf ssid line MUST all hold the
+    same MySignXXX string. The single-source-of-truth claim only
+    holds if the four representations stay in lockstep."""
+    _run_oneshot(fakefs)
+    identity = json.loads(
+        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
+    )
+    wifi = json.loads(
+        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
+    )
+    hostname = (fakefs / "etc" / "hostname").read_text().strip()
+    hostapd = (fakefs / "etc" / "hostapd" / "hostapd.conf").read_text()
+    device_id = identity["device_id"]
+    assert wifi["ssid"] == device_id
+    assert hostname == device_id
+    assert f"ssid={device_id}" in hostapd
+
+
+def test_etc_hosts_127_0_1_1_points_at_mysign(fakefs: Path) -> None:
+    """Without /etc/hosts mirroring the hostname, `sudo` warns
+    "unable to resolve host MySignXXX" on every invocation."""
+    _run_oneshot(fakefs)
+    hosts = (fakefs / "etc" / "hosts").read_text()
+    identity = json.loads(
+        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
+    )
+    device_id = identity["device_id"]
+    # The 127.0.1.1 line should point at MySignXXX, not at the
+    # pre-firstboot bootstrap hostname.
+    assert re.search(rf"^127\.0\.1\.1\s+{device_id}$", hosts, re.MULTILINE), (
+        f"127.0.1.1 line not retargeted in /etc/hosts:\n{hosts}"
+    )
+
+
+def test_idempotent_rerun_preserves_device_id(fakefs: Path) -> None:
+    """Second run reads existing identity.json instead of generating
+    a new MySignXXX. Without this property an interrupted first run
+    (power-cycle between identity.json + wifi.json writes) would
+    rotate the device_id on the next boot and decouple the operator's
+    welcome-card sticker from the device."""
+    _run_oneshot(fakefs)
+    first = json.loads(
+        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
+    )["device_id"]
+    _run_oneshot(fakefs)
+    second = json.loads(
+        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
+    )["device_id"]
+    assert first == second
 
 
 # --- hostapd.conf templating ---
@@ -184,6 +264,19 @@ def test_welcome_html_password_placeholder_filled(fakefs: Path) -> None:
     welcome = (fakefs / "opt" / "openmarquee" / "ui" / "welcome.html").read_text()
     assert "{{AP_PASSWORD}}" not in welcome
     assert payload["passphrase"] in welcome
+
+
+def test_welcome_html_device_id_placeholder_filled(fakefs: Path) -> None:
+    """qarl 2026-05-12: welcome.html greets the operator with
+    "Your sign: MySignXXX" so they have something memorable to
+    reference. {{DEVICE_ID}} must be substituted."""
+    _run_oneshot(fakefs)
+    identity = json.loads(
+        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
+    )
+    welcome = (fakefs / "opt" / "openmarquee" / "ui" / "welcome.html").read_text()
+    assert "{{DEVICE_ID}}" not in welcome
+    assert identity["device_id"] in welcome
 
 
 def test_welcome_html_qr_substituted_when_qrencode_available(fakefs: Path) -> None:

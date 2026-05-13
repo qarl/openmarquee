@@ -310,6 +310,12 @@
         <header class="welcome-header">
             <div class="brand-mark" aria-hidden="true">oM</div>
             <h1 class="brand brand-word">open<span>Marquee</span></h1>
+            <!-- Templated by system/openmarquee-firstboot.sh on first
+                 boot (B.4 + qarl 2026-05-12). The literal "{{DEVICE_ID}}"
+                 rendering means the templating step didn't run. -->
+            <p class="welcome-device-id" data-field="device-id">
+                Your sign: <strong>{{DEVICE_ID}}</strong>
+            </p>
         </header>
 
         <section class="welcome-body">

@@ -374,15 +374,43 @@ class SettingsStorage:
         if not self.path.exists():
             fresh = SystemSettings()
             updates: dict[str, str] = {}
-            if fresh.sign_name.startswith("Sign") and len(fresh.sign_name) > 4:
-                suffix = fresh.sign_name[4:]
-                updates["wifi_ssid"] = f"openMarquee{suffix}"
-            # Bug B15 (qarl batch 2026-04-29): Tailscale hostname starts
-            # empty, so the first-run UI surfaces a blank field. Pre-fill
-            # with the lowercased sign_name (DNS-safe by construction —
-            # `Sign<3-hex>` matches _TAILSCALE_HOSTNAME_PATTERN). Operator
-            # can still override before enabling the daemon.
-            updates["tailscale_hostname"] = fresh.sign_name.lower()
+            # qarl 2026-05-12 (a2): the factory-stamped MySignXXX
+            # device_id (set by openmarquee-firstboot.sh) is the
+            # IMMUTABLE infrastructure identifier. Anchor sign_name +
+            # wifi_ssid + tailscale_hostname against it at first-load:
+            #   - sign_name defaults to device_id but stays operator-
+            #     editable (it's the display label, not the
+            #     infrastructure ID)
+            #   - wifi_ssid = device_id (mirrors the firstboot-written
+            #     hostapd.conf, single source of truth)
+            #   - tailscale_hostname = device_id (lowercased; device_id
+            #     is [A-Z0-9] so lowercase is DNS-safe). Pinning to
+            #     device_id, not sign_name, means renaming the
+            #     display label doesn't churn magic-DNS.
+            # If identity.json isn't present (off-device dev), fall
+            # back to the legacy Sign<3-hex> path so existing dev
+            # flows keep working.
+            from openmarquee import identity as _identity
+            device_id = _identity.read_device_id()
+            if device_id is not None:
+                updates["sign_name"] = device_id
+                updates["wifi_ssid"] = device_id
+                # TODO (arc 4 -- Tailscale URL-auth): tailscale_hostname
+                # is currently a first-load mirror of device_id.lower()
+                # but stays operator-editable in the wire shape. Arc 4
+                # locks this down: tailscale_hostname becomes a
+                # derived-read-only field anchored to device_id so
+                # magic-DNS never churns.
+                updates["tailscale_hostname"] = device_id.lower()
+            else:
+                if fresh.sign_name.startswith("Sign") and len(fresh.sign_name) > 4:
+                    suffix = fresh.sign_name[4:]
+                    updates["wifi_ssid"] = f"openMarquee{suffix}"
+                # Bug B15 (qarl batch 2026-04-29): Tailscale hostname
+                # starts empty, so the first-run UI surfaces a blank
+                # field. Pre-fill with lowercased sign_name (DNS-safe
+                # by Sign<3-hex> construction).
+                updates["tailscale_hostname"] = fresh.sign_name.lower()
             if updates:
                 fresh = fresh.model_copy(update=updates)
             self.save(fresh)

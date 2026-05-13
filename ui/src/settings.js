@@ -60,8 +60,19 @@ const SECTION_TEMPLATE = `
             <div class="om-card">
                 <div ${CARD_EYEBROW}>Display</div>
                 <div class="om-stack" style="gap: 12px;">
+                    <!-- qarl 2026-05-12 (a2): device_id is the
+                         factory-stamped MySignXXX identifier set at
+                         first boot. IMMUTABLE -- drives hostapd SSID,
+                         /etc/hostname, Tailscale magic-DNS. Read-only
+                         here; renaming the display below doesn't
+                         touch it. Row is hidden off-device (no
+                         identity.json) since there's nothing to show. -->
+                    <label class="field om-field field-device-id-row" hidden>
+                        <span>Device ID</span>
+                        <input type="text" class="om-input field-device-id" readonly aria-readonly="true">
+                    </label>
                     <label class="field om-field">
-                        <span>Sign name</span>
+                        <span>Display name</span>
                         <input type="text" class="om-input field-sign-name" maxlength="64" required>
                     </label>
                     <label class="field om-field">
@@ -298,6 +309,8 @@ export function mountSettings(container, { fetchSettings, onSave }) {
     const saveBtn = container.querySelector(".settings-save");
 
     const signNameEl = container.querySelector(".field-sign-name");
+    const deviceIdEl = container.querySelector(".field-device-id");
+    const deviceIdRow = container.querySelector(".field-device-id-row");
     const outputModeEl = container.querySelector(".field-output-mode");
     const widthEl = container.querySelector(".field-display-width");
     const heightEl = container.querySelector(".field-display-height");
@@ -657,6 +670,24 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         statusEl.textContent = "";
         try {
             const settings = await fetchSettings();
+            // Best-effort fetch /api/system/info for the factory-stamped
+            // device_id. Off-device dev (no identity.json) returns null;
+            // we hide the row in that case. Failure is non-fatal -- the
+            // rest of the settings page must still load.
+            let systemInfo = null;
+            try {
+                const r = await fetch("/api/system/info", {
+                    headers: { "Authorization":
+                        `Bearer ${localStorage.getItem("openmarquee_auth_token") || ""}` },
+                });
+                if (r.ok) systemInfo = await r.json();
+            } catch { /* network glitch -- leave device_id row hidden */ }
+            if (systemInfo?.device_id) {
+                deviceIdEl.value = systemInfo.device_id;
+                deviceIdRow.hidden = false;
+            } else {
+                deviceIdRow.hidden = true;
+            }
             signNameEl.value = settings.sign_name ?? "";
             ensureSelectValue(outputModeEl, settings.output_mode);
             outputModeEl.value = settings.output_mode ?? "hdmi";

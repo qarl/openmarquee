@@ -107,6 +107,33 @@ def test_format_uptime_zero_is_zero_seconds():
 # --- /api/system/info endpoint behavior ---
 
 
+def test_info_exposes_device_id_when_identity_present(
+    client: TestClient, tmp_path, monkeypatch
+):
+    """qarl 2026-05-12: /api/system/info exposes the MySignXXX
+    device_id from /var/openmarquee/identity.json. Point the reader
+    at a fixture file to verify the field round-trips through the
+    Pydantic wire model."""
+    identity_path = tmp_path / "identity.json"
+    identity_path.write_text('{"device_id": "MySign7K2"}')
+    monkeypatch.setenv("OPENMARQUEE_IDENTITY_PATH", str(identity_path))
+    response = client.get("/api/system/info")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["device_id"] == "MySign7K2"
+
+
+def test_info_device_id_null_when_identity_absent(client: TestClient, tmp_path, monkeypatch):
+    """Off-device dev path: identity.json doesn't exist; the field
+    is null. UI falls back to OS hostname there."""
+    monkeypatch.setenv(
+        "OPENMARQUEE_IDENTITY_PATH", str(tmp_path / "does-not-exist.json")
+    )
+    response = client.get("/api/system/info")
+    assert response.status_code == 200
+    assert response.json()["device_id"] is None
+
+
 def test_info_returns_fallback_payload_on_dev_box(client: TestClient):
     """On a dev laptop without /proc/* sources, /info returns the
     SELF_PLACEHOLDER-matching values + source='fallback'. This is

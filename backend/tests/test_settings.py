@@ -197,13 +197,41 @@ def test_storage_seeds_tailscale_hostname_from_sign_name_on_first_load(tmp_path)
     """Bug B15 (qarl batch 2026-04-29): the Tailscale hostname field
     started empty on a fresh device, so the first-run UI surfaced a
     blank input. SettingsStorage.load() now pre-fills it with the
-    lowercased sign_name (DNS-safe by construction)."""
+    lowercased sign_name (DNS-safe by construction).
+
+    Off-device (no identity.json) path -- see the next test for the
+    on-device (identity.json present) anchoring path."""
     from openmarquee.settings import SettingsStorage
 
     storage = SettingsStorage(tmp_path / "settings.json")
     loaded = storage.load()
     assert loaded.sign_name.startswith("Sign")
     assert loaded.tailscale_hostname == loaded.sign_name.lower()
+
+
+def test_storage_anchors_to_device_id_when_identity_json_present(
+    tmp_path, monkeypatch
+):
+    """qarl 2026-05-12 (a2): when identity.json holds a MySignXXX
+    device_id (set at first boot), the IMMUTABLE infrastructure fields
+    anchor to it instead of the random Sign<XXX> mint:
+      - sign_name (display label) defaults to device_id but remains
+        operator-editable
+      - wifi_ssid = device_id (mirrors firstboot's hostapd.conf)
+      - tailscale_hostname = device_id.lower()
+    Renaming the display label doesn't churn magic-DNS because we
+    pin Tailscale's hostname to device_id, not sign_name."""
+    from openmarquee.settings import SettingsStorage
+
+    identity_path = tmp_path / "identity.json"
+    identity_path.write_text('{"device_id": "MySign7K2"}')
+    monkeypatch.setenv("OPENMARQUEE_IDENTITY_PATH", str(identity_path))
+
+    storage = SettingsStorage(tmp_path / "settings.json")
+    loaded = storage.load()
+    assert loaded.sign_name == "MySign7K2"
+    assert loaded.wifi_ssid == "MySign7K2"
+    assert loaded.tailscale_hostname == "mysign7k2"
 
 
 def test_timezone_accepts_well_formed_iana():

@@ -2,12 +2,20 @@
 # openmarquee-firstboot.sh — runs once on the very first boot of a
 # freshly-flashed openMarquee SD card (Phase B.4, closes sweep #5 #2).
 #
-# Generates a per-device random AP passphrase + MAC-derived SSID
-# suffix, writes /var/openmarquee/wifi.json (0600), templates
-# /etc/hostapd/hostapd.conf, templates the SSID + password +
-# QR-code SVG into /opt/openmarquee/ui/welcome.html, then touches
+# Generates a per-device MySignXXX identifier (qarl 2026-05-12) + a
+# random AP passphrase, writes /var/openmarquee/identity.json (0644)
+# + wifi.json (0600), sets /etc/hostname to MySignXXX (replacing the
+# cloud-init random hostname), templates /etc/hostapd/hostapd.conf,
+# templates the SSID + password + QR-code SVG + device_id into
+# /opt/openmarquee/ui/welcome.html, then touches
 # /var/openmarquee/.bootstrapped and disables itself (the service
 # unit's ExecStartPost also runs systemctl disable as belt-and-braces).
+#
+# MySignXXX format: literal "MySign" + 3 alphanumeric chars from
+# [A-Z0-9] (36 chars / position; 36^3 = 46,656 IDs). qarl-chosen
+# format -- mnemonic for "this is MY sign," short enough to memorize,
+# big enough namespace for any plausible fleet. Lives in identity.json
+# as the SINGLE SOURCE OF TRUTH for SSID + hostname + welcome.html.
 #
 # Idempotency:
 #   - If /var/openmarquee/wifi.json already exists with both fields
@@ -27,41 +35,42 @@
 set -euo pipefail
 
 WIFI_JSON="${WIFI_JSON:-/var/openmarquee/wifi.json}"
+IDENTITY_JSON="${IDENTITY_JSON:-/var/openmarquee/identity.json}"
 HOSTAPD_CONF="${HOSTAPD_CONF:-/etc/hostapd/hostapd.conf}"
 WELCOME_HTML="${WELCOME_HTML:-/opt/openmarquee/ui/welcome.html}"
 BOOTSTRAP_MARKER="${BOOTSTRAP_MARKER:-/var/openmarquee/.bootstrapped}"
+ETC_HOSTNAME="${ETC_HOSTNAME:-/etc/hostname}"
+ETC_HOSTS="${ETC_HOSTS:-/etc/hosts}"
 PHY_IFACE="${PHY_IFACE:-wlan0}"
 
 # Allow tests to redirect everything under a tmpdir.
 ROOT_PREFIX="${ROOT_PREFIX:-}"
 WIFI_JSON="${ROOT_PREFIX}${WIFI_JSON}"
+IDENTITY_JSON="${ROOT_PREFIX}${IDENTITY_JSON}"
 HOSTAPD_CONF="${ROOT_PREFIX}${HOSTAPD_CONF}"
 WELCOME_HTML="${ROOT_PREFIX}${WELCOME_HTML}"
 BOOTSTRAP_MARKER="${ROOT_PREFIX}${BOOTSTRAP_MARKER}"
+ETC_HOSTNAME="${ROOT_PREFIX}${ETC_HOSTNAME}"
+ETC_HOSTS="${ROOT_PREFIX}${ETC_HOSTS}"
 
 say() { printf '==> %s\n' "$*"; }
 fatal() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-# --- 1. Generate or read AP credentials -------------------------------------
+# --- 1a. Generate or read MySignXXX device identifier -----------------------
 
-# SSID: openMarquee-<MAC-suffix>. The suffix is the last two bytes of
-# wlan0's MAC (e.g. "A3F7"), uppercased. Matches the convention in
-# system/hostapd.conf comments + system/README.md feedback memo about
-# sign name + AP SSID staying in sync.
-derive_ssid_suffix() {
-    local mac_path="/sys/class/net/${PHY_IFACE}/address"
-    if [ -r "$mac_path" ]; then
-        # MAC format: aa:bb:cc:dd:ee:ff -- take last two octets, strip colons, uppercase.
-        local mac
-        mac=$(cat "$mac_path")
-        printf '%s' "${mac##*:}${mac:$((${#mac}-5)):2}" | tr -d ':' | tr 'a-f' 'A-F'
-    else
-        # Off-device test / WLAN0 absent -- generate a deterministic
-        # fallback so test runs don't fail noisily. Real devices
-        # always have wlan0.
-        printf '%s' "$(od -An -tx1 -N2 /dev/urandom | tr -d ' \n' | tr 'a-f' 'A-F')"
-    fi
+# MySign + 3 alphanumeric [A-Z0-9]. 36^3 = 46,656 IDs -- plenty for any
+# plausible openMarquee fleet. Used as: AP SSID, /etc/hostname,
+# Tailscale magic-DNS name, the operator-facing "what's my sign called"
+# string in welcome.html.
+generate_device_id() {
+    local suffix
+    # tr -dc filters /dev/urandom to our alphabet; head -c 3 caps.
+    # head -c works because the alphabet is single-byte ASCII.
+    suffix=$(LC_ALL=C tr -dc 'A-Z0-9' < /dev/urandom | head -c 3)
+    printf 'MySign%s' "$suffix"
 }
+
+# --- 1b. Generate or read AP credentials ------------------------------------
 
 # Passphrase: 16-char alphanumeric + a few safe symbols (no quotes,
 # no backslash, no ampersand -- those break shell + hostapd.conf
@@ -78,24 +87,51 @@ generate_passphrase() {
     printf '%s' "${pw:0:16}"
 }
 
+# Read existing identity.json (idempotent re-run) or generate fresh.
+# Order matters: device_id is established BEFORE wifi creds so the
+# SSID can derive from it.
+if [ -f "$IDENTITY_JSON" ]; then
+    say "Reading existing $IDENTITY_JSON (idempotent re-run)"
+    DEVICE_ID=$(sed -n 's/.*"device_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$IDENTITY_JSON")
+    [ -n "$DEVICE_ID" ] || fatal "identity.json missing device_id"
+else
+    say "Generating per-device identifier"
+    DEVICE_ID=$(generate_device_id)
+fi
+
 WIFI_JSON_REGENERATED=0
 if [ -f "$WIFI_JSON" ]; then
     say "Reading existing $WIFI_JSON (idempotent re-run)"
-    # Tolerant parse: extract "ssid" and "passphrase" via grep+sed.
-    # Cleaner with `jq` but we'd add a system dep just for this.
     SSID=$(sed -n 's/.*"ssid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$WIFI_JSON")
     PASSPHRASE=$(sed -n 's/.*"passphrase"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$WIFI_JSON")
     [ -n "$SSID" ] || fatal "wifi.json missing ssid"
     [ -n "$PASSPHRASE" ] || fatal "wifi.json missing passphrase"
 else
     say "Generating per-device AP credentials"
-    SSID_SUFFIX=$(derive_ssid_suffix)
-    SSID="openMarquee-${SSID_SUFFIX}"
+    # SSID is now the device_id verbatim (qarl 2026-05-12). Replaces the
+    # MAC-derived openMarquee-<suffix> form; single source of truth in
+    # identity.json. WPA2 SSID limit is 32 chars; "MySign" + 3 = 9.
+    SSID="${DEVICE_ID}"
     PASSPHRASE=$(generate_passphrase)
     WIFI_JSON_REGENERATED=1
 fi
 
-# --- 2. Write wifi.json (0600) only when we generated new creds ----------
+# --- 2a. Write identity.json (0644 -- public ID, not a secret) --------------
+
+if [ ! -f "$IDENTITY_JSON" ]; then
+    say "Writing $IDENTITY_JSON (0644)"
+    mkdir -p "$(dirname "$IDENTITY_JSON")"
+    TMP_ID="${IDENTITY_JSON}.tmp"
+    cat > "$TMP_ID" <<EOF
+{
+  "device_id": "${DEVICE_ID}"
+}
+EOF
+    chmod 0644 "$TMP_ID"
+    mv "$TMP_ID" "$IDENTITY_JSON"
+fi
+
+# --- 2b. Write wifi.json (0600) only when we generated new creds ------------
 
 if [ "$WIFI_JSON_REGENERATED" -eq 1 ]; then
     say "Writing $WIFI_JSON (0600)"
@@ -111,6 +147,26 @@ if [ "$WIFI_JSON_REGENERATED" -eq 1 ]; then
 EOF
     chmod 0600 "$TMP_JSON"
     mv "$TMP_JSON" "$WIFI_JSON"
+fi
+
+# --- 2c. Set /etc/hostname (overrides cloud-init's random openmarquee-<hex>)
+
+say "Setting hostname to ${DEVICE_ID}"
+# Write /etc/hostname directly + update /etc/hosts 127.0.1.1 line so
+# `sudo` doesn't warn about an unresolvable hostname. hostnamectl
+# requires systemd which may not be running yet in test environments;
+# call it best-effort. Real devices have it.
+echo "${DEVICE_ID}" > "$ETC_HOSTNAME"
+if [ -f "$ETC_HOSTS" ]; then
+    if grep -q "^127\.0\.1\.1" "$ETC_HOSTS"; then
+        sed -i.bak "s/^127\.0\.1\.1.*/127.0.1.1\t${DEVICE_ID}/" "$ETC_HOSTS"
+        rm -f "${ETC_HOSTS}.bak"
+    else
+        printf '127.0.1.1\t%s\n' "${DEVICE_ID}" >> "$ETC_HOSTS"
+    fi
+fi
+if command -v hostnamectl >/dev/null 2>&1 && [ -z "$ROOT_PREFIX" ]; then
+    hostnamectl set-hostname "${DEVICE_ID}" 2>/dev/null || true
 fi
 
 # --- 3. Template hostapd.conf -----------------------------------------------
@@ -137,11 +193,12 @@ if [ ! -f "$WELCOME_HTML" ]; then
     fatal "welcome.html not found at $WELCOME_HTML"
 fi
 
-# Substitute {{AP_SSID}} and {{AP_PASSWORD}} placeholders. Use a
-# delimiter (|) that won't appear in our charset (which has no pipe).
+# Substitute {{AP_SSID}}, {{AP_PASSWORD}}, {{DEVICE_ID}} placeholders.
+# Use a delimiter (|) that won't appear in our charset (no pipe).
 sed -i.bak \
     -e "s|{{AP_SSID}}|${SSID}|g" \
     -e "s|{{AP_PASSWORD}}|${PASSPHRASE}|g" \
+    -e "s|{{DEVICE_ID}}|${DEVICE_ID}|g" \
     "$WELCOME_HTML"
 
 # --- 5. Generate QR-code SVG and substitute the fallback ---------------------

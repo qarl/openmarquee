@@ -658,6 +658,10 @@
                 display_width: 1920,
                 display_height: 1080,
                 display_rotation: 0,
+                // qarl 2026-05-12 (a2): demo runs off-device so there's
+                // no identity.json -> device_id is null. The settings
+                // UI's device_id row hides accordingly.
+                device_id: null,
             });
         }
 
