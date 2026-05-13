@@ -305,6 +305,30 @@
             "transition_t": 0.5,
             "golden": "transition_mid_pixelate",
             "purpose": "Pixelate midpoint. wave/blockSize math + mix vs Rust FS_PIXELATE."
+        },
+        {
+            "name": "parity_animated_uncage",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000020",
+            "tick": 0.8,
+            "golden": "animated_uncage",
+            "purpose": "Motion (shake) + background_pattern (gradient) at the same tick. Closes the UNCAGE-gradient-missing regression class — surface where inline-preview previously dropped pattern bg silently."
+        },
+        {
+            "name": "parity_animated_halftone_pulse",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000021",
+            "tick": 0.5,
+            "golden": "animated_halftone_pulse",
+            "purpose": "Motion (pulse) + background_pattern (halftone). Pattern with periodic structure × motion phase."
+        },
+        {
+            "name": "parity_animated_stripes_bounce",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000022",
+            "tick": 0.5,
+            "golden": "animated_stripes_bounce",
+            "purpose": "Motion (bounce) + background_pattern (stripes). Different motion-pattern pair than halftone/pulse so a drift hits two fixtures, not one."
         }
     ]
 }

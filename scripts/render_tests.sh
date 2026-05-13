@@ -210,6 +210,16 @@ FIXTURES=(
     # separate follow-up if needed (would need ffmpeg + a frame-pin
     # mechanism in the decoder loop).
     "video_slide|slide|f0000000-0000-4000-8000-000000000009|$PI_FIXTURE_ROOT"
+    # --- c4 (qarl 2026-05-13) render-path consolidation: motion +
+    # background_pattern combos. Closes the UNCAGE-gradient-missing
+    # bug class (inline-preview dropped pattern bg for animated
+    # slides). Each fixture pairs ONE motion kind with ONE pattern
+    # bg so a future cross-renderer drift surfaces with the
+    # smallest possible diff. tick chosen mid-cycle so motion
+    # actually contributes.
+    "animated_uncage|animated_slide|f0000000-0000-4000-8000-000000000020,0.8|$PI_FIXTURE_ROOT"
+    "animated_halftone_pulse|animated_slide|f0000000-0000-4000-8000-000000000021,0.5|$PI_FIXTURE_ROOT"
+    "animated_stripes_bounce|animated_slide|f0000000-0000-4000-8000-000000000022,0.5|$PI_FIXTURE_ROOT"
     # --- 18.6 / sweep #9 N7: auto_mode dynamic-layer golden ---
     # auto_mode=time/date/day layers regenerate text per-tick from
     # the renderer's wall_clock_unix. The animated_slide TYPE

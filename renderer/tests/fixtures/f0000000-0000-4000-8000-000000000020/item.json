@@ -1,0 +1,67 @@
+{
+  "schema_version": 3,
+  "updated_at": "2026-05-13T00:00:00.000000+00:00",
+  "item": {
+    "type": "text_slide",
+    "id": "f0000000-0000-4000-8000-000000000020",
+    "name": "UNCAGE animated parity fixture",
+    "duration_ms": 1700,
+    "text_layers": [
+      {
+        "text": "UNCAGE\nYOUR SIGN!!",
+        "name": "headline",
+        "font_family": "Alfa Slab One",
+        "font_size_px": null,
+        "font_size_pct": 33.0,
+        "weight": null,
+        "text_color": "#FFF1B0",
+        "text_align": "center",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "shake",
+        "motion_intensity": 70,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {"x": 0.05, "y": 0.15, "w": 0.9, "h": 0.65}
+      },
+      {
+        "text": "// synonyms.length === 2",
+        "name": "caption",
+        "font_family": "VT323",
+        "font_size_px": null,
+        "font_size_pct": 4.0,
+        "weight": null,
+        "text_color": "#FFD580",
+        "text_align": "left",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {"x": 0.1, "y": 0.85, "w": 0.8, "h": 0.1}
+      }
+    ],
+    "background_color": "#050608",
+    "background_pattern": {
+      "pattern": "gradient",
+      "color_a": "#FFB43C",
+      "color_b": "#5E1A1A",
+      "density": 0.0
+    },
+    "transition": "flip",
+    "transition_ms": 600
+  }
+}
