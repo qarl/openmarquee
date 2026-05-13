@@ -229,10 +229,13 @@
             // measuring a glyph in each family. document.fonts.load
             // is per-family + size; pick a representative size.
             const families = [
-                "Anton", "Oswald", "Bebas Neue", "Bowlby One SC",
-                "Archivo Black", "Alfa Slab One", "Cinzel",
-                "DM Serif Display", "Caveat", "Pacifico",
-                "JetBrains Mono", "Inter",
+                "Inter", "Oswald", "Bebas Neue", "Roboto Slab",
+                "Caveat Brush", "Permanent Marker", "Cinzel",
+                "UnifrakturCook", "Rye", "Pacifico",
+                "Sedgwick Ave Display", "Bowlby One SC",
+                "Anton", "Archivo Black", "Alfa Slab One",
+                "Playfair Display", "DM Serif Display",
+                "VT323", "JetBrains Mono", "Space Mono",
             ];
             await Promise.all(
                 families.map((fam) => document.fonts.load(`700 100px "${fam}"`)),
