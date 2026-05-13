@@ -10,6 +10,15 @@ function tick() {
     return new Promise((r) => setTimeout(r, 0));
 }
 
+// arc-3 (qarl 2026-05-12): mountSettings switched from explicit Save
+// button to attachAutoSave debounced PUT. Tests use this helper to
+// inject debounceMs:0 so dispatching an `input` event on the form
+// fires the save on the next microtask, matching the (pre-arc-3)
+// behavior where dispatching `submit` called onSave synchronously.
+function mount(container, opts) {
+    return mountSettings(container, { debounceMs: 0, ...opts });
+}
+
 // Batch 20.4: GET /api/settings now returns the secret fields redacted
 // (sentinel "<set>" when populated, null when unset). The fixture
 // reflects the wire shape post-20.4.
@@ -52,7 +61,7 @@ describe("mountSettings", () => {
             }),
         );
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -78,7 +87,7 @@ describe("mountSettings", () => {
             json: async () => ({ device_id: null }),
         });
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -95,7 +104,7 @@ describe("mountSettings", () => {
             new Error("network glitch"),
         );
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -109,7 +118,7 @@ describe("mountSettings", () => {
 
     it("hydrates every field from the fetched settings", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -143,7 +152,7 @@ describe("mountSettings", () => {
         // which strips the border, making it read as a hint string
         // rather than a tappable control next to the SSID field.
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -158,7 +167,7 @@ describe("mountSettings", () => {
         // field-hint-btn` combo as Rescan — flagged in 67e50a1's review
         // as out-of-scope, now greenlit.
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -170,7 +179,7 @@ describe("mountSettings", () => {
 
     it("output mode select covers every SYSTEM_SPEC output variant", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -183,7 +192,7 @@ describe("mountSettings", () => {
 
     it("preserves a stored timezone value even if Intl doesn't surface it", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => ({ ...SAMPLE, timezone: "Mars/Olympus_Mons" }),
             onSave: vi.fn(),
         });
@@ -199,7 +208,7 @@ describe("mountSettings", () => {
     it("Save sends the full settings payload to onSave", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave,
         });
@@ -208,7 +217,7 @@ describe("mountSettings", () => {
         // Mutate a couple of fields and save.
         container.querySelector(".field-brightness").value = "42";
         container.querySelector(".field-sign-name").value = "Kitchen";
-        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
 
         expect(onSave).toHaveBeenCalledTimes(1);
@@ -226,14 +235,14 @@ describe("mountSettings", () => {
     it("Save with timezone cleared sends null (not empty string)", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave,
         });
         await tick();
 
         container.querySelector(".field-timezone").value = "";
-        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
 
         expect(onSave.mock.calls[0][0].timezone).toBeNull();
@@ -241,7 +250,7 @@ describe("mountSettings", () => {
 
     it("WiFi station fieldset is grayed out when station toggle is off", async () => {
         const container = document.createElement("div");
-        mountSettings(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
         await tick();
         const stationFieldset = container.querySelector(".settings-wifi-station");
         expect(stationFieldset.classList.contains("is-disabled")).toBe(true);
@@ -250,7 +259,7 @@ describe("mountSettings", () => {
 
     it("enabling the station toggle un-grays its fieldset", async () => {
         const container = document.createElement("div");
-        mountSettings(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
         await tick();
         const toggle = container.querySelector(".field-wifi-station-enabled");
         toggle.checked = true;
@@ -262,7 +271,7 @@ describe("mountSettings", () => {
 
     it("refuses to let the operator disable both WiFi modes", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => ({ ...SAMPLE, wifi_station_enabled: false }),
             onSave: vi.fn(),
         });
@@ -281,7 +290,7 @@ describe("mountSettings", () => {
     it("sends all WiFi fields in the save payload", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => ({
                 ...SAMPLE,
                 wifi_station_enabled: true,
@@ -292,7 +301,7 @@ describe("mountSettings", () => {
             onSave,
         });
         await tick();
-        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
         const p = onSave.mock.calls[0][0];
         expect(p.wifi_ap_enabled).toBe(true);
@@ -305,7 +314,7 @@ describe("mountSettings", () => {
 
     it("rotation dropdown exposes the four cardinal angles + hydrates from settings", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => ({ ...SAMPLE, display_rotation: 90 }),
             onSave: vi.fn(),
         });
@@ -319,7 +328,7 @@ describe("mountSettings", () => {
     it("changing output_mode from a default snaps dims to the new mode's default", async () => {
         const container = document.createElement("div");
         // Operator is at HUB75 defaults (128x96).
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => ({
                 ...SAMPLE,
                 output_mode: "hub75",
@@ -341,7 +350,7 @@ describe("mountSettings", () => {
     it("leaves customized dims alone on output_mode change", async () => {
         const container = document.createElement("div");
         // Operator has non-default dims (say a 256x128 HUB75 cluster).
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => ({
                 ...SAMPLE,
                 output_mode: "hub75",
@@ -364,13 +373,13 @@ describe("mountSettings", () => {
     it("saves display_rotation in the payload", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave,
         });
         await tick();
         container.querySelector(".field-display-rotation").value = "270";
-        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
         expect(onSave.mock.calls[0][0].display_rotation).toBe(270);
     });
@@ -378,7 +387,7 @@ describe("mountSettings", () => {
     it("hydrates Tailscale fields + round-trips them to onSave", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => ({
                 ...SAMPLE,
                 tailscale_enabled: true,
@@ -401,7 +410,7 @@ describe("mountSettings", () => {
         );
         expect(tsSecretStatus.textContent).toMatch(/Set/i);
 
-        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
         const payload = onSave.mock.calls[0][0];
         expect(payload.tailscale_enabled).toBe(true);
@@ -413,7 +422,7 @@ describe("mountSettings", () => {
     it("sends Tailscale hostname + key as null when cleared", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave,
         });
@@ -421,7 +430,7 @@ describe("mountSettings", () => {
 
         container.querySelector(".field-tailscale-hostname").value = "  ";
         container.querySelector(".field-tailscale-auth-key").value = "";
-        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
 
         const payload = onSave.mock.calls[0][0];
@@ -433,7 +442,7 @@ describe("mountSettings", () => {
 
     it("renders 'Set' indicator when GET returns the <set> sentinel", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -455,7 +464,7 @@ describe("mountSettings", () => {
 
     it("Change… reveals the inline current_password + new_value form", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -471,7 +480,7 @@ describe("mountSettings", () => {
 
     it("Cancel collapses the form back to the display row", async () => {
         const container = document.createElement("div");
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -498,7 +507,7 @@ describe("mountSettings", () => {
             }),
         );
         vi.stubGlobal("fetch", fetchMock);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -542,7 +551,7 @@ describe("mountSettings", () => {
             });
         });
         vi.stubGlobal("fetch", fetchMock);
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave: vi.fn(),
         });
@@ -565,17 +574,20 @@ describe("mountSettings", () => {
     it("surfaces backend failures into the status line without throwing", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockRejectedValue(new Error("backend rejected"));
-        mountSettings(container, {
+        mount(container, {
             fetchSettings: async () => SAMPLE,
             onSave,
         });
         await tick();
 
-        container.querySelector(".settings-form").dispatchEvent(new Event("submit"));
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
 
+        // arc-3: attachAutoSave's error format is "Couldn't save · <msg>"
+        // (auto-save.js setStatus); replaces the prior submit-handler's
+        // "Save failed: <msg>".
         expect(container.querySelector(".settings-status").textContent).toMatch(
-            /Save failed: backend rejected/,
+            /Couldn't save.*backend rejected/,
         );
     });
 });

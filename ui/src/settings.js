@@ -13,6 +13,7 @@
 // See backend/openmarquee/settings.py for the authoritative scope notes.
 
 import { apiFetch } from "./api.js";
+import { attachAutoSave } from "./auto-save.js";
 import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
 
 const OUTPUT_MODES = [
@@ -288,8 +289,20 @@ const SECTION_TEMPLATE = `
                 </div>
             </div>
 
-            <button type="submit" class="om-btn primary settings-save" style="width: 100%; height: 46px; font-size: 14.5px;">Save settings</button>
-            <p class="settings-status" role="status" aria-live="polite" style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
+            <!-- qarl 2026-05-12 (arc 3): the explicit "Save settings"
+                 submit button is gone -- every field auto-saves on
+                 input/change via attachAutoSave (auto-save.js). The
+                 status pill below shows the persisted state
+                 (saving/saved/error) so the operator has feedback
+                 without having to hunt for a button. The 4 inline
+                 secret-save buttons (SSH / Wi-Fi STA / Tailscale auth
+                 key / change-password) keep their explicit Save
+                 affordance because the inputs are write-only +
+                 redacted-on-read -- autosaving an empty redacted
+                 field every keystroke would clobber the stored secret. -->
+            <p class="settings-status om-auto-save-status" role="status"
+               aria-live="polite"
+               style="margin: 6px 0 0; min-height: 1.2em; color: var(--om-text-dim); font-size: 12.5px;"></p>
         </form>
     </section>
 `;
@@ -302,11 +315,10 @@ const SECTION_TEMPLATE = `
  * @param {() => Promise<object>} options.fetchSettings
  * @param {(payload: object) => Promise<any>} options.onSave
  */
-export function mountSettings(container, { fetchSettings, onSave }) {
+export function mountSettings(container, { fetchSettings, onSave, debounceMs }) {
     container.innerHTML = SECTION_TEMPLATE;
     const form = container.querySelector(".settings-form");
     const statusEl = container.querySelector(".settings-status");
-    const saveBtn = container.querySelector(".settings-save");
 
     const signNameEl = container.querySelector(".field-sign-name");
     const deviceIdEl = container.querySelector(".field-device-id");
@@ -443,6 +455,11 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             if (d) {
                 widthEl.value = String(d.width);
                 heightEl.value = String(d.height);
+                // arc-3: programmatic .value= writes don't fire input
+                // events, so attachAutoSave wouldn't see the new dims.
+                // Dispatch synthetic events so autosave picks them up.
+                widthEl.dispatchEvent(new Event("input", { bubbles: true }));
+                heightEl.dispatchEvent(new Event("input", { bubbles: true }));
             }
         }
     });
@@ -732,49 +749,53 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         }
     }
 
-    form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        if (!form.reportValidity()) return;
-        saveBtn.disabled = true;
-        statusEl.textContent = "Saving…";
-        try {
-            const payload = {
-                sign_name: signNameEl.value,
-                output_mode: outputModeEl.value,
-                display_width: Number(widthEl.value),
-                display_height: Number(heightEl.value),
-                display_rotation: Number(rotationEl.value),
-                brightness: Number(brightnessEl.value),
-                gamma: Number(gammaEl.value),
-                wifi_ap_enabled: apEnabledEl.checked,
-                wifi_ssid: ssidEl.value,
-                wifi_password: passwordEl.value,
-                wifi_station_enabled: stationEnabledEl.checked,
-                wifi_station_ssid: stationSsidEl.value.trim() || null,
-                wifi_station_password: stationPasswordEl.value || null,
-                ws281x_pixel_order: ws281xOrderEl.value || "row_major",
-                timezone: tzEl.value || null,
-                tailscale_enabled: tsEnabledEl.checked,
-                tailscale_hostname: tsHostnameEl.value.trim() || null,
-                tailscale_auth_key: tsAuthKeyEl.value || null,
-            };
+    function collectPayload() {
+        return {
+            sign_name: signNameEl.value,
+            output_mode: outputModeEl.value,
+            display_width: Number(widthEl.value),
+            display_height: Number(heightEl.value),
+            display_rotation: Number(rotationEl.value),
+            brightness: Number(brightnessEl.value),
+            gamma: Number(gammaEl.value),
+            wifi_ap_enabled: apEnabledEl.checked,
+            wifi_ssid: ssidEl.value,
+            wifi_password: passwordEl.value,
+            wifi_station_enabled: stationEnabledEl.checked,
+            wifi_station_ssid: stationSsidEl.value.trim() || null,
+            wifi_station_password: stationPasswordEl.value || null,
+            ws281x_pixel_order: ws281xOrderEl.value || "row_major",
+            timezone: tzEl.value || null,
+            tailscale_enabled: tsEnabledEl.checked,
+            tailscale_hostname: tsHostnameEl.value.trim() || null,
+            tailscale_auth_key: tsAuthKeyEl.value || null,
+        };
+    }
+
+    // qarl 2026-05-12 (arc 3): drop the explicit "Save settings" button
+    // and route all field changes through attachAutoSave's debounced
+    // PUT. The status pill shows saving / saved / error. Validation
+    // runs before each save attempt so a known-invalid form (e.g.
+    // empty display name) surfaces the error inline instead of
+    // round-tripping to the server.
+    const autoSave = attachAutoSave(form, {
+        debounceMs: debounceMs,
+        validate: () => form.reportValidity() ? "" : "Fix the highlighted field.",
+        save: async () => {
+            const payload = collectPayload();
             await onSave(payload);
-            statusEl.textContent = "Saved.";
             // Tell the rest of the app the settings changed. main.js
-            // re-mounts the editor + uploader panels with fresh dims so
-            // the canvas size matches the operator's new display config.
-            // Existing stored slides keep their old-dim PNGs until
-            // re-saved — that's expected, not a bug.
+            // re-mounts the editor + uploader panels with fresh dims
+            // so the canvas size matches the operator's new display
+            // config. Existing stored slides keep their old-dim PNGs
+            // until re-saved -- that's expected, not a bug.
             document.dispatchEvent(
                 new CustomEvent("openmarquee:settings-updated", {
                     detail: { settings: payload },
                 }),
             );
-        } catch (err) {
-            statusEl.textContent = `Save failed: ${err.message}`;
-        } finally {
-            saveBtn.disabled = false;
-        }
+        },
+        status: statusEl,
     });
 
     // --- detect dims from device's framebuffer / display probe ---
@@ -787,6 +808,9 @@ export function mountSettings(container, { fetchSettings, onSave }) {
             if (data.width && data.height) {
                 widthEl.value = String(data.width);
                 heightEl.value = String(data.height);
+                // arc-3: synthetic input event so autosave fires.
+                widthEl.dispatchEvent(new Event("input", { bubbles: true }));
+                heightEl.dispatchEvent(new Event("input", { bubbles: true }));
                 detectStatusEl.textContent = `Detected ${data.width}×${data.height} (${data.source}).`;
             } else {
                 detectStatusEl.textContent =
@@ -840,6 +864,9 @@ export function mountSettings(container, { fetchSettings, onSave }) {
         } else {
             stationSsidEl.hidden = true;
             stationSsidEl.value = stationSsidPickerEl.value;
+            // arc-3: synthetic input event so autosave persists the
+            // picked SSID without requiring a second touch.
+            stationSsidEl.dispatchEvent(new Event("input", { bubbles: true }));
         }
     });
     wifiRescanBtn.addEventListener("click", populateWifiScan);
