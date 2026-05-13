@@ -22,35 +22,10 @@
         // drives the page, evaluates the helper per fixture, and
         // diffs the result against renderer/tests/golden/<name>.png.
         import { drawCanvas } from "./src/rasterize.js";
+        import { stateFromItem } from "./src/state-from-item.js";
 
         const canvas = document.getElementById("parity-canvas");
         const status = document.getElementById("parity-status");
-
-        // Wire-shape → drawCanvas state shape. drawCanvas accepts
-        // BOTH wire-snake-case (font_family, text_color) and editor-
-        // camelCase via paintLayer's fallback reads, so we mostly
-        // just pass layers through verbatim. We DO normalize the bg
-        // fields because drawCanvas only checks `bgSource` + the
-        // matching state holder.
-        function stateFromItem(item) {
-            const state = {
-                backgroundColor: item.background_color || "#000000",
-                bgSource: "color",
-                bgPattern: null,
-                bgImage: null,
-                layers: Array.isArray(item.text_layers) ? item.text_layers : [],
-            };
-            if (item.background_pattern) {
-                state.bgSource = "pattern";
-                state.bgPattern = {
-                    pattern: item.background_pattern.pattern,
-                    color_a: item.background_pattern.color_a,
-                    color_b: item.background_pattern.color_b,
-                    density: item.background_pattern.density,
-                };
-            }
-            return state;
-        }
 
         function canvasToBase64(c) {
             return c.toDataURL("image/png").split(",")[1];

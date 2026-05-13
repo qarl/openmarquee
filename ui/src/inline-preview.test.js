@@ -1,5 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// Mock drawCanvas BEFORE importing inline-preview so the regression
+// tests can verify wire-shape → state-shape conversion. The non-mock
+// tests don't read this; vi.fn() is a no-op for them.
+vi.mock("./rasterize.js", async (importOriginal) => {
+    const actual = await importOriginal();
+    return { ...actual, drawCanvas: vi.fn() };
+});
+import { drawCanvas } from "./rasterize.js";
 import { formatSec, mountInlinePreview, pickSkin } from "./inline-preview.js";
 
 function tick() {
@@ -138,70 +146,22 @@ describe("mountInlinePreview", () => {
         expect(Number(slider.max)).toBeCloseTo(8, 1);
     });
 
-    it("text-slide WITH motion routes through canvas-render path (not cached PNG)", async () => {
+    it("text-slide WITH motion routes through drawCanvas (not cached PNG)", async () => {
         // Bug 1b (qarl 2026-05-02): motion in the playlist's inline-
         // preview during playback. A text_slide whose layers include
         // motion != static must NOT freeze on the cached PNG —
-        // drawSlot sends it through drawTextSlideAnimated which calls
-        // drawTextOnly+motion-aware paint via canvas-motion.
+        // drawSlot sends it through drawTextSlideAnimated which now
+        // (post-2026-05-13 consolidation) calls drawCanvas directly.
         //
-        // Distinguishing signal: canvas-motion's paintLayerWithMotion
-        // calls ctx.beginPath/rect/clip for every animated layer (the
-        // box-bounded clip), which the cached-PNG drawImage path
-        // never does. Spy on the shared fakeCtx's beginPath calls to
-        // detect routing.
-        const beginPathCalls = [];
-        // Wide ctx mock — covers paintLayerWithMotion, drawTextOnly,
-        // drawForSkin (and any future LED-skin paths that add stroke /
-        // shadow / measureText / composite ops). Drift between this
-        // and canvas-motion.test.js's fakeCtx is the load-bearing risk
-        // — keep the surfaces aligned.
-        const fakeCtx = {
-            putImageData: vi.fn(),
-            drawImage: vi.fn(),
-            fillRect: vi.fn(),
-            getImageData: vi.fn(() => ({ data: new Uint8ClampedArray(0) })),
-            createRadialGradient: vi.fn(() => ({ addColorStop: vi.fn() })),
-            beginPath: vi.fn(() => beginPathCalls.push("beginPath")),
-            rect: vi.fn(),
-            clip: vi.fn(),
-            arc: vi.fn(),
-            fill: vi.fn(),
-            stroke: vi.fn(),
-            save: vi.fn(),
-            restore: vi.fn(),
-            translate: vi.fn(),
-            scale: vi.fn(),
-            clearRect: vi.fn(),
-            fillText: vi.fn(),
-            measureText: vi.fn(() => ({ width: 10 })),
-            set globalAlpha(_v) {},
-            set fillStyle(_v) {},
-            set strokeStyle(_v) {},
-            set lineWidth(_v) {},
-            set imageSmoothingEnabled(_v) {},
-            set globalCompositeOperation(_v) {},
-            set shadowColor(_v) {},
-            set shadowBlur(_v) {},
-            set font(_v) {},
-            set textAlign(_v) {},
-            set textBaseline(_v) {},
-        };
-        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
-            fakeCtx,
-        );
-        // JSDOM doesn't run layout, so getBoundingClientRect returns
-        // 0×0 by default — sizeCanvasToStage (inline-preview.js)
-        // would bail and recurse via rAF forever, drawSlot never
-        // fires, and ctx.beginPath never gets called. Stub the rect
-        // to a non-zero size so the render path actually runs in
-        // jsdom (QA caught this gap on the verifier — 71e513f works
-        // in real Chromium but the unit test needs the stub).
+        // Distinguishing signal: drawCanvas (mocked at top of file)
+        // gets called for animated text slides; the static drawImage
+        // path uses ctx.drawImage against the cached PNG and never
+        // invokes drawCanvas.
         vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
             x: 0, y: 0, top: 0, left: 0, right: 416, bottom: 234,
             width: 416, height: 234, toJSON: () => ({}),
         });
-
+        drawCanvas.mockClear();
         const container = document.createElement("div");
         document.body.appendChild(container);
         try {
@@ -237,15 +197,201 @@ describe("mountInlinePreview", () => {
             });
             await tick();
             await tick();
-            // Press play — first tick fires renderOnce → drawSlot →
-            // drawTextSlideAnimated → drawTextOnly → paintLayerWithMotion
-            // → ctx.beginPath (the box-clip setup).
-            container.querySelector(".inline-preview-play").click();
+            expect(drawCanvas).toHaveBeenCalled();
+        } finally {
+            container.remove();
+        }
+    });
+
+    it("animated text-slide with bg pattern routes pattern through drawCanvas (UNCAGE regression)", async () => {
+        // qarl-direct 2026-05-13: before this fix, drawTextSlideAnimated
+        // hand-rolled bg fill that only handled background_color +
+        // background_image_slide_id, silently dropping
+        // background_pattern. UNCAGE's amber→scarlet gradient was
+        // invisible in the playlist preview. After the fix,
+        // drawTextSlideAnimated routes through drawCanvas via
+        // stateFromItem so pattern bg is paint-time honored. This
+        // test pins the wire-shape → state-shape contract: when the
+        // playlist contains an animated slide with background_pattern,
+        // drawCanvas is called with bgSource=pattern + the pattern
+        // payload intact.
+        vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+            x: 0, y: 0, top: 0, left: 0, right: 416, bottom: 234,
+            width: 416, height: 234, toJSON: () => ({}),
+        });
+        drawCanvas.mockClear();
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountInlinePreview(container, {
+                width: 1920,
+                height: 1080,
+                outputMode: "hdmi",
+                fetchPlaylist: async () => ({
+                    items: [
+                        {
+                            item_id: "uncage",
+                            transition: "cut",
+                            transition_ms: 0,
+                            content: {
+                                id: "uncage",
+                                type: "text_slide",
+                                duration_ms: 1700,
+                                background_color: "#050608",
+                                background_pattern: {
+                                    pattern: "gradient",
+                                    color_a: "#FFB43C",
+                                    color_b: "#5E1A1A",
+                                    density: 0.0,
+                                },
+                                text_layers: [
+                                    {
+                                        text: "UNCAGE\nYOUR SIGN!!",
+                                        motion: "shake",
+                                        motion_intensity: 70,
+                                        motion_phase: 0,
+                                        text_color: "#FFF1B0",
+                                        font_family: "Alfa Slab One",
+                                        font_size_pct: 33,
+                                        box: { x: 0.05, y: 0.15, w: 0.9, h: 0.65 },
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                }),
+            });
             await tick();
-            await new Promise((r) => requestAnimationFrame(r));
             await tick();
-            // beginPath was called by the motion-aware paint path.
-            expect(beginPathCalls.length).toBeGreaterThan(0);
+            // First renderOnce fires synchronously in refresh() →
+            // drawSlot → drawTextSlideAnimated → drawCanvas.
+            expect(drawCanvas).toHaveBeenCalled();
+            const [, state, opts] = drawCanvas.mock.calls[0];
+            expect(state.bgSource).toBe("pattern");
+            expect(state.bgPattern).toMatchObject({
+                pattern: "gradient",
+                color_a: "#FFB43C",
+                color_b: "#5E1A1A",
+                density: 0.0,
+            });
+            expect(state.layers).toHaveLength(1);
+            expect(state.layers[0].text).toBe("UNCAGE\nYOUR SIGN!!");
+            // elapsed_s is position-within-slot, 0 at slot entry.
+            expect(opts).toMatchObject({ elapsed_s: expect.any(Number) });
+        } finally {
+            container.remove();
+        }
+    });
+
+    it("animated text-slide with solid bg passes bgSource=color through drawCanvas", async () => {
+        // Companion to the pattern regression: confirm the
+        // wire-shape → state-shape mapping handles the non-pattern
+        // case identically. Same code path; different input.
+        vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+            x: 0, y: 0, top: 0, left: 0, right: 416, bottom: 234,
+            width: 416, height: 234, toJSON: () => ({}),
+        });
+        drawCanvas.mockClear();
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountInlinePreview(container, {
+                width: 1920,
+                height: 1080,
+                outputMode: "hdmi",
+                fetchPlaylist: async () => ({
+                    items: [
+                        {
+                            item_id: "solid",
+                            transition: "cut",
+                            transition_ms: 0,
+                            content: {
+                                id: "solid",
+                                type: "text_slide",
+                                duration_ms: 1700,
+                                background_color: "#112233",
+                                text_layers: [
+                                    {
+                                        text: "PLAIN",
+                                        motion: "pulse",
+                                        motion_intensity: 50,
+                                        motion_phase: 0,
+                                        text_color: "#FFF",
+                                        box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                }),
+            });
+            await tick();
+            await tick();
+            expect(drawCanvas).toHaveBeenCalled();
+            const [, state] = drawCanvas.mock.calls[0];
+            expect(state.bgSource).toBe("color");
+            expect(state.backgroundColor).toBe("#112233");
+            expect(state.bgPattern).toBeNull();
+            expect(state.bgImage).toBeNull();
+        } finally {
+            container.remove();
+        }
+    });
+
+    it("animated text-slide elapsed_s advances with playback position", async () => {
+        // Lock the timing contract: elapsed_s passed to drawCanvas is
+        // (position - slot.startSec). A scrub to t=0.8s on a single-
+        // slot playlist should produce drawCanvas calls with
+        // elapsed_s≈0.8. Pins the motion-phase clock semantics — the
+        // same elapsed_s the editor preview consumes.
+        vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+            x: 0, y: 0, top: 0, left: 0, right: 416, bottom: 234,
+            width: 416, height: 234, toJSON: () => ({}),
+        });
+        drawCanvas.mockClear();
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountInlinePreview(container, {
+                width: 1920,
+                height: 1080,
+                outputMode: "hdmi",
+                fetchPlaylist: async () => ({
+                    items: [
+                        {
+                            item_id: "uncage",
+                            transition: "cut",
+                            transition_ms: 0,
+                            content: {
+                                id: "uncage",
+                                type: "text_slide",
+                                duration_ms: 1700,
+                                background_color: "#000",
+                                text_layers: [
+                                    {
+                                        text: "X",
+                                        motion: "shake",
+                                        motion_intensity: 70,
+                                        motion_phase: 0,
+                                        text_color: "#FFF",
+                                        box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                }),
+            });
+            await tick();
+            await tick();
+            // Scrub to t=0.8s.
+            const slider = container.querySelector(".inline-preview-scrub");
+            slider.value = "0.8";
+            slider.dispatchEvent(new Event("input"));
+            await tick();
+            // Last drawCanvas call reflects the new position.
+            const lastCall = drawCanvas.mock.calls[drawCanvas.mock.calls.length - 1];
+            expect(lastCall[2].elapsed_s).toBeCloseTo(0.8, 1);
         } finally {
             container.remove();
         }
