@@ -69,6 +69,7 @@ from openmarquee.settings import SettingsStorage, SystemSettings
 # PNGs intact — the device's playback engine cover-fits at panel-
 # native dims, and the operator's next edit-and-save in the editor
 # re-bakes at the new dims (Option α from the dispatch).
+from openmarquee import wifi_station
 from openmarquee.wifi_prefill import read_system_wifi
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -156,6 +157,23 @@ def _redact_secrets(dump: dict[str, Any]) -> dict[str, Any]:
         else:
             dump[key] = None
     return dump
+
+
+@router.get("/wifi-station-state")
+async def get_wifi_station_state() -> dict[str, Any]:
+    """Return the in-memory station-mode applier status. The UI polls
+    this after submitting a PUT/PATCH so the operator sees connecting
+    -> connected | failed transitions without a page reload.
+
+    Shape: {state, detail, ssid}. `state` is one of
+    'idle' / 'connecting' / 'connected' / 'failed' / 'disabled'.
+    """
+    state = wifi_station.current_state()
+    return {
+        "state": state.state,
+        "detail": state.detail,
+        "ssid": state.ssid,
+    }
 
 
 @router.get("")
@@ -277,6 +295,19 @@ async def set_settings(
         or int(previous.display_width) != int(validated.display_width)
         or int(previous.display_height) != int(validated.display_height)
     )
+    # Wifi-station fields: BEFORE save so we can diff. The actual
+    # apply (template wpa_supplicant-wlan0.conf + systemctl restart
+    # + iw poll) runs in a background thread so the HTTP response
+    # returns immediately. UI polls GET /api/settings/wifi-station-
+    # state for live status.
+    wifi_station_changed = wifi_station.has_settings_changed(
+        prev_enabled=previous.wifi_station_enabled,
+        prev_ssid=previous.wifi_station_ssid,
+        prev_password=previous.wifi_station_password,
+        new_enabled=validated.wifi_station_enabled,
+        new_ssid=validated.wifi_station_ssid,
+        new_password=validated.wifi_station_password,
+    )
     storage.save(validated)
     # Dim change handling (DELETE-PIL Option α, qarl-direct 2026-05-13):
     # we used to call text_rerender.rerender_text_slides_for_dims here
@@ -286,6 +317,12 @@ async def set_settings(
     # bake — the visible drift is bounded (slight pixel-density change)
     # and corrects fully on the next operator save in the editor.
     _ = dims_changed  # kept for clarity; could be deleted in follow-up
+    if wifi_station_changed:
+        wifi_station.apply_in_background(
+            enabled=validated.wifi_station_enabled,
+            ssid=validated.wifi_station_ssid,
+            password=validated.wifi_station_password,
+        )
     return _redact_secrets(validated.model_dump())
 
 
@@ -410,7 +447,23 @@ async def patch_wifi_station_password(
     # Empty string → null per the model's _check_station_password
     # validator. Both shapes resolve to "clear the field".
     new_value = payload.new_value or None
-    return _patch_secret_field(storage, "wifi_station_password", new_value)
+    previous = storage.load()
+    response = _patch_secret_field(storage, "wifi_station_password", new_value)
+    # If station mode is enabled and the password actually changed,
+    # re-template the conf + restart wpa_supplicant. Background thread
+    # so the PATCH returns immediately; UI polls
+    # /api/settings/wifi-station-state for live status.
+    if (
+        previous.wifi_station_enabled
+        and previous.wifi_station_password != new_value
+    ):
+        latest = storage.load()
+        wifi_station.apply_in_background(
+            enabled=latest.wifi_station_enabled,
+            ssid=latest.wifi_station_ssid,
+            password=latest.wifi_station_password,
+        )
+    return response
 
 
 @router.patch("/tailscale-auth-key")

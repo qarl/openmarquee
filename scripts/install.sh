@@ -237,6 +237,32 @@ if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-firstboot.service
            "${SYSTEMD_DIR}/openmarquee-firstboot.service"
 fi
 
+# --- 7b. sudoers (wifi-station applier) -------------------------------------
+#
+# Drop the narrowly-scoped sudoers fragment that lets the openmarquee
+# user restart/stop wpa_supplicant@wlan0 without a password. The
+# backend's wifi_station.py shells out to those two systemctl calls
+# when the operator updates home-WiFi creds via the Settings UI.
+#
+# /etc/sudoers.d/openmarquee MUST be mode 0440 (sudoers refuses to
+# parse it otherwise). visudo -c validates the full /etc/sudoers tree
+# including the .d/ fragments; abort the install if validation trips.
+say "Stage openmarquee-sudoers"
+SUDOERS_DST="${ROOT_PREFIX}/etc/sudoers.d/openmarquee"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-sudoers" ]; then
+    run mkdir -p "$(dirname "$SUDOERS_DST")"
+    run cp "${OPT_DIR}/system/openmarquee-sudoers" "$SUDOERS_DST"
+    run chmod 0440 "$SUDOERS_DST"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        if ! visudo -c -f "$SUDOERS_DST" >/dev/null; then
+            echo "FAIL: visudo rejected $SUDOERS_DST" >&2
+            exit 1
+        fi
+    else
+        printf 'DRYRUN: visudo -c -f %s\n' "$SUDOERS_DST"
+    fi
+fi
+
 if [ ! -f "$BOOTSTRAP_MARKER" ] && [ "$DRY_RUN" -eq 0 ]; then
     # First boot. `enable --now` is synchronous for Type=oneshot units --
     # blocks until firstboot.sh exits, so hostapd.conf + welcome.html
