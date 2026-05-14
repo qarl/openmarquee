@@ -144,11 +144,56 @@ class RustRendererOpError(RustRendererError):
       - "paint_transition: from non-text slide TBD"
       - "paint_transition: to non-text slide TBD"
       - "Capture: video slides TBD (image + text both supported)"
+
+    Subclass `RustRendererUnsupportedSlideError` covers the slide-kind-
+    not-implemented cases (video / non-text transition). The proxy
+    promotes those at `_decode_response` so callers can dispatch on
+    type rather than parsing the message.
     """
 
     def __init__(self, message: str):
         super().__init__(message)
         self.message = message
+
+
+class RustRendererUnsupportedSlideError(RustRendererOpError):
+    """The sidecar refused an op because the slide kind isn't supported
+    yet (today: VideoSlide -- V4L2 M2M + dmabuf import are task #76).
+
+    Distinct from generic RustRendererOpError so AutoFallbackRenderer
+    treats "this slide doesn't fit through the Rust route" differently
+    from "the proxy is busted" -- the former lets the playback loop
+    skip the slide and continue on the Rust route; the latter swaps
+    the process over to MockRenderer.
+
+    Promoted at the proxy boundary (`_decode_response`) by matching the
+    sidecar's byte-stable wire-format error strings. Subclass of
+    `RustRendererOpError` so callers that broad-except the latter still
+    catch this; callers that want to distinguish unsupported-content
+    from generic op-errors catch this first.
+
+    Wire-format substrings that promote to this class:
+      - "video slides TBD"          (paint_slide / Capture)
+      - "non-text slide TBD"        (paint_transition from/to)
+
+    Do not re-word the matched substrings without bumping the cargo
+    tests in `renderer/src/ipc_main.rs` in lockstep.
+    """
+
+
+_UNSUPPORTED_SLIDE_WIRE_MARKERS: tuple[str, ...] = (
+    "video slides TBD",
+    "non-text slide TBD",
+)
+
+
+def _classify_op_error(message: str) -> RustRendererOpError:
+    """Pick the most specific `RustRendererOpError` subclass for a
+    sidecar-emitted error string. Default is bare `RustRendererOpError`."""
+    for marker in _UNSUPPORTED_SLIDE_WIRE_MARKERS:
+        if marker in message:
+            return RustRendererUnsupportedSlideError(message)
+    return RustRendererOpError(message)
 
 
 # ============================================================
@@ -675,7 +720,7 @@ class RustRenderer:
                 raise RustRendererProtocolError(
                     f"Malformed Err response (op {op!r}): {resp!r}"
                 )
-            raise RustRendererOpError(str(err_body["error"]))
+            raise _classify_op_error(str(err_body["error"]))
         if "ok" not in resp:
             raise RustRendererProtocolError(
                 f"Response missing both 'ok' and 'err' (op {op!r}): {resp!r}"

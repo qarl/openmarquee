@@ -690,6 +690,30 @@ class PlaybackLoop:
                     keep_ids.add(next_item.id)
                 self._evict_caches_to_window(keep_ids)
 
+                # Slice 4 gate: when the renderer is the Rust IPC
+                # sidecar proxy (or AutoFallbackRenderer wrapping one),
+                # the per-tick PIL composite + render_frame(bytes) hot
+                # path doesn't fit -- the sidecar owns rasterization
+                # AND DRM page-flip. Drive it via begin_slide + advance
+                # IPC ops instead. Skip the existing dynamic/static
+                # dispatch + transition fork; transitions on the rust
+                # route are instant cuts for this slice (follow-up will
+                # wire begin_transition).
+                if self._renderer_supports_ipc_ops():
+                    rendered = await self._play_via_rust_ipc(item)
+                    if self._stop_event.is_set():
+                        break
+                    if self._pause_event.is_set():
+                        self._resume_at_index = i
+                        break
+                    # Whether the slide rendered or was skipped (e.g.,
+                    # VideoSlide on a video-less sidecar build), move
+                    # to the next item. `rendered=False` means
+                    # UnsupportedSlideError fired and was logged by
+                    # _play_via_rust_ipc; the sidecar is healthy.
+                    _ = rendered
+                    continue
+
                 is_dynamic = (
                     item.type == "text_slide"
                     and slide_has_dynamic_content(item)
@@ -886,6 +910,103 @@ class PlaybackLoop:
             return
         self._pause_event.clear()
         self._resume_event.set()
+
+    def _renderer_supports_ipc_ops(self) -> bool:
+        """True when the injected renderer drives the Rust IPC sidecar
+        (RustRenderer or AutoFallbackRenderer wrapping one).
+
+        Gates the slice-4 Rust route. Duck-typed on `begin_slide` +
+        `advance` so a test stub doesn't need to be a real RustRenderer
+        subclass. False for DRMRenderer / MockRenderer / LED-matrix
+        adapters -- those paths stay on the existing PIL hot path."""
+        return (
+            hasattr(self._renderer, "begin_slide")
+            and hasattr(self._renderer, "advance")
+        )
+
+    async def _play_via_rust_ipc(self, item: ContentItem) -> bool:
+        """Drive one slide through the Rust IPC sidecar's begin_slide
+        + advance contract. The sidecar owns rasterization AND DRM
+        page-flip; Python sends ops and waits for SlideComplete or
+        duration-elapsed.
+
+        Returns True when the slide played out normally. Returns False
+        when the slide kind isn't supported by the sidecar yet (today:
+        VideoSlide -- task #76 wires V4L2). Caller advances to the
+        next item on False.
+
+        Zero PIL invocation on the hot path: bytes never cross the IPC
+        boundary; the sidecar paints into its own EGL session and
+        commits the DRM framebuffer.
+
+        Transitions are out of scope for this slice -- they become
+        instant cuts between slides on the rust route. Follow-up slice
+        will wire begin_transition for the 15 transition kinds. The
+        sidecar already exposes begin_transition; just no Python caller
+        yet.
+
+        TODO(slice 4-followup): handle `AutoFallbackInMockError` (the
+        wrapper post-fallback swap) and `RustRendererRespawnedError`
+        (transient subprocess reconnect; caller must replay begin_slide
+        on the fresh subprocess). Both currently propagate uncaught
+        and would crash the outer `_loop`. Acceptable for this slice
+        since the wrapper's swap is permanent + an immediate
+        restart-loop will reach a clean state, but the respawn-replay
+        path is the operationally-correct fix.
+        """
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererUnsupportedSlideError,
+            SlideComplete,
+        )
+        assert self._stop_event is not None
+        assert self._pause_event is not None
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        self._slot_t0 = t0
+        # Sidecar uses ms-resolution monotonic. t0_ms is the wall-clock
+        # anchor passed to begin_slide; advance() ticks are deltas off
+        # it. Using int(loop.time() * 1000) keeps the same clock the
+        # rest of the loop uses for end_at math.
+        t0_ms = int(t0 * 1000)
+        duration_ms = int(item.duration_ms)
+        try:
+            self._renderer.begin_slide(item.id, t0_ms, duration_ms)
+        except RustRendererUnsupportedSlideError as e:
+            log.info(
+                "playback: skipping slide %s (Rust sidecar doesn't yet "
+                "support this kind): %s", item.id, e.message,
+            )
+            return False
+        # 30 Hz tick. Matches the auto_tick_seconds-aware cadence the
+        # other paths use; the sidecar's internal state machine clamps
+        # to its own paint cadence so over-ticking is harmless.
+        tick_period = 1.0 / 30
+        end_at = t0 + duration_ms / 1000
+        while True:
+            if self._stop_event.is_set() or self._pause_event.is_set():
+                break
+            elapsed = loop.time() - t0
+            t_ms = t0_ms + int(elapsed * 1000)
+            try:
+                result = self._renderer.advance(t_ms)
+            except RustRendererUnsupportedSlideError as e:
+                # Begin_slide accepted the slide but advance hit the
+                # unsupported-kind rail (happens for video on the very
+                # first paint_slide). Skip gracefully.
+                log.info(
+                    "playback: slide %s became unsupported mid-play: %s",
+                    item.id, e.message,
+                )
+                return False
+            if isinstance(result, SlideComplete):
+                # Sidecar's state machine signaled duration-end. Slide
+                # finished cleanly; advance to next item.
+                break
+            remaining = end_at - loop.time()
+            if remaining <= 0:
+                break
+            await self._wait(min(tick_period, remaining))
+        return True
 
     async def _play_dynamic_slide(self, item: ContentItem) -> Image.Image | None:
         """Tick-render a slide with auto-mode and/or motion layers for

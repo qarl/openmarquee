@@ -56,6 +56,11 @@ class AutoFallbackRenderer:
         Mock can't satisfy IPC semantics so callers that depend on
         them (slice 4's playback bypass) need to know to switch
         to `render_frame`.
+      - `RustRendererUnsupportedSlideError` from any IPC op (today:
+        VideoSlide hitting paint_slide) is logged and re-raised
+        unwrapped -- the proxy is fine, the SLIDE kind isn't
+        supported. Playback loop catches the propagated exception
+        and skips the slide (advance to next). DOES NOT swap to Mock.
 
     NOT forwarded: `is_alive`, `health_probe`, reconnect-related
     helpers -- these are RustRenderer-internal. The wrapper exposes
@@ -134,12 +139,20 @@ class AutoFallbackRenderer:
         from openmarquee.rendering.rust_renderer import (
             RustRendererRespawnedError,
             RustRendererSubprocessError,
+            RustRendererUnsupportedSlideError,
         )
         try:
             self._primary.render_frame(frame)
         except RustRendererRespawnedError:
             # Proxy is alive, just had a transient blip. Bubble up
             # so the caller knows to replay session state.
+            raise
+        except RustRendererUnsupportedSlideError:
+            # render_frame doesn't normally raise this -- the proxy's
+            # render_frame raises NotImplementedError per the Rust
+            # sidecar contract (frames don't cross the IPC boundary).
+            # But if a future impl ever did, treat the same as the
+            # IPC-op path: don't swap to Mock, let caller handle.
             raise
         except RustRendererSubprocessError as e:
             mock = self._swap_to_mock(f"render_frame: {e}")
@@ -228,6 +241,7 @@ class AutoFallbackRenderer:
         from openmarquee.rendering.rust_renderer import (
             RustRendererRespawnedError,
             RustRendererSubprocessError,
+            RustRendererUnsupportedSlideError,
         )
         method = getattr(self._primary, op_name)
         try:
@@ -236,6 +250,23 @@ class AutoFallbackRenderer:
             # Successful auto-reconnect; the proxy is alive. Let the
             # caller see the original RespawnedError so they replay
             # session state on the new subprocess.
+            raise
+        except RustRendererUnsupportedSlideError as e:
+            # The slide kind isn't yet supported by the sidecar (today:
+            # VideoSlide; task #76 wires V4L2). The proxy is fine --
+            # we DO NOT swap to MockRenderer. Log + re-raise so the
+            # playback loop can skip the slide and advance to the next.
+            #
+            # MUST come before the RustRendererSubprocessError clause
+            # below; UnsupportedSlideError is a RustRendererOpError
+            # subclass, not a SubprocessError subclass, so technically
+            # it would propagate through the SubprocessError clause
+            # without being caught -- but naming it explicitly here
+            # both documents the policy and pins the log line.
+            log.info(
+                "AutoFallbackRenderer: %s skipped (unsupported slide kind): %s",
+                op_name, e.message,
+            )
             raise
         except RustRendererSubprocessError as e:
             self._swap_to_mock(f"{op_name}: {e}")

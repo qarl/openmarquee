@@ -649,3 +649,81 @@ class TestAutoFallbackRenderer:
             wrapper.advance(t_ms=100)
         assert wrapper.is_in_fallback is False
         assert wrapper._primary is fake
+
+    def test_unsupported_slide_error_does_not_trigger_fallback(self, tmp_path):
+        """Slice 4: RustRendererUnsupportedSlideError signals a SLIDE-kind
+        limitation (today: VideoSlide), not a process-layer failure. The
+        wrapper must NOT swap to Mock; the playback loop catches the
+        propagated exception and skips the slide.
+
+        Wired BEFORE the SubprocessError clause in `_forward_ipc_op` --
+        UnsupportedSlideError isn't a SubprocessError subclass so it'd
+        propagate either way, but the explicit clause pins the policy
+        (and emits the log line operators look for)."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererUnsupportedSlideError,
+        )
+
+        fake = _FakeRustRenderer()
+        wire_msg = "paint_slide: video slides TBD (image + text both supported)"
+        fake.raise_on_op["begin_slide"] = RustRendererUnsupportedSlideError(wire_msg)
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        with pytest.raises(RustRendererUnsupportedSlideError) as exc_info:
+            wrapper.begin_slide("00000000-0000-0000-0000-000000000001", 0, 5000)
+        # Exception message preserved verbatim so playback's skip-log
+        # carries the same wire-format string operators see in tests.
+        assert exc_info.value.message == wire_msg
+        # Critical: wrapper did NOT swap to Mock -- proxy stays.
+        assert wrapper.is_in_fallback is False
+        assert wrapper._primary is fake
+        assert fake.close_called == 0
+
+    def test_unsupported_slide_error_emits_skip_log(self, tmp_path, caplog):
+        """Operator-visible log line at INFO is the AutoFallbackRenderer-
+        level "this slide was skipped" signal. Slice 4 wires playback to
+        catch the exception and advance; the log is the breadcrumb that
+        ties the two halves of the story together."""
+        import logging as _logging
+
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererUnsupportedSlideError,
+        )
+
+        fake = _FakeRustRenderer()
+        fake.raise_on_op["advance"] = RustRendererUnsupportedSlideError(
+            "paint_slide: video slides TBD (image + text both supported)"
+        )
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        with caplog.at_level(_logging.INFO, logger="openmarquee.dependencies"):
+            with pytest.raises(RustRendererUnsupportedSlideError):
+                wrapper.advance(t_ms=100)
+        # Log line names the op + reproduces the wire-format message.
+        matching = [
+            r for r in caplog.records
+            if "skipped" in r.getMessage() and "advance" in r.getMessage()
+        ]
+        assert matching, f"expected skip log; got {[r.getMessage() for r in caplog.records]}"
+
+    def test_unsupported_slide_error_is_caught_before_subprocess_error(
+        self, tmp_path
+    ):
+        """Subagent-flagged invariant from the slice-4 dispatch: the
+        except chain MUST list UnsupportedSlideError BEFORE
+        SubprocessError. Today the chain is technically safe even with
+        SubprocessError first (UnsupportedSlideError isn't a
+        SubprocessError subclass), but if the class hierarchy ever
+        shifts, this test catches the regression."""
+        import openmarquee.dependencies as deps_module
+        import inspect
+
+        src = inspect.getsource(deps_module.AutoFallbackRenderer._forward_ipc_op)
+        unsupported_at = src.find("RustRendererUnsupportedSlideError")
+        subprocess_at = src.find("RustRendererSubprocessError as e")
+        assert unsupported_at > 0, "UnsupportedSlideError clause missing"
+        assert subprocess_at > 0, "SubprocessError clause missing"
+        assert unsupported_at < subprocess_at, (
+            "UnsupportedSlideError must be caught BEFORE SubprocessError "
+            "(see slice-4 dispatch subagent-review item #1)"
+        )

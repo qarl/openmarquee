@@ -39,6 +39,7 @@ from openmarquee.rendering.rust_renderer import (
     RustRendererProtocolError,
     RustRendererRespawnedError,
     RustRendererSubprocessError,
+    RustRendererUnsupportedSlideError,
     SlideComplete,
 )
 
@@ -403,6 +404,84 @@ def test_op_error_is_subclass_of_renderer_error(make_renderer):
         r.open()
         with pytest.raises(RustRendererError):
             r.reconfigure(brightness=0.5)
+    finally:
+        r.close()
+
+
+# ============================================================
+# Slice 4: RustRendererUnsupportedSlideError promotion at the
+# decode boundary. The proxy translates the byte-stable sidecar
+# error strings for unsupported slide kinds into the typed
+# subclass so callers can dispatch on isinstance instead of
+# parsing the message.
+# ============================================================
+
+
+@pytest.mark.parametrize(
+    "wire_string",
+    [
+        "paint_slide: video slides TBD (image + text both supported)",
+        "Capture: video slides TBD (image + text both supported)",
+        "paint_transition: from non-text slide TBD",
+        "paint_transition: to non-text slide TBD",
+    ],
+)
+def test_unsupported_slide_wire_strings_promote_to_subclass(
+    make_renderer, wire_string
+):
+    """Sidecar wire-format strings that signal "slide kind not yet
+    supported" get promoted to RustRendererUnsupportedSlideError at
+    the proxy boundary. The promotion is what lets AutoFallbackRenderer
+    treat "skip this slide" differently from "the subprocess is busted"
+    (which swaps to MockRenderer).
+    """
+    r = make_renderer(env_extra={"FAKE_SIDECAR_RECONFIGURE_ERR": wire_string})
+    try:
+        r.open()
+        with pytest.raises(RustRendererUnsupportedSlideError) as exc_info:
+            r.reconfigure(brightness=0.5)
+        assert exc_info.value.message == wire_string
+        # Verbatim str() so callers that log .args still see the wire string.
+        assert str(exc_info.value) == wire_string
+    finally:
+        r.close()
+
+
+def test_unsupported_slide_error_is_subclass_of_op_error(make_renderer):
+    """isinstance(e, RustRendererOpError) must be True for the promoted
+    subclass so existing broad-except callers still catch it. Pins the
+    subclass relationship that AutoFallbackRenderer relies on for its
+    except-chain ordering."""
+    r = make_renderer(
+        env_extra={
+            "FAKE_SIDECAR_RECONFIGURE_ERR":
+                "paint_slide: video slides TBD (image + text both supported)"
+        }
+    )
+    try:
+        r.open()
+        with pytest.raises(RustRendererOpError) as exc_info:
+            r.reconfigure(brightness=0.5)
+        assert isinstance(exc_info.value, RustRendererUnsupportedSlideError)
+    finally:
+        r.close()
+
+
+def test_generic_op_error_not_promoted(make_renderer):
+    """Errors that aren't slide-kind-related stay as bare
+    RustRendererOpError -- promotion is substring-gated, not blanket."""
+    r = make_renderer(
+        env_extra={
+            "FAKE_SIDECAR_RECONFIGURE_ERR":
+                "paint_slide: image_slide requires content_root (--content-root)"
+        }
+    )
+    try:
+        r.open()
+        with pytest.raises(RustRendererOpError) as exc_info:
+            r.reconfigure(brightness=0.5)
+        # Not the subclass -- this is a different failure class.
+        assert not isinstance(exc_info.value, RustRendererUnsupportedSlideError)
     finally:
         r.close()
 
