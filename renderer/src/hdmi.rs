@@ -2692,6 +2692,187 @@ pub fn paint_and_present_one_image_slide_frame(
     Ok(())
 }
 
+/// V4L2 piece 3e (2026-05-14) -- per-advance VideoSlide paint.
+/// Feeds the next H.264 sample (if any) into a primed v4l2::Decoder,
+/// drains the next decoded NV12 Frame (with a short EAGAIN retry
+/// budget), uploads Y + UV planes to GLES textures, blits through
+/// the BT.601 NV12 -> RGB shader (FS_NV12_TO_RGB from piece 3d),
+/// and swaps + commits the scanout buffer pair (same FB-rotation
+/// shape as paint_and_present_one_image_slide_frame).
+///
+/// Inputs:
+///   - `samples`: the demuxer's per-sample Annex-B NAL buffers.
+///   - `next_sample_idx`: index of the next sample to feed; the
+///     caller updates this in place after a successful feed.
+///   - `frames_decoded`: number of frames returned so far; the
+///     caller increments after a successful paint. Used to log
+///     a per-slide-end frame count.
+///   - `decoder`: the primed v4l2::Decoder (from piece 3c).
+///
+/// Returns Ok(()) on a successful paint. Returns Err if the codec
+/// hits a non-EAGAIN error, the upload fails, or scanout commit
+/// fails. On EOS (no more samples + drain returns None) returns
+/// Ok(()) without painting -- caller's advance state machine has
+/// already moved on by then.
+#[cfg(target_os = "linux")]
+pub fn paint_and_present_one_video_slide_frame(
+    session: &mut EglSession,
+    card: &Card,
+    samples: &[crate::mp4_demux::Sample],
+    next_sample_idx: &mut usize,
+    frames_decoded: &mut usize,
+    decoder: &crate::v4l2::Decoder,
+) -> Result<()> {
+    use glow::HasContext;
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    // Feed the next sample if any remain. Codec is pipelined: a
+    // single feed may not produce a frame this tick; the EAGAIN
+    // retry below covers the latency. When samples are exhausted
+    // we send EOF on the first such tick.
+    if *next_sample_idx < samples.len() {
+        let s = &samples[*next_sample_idx];
+        decoder.feed(s)
+            .with_context(|| format!("feed sample {}", *next_sample_idx))?;
+        *next_sample_idx += 1;
+    } else if !decoder.is_output_eof_sent() {
+        // No more samples; signal end-of-stream.
+        decoder.feed(&[]).context("feed EOF")?;
+    }
+    // Drain a frame with a small EAGAIN budget so transient
+    // codec back-pressure doesn't lose us a frame. Budget of
+    // 5 retries × 2ms = 10ms max per paint; we have ~33ms total
+    // at 30fps so this leaves ample slack for the actual GL
+    // work.
+    let mut frame_opt: Option<crate::v4l2::Frame> = None;
+    for _ in 0..5 {
+        match decoder.next_frame() {
+            Ok(Some(f)) => { frame_opt = Some(f); break; }
+            Ok(None) => break,
+            Err(e) if e.to_string().contains("EAGAIN") => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(e).context("next_frame"),
+        }
+    }
+    let Some(frame) = frame_opt else {
+        // No frame ready this tick. Don't error -- the next
+        // advance can try again. Leaves whatever's on screen
+        // (last decoded frame or black if never decoded).
+        return Ok(());
+    };
+    let f_w = frame.width();
+    let f_h = frame.height();
+    // TODO(piece 4): stride-vs-width. bcm2835-codec currently emits
+    // NV12 with stride == width for the cases we use (320x240 fixture
+    // and 720p/1080p mode targets), so treating the plane slices as
+    // tightly packed at `f_w` bytes/row works. If a future codec or
+    // alignment quirk produces stride > width, the upload below
+    // would interpret the stride padding as image data; either move
+    // to GL_UNPACK_ROW_LENGTH (GLES3) or stop relying on width here.
+    let y_plane = frame.y_plane();
+    let uv_plane = frame.uv_plane();
+    unsafe {
+        let gl = session.gl;
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        let y_tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(video Y): {e}"))?;
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        // Y plane: width=f_w, height=f_h, one byte per pixel,
+        // uploaded as GL_LUMINANCE. Pixel-store alignment 1
+        // because Y plane stride may be width (not 4-aligned).
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::LUMINANCE as i32,
+            f_w as i32, f_h as i32, 0,
+            glow::LUMINANCE, glow::UNSIGNED_BYTE, Some(y_plane),
+        );
+        let uv_tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(video UV): {e}"))?;
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        // UV plane: NV12 layout is 4:2:0 subsampled, width=f_w
+        // (U+V interleaved -> f_w/2 UV pairs across one row =
+        // f_w bytes/row), height=f_h/2. Uploaded as GL_LUMINANCE_
+        // ALPHA so each 2-byte UV pair lands in (L, A) of one
+        // texel; the FS_NV12_TO_RGB shader samples .ra to recover.
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::LUMINANCE_ALPHA as i32,
+            (f_w / 2) as i32, (f_h / 2) as i32, 0,
+            glow::LUMINANCE_ALPHA, glow::UNSIGNED_BYTE, Some(uv_plane),
+        );
+        // Reset active unit so run_nv12_blit_pass's own binding
+        // sequence starts from a clean slate.
+        gl.active_texture(glow::TEXTURE0);
+        let blit_result = run_nv12_blit_pass(gl, y_tex, uv_tex);
+        gl.delete_texture(y_tex);
+        gl.delete_texture(uv_tex);
+        // Restore GL_UNPACK_ALIGNMENT to the default (4). We
+        // bumped to 1 above for the NV12 upload; leaving it at 1
+        // is safe but unusual for non-NV12 callers downstream.
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        blit_result?;
+    }
+    // Drop the Frame here so its Drop impl re-QBUFs the CAPTURE
+    // buffer back to the kernel before we yield to the next IPC
+    // tick. Critical: holding the Frame across the next advance
+    // call would starve the codec of CAPTURE buffers.
+    drop(frame);
+    *frames_decoded += 1;
+    // Mirror paint_and_present_one_image_slide_frame's scanout-
+    // rotation: swap, lock front BO, addFB, commit, shift
+    // scanout_current -> scanout_prev.
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers (video_slide) failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer (video_slide) failed")?
+    };
+    let fb_buf = GbmBufferAdapter::new(&new_bo).context("read GBM bo metadata (video_slide)")?;
+    let new_fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB (video_slide) failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card, new_fb) {
+        if let Err(de) = card.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail (video_slide): {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev, video_slide): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+    Ok(())
+}
+
 /// QA-direct (2026-05-13 sidecar feature-gaps slice) -- repaint an
 /// ImageSlide into the EGL window surface WITHOUT scanout commit.
 /// Used by the IPC Capture op's re-paint pattern: paint into the

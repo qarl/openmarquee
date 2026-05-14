@@ -136,19 +136,21 @@ class RustRendererOpError(RustRendererError):
 
     `.message` is the verbatim error string from the sidecar. These
     strings are byte-stable per the cargo tests in
-    `renderer/src/ipc_main.rs` (commit 601820f). Match against them
-    for error-class dispatch:
+    `renderer/src/ipc_main.rs` (commit 601820f; updated piece 3e).
+    Match against them for error-class dispatch:
 
       - "paint_slide: image_slide requires content_root (--content-root)"
-      - "paint_slide: video slides TBD (image + text both supported)"
       - "paint_transition: from non-text slide TBD"
       - "paint_transition: to non-text slide TBD"
       - "Capture: video slides TBD (image + text both supported)"
+        (V4L2 piece 3e: paint_slide for Video now renders; Capture
+        still TBD pending a separate piece -- the Capture wire
+        marker stays for VideoSlide screenshots / thumbnails.)
 
     Subclass `RustRendererUnsupportedSlideError` covers the slide-kind-
-    not-implemented cases (video / non-text transition). The proxy
-    promotes those at `_decode_response` so callers can dispatch on
-    type rather than parsing the message.
+    not-implemented cases (today: non-text transition; Capture of
+    Video). The proxy promotes those at `_decode_response` so callers
+    can dispatch on type rather than parsing the message.
     """
 
     def __init__(self, message: str):
@@ -208,6 +210,19 @@ class RustRendererUnsupportedTransitionError(RustRendererOpError):
     """
 
 
+# V4L2 piece 3e (2026-05-14): the paint-side validator no longer
+# emits "video slides TBD" -- VideoSlide paint is now wired through
+# the V4L2 M2M H.264 decoder + GLES BT.601 NV12 shader. The marker
+# substring stays in this tuple because the Capture-side validator
+# still emits "Capture: video slides TBD (image + text both
+# supported)" (Video screenshots / thumbnails are out of scope for
+# piece 3); leaving the substring keeps that Capture path on the
+# PIL-fallback wire so dashboards still work. If paint fails at
+# runtime (e.g., asset.mp4 corrupt, codec absent, frame upload
+# failure), the sidecar emits a different message that falls
+# through to bare RustRendererOpError -- the Python proxy treats
+# that as a hard render failure (no fallback), matching the
+# Image-slide / Text-slide failure shape.
 _UNSUPPORTED_SLIDE_WIRE_MARKERS: tuple[str, ...] = (
     "video slides TBD",
     "non-text slide TBD",

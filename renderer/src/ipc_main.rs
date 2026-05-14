@@ -58,11 +58,29 @@ struct VideoDecoderState {
     /// primes by feeding sample 0 (the IDR + any pre-IDR NALs);
     /// after priming this is 1.
     next_sample_idx: usize,
+    /// Number of frames successfully painted via the per-advance
+    /// paint hook (piece 3e). Incremented in
+    /// `paint_and_present_one_video_slide_frame` after a
+    /// successful blit+swap. Used for first-frame logging +
+    /// future slide-end frame-count diagnostics.
+    frames_decoded: usize,
     /// Negotiated capture dimensions (may differ from the input
-    /// dims via codec width/height adjustment). Piece 3d will use
-    /// these to size the GLES texture upload.
+    /// dims via codec width/height adjustment). Used by piece 3e
+    /// to size the GLES texture upload at exactly the codec's
+    /// stride (avoids spurious right-edge garbage on non-aligned
+    /// widths).
     capture_w: u32,
     capture_h: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl VideoDecoderState {
+    /// Convenience for the paint hook's "did we make progress
+    /// this tick?" check; returns the current frames_decoded
+    /// counter (incremented by the paint helper on success).
+    fn frames_decoded_for_log(&self) -> usize {
+        self.frames_decoded
+    }
 }
 
 /// Cached slide content keyed by UUID. Populated on BeginSlide
@@ -243,6 +261,7 @@ fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     Ok(VideoDecoderState {
         decoder: dec,
         next_sample_idx: 1,
+        frames_decoded: 0,
         capture_w: cap_fmt.width,
         capture_h: cap_fmt.height,
     })
@@ -526,7 +545,7 @@ where
                 &resp,
                 session,
                 &card,
-                &cache,
+                &mut cache,
                 fonts,
                 Some(content_root),
             );
@@ -665,9 +684,17 @@ fn validate_paint_slide_inputs(
                 Ok(())
             }
         }
-        ContentItem::Video(_) => {
-            Err("paint_slide: video slides TBD (image + text both supported)")
-        }
+        // V4L2 piece 3e: Video is now a first-class paint target.
+        // The Python proxy classifier (rust_renderer.py) loses the
+        // "video slides TBD" substring match in lockstep with this
+        // commit so VideoSlide doesn't fall back to PIL anymore.
+        // The actual decoder + demuxer must be in SlideCache.video_
+        // {decoders, demuxers} for the paint hook to succeed; if
+        // they're missing (e.g., asset.mp4 absent / malformed /
+        // codec absent at cache.load time), the paint hook returns
+        // its own honest error which the Python proxy treats as a
+        // hard render failure (no fallback).
+        ContentItem::Video(_) => Ok(()),
     }
 }
 
@@ -705,7 +732,7 @@ fn run_paint_hook(
     resp: &IpcResponse,
     session: &mut crate::hdmi::EglSession,
     card: &crate::Card,
-    cache: &SlideCache,
+    cache: &mut SlideCache,
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
 ) -> IpcResponse {
@@ -719,8 +746,14 @@ fn run_paint_hook(
     };
     match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
-            let item = match cache.items.get(slide_id) {
-                Some(i) => i,
+            // Clone the borrow shape we need so we can take a
+            // mutable borrow on cache.video_decoders later for
+            // the Video branch without re-entering the borrow.
+            // Text/Image only need an immutable items lookup.
+            let item_kind = match cache.items.get(slide_id) {
+                Some(ContentItem::Text(_)) => "text",
+                Some(ContentItem::Image(_)) => "image",
+                Some(ContentItem::Video(_)) => "video",
                 None => {
                     return err(format!(
                         "paint_slide: slide {slide_id} not in cache (begin_slide first?)"
@@ -731,11 +764,19 @@ fn run_paint_hook(
             // validate inputs via the pure-Rust helper first.
             // Pins the wire-format errors for the Python proxy's
             // error-class dispatch.
-            if let Err(msg) = validate_paint_slide_inputs(item, content_root) {
-                return err(msg);
+            {
+                let item = cache.items.get(slide_id).expect("checked above");
+                if let Err(msg) = validate_paint_slide_inputs(item, content_root) {
+                    return err(msg);
+                }
             }
-            match item {
-                ContentItem::Text(slide) => {
+            match item_kind {
+                "text" => {
+                    let item = cache.items.get(slide_id).expect("checked above");
+                    let slide = match item {
+                        ContentItem::Text(s) => s,
+                        _ => unreachable!("item_kind matched text"),
+                    };
                     if let Err(e) = hdmi::paint_and_present_one_frame_for_slide(
                         session,
                         card,
@@ -748,12 +789,17 @@ fn run_paint_hook(
                     }
                     resp.clone()
                 }
-                ContentItem::Image(slide) => {
+                "image" => {
                     // Validator above already enforced content_root
                     // presence; unwrap is safe here.
                     let cr = content_root.expect(
                         "validate_paint_slide_inputs guarantees content_root for Image",
                     );
+                    let item = cache.items.get(slide_id).expect("checked above");
+                    let slide = match item {
+                        ContentItem::Image(s) => s,
+                        _ => unreachable!("item_kind matched image"),
+                    };
                     if let Err(e) = hdmi::paint_and_present_one_image_slide_frame(
                         session, card, slide, cr,
                     ) {
@@ -761,11 +807,54 @@ fn run_paint_hook(
                     }
                     resp.clone()
                 }
-                ContentItem::Video(_) => {
-                    // Unreachable: validator rejects Video. Kept
-                    // for the exhaustive-match invariant.
-                    err("paint_slide: video slides TBD (image + text both supported)")
+                "video" => {
+                    // V4L2 piece 3e: drive one frame of decode +
+                    // upload + paint per advance tick. Requires
+                    // the demuxer + decoder primed in cache.load.
+                    let dem = match cache.video_demuxers.get(slide_id) {
+                        Some(d) => d,
+                        None => {
+                            return err(format!(
+                                "paint_slide (video): no demuxer for slide {slide_id} (asset.mp4 missing or malformed at begin_slide?)"
+                            ));
+                        }
+                    };
+                    let dec_state = match cache.video_decoders.get_mut(slide_id) {
+                        Some(d) => d,
+                        None => {
+                            return err(format!(
+                                "paint_slide (video): no V4L2 decoder for slide {slide_id} (codec absent at begin_slide?)"
+                            ));
+                        }
+                    };
+                    // Borrow gymnastics: dec_state holds a Decoder
+                    // by value; we need &Decoder for the paint call
+                    // but also &mut on next_sample_idx +
+                    // frames_decoded. Take the indices by &mut and
+                    // the decoder by & via splitting the borrow.
+                    let frames_decoded_before = dec_state.frames_decoded_for_log();
+                    if let Err(e) = hdmi::paint_and_present_one_video_slide_frame(
+                        session,
+                        card,
+                        &dem.samples,
+                        &mut dec_state.next_sample_idx,
+                        &mut dec_state.frames_decoded,
+                        &dec_state.decoder,
+                    ) {
+                        return err(format!("paint_slide (video) failed: {e:#}"));
+                    }
+                    if dec_state.frames_decoded > frames_decoded_before {
+                        // First-frame log only to avoid spam.
+                        if dec_state.frames_decoded == 1 {
+                            eprintln!(
+                                "ipc: paint_slide (video) {slide_id}: first frame painted (sample idx {})",
+                                dec_state.next_sample_idx
+                            );
+                        }
+                    }
+                    resp.clone()
                 }
+                _ => unreachable!("item_kind from match above"),
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
@@ -1125,20 +1214,22 @@ mod tests {
         );
     }
 
+    /// V4L2 piece 3e: validate_paint_slide_inputs now accepts
+    /// Video (was: rejected with "video slides TBD"). The actual
+    /// per-advance decode/paint is run by run_paint_hook against
+    /// SlideCache.video_{decoders,demuxers}; the validator no
+    /// longer gates Video. This test pins the new contract --
+    /// any regression here would silently flip Video back into
+    /// the Python proxy's PIL-fallback path.
     #[test]
-    fn validate_paint_slide_video_always_errs_with_stable_string() {
+    fn validate_paint_slide_video_now_accepted() {
         let item = video_item();
         let cr = std::path::PathBuf::from("/tmp/whatever");
-        let err_msg = validate_paint_slide_inputs(&item, Some(&cr)).unwrap_err();
-        assert_eq!(
-            err_msg,
-            "paint_slide: video slides TBD (image + text both supported)",
-            "wire-format error must match exactly"
-        );
-        // Same error whether content_root is set or not -- the
-        // Video bail takes precedence.
-        let err_msg2 = validate_paint_slide_inputs(&item, None).unwrap_err();
-        assert_eq!(err_msg, err_msg2);
+        assert!(validate_paint_slide_inputs(&item, Some(&cr)).is_ok());
+        // No content_root: still ok -- Video uses asset.mp4 which
+        // is resolved via the begin_slide content_root, not the
+        // paint-time one.
+        assert!(validate_paint_slide_inputs(&item, None).is_ok());
     }
 
     /// V4L2 piece 3b: when a VideoSlide loads + the asset.mp4 is

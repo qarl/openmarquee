@@ -701,6 +701,13 @@ impl Decoder {
         self.inner.lock().unwrap().capture_buffer_type
     }
 
+    /// V4L2 piece 3e: has the OUTPUT queue been signaled EOF via
+    /// `feed(&[])`? Lets per-advance callers avoid spurious extra
+    /// EOF feeds when a video has run out of samples.
+    pub fn is_output_eof_sent(&self) -> bool {
+        self.inner.lock().unwrap().output_eof_sent
+    }
+
     /// VIDIOC_S_FMT on the OUTPUT (compressed-in) queue.
     pub fn set_output_format(
         &self, pixel_format: u32, width: u32, height: u32,
