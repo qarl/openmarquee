@@ -2399,6 +2399,14 @@ pub fn paint_and_present_one_frame_for_slide(
     _t_in_slide_ms: u64,
 ) -> Result<()> {
     use glow::HasContext;
+    // QA-direct (2026-05-14 slide-boundary characterization slice):
+    // OPENMARQUEE_BOUNDARY_TRACE=1 emits one JSON line per painted
+    // frame to stderr with per-phase Instant deltas in microseconds.
+    // Zero overhead when off (one env::var lookup per frame; the
+    // Instant captures are skipped entirely). Drained by the
+    // sidecar smoke driver's stderr thread for offline analysis.
+    let trace = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
+    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
     let (bg_kind, _pattern_label, text_layers) =
         resolve_slide_layers(slide, fonts, content_root)?;
     // Bug 1 fix extension (qarl-flag 2026-05-09, applied 2026-05-13):
@@ -2432,6 +2440,7 @@ pub fn paint_and_present_one_frame_for_slide(
             session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
         }
     }
+    let t_after_setup = if trace { Some(std::time::Instant::now()) } else { None };
 
     paint_slide(
         session.gl,
@@ -2446,6 +2455,7 @@ pub fn paint_and_present_one_frame_for_slide(
         None,  // tex_cache: one-shot capture path, no caching needed
     )?;
     unsafe { session.gl.flush(); }
+    let t_after_paint = if trace { Some(std::time::Instant::now()) } else { None };
 
     // v1-spec-delta #10 (slice c): if non-identity, the scene
     // is in scene_fbo. Bind default fb + run FS_BRIGHT_GAMMA
@@ -2460,6 +2470,7 @@ pub fn paint_and_present_one_frame_for_slide(
             run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
         }
     }
+    let t_after_postpass = if trace { Some(std::time::Instant::now()) } else { None };
 
     // swap_buffers → lock → addFB → commit_fb. Same primitive
     // sequence as render_animated_slide_in_session's per-frame
@@ -2472,6 +2483,7 @@ pub fn paint_and_present_one_frame_for_slide(
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
         .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+    let t_after_swap = if trace { Some(std::time::Instant::now()) } else { None };
     let new_bo = unsafe {
         session
             .gbm_surface
@@ -2482,6 +2494,7 @@ pub fn paint_and_present_one_frame_for_slide(
     let new_fb = card
         .add_framebuffer(&fb_buf, 32, 32)
         .map_err(|e| anyhow!("drmModeAddFB failed: {e}"))?;
+    let t_after_gbm = if trace { Some(std::time::Instant::now()) } else { None };
     if let Err(e) = commit_fb(session, card, new_fb) {
         // Roll back: free the new FB + drop the new BO before
         // propagating. session's scanout_*_* holders untouched
@@ -2511,6 +2524,32 @@ pub fn paint_and_present_one_frame_for_slide(
     session.scanout_prev_bo = session.scanout_current_bo.take();
     session.scanout_current_bo = Some(new_bo);
     session.scanout_current_fb = Some(new_fb);
+    let t_end = if trace { Some(std::time::Instant::now()) } else { None };
+
+    // Emit per-phase trace if OPENMARQUEE_BOUNDARY_TRACE was on.
+    // One JSON line per painted frame; consumer is the sidecar
+    // smoke driver's stderr drainer.
+    if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5), Some(t6)) = (
+        t_start,
+        t_after_setup,
+        t_after_paint,
+        t_after_postpass,
+        t_after_swap,
+        t_after_gbm,
+        t_end,
+    ) {
+        eprintln!(
+            "{{\"trace\":\"boundary\",\"slide_id\":\"{}\",\"setup_us\":{},\"paint_us\":{},\"postpass_us\":{},\"swap_us\":{},\"gbm_us\":{},\"commit_us\":{},\"total_us\":{}}}",
+            slide.id,
+            (t1 - t0).as_micros(),
+            (t2 - t1).as_micros(),
+            (t3 - t2).as_micros(),
+            (t4 - t3).as_micros(),
+            (t5 - t4).as_micros(),
+            (t6 - t5).as_micros(),
+            (t6 - t0).as_micros(),
+        );
+    }
     Ok(())
 }
 
