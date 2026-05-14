@@ -1,20 +1,17 @@
-"""Tests for backend/openmarquee/wifi_station.py.
+"""Tests for backend/openmarquee/wifi_station.py (nmcli backend).
 
-The apply path shells out to systemctl + iw — both are mocked here so
-the test runs on Mac (no Pi hardware required). What we DO verify
-end-to-end:
-  - The rendered conf body lands at the override path with the right
-    content.
-  - Idempotent re-submit doesn't fire a second systemctl restart.
-  - Changed creds DO fire the restart.
-  - has_settings_changed diff logic matches the wire contract.
-  - apply_disabled stops the supplicant + removes the conf.
+The apply path shells out to `nmcli` — mocked here so the test
+runs on Mac with no NetworkManager / no Pi. What we DO verify:
+  - Idempotent re-submit (same SSID already active) -> no destructive op.
+  - Different SSID submit -> delete-then-connect dance.
+  - apply_disabled removes the active connection profile.
+  - nmcli non-zero exit -> state='failed' with stderr in detail.
+  - Poll-timeout when device-state never reaches 100 -> 'failed'.
+  - has_settings_changed diff helper.
 """
 from __future__ import annotations
 
-import os
-import tempfile
-from pathlib import Path
+import importlib
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -22,193 +19,250 @@ import pytest
 
 
 @pytest.fixture
-def tmp_wpa_conf_path(monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Override the wpa_supplicant conf path to a tempfile so the
-    test doesn't try to write /etc/wpa_supplicant/* on the dev Mac.
-    The module reads the env var at import time, so we set it +
-    reimport the module fresh."""
-    tmp_dir = tempfile.mkdtemp(prefix="wifi-station-test-")
-    conf_path = Path(tmp_dir) / "wpa_supplicant-wlan0.conf"
-    monkeypatch.setenv("OPENMARQUEE_WPA_SUPPLICANT_CONF", str(conf_path))
-    # Force module re-import so it picks up the new env var.
-    import importlib
+def reset_module():
+    """Re-import wifi_station so each test starts with a fresh
+    module-global state (the _STATE singleton + the nmcli_runner
+    handle) regardless of test order."""
     import openmarquee.wifi_station
     importlib.reload(openmarquee.wifi_station)
-    return conf_path
+    yield openmarquee.wifi_station
 
 
-@pytest.fixture
-def mock_iw_connected() -> MagicMock:
-    """iw_link_fn that immediately reports the target ssid as
-    connected -- short-circuits the poll loop so tests don't sleep."""
-    return MagicMock(return_value="testnet")
-
-
-@pytest.fixture
-def mock_iw_disconnected() -> MagicMock:
-    """iw_link_fn that always reports Not connected -- forces the
-    poll loop to time out."""
-    return MagicMock(return_value=None)
-
-
-def test_apply_enabled_writes_conf(
-    tmp_wpa_conf_path: Path,
-    mock_iw_connected: MagicMock,
-) -> None:
-    """Submitting valid creds with enabled=true templates the conf
-    at the configured path + invokes the restart fn + reports the
-    'connected' state when iw reports the SSID."""
+def _nmcli_result(returncode: int = 0, stdout: str = "", stderr: str = "") -> object:
+    """Build a fake _NmcliResult for monkey-patched nmcli_runner returns."""
     import openmarquee.wifi_station as ws
+    return ws._NmcliResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
-    restart_fn = MagicMock()
-    ok = ws.apply_enabled(
-        "testnet",
-        "secret-passphrase-12345",
-        restart_fn=restart_fn,
-        iw_link_fn=mock_iw_connected,
-        poll_timeout_sec=1,
-    )
 
+def test_apply_enabled_idempotent_when_already_connected(reset_module) -> None:
+    """If wlan0 is already on the requested SSID with state '100
+    (connected)', apply_enabled MUST NOT issue a connect or delete --
+    just snaps state to 'connected' and returns True."""
+    ws = reset_module
+    target_ssid = "pikazo"
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        # `nmcli -t -f NAME,DEVICE connection show --active` -> "pikazo:wlan0"
+        if "connection" in args and "show" in args and "--active" in args:
+            return _nmcli_result(stdout=f"{target_ssid}:wlan0\n")
+        # `nmcli -t -f GENERAL.STATE device show wlan0` -> "100 (connected)"
+        if "GENERAL.STATE" in args and "show" in args:
+            return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+        # Anything else (e.g. wifi connect) MUST NOT be called.
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(target_ssid, "Picasso!", poll_timeout_sec=1)
     assert ok is True
-    assert tmp_wpa_conf_path.exists()
-    body = tmp_wpa_conf_path.read_text()
-    assert 'ssid="testnet"' in body or "ssid=" in body  # either form
-    assert "ctrl_interface=DIR=/var/run/wpa_supplicant" in body
-    assert "country=US" in body
-    restart_fn.assert_called_once()
+    state = ws.current_state()
+    assert state.state == "connected"
+    assert state.ssid == target_ssid
+
+
+def test_apply_enabled_new_ssid_deletes_old_then_connects(reset_module) -> None:
+    """When wlan0 is on a DIFFERENT active connection, apply_enabled
+    must delete the old profile BEFORE issuing the new connect (so
+    nmcli's auto-fallback can't reuse stale creds on failure)."""
+    ws = reset_module
+    new_ssid = "newnet"
+    old_ssid = "oldnet"
+    call_log: list = []
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        call_log.append((tuple(args), sudo))
+        if "connection" in args and "show" in args and "--active" in args:
+            # First query: still on oldnet.
+            # After we delete + connect, the next query reports newnet.
+            if any(call[0][:5] == ("device", "wifi", "connect", new_ssid, "password")
+                   for call in call_log):
+                return _nmcli_result(stdout=f"{new_ssid}:wlan0\n")
+            return _nmcli_result(stdout=f"{old_ssid}:wlan0\n")
+        if "GENERAL.STATE" in args:
+            return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+        if args[:3] == ["connection", "delete", old_ssid]:
+            return _nmcli_result(returncode=0)
+        if args[:3] == ["device", "wifi", "connect"]:
+            return _nmcli_result(returncode=0)
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(new_ssid, "newpassword", poll_timeout_sec=1)
+    assert ok is True
+
+    # The delete-old MUST appear in the call log BEFORE the
+    # wifi-connect-new (sequential ordering pin).
+    delete_idx = next(
+        i for i, (args, _) in enumerate(call_log)
+        if args[:3] == ("connection", "delete", old_ssid)
+    )
+    connect_idx = next(
+        i for i, (args, _) in enumerate(call_log)
+        if args[:3] == ("device", "wifi", "connect")
+    )
+    assert delete_idx < connect_idx, (
+        f"delete-old must precede connect-new; log: {call_log}"
+    )
 
     state = ws.current_state()
     assert state.state == "connected"
-    assert state.ssid == "testnet"
+    assert state.ssid == new_ssid
 
 
-def test_apply_enabled_idempotent_skips_restart(
-    tmp_wpa_conf_path: Path,
-    mock_iw_connected: MagicMock,
-) -> None:
-    """Calling apply_enabled twice with the same creds writes the
-    conf only once + skips the systemctl restart on the second call
-    (conf body is identical)."""
-    import openmarquee.wifi_station as ws
+def test_apply_enabled_nmcli_failure_sets_failed_state(reset_module) -> None:
+    """When `nmcli device wifi connect` returns non-zero (wrong
+    password, ssid out of range), state -> 'failed' with the
+    stderr verbatim in detail. No 'success on subprocess error'."""
+    ws = reset_module
+    target_ssid = "homenet"
 
-    restart_fn = MagicMock()
-    # First call: conf is written, restart fires.
-    ok1 = ws.apply_enabled(
-        "testnet",
-        "secret-passphrase-12345",
-        restart_fn=restart_fn,
-        iw_link_fn=mock_iw_connected,
-        poll_timeout_sec=1,
-    )
-    assert ok1 is True
-    assert restart_fn.call_count == 1
+    def fake_runner(args, *, sudo=False, timeout=30):
+        if "connection" in args and "show" in args and "--active" in args:
+            # Not currently connected to anything.
+            return _nmcli_result(stdout="")
+        if "GENERAL.STATE" in args:
+            return _nmcli_result(stdout="GENERAL.STATE:30 (disconnected)\n")
+        if args[:3] == ["device", "wifi", "connect"]:
+            return _nmcli_result(
+                returncode=4,
+                stderr=(
+                    "Error: Connection activation failed: (7) Secrets "
+                    "were required, but not provided.\n"
+                ),
+            )
+        raise AssertionError(f"unexpected nmcli call: {args}")
 
-    # Second call with same creds: idempotent.
-    ok2 = ws.apply_enabled(
-        "testnet",
-        "secret-passphrase-12345",
-        restart_fn=restart_fn,
-        iw_link_fn=mock_iw_connected,
-        poll_timeout_sec=1,
-    )
-    assert ok2 is True
-    # No additional restart call: still 1.
-    assert restart_fn.call_count == 1
-
-
-def test_apply_enabled_changed_creds_triggers_restart(
-    tmp_wpa_conf_path: Path,
-    mock_iw_connected: MagicMock,
-) -> None:
-    """Different creds (new ssid OR new password) re-templates the
-    conf + fires the restart. mock_iw_connected reports whatever ssid
-    we pass it via the fixture re-config."""
-    import openmarquee.wifi_station as ws
-
-    restart_fn = MagicMock()
-    # Apply first creds.
-    ws.apply_enabled(
-        "testnet",
-        "secret-passphrase-12345",
-        restart_fn=restart_fn,
-        iw_link_fn=mock_iw_connected,
-        poll_timeout_sec=1,
-    )
-    body_a = tmp_wpa_conf_path.read_text()
-    assert restart_fn.call_count == 1
-
-    # Apply different creds. Configure iw mock to report the new ssid.
-    iw_for_other = MagicMock(return_value="othernet")
-    ws.apply_enabled(
-        "othernet",
-        "different-passphrase-67890",
-        restart_fn=restart_fn,
-        iw_link_fn=iw_for_other,
-        poll_timeout_sec=1,
-    )
-    body_b = tmp_wpa_conf_path.read_text()
-    assert restart_fn.call_count == 2  # second restart fired
-    assert body_a != body_b
-    # New body has the new ssid (either cleartext or hashed-via-wpa_passphrase)
-    assert "othernet" in body_b
-
-
-def test_apply_disabled_stops_supplicant_and_removes_conf(
-    tmp_wpa_conf_path: Path,
-    mock_iw_connected: MagicMock,
-) -> None:
-    """apply_disabled removes the conf + invokes the stop fn + sets
-    the state to 'disabled'."""
-    import openmarquee.wifi_station as ws
-
-    # Get a conf on disk first so we have something to remove.
-    ws.apply_enabled(
-        "testnet",
-        "secret-passphrase-12345",
-        restart_fn=MagicMock(),
-        iw_link_fn=mock_iw_connected,
-        poll_timeout_sec=1,
-    )
-    assert tmp_wpa_conf_path.exists()
-
-    stop_fn = MagicMock()
-    ws.apply_disabled(stop_fn=stop_fn)
-
-    assert not tmp_wpa_conf_path.exists()
-    stop_fn.assert_called_once()
-    state = ws.current_state()
-    assert state.state == "disabled"
-
-
-def test_apply_enabled_poll_timeout_reports_failed(
-    tmp_wpa_conf_path: Path,
-    mock_iw_disconnected: MagicMock,
-) -> None:
-    """When wpa_supplicant never associates (iw always reports Not
-    connected), the apply ends in state='failed' with a 'no
-    association' detail."""
-    import openmarquee.wifi_station as ws
-
-    restart_fn = MagicMock()
-    ok = ws.apply_enabled(
-        "testnet",
-        "secret-passphrase-12345",
-        restart_fn=restart_fn,
-        iw_link_fn=mock_iw_disconnected,
-        poll_timeout_sec=1,  # short poll so the test doesn't sleep 30s
-    )
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(target_ssid, "wrongpassword", poll_timeout_sec=1)
     assert ok is False
     state = ws.current_state()
     assert state.state == "failed"
     assert state.detail is not None
-    assert "association" in state.detail
+    assert "Secrets were required" in state.detail
+    assert state.ssid == target_ssid
+
+
+def test_apply_enabled_poll_timeout_when_state_never_reaches_100(
+    reset_module,
+) -> None:
+    """If nmcli connect returns 0 but the device GENERAL.STATE never
+    reaches '100 (connected)' within the poll budget, state ->
+    'failed' with 'no association within Ns' detail."""
+    ws = reset_module
+    target_ssid = "slownet"
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        if "connection" in args and "show" in args and "--active" in args:
+            return _nmcli_result(stdout="")
+        if "GENERAL.STATE" in args:
+            # Stuck in connecting state forever.
+            return _nmcli_result(stdout="GENERAL.STATE:50 (connecting)\n")
+        if args[:3] == ["device", "wifi", "connect"]:
+            return _nmcli_result(returncode=0)
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(target_ssid, "rightpassword", poll_timeout_sec=1)
+    assert ok is False
+    state = ws.current_state()
+    assert state.state == "failed"
+    assert "association" in (state.detail or "")
+
+
+def test_apply_disabled_deletes_active_connection(reset_module) -> None:
+    """apply_disabled removes the active wlan0 connection profile
+    (uses `connection delete`, NOT `device disconnect` -- the latter
+    would free the whole device + might cascade into ap0)."""
+    ws = reset_module
+    current_ssid = "old-managed-network"
+    call_log: list = []
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        call_log.append((tuple(args), sudo))
+        if "connection" in args and "show" in args and "--active" in args:
+            return _nmcli_result(stdout=f"{current_ssid}:wlan0\n")
+        if args[:3] == ["connection", "delete", current_ssid]:
+            return _nmcli_result(returncode=0)
+        # device disconnect would be a BUG -- explicit guard.
+        if args[:2] == ["device", "disconnect"]:
+            raise AssertionError(
+                "apply_disabled used device disconnect; must use connection delete"
+            )
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ws.apply_disabled()
+    state = ws.current_state()
+    assert state.state == "disabled"
+    # Verify the delete fired.
+    assert any(
+        args[:3] == ("connection", "delete", current_ssid)
+        for args, _ in call_log
+    )
+
+
+def test_apply_disabled_when_no_active_connection_is_a_noop(
+    reset_module,
+) -> None:
+    """If wlan0 has no active connection (e.g., already disabled,
+    or never enabled), apply_disabled silently no-ops + sets state
+    to 'disabled'. No subprocess shells beyond the status query."""
+    ws = reset_module
+    call_log: list = []
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        call_log.append((tuple(args), sudo))
+        if "connection" in args and "show" in args and "--active" in args:
+            return _nmcli_result(stdout="")  # nothing active
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ws.apply_disabled()
+    state = ws.current_state()
+    assert state.state == "disabled"
+    # Only the status query fired; no destructive op.
+    assert len(call_log) == 1
+
+
+def test_apply_enabled_uses_sudo_only_for_destructive_ops(
+    reset_module,
+) -> None:
+    """Read-only queries (`connection show --active`, `device show
+    wlan0`) run WITHOUT sudo. Destructive operations (`device wifi
+    connect`, `connection delete`) run WITH sudo. Validates the
+    sudoers grant boundary -- the sudoers fragment must match the
+    actual code paths."""
+    ws = reset_module
+    target_ssid = "anothernet"
+    sudo_log: list = []
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        sudo_log.append((tuple(args), sudo))
+        if "connection" in args and "show" in args and "--active" in args:
+            return _nmcli_result(stdout="")
+        if "GENERAL.STATE" in args:
+            return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+        if args[:3] == ["device", "wifi", "connect"]:
+            return _nmcli_result(returncode=0)
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ws.apply_enabled(target_ssid, "rightpassword", poll_timeout_sec=1)
+
+    for args, sudo in sudo_log:
+        if args[:3] == ("device", "wifi", "connect"):
+            assert sudo is True, "wifi connect MUST use sudo"
+        elif args[:2] == ("connection", "delete"):
+            assert sudo is True, "connection delete MUST use sudo"
+        else:
+            # Status queries: no sudo.
+            assert sudo is False, f"read-only nmcli must not sudo: {args}"
+
+
+# --- has_settings_changed tests (preserved from prior version) -------------
 
 
 def test_has_settings_changed_detects_toggle_on() -> None:
-    """Flipping enabled false -> true triggers an apply regardless
-    of ssid/password values."""
     from openmarquee.wifi_station import has_settings_changed
-
     assert has_settings_changed(
         prev_enabled=False, prev_ssid=None, prev_password=None,
         new_enabled=True, new_ssid="net", new_password="pw1234567890",
@@ -216,10 +270,7 @@ def test_has_settings_changed_detects_toggle_on() -> None:
 
 
 def test_has_settings_changed_detects_toggle_off() -> None:
-    """Flipping enabled true -> false triggers an apply (we need to
-    stop the supplicant + remove conf)."""
     from openmarquee.wifi_station import has_settings_changed
-
     assert has_settings_changed(
         prev_enabled=True, prev_ssid="net", prev_password="pw1234567890",
         new_enabled=False, new_ssid="net", new_password="pw1234567890",
@@ -227,9 +278,7 @@ def test_has_settings_changed_detects_toggle_off() -> None:
 
 
 def test_has_settings_changed_detects_creds_diff_when_enabled() -> None:
-    """Stays enabled but ssid OR password changed -> apply."""
     from openmarquee.wifi_station import has_settings_changed
-
     assert has_settings_changed(
         prev_enabled=True, prev_ssid="old", prev_password="pw1",
         new_enabled=True, new_ssid="new", new_password="pw1",
@@ -241,9 +290,7 @@ def test_has_settings_changed_detects_creds_diff_when_enabled() -> None:
 
 
 def test_has_settings_changed_stable_when_disabled() -> None:
-    """Stays disabled -> no work."""
     from openmarquee.wifi_station import has_settings_changed
-
     assert not has_settings_changed(
         prev_enabled=False, prev_ssid=None, prev_password=None,
         new_enabled=False, new_ssid=None, new_password=None,
@@ -251,44 +298,8 @@ def test_has_settings_changed_stable_when_disabled() -> None:
 
 
 def test_has_settings_changed_stable_when_enabled_with_same_creds() -> None:
-    """Stays enabled with identical creds -> no work (apply would
-    no-op via conf-comparison short-circuit anyway, but skipping the
-    thread spawn is cleaner)."""
     from openmarquee.wifi_station import has_settings_changed
-
     assert not has_settings_changed(
         prev_enabled=True, prev_ssid="net", prev_password="pw1234567890",
         new_enabled=True, new_ssid="net", new_password="pw1234567890",
     )
-
-
-def test_conf_no_cleartext_psk_when_wpa_passphrase_available(
-    tmp_wpa_conf_path: Path,
-    mock_iw_connected: MagicMock,
-) -> None:
-    """If wpa_passphrase is on the PATH (it is on the dev Mac via
-    Homebrew, and on Pi OS via the wpasupplicant package), the
-    rendered conf MUST NOT contain the cleartext password. The block
-    keeps `psk=<hash>` (no quotes -- that's how wpa_passphrase output
-    differs from a hand-written `psk="..."`)."""
-    import shutil
-    import openmarquee.wifi_station as ws
-
-    if shutil.which("wpa_passphrase") is None:
-        pytest.skip("wpa_passphrase not on PATH; cleartext fallback is documented")
-
-    password = "uniquesecret87654321"
-    ws.apply_enabled(
-        "testnet",
-        password,
-        restart_fn=MagicMock(),
-        iw_link_fn=mock_iw_connected,
-        poll_timeout_sec=1,
-    )
-    body = tmp_wpa_conf_path.read_text()
-    # The cleartext password must not appear in the conf body.
-    assert password not in body, (
-        f"cleartext password leaked into conf body:\n{body}"
-    )
-    # And the hashed psk line should be present (32-byte hex digest).
-    assert "psk=" in body
