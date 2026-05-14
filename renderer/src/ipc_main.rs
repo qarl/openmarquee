@@ -21,6 +21,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 
 use crate::content::{
     find_image_slide, find_text_slide, find_video_slide, video_slide_asset_path,
@@ -33,6 +35,35 @@ use crate::playback::{
 };
 #[cfg(target_os = "linux")]
 use crate::hdmi_logic::FontCatalog;
+#[cfg(target_os = "linux")]
+use crate::v4l2;
+
+/// V4L2 piece 3c (2026-05-14): /dev/video10 is the bcm2835-codec
+/// decode-side node on Raspberry Pi (verified via piece 1 inventory
+/// and piece 2b live decode). Hardcoded for now; a future settings
+/// surface might let operators override on different SoCs.
+#[cfg(target_os = "linux")]
+const V4L2_DECODER_PATH: &str = "/dev/video10";
+
+/// Linux-only V4L2 H.264 decoder state cached alongside the
+/// Mp4Demuxer for a VideoSlide. cache.load opens + primes the
+/// decoder (format negotiation, REQBUFS, STREAMON, SPS+PPS+IDR
+/// fed); piece 3d paint_slide consumes per-advance samples and
+/// uploads decoded NV12 frames to GLES textures.
+#[cfg(target_os = "linux")]
+struct VideoDecoderState {
+    decoder: v4l2::Decoder,
+    /// Index of the next sample (in the demuxer's `samples` Vec)
+    /// to feed on the next paint_slide / advance tick. cache.load
+    /// primes by feeding sample 0 (the IDR + any pre-IDR NALs);
+    /// after priming this is 1.
+    next_sample_idx: usize,
+    /// Negotiated capture dimensions (may differ from the input
+    /// dims via codec width/height adjustment). Piece 3d will use
+    /// these to size the GLES texture upload.
+    capture_w: u32,
+    capture_h: u32,
+}
 
 /// Cached slide content keyed by UUID. Populated on BeginSlide
 /// + BeginTransition; consumed by Advance's actual-paint path
@@ -52,6 +83,18 @@ use crate::hdmi_logic::FontCatalog;
 struct SlideCache {
     items: std::collections::HashMap<uuid::Uuid, ContentItem>,
     video_demuxers: std::collections::HashMap<uuid::Uuid, Mp4Demuxer>,
+    /// V4L2 piece 3c: Linux-only V4L2 decoder per Video slide id.
+    /// cache.load primes the decoder once on first encounter; piece
+    /// 3d's paint_slide drains frames per advance tick.
+    ///
+    /// TODO(piece 4+): release decoder on cache eviction. Each
+    /// primed decoder holds ~5 MB at 320x240 / ~20-25 MB at 1080p
+    /// (4+4 buffers × per-plane size). On a 512 MB Pi Zero 2 W
+    /// a ~10-slide playlist hits ~250 MB just for decoder buffers.
+    /// LRU eviction (or reactive release on slide-leave) needed
+    /// before production at scale.
+    #[cfg(target_os = "linux")]
+    video_decoders: std::collections::HashMap<uuid::Uuid, VideoDecoderState>,
 }
 
 impl SlideCache {
@@ -59,6 +102,8 @@ impl SlideCache {
         Self {
             items: std::collections::HashMap::new(),
             video_demuxers: std::collections::HashMap::new(),
+            #[cfg(target_os = "linux")]
+            video_decoders: std::collections::HashMap::new(),
         }
     }
 
@@ -100,6 +145,22 @@ impl SlideCache {
                             "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
                             item_id, dem.width, dem.height, dem.samples.len()
                         );
+                        // V4L2 piece 3c: on Linux, also prime the
+                        // hardware decoder. Failure is best-effort
+                        // (warn + fall through to PIL fallback via
+                        // the "video slides TBD" wire). Mac: skip.
+                        #[cfg(target_os = "linux")]
+                        match prime_video_decoder(&dem) {
+                            Ok(dec_state) => {
+                                self.video_decoders.insert(item_id, dec_state);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "ipc: warning -- failed to prime V4L2 decoder for video slide {}: {:#}",
+                                    item_id, e
+                                );
+                            }
+                        }
                         self.video_demuxers.insert(item_id, dem);
                     }
                     Err(e) => {
@@ -118,6 +179,73 @@ impl SlideCache {
             content_root.display()
         ))
     }
+}
+
+/// V4L2 piece 3c: open + prime an `v4l2::Decoder` against the
+/// Pi's bcm2835-codec for a given Mp4Demuxer's stream. Returns a
+/// `VideoDecoderState` ready for piece 3d to drain frames from.
+///
+/// Priming sequence (per bcm2835-codec / V4L2 M2M MPLANE recipe):
+///   1. Decoder::open("/dev/video10")
+///   2. set_output_format(H264, w, h) -- compressed-in queue
+///   3. set_capture_format(NV12, w, h) -- decoded-out queue;
+///      negotiated dims may differ from the request (codec
+///      rounds to its alignment).
+///   4. allocate_buffers(OUTPUT, 4) + allocate_buffers(CAPTURE, 4)
+///   5. start_streaming() -- STREAMON OUTPUT then CAPTURE
+///   6. feed(sps_pps_annexb) -- header NALs prepended once
+///   7. feed(sample[0]) -- first sample (IDR + any pre-IDR NALs)
+///
+/// Failure at any step bubbles; the cache.load caller swallows
+/// to eprintln + falls through to the "video slides TBD" PIL
+/// fallback wire.
+#[cfg(target_os = "linux")]
+fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
+    use std::path::Path;
+    let path = Path::new(V4L2_DECODER_PATH);
+    if !path.exists() {
+        anyhow::bail!(
+            "V4L2 decoder device {} does not exist (no codec driver loaded?)",
+            V4L2_DECODER_PATH
+        );
+    }
+    let dec = v4l2::Decoder::open(path)
+        .with_context(|| format!("open V4L2 decoder at {}", V4L2_DECODER_PATH))?;
+    let w = dem.width as u32;
+    let h = dem.height as u32;
+    let _out_fmt = dec
+        .set_output_format(v4l2::V4L2_PIX_FMT_H264, w, h)
+        .context("S_FMT OUTPUT (H264)")?;
+    let cap_fmt = dec
+        .set_capture_format(v4l2::V4L2_PIX_FMT_NV12, w, h)
+        .context("S_FMT CAPTURE (NV12)")?;
+    dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
+        .context("REQBUFS OUTPUT")?;
+    dec.allocate_buffers(v4l2::QueueDirection::Capture, 4)
+        .context("REQBUFS CAPTURE")?;
+    dec.start_streaming().context("STREAMON")?;
+    // Feed the codec headers + first sample as a SINGLE
+    // concatenated buffer. `v4l2::Decoder::feed` is single-shot-
+    // safe per its docstring -- back-to-back calls collide on
+    // OUTPUT buffer index 0 (the second feed clobbers the first
+    // before the kernel has dequeued it). The proven-working
+    // recipe in v4l2::tests::decode_test_fixture_320x240 feeds
+    // the entire Annex-B stream in one call; we mirror that.
+    let first_sample = dem
+        .samples
+        .first()
+        .ok_or_else(|| anyhow!("MP4 contains zero samples"))?;
+    let header = dem.sps_pps_annexb();
+    let mut primer: Vec<u8> = Vec::with_capacity(header.len() + first_sample.len());
+    primer.extend_from_slice(&header);
+    primer.extend_from_slice(first_sample);
+    dec.feed(&primer).context("feed SPS+PPS+IDR primer")?;
+    Ok(VideoDecoderState {
+        decoder: dec,
+        next_sample_idx: 1,
+        capture_w: cap_fmt.width,
+        capture_h: cap_fmt.height,
+    })
 }
 
 /// Emit a response to stdout as a single JSON line + flush.
@@ -1055,6 +1183,57 @@ mod tests {
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
         assert!(!dem.samples.is_empty());
+    }
+
+    /// V4L2 piece 3c (Linux-gated): when the dev Pi V4L2 codec
+    /// is present, cache.load also primes the v4l2::Decoder and
+    /// records it in video_decoders. Skipped without
+    /// /dev/video10. Exercises the full open-format-buffers-
+    /// stream-on-feed-headers path on real hardware.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cache_load_video_primes_v4l2_decoder_on_linux() {
+        if !std::path::Path::new(V4L2_DECODER_PATH).exists() {
+            eprintln!("skipping: {} absent (no codec driver)", V4L2_DECODER_PATH);
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(5);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("item.json"),
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "video",
+                "id": "05050505-0505-0505-0505-050505050505",
+                "name": "vid-linux",
+                "duration_ms": 2000,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        let fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        std::fs::copy(&fixture, dir.join("asset.mp4")).unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("cache.load");
+        assert!(cache.items.contains_key(&id), "Video item must be in items");
+        assert!(cache.video_demuxers.contains_key(&id), "Demuxer must be in video_demuxers");
+        let dec_state = cache.video_decoders.get(&id)
+            .expect("Decoder must be primed in video_decoders on Linux");
+        assert_eq!(dec_state.capture_w, 320, "negotiated capture width");
+        assert_eq!(dec_state.capture_h, 240, "negotiated capture height");
+        assert_eq!(dec_state.next_sample_idx, 1,
+            "priming should have consumed sample 0; next_sample_idx = 1");
     }
 
     /// V4L2 piece 3b: when asset.mp4 is missing or malformed,

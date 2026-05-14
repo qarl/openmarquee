@@ -938,6 +938,19 @@ impl Decoder {
         let buf_idx = 0u32;
         let num_planes = out_fmt.num_planes as usize;
         let plane_max = out_fmt.plane_fmt[0].sizeimage as usize;
+        // Snapshot the per-plane sizeimages BEFORE taking the
+        // &mut on `inner.mapped_output`, since `out_fmt` is itself
+        // borrowed from `inner.output_format`. Without this copy
+        // the borrow checker rejects the simultaneous immutable
+        // borrow of `inner.output_format` and mutable borrow of
+        // `inner.mapped_output` (caught by piece 3c cross-compile).
+        let plane_sizeimages: [u32; 8] = {
+            let mut a = [0u32; 8];
+            for p in 0..num_planes {
+                a[p] = out_fmt.plane_fmt[p].sizeimage;
+            }
+            a
+        };
         if h264_nal.len() > plane_max {
             return Err(anyhow!(
                 "feed: NAL chunk ({} bytes) larger than OUTPUT buffer ({})",
@@ -950,7 +963,7 @@ impl Decoder {
         dst[..h264_nal.len()].copy_from_slice(h264_nal);
         let mut planes = [V4l2Plane::default(); 8];
         for p in 0..num_planes {
-            planes[p].length = out_fmt.plane_fmt[p].sizeimage;
+            planes[p].length = plane_sizeimages[p];
         }
         planes[0].bytesused = h264_nal.len() as u32;
         let mut buf = V4l2Buffer {
