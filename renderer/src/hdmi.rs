@@ -2726,6 +2726,24 @@ pub fn paint_and_present_one_video_slide_frame(
     use glow::HasContext;
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
+    // V4L2 piece 4f first-frame profile gate (2026-05-14). When
+    // OPENMARQUEE_FIRSTFRAME_PROFILE=1 is set, the per-frame cost
+    // checkpoints below print to stderr exactly ONCE per slide
+    // (the first PaintSlide for each new decoder). Zero overhead
+    // when unset; one branch + a few Instant::now() calls when
+    // set. The trace lines are picked up by the smoke driver's
+    // stderr capture for offline analysis.
+    // Profile gate: prime_video_decoder sets next_sample_idx=1
+    // BEFORE the first paint (it feeds the SPS+PPS+IDR primer +
+    // sample[0]), and frames_decoded stays 0 across the codec-
+    // warmup advances that return None. So the right "first
+    // PaintSlide for this slide" signal is next_sample_idx==1
+    // AND frames_decoded==0.
+    let profile_first = *next_sample_idx == 1 && *frames_decoded == 0
+        && std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE").ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let t_enter = if profile_first { Some(std::time::Instant::now()) } else { None };
     // Feed the next sample if any remain. Codec is pipelined: a
     // single feed may not produce a frame this tick; the EAGAIN
     // retry below covers the latency. When samples are exhausted
@@ -2739,6 +2757,10 @@ pub fn paint_and_present_one_video_slide_frame(
         // No more samples; signal end-of-stream.
         decoder.feed(&[]).context("feed EOF")?;
     }
+    if let Some(t) = t_enter {
+        eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
     // Drain a frame with a small EAGAIN budget so transient
     // codec back-pressure doesn't lose us a frame. Budget of
     // 5 retries × 2ms = 10ms max per paint; we have ~33ms total
@@ -2754,6 +2776,9 @@ pub fn paint_and_present_one_video_slide_frame(
             }
             Err(e) => return Err(e).context("next_frame"),
         }
+    }
+    if let Some(t) = t_dqbuf_start {
+        eprintln!("[firstframe] dqbuf={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
     let Some(frame) = frame_opt else {
         // No frame ready this tick. Don't error -- the next
@@ -2780,6 +2805,7 @@ pub fn paint_and_present_one_video_slide_frame(
         // GL context is current via EGL make_current at session
         // construction; fd is owned by the Decoder and outlives
         // this call (Frame is alive until drop(frame) below).
+        let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
         let took_dmabuf = unsafe {
             let gl = session.gl;
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
@@ -2790,6 +2816,12 @@ pub fn paint_and_present_one_video_slide_frame(
                 fd, f_w, f_h, stride,
             )?
         };
+        if let Some(t) = t_blit {
+            eprintln!(
+                "[firstframe] dmabuf_blit_pass={:.2}ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         if took_dmabuf {
             // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE
             // the buffer swap (mirrors the MMAP-path discipline
@@ -2797,7 +2829,16 @@ pub fn paint_and_present_one_video_slide_frame(
             // would starve the codec of CAPTURE buffers).
             drop(frame);
             *frames_decoded += 1;
-            return finish_video_slide_swap_and_commit(session, card);
+            let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
+            let r = finish_video_slide_swap_and_commit(session, card);
+            if let Some(t) = t_commit {
+                eprintln!(
+                    "[firstframe] swap_commit={:.2}ms total={:.2}ms (DMABUF)",
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    t_enter.unwrap().elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            return r;
         }
         // Extensions missing at runtime: fall through to the
         // MMAP upload path below. Piece 4a-fix (2026-05-14) made
