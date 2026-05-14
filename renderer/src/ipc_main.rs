@@ -425,6 +425,13 @@ fn capture_current_scene_to_png(
     // case routes through paint_one_image_slide_for_capture, mirror
     // of paint_one_for_capture for the static-PNG case. VideoSlide
     // still TBD (needs V4L2 M2M + dmabuf import).
+    // QA-direct (2026-05-13 sidecar error-paths slice):
+    // validate inputs via pure-Rust helper first so the
+    // Python proxy's error-class dispatch sees a stable
+    // wire-format string.
+    if let Err(msg) = validate_capture_inputs(item) {
+        return err(msg);
+    }
     let (mode_w, mode_h) = hdmi::egl_session_mode_size(session);
     let t_in_slide_ms = 0_u64;
     let paint_res = match item {
@@ -440,7 +447,10 @@ fn capture_current_scene_to_png(
             image_slide,
             content_root,
         ),
-        _ => return err("Capture: video slides TBD (image + text both supported)"),
+        ContentItem::Video(_) => {
+            // Unreachable: validator rejects Video.
+            return err("Capture: video slides TBD (image + text both supported)");
+        }
     };
     if let Err(e) = paint_res {
         return err(format!("Capture: paint failed: {e:#}"));
@@ -464,6 +474,60 @@ fn capture_current_scene_to_png(
             bytes,
         },
     }
+}
+
+/// Pure-Rust input validators for the IPC paint/capture
+/// ops. These pin the wire-format error strings that the
+/// Python proxy matches on for error-class dispatch. Kept
+/// separate from the GL-dependent paint helpers so cargo
+/// tests can exercise them on Mac without an EGL session.
+///
+/// QA-direct (2026-05-13 sidecar error-paths slice): every
+/// string returned by these validators is a stable contract
+/// surface. Don't reword without bumping the Python proxy's
+/// error-class dispatch in lock-step.
+#[cfg(any(target_os = "linux", test))]
+fn validate_paint_slide_inputs(
+    item: &ContentItem,
+    content_root: Option<&Path>,
+) -> Result<(), &'static str> {
+    match item {
+        ContentItem::Text(_) => Ok(()),
+        ContentItem::Image(_) => {
+            if content_root.is_none() {
+                Err("paint_slide: image_slide requires content_root (--content-root)")
+            } else {
+                Ok(())
+            }
+        }
+        ContentItem::Video(_) => {
+            Err("paint_slide: video slides TBD (image + text both supported)")
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_capture_inputs(item: &ContentItem) -> Result<(), &'static str> {
+    match item {
+        ContentItem::Text(_) | ContentItem::Image(_) => Ok(()),
+        ContentItem::Video(_) => {
+            Err("Capture: video slides TBD (image + text both supported)")
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_paint_transition_endpoints(
+    from: &ContentItem,
+    to: &ContentItem,
+) -> Result<(), &'static str> {
+    if !matches!(from, ContentItem::Text(_)) {
+        return Err("paint_transition: from non-text slide TBD");
+    }
+    if !matches!(to, ContentItem::Text(_)) {
+        return Err("paint_transition: to non-text slide TBD");
+    }
+    Ok(())
 }
 
 /// Linux paint hook: translate PaintSlide / PaintTransition
@@ -498,6 +562,13 @@ fn run_paint_hook(
                     ));
                 }
             };
+            // QA-direct (2026-05-13 sidecar error-paths slice):
+            // validate inputs via the pure-Rust helper first.
+            // Pins the wire-format errors for the Python proxy's
+            // error-class dispatch.
+            if let Err(msg) = validate_paint_slide_inputs(item, content_root) {
+                return err(msg);
+            }
             match item {
                 ContentItem::Text(slide) => {
                     if let Err(e) = hdmi::paint_and_present_one_frame_for_slide(
@@ -513,17 +584,11 @@ fn run_paint_hook(
                     resp.clone()
                 }
                 ContentItem::Image(slide) => {
-                    // QA-direct (2026-05-13 sidecar feature-gaps slice):
-                    // ImageSlide PaintSlide support. content_root is
-                    // required to resolve asset.png; absent = err.
-                    let cr = match content_root {
-                        Some(p) => p,
-                        None => {
-                            return err(
-                                "paint_slide: image_slide requires content_root (--content-root)",
-                            );
-                        }
-                    };
+                    // Validator above already enforced content_root
+                    // presence; unwrap is safe here.
+                    let cr = content_root.expect(
+                        "validate_paint_slide_inputs guarantees content_root for Image",
+                    );
                     if let Err(e) = hdmi::paint_and_present_one_image_slide_frame(
                         session, card, slide, cr,
                     ) {
@@ -531,19 +596,32 @@ fn run_paint_hook(
                     }
                     resp.clone()
                 }
-                _ => err("paint_slide: video slides TBD (image + text both supported)"),
+                ContentItem::Video(_) => {
+                    // Unreachable: validator rejects Video. Kept
+                    // for the exhaustive-match invariant.
+                    err("paint_slide: video slides TBD (image + text both supported)")
+                }
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
-            let from_item = match cache.items.get(from) {
-                Some(ContentItem::Text(s)) => s,
-                Some(_) => return err("paint_transition: from non-text slide TBD"),
+            let from_ci = match cache.items.get(from) {
+                Some(i) => i,
                 None => return err(format!("paint_transition: from slide {from} not in cache")),
             };
-            let to_item = match cache.items.get(to) {
-                Some(ContentItem::Text(s)) => s,
-                Some(_) => return err("paint_transition: to non-text slide TBD"),
+            let to_ci = match cache.items.get(to) {
+                Some(i) => i,
                 None => return err(format!("paint_transition: to slide {to} not in cache")),
+            };
+            if let Err(msg) = validate_paint_transition_endpoints(from_ci, to_ci) {
+                return err(msg);
+            }
+            let from_item = match from_ci {
+                ContentItem::Text(s) => s,
+                _ => unreachable!("validator rejects non-text"),
+            };
+            let to_item = match to_ci {
+                ContentItem::Text(s) => s,
+                _ => unreachable!("validator rejects non-text"),
             };
             if let Err(e) = hdmi::paint_and_present_one_transition_frame(
                 session,
@@ -625,6 +703,7 @@ fn handle_inner_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::{ImageSlide, TextSlide, VideoSlide};
     use crate::playback::{
         AdvanceParams, BeginSlideParams, BeginTransitionParams, IpcRequest,
         IpcResponse, OpResult,
@@ -633,6 +712,30 @@ mod tests {
 
     fn uuid(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])
+    }
+
+    fn text_item() -> ContentItem {
+        let s: TextSlide = serde_json::from_str(
+            r#"{"id":"01010101-0101-0101-0101-010101010101"}"#,
+        )
+        .unwrap();
+        ContentItem::Text(s)
+    }
+
+    fn image_item() -> ContentItem {
+        let s: ImageSlide = serde_json::from_str(
+            r#"{"id":"02020202-0202-0202-0202-020202020202","name":"img"}"#,
+        )
+        .unwrap();
+        ContentItem::Image(s)
+    }
+
+    fn video_item() -> ContentItem {
+        let s: VideoSlide = serde_json::from_str(
+            r#"{"id":"03030303-0303-0303-0303-030303030303","name":"vid"}"#,
+        )
+        .unwrap();
+        ContentItem::Video(s)
     }
 
     fn handle_with_text_slide_fixture(
@@ -820,6 +923,115 @@ mod tests {
             }
             other => panic!("expected Err, got {other:?}"),
         }
+    }
+
+    // ---- Validator tests (sidecar error-paths slice, 2026-05-13) ----
+    //
+    // These tests pin the wire-format error strings the Python
+    // proxy matches on for error-class dispatch. Any rewording
+    // here is a contract break -- bump the Python side in
+    // lock-step. The validators are pure-Rust and Mac-testable;
+    // the GL-dependent paint helpers live in hdmi.rs (Linux-
+    // only) and are exercised via the on-Pi smoke run.
+
+    #[test]
+    fn validate_paint_slide_text_with_or_without_content_root_ok() {
+        let item = text_item();
+        let cr = std::path::PathBuf::from("/tmp/whatever");
+        assert!(validate_paint_slide_inputs(&item, Some(&cr)).is_ok());
+        assert!(validate_paint_slide_inputs(&item, None).is_ok());
+    }
+
+    #[test]
+    fn validate_paint_slide_image_with_content_root_ok() {
+        let item = image_item();
+        let cr = std::path::PathBuf::from("/tmp/whatever");
+        assert!(validate_paint_slide_inputs(&item, Some(&cr)).is_ok());
+    }
+
+    #[test]
+    fn validate_paint_slide_image_missing_content_root_errs_with_stable_string() {
+        let item = image_item();
+        let err_msg = validate_paint_slide_inputs(&item, None).unwrap_err();
+        assert_eq!(
+            err_msg,
+            "paint_slide: image_slide requires content_root (--content-root)",
+            "wire-format error must match exactly (Python proxy dispatches on it)"
+        );
+    }
+
+    #[test]
+    fn validate_paint_slide_video_always_errs_with_stable_string() {
+        let item = video_item();
+        let cr = std::path::PathBuf::from("/tmp/whatever");
+        let err_msg = validate_paint_slide_inputs(&item, Some(&cr)).unwrap_err();
+        assert_eq!(
+            err_msg,
+            "paint_slide: video slides TBD (image + text both supported)",
+            "wire-format error must match exactly"
+        );
+        // Same error whether content_root is set or not -- the
+        // Video bail takes precedence.
+        let err_msg2 = validate_paint_slide_inputs(&item, None).unwrap_err();
+        assert_eq!(err_msg, err_msg2);
+    }
+
+    #[test]
+    fn validate_capture_text_and_image_ok() {
+        assert!(validate_capture_inputs(&text_item()).is_ok());
+        assert!(validate_capture_inputs(&image_item()).is_ok());
+    }
+
+    #[test]
+    fn validate_capture_video_errs_with_stable_string() {
+        let err_msg = validate_capture_inputs(&video_item()).unwrap_err();
+        assert_eq!(
+            err_msg,
+            "Capture: video slides TBD (image + text both supported)",
+            "wire-format error must match exactly"
+        );
+    }
+
+    #[test]
+    fn validate_paint_transition_text_to_text_ok() {
+        assert!(validate_paint_transition_endpoints(&text_item(), &text_item()).is_ok());
+    }
+
+    #[test]
+    fn validate_paint_transition_from_image_errs_with_stable_string() {
+        let err_msg =
+            validate_paint_transition_endpoints(&image_item(), &text_item()).unwrap_err();
+        assert_eq!(err_msg, "paint_transition: from non-text slide TBD");
+    }
+
+    #[test]
+    fn validate_paint_transition_from_video_errs_with_stable_string() {
+        let err_msg =
+            validate_paint_transition_endpoints(&video_item(), &text_item()).unwrap_err();
+        assert_eq!(err_msg, "paint_transition: from non-text slide TBD");
+    }
+
+    #[test]
+    fn validate_paint_transition_to_image_errs_with_stable_string() {
+        let err_msg =
+            validate_paint_transition_endpoints(&text_item(), &image_item()).unwrap_err();
+        assert_eq!(err_msg, "paint_transition: to non-text slide TBD");
+    }
+
+    #[test]
+    fn validate_paint_transition_to_video_errs_with_stable_string() {
+        let err_msg =
+            validate_paint_transition_endpoints(&text_item(), &video_item()).unwrap_err();
+        assert_eq!(err_msg, "paint_transition: to non-text slide TBD");
+    }
+
+    #[test]
+    fn validate_paint_transition_from_takes_precedence_when_both_non_text() {
+        // If both endpoints are non-text, the "from" error fires
+        // first (matches the production code's check order).
+        let err_msg =
+            validate_paint_transition_endpoints(&image_item(), &video_item()).unwrap_err();
+        assert_eq!(err_msg, "paint_transition: from non-text slide TBD");
     }
 
     #[test]
