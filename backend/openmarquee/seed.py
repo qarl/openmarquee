@@ -42,6 +42,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from openmarquee._atomic import atomic_write_text
 from openmarquee.content import (
     BackgroundPattern,
     ImageSlide,
@@ -50,7 +51,6 @@ from openmarquee.content import (
     TextSlide,
     VideoSlide,
 )
-from openmarquee._atomic import atomic_write_text
 from openmarquee.content.storage import ContentStorage
 from openmarquee.playlist import PlaylistStorage
 

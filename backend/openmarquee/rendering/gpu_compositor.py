@@ -396,7 +396,7 @@ class GPUSlideCompositor:
             bg = load_background(self.slide, self.width, self.height, self.read_asset)
             if bg.mode != "RGBA":
                 bg = bg.convert("RGBA")
-            for idx, layer in enumerate(layers):
+            for layer in layers:
                 kind = classify_layer(layer)
                 if kind != "static":
                     continue

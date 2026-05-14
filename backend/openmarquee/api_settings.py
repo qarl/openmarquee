@@ -54,6 +54,13 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
+# text_rerender removed in DELETE-PIL phase 3 (qarl-direct 2026-05-13):
+# the Python+PIL rasterizer is gone; operator-saved PNGs are baked
+# browser-side via Canvas2D. Display-dim changes now leave the stored
+# PNGs intact — the device's playback engine cover-fits at panel-
+# native dims, and the operator's next edit-and-save in the editor
+# re-bakes at the new dims (Option α from the dispatch).
+from openmarquee import wifi_station
 from openmarquee.api_auth import _strip_bearer
 from openmarquee.auth import AuthStorage, verify_password, verify_token
 from openmarquee.content.storage import ContentStorage
@@ -63,13 +70,6 @@ from openmarquee.dependencies import (
     get_settings_storage,
 )
 from openmarquee.settings import SettingsStorage, SystemSettings
-# text_rerender removed in DELETE-PIL phase 3 (qarl-direct 2026-05-13):
-# the Python+PIL rasterizer is gone; operator-saved PNGs are baked
-# browser-side via Canvas2D. Display-dim changes now leave the stored
-# PNGs intact — the device's playback engine cover-fits at panel-
-# native dims, and the operator's next edit-and-save in the editor
-# re-bakes at the new dims (Option α from the dispatch).
-from openmarquee import wifi_station
 from openmarquee.wifi_prefill import read_system_wifi
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])

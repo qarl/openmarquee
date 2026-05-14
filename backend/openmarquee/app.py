@@ -40,7 +40,6 @@ from openmarquee.dev import router as dev_router
 from openmarquee.perf_middleware import PerfMiddleware
 from openmarquee.seed import seed_if_needed
 
-
 log = logging.getLogger(__name__)
 
 
@@ -196,6 +195,7 @@ app.add_middleware(PerfMiddleware)
 # (useful for "are we 401-ing a lot?" observability). AuthMiddleware
 # fails closed: requests not on the whitelist need a valid token.
 from openmarquee.auth_middleware import AuthMiddleware
+
 # Pass a callable resolver -- the middleware looks up the storage
 # per-request so the singleton's lru_cache can be cleared between
 # tests (tests point OPENMARQUEE_AUTH_PATH at a tmp dir).

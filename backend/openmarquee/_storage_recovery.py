@@ -26,7 +26,7 @@ class's load() so they can construct the right default.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ def quarantine_corrupt_file(path: Path, exc: Exception) -> Path | None:
     """
     if not path.exists():
         return None
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     corrupt = path.with_name(f"{path.name}.corrupt-{ts}")
     try:
         path.rename(corrupt)

@@ -1487,7 +1487,7 @@ class ShaderRenderer:
                     arr = (ctypes.c_uint * 1)(self._vbo)
                     _g.glDeleteBuffers(1, arr)
                     self._vbo = 0
-                for kind, prog in list(self._programs.items()):
+                for prog in list(self._programs.values()):
                     if prog:
                         _g.glDeleteProgram(prog)
                 self._programs.clear()

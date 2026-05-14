@@ -870,7 +870,9 @@ class RustRenderer:
         now = time.monotonic()
         cutoff = now - self._reconnect_window_s
         kept = [
-            (t, r) for t, r in zip(self._reconnect_attempts, self._reconnect_reasons)
+            (t, r) for t, r in zip(
+                self._reconnect_attempts, self._reconnect_reasons, strict=True
+            )
             if t >= cutoff
         ]
         self._reconnect_attempts = [t for t, _ in kept]

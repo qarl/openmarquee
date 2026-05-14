@@ -146,7 +146,7 @@ def stats_snapshot() -> dict[str, int]:
 # Pi Zero 2 W. clear_image_bg_cache() is the safety valve if a
 # future operator-driven scenario blows past 4.
 _IMAGE_BG_LRU_MAX = 4
-_image_bg_cache: "OrderedDict[tuple[UUID, int, int], Image.Image]" = OrderedDict()
+_image_bg_cache: OrderedDict[tuple[UUID, int, int], Image.Image] = OrderedDict()
 
 
 def clear_image_bg_cache() -> None:

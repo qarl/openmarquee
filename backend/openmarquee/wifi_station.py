@@ -63,11 +63,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 import subprocess
 import threading
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
@@ -102,8 +101,8 @@ class WifiStationState:
 
     state: str = "idle"
     # idle | rescanning | connecting | connected | failed | disabled
-    detail: Optional[str] = None  # human-readable explanation
-    ssid: Optional[str] = None  # which network we're connected/connecting to
+    detail: str | None = None  # human-readable explanation
+    ssid: str | None = None  # which network we're connected/connecting to
 
 
 _STATE = WifiStationState()
@@ -117,7 +116,7 @@ def current_state() -> WifiStationState:
         return dataclasses.replace(_STATE)
 
 
-def _set_state(state: str, detail: Optional[str] = None, ssid: Optional[str] = None) -> None:
+def _set_state(state: str, detail: str | None = None, ssid: str | None = None) -> None:
     with _STATE_LOCK:
         _STATE.state = state
         _STATE.detail = detail
@@ -173,7 +172,7 @@ def _run_nmcli(args: list[str], *, sudo: bool = False, timeout: int = 30) -> _Nm
 nmcli_runner: Callable[..., _NmcliResult] = _run_nmcli
 
 
-def _active_connection_for_device() -> Optional[str]:
+def _active_connection_for_device() -> str | None:
     """Return the NAME of the active connection on wlan0, or None if
     wlan0 has no active connection. Uses the terse output format so
     we can parse without fancy nmcli output gymnastics.
@@ -228,7 +227,7 @@ def _is_device_connected() -> bool:
     return _device_state().startswith("100 ")
 
 
-def _device_state_code(state: str) -> Optional[int]:
+def _device_state_code(state: str) -> int | None:
     """Pull the numeric leading code from a device-state string like
     '100 (connected)' / '20 (unavailable)'. Returns None on parse
     failure (covers empty + unrecognized strings). Numeric codes are
@@ -465,8 +464,8 @@ def apply_enabled(
 
 def apply_in_background(
     enabled: bool,
-    ssid: Optional[str],
-    password: Optional[str],
+    ssid: str | None,
+    password: str | None,
 ) -> threading.Thread:
     """Dispatch the apply() to a background thread so the HTTP handler
     can return immediately. Returns the started thread so callers
@@ -501,11 +500,11 @@ def apply_in_background(
 
 def has_settings_changed(
     prev_enabled: bool,
-    prev_ssid: Optional[str],
-    prev_password: Optional[str],
+    prev_ssid: str | None,
+    prev_password: str | None,
     new_enabled: bool,
-    new_ssid: Optional[str],
-    new_password: Optional[str],
+    new_ssid: str | None,
+    new_password: str | None,
 ) -> bool:
     """Did the wifi_station_* surface change in a way that requires an
     apply()? Helper for the api_settings PUT handler.

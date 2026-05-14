@@ -24,7 +24,6 @@ from pathlib import Path
 
 from PIL import ImageDraw, ImageFont
 
-
 # Map the UI font-family strings to the bundled TTF filenames under
 # ui/fonts/. The browser editor uses these names via @font-face;
 # server-side rendering (auto-render, seed text PNGs, motion
