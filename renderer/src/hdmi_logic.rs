@@ -2048,10 +2048,18 @@ void main() {
 ///   - TEXTURE1: u_tex_uv -- UV plane, GL_LUMINANCE_ALPHA,
 ///                           samples .r (U) + .a (V) on GLES2
 ///
-/// Matrix coefficients are BT.601 (the original ITU-R / SMPTE
-/// 170M variant). Pi 4+ typically emits BT.709 for 1080p sources;
-/// if a future profile fight surfaces, swap matrix coefficients
-/// via uniforms.
+/// Matrix coefficients are **BT.709 limited-range** (ITU-R BT.709
+/// Annex B). The Pi's `bcm2835-codec` reports `Colorspace=Rec.709`
+/// + `YCbCr Encoding=Default` per `v4l2-ctl --get-fmt-video` on the
+/// dev Pi (verified 2026-05-14 in a5021ac); V4L2 spec says Default-
+/// for-Rec.709 is BT.709. Using BT.601 coefficients on BT.709
+/// content produces a slight chroma drift (greens slightly yellower,
+/// blues slightly purpler) — visible on saturated content, subtle
+/// on broadcast skin tones.
+///
+/// The companion DMABUF path (`FS_NV12_DMABUF_TO_RGB`) doesn't need
+/// this — Mesa reads the colorimetry hint from the EGLImage
+/// attribs and inserts the right matrix.
 pub const FS_NV12_TO_RGB: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_tex_y;
@@ -2064,9 +2072,11 @@ void main() {
     vec2 uv_sample = texture2D(u_tex_uv, v_uv).ra;
     // Limited-range UV: [16/255, 240/255] -> [-0.5, 0.5].
     vec2 uv = (uv_sample - vec2(128.0/255.0)) * (255.0/224.0);
-    float r = y + 1.402 * uv.y;
-    float g = y - 0.344136 * uv.x - 0.714136 * uv.y;
-    float b = y + 1.772 * uv.x;
+    // ITU-R BT.709 Annex B coefficients (limited-range scaling above
+    // is the same as BT.601 — both use 219/224 for Y/UV range).
+    float r = y + 1.5748 * uv.y;
+    float g = y - 0.1873 * uv.x - 0.4681 * uv.y;
+    float b = y + 1.8556 * uv.x;
     gl_FragColor = vec4(r, g, b, 1.0);
 }
 "#;
@@ -5603,30 +5613,53 @@ mod tests {
     }
 
     #[test]
-    fn fs_nv12_to_rgb_targets_gles2_and_pins_uniforms_and_coefficients() {
-        // V4L2 piece 3d: NV12 -> RGB BT.601 limited-range shader.
-        // Pin GLES2 version + both samplers (Y plane on TEXTURE0,
-        // UV plane on TEXTURE1) + the BT.601 matrix coefficients.
-        // A rename or coefficient drift would silently produce
-        // wrong colors with no Mac-side way to catch it (the
-        // shader only runs on the Pi's GLES2 driver).
+    fn fs_nv12_to_rgb_targets_gles2_and_pins_bt709_coefficients() {
+        // V4L2 piece 3d (BT.709 update 2026-05-14): NV12 -> RGB
+        // BT.709 limited-range shader. The Pi's bcm2835-codec
+        // reports Colorspace=Rec.709 + YCbCr Encoding=Default
+        // (V4L2 spec: Default-for-Rec.709 = BT.709). Pin GLES2
+        // version + both samplers (Y plane on TEXTURE0, UV plane
+        // on TEXTURE1) + the BT.709 matrix coefficients. A rename
+        // or coefficient drift would silently produce wrong colors
+        // with no Mac-side way to catch it (the shader only runs
+        // on the Pi's GLES2 driver).
         assert!(FS_NV12_TO_RGB.starts_with("#version 100\n"));
         assert!(FS_NV12_TO_RGB.contains("precision mediump float"));
         assert!(FS_NV12_TO_RGB.contains("u_tex_y"));
         assert!(FS_NV12_TO_RGB.contains("u_tex_uv"));
         assert!(FS_NV12_TO_RGB.contains("v_uv"));
         assert!(FS_NV12_TO_RGB.contains("texture2D"));
-        // BT.601 limited-range Y scaling: (Y - 16/255) * 255/219.
+        // Limited-range Y scaling: (Y - 16/255) * 255/219.
+        // (Range scaling is the same as BT.601; only the matrix
+        // coefficients below differ.)
         assert!(FS_NV12_TO_RGB.contains("16.0/255.0"));
         assert!(FS_NV12_TO_RGB.contains("255.0/219.0"));
         // Limited-range UV center + range: (UV - 128/255) * 255/224.
         assert!(FS_NV12_TO_RGB.contains("128.0/255.0"));
         assert!(FS_NV12_TO_RGB.contains("255.0/224.0"));
-        // BT.601 matrix coefficients (Rec ITU-R BT.601 / SMPTE 170M).
-        assert!(FS_NV12_TO_RGB.contains("1.402"));
-        assert!(FS_NV12_TO_RGB.contains("0.344136"));
-        assert!(FS_NV12_TO_RGB.contains("0.714136"));
-        assert!(FS_NV12_TO_RGB.contains("1.772"));
+        // ITU-R BT.709 Annex B matrix coefficients.
+        assert!(FS_NV12_TO_RGB.contains("1.5748"));
+        assert!(FS_NV12_TO_RGB.contains("0.1873"));
+        assert!(FS_NV12_TO_RGB.contains("0.4681"));
+        assert!(FS_NV12_TO_RGB.contains("1.8556"));
+        // Anti-assertions: legacy BT.601 coefficients must NOT
+        // reappear (regression guard for an accidental revert).
+        assert!(
+            !FS_NV12_TO_RGB.contains("1.402"),
+            "legacy BT.601 Cr coefficient (1.402) leaked back in"
+        );
+        assert!(
+            !FS_NV12_TO_RGB.contains("0.344136"),
+            "legacy BT.601 G/Cb coefficient (0.344136) leaked back in"
+        );
+        assert!(
+            !FS_NV12_TO_RGB.contains("0.714136"),
+            "legacy BT.601 G/Cr coefficient (0.714136) leaked back in"
+        );
+        assert!(
+            !FS_NV12_TO_RGB.contains("1.772"),
+            "legacy BT.601 Cb coefficient (1.772) leaked back in"
+        );
         // LUMINANCE_ALPHA sampling convention: UV plane is sampled
         // as `.ra` because GLES2 LUMINANCE_ALPHA returns L in .r
         // and A in .a (we map U->L, V->A on upload).
