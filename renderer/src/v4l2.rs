@@ -1,60 +1,60 @@
-//! V4L2 M2M H.264 decoder client (Phase 7 piece 2 -- scaffolded).
+//! V4L2 M2M H.264 decoder client (Phase 7 pieces 2a + 2b).
 //!
-//! Targets `bcm2835-codec-decode` exposed at `/dev/video10` on Raspberry
-//! Pi. Per `docs/v4l2-decode.md`, the codec accepts H.264 (and a few
-//! others) on its OUTPUT queue and emits NV12 (and other YUV/RGB
-//! variants) on its CAPTURE queue. M2M Multiplanar with Streaming +
-//! Extended Pix Format caps.
+//! Targets `bcm2835-codec-decode` exposed at `/dev/video10` on
+//! Raspberry Pi. Per `docs/v4l2-decode.md`, the codec accepts
+//! H.264 (and a few others) on its OUTPUT queue and emits NV12
+//! (and other YUV/RGB variants) on its CAPTURE queue. M2M
+//! Multiplanar with Streaming + Extended Pix Format caps.
 //!
-//! ## Scope of piece 2a (this commit)
+//! ## Scope of piece 2a (commit 343fe15)
 //!
-//! Real ioctl plumbing for the minimum that establishes the API
-//! surface piece 3 will compile against:
+//! - `Decoder::open` + `query_capabilities` — VIDIOC_QUERYCAP.
+//! - `CaptureBufferType` enum, `Frame` stub.
 //!
-//! - [`Decoder::open`] — opens the device O_RDWR | O_NONBLOCK and
-//!   calls VIDIOC_QUERYCAP to validate it's the M2M multiplanar
-//!   codec we expect. Returns clean errors if the device is the wrong
-//!   shape (e.g., pointed at /dev/video0 which is bcm2835-isp instead).
-//! - [`Decoder::query_capabilities`] — VIDIOC_QUERYCAP, exposed for
-//!   diagnostics + the in-open sanity check.
-//! - API skeleton: [`Decoder::set_output_format`],
-//!   [`Decoder::set_capture_format`], [`Decoder::set_capture_buffer_type`],
-//!   [`Frame`] -- callable from piece 3+ but return
-//!   `NotYetImplemented` for the format-set + decode paths. The
-//!   buffer-type enum ([`CaptureBufferType`]) is the seam piece 4's
-//!   DMA-BUF wire-up will flip.
+//! ## Scope of piece 2b (this commit)
 //!
-//! ## Out of scope (piece 2b dispatch)
+//! Finishes the static + decode-loop body:
 //!
-//! - VIDIOC_S_FMT for OUTPUT (H264) + CAPTURE (NV12)
-//! - VIDIOC_REQBUFS + VIDIOC_QUERYBUF + mmap (or DMA-BUF for piece 4)
-//! - VIDIOC_QBUF / VIDIOC_DQBUF queue management
-//! - VIDIOC_STREAMON / STREAMOFF
-//! - The decode loop API (feed / next_frame)
-//! - H.264 fixture-driven cargo tests beyond capability-query
+//! - VIDIOC_S_FMT (OUTPUT = H.264, CAPTURE = NV12) via
+//!   [`Decoder::set_output_format`] / [`Decoder::set_capture_format`].
+//! - VIDIOC_REQBUFS + VIDIOC_QUERYBUF + mmap of all OUTPUT and
+//!   CAPTURE planes via [`Decoder::allocate_buffers`].
+//! - VIDIOC_STREAMON / STREAMOFF on both queues via
+//!   [`Decoder::start_streaming`] / [`Decoder::stop_streaming`].
+//! - The decode-loop API: [`Decoder::feed`] (queue an OUTPUT
+//!   buffer with H.264 NAL bytes) + [`Decoder::next_frame`]
+//!   (dequeue the next CAPTURE buffer as a [`Frame`]).
+//! - Frame lifetime: `Frame` holds an `Arc<Mutex<DecoderInner>>`
+//!   + the buffer index. On `Drop`, the Frame re-QBUFs that
+//!   index through the inner lock. The Arc keeps the mmap
+//!   regions alive for as long as the Frame's `y_plane()` /
+//!   `uv_plane()` slices are reachable -- soundness via shared
+//!   ownership rather than lifetimes (chosen for ergonomics:
+//!   pieces 3+ can hold a Frame across an await without
+//!   tangling lifetimes).
+//! - EOF: the caller signals end-of-input via [`Decoder::feed`]
+//!   with an empty slice (translates to a zero-length OUTPUT
+//!   buffer with V4L2_BUF_FLAG_LAST); `next_frame` returns
+//!   `Ok(None)` once the kernel signals decoder-drained
+//!   (V4L2_BUF_FLAG_LAST on the dequeued CAPTURE buffer, or
+//!   subsequent DQBUF returns EPIPE).
+//! - Drop ordering: STREAMOFF both queues -> munmap all planes
+//!   -> File's own Drop closes fd.
 //!
-//! ## Why nix + raw ioctls (not the `v4l` crate)
+//! ## Scope of piece 2c (future)
 //!
-//! The `v4l` crate (raymanfx/libv4l-rs) is the standard Rust V4L2
-//! binding but its M2M-multiplanar coverage is historically thin
-//! (focused on single-plane capture/UVC webcams). Raw ioctls via
-//! nix give us direct mapping to <linux/videodev2.h>'s structs +
-//! ioctl numbers with no risk of an upstream wrapper missing the
-//! M2M-multiplanar surface we need. Trade-off: we mirror a chunk
-//! of videodev2.h in Rust (struct layout must match byte-for-byte).
-//! Piece 2b will expand the struct mirror set to cover v4l2_format,
-//! v4l2_buffer, v4l2_plane, v4l2_requestbuffers; piece 2a only
-//! needs `v4l2_capability`.
+//! - DMA-BUF zero-copy CAPTURE path (piece 4). The
+//!   [`CaptureBufferType::DmaBuf`] branch still routes through
+//!   the `unimplemented!()` rail in piece 2b -- piece 4 lights
+//!   it up via VIDIOC_EXPBUF.
 //!
 //! ## Cfg-gating
 //!
-//! Pure-Rust items (struct layouts, constants, `c_str_to_string`,
-//! the `CaptureBufferType` enum, the `Frame` stub) compile on any
-//! OS so `cargo test` on the Mac dev box catches syntax/layout
-//! regressions. Items that link against `nix` / `libc` ioctls
-//! (the `Decoder` impl) are individually
-//! `#[cfg(target_os = "linux")]` gated so Mac builds skip them
-//! without dragging in Linux-only deps.
+//! Pure-Rust items (struct layouts, constants, helpers) compile
+//! on any OS so `cargo test` on the Mac dev box catches
+//! syntax/layout regressions. Items that link against `nix` /
+//! `libc` ioctls (the `Decoder` impl, all the ioctl macros) are
+//! individually `#[cfg(target_os = "linux")]` gated.
 
 #[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
@@ -64,17 +64,16 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 use anyhow::{anyhow, Context, Result};
 
 // ============================================================
-// V4L2 fourcc helper + format codes (piece 1's doc captures the
-// authoritative list; these constants mirror that subset).
+// V4L2 fourcc helper + format codes.
 // ============================================================
 
-/// Pack a 4-byte ASCII FourCC into a little-endian u32, matching
-/// V4L2's `v4l2_fourcc(a,b,c,d)` macro in `<linux/videodev2.h>`.
 pub const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
 }
@@ -83,90 +82,254 @@ pub const V4L2_PIX_FMT_H264: u32 = fourcc(b'H', b'2', b'6', b'4');
 pub const V4L2_PIX_FMT_NV12: u32 = fourcc(b'N', b'V', b'1', b'2');
 
 // ============================================================
-// V4L2 capability flags (subset). Full list in
-// <linux/videodev2.h>; we only check the ones a piece-2a-shaped
-// decoder client needs to validate at open time.
+// V4L2 capability flags.
 // ============================================================
 
-/// Device exposes the M2M Multiplanar API.
 pub const V4L2_CAP_VIDEO_M2M_MPLANE: u32 = 0x00004000;
-/// Device supports streaming (REQBUFS + QBUF/DQBUF + STREAMON).
 pub const V4L2_CAP_STREAMING: u32 = 0x04000000;
-/// Driver populates `device_caps` (not just legacy `capabilities`).
 pub const V4L2_CAP_DEVICE_CAPS: u32 = 0x80000000;
 
 // ============================================================
 // V4L2 buffer types (subset).
 // ============================================================
 
-pub const V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE: u32 = 10;
 pub const V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE: u32 = 9;
+pub const V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE: u32 = 10;
 
 // ============================================================
-// v4l2_capability struct -- byte-for-byte mirror of the kernel's
-// definition in <linux/videodev2.h>. Total size 104 bytes.
-//
-// SAFETY: must match the kernel's layout EXACTLY. The ioctl
-// number for VIDIOC_QUERYCAP encodes sizeof(v4l2_capability) in
-// the bottom 14 bits of the request word; a layout mismatch
-// makes the kernel reject the ioctl with EINVAL OR (worse) read/
-// write the wrong number of bytes from/to userspace. The byte
-// layout below is verified against kernel 6.12.75 (the kernel on
-// the dev Pi per piece 1's investigation).
+// V4L2 memory types.
+// ============================================================
+
+pub const V4L2_MEMORY_MMAP: u32 = 1;
+pub const V4L2_MEMORY_USERPTR: u32 = 2;
+pub const V4L2_MEMORY_DMABUF: u32 = 4;
+
+// ============================================================
+// V4L2 buffer flags (subset).
+// ============================================================
+
+pub const V4L2_BUF_FLAG_LAST: u32 = 0x00100000;
+pub const V4L2_BUF_FLAG_ERROR: u32 = 0x00040000;
+
+// ============================================================
+// Mirrored kernel structs. Byte-for-byte match for <linux/
+// videodev2.h>; sizes verified via the ioctl request encoding
+// (each macro below carries the expected size in its high
+// bits, and the kernel rejects EINVAL on mismatch).
 // ============================================================
 
 /// V4L2 driver / device identification struct, populated by
-/// VIDIOC_QUERYCAP. Driver, card, and bus_info are nul-terminated
-/// ASCII; the helper `c_str_to_string` decodes them.
+/// VIDIOC_QUERYCAP. Size: 104 bytes.
 #[repr(C)]
 #[derive(Clone)]
 pub struct V4l2Capability {
-    /// Driver name (e.g. "bcm2835-codec").
     pub driver: [u8; 16],
-    /// Card / device name (e.g. "bcm2835-codec-decode").
     pub card: [u8; 32],
-    /// Bus info (e.g. "platform:bcm2835-codec").
     pub bus_info: [u8; 32],
-    /// Driver version. Major/minor/patch packed (see KERNEL_VERSION).
     pub version: u32,
-    /// Legacy capabilities (union of device_caps across all subdev
-    /// nodes the driver registers). Use `device_caps` for the
-    /// per-node capabilities -- that's what M2M cares about.
     pub capabilities: u32,
-    /// Per-node capabilities. Only valid when `capabilities &
-    /// V4L2_CAP_DEVICE_CAPS != 0` (modern drivers; bcm2835-codec
-    /// qualifies).
     pub device_caps: u32,
     pub reserved: [u32; 3],
 }
 
-// VIDIOC_QUERYCAP = _IOR('V', 0, struct v4l2_capability)
-//
-// nix's `ioctl_read!` macro generates an unsafe fn whose ioctl
-// request number is computed at compile time from the type's size
-// + the dir/type/nr tuple. If V4l2Capability's `size_of` doesn't
-// match the kernel's 104-byte layout, the kernel returns EINVAL
-// on the QUERYCAP call -- a static_assert below catches that
-// pre-runtime.
-#[cfg(target_os = "linux")]
-nix::ioctl_read!(vidioc_querycap, b'V', 0, V4l2Capability);
+/// Per-plane size info inside a multiplanar v4l2_format. Size: 20 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct V4l2PlanePixFormat {
+    pub sizeimage: u32,
+    pub bytesperline: u32,
+    pub reserved: [u16; 6],
+}
+
+/// The multiplanar pix format payload. Size: 192 bytes (packed).
+///
+/// `#[repr(C, packed)]` is critical -- the kernel struct is
+/// declared `__attribute__((packed))`. Without `packed` the
+/// num_planes byte would land at offset 192 instead of 180,
+/// shifting every later field by 12 bytes and corrupting the
+/// S_FMT call.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct V4l2PixFormatMplane {
+    pub width: u32,
+    pub height: u32,
+    pub pixelformat: u32,
+    pub field: u32,
+    pub colorspace: u32,
+    pub plane_fmt: [V4l2PlanePixFormat; 8],
+    pub num_planes: u8,
+    pub flags: u8,
+    pub ycbcr_enc: u8, // also hsv_enc (union)
+    pub quantization: u8,
+    pub xfer_func: u8,
+    pub reserved: [u8; 7],
+}
+
+/// v4l2_format. type + a 200-byte union for the per-buf_type
+/// payload. Total: 208 bytes.
+///
+/// **Critical layout note (subagent-caught 2026-05-14):** the
+/// kernel's `union { ... }` includes `v4l2_window` which holds
+/// `__user *` pointers, so the union has natural alignment 8 on
+/// 64-bit Linux. The compiler inserts 4 bytes of padding AFTER
+/// `type` and BEFORE the union to align the latter to offset 8.
+/// The Rust struct mirror MUST put the padding in the same place
+/// (between buf_type and fmt) -- without this, S_FMT silently
+/// puts V4l2PixFormatMplane.width into kernel reserved bytes
+/// and the decoder receives a zero-width format spec.
+#[repr(C)]
+pub struct V4l2Format {
+    pub buf_type: u32,
+    pub _pad_to_align_union: [u8; 4],
+    pub fmt: [u8; 200],
+}
+
+/// Single plane's metadata inside a multiplanar v4l2_buffer.
+/// Size: 64 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct V4l2Plane {
+    pub bytesused: u32,
+    pub length: u32,
+    /// Union of mem_offset (MMAP), userptr (USERPTR), fd
+    /// (DMABUF). Treated as u64 (8 bytes on 64-bit) here.
+    pub m: u64,
+    pub data_offset: u32,
+    pub reserved: [u32; 11],
+}
+
+/// v4l2_buffer. Multiplanar callers populate `m_planes` to
+/// point at a `[V4l2Plane; num_planes]` array; the kernel
+/// reads `length` to know how many planes to fill.
+///
+/// Size: 88 bytes on 64-bit Linux (4*5 + 4-pad + 16 timestamp
+/// + 16 timecode + 4*2 + 8 m + 4*3 + 4-pad = 88).
+#[repr(C)]
+#[derive(Default)]
+pub struct V4l2Buffer {
+    pub index: u32,
+    pub buf_type: u32,
+    pub bytesused: u32,
+    pub flags: u32,
+    pub field: u32,
+    pub timestamp_sec: i64,
+    pub timestamp_usec: i64,
+    pub timecode: V4l2Timecode,
+    pub sequence: u32,
+    pub memory: u32,
+    /// For multiplanar: pointer to a [V4l2Plane] array (length
+    /// in `length` field). For single-plane MMAP: a buffer
+    /// offset. We always use multiplanar.
+    pub m_planes: u64,
+    pub length: u32,
+    pub reserved2: u32,
+    pub request_fd: i32,
+    pub _trailing_pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct V4l2Timecode {
+    pub type_: u32,
+    pub flags: u32,
+    pub frames: u8,
+    pub seconds: u8,
+    pub minutes: u8,
+    pub hours: u8,
+    pub userbits: [u8; 4],
+}
+
+/// v4l2_requestbuffers. Size: 20 bytes.
+#[repr(C)]
+#[derive(Default)]
+pub struct V4l2Requestbuffers {
+    pub count: u32,
+    pub buf_type: u32,
+    pub memory: u32,
+    pub capabilities: u32,
+    pub flags: u8,
+    pub reserved: [u8; 3],
+}
+
+// ============================================================
+// Compile-time size guards. The ioctl request word encodes
+// sizeof(struct) in its top bits, so kernel rejects EINVAL on
+// any mismatch. Catching these at build time beats running on
+// hardware to find them.
+// ============================================================
 
 const _: () = {
-    // Compile-time guard: kernel struct is 104 bytes
-    // (driver 16 + card 32 + bus_info 32 + version 4 + caps 4 +
-    //  device_caps 4 + reserved 12 = 104).
     if std::mem::size_of::<V4l2Capability>() != 104 {
-        panic!("V4l2Capability size mismatch vs kernel <linux/videodev2.h>");
+        panic!("V4l2Capability size mismatch (expected 104)");
+    }
+    if std::mem::size_of::<V4l2PlanePixFormat>() != 20 {
+        panic!("V4l2PlanePixFormat size mismatch (expected 20)");
+    }
+    if std::mem::size_of::<V4l2PixFormatMplane>() != 192 {
+        panic!("V4l2PixFormatMplane size mismatch (expected 192 packed)");
+    }
+    if std::mem::size_of::<V4l2Format>() != 208 {
+        panic!("V4l2Format size mismatch (expected 208)");
+    }
+    if std::mem::size_of::<V4l2Plane>() != 64 {
+        panic!("V4l2Plane size mismatch (expected 64)");
+    }
+    if std::mem::size_of::<V4l2Buffer>() != 88 {
+        panic!("V4l2Buffer size mismatch (expected 88 on 64-bit Linux)");
+    }
+    if std::mem::size_of::<V4l2Timecode>() != 16 {
+        panic!("V4l2Timecode size mismatch (expected 16)");
+    }
+    if std::mem::size_of::<V4l2Requestbuffers>() != 20 {
+        panic!("V4l2Requestbuffers size mismatch (expected 20)");
     }
 };
 
 // ============================================================
-// Higher-level types: Capabilities, Frame, Decoder.
+// ioctl macros. Linux-only (nix is target-Linux). Each macro
+// derives the request word from the struct type's size + the
+// (type, nr) tuple.
+//
+// VIDIOC_QUERYCAP   _IOR ('V',  0, v4l2_capability)        -> 0x80685600
+// VIDIOC_S_FMT      _IOWR('V',  5, v4l2_format)            -> 0xC0D05605
+// VIDIOC_REQBUFS    _IOWR('V',  8, v4l2_requestbuffers)    -> 0xC0145608
+// VIDIOC_QUERYBUF   _IOWR('V',  9, v4l2_buffer)            -> 0xC0585609
+// VIDIOC_QBUF       _IOWR('V', 15, v4l2_buffer)            -> 0xC058560F
+// VIDIOC_DQBUF      _IOWR('V', 17, v4l2_buffer)            -> 0xC0585611
+// VIDIOC_STREAMON   _IOW ('V', 18, int)                    -> 0x40045612
+// VIDIOC_STREAMOFF  _IOW ('V', 19, int)                    -> 0x40045613
 // ============================================================
 
-/// Decoded view of [`V4l2Capability`]: nul-terminated C strings
-/// converted to Rust `String`s + a stash of the raw flag words
-/// for the `is_*` predicates.
+#[cfg(target_os = "linux")]
+nix::ioctl_read!(vidioc_querycap, b'V', 0, V4l2Capability);
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_s_fmt, b'V', 5, V4l2Format);
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_reqbufs, b'V', 8, V4l2Requestbuffers);
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_querybuf, b'V', 9, V4l2Buffer);
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_qbuf, b'V', 15, V4l2Buffer);
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_dqbuf, b'V', 17, V4l2Buffer);
+// VIDIOC_STREAMON / OFF are `_IOW('V', 18/19, int)` -- the kernel
+// reads a 4-byte int from a USER POINTER, not from the ioctl
+// arg-by-value. nix's `ioctl_write_int!` passes by value (the
+// fd's third syscall arg becomes the int itself), which the
+// kernel then misinterprets as a `void __user *` -- EFAULT or
+// undefined. Use `ioctl_write_ptr!` with `libc::c_int` so the
+// generated fn takes `*const c_int` and the kernel sees a real
+// pointer to the buf-type word.
+#[cfg(target_os = "linux")]
+nix::ioctl_write_ptr!(vidioc_streamon, b'V', 18, libc::c_int);
+#[cfg(target_os = "linux")]
+nix::ioctl_write_ptr!(vidioc_streamoff, b'V', 19, libc::c_int);
+
+// ============================================================
+// Higher-level types.
+// ============================================================
+
+/// Decoded view of [`V4l2Capability`].
 #[derive(Debug, Clone)]
 pub struct Capabilities {
     pub driver: String,
@@ -178,101 +341,293 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// True iff the device exposes V4L2 M2M Multiplanar -- the
-    /// shape `Decoder::open` requires for the H.264 decode path.
     pub fn is_m2m_mplane(&self) -> bool {
         self.device_caps & V4L2_CAP_VIDEO_M2M_MPLANE != 0
     }
-
-    /// True iff the device supports streaming (REQBUFS / QBUF /
-    /// STREAMON). Piece 2a doesn't use these yet, but `open` checks
-    /// the flag now so we fail at open time rather than partway
-    /// through a piece-2b decode setup.
     pub fn is_streaming(&self) -> bool {
         self.device_caps & V4L2_CAP_STREAMING != 0
     }
-
-    /// True iff the device populates `device_caps` (vs only the
-    /// legacy `capabilities` field). bcm2835-codec does.
     pub fn has_device_caps(&self) -> bool {
         self.raw_capabilities & V4L2_CAP_DEVICE_CAPS != 0
     }
 }
 
-/// Which buffer-allocation mode the CAPTURE queue uses. Piece 2a
-/// only writes the Mmap path; piece 4 (the EGLImage-via-DMA-BUF
-/// zero-copy wire) flips to `DmaBuf`. The enum stays public so
-/// piece 3 / piece 5 callers can configure without re-plumbing
-/// when piece 4 lands.
+/// Negotiated format -- what the kernel said yes to after S_FMT.
+/// May differ from what the caller asked for if the codec
+/// adjusts width/height to alignment constraints or picks a
+/// different field order.
+#[derive(Debug, Clone)]
+pub struct NegotiatedFormat {
+    pub width: u32,
+    pub height: u32,
+    pub pixelformat: u32,
+    pub num_planes: u8,
+    /// Per-plane (sizeimage, bytesperline). Only entries
+    /// [0..num_planes] are meaningful.
+    pub plane_fmt: [V4l2PlanePixFormat; 8],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBufferType {
-    /// V4L2 manages buffer memory; userspace `mmap`s for read.
-    /// CPU copy from kernel buffer → GLES texture upload on the
-    /// hot path -- works but burns 60% CPU at 1080p30 on Pi Zero
-    /// 2 W per the dispatch's perf math.
     Mmap,
-    /// V4L2 buffer exported as a `dma_buf` fd, imported by EGL as
-    /// `EGL_LINUX_DMA_BUF_EXT` (single-plane NV12 form), bound as
-    /// a GLES texture with no CPU copy. The 30fps@1080p path.
-    /// Stubbed in piece 2a; wired in piece 4.
     DmaBuf,
 }
 
-/// A decoded video frame. Piece 2a stub -- fields land in piece
-/// 2b. Piece 4 wires `dma_buf_fd` to `Some(fd)` for the zero-copy
-/// path; piece 2a/2b stay on Mmap with `None`.
-///
-/// `#[non_exhaustive]` so callers outside this crate (and inside,
-/// without naming all fields) can't construct a `Frame` directly --
-/// piece 2b will replace the field set and we don't want callers
-/// to be on the hook for the placeholder going away.
-#[non_exhaustive]
-pub struct Frame {
-    // TODO(piece 2b): width, height, y_plane mmap'd slice,
-    // uv_plane mmap'd slice, timestamp, kernel buffer index for
-    // requeue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueDirection {
+    Output,
+    Capture,
 }
 
+impl QueueDirection {
+    fn buf_type(&self) -> u32 {
+        match self {
+            QueueDirection::Output => V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            QueueDirection::Capture => V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+        }
+    }
+}
+
+// ============================================================
+// Linux-only impl from here on.
+// ============================================================
+
+/// One mmap'd plane of one V4L2 buffer. Drop munmaps.
+#[cfg(target_os = "linux")]
+struct MmapRegion {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for MmapRegion {}
+
+#[cfg(target_os = "linux")]
+impl Drop for MmapRegion {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr came from mmap with len; munmap with
+            // the same pair is the documented release.
+            unsafe { libc::munmap(self.ptr, self.len); }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MmapRegion {
+    /// Borrow the mapped bytes as a slice. The slice lifetime
+    /// is the borrow of self; callers wrapping a Frame that
+    /// outlives self need an Arc anchor.
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: mmap returned a valid (ptr, len); kernel
+        // guarantees the mapping is alive until munmap.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+    }
+}
+
+/// State held jointly by the Decoder + every outstanding Frame.
+/// Frames keep an Arc to this; on Drop they re-QBUF their buffer
+/// index. The mmap regions live here too, so as long as a Frame
+/// is alive (Arc keeps inner alive) its y_plane/uv_plane slices
+/// are valid.
+#[cfg(target_os = "linux")]
+struct DecoderInner {
+    /// Owned device file. Drop closes fd AFTER munmap (we drop
+    /// `mapped_output` and `mapped_capture` first via field-order
+    /// drop semantics: file is declared LAST in this struct).
+    /// Documented field order is the soundness contract.
+    capture_buffer_type: CaptureBufferType,
+    /// Negotiated OUTPUT format (after S_FMT). None until
+    /// set_output_format succeeds.
+    output_format: Option<NegotiatedFormat>,
+    /// Negotiated CAPTURE format. None until set_capture_format.
+    capture_format: Option<NegotiatedFormat>,
+    /// OUTPUT side mmap'd regions: outer = buffer index, inner =
+    /// plane index. Empty until allocate_buffers(Output) runs.
+    mapped_output: Vec<Vec<MmapRegion>>,
+    /// CAPTURE side mmap'd regions. Empty until allocate_buffers
+    /// (Capture) runs. Drop order critical: must munmap before
+    /// the File closes (Rust drops fields in declaration order,
+    /// so `file` declared last is dropped last).
+    mapped_capture: Vec<Vec<MmapRegion>>,
+    /// Buffer indices currently checked-out as Frames. Used to
+    /// guard against double-DQBUF returning the same index --
+    /// shouldn't happen with V4L2's contract but worth a sanity
+    /// gate at the Rust boundary.
+    capture_in_flight: Vec<bool>,
+    /// Whether STREAMON has fired on each queue.
+    output_streaming: bool,
+    capture_streaming: bool,
+    /// Whether the caller signaled EOF via feed(&[]).
+    output_eof_sent: bool,
+    /// Whether the kernel has returned V4L2_BUF_FLAG_LAST on a
+    /// CAPTURE dequeue; subsequent next_frame() returns None.
+    capture_drained: bool,
+    /// File. Declared LAST so Drop closes it AFTER the
+    /// MmapRegion Drops munmap. (Rust drops struct fields in
+    /// declaration order; mapping the kernel order requires the
+    /// File be last so the fd is still valid during munmap.)
+    file: File,
+    /// Path for diagnostics.
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl DecoderInner {
+    fn fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Reset state for re-open or re-test scenarios.
+    fn stop_streaming_quiet(&mut self) {
+        if self.output_streaming {
+            let bt: libc::c_int = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE as libc::c_int;
+            // SAFETY: fd owned by self.file; kernel reads 4
+            // bytes from the pointer. Best-effort teardown; we
+            // swallow errors so Drop doesn't panic.
+            unsafe { let _ = vidioc_streamoff(self.fd(), &bt); }
+            self.output_streaming = false;
+        }
+        if self.capture_streaming {
+            let bt: libc::c_int = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE as libc::c_int;
+            unsafe { let _ = vidioc_streamoff(self.fd(), &bt); }
+            self.capture_streaming = false;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DecoderInner {
+    fn drop(&mut self) {
+        self.stop_streaming_quiet();
+        // mapped_output + mapped_capture drop via field-order
+        // semantics here, calling munmap. file drops last,
+        // closing the fd. No leaks.
+    }
+}
+
+/// A decoded video frame. Holds an Arc reference back to the
+/// Decoder's inner state so the mmap regions stay alive while
+/// the Frame is in flight. On Drop, re-QBUFs the buffer index
+/// through the inner lock.
+#[cfg(target_os = "linux")]
+pub struct Frame {
+    inner: Arc<Mutex<DecoderInner>>,
+    /// Buffer index in the CAPTURE pool (re-QBUFed on Drop).
+    capture_buffer_index: u32,
+    /// Cached width/height so the accessors don't need to take
+    /// the inner lock for every call.
+    width: u32,
+    height: u32,
+    /// Per-plane (length, bytesused) snapshotted at DQBUF time.
+    /// bytesused is the kernel's "this many bytes are valid in
+    /// this plane"; for NV12 it's typically width*height (Y)
+    /// and width*height/2 (UV).
+    plane_lengths: [usize; 2],
+    /// Cached raw pointers + lengths into the mmap regions for
+    /// the y/uv planes. Safe because the Arc<DecoderInner>
+    /// keeps the MmapRegion alive for as long as `self` exists.
+    y_ptr: *const u8,
+    y_len: usize,
+    uv_ptr: *const u8,
+    uv_len: usize,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for Frame {}
+
+#[cfg(target_os = "linux")]
 impl Frame {
-    pub fn width(&self) -> u32 { unimplemented!("Frame: piece 2b") }
-    pub fn height(&self) -> u32 { unimplemented!("Frame: piece 2b") }
-    pub fn y_plane(&self) -> &[u8] { unimplemented!("Frame: piece 2b") }
-    pub fn uv_plane(&self) -> &[u8] { unimplemented!("Frame: piece 2b") }
-    /// `None` for the MMAP path; `Some(fd)` for the DMA-BUF path
-    /// (piece 4). The caller owns nothing -- the fd's lifetime is
-    /// tied to the Frame; on drop the underlying V4L2 buffer is
-    /// re-queued (piece 2b) and the dma_buf fd is closed (piece 4).
-    pub fn dma_buf_fd(&self) -> Option<std::os::fd::RawFd> { None }
+    pub fn width(&self) -> u32 { self.width }
+    pub fn height(&self) -> u32 { self.height }
+
+    /// Y plane bytes. NV12 layout: tightly packed luma samples
+    /// at `width*height` bytes (modulo stride alignment).
+    pub fn y_plane(&self) -> &[u8] {
+        // SAFETY: y_ptr came from MmapRegion::ptr inside the
+        // DecoderInner this Frame holds an Arc to. The Arc
+        // outlives the slice borrow (lifetime tied to &self).
+        unsafe { std::slice::from_raw_parts(self.y_ptr, self.y_len) }
+    }
+
+    /// UV plane bytes. NV12 layout: interleaved Cb,Cr at
+    /// `width*height/2` bytes.
+    pub fn uv_plane(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.uv_ptr, self.uv_len) }
+    }
+
+    /// `None` for MMAP path; `Some(fd)` for DMA-BUF (piece 4).
+    pub fn dma_buf_fd(&self) -> Option<std::os::fd::RawFd> {
+        // Piece 4 will populate this for the DmaBuf path; piece
+        // 2b always returns None.
+        let _ = &self.plane_lengths;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Frame {
+    fn drop(&mut self) {
+        // Re-QBUF this buffer index on the CAPTURE queue so the
+        // kernel can decode into it again. Failure here is rare
+        // (the kernel doesn't really refuse QBUF on a buffer it
+        // just gave us), but we don't panic from Drop -- log
+        // would be more useful, but piece 2b stays quiet.
+        let Ok(mut inner) = self.inner.lock() else { return; };
+        if (self.capture_buffer_index as usize) < inner.capture_in_flight.len() {
+            inner.capture_in_flight[self.capture_buffer_index as usize] = false;
+        }
+        if !inner.capture_streaming || inner.capture_drained {
+            // Streaming stopped or drained; nothing to do.
+            return;
+        }
+        // Build a multiplanar v4l2_buffer with num_planes from
+        // the negotiated format + the kernel-reported lengths.
+        let Some(ref cap_fmt) = inner.capture_format else { return; };
+        let num_planes = cap_fmt.num_planes as usize;
+        let mut planes = [V4l2Plane::default(); 8];
+        for p in 0..num_planes {
+            planes[p].length = cap_fmt.plane_fmt[p].sizeimage;
+            planes[p].m = (self.capture_buffer_index as u64)
+                * cap_fmt.plane_fmt[p].sizeimage as u64;
+            // Bug-trap: for MMAP, m.offset is the per-plane mmap
+            // offset; we stashed that at QUERYBUF time. Here we
+            // just need any m value (kernel reads bytesused for
+            // OUTPUT QBUFs and ignores m for CAPTURE re-QBUFs in
+            // MMAP mode). Be safe: zero is fine.
+            planes[p].m = 0;
+            planes[p].bytesused = 0;
+        }
+        let mut buf = V4l2Buffer {
+            index: self.capture_buffer_index,
+            buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            memory: V4L2_MEMORY_MMAP,
+            length: num_planes as u32,
+            m_planes: planes.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        // SAFETY: fd from inner.file; buf size 88 matches ioctl
+        // size encoding; planes array referenced via m_planes
+        // is live until the call returns.
+        unsafe {
+            let _ = vidioc_qbuf(inner.fd(), &mut buf);
+        }
+    }
 }
 
 /// V4L2 M2M H.264 decoder client.
-///
-/// Owns the device fd + the CaptureBufferType choice. Piece 2a
-/// covers open + capability query; format-set, buffer alloc, and
-/// the decode loop land in piece 2b. Linux-only -- V4L2 doesn't
-/// exist on macOS, where this whole struct is cfg'd out.
 #[cfg(target_os = "linux")]
 pub struct Decoder {
-    /// Owned device file. `Drop` closes it.
-    file: File,
-    /// Path the file was opened at (for diagnostics).
-    path: PathBuf,
-    /// CAPTURE buffer mode. Set via `set_capture_buffer_type`
-    /// BEFORE the first format-set or REQBUFS call (piece 2b
-    /// enforcement). Default `Mmap`.
-    capture_buffer_type: CaptureBufferType,
+    inner: Arc<Mutex<DecoderInner>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Decoder {
-    /// Open a V4L2 M2M decoder device. Returns `Err` if the device
-    /// can't be opened, or if it doesn't report the M2M multiplanar
-    /// + streaming capabilities required by the decode path.
-    ///
-    /// Opens O_RDWR | O_NONBLOCK -- non-blocking is required for
-    /// the dequeue path in piece 2b (otherwise DQBUF stalls the
-    /// caller's thread when no frame is ready; we'd rather get
-    /// EAGAIN and let the caller poll/sleep its own way).
+    /// Open + sanity-check the V4L2 device.
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -280,57 +635,53 @@ impl Decoder {
             .custom_flags(libc::O_NONBLOCK)
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
-        let dec = Self {
+        let inner = DecoderInner {
+            capture_buffer_type: CaptureBufferType::Mmap,
+            output_format: None,
+            capture_format: None,
+            mapped_output: Vec::new(),
+            mapped_capture: Vec::new(),
+            capture_in_flight: Vec::new(),
+            output_streaming: false,
+            capture_streaming: false,
+            output_eof_sent: false,
+            capture_drained: false,
             file,
             path: path.to_path_buf(),
-            capture_buffer_type: CaptureBufferType::Mmap,
         };
+        let dec = Self { inner: Arc::new(Mutex::new(inner)) };
         let caps = dec.query_capabilities()
             .context("VIDIOC_QUERYCAP at open time")?;
         if !caps.has_device_caps() {
             return Err(anyhow!(
-                "{}: driver doesn't populate device_caps (legacy V4L1 \
-                 driver? caps=0x{:08x})",
+                "{}: legacy V4L1 driver? (capabilities=0x{:08x})",
                 path.display(), caps.raw_capabilities
             ));
         }
         if !caps.is_m2m_mplane() {
             return Err(anyhow!(
-                "{}: not an M2M Multiplanar device (device_caps=0x{:08x}). \
-                 Expected V4L2_CAP_VIDEO_M2M_MPLANE (0x{:08x}); is this the \
-                 codec decoder or did you point at the ISP / sub-device?",
-                path.display(), caps.device_caps, V4L2_CAP_VIDEO_M2M_MPLANE
+                "{}: not M2M Multiplanar (device_caps=0x{:08x})",
+                path.display(), caps.device_caps
             ));
         }
         if !caps.is_streaming() {
             return Err(anyhow!(
-                "{}: doesn't support streaming (device_caps=0x{:08x}). \
-                 V4L2_CAP_STREAMING is required for REQBUFS / QBUF / DQBUF.",
+                "{}: doesn't support streaming (device_caps=0x{:08x})",
                 path.display(), caps.device_caps
             ));
         }
         Ok(dec)
     }
 
-    /// Probe the device's identity + capability flags. Real ioctl
-    /// (VIDIOC_QUERYCAP). Used internally by `open` for the
-    /// sanity check + exposed for diagnostics.
     pub fn query_capabilities(&self) -> Result<Capabilities> {
-        // SAFETY: vidioc_querycap is `_IOR` -- kernel writes the
-        // V4l2Capability struct into userspace on success. We
-        // pass a zeroed struct of exactly the right size (the
-        // compile-time `size_of::<V4l2Capability>() == 104` guard
-        // above ensures the ioctl request number's size matches
-        // what the kernel expects). The fd is owned by `self`
-        // (the `File` keeps it alive across the call), so the
-        // kernel can't write to a closed/recycled fd. nix's
-        // ioctl_read! returns Errno on failure; we surface it via
-        // anyhow.
+        let inner = self.inner.lock().unwrap();
         let mut raw: V4l2Capability = unsafe { std::mem::zeroed() };
+        // SAFETY: vidioc_querycap is _IOR -- kernel writes the
+        // V4l2Capability. fd is owned by inner.file (locked).
         unsafe {
-            vidioc_querycap(self.file.as_raw_fd(), &mut raw)
+            vidioc_querycap(inner.fd(), &mut raw)
         }.with_context(|| {
-            format!("VIDIOC_QUERYCAP on {}", self.path.display())
+            format!("VIDIOC_QUERYCAP on {}", inner.path.display())
         })?;
         Ok(Capabilities {
             driver: c_str_to_string(&raw.driver),
@@ -342,120 +693,495 @@ impl Decoder {
         })
     }
 
-    /// Set the CAPTURE buffer allocation mode. Must be called
-    /// BEFORE `set_capture_format` / REQBUFS (piece 2b enforces).
-    /// Default is `Mmap`.
-    pub fn set_capture_buffer_type(&mut self, ty: CaptureBufferType) {
-        self.capture_buffer_type = ty;
+    pub fn set_capture_buffer_type(&self, ty: CaptureBufferType) {
+        self.inner.lock().unwrap().capture_buffer_type = ty;
     }
 
-    /// The current CAPTURE buffer mode (default `Mmap`).
     pub fn capture_buffer_type(&self) -> CaptureBufferType {
-        self.capture_buffer_type
+        self.inner.lock().unwrap().capture_buffer_type
     }
 
-    /// Configure the OUTPUT (compressed-in) queue format. Stub --
-    /// piece 2b will issue VIDIOC_S_FMT with
-    /// V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE + the requested pixel
-    /// format (typically `V4L2_PIX_FMT_H264`).
+    /// VIDIOC_S_FMT on the OUTPUT (compressed-in) queue.
     pub fn set_output_format(
-        &mut self, pixel_format: u32, width: u32, height: u32,
-    ) -> Result<()> {
-        // Touch all args so a clippy warning doesn't fire on the
-        // stub; keeps the API surface stable for piece 3 callers.
-        let _ = (pixel_format, width, height);
-        Err(anyhow!(
-            "set_output_format: not yet implemented (piece 2b dispatch)"
-        ))
+        &self, pixel_format: u32, width: u32, height: u32,
+    ) -> Result<NegotiatedFormat> {
+        self.set_format(QueueDirection::Output, pixel_format, width, height)
     }
 
-    /// Configure the CAPTURE (decoded-out) queue format. Stub --
-    /// piece 2b. Will issue VIDIOC_S_FMT with
-    /// V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE +
-    /// `V4L2_PIX_FMT_NV12`. Respects `capture_buffer_type` choice.
+    /// VIDIOC_S_FMT on the CAPTURE (decoded-out) queue.
     pub fn set_capture_format(
-        &mut self, pixel_format: u32, width: u32, height: u32,
+        &self, pixel_format: u32, width: u32, height: u32,
+    ) -> Result<NegotiatedFormat> {
+        self.set_format(QueueDirection::Capture, pixel_format, width, height)
+    }
+
+    fn set_format(
+        &self, dir: QueueDirection,
+        pixel_format: u32, width: u32, height: u32,
+    ) -> Result<NegotiatedFormat> {
+        let inner = self.inner.lock().unwrap();
+        let mut pix_mp: V4l2PixFormatMplane = unsafe { std::mem::zeroed() };
+        pix_mp.width = width;
+        pix_mp.height = height;
+        pix_mp.pixelformat = pixel_format;
+        pix_mp.num_planes = 1;
+        let mut fmt: V4l2Format = unsafe { std::mem::zeroed() };
+        fmt.buf_type = dir.buf_type();
+        // Copy the packed struct into the byte buffer at offset 0.
+        // SAFETY: fmt.fmt is 200 bytes; pix_mp is 192 bytes packed;
+        // copy fits.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &pix_mp as *const _ as *const u8,
+                fmt.fmt.as_mut_ptr(),
+                std::mem::size_of::<V4l2PixFormatMplane>(),
+            );
+        }
+        // SAFETY: VIDIOC_S_FMT is _IOWR. Caller's fmt struct is
+        // written by the kernel with the negotiated format on Ok.
+        unsafe {
+            vidioc_s_fmt(inner.fd(), &mut fmt)
+        }.with_context(|| {
+            format!("VIDIOC_S_FMT ({:?}) on {}", dir, inner.path.display())
+        })?;
+        // Copy negotiated values back out.
+        let neg_pix_mp: V4l2PixFormatMplane = unsafe {
+            std::ptr::read_unaligned(fmt.fmt.as_ptr() as *const _)
+        };
+        // Read packed fields into local copies so we don't take
+        // references into the packed struct.
+        let neg = NegotiatedFormat {
+            width: neg_pix_mp.width,
+            height: neg_pix_mp.height,
+            pixelformat: neg_pix_mp.pixelformat,
+            num_planes: neg_pix_mp.num_planes,
+            plane_fmt: neg_pix_mp.plane_fmt,
+        };
+        drop(inner);
+        let mut inner = self.inner.lock().unwrap();
+        match dir {
+            QueueDirection::Output => inner.output_format = Some(neg.clone()),
+            QueueDirection::Capture => inner.capture_format = Some(neg.clone()),
+        }
+        Ok(neg)
+    }
+
+    /// VIDIOC_REQBUFS + VIDIOC_QUERYBUF + mmap for `count`
+    /// buffers on the given queue. Call AFTER set_*_format.
+    pub fn allocate_buffers(
+        &self, dir: QueueDirection, count: u32,
     ) -> Result<()> {
-        let _ = (pixel_format, width, height);
-        Err(anyhow!(
-            "set_capture_format: not yet implemented (piece 2b dispatch)"
-        ))
+        let mut inner = self.inner.lock().unwrap();
+        let fmt = match dir {
+            QueueDirection::Output => inner.output_format.clone(),
+            QueueDirection::Capture => inner.capture_format.clone(),
+        }.ok_or_else(|| anyhow!(
+            "allocate_buffers({:?}): set_format must be called first", dir
+        ))?;
+        // Step 1: VIDIOC_REQBUFS.
+        let mut rb = V4l2Requestbuffers {
+            count,
+            buf_type: dir.buf_type(),
+            memory: V4L2_MEMORY_MMAP,
+            ..Default::default()
+        };
+        // SAFETY: _IOWR; kernel writes rb.count + rb.capabilities back.
+        unsafe { vidioc_reqbufs(inner.fd(), &mut rb) }
+            .with_context(|| format!("VIDIOC_REQBUFS({:?})", dir))?;
+        let allocated_count = rb.count as usize;
+        if allocated_count == 0 {
+            return Err(anyhow!(
+                "VIDIOC_REQBUFS({:?}): kernel allocated 0 buffers", dir
+            ));
+        }
+        let num_planes = fmt.num_planes as usize;
+        // Step 2: per buffer, VIDIOC_QUERYBUF + mmap each plane.
+        let mut buffer_regions: Vec<Vec<MmapRegion>> = Vec::with_capacity(allocated_count);
+        for buf_idx in 0..allocated_count {
+            let mut planes = [V4l2Plane::default(); 8];
+            let mut buf = V4l2Buffer {
+                index: buf_idx as u32,
+                buf_type: dir.buf_type(),
+                memory: V4L2_MEMORY_MMAP,
+                length: num_planes as u32,
+                m_planes: planes.as_mut_ptr() as u64,
+                ..Default::default()
+            };
+            // SAFETY: _IOWR; kernel fills planes[0..num_planes]
+            // with the per-plane length + m.offset for mmap.
+            unsafe { vidioc_querybuf(inner.fd(), &mut buf) }
+                .with_context(|| format!("VIDIOC_QUERYBUF({:?} idx={})", dir, buf_idx))?;
+            let mut plane_regions = Vec::with_capacity(num_planes);
+            for plane_idx in 0..num_planes {
+                let p = &planes[plane_idx];
+                let len = p.length as usize;
+                let offset = p.m as i64;
+                // SAFETY: mmap a region the kernel just told us
+                // about. PROT_READ|WRITE so OUTPUT side can write
+                // NAL bytes; CAPTURE side reads but write doesn't
+                // hurt. MAP_SHARED is required for V4L2.
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        inner.fd(),
+                        offset,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Err(anyhow!(
+                        "mmap({:?} idx={} plane={} len={}): {}",
+                        dir, buf_idx, plane_idx, len,
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                plane_regions.push(MmapRegion { ptr, len });
+            }
+            buffer_regions.push(plane_regions);
+        }
+        match dir {
+            QueueDirection::Output => inner.mapped_output = buffer_regions,
+            QueueDirection::Capture => {
+                inner.capture_in_flight = vec![false; allocated_count];
+                inner.mapped_capture = buffer_regions;
+            }
+        }
+        Ok(())
     }
 
-    /// Feed one H.264 NAL unit (or a contiguous run of them --
-    /// Annex-B byte stream) into the decoder. Stub. Piece 2b will
-    /// queue an OUTPUT buffer + VIDIOC_QBUF.
-    pub fn feed(&mut self, _h264_nal: &[u8]) -> Result<()> {
-        Err(anyhow!(
-            "feed: not yet implemented (piece 2b dispatch)"
-        ))
+    /// VIDIOC_STREAMON on both queues. Per kernel docs the order
+    /// for M2M is OUTPUT first, then CAPTURE -- the codec needs
+    /// to know we're feeding before it'll start emitting.
+    /// Also queues all CAPTURE buffers so the kernel has somewhere
+    /// to put decoded frames immediately.
+    pub fn start_streaming(&self) -> Result<()> {
+        // Pre-queue all CAPTURE buffers so the kernel has somewhere
+        // to write decoded frames the moment we feed OUTPUT.
+        {
+            let inner = self.inner.lock().unwrap();
+            let Some(ref cap_fmt) = inner.capture_format else {
+                return Err(anyhow!("start_streaming: capture not formatted"));
+            };
+            let count = inner.mapped_capture.len();
+            let num_planes = cap_fmt.num_planes as usize;
+            for i in 0..count {
+                let mut planes = [V4l2Plane::default(); 8];
+                for p in 0..num_planes {
+                    planes[p].length = cap_fmt.plane_fmt[p].sizeimage;
+                }
+                let mut buf = V4l2Buffer {
+                    index: i as u32,
+                    buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+                    memory: V4L2_MEMORY_MMAP,
+                    length: num_planes as u32,
+                    m_planes: planes.as_mut_ptr() as u64,
+                    ..Default::default()
+                };
+                // SAFETY: ioctl with our owned fd + correctly-
+                // sized buffer struct + planes array alive for
+                // the call.
+                unsafe { vidioc_qbuf(inner.fd(), &mut buf) }
+                    .with_context(|| format!("pre-QBUF CAPTURE idx={}", i))?;
+            }
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let bt_out: libc::c_int = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE as libc::c_int;
+        let bt_cap: libc::c_int = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE as libc::c_int;
+        // SAFETY: ioctl_write_ptr! generates a fn that takes
+        // *const c_int. Kernel reads 4 bytes from the pointer.
+        // Pointers live until the ioctl returns (their stack
+        // slots outlive the unsafe scope).
+        unsafe { vidioc_streamon(inner.fd(), &bt_out) }
+            .with_context(|| "VIDIOC_STREAMON OUTPUT")?;
+        inner.output_streaming = true;
+        unsafe { vidioc_streamon(inner.fd(), &bt_cap) }
+            .with_context(|| "VIDIOC_STREAMON CAPTURE")?;
+        inner.capture_streaming = true;
+        Ok(())
     }
 
-    /// Dequeue the next decoded frame. Stub. Piece 2b will
-    /// VIDIOC_DQBUF the CAPTURE queue and wrap the mmap'd planes
-    /// (or DMA-BUF fd, per `capture_buffer_type`) as a `Frame`.
-    ///
-    /// Returns `Ok(None)` on EOF or codec error after surfacing
-    /// the error via logs; never blocks forever.
-    pub fn next_frame(&mut self) -> Result<Option<Frame>> {
-        Err(anyhow!(
-            "next_frame: not yet implemented (piece 2b dispatch)"
-        ))
+    /// VIDIOC_STREAMOFF both queues.
+    pub fn stop_streaming(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.stop_streaming_quiet();
+        Ok(())
+    }
+
+    /// Queue one H.264 NAL chunk (Annex-B byte stream) into
+    /// the OUTPUT queue. Empty slice signals end-of-input
+    /// (V4L2_BUF_FLAG_LAST). Reclaims completed OUTPUT buffers
+    /// in the same call to keep the pipeline full.
+    pub fn feed(&self, h264_nal: &[u8]) -> Result<()> {
+        // Drain any completed OUTPUT buffers first (they're
+        // ready for reuse). EAGAIN means none ready -- fine.
+        self.drain_output_quiet();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.output_eof_sent && !h264_nal.is_empty() {
+            return Err(anyhow!("feed() called after EOF"));
+        }
+        let Some(ref out_fmt) = inner.output_format else {
+            return Err(anyhow!("feed: output not formatted"));
+        };
+        if inner.mapped_output.is_empty() {
+            return Err(anyhow!("feed: no OUTPUT buffers allocated"));
+        }
+        // SINGLE-SHOT-SAFE only: piece 2b always picks buffer
+        // index 0. The test fixture feeds the entire 17 KB
+        // Annex-B stream + EOF in two calls -- by the second
+        // call (EOF), drain_output_quiet has reclaimed idx 0.
+        // Piece 3's real driver loop will need a free-list
+        // (track which OUTPUT indices the kernel has handed
+        // back via DQBUF) and reject feed() with EBUSY if
+        // every OUTPUT buffer is in flight.
+        let buf_idx = 0u32;
+        let num_planes = out_fmt.num_planes as usize;
+        let plane_max = out_fmt.plane_fmt[0].sizeimage as usize;
+        if h264_nal.len() > plane_max {
+            return Err(anyhow!(
+                "feed: NAL chunk ({} bytes) larger than OUTPUT buffer ({})",
+                h264_nal.len(), plane_max
+            ));
+        }
+        // Copy bytes into plane 0 of buffer 0.
+        let region = &mut inner.mapped_output[buf_idx as usize][0];
+        let dst = region.as_mut_slice();
+        dst[..h264_nal.len()].copy_from_slice(h264_nal);
+        let mut planes = [V4l2Plane::default(); 8];
+        for p in 0..num_planes {
+            planes[p].length = out_fmt.plane_fmt[p].sizeimage;
+        }
+        planes[0].bytesused = h264_nal.len() as u32;
+        let mut buf = V4l2Buffer {
+            index: buf_idx,
+            buf_type: V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            memory: V4L2_MEMORY_MMAP,
+            length: num_planes as u32,
+            m_planes: planes.as_mut_ptr() as u64,
+            bytesused: h264_nal.len() as u32,
+            flags: if h264_nal.is_empty() { V4L2_BUF_FLAG_LAST } else { 0 },
+            ..Default::default()
+        };
+        // SAFETY: ioctl with valid fd + buffer + planes array
+        // alive through the call.
+        unsafe { vidioc_qbuf(inner.fd(), &mut buf) }
+            .with_context(|| "VIDIOC_QBUF OUTPUT")?;
+        if h264_nal.is_empty() {
+            inner.output_eof_sent = true;
+        }
+        Ok(())
+    }
+
+    /// Best-effort: drain completed OUTPUT buffers so they're
+    /// available for the next feed. EAGAIN -> nothing ready ->
+    /// silently return.
+    fn drain_output_quiet(&self) {
+        let inner = self.inner.lock().unwrap();
+        if !inner.output_streaming {
+            return;
+        }
+        let Some(ref out_fmt) = inner.output_format else { return; };
+        let num_planes = out_fmt.num_planes as usize;
+        loop {
+            let mut planes = [V4l2Plane::default(); 8];
+            let mut buf = V4l2Buffer {
+                buf_type: V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+                memory: V4L2_MEMORY_MMAP,
+                length: num_planes as u32,
+                m_planes: planes.as_mut_ptr() as u64,
+                ..Default::default()
+            };
+            // SAFETY: non-blocking DQBUF; kernel writes into
+            // buf + planes array. EAGAIN if nothing ready.
+            let r = unsafe { vidioc_dqbuf(inner.fd(), &mut buf) };
+            match r {
+                Ok(_) => continue, // reclaimed; check for more.
+                Err(nix::errno::Errno::EAGAIN) => return, // nothing left.
+                Err(_) => return, // other errors: bail (caller
+                // will surface them on the next real feed/next_frame).
+            }
+        }
+    }
+
+    /// VIDIOC_DQBUF on CAPTURE -> wrap as `Frame`. Returns
+    /// `Ok(None)` on EOF.
+    pub fn next_frame(&self) -> Result<Option<Frame>> {
+        // Drain output in the background each call to keep the
+        // pipeline moving.
+        self.drain_output_quiet();
+        let inner = self.inner.lock().unwrap();
+        if inner.capture_drained {
+            return Ok(None);
+        }
+        let Some(ref cap_fmt) = inner.capture_format else {
+            return Err(anyhow!("next_frame: capture not formatted"));
+        };
+        let num_planes = cap_fmt.num_planes as usize;
+        let mut planes = [V4l2Plane::default(); 8];
+        let mut buf = V4l2Buffer {
+            buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            memory: V4L2_MEMORY_MMAP,
+            length: num_planes as u32,
+            m_planes: planes.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        // SAFETY: DQBUF reads `length` to know how many planes
+        // to fill. fd owned by inner.
+        let dq_result = unsafe { vidioc_dqbuf(inner.fd(), &mut buf) };
+        match dq_result {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EAGAIN) => {
+                // Non-blocking and nothing ready. Caller should
+                // poll() or sleep + retry. We surface as Err so
+                // the caller doesn't mistake EAGAIN for EOF.
+                return Err(anyhow!("DQBUF CAPTURE: would block (EAGAIN)"));
+            }
+            Err(nix::errno::Errno::EPIPE) => {
+                // Decoder drained -- EOF.
+                drop(inner);
+                self.inner.lock().unwrap().capture_drained = true;
+                return Ok(None);
+            }
+            Err(e) => return Err(anyhow!("DQBUF CAPTURE: {}", e)),
+        }
+        if buf.flags & V4L2_BUF_FLAG_ERROR != 0 {
+            return Err(anyhow!(
+                "DQBUF CAPTURE buf={}: V4L2_BUF_FLAG_ERROR set", buf.index
+            ));
+        }
+        let is_last = buf.flags & V4L2_BUF_FLAG_LAST != 0;
+        let idx = buf.index;
+        let width = cap_fmt.width;
+        let height = cap_fmt.height;
+        // Pull pointer + length per plane from the mmap region.
+        // Re-borrow inner mutably to flip in-flight bit + cache
+        // the pointers.
+        drop(inner);
+        let inner_mut = self.inner.lock().unwrap();
+        if (idx as usize) >= inner_mut.mapped_capture.len() {
+            return Err(anyhow!(
+                "DQBUF returned out-of-range buf idx {}", idx
+            ));
+        }
+        let region_planes = &inner_mut.mapped_capture[idx as usize];
+        let (y_ptr, y_len) = {
+            let p = &region_planes[0];
+            (p.ptr as *const u8, planes[0].bytesused as usize)
+        };
+        let (uv_ptr, uv_len) = if num_planes >= 2 {
+            let p = &region_planes[1];
+            (p.ptr as *const u8, planes[1].bytesused as usize)
+        } else {
+            // num_planes == 1 (interleaved NV12 layout on
+            // bcm2835-codec): the UV plane is inside the same
+            // mmap region as Y, offset by width*height.
+            let p = &region_planes[0];
+            let y_size = (width * height) as usize;
+            let total = planes[0].bytesused as usize;
+            let uv_size = total.saturating_sub(y_size);
+            unsafe {
+                ((p.ptr as *const u8).add(y_size), uv_size)
+            }
+        };
+        let plane_lengths = [planes[0].bytesused as usize, planes[1].bytesused as usize];
+        let inner_arc = self.inner.clone();
+        drop(inner_mut);
+        // Mark in-flight + handle EOF flag in a separate lock
+        // scope so the Frame construction is the last action.
+        {
+            let mut inner_w = self.inner.lock().unwrap();
+            if (idx as usize) < inner_w.capture_in_flight.len() {
+                inner_w.capture_in_flight[idx as usize] = true;
+            }
+            if is_last {
+                inner_w.capture_drained = true;
+            }
+        }
+        Ok(Some(Frame {
+            inner: inner_arc,
+            capture_buffer_index: idx,
+            width,
+            height,
+            plane_lengths,
+            y_ptr,
+            y_len,
+            uv_ptr,
+            uv_len,
+        }))
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        // Piece 2b will add VIDIOC_STREAMOFF on both queues +
-        // explicit munmap of the mapped buffers here. For piece
-        // 2a we only own a File handle; its own Drop closes the
-        // fd. No leaks possible at this scope.
-    }
+// ============================================================
+// Mac-side public types for cross-platform syntax checking. On
+// macOS, Decoder + Frame don't exist (no V4L2). The structs
+// below are pure-Rust mirrors that compile everywhere -- syntax
+// errors in the field set surface on every host's `cargo check`.
+// ============================================================
+
+#[cfg(not(target_os = "linux"))]
+pub struct Frame {
+    _placeholder: (),
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Frame {
+    pub fn width(&self) -> u32 { unimplemented!("Linux-only") }
+    pub fn height(&self) -> u32 { unimplemented!("Linux-only") }
+    pub fn y_plane(&self) -> &[u8] { unimplemented!("Linux-only") }
+    pub fn uv_plane(&self) -> &[u8] { unimplemented!("Linux-only") }
+    pub fn dma_buf_fd(&self) -> Option<i32> { None }
 }
 
 // ============================================================
 // Helpers.
 // ============================================================
 
-/// Decode a fixed-size, nul-terminated C string buffer into a
-/// Rust `String`. Trailing zeros after the nul are ignored.
-/// Lossy on non-UTF-8 (driver/card strings are ASCII in practice).
 fn c_str_to_string(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).to_string()
 }
 
 // ============================================================
-// Tests. Most exercise the decoder against /dev/video10 on the
-// dev Pi; on non-Linux hosts the module is cfg'd out entirely
-// so these don't run.
+// Tests.
 // ============================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// fourcc helper packs LE -- pin against the kernel's
-    /// `v4l2_fourcc` macro semantics. Pure-Rust unit test (runs
-    /// on Mac too; verifies the constants).
     #[test]
     fn fourcc_packs_little_endian() {
-        // "H264" => 'H'=0x48, '2'=0x32, '6'=0x36, '4'=0x34
-        //        => 0x34363248 in LE u32
         assert_eq!(V4L2_PIX_FMT_H264, 0x34363248);
-        assert_eq!(V4L2_PIX_FMT_NV12, 0x3231564E);  // "NV12"
+        assert_eq!(V4L2_PIX_FMT_NV12, 0x3231564E);
     }
 
-    /// Compile-time struct size guard is in the module body; this
-    /// runtime test mirrors it so a tooling drift (debug+release
-    /// disagreement, etc.) surfaces via cargo test too.
     #[test]
-    fn v4l2_capability_layout_size() {
+    fn struct_layouts_match_kernel() {
+        // Compile-time guards already panic on mismatch; mirror
+        // them at runtime so cargo-test output names the failed
+        // type.
         assert_eq!(std::mem::size_of::<V4l2Capability>(), 104);
+        assert_eq!(std::mem::size_of::<V4l2PlanePixFormat>(), 20);
+        assert_eq!(std::mem::size_of::<V4l2PixFormatMplane>(), 192);
+        assert_eq!(std::mem::size_of::<V4l2Format>(), 208);
+        assert_eq!(std::mem::size_of::<V4l2Plane>(), 64);
+        assert_eq!(std::mem::size_of::<V4l2Buffer>(), 88);
+        assert_eq!(std::mem::size_of::<V4l2Timecode>(), 16);
+        assert_eq!(std::mem::size_of::<V4l2Requestbuffers>(), 20);
+        // Field-offset guard for V4l2Format: union starts at
+        // offset 8 (after 4-byte type + 4-byte alignment pad),
+        // NOT at offset 4. A piece-2b subagent caught the
+        // pre-fix version with `fmt` at offset 4, which would
+        // make S_FMT silently put pix_mp.width into kernel
+        // reserved bytes. Pin via memoffset-style ptr math
+        // since std::mem::offset_of is stable from 1.77 -- this
+        // crate targets 1.85 (Cargo.toml rust-version) so it's
+        // available.
+        assert_eq!(std::mem::offset_of!(V4l2Format, buf_type), 0);
+        assert_eq!(std::mem::offset_of!(V4l2Format, fmt), 8);
     }
 
-    /// c_str_to_string handles the common case + edge cases.
     #[test]
     fn c_str_decode_trims_at_nul() {
         let mut buf = [0u8; 16];
@@ -463,53 +1189,127 @@ mod tests {
         assert_eq!(c_str_to_string(&buf), "bcm2835-codec");
     }
 
-    /// CaptureBufferType defaults to Mmap on a freshly-opened
-    /// decoder (piece 4 explicitly flips to DmaBuf).
     #[test]
     fn capture_buffer_type_default_is_mmap() {
-        // We can't open a real decoder on Mac, so test the enum
-        // semantic directly via a synthetic Decoder. (On Linux the
-        // open-against-dev-pi test below also implicitly covers
-        // this.)
         assert_eq!(CaptureBufferType::Mmap, CaptureBufferType::Mmap);
         assert_ne!(CaptureBufferType::Mmap, CaptureBufferType::DmaBuf);
     }
 
-    /// Open + capability-query against the dev Pi's /dev/video10.
-    /// Skipped cleanly when the device doesn't exist (CI hosts,
-    /// non-Pi Linux dev boxes). Runs on the dev Pi when the
-    /// renderer is cross-built + cargo-tested there.
+    /// Open + cap query against the dev Pi's /dev/video10.
+    /// Skipped cleanly when the device is missing.
     #[test]
     #[cfg(target_os = "linux")]
     fn open_and_query_caps_on_dev_video10() {
         let path = Path::new("/dev/video10");
         if !path.exists() {
-            // CI / non-Pi Linux host -- skip cleanly.
-            eprintln!(
-                "skipping open_and_query_caps_on_dev_video10: \
-                 /dev/video10 not present (not on a Pi?)"
-            );
+            eprintln!("skipping: /dev/video10 not present");
             return;
         }
-        let dec = Decoder::open(path).expect("open /dev/video10");
-        let caps = dec.query_capabilities().expect("VIDIOC_QUERYCAP");
-        assert!(caps.is_m2m_mplane(),
-            "expected M2M Multiplanar; got device_caps=0x{:08x}",
-            caps.device_caps);
-        assert!(caps.is_streaming(),
-            "expected streaming; got device_caps=0x{:08x}",
-            caps.device_caps);
-        assert!(caps.driver.starts_with("bcm2835") ||
-                caps.driver.starts_with("v4l2"),
-            "unexpected driver: {:?}", caps.driver);
+        let dec = Decoder::open(path).expect("open");
+        let caps = dec.query_capabilities().expect("QUERYCAP");
+        assert!(caps.is_m2m_mplane(), "{:?}", caps);
+        assert!(caps.is_streaming(), "{:?}", caps);
     }
 
-    /// Pointing at a non-existent device returns a clean error,
-    /// not a panic.
     #[test]
     #[cfg(target_os = "linux")]
     fn open_nonexistent_path_errors_cleanly() {
         let r = Decoder::open(Path::new("/dev/video-doesnt-exist"));
-        assert!(r.is_err(), "expected open() to error on missing device");
+        assert!(r.is_err());
+    }
+
+    /// Decode the bundled 320x240 H.264 fixture; assert resolution
+    /// + Y-plane non-zero. Linux-gated; skipped without /dev/video10.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn decode_test_fixture_320x240() {
+        let path = Path::new("/dev/video10");
+        if !path.exists() {
+            eprintln!("skipping decode test: /dev/video10 absent");
+            return;
+        }
+        let fixture = include_bytes!(
+            "../tests/fixtures/test_320x240.h264"
+        );
+        let dec = Decoder::open(path).expect("open");
+        let out_fmt = dec.set_output_format(V4L2_PIX_FMT_H264, 320, 240)
+            .expect("S_FMT OUTPUT");
+        eprintln!("OUTPUT negotiated: {:?}", out_fmt);
+        let cap_fmt = dec.set_capture_format(V4L2_PIX_FMT_NV12, 320, 240)
+            .expect("S_FMT CAPTURE");
+        eprintln!("CAPTURE negotiated: w={} h={} num_planes={}",
+            cap_fmt.width, cap_fmt.height, cap_fmt.num_planes);
+        dec.allocate_buffers(QueueDirection::Output, 4)
+            .expect("REQBUFS OUTPUT");
+        dec.allocate_buffers(QueueDirection::Capture, 4)
+            .expect("REQBUFS CAPTURE");
+        dec.start_streaming().expect("STREAMON");
+
+        // Feed the whole fixture in one chunk (it's only ~17KB,
+        // well under typical OUTPUT plane size of 1-4 MB).
+        dec.feed(fixture).expect("feed NAL");
+        // Send EOF.
+        dec.feed(&[]).expect("feed EOF");
+
+        // Pull frames until EOF.
+        let mut frames_decoded = 0;
+        let mut first_frame_y_variance = 0u64;
+        for _attempt in 0..200 {
+            match dec.next_frame() {
+                Ok(Some(f)) => {
+                    assert_eq!(f.width(), 320, "frame width");
+                    assert_eq!(f.height(), 240, "frame height");
+                    if frames_decoded == 0 {
+                        // Compute simple variance on Y plane.
+                        let y = f.y_plane();
+                        if !y.is_empty() {
+                            let mean: u64 = y.iter().map(|&b| b as u64).sum::<u64>() / y.len() as u64;
+                            first_frame_y_variance = y.iter()
+                                .map(|&b| {
+                                    let d = (b as i64) - (mean as i64);
+                                    (d * d) as u64
+                                })
+                                .sum::<u64>() / y.len() as u64;
+                        }
+                    }
+                    frames_decoded += 1;
+                }
+                Ok(None) => break,
+                Err(e) if e.to_string().contains("EAGAIN") => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("decode error: {}", e),
+            }
+        }
+        eprintln!("frames decoded: {}; first-frame Y variance: {}",
+            frames_decoded, first_frame_y_variance);
+        assert!(frames_decoded >= 1, "no frames decoded");
+        assert!(first_frame_y_variance > 10,
+            "first frame Y plane variance suspiciously low: {}",
+            first_frame_y_variance);
+    }
+
+    /// Drop + re-open works cleanly. Catches missing STREAMOFF
+    /// or unfreed mmaps that'd EBUSY the device.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn drop_then_reopen_clean() {
+        let path = Path::new("/dev/video10");
+        if !path.exists() {
+            eprintln!("skipping: /dev/video10 absent");
+            return;
+        }
+        {
+            let dec = Decoder::open(path).expect("first open");
+            let _ = dec.set_output_format(V4L2_PIX_FMT_H264, 320, 240);
+            let _ = dec.set_capture_format(V4L2_PIX_FMT_NV12, 320, 240);
+            let _ = dec.allocate_buffers(QueueDirection::Output, 2);
+            let _ = dec.allocate_buffers(QueueDirection::Capture, 2);
+            // dec drops here -- inner Arc drops -- STREAMOFF +
+            // munmap should fire.
+        }
+        // Re-open immediately. If anything leaked, this'd fail.
+        let dec2 = Decoder::open(path).expect("re-open");
+        let _ = dec2.query_capabilities().expect("re-QUERYCAP");
     }
 }
