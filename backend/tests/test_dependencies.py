@@ -185,12 +185,15 @@ class TestRealRendererFactory:
         renderer = factory()
         assert isinstance(renderer, MockRenderer)
 
-    def test_renderer_rust_sidecar_env_returns_rust_renderer(
+    def test_renderer_rust_sidecar_env_returns_auto_fallback_wrapper(
         self, monkeypatch, tmp_path
     ):
-        """New slice-2 branch: OPENMARQUEE_RENDERER=rust-sidecar returns a
-        RustRenderer instance WITHOUT launching the subprocess (construction-
-        only at factory time)."""
+        """slice-2 branch + slice-2-followup (2026-05-14):
+        OPENMARQUEE_RENDERER=rust-sidecar returns an AutoFallbackRenderer
+        wrapping a RustRenderer instance, NOT the bare proxy. This pins
+        the wrapper contract so playback always gets the fallback
+        capability."""
+        from openmarquee.dependencies import AutoFallbackRenderer
         from openmarquee.rendering.rust_renderer import RustRenderer
 
         monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidecar")
@@ -203,13 +206,15 @@ class TestRealRendererFactory:
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
-        assert isinstance(renderer, RustRenderer)
-        # Dims from settings (negotiated dims would update at open() time;
-        # the factory doesn't open).
+        assert isinstance(renderer, AutoFallbackRenderer)
+        assert isinstance(renderer._primary, RustRenderer)
+        # Dims forwarded through the wrapper from the proxy.
         assert renderer.width == 1920
         assert renderer.height == 1080
         # Subprocess not yet launched.
-        assert renderer.is_alive is False
+        assert renderer._primary.is_alive is False
+        # Wrapper is not in fallback mode yet (no failure has happened).
+        assert renderer.is_in_fallback is False
 
     def test_renderer_rust_sidecar_honors_binary_env_override(
         self, monkeypatch, tmp_path
@@ -218,7 +223,7 @@ class TestRealRendererFactory:
         binary_path. The proxy doesn't validate path existence at
         construction time (it errors at open()); that's the lifespan's
         job."""
-        from openmarquee.rendering.rust_renderer import RustRenderer
+        from openmarquee.dependencies import AutoFallbackRenderer
 
         custom_path = tmp_path / "my-custom-render-binary"
         monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidecar")
@@ -230,9 +235,9 @@ class TestRealRendererFactory:
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
-        assert isinstance(renderer, RustRenderer)
-        # Access the private attr — this test pins the env-var contract.
-        assert renderer._binary_path == str(custom_path)
+        assert isinstance(renderer, AutoFallbackRenderer)
+        # Drill through to the wrapped proxy to pin the env-var contract.
+        assert renderer._primary._binary_path == str(custom_path)
 
     def test_renderer_rust_sidecar_uses_content_root_from_env(
         self, monkeypatch, tmp_path
@@ -240,7 +245,7 @@ class TestRealRendererFactory:
         """The proxy receives the content_root the rest of the backend
         resolved via _resolve_content_root (env override first, then
         ./openmarquee-content)."""
-        from openmarquee.rendering.rust_renderer import RustRenderer
+        from openmarquee.dependencies import AutoFallbackRenderer
 
         my_cr = tmp_path / "my-content-root"
         my_cr.mkdir()
@@ -252,8 +257,8 @@ class TestRealRendererFactory:
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
-        assert isinstance(renderer, RustRenderer)
-        assert renderer._content_root == str(my_cr)
+        assert isinstance(renderer, AutoFallbackRenderer)
+        assert renderer._primary._content_root == str(my_cr)
 
     def test_renderer_rust_sidecar_unknown_value_falls_through_to_auto(
         self, monkeypatch
@@ -273,3 +278,374 @@ class TestRealRendererFactory:
         # Typo'd value isn't "rust-sidecar" so we fall through to the
         # want_drm branch; with output_mode=mock that returns Mock.
         assert isinstance(renderer, MockRenderer)
+
+
+# ============================================================
+# AutoFallbackRenderer (2026-05-14 dispatch — slice-2 followup).
+# ============================================================
+
+
+class _FakeRustRenderer:
+    """Minimal stand-in for RustRenderer used in AutoFallbackRenderer
+    unit tests. Behaves enough like the real proxy for the wrapper to
+    exercise its forwarding + swap-on-error paths without spinning up
+    a real subprocess. The wrapper only depends on:
+      - width / height attrs
+      - open() / close() / render_frame()
+      - the IPC ops (begin_slide, advance, ...)
+      - raising `RustRendererSubprocessError` from any op to trigger fallback.
+    Configure the raise behavior per-test via `raise_on_op`.
+    """
+
+    def __init__(self, width: int = 1920, height: int = 1080):
+        self.width = width
+        self.height = height
+        self.open_called = 0
+        self.close_called = 0
+        self.calls: list[tuple[str, tuple, dict]] = []
+        # op_name -> exception to raise once at that op's next call.
+        self.raise_on_op: dict[str, Exception] = {}
+
+    def _maybe_raise(self, op_name: str):
+        exc = self.raise_on_op.pop(op_name, None)
+        if exc is not None:
+            raise exc
+
+    def open(self):
+        self.open_called += 1
+        self.calls.append(("open", (), {}))
+        self._maybe_raise("open")
+        return ("mock_open_ok", self.width, self.height)
+
+    def close(self):
+        self.close_called += 1
+        self.calls.append(("close", (), {}))
+        # Don't raise from close — wrapper should swallow teardown
+        # errors anyway, but we don't want to obscure assertions.
+
+    def render_frame(self, frame: bytes) -> None:
+        self.calls.append(("render_frame", (len(frame),), {}))
+        self._maybe_raise("render_frame")
+
+    def begin_slide(self, *args, **kwargs):
+        self.calls.append(("begin_slide", args, kwargs))
+        self._maybe_raise("begin_slide")
+
+    def advance(self, *args, **kwargs):
+        self.calls.append(("advance", args, kwargs))
+        self._maybe_raise("advance")
+        return ("advance_ok", args, kwargs)
+
+    def begin_transition(self, *args, **kwargs):
+        self.calls.append(("begin_transition", args, kwargs))
+        self._maybe_raise("begin_transition")
+
+    def capture(self, *args, **kwargs):
+        self.calls.append(("capture", args, kwargs))
+        self._maybe_raise("capture")
+
+    def reconfigure(self, *args, **kwargs):
+        self.calls.append(("reconfigure", args, kwargs))
+        self._maybe_raise("reconfigure")
+
+
+class TestAutoFallbackRenderer:
+    """Unit tests for the dependencies.AutoFallbackRenderer wrapper.
+
+    The wrapper closes Phase 7 slice 2's robustness story: 1796584
+    landed bounded auto-reconnect inside the proxy; this wrapper
+    catches reconnect-exhaustion exceptions and swaps the dead
+    proxy for a MockRenderer for the rest of the session.
+    """
+
+    @pytest.fixture
+    def mock_factory_factory(self):
+        """Returns a factory that builds a MockRenderer wired into the
+        test's tmp directory + a sentinel callsite counter so tests can
+        assert lazy construction."""
+        def _build(tmp_path: Path):
+            calls = [0]
+
+            def _factory():
+                calls[0] += 1
+                return _mock_renderer_singleton()
+
+            return _factory, calls
+
+        return _build
+
+    def test_satisfies_renderer_protocol(self, tmp_path):
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering import Renderer
+
+        fake = _FakeRustRenderer(width=1920, height=1080)
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        assert isinstance(wrapper, Renderer)
+        assert wrapper.width == 1920
+        assert wrapper.height == 1080
+
+    def test_happy_path_forwards_to_primary(self, tmp_path):
+        from openmarquee.dependencies import AutoFallbackRenderer
+
+        fake = _FakeRustRenderer(width=128, height=96)
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        frame = b"\xff\x00\x00" * 128 * 96  # 1 frame of red, RGB888
+        wrapper.render_frame(frame)
+        assert ("render_frame", (len(frame),), {}) in fake.calls
+        assert wrapper.is_in_fallback is False
+
+    def test_render_frame_subprocess_error_triggers_fallback(self, tmp_path):
+        """The headline behavior: when the primary raises
+        RustRendererSubprocessError (e.g. reconnect exhausted), the
+        wrapper swaps to MockRenderer and replays the same frame
+        against it. is_in_fallback becomes True permanently."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.mock import MockRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=128, display_height=96)
+        )
+        _settings_storage_singleton.cache_clear()
+
+        fake = _FakeRustRenderer(width=128, height=96)
+        fake.raise_on_op["render_frame"] = RustRendererSubprocessError(
+            "reconnect exhausted (max=3 in 60s) -- trail: [...]"
+        )
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        assert wrapper.is_in_fallback is False
+        frame = b"\x00\xff\x00" * 128 * 96
+        # Call should succeed: wrapper catches the exhaustion, swaps,
+        # and replays the frame against MockRenderer.
+        wrapper.render_frame(frame)
+        assert wrapper.is_in_fallback is True
+        # Primary was closed during the swap.
+        assert fake.close_called == 1
+        # Subsequent render_frame calls route to Mock without touching
+        # the (now-released) primary.
+        wrapper.render_frame(frame)
+        # No NEW calls to the fake's render_frame after the first.
+        assert fake.calls.count(("render_frame", (len(frame),), {})) == 1
+        # The MockRenderer wrote the PNG at the dev preview path.
+        preview = Path(os.environ["OPENMARQUEE_DEV_PREVIEW_PATH"])
+        assert preview.exists()
+
+    def test_fallback_is_one_way_permanent(self, tmp_path):
+        """Once the wrapper falls back, it never goes back to the
+        primary even if the primary 'recovers' (e.g. someone restarts
+        the binary). Restart-of-process is the recovery story."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=128, display_height=96)
+        )
+        _settings_storage_singleton.cache_clear()
+        fake = _FakeRustRenderer(width=128, height=96)
+        fake.raise_on_op["render_frame"] = RustRendererSubprocessError("boom")
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        wrapper.render_frame(b"\x00" * 128 * 96 * 3)
+        assert wrapper.is_in_fallback
+        # Wrapper released the reference to the dead primary.
+        assert wrapper._primary is None
+
+    def test_ipc_op_subprocess_error_swaps_and_raises_autofallback_error(
+        self, tmp_path
+    ):
+        """When an IPC op (advance / begin_slide / etc.) raises
+        SubprocessError on the primary, the wrapper swaps to Mock and
+        re-raises as AutoFallbackInMockError so the caller knows to
+        switch to render_frame()."""
+        from openmarquee.dependencies import (
+            AutoFallbackInMockError,
+            AutoFallbackRenderer,
+        )
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=128, display_height=96)
+        )
+        _settings_storage_singleton.cache_clear()
+        fake = _FakeRustRenderer()
+        fake.raise_on_op["advance"] = RustRendererSubprocessError("boom")
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        with pytest.raises(AutoFallbackInMockError, match="advance"):
+            wrapper.advance(t_ms=100)
+        assert wrapper.is_in_fallback is True
+        # Subsequent IPC ops also raise (Mock can't satisfy IPC).
+        with pytest.raises(AutoFallbackInMockError, match="begin_slide"):
+            wrapper.begin_slide("slide_id", t0_ms=0, duration_ms=5000)
+        # But render_frame routes cleanly to Mock.
+        wrapper.render_frame(b"\x00" * 128 * 96 * 3)
+
+    def test_open_subprocess_error_swaps_and_reraises(self, tmp_path):
+        """If even open() can't launch, the wrapper swaps to Mock
+        immediately but re-raises so the lifespan sees the original
+        SubprocessError. Future render_frames work against Mock."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=128, display_height=96)
+        )
+        _settings_storage_singleton.cache_clear()
+        fake = _FakeRustRenderer()
+        fake.raise_on_op["open"] = RustRendererSubprocessError(
+            "rust binary not found"
+        )
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        with pytest.raises(RustRendererSubprocessError, match="not found"):
+            wrapper.open()
+        assert wrapper.is_in_fallback is True
+        # Mock takes over; render_frame works.
+        wrapper.render_frame(b"\xff" * 128 * 96 * 3)
+
+    def test_close_tears_down_primary_when_alive(self, tmp_path):
+        """close() before any fallback: tears down the primary, no
+        Mock construction (lazy)."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+
+        fake = _FakeRustRenderer()
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        wrapper.close()
+        assert fake.close_called == 1
+        # Second close is a no-op.
+        wrapper.close()
+        assert fake.close_called == 1
+
+    def test_close_after_fallback_does_not_double_teardown(self, tmp_path):
+        """After fallback, the primary was already closed during the
+        swap. close() on the wrapper must NOT call close() on the
+        (released) primary again, and must not raise."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=128, display_height=96)
+        )
+        _settings_storage_singleton.cache_clear()
+        fake = _FakeRustRenderer()
+        fake.raise_on_op["render_frame"] = RustRendererSubprocessError("boom")
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        wrapper.render_frame(b"\x00" * 128 * 96 * 3)
+        assert fake.close_called == 1
+        wrapper.close()
+        # close_called still 1 — wrapper didn't try to close the
+        # already-torn-down primary again.
+        assert fake.close_called == 1
+
+    def test_context_manager_lifecycle(self, tmp_path):
+        from openmarquee.dependencies import AutoFallbackRenderer
+
+        fake = _FakeRustRenderer()
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        with wrapper:
+            assert fake.open_called == 1
+        assert fake.close_called == 1
+
+    def test_lazy_mock_construction(self, tmp_path):
+        """The MockRenderer factory is only called on the FIRST fallback.
+        Construction is otherwise lazy — happy-path operations don't
+        pay the Mock-construction cost."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=128, display_height=96)
+        )
+        _settings_storage_singleton.cache_clear()
+        calls = [0]
+
+        def _factory():
+            calls[0] += 1
+            return _mock_renderer_singleton()
+
+        fake = _FakeRustRenderer(width=128, height=96)
+        wrapper = AutoFallbackRenderer(fake, _factory)
+        # Happy path: no factory call.
+        wrapper.render_frame(b"\x00" * 128 * 96 * 3)
+        assert calls[0] == 0
+        # Force a swap.
+        fake.raise_on_op["render_frame"] = RustRendererSubprocessError("boom")
+        wrapper.render_frame(b"\x00" * 128 * 96 * 3)
+        assert calls[0] == 1
+        # Subsequent renders don't reconstruct Mock.
+        wrapper.render_frame(b"\x00" * 128 * 96 * 3)
+        assert calls[0] == 1
+
+    def test_non_subprocess_errors_propagate_unwrapped(self, tmp_path):
+        """The wrapper only catches RustRendererSubprocessError. OTHER
+        exceptions (e.g. RustRendererOpError for a TBD-image-slide, or
+        a Python TypeError) propagate normally so callers see them."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import RustRendererOpError
+
+        fake = _FakeRustRenderer()
+        fake.raise_on_op["advance"] = RustRendererOpError(
+            "paint_slide: image_slide requires content_root"
+        )
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        # Op-level error should propagate unchanged; no fallback swap.
+        with pytest.raises(RustRendererOpError, match="image_slide"):
+            wrapper.advance(t_ms=100)
+        assert wrapper.is_in_fallback is False
+
+    def test_respawned_error_does_not_trigger_fallback(self, tmp_path):
+        """RustRendererRespawnedError is a SUBCLASS of SubprocessError
+        but indicates a SUCCESSFUL reconnect (proxy is alive). The
+        wrapper must NOT swap to Mock — it should re-raise so the
+        caller knows to replay session state on the healthy proxy.
+
+        Regression test for the subagent-flagged bug where the wrapper
+        threw away a respawned-but-healthy primary."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererRespawnedError,
+        )
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=128, display_height=96)
+        )
+        _settings_storage_singleton.cache_clear()
+        fake = _FakeRustRenderer(width=128, height=96)
+        fake.raise_on_op["render_frame"] = RustRendererRespawnedError(
+            "subprocess died during op 'render_frame'; proxy reconnected"
+        )
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        with pytest.raises(RustRendererRespawnedError):
+            wrapper.render_frame(b"\x00" * 128 * 96 * 3)
+        # Critical: wrapper did NOT swap to Mock — proxy stays.
+        assert wrapper.is_in_fallback is False
+        assert wrapper._primary is fake
+        assert fake.close_called == 0  # primary not torn down
+
+    def test_respawned_error_in_ipc_op_does_not_trigger_fallback(self, tmp_path):
+        """Same regression as test_respawned_error_does_not_trigger_fallback
+        but exercised through an IPC op (advance) instead of
+        render_frame."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererRespawnedError,
+        )
+
+        fake = _FakeRustRenderer()
+        fake.raise_on_op["advance"] = RustRendererRespawnedError(
+            "subprocess died during op 'advance'; proxy reconnected"
+        )
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        with pytest.raises(RustRendererRespawnedError):
+            wrapper.advance(t_ms=100)
+        assert wrapper.is_in_fallback is False
+        assert wrapper._primary is fake

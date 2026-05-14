@@ -8,8 +8,10 @@ import logging
 import os
 import socket
 import tempfile
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from openmarquee.content.storage import ContentStorage
 from openmarquee.flock import FlockStorage
@@ -22,6 +24,233 @@ from openmarquee.settings import SettingsStorage
 from openmarquee.tombstone import TombstoneStorage
 
 log = logging.getLogger(__name__)
+
+
+class AutoFallbackRenderer:
+    """Wraps a primary RustRenderer; on `RustRendererSubprocessError`
+    raised at any operation, transparently swaps to a MockRenderer for
+    the rest of the session and logs the transition.
+
+    Wraps the proxy AT THE FACTORY BOUNDARY -- the factory hands the
+    playback loop an `AutoFallbackRenderer`, never a bare RustRenderer.
+    Closes the loop on Phase 7 slice 2's robustness story: 1796584
+    landed bounded auto-reconnect inside RustRenderer (3 retries in
+    60s window). If reconnect exhausts, the proxy raises
+    `RustRendererSubprocessError`. Without this wrapper, that would
+    crash the playback loop. With it, prod degrades to MockRenderer
+    (which writes PNGs to the dev preview path) and stays online.
+
+    The swap is one-way and permanent: once Mock takes over, the dead
+    proxy is torn down and never revived. Operators see a one-time
+    log line + the renderer-monitor can detect the swap via
+    `is_in_fallback`.
+
+    Surface (matches the Renderer Protocol AT A MINIMUM):
+      - `width: int` / `height: int` (forwarded to active renderer)
+      - `render_frame(frame)` (the Protocol op; swap-on-error wired here)
+      - Lifecycle: `open()` / `close()` / `__enter__` / `__exit__`
+      - IPC ops forwarded to the proxy while alive: `begin_slide`,
+        `advance`, `begin_transition`, `capture`, `reconfigure`.
+        These all swap to Mock on `RustRendererSubprocessError`. Once
+        in fallback, the IPC ops raise `AutoFallbackInMockError` --
+        Mock can't satisfy IPC semantics so callers that depend on
+        them (slice 4's playback bypass) need to know to switch
+        to `render_frame`.
+
+    NOT forwarded: `is_alive`, `health_probe`, reconnect-related
+    helpers -- these are RustRenderer-internal. The wrapper exposes
+    its own `is_in_fallback` instead.
+    """
+
+    def __init__(
+        self,
+        primary: Any,  # RustRenderer; typed `Any` to avoid import cycle
+        mock_factory: Callable[[], MockRenderer],
+    ):
+        self._primary = primary
+        self._mock_factory = mock_factory
+        self._mock: MockRenderer | None = None
+        self._closed = False
+
+    # --- inspection ---
+
+    @property
+    def is_in_fallback(self) -> bool:
+        """True once the proxy was swapped out for Mock. One-way flag."""
+        return self._mock is not None
+
+    @property
+    def width(self) -> int:
+        return self._active_for_dims().width
+
+    @property
+    def height(self) -> int:
+        return self._active_for_dims().height
+
+    def _active_for_dims(self):
+        if self._mock is not None:
+            return self._mock
+        return self._primary
+
+    # --- the swap ---
+
+    def _swap_to_mock(self, reason: str) -> MockRenderer:
+        """Tear down the dead proxy and lazy-init the MockRenderer.
+        Idempotent: a second call returns the existing Mock without
+        re-tearing-down."""
+        if self._mock is not None:
+            return self._mock
+        log.error("RustRenderer exhausted; falling back to MockRenderer: %s", reason)
+        # Tear down the proxy BEFORE constructing Mock so any teardown
+        # exception doesn't half-state us. Catch broad because the
+        # proxy is by definition in a degraded state here.
+        if self._primary is not None:
+            try:
+                self._primary.close()
+            except Exception:
+                log.debug("primary close during fallback swap raised", exc_info=True)
+            self._primary = None
+        self._mock = self._mock_factory()
+        return self._mock
+
+    # --- Renderer Protocol ---
+
+    def render_frame(self, frame: bytes) -> None:
+        """Forward to the active renderer. On subprocess exhaustion at
+        the proxy, swap to Mock and replay the frame against it.
+
+        IMPORTANT: `RustRendererRespawnedError` is a SUBCLASS of
+        `RustRendererSubprocessError` (raised after a SUCCESSFUL
+        reconnect — the proxy is alive, caller must replay state).
+        We catch it FIRST and re-raise unwrapped so the playback loop
+        can replay begin_slide rather than throwing away a healthy
+        proxy.
+        """
+        if self._mock is not None:
+            self._mock.render_frame(frame)
+            return
+        # Lazy import: avoids paying the rust_renderer module-import
+        # cost when the factory routed elsewhere (auto/drm/mock paths).
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererRespawnedError,
+            RustRendererSubprocessError,
+        )
+        try:
+            self._primary.render_frame(frame)
+        except RustRendererRespawnedError:
+            # Proxy is alive, just had a transient blip. Bubble up
+            # so the caller knows to replay session state.
+            raise
+        except RustRendererSubprocessError as e:
+            mock = self._swap_to_mock(f"render_frame: {e}")
+            mock.render_frame(frame)
+
+    # --- Lifecycle ---
+
+    def open(self):
+        """Forward open() to the proxy. If the proxy can't even open,
+        swap to Mock immediately and re-raise so the lifespan sees the
+        original failure cause. Subsequent `render_frame()` calls
+        succeed against the Mock (lifespan can choose to log + continue
+        rather than abort).
+
+        Like `render_frame`, we catch `RustRendererRespawnedError` first
+        and re-raise unwrapped — though it's unusual to see a respawn
+        during the initial Open (it implies the very first launch's
+        subprocess died and the proxy auto-reconnected).
+        """
+        if self._mock is not None:
+            return None  # Mock has no open()
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererRespawnedError,
+            RustRendererSubprocessError,
+        )
+        try:
+            return self._primary.open()
+        except RustRendererRespawnedError:
+            raise
+        except RustRendererSubprocessError as e:
+            self._swap_to_mock(f"open: {e}")
+            raise
+
+    def close(self) -> None:
+        """Tear down whichever instance is active. Idempotent; safe
+        to call multiple times. Mock has no close() of its own (it's
+        a file-write target), so closing the wrapper after fallback
+        just marks us closed."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._primary is not None:
+            try:
+                self._primary.close()
+            except Exception:
+                log.debug("primary close during wrapper teardown raised", exc_info=True)
+            self._primary = None
+        # Drop the Mock reference too -- subsequent ops would fail
+        # cleanly via the closed flag.
+        self._mock = None
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        try:
+            self.close()
+        except Exception:
+            log.exception("AutoFallbackRenderer.close failed during __exit__")
+
+    # --- IPC ops (forwarded to proxy; AutoFallbackInMockError after swap) ---
+
+    def begin_slide(self, *args, **kwargs):
+        return self._forward_ipc_op("begin_slide", args, kwargs)
+
+    def advance(self, *args, **kwargs):
+        return self._forward_ipc_op("advance", args, kwargs)
+
+    def begin_transition(self, *args, **kwargs):
+        return self._forward_ipc_op("begin_transition", args, kwargs)
+
+    def capture(self, *args, **kwargs):
+        return self._forward_ipc_op("capture", args, kwargs)
+
+    def reconfigure(self, *args, **kwargs):
+        return self._forward_ipc_op("reconfigure", args, kwargs)
+
+    def _forward_ipc_op(self, op_name: str, args: tuple, kwargs: dict):
+        if self._mock is not None:
+            raise AutoFallbackInMockError(
+                f"{op_name}: wrapper is in MockRenderer fallback; IPC ops "
+                f"unavailable. Switch to render_frame() for the rest of "
+                f"the session, or restart the process to retry the sidecar."
+            )
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererRespawnedError,
+            RustRendererSubprocessError,
+        )
+        method = getattr(self._primary, op_name)
+        try:
+            return method(*args, **kwargs)
+        except RustRendererRespawnedError:
+            # Successful auto-reconnect; the proxy is alive. Let the
+            # caller see the original RespawnedError so they replay
+            # session state on the new subprocess.
+            raise
+        except RustRendererSubprocessError as e:
+            self._swap_to_mock(f"{op_name}: {e}")
+            raise AutoFallbackInMockError(
+                f"{op_name}: subprocess exhausted; swapped to MockRenderer. "
+                f"Subsequent ops should use render_frame(). (cause: {e})"
+            ) from e
+
+
+class AutoFallbackInMockError(Exception):
+    """Raised when an IPC op is called on an AutoFallbackRenderer that
+    has already swapped to MockRenderer. Mock can't satisfy IPC
+    semantics; callers must switch to `render_frame()` or restart the
+    process to retry the sidecar.
+    """
 
 
 def _resolve_content_root() -> Path:
@@ -132,9 +361,14 @@ def _real_renderer_singleton():
 
 
 def _rust_sidecar_renderer_or_fallback():
-    """Phase 7 slice 2 (2026-05-13): construct a RustRenderer instance
-    from `rendering/rust_renderer.py`. On import or construction failure,
-    fall back to MockRenderer (same defensive pattern the DRM path uses).
+    """Phase 7 slice 2 (2026-05-13) + slice 4-prep (2026-05-14):
+    construct a RustRenderer instance from `rendering/rust_renderer.py`,
+    wrapped in `AutoFallbackRenderer` so reconnect exhaustion at
+    runtime degrades to MockRenderer instead of crashing playback.
+
+    On IMPORT or CONSTRUCTION failure, fall back to bare
+    MockRenderer immediately -- the AutoFallbackRenderer needs a
+    primary to wrap, so no proxy means no wrapper.
 
     Env vars (proxy-specific):
       OPENMARQUEE_RENDERER_BINARY   path to the Rust binary
@@ -151,8 +385,8 @@ def _rust_sidecar_renderer_or_fallback():
     is unchanged until an operator sets OPENMARQUEE_RENDERER=rust-sidecar.
     Slice 4 will teach playback.py to use the proxy's IPC ops instead of
     render_frame; until then, even an opted-in caller will hit the
-    NotImplementedError on the first frame (the proxy refuses push-frame
-    rendering by design).
+    NotImplementedError on the first frame (the wrapper forwards
+    render_frame to the proxy, which refuses push-frame rendering).
     """
     try:
         from openmarquee.rendering.rust_renderer import RustRenderer
@@ -168,7 +402,7 @@ def _rust_sidecar_renderer_or_fallback():
     )
     content_root = _resolve_content_root()
     try:
-        return RustRenderer(
+        primary = RustRenderer(
             width=width,
             height=height,
             binary_path=binary_path,
@@ -177,6 +411,7 @@ def _rust_sidecar_renderer_or_fallback():
     except Exception:
         log.exception("RustRenderer construction failed; falling back to mock")
         return _mock_renderer_singleton()
+    return AutoFallbackRenderer(primary, _mock_renderer_singleton)
 
 
 def get_renderer():
