@@ -26,6 +26,14 @@ mod lru;
 mod mem;
 mod playback;
 mod profile;
+// V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
+// M2M decoder client. Open + capability query are wired; format-set,
+// REQBUFS, STREAMON, and the decode loop are stubbed for piece 2b.
+// Module is declared unconditionally so Mac `cargo check` syntax-
+// validates the file; the items that link against libc/nix are
+// individually `#[cfg(target_os = "linux")]` gated inside the
+// module so Mac compiles + runs the pure-Rust tests.
+mod v4l2;
 
 use std::path::PathBuf;
 

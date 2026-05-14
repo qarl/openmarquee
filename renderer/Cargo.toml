@@ -64,6 +64,15 @@ libc = "0.2"
 # struct. Same major version drm-rs links against to avoid layout
 # drift.
 drm-ffi = "0.8"
+# V4L2 piece 2a (2026-05-14): typed ioctl macros for the V4L2 M2M
+# H.264 decoder client (src/v4l2.rs). `nix::ioctl_read!` / similar
+# compute the ioctl number (size + dir + nr + type) from the Rust
+# struct's size at compile time, so the in-Rust struct definition
+# of V4l2Capability et al. has to match the kernel's <linux/
+# videodev2.h> byte-for-byte. Nix's `ioctl` feature is what we
+# need; the crate's default features pull in a lot of other Linux
+# syscall wrappers we don't use.
+nix = { version = "0.29", features = ["ioctl"], default-features = false }
 
 [dev-dependencies]
 # Integration tests for content.rs's file-IO wrappers.
