@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -23,7 +24,7 @@ from openmarquee.dependencies import (
     get_tombstone_storage,
 )
 from openmarquee.flock import FlockStorage
-from openmarquee.flock_sync import NotifyKind
+from openmarquee.flock_sync import FlockSync, NotifyKind
 from openmarquee.tombstone import TombstoneStorage
 
 
@@ -34,20 +35,55 @@ _TINY_PNG_B64 = (
 )
 
 
+def _build_mocked_flock_sync(
+    flock: FlockStorage,
+    content: ContentStorage,
+    tombstones: TombstoneStorage,
+) -> FlockSync:
+    # task #94 root cause: the default FlockSync builds a real
+    # httpx.AsyncClient that issues DNS lookups against test-fixture
+    # peer addresses (e.g. "lobby.ts.net"). On macOS that loads
+    # CFNetwork into a worker thread, which marks the process
+    # multi-threaded; any later subprocess.run() child SIGSEGVs in
+    # `*** multi-threaded process forked ***`. Swap in a MockTransport
+    # so no real network init ever happens. 200 + {} is permissive for
+    # every path: status-only callers (_post_hello, _push_one,
+    # announce_sync_to_peer) treat <400 as success; probe_peer_name
+    # parses r.json() and a {} dict cleanly returns no sign_name.
+    def _handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    return FlockSync(
+        content_storage=content,
+        tombstone_storage=tombstones,
+        flock_storage=flock,
+        get_self_address=lambda: "test-host.ts.net",
+        get_sync_enabled=lambda: True,
+        http_client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(_handler), timeout=5.0
+        ),
+    )
+
+
 @pytest.fixture
 def storage(tmp_path: Path) -> FlockStorage:
     return FlockStorage(tmp_path / "flock.json")
 
 
 @pytest.fixture
-def client(storage: FlockStorage) -> TestClient:
+def client(storage: FlockStorage, tmp_path: Path) -> TestClient:
+    content = ContentStorage(tmp_path / "content")
+    tombstones = TombstoneStorage(tmp_path / "tombstones.json")
+    sync = _build_mocked_flock_sync(storage, content, tombstones)
     app.dependency_overrides[get_flock_storage] = lambda: storage
+    app.dependency_overrides[get_flock_sync] = lambda: sync
     try:
         with TestClient(app) as test_client:
             yield test_client
     finally:
         app.dependency_overrides.clear()
         _flock_storage_singleton.cache_clear()
+        _flock_sync_singleton.cache_clear()
 
 
 @pytest.fixture
@@ -57,9 +93,11 @@ def manifest_client(tmp_path: Path):
     flock = FlockStorage(tmp_path / "flock.json")
     content = ContentStorage(tmp_path / "content")
     tombstones = TombstoneStorage(tmp_path / "tombstones.json")
+    sync = _build_mocked_flock_sync(flock, content, tombstones)
     app.dependency_overrides[get_flock_storage] = lambda: flock
     app.dependency_overrides[get_content_storage] = lambda: content
     app.dependency_overrides[get_tombstone_storage] = lambda: tombstones
+    app.dependency_overrides[get_flock_sync] = lambda: sync
     try:
         with TestClient(app) as test_client:
             yield test_client
@@ -68,6 +106,7 @@ def manifest_client(tmp_path: Path):
         _flock_storage_singleton.cache_clear()
         _content_storage_singleton.cache_clear()
         _tombstone_storage_singleton.cache_clear()
+        _flock_sync_singleton.cache_clear()
 
 
 def test_get_empty_flock_returns_empty_peer_list(client: TestClient):
