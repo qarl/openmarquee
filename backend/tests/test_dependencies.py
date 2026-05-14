@@ -666,7 +666,7 @@ class TestAutoFallbackRenderer:
         )
 
         fake = _FakeRustRenderer()
-        wire_msg = "paint_slide: video slides TBD (image + text both supported)"
+        wire_msg = "Capture: VideoSlide capture not implemented (image + text only)"
         fake.raise_on_op["begin_slide"] = RustRendererUnsupportedSlideError(wire_msg)
         wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
         with pytest.raises(RustRendererUnsupportedSlideError) as exc_info:
@@ -693,7 +693,7 @@ class TestAutoFallbackRenderer:
 
         fake = _FakeRustRenderer()
         fake.raise_on_op["advance"] = RustRendererUnsupportedSlideError(
-            "paint_slide: video slides TBD (image + text both supported)"
+            "Capture: VideoSlide capture not implemented (image + text only)"
         )
         wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
         with caplog.at_level(_logging.INFO, logger="openmarquee.dependencies"):

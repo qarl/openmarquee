@@ -142,10 +142,12 @@ class RustRendererOpError(RustRendererError):
       - "paint_slide: image_slide requires content_root (--content-root)"
       - "paint_transition: from non-text slide TBD"
       - "paint_transition: to non-text slide TBD"
-      - "Capture: video slides TBD (image + text both supported)"
+      - "Capture: VideoSlide capture not implemented (image + text only)"
         (V4L2 piece 3e: paint_slide for Video now renders; Capture
-        still TBD pending a separate piece -- the Capture wire
-        marker stays for VideoSlide screenshots / thumbnails.)
+        for Video remains a separate arc — Video screenshots /
+        thumbnails out of scope. The marker uses its own distinct
+        substring so paint_slide failures can't be misclassified
+        as the deferred Capture path.)
 
     Subclass `RustRendererUnsupportedSlideError` covers the slide-kind-
     not-implemented cases (today: non-text transition; Capture of
@@ -175,8 +177,9 @@ class RustRendererUnsupportedSlideError(RustRendererOpError):
     from generic op-errors catch this first.
 
     Wire-format substrings that promote to this class:
-      - "video slides TBD"          (paint_slide / Capture)
-      - "non-text slide TBD"        (paint_transition from/to)
+      - "VideoSlide capture not implemented"  (Capture only;
+                                                paint_slide ships)
+      - "non-text slide TBD"                  (paint_transition from/to)
 
     Do not re-word the matched substrings without bumping the cargo
     tests in `renderer/src/ipc_main.rs` in lockstep.
@@ -210,21 +213,19 @@ class RustRendererUnsupportedTransitionError(RustRendererOpError):
     """
 
 
-# V4L2 piece 3e (2026-05-14): the paint-side validator no longer
-# emits "video slides TBD" -- VideoSlide paint is now wired through
-# the V4L2 M2M H.264 decoder + GLES BT.601 NV12 shader. The marker
-# substring stays in this tuple because the Capture-side validator
-# still emits "Capture: video slides TBD (image + text both
-# supported)" (Video screenshots / thumbnails are out of scope for
-# piece 3); leaving the substring keeps that Capture path on the
-# PIL-fallback wire so dashboards still work. If paint fails at
-# runtime (e.g., asset.mp4 corrupt, codec absent, frame upload
-# failure), the sidecar emits a different message that falls
-# through to bare RustRendererOpError -- the Python proxy treats
-# that as a hard render failure (no fallback), matching the
-# Image-slide / Text-slide failure shape.
+# Closed 2026-05-14 (this commit): the legacy "video slides TBD"
+# substring is gone from the tuple. VideoSlide paint is wired
+# through V4L2 M2M H.264 decode + GLES BT.601 NV12 shader (pieces
+# 3 + 4); Capture-side still emits its own distinct marker for
+# VideoSlide screenshots / thumbnails (separate arc). The
+# Capture marker now uses a non-overlapping substring so a real
+# paint_slide failure (asset.mp4 corrupt, codec absent, frame
+# upload failure) can NEVER be misclassified as the deferred
+# Capture path -- those failures fall through to bare
+# RustRendererOpError as a hard render failure (no fallback),
+# matching the Image-slide / Text-slide failure shape.
 _UNSUPPORTED_SLIDE_WIRE_MARKERS: tuple[str, ...] = (
-    "video slides TBD",
+    "VideoSlide capture not implemented",
     "non-text slide TBD",
 )
 

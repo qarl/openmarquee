@@ -661,7 +661,7 @@ fn capture_current_scene_to_png(
         ),
         ContentItem::Video(_) => {
             // Unreachable: validator rejects Video.
-            return err("Capture: video slides TBD (image + text both supported)");
+            return err("Capture: VideoSlide capture not implemented (image + text only)");
         }
     };
     if let Err(e) = paint_res {
@@ -713,10 +713,14 @@ fn validate_paint_slide_inputs(
             }
         }
         // V4L2 piece 3e: Video is now a first-class paint target.
-        // The Python proxy classifier (rust_renderer.py) loses the
-        // "video slides TBD" substring match in lockstep with this
-        // commit so VideoSlide doesn't fall back to PIL anymore.
-        // The actual decoder + demuxer must be in SlideCache.video_
+        // Capture-side still emits the
+        // "VideoSlide capture not implemented" marker (separate
+        // arc — Video thumbnails / screenshots are out of scope
+        // for the V4L2 paint work). The Python proxy classifier
+        // matches on that distinct substring so paint_slide
+        // failures (which would be a hard render bug) don't get
+        // misclassified as the deferred Capture path. The actual
+        // decoder + demuxer must be in SlideCache.video_
         // {decoders, demuxers} for the paint hook to succeed; if
         // they're missing (e.g., asset.mp4 absent / malformed /
         // codec absent at cache.load time), the paint hook returns
@@ -731,7 +735,7 @@ fn validate_capture_inputs(item: &ContentItem) -> Result<(), &'static str> {
     match item {
         ContentItem::Text(_) | ContentItem::Image(_) => Ok(()),
         ContentItem::Video(_) => {
-            Err("Capture: video slides TBD (image + text both supported)")
+            Err("Capture: VideoSlide capture not implemented (image + text only)")
         }
     }
 }
@@ -1399,7 +1403,7 @@ mod tests {
         let err_msg = validate_capture_inputs(&video_item()).unwrap_err();
         assert_eq!(
             err_msg,
-            "Capture: video slides TBD (image + text both supported)",
+            "Capture: VideoSlide capture not implemented (image + text only)",
             "wire-format error must match exactly"
         );
     }

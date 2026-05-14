@@ -368,12 +368,13 @@ def test_request_json_encoding_matches_spec(make_renderer, tmp_path):
     [
         # From renderer/src/ipc_main.rs::validate_paint_slide_inputs.
         "paint_slide: image_slide requires content_root (--content-root)",
-        "paint_slide: video slides TBD (image + text both supported)",
         # From renderer/src/ipc_main.rs::validate_paint_transition_endpoints.
         "paint_transition: from non-text slide TBD",
         "paint_transition: to non-text slide TBD",
         # From renderer/src/ipc_main.rs::validate_capture_inputs.
-        "Capture: video slides TBD (image + text both supported)",
+        # (paint_slide for Video now succeeds via V4L2 pieces 3+4;
+        # only Capture remains unimplemented for VideoSlide.)
+        "Capture: VideoSlide capture not implemented (image + text only)",
     ],
 )
 def test_err_response_raises_op_error_with_stable_message(
@@ -420,8 +421,10 @@ def test_op_error_is_subclass_of_renderer_error(make_renderer):
 @pytest.mark.parametrize(
     "wire_string",
     [
-        "paint_slide: video slides TBD (image + text both supported)",
-        "Capture: video slides TBD (image + text both supported)",
+        # paint_slide for Video is now wired (V4L2 pieces 3+4); the
+        # only remaining UnsupportedSlide wire-format for Video is
+        # the Capture-side validator.
+        "Capture: VideoSlide capture not implemented (image + text only)",
         "paint_transition: from non-text slide TBD",
         "paint_transition: to non-text slide TBD",
     ],
@@ -455,7 +458,7 @@ def test_unsupported_slide_error_is_subclass_of_op_error(make_renderer):
     r = make_renderer(
         env_extra={
             "FAKE_SIDECAR_RECONFIGURE_ERR":
-                "paint_slide: video slides TBD (image + text both supported)"
+                "Capture: VideoSlide capture not implemented (image + text only)"
         }
     )
     try:
@@ -465,6 +468,28 @@ def test_unsupported_slide_error_is_subclass_of_op_error(make_renderer):
         assert isinstance(exc_info.value, RustRendererUnsupportedSlideError)
     finally:
         r.close()
+
+
+def test_legacy_video_slides_tbd_marker_is_gone():
+    """Regression guard for qa/v1-spec-delta-2026-05-14.md final P2.
+
+    The legacy "video slides TBD" wire-substring used to match both
+    the paint_slide validator AND the Capture validator. Paint
+    shipped via V4L2 pieces 3+4; Capture's marker was renamed to a
+    distinct substring ("VideoSlide capture not implemented") so a
+    paint_slide-side failure (asset.mp4 corrupt, codec absent,
+    frame upload failure) can never be misclassified as the deferred
+    Capture path. This test pins the absence of the legacy substring
+    so a future regression that re-introduces it gets caught loud.
+    """
+    from openmarquee.rendering.rust_renderer import (
+        _UNSUPPORTED_SLIDE_WIRE_MARKERS,
+    )
+
+    for marker in _UNSUPPORTED_SLIDE_WIRE_MARKERS:
+        assert "video slides TBD" not in marker, (
+            f"legacy 'video slides TBD' substring found in marker: {marker!r}"
+        )
 
 
 def test_generic_op_error_not_promoted(make_renderer):

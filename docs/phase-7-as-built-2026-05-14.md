@@ -187,13 +187,20 @@ swap + commit. Frame drops BEFORE swap so its
 memory: ~10-15 MB at 720p (~20-25 MB at 1080p) for the 4+4
 buffer pool; CMA usage ~196 MB during decode.
 
-**Known doc-vs-code gap (surface for follow-up):** the
-`_UNSUPPORTED_SLIDE_WIRE_MARKERS` tuple in `rust_renderer.py`
-still contains `"video slides TBD"`. Reason: the Capture-side
-validator still emits `"Capture: video slides TBD (image +
-text both supported)"` for VideoSlide screenshots, and the
-substring match catches both. Once VideoSlide capture lands
-(separate piece), this marker should be split or removed.
+**Doc-vs-code gap CLOSED 2026-05-14:** the
+`_UNSUPPORTED_SLIDE_WIRE_MARKERS` tuple's legacy `"video slides
+TBD"` substring is gone. The Capture-side validator now emits
+`"Capture: VideoSlide capture not implemented (image + text
+only)"` — a distinct phrasing without the legacy "TBD"
+overlap. The marker tuple matches `"VideoSlide capture not
+implemented"` so paint_slide-side failures (asset.mp4 corrupt,
+codec absent, frame upload failure) fall through to bare
+`RustRendererOpError` as a hard render failure instead of
+silently classifying as UnsupportedSlide. Capture for Video
+remains a separate arc (Video screenshots / thumbnails).
+Regression-guard test at
+`backend/tests/rendering/test_rust_renderer.py::
+test_legacy_video_slides_tbd_marker_is_gone`.
 
 ## 4. Perf characteristics
 

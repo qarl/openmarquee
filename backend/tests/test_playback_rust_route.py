@@ -119,7 +119,7 @@ class _FakeRustRenderer:
         self.begin_slide_calls.append((slide_id, t0_ms, duration_ms))
         if slide_id in self.unsupported_slide_ids:
             raise RustRendererUnsupportedSlideError(
-                "paint_slide: video slides TBD (image + text both supported)"
+                "Capture: VideoSlide capture not implemented (image + text only)"
             )
         self._current_slide = slide_id
         self._begin_t_ms = int(t0_ms)
