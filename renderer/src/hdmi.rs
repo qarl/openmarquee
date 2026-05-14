@@ -2440,6 +2440,31 @@ pub fn paint_and_present_one_frame_for_slide(
             session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
         }
     }
+    // QA-direct (2026-05-14 paint_slide profile, 34e952d): the IPC
+    // sidecar path was passing glyph_cache=None / tex_cache=None,
+    // so layout_text_to_alpha fired for every layer on every frame.
+    // 85.9% of paint_us was CPU font rasterize for the 4 heavy FYS
+    // slides. Mirror render_animated_slide_in_session's get-or-init
+    // against session.slide_caches keyed by slide_id (line ~1204).
+    // Existing 6-slide LRU (Atlas SB P0) handles bounded growth.
+    {
+        let needs_new = match session.slide_caches.get(&slide.id) {
+            Some(c) => c.glyph.len() != text_layers.len(),
+            None => true,
+        };
+        if needs_new {
+            if let Some(old) = session.slide_caches.remove(&slide.id) {
+                free_slide_render_cache(session.gl, old);
+            }
+            session
+                .slide_caches
+                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+        }
+    }
+    let cache = session
+        .slide_caches
+        .get_mut(&slide.id)
+        .expect("slide_caches entry initialized above");
     let t_after_setup = if trace { Some(std::time::Instant::now()) } else { None };
 
     paint_slide(
@@ -2450,9 +2475,9 @@ pub fn paint_and_present_one_frame_for_slide(
         &text_layers,
         Some(&motion_states),
         wall_clock_unix,
-        None,
+        Some(&mut cache.glyph),
         Some(&mut session.image_bg_cache),
-        None,  // tex_cache: one-shot capture path, no caching needed
+        Some(&mut cache.tex),
     )?;
     unsafe { session.gl.flush(); }
     let t_after_paint = if trace { Some(std::time::Instant::now()) } else { None };
