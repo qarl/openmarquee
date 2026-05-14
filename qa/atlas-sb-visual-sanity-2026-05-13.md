@@ -65,3 +65,33 @@ Atlas SB half-rez scissored-bake produces visually-indistinguishable output from
   * Force-mode: 1920x1080@60 (EDID-less override per Bug 17 / #268).
   * Capture date: 2026-05-13.
   * Re-bless: `bash scripts/renderer_cross_build.sh && scp <binary> openmarquee@openMarqueeDev:/tmp/openmarquee-render-fullres && ssh ... run captures && scp PNGs back && python3 scripts/atlas_sb_ssim.py --include-stretch`.
+
+## Addendum — tick > 0 stretch (motion-in-flight)
+
+Closes the "motion frozen" limitation flagged in the Limitations section. Added `--capture-motion-tick TICK` flag (mirror plumbing through both `capture_sb_transition_mid_to_png` and `capture_fullres_transition_mid_to_png` via `motion_tick_override: Option<f64>` param; None preserves the legacy tick=0 pin). Re-ran the same 5 SP-portable transitions + motion-on-both-sides stretch at tick=2.5s (motion phase well into the non-zero region for shake / bounce / breathe).
+
+| Kind     | SSIM   | Max ΔL1 | Mean ΔL1 | %px Δ>50 | Gate (≥0.95) |
+|----------|--------|---------|----------|----------|--------------|
+| cut      | 0.9994 |      63 |    0.131 |   0.000% | PASS         |
+| fade     | 0.9990 |      36 |    0.133 |   0.000% | PASS         |
+| wipe     | 0.9990 |      70 |    0.136 |   0.034% | PASS         |
+| slide    | 0.9981 |     255 |    0.193 |   0.056% | PASS         |
+| pixelate | 0.9998 |      15 |    0.107 |   0.000% | PASS         |
+| stretch  | 0.9984 |      44 |    0.233 |   0.000% | PASS         |
+
+Captured at tick=2.5s on dev Pi `openmarquee@openMarqueeDev`, 1920x1080@60.
+
+**All 6 fixtures PASS at the 0.95 gate.** Numbers track the tick=0 baseline to within noise (largest delta: mean ΔL1 went 0.115→0.131 on cut; stretch's max ΔL1 went 41→44; SSIM didn't shift by more than 0.0006 on any fixture). The marginal uptick at higher motion phase suggests the SB bake has a tiny softening contribution from motion-in-flight glyph offsets, but it remains **26x above the gate** at worst case ((1-0.95)/(1-0.9981)).
+
+**Verdict update.** Atlas SB output remains visually-indistinguishable from a full-res reference baseline at non-zero motion tick. The "motion frozen" caveat from the original limitations section is closed. The original verdict (SB bake is not the marquee 29.5 vc4 ceiling) holds at motion-in-flight.
+
+Pi capture command (per-fixture):
+```
+/tmp/openmarquee-render-tick --output hdmi <FLAG> \
+    --fade-from <FROM> --fade-to <TO> --transition <KIND> \
+    --capture-sb-t 0.5 --capture-motion-tick 2.5 \
+    --content-root /tmp/render-test-content \
+    --capture-path <OUT> --force-mode 1920x1080@60
+```
+
+Where `<FLAG>` is `--capture-sb-mid` or `--capture-fullres-mid`. The `--capture-motion-tick 2.5` is the new override; without it, captures pin motion at tick=0.

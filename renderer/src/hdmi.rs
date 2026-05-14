@@ -2805,6 +2805,10 @@ pub fn capture_sb_transition_mid_to_png(
     kind: &str,
     t: f32,
     png_path: &Path,
+    // 2026-05-13 tick>0 stretch: motion_tick_override pins the
+    // tick fed into motion_states_for_layers. None preserves the
+    // legacy tick=0 (Batch 17.fix-A) reproducibility pin.
+    motion_tick_override: Option<f64>,
 ) -> Result<()> {
     use crate::hdmi_logic::rgba_to_png_bytes;
     use glow::HasContext;
@@ -2892,11 +2896,18 @@ pub fn capture_sb_transition_mid_to_png(
             f
         };
 
-        let states_a = motion_states_for_layers(slide_a.id, &layers_a, 0.0);
-        let states_b = motion_states_for_layers(slide_b.id, &layers_b, 0.0);
+        // 2026-05-13 tick>0 stretch: when motion_tick_override is Some,
+        // both slides bake at that tick so motion is in-flight; when
+        // None, both bake at tick=0 for the legacy 17.fix-A bless
+        // reproducibility pin.
+        let motion_tick = motion_tick_override.unwrap_or(0.0);
+        let states_a = motion_states_for_layers(slide_a.id, &layers_a, motion_tick);
+        let states_b = motion_states_for_layers(slide_b.id, &layers_b, motion_tick);
         // 17.fix-A: same wall_clock pin as 17.2 applied to
-        // capture_slide_to_png. Motion states pin to tick=0 above,
-        // but wall_clock_unix flows into paint_slide_with_viewport
+        // capture_slide_to_png. Motion states use motion_tick above
+        // (defaults to 0 per the original 17.fix-A pin, override
+        // available via --capture-motion-tick for tick>0 stretch
+        // verification), and wall_clock_unix flows into paint_slide_with_viewport
         // at lines ~2932/2965 and the motion compositor uses it to
         // derive phase for time-based effects (ticker horizontal
         // wrap, blink, etc.). Without pinning wall_clock, a re-run
@@ -3084,6 +3095,10 @@ pub fn capture_fullres_transition_mid_to_png(
     kind: &str,
     t: f32,
     png_path: &Path,
+    // 2026-05-13 tick>0 stretch: see sibling capture_sb_transition_
+    // mid_to_png. Same semantics: None preserves the tick=0 pin, Some
+    // bakes both slides at that motion tick for in-flight comparison.
+    motion_tick_override: Option<f64>,
 ) -> Result<()> {
     use crate::hdmi_logic::rgba_to_png_bytes;
     use glow::HasContext;
@@ -3100,10 +3115,13 @@ pub fn capture_fullres_transition_mid_to_png(
         let ccp = cached_composite_program(session.gl, kind)?;
         let vbo = ensure_transition_sp_quad_vbo(session)?;
 
-        // Same tick + wall_clock pin as SB path: motion at phase
-        // zero, wall_clock at epoch. Makes bless captures reproducible.
-        let states_a = motion_states_for_layers(slide_a.id, &layers_a, 0.0);
-        let states_b = motion_states_for_layers(slide_b.id, &layers_b, 0.0);
+        // Same tick + wall_clock pin as SB path: motion at the
+        // override (or phase 0 by default), wall_clock at epoch.
+        // Makes bless captures reproducible AND keeps SB / fullres
+        // on the same motion phase for fair SSIM comparison.
+        let motion_tick = motion_tick_override.unwrap_or(0.0);
+        let states_a = motion_states_for_layers(slide_a.id, &layers_a, motion_tick);
+        let states_b = motion_states_for_layers(slide_b.id, &layers_b, motion_tick);
         let wall_clock_unix: i64 = 0;
 
         let gl = session.gl;

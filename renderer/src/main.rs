@@ -230,6 +230,18 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     capture_sb_t: f32,
 
+    /// QA-direct (2026-05-13) -- override the motion `tick_seconds`
+    /// value used by both --capture-sb-mid and --capture-fullres-mid
+    /// when computing motion_states. Without this flag the captures
+    /// use tick=0 (Batch 17.fix-A bless reproducibility pin); with
+    /// this flag, motion is rendered at the specified tick so the
+    /// SB-vs-fullres parity comparison can exercise motion-in-flight
+    /// (closes the "motion frozen" limitation flagged in
+    /// qa/atlas-sb-visual-sanity-2026-05-13.md). Per-fixture re-bless
+    /// is required when the tick changes.
+    #[arg(long)]
+    capture_motion_tick: Option<f64>,
+
     /// QA-direct (2026-05-13) Atlas SB visual-sanity counterpart
     /// to --capture-sb-mid. Takes the SAME args (--fade-from /
     /// --fade-to / --transition / --capture-sb-t / --capture-path
@@ -1395,6 +1407,7 @@ fn main() -> Result<()> {
                         &args.transition,
                         args.capture_sb_t,
                         png_path,
+                        args.capture_motion_tick,
                     )?;
                     return Ok(());
                 }
@@ -1455,6 +1468,7 @@ fn main() -> Result<()> {
                         &args.transition,
                         args.capture_sb_t,
                         png_path,
+                        args.capture_motion_tick,
                     )?;
                     return Ok(());
                 }
