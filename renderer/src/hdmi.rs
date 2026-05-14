@@ -306,10 +306,12 @@ pub struct EglSession<'a> {
     /// boundary -- visible "phase confusion" on glass at every
     /// hold->transition or transition->hold edge.
     ///
-    /// Fix: tick_seconds is `session.session_start.elapsed().
-    /// as_secs_f64()` everywhere. Motion phase is continuous
-    /// across the entire session lifetime; render calls are
-    /// transparent timing checkpoints, not phase resets.
+    /// Fix: every motion-tick derivation goes through
+    /// `EglSession::motion_tick_seconds()` (impl block below).
+    /// Motion phase is continuous across the entire session
+    /// lifetime; render calls are transparent timing checkpoints,
+    /// not phase resets. Direct reads of this field outside the
+    /// helper would re-open the regression class -- don't.
     session_start: std::time::Instant,
     /// v1-spec-delta #10 (slice c): persistent scene FBO for
     /// the brightness/gamma post-pass. Lazy-allocated on first
@@ -1231,7 +1233,7 @@ fn render_animated_slide_in_session(
             // global, NOT call-local. Motion phase stays continuous
             // across hold/transition boundaries. `elapsed` (call-
             // local) still drives the hold-loop exit at hold_ms.
-            let tick_seconds = session.session_start.elapsed().as_secs_f64();
+            let tick_seconds = session.motion_tick_seconds();
             let motion_states =
                 motion_states_for_layers(slide_id, text_layers, tick_seconds);
             let wall_clock_unix = current_unix_seconds();
@@ -2407,7 +2409,7 @@ pub fn paint_and_present_one_frame_for_slide(
     // every BeginSlide. With transitions baking motion frozen between
     // slide A and slide B, that reset produced a visible phase snap at
     // hold-A->transition AND transition->hold-B boundaries on glass.
-    let tick_seconds = session.session_start.elapsed().as_secs_f64();
+    let tick_seconds = session.motion_tick_seconds();
     let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
     let wall_clock_unix = current_unix_seconds();
 
@@ -3229,6 +3231,20 @@ impl<'a> EglSession<'a> {
         let textures = (self.scene_tex.is_some() as u32)
                      + self.image_bg_cache.len() as u32;
         crate::mem::GpuCounters { bo, fb, fbo, textures }
+    }
+
+    /// Bug 1 fix (qarl-flag 2026-05-09): the canonical motion
+    /// `tick_seconds` basis. session_start is set once at EglSession
+    /// construction and never reset, so every render path (standalone
+    /// hold / standalone transition variants / IPC sidecar) reads a
+    /// single monotonic clock. Centralizing the derivation here is
+    /// the structural guard against the same bug recurring on a new
+    /// render-call entry point -- 7417ae0 covered the 4 standalone
+    /// in-session paths; 413efca extended it to the IPC PaintSlide
+    /// path. Future paint entry points: call this, do NOT roll your
+    /// own from a call-local clock.
+    pub fn motion_tick_seconds(&self) -> f64 {
+        self.session_start.elapsed().as_secs_f64()
     }
 }
 
@@ -4279,7 +4295,7 @@ fn render_transition_animated_in_session(
             // motion against the same continuous monotonic basis
             // as the surrounding hold loops -- no phase snap at
             // transition entry / exit (qarl-flagged on glass).
-            let tick_seconds = session.session_start.elapsed().as_secs_f64();
+            let tick_seconds = session.motion_tick_seconds();
             let wall_clock_unix = current_unix_seconds();
             unsafe {
                 let t_bake_a = std::time::Instant::now();
@@ -4871,7 +4887,7 @@ fn render_transition_single_pass_in_session(
                 let frame_start_t = Instant::now();
                 let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
                 // Bug 1 fix: session-global tick (see Bug 1 doc).
-                let tick_seconds = session.session_start.elapsed().as_secs_f64();
+                let tick_seconds = session.motion_tick_seconds();
                 let wall_clock_unix = current_unix_seconds();
 
                 let states_a =
@@ -5341,7 +5357,7 @@ fn render_transition_scissored_bake_in_session(
                 let frame_start_t = Instant::now();
                 let t = (frame as f32 / (total_frames - 1).max(1) as f32).clamp(0.0, 1.0);
                 // Bug 1 fix: session-global tick (see Bug 1 doc).
-                let tick_seconds = session.session_start.elapsed().as_secs_f64();
+                let tick_seconds = session.motion_tick_seconds();
                 let wall_clock_unix = current_unix_seconds();
 
                 // Cut composite specialization (Phase 2.6) reads
