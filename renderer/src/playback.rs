@@ -713,6 +713,47 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn _print_wire_format_samples_for_proxy_development() {
+        // Run via `cargo test _print_wire_format -- --ignored --nocapture`.
+        // Used to confirm exact JSON shape for the Python proxy.
+        let u = uuid(1);
+        let v = uuid(2);
+        let cases: Vec<(&str, String)> = vec![
+            ("req_open", serde_json::to_string(&IpcRequest::Open(OpenParams {
+                output: "hdmi".into(), drm_card: None,
+                content_root: Some("/tmp".into()),
+            })).unwrap()),
+            ("req_begin_slide", serde_json::to_string(&IpcRequest::BeginSlide(BeginSlideParams {
+                slide_id: u, t0_ms: 100, duration_ms: 5000,
+            })).unwrap()),
+            ("req_advance", serde_json::to_string(&IpcRequest::Advance(AdvanceParams { t_ms: 500 })).unwrap()),
+            ("req_close", serde_json::to_string(&IpcRequest::Close).unwrap()),
+            ("resp_open_ok", serde_json::to_string(&IpcResponse::Ok {
+                result: OpResult::OpenOk { mode_w: 1920, mode_h: 1080 },
+            }).unwrap()),
+            ("resp_paint_slide", serde_json::to_string(&IpcResponse::Ok {
+                result: OpResult::PaintSlide { slide_id: u, t_in_slide_ms: 500 },
+            }).unwrap()),
+            ("resp_paint_transition", serde_json::to_string(&IpcResponse::Ok {
+                result: OpResult::PaintTransition { from: u, to: v, kind: "fade".into(), progress: 0.42 },
+            }).unwrap()),
+            ("resp_slide_complete", serde_json::to_string(&IpcResponse::Ok {
+                result: OpResult::SlideComplete { slide_id: u },
+            }).unwrap()),
+            ("resp_idle", serde_json::to_string(&IpcResponse::Ok { result: OpResult::Idle }).unwrap()),
+            ("resp_capture_ok", serde_json::to_string(&IpcResponse::Ok {
+                result: OpResult::CaptureOk { path: "/tmp/x.png".into(), bytes: 184 },
+            }).unwrap()),
+            ("resp_empty", serde_json::to_string(&IpcResponse::Ok { result: OpResult::Empty }).unwrap()),
+            ("resp_err", serde_json::to_string(&IpcResponse::Err { error: "video TBD".into() }).unwrap()),
+        ];
+        for (label, json) in cases {
+            println!("WIRE {}: {}", label, json);
+        }
+    }
+
+    #[test]
     fn advance_command_to_op_result_maps_each_variant() {
         assert_eq!(
             advance_command_to_op_result(AdvanceCommand::Idle),

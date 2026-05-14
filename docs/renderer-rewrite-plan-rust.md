@@ -409,6 +409,14 @@ Cross-compiling to aarch64 is technically clean (rust+aarch64 targets are stable
 
 ## 7. Python ↔ Rust integration
 
+**Implementation note (2026-05-13 update):** the actual sidecar wire format
+that landed in `renderer/src/ipc_main.rs` is **stdin/stdout + JSON lines**,
+not UDS + bincode as originally planned below. The simpler shape made the
+Bug-1 verify path trivial (manual stdin scripting) and the Phase 7 slice 1
+Python proxy at `backend/openmarquee/rendering/rust_renderer.py` matches the
+code, not the original §7 plan. The doc-vs-code drift is left below for
+historical context; treat the running code as the source of truth.
+
 **Decision: subprocess + Unix domain socket + length-prefixed bincode frames.**
 
 **Rejected alternatives:**
@@ -548,6 +556,12 @@ Per the spike, the unified-shader stretch goal is unlikely to close at 1080p wit
 
 **Secondary risks:**
 
+**Status update (2026-05-13):** the IPC sidecar now supports TextSlide
+(including auto_mode) + ImageSlide for PaintSlide and Capture (landed
+d6b4f6a). VideoSlide remains the only TBD per the V4L2 line below.
+Error paths are wire-format-pinned via cargo unit tests at 601820f and
+matched by the Python proxy's `RustRendererOpError.message` (slice 1).
+
 - **V4L2 M2M dmabuf modifier negotiation** is the highest-likelihood blocker. Step -1 spike mitigates. If it fails, the memcpy fallback drops video to ~25 fps; we ship that with a known-issue flag and prioritize a v4l investigation.
 - **Plane rotation property absence.** Mitigated by shader-side UV transform (free).
 - **The 2-buffer GBM scanout chain.** Step -1 spike confirms. If 3 needed, eat 8 MB CMA — within budget.
@@ -562,7 +576,7 @@ Per the spike, the unified-shader stretch goal is unlikely to close at 1080p wit
 
 - The existing Python renderer at `backend/openmarquee/rendering/` stays unchanged. Production keeps running it. The systemd unit's `OPENMARQUEE_RENDERER=auto` continues to select the Python multi-plane path or shader path per the existing logic.
 - The new Rust crate lives at `renderer/`. It builds independently. Its standalone binary is exercised by `bash scripts/deploy.sh && ssh ... openmarquee-render --playlist ... --output hdmi` — manual, alongside the running Python renderer. Because the Python renderer normally holds DRM master, the Rust standalone test requires `systemctl stop openmarquee-backend` for the test window. **A separate playlist directory** can be passed via `--content-root /var/openmarquee/content-test` if we want isolated test data.
-- After Step 7 (sidecar IPC mode lands), the Python backend gains a `RustRenderer` proxy class. The env-var `OPENMARQUEE_RENDERER=rust-sidecar` switches playback to use it. **Default stays `auto` (Python).** Operators can opt in.
+- After Step 7 (sidecar IPC mode lands), the Python backend gains a `RustRenderer` proxy class. The env-var `OPENMARQUEE_RENDERER=rust-sidecar` switches playback to use it. **Default stays `auto` (Python).** Operators can opt in. *(Phase 7 slice 1 landed 2026-05-13: `backend/openmarquee/rendering/rust_renderer.py`. Slices 2-7 — factory wiring, systemd unit, playback.py hot-path bypass — remain pending qarl-direct greenlight.)*
 - After Step 9 (acceptance soak passes on the dev Pi), the live device's systemd unit flips to `OPENMARQUEE_RENDERER=rust-sidecar`. The Python renderer code is untouched in the tree — just unselected.
 - **Emergency rollback for 30 days.** The flip is one env-var. `ssh openMarqueeDev "sudo sed -i 's/rust-sidecar/auto/' /etc/systemd/system/openmarquee-backend.service.d/override.conf && sudo systemctl daemon-reload && sudo systemctl restart openmarquee-backend"`. ~5 seconds. The Python renderer is still on disk; no rebuild needed.
 - After 30 days clean (no rollbacks invoked), Step 10 deletes `backend/openmarquee/rendering/` (except the import shim). The env-var gate goes away.
