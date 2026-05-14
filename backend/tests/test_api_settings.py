@@ -214,49 +214,32 @@ def test_put_with_no_dim_change_does_not_rerender_text_slides(
     assert content_storage.read_asset(slide.id) == original_png
 
 
-def test_put_rotation_flip_rerenders_text_slides_at_swapped_dims(
+def test_put_dim_change_preserves_stored_png_bytes(
     client: TestClient, content_storage: ContentStorage
 ):
-    """Rotating from 0 to 90 swaps width/height — text PNGs re-render
-    portrait so the device's renderer doesn't have to letterbox the
-    landscape original."""
+    """qarl-direct 2026-05-13 (DELETE-PIL Option α): display-dim
+    changes no longer re-rasterize stored PNGs on the backend. The
+    operator's last in-browser bake is preserved verbatim; the device
+    cover-fits at panel-native dims, and the next editor save re-bakes
+    at the new dims. Pin that bytes are stable across a rotation flip
+    + a resolution swap.
+    """
     slide = _seed_text_slide(content_storage, width=1920, height=1080)
-    original_dims = _png_dims(content_storage.read_asset(slide.id))
+    original_png = content_storage.read_asset(slide.id)
+    original_dims = _png_dims(original_png)
     assert original_dims == (1920, 1080)
 
     response = client.put(
         "/api/settings",
         json={
-            "display_width": 1920,
-            "display_height": 1080,
+            "display_width": 128,
+            "display_height": 64,
             "display_rotation": 90,
         },
     )
     assert response.status_code == 200
-
-    new_png = content_storage.read_asset(slide.id)
-    assert _png_dims(new_png) == (1080, 1920)
-
-
-def test_put_resolution_change_rerenders_text_slides(
-    client: TestClient, content_storage: ContentStorage
-):
-    """Switching from 1920×1080 hdmi to 128×64 hub75 re-renders text
-    slides at the smaller panel — squish kicks in for any text that
-    overflows the new width."""
-    slide = _seed_text_slide(content_storage, width=1920, height=1080)
-    response = client.put(
-        "/api/settings",
-        json={
-            "output_mode": "hub75",
-            "display_width": 128,
-            "display_height": 64,
-            "display_rotation": 0,
-        },
-    )
-    assert response.status_code == 200
-
-    assert _png_dims(content_storage.read_asset(slide.id)) == (128, 64)
+    # Bytes unchanged — no backend rasterization.
+    assert content_storage.read_asset(slide.id) == original_png
 
 
 def test_put_dim_change_with_no_text_slides_is_a_clean_noop(

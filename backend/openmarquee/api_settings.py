@@ -63,7 +63,12 @@ from openmarquee.dependencies import (
     get_settings_storage,
 )
 from openmarquee.settings import SettingsStorage, SystemSettings
-from openmarquee.text_rerender import rerender_text_slides_for_dims
+# text_rerender removed in DELETE-PIL phase 3 (qarl-direct 2026-05-13):
+# the Python+PIL rasterizer is gone; operator-saved PNGs are baked
+# browser-side via Canvas2D. Display-dim changes now leave the stored
+# PNGs intact — the device's playback engine cover-fits at panel-
+# native dims, and the operator's next edit-and-save in the editor
+# re-bakes at the new dims (Option α from the dispatch).
 from openmarquee.wifi_prefill import read_system_wifi
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -273,19 +278,14 @@ async def set_settings(
         or int(previous.display_height) != int(validated.display_height)
     )
     storage.save(validated)
-    if dims_changed:
-        # Synchronous: operator's UI re-mounts panels on the
-        # settings-updated event; if rerender ran in the background
-        # the re-mount would race ahead and fetch stale updated_at
-        # from /api/content. Cost is ~1s on a rotation flip — rare,
-        # and the operator already expects "something happens" on
-        # this knob.
-        rerender_text_slides_for_dims(
-            content_storage,
-            int(validated.display_rotation),
-            int(validated.display_width),
-            int(validated.display_height),
-        )
+    # Dim change handling (DELETE-PIL Option α, qarl-direct 2026-05-13):
+    # we used to call text_rerender.rerender_text_slides_for_dims here
+    # to re-rasterize every stored TextSlide at the new dims. With the
+    # PIL rasterizer gone, the device's playback engine cover-fits at
+    # panel-native dims when displaying the operator's last in-browser
+    # bake — the visible drift is bounded (slight pixel-density change)
+    # and corrects fully on the next operator save in the editor.
+    _ = dims_changed  # kept for clarity; could be deleted in follow-up
     return _redact_secrets(validated.model_dump())
 
 
