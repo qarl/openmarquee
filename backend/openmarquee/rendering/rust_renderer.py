@@ -232,7 +232,7 @@ class RustRenderer:
 
         self._binary_path = str(
             binary_path
-            or os.environ.get("OPENMARQUEE_RUST_BINARY", self.DEFAULT_BINARY)
+            or os.environ.get("OPENMARQUEE_RENDERER_BINARY", self.DEFAULT_BINARY)
         )
         self._content_root = str(content_root) if content_root is not None else None
         self._drm_card = drm_card

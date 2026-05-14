@@ -57,7 +57,16 @@ Environment="OPENMARQUEE_DISABLE_DEV=1"
 # bg + statics on the primary plane, animated layers on overlays,
 # scanout via vc4 HVS instead of per-tick PIL composite. Falls back
 # to MockRenderer at startup if DRM init fails (see app.py lifespan).
+#
+# Phase 7 slice 3 (2026-05-13): the Rust IPC sidecar is opt-in via
+# OPENMARQUEE_RENDERER=rust-sidecar (flip the line below). Default
+# stays `auto` per the Phase 7 migration plan -- operators opt in
+# explicitly after slice-4 playback.py bypass + V4L2 video support
+# both land. The binary lives at /usr/local/bin/openmarquee-render
+# when install.sh has staged it; override with OPENMARQUEE_RENDERER_
+# BINARY if you've put it elsewhere.
 Environment="OPENMARQUEE_RENDERER=auto"
+Environment="OPENMARQUEE_RENDERER_BINARY=/usr/local/bin/openmarquee-render"
 
 # Shader transitions still off on Pi Zero 2 W. Three rounds of
 # fixes -- cycle-aware cache eviction (2026-05-06), pool 20->6,

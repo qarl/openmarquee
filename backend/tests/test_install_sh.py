@@ -256,3 +256,70 @@ def test_dry_run_does_not_actually_mutate_filesystem(tmp_path: Path) -> None:
     # Walk tmp_path; expect nothing inside.
     contents = list(tmp_path.rglob("*"))
     assert contents == [], f"dry-run created files: {contents}"
+
+
+# --- Phase 7 slice 3 (2026-05-13): Rust IPC sidecar binary install ---
+
+
+def test_dry_run_installs_rust_sidecar_binary_to_usr_local_bin(
+    dry_output: str,
+) -> None:
+    """Slice 3 step 3b: when a staged binary is present (dry-run always
+    shows the install regardless), the script copies it to /usr/local/bin/
+    and chmod +x's it. The destination path is what the systemd unit
+    points OPENMARQUEE_RENDERER_BINARY at."""
+    # The header line.
+    assert (
+        "Install Rust IPC sidecar binary" in dry_output
+    ), "missing rust sidecar install step in dry-run"
+    # The actions: mkdir parent, cp binary, chmod +x. Each must reference
+    # the production path /usr/local/bin/openmarquee-render (the systemd
+    # unit's OPENMARQUEE_RENDERER_BINARY default).
+    assert (
+        "/usr/local/bin/openmarquee-render" in dry_output
+    ), "rust binary destination must be /usr/local/bin/openmarquee-render"
+    assert (
+        "chmod +x" in dry_output and "openmarquee-render" in dry_output
+    ), "rust binary must be chmod +x'd"
+    # The source path the staged binary is copied FROM. deploy.sh's
+    # corresponding rsync step puts it here.
+    assert (
+        "/opt/openmarquee/bin/openmarquee-render" in dry_output
+    ), "rust binary staging source must be /opt/openmarquee/bin/openmarquee-render"
+
+
+def test_dry_run_rust_sidecar_install_runs_after_systemd_units_before_hostapd(
+    dry_output: str,
+) -> None:
+    """The Rust binary install (step 3b) sits between systemd-unit install
+    (step 3) and hostapd staging (step 4). Order matters: systemd unit
+    references the binary path (OPENMARQUEE_RENDERER_BINARY), so the
+    binary must be on disk before the units get reloaded + restarted."""
+    systemd_idx = dry_output.find("Install systemd units")
+    rust_idx = dry_output.find("Install Rust IPC sidecar binary")
+    hostapd_idx = dry_output.find("Stage hostapd.conf")
+    reload_idx = dry_output.find("systemctl daemon-reload")
+    for marker, idx in [
+        ("systemd", systemd_idx),
+        ("rust binary", rust_idx),
+        ("hostapd", hostapd_idx),
+        ("daemon-reload", reload_idx),
+    ]:
+        assert idx != -1, f"missing dry-run marker: {marker}"
+    assert systemd_idx < rust_idx < hostapd_idx < reload_idx, (
+        f"slice-3 ordering broken: {systemd_idx=} {rust_idx=} "
+        f"{hostapd_idx=} {reload_idx=}"
+    )
+
+
+def test_dry_run_rust_sidecar_step_uses_root_prefix(tmp_path: Path) -> None:
+    """The Rust binary install must respect --root <prefix> so off-device
+    tests don't accidentally write to the real /usr/local/bin/."""
+    output = _run_dry(tmp_path)
+    # The dry-run paths must include the tmp prefix.
+    assert (
+        f"{tmp_path}/usr/local/bin/openmarquee-render" in output
+    ), "rust binary destination should respect --root prefix"
+    assert (
+        f"{tmp_path}/opt/openmarquee/bin/openmarquee-render" in output
+    ), "rust binary source should respect --root prefix"

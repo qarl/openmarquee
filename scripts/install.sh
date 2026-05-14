@@ -11,6 +11,10 @@
 #   2. Python venv at /opt/openmarquee/venv + pip install -e .
 #   3. Systemd unit files (openmarquee-backend, openmarquee-ap0,
 #      openmarquee-tailscale)
+#   3b. Rust IPC sidecar binary (Phase 7 slice 3) -- if staged at
+#      /opt/openmarquee/bin/openmarquee-render by deploy.sh, install
+#      to /usr/local/bin/ with chmod +x. Opt-in via OPENMARQUEE_
+#      RENDERER=rust-sidecar; absence is fine (sidecar isn't used).
 #   4. hostapd.conf staging (B.4 first-boot oneshot rotates the password)
 #   5. dnsmasq.conf for captive-portal DNS intercept
 #   6. iptables rules to redirect ap0 → port 80
@@ -146,6 +150,24 @@ for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tail
         run cp "$SRC" "$DST"
     fi
 done
+
+# --- 3b. Rust IPC sidecar binary (Phase 7 slice 3) --------------------------
+
+# Install the openmarquee-render binary to /usr/local/bin/ if deploy.sh
+# staged it under /opt/openmarquee/bin/. This binary is opt-in via
+# OPENMARQUEE_RENDERER=rust-sidecar (see backend/openmarquee/
+# dependencies.py); a missing staged binary just means the operator
+# hasn't enabled the sidecar yet -- not an error.
+RUST_BIN_STAGED="${OPT_DIR}/bin/openmarquee-render"
+RUST_BIN_INSTALLED="${ROOT_PREFIX}/usr/local/bin/openmarquee-render"
+say "Install Rust IPC sidecar binary (opt-in via OPENMARQUEE_RENDERER=rust-sidecar)"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "$RUST_BIN_STAGED" ]; then
+    run mkdir -p "$(dirname "$RUST_BIN_INSTALLED")"
+    run cp "$RUST_BIN_STAGED" "$RUST_BIN_INSTALLED"
+    run chmod +x "$RUST_BIN_INSTALLED"
+else
+    say "  no staged binary at ${RUST_BIN_STAGED}; skip (sidecar opt-in unused)"
+fi
 
 # --- 4. hostapd.conf --------------------------------------------------------
 

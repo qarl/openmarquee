@@ -59,6 +59,22 @@ rsync -avz --delete --delete-excluded \
     --exclude '._*' \
     "$OPENMARQUEE_BUILD_DIR/backend/" "$TARGET:$REMOTE_ROOT/backend/"
 
+# Phase 7 slice 3 (2026-05-13): rsync the cross-built Rust IPC sidecar
+# binary if it exists. The cross-build is heavyweight (cargo-zigbuild +
+# sysroot per scripts/renderer_cross_build.sh) so we don't kick it off
+# implicitly here -- operators run renderer_cross_build.sh ahead of
+# deploy when they want the sidecar opt-in active. A missing binary
+# just means install.sh will skip the binary install step (sidecar is
+# opt-in via OPENMARQUEE_RENDERER=rust-sidecar).
+RUST_BIN_HOST="$OPENMARQUEE_BUILD_DIR/renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-render"
+if [ -f "$RUST_BIN_HOST" ]; then
+    echo "==> rsync Rust IPC sidecar binary to $TARGET:$REMOTE_ROOT/bin/"
+    ssh "$TARGET" "mkdir -p $REMOTE_ROOT/bin"
+    rsync -avz "$RUST_BIN_HOST" "$TARGET:$REMOTE_ROOT/bin/openmarquee-render"
+else
+    echo "==> no Rust sidecar binary at $RUST_BIN_HOST; skipping (run scripts/renderer_cross_build.sh first to enable opt-in)"
+fi
+
 echo "==> rsync UI to $TARGET:$REMOTE_ROOT/ui/"
 rsync -avz --delete --delete-excluded \
     --exclude 'src/' \
