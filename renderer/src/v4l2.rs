@@ -486,8 +486,11 @@ struct DecoderInner {
     /// the File closes (Rust drops fields in declaration order,
     /// so `file` declared last is dropped last).
     ///
-    /// Populated ONLY when capture_buffer_type == Mmap. The DmaBuf
-    /// path keeps this empty + uses `capture_dmabuf_fds` instead.
+    /// Populated for BOTH MMAP-only and DmaBuf modes (piece 4a-fix
+    /// 2026-05-14: REQBUFS uses V4L2_MEMORY_MMAP regardless of
+    /// capture_buffer_type; the DmaBuf path layers an EXPBUF step
+    /// on top to ALSO obtain `capture_dmabuf_fds` referring to the
+    /// same kernel buffers).
     mapped_capture: Vec<Vec<MmapRegion>>,
     /// CAPTURE-side DMA-BUF fds. Populated ONLY when
     /// capture_buffer_type == DmaBuf (V4L2 piece 4a). One fd per
@@ -558,8 +561,12 @@ impl Drop for DecoderInner {
         // kernel), but our fd handles are no longer needed once
         // streaming has stopped + Frames have been dropped. Doing
         // this BEFORE field-order drops mapped_capture is fine --
-        // the two are disjoint resources (DmaBuf vs Mmap modes;
-        // never both populated for the CAPTURE side).
+        // since piece 4a-fix both mapped_capture (mmap regions)
+        // AND capture_dmabuf_fds (exported fds) can be populated
+        // simultaneously, but the teardown paths are disjoint:
+        // close(2) for the fds here, munmap via field-order for
+        // mapped_capture below. The kernel reference-counts the
+        // underlying buffer memory; freeing both views is safe.
         for fd in self.capture_dmabuf_fds.drain(..) {
             // SAFETY: fd was returned by VIDIOC_EXPBUF + owned by
             // self until now; close(2) is the matched teardown.
@@ -589,20 +596,26 @@ pub struct Frame {
     /// this plane"; for NV12 it's typically width*height (Y)
     /// and width*height/2 (UV).
     plane_lengths: [usize; 2],
-    /// MMAP-path: cached raw pointers + lengths into the mmap
-    /// regions for the y/uv planes. Null on the DmaBuf path
-    /// (see `dmabuf_fd` instead).
+    /// Cached raw pointers + lengths into the mmap regions for
+    /// the y/uv planes. Populated for BOTH MMAP-only and DmaBuf
+    /// paths since piece 4a-fix (REQBUFS uses V4L2_MEMORY_MMAP
+    /// regardless of capture_buffer_type; the dma_buf fds are an
+    /// ADDITIONAL view on the same kernel buffers, not a
+    /// replacement). The paint helper prefers `dmabuf_fd` when
+    /// available + EGL_EXT_image_dma_buf_import is present, but
+    /// can fall back to these CPU pointers if extensions are
+    /// missing at runtime.
     y_ptr: *const u8,
     y_len: usize,
     uv_ptr: *const u8,
     uv_len: usize,
     /// DMA-BUF path (V4L2 piece 4): the exported fd that GLES
-    /// imports via EGLImage. None on the MMAP path. Caller MUST
-    /// NOT close() this fd directly -- the Decoder owns it and
-    /// closes it from Drop after stop_streaming. EGLImage import
-    /// must happen while the Frame is alive; once imported, the
-    /// EGLImage holds its own kernel-side dmabuf reference and
-    /// the Frame can drop freely.
+    /// imports via EGLImage. None when capture_buffer_type=Mmap.
+    /// Caller MUST NOT close() this fd directly -- the Decoder
+    /// owns it and closes it from Drop after stop_streaming.
+    /// EGLImage import must happen while the Frame is alive;
+    /// once imported, the EGLImage holds its own kernel-side
+    /// dmabuf reference and the Frame can drop freely.
     dmabuf_fd: Option<std::os::fd::RawFd>,
     /// Kernel-reported `plane_fmt[0].bytesperline` -- the Y-plane
     /// stride in bytes. For bcm2835-codec NV12 this is typically
@@ -623,9 +636,11 @@ impl Frame {
     pub fn height(&self) -> u32 { self.height }
 
     /// Y plane bytes. NV12 layout: tightly packed luma samples
-    /// at `width*height` bytes (modulo stride alignment). Empty
-    /// slice on the DmaBuf path (CPU never sees the bytes; use
-    /// `dma_buf_fd()` for the EGLImage import).
+    /// at `width*height` bytes (modulo stride alignment).
+    /// Populated for BOTH MMAP and DmaBuf modes (piece 4a-fix
+    /// 2026-05-14: REQBUFS uses V4L2_MEMORY_MMAP regardless of
+    /// capture_buffer_type; the dma_buf fds are an additional
+    /// view on the same kernel buffers).
     pub fn y_plane(&self) -> &[u8] {
         if self.y_ptr.is_null() {
             return &[];
@@ -637,7 +652,8 @@ impl Frame {
     }
 
     /// UV plane bytes. NV12 layout: interleaved Cb,Cr at
-    /// `width*height/2` bytes. Empty slice on the DmaBuf path.
+    /// `width*height/2` bytes. Populated for both MMAP and
+    /// DmaBuf modes (piece 4a-fix 2026-05-14).
     pub fn uv_plane(&self) -> &[u8] {
         if self.uv_ptr.is_null() {
             return &[];
@@ -683,34 +699,17 @@ impl Drop for Frame {
         // the negotiated format + the kernel-reported lengths.
         let Some(ref cap_fmt) = inner.capture_format else { return; };
         let num_planes = cap_fmt.num_planes as usize;
-        let memory = match inner.capture_buffer_type {
-            CaptureBufferType::Mmap => V4L2_MEMORY_MMAP,
-            CaptureBufferType::DmaBuf => V4L2_MEMORY_DMABUF,
-        };
+        // Piece 4a-fix: REQBUFS used V4L2_MEMORY_MMAP regardless
+        // of capture_buffer_type, so re-QBUF on Drop is always
+        // MMAP too. The kernel manages buffers by index; the
+        // exported dma_buf fds (if any) are for the GLES paint
+        // path only.
+        let memory = V4L2_MEMORY_MMAP;
         let mut planes = [V4l2Plane::default(); 8];
-        // bcm2835-codec NV12 CAPTURE is num_planes=1 -- piece 4a's
-        // allocate_buffers enforces it for DmaBuf. Re-QBUF uses
-        // the same fd per buffer; writing the same fd to every
-        // plane (if num_planes ever >1) would be wrong.
-        debug_assert!(memory != V4L2_MEMORY_DMABUF || num_planes == 1,
-            "DmaBuf re-QBUF assumes num_planes=1");
         for p in 0..num_planes {
             planes[p].length = cap_fmt.plane_fmt[p].sizeimage;
-            // For MMAP: kernel ignores m on CAPTURE re-QBUF
-            // (looks up the index instead). For DMABUF: m must
-            // be the exported fd so the kernel re-associates the
-            // buffer with the dmabuf reference.
-            planes[p].m = match memory {
-                V4L2_MEMORY_DMABUF => {
-                    let idx = self.capture_buffer_index as usize;
-                    if idx < inner.capture_dmabuf_fds.len() {
-                        inner.capture_dmabuf_fds[idx] as u64
-                    } else {
-                        0
-                    }
-                }
-                _ => 0,
-            };
+            // MMAP: kernel ignores m on CAPTURE re-QBUF (looks up
+            // the index instead). planes[p].m stays 0.
             planes[p].bytesused = 0;
         }
         let mut buf = V4l2Buffer {
@@ -898,17 +897,24 @@ impl Decoder {
             "allocate_buffers({:?}): set_format must be called first", dir
         ))?;
 
-        // OUTPUT queue is always MMAP -- we feed compressed NAL
-        // bytes from userspace memory the codec maps in. CAPTURE
-        // queue selection is driven by capture_buffer_type so
-        // piece 4's DmaBuf path can opt into zero-copy.
-        let memory_type = match dir {
-            QueueDirection::Output => V4L2_MEMORY_MMAP,
-            QueueDirection::Capture => match inner.capture_buffer_type {
-                CaptureBufferType::Mmap => V4L2_MEMORY_MMAP,
-                CaptureBufferType::DmaBuf => V4L2_MEMORY_DMABUF,
-            },
-        };
+        // BOTH queues + BOTH modes use V4L2_MEMORY_MMAP for
+        // REQBUFS. The kernel allocates the buffer memory either
+        // way; V4L2_MEMORY_DMABUF would be for an IMPORT case
+        // (userspace gives the kernel an fd), which is not what
+        // we want on the CAPTURE side. For the DmaBuf zero-copy
+        // path we run VIDIOC_EXPBUF AFTER mmap to obtain dma_buf
+        // fds that refer to the kernel-allocated buffers --
+        // EXPBUF requires V4L2_MEMORY_MMAP to have been used at
+        // REQBUFS time.
+        //
+        // Piece 4a-fix (2026-05-14): the original piece 4a wired
+        // REQBUFS with V4L2_MEMORY_DMABUF on the CaptureBufferType
+        // ::DmaBuf path, which caused EXPBUF to fail with EINVAL
+        // -- the buffers had no kernel-side backing memory because
+        // DMABUF mode is the import direction. The fix is to keep
+        // REQBUFS as MMAP regardless of capture_buffer_type, and
+        // add EXPBUF as a post-mmap step when DmaBuf is requested.
+        let memory_type = V4L2_MEMORY_MMAP;
 
         // Step 1: VIDIOC_REQBUFS.
         let mut rb = V4l2Requestbuffers {
@@ -928,64 +934,7 @@ impl Decoder {
         }
         let num_planes = fmt.num_planes as usize;
 
-        // Step 2 branches on memory_type:
-        //  - MMAP: VIDIOC_QUERYBUF + mmap each plane (legacy path)
-        //  - DMABUF: VIDIOC_EXPBUF to obtain a fd per buffer
-        //    (one fd per buffer; bcm2835-codec NV12 has
-        //    num_planes=1, plane=0 only).
-        if memory_type == V4L2_MEMORY_DMABUF {
-            // DmaBuf path: bcm2835-codec NV12 CAPTURE is
-            // num_planes=1 (single fd covers Y + UV). Other M2M
-            // codecs with num_planes=2 would need one EXPBUF per
-            // plane; we'd return a Vec<Vec<RawFd>> instead. Out
-            // of scope until we hit such a codec.
-            if num_planes != 1 {
-                return Err(anyhow!(
-                    "DmaBuf path only supports num_planes=1 (got {})",
-                    num_planes
-                ));
-            }
-            let mut fds: Vec<std::os::fd::RawFd> = Vec::with_capacity(allocated_count);
-            for buf_idx in 0..allocated_count {
-                let mut expbuf = V4l2Exportbuffer {
-                    buf_type: dir.buf_type(),
-                    index: buf_idx as u32,
-                    plane: 0,
-                    flags: libc::O_CLOEXEC as u32,
-                    fd: -1,
-                    reserved: [0u32; 11],
-                };
-                // SAFETY: _IOWR; kernel writes expbuf.fd. Caller
-                // owns the resulting fd until close(2).
-                unsafe { vidioc_expbuf(inner.fd(), &mut expbuf) }
-                    .with_context(|| {
-                        format!("VIDIOC_EXPBUF({:?} idx={})", dir, buf_idx)
-                    })?;
-                if expbuf.fd < 0 {
-                    return Err(anyhow!(
-                        "VIDIOC_EXPBUF({:?} idx={}) returned fd={}",
-                        dir, buf_idx, expbuf.fd
-                    ));
-                }
-                fds.push(expbuf.fd);
-            }
-            match dir {
-                QueueDirection::Output => {
-                    // Unreachable: OUTPUT always MMAP. Defensive.
-                    for fd in fds.drain(..) {
-                        unsafe { libc::close(fd); }
-                    }
-                    return Err(anyhow!("DmaBuf on OUTPUT queue is unsupported"));
-                }
-                QueueDirection::Capture => {
-                    inner.capture_in_flight = vec![false; allocated_count];
-                    inner.capture_dmabuf_fds = fds;
-                }
-            }
-            return Ok(());
-        }
-
-        // MMAP path (legacy + OUTPUT).
+        // MMAP path (always).
         let mut buffer_regions: Vec<Vec<MmapRegion>> = Vec::with_capacity(allocated_count);
         for buf_idx in 0..allocated_count {
             let mut planes = [V4l2Plane::default(); 8];
@@ -1038,6 +987,59 @@ impl Decoder {
                 inner.mapped_capture = buffer_regions;
             }
         }
+
+        // Step 3 (CAPTURE + DmaBuf only): VIDIOC_EXPBUF per buffer
+        // index, obtaining an O_CLOEXEC dma_buf fd that GLES can
+        // import via EGLImage. bcm2835-codec NV12 CAPTURE has
+        // num_planes=1, so a single fd per buffer covers the
+        // entire Y+UV region (UV at offset Y_SIZE within the same
+        // buffer). Future codecs with num_planes>1 would need one
+        // fd per plane and the field shape would change to
+        // Vec<Vec<RawFd>>; we error cleanly until that's needed.
+        // The Decoder owns these fds + closes them from Drop
+        // after stop_streaming. (Piece 4a-fix.)
+        if dir == QueueDirection::Capture
+            && inner.capture_buffer_type == CaptureBufferType::DmaBuf
+        {
+            if num_planes != 1 {
+                return Err(anyhow!(
+                    "DmaBuf CAPTURE path only supports num_planes=1 (got {})",
+                    num_planes
+                ));
+            }
+            let mut fds: Vec<std::os::fd::RawFd> = Vec::with_capacity(allocated_count);
+            for buf_idx in 0..allocated_count {
+                let mut expbuf = V4l2Exportbuffer {
+                    buf_type: dir.buf_type(),
+                    index: buf_idx as u32,
+                    plane: 0,
+                    flags: libc::O_CLOEXEC as u32,
+                    fd: -1,
+                    reserved: [0u32; 11],
+                };
+                // SAFETY: _IOWR; kernel writes expbuf.fd. Caller
+                // owns the resulting fd until close(2). REQBUFS
+                // above used V4L2_MEMORY_MMAP, so the kernel HAS
+                // a buffer at this index to export -- this is
+                // the canonical pattern (piece 4a's original
+                // V4L2_MEMORY_DMABUF for REQBUFS was wrong; the
+                // kernel returned EINVAL on EXPBUF because no
+                // buffer existed at that index).
+                unsafe { vidioc_expbuf(inner.fd(), &mut expbuf) }
+                    .with_context(|| format!(
+                        "VIDIOC_EXPBUF({:?} idx={}) on MMAP-allocated buffer",
+                        dir, buf_idx
+                    ))?;
+                if expbuf.fd < 0 {
+                    return Err(anyhow!(
+                        "VIDIOC_EXPBUF({:?} idx={}) returned fd={}",
+                        dir, buf_idx, expbuf.fd
+                    ));
+                }
+                fds.push(expbuf.fd);
+            }
+            inner.capture_dmabuf_fds = fds;
+        }
         Ok(())
     }
 
@@ -1054,30 +1056,20 @@ impl Decoder {
             let Some(ref cap_fmt) = inner.capture_format else {
                 return Err(anyhow!("start_streaming: capture not formatted"));
             };
-            let (count, memory) = match inner.capture_buffer_type {
-                CaptureBufferType::Mmap => (inner.mapped_capture.len(), V4L2_MEMORY_MMAP),
-                CaptureBufferType::DmaBuf => (inner.capture_dmabuf_fds.len(), V4L2_MEMORY_DMABUF),
-            };
+            // Piece 4a-fix: REQBUFS used V4L2_MEMORY_MMAP regardless
+            // of capture_buffer_type, so the kernel manages buffers
+            // by index here too. The capture_dmabuf_fds vec (when
+            // DmaBuf mode is on) is only used by the EGLImage import
+            // path on the paint side; QBUF/DQBUF don't need it.
+            let count = inner.mapped_capture.len();
+            let memory = V4L2_MEMORY_MMAP;
             let num_planes = cap_fmt.num_planes as usize;
             for i in 0..count {
                 let mut planes = [V4l2Plane::default(); 8];
                 for p in 0..num_planes {
                     planes[p].length = cap_fmt.plane_fmt[p].sizeimage;
-                    // DmaBuf path: m.fd = the exported fd. The
-                    // kernel uses this to associate the buffer
-                    // index with the dmabuf reference. MMAP path
-                    // leaves m=0 (kernel reads from the index).
-                    if memory == V4L2_MEMORY_DMABUF {
-                        // bcm2835-codec NV12 CAPTURE is num_planes=1;
-                        // allocate_buffers DmaBuf branch enforces
-                        // this. If a future codec splits NV12 across
-                        // planes, the EXPBUF call shape changes
-                        // (one fd per plane) -- don't silently write
-                        // the same fd to every plane.
-                        debug_assert!(num_planes == 1,
-                            "DmaBuf path assumes num_planes=1");
-                        planes[p].m = inner.capture_dmabuf_fds[i] as u64;
-                    }
+                    // MMAP path: kernel reads from the buffer index;
+                    // planes[p].m stays 0.
                 }
                 let mut buf = V4l2Buffer {
                     index: i as u32,
@@ -1289,48 +1281,48 @@ impl Decoder {
         // inner mutably to flip in-flight bit + cache the values.
         drop(inner);
         let inner_mut = self.inner.lock().unwrap();
-        let (y_ptr, y_len, uv_ptr, uv_len, dmabuf_fd) = match capture_buffer_type {
-            CaptureBufferType::Mmap => {
-                if (idx as usize) >= inner_mut.mapped_capture.len() {
-                    return Err(anyhow!(
-                        "DQBUF returned out-of-range buf idx {}", idx
-                    ));
-                }
-                let region_planes = &inner_mut.mapped_capture[idx as usize];
-                let (y_ptr, y_len) = {
-                    let p = &region_planes[0];
-                    (p.ptr as *const u8, planes[0].bytesused as usize)
-                };
-                let (uv_ptr, uv_len) = if num_planes >= 2 {
-                    let p = &region_planes[1];
-                    (p.ptr as *const u8, planes[1].bytesused as usize)
-                } else {
-                    // num_planes == 1 (interleaved NV12 layout on
-                    // bcm2835-codec): the UV plane is inside the
-                    // same mmap region as Y, offset by width*height.
-                    let p = &region_planes[0];
-                    let y_size = (width * height) as usize;
-                    let total = planes[0].bytesused as usize;
-                    let uv_size = total.saturating_sub(y_size);
-                    unsafe {
-                        ((p.ptr as *const u8).add(y_size), uv_size)
-                    }
-                };
-                (y_ptr, y_len, uv_ptr, uv_len, None)
+        // Both MMAP-only and DmaBuf paths run REQBUFS as MMAP
+        // (piece 4a-fix), so mapped_capture is populated either
+        // way. The DmaBuf path additionally has fds in
+        // capture_dmabuf_fds. Populate y_ptr/uv_ptr from mmap
+        // unconditionally so the paint side can fall back to the
+        // CPU upload path if EGLImage extensions are missing at
+        // runtime; populate dmabuf_fd only when DmaBuf is enabled.
+        if (idx as usize) >= inner_mut.mapped_capture.len() {
+            return Err(anyhow!(
+                "DQBUF returned out-of-range buf idx {}", idx
+            ));
+        }
+        let region_planes = &inner_mut.mapped_capture[idx as usize];
+        let (y_ptr, y_len) = {
+            let p = &region_planes[0];
+            (p.ptr as *const u8, planes[0].bytesused as usize)
+        };
+        let (uv_ptr, uv_len) = if num_planes >= 2 {
+            let p = &region_planes[1];
+            (p.ptr as *const u8, planes[1].bytesused as usize)
+        } else {
+            // num_planes == 1 (interleaved NV12 layout on
+            // bcm2835-codec): the UV plane is inside the
+            // same mmap region as Y, offset by width*height.
+            let p = &region_planes[0];
+            let y_size = (width * height) as usize;
+            let total = planes[0].bytesused as usize;
+            let uv_size = total.saturating_sub(y_size);
+            unsafe {
+                ((p.ptr as *const u8).add(y_size), uv_size)
             }
+        };
+        let dmabuf_fd = match capture_buffer_type {
+            CaptureBufferType::Mmap => None,
             CaptureBufferType::DmaBuf => {
-                // CPU never reads the bytes on this path. y_ptr +
-                // uv_ptr stay null; y_plane()/uv_plane() return
-                // empty slices. The exported fd is what callers
-                // import into EGLImage.
                 if (idx as usize) >= inner_mut.capture_dmabuf_fds.len() {
                     return Err(anyhow!(
                         "DQBUF DmaBuf: idx {} out of range for fd table (len={})",
                         idx, inner_mut.capture_dmabuf_fds.len()
                     ));
                 }
-                let fd = inner_mut.capture_dmabuf_fds[idx as usize];
-                (std::ptr::null::<u8>(), 0usize, std::ptr::null::<u8>(), 0usize, Some(fd))
+                Some(inner_mut.capture_dmabuf_fds[idx as usize])
             }
         };
         let plane_lengths = [planes[0].bytesused as usize, planes[1].bytesused as usize];
@@ -1542,10 +1534,12 @@ mod tests {
     }
 
     /// DMA-BUF path parallel to decode_test_fixture_320x240.
-    /// Asserts Frame::dma_buf_fd() returns Some(fd) (>=0) and that
-    /// CPU-side y_plane()/uv_plane() return EMPTY slices (the bytes
-    /// live only in the GPU-shareable dmabuf, never in userspace).
-    /// Skipped cleanly when /dev/video10 absent.
+    /// Asserts Frame::dma_buf_fd() returns Some(fd) (>=0) AND
+    /// that CPU-side y_plane()/uv_plane() return non-empty
+    /// slices (piece 4a-fix: REQBUFS is V4L2_MEMORY_MMAP for
+    /// both modes; dma_buf fds are an additional view on the
+    /// kernel-allocated buffers, not a replacement). Skipped
+    /// cleanly when /dev/video10 absent.
     ///
     /// NOTE: cargo's default parallel test runner can race against
     /// the MMAP test for /dev/video10 (EBUSY). Run with
@@ -1592,11 +1586,15 @@ mod tests {
                 Ok(Some(f)) => {
                     assert_eq!(f.width(), 320, "frame width");
                     assert_eq!(f.height(), 240, "frame height");
-                    // CPU planes MUST be empty on DmaBuf path.
-                    assert!(f.y_plane().is_empty(),
-                        "y_plane() should be empty on DmaBuf");
-                    assert!(f.uv_plane().is_empty(),
-                        "uv_plane() should be empty on DmaBuf");
+                    // Piece 4a-fix: both y_plane() and uv_plane()
+                    // are populated on DmaBuf since REQBUFS now
+                    // uses V4L2_MEMORY_MMAP for both modes. The
+                    // dma_buf fd is an ADDITIONAL view, not a
+                    // replacement.
+                    assert!(!f.y_plane().is_empty(),
+                        "y_plane() should still be populated on DmaBuf");
+                    assert!(!f.uv_plane().is_empty(),
+                        "uv_plane() should still be populated on DmaBuf");
                     // The exported fd must be present + valid.
                     let fd = f.dma_buf_fd()
                         .expect("dma_buf_fd() must be Some on DmaBuf");

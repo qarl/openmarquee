@@ -2797,27 +2797,18 @@ pub fn paint_and_present_one_video_slide_frame(
             // would starve the codec of CAPTURE buffers).
             drop(frame);
             *frames_decoded += 1;
-            // Reuse the existing scanout swap+commit tail; jump
-            // there by re-binding the variables it expects.
-            // Implementation note: the swap+commit block reads
-            // `session`, `card`, and mutates session.scanout_*.
-            // It's identical for both paths, so we fall through
-            // to the shared tail by NOT taking the MMAP branch.
             return finish_video_slide_swap_and_commit(session, card);
         }
-        // Extensions missing AND the decoder is DmaBuf-primed
-        // (no MMAP buffers exist on the CAPTURE queue), so we
-        // cannot revert mid-stream. y_plane() / uv_plane() are
-        // empty slices on this path; the MMAP upload would write
-        // a black texture. Surface as Err so the operator can
-        // see the misconfiguration: OPENMARQUEE_RENDERER_DMABUF
-        // was set but the Pi's EGL stack lacks one of EGL_EXT_
-        // image_dma_buf_import / GL_OES_EGL_image_external.
-        return Err(anyhow!(
-            "OPENMARQUEE_RENDERER_DMABUF=1 but EGL extensions missing; \
-             cannot fall back to MMAP for an in-flight DmaBuf decoder. \
-             Unset the env var + restart the sidecar."
-        ));
+        // Extensions missing at runtime: fall through to the
+        // MMAP upload path below. Piece 4a-fix (2026-05-14) made
+        // this safe by keeping REQBUFS=V4L2_MEMORY_MMAP for both
+        // capture modes, so y_plane()/uv_plane() are populated
+        // regardless of capture_buffer_type. The dma_buf fd is
+        // an ADDITIONAL view used by run_nv12_dmabuf_blit_pass
+        // when extensions are present; when missing we transparently
+        // use the CPU-upload path on the same kernel buffers.
+        // No log here -- the cached extension check in
+        // dma_buf_egl_entry_points already prints once.
     }
     // MMAP path (piece 3d-e). stride==width is a bcm2835-codec
     // empirical fact; a future codec or alignment regime could
