@@ -17,15 +17,18 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from openmarquee.rendering import Renderer
 from openmarquee.rendering.rust_renderer import (
     CaptureResult,
+    HealthState,
     Idle,
     OpenResult,
     PaintSlide,
@@ -34,6 +37,7 @@ from openmarquee.rendering.rust_renderer import (
     RustRendererError,
     RustRendererOpError,
     RustRendererProtocolError,
+    RustRendererRespawnedError,
     RustRendererSubprocessError,
     SlideComplete,
 )
@@ -409,17 +413,27 @@ def test_op_error_is_subclass_of_renderer_error(make_renderer):
 
 
 def test_subprocess_death_mid_session_raises_subprocess_error(make_renderer):
-    """If the subprocess dies before responding (per the fail-loud-no-respawn
-    contract for slice 1), the next op raises RustRendererSubprocessError."""
-    # Configure fake sidecar to exit after the first begin_slide.
-    r = make_renderer(env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "begin_slide"})
+    """If the subprocess dies mid-session and reconnect is DISABLED, the
+    next op raises plain RustRendererSubprocessError. This pins the
+    fail-loud-no-respawn fallback path. (See
+    test_subprocess_death_triggers_reconnect for the auto-reconnect
+    behavior with reconnect enabled.)"""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "begin_slide"},
+        reconnect_max_retries=0,
+        watchdog_enabled=False,
+    )
     try:
         r.open()
         r.begin_slide(uuid.uuid4(), t0_ms=0, duration_ms=5000)
         # Give the subprocess a moment to exit.
         time.sleep(0.1)
-        with pytest.raises(RustRendererSubprocessError):
+        with pytest.raises(RustRendererSubprocessError) as exc_info:
             r.advance(t_ms=100)
+        # With reconnect disabled, NOT a RespawnedError.
+        assert not isinstance(exc_info.value, RustRendererRespawnedError)
+        # Trail mentions "reconnect exhausted" since max_retries=0.
+        assert "reconnect exhausted" in str(exc_info.value)
     finally:
         r.close()
 
@@ -585,6 +599,244 @@ def test_decode_response_non_object_raises_protocol_error():
     r = RustRenderer(width=1, height=1)
     with pytest.raises(RustRendererProtocolError, match="not an object"):
         r._decode_response("open", "this is a string")
+
+
+# ============================================================
+# Reconnect / watchdog / health-probe (2026-05-14 dispatch).
+# ============================================================
+
+
+def test_subprocess_death_triggers_reconnect_and_raises_respawned(make_renderer):
+    """With auto-reconnect ENABLED (default 3 retries / 60s window):
+    a subprocess that dies mid-session is transparently respawned.
+    The failing op raises RustRendererRespawnedError (a subclass of
+    SubprocessError) so callers know to replay session state.
+    Subsequent ops succeed on the fresh subprocess.
+    """
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "begin_slide"},
+        # Disable watchdog so the only reconnect path is the in-op
+        # death detection (predictable for the assertion below).
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        r.begin_slide(uuid.uuid4(), t0_ms=0, duration_ms=5000)
+        time.sleep(0.1)  # let subprocess exit
+        # The advance op detects death + reconnects + raises Respawned.
+        with pytest.raises(RustRendererRespawnedError) as exc_info:
+            r.advance(t_ms=100)
+        # Respawned is a SubprocessError subclass.
+        assert isinstance(exc_info.value, RustRendererSubprocessError)
+        # Proxy is now ready on the new subprocess.
+        assert r.is_alive is True
+        # The NEW subprocess never received a begin_slide, so DIE_AFTER_
+        # OP=begin_slide hasn't fired yet — advance + capture succeed.
+        result = r.advance(t_ms=200)
+        assert isinstance(result, PaintSlide)
+    finally:
+        r.close()
+
+
+def test_reconnect_exhausted_after_max_retries(make_renderer, tmp_path):
+    """If the subprocess dies on every op (e.g. an unrecoverable
+    binary), reconnect bounded retries (default 3) exhaust within the
+    window and a plain SubprocessError is raised with the trail."""
+    # Configure fake sidecar to die after EVERY op via die-after-open.
+    # Each reconnect attempts open + the new sub dies immediately
+    # after responding to that open.
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "open"},
+        reconnect_max_retries=2,
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()  # first open succeeds, sub dies AFTER responding
+        time.sleep(0.1)
+        # First advance: detects death → reconnect #1 (Open lands, sub
+        # dies after). The post-reconnect Open succeeded so the
+        # _send_op call inside reconnect didn't raise; we surface a
+        # RespawnedError on this op.
+        with pytest.raises(RustRendererSubprocessError):
+            r.advance(t_ms=100)
+        time.sleep(0.1)
+        # Second advance: detects death again → reconnect #2 succeeds.
+        # Surface Respawned again.
+        with pytest.raises(RustRendererSubprocessError):
+            r.advance(t_ms=100)
+        time.sleep(0.1)
+        # Third advance: would need reconnect #3, but max_retries=2 so
+        # exhausted -> plain SubprocessError (NOT RespawnedError) with
+        # trail in the message.
+        with pytest.raises(RustRendererSubprocessError) as exc_info:
+            r.advance(t_ms=100)
+        assert not isinstance(exc_info.value, RustRendererRespawnedError)
+        assert "reconnect exhausted" in str(exc_info.value)
+        # The trail should mention both prior reconnect reasons.
+        assert "trail:" in str(exc_info.value)
+    finally:
+        r.close()
+
+
+def test_reconnect_window_resets_after_idle_period(make_renderer):
+    """The reconnect counter trims out attempts older than the rolling
+    window, so a long quiet period 'forgives' transient blips."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "begin_slide"},
+        reconnect_max_retries=2,
+        reconnect_window_s=0.5,  # short window for fast test
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        r.begin_slide(uuid.uuid4(), t0_ms=0, duration_ms=5000)
+        time.sleep(0.1)
+        with pytest.raises(RustRendererRespawnedError):
+            r.advance(t_ms=100)
+        # We've used 1 of 2 reconnect slots. Wait past the window.
+        time.sleep(0.7)
+        # The probe + count should now show 0 in-window attempts.
+        health = r.health_probe()
+        assert health.reconnect_attempts_in_window == 0
+    finally:
+        r.close()
+
+
+def test_watchdog_detects_death_and_reconnects(make_renderer):
+    """The watchdog thread polls liveness; on detected death between
+    ops it triggers reconnect on its own. The next caller op finds the
+    proxy already healthy."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "begin_slide"},
+        watchdog_interval_s=0.05,  # 20Hz for fast test
+    )
+    try:
+        r.open()
+        original_pid = r._proc.pid  # type: ignore[union-attr]
+        r.begin_slide(uuid.uuid4(), t0_ms=0, duration_ms=5000)
+        # Wait long enough for the subprocess to exit AND the watchdog
+        # to notice + reconnect. 20Hz * 5 ticks = 0.25s upper bound;
+        # add a generous fudge for thread scheduling.
+        time.sleep(1.0)
+        # Watchdog should have reconnected by now: liveness restored.
+        assert r.is_alive is True
+        # And the underlying pid should be different (proves respawn).
+        assert r._proc.pid != original_pid  # type: ignore[union-attr]
+        # Reconnect bookkeeping recorded the event.
+        health = r.health_probe()
+        assert health.reconnect_attempts_in_window >= 1
+        assert any("watchdog" in r for r in health.reconnect_history)
+    finally:
+        r.close()
+
+
+def test_watchdog_joins_cleanly_on_close(make_renderer):
+    """Close() stops the watchdog thread before tearing down the
+    subprocess. After close(), no watchdog thread is alive."""
+    r = make_renderer(watchdog_interval_s=0.05)
+    r.open()
+    # Confirm watchdog is running.
+    assert r._watchdog_thread is not None
+    assert r._watchdog_thread.is_alive() is True
+    r.close()
+    assert r._watchdog_thread is None
+
+
+def test_watchdog_doesnt_deadlock_under_op_pressure(make_renderer):
+    """The watchdog must use non-blocking lock acquisition so that a
+    slow op never deadlocks it (and the watchdog thread join in close()
+    never wedges). Sanity test: fire many ops concurrently with a tight
+    watchdog tick and confirm everything completes within bounds."""
+    r = make_renderer(watchdog_interval_s=0.01)  # 100Hz
+    results: list[Any] = []
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            for _ in range(50):
+                results.append(r.advance(t_ms=42))
+        except Exception as e:
+            errors.append(e)
+
+    try:
+        r.open()
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)  # generous; should be near-instant
+            assert not t.is_alive(), "worker stuck — possible deadlock"
+        assert errors == [], f"workers raised: {errors}"
+        # 4 threads × 50 ops each.
+        assert len(results) == 200
+    finally:
+        r.close()
+
+
+def test_health_probe_alive_after_open(make_renderer):
+    r = make_renderer(watchdog_enabled=False)
+    try:
+        r.open()
+        h = r.health_probe()
+        assert isinstance(h, HealthState)
+        assert h.is_alive is True
+        assert h.exit_code is None
+        assert h.reconnect_attempts_in_window == 0
+        assert h.reconnect_history == ()
+    finally:
+        r.close()
+
+
+def test_health_probe_dead_after_close(make_renderer):
+    r = make_renderer(watchdog_enabled=False)
+    r.open()
+    r.close()
+    h = r.health_probe()
+    assert h.is_alive is False
+    # After teardown, _proc is None and exit_code is also None.
+    assert h.exit_code is None
+
+
+def test_health_probe_records_reconnect_history(make_renderer):
+    """After a reconnect, health_probe surfaces the bookkeeping."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "begin_slide"},
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        r.begin_slide(uuid.uuid4(), t0_ms=0, duration_ms=5000)
+        time.sleep(0.1)
+        with pytest.raises(RustRendererRespawnedError):
+            r.advance(t_ms=100)
+        h = r.health_probe()
+        assert h.is_alive is True
+        assert h.reconnect_attempts_in_window == 1
+        assert len(h.reconnect_history) == 1
+        # The reason mentions which op triggered + that it was attempt 1.
+        assert "attempt 1" in h.reconnect_history[0]
+    finally:
+        r.close()
+
+
+def test_reconnect_disabled_when_max_retries_zero(make_renderer):
+    """reconnect_max_retries=0 disables auto-reconnect: subprocess
+    death immediately raises plain SubprocessError on the next op."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_DIE_AFTER_OP": "begin_slide"},
+        reconnect_max_retries=0,
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        r.begin_slide(uuid.uuid4(), t0_ms=0, duration_ms=5000)
+        time.sleep(0.1)
+        with pytest.raises(RustRendererSubprocessError) as exc_info:
+            r.advance(t_ms=100)
+        assert not isinstance(exc_info.value, RustRendererRespawnedError)
+        assert r.is_alive is False  # no respawn happened
+    finally:
+        r.close()
 
 
 # ============================================================
