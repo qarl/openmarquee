@@ -2071,6 +2071,55 @@ void main() {
 }
 "#;
 
+/// V4L2 piece 4b (2026-05-14) -- DMA-BUF zero-copy NV12 sampler
+/// via `GL_OES_EGL_image_external`. Pairs with `VS_TEXTURED_QUAD`
+/// (no vertex changes needed; the difference is purely the
+/// sampler type and texture target).
+///
+/// Usage contract:
+///   - The fragment color comes from ONE `samplerExternalOES`
+///     bound to a GLES texture whose target is
+///     `GL_TEXTURE_EXTERNAL_OES`. The texture has been associated
+///     with an EGLImage created from a V4L2-exported DMA-BUF fd
+///     via `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT, attribs)`
+///     using `EGL_DMA_BUF_PLANE0_FD_EXT = fd`, both Y and UV
+///     planes referencing the SAME fd with PLANE1_OFFSET = Y_SIZE
+///     (single-plane NV12 layout from bcm2835-codec).
+///   - The Pi's Mesa stack does YUV->RGB conversion internally
+///     for external-OES samples of NV12 EGLImages -- the colors
+///     come back already in RGB space, so this shader does no
+///     BT.601 math. (Compared to FS_NV12_TO_RGB which samples two
+///     separate Y + UV textures and does the matrix in-shader.)
+///
+/// **Documented assumption to verify in piece 4e:** on the Pi 4
+/// dev board's vc4 + Mesa stack, color output from this shader
+/// matches FS_NV12_TO_RGB output side-by-side. If the on-Pi smoke
+/// shows a color cast or wrong range (e.g. dark-shadow elevated),
+/// fall back to manually applying the BT.601 transform on the
+/// .r/.g/.b channels here. Most BT.601-tagged EGLImages on Mesa
+/// hit the driver fast-path correctly; a known regression vector
+/// is when the V4L2 quantization metadata is missing or mis-set.
+///
+/// Extension requirements (checked at runtime in piece 4c):
+///   - EGL: `EGL_EXT_image_dma_buf_import`
+///   - GLES2: `GL_OES_EGL_image_external`
+///
+/// If either is missing, paint_and_present_one_video_slide_frame
+/// falls back to the MMAP path with FS_NV12_TO_RGB (piece 4d).
+pub const FS_NV12_DMABUF_TO_RGB: &str = r#"#version 100
+#extension GL_OES_EGL_image_external : require
+precision mediump float;
+uniform samplerExternalOES u_tex_external;
+varying vec2 v_uv;
+void main() {
+    // The Mesa driver decodes NV12 -> RGB for the external-OES
+    // sample on the Pi's vc4. Output is RGB in [0,1]; alpha
+    // forced to opaque (NV12 has no alpha channel).
+    vec3 rgb = texture2D(u_tex_external, v_uv).rgb;
+    gl_FragColor = vec4(rgb, 1.0);
+}
+"#;
+
 /// v1-spec-delta #7 (slice c, 2026-05-08) -- Photoshop/Pillow
 /// `overlay` blend mode. Per-channel formula:
 ///   if dst < 0.5:  out = 2 · src · dst
@@ -5582,6 +5631,55 @@ mod tests {
         // as `.ra` because GLES2 LUMINANCE_ALPHA returns L in .r
         // and A in .a (we map U->L, V->A on upload).
         assert!(FS_NV12_TO_RGB.contains(".ra"));
+    }
+
+    #[test]
+    fn fs_nv12_dmabuf_to_rgb_targets_external_oes_and_pins_extension() {
+        // V4L2 piece 4b: DMA-BUF zero-copy NV12 sampler.
+        // The shape is small but unforgiving -- a missing #extension
+        // line is a compile-time error on Pi; a sampler2D where
+        // samplerExternalOES is needed produces undefined results.
+        // Pin both the extension directive AND the external-OES
+        // sampler so a rename or accidental conversion to the
+        // legacy two-texture path fails loudly on Mac CI before
+        // it lands on Pi.
+        assert!(FS_NV12_DMABUF_TO_RGB.starts_with("#version 100\n"));
+        // Extension directive must appear BEFORE the precision +
+        // uniform declarations (GLSL ES spec: extension directives
+        // are preprocessor-tier).
+        assert!(
+            FS_NV12_DMABUF_TO_RGB.contains("#extension GL_OES_EGL_image_external : require"),
+            "missing GL_OES_EGL_image_external require"
+        );
+        assert!(FS_NV12_DMABUF_TO_RGB.contains("precision mediump float"));
+        // External OES sampler type -- distinct from sampler2D.
+        assert!(FS_NV12_DMABUF_TO_RGB.contains("samplerExternalOES"));
+        // Single sampler uniform; bound to GL_TEXTURE_EXTERNAL_OES
+        // target with an EGLImage in piece 4c.
+        assert!(FS_NV12_DMABUF_TO_RGB.contains("u_tex_external"));
+        // varying name must match VS_TEXTURED_QUAD (shared with the
+        // MMAP path so the program-cache vertex shader is reused).
+        assert!(FS_NV12_DMABUF_TO_RGB.contains("v_uv"));
+        // BT.601 math is NOT inline here -- the Pi's Mesa driver
+        // performs YUV->RGB inside the external-OES sampler fast
+        // path. The shader output is direct RGB. If a future Mesa
+        // regression breaks this assumption (color cast / wrong
+        // range), piece 4e's live-Pi smoke surfaces it; the fix
+        // would be to reintroduce the BT.601 matrix here. Pin the
+        // .rgb swizzle so an accidental sample of .raw or .rraa
+        // doesn't slip through.
+        assert!(FS_NV12_DMABUF_TO_RGB.contains(".rgb"));
+        // No alpha channel in NV12; the shader forces opaque.
+        assert!(FS_NV12_DMABUF_TO_RGB.contains("vec4(rgb, 1.0)"));
+        // CRITICAL: no manual BT.601 coefficients here. If a
+        // future patch adds them inline, the Mesa fast-path
+        // contract changed and the docstring above needs updating.
+        // (Listed coefficients from FS_NV12_TO_RGB that should
+        // NOT appear here.)
+        assert!(!FS_NV12_DMABUF_TO_RGB.contains("1.402"),
+            "BT.601 math should not be inline -- Mesa handles it");
+        assert!(!FS_NV12_DMABUF_TO_RGB.contains("255.0/219.0"),
+            "limited-range Y scale should not be inline -- Mesa handles it");
     }
 
     #[test]
