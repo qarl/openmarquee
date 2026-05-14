@@ -9,7 +9,11 @@ code; the spec has drifted in places that are now load-bearing
 
 Audience: a future maintainer (or qarl, when picking up the slice 4
 design call) who needs the current state without reverse-engineering
-~26 commits.
+~40 commits.
+
+**Refresh history:** Initial snapshot `ce440ed`. Refreshed
+2026-05-14 23:xx (this commit) to fold in slice 4 followups + V4L2
+piece 1-3 + SD-burn flow + Mac-side single-command burn.
 
 ## 1. State of Phase 7
 
@@ -18,14 +22,31 @@ design call) who needs the current state without reverse-engineering
 | 1 | **Shipped** | Python `RustRenderer` IPC proxy (`backend/openmarquee/rendering/rust_renderer.py`) | `8a2a4a0` |
 | 2 | **Shipped** | `dependencies.py` factory branch (`OPENMARQUEE_RENDERER=rust-sidecar`) | `9693517` |
 | 3 | **Shipped** | systemd unit + `install.sh` staging for the binary at `/usr/local/bin/openmarquee-render` | `cc66a5e` |
-| 4 | **Pending qarl** | `playback.py` bypass: stop pushing frames via `render_frame()`, drive IPC ops directly. Blocked on VideoSlide handling design call (task #75). | — |
-| 5+ | **Pending qarl** | Flip default to rust-sidecar; remove embedded reel-driver fallback. | — |
+| 4 | **Shipped** | `playback.py` drives the IPC ops directly via `_play_via_rust_ipc`; `UnsupportedSlideError` skip path keeps Video on PIL fallback (until V4L2 piece 3) | `71079bb` |
+| 4-followup | **Shipped** | `begin_transition` wired through the Rust IPC route (TextSlide-to-TextSlide; non-text endpoints still fall back) | `f481794` |
+| 5 | **Pending qarl** | Flip default to `OPENMARQUEE_RENDERER=rust-sidecar` after qarl visual eyeball pass on dev Pi | — |
 
-Slices 1-3 are in tree but **OFF by default**. Production paths
-unchanged until an operator sets `OPENMARQUEE_RENDERER=rust-sidecar`.
-Slice 4 turns it on; until then the proxy refuses push-frame rendering
-via `NotImplementedError` (by design — the proxy doesn't accept frame
-bytes, the sidecar owns GPU composition).
+**Adjacent arcs that shipped this session (separate workstreams,
+same flight):**
+
+| Arc | Status | What it is | Anchor commits |
+|-----|--------|------------|----------------|
+| V4L2 H.264 decode (piece 1) | **Shipped** | Dev Pi V4L2 state inventory + `docs/v4l2-decode.md` + `v4l-utils` install | `3b6c3bf` |
+| V4L2 (piece 2a) | **Shipped** | `renderer/src/v4l2.rs` Decoder client scaffold + cap query | `343fe15` |
+| V4L2 (piece 2b) | **Shipped** | Decode loop + mmap buffer pool + Frame lifetime via `Arc<Mutex<DecoderInner>>` | `5f67ea5` |
+| V4L2 (piece 3a) | **Shipped** | Hand-rolled `mp4_demux.rs` + 7 tests + 320×240 + 720p fixtures | `2dbe775` |
+| V4L2 (piece 3b) | **Shipped** | `SlideCache.video_demuxers` populated on `BeginSlide(Video)` | `c56793b` |
+| V4L2 (piece 3c) | **Shipped** | Linux-only `prime_video_decoder` opens `/dev/video10` + format-set + REQBUFS + STREAMON + SPS+PPS+IDR feed | `89f9591` |
+| V4L2 (piece 3d) | **Shipped** | `FS_NV12_TO_RGB` BT.601 limited-range shader + `CachedNv12Program` + `run_nv12_blit_pass` | `6ffcb33` |
+| V4L2 (piece 3e) | **Shipped** | `paint_and_present_one_video_slide_frame` end-to-end; `validate_paint_slide_inputs` accepts Video; Python proxy classifier docstring updated | `e7be17f` |
+| V4L2 (piece 3f) | **Live-Pi verified** | 720p smoke on dev Pi: 150/150 PaintSlide responses, mean 28.55 ms, p99 46.48 ms, max 292 ms (first-frame spike), 70 MB RSS, no EAGAIN stalls | (no commit; data captured) |
+| V4L2 (piece 4) | **Pending** | DMA-BUF zero-copy via EGLImage (perf tune; current per-frame `glTexImage2D` works but causes the p99 over budget) | — |
+| SD-burn flow | **Shipped** | `build_sd_bundle.sh` + `stage_sd_card.sh` + cloud-init + `docs/sd-burn.md` | `1aa6dfe` |
+| SD-burn from Mac | **Shipped** | `scripts/burn_sd_card.sh` single-command flasher + `scripts/tests/test_burn_sd_card.sh` (17 PASS validation gauntlet) | `6291b49` |
+
+Slices 1-4 are in tree. Production paths unchanged until an
+operator sets `OPENMARQUEE_RENDERER=rust-sidecar` AND slice 5
+flips the default; the env-switch path is the explicit opt-in.
 
 The robustness layer (reconnect + watchdog + health-probe +
 AutoFallbackRenderer) landed AFTER slices 1-3 and is wired into the
@@ -121,6 +142,47 @@ The byte-stability of error strings is pinned by cargo tests at
 strings like `"paint_slide: image_slide requires content_root
 (--content-root)"`.
 
+### VideoSlide wire path (V4L2 pieces 3a-3e, 2026-05-14)
+
+`BeginSlide(Video)` now exercises a real decode pipeline. On
+Linux, `cache.load` for a Video item does:
+
+1. `find_video_slide` parses `<content_root>/<uuid>/item.json`
+   into a `VideoSlide`.
+2. `Mp4Demuxer::open(<content_root>/<uuid>/asset.mp4)` parses
+   the MP4 box tree, extracts SPS+PPS from `avcC`, walks
+   `stsz`/`stco`/`stsc` to enumerate samples, converts
+   AVCC-length-prefixed NALs to Annex-B start-codes. Hand-rolled,
+   ~250 LOC, zero external unsafe to audit, every length read
+   bounds-checked. Stored in `SlideCache.video_demuxers`.
+3. `prime_video_decoder(&dem)` opens `/dev/video10`
+   (bcm2835-codec) via the `v4l2::Decoder` from piece 2b: S_FMT
+   OUTPUT(H264, w, h) → S_FMT CAPTURE(NV12, w, h) → REQBUFS(4+4)
+   → STREAMON → feeds SPS+PPS+IDR as a SINGLE concatenated buffer
+   (single-shot-safe `feed()` constraint). Stored in
+   `SlideCache.video_decoders` (Linux-gated field).
+
+Per-advance paint (`paint_and_present_one_video_slide_frame`):
+feed next sample → drain `next_frame()` with 5×2 ms EAGAIN
+budget → upload Y as `GL_LUMINANCE` (TEXTURE0) + UV as
+`GL_LUMINANCE_ALPHA` (TEXTURE1) → blit through
+`FS_NV12_TO_RGB` BT.601 limited-range shader (piece 3d) →
+swap + commit. Frame drops BEFORE swap so its
+`Arc<Mutex<DecoderInner>>`-backed re-QBUF runs synchronously.
+
+`validate_paint_slide_inputs` accepts Video as of piece 3e
+(was: returns `"paint_slide: video slides TBD"`). Per-slide
+memory: ~10-15 MB at 720p (~20-25 MB at 1080p) for the 4+4
+buffer pool; CMA usage ~196 MB during decode.
+
+**Known doc-vs-code gap (surface for follow-up):** the
+`_UNSUPPORTED_SLIDE_WIRE_MARKERS` tuple in `rust_renderer.py`
+still contains `"video slides TBD"`. Reason: the Capture-side
+validator still emits `"Capture: video slides TBD (image +
+text both supported)"` for VideoSlide screenshots, and the
+substring match catches both. Once VideoSlide capture lands
+(separate piece), this marker should be split or removed.
+
 ## 4. Perf characteristics
 
 Sustained-smoke baselines on the dev Pi at 1024×768 HDMI, 50 loops
@@ -174,6 +236,39 @@ cache wire is resolution-independent (cache key is `(text,
 size_px)`, not output res), so the same gates should hold at
 1920×1080 with similar margins. Verification deferred until office-
 glass time (see `project_phase7_pending_at_office`).
+
+### VideoSlide live-Pi smoke (piece 3f, 2026-05-14)
+
+5-second smoke against `test_720p.mp4` (10 sec H.264 baseline @
+1280×720, 30 fps, libx264) driven through the cross-built sidecar
+in IPC mode. Driver: `/tmp/v4l2_video_smoke.py` (Pi-side, ad-hoc;
+not committed since it's a one-off Mac-side artifact). Backend was
+stopped to release DRM master for the smoke.
+
+| Metric | Value |
+|--------|-------|
+| Advance round-trip mean | 28.55 ms |
+| Advance round-trip p99 | 46.48 ms |
+| Advance round-trip max | 292 ms (advance #1, first-frame texture-alloc + codec warmup) |
+| PaintSlide responses | 150 / 150 |
+| EAGAIN stalls | 0 |
+| Errors / idle / slide_complete misses | 0 / 0 / 0 |
+| First frame produced at | sample_idx = 3 (2-3 sample codec pipeline warmup) |
+| RSS at smoke end | 69.9 MB (was 60.8 MB at Open; +9 MB during decode) |
+| CMA in-use during decode | 193-196 MB (V4L2 buffer pool) |
+
+**Sub-33 ms target: mean YES (28.55 ms), p99 NO (46.48 ms over
+the 30 fps budget).** Steady-state from advance #2 onward sits at
+~26-29 ms; the p99 over budget is a small minority of frames
+likely solved by piece 4's DMA-BUF zero-copy (which removes the
+per-frame `glTexImage2D` upload of Y + UV planes).
+
+**HDMI EDID note (`project_phase7_pending_at_office`):** the dev
+Pi's EDID is restoring to 1024×768 instead of the connected TV's
+1280×720 / 1920×1080. The smoke painted 1280×720 NV12 textures
+scaled down to a 1024×768 framebuffer via the BT.601 shader's
+bilinear filter. Full-resolution 720p / 1080p numbers are
+qarl-direct pending until office-glass time recovers the EDID.
 
 ## 5. Robustness layer
 
@@ -286,24 +381,85 @@ gating, not per-commit.** Logs to `/tmp/sidecar-*.jsonl` for
 post-analysis. The 4 sustained-smoke reports in `qa/sidecar-*.md`
 are the empirical baseline for the perf claims in §4.
 
+### SD-burn workflow (`1aa6dfe` + `6291b49`)
+
+End-to-end Mac-side SD card provisioning. Two layers:
+
+- **`scripts/build_sd_bundle.sh`** (`1aa6dfe`): produces
+  `dist/openmarquee-sd-bundle.tar.zst` with `backend/`, pre-built
+  `ui/`, cross-built `bin/openmarquee-render` (if present),
+  vendored aarch64 wheels, systemd units, hostapd/dnsmasq
+  config, `install.sh`. Hard-refuses to bundle anything with
+  secret-shape (`.env`, `.pem`, `id_rsa`, etc).
+- **`scripts/stage_sd_card.sh`** (`1aa6dfe`): drops the bundle
+  + cloud-init `user-data` / `meta-data` / `network-config`
+  onto a mounted bootfs partition. Refuses if the mount path
+  doesn't look like a Pi bootfs (no `cmdline.txt` / `config.txt`).
+- **`scripts/burn_sd_card.sh`** (`6291b49`, new this session):
+  collapses the prior two-step flow (Pi Imager GUI → stage) into
+  one CLI command. Validates target via `diskutil info -plist`
+  (rejects internal + non-removable + partition paths). Requires
+  the operator to type the EXACT `diskN` identifier — no
+  `--force` flag. Caches Pi OS Lite arm64 image at
+  `$OPENMARQUEE_BUILD_DIR/cache/` (or `~/Library/Caches/
+  openmarquee/`) with SHA256 verify + 30-day staleness gate.
+  Flashes via `xz -dc | sudo dd of=/dev/rdiskN bs=4m` (raw
+  device for ~5× throughput). Waits for `bootfs` auto-mount
+  with 60s timeout + explicit `mountDisk` fallback. Calls
+  `stage_sd_card.sh` (deliberately NOT under sudo, to preserve
+  file ownership). `SIGINT` trap re-ejects + warns. Wall time
+  estimate: ~5-8 min on USB 3.
+
+### `scripts/tests/test_burn_sd_card.sh` (`6291b49`, 17 PASS)
+
+Validation gauntlet for `burn_sd_card.sh`. Mocks `diskutil`
+via a shim script on a tmpdir `$PATH`; real `plutil` parses
+fixture plists so internal-vs-external classification runs
+against real parser behavior. 8 test cases × 17 assertions
+covering: missing target, `--help`, partition path rejection,
+random-path rejection, **internal disk refusal** (the
+wipes-mac-ssd guard), external+removable acceptance in
+dry-run, missing-bundle bail, unknown flag rejection.
+
 ## 7. Open questions (NOT decided here)
 
 These are qarl-direct items pending design calls. Listed so the
 maintainer can scope around them but not so they get answered
 without qarl input:
 
-- **Slice 4 — `playback.py` bypass shape for VideoSlide** (task
-  #75). The proxy refuses push-frame rendering. The sidecar's
-  current 7-op contract covers TextSlide + ImageSlide. VideoSlide
-  routes through `paint_video_slide_to_png` (capture path only,
-  per `d6b4f6a`); the per-frame video decode path is TBD.
-- **V4L2 M2M decoder arc** (task #76). The sidecar will need a
-  GPU-side decode path for VideoSlide if slice 4 wants to bypass
-  push-frame rendering for video too. Currently scoped as a
-  separate multi-day arc.
-- **1080p re-test** — HDMI EDID restore on dev Pi (office-glass-
-  gated). Cache wire is resolution-independent so gates should
-  hold at 1080p, but the empirical baseline is pinned at 1024×768.
+- **qarl visual eyeball pass on dev Pi `rust-sidecar`.** Code
+  for TextSlide + ImageSlide + transitions + VideoSlide is all
+  in tree + cross-build verified + 720p smoke captured (§4).
+  The remaining gate before flipping `OPENMARQUEE_RENDERER=
+  rust-sidecar` as the production default is qarl-on-glass:
+  does video look right? do transitions look right? any visual
+  regression vs the PIL `GPUSlideCompositor` baseline? Live-Pi
+  smoke can verify numerics but not "looks right."
+- **V4L2 piece 4 — DMA-BUF zero-copy.** Piece 3e uses
+  `glTexImage2D` per-frame for both Y + UV planes (~3 MB upload
+  per frame at 720p). Piece 4 imports the V4L2 CAPTURE buffer
+  as an `EGLImage` via `EGL_EXT_image_dma_buf_import`,
+  eliminating the upload. Likely fixes the p99-over-33 ms result
+  from piece 3f's smoke. Multi-day arc; deferred until after
+  the qarl visual pass since the current path is correct, just
+  slow on the tail.
+- **Default-flip decision** (slice 5). Once qarl signs off
+  visually, flip `OPENMARQUEE_RENDERER=rust-sidecar` as the
+  production default. The MockRenderer fallback via
+  `AutoFallbackRenderer` covers process-exhaustion edge cases;
+  the PIL `GPUSlideCompositor` path becomes legacy.
+- **1080p re-test + HDMI EDID restore** — dev Pi EDID currently
+  restores to 1024×768; the connected TV's native 1280×720 /
+  1920×1080 modes aren't being negotiated. Office-glass-gated;
+  per `project_phase7_pending_at_office`. The piece 3f smoke
+  numbers above were captured at 1024×768 with the video
+  texture scaled down via the GLES shader.
+- **VideoSlide Capture / thumbnail path.** Currently still
+  returns `"Capture: video slides TBD"`. Separate piece; would
+  need to drive the decoder, capture one frame, readback as PNG.
+  Drives the doc-vs-code gap noted in §3 (the
+  `_UNSUPPORTED_SLIDE_WIRE_MARKERS` substring `"video slides
+  TBD"` stays in the marker tuple until that lands).
 - **Marquee 29.5 vc4 ceiling** (task #279). The Atlas SB
   sanity-capture work concluded that SB bake is NOT the
   bottleneck; the vc4 ceiling lives elsewhere. Decision still
@@ -311,8 +467,8 @@ without qarl input:
 
 ## 8. Cited commits
 
-All SHAs verified present on `main` at write time
-(2026-05-14 04:30 UTC):
+All SHAs verified present on `main` at refresh time
+(2026-05-14 16:48 UTC, this refresh commit):
 
 | SHA | Anchor |
 |-----|--------|
@@ -337,3 +493,17 @@ All SHAs verified present on `main` at write time
 | `0a81a2c` | backend AutoFallbackRenderer wrapper |
 | `c067332` | scripts cache-regression gate |
 | `555e6b9` | scripts pkill-self-kill fix (4 scripts) |
+| `ce440ed` | docs Phase 7 as-built initial snapshot (this doc) |
+| `6b86fcf` | docs renderer-rewrite-plan-rust.md → as-built pointer thread |
+| `71079bb` | backend Phase 7 slice 4 wire playback.py to Rust IPC sidecar |
+| `1aa6dfe` | scripts SD-burn flow (build_sd_bundle / stage_sd_card) + install.sh fix |
+| `f481794` | backend slice-4 followup — begin_transition on the Rust IPC route |
+| `3b6c3bf` | V4L2 piece 1 — dev Pi state inventory + decoder device-path doc |
+| `343fe15` | V4L2 piece 2a — Decoder client scaffold + cap query |
+| `5f67ea5` | V4L2 piece 2b — decode loop + buffer pool + Frame lifetime |
+| `2dbe775` | V4L2 piece 3a — MP4 demuxer for H.264-in-MP4 |
+| `c56793b` | V4L2 piece 3b — SlideCache.video_demuxers + BeginSlide(Video) wire |
+| `89f9591` | V4L2 piece 3c — prime v4l2::Decoder on BeginSlide(Video) |
+| `6ffcb33` | V4L2 piece 3d — NV12 → RGB BT.601 shader + program cache + blit pass |
+| `e7be17f` | V4L2 piece 3e — paint_and_present_one_video_slide_frame end-to-end |
+| `6291b49` | scripts burn_sd_card.sh — single-command Mac-side SD flasher |
