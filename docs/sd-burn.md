@@ -5,21 +5,47 @@ Zero 2 W on Pi OS Lite arm64 (Bookworm). Scope: AP-mode only — the Pi
 serves its captive-portal welcome UI over its own wifi. Joining a home
 network is a separate flow (deliberately out of scope here).
 
+## TL;DR (Mac, single command)
+
+```
+bash scripts/build_sd_bundle.sh
+bash scripts/burn_sd_card.sh /dev/diskN
+```
+
+`burn_sd_card.sh` validates the target is a removable disk, prompts
+you to type `diskN` to confirm, fetches + caches the latest Pi OS
+Lite arm64 image, flashes via `dd` against the raw `/dev/rdiskN`
+device (~5x faster), waits for `bootfs` auto-mount, calls
+`stage_sd_card.sh` to drop the bundle + cloud-init, ejects. About
+5-8 minutes wall time end-to-end on USB 3 (mostly the dd phase).
+
+Find the right `/dev/diskN`: `diskutil list external removable`. The
+script refuses any target flagged Internal by `diskutil info`, so
+you can't accidentally wipe your Mac's SSD even with a typo.
+
+See "Two-step flow (GUI flash)" below if you prefer Raspberry Pi
+Imager's GUI for the flash step.
+
 ## Prerequisites
 
 On the Mac (or Linux laptop) you're staging from:
 - `zstd` — `brew install zstd` on macOS, `apt-get install zstd` on Debian
+- `xz` — `brew install xz` on macOS (only needed for the one-command
+  `burn_sd_card.sh` flow; the GUI flow doesn't use it)
 - `rsync` — usually preinstalled
 - `pip` (Python 3.13+) — only if you're vendoring wheels (`--wheels`)
 - The cross-built Rust renderer binary, if you want the sidecar opt-in.
   Run `bash scripts/renderer_cross_build.sh` ahead of time; the bundle
   picks it up from `renderer/target/aarch64-unknown-linux-gnu/release/`.
-- [Raspberry Pi Imager](https://www.raspberrypi.com/software/) to flash
-  the base OS image to the SD card.
+- [Raspberry Pi Imager](https://www.raspberrypi.com/software/) — only
+  needed for the GUI fallback flow below.
 
 On the Pi side, nothing — that's the point.
 
-## The flow
+## Two-step flow (GUI flash)
+
+For operators who prefer the Raspberry Pi Imager GUI for the flash
+step. The single-command path above is the recommended default.
 
 1. **Flash Pi OS Lite arm64 to the SD card** using Raspberry Pi Imager.
    - Choose `Raspberry Pi OS Lite (64-bit)`.
@@ -94,6 +120,56 @@ On the Pi side, nothing — that's the point.
      ethernet (see Recovery below)
    - Once connected, the captive-portal redirect should bring up the
      welcome UI; if not, manually navigate to `http://10.0.0.1/`
+
+## How `burn_sd_card.sh` works
+
+The one-command path (`scripts/burn_sd_card.sh /dev/diskN`):
+
+1. **Validates target** via `diskutil info -plist`. Refuses anything
+   that isn't shape `/dev/diskN` (whole disk; not `/dev/disk4s1`).
+   Refuses anything flagged `Internal: true` in the plist. Refuses
+   anything not flagged `RemovableMediaOrExternalDevice` or
+   `Ejectable`. Bails loudly if the device isn't present.
+
+2. **Confirmation prompt.** Operator must type the exact identifier
+   (e.g. `disk7`) to proceed. No `--force` flag. This is the
+   wipes-wrong-disk guard.
+
+3. **Image cache.** Pi OS Lite arm64 (`raspios_lite_arm64_latest`)
+   downloads to `$OPENMARQUEE_BUILD_DIR/cache/pi-os-lite-arm64.img.xz`
+   (or `~/Library/Caches/openmarquee/` when `OPENMARQUEE_BUILD_DIR`
+   isn't set). Cached for 30 days. SHA256 verified against the
+   Raspberry Pi Foundation's published `.sha256` sibling URL.
+
+4. **Sudo once.** `sudo -v` at the start primes the credential cache;
+   the dd + `diskutil unmountDisk` / `mountDisk` / `eject` calls
+   reuse it. The bundle stage step does NOT run as root (would dirty
+   file ownership inside the bundle tar).
+
+5. **Unmount whole disk** with `sudo diskutil unmountDisk /dev/diskN`
+   (not `diskutil unmount` per-volume).
+
+6. **Flash** via `xz -dc <cache> | sudo dd of=/dev/rdiskN bs=4m`. The
+   raw `rdiskN` device is ~5x faster than the buffered `diskN` on
+   macOS. A Finder "disk not recognized" popup may appear mid-dd;
+   it's harmless.
+
+7. **Wait for bootfs.** macOS typically auto-mounts the FAT bootfs
+   partition within 5-20 seconds. If it doesn't, force with
+   `sudo diskutil mountDisk /dev/diskN`. 60-second timeout.
+
+8. **Stage bundle** by calling `stage_sd_card.sh /Volumes/bootfs`.
+   If staging fails, the SD is left mounted so you can re-run or
+   inspect.
+
+9. **Eject** via `sudo diskutil eject /dev/diskN`. SIGINT mid-flash
+   triggers a cleanup eject + warns that the card is in an
+   undefined state.
+
+`scripts/burn_sd_card.sh --dry-run /dev/diskN` runs everything
+through step 1+8 without invoking dd / diskutil destructive ops; the
+output prints what it WOULD do. Good for verifying your target
+identifier before the real burn.
 
 ## Recovery: install.sh failed mid-boot
 
