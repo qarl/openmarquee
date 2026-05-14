@@ -323,3 +323,88 @@ def test_dry_run_rust_sidecar_step_uses_root_prefix(tmp_path: Path) -> None:
     assert (
         f"{tmp_path}/opt/openmarquee/bin/openmarquee-render" in output
     ), "rust binary source should respect --root prefix"
+
+
+# --- Task #99 (2026-05-14): AP/NM coexistence fixes ---
+
+
+def test_dry_run_chmod_plus_x_on_system_sh_helpers(dry_output: str) -> None:
+    """Task #99 Fix 2 (2026-05-14): the deployed Pi had system/*.sh files
+    at -rw-r--r-- despite Mac source being -rwxr-xr-x. Without +x,
+    systemd ExecStart= fails with EACCES; ap0 never comes up; no
+    captive-portal AP. Defensive chmod +x in install.sh covers any
+    rsync/tar perm-strip in the delivery chain."""
+    assert "Ensure +x on system/*.sh helpers" in dry_output
+    # Each .sh helper must be explicitly chmod'd. Dropping any one
+    # silently reintroduces the regression for that script.
+    for helper in [
+        "openmarquee-ap0-setup.sh",
+        "openmarquee-firstboot.sh",
+        "openmarquee-tailscale.sh",
+    ]:
+        assert (
+            f"chmod +x" in dry_output and helper in dry_output
+        ), f"system helper {helper} must be chmod +x'd"
+
+
+def test_dry_run_unmasks_hostapd_and_dnsmasq(dry_output: str) -> None:
+    """Task #99 Fix 1 (2026-05-14): Pi OS Lite trixie ships hostapd.service
+    masked (prevents accidental AP-on-boot on unrelated images). Without
+    `systemctl unmask hostapd`, openmarquee-ap0.service's `Before=
+    hostapd.service` ordering pulls in a masked unit that refuses to
+    start -- no AP, no captive portal."""
+    assert "systemctl unmask hostapd.service dnsmasq.service" in dry_output
+
+
+def test_dry_run_enables_hostapd_and_dnsmasq(dry_output: str) -> None:
+    """Task #99 Fix 1: alongside unmask, both must be `systemctl enable`d
+    so they auto-start on boot. enable on a masked unit fails; enable
+    on an already-enabled unit is a no-op. The unmask MUST run first."""
+    # The enable line bundles all four units; assert each appears.
+    enable_block = dry_output.split("systemctl daemon-reload")[1]
+    for unit in [
+        "openmarquee-backend.service",
+        "openmarquee-ap0.service",
+        "hostapd.service",
+        "dnsmasq.service",
+    ]:
+        assert unit in enable_block, (
+            f"unit {unit} must appear after daemon-reload (in the enable block)"
+        )
+
+
+def test_dry_run_unmask_precedes_enable_for_hostapd(dry_output: str) -> None:
+    """Order: unmask -> enable. If enable runs first against a masked
+    unit, systemctl returns 1 and -- under `set -e` -- aborts install.sh
+    before the rest of the enable line."""
+    unmask_idx = dry_output.find("systemctl unmask hostapd.service")
+    enable_idx = dry_output.find("systemctl enable openmarquee-backend.service")
+    assert unmask_idx != -1, "unmask marker missing"
+    assert enable_idx != -1, "enable marker missing"
+    assert unmask_idx < enable_idx, (
+        f"unmask must precede enable: {unmask_idx=} {enable_idx=}"
+    )
+
+
+def test_ap0_service_orders_before_networkmanager() -> None:
+    """Task #99 Fix 3 (2026-05-14): openmarquee-ap0.service must run
+    BEFORE NetworkManager.service so `iw dev wlan0 interface add ap0`
+    completes before NM begins associating wlan0. This eliminates a
+    brcmfmac race where NM mid-association could refuse the __ap vif
+    spawn. NM still manages wlan0 normally afterwards -- the
+    wifi_station nmcli applier (commit 6ecd1a2) keeps working."""
+    unit = (_REPO_ROOT / "system" / "openmarquee-ap0.service").read_text()
+    # Single Before= line should list hostapd + NM + NM-wait-online.
+    # The ordering keywords are case-sensitive in systemd.
+    assert "Before=" in unit, "openmarquee-ap0.service missing Before="
+    # Pull the Before= value(s) and assert NM appears.
+    before_lines = [
+        line for line in unit.splitlines() if line.startswith("Before=")
+    ]
+    assert before_lines, "no Before= directive found"
+    joined = " ".join(before_lines)
+    assert "hostapd.service" in joined, "Before= must keep hostapd ordering"
+    assert "NetworkManager.service" in joined, (
+        "Before= must include NetworkManager.service so ap0 setup precedes NM "
+        "association attempt on wlan0"
+    )

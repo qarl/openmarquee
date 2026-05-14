@@ -151,6 +151,22 @@ for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tail
     fi
 done
 
+# --- 3a. Ensure +x on system/*.sh helpers -----------------------------------
+#
+# Task #99 investigation (2026-05-14): the deployed Pi had system/*.sh
+# files at -rw-r--r-- despite Mac source being -rwxr-xr-x. `rsync -avz`
+# SHOULD preserve perms (--perms is part of -a) and the tar-cf/-xf bundle
+# path should too, but the dev Pi shows otherwise. Belt-and-suspenders:
+# explicitly chmod +x the .sh ExecStart= targets so systemd can invoke
+# them. Idempotent: chmod +x on an already-executable file is a no-op.
+say "Ensure +x on system/*.sh helpers"
+for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh; do
+    SH_PATH="${OPT_DIR}/system/${sh_helper}"
+    if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
+        run chmod +x "$SH_PATH"
+    fi
+done
+
 # --- 3b. Rust IPC sidecar binary (Phase 7 slice 3) --------------------------
 
 # Install the openmarquee-render binary to /usr/local/bin/ if deploy.sh
@@ -297,8 +313,18 @@ fi
 
 say "Reload systemd + enable units"
 run systemctl daemon-reload
+# Pi OS Lite trixie ships hostapd.service MASKED to prevent accidental
+# AP-on-boot on images without an AP plan. Unmask before enable so
+# openmarquee-ap0.service's `Before=hostapd.service` ordering actually
+# pulls hostapd up at boot. dnsmasq.service ships unmasked-but-disabled;
+# enabling makes the captive-portal DHCP+DNS reach the boot critical
+# path. Both unmasks are idempotent (no-op on already-unmasked units).
+# Task #99 surfaced this gap (2026-05-14).
+run systemctl unmask hostapd.service dnsmasq.service
 run systemctl enable openmarquee-backend.service \
-                    openmarquee-ap0.service
+                    openmarquee-ap0.service \
+                    hostapd.service \
+                    dnsmasq.service
 
 # Restart the backend so the new code takes effect on developer redeploy.
 # On first boot the unit isn't running; --no-block queues the restart and

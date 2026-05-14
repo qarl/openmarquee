@@ -2,7 +2,15 @@
 Description=openMarquee AP virtual interface (ap0) setup
 Documentation=https://github.com/qarl/openmarquee
 # Run before hostapd — hostapd.conf binds to ap0, which this script creates.
-Before=hostapd.service
+# Also run before NetworkManager so the `iw dev wlan0 interface add ap0`
+# completes BEFORE NM begins associating wlan0. Without this, NM's
+# wpa_supplicant subprocess can be mid-association when brcmfmac is
+# asked to spawn the __ap vif; brcmfmac sometimes accepts and sometimes
+# refuses depending on the exact wlan0 state. Ordering ap0 setup
+# strictly before NM eliminates the race. NM still manages wlan0
+# normally afterwards -- the wifi_station nmcli applier path (commit
+# 6ecd1a2) keeps working. Task #99 (2026-05-14).
+Before=hostapd.service NetworkManager.service NetworkManager-wait-online.service
 # Wait for the physical radio to exist; otherwise the `iw dev wlan0 …`
 # add fails on a just-booted board. `sys-subsystem-net-devices-wlan0.device`
 # is synthesized from udev; it fires when wlan0 is up at link level.
