@@ -89,14 +89,18 @@ class WifiStationState:
     """In-memory status surface for the UI to poll.
 
     `state` is monotonic within a single attempt:
-        idle -> connecting -> (connected | failed)
+        idle -> rescanning -> connecting -> (connected | failed)
 
-    A subsequent apply() resets it to `connecting` again. The model
+    Fast-fail path skips rescanning/connecting:
+        idle -> failed (when wlan0 radio reports state 20=unavailable)
+
+    A subsequent apply() resets it to `rescanning` again. The model
     is intentionally simple -- no history; the UI polls + displays
     the current value.
     """
 
-    state: str = "idle"  # idle | connecting | connected | failed | disabled
+    state: str = "idle"
+    # idle | rescanning | connecting | connected | failed | disabled
     detail: Optional[str] = None  # human-readable explanation
     ssid: Optional[str] = None  # which network we're connected/connecting to
 
@@ -223,6 +227,43 @@ def _is_device_connected() -> bool:
     return _device_state().startswith("100 ")
 
 
+def _device_state_code(state: str) -> Optional[int]:
+    """Pull the numeric leading code from a device-state string like
+    '100 (connected)' / '20 (unavailable)'. Returns None on parse
+    failure (covers empty + unrecognized strings). Numeric codes are
+    NM's stable contract; the parenthetical text is human prose."""
+    if not state:
+        return None
+    head = state.split(" ", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+def _wifi_rescan() -> _NmcliResult:
+    """`nmcli device wifi rescan ifname wlan0`. Best-effort scan
+    refresh BEFORE issuing connect, so a stale NM cache doesn't
+    fail-fast with 'No network with SSID "..." found'.
+
+    Runs WITHOUT sudo: NetworkManager allows scan ops for any user
+    in the `netdev` group on Pi OS / Debian (verified 2026-05-14 on
+    dev Pi). The previous follow-up dispatch said to add a sudoers
+    grant -- empirically NOT needed for the openmarquee user, so
+    no sudoers change rides with this commit.
+
+    Returns the _NmcliResult unchanged; callers MUST treat this as
+    best-effort (a rescan that errors is fine -- proceed to connect
+    anyway since NM may have already cached the SSID from a prior
+    scan or from a connection-up event).
+    """
+    return nmcli_runner(
+        ["device", "wifi", "rescan", "ifname", _STATION_IFNAME],
+        sudo=False,
+        timeout=10,
+    )
+
+
 def _wifi_connect(ssid: str, password: str) -> _NmcliResult:
     """`nmcli device wifi connect "<ssid>" password "<pw>" ifname wlan0`.
 
@@ -295,19 +336,34 @@ def apply_disabled() -> None:
         _set_state("disabled", detail=None, ssid=None)
 
 
-def apply_enabled(ssid: str, password: str, poll_timeout_sec: int = 30) -> bool:
+def apply_enabled(
+    ssid: str,
+    password: str,
+    poll_timeout_sec: int = 30,
+    rescan_settle_sec: float = 2.0,
+) -> bool:
     """Bring wlan0 onto the given home WiFi via nmcli. Idempotent:
     if wlan0 is already associated with `ssid`, the function
     no-ops + returns True. Otherwise:
 
-    1. Set state -> 'connecting'.
-    2. If wlan0 is on a different active connection, `nmcli
+    1. Idempotent fast path: if already on `ssid` + connected, no-op.
+    2. Pre-check `nmcli device show wlan0` GENERAL.STATE. If the
+       state is 20 (unavailable) -- rfkill, kernel module missing,
+       radio off -- fast-fail with an actionable detail BEFORE
+       wasting the slow connect-call (which would surface the same
+       symptom as 'No network with SSID found').
+    3. Set state -> 'rescanning'. Run `nmcli device wifi rescan
+       ifname wlan0` (best-effort) + sleep `rescan_settle_sec` so
+       NM's scan cache is fresh. Failure here is non-fatal --
+       proceed to connect anyway.
+    4. Set state -> 'connecting'.
+    5. If wlan0 is on a different active connection, `nmcli
        connection delete` it (so the new connect doesn't auto-fall
        back to the old profile on failure).
-    3. `nmcli device wifi connect` to bring up the new profile.
-    4. Poll device-state for the connected (100) state, up to
+    6. `nmcli device wifi connect` to bring up the new profile.
+    7. Poll device-state for the connected (100) state, up to
        `poll_timeout_sec`.
-    5. Set state -> 'connected' on success, 'failed' on
+    8. Set state -> 'connected' on success, 'failed' on
        nmcli-non-zero OR poll-timeout.
 
     Returns True on success, False on any failure. The caller
@@ -315,12 +371,46 @@ def apply_enabled(ssid: str, password: str, poll_timeout_sec: int = 30) -> bool:
     -- the in-memory _STATE singleton is the contract surface.
     """
     with _APPLY_LOCK:
-        # Idempotent short-circuit.
+        # Idempotent short-circuit (step 1).
         active = _active_connection_for_device()
         if active == ssid and _is_device_connected():
             log.info("wifi station: already connected to ssid=%r; no-op", ssid)
             _set_state("connected", detail=None, ssid=ssid)
             return True
+
+        # Radio pre-check (step 2). State code 20 means NM cannot
+        # use wlan0 at all -- typically rfkill or a missing module.
+        # Surface a diagnostic IMMEDIATELY rather than waiting for
+        # the slow connect-call to fail with the same root cause
+        # but a misleading 'No network...' error.
+        state_str = _device_state()
+        code = _device_state_code(state_str)
+        if code == 20:
+            detail = (
+                f"wlan0 radio unavailable (state {state_str!r}); "
+                "check `rfkill list` for a soft/hard block, verify the "
+                "brcmfmac driver loaded, or power-cycle the device"
+            )
+            log.error("wifi station: %s", detail)
+            _set_state("failed", detail=detail, ssid=ssid)
+            return False
+
+        # Pre-connect rescan (step 3). Refreshes NM's scan cache so
+        # the connect-call doesn't fast-fail with 'No network with
+        # SSID found' on a stale cache. The rescan itself is best-
+        # effort -- if it errors, NM may still have a cached entry
+        # from a prior connection event. Don't abort the flow.
+        _set_state("rescanning", detail=None, ssid=ssid)
+        log.info("wifi station: rescanning before connect to ssid=%r", ssid)
+        rescan_result = _wifi_rescan()
+        if rescan_result.returncode != 0:
+            log.info(
+                "wifi station: rescan returned %d (best-effort; proceeding): %s",
+                rescan_result.returncode,
+                rescan_result.stderr.strip(),
+            )
+        if rescan_settle_sec > 0:
+            time.sleep(rescan_settle_sec)
 
         _set_state("connecting", detail=None, ssid=ssid)
 

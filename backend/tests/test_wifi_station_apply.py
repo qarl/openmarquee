@@ -48,6 +48,13 @@ def test_apply_enabled_idempotent_when_already_connected(reset_module) -> None:
         # `nmcli -t -f GENERAL.STATE device show wlan0` -> "100 (connected)"
         if "GENERAL.STATE" in args and "show" in args:
             return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+        # rescan is best-effort and not gated on this test's idempotent
+        # path -- but the new apply path doesn't call rescan when
+        # idempotent-short-circuiting, so it should NOT appear.
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            raise AssertionError(
+                "rescan must NOT fire on idempotent-already-connected path"
+            )
         # Anything else (e.g. wifi connect) MUST NOT be called.
         raise AssertionError(f"unexpected nmcli call: {args}")
 
@@ -79,6 +86,8 @@ def test_apply_enabled_new_ssid_deletes_old_then_connects(reset_module) -> None:
             return _nmcli_result(stdout=f"{old_ssid}:wlan0\n")
         if "GENERAL.STATE" in args:
             return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            return _nmcli_result(returncode=0)
         if args[:3] == ["connection", "delete", old_ssid]:
             return _nmcli_result(returncode=0)
         if args[:3] == ["device", "wifi", "connect"]:
@@ -86,7 +95,7 @@ def test_apply_enabled_new_ssid_deletes_old_then_connects(reset_module) -> None:
         raise AssertionError(f"unexpected nmcli call: {args}")
 
     ws.nmcli_runner = MagicMock(side_effect=fake_runner)
-    ok = ws.apply_enabled(new_ssid, "newpassword", poll_timeout_sec=1)
+    ok = ws.apply_enabled(new_ssid, "newpassword", poll_timeout_sec=1, rescan_settle_sec=0)
     assert ok is True
 
     # The delete-old MUST appear in the call log BEFORE the
@@ -121,6 +130,8 @@ def test_apply_enabled_nmcli_failure_sets_failed_state(reset_module) -> None:
             return _nmcli_result(stdout="")
         if "GENERAL.STATE" in args:
             return _nmcli_result(stdout="GENERAL.STATE:30 (disconnected)\n")
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            return _nmcli_result(returncode=0)
         if args[:3] == ["device", "wifi", "connect"]:
             return _nmcli_result(
                 returncode=4,
@@ -132,7 +143,7 @@ def test_apply_enabled_nmcli_failure_sets_failed_state(reset_module) -> None:
         raise AssertionError(f"unexpected nmcli call: {args}")
 
     ws.nmcli_runner = MagicMock(side_effect=fake_runner)
-    ok = ws.apply_enabled(target_ssid, "wrongpassword", poll_timeout_sec=1)
+    ok = ws.apply_enabled(target_ssid, "wrongpassword", poll_timeout_sec=1, rescan_settle_sec=0)
     assert ok is False
     state = ws.current_state()
     assert state.state == "failed"
@@ -156,12 +167,14 @@ def test_apply_enabled_poll_timeout_when_state_never_reaches_100(
         if "GENERAL.STATE" in args:
             # Stuck in connecting state forever.
             return _nmcli_result(stdout="GENERAL.STATE:50 (connecting)\n")
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            return _nmcli_result(returncode=0)
         if args[:3] == ["device", "wifi", "connect"]:
             return _nmcli_result(returncode=0)
         raise AssertionError(f"unexpected nmcli call: {args}")
 
     ws.nmcli_runner = MagicMock(side_effect=fake_runner)
-    ok = ws.apply_enabled(target_ssid, "rightpassword", poll_timeout_sec=1)
+    ok = ws.apply_enabled(target_ssid, "rightpassword", poll_timeout_sec=1, rescan_settle_sec=0)
     assert ok is False
     state = ws.current_state()
     assert state.state == "failed"
@@ -241,21 +254,211 @@ def test_apply_enabled_uses_sudo_only_for_destructive_ops(
             return _nmcli_result(stdout="")
         if "GENERAL.STATE" in args:
             return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            return _nmcli_result(returncode=0)
         if args[:3] == ["device", "wifi", "connect"]:
             return _nmcli_result(returncode=0)
         raise AssertionError(f"unexpected nmcli call: {args}")
 
     ws.nmcli_runner = MagicMock(side_effect=fake_runner)
-    ws.apply_enabled(target_ssid, "rightpassword", poll_timeout_sec=1)
+    ws.apply_enabled(target_ssid, "rightpassword", poll_timeout_sec=1, rescan_settle_sec=0)
 
     for args, sudo in sudo_log:
         if args[:3] == ("device", "wifi", "connect"):
             assert sudo is True, "wifi connect MUST use sudo"
         elif args[:2] == ("connection", "delete"):
             assert sudo is True, "connection delete MUST use sudo"
+        elif args[:4] == ("device", "wifi", "rescan", "ifname"):
+            # Rescan: NM allows scan ops without sudo (verified
+            # 2026-05-14 on dev Pi). The sudoers fragment does NOT
+            # need to grant rescan.
+            assert sudo is False, "rescan MUST NOT use sudo"
         else:
             # Status queries: no sudo.
             assert sudo is False, f"read-only nmcli must not sudo: {args}"
+
+
+# --- Task #468 (2026-05-14): rescan + unavailable-radio detection ---
+
+
+def test_apply_enabled_rescans_before_connect(reset_module) -> None:
+    """A `nmcli device wifi rescan ifname wlan0` must fire BEFORE the
+    `nmcli device wifi connect` so a stale scan cache doesn't fast-
+    fail with 'No network with SSID found'. Pin the rescan-before-
+    connect ordering with a call-log index comparison."""
+    ws = reset_module
+    target_ssid = "freshnet"
+    call_log: list = []
+    connect_fired = False
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        nonlocal connect_fired
+        call_log.append(tuple(args))
+        if "connection" in args and "show" in args and "--active" in args:
+            # After the connect call lands, report wlan0 on target_ssid
+            # so the poll-for-connection loop satisfies + returns True.
+            if connect_fired:
+                return _nmcli_result(stdout=f"{target_ssid}:wlan0\n")
+            return _nmcli_result(stdout="")
+        if "GENERAL.STATE" in args:
+            if connect_fired:
+                return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+            return _nmcli_result(stdout="GENERAL.STATE:30 (disconnected)\n")
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            return _nmcli_result(returncode=0)
+        if args[:3] == ["device", "wifi", "connect"]:
+            connect_fired = True
+            return _nmcli_result(returncode=0)
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(target_ssid, "password", poll_timeout_sec=1, rescan_settle_sec=0)
+    assert ok is True
+
+    rescan_idx = next(
+        i for i, args in enumerate(call_log)
+        if args[:4] == ("device", "wifi", "rescan", "ifname")
+    )
+    connect_idx = next(
+        i for i, args in enumerate(call_log)
+        if args[:3] == ("device", "wifi", "connect")
+    )
+    assert rescan_idx < connect_idx, (
+        f"rescan must precede connect; log: {call_log}"
+    )
+
+
+def test_apply_enabled_rescan_failure_is_best_effort(reset_module) -> None:
+    """If `nmcli device wifi rescan` returns non-zero (e.g. NM busy,
+    scan interval not elapsed yet), the connect attempt MUST still
+    happen. The rescan is a cache-refresh hint, NOT a gate."""
+    ws = reset_module
+    target_ssid = "anyhownet"
+    call_log: list = []
+    connect_fired = False
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        nonlocal connect_fired
+        call_log.append(tuple(args))
+        if "connection" in args and "show" in args and "--active" in args:
+            if connect_fired:
+                return _nmcli_result(stdout=f"{target_ssid}:wlan0\n")
+            return _nmcli_result(stdout="")
+        if "GENERAL.STATE" in args:
+            if connect_fired:
+                return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+            return _nmcli_result(stdout="GENERAL.STATE:30 (disconnected)\n")
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            # rescan fails with the typical 'Scanning not allowed
+            # while unavailable' / 'Device or resource busy' shape.
+            return _nmcli_result(
+                returncode=4,
+                stderr="Error: Scanning not allowed while unavailable\n",
+            )
+        if args[:3] == ["device", "wifi", "connect"]:
+            connect_fired = True
+            return _nmcli_result(returncode=0)
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(target_ssid, "password", poll_timeout_sec=1, rescan_settle_sec=0)
+    assert ok is True
+
+    # Connect MUST appear despite rescan failure.
+    assert any(
+        args[:3] == ("device", "wifi", "connect")
+        for args in call_log
+    ), "connect must fire even when rescan errored"
+
+
+def test_apply_enabled_radio_unavailable_fast_fails(reset_module) -> None:
+    """When wlan0 is in state '20 (unavailable)' -- rfkill, missing
+    brcmfmac, etc. -- apply_enabled MUST NOT waste cycles on rescan
+    + connect (both would surface the same error with a misleading
+    'No network with SSID found' shape). Surface an actionable
+    detail immediately."""
+    ws = reset_module
+    target_ssid = "pikazo"
+    call_log: list = []
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        call_log.append(tuple(args))
+        if "connection" in args and "show" in args and "--active" in args:
+            return _nmcli_result(stdout="")
+        if "GENERAL.STATE" in args:
+            return _nmcli_result(stdout="GENERAL.STATE:20 (unavailable)\n")
+        # Anything beyond the two read-only queries is a bug.
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            raise AssertionError(
+                "rescan must NOT fire when device is unavailable"
+            )
+        if args[:3] == ["device", "wifi", "connect"]:
+            raise AssertionError(
+                "connect must NOT fire when device is unavailable"
+            )
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(target_ssid, "password", poll_timeout_sec=1, rescan_settle_sec=0)
+    assert ok is False
+    state = ws.current_state()
+    assert state.state == "failed"
+    # The detail must reference the actionable diagnosis: rfkill /
+    # driver / power-cycle. Generic "nmcli exited" would be useless.
+    detail = state.detail or ""
+    assert "unavailable" in detail.lower()
+    assert "rfkill" in detail.lower() or "driver" in detail.lower()
+    assert state.ssid == target_ssid
+
+
+def test_apply_enabled_disconnected_state_proceeds_normally(reset_module) -> None:
+    """State 30 (disconnected) is the normal idle state when wlan0
+    has no active connection but the radio is fine. apply_enabled
+    must NOT fast-fail on this -- it should run rescan + connect."""
+    ws = reset_module
+    target_ssid = "homenet"
+    call_log: list = []
+    connect_fired = False
+
+    def fake_runner(args, *, sudo=False, timeout=30):
+        nonlocal connect_fired
+        call_log.append(tuple(args))
+        if "connection" in args and "show" in args and "--active" in args:
+            if connect_fired:
+                return _nmcli_result(stdout=f"{target_ssid}:wlan0\n")
+            return _nmcli_result(stdout="")
+        if "GENERAL.STATE" in args:
+            if connect_fired:
+                return _nmcli_result(stdout="GENERAL.STATE:100 (connected)\n")
+            return _nmcli_result(stdout="GENERAL.STATE:30 (disconnected)\n")
+        if args[:4] == ["device", "wifi", "rescan", "ifname"]:
+            return _nmcli_result(returncode=0)
+        if args[:3] == ["device", "wifi", "connect"]:
+            connect_fired = True
+            return _nmcli_result(returncode=0)
+        raise AssertionError(f"unexpected nmcli call: {args}")
+
+    ws.nmcli_runner = MagicMock(side_effect=fake_runner)
+    ok = ws.apply_enabled(target_ssid, "password", poll_timeout_sec=1, rescan_settle_sec=0)
+    assert ok is True
+    state = ws.current_state()
+    assert state.state == "connected"
+    # Both rescan + connect should have fired (the path's full flow).
+    assert any(args[:4] == ("device", "wifi", "rescan", "ifname") for args in call_log)
+    assert any(args[:3] == ("device", "wifi", "connect") for args in call_log)
+
+
+def test_device_state_code_parses_numeric_prefix() -> None:
+    """The pre-check relies on parsing the leading integer code from
+    nmcli's state string (the parenthetical text is human prose).
+    Pin the parser shape so a future nmcli format-change is loud."""
+    from openmarquee.wifi_station import _device_state_code
+    assert _device_state_code("100 (connected)") == 100
+    assert _device_state_code("20 (unavailable)") == 20
+    assert _device_state_code("30 (disconnected)") == 30
+    assert _device_state_code("50 (connecting (config))") == 50
+    assert _device_state_code("") is None
+    assert _device_state_code("(unrecognized)") is None
 
 
 # --- has_settings_changed tests (preserved from prior version) -------------
