@@ -63,9 +63,14 @@ def _real_renderer_singleton():
     output_mode=hdmi -> DRMRenderer (multi-plane KMS, vc4 HVS scanout).
     Anything else (or DRM init failure) -> MockRenderer.
 
-    Two opt-out levers:
-      OPENMARQUEE_RENDERER=mock  -> always mock
-      OPENMARQUEE_RENDERER=drm   -> always try DRM (override settings)
+    Opt-in levers:
+      OPENMARQUEE_RENDERER=mock          -> always mock
+      OPENMARQUEE_RENDERER=drm           -> always try DRM (override settings)
+      OPENMARQUEE_RENDERER=rust-sidecar  -> Phase 7 slice 2: use the Rust
+        IPC sidecar proxy (backend/openmarquee/rendering/rust_renderer.py).
+        Construction-only here; the proxy launches the subprocess on
+        open(). Binary path defaults to /usr/local/bin/openmarquee-render
+        overridable via OPENMARQUEE_RENDERER_BINARY.
 
     The renderer is constructed eagerly here but opened by app.py's
     lifespan so a __enter__ failure surfaces at startup, not first
@@ -75,6 +80,8 @@ def _real_renderer_singleton():
     override = os.environ.get("OPENMARQUEE_RENDERER", "auto").lower()
     if override == "mock":
         return _mock_renderer_singleton()
+    if override == "rust-sidecar":
+        return _rust_sidecar_renderer_or_fallback()
 
     settings = _settings_storage_singleton().load()
     output_mode = settings.output_mode
@@ -121,6 +128,54 @@ def _real_renderer_singleton():
         )
     except Exception:
         log.exception("DRMRenderer construction failed; falling back to mock")
+        return _mock_renderer_singleton()
+
+
+def _rust_sidecar_renderer_or_fallback():
+    """Phase 7 slice 2 (2026-05-13): construct a RustRenderer instance
+    from `rendering/rust_renderer.py`. On import or construction failure,
+    fall back to MockRenderer (same defensive pattern the DRM path uses).
+
+    Env vars (proxy-specific):
+      OPENMARQUEE_RENDERER_BINARY   path to the Rust binary
+        (default: /usr/local/bin/openmarquee-render)
+      OPENMARQUEE_CONTENT_ROOT      already used elsewhere; threaded
+        through to the sidecar via the Open op's content_root param.
+
+    Dims come from SystemSettings (display_width / display_height) just
+    like the DRMRenderer path. The sidecar may negotiate a different mode
+    on HDMI mode-set; RustRenderer.open() refreshes width/height to the
+    negotiated values at __enter__ time.
+
+    NOTE: this branch does NOT change the default. Production Pi behavior
+    is unchanged until an operator sets OPENMARQUEE_RENDERER=rust-sidecar.
+    Slice 4 will teach playback.py to use the proxy's IPC ops instead of
+    render_frame; until then, even an opted-in caller will hit the
+    NotImplementedError on the first frame (the proxy refuses push-frame
+    rendering by design).
+    """
+    try:
+        from openmarquee.rendering.rust_renderer import RustRenderer
+    except Exception:
+        log.exception("rust_renderer module import failed; falling back to mock")
+        return _mock_renderer_singleton()
+
+    settings = _settings_storage_singleton().load()
+    width = int(settings.display_width)
+    height = int(settings.display_height)
+    binary_path = os.environ.get(
+        "OPENMARQUEE_RENDERER_BINARY", "/usr/local/bin/openmarquee-render"
+    )
+    content_root = _resolve_content_root()
+    try:
+        return RustRenderer(
+            width=width,
+            height=height,
+            binary_path=binary_path,
+            content_root=str(content_root),
+        )
+    except Exception:
+        log.exception("RustRenderer construction failed; falling back to mock")
         return _mock_renderer_singleton()
 
 

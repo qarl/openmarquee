@@ -136,3 +136,140 @@ class TestResolveSelfAddress:
             return_value="mymachine.local",
         ):
             assert _resolve_self_address() == "mymachine.local"
+
+
+class TestRealRendererFactory:
+    """Factory dispatch matrix for `_real_renderer_singleton`.
+
+    Phase 7 slice 2 (2026-05-13) adds an `OPENMARQUEE_RENDERER=rust-sidecar`
+    branch to the existing `mock` / `drm` / `auto` matrix. Tests pin the
+    selection logic so:
+      - the default (`auto`) continues to resolve to the same class it
+        did before this slice (no accidental priority shift toward rust-
+        sidecar);
+      - `rust-sidecar` is opt-in only.
+    """
+
+    def _import_factory(self):
+        from openmarquee.dependencies import _real_renderer_singleton
+
+        _real_renderer_singleton.cache_clear()
+        return _real_renderer_singleton
+
+    def test_renderer_mock_env_returns_mock(self, monkeypatch):
+        """Pre-existing behavior: OPENMARQUEE_RENDERER=mock -> MockRenderer."""
+        from openmarquee.rendering.mock import MockRenderer
+
+        monkeypatch.setenv("OPENMARQUEE_RENDERER", "mock")
+        factory = self._import_factory()
+        renderer = factory()
+        assert isinstance(renderer, MockRenderer)
+
+    def test_renderer_default_auto_resolves_unchanged_with_non_hdmi_settings(
+        self, monkeypatch
+    ):
+        """Pre-existing behavior: with the default env (auto) AND non-HDMI
+        output_mode, the factory returns MockRenderer. This is the test
+        that pins "auto behavior is unchanged by the slice-2 patch"."""
+        monkeypatch.delenv("OPENMARQUEE_RENDERER", raising=False)
+        # SystemSettings default output_mode is "mock" (set by the
+        # _isolated_singletons fixture's tmp_path settings save). Use
+        # the dev MockRenderer path.
+        from openmarquee.rendering.mock import MockRenderer
+
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(output_mode="hub75")
+        )
+        _settings_storage_singleton.cache_clear()
+        factory = self._import_factory()
+        renderer = factory()
+        assert isinstance(renderer, MockRenderer)
+
+    def test_renderer_rust_sidecar_env_returns_rust_renderer(
+        self, monkeypatch, tmp_path
+    ):
+        """New slice-2 branch: OPENMARQUEE_RENDERER=rust-sidecar returns a
+        RustRenderer instance WITHOUT launching the subprocess (construction-
+        only at factory time)."""
+        from openmarquee.rendering.rust_renderer import RustRenderer
+
+        monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidecar")
+        # Provide writable content_root so _resolve_content_root doesn't
+        # surprise us.
+        monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(tmp_path))
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(display_width=1920, display_height=1080)
+        )
+        _settings_storage_singleton.cache_clear()
+        factory = self._import_factory()
+        renderer = factory()
+        assert isinstance(renderer, RustRenderer)
+        # Dims from settings (negotiated dims would update at open() time;
+        # the factory doesn't open).
+        assert renderer.width == 1920
+        assert renderer.height == 1080
+        # Subprocess not yet launched.
+        assert renderer.is_alive is False
+
+    def test_renderer_rust_sidecar_honors_binary_env_override(
+        self, monkeypatch, tmp_path
+    ):
+        """OPENMARQUEE_RENDERER_BINARY routes through to the proxy's
+        binary_path. The proxy doesn't validate path existence at
+        construction time (it errors at open()); that's the lifespan's
+        job."""
+        from openmarquee.rendering.rust_renderer import RustRenderer
+
+        custom_path = tmp_path / "my-custom-render-binary"
+        monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidecar")
+        monkeypatch.setenv("OPENMARQUEE_RENDERER_BINARY", str(custom_path))
+        monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(tmp_path))
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings()
+        )
+        _settings_storage_singleton.cache_clear()
+        factory = self._import_factory()
+        renderer = factory()
+        assert isinstance(renderer, RustRenderer)
+        # Access the private attr — this test pins the env-var contract.
+        assert renderer._binary_path == str(custom_path)
+
+    def test_renderer_rust_sidecar_uses_content_root_from_env(
+        self, monkeypatch, tmp_path
+    ):
+        """The proxy receives the content_root the rest of the backend
+        resolved via _resolve_content_root (env override first, then
+        ./openmarquee-content)."""
+        from openmarquee.rendering.rust_renderer import RustRenderer
+
+        my_cr = tmp_path / "my-content-root"
+        my_cr.mkdir()
+        monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidecar")
+        monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(my_cr))
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings()
+        )
+        _settings_storage_singleton.cache_clear()
+        factory = self._import_factory()
+        renderer = factory()
+        assert isinstance(renderer, RustRenderer)
+        assert renderer._content_root == str(my_cr)
+
+    def test_renderer_rust_sidecar_unknown_value_falls_through_to_auto(
+        self, monkeypatch
+    ):
+        """Sanity check: a typo in OPENMARQUEE_RENDERER (e.g. "rust-side"
+        without the "-car") does NOT silently route to the sidecar.
+        Unknown values fall through to the default auto/drm path."""
+        from openmarquee.rendering.mock import MockRenderer
+
+        monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidec")  # typo
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
+            SystemSettings(output_mode="hub75")
+        )
+        _settings_storage_singleton.cache_clear()
+        factory = self._import_factory()
+        renderer = factory()
+        # Typo'd value isn't "rust-sidecar" so we fall through to the
+        # want_drm branch; with output_mode=mock that returns Mock.
+        assert isinstance(renderer, MockRenderer)
