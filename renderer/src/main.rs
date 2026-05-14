@@ -226,8 +226,28 @@ struct Args {
 
     /// QA-direct (2026-05-09) -- override the t value the
     /// capture-sb-mid samples at. Default 0.5 (mid-transition).
+    /// Also used by --capture-fullres-mid.
     #[arg(long, default_value_t = 0.5)]
     capture_sb_t: f32,
+
+    /// QA-direct (2026-05-13) Atlas SB visual-sanity counterpart
+    /// to --capture-sb-mid. Takes the SAME args (--fade-from /
+    /// --fade-to / --transition / --capture-sb-t / --capture-path
+    /// / --content-root) but bakes both slides at full mode
+    /// resolution into per-slide FBOs instead of two half-res atlas
+    /// regions. The PNG is the full-res reference baseline that
+    /// the SB-path golden can be SSIM-diffed against. SSIM gate is
+    /// 0.95 per spec §11 / Atlas SB acceptance.
+    ///
+    /// Example:
+    ///   /tmp/openmarquee-render --output hdmi \\
+    ///     --capture-fullres-mid \\
+    ///     --fade-from <a> --fade-to <b> --transition fade \\
+    ///     --capture-sb-t 0.5 \\
+    ///     --capture-path /tmp/fullres-mid.png \\
+    ///     --content-root /path/to/content
+    #[arg(long, default_value_t = false)]
+    capture_fullres_mid: bool,
 
     /// Batch 17.2 / sweep #9 #2 -- pin tick_seconds for
     /// --capture-slide so motion compositor evaluates at a fixed
@@ -1367,6 +1387,66 @@ fn main() -> Result<()> {
                             content_root.display()
                         ))?;
                     hdmi::capture_sb_transition_mid_to_png(
+                        &card,
+                        &slide_a,
+                        &slide_b,
+                        catalog_opt,
+                        Some(content_root),
+                        &args.transition,
+                        args.capture_sb_t,
+                        png_path,
+                    )?;
+                    return Ok(());
+                }
+                if args.capture_fullres_mid {
+                    // QA-direct (2026-05-13) Atlas SB visual-sanity
+                    // counterpart. Same CLI args as --capture-sb-mid;
+                    // bakes both slides full-res into per-slide FBOs
+                    // and composites with the SAME SP shader -- the
+                    // PNG is the full-res reference baseline that SB
+                    // half-rez output can be SSIM-diffed against.
+                    let png_path = args
+                        .capture_path
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "--capture-fullres-mid requires --capture-path"
+                        ))?;
+                    let content_root = args
+                        .content_root
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "--capture-fullres-mid requires --content-root"
+                        ))?;
+                    let from_id = args.fade_from.ok_or_else(|| anyhow::anyhow!(
+                        "--capture-fullres-mid requires --fade-from"
+                    ))?;
+                    let to_id = args.fade_to.ok_or_else(|| anyhow::anyhow!(
+                        "--capture-fullres-mid requires --fade-to"
+                    ))?;
+                    let catalog = hdmi_logic::FontCatalog::new(
+                        args.font_dir.clone(),
+                        args.fallback_font_family.clone(),
+                    );
+                    let catalog_opt = if catalog.fallback_available() {
+                        Some(&catalog)
+                    } else {
+                        bail!(
+                            "font catalog at {} can't load fallback {:?} -- needed for capture",
+                            args.font_dir.display(),
+                            args.fallback_font_family,
+                        );
+                    };
+                    let slide_a = content::find_text_slide(content_root, from_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide for --fade-from {from_id} under {}",
+                            content_root.display()
+                        ))?;
+                    let slide_b = content::find_text_slide(content_root, to_id)?
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "no text_slide for --fade-to {to_id} under {}",
+                            content_root.display()
+                        ))?;
+                    hdmi::capture_fullres_transition_mid_to_png(
                         &card,
                         &slide_a,
                         &slide_b,

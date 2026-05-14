@@ -3058,6 +3058,251 @@ pub fn capture_sb_transition_mid_to_png(
     })
 }
 
+/// QA-direct (2026-05-13) Atlas SB visual-sanity counterpart.
+/// Mirrors capture_sb_transition_mid_to_png's machinery but bakes
+/// slide_a + slide_b into full-mode-resolution per-slide FBOs
+/// (1920x1080 each on the dev Pi) instead of two half-rez regions
+/// of the shared scissored-bake atlas. Composites with the SAME
+/// `cached_composite_program(kind)` SP shader at progress=t, with
+/// identity UV xforms for both sources, then reads back to PNG.
+///
+/// Purpose: provide the full-res reference baseline that the SB
+/// path's softening-from-half-rez can be diffed against. The SB
+/// vs full-res delta isolates the Atlas SB bake-resolution cost
+/// (half-rez → upscale → composite) from any shader / blend math
+/// drift. SSIM ≥ 0.95 is the §11 / Atlas SB acceptance gate.
+///
+/// Uses the SAME tick-zero + wall_clock-zero pins as
+/// capture_sb_transition_mid_to_png (17.fix-A) so bless captures
+/// reproduce bit-identically across runs.
+pub fn capture_fullres_transition_mid_to_png(
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    kind: &str,
+    t: f32,
+    png_path: &Path,
+) -> Result<()> {
+    use crate::hdmi_logic::rgba_to_png_bytes;
+    use glow::HasContext;
+    if !is_transition_kind_single_pass(kind) {
+        bail!("capture_fullres_mid: kind {kind:?} not in SP-portable set");
+    }
+    let t = t.clamp(0.0, 1.0);
+    let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
+    let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    with_egl_session(card, |session| {
+        let mode_w = session.mode_w as u32;
+        let mode_h = session.mode_h as u32;
+
+        let ccp = cached_composite_program(session.gl, kind)?;
+        let vbo = ensure_transition_sp_quad_vbo(session)?;
+
+        // Same tick + wall_clock pin as SB path: motion at phase
+        // zero, wall_clock at epoch. Makes bless captures reproducible.
+        let states_a = motion_states_for_layers(slide_a.id, &layers_a, 0.0);
+        let states_b = motion_states_for_layers(slide_b.id, &layers_b, 0.0);
+        let wall_clock_unix: i64 = 0;
+
+        let gl = session.gl;
+
+        // Allocate two full-res slide FBOs + capture FBO.
+        let (fbo_a, tex_a) = unsafe {
+            make_fullres_slide_fbo_with_motion(
+                gl, mode_w, mode_h, &bg_a_kind, &layers_a,
+                Some(&states_a), wall_clock_unix,
+            )?
+        };
+        let (fbo_b, tex_b) = match unsafe {
+            make_fullres_slide_fbo_with_motion(
+                gl, mode_w, mode_h, &bg_b_kind, &layers_b,
+                Some(&states_b), wall_clock_unix,
+            )
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                }
+                return Err(e);
+            }
+        };
+
+        let cap_tex = unsafe {
+            let t_ = gl
+                .create_texture()
+                .map_err(|e| anyhow!("capture tex: {e}"))?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t_));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA as i32, mode_w as i32, mode_h as i32, 0,
+                glow::RGBA, glow::UNSIGNED_BYTE, None,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+            );
+            t_
+        };
+        let cap_fbo = unsafe {
+            let f = gl.create_framebuffer().map_err(|e| {
+                gl.delete_texture(cap_tex);
+                gl.delete_framebuffer(fbo_a);
+                gl.delete_texture(tex_a);
+                gl.delete_framebuffer(fbo_b);
+                gl.delete_texture(tex_b);
+                anyhow!("capture fbo: {e}")
+            })?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(cap_tex), 0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                gl.delete_framebuffer(f);
+                gl.delete_texture(cap_tex);
+                gl.delete_framebuffer(fbo_a);
+                gl.delete_texture(tex_a);
+                gl.delete_framebuffer(fbo_b);
+                gl.delete_texture(tex_b);
+                bail!("capture fbo incomplete: status=0x{status:x}");
+            }
+            f
+        };
+
+        // Composite at t into cap_fbo. Identity UV xforms: each
+        // source texture is full-mode-res; sample its full UV range.
+        let xform_a: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+        let xform_b: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+        let work_result: Result<()> = (|| {
+            unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(cap_fbo));
+                gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                gl.disable(glow::BLEND);
+                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+                gl.use_program(Some(ccp.program));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+                gl.uniform_1_i32(ccp.u_src_a.as_ref(), 0);
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+                gl.uniform_1_i32(ccp.u_src_b.as_ref(), 1);
+                gl.uniform_4_f32(
+                    ccp.u_a_xform.as_ref(),
+                    xform_a[0], xform_a[1], xform_a[2], xform_a[3],
+                );
+                gl.uniform_4_f32(
+                    ccp.u_b_xform.as_ref(),
+                    xform_b[0], xform_b[1], xform_b[2], xform_b[3],
+                );
+                gl.uniform_1_f32(ccp.u_t.as_ref(), t);
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let stride = (4 * std::mem::size_of::<f32>()) as i32;
+                gl.enable_vertex_attrib_array(ccp.a_pos);
+                gl.vertex_attrib_pointer_f32(ccp.a_pos, 2, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(ccp.a_uv);
+                gl.vertex_attrib_pointer_f32(
+                    ccp.a_uv, 2, glow::FLOAT, false, stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
+                );
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.flush();
+            }
+
+            let rgba = capture_fbo_to_rgba(gl, Some(cap_fbo), mode_w, mode_h)?;
+            let png_bytes = rgba_to_png_bytes(&rgba, mode_w, mode_h)?;
+            std::fs::write(png_path, &png_bytes)
+                .with_context(|| format!("write png {}", png_path.display()))?;
+            eprintln!(
+                "captured FULLRES transition kind={kind:?} slide_a={} slide_b={} t={t:.3} -> {} ({} bytes)",
+                slide_a.id, slide_b.id, png_path.display(), png_bytes.len(),
+            );
+            Ok(())
+        })();
+
+        // Unconditional cleanup. Mirrors the SB-path discipline.
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(cap_fbo);
+            gl.delete_texture(cap_tex);
+            gl.delete_framebuffer(fbo_a);
+            gl.delete_texture(tex_a);
+            gl.delete_framebuffer(fbo_b);
+            gl.delete_texture(tex_b);
+        }
+        work_result
+    })
+}
+
+/// Variant of make_slide_fbo that takes motion_states + wall_clock_unix
+/// so the SB-vs-fullres parity capture can apply the SAME motion-at-tick-0
+/// pin in both paths. The existing make_slide_fbo is hot-path (called by
+/// paint_and_present_one_transition_frame's per-Advance bake) and bakes
+/// statically with `None` motion + real wall_clock; not modifying its
+/// signature avoids touching that hot path.
+unsafe fn make_fullres_slide_fbo_with_motion(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    bg_kind: &BgKind,
+    text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    motion_states: Option<&[crate::hdmi_logic::MotionState]>,
+    wall_clock_unix: i64,
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(fullres_fbo): {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_image_2d(
+        glow::TEXTURE_2D, 0, glow::RGBA as i32, mode_w as i32, mode_h as i32, 0,
+        glow::RGBA, glow::UNSIGNED_BYTE, None,
+    );
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    let fbo = match gl.create_framebuffer() {
+        Ok(f) => f,
+        Err(e) => {
+            gl.delete_texture(tex);
+            return Err(anyhow!("glGenFramebuffers(fullres_fbo): {e}"));
+        }
+    };
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+    gl.framebuffer_texture_2d(
+        glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0,
+    );
+    let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+    if status != glow::FRAMEBUFFER_COMPLETE {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        return Err(anyhow!("framebuffer incomplete (fullres_fbo): status=0x{status:x}"));
+    }
+    let paint_result = paint_slide(
+        gl, mode_w, mode_h, bg_kind, text_layers,
+        motion_states, wall_clock_unix,
+        None,
+        None,
+        None,
+    );
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    if let Err(e) = paint_result {
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        return Err(e);
+    }
+    Ok((fbo, tex))
+}
+
 pub fn capture_slide_to_png(
     card: &Card,
     slide: &TextSlide,
