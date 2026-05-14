@@ -6508,6 +6508,85 @@ fn clear_blit_program_cache(gl: &glow::Context) {
     });
 }
 
+/// V4L2 piece 3d (2026-05-14): cached NV12 -> RGB program for
+/// VideoSlide paint. Mirrors `CachedBlitProgram` but exposes
+/// two sampler uniforms (Y on TEXTURE0, UV on TEXTURE1).
+#[derive(Copy, Clone)]
+struct CachedNv12Program {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_tex_y: Option<glow::NativeUniformLocation>,
+    u_tex_uv: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static NV12_PROGRAM: std::cell::Cell<Option<CachedNv12Program>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_nv12_program(gl: &glow::Context) -> Result<CachedNv12Program> {
+    use glow::HasContext;
+    NV12_PROGRAM.with(|c| {
+        if let Some(p) = c.get() {
+            return Ok(p);
+        }
+        let program = link_program(
+            gl,
+            VS_TEXTURED_QUAD,
+            crate::hdmi_logic::FS_NV12_TO_RGB,
+        )
+        .context("link FS_NV12_TO_RGB (VideoSlide paint)")?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("FS_NV12_TO_RGB VS missing a_pos"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("FS_NV12_TO_RGB VS missing a_uv"))?;
+        let u_tex_y = unsafe { gl.get_uniform_location(program, "u_tex_y") };
+        let u_tex_uv = unsafe { gl.get_uniform_location(program, "u_tex_uv") };
+        let cnp = CachedNv12Program { program, a_pos, a_uv, u_tex_y, u_tex_uv };
+        c.set(Some(cnp));
+        Ok(cnp)
+    })
+}
+
+/// V4L2 piece 3d: draw a fullscreen quad sampling `y_tex` (Y plane,
+/// GL_LUMINANCE) and `uv_tex` (UV plane, GL_LUMINANCE_ALPHA) through
+/// the BT.601 limited-range NV12 -> RGB shader. Caller binds the
+/// destination FBO + viewport beforehand. The two source textures
+/// must already be uploaded; this pass does no allocation -- just
+/// the per-frame draw.
+unsafe fn run_nv12_blit_pass(
+    gl: &glow::Context,
+    y_tex: glow::NativeTexture,
+    uv_tex: glow::NativeTexture,
+) -> Result<()> {
+    use glow::HasContext;
+    let cnp = cached_nv12_program(gl)?;
+    let vbo = cached_textured_quad_vbo(gl)?;
+    gl.use_program(Some(cnp.program));
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
+    gl.uniform_1_i32(cnp.u_tex_y.as_ref(), 0);
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
+    gl.uniform_1_i32(cnp.u_tex_uv.as_ref(), 1);
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.enable_vertex_attrib_array(cnp.a_pos);
+    gl.vertex_attrib_pointer_f32(cnp.a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(cnp.a_uv);
+    gl.vertex_attrib_pointer_f32(cnp.a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    gl.disable_vertex_attrib_array(cnp.a_pos);
+    gl.disable_vertex_attrib_array(cnp.a_uv);
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    // Program + shared VBO come from session-lived caches; never
+    // freed here.
+    Ok(())
+}
+
 /// Populate `slide_caches[slide_id].bg_tex` for non-solid bgs
 /// at atlas region size (2048x1024). Idempotent: returns early
 /// if already cached. Returns `Ok(())` for solid bgs (no cache

@@ -2034,6 +2034,43 @@ void main() {
 }
 "#;
 
+/// V4L2 piece 3d (2026-05-14) -- BT.601 limited-range NV12 -> RGB
+/// fragment shader. Pairs with `VS_TEXTURED_QUAD`.
+///
+/// bcm2835-codec emits NV12 with **limited-range** quantization
+/// by default (Y in [16/255, 235/255], UV in [16/255, 240/255])
+/// unless V4L2_CID_QUANTIZATION is set to V4L2_QUANTIZATION_FULL_
+/// RANGE on the CAPTURE queue. Piece 3c doesn't set that ctrl,
+/// so we apply the limited-range pre-scaling here in the shader.
+///
+/// Texture binding contract (set up in run_nv12_blit_pass):
+///   - TEXTURE0: u_tex_y  -- Y plane,  GL_LUMINANCE, samples .r
+///   - TEXTURE1: u_tex_uv -- UV plane, GL_LUMINANCE_ALPHA,
+///                           samples .r (U) + .a (V) on GLES2
+///
+/// Matrix coefficients are BT.601 (the original ITU-R / SMPTE
+/// 170M variant). Pi 4+ typically emits BT.709 for 1080p sources;
+/// if a future profile fight surfaces, swap matrix coefficients
+/// via uniforms.
+pub const FS_NV12_TO_RGB: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_tex_y;
+uniform sampler2D u_tex_uv;
+varying vec2 v_uv;
+void main() {
+    // Limited-range Y: [16/255, 235/255] -> [0, 1].
+    float y = (texture2D(u_tex_y, v_uv).r - (16.0/255.0)) * (255.0/219.0);
+    // GLES2 LUMINANCE_ALPHA: r=L (U here), a=A (V here).
+    vec2 uv_sample = texture2D(u_tex_uv, v_uv).ra;
+    // Limited-range UV: [16/255, 240/255] -> [-0.5, 0.5].
+    vec2 uv = (uv_sample - vec2(128.0/255.0)) * (255.0/224.0);
+    float r = y + 1.402 * uv.y;
+    float g = y - 0.344136 * uv.x - 0.714136 * uv.y;
+    float b = y + 1.772 * uv.x;
+    gl_FragColor = vec4(r, g, b, 1.0);
+}
+"#;
+
 /// v1-spec-delta #7 (slice c, 2026-05-08) -- Photoshop/Pillow
 /// `overlay` blend mode. Per-channel formula:
 ///   if dst < 0.5:  out = 2 · src · dst
@@ -5514,6 +5551,37 @@ mod tests {
         assert!(FS_BLIT.contains("u_src"));
         assert!(FS_BLIT.contains("v_uv"));
         assert!(FS_BLIT.contains("texture2D"));
+    }
+
+    #[test]
+    fn fs_nv12_to_rgb_targets_gles2_and_pins_uniforms_and_coefficients() {
+        // V4L2 piece 3d: NV12 -> RGB BT.601 limited-range shader.
+        // Pin GLES2 version + both samplers (Y plane on TEXTURE0,
+        // UV plane on TEXTURE1) + the BT.601 matrix coefficients.
+        // A rename or coefficient drift would silently produce
+        // wrong colors with no Mac-side way to catch it (the
+        // shader only runs on the Pi's GLES2 driver).
+        assert!(FS_NV12_TO_RGB.starts_with("#version 100\n"));
+        assert!(FS_NV12_TO_RGB.contains("precision mediump float"));
+        assert!(FS_NV12_TO_RGB.contains("u_tex_y"));
+        assert!(FS_NV12_TO_RGB.contains("u_tex_uv"));
+        assert!(FS_NV12_TO_RGB.contains("v_uv"));
+        assert!(FS_NV12_TO_RGB.contains("texture2D"));
+        // BT.601 limited-range Y scaling: (Y - 16/255) * 255/219.
+        assert!(FS_NV12_TO_RGB.contains("16.0/255.0"));
+        assert!(FS_NV12_TO_RGB.contains("255.0/219.0"));
+        // Limited-range UV center + range: (UV - 128/255) * 255/224.
+        assert!(FS_NV12_TO_RGB.contains("128.0/255.0"));
+        assert!(FS_NV12_TO_RGB.contains("255.0/224.0"));
+        // BT.601 matrix coefficients (Rec ITU-R BT.601 / SMPTE 170M).
+        assert!(FS_NV12_TO_RGB.contains("1.402"));
+        assert!(FS_NV12_TO_RGB.contains("0.344136"));
+        assert!(FS_NV12_TO_RGB.contains("0.714136"));
+        assert!(FS_NV12_TO_RGB.contains("1.772"));
+        // LUMINANCE_ALPHA sampling convention: UV plane is sampled
+        // as `.ra` because GLES2 LUMINANCE_ALPHA returns L in .r
+        // and A in .a (we map U->L, V->A on upload).
+        assert!(FS_NV12_TO_RGB.contains(".ra"));
     }
 
     #[test]
