@@ -139,58 +139,49 @@ impl SlideCache {
         if self.items.contains_key(&item_id) {
             return Ok(());
         }
-        match find_text_slide(content_root, item_id)? {
-            Some(s) => {
-                self.items.insert(item_id, ContentItem::Text(s));
-                return Ok(());
-            }
-            None => {}
+        if let Some(s) = find_text_slide(content_root, item_id)? {
+            self.items.insert(item_id, ContentItem::Text(s));
+            return Ok(());
         }
-        match find_image_slide(content_root, item_id)? {
-            Some(s) => {
-                self.items.insert(item_id, ContentItem::Image(s));
-                return Ok(());
-            }
-            None => {}
+        if let Some(s) = find_image_slide(content_root, item_id)? {
+            self.items.insert(item_id, ContentItem::Image(s));
+            return Ok(());
         }
-        match find_video_slide(content_root, item_id)? {
-            Some(s) => {
-                self.items.insert(item_id, ContentItem::Video(s));
-                let asset_path = video_slide_asset_path(content_root, item_id);
-                match Mp4Demuxer::open(&asset_path) {
-                    Ok(dem) => {
-                        eprintln!(
-                            "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
-                            item_id, dem.width, dem.height, dem.samples.len()
-                        );
-                        // V4L2 piece 3c: on Linux, also prime the
-                        // hardware decoder. Failure is best-effort
-                        // (warn + fall through to PIL fallback via
-                        // the "video slides TBD" wire). Mac: skip.
-                        #[cfg(target_os = "linux")]
-                        match prime_video_decoder(&dem) {
-                            Ok(dec_state) => {
-                                self.video_decoders.insert(item_id, dec_state);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "ipc: warning -- failed to prime V4L2 decoder for video slide {}: {:#}",
-                                    item_id, e
-                                );
-                            }
+        if let Some(s) = find_video_slide(content_root, item_id)? {
+            self.items.insert(item_id, ContentItem::Video(s));
+            let asset_path = video_slide_asset_path(content_root, item_id);
+            match Mp4Demuxer::open(&asset_path) {
+                Ok(dem) => {
+                    eprintln!(
+                        "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
+                        item_id, dem.width, dem.height, dem.samples.len()
+                    );
+                    // V4L2 piece 3c: on Linux, also prime the
+                    // hardware decoder. Failure is best-effort
+                    // (warn + fall through to PIL fallback via
+                    // the "video slides TBD" wire). Mac: skip.
+                    #[cfg(target_os = "linux")]
+                    match prime_video_decoder(&dem) {
+                        Ok(dec_state) => {
+                            self.video_decoders.insert(item_id, dec_state);
                         }
-                        self.video_demuxers.insert(item_id, dem);
+                        Err(e) => {
+                            eprintln!(
+                                "ipc: warning -- failed to prime V4L2 decoder for video slide {}: {:#}",
+                                item_id, e
+                            );
+                        }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "ipc: warning -- failed to open MP4 {} for video slide {}: {:#}",
-                            asset_path.display(), item_id, e
-                        );
-                    }
+                    self.video_demuxers.insert(item_id, dem);
                 }
-                return Ok(());
+                Err(e) => {
+                    eprintln!(
+                        "ipc: warning -- failed to open MP4 {} for video slide {}: {:#}",
+                        asset_path.display(), item_id, e
+                    );
+                }
             }
-            None => {}
+            return Ok(());
         }
         Err(anyhow!(
             "no item found for {item_id} under {} (type not text_slide / image / video)",
@@ -322,6 +313,11 @@ pub fn run_ipc_sidecar() -> Result<()> {
     let stdin_lock = stdin.lock();
     let mut lines = stdin_lock.lines();
 
+    // clippy::while_let_on_iterator suggests `for line in lines.by_ref()`,
+    // but the inner Open handler below passes `&mut lines` to the inner
+    // loop function — `for` + `by_ref()` would hold a borrow across that
+    // call (E0499). Keep the while-let form for the outer dispatch.
+    #[allow(clippy::while_let_on_iterator)]
     while let Some(line) = lines.next() {
         let line = line?;
         let req: IpcRequest = match serde_json::from_str(&line) {
@@ -425,7 +421,7 @@ where
     )?;
     let mut state = PlaybackState::new();
     let mut cache = SlideCache::new();
-    while let Some(line) = lines.next() {
+    for line in lines.by_ref() {
         let line = line?;
         let req: IpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,

@@ -1978,11 +1978,11 @@ pub fn apply_brightness_gamma_rgba(
 ) {
     let inv_gamma = 1.0 / gamma.max(0.001);
     for px in rgba.chunks_exact_mut(4) {
-        for i in 0..3 {
-            let v = (px[i] as f32) / 255.0;
+        for val in &mut px[..3] {
+            let v = (*val as f32) / 255.0;
             let scaled = (v * brightness).clamp(0.0, 1.0);
             let corrected = scaled.powf(inv_gamma);
-            px[i] = (corrected * 255.0).round().clamp(0.0, 255.0) as u8;
+            *val = (corrected * 255.0).round().clamp(0.0, 255.0) as u8;
         }
         // alpha unchanged.
     }
@@ -3309,7 +3309,7 @@ fn motion_ticker(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64)
     // ~3 s). Linear interp keeps the math obvious; the spec
     // explicitly tolerates approximate timing because operators
     // can't perceive sub-second period differences.
-    let base_period = 6.0 - 5.0 * intensity_norm as f32;
+    let base_period = 6.0 - 5.0 * intensity_norm;
     if speed == 0.0 {
         // Frozen: hold at phase=0 visual state (entry edge).
         return MotionState {

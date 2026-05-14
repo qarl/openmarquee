@@ -1002,16 +1002,13 @@ mod tests {
     #[test]
     fn settings_is_color_identity_at_b100_g1() {
         // Explicit identity: brightness=100, gamma=1.0.
-        let mut s = Settings::default();
-        s.gamma = 1.0;
+        let s = Settings { gamma: 1.0, ..Settings::default() };
         assert!(s.is_color_identity());
     }
 
     #[test]
     fn settings_not_color_identity_when_brightness_dimmed() {
-        let mut s = Settings::default();
-        s.gamma = 1.0;
-        s.brightness = 50;
+        let s = Settings { gamma: 1.0, brightness: 50, ..Settings::default() };
         assert!(!s.is_color_identity());
     }
 

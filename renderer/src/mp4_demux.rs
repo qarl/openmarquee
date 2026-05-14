@@ -118,7 +118,7 @@ impl Mp4Demuxer {
             if size < 8 {
                 bail!("malformed mp4: box size < 8 at offset {}", pos);
             }
-            if size as u64 > file_size - pos {
+            if size > file_size - pos {
                 bail!(
                     "malformed mp4: box size {} at offset {} > file size",
                     size, pos
