@@ -181,9 +181,46 @@ class RustRendererUnsupportedSlideError(RustRendererOpError):
     """
 
 
+class RustRendererUnsupportedTransitionError(RustRendererOpError):
+    """The sidecar refused a `begin_transition` op because the requested
+    transition kind isn't yet wired in the shader pipeline.
+
+    Parallel to `RustRendererUnsupportedSlideError`: distinguishes "this
+    transition kind isn't implemented" from "the proxy is busted" so
+    AutoFallbackRenderer can let playback log + fall through to an
+    instant-cut for the one transition, without swapping the whole
+    process over to MockRenderer.
+
+    Forward-compat: as of 2026-05-14, `hdmi_logic::fs_for_transition_kind`
+    accepts ALL 16 known kinds (cut + the 15 named in
+    playback._SHADER_TRANSITION_KINDS) and silently FS_CUT-fallbacks
+    for anything else (see `paint_and_present_one_transition_frame`).
+    The proxy can't promote what the sidecar doesn't emit, so this
+    exception class never fires TODAY. It exists for the case where
+    a future Python schema adds a kind that hasn't been shader-wired
+    AND a future Rust change starts emitting an explicit error for
+    unknown kinds (e.g. "paint_transition: unknown kind 'foo'").
+
+    Wire-format substring that promotes to this class (provisional;
+    Rust doesn't emit this today):
+      - "transition kind not implemented"
+      - "unknown transition kind"
+    """
+
+
 _UNSUPPORTED_SLIDE_WIRE_MARKERS: tuple[str, ...] = (
     "video slides TBD",
     "non-text slide TBD",
+)
+
+
+_UNSUPPORTED_TRANSITION_WIRE_MARKERS: tuple[str, ...] = (
+    # Provisional markers. Rust currently FS_CUT-fallbacks silently;
+    # if a future change emits explicit errors for unknown kinds, the
+    # substrings should match one of these. Drift-tolerant: if Rust
+    # picks a different phrasing, update both ends in lockstep.
+    "transition kind not implemented",
+    "unknown transition kind",
 )
 
 
@@ -193,6 +230,9 @@ def _classify_op_error(message: str) -> RustRendererOpError:
     for marker in _UNSUPPORTED_SLIDE_WIRE_MARKERS:
         if marker in message:
             return RustRendererUnsupportedSlideError(message)
+    for marker in _UNSUPPORTED_TRANSITION_WIRE_MARKERS:
+        if marker in message:
+            return RustRendererUnsupportedTransitionError(message)
     return RustRendererOpError(message)
 
 

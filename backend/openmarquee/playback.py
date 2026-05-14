@@ -695,12 +695,29 @@ class PlaybackLoop:
                 # the per-tick PIL composite + render_frame(bytes) hot
                 # path doesn't fit -- the sidecar owns rasterization
                 # AND DRM page-flip. Drive it via begin_slide + advance
-                # IPC ops instead. Skip the existing dynamic/static
-                # dispatch + transition fork; transitions on the rust
-                # route are instant cuts for this slice (follow-up will
-                # wire begin_transition).
+                # IPC ops instead.
+                #
+                # Slice-4-followup (rust transitions): after the current
+                # slide's duration loop ends, drive begin_transition +
+                # advance through the transition window into the next
+                # slide -- the sidecar's state machine internally
+                # promotes from PaintTransition to PaintSlide(next), so
+                # the next iteration's begin_slide just re-anchors the
+                # to-slide's clock (idempotent visible-state-wise).
                 if self._renderer_supports_ipc_ops():
-                    rendered = await self._play_via_rust_ipc(item)
+                    # Compute next item for the transition handoff.
+                    # Playlist wraps: at end-of-list, transition into
+                    # items[0] to mirror the existing PIL transition
+                    # path's behavior.
+                    next_for_transition = (
+                        items[(i + 1) % len(items)] if len(items) > 1 else None
+                    )
+                    rendered = await self._play_via_rust_ipc(
+                        item,
+                        next_item=next_for_transition,
+                        transition_kind=(item.transition or "cut"),
+                        transition_ms=int(item.transition_ms or 0),
+                    )
                     if self._stop_event.is_set():
                         break
                     if self._pause_event.is_set():
@@ -924,11 +941,19 @@ class PlaybackLoop:
             and hasattr(self._renderer, "advance")
         )
 
-    async def _play_via_rust_ipc(self, item: ContentItem) -> bool:
+    async def _play_via_rust_ipc(
+        self,
+        item: ContentItem,
+        *,
+        next_item: ContentItem | None = None,
+        transition_kind: str = "cut",
+        transition_ms: int = 0,
+    ) -> bool:
         """Drive one slide through the Rust IPC sidecar's begin_slide
-        + advance contract. The sidecar owns rasterization AND DRM
-        page-flip; Python sends ops and waits for SlideComplete or
-        duration-elapsed.
+        + advance contract, AND drive begin_transition into the next
+        slide if one is specified. The sidecar owns rasterization +
+        DRM page-flip; Python sends ops and waits for SlideComplete
+        + the transition state machine to promote into the to-slide.
 
         Returns True when the slide played out normally. Returns False
         when the slide kind isn't supported by the sidecar yet (today:
@@ -939,23 +964,33 @@ class PlaybackLoop:
         boundary; the sidecar paints into its own EGL session and
         commits the DRM framebuffer.
 
-        Transitions are out of scope for this slice -- they become
-        instant cuts between slides on the rust route. Follow-up slice
-        will wire begin_transition for the 15 transition kinds. The
-        sidecar already exposes begin_transition; just no Python caller
-        yet.
+        Transition handoff (slice 4-followup): if `next_item` is set
+        AND `transition_kind != "cut"` AND `transition_ms > 0`, after
+        the slide-duration advance loop ends we call begin_transition
+        and keep advancing until the sidecar's state machine promotes
+        the to-slide (advance returns PaintSlide(next_item) instead of
+        PaintTransition). The next outer iteration's begin_slide on
+        next_item re-anchors that slide's clock from 0 -- visible
+        state is identical since the sidecar just promoted with
+        t_in_slide_ms=0 anyway.
 
-        TODO(slice 4-followup): handle `AutoFallbackInMockError` (the
-        wrapper post-fallback swap) and `RustRendererRespawnedError`
-        (transient subprocess reconnect; caller must replay begin_slide
-        on the fresh subprocess). Both currently propagate uncaught
-        and would crash the outer `_loop`. Acceptable for this slice
-        since the wrapper's swap is permanent + an immediate
-        restart-loop will reach a clean state, but the respawn-replay
-        path is the operationally-correct fix.
+        Cut transitions (transition_kind == "cut" or transition_ms <=
+        0) are no-ops here; the outer loop's begin_slide on the next
+        iteration is the instant cut.
+
+        TODO: handle `AutoFallbackInMockError` (the wrapper post-
+        fallback swap) and `RustRendererRespawnedError` (transient
+        subprocess reconnect; caller must replay begin_slide on the
+        fresh subprocess). Both currently propagate uncaught and
+        would crash the outer `_loop`. Acceptable until the
+        respawn-replay path is wired -- the wrapper's swap is
+        permanent + an immediate restart-loop will reach a clean
+        state.
         """
         from openmarquee.rendering.rust_renderer import (
+            PaintTransition,
             RustRendererUnsupportedSlideError,
+            RustRendererUnsupportedTransitionError,
             SlideComplete,
         )
         assert self._stop_event is not None
@@ -1006,6 +1041,80 @@ class PlaybackLoop:
             if remaining <= 0:
                 break
             await self._wait(min(tick_period, remaining))
+
+        # Transition handoff. Only fires when caller passed a non-cut
+        # transition AND there's a next slide to transition INTO. Pause
+        # or stop events skip transitions -- a paused/stopped loop
+        # should yield immediately, not paint another transition_ms.
+        if (
+            next_item is not None
+            and transition_kind != "cut"
+            and transition_ms > 0
+            and not self._stop_event.is_set()
+            and not self._pause_event.is_set()
+        ):
+            transition_t0_ms = t0_ms + int((loop.time() - t0) * 1000)
+            try:
+                self._renderer.begin_transition(
+                    next_item.id,
+                    int(next_item.duration_ms),
+                    transition_kind,
+                    int(transition_ms),
+                    transition_t0_ms,
+                )
+            except RustRendererUnsupportedTransitionError as e:
+                # Forward-compat catch -- today's Rust silently FS_CUT-
+                # fallbacks for unknown kinds so this path doesn't fire.
+                # If a future Rust change starts erroring explicitly,
+                # we log + return cleanly so the next outer iteration
+                # begin_slide's the next item (= instant cut, same
+                # visible result the silent fallback produced).
+                log.info(
+                    "playback: transition kind %r unsupported; falling "
+                    "through to instant cut: %s", transition_kind, e.message,
+                )
+                return True
+            # Drive the transition window. Exit on:
+            #   (a) advance returns PaintSlide(next_item) -- state machine
+            #       promoted the to-slide; visible result is identical
+            #       to "transition complete, next slide playing"
+            #   (b) transition_ms elapsed (safety bound; the sidecar's
+            #       clamp at line 159 of playback.rs already guarantees
+            #       this but extra round-trip protection costs nothing)
+            #
+            # Note: a stop or pause inside this window leaves the
+            # sidecar's `pending` transition state set until the next
+            # begin_slide or close op clears it. Harmless: not a leak,
+            # and the next outer iteration's begin_slide re-anchors
+            # cleanly. Visible effect of a pause mid-window is a
+            # partially-blended frame frozen on screen rather than a
+            # clean slide; tracked as a known polish item.
+            transition_end_at = loop.time() + transition_ms / 1000
+            while True:
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                t_ms = t0_ms + int((loop.time() - t0) * 1000)
+                try:
+                    result = self._renderer.advance(t_ms)
+                except RustRendererUnsupportedTransitionError as e:
+                    # Mid-transition error -- shouldn't happen (begin_
+                    # transition already succeeded), but if it does
+                    # treat as cut: log + bail.
+                    log.info(
+                        "playback: transition %r failed mid-window; "
+                        "treating as cut: %s", transition_kind, e.message,
+                    )
+                    break
+                if not isinstance(result, PaintTransition):
+                    # Sidecar promoted out of the transition state into
+                    # either PaintSlide(next_item) or SlideComplete. The
+                    # next outer iteration's begin_slide will pick up
+                    # cleanly. Either way, transition is done.
+                    break
+                remaining = transition_end_at - loop.time()
+                if remaining <= 0:
+                    break
+                await self._wait(min(tick_period, remaining))
         return True
 
     async def _play_dynamic_slide(self, item: ContentItem) -> Image.Image | None:

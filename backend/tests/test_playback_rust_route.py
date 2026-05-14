@@ -29,7 +29,10 @@ from openmarquee.rendering.mock import MockRenderer
 from openmarquee.rendering.rust_renderer import (
     Idle,
     PaintSlide,
+    PaintTransition,
+    RustRendererSubprocessError,
     RustRendererUnsupportedSlideError,
+    RustRendererUnsupportedTransitionError,
     SlideComplete,
 )
 
@@ -69,16 +72,33 @@ class _FakeRustRenderer:
         height: int = 8,
         *,
         unsupported_slide_ids: set[UUID] | None = None,
+        unsupported_transition_kinds: set[str] | None = None,
+        subprocess_error_on_begin_transition: bool = False,
     ):
         self.width = width
         self.height = height
         self.unsupported_slide_ids: set[UUID] = unsupported_slide_ids or set()
+        self.unsupported_transition_kinds: set[str] = (
+            unsupported_transition_kinds or set()
+        )
+        self.subprocess_error_on_begin_transition = (
+            subprocess_error_on_begin_transition
+        )
         self.begin_slide_calls: list[tuple[UUID, int, int]] = []
+        # (to_slide_id, to_duration_ms, kind, transition_ms, t0_ms)
+        self.begin_transition_calls: list[tuple[UUID, int, str, int, int]] = []
         self.advance_calls: list[int] = []
         self.render_frame_calls: int = 0
         self._current_slide: UUID | None = None
         self._begin_t_ms: int = 0
         self._duration_ms: int = 0
+        # Transition state (populated by begin_transition; cleared
+        # after promote-to-slide on advance).
+        self._transition_from: UUID | None = None
+        self._transition_to: UUID | None = None
+        self._transition_kind: str | None = None
+        self._transition_t0_ms: int = 0
+        self._transition_ms: int = 0
 
     # Renderer Protocol surface --------------------------------------
 
@@ -107,6 +127,34 @@ class _FakeRustRenderer:
 
     def advance(self, t_ms: int) -> Any:
         self.advance_calls.append(t_ms)
+        # Mirror the real Rust state machine (playback.rs::advance):
+        # transition state takes precedence during its blend window;
+        # when elapsed >= transition_ms, promote to PaintSlide(to_slide)
+        # and clear the transition.
+        if self._transition_to is not None:
+            elapsed = t_ms - self._transition_t0_ms
+            if elapsed >= self._transition_ms:
+                # Promote to-slide. Set up steady state so subsequent
+                # advance() calls return PaintSlide(to_slide).
+                self._current_slide = self._transition_to
+                self._begin_t_ms = self._transition_t0_ms + self._transition_ms
+                # duration_ms stays at whatever the to-slide's was;
+                # caller's begin_transition recorded it. We approximate
+                # by re-using the existing _duration_ms (or 0); the
+                # outer loop will begin_slide-reset shortly after.
+                self._transition_from = None
+                self._transition_to = None
+                self._transition_kind = None
+                return PaintSlide(
+                    slide_id=self._current_slide,
+                    t_in_slide_ms=0,
+                )
+            return PaintTransition(
+                from_id=self._transition_from,
+                to=self._transition_to,
+                kind=self._transition_kind or "cut",
+                progress=elapsed / max(1, self._transition_ms),
+            )
         if self._current_slide is None:
             return Idle()
         elapsed_in_slide = t_ms - self._begin_t_ms
@@ -116,6 +164,35 @@ class _FakeRustRenderer:
             slide_id=self._current_slide,
             t_in_slide_ms=elapsed_in_slide,
         )
+
+    def begin_transition(
+        self,
+        to_slide_id: UUID,
+        to_duration_ms: int,
+        kind: str,
+        transition_ms: int,
+        t0_ms: int,
+    ) -> None:
+        self.begin_transition_calls.append(
+            (to_slide_id, to_duration_ms, kind, transition_ms, t0_ms)
+        )
+        if self.subprocess_error_on_begin_transition:
+            raise RustRendererSubprocessError(
+                "subprocess died during op 'begin_transition'"
+            )
+        if kind in self.unsupported_transition_kinds:
+            raise RustRendererUnsupportedTransitionError(
+                f"transition kind not implemented: {kind}"
+            )
+        self._transition_from = self._current_slide
+        self._transition_to = to_slide_id
+        self._transition_kind = kind
+        self._transition_t0_ms = int(t0_ms)
+        self._transition_ms = int(transition_ms)
+        # Stash to-slide duration so post-promote advances are
+        # plausible (the real outer loop calls begin_slide next, which
+        # resets begin_t_ms anyway).
+        self._duration_ms = int(to_duration_ms)
 
 
 # ============================================================
@@ -283,3 +360,191 @@ def test_ipc_renderer_dispatch_gate_evaluates_true():
         empty_playlist_poll_seconds=0.01,
     )
     assert loop._renderer_supports_ipc_ops() is True
+
+
+# ============================================================
+# Slice-4-followup: rust-route transitions wired via begin_transition.
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_non_cut_transition_calls_begin_transition_for_each_slide():
+    """When the playlist has slides with non-cut transitions, the
+    loop calls begin_transition INTO the next slide for each one.
+    Pins the slice-4-followup wire-up: cut path stayed for slice 4;
+    this asserts the new path fires when the transition spec asks
+    for it."""
+    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
+                         transition="fade", transition_ms=30)
+    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
+                         transition="wipe", transition_ms=30)
+
+    fake = _FakeRustRenderer(width=8, height=8)
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [text_a, text_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    await loop.start()
+    await asyncio.sleep(0.4)
+    await loop.stop()
+
+    # At least one fade + one wipe transition fired -- the loop went
+    # through the playlist at least once. Each begin_transition entry:
+    # (to_slide_id, to_duration_ms, kind, transition_ms, t0_ms).
+    kinds_seen = [c[2] for c in fake.begin_transition_calls]
+    assert "fade" in kinds_seen, (
+        f"expected fade transition; got {kinds_seen}"
+    )
+    assert "wipe" in kinds_seen, (
+        f"expected wipe transition; got {kinds_seen}"
+    )
+    # fade transition's to_slide is text_b; wipe's to_slide is text_a
+    # (playlist wrap). Pin both.
+    for to_id, _dur, kind, _ms, _t0 in fake.begin_transition_calls:
+        if kind == "fade":
+            assert to_id == text_b.id
+        elif kind == "wipe":
+            assert to_id == text_a.id
+
+
+@pytest.mark.asyncio
+async def test_cut_transition_does_not_call_begin_transition():
+    """transition='cut' (or unset) means instant cut between slides.
+    begin_transition MUST NOT fire -- the outer loop's begin_slide on
+    the next iteration IS the instant cut."""
+    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
+                         transition="cut", transition_ms=0)
+    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
+                         transition="cut", transition_ms=0)
+
+    fake = _FakeRustRenderer(width=8, height=8)
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [text_a, text_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    await loop.start()
+    await asyncio.sleep(0.35)
+    await loop.stop()
+
+    assert fake.begin_transition_calls == [], (
+        f"cut transitions should not call begin_transition; got "
+        f"{fake.begin_transition_calls}"
+    )
+    # begin_slide still fires for each slide.
+    assert len(fake.begin_slide_calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_zero_duration_transition_does_not_call_begin_transition():
+    """A non-cut kind name with transition_ms=0 is also a cut (no
+    blend window to drive). Edge case from the dispatch's test plan."""
+    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
+                         transition="fade", transition_ms=0)
+    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
+                         transition="fade", transition_ms=0)
+
+    fake = _FakeRustRenderer(width=8, height=8)
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [text_a, text_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    await loop.start()
+    await asyncio.sleep(0.3)
+    await loop.stop()
+
+    assert fake.begin_transition_calls == [], (
+        f"0-duration transitions should not call begin_transition; "
+        f"got {fake.begin_transition_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unsupported_transition_falls_through_to_cut(caplog):
+    """If the sidecar raises RustRendererUnsupportedTransitionError
+    on begin_transition (forward-compat: Rust silently FS_CUTs today,
+    but a future explicit-error path is provisioned), the loop logs
+    + falls through to instant cut. The next slide still begin_slides
+    on the next iteration -- visible result is a cut."""
+    import logging
+
+    # Pydantic gates the schema's `transition` to the existing 16 kind
+    # names, so we can't construct a slide with a truly-unknown kind.
+    # Instead: use a real kind ("glitch") and have the fake renderer
+    # raise UnsupportedTransitionError for it, simulating the future
+    # case where a Rust regression unwires a kind that the schema
+    # still accepts.
+    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
+                         transition="glitch", transition_ms=30)
+    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
+                         transition="cut", transition_ms=0)
+
+    fake = _FakeRustRenderer(
+        width=8, height=8,
+        unsupported_transition_kinds={"glitch"},
+    )
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [text_a, text_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    with caplog.at_level(logging.INFO, logger="openmarquee.playback"):
+        await loop.start()
+        await asyncio.sleep(0.3)
+        await loop.stop()
+
+    # begin_transition WAS called (we recorded the call before the raise).
+    fake_calls = [c for c in fake.begin_transition_calls
+                  if c[2] == "glitch"]
+    assert fake_calls, "begin_transition should have been attempted"
+    # Loop logged the fallback.
+    skip_logs = [
+        r for r in caplog.records
+        if "falling through to instant cut" in r.getMessage()
+    ]
+    assert skip_logs, (
+        f"expected fall-through log; got {[r.getMessage() for r in caplog.records]}"
+    )
+    # Loop didn't crash -- both slides reached begin_slide.
+    slide_ids = [c[0] for c in fake.begin_slide_calls]
+    assert text_a.id in slide_ids
+    assert text_b.id in slide_ids
+
+
+@pytest.mark.asyncio
+async def test_subprocess_error_during_begin_transition_swaps_to_mock():
+    """Slice 4 invariant regression: if the proxy raises a generic
+    SubprocessError during begin_transition (the subprocess died),
+    AutoFallbackRenderer DOES swap to Mock. Distinguishes the
+    "transition kind unsupported" path (log + fall through) from
+    the "proxy busted" path (one-way swap)."""
+    from openmarquee.dependencies import (
+        AutoFallbackInMockError,
+        AutoFallbackRenderer,
+        _mock_renderer_singleton,
+    )
+
+    fake = _FakeRustRenderer(
+        width=8, height=8,
+        subprocess_error_on_begin_transition=True,
+    )
+    wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+    # Calling begin_transition on the wrapper should raise the
+    # AutoFallbackInMockError (per slice 4's contract -- subprocess-
+    # error path wraps the raise) AND swap to Mock.
+    with pytest.raises(AutoFallbackInMockError):
+        wrapper.begin_transition(
+            UUID("00000000-0000-0000-0000-000000000001"),
+            5000, "fade", 30, 0,
+        )
+    assert wrapper.is_in_fallback is True

@@ -61,6 +61,11 @@ class AutoFallbackRenderer:
         unwrapped -- the proxy is fine, the SLIDE kind isn't
         supported. Playback loop catches the propagated exception
         and skips the slide (advance to next). DOES NOT swap to Mock.
+      - `RustRendererUnsupportedTransitionError` from `begin_transition`
+        is logged and re-raised unwrapped, parallel to the slide-kind
+        case. Playback loop falls through to an instant cut. DOES NOT
+        swap to Mock. Today this never fires (all 15 kinds are wired
+        in Rust); forward-compat for an unknown kind.
 
     NOT forwarded: `is_alive`, `health_probe`, reconnect-related
     helpers -- these are RustRenderer-internal. The wrapper exposes
@@ -242,6 +247,7 @@ class AutoFallbackRenderer:
             RustRendererRespawnedError,
             RustRendererSubprocessError,
             RustRendererUnsupportedSlideError,
+            RustRendererUnsupportedTransitionError,
         )
         method = getattr(self._primary, op_name)
         try:
@@ -266,6 +272,21 @@ class AutoFallbackRenderer:
             log.info(
                 "AutoFallbackRenderer: %s skipped (unsupported slide kind): %s",
                 op_name, e.message,
+            )
+            raise
+        except RustRendererUnsupportedTransitionError as e:
+            # Sidecar shader pipeline doesn't have this transition kind
+            # wired; let the playback loop fall through to an instant
+            # cut for this one transition. Forward-compat -- as of
+            # 2026-05-14 every named kind is wired and the Rust side
+            # silently FS_CUT-fallbacks for the unknown, so this never
+            # fires today. Listed explicitly here so when Rust starts
+            # emitting an explicit error for unknown kinds the policy
+            # is already in place (same shape as UnsupportedSlideError:
+            # log + re-raise, do NOT swap to Mock).
+            log.info(
+                "AutoFallbackRenderer: %s downgraded to cut (unsupported "
+                "transition kind): %s", op_name, e.message,
             )
             raise
         except RustRendererSubprocessError as e:
