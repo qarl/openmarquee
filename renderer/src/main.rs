@@ -24,6 +24,7 @@ mod hdmi_logic;
 mod ipc_main;
 mod lru;
 mod mem;
+mod mp4_demux;
 mod playback;
 mod profile;
 // V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
