@@ -2377,10 +2377,10 @@ fn render_image_slide_in_session(
 /// Pre-conditions:
 ///   * EglSession is bound (with_egl_session is the caller).
 ///   * slide layers + bg are pre-resolved by caller.
-///   * t_in_slide_ms is the relative ms since slide entry; the
-///     state machine produces this from advance() so the
-///     render side stays purely a function of (slide,
-///     t_in_slide).
+///   * t_in_slide_ms is the relative ms since slide entry, kept
+///     for IPC schema parity + future per-slide pacing needs.
+///     **NOT** used to derive motion tick -- motion tick is
+///     session-global (see Bug 1 fix extension below).
 ///
 /// Post-conditions:
 ///   * One frame painted to scanout (set_crtc on first call,
@@ -2394,12 +2394,20 @@ pub fn paint_and_present_one_frame_for_slide(
     slide: &TextSlide,
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
-    t_in_slide_ms: u64,
+    _t_in_slide_ms: u64,
 ) -> Result<()> {
     use glow::HasContext;
     let (bg_kind, _pattern_label, text_layers) =
         resolve_slide_layers(slide, fonts, content_root)?;
-    let tick_seconds = t_in_slide_ms as f64 / 1000.0;
+    // Bug 1 fix extension (qarl-flag 2026-05-09, applied 2026-05-13):
+    // motion tick is session-global -- matches the basis used by
+    // render_animated_slide_in_session (standalone hold) and the SP/SB
+    // transition loops. Pre-fix, this IPC-sidecar path derived
+    // tick_seconds from `t_in_slide_ms / 1000`, which resets to 0 at
+    // every BeginSlide. With transitions baking motion frozen between
+    // slide A and slide B, that reset produced a visible phase snap at
+    // hold-A->transition AND transition->hold-B boundaries on glass.
+    let tick_seconds = session.session_start.elapsed().as_secs_f64();
     let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
     let wall_clock_unix = current_unix_seconds();
 
