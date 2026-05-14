@@ -48,6 +48,14 @@ echo "==> rebuilding UI bundle in $OPENMARQUEE_BUILD_DIR/ui"
 (cd "$OPENMARQUEE_BUILD_DIR/ui" && npm run build --silent)
 
 echo "==> rsync backend to $TARGET:$REMOTE_ROOT/backend/"
+# Pre-clean any __pycache__ + *.egg-info that the running backend (which
+# writes .pyc as root) and pip install -e . (which creates .egg-info as
+# root via install.sh's sudo run) left behind. Without this, --delete-
+# excluded in the rsync below tries to delete root-owned files as the
+# openmarquee user and exits 23 ("partial transfer"). The 2>/dev/null
+# || true guards against the pre-clean failing on a fresh Pi where
+# none of these paths exist yet.
+ssh "$TARGET" "sudo find $REMOTE_ROOT/backend -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; sudo find $REMOTE_ROOT/backend -name '*.egg-info' -type d -exec rm -rf {} + 2>/dev/null; true"
 rsync -avz --delete --delete-excluded \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
@@ -88,6 +96,22 @@ rsync -avz --delete --delete-excluded \
     --exclude 'package-lock.json' \
     --exclude '._*' \
     "$OPENMARQUEE_BUILD_DIR/ui/" "$TARGET:$REMOTE_ROOT/ui/"
+
+# scripts/ and system/ both need to be on the Pi for install.sh to find
+# itself + the systemd units, hostapd.conf, dnsmasq.conf it stages. Without
+# these the next line ("ssh $TARGET sudo bash $REMOTE_ROOT/scripts/install.sh")
+# fails with "No such file or directory" and the deploy aborts. Both
+# directories are small (<200KB total) so unconditional rsync is fine.
+echo "==> rsync scripts/ to $TARGET:$REMOTE_ROOT/scripts/"
+rsync -avz --delete --delete-excluded \
+    --exclude '._*' \
+    --exclude '__pycache__' \
+    "$OPENMARQUEE_BUILD_DIR/scripts/" "$TARGET:$REMOTE_ROOT/scripts/"
+
+echo "==> rsync system/ to $TARGET:$REMOTE_ROOT/system/"
+rsync -avz --delete --delete-excluded \
+    --exclude '._*' \
+    "$OPENMARQUEE_BUILD_DIR/system/" "$TARGET:$REMOTE_ROOT/system/"
 
 echo "==> running install.sh on remote (idempotent provisioning)"
 # install.sh handles venv (Batch 11.1 / sweep #5 #7 requirements.lock

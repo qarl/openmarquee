@@ -35,10 +35,14 @@ ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
-# We DO need to write to /etc/hostapd, /opt/openmarquee/ui, and
-# /var/openmarquee -- ProtectSystem=full makes /usr + /boot
-# read-only but leaves /etc + /var + /opt writable.
-ReadWritePaths=/etc/hostapd /opt/openmarquee/ui /var/openmarquee
+# We DO need to write to /etc/hostapd, /etc/hostname, /etc/hosts,
+# /opt/openmarquee/ui, and /var/openmarquee. ProtectSystem=full
+# makes /usr + /boot read-only AND drops write on /etc by default,
+# so each writable file under /etc must be explicitly listed.
+# hostname + hosts are templated by firstboot.sh's setup_hostname()
+# step; without these entries hostnamectl + sed fail with "Read-only
+# file system" on the first run.
+ReadWritePaths=/etc/hostapd /etc/hostname /etc/hosts /opt/openmarquee/ui /var/openmarquee
 # Restart only on failure -- a clean exit means we're done.
 Restart=on-failure
 # But cap retries: if the script keeps crashing, stop trying so
