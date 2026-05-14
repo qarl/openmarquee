@@ -23,8 +23,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 
 use crate::content::{
-    find_image_slide, find_text_slide, find_video_slide, ContentItem, SettingsWatcher,
+    find_image_slide, find_text_slide, find_video_slide, video_slide_asset_path,
+    ContentItem, SettingsWatcher,
 };
+use crate::mp4_demux::Mp4Demuxer;
 use crate::playback::{
     advance_command_to_op_result, AdvanceCommand, IpcRequest, IpcResponse, OpResult,
     OpenParams, PlaybackState,
@@ -36,14 +38,27 @@ use crate::hdmi_logic::FontCatalog;
 /// + BeginTransition; consumed by Advance's actual-paint path
 /// in slice (d). Slice (c) populates the cache but doesn't
 /// paint -- the cache is plumbed for slice (d) to pick up.
+///
+/// V4L2 piece 3b (2026-05-14): video_demuxers holds an
+/// `Mp4Demuxer` per VideoSlide seen on BeginSlide. The MP4 box
+/// parse runs once on first cache.load and is reused across
+/// advance ticks. Piece 3c will add a parallel decoders map
+/// holding `v4l2::Decoder` instances on Linux + wire the
+/// demuxer's SPS/PPS/samples through the codec. Demuxer
+/// instantiation is best-effort -- if `asset.mp4` is missing or
+/// malformed, we log + continue with the cache populated only
+/// for `items`; the paint_slide "video slides TBD" path still
+/// triggers the Python proxy's PIL fallback.
 struct SlideCache {
     items: std::collections::HashMap<uuid::Uuid, ContentItem>,
+    video_demuxers: std::collections::HashMap<uuid::Uuid, Mp4Demuxer>,
 }
 
 impl SlideCache {
     fn new() -> Self {
         Self {
             items: std::collections::HashMap::new(),
+            video_demuxers: std::collections::HashMap::new(),
         }
     }
 
@@ -51,6 +66,12 @@ impl SlideCache {
     /// required for the find_*_slide chain. Tries text -> image
     /// -> video. Returns Err with a message if all three return
     /// Ok(None) (unknown type) or any return Err.
+    ///
+    /// V4L2 piece 3b: on a successful Video load, also open
+    /// the asset.mp4 + parse it into an Mp4Demuxer. Failure to
+    /// open the MP4 logs a warning + leaves video_demuxers
+    /// without an entry; downstream paint paths fall back via
+    /// the existing "video slides TBD" wire.
     fn load(&mut self, content_root: &std::path::Path, item_id: uuid::Uuid) -> Result<()> {
         if self.items.contains_key(&item_id) {
             return Ok(());
@@ -72,6 +93,22 @@ impl SlideCache {
         match find_video_slide(content_root, item_id)? {
             Some(s) => {
                 self.items.insert(item_id, ContentItem::Video(s));
+                let asset_path = video_slide_asset_path(content_root, item_id);
+                match Mp4Demuxer::open(&asset_path) {
+                    Ok(dem) => {
+                        eprintln!(
+                            "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
+                            item_id, dem.width, dem.height, dem.samples.len()
+                        );
+                        self.video_demuxers.insert(item_id, dem);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "ipc: warning -- failed to open MP4 {} for video slide {}: {:#}",
+                            asset_path.display(), item_id, e
+                        );
+                    }
+                }
                 return Ok(());
             }
             None => {}
@@ -974,6 +1011,83 @@ mod tests {
         // Video bail takes precedence.
         let err_msg2 = validate_paint_slide_inputs(&item, None).unwrap_err();
         assert_eq!(err_msg, err_msg2);
+    }
+
+    /// V4L2 piece 3b: when a VideoSlide loads + the asset.mp4 is
+    /// present + parses cleanly, the SlideCache stores an
+    /// Mp4Demuxer indexed by slide id. Piece 3c will consume it
+    /// at paint_slide time.
+    #[test]
+    fn cache_load_video_populates_demuxer_when_asset_present() {
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(3);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("item.json"),
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "video",
+                "id": "03030303-0303-0303-0303-030303030303",
+                "name": "vid",
+                "duration_ms": 2000,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        // Copy the committed MP4 fixture into the temp item dir.
+        let fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        std::fs::copy(&fixture, dir.join("asset.mp4")).unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("cache.load");
+        assert!(cache.items.contains_key(&id), "Video item must be in items");
+        let dem = cache.video_demuxers.get(&id)
+            .expect("Mp4Demuxer must be in video_demuxers when asset present");
+        assert_eq!(dem.width, 320);
+        assert_eq!(dem.height, 240);
+        assert!(!dem.samples.is_empty());
+    }
+
+    /// V4L2 piece 3b: when asset.mp4 is missing or malformed,
+    /// cache.load still succeeds (Video item is in items),
+    /// video_demuxers is left empty for that id, and the
+    /// "video slides TBD" PIL-fallback path stays usable.
+    #[test]
+    fn cache_load_video_tolerates_missing_asset() {
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(4);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("item.json"),
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "video",
+                "id": "04040404-0404-0404-0404-040404040404",
+                "name": "vid-no-asset",
+                "duration_ms": 2000,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        // Deliberately no asset.mp4.
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("cache.load should succeed without asset");
+        assert!(cache.items.contains_key(&id), "Video item still in items");
+        assert!(!cache.video_demuxers.contains_key(&id),
+            "video_demuxers must be empty when asset missing");
     }
 
     #[test]
