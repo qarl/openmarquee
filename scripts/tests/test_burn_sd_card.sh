@@ -123,7 +123,10 @@ echo "burn_sd_card.sh -- disk validation gauntlet"
 echo ""
 
 MOCK_DIR="$(make_mock_dir)"
-trap "rm -rf $MOCK_DIR" EXIT
+# Single-quote so $MOCK_DIR is resolved at signal time, not at trap-set time
+# (SC2064). Today MOCK_DIR isn't reassigned, but the late-expansion form is
+# the safer pattern + keeps shellcheck quiet.
+trap 'rm -rf "$MOCK_DIR"' EXIT
 
 # --- Test 1: missing target arg ---
 echo "test 1: missing target"
@@ -145,7 +148,10 @@ assert_contains "--help prints usage" "burn_sd_card.sh" "$OUT"
 # --- Test 3: invalid disk shape (partition, not whole disk) ---
 echo ""
 echo "test 3: rejects partition path /dev/disk4s1"
-export MOCK_FIXTURE_PATH="$(mktemp)"
+# Declare + assign separately so mktemp's exit code propagates (SC2155).
+# Combined `export X="$(mktemp)"` would mask a mktemp failure.
+MOCK_FIXTURE_PATH="$(mktemp)"
+export MOCK_FIXTURE_PATH
 echo "$EXTERNAL_REMOVABLE_PLIST" > "$MOCK_FIXTURE_PATH"
 RESULT="$(run_with_mock "$MOCK_DIR" --dry-run /dev/disk4s1)"
 EXIT="${RESULT%%$'\n'*}"
