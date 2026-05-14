@@ -249,6 +249,22 @@ fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     let cap_fmt = dec
         .set_capture_format(v4l2::V4L2_PIX_FMT_NV12, w, h)
         .context("S_FMT CAPTURE (NV12)")?;
+    // Fail loud if the codec emits FULL_RANGE quantization — the
+    // MMAP-path FS_NV12_TO_RGB shader does explicit LIM_RANGE
+    // scaling and would crush blacks / clip whites. See
+    // `qa/v1-spec-delta-2026-05-14.md` P1.
+    let q = dec
+        .assert_capture_quantization_compatible()
+        .context("CAPTURE quantization compatibility")?;
+    eprintln!(
+        "v4l2 capture quantization: {} ({})",
+        q,
+        match q {
+            v4l2::V4L2_QUANTIZATION_DEFAULT => "DEFAULT",
+            v4l2::V4L2_QUANTIZATION_LIM_RANGE => "LIM_RANGE",
+            _ => "?",
+        }
+    );
     dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
         .context("REQBUFS OUTPUT")?;
     dec.allocate_buffers(v4l2::QueueDirection::Capture, 4)

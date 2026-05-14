@@ -384,6 +384,40 @@ impl Capabilities {
     }
 }
 
+// V4L2 quantization range values (from <linux/videodev2.h>).
+// Set in V4l2PixFormatMplane.quantization at S_FMT time; on
+// CAPTURE the driver may overwrite with its choice (the quantization
+// of an M2M decoder's output is a property of the bitstream's VUI).
+// The MMAP-path FS_NV12_TO_RGB shader assumes LIM_RANGE math;
+// FULL_RANGE input would visibly crush blacks + clip whites.
+pub const V4L2_QUANTIZATION_DEFAULT: u8 = 0;
+pub const V4L2_QUANTIZATION_FULL_RANGE: u8 = 1;
+pub const V4L2_QUANTIZATION_LIM_RANGE: u8 = 2;
+
+/// Validate a V4L2 quantization byte against the MMAP-path
+/// `FS_NV12_TO_RGB` shader's LIM_RANGE assumption. Accepts
+/// DEFAULT (driver defers to colorspace spec defaults — limited
+/// for SMPTE170M / REC709 which is what bcm2835-codec emits) or
+/// LIM_RANGE explicitly. Returns Err for FULL_RANGE (the shader
+/// would crush blacks + clip whites) or any unknown value.
+///
+/// Module-level (not method) so unit tests can exercise it
+/// without opening a real V4L2 device.
+pub fn check_quantization_for_lim_range_shader(q: u8) -> anyhow::Result<u8> {
+    match q {
+        V4L2_QUANTIZATION_DEFAULT | V4L2_QUANTIZATION_LIM_RANGE => Ok(q),
+        V4L2_QUANTIZATION_FULL_RANGE => Err(anyhow::anyhow!(
+            "V4L2 CAPTURE emitting FULL_RANGE quantization; \
+             FS_NV12_TO_RGB assumes LIM_RANGE and would clip. \
+             Either fix the shader or constrain the input bitstream."
+        )),
+        other => Err(anyhow::anyhow!(
+            "V4L2 CAPTURE quantization is {} (expected 0=DEFAULT or 2=LIM_RANGE)",
+            other
+        )),
+    }
+}
+
 /// Negotiated format -- what the kernel said yes to after S_FMT.
 /// May differ from what the caller asked for if the codec
 /// adjusts width/height to alignment constraints or picks a
@@ -394,6 +428,12 @@ pub struct NegotiatedFormat {
     pub height: u32,
     pub pixelformat: u32,
     pub num_planes: u8,
+    /// V4L2 quantization range: one of V4L2_QUANTIZATION_DEFAULT /
+    /// FULL_RANGE / LIM_RANGE. On CAPTURE this reflects what the
+    /// codec emits; downstream shaders must match. Set on the
+    /// CAPTURE side by `bcm2835-codec` based on the bitstream VUI
+    /// (typically LIM_RANGE for H.264 broadcast content).
+    pub quantization: u8,
     /// Per-plane (sizeimage, bytesperline). Only entries
     /// [0..num_planes] are meaningful.
     pub plane_fmt: [V4l2PlanePixFormat; 8],
@@ -819,6 +859,36 @@ impl Decoder {
         self.inner.lock().unwrap().output_eof_sent
     }
 
+    /// Verify the CAPTURE quantization the driver picked is
+    /// compatible with the MMAP-path BT.601 limited-range shader.
+    /// Call AFTER `set_capture_format`.
+    ///
+    /// Background (P1 from `qa/v1-spec-delta-2026-05-14.md`):
+    /// `FS_NV12_TO_RGB` does explicit `(Y-16)/219` style scaling
+    /// assuming LIM_RANGE input. If the codec emits FULL_RANGE
+    /// (Y in [0,255]), the math crushes blacks + clips whites.
+    /// V4L2 sets quantization via the format struct's `quantization`
+    /// byte (NOT a `V4L2_CID_QUANTIZATION` control — no such control
+    /// exists in standard V4L2). The dispatch named G_CTRL/S_CTRL as
+    /// the mechanism; this implementation uses the canonical format-
+    /// struct field instead.
+    ///
+    /// Accepts: LIM_RANGE (explicit limited) or DEFAULT (driver
+    /// defers to spec defaults; for V4L2_COLORSPACE_SMPTE170M /
+    /// REC709 the default IS limited-range). Fails loud on
+    /// FULL_RANGE — that's the only value that would visibly break
+    /// the shader.
+    ///
+    /// DMABUF path is not affected — Mesa reads the colorimetry hint
+    /// from the EGLImage attribs and inserts the right matrix.
+    pub fn assert_capture_quantization_compatible(&self) -> Result<u8> {
+        let inner = self.inner.lock().unwrap();
+        let cap = inner.capture_format.as_ref().ok_or_else(|| {
+            anyhow!("assert_capture_quantization_compatible called before set_capture_format")
+        })?;
+        check_quantization_for_lim_range_shader(cap.quantization)
+    }
+
     /// VIDIOC_S_FMT on the OUTPUT (compressed-in) queue.
     pub fn set_output_format(
         &self, pixel_format: u32, width: u32, height: u32,
@@ -873,6 +943,7 @@ impl Decoder {
             height: neg_pix_mp.height,
             pixelformat: neg_pix_mp.pixelformat,
             num_planes: neg_pix_mp.num_planes,
+            quantization: neg_pix_mp.quantization,
             plane_fmt: neg_pix_mp.plane_fmt,
         };
         drop(inner);
@@ -1439,6 +1510,42 @@ mod tests {
         assert_ne!(CaptureBufferType::Mmap, CaptureBufferType::DmaBuf);
     }
 
+    #[test]
+    fn quantization_check_accepts_default_and_lim_range() {
+        // DEFAULT (0) accepted: driver defers to spec defaults,
+        // which is limited-range for V4L2_COLORSPACE_SMPTE170M /
+        // REC709 -- the colorspaces bcm2835-codec emits.
+        assert_eq!(
+            check_quantization_for_lim_range_shader(V4L2_QUANTIZATION_DEFAULT)
+                .expect("DEFAULT accepted"),
+            V4L2_QUANTIZATION_DEFAULT,
+        );
+        assert_eq!(
+            check_quantization_for_lim_range_shader(V4L2_QUANTIZATION_LIM_RANGE)
+                .expect("LIM_RANGE accepted"),
+            V4L2_QUANTIZATION_LIM_RANGE,
+        );
+    }
+
+    #[test]
+    fn quantization_check_rejects_full_range_with_meaningful_message() {
+        let err = check_quantization_for_lim_range_shader(
+            V4L2_QUANTIZATION_FULL_RANGE,
+        )
+        .expect_err("FULL_RANGE must error");
+        let msg = format!("{}", err);
+        assert!(msg.contains("FULL_RANGE"), "got: {msg}");
+        assert!(msg.contains("FS_NV12_TO_RGB"), "got: {msg}");
+    }
+
+    #[test]
+    fn quantization_check_rejects_unknown_values() {
+        let err = check_quantization_for_lim_range_shader(42)
+            .expect_err("unknown quantization must error");
+        let msg = format!("{}", err);
+        assert!(msg.contains("42"), "got: {msg}");
+    }
+
     /// Open + cap query against the dev Pi's /dev/video10.
     /// Skipped cleanly when the device is missing.
     #[test]
@@ -1481,8 +1588,20 @@ mod tests {
         eprintln!("OUTPUT negotiated: {:?}", out_fmt);
         let cap_fmt = dec.set_capture_format(V4L2_PIX_FMT_NV12, 320, 240)
             .expect("S_FMT CAPTURE");
-        eprintln!("CAPTURE negotiated: w={} h={} num_planes={}",
-            cap_fmt.width, cap_fmt.height, cap_fmt.num_planes);
+        eprintln!("CAPTURE negotiated: w={} h={} num_planes={} quantization={}",
+            cap_fmt.width, cap_fmt.height, cap_fmt.num_planes,
+            cap_fmt.quantization);
+        // Quantization compatibility check (qa/v1-spec-delta P1).
+        // bcm2835-codec is expected to emit LIM_RANGE or DEFAULT for
+        // typical H.264 broadcast content; assert this so a future
+        // codec regression to FULL_RANGE fails the test instead of
+        // silently shipping clipped output.
+        let q = dec.assert_capture_quantization_compatible()
+            .expect("CAPTURE quantization compatible");
+        eprintln!("CAPTURE quantization OK: {} ({})", q,
+            if q == V4L2_QUANTIZATION_DEFAULT { "DEFAULT" }
+            else if q == V4L2_QUANTIZATION_LIM_RANGE { "LIM_RANGE" }
+            else { "?" });
         dec.allocate_buffers(QueueDirection::Output, 4)
             .expect("REQBUFS OUTPUT");
         dec.allocate_buffers(QueueDirection::Capture, 4)
