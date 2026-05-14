@@ -6768,6 +6768,379 @@ unsafe fn run_nv12_blit_pass(
     Ok(())
 }
 
+// ============================================================
+// V4L2 piece 4c (2026-05-14) -- DMA-BUF zero-copy NV12 paint
+// ============================================================
+//
+// Imports a V4L2-exported DMA-BUF fd (piece 4a, Frame::dma_buf_fd)
+// as an EGLImage, binds it to a GL_TEXTURE_EXTERNAL_OES texture,
+// and blits it through FS_NV12_DMABUF_TO_RGB (piece 4b). This is
+// the zero-copy paint path -- no glTexImage2D upload, no per-frame
+// CPU traffic across the PCIe/memory bus. Piece 4d wires this into
+// paint_and_present_one_video_slide_frame; piece 4c is just the
+// machinery.
+
+#[cfg(target_os = "linux")]
+const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
+#[cfg(target_os = "linux")]
+const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+#[cfg(target_os = "linux")]
+const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+#[cfg(target_os = "linux")]
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+#[cfg(target_os = "linux")]
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+#[cfg(target_os = "linux")]
+const EGL_DMA_BUF_PLANE1_FD_EXT: i32 = 0x3275;
+#[cfg(target_os = "linux")]
+const EGL_DMA_BUF_PLANE1_OFFSET_EXT: i32 = 0x3276;
+#[cfg(target_os = "linux")]
+const EGL_DMA_BUF_PLANE1_PITCH_EXT: i32 = 0x3277;
+#[cfg(target_os = "linux")]
+const EGL_NONE_ATTR: i32 = 0x3038; // EGL_NONE terminator for attrib lists
+/// FourCC code DRM_FORMAT_NV12 = 'N','V','1','2' little-endian =
+/// 0x3231564E. Used in the EGL_LINUX_DRM_FOURCC_EXT slot of the
+/// dma_buf attrib list to tell Mesa what pixel format the bytes
+/// represent.
+#[cfg(target_os = "linux")]
+const DRM_FORMAT_NV12: i32 = 0x3231564E;
+/// GLES texture target for external-OES samples. Bound via
+/// glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex). The texture must
+/// have an EGLImage associated via glEGLImageTargetTexture2DOES
+/// BEFORE it can be sampled. Equivalent to GL_TEXTURE_2D = 0x0DE1
+/// but lives in a separate target enum so the driver knows to use
+/// the YUV->RGB fast-path.
+#[cfg(target_os = "linux")]
+const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+
+/// Cached EGL/GLES extension entry points + the negotiated cap.
+/// Loaded on first use; thread_local because EGL state is
+/// per-thread anyway + the renderer's GL context lives on one
+/// thread (the IPC loop).
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone)]
+struct DmaBufEglEntryPoints {
+    /// `eglCreateImageKHR(EGLDisplay, EGLContext, EGLenum target,
+    /// EGLClientBuffer, const EGLint *attrib_list) -> EGLImageKHR`
+    create_image: unsafe extern "C" fn(
+        dpy: *mut std::ffi::c_void,
+        ctx: *mut std::ffi::c_void,
+        target: u32,
+        buffer: *mut std::ffi::c_void,
+        attrib_list: *const i32,
+    ) -> *mut std::ffi::c_void,
+    /// `eglDestroyImageKHR(EGLDisplay, EGLImageKHR) -> EGLBoolean (u32)`
+    destroy_image: unsafe extern "C" fn(
+        dpy: *mut std::ffi::c_void,
+        image: *mut std::ffi::c_void,
+    ) -> u32,
+    /// `glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image)`
+    image_target_texture_2d:
+        unsafe extern "C" fn(target: u32, image: *mut std::ffi::c_void),
+}
+
+/// Tri-state cache:
+///   `Some(Some(eps))` -> extensions present + entry points loaded
+///   `Some(None)`      -> extensions checked + at least one missing
+///   `None`            -> not yet checked (lazy init on first call)
+#[cfg(target_os = "linux")]
+std::thread_local! {
+    static DMA_BUF_EGL_CACHE: std::cell::Cell<Option<Option<DmaBufEglEntryPoints>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Look up EGL_EXT_image_dma_buf_import + GL_OES_EGL_image_external
+/// + resolve the three needed entry points via eglGetProcAddress.
+/// Returns Some(eps) on success, None if either extension or any
+/// entry point is missing. Caller is expected to fall back to the
+/// MMAP path on None. Cached for the lifetime of the thread; safe
+/// to call per-frame.
+#[cfg(target_os = "linux")]
+fn dma_buf_egl_entry_points(
+    egl_lib: &egl::DynamicInstance<egl::EGL1_5>,
+    display: egl::Display,
+    gl: &glow::Context,
+) -> Option<DmaBufEglEntryPoints> {
+    DMA_BUF_EGL_CACHE.with(|cell| {
+        if let Some(state) = cell.get() {
+            return state;
+        }
+        // EGL extension string: per-display query.
+        let egl_exts = egl_lib
+            .query_string(Some(display), egl::EXTENSIONS)
+            .ok()
+            .and_then(|s| s.to_str().ok().map(str::to_string))
+            .unwrap_or_default();
+        let has_dmabuf_import = egl_exts.split_whitespace()
+            .any(|t| t == "EGL_EXT_image_dma_buf_import");
+        // GLES extension string: GL_OES_EGL_image_external in
+        // GL_EXTENSIONS (the spec-string form via glGetString).
+        let gl_exts = unsafe {
+            use glow::HasContext;
+            gl.get_parameter_string(glow::EXTENSIONS)
+        };
+        let has_external_oes = gl_exts.split_whitespace()
+            .any(|t| t == "GL_OES_EGL_image_external");
+        if !has_dmabuf_import || !has_external_oes {
+            eprintln!(
+                "DmaBuf EGLImage path disabled -- EGL_EXT_image_dma_buf_import={} GL_OES_EGL_image_external={}",
+                has_dmabuf_import, has_external_oes
+            );
+            cell.set(Some(None));
+            return None;
+        }
+        // Resolve entry points. eglGetProcAddress returns NULL for
+        // missing functions; we treat any NULL as "extension lied"
+        // and fall back.
+        let create_ptr = egl_lib.get_proc_address("eglCreateImageKHR");
+        let destroy_ptr = egl_lib.get_proc_address("eglDestroyImageKHR");
+        let target_ptr = egl_lib.get_proc_address("glEGLImageTargetTexture2DOES");
+        let (Some(create_ptr), Some(destroy_ptr), Some(target_ptr)) =
+            (create_ptr, destroy_ptr, target_ptr)
+        else {
+            eprintln!(
+                "DmaBuf EGLImage path disabled -- eglGetProcAddress returned NULL: create={} destroy={} target={}",
+                create_ptr.is_some(), destroy_ptr.is_some(), target_ptr.is_some()
+            );
+            cell.set(Some(None));
+            return None;
+        };
+        // SAFETY: ptrs are extern "C" function pointers loaded by
+        // the EGL implementation; signatures pinned by the EGL +
+        // GL_OES_EGL_image_external specs. Mis-signature would be
+        // a Mesa bug; we trust the spec.
+        let eps = unsafe {
+            DmaBufEglEntryPoints {
+                create_image: std::mem::transmute::<
+                    extern "system" fn(),
+                    unsafe extern "C" fn(
+                        *mut std::ffi::c_void,
+                        *mut std::ffi::c_void,
+                        u32,
+                        *mut std::ffi::c_void,
+                        *const i32,
+                    ) -> *mut std::ffi::c_void,
+                >(create_ptr),
+                destroy_image: std::mem::transmute::<
+                    extern "system" fn(),
+                    unsafe extern "C" fn(
+                        *mut std::ffi::c_void,
+                        *mut std::ffi::c_void,
+                    ) -> u32,
+                >(destroy_ptr),
+                image_target_texture_2d: std::mem::transmute::<
+                    extern "system" fn(),
+                    unsafe extern "C" fn(u32, *mut std::ffi::c_void),
+                >(target_ptr),
+            }
+        };
+        cell.set(Some(Some(eps)));
+        Some(eps)
+    })
+}
+
+/// Cached external-OES NV12 program (piece 4b's
+/// FS_NV12_DMABUF_TO_RGB). Single sampler uniform `u_tex_external`
+/// (bound to GL_TEXTURE_EXTERNAL_OES + an EGLImage).
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone)]
+struct CachedNv12DmaBufProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_tex_external: Option<glow::NativeUniformLocation>,
+}
+
+#[cfg(target_os = "linux")]
+std::thread_local! {
+    static NV12_DMABUF_PROGRAM: std::cell::Cell<Option<CachedNv12DmaBufProgram>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+fn cached_nv12_dmabuf_program(gl: &glow::Context) -> Result<CachedNv12DmaBufProgram> {
+    use glow::HasContext;
+    NV12_DMABUF_PROGRAM.with(|c| {
+        if let Some(p) = c.get() {
+            return Ok(p);
+        }
+        let program = link_program(
+            gl,
+            VS_TEXTURED_QUAD,
+            crate::hdmi_logic::FS_NV12_DMABUF_TO_RGB,
+        )
+        .context("link FS_NV12_DMABUF_TO_RGB (VideoSlide DmaBuf paint)")?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("FS_NV12_DMABUF_TO_RGB VS missing a_pos"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("FS_NV12_DMABUF_TO_RGB VS missing a_uv"))?;
+        let u_tex_external = unsafe {
+            gl.get_uniform_location(program, "u_tex_external")
+        };
+        let cnp = CachedNv12DmaBufProgram { program, a_pos, a_uv, u_tex_external };
+        c.set(Some(cnp));
+        Ok(cnp)
+    })
+}
+
+/// V4L2 piece 4c: zero-copy NV12 paint via EGLImage import.
+///
+/// Inputs:
+///   - `gl`: the active GLES2 context.
+///   - `egl_lib`, `display`: the EGL display the GL context was
+///     created against. Used for eglCreateImageKHR.
+///   - `fd`: V4L2-exported DMA-BUF file descriptor (from
+///     `Frame::dma_buf_fd()`). Caller MUST hold the Frame alive
+///     until this function returns (the fd is closed by the
+///     Decoder's Drop, not here).
+///   - `width`, `height`: frame dimensions in pixels.
+///   - `stride`: V4L2-reported `plane_fmt[0].bytesperline`. For
+///     NV12 single-plane, the Y plane has `stride` bytes per row
+///     and the UV plane starts at offset `stride * height` with
+///     the same `stride`. Stride MUST be the kernel-reported value,
+///     NOT width -- alignment padding makes them differ on some
+///     codecs.
+///
+/// Behavior:
+///   - Calls eglCreateImageKHR with EGL_LINUX_DMA_BUF_EXT + both
+///     plane attribs pointing at the SAME fd (bcm2835-codec NV12
+///     CAPTURE is single-plane; UV at offset Y_SIZE).
+///   - Creates a transient GL_TEXTURE_EXTERNAL_OES texture, binds
+///     the EGLImage via glEGLImageTargetTexture2DOES.
+///   - Draws a fullscreen quad through FS_NV12_DMABUF_TO_RGB.
+///   - Tears down the texture + EGLImage. Caller-managed:
+///     destruction order is texture-then-image (the texture holds
+///     a reference to the image until unbound; destroying the
+///     image first would briefly leave the texture pointing at a
+///     freed kernel resource, which Mesa would NaN-fill on next
+///     sample).
+///
+/// Returns:
+///   - `Ok(true)` -- DmaBuf path took the paint; caller does not
+///     need to fall back.
+///   - `Ok(false)` -- extensions or entry points missing; caller
+///     SHOULD fall back to the MMAP + FS_NV12_TO_RGB path. No GL
+///     state was mutated.
+///   - `Err(_)` -- eglCreateImageKHR returned EGL_NO_IMAGE or
+///     GL pass errored. State may be partially mutated; caller
+///     should treat this as a transient frame failure.
+#[cfg(target_os = "linux")]
+pub unsafe fn run_nv12_dmabuf_blit_pass(
+    gl: &glow::Context,
+    egl_lib: &egl::DynamicInstance<egl::EGL1_5>,
+    display: egl::Display,
+    fd: std::os::fd::RawFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<bool> {
+    use glow::HasContext;
+    // Lazy-resolve EGL+GLES extension entry points. None -> caller
+    // falls back to MMAP path.
+    let Some(eps) = dma_buf_egl_entry_points(egl_lib, display, gl) else {
+        return Ok(false);
+    };
+    // EGL attribute list: width/height + format + plane0 (Y) and
+    // plane1 (UV) attribs. Same fd for both planes because bcm2835-
+    // codec NV12 packs Y+UV in one buffer (UV at offset Y_SIZE).
+    // EGL_DMA_BUF_PLANE*_PITCH_EXT must use the V4L2-reported
+    // `bytesperline`, NOT `width` -- piece 4 dispatch §"Stride vs
+    // width" subagent-blocker check.
+    let y_size: i32 = (stride as i32) * (height as i32);
+    // 9 attribute pairs (18 elements) + EGL_NONE terminator +
+    // trailing pad = 20 elements. The EGL spec terminates at the
+    // first EGL_NONE; the trailing 0 is unused but keeps the
+    // array length even for a stable size signature if a future
+    // plane needs adding.
+    let attribs: [i32; 20] = [
+        // EGL_WIDTH + EGL_HEIGHT are spec'd as 0x3057 + 0x3056.
+        0x3057, width as i32,
+        0x3056, height as i32,
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_NV12,
+        EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as i32,
+        EGL_DMA_BUF_PLANE1_FD_EXT, fd,
+        EGL_DMA_BUF_PLANE1_OFFSET_EXT, y_size,
+        EGL_DMA_BUF_PLANE1_PITCH_EXT, stride as i32,
+        EGL_NONE_ATTR,
+        // Trailing 0 -- unused; EGL parser stops at EGL_NONE.
+        0,
+    ];
+    // SAFETY: eps.create_image is a Mesa-loaded extern "C" fn ptr
+    // matching the eglCreateImageKHR spec. display.as_ptr() is the
+    // raw EGLDisplay; ctx = NULL because EGL_LINUX_DMA_BUF_EXT is
+    // a client-buffer import and doesn't need a context.
+    let egl_image = (eps.create_image)(
+        display.as_ptr(),
+        std::ptr::null_mut(),  // EGL_NO_CONTEXT
+        EGL_LINUX_DMA_BUF_EXT,
+        std::ptr::null_mut(),  // buffer = NULL for dma_buf
+        attribs.as_ptr(),
+    );
+    if egl_image.is_null() {
+        return Err(anyhow!(
+            "eglCreateImageKHR(LINUX_DMA_BUF_EXT, fd={}, w={}, h={}, stride={}) -> EGL_NO_IMAGE",
+            fd, width, height, stride
+        ));
+    }
+    // Create + bind the external-OES texture. Set min/mag filter
+    // to LINEAR; CLAMP_TO_EDGE both axes (the spec lists wrap as
+    // one of the supported parameters on TEXTURE_EXTERNAL_OES;
+    // CLAMP_TO_EDGE is universally accepted).
+    let tex = gl.create_texture()
+        .map_err(|e| anyhow!("glGenTextures(external-OES): {e}"))?;
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, Some(tex));
+    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    // Associate the EGLImage with the bound external-OES texture.
+    // From this point the texture samples the dma_buf bytes
+    // directly -- zero CPU copy.
+    (eps.image_target_texture_2d)(GL_TEXTURE_EXTERNAL_OES, egl_image);
+
+    // Run the blit pass. cached_nv12_dmabuf_program lazy-links
+    // FS_NV12_DMABUF_TO_RGB on first call.
+    let blit_result = (|| -> Result<()> {
+        let cnp = cached_nv12_dmabuf_program(gl)?;
+        let vbo = cached_textured_quad_vbo(gl)?;
+        gl.use_program(Some(cnp.program));
+        // Texture is ALREADY bound + the image associated above;
+        // just set the sampler uniform to TEXTURE0.
+        gl.uniform_1_i32(cnp.u_tex_external.as_ref(), 0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.enable_vertex_attrib_array(cnp.a_pos);
+        gl.vertex_attrib_pointer_f32(cnp.a_pos, 2, glow::FLOAT, false, 16, 0);
+        gl.enable_vertex_attrib_array(cnp.a_uv);
+        gl.vertex_attrib_pointer_f32(cnp.a_uv, 2, glow::FLOAT, false, 16, 8);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.disable_vertex_attrib_array(cnp.a_pos);
+        gl.disable_vertex_attrib_array(cnp.a_uv);
+        Ok(())
+    })();
+
+    // Teardown ordering: unbind texture, delete texture, THEN
+    // destroy the EGLImage. The driver keeps the dma_buf reference
+    // alive via the EGLImage until destroy. Frame::Drop's re-QBUF
+    // is what re-enqueues the buffer index for the next decode; the
+    // EGLImage ref-count is dropped here so the kernel can release
+    // the dma_buf at the right moment.
+    gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, None);
+    gl.delete_texture(tex);
+    let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
+    if destroyed == 0 {
+        // EGL_FALSE -- surfacing as a warn rather than an Err
+        // because the paint already happened + the next frame's
+        // re-import will catch any persistent leak.
+        eprintln!("warn: eglDestroyImageKHR returned EGL_FALSE for fd={}", fd);
+    }
+
+    blit_result?;
+    Ok(true)
+}
+
 /// Populate `slide_caches[slide_id].bg_tex` for non-solid bgs
 /// at atlas region size (2048x1024). Idempotent: returns early
 /// if already cached. Returns `Ok(())` for solid bgs (no cache
