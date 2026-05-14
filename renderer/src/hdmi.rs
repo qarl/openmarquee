@@ -2795,11 +2795,73 @@ pub fn paint_and_present_one_transition_frame(
     let mode_w_u32 = session.mode_w as u32;
     let mode_h_u32 = session.mode_h as u32;
 
+    // QA-direct (2026-05-14 transition-cache wire, followup to
+    // 9e776e7): pre-warm slide_caches entries for both transition
+    // slides before the unsafe IIFE. The two make_slide_fbo bakes
+    // below pull from these caches (mirroring the hold-path fix in
+    // paint_and_present_one_frame_for_slide). Two sequential
+    // get_mut borrows -- one for slide_a's bake, then again for
+    // slide_b's -- so the &mut HashMap borrow lifetime is
+    // single-entry-scoped per bake call (no disjoint-mut needed).
+    // Same-id case (slide_a.id == slide_b.id) is fine: the second
+    // get-or-init sees needs_new=false and reuses the warm cache
+    // populated by the slide_a bake.
+    let layers_a_len = layers_a.len();
+    let layers_b_len = layers_b.len();
+    {
+        let needs_new = match session.slide_caches.get(&slide_a.id) {
+            Some(c) => c.glyph.len() != layers_a_len,
+            None => true,
+        };
+        if needs_new {
+            if let Some(old) = session.slide_caches.remove(&slide_a.id) {
+                free_slide_render_cache(session.gl, old);
+            }
+            session
+                .slide_caches
+                .insert(slide_a.id, SlideRenderCache::new(layers_a_len));
+        }
+    }
+
     let work: Result<()> = (|| unsafe {
         // Bake slide_a + slide_b into FBOs (same machinery as
         // render_transition_animated_in_session's bake).
-        let (fbo_a, tex_a) = make_slide_fbo(session.gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a)?;
-        let (fbo_b, tex_b) = match make_slide_fbo(session.gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b) {
+        // First bake: slide_a's cache borrow ends with the call.
+        let cache_a = session
+            .slide_caches
+            .get_mut(&slide_a.id)
+            .expect("slide_caches entry for slide_a initialized above");
+        let (fbo_a, tex_a) = make_slide_fbo(
+            session.gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a,
+            Some(&mut cache_a.glyph),
+            Some(&mut cache_a.tex),
+        )?;
+        // slide_b cache get-or-init (must happen after cache_a's
+        // &mut borrow ends, which it does at the function-call
+        // boundary above).
+        {
+            let needs_new = match session.slide_caches.get(&slide_b.id) {
+                Some(c) => c.glyph.len() != layers_b_len,
+                None => true,
+            };
+            if needs_new {
+                if let Some(old) = session.slide_caches.remove(&slide_b.id) {
+                    free_slide_render_cache(session.gl, old);
+                }
+                session
+                    .slide_caches
+                    .insert(slide_b.id, SlideRenderCache::new(layers_b_len));
+            }
+        }
+        let cache_b = session
+            .slide_caches
+            .get_mut(&slide_b.id)
+            .expect("slide_caches entry for slide_b initialized above");
+        let (fbo_b, tex_b) = match make_slide_fbo(
+            session.gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b,
+            Some(&mut cache_b.glyph),
+            Some(&mut cache_b.tex),
+        ) {
             Ok(p) => p,
             Err(e) => {
                 session.gl.delete_framebuffer(fbo_a);
@@ -4219,6 +4281,8 @@ unsafe fn make_slide_fbo(
     mode_h: u32,
     bg_kind: &BgKind,
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    glyph_cache: Option<&mut GlyphCache>,
+    tex_cache: Option<&mut TextureCache>,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
     let tex = gl
@@ -4277,6 +4341,12 @@ unsafe fn make_slide_fbo(
     // None is correct.
     // v1-spec-delta #3: pass current wall-clock so any auto_mode
     // layer in the FBO bake renders the right time-of-day.
+    // QA-direct (2026-05-14 transition-cache wire): the IPC sidecar
+    // transition path (paint_and_present_one_transition_frame)
+    // passes Some(&mut cache.{glyph,tex}) keyed by slide.id so the
+    // bake reuses rasterized bitmaps + GL textures across calls.
+    // Standalone bake sites (render_fade_composite,
+    // render_transition_animated_in_session) still pass None.
     let paint_result = paint_slide(
         gl,
         mode_w,
@@ -4285,9 +4355,9 @@ unsafe fn make_slide_fbo(
         text_layers,
         None,
         current_unix_seconds(),
-        None,
+        glyph_cache,
         None,  // image_bg_cache: standalone bake, no session
-        None,  // tex_cache: standalone bake, no caching needed
+        tex_cache,
     );
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
@@ -4394,8 +4464,8 @@ pub fn render_fade_composite(
         use glow::HasContext;
         unsafe {
             // -- Render each slide into its own FBO.
-            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a)?;
-            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b) {
+            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None)?;
+            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -4655,9 +4725,9 @@ fn render_transition_animated_in_session(
         let gl = session.gl;
 
         // -- Build slide_a and slide_b FBOs once.
-        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a)? };
+        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None)? };
         let (fbo_b, tex_b) = unsafe {
-            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b) {
+            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
