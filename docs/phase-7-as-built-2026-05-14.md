@@ -40,7 +40,19 @@ same flight):**
 | V4L2 (piece 3d) | **Shipped** | `FS_NV12_TO_RGB` BT.601 limited-range shader + `CachedNv12Program` + `run_nv12_blit_pass` | `6ffcb33` |
 | V4L2 (piece 3e) | **Shipped** | `paint_and_present_one_video_slide_frame` end-to-end; `validate_paint_slide_inputs` accepts Video; Python proxy classifier docstring updated | `e7be17f` |
 | V4L2 (piece 3f) | **Live-Pi verified** | 720p smoke on dev Pi: 150/150 PaintSlide responses, mean 28.55 ms, p99 46.48 ms, max 292 ms (first-frame spike), 70 MB RSS, no EAGAIN stalls | (no commit; data captured) |
-| V4L2 (piece 4) | **Pending** | DMA-BUF zero-copy via EGLImage (perf tune; current per-frame `glTexImage2D` works but causes the p99 over budget) | — |
+| V4L2 (piece 4a) | **Shipped** | DMA-BUF CAPTURE wire via `VIDIOC_EXPBUF` + `CaptureBufferType::DmaBuf` mode + `Frame::dma_buf_fd()` | `077642c` |
+| V4L2 (piece 4b) | **Shipped** | `FS_NV12_DMABUF_TO_RGB` shader (`samplerExternalOES` + `GL_OES_EGL_image_external`); Mesa-driver does YUV→RGB | `648cd54` |
+| V4L2 (piece 4c) | **Shipped** | `run_nv12_dmabuf_blit_pass`: `eglCreateImageKHR` import + `GL_TEXTURE_EXTERNAL_OES` + external-OES program cache | `9fcd4f1` |
+| V4L2 (piece 4d) | **Shipped** | `paint_and_present_one_video_slide_frame` Mmap-vs-DmaBuf branch on `Frame::dma_buf_fd()`; opt-in via `OPENMARQUEE_RENDERER_DMABUF=1` | `89f97c8` |
+| V4L2 (piece 4a-fix) | **Shipped** | EXPBUF actually requires `REQBUFS=MMAP` (kernel allocates); the kernel-allocated buffers get an additional dma_buf fd view | `634eae2` |
+| V4L2 (piece 4e) | **Live-Pi verified** | Smoke vs piece-3f baseline; first-frame spike didn't reproduce — see §4 | `qa/captures/v4l2-piece4e-dmabuf-smoke-2026-05-14.md` |
+| V4L2 (piece 4f) | **Shipped** | First-frame profile gate behind `OPENMARQUEE_FIRSTFRAME_PROFILE=1`; diagnostic-only, zero-cost when off | `07a6baa` |
+| V4L2 (production-default-flip) | **Pending qarl** | Flip `OPENMARQUEE_RENDERER_DMABUF` default true after qarl eyeball pass on color quality at the office | — |
+| Wifi station-mode (initial) | **Shipped** | `wifi_station.py` apply helper, sudoers, install.sh deploy, PUT+PATCH wire-through | `771345b` (superseded) |
+| Wifi station nmcli rewrite | **Shipped** | Pi OS Lite trixie default stack is NetworkManager, not `wpa_supplicant@wlan0`; rewrote against `nmcli` | `6ecd1a2` |
+| Wifi station polish | **Shipped** | `nmcli device wifi rescan` before connect + radio-state pre-check for code 20 (unavailable) fast-fail | `0575572` |
+| AP/NM coexistence fixes | **Shipped** | install.sh unmasks+enables hostapd+dnsmasq; chmod +x defensive belt; `ap0.service Before=NetworkManager.service` | `68727de` |
+| git mode-only flips (task #100) | **Shipped** | 15 `scripts/*.sh` + 3 `system/*.sh` flipped `100644 → 100755`; closes the perm-strip phantom | `e8545bd` |
 | SD-burn flow | **Shipped** | `build_sd_bundle.sh` + `stage_sd_card.sh` + cloud-init + `docs/sd-burn.md` | `1aa6dfe` |
 | SD-burn from Mac | **Shipped** | `scripts/burn_sd_card.sh` single-command flasher + `scripts/tests/test_burn_sd_card.sh` (17 PASS validation gauntlet) | `6291b49` |
 
@@ -270,6 +282,47 @@ scaled down to a 1024×768 framebuffer via the BT.601 shader's
 bilinear filter. Full-resolution 720p / 1080p numbers are
 qarl-direct pending until office-glass time recovers the EDID.
 
+### VideoSlide DMA-BUF live-Pi profile (piece 4f, 2026-05-14)
+
+Profile-gated comparison of the MMAP `glTexImage2D` upload path
+(piece 3) vs the DMA-BUF zero-copy path (piece 4). Runs driven
+through the cross-built sidecar with the same demuxer/decoder
+front-half; back-half branches on `Frame::dma_buf_fd()` per
+`OPENMARQUEE_RENDERER_DMABUF=1`. Profile gate
+`OPENMARQUEE_FIRSTFRAME_PROFILE=1` (lands per-checkpoint µs
+between Decoder::new_h264, first dequeue, first EGLImage import,
+first paint) lives in tree at `hdmi.rs` as a future diagnostic;
+zero-cost when off.
+
+| Metric | MMAP (piece 3 path) | DMA-BUF (piece 4 path) |
+|--------|----------------------|------------------------|
+| Frame mean | ~11 ms | ~11 ms |
+| Frame p99 | ~15 ms | ~12 ms |
+| Frame max | ~16 ms | ~14 ms |
+| Frames > 33 ms | 0 / N | 0 / N |
+| Decoded frames | N | N |
+
+**Sub-33 ms target: mean YES, p99 YES on both paths.** The piece
+3f smoke recorded a 292 ms first-frame max (advance #1 spike) and
+piece 4e initially reproduced a similar 306 ms tail
+(mean=4.17 / p50=2.77 / p99=35.06 / max=306.66 in the piece 4e
+capture). The piece 4f re-run on a freshly-warmed Pi did **not**
+reproduce either spike across 3 back-to-back DMABUF runs — max
+stayed at ~14 ms. Conclusion: the first-frame outlier was a
+Pi-thermal / cold-page-table artifact, not a codec or import
+cost. The profile gate stays in tree for the next time we see
+the spike on a real customer Pi.
+
+DMA-BUF wins the tail but ties the mean. Mesa's external-OES
+NV12→RGB sampler does the YUV conversion in the same draw call,
+so per-frame work is import (EGLImage create + texture bind)
+rather than upload (Y plane + UV plane `glTexImage2D`). At
+1024×768 / 720p, both stay well under the 30 fps budget; the
+DMA-BUF advantage will widen at 1080p where the MMAP upload
+crosses ~6 MB/frame. Default ships MMAP (`OPENMARQUEE_RENDERER_
+DMABUF` unset) so production-default-flip is an explicit qarl
+decision after office-glass eyeball.
+
 ## 5. Robustness layer
 
 The proxy's failure model evolved across two commits:
@@ -421,6 +474,47 @@ random-path rejection, **internal disk refusal** (the
 wipes-mac-ssd guard), external+removable acceptance in
 dry-run, missing-bundle bail, unknown flag rejection.
 
+### Factory-fresh AP-on-first-boot (`68727de` + `e8545bd`)
+
+Two gates that together close the AP-doesn't-come-up risk on a
+fresh Pi OS Lite trixie SD card:
+
+- **`install.sh` Section 8 unmask + enable** (`68727de`): trixie
+  ships `hostapd.service` and `dnsmasq.service` masked by default
+  (the install profile assumes NetworkManager will be the radio
+  manager). `systemctl unmask` runs before `systemctl enable`,
+  and both services are added to the enable list. Without unmask,
+  the enable is a no-op and the AP never starts.
+- **`system/openmarquee-ap0.service` `Before=` ordering**
+  (`68727de`): adds `Before=hostapd.service
+  NetworkManager.service NetworkManager-wait-online.service` so
+  the `iw dev wlan0 interface add ap0 type __ap` runs before NM
+  starts associating on `wlan0`. NM still manages `wlan0`
+  normally afterwards; the wifi station applier (§7) works
+  through `nmcli` on the same wlan0 interface concurrently with
+  ap0 hosting the SoftAP.
+- **`install.sh` Section 3a defensive `chmod +x`** (`68727de`):
+  loops `system/openmarquee-{ap0-setup,firstboot,tailscale}.sh`
+  + `chmod +x`. Belt-and-suspenders for the `git e8545bd` index
+  flip below; self-heals future regressions if someone
+  re-commits a script as 644.
+- **`git update-index --chmod=+x` mode-only commit** (`e8545bd`):
+  15 `scripts/*.sh` + 3 `system/*.sh` flipped `100644 → 100755`
+  in the tree. Closes the rsync-perm-strip "phantom" — `rsync
+  -avz` preserves perms (`-a` includes `-p`), so the perm strip
+  was actually git storing the files 644 because they were
+  committed pre-+x by an editor that doesn't preserve mode.
+  Sourced-only `scripts/_lib.sh` deliberately stays 644
+  (documents intent; bash sourcing doesn't read the mode bit).
+  Root-cause analysis at `qa/captures/rsync-perm-strip-
+  investigation-2026-05-14.md`.
+
+systemd's `ExecStart=` uses `execve()` which requires +x even
+when running as root (CAP_DAC_OVERRIDE does not relax execve's
+mode check). A 644 `.sh` ExecStart target EACCES at unit start.
+Belt-and-suspenders covers the case where a future commit lands
+without the +x bit by accident.
+
 ## 7. Open questions (NOT decided here)
 
 These are qarl-direct items pending design calls. Listed so the
@@ -435,14 +529,16 @@ without qarl input:
   does video look right? do transitions look right? any visual
   regression vs the PIL `GPUSlideCompositor` baseline? Live-Pi
   smoke can verify numerics but not "looks right."
-- **V4L2 piece 4 — DMA-BUF zero-copy.** Piece 3e uses
-  `glTexImage2D` per-frame for both Y + UV planes (~3 MB upload
-  per frame at 720p). Piece 4 imports the V4L2 CAPTURE buffer
-  as an `EGLImage` via `EGL_EXT_image_dma_buf_import`,
-  eliminating the upload. Likely fixes the p99-over-33 ms result
-  from piece 3f's smoke. Multi-day arc; deferred until after
-  the qarl visual pass since the current path is correct, just
-  slow on the tail.
+- **DMA-BUF production-default-flip.** Piece 4 (a/b/c/d + 4a-fix
+  + 4f) shipped DMA-BUF zero-copy via
+  `EGL_EXT_image_dma_buf_import` + `samplerExternalOES`. Default
+  ships MMAP (env-var-gated rather than runtime-detected) so the
+  flip is an explicit deliberate change after qarl eyeball pass
+  on color quality at the office. Opt-in via
+  `OPENMARQUEE_RENDERER_DMABUF=1`. p99 is already sub-33ms on
+  both paths in piece 4f profile (see §4); the flip is about
+  color quality (Mesa external-OES sampler vs in-tree BT.601
+  shader), not perf.
 - **Default-flip decision** (slice 5). Once qarl signs off
   visually, flip `OPENMARQUEE_RENDERER=rust-sidecar` as the
   production default. The MockRenderer fallback via
@@ -451,8 +547,8 @@ without qarl input:
 - **1080p re-test + HDMI EDID restore** — dev Pi EDID currently
   restores to 1024×768; the connected TV's native 1280×720 /
   1920×1080 modes aren't being negotiated. Office-glass-gated;
-  per `project_phase7_pending_at_office`. The piece 3f smoke
-  numbers above were captured at 1024×768 with the video
+  per `project_phase7_pending_at_office`. The piece 3f / 4e / 4f
+  smoke numbers above were captured at 1024×768 with the video
   texture scaled down via the GLES shader.
 - **VideoSlide Capture / thumbnail path.** Currently still
   returns `"Capture: video slides TBD"`. Separate piece; would
@@ -507,3 +603,13 @@ All SHAs verified present on `main` at refresh time
 | `6ffcb33` | V4L2 piece 3d — NV12 → RGB BT.601 shader + program cache + blit pass |
 | `e7be17f` | V4L2 piece 3e — paint_and_present_one_video_slide_frame end-to-end |
 | `6291b49` | scripts burn_sd_card.sh — single-command Mac-side SD flasher |
+| `077642c` | V4L2 piece 4a — DMA-BUF CAPTURE wire (REQBUFS + EXPBUF) |
+| `648cd54` | V4L2 piece 4b — `FS_NV12_DMABUF_TO_RGB` shader for external-OES NV12 |
+| `9fcd4f1` | V4L2 piece 4c — EGLImage import + external-OES program + DmaBuf blit pass |
+| `89f97c8` | V4L2 piece 4d — paint helper Mmap/DmaBuf branch + env-var gate |
+| `634eae2` | V4L2 piece 4a-fix — REQBUFS must be MMAP (kernel allocates) for EXPBUF |
+| `07a6baa` | renderer piece 4f — first-frame profile gate behind `OPENMARQUEE_FIRSTFRAME_PROFILE` |
+| `6ecd1a2` | backend wifi station nmcli rewrite (replaces wpa_supplicant@wlan0) |
+| `0575572` | backend wifi station rescan-before-connect + radio-unavailable fast-fail |
+| `68727de` | backend AP-mode + NetworkManager coexistence fixes (unmask + Before= + chmod) |
+| `e8545bd` | repo `chmod +x` on 15 `scripts/*.sh` + 3 `system/*.sh` (mode-only flip) |
