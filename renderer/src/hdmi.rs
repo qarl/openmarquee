@@ -6987,6 +6987,19 @@ fn paint_slide_with_viewport(
     // Skip the BgKind branch entirely; just set viewport + paint
     // layers. (2026-05-09 atlas SB Phase 2.5 bg-cache.)
     use glow::HasContext;
+    // QA-direct (2026-05-14 paint_slide profiling slice): same
+    // env-gate as the outer paint_and_present trace. Emits one
+    // JSON line per paint_slide invocation with bg / raster /
+    // draw_loop sub-phase deltas in microseconds. The line is
+    // emitted RIGHT BEFORE the outer "boundary" trace line so the
+    // analysis script can pair them by stream order. Zero overhead
+    // when off (single env::var_os check at entry).
+    let trace_sub = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
+    let t_sub_start = if trace_sub { Some(std::time::Instant::now()) } else { None };
+    let mut t_after_bg: Option<std::time::Instant> = None;
+    let mut t_after_raster: Option<std::time::Instant> = None;
+    let mut t_after_draw: Option<std::time::Instant> = None;
+    let mut raster_misses = 0u32;
     // vp_w/h for the GL viewport; mode_w/h for layer NDC math
     // (box ratios -> pixel coords -> NDC). Pattern + gradient bg
     // shaders use gl_FragCoord (viewport-pixel coords) + uniforms
@@ -7051,6 +7064,9 @@ fn paint_slide_with_viewport(
     // IIFE guard ensures `gl.disable(BLEND)` always runs even when
     // a layer's draw errors mid-loop (4.3+ persistent-context
     // future-correctness).
+    if trace_sub {
+        t_after_bg = Some(std::time::Instant::now());
+    }
     if !text_layers.is_empty() {
         // v1-spec-delta #2 (slice c-1): None = all-identity (no
         // animation). FBO bake / transition snapshots / static
@@ -7137,7 +7153,13 @@ fn paint_slide_with_viewport(
                     size_px,
                     bitmap: bm,
                 });
+                if trace_sub {
+                    raster_misses += 1;
+                }
             }
+        }
+        if trace_sub {
+            t_after_raster = Some(std::time::Instant::now());
         }
         // v1-spec-delta #7 (slice c): if any layer has blend=
         // overlay, take the FBO ping-pong route. Overlay's per-
@@ -7176,6 +7198,9 @@ fn paint_slide_with_viewport(
                 cache_ref,
                 image_bg_cache,
             )?;
+            // Overlay-route emits its own GPU work; we don't split
+            // it further here. Skip the sub-phase emit to avoid
+            // logging misleading partial-zero deltas.
             return Ok(());
         }
         let layer_loop_result: Result<()> = (|| {
@@ -7241,6 +7266,34 @@ fn paint_slide_with_viewport(
         })();
         unsafe { gl.disable(glow::BLEND); }
         layer_loop_result?;
+        if trace_sub {
+            t_after_draw = Some(std::time::Instant::now());
+        }
+    }
+    // QA-direct (2026-05-14): emit sub-phase trace. Ordered RIGHT
+    // before the outer "boundary" trace line so the analysis
+    // script pairs them by stream order (subphase precedes
+    // boundary for each painted frame).
+    if let (Some(t0), Some(t_bg)) = (t_sub_start, t_after_bg) {
+        // bg phase always present. raster + draw only present when
+        // text_layers was non-empty; emit zeros for the empty case.
+        let raster_us = match (t_after_bg, t_after_raster) {
+            (Some(a), Some(b)) => (b - a).as_micros(),
+            _ => 0,
+        };
+        let draw_us = match (t_after_raster, t_after_draw) {
+            (Some(a), Some(b)) => (b - a).as_micros(),
+            _ => 0,
+        };
+        let bg_us = (t_bg - t0).as_micros();
+        let total_us = match t_after_draw.or(t_after_raster).or(t_after_bg) {
+            Some(t) => (t - t0).as_micros(),
+            None => 0,
+        };
+        eprintln!(
+            "{{\"trace\":\"paint_sub\",\"bg_us\":{},\"raster_us\":{},\"draw_us\":{},\"raster_misses\":{},\"layers\":{},\"total_us\":{}}}",
+            bg_us, raster_us, draw_us, raster_misses, text_layers.len(), total_us,
+        );
     }
     Ok(())
 }
