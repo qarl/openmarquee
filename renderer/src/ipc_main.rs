@@ -229,6 +229,18 @@ fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     }
     let dec = v4l2::Decoder::open(path)
         .with_context(|| format!("open V4L2 decoder at {}", V4L2_DECODER_PATH))?;
+    // V4L2 piece 4d (2026-05-14): opt-in DMA-BUF zero-copy path
+    // via env var. Default stays MMAP for safety (the dispatch
+    // recommendation flips the default after qarl eyeballs piece
+    // 4e's smoke). Set BEFORE allocate_buffers so REQBUFS uses
+    // the right memory type.
+    let use_dmabuf = std::env::var("OPENMARQUEE_RENDERER_DMABUF")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if use_dmabuf {
+        dec.set_capture_buffer_type(v4l2::CaptureBufferType::DmaBuf);
+    }
     let w = dem.width as u32;
     let h = dem.height as u32;
     let _out_fmt = dec

@@ -2763,13 +2763,70 @@ pub fn paint_and_present_one_video_slide_frame(
     };
     let f_w = frame.width();
     let f_h = frame.height();
-    // TODO(piece 4): stride-vs-width. bcm2835-codec currently emits
-    // NV12 with stride == width for the cases we use (320x240 fixture
-    // and 720p/1080p mode targets), so treating the plane slices as
-    // tightly packed at `f_w` bytes/row works. If a future codec or
-    // alignment quirk produces stride > width, the upload below
-    // would interpret the stride padding as image data; either move
-    // to GL_UNPACK_ROW_LENGTH (GLES3) or stop relying on width here.
+    // V4L2 piece 4d: branch on the Frame's transport mode. DmaBuf
+    // path (piece 4a-c) skips the per-frame Y/UV CPU upload + uses
+    // an EGLImage-bound external-OES sampler -- the perf win is
+    // the entire reason piece 4 exists. MMAP path (piece 3d-e) is
+    // the existing two-texture upload; kept as the fallback for
+    // hosts missing EGL_EXT_image_dma_buf_import / GL_OES_EGL_
+    // image_external (run_nv12_dmabuf_blit_pass returns Ok(false)
+    // in that case + we fall through to MMAP). Today the dispatch
+    // is env-var-gated (OPENMARQUEE_RENDERER_DMABUF=1 at decoder
+    // prime in ipc_main.rs); piece 4e flips the default after
+    // qarl-eyeball.
+    if let Some(fd) = frame.dma_buf_fd() {
+        let stride = frame.stride();
+        // SAFETY: gl + egl_lib + display are all session-owned;
+        // GL context is current via EGL make_current at session
+        // construction; fd is owned by the Decoder and outlives
+        // this call (Frame is alive until drop(frame) below).
+        let took_dmabuf = unsafe {
+            let gl = session.gl;
+            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            run_nv12_dmabuf_blit_pass(
+                gl, session.egl_lib, session.display,
+                fd, f_w, f_h, stride,
+            )?
+        };
+        if took_dmabuf {
+            // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE
+            // the buffer swap (mirrors the MMAP-path discipline
+            // below: holding the Frame across the next advance
+            // would starve the codec of CAPTURE buffers).
+            drop(frame);
+            *frames_decoded += 1;
+            // Reuse the existing scanout swap+commit tail; jump
+            // there by re-binding the variables it expects.
+            // Implementation note: the swap+commit block reads
+            // `session`, `card`, and mutates session.scanout_*.
+            // It's identical for both paths, so we fall through
+            // to the shared tail by NOT taking the MMAP branch.
+            return finish_video_slide_swap_and_commit(session, card);
+        }
+        // Extensions missing AND the decoder is DmaBuf-primed
+        // (no MMAP buffers exist on the CAPTURE queue), so we
+        // cannot revert mid-stream. y_plane() / uv_plane() are
+        // empty slices on this path; the MMAP upload would write
+        // a black texture. Surface as Err so the operator can
+        // see the misconfiguration: OPENMARQUEE_RENDERER_DMABUF
+        // was set but the Pi's EGL stack lacks one of EGL_EXT_
+        // image_dma_buf_import / GL_OES_EGL_image_external.
+        return Err(anyhow!(
+            "OPENMARQUEE_RENDERER_DMABUF=1 but EGL extensions missing; \
+             cannot fall back to MMAP for an in-flight DmaBuf decoder. \
+             Unset the env var + restart the sidecar."
+        ));
+    }
+    // MMAP path (piece 3d-e). stride==width is a bcm2835-codec
+    // empirical fact; a future codec or alignment regime could
+    // surface stride > width here. Frame::stride() exposes the
+    // V4L2-reported bytesperline but the MMAP upload below
+    // doesn't use it (the plane bytes are already laid out at
+    // width bytes/row in the mmap region for bcm2835-codec). If a
+    // future stride > width surfaces, swap to GL_UNPACK_ROW_LENGTH
+    // (GLES3) here.
     let y_plane = frame.y_plane();
     let uv_plane = frame.uv_plane();
     unsafe {
@@ -2832,9 +2889,22 @@ pub fn paint_and_present_one_video_slide_frame(
     // call would starve the codec of CAPTURE buffers.
     drop(frame);
     *frames_decoded += 1;
-    // Mirror paint_and_present_one_image_slide_frame's scanout-
-    // rotation: swap, lock front BO, addFB, commit, shift
-    // scanout_current -> scanout_prev.
+    finish_video_slide_swap_and_commit(session, card)
+}
+
+/// V4L2 piece 4d (2026-05-14): shared scanout swap + commit tail
+/// for `paint_and_present_one_video_slide_frame`. Both the MMAP
+/// blit path (piece 3d/e) and the DmaBuf EGLImage path (piece 4c)
+/// finish via this. Mirrors paint_and_present_one_image_slide_
+/// frame's scanout rotation: eglSwapBuffers, lock front BO,
+/// drmModeAddFB, page-flip commit, shift scanout_current ->
+/// scanout_prev. Caller must have ALREADY dropped the Frame +
+/// incremented frames_decoded.
+#[cfg(target_os = "linux")]
+fn finish_video_slide_swap_and_commit(
+    session: &mut EglSession,
+    card: &Card,
+) -> Result<()> {
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)

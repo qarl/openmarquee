@@ -604,6 +604,14 @@ pub struct Frame {
     /// EGLImage holds its own kernel-side dmabuf reference and
     /// the Frame can drop freely.
     dmabuf_fd: Option<std::os::fd::RawFd>,
+    /// Kernel-reported `plane_fmt[0].bytesperline` -- the Y-plane
+    /// stride in bytes. For bcm2835-codec NV12 this is typically
+    /// `width` (no padding) but a future codec / alignment quirk
+    /// may report stride > width. Callers (especially the DmaBuf
+    /// EGLImage import path) MUST use this value, not `width`,
+    /// for `EGL_DMA_BUF_PLANE*_PITCH_EXT` -- subagent-blocker
+    /// check in piece 4's "Stride vs width" review section.
+    stride: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -643,6 +651,15 @@ impl Frame {
     /// `EGL_EXT_image_dma_buf_import` before the Frame drops.
     pub fn dma_buf_fd(&self) -> Option<std::os::fd::RawFd> {
         self.dmabuf_fd
+    }
+
+    /// Y-plane stride in bytes (`plane_fmt[0].bytesperline` from
+    /// VIDIOC_S_FMT). Equal to width on bcm2835-codec NV12 in
+    /// practice but MAY exceed width on other codecs / alignment
+    /// regimes. DmaBuf EGLImage import requires this value (not
+    /// width) for `EGL_DMA_BUF_PLANE*_PITCH_EXT`.
+    pub fn stride(&self) -> u32 {
+        self.stride
     }
 }
 
@@ -1258,6 +1275,14 @@ impl Decoder {
         let idx = buf.index;
         let width = cap_fmt.width;
         let height = cap_fmt.height;
+        // Snapshot the Y-plane stride from the negotiated format so
+        // it travels with the Frame (DmaBuf EGLImage import needs
+        // it for EGL_DMA_BUF_PLANE*_PITCH_EXT, NOT width). Use 0
+        // as a sentinel if num_planes==0 -- impossible per S_FMT
+        // contract, but a defensive fallback keeps the unwrap-free.
+        let stride = cap_fmt.plane_fmt.first()
+            .map(|pf| pf.bytesperline)
+            .unwrap_or(0);
         let capture_buffer_type = inner.capture_buffer_type;
         // Pull pointer + length per plane from the mmap region
         // (MMAP path) OR the exported fd (DmaBuf path). Re-borrow
@@ -1333,6 +1358,7 @@ impl Decoder {
             uv_ptr,
             uv_len,
             dmabuf_fd,
+            stride,
         }))
     }
 }
@@ -1356,6 +1382,7 @@ impl Frame {
     pub fn y_plane(&self) -> &[u8] { unimplemented!("Linux-only") }
     pub fn uv_plane(&self) -> &[u8] { unimplemented!("Linux-only") }
     pub fn dma_buf_fd(&self) -> Option<i32> { None }
+    pub fn stride(&self) -> u32 { unimplemented!("Linux-only") }
 }
 
 // ============================================================
