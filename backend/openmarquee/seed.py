@@ -1045,51 +1045,34 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
 )
 
 
+_DEMO_REEL_PNG_DIR = Path(__file__).parent / "seed_assets" / "demo_reel"
+
+
 def _seed_demo_reel_slides(
     storage: ContentStorage,
     width: int,
     height: int,
 ) -> list[TextSlide]:
-    """Render + save the FREE YOUR SIGN demo reel as a list of TextSlides.
+    """Save the FREE YOUR SIGN demo reel as a list of TextSlides, loading
+    pre-baked PNGs from `seed_assets/demo_reel/`.
 
     Each frame becomes one TextSlide with multi-layer text + per-layer
     motion + an optional background_pattern. The slides preserve the
     `transition_out` choice on the spec — the caller threads that into
     the playlist's per-item transition.
+
+    qarl-direct 2026-05-13 (DELETE-PIL phase 1): pre-baked PNGs live
+    next to seed.py; re-bake any time `_DEMO_REEL` changes via
+    `scripts/prebake_seed_assets.py`. Pre-bakes are 1920×1080 — the
+    device's playback engine cover-fits when rendering at the panel's
+    native dims, so the same asset works for HUB75 64×32 / HDMI 1080p
+    / composite 720×480. `width` and `height` params are kept on the
+    signature for back-compat but no longer drive rasterization.
     """
-    from openmarquee.auto_render import render_pattern as render_bg_pattern
-
     slides: list[TextSlide] = []
-    for spec in _DEMO_REEL:
-        # Build the bg image: pattern → solid color fallback.
-        if spec.background_pattern is not None:
-            bg_img = render_bg_pattern(spec.background_pattern, width, height)
-        else:
-            bg_img = Image.new("RGB", (width, height), spec.background_color)
-
-        # Composite each layer's text on top in array order (index 0 first;
-        # later entries paint over). Same contract as
-        # render_layered_text_slide_png + the device's compose_motion_frame.
-        for layer in spec.layers:
-            box = TextBox(
-                x=layer.box[0], y=layer.box[1], w=layer.box[2], h=layer.box[3],
-            )
-            _draw_text_into(
-                bg_img,
-                text=layer.text,
-                fg=layer.text_color,
-                font_family=layer.font_family,
-                box=box,
-                slide_width=width,
-                slide_height=height,
-                font_size_pct=layer.font_size_pct,
-                font_size_px=layer.font_size_px,
-                text_align=layer.text_align,
-            )
-        buf = BytesIO()
-        bg_img.save(buf, format="PNG")
-        png = buf.getvalue()
-
+    for slot_idx, spec in enumerate(_DEMO_REEL):
+        png_path = _DEMO_REEL_PNG_DIR / f"{slot_idx:02d}.png"
+        png = png_path.read_bytes()
         # Build the TextSlide record. Per-layer motion + box + blend +
         # font + color all carry forward; the device's playback engine
         # re-composes per-tick at playback time using these.

@@ -51,6 +51,8 @@ backend/openmarquee/seed_assets/*
 !backend/openmarquee/seed_assets/backgrounds/**
 !backend/openmarquee/seed_assets/videos/
 !backend/openmarquee/seed_assets/videos/**
+!backend/openmarquee/seed_assets/demo_reel/
+!backend/openmarquee/seed_assets/demo_reel/**
 # Re-ignore AppleDouble + .DS_Store inside the un-ignored seed_assets
 # subtree -- the `**` negations above un-ignore EVERYTHING under those
 # paths, which would silently leak macOS metadata (`._brick-wall.png`
