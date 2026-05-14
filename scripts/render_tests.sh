@@ -250,7 +250,17 @@ ssh -q "$TARGET" "sudo systemctl stop openmarquee-backend"
 # `|| true` because pkill exit-1 means "nothing matched" -- expected
 # in the happy case where no stale binary exists.
 echo "==> releasing DRM master from any stale renderer binary"
-ssh -q "$TARGET" "sudo pkill -f /tmp/openmarquee-render || true; sleep 1"
+# pkill-self-kill avoidance (caught 2026-05-14 while writing
+# scripts/render_cache_gate.sh): an inline
+# `ssh "$TARGET" "sudo pkill -f /tmp/openmarquee-render ..."` puts the
+# pkill pattern in the remote bash's argv, which pkill -f then matches
+# and kills the SSH session itself (exit 255) -- silently, even when
+# no stale renderer exists. Heredoc the body so remote argv is just
+# `bash -s` and the pattern only lives in stdin.
+ssh -q "$TARGET" 'bash -s' <<'REMOTE'
+sudo pkill -f /tmp/openmarquee-render 2>/dev/null || true
+sleep 1
+REMOTE
 
 # 17.5 / sweep #9 #5: capture provenance for bless / diff. When a
 # future diff fails, the operator needs to know whether the GOLDEN

@@ -63,7 +63,14 @@ sleep 2
 # `|| true` because pkill exit-1 means "nothing matched" -- expected
 # in the happy case where no stale binary exists.
 echo "==> releasing DRM master from any stale renderer binary"
-ssh "$TARGET" "sudo pkill -f /tmp/openmarquee-render || true; sleep 1"
+# pkill-self-kill avoidance: see render_cache_gate.sh for the
+# diagnosis. Inline `ssh "...pkill -f /tmp/openmarquee-render..."`
+# silently returns 255 because pkill matches its own parent bash's
+# argv. Heredoc collapses argv to `bash -s`.
+ssh "$TARGET" 'bash -s' <<'REMOTE'
+sudo pkill -f /tmp/openmarquee-render 2>/dev/null || true
+sleep 1
+REMOTE
 
 echo "==> Phase 2 -- --solid-color 0,1,1 --hold-secs 3"
 COLOR_LOG="$LOG_DIR/solid-color.log"
