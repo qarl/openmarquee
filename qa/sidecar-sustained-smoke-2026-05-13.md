@@ -87,6 +87,15 @@ A few notes on context:
   The 2-MB gate was designed to catch monotonic growth; LRU eviction
   cycles produce drift in the favorable direction. Suggest reframing
   the gate as "no monotonic growth" rather than strict drift bound.
+
+  **Addendum (2026-05-14, per dispatch followup):** the preferred gate
+  framing for future sustained-smoke runs is **"no monotonic growth
+  across the run window"** — i.e., comparing first-N-min median VmRSS
+  to last-N-min median VmRSS, asserting `last <= first + small_epsilon`.
+  This catches leaks (monotonic upward drift) while not penalizing LRU
+  eviction (which produces large but favorable drops). For this run:
+  first-5-min median 90.8 MB → last-5-min median 54.7 MB → delta
+  -36.1 MB → **PASS** under the proposed framing.
 - **fd delta == 0**: ✓ Perfect.
 - **frames > 33 ms count**: 10,783 (22.8%). Concentrated at slide
   boundaries; investigate before slice 4 production commit.
