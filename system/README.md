@@ -24,7 +24,7 @@ device-OS / manual-bring-up reference.
 | `openmarquee-ap0-setup.sh` | `/opt/openmarquee/system/` | invoked by the service above — `iw dev` add + IP + MAC |
 | `openmarquee-firstboot.service` | `/etc/systemd/system/` | one-time oneshot that runs on the first boot of a fresh SD card; rotates per-device AP SSID + passphrase into `hostapd.conf`, writes `wifi.json`, templates `welcome.html`. Idempotent + self-disabling via `/var/openmarquee/.bootstrapped` |
 | `openmarquee-firstboot.sh` | `/opt/openmarquee/system/` | the bring-up script for the firstboot service above |
-| `hostapd.conf` | `/etc/hostapd/hostapd.conf` | AP config, binds to `ap0` (not `wlan0`). Ships with `ssid=openMarquee-SETUP` as cold-boot default; firstboot rotates to `MySign<N>` (operator-visible value) |
+| `hostapd.conf` | `/etc/hostapd/hostapd.conf` | AP config, binds to `ap0` (not `wlan0`). Ships with `ssid=openMarquee-SETUP` as cold-boot default; firstboot rotates to `MySignXXX` (operator-visible value) |
 | `dnsmasq.conf` | `/etc/dnsmasq.d/openmarquee.conf` | DHCP on 10.0.0.x + DNS intercept on `ap0` only |
 | `wpa_supplicant-openmarquee.conf` | `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf` | legacy station-mode template (kept for fallback / pre-trixie boards). Pi OS Lite trixie uses NetworkManager + nmcli instead — see Station-mode applier below. |
 | `openmarquee-sudoers` | `/etc/sudoers.d/openmarquee` | minimal NOPASSWD grants for the `openmarquee` user: two narrow `nmcli` subcommands needed by the wifi-station applier. Read-only nmcli queries don't need sudo (the user is in the `netdev` group) |
@@ -205,7 +205,7 @@ the manual steps to provision a fresh Pi Zero 2 W for openMarquee:
    - The Pi should now broadcast its SSID on `ap0` at 2.4 GHz.
      A factory-fresh board shows `openMarquee-SETUP` for the brief
      window before `openmarquee-firstboot.service` runs; after
-     first-boot rotation it broadcasts `MySign<N>` (the per-device
+     first-boot rotation it broadcasts `MySignXXX` (the per-device
      ID stamped into `hostapd.conf`).
    - Connect a phone → captive portal should pop with the setup UI.
    - `ip addr show ap0` shows `10.0.0.1/24`; `ip addr show wlan0` shows
@@ -220,7 +220,7 @@ The configs here started as *setup-mode* defaults. Phase 7
 (WiFi AP + captive portal) has now largely shipped:
 
 - **SSID rotation:** SHIPPED via `openmarquee-firstboot.service`.
-  Rewrites `hostapd.conf`'s `ssid=` line to `MySign<N>` derived
+  Rewrites `hostapd.conf`'s `ssid=` line to `MySignXXX` derived
   from `device_id` (the same value used for the Tailscale
   hostname + sign_name default), so every device has a
   unique-looking network. Note: the rotation target is the

@@ -40,12 +40,13 @@ Design choices:
 - **Per-interface lock.** `_APPLY_LOCK` serializes apply() calls so
   two operator-mashed Saves don't race nmcli against itself.
 
-- **Sudo scope is narrow.** Exactly four nmcli subcommands:
-  `device wifi connect *`, `connection delete *`, `connection up *`,
-  `connection down *`. Read-only queries (`nmcli device status`,
-  `nmcli connection show`) run as the openmarquee user without
-  sudo — NM grants read access to the `netdev` group by default
-  on Pi OS / Debian.
+- **Sudo scope is narrow.** Exactly two nmcli subcommands:
+  `device wifi connect *` and `connection delete *`. Read-only
+  queries (`nmcli device status`, `nmcli connection show`) AND
+  the pre-connect rescan (`nmcli device wifi rescan ifname
+  wlan0`, per 0575572) run as the openmarquee user without
+  sudo — NM grants read + scan access to the `netdev` group by
+  default on Pi OS / Debian.
 
 - **nmcli exit code is authoritative.** nmcli returns non-zero on
   wrong-password, ssid-not-in-range, no-NM-running. We capture the
