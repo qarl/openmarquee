@@ -56,6 +56,15 @@ echo "==> stopping openmarquee-backend (DRM master grab)"
 ssh "$TARGET" "sudo systemctl stop openmarquee-backend"
 sleep 2
 
+# Task #406 (2026-05-13): pkill any stale openmarquee-render-* binary
+# that's running outside systemd. Caught during Bug-1 verify when a
+# /tmp/openmarquee-render-fys --play-reel from 2026-05-10 was still
+# holding DRM master, causing EACCES on every capture until killed.
+# `|| true` because pkill exit-1 means "nothing matched" -- expected
+# in the happy case where no stale binary exists.
+echo "==> releasing DRM master from any stale renderer binary"
+ssh "$TARGET" "sudo pkill -f /tmp/openmarquee-render || true; sleep 1"
+
 echo "==> Phase 2 -- --solid-color 0,1,1 --hold-secs 3"
 COLOR_LOG="$LOG_DIR/solid-color.log"
 COLOR_EXIT=0

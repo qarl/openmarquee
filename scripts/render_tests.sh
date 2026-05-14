@@ -243,6 +243,15 @@ scp -qr "$FIXTURE_DIR/." "$TARGET:$PI_FIXTURE_ROOT/"
 echo "==> stopping openmarquee-backend (DRM master grab)"
 ssh -q "$TARGET" "sudo systemctl stop openmarquee-backend"
 
+# Task #406 (2026-05-13): pkill any stale openmarquee-render-* binary
+# that's running outside systemd. Caught during Bug-1 verify when a
+# /tmp/openmarquee-render-fys --play-reel from 2026-05-10 was still
+# holding DRM master, causing EACCES on every capture until killed.
+# `|| true` because pkill exit-1 means "nothing matched" -- expected
+# in the happy case where no stale binary exists.
+echo "==> releasing DRM master from any stale renderer binary"
+ssh -q "$TARGET" "sudo pkill -f /tmp/openmarquee-render || true; sleep 1"
+
 # 17.5 / sweep #9 #5: capture provenance for bless / diff. When a
 # future diff fails, the operator needs to know whether the GOLDEN
 # was blessed under a different driver build (vc4) or a different
