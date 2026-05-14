@@ -2514,6 +2514,185 @@ pub fn paint_and_present_one_frame_for_slide(
     Ok(())
 }
 
+/// QA-direct (2026-05-13 sidecar feature-gaps slice) -- one-shot
+/// paint + present for an ImageSlide. Mirrors paint_and_present_
+/// one_frame_for_slide's scanout-rotation discipline but the body
+/// is a single PNG-tex upload + FS_BLIT, no motion / no auto_mode
+/// (ImageSlide is static per the v1-spec-delta #8 schema).
+///
+/// Pre-conditions: EglSession bound, content_root resolves
+/// `<root>/<slide.id>/asset.png`, asset is browser-pre-scaled to
+/// the panel mode per the ImageSlide docstring.
+///
+/// Post-conditions: one frame painted to scanout (set_crtc on
+/// first call, page_flip thereafter). scanout_prev / scanout_
+/// current rotated, stale prev BO/FB freed.
+pub fn paint_and_present_one_image_slide_frame(
+    session: &mut EglSession,
+    card: &Card,
+    slide: &ImageSlide,
+    content_root: &Path,
+) -> Result<()> {
+    use glow::HasContext;
+    let asset_path = crate::content::image_slide_asset_path(content_root, slide.id);
+    let (rgba, img_w, img_h) = load_png_rgba(&asset_path)?;
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    // v1-spec-delta #10 (slice c): non-identity brightness/gamma
+    // routes the bake through the scene FBO + post-pass blit. Mirrors
+    // paint_and_present_one_frame_for_slide's pattern so ImageSlide
+    // honors the operator's color settings on glass.
+    let identity = session.current_settings.is_color_identity();
+    let scene_fbo_handle = if !identity {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        }
+    }
+    unsafe {
+        let gl = session.gl;
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        let tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(image_slide ipc): {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::RGBA as i32,
+            img_w as i32, img_h as i32, 0,
+            glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
+        );
+        let blit_result = run_blit_pass(gl, tex);
+        gl.delete_texture(tex);
+        blit_result?;
+    }
+    // v1-spec-delta #10 (slice c): non-identity path runs the
+    // brightness/gamma post-pass from scene FBO to default fb.
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = (session.current_settings.brightness as f32) / 100.0;
+        let gamma = session.current_settings.gamma;
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+        }
+    }
+    // Mirror paint_and_present_one_frame_for_slide's scanout
+    // rotation: swap, lock front BO, addFB, commit_fb, then
+    // shift scanout_current -> scanout_prev and stash the new pair.
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers (image_slide) failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer (image_slide) failed")?
+    };
+    let fb_buf = GbmBufferAdapter::new(&new_bo).context("read GBM bo metadata (image_slide)")?;
+    let new_fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB (image_slide) failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card, new_fb) {
+        if let Err(de) = card.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail (image_slide): {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev, image_slide): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+    Ok(())
+}
+
+/// QA-direct (2026-05-13 sidecar feature-gaps slice) -- repaint an
+/// ImageSlide into the EGL window surface WITHOUT scanout commit.
+/// Used by the IPC Capture op's re-paint pattern: paint into the
+/// surface, glReadPixels back from the default framebuffer.
+/// Counterpart to paint_one_for_capture (which handles TextSlide).
+pub fn paint_one_image_slide_for_capture(
+    session: &mut EglSession,
+    slide: &ImageSlide,
+    content_root: &Path,
+) -> Result<()> {
+    use glow::HasContext;
+    let asset_path = crate::content::image_slide_asset_path(content_root, slide.id);
+    let (rgba, img_w, img_h) = load_png_rgba(&asset_path)?;
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    // v1-spec-delta #10 (slice c): match paint_and_present_one_image_
+    // slide_frame's non-identity post-pass so captures reflect
+    // operator color settings.
+    let identity = session.current_settings.is_color_identity();
+    let scene_fbo_handle = if !identity {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        }
+    }
+    unsafe {
+        let gl = session.gl;
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        let tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(image_slide capture): {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::RGBA as i32,
+            img_w as i32, img_h as i32, 0,
+            glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
+        );
+        let blit_result = run_blit_pass(gl, tex);
+        gl.delete_texture(tex);
+        blit_result?;
+    }
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = (session.current_settings.brightness as f32) / 100.0;
+        let gamma = session.current_settings.gamma;
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+        }
+    }
+    unsafe { session.gl.flush(); }
+    Ok(())
+}
+
 /// v1-spec-delta #9 (slice d) -- one-frame transition paint
 /// for the IPC dispatcher's Advance(PaintTransition) branch.
 /// Bakes both slide_a and slide_b into FBOs (per-call, no

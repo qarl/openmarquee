@@ -418,22 +418,31 @@ fn capture_current_scene_to_png(
         Some(i) => i,
         None => return err(format!("Capture: slide {slide_id} not in cache")),
     };
-    let text_slide = match item {
-        ContentItem::Text(s) => s,
-        _ => return err("Capture: only text slides supported in slice (e); image/video TBD"),
-    };
-
-    // Re-paint into the EGL window surface (no commit_fb --
-    // this is offscreen for capture). Then read back.
+    // Re-paint into the EGL window surface (no commit_fb -- this
+    // is offscreen for capture). Then read back.
+    //
+    // QA-direct (2026-05-13 sidecar feature-gaps slice): ImageSlide
+    // case routes through paint_one_image_slide_for_capture, mirror
+    // of paint_one_for_capture for the static-PNG case. VideoSlide
+    // still TBD (needs V4L2 M2M + dmabuf import).
     let (mode_w, mode_h) = hdmi::egl_session_mode_size(session);
     let t_in_slide_ms = 0_u64;
-    if let Err(e) = hdmi::paint_one_for_capture(
-        session,
-        text_slide,
-        fonts,
-        Some(content_root),
-        t_in_slide_ms,
-    ) {
+    let paint_res = match item {
+        ContentItem::Text(text_slide) => hdmi::paint_one_for_capture(
+            session,
+            text_slide,
+            fonts,
+            Some(content_root),
+            t_in_slide_ms,
+        ),
+        ContentItem::Image(image_slide) => hdmi::paint_one_image_slide_for_capture(
+            session,
+            image_slide,
+            content_root,
+        ),
+        _ => return err("Capture: video slides TBD (image + text both supported)"),
+    };
+    if let Err(e) = paint_res {
         return err(format!("Capture: paint failed: {e:#}"));
     }
 
@@ -503,7 +512,26 @@ fn run_paint_hook(
                     }
                     resp.clone()
                 }
-                _ => err("paint_slide: only text slides supported in slice (d); image/video TBD"),
+                ContentItem::Image(slide) => {
+                    // QA-direct (2026-05-13 sidecar feature-gaps slice):
+                    // ImageSlide PaintSlide support. content_root is
+                    // required to resolve asset.png; absent = err.
+                    let cr = match content_root {
+                        Some(p) => p,
+                        None => {
+                            return err(
+                                "paint_slide: image_slide requires content_root (--content-root)",
+                            );
+                        }
+                    };
+                    if let Err(e) = hdmi::paint_and_present_one_image_slide_frame(
+                        session, card, slide, cr,
+                    ) {
+                        return err(format!("paint_slide (image) failed: {e:#}"));
+                    }
+                    resp.clone()
+                }
+                _ => err("paint_slide: video slides TBD (image + text both supported)"),
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
