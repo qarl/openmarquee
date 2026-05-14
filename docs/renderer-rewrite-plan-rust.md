@@ -4,6 +4,15 @@
 **Companion to:** `renderer-rewrite-requirements.md` (spec) and `renderer-rewrite-plan.md` (prior Python plan, superseded).
 **Grounded in:** `renderer-rewrite-spike-data.md` (measured, 2026-05-06).
 
+> **Plan vs reality.** This doc is forward-looking. The empirical
+> state of Phase 7 as actually shipped lives at
+> [`docs/phase-7-as-built-2026-05-14.md`](phase-7-as-built-2026-05-14.md)
+> (last update 2026-05-14). Read that for current architecture,
+> measured perf characteristics, the wire-format drift between this
+> plan's §7 and the in-tree IPC contract, and what's shipped vs
+> qarl-pending. Where this plan and the as-built disagree, the
+> as-built reflects code at HEAD.
+
 ---
 
 ## 1. Architecture overview
@@ -542,6 +551,17 @@ Each step produces a working slice. Identify the MVD (minimum viable demo) miles
 
 ## 10. Risks and proposed scope cuts
 
+> **Empirical risk update (2026-05-14).** See
+> [`docs/phase-7-as-built-2026-05-14.md`](phase-7-as-built-2026-05-14.md)
+> §4 (perf characteristics) and §6 (gates) for the actual measured
+> baseline: 41× over_33 improvement to a 0.24% floor with p99 under
+> the 33 ms budget, sustained across 58k IPC ops with flat memory
+> trajectory. The split-shader baseline is validated at 1024×768;
+> 1080p re-test is still office-glass-gated (HDMI EDID stuck at 0
+> bytes on dev Pi). The risks below reflect the original plan;
+> consult the as-built for risks that have been retired or
+> surfaced anew.
+
 **Honest read on whether the full feature set fits at 1080p × 30 fps:**
 
 Per the spike, the unified-shader stretch goal is unlikely to close at 1080p with 6 active layers per side during a transition. The split shader **does close** at 1080p × 30 fps for the steady state and for transitions where motion is on at most one side, with the half-rez-Pass-1 trick during full motion-on-both-sides transitions. **The plan ships the split as the baseline.** Unified is a Phase-2 optimization.
@@ -571,6 +591,15 @@ matched by the Python proxy's `RustRendererOpError.message` (slice 1).
 ---
 
 ## 11. Migration plan
+
+> **Shipped vs pending status.** See
+> [`docs/phase-7-as-built-2026-05-14.md`](phase-7-as-built-2026-05-14.md)
+> §1 for the per-slice ledger as of 2026-05-14. Slices 1-3 (Python
+> proxy, factory branch, systemd unit) are in tree but OFF by
+> default. Slice 4 (`playback.py` IPC-op bypass) is blocked on
+> qarl's VideoSlide handling design call (task #75). The
+> robustness layer (reconnect + watchdog + AutoFallbackRenderer)
+> landed after slices 1-3 and is wired into the slice-2 factory.
 
 **Both renderers in tree, side by side, until parity.**
 
