@@ -152,12 +152,25 @@ users:
     shell: /usr/sbin/nologin
     home: /var/openmarquee
     homedir: /var/openmarquee
+    # `video` group: required to open /dev/video10 (the bcm2835-codec
+    # H.264 M2M decoder) for VideoSlide rendering on the Rust IPC
+    # route. Device is rooted as `crw-rw---- root video` by udev; only
+    # users in the video group can read/write it. Without this group
+    # membership the rust-sidecar fails at codec open() with EACCES.
+    # `render` group: dri/card permissions for the same renderer path
+    # under tighter Pi OS Lite trixie udev defaults -- doesn't hurt to
+    # include even when card access goes through DRM master grab.
+    groups: [video, render]
 
 # packages cloud-init installs BEFORE runcmd. We need:
 #   - zstd to decompress the bundle tarball
 #   - python3-venv to bootstrap the venv (install.sh expects it)
 #   - hostapd + dnsmasq for AP mode (install.sh stages configs)
 #   - iptables for the captive-portal NAT rule
+#   - v4l-utils for diagnosing the H.264 decoder out-of-band; not
+#     load-bearing for the rendering path (rust uses ioctls directly)
+#     but a Pi without v4l2-ctl is a Pi where field-debugging
+#     VideoSlide problems is much harder
 package_update: true
 packages:
   - zstd
@@ -165,6 +178,7 @@ packages:
   - hostapd
   - dnsmasq
   - iptables
+  - v4l-utils
 
 runcmd:
   - [ systemctl, unmask, ssh.service ]
