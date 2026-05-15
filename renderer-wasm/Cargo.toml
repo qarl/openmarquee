@@ -1,0 +1,42 @@
+# renderer-wasm — fontdue text rasterizer exposed to Canvas2D via
+# wasm-bindgen. Parity-audit P0 follow-up to 4cbd08b: per-engine
+# glyph AA + per-glyph kerning was the residual divergence
+# Canvas-native fillText couldn't match Rust. Shipping the SAME
+# fontdue rasterizer the device uses, compiled to WebAssembly,
+# eliminates the divergence at source.
+#
+# Build: scripts/build_wasm_renderer.sh (wraps cargo build + wasm-bindgen)
+# Output: renderer-wasm/pkg/ → consumed by ui/ as ESM
+#
+# Phase 0 (this commit): scaffold + minimal text-to-bitmap fn.
+# Phase 1 (next dispatch): wire into ui/src/rasterize.js paintLayer.
+
+[package]
+name = "renderer-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Same rasterizer the renderer crate uses — version-pinned to keep
+# byte-for-byte parity. Renderer crate pins fontdue 0.9 per
+# renderer/Cargo.toml.
+fontdue = "0.9"
+# wasm-bindgen exports Rust fns to JS. ~90 KiB of generated glue
+# at this version (0.2.95); newer versions reduce that further.
+wasm-bindgen = "0.2.95"
+
+[profile.release]
+# wasm size optimization: trade off ~10-15 % runtime for ~30 % blob
+# size reduction. Editor-preview rasterization isn't the hot path
+# (60 Hz at best, layered over a single user editing). The bytes-
+# over-the-wire savings matter more.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
