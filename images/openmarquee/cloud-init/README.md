@@ -49,4 +49,9 @@ serial console to fix it.)
   committed). `install.sh` will be responsible for triggering it.
 - Network config (`network-config` file). Default cloud-init network
   config is fine for our setup (DHCP on whatever interfaces are up).
-  station-mode WiFi join is handled later, post-captive-portal.
+  Station-mode WiFi join is NOT supported via cloud-init's `wifis:`
+  block on this image -- cloud-init writes eni format which NM
+  silently ignores (`qa/captures/cloud-init-wifis-investigation-
+  2026-05-15.md`). Use `scripts/burn_sd_card.sh --wifi-ssid`
+  (Phase 4e-b NM keyfile drop, commit `9c7ae78`) or the post-AP
+  welcome-UI flow (`backend/openmarquee/wifi_station.py`).

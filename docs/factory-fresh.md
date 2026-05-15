@@ -136,6 +136,27 @@ the AP comes up as designed.
   network-isolated environment, verify AP comes up + welcome UI
   responds. This is the human-in-the-loop validation.
 
+## CAUTION: cloud-init `wifis:` block is NOT supported
+
+**Do NOT edit `/boot/firmware/network-config` to add a `wifis:`
+block.** Pi OS Lite trixie's cloud-init writes the `wifis:` block
+as an `/etc/network/interfaces.d/` eni file rather than an NM
+keyfile (renderer-selection prefers `eni` over `network-manager`
+for legacy compat). NetworkManager on trixie has `[ifupdown]
+managed=false` so the eni drop is silently ignored. Result: no
+NM keyfile is created, no DHCP lease, no station-mode WiFi --
+operator has no signal that anything went wrong.
+
+This was diagnosed empirically on 2026-05-15 (QA bumped
+instance-id + added a `wifis:` block; after two reboots the NM
+keyfile dir was empty). Full root-cause analysis in
+`qa/captures/cloud-init-wifis-investigation-2026-05-15.md`
+(commit `cb11b04`).
+
+Use the Phase 4e-b path below (`burn_sd_card.sh --wifi-ssid`)
+instead. It drops an NM keyfile directly and bypasses cloud-init's
+network-config processing entirely.
+
 ## Optional: pre-configure WiFi at flash time (Phase 4e-b)
 
 The default factory-fresh path brings up an AP that the operator
