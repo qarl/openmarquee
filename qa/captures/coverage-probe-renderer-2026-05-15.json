@@ -1,0 +1,61 @@
+{
+  "probe": "renderer/examples/coverage_probe.rs",
+  "ttf": "ui/fonts/inter.ttf",
+  "ttf_size_bytes": 876576,
+  "ttf_fnv1a_64": "ceb145339431935c",
+  "fontdue_version": "0.9.3",
+  "font_settings": "FontSettings::default()",
+  "text": "INTER",
+  "runs": [
+    {
+      "size_px": 1037,
+      "glyphs": [
+      {"ch": 'I', "width": 97, "height": 755, "xmin": 91, "ymin": 0, "advance_width": 278.491211, "bitmap_len": 73235, "bitmap_fnv1a_64": "4c95d4656ea3abd2", "bitmap_head_32": "6475757575757575757575757575757575757575757575757575757575757575", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff59"},
+      {"ch": 'N', "width": 600, "height": 755, "xmin": 91, "ymin": 0, "advance_width": 781.294434, "bitmap_len": 453000, "bitmap_fnv1a_64": "128588225b8141c8", "bitmap_head_32": "6475757575757575757575757575757575757575757575757575757575757575", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff26"},
+      {"ch": 'T', "width": 571, "height": 755, "xmin": 49, "ymin": 0, "advance_width": 669.391602, "bitmap_len": 431105, "bitmap_fnv1a_64": "d88b171cd010058a", "bitmap_head_32": "2c75757575757575757575757575757575757575757575757575757575757575", "bitmap_tail_32": "0000000000000000000000000000000000000000000000000000000000000000"},
+      {"ch": 'E', "width": 465, "height": 755, "xmin": 91, "ymin": 0, "advance_width": 623.313965, "bitmap_len": 351075, "bitmap_fnv1a_64": "67090a231e473024", "bitmap_head_32": "6475757575757575757575757575757575757575757575757575757575757575", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff76"},
+      {"ch": 'R', "width": 545, "height": 755, "xmin": 91, "ymin": 0, "advance_width": 667.366211, "bitmap_len": 411475, "bitmap_fnv1a_64": "8fae894b43c43185", "bitmap_head_32": "6475757575757575757575757575757575757575757575757575757575757575", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffb3"}
+      ]
+    },
+    {
+      "size_px": 297,
+      "glyphs": [
+      {"ch": 'I', "width": 28, "height": 217, "xmin": 26, "ymin": 0, "advance_width": 79.760742, "bitmap_len": 6076, "bitmap_fnv1a_64": "bd11a0a1d7831de8", "bitmap_head_32": "1214141414141414141414141414141414141414141414141414140de5ffffff", "bitmap_tail_32": "ffffffa8e5ffffffffffffffffffffffffffffffffffffffffffffffffffffa8"},
+      {"ch": 'N', "width": 172, "height": 217, "xmin": 26, "ymin": 0, "advance_width": 223.765137, "bitmap_len": 37324, "bitmap_fnv1a_64": "96003c9d52d95eb1", "bitmap_head_32": "1214141414141414141414141414141414141414141414141414141414141414", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa9"},
+      {"ch": 'T', "width": 164, "height": 217, "xmin": 14, "ymin": 0, "advance_width": 191.715820, "bitmap_len": 35588, "bitmap_fnv1a_64": "71d1658227ccc3a1", "bitmap_head_32": "0f14141414141414141414141414141414141414141414141414141414141414", "bitmap_tail_32": "0000000000000000000000000000000000000000000000000000000000000000"},
+      {"ch": 'E', "width": 134, "height": 217, "xmin": 26, "ymin": 0, "advance_width": 178.519043, "bitmap_len": 29078, "bitmap_fnv1a_64": "7ab765f07ac6a331", "bitmap_head_32": "1214141414141414141414141414141414141414141414141414141414141414", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff16"},
+      {"ch": 'R', "width": 157, "height": 217, "xmin": 26, "ymin": 0, "advance_width": 191.135742, "bitmap_len": 34069, "bitmap_fnv1a_64": "465ccc551dca7408", "bitmap_head_32": "1214141414141414141414141414141414141414141414141414141414141414", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffda04"}
+      ]
+    },
+    {
+      "size_px": 216,
+      "glyphs": [
+      {"ch": 'I', "width": 22, "height": 158, "xmin": 18, "ymin": 0, "advance_width": 58.007812, "bitmap_len": 3476, "bitmap_fnv1a_64": "4f2e687e5f546b05", "bitmap_head_32": "0025252525252525252525252525252525252525250003ffffffffffffffffff", "bitmap_tail_32": "ffffffffffffffffff0503ffffffffffffffffffffffffffffffffffffffff05"},
+      {"ch": 'N', "width": 126, "height": 158, "xmin": 18, "ymin": 0, "advance_width": 162.738281, "bitmap_len": 19908, "bitmap_fnv1a_64": "bbe820671089fdd6", "bitmap_head_32": "0025252525252525252525252525252525252525252525251800000000000000", "bitmap_tail_32": "0000000000000066ffffffffffffffffffffffffffffffffffffffffffffffc0"},
+      {"ch": 'T', "width": 120, "height": 158, "xmin": 10, "ymin": 0, "advance_width": 139.429688, "bitmap_len": 18960, "bitmap_fnv1a_64": "1c77954b1a81cbd4", "bitmap_head_32": "1925252525252525252525252525252525252525252525252525252525252525", "bitmap_tail_32": "0000000000000000000000000000000000000000000000000000000000000000"},
+      {"ch": 'E', "width": 98, "height": 158, "xmin": 18, "ymin": 0, "advance_width": 129.832031, "bitmap_len": 15484, "bitmap_fnv1a_64": "24d3f781691f19e4", "bitmap_head_32": "0025252525252525252525252525252525252525252525252525252525252525", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffb2"},
+      {"ch": 'R', "width": 115, "height": 158, "xmin": 18, "ymin": 0, "advance_width": 139.007812, "bitmap_len": 18170, "bitmap_fnv1a_64": "01582893f9416a27", "bitmap_head_32": "0025252525252525252525252525252525252525252525252525252525252525", "bitmap_tail_32": "0000000000000011effffffffffffffffffffffffffffffffffffffffffffe33"}
+      ]
+    },
+    {
+      "size_px": 100,
+      "glyphs": [
+      {"ch": 'I', "width": 11, "height": 73, "xmin": 8, "ymin": 0, "advance_width": 26.855469, "bitmap_len": 803, "bitmap_fnv1a_64": "75e45a9f35280ecb", "bitmap_head_32": "28c0c0c0c0c0c0c0c0c00c35ffffffffffffffffff1035ffffffffffffffffff", "bitmap_tail_32": "ffffffffffffffffff1035ffffffffffffffffff1035ffffffffffffffffff10"},
+      {"ch": 'N', "width": 59, "height": 73, "xmin": 8, "ymin": 0, "advance_width": 75.341797, "bitmap_len": 4307, "bitmap_fnv1a_64": "bf0ce450b7f93d98", "bitmap_head_32": "28c0c0c0c0c0c0c0c0c0c0b10800000000000000000000000000000000000000", "bitmap_tail_32": "0000000000000000000000000000000000000002caffffffffffffffffffff8d"},
+      {"ch": 'T', "width": 56, "height": 73, "xmin": 4, "ymin": 0, "advance_width": 64.550781, "bitmap_len": 4088, "bitmap_fnv1a_64": "728471d9682a47fb", "bitmap_head_32": "29c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0", "bitmap_tail_32": "fffffffffffffffff60000000000000000000000000000000000000000000000"},
+      {"ch": 'E', "width": 46, "height": 73, "xmin": 8, "ymin": 0, "advance_width": 60.107422, "bitmap_len": 3358, "bitmap_fnv1a_64": "c0ddfaf02f0ef0ba", "bitmap_head_32": "28c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0", "bitmap_tail_32": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff90"},
+      {"ch": 'R', "width": 54, "height": 73, "xmin": 8, "ymin": 0, "advance_width": 64.355469, "bitmap_len": 3942, "bitmap_fnv1a_64": "eadd58dd079ca6a2", "bitmap_head_32": "28c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0b7aca0947650", "bitmap_tail_32": "0000000000000000000000000000000000000000aefffffffffffffffffff419"}
+      ]
+    },
+    {
+      "size_px": 24,
+      "glyphs": [
+      {"ch": 'I', "width": 3, "height": 18, "xmin": 2, "ymin": 0, "advance_width": 6.445312, "bitmap_len": 54, "bitmap_fnv1a_64": "f7063eab6c0c7a59", "bitmap_head_32": "697527e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff", "bitmap_tail_32": "ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55e3ff55"},
+      {"ch": 'N', "width": 14, "height": 18, "xmin": 2, "ymin": 0, "advance_width": 18.082031, "bitmap_len": 252, "bitmap_fnv1a_64": "70ca103f6dd790c1", "bitmap_head_32": "69756700000000000000001d7572e3ffff580000000000000040fff8e3ffffe9", "bitmap_tail_32": "fffefff8e3ff5800000000000000a1fffff8e3ff580000000000000013eafff8"},
+      {"ch": 'T', "width": 14, "height": 18, "xmin": 1, "ymin": 0, "advance_width": 15.492188, "bitmap_len": 252, "bitmap_fnv1a_64": "2027cf0f643a4209", "bitmap_head_32": "6475757575757575757575757528d9ffffffffffffffffffffffff576e818181", "bitmap_tail_32": "0000000000000000005affde00000000000000000000005affde000000000000"},
+      {"ch": 'E', "width": 11, "height": 18, "xmin": 2, "ymin": 0, "advance_width": 14.425781, "bitmap_len": 198, "bitmap_fnv1a_64": "f271957e47611595", "bitmap_head_32": "6975757575757575757558e3ffffffffffffffffffbfe3ffac81818181818181", "bitmap_tail_32": "ff550000000000000000e3fffaf7f7f7f7f7f7f7d4e3ffffffffffffffffffda"},
+      {"ch": 'R', "width": 13, "height": 18, "xmin": 2, "ymin": 0, "advance_width": 15.445312, "bitmap_len": 234, "bitmap_fnv1a_64": "903deaa250488820", "bitmap_head_32": "697575757575715a2100000000e3ffffffffffffffffb51c0000e3ffaa7e7e7e", "bitmap_tail_32": "0034feff5a00e3ff55000000000000a9ffdf07e3ff5500000000000025fbff72"}
+      ]
+    }
+  ]
+}
