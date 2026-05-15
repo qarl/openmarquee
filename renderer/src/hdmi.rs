@@ -2644,7 +2644,6 @@ pub fn paint_and_present_one_image_slide_frame(
 ) -> Result<()> {
     use glow::HasContext;
     let asset_path = crate::content::image_slide_asset_path(content_root, slide.id);
-    let (rgba, img_w, img_h) = load_png_rgba(&asset_path)?;
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // v1-spec-delta #10 (slice c): non-identity brightness/gamma
@@ -2664,26 +2663,7 @@ pub fn paint_and_present_one_image_slide_frame(
         }
     }
     unsafe {
-        let gl = session.gl;
-        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-        gl.clear_color(0.0, 0.0, 0.0, 1.0);
-        gl.clear(glow::COLOR_BUFFER_BIT);
-        let tex = gl
-            .create_texture()
-            .map_err(|e| anyhow!("glGenTextures(image_slide ipc): {e}"))?;
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, glow::RGBA as i32,
-            img_w as i32, img_h as i32, 0,
-            glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
-        );
-        let blit_result = run_blit_pass(gl, tex);
-        gl.delete_texture(tex);
-        blit_result?;
+        bake_image_slide_to_current_fbo(session.gl, &asset_path, mode_w, mode_h)?;
     }
     // v1-spec-delta #10 (slice c): non-identity path runs the
     // brightness/gamma post-pass from scene FBO to default fb.
@@ -4592,6 +4572,44 @@ fn motion_states_for_layers(
             )
         })
         .collect()
+}
+
+/// Load the image at `asset_path` and blit it into the currently-
+/// bound framebuffer via FS_BLIT. Caller is responsible for binding
+/// the destination framebuffer (default fb or an FBO) and for any
+/// post-pass / scanout handling. Allocates one transient RGBA
+/// texture for the upload and deletes it before returning.
+///
+/// Extracted from paint_and_present_one_image_slide_frame so the
+/// non-text transition path can route image endpoints through the
+/// same machinery against an FBO target.
+unsafe fn bake_image_slide_to_current_fbo(
+    gl: &glow::Context,
+    asset_path: &Path,
+    mode_w: u32,
+    mode_h: u32,
+) -> Result<()> {
+    use glow::HasContext;
+    let (rgba, img_w, img_h) = load_png_rgba(asset_path)?;
+    gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(bake_image_slide): {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D, 0, glow::RGBA as i32,
+        img_w as i32, img_h as i32, 0,
+        glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
+    );
+    let blit_result = run_blit_pass(gl, tex);
+    gl.delete_texture(tex);
+    blit_result
 }
 
 /// Phase 5-b — create an FBO + RGBA color texture sized to the
