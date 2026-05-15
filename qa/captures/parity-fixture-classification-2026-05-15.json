@@ -1,0 +1,861 @@
+{
+  "total_fixtures": 39,
+  "text_bearing_count": 39,
+  "non_text_count": 0,
+  "text_pass_count": 0,
+  "non_text_pass_count": 0,
+  "note": "Every fixture in this corpus carries at least one text layer (bg-pattern tests use a small label as a visual identifier). Category + mean_tier give an alternative axis: mean_delta<1 implies the diff is dominated by text-AA hairlines (Cause B); mean_delta>10 implies a broader/structural mismatch.",
+  "by_category": {
+    "other": {
+      "count": 7,
+      "pass_count": 0,
+      "closest_max_delta": 223,
+      "mean_of_mean_delta": 15.994285714285713
+    },
+    "bg": {
+      "count": 12,
+      "pass_count": 0,
+      "closest_max_delta": 197,
+      "mean_of_mean_delta": 8.191583333333332
+    },
+    "font": {
+      "count": 11,
+      "pass_count": 0,
+      "closest_max_delta": 214,
+      "mean_of_mean_delta": 7.637181818181818
+    },
+    "transition": {
+      "count": 6,
+      "pass_count": 0,
+      "closest_max_delta": 203,
+      "mean_of_mean_delta": 31.4465
+    },
+    "animated": {
+      "count": 3,
+      "pass_count": 0,
+      "closest_max_delta": 184,
+      "mean_of_mean_delta": 13.350333333333333
+    }
+  },
+  "by_mean_tier": {
+    "structural": {
+      "count": 16,
+      "pass_count": 0,
+      "closest_max_delta": 184,
+      "mean_of_mean_delta": 28.862
+    },
+    "broad": {
+      "count": 12,
+      "pass_count": 0,
+      "closest_max_delta": 223,
+      "mean_of_mean_delta": 4.635
+    },
+    "hairlines": {
+      "count": 11,
+      "pass_count": 0,
+      "closest_max_delta": 197,
+      "mean_of_mean_delta": 0.5078181818181818
+    }
+  },
+  "top5_closest_to_pass_text_bearing": [
+    {
+      "name": "parity_animated_uncage",
+      "uuid": "f0000000-0000-4000-8000-000000000020",
+      "kind": "single",
+      "golden": "animated_uncage",
+      "has_text": true,
+      "text_samples": [
+        "UNCAGE\nYOUR SIGN!!",
+        "// synonyms.length === 2"
+      ],
+      "status": "FAIL",
+      "ssim": 0.8341,
+      "max_delta": 184,
+      "mean_delta": 30.6,
+      "pixels_over_10_pct": 27.25,
+      "category": "animated",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_bg_pattern_gradient",
+      "uuid": "f0000000-0000-4000-8000-00000000000b",
+      "kind": "single",
+      "golden": "bg_pattern_gradient",
+      "has_text": true,
+      "text_samples": [
+        "GRADIENT"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9881,
+      "max_delta": 197,
+      "mean_delta": 0.66,
+      "pixels_over_10_pct": 0.52,
+      "category": "bg",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_transition_fade",
+      "uuid": "3964c302->2c858968",
+      "kind": "transition_mid",
+      "golden": "transition_mid_fade",
+      "has_text": true,
+      "text_samples": [
+        "FREE",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.7394,
+      "max_delta": 203,
+      "mean_delta": 26.58,
+      "pixels_over_10_pct": 32.41,
+      "category": "transition",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_font_rye",
+      "uuid": "f0000000-0000-4000-8000-00000000001d",
+      "kind": "single",
+      "golden": "font_rye",
+      "has_text": true,
+      "text_samples": [
+        "RYE"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9973,
+      "max_delta": 214,
+      "mean_delta": 0.179,
+      "pixels_over_10_pct": 0.24,
+      "category": "font",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_bg_pattern_solid",
+      "uuid": "f0000000-0000-4000-8000-00000000000a",
+      "kind": "single",
+      "golden": "bg_pattern_solid",
+      "has_text": true,
+      "text_samples": [
+        "SOLID"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9981,
+      "max_delta": 221,
+      "mean_delta": 0.113,
+      "pixels_over_10_pct": 0.17,
+      "category": "bg",
+      "mean_tier": "hairlines"
+    }
+  ],
+  "all_fixtures_sorted_by_closeness": [
+    {
+      "name": "parity_animated_uncage",
+      "uuid": "f0000000-0000-4000-8000-000000000020",
+      "kind": "single",
+      "golden": "animated_uncage",
+      "has_text": true,
+      "text_samples": [
+        "UNCAGE\nYOUR SIGN!!",
+        "// synonyms.length === 2"
+      ],
+      "status": "FAIL",
+      "ssim": 0.8341,
+      "max_delta": 184,
+      "mean_delta": 30.6,
+      "pixels_over_10_pct": 27.25,
+      "category": "animated",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_bg_pattern_gradient",
+      "uuid": "f0000000-0000-4000-8000-00000000000b",
+      "kind": "single",
+      "golden": "bg_pattern_gradient",
+      "has_text": true,
+      "text_samples": [
+        "GRADIENT"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9881,
+      "max_delta": 197,
+      "mean_delta": 0.66,
+      "pixels_over_10_pct": 0.52,
+      "category": "bg",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_transition_fade",
+      "uuid": "3964c302->2c858968",
+      "kind": "transition_mid",
+      "golden": "transition_mid_fade",
+      "has_text": true,
+      "text_samples": [
+        "FREE",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.7394,
+      "max_delta": 203,
+      "mean_delta": 26.58,
+      "pixels_over_10_pct": 32.41,
+      "category": "transition",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_font_rye",
+      "uuid": "f0000000-0000-4000-8000-00000000001d",
+      "kind": "single",
+      "golden": "font_rye",
+      "has_text": true,
+      "text_samples": [
+        "RYE"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9973,
+      "max_delta": 214,
+      "mean_delta": 0.179,
+      "pixels_over_10_pct": 0.24,
+      "category": "font",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_bg_pattern_solid",
+      "uuid": "f0000000-0000-4000-8000-00000000000a",
+      "kind": "single",
+      "golden": "bg_pattern_solid",
+      "has_text": true,
+      "text_samples": [
+        "SOLID"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9981,
+      "max_delta": 221,
+      "mean_delta": 0.113,
+      "pixels_over_10_pct": 0.17,
+      "category": "bg",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_blend_screen",
+      "uuid": "f0000000-0000-4000-8000-000000000013",
+      "kind": "single",
+      "golden": "blend_screen",
+      "has_text": true,
+      "text_samples": [
+        "SCREEN",
+        "BLEND"
+      ],
+      "status": "FAIL",
+      "ssim": 0.983,
+      "max_delta": 223,
+      "mean_delta": 0.934,
+      "pixels_over_10_pct": 1.29,
+      "category": "other",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_blend_normal",
+      "uuid": "f0000000-0000-4000-8000-000000000014",
+      "kind": "single",
+      "golden": "blend_normal",
+      "has_text": true,
+      "text_samples": [
+        "NORMAL",
+        "BLEND"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9803,
+      "max_delta": 223,
+      "mean_delta": 1.143,
+      "pixels_over_10_pct": 1.44,
+      "category": "other",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_blend_overlay",
+      "uuid": "f0000000-0000-4000-8000-000000000001",
+      "kind": "single",
+      "golden": "p2g_overlay_route",
+      "has_text": true,
+      "text_samples": [
+        "OVERLAY",
+        "BLEND"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9778,
+      "max_delta": 223,
+      "mean_delta": 1.287,
+      "pixels_over_10_pct": 1.4,
+      "category": "other",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_blend_multiply",
+      "uuid": "f0000000-0000-4000-8000-000000000012",
+      "kind": "single",
+      "golden": "blend_multiply",
+      "has_text": true,
+      "text_samples": [
+        "MULTIPLY",
+        "BLEND"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9767,
+      "max_delta": 223,
+      "mean_delta": 1.767,
+      "pixels_over_10_pct": 1.78,
+      "category": "other",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_bg_pattern_rays",
+      "uuid": "f0000000-0000-4000-8000-000000000010",
+      "kind": "single",
+      "golden": "bg_pattern_rays",
+      "has_text": true,
+      "text_samples": [
+        "RAYS"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9935,
+      "max_delta": 229,
+      "mean_delta": 0.308,
+      "pixels_over_10_pct": 0.54,
+      "category": "bg",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_animated_stripes_bounce",
+      "uuid": "f0000000-0000-4000-8000-000000000022",
+      "kind": "single",
+      "golden": "animated_stripes_bounce",
+      "has_text": true,
+      "text_samples": [
+        "STRIPES"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9894,
+      "max_delta": 229,
+      "mean_delta": 0.799,
+      "pixels_over_10_pct": 3.11,
+      "category": "animated",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_bg_pattern_stripes",
+      "uuid": "f0000000-0000-4000-8000-000000000004",
+      "kind": "single",
+      "golden": "bg_pattern_stripes",
+      "has_text": true,
+      "text_samples": [
+        "STRIPES"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9892,
+      "max_delta": 229,
+      "mean_delta": 0.871,
+      "pixels_over_10_pct": 3.27,
+      "category": "bg",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_bg_pattern_dots",
+      "uuid": "f0000000-0000-4000-8000-000000000003",
+      "kind": "single",
+      "golden": "bg_pattern_dots",
+      "has_text": true,
+      "text_samples": [
+        "DOTS"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9487,
+      "max_delta": 229,
+      "mean_delta": 2.231,
+      "pixels_over_10_pct": 3.8,
+      "category": "bg",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_bg_pattern_grid",
+      "uuid": "f0000000-0000-4000-8000-00000000000f",
+      "kind": "single",
+      "golden": "bg_pattern_grid",
+      "has_text": true,
+      "text_samples": [
+        "GRID"
+      ],
+      "status": "FAIL",
+      "ssim": 0.908,
+      "max_delta": 229,
+      "mean_delta": 2.544,
+      "pixels_over_10_pct": 2.19,
+      "category": "bg",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_bg_pattern_confetti",
+      "uuid": "f0000000-0000-4000-8000-000000000006",
+      "kind": "single",
+      "golden": "bg_pattern_confetti",
+      "has_text": true,
+      "text_samples": [
+        "CONFETTI"
+      ],
+      "status": "FAIL",
+      "ssim": 0.94,
+      "max_delta": 229,
+      "mean_delta": 3.087,
+      "pixels_over_10_pct": 2.9,
+      "category": "bg",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_bg_pattern_checker",
+      "uuid": "f0000000-0000-4000-8000-00000000000e",
+      "kind": "single",
+      "golden": "bg_pattern_checker",
+      "has_text": true,
+      "text_samples": [
+        "CHECKER"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9054,
+      "max_delta": 229,
+      "mean_delta": 5.045,
+      "pixels_over_10_pct": 4.3,
+      "category": "bg",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_bg_pattern_bricks",
+      "uuid": "f0000000-0000-4000-8000-000000000011",
+      "kind": "single",
+      "golden": "bg_pattern_bricks",
+      "has_text": true,
+      "text_samples": [
+        "BRICKS"
+      ],
+      "status": "FAIL",
+      "ssim": 0.8299,
+      "max_delta": 229,
+      "mean_delta": 7.451,
+      "pixels_over_10_pct": 6.58,
+      "category": "bg",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_bg_pattern_halftone",
+      "uuid": "f0000000-0000-4000-8000-00000000000c",
+      "kind": "single",
+      "golden": "bg_pattern_halftone",
+      "has_text": true,
+      "text_samples": [
+        "HALFTONE"
+      ],
+      "status": "FAIL",
+      "ssim": 0.8621,
+      "max_delta": 229,
+      "mean_delta": 7.625,
+      "pixels_over_10_pct": 11.1,
+      "category": "bg",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_animated_halftone_pulse",
+      "uuid": "f0000000-0000-4000-8000-000000000021",
+      "kind": "single",
+      "golden": "animated_halftone_pulse",
+      "has_text": true,
+      "text_samples": [
+        "HALFTONE"
+      ],
+      "status": "FAIL",
+      "ssim": 0.8489,
+      "max_delta": 229,
+      "mean_delta": 8.652,
+      "pixels_over_10_pct": 21.21,
+      "category": "animated",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_bg_pattern_scanlines",
+      "uuid": "f0000000-0000-4000-8000-00000000000d",
+      "kind": "single",
+      "golden": "bg_pattern_scanlines",
+      "has_text": true,
+      "text_samples": [
+        "SCANLINES"
+      ],
+      "status": "FAIL",
+      "ssim": 0.6665,
+      "max_delta": 229,
+      "mean_delta": 9.256,
+      "pixels_over_10_pct": 7.68,
+      "category": "bg",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_text_static",
+      "uuid": "f0000000-0000-4000-8000-000000000002",
+      "kind": "single",
+      "golden": "multiline_wrap",
+      "has_text": true,
+      "text_samples": [
+        "the quick brown fox jumps over the lazy dog while running through the meadow on a sunny afternoon"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9269,
+      "max_delta": 229,
+      "mean_delta": 10.674,
+      "pixels_over_10_pct": 5.08,
+      "category": "other",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_bg_pattern_rings",
+      "uuid": "f0000000-0000-4000-8000-000000000005",
+      "kind": "single",
+      "golden": "bg_pattern_rings",
+      "has_text": true,
+      "text_samples": [
+        "RINGS"
+      ],
+      "status": "FAIL",
+      "ssim": 0.7146,
+      "max_delta": 229,
+      "mean_delta": 59.108,
+      "pixels_over_10_pct": 49.08,
+      "category": "bg",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_font_inter",
+      "uuid": "f0000000-0000-4000-8000-000000000015",
+      "kind": "single",
+      "golden": "font_inter",
+      "has_text": true,
+      "text_samples": [
+        "INTER"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9961,
+      "max_delta": 231,
+      "mean_delta": 0.245,
+      "pixels_over_10_pct": 0.31,
+      "category": "font",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_font_cinzel",
+      "uuid": "f0000000-0000-4000-8000-00000000001b",
+      "kind": "single",
+      "golden": "font_cinzel",
+      "has_text": true,
+      "text_samples": [
+        "CINZEL"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9961,
+      "max_delta": 231,
+      "mean_delta": 0.255,
+      "pixels_over_10_pct": 0.36,
+      "category": "font",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_font_pacifico",
+      "uuid": "f0000000-0000-4000-8000-00000000001e",
+      "kind": "single",
+      "golden": "font_pacifico",
+      "has_text": true,
+      "text_samples": [
+        "PACIFICO"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9906,
+      "max_delta": 231,
+      "mean_delta": 0.533,
+      "pixels_over_10_pct": 0.57,
+      "category": "font",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_font_oswald",
+      "uuid": "f0000000-0000-4000-8000-000000000016",
+      "kind": "single",
+      "golden": "font_oswald",
+      "has_text": true,
+      "text_samples": [
+        "OSWALD"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9891,
+      "max_delta": 231,
+      "mean_delta": 0.689,
+      "pixels_over_10_pct": 0.5,
+      "category": "font",
+      "mean_tier": "hairlines"
+    },
+    {
+      "name": "parity_font_unifrakturcook",
+      "uuid": "f0000000-0000-4000-8000-00000000001c",
+      "kind": "single",
+      "golden": "font_unifrakturcook",
+      "has_text": true,
+      "text_samples": [
+        "UNIFRAKTURCOOK"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9454,
+      "max_delta": 231,
+      "mean_delta": 5.532,
+      "pixels_over_10_pct": 3.09,
+      "category": "font",
+      "mean_tier": "broad"
+    },
+    {
+      "name": "parity_font_sedgwick_ave",
+      "uuid": "f0000000-0000-4000-8000-00000000001f",
+      "kind": "single",
+      "golden": "font_sedgwick_ave",
+      "has_text": true,
+      "text_samples": [
+        "SEDGWICK AVE"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9299,
+      "max_delta": 231,
+      "mean_delta": 12.833,
+      "pixels_over_10_pct": 5.86,
+      "category": "font",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_font_bebas_neue",
+      "uuid": "f0000000-0000-4000-8000-000000000017",
+      "kind": "single",
+      "golden": "font_bebas_neue",
+      "has_text": true,
+      "text_samples": [
+        "BEBAS NEUE"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9285,
+      "max_delta": 231,
+      "mean_delta": 14.207,
+      "pixels_over_10_pct": 6.4,
+      "category": "font",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_font_permanent_marker",
+      "uuid": "f0000000-0000-4000-8000-00000000001a",
+      "kind": "single",
+      "golden": "font_permanent_marker",
+      "has_text": true,
+      "text_samples": [
+        "PERMANENT MARKER"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9138,
+      "max_delta": 231,
+      "mean_delta": 15.914,
+      "pixels_over_10_pct": 7.29,
+      "category": "font",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_font_caveat_brush",
+      "uuid": "f0000000-0000-4000-8000-000000000019",
+      "kind": "single",
+      "golden": "font_caveat_brush",
+      "has_text": true,
+      "text_samples": [
+        "CAVEAT BRUSH"
+      ],
+      "status": "FAIL",
+      "ssim": 0.914,
+      "max_delta": 231,
+      "mean_delta": 16.706,
+      "pixels_over_10_pct": 7.59,
+      "category": "font",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_font_roboto_slab",
+      "uuid": "f0000000-0000-4000-8000-000000000018",
+      "kind": "single",
+      "golden": "font_roboto_slab",
+      "has_text": true,
+      "text_samples": [
+        "ROBOTO SLAB"
+      ],
+      "status": "FAIL",
+      "ssim": 0.9124,
+      "max_delta": 231,
+      "mean_delta": 16.916,
+      "pixels_over_10_pct": 7.66,
+      "category": "font",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_transition_wipe",
+      "uuid": "3964c302->2c858968",
+      "kind": "transition_mid",
+      "golden": "transition_mid_wipe",
+      "has_text": true,
+      "text_samples": [
+        "FREE",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.8151,
+      "max_delta": 250,
+      "mean_delta": 26.078,
+      "pixels_over_10_pct": 16.27,
+      "category": "transition",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_transition_scroll",
+      "uuid": "3964c302->2c858968",
+      "kind": "transition_mid",
+      "golden": "transition_mid_scroll",
+      "has_text": true,
+      "text_samples": [
+        "FREE",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.7957,
+      "max_delta": 250,
+      "mean_delta": 26.662,
+      "pixels_over_10_pct": 18.53,
+      "category": "transition",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_transition_pixelate",
+      "uuid": "3964c302->2c858968",
+      "kind": "transition_mid",
+      "golden": "transition_mid_pixelate",
+      "has_text": true,
+      "text_samples": [
+        "FREE",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.761,
+      "max_delta": 250,
+      "mean_delta": 30.676,
+      "pixels_over_10_pct": 37.62,
+      "category": "transition",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_motion_compound",
+      "uuid": "99c11690-415b-40f6-8e3c-6491f3bdf60e",
+      "kind": "single",
+      "golden": "animated_multi_chaos",
+      "has_text": true,
+      "text_samples": [
+        "FREE YOUR\nSIGN!!!",
+        "FREE YOUR\nSIGN!!!",
+        "FREE YOUR\nSIGN!!!",
+        "FREE YOUR\nSIGN!!!",
+        "FREE YOUR\nSIGN!!!"
+      ],
+      "status": "FAIL",
+      "ssim": 0.6598,
+      "max_delta": 250,
+      "mean_delta": 40.014,
+      "pixels_over_10_pct": 31.86,
+      "category": "other",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_transition_cut",
+      "uuid": "3964c302->2c858968",
+      "kind": "transition_mid",
+      "golden": "transition_mid_cut",
+      "has_text": true,
+      "text_samples": [
+        "FREE",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.6295,
+      "max_delta": 250,
+      "mean_delta": 52.605,
+      "pixels_over_10_pct": 32.08,
+      "category": "transition",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_motion_ticker",
+      "uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
+      "kind": "single",
+      "golden": "animated_ticker_chant",
+      "has_text": true,
+      "text_samples": [
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.6151,
+      "max_delta": 250,
+      "mean_delta": 56.141,
+      "pixels_over_10_pct": 34.03,
+      "category": "other",
+      "mean_tier": "structural"
+    },
+    {
+      "name": "parity_transition_slide",
+      "uuid": "3964c302->2c858968",
+      "kind": "transition_mid",
+      "golden": "transition_mid_slide",
+      "has_text": true,
+      "text_samples": [
+        "FREE",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN  ",
+        "FREE  YOUR  SIGN ",
+        "FREE  YOUR  SIGN"
+      ],
+      "status": "FAIL",
+      "ssim": 0.8154,
+      "max_delta": 255,
+      "mean_delta": 26.078,
+      "pixels_over_10_pct": 16.25,
+      "category": "transition",
+      "mean_tier": "structural"
+    }
+  ]
+}
