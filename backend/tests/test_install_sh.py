@@ -125,7 +125,29 @@ def test_dry_run_creates_python_venv(dry_output: str) -> None:
     """Step 2 -- /opt/openmarquee/venv. python3 -m venv must appear
     AND pip install -e on backend/."""
     assert "python3 -m venv" in dry_output
-    assert "pip install --upgrade -e" in dry_output
+    assert "pip install --upgrade" in dry_output
+    assert "-e " in dry_output
+    # Phase 4a 2026-05-15: without a wheels/ directory the script
+    # falls back to the previous (online) pip behavior. Verify that
+    # path still works -- the offline path is exercised by
+    # test_dry_run_pip_install_uses_wheels_when_present.
+    assert "falling back to online pip" in dry_output
+
+
+def test_dry_run_pip_install_uses_wheels_when_present(
+    tmp_path: Path,
+) -> None:
+    """Phase 4a: when ${OPT_DIR}/wheels exists and is non-empty,
+    install.sh must call pip with --no-index + --find-links +
+    --no-build-isolation so first-boot needs zero network."""
+    wheels = tmp_path / "opt" / "openmarquee" / "wheels"
+    wheels.mkdir(parents=True)
+    (wheels / "fake-1.0-py3-none-any.whl").write_bytes(b"")
+    out = _run_dry(tmp_path)
+    assert "installing offline" in out
+    assert "--no-index" in out
+    assert f"--find-links={wheels}" in out
+    assert "--no-build-isolation" in out
 
 
 def test_dry_run_installs_three_systemd_units(dry_output: str) -> None:

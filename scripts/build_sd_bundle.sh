@@ -246,6 +246,18 @@ if [ "$DO_WHEELS" -eq 1 ]; then
         --only-binary=:all: \
         --requirement "$REPO_ROOT/backend/requirements.lock" \
         2>&1 | tail -40
+    # Phase 4a 2026-05-15: also vendor setuptools + wheel + pip so that
+    # install.sh's `pip install -e backend --no-index --no-build-isolation`
+    # finds the PEP-517 build backend offline. Python 3.13's venv no
+    # longer installs setuptools by default, so without these, an offline
+    # `pip install -e .` would fail importing setuptools.build_meta.
+    # These three are pure-Python (py3-none-any wheels), arch-independent.
+    pip download \
+        --dest "$ROOT/wheels" \
+        --no-deps \
+        --only-binary=:all: \
+        setuptools wheel pip \
+        2>&1 | tail -10
     WHEEL_COUNT=$(find "$ROOT/wheels" -name '*.whl' | wc -l | tr -d ' ')
     say "  vendored $WHEEL_COUNT wheels"
     # Quick sanity check: every wheel's filename should contain

@@ -129,10 +129,34 @@ say "Install backend package into venv (pip install -e .)"
 # requirements.lock first (CVE-pinned dep tree), then editable install of
 # the backend package itself for the openmarquee module + entry points.
 # Both are idempotent — pip checks sha + skips no-op installs.
-if [ -f "${OPT_DIR}/backend/requirements.lock" ]; then
-    run "${VENV_DIR}/bin/pip" install --upgrade -r "${OPT_DIR}/backend/requirements.lock"
+#
+# Phase 4a 2026-05-15: prefer vendored wheels (factory-fresh offline-
+# install promise). build_sd_bundle.sh ships aarch64 wheels at
+# ${OPT_DIR}/wheels when bundled with --no-wheels=0 (the default).
+# When the directory is present, install fully offline:
+#   --no-index            don't consult PyPI
+#   --find-links=$WHEELS  resolve from the bundled directory only
+#   --no-build-isolation  reuse the venv's pre-installed setuptools/pip
+#                         so `pip install -e .` doesn't trigger a PEP-517
+#                         build-deps fetch from PyPI.
+# When wheels/ is absent (e.g. dev redeploys, --no-wheels bundles), fall
+# back to the previous online behavior. The cloud-init code path on
+# fresh-flashed SD cards always ships wheels/ — so first-boot has no
+# network dependency. A bundle that DOES ship wheels/ but is missing a
+# required package fails LOUDLY here with pip's "No matching distribution"
+# message, naming the missing package -- exactly what the operator needs.
+PIP_OFFLINE_FLAGS=()
+WHEELS_DIR="${OPT_DIR}/wheels"
+if [ -d "$WHEELS_DIR" ] && [ -n "$(ls -A "$WHEELS_DIR" 2>/dev/null)" ]; then
+    say "  found vendored wheels at $WHEELS_DIR — installing offline"
+    PIP_OFFLINE_FLAGS=(--no-index "--find-links=$WHEELS_DIR" --no-build-isolation)
+else
+    say "  no vendored wheels at $WHEELS_DIR — falling back to online pip"
 fi
-run "${VENV_DIR}/bin/pip" install --upgrade -e "${OPT_DIR}/backend"
+if [ -f "${OPT_DIR}/backend/requirements.lock" ]; then
+    run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} -r "${OPT_DIR}/backend/requirements.lock"
+fi
+run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} -e "${OPT_DIR}/backend"
 
 # --- 3. Systemd unit files --------------------------------------------------
 
