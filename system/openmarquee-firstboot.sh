@@ -42,6 +42,12 @@ BOOTSTRAP_MARKER="${BOOTSTRAP_MARKER:-/var/openmarquee/.bootstrapped}"
 ETC_HOSTNAME="${ETC_HOSTNAME:-/etc/hostname}"
 ETC_HOSTS="${ETC_HOSTS:-/etc/hosts}"
 PHY_IFACE="${PHY_IFACE:-wlan0}"
+# Phase 4e-b 2026-05-15: optional WiFi pre-config path. burn_sd_card.sh
+# --wifi-ssid drops an NM keyfile to /boot/firmware/. On first boot we
+# move it into NetworkManager's system-connections/ with the right perms
+# (NM rejects keyfiles with looser perms than 600).
+BOOTFS_NM_KEYFILE="${BOOTFS_NM_KEYFILE:-/boot/firmware/openmarquee-wifi.nmconnection}"
+NM_SYSTEM_CONNECTIONS="${NM_SYSTEM_CONNECTIONS:-/etc/NetworkManager/system-connections}"
 
 # Allow tests to redirect everything under a tmpdir.
 ROOT_PREFIX="${ROOT_PREFIX:-}"
@@ -52,6 +58,8 @@ WELCOME_HTML="${ROOT_PREFIX}${WELCOME_HTML}"
 BOOTSTRAP_MARKER="${ROOT_PREFIX}${BOOTSTRAP_MARKER}"
 ETC_HOSTNAME="${ROOT_PREFIX}${ETC_HOSTNAME}"
 ETC_HOSTS="${ROOT_PREFIX}${ETC_HOSTS}"
+BOOTFS_NM_KEYFILE="${ROOT_PREFIX}${BOOTFS_NM_KEYFILE}"
+NM_SYSTEM_CONNECTIONS="${ROOT_PREFIX}${NM_SYSTEM_CONNECTIONS}"
 
 say() { printf '==> %s\n' "$*"; }
 fatal() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -255,6 +263,41 @@ WPA_CONF="${ROOT_PREFIX}/etc/wpa_supplicant/wpa_supplicant.conf"
 if [ -f "$WPA_CONF" ]; then
     say "Widening $WPA_CONF to 644 for wifi-prefill read access"
     chmod 644 "$WPA_CONF" || true
+fi
+
+# --- 5c. Phase 4e-b: operator WiFi pre-config via NM keyfile ----------------
+
+# burn_sd_card.sh --wifi-ssid drops /boot/firmware/openmarquee-wifi.
+# nmconnection onto bootfs (FAT32, no perms). Move it into
+# /etc/NetworkManager/system-connections/ with the right perms; NM
+# silently rejects keyfiles that aren't chmod 600 + chown root:root.
+# Once moved, delete the bootfs copy so the plaintext psk doesn't
+# linger on a partition any other host can mount.
+if [ -f "$BOOTFS_NM_KEYFILE" ]; then
+    DST="${NM_SYSTEM_CONNECTIONS}/openmarquee-wifi.nmconnection"
+    say "Operator pre-configured WiFi keyfile found; moving to $DST"
+    # Extract SSID for logging (do NOT log the psk; that line lives in
+    # the keyfile and ends up readable to root via the destination
+    # path, but we never echo it to stdout / journalctl).
+    KEY_SSID="$(grep '^ssid=' "$BOOTFS_NM_KEYFILE" | head -1 | cut -d= -f2- || true)"
+    say "  SSID: ${KEY_SSID:-<unparseable>}"
+    mkdir -p "$NM_SYSTEM_CONNECTIONS"
+    cp "$BOOTFS_NM_KEYFILE" "$DST"
+    chmod 600 "$DST" || say "  WARN: chmod 600 failed (test mode?)"
+    # chown only when running as root on a real device; test mode
+    # (ROOT_PREFIX set) skips because the tmpdir is operator-owned.
+    if [ -z "$ROOT_PREFIX" ] && [ "$(id -u)" -eq 0 ]; then
+        chown root:root "$DST"
+        # Tell NM to re-read system-connections/ so the new keyfile
+        # gets picked up without waiting for the next boot. Best-effort:
+        # NM may not be active yet on first boot (we run before it per
+        # the Before= ordering in the service unit); failure is fine.
+        if command -v nmcli >/dev/null 2>&1; then
+            nmcli connection reload 2>/dev/null || true
+        fi
+    fi
+    rm -f "$BOOTFS_NM_KEYFILE"
+    say "  applied; bootfs copy removed"
 fi
 
 # --- 6. Touch bootstrap marker ----------------------------------------------

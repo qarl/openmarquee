@@ -12,6 +12,22 @@
 #     scripts/burn_sd_card.sh --dry-run /dev/diskN     # validate + plan only
 #     scripts/burn_sd_card.sh --help
 #
+# Optional WiFi pre-config (Phase 4e-b, 2026-05-15):
+#     scripts/burn_sd_card.sh --wifi-ssid HomeWifi /dev/diskN
+#         # Reads password from $OPENMARQUEE_WIFI_PASSWORD env var or
+#         # prompts interactively. Drops an NM keyfile onto bootfs;
+#         # openmarquee-firstboot.sh copies it to NM's
+#         # system-connections/ on first boot and the Pi joins the
+#         # network without going through the AP setup dance.
+#     scripts/burn_sd_card.sh --wifi-ssid HomeWifi \
+#                             --wifi-password-file ~/.wifi-pass \
+#                             /dev/diskN
+#         # Reads password from a file (preferred over --wifi-password
+#         # for security: --wifi-password PASS shows up in `ps auxww`).
+#     scripts/burn_sd_card.sh --wifi-ssid HomeWifi \
+#                             --wifi-password 'inline-secret' /dev/diskN
+#         # Inline -- WARNING: visible in `ps`. Use env / file in CI.
+#
 # Safety:
 #   - The target must be a removable / external disk per diskutil
 #     info. Internal disks (/dev/disk0 / /dev/disk1 typically) are
@@ -67,6 +83,10 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 # ============================================================
 
 TARGET=""
+WIFI_SSID=""
+WIFI_PASSWORD=""
+WIFI_PASSWORD_FILE=""
+WIFI_PASSWORD_INLINE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -75,8 +95,37 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --help|-h)
-            sed -n '2,35p' "$0"
+            sed -n '2,55p' "$0"
             exit 0
+            ;;
+        --wifi-ssid)
+            WIFI_SSID="${2:-}"
+            [ -z "$WIFI_SSID" ] && die "--wifi-ssid requires a value"
+            shift 2
+            ;;
+        --wifi-ssid=*)
+            WIFI_SSID="${1#*=}"
+            shift
+            ;;
+        --wifi-password)
+            WIFI_PASSWORD="${2:-}"
+            WIFI_PASSWORD_INLINE=1
+            [ -z "$WIFI_PASSWORD" ] && die "--wifi-password requires a value"
+            shift 2
+            ;;
+        --wifi-password=*)
+            WIFI_PASSWORD="${1#*=}"
+            WIFI_PASSWORD_INLINE=1
+            shift
+            ;;
+        --wifi-password-file)
+            WIFI_PASSWORD_FILE="${2:-}"
+            [ -z "$WIFI_PASSWORD_FILE" ] && die "--wifi-password-file requires a path"
+            shift 2
+            ;;
+        --wifi-password-file=*)
+            WIFI_PASSWORD_FILE="${1#*=}"
+            shift
             ;;
         --)
             shift
@@ -96,6 +145,38 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Resolve WiFi password from one of three sources, in priority order:
+#   1. --wifi-password-file PATH (preferred; trimmed of trailing newline)
+#   2. OPENMARQUEE_WIFI_PASSWORD env (preferred; ps-safe)
+#   3. --wifi-password PASS (warn: visible in ps)
+#   4. Interactive prompt via read -s (when --wifi-ssid given but no source)
+# Refuse partial specs (e.g., SSID without password) loudly.
+if [ -n "$WIFI_SSID" ]; then
+    if [ -n "$WIFI_PASSWORD_FILE" ]; then
+        [ -r "$WIFI_PASSWORD_FILE" ] || die "--wifi-password-file: cannot read $WIFI_PASSWORD_FILE"
+        # Read first line, trim trailing newline. Don't expose path or
+        # contents in error messages even if read fails.
+        WIFI_PASSWORD="$(head -n1 "$WIFI_PASSWORD_FILE" | tr -d '\r\n')"
+        [ -z "$WIFI_PASSWORD" ] && die "--wifi-password-file: file is empty"
+    elif [ -n "${OPENMARQUEE_WIFI_PASSWORD:-}" ]; then
+        WIFI_PASSWORD="$OPENMARQUEE_WIFI_PASSWORD"
+    elif [ "$WIFI_PASSWORD_INLINE" -eq 1 ]; then
+        warn "--wifi-password as inline arg is visible in 'ps auxww'."
+        warn "    For production / CI use \$OPENMARQUEE_WIFI_PASSWORD or"
+        warn "    --wifi-password-file instead."
+    else
+        # Interactive prompt -- only viable for hands-on operator burns.
+        if [ -t 0 ]; then
+            printf 'WiFi password for SSID %s (input hidden): ' "$WIFI_SSID" >&2
+            IFS= read -rs WIFI_PASSWORD || die "read failed"
+            printf '\n' >&2
+            [ -z "$WIFI_PASSWORD" ] && die "empty password"
+        else
+            die "--wifi-ssid requires --wifi-password, --wifi-password-file, or \$OPENMARQUEE_WIFI_PASSWORD (no tty for interactive prompt)"
+        fi
+    fi
+fi
 
 [ -z "$TARGET" ] && die "missing target disk path. usage: $0 [--dry-run] /dev/diskN"
 
@@ -383,6 +464,58 @@ else
         warn "Re-run: bash $SCRIPT_DIR/stage_sd_card.sh $BOOTFS"
         warn "After fix, manually: sudo diskutil eject $TARGET"
         exit 1
+    fi
+fi
+
+# Phase 4e-b 2026-05-15: optional WiFi pre-config via NM keyfile drop.
+# When --wifi-ssid is given, write an NM keyfile to bootfs alongside
+# the bundle. openmarquee-firstboot.sh detects this on first boot and
+# moves it into /etc/NetworkManager/system-connections/ with the
+# right perms (chmod 600, root:root). This BYPASSES cloud-init's
+# network-config (which empirically doesn't translate `wifis:` blocks
+# into NM keyfiles on this image — Phase 4e investigation, e092005).
+if [ -n "$WIFI_SSID" ]; then
+    KEYFILE="$BOOTFS/openmarquee-wifi.nmconnection"
+    info "writing WiFi pre-config keyfile to $KEYFILE (SSID=$WIFI_SSID)..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "    [DRY-RUN] would write keyfile (password redacted)"
+    else
+        # Heredoc EOF is UNQUOTED so $WIFI_SSID + $WIFI_PASSWORD expand
+        # into the file body. Bash does NOT re-interpret the resulting
+        # text as shell -- $(cmd) / backticks / etc. inside the password
+        # VALUE land as literal characters, not command substitution.
+        # NM keyfile is INI-format; a password containing a literal
+        # newline (rare) could inject extra INI sections. The
+        # --wifi-password-file path strips with `head -n1 | tr -d '\r\n'`
+        # upstream; --wifi-password / $OPENMARQUEE_WIFI_PASSWORD trust
+        # the operator's input. NB: bootfs is FAT32 (no perms);
+        # firstboot.sh chmod's the destination after copy to rootfs.
+        umask 077  # FAT32 ignores; the rootfs-side chmod 600 is what matters
+        cat > "$KEYFILE" <<KEYFILE_EOF
+[connection]
+id=openmarquee-wifi
+type=wifi
+interface-name=wlan0
+autoconnect=true
+autoconnect-priority=100
+
+[wifi]
+mode=infrastructure
+ssid=$WIFI_SSID
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$WIFI_PASSWORD
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+addr-gen-mode=default
+KEYFILE_EOF
+        umask 022
+        log "    wrote keyfile ($(wc -c < "$KEYFILE") bytes); password not logged"
     fi
 fi
 

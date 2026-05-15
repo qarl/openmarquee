@@ -386,3 +386,93 @@ def test_second_run_keeps_hostapd_conf_consistent(fakefs: Path) -> None:
     _run_oneshot(fakefs)
     hostapd_2 = (fakefs / "etc" / "hostapd" / "hostapd.conf").read_text()
     assert hostapd_1 == hostapd_2
+
+
+# --- Phase 4e-b: operator WiFi pre-config via NM keyfile -----------------
+
+
+def _stage_bootfs_keyfile(fakefs: Path, ssid: str, psk: str) -> Path:
+    """Drop a faux /boot/firmware/openmarquee-wifi.nmconnection in the
+    fakefs so the firstboot detection path fires."""
+    keyfile = fakefs / "boot" / "firmware" / "openmarquee-wifi.nmconnection"
+    keyfile.parent.mkdir(parents=True, exist_ok=True)
+    keyfile.write_text(
+        "[connection]\n"
+        f"id=openmarquee-wifi\n"
+        "type=wifi\n"
+        "interface-name=wlan0\n"
+        "\n"
+        "[wifi]\n"
+        "mode=infrastructure\n"
+        f"ssid={ssid}\n"
+        "\n"
+        "[wifi-security]\n"
+        "key-mgmt=wpa-psk\n"
+        f"psk={psk}\n"
+    )
+    return keyfile
+
+
+def test_nm_keyfile_moved_from_bootfs_to_system_connections(
+    fakefs: Path,
+) -> None:
+    _stage_bootfs_keyfile(fakefs, ssid="HomeWifi", psk="hunter2-test")
+    _run_oneshot(fakefs)
+    dst = (
+        fakefs
+        / "etc"
+        / "NetworkManager"
+        / "system-connections"
+        / "openmarquee-wifi.nmconnection"
+    )
+    assert dst.exists(), "keyfile not copied to system-connections/"
+    body = dst.read_text()
+    assert "ssid=HomeWifi" in body
+    assert "psk=hunter2-test" in body
+
+
+def test_nm_keyfile_bootfs_copy_removed_after_move(fakefs: Path) -> None:
+    """The plaintext psk on bootfs would be readable to anyone who
+    mounts the SD card on another host -- remove the bootfs copy
+    once it's been promoted to system-connections/."""
+    keyfile = _stage_bootfs_keyfile(fakefs, ssid="x", psk="y")
+    assert keyfile.exists()
+    _run_oneshot(fakefs)
+    assert not keyfile.exists(), "bootfs keyfile not removed after move"
+
+
+def test_nm_keyfile_chmod_600_after_move(fakefs: Path) -> None:
+    """NM silently rejects keyfiles wider than 0600 -- chmod is
+    load-bearing."""
+    _stage_bootfs_keyfile(fakefs, ssid="x", psk="y")
+    _run_oneshot(fakefs)
+    dst = (
+        fakefs
+        / "etc"
+        / "NetworkManager"
+        / "system-connections"
+        / "openmarquee-wifi.nmconnection"
+    )
+    mode = stat.S_IMODE(dst.stat().st_mode)
+    assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+
+def test_no_keyfile_no_op(fakefs: Path) -> None:
+    """When bootfs has no keyfile, the firstboot run leaves
+    system-connections/ untouched. AP-only path stays intact."""
+    _run_oneshot(fakefs)
+    sysconn = fakefs / "etc" / "NetworkManager" / "system-connections"
+    if sysconn.exists():
+        assert not list(sysconn.iterdir()), (
+            "system-connections/ should be empty when no bootfs keyfile staged"
+        )
+
+
+def test_nm_keyfile_psk_not_logged_to_stdout(fakefs: Path) -> None:
+    """Defense-in-depth: the psk shouldn't appear in the firstboot
+    log even though it lives in the keyfile contents. The SSID is OK
+    to log (it's broadcast over the air anyway)."""
+    _stage_bootfs_keyfile(fakefs, ssid="MyHome", psk="super-secret-psk-1234")
+    stdout = _run_oneshot(fakefs)
+    assert "super-secret-psk-1234" not in stdout
+    assert "MyHome" in stdout, "SSID should be logged for operator visibility"

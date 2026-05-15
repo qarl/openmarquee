@@ -136,6 +136,50 @@ the AP comes up as designed.
   network-isolated environment, verify AP comes up + welcome UI
   responds. This is the human-in-the-loop validation.
 
+## Optional: pre-configure WiFi at flash time (Phase 4e-b)
+
+The default factory-fresh path brings up an AP that the operator
+configures via the welcome UI. For headless field deployments
+where the operator wants the Pi to join an existing WiFi at first
+boot (no AP dance), pass WiFi creds to `burn_sd_card.sh`:
+
+```bash
+# Preferred: env var, ps-safe
+OPENMARQUEE_WIFI_PASSWORD='hunter2' \
+  scripts/burn_sd_card.sh --wifi-ssid HomeWifi /dev/diskN
+
+# Or read from a file (also ps-safe)
+scripts/burn_sd_card.sh \
+  --wifi-ssid HomeWifi \
+  --wifi-password-file ~/.config/openmarquee/wifi-pass \
+  /dev/diskN
+
+# Interactive (read -s prompt)
+scripts/burn_sd_card.sh --wifi-ssid HomeWifi /dev/diskN
+
+# CLI literal (WARNING: visible in `ps auxww`; avoid in CI)
+scripts/burn_sd_card.sh \
+  --wifi-ssid HomeWifi --wifi-password 'hunter2' /dev/diskN
+```
+
+What happens:
+1. burn_sd_card.sh writes an NM keyfile to
+   `/Volumes/bootfs/openmarquee-wifi.nmconnection`.
+2. On first boot, `openmarquee-firstboot.sh` detects the keyfile,
+   copies it to `/etc/NetworkManager/system-connections/openmarquee-wifi.nmconnection`
+   with `chmod 600 + chown root:root` (NM silently rejects looser
+   perms), runs `nmcli connection reload`, then deletes the
+   bootfs copy so the plaintext PSK doesn't linger on a partition
+   any other host can mount.
+3. NM joins the operator-supplied SSID. AP still comes up alongside
+   (per existing `Before=NetworkManager.service` ordering); operator
+   can use either path for first-time setup.
+
+This bypasses cloud-init's `network-config` processing entirely.
+Empirically (2026-05-15 Phase 4e investigation), cloud-init's
+`wifis:` block doesn't reliably translate to NM keyfiles on this
+image; the explicit bootfs-keyfile-drop is the supported path.
+
 ## Related
 
 - `docs/sd-burn.md` — operator instructions for `scripts/burn_sd_card.sh`.
