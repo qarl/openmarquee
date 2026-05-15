@@ -1,0 +1,68 @@
+{
+  "ttf": "ui/fonts/inter.ttf",
+  "ttf_size_bytes": 876576,
+  "fontdue_version": "0.9.3 (pinned in both renderer and renderer-wasm Cargo.toml)",
+  "text": "INTER",
+  "runs": [
+    {
+      "size_px": 1037,
+      "glyphs": [
+      {"ch": 'I', "advance": 278.491211, "advance_rounded": 278, "cursor_unrounded_after": 278.491211, "cursor_rounded_after": 278, "ymin": 0, "height": 755},
+      {"ch": 'N', "advance": 781.294434, "advance_rounded": 781, "cursor_unrounded_after": 1059.785645, "cursor_rounded_after": 1059, "ymin": 0, "height": 755},
+      {"ch": 'T', "advance": 669.391602, "advance_rounded": 669, "cursor_unrounded_after": 1729.177246, "cursor_rounded_after": 1728, "ymin": 0, "height": 755},
+      {"ch": 'E', "advance": 623.313965, "advance_rounded": 623, "cursor_unrounded_after": 2352.491211, "cursor_rounded_after": 2351, "ymin": 0, "height": 755},
+      {"ch": 'R', "advance": 667.366211, "advance_rounded": 667, "cursor_unrounded_after": 3019.857422, "cursor_rounded_after": 3018, "ymin": 0, "height": 755}
+      ],
+      "total_advance_unrounded": 3019.857422,
+      "total_advance_rounded": 3018
+    },
+    {
+      "size_px": 215.7,
+      "glyphs": [
+      {"ch": 'I', "advance": 57.927246, "advance_rounded": 58, "cursor_unrounded_after": 57.927246, "cursor_rounded_after": 58, "ymin": 0, "height": 157},
+      {"ch": 'N', "advance": 162.512253, "advance_rounded": 163, "cursor_unrounded_after": 220.439499, "cursor_rounded_after": 221, "ymin": 0, "height": 157},
+      {"ch": 'T', "advance": 139.236038, "advance_rounded": 139, "cursor_unrounded_after": 359.675537, "cursor_rounded_after": 360, "ymin": 0, "height": 157},
+      {"ch": 'E', "advance": 129.651703, "advance_rounded": 130, "cursor_unrounded_after": 489.327240, "cursor_rounded_after": 490, "ymin": 0, "height": 157},
+      {"ch": 'R', "advance": 138.814743, "advance_rounded": 139, "cursor_unrounded_after": 628.141968, "cursor_rounded_after": 629, "ymin": 0, "height": 157}
+      ],
+      "total_advance_unrounded": 628.141968,
+      "total_advance_rounded": 629
+    },
+    {
+      "size_px": 213,
+      "glyphs": [
+      {"ch": 'I', "advance": 57.202148, "advance_rounded": 57, "cursor_unrounded_after": 57.202148, "cursor_rounded_after": 57, "ymin": 0, "height": 155},
+      {"ch": 'N', "advance": 160.478027, "advance_rounded": 160, "cursor_unrounded_after": 217.680176, "cursor_rounded_after": 217, "ymin": 0, "height": 155},
+      {"ch": 'T', "advance": 137.493164, "advance_rounded": 137, "cursor_unrounded_after": 355.173340, "cursor_rounded_after": 354, "ymin": 0, "height": 155},
+      {"ch": 'E', "advance": 128.028809, "advance_rounded": 128, "cursor_unrounded_after": 483.202148, "cursor_rounded_after": 482, "ymin": 0, "height": 155},
+      {"ch": 'R', "advance": 137.077148, "advance_rounded": 137, "cursor_unrounded_after": 620.279297, "cursor_rounded_after": 619, "ymin": 0, "height": 155}
+      ],
+      "total_advance_unrounded": 620.279297,
+      "total_advance_rounded": 619
+    },
+    {
+      "size_px": 200,
+      "glyphs": [
+      {"ch": 'I', "advance": 53.710938, "advance_rounded": 54, "cursor_unrounded_after": 53.710938, "cursor_rounded_after": 54, "ymin": 0, "height": 146},
+      {"ch": 'N', "advance": 150.683594, "advance_rounded": 151, "cursor_unrounded_after": 204.394531, "cursor_rounded_after": 205, "ymin": 0, "height": 146},
+      {"ch": 'T', "advance": 129.101562, "advance_rounded": 129, "cursor_unrounded_after": 333.496094, "cursor_rounded_after": 334, "ymin": 0, "height": 146},
+      {"ch": 'E', "advance": 120.214844, "advance_rounded": 120, "cursor_unrounded_after": 453.710938, "cursor_rounded_after": 454, "ymin": 0, "height": 146},
+      {"ch": 'R', "advance": 128.710938, "advance_rounded": 129, "cursor_unrounded_after": 582.421875, "cursor_rounded_after": 583, "ymin": 0, "height": 146}
+      ],
+      "total_advance_unrounded": 582.421875,
+      "total_advance_rounded": 583
+    },
+    {
+      "size_px": 100,
+      "glyphs": [
+      {"ch": 'I', "advance": 26.855469, "advance_rounded": 27, "cursor_unrounded_after": 26.855469, "cursor_rounded_after": 27, "ymin": 0, "height": 73},
+      {"ch": 'N', "advance": 75.341797, "advance_rounded": 75, "cursor_unrounded_after": 102.197266, "cursor_rounded_after": 102, "ymin": 0, "height": 73},
+      {"ch": 'T', "advance": 64.550781, "advance_rounded": 65, "cursor_unrounded_after": 166.748047, "cursor_rounded_after": 167, "ymin": 0, "height": 73},
+      {"ch": 'E', "advance": 60.107422, "advance_rounded": 60, "cursor_unrounded_after": 226.855469, "cursor_rounded_after": 227, "ymin": 0, "height": 73},
+      {"ch": 'R', "advance": 64.355469, "advance_rounded": 64, "cursor_unrounded_after": 291.210938, "cursor_rounded_after": 291, "ymin": 0, "height": 73}
+      ],
+      "total_advance_unrounded": 291.210938,
+      "total_advance_rounded": 291
+    }
+  ]
+}
