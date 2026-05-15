@@ -429,5 +429,29 @@
         26
       ]
     }
-  ]
+  ],
+  "multirow_transitions": [
+    {
+      "y": 270,
+      "rust_transition_x": 31.5,
+      "canvas2d_transition_x": 21.0,
+      "offset_rust_minus_canvas": 10.5,
+      "offset_normalized_signed": 10.5
+    },
+    {
+      "y": 540,
+      "rust_transition_x": 20.5,
+      "canvas2d_transition_x": 9.675925925925926,
+      "offset_rust_minus_canvas": 10.824074074074074,
+      "offset_normalized_signed": 10.824074074074074
+    },
+    {
+      "y": 810,
+      "rust_transition_x": 9.5,
+      "canvas2d_transition_x": 85.0,
+      "offset_rust_minus_canvas": -75.5,
+      "offset_normalized_signed": 10.767027160000012
+    }
+  ],
+  "multirow_verdict": "top-left-anchor (constant offset ~+10.70 px along x, spread 0.32). Phase 3l fix shape: 1-line shader phase shift by ~+7.56 along the 45deg axis."
 }

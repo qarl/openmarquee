@@ -107,6 +107,75 @@ float t = smoothstep(u_tile * 0.5 - 0.5, u_tile * 0.5 + 0.5, modv);
 transition-zone disagreement (probably half the 23% loud-pixel
 mass).
 
+## Phase 3l-prep update (2026-05-15): multi-row probe = top-left-anchor
+
+The multi-row extension to `scripts/parity/stripes_diag.py` samples
+y=270 / y=540 / y=810 and **normalizes** the offset modulo the
+x-period (`tile * sqrt(2)` = 86.27 px for tile=61 at
+density_curve(0.5)). Raw "first low->high transition" can match
+different period boundaries between renderers when one starts in
+color_a and the other in color_b — fixed by signed-mod into
+(-period/2, +period/2].
+
+Normalized offsets:
+
+| y    | rust_x | canvas2d_x | raw offset | normalized |
+|------|--------|------------|------------|------------|
+| 270  | 31.500 |  21.000    |  +10.500   |  +10.500   |
+| 540  | 20.500 |   9.676    |  +10.824   |  +10.824   |
+| 810  |  9.500 |  85.000    |  -75.500   |  +10.770   |
+
+(at y=810 the raw offset compares non-corresponding boundaries —
+canvas2d starts in color_b there, so its FIRST color_a→color_b is
+one period later than rust's. Period-normalized, all 3 rows agree
+within 0.32 px.)
+
+**Verdict: top-left-anchor (constant phase shift ~+10.70 px along
+x, i.e., ~+7.56 along the 45deg axis).** The CSS-axis-center
+model is ruled out — its slope prediction (~-0.707/row) is not
+observed; the normalized offset is constant across y to within
+the AA-noise floor.
+
+Phase 3k's "12 px observed offset" was a coarse single-row read;
+the multi-row period-aware probe pins it more precisely at
+**10.70 ± 0.16 px**.
+
+## Phase 3l proposed fix (1-line shader phase shift)
+
+Cause 2 is now a single-constant phase shift, not a structural
+anchor swap. In `renderer/src/hdmi_logic.rs::FS_PATTERN_STRIPES`,
+change:
+
+```glsl
+float proj = (pos.x + pos.y) / 1.41421356;
+```
+
+to:
+
+```glsl
+float proj = (pos.x + pos.y) / 1.41421356 + 7.56;
+```
+
+(or pass the shift in as a uniform for future fixture cases). Then
+combine with Cause 1 smoothstep:
+
+```glsl
+float t = smoothstep(u_tile * 0.5 - 0.5, u_tile * 0.5 + 0.5, modv);
+```
+
+Predicted impact on parity_animated_stripes_bounce:
+- max_delta floor 229 → likely still ~80-100 (text-glyph AA at the
+  small "STRIPES" headline). Pattern-edge AA collapses to <10.
+- disagreement-pixel mass: 23% → ~3% (the pattern body now agrees
+  byte-for-byte; only the small text + remaining boundary noise
+  contribute).
+- SSIM 0.5715 → > 0.95 likely.
+
+Scope: ~3 lines of shader changes, +1-line stripes_uniforms test
+update, ~12 pattern-fixture goldens re-bless. Still **<4 hour
+slice**, gated on qarl-direct ack of visible-on-glass implications
+(softer stripe edges + stripes land at new screen positions).
+
 ## Cause 2: Gradient anchor / phase offset
 
 CSS `repeating-linear-gradient(45deg, ...)`:

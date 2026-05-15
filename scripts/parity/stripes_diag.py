@@ -111,6 +111,78 @@ def main():
         canvas_px = [int(canvas[row_mid, x, c]) for c in range(3)]
         samples.append({"x": x, "rust_rgb": rust_px, "canvas_rgb": canvas_px})
 
+    # Phase 3l-prep multi-row probe: find the first stripe transition
+    # x position in BOTH renderers at 3 y rows. Disambiguates
+    # top-left-anchor model (constant offset across y) vs CSS-axis-
+    # center model (offset linear in (y - center_y)) vs other.
+    #
+    # "Transition x" defined as the first x >= 0 where the pixel's
+    # G channel crosses the midpoint between color_a.G (=26) and
+    # color_b.G (=180), i.e. >=103. Using G is the cleanest signal
+    # since color_a=[94,26,26] and color_b=[255,180,60] differ most
+    # in G (154 vs 60 in B). Sub-pixel: linearly interpolate
+    # between the bracketing pixels for AA-ramped Canvas2D so the
+    # transition x captures the sub-pixel center, not the integer
+    # bracket. Rust is a hard step so the same lerp degenerates to
+    # whichever pixel-boundary crossed 103 first.
+    MID_G = 103  # midpoint of color_a.G=26 and color_b.G=180
+    def find_transition_x(arr_2d, y):
+        row = arr_2d[y, :, 1]  # G channel of row y, all x
+        # Walk from x=0 to find first crossing low->high.
+        # Stop at w/2 -- we just want the FIRST transition.
+        for x in range(1, min(w // 2, w)):
+            if row[x - 1] < MID_G <= row[x]:
+                # Sub-pixel: linear interp between bracketing pixels.
+                g_lo, g_hi = float(row[x - 1]), float(row[x])
+                if g_hi == g_lo:
+                    return float(x)
+                frac = (MID_G - g_lo) / (g_hi - g_lo)
+                return float(x - 1) + frac
+        return None
+    rows_to_probe = [270, 540, 810]
+    multirow = []
+    for y in rows_to_probe:
+        rust_tx = find_transition_x(rust, y)
+        canvas_tx = find_transition_x(canvas, y)
+        offset = (rust_tx - canvas_tx) if (rust_tx is not None and canvas_tx is not None) else None
+        multirow.append({
+            "y": y,
+            "rust_transition_x": rust_tx,
+            "canvas2d_transition_x": canvas_tx,
+            "offset_rust_minus_canvas": offset,
+        })
+    # Verdict heuristic: the raw "first low->high" offset is unreliable
+    # because each row may start in different stripe-zone (e.g., row
+    # y=810 starts in color_b for Canvas2D but color_a for Rust due
+    # to phase wrap). Take the offset MODULO the x-period (which is
+    # tile*sqrt(2) for 45deg stripes -- empirically ~86 px for
+    # tile=61 from density_curve(0.5)). The signed-minimum residue
+    # is the true phase offset along x.
+    X_PERIOD = 61.0 * 1.41421356  # 45deg x-period for tile=61
+    def signed_mod(v, p):
+        # Map v into (-p/2, p/2].
+        r = v - p * round(v / p)
+        return r
+    valid = [r for r in multirow if r["offset_rust_minus_canvas"] is not None]
+    if len(valid) == 3:
+        normalized = [signed_mod(r["offset_rust_minus_canvas"], X_PERIOD)
+                      for r in valid]
+        for r, n in zip(valid, normalized):
+            r["offset_normalized_signed"] = n
+        max_spread = max(normalized) - min(normalized)
+        if max_spread < 1.0:
+            verdict = (f"top-left-anchor (constant offset ~{sum(normalized)/3:+.2f} px along x, "
+                      f"spread {max_spread:.2f}). Phase 3l fix shape: 1-line shader "
+                      f"phase shift by ~{(sum(normalized)/3)/1.41421356:+.2f} along the 45deg axis.")
+        elif max_spread < 5.0:
+            verdict = (f"approx-constant offset ~{sum(normalized)/3:+.2f}+-{max_spread/2:.2f} px "
+                      f"along x. Likely top-left-anchor with AA-sampling noise.")
+        else:
+            verdict = (f"OTHER -- normalized offsets {[round(n,2) for n in normalized]} "
+                      f"vary by {max_spread:.2f} px. Geometry mechanism non-obvious.")
+    else:
+        verdict = "INCONCLUSIVE: one or more rows had no transition"
+
     out = {
         "fixture": "parity_animated_stripes_bounce",
         "dims": [w, h],
@@ -124,6 +196,8 @@ def main():
         "histogram_delta_max": hist,
         "loud_pixel_bbox": bbox,
         "row_mid_samples_first60x_step2": samples,
+        "multirow_transitions": multirow,
+        "multirow_verdict": verdict,
     }
     (OUT_DIR / "stripes-diag.json").write_text(json.dumps(out, indent=2))
 
@@ -164,6 +238,17 @@ def main():
         pct = 100.0 * cnt / (h * w)
         print(f"  {label:6}: {cnt:9d}  ({pct:.2f}%)", file=sys.stderr)
     print(f"loud-pixel bbox (delta>50): {bbox}", file=sys.stderr)
+    print("\nMulti-row transition probe (Phase 3l-prep):", file=sys.stderr)
+    for r in multirow:
+        rt = r["rust_transition_x"]
+        ct = r["canvas2d_transition_x"]
+        off = r["offset_rust_minus_canvas"]
+        rt_s = f"{rt:7.3f}" if rt is not None else "  none "
+        ct_s = f"{ct:7.3f}" if ct is not None else "  none "
+        off_s = f"{off:+7.3f}" if off is not None else "  none "
+        print(f"  y={r['y']:4d}  rust_x={rt_s}  canvas_x={ct_s}  offset={off_s}",
+              file=sys.stderr)
+    print(f"verdict: {verdict}", file=sys.stderr)
     print(f"\nartifacts: {OUT_DIR / 'stripes-*.png'}, stripes-diag.json", file=sys.stderr)
 
 
