@@ -2314,13 +2314,24 @@ pub const FS_PATTERN_SCANLINES: &str = r#"#version 100
 precision mediump float;
 uniform vec2 u_viewport;
 uniform float u_tile;
+uniform float u_y_phase;
 uniform vec3 u_color_a;
 uniform vec3 u_color_b;
 void main() {
-    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
-    float row = floor(pos.y);
-    // step(mod(row, tile), 0.5) is 1 when mod == 0, 0 otherwise.
-    float t = step(mod(row, u_tile), 0.5);
+    // Phase 3x 2026-05-15 (Candidate B winner): drop the large-
+    // magnitude `u_viewport.y - gl_FragCoord.y` subtraction (vc4
+    // mediump truncated gl_FragCoord.y at top-of-viewport, so the
+    // resulting row math missed every scanline except y=0 -- see
+    // qa/captures/parity-phase3w-scanlines-2026-05-15.md). Use
+    // gl_FragCoord.y directly via mod; u_y_phase precomputed CPU-
+    // side = mod(viewport_h - 0.5, u_tile) so scanlines land at
+    // mod ~= u_y_phase. The +/-0.5 step tolerance accepts both
+    // possible truncation outcomes of gl_FragCoord.y at every
+    // pixel center. 3-way probe vs Cand A (int-domain, +1 px
+    // shift bug like checker) and Cand C (vertex UV varying,
+    // no fix): qa/captures/parity-phase3x-candidates-2026-05-15.md.
+    float m = mod(gl_FragCoord.y, u_tile);
+    float t = step(abs(m - u_y_phase), 0.5);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
 }
 "#;

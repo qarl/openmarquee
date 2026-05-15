@@ -1624,12 +1624,23 @@ fn draw_pattern(
         }
         PatternKind::Scanlines => {
             let u = scanlines_uniforms(density);
+            // Phase 3x: precompute y-phase so shader doesn't have to
+            // do the large-magnitude `viewport.y - gl_FragCoord.y`
+            // subtraction (vc4 mediump precision-truncates it).
+            // u_y_phase = mod(viewport_h - 0.5, tile), where -0.5
+            // accounts for gl_FragCoord at pixel CENTER not corner.
+            let y_phase = {
+                let v = (mode_h as f32) - 0.5;
+                ((v % u.tile) + u.tile) % u.tile
+            };
             draw_full_screen_pattern(
                 gl, mode_w, mode_h, FS_PATTERN_SCANLINES, color_a, color_b,
                 |gl, program| unsafe {
                     use glow::HasContext;
                     let u_tile = gl.get_uniform_location(program, "u_tile");
+                    let u_y_phase = gl.get_uniform_location(program, "u_y_phase");
                     gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                    gl.uniform_1_f32(u_y_phase.as_ref(), y_phase);
                 },
             )
         }
