@@ -122,49 +122,65 @@ fn rasterize_inner(
     if !has_ink {
         return None;
     }
-    // Bitmap dims. Single-line case so bm_h = ascent + descent
-    // (no inter-line stride). No padding — caller positions by
-    // exact pixel coords + the canvas does its own AA at the
-    // boundary if needed.
+    // Bitmap dims. Single-line case so the un-padded line height is
+    // max_ascent - min_descent (no inter-line stride).
+    //
+    // Phase 2 pad (2026-05-14): mirror the 1-pixel pad Rust adds in
+    // hdmi_logic.rs:464 (layout_text_to_alpha). Without the pad the
+    // Canvas2D-WASM bitmap is 2px narrower + 2px shorter than the
+    // Rust bitmap, and when both bitmaps are placed at the same
+    // canvas X/Y, the Rust glyph appears 1px right + ~0.2px down of
+    // the Canvas2D-WASM glyph (Phase 1c localized this: dx=-1.003,
+    // dy=+0.214 on a single-glyph "B" diagnostic, 5759b1e).
+    // Mirroring the pad here makes the two bitmaps byte-equivalent
+    // at the fontdue layer and the quad placements canvas-equivalent
+    // on both renderers.
+    const PAD: u32 = 1;
     let line_w = line_advance.round() as u32;
     let line_h = (max_ascent - min_descent).max(0) as u32;
     if line_w == 0 || line_h == 0 {
         return None;
     }
+    let bm_w = line_w + 2 * PAD;
+    let bm_h = line_h + 2 * PAD;
     // Header (12 bytes: width u32 LE, height u32 LE, ascent u32 LE)
-    // + RGBA pixel data (line_w * line_h * 4 bytes). The ascent is
-    // the bitmap-internal baseline row index — needed by callers to
-    // align the rasterized bitmap to their layout's baseline.
-    let ascent_u32 = max_ascent.max(0) as u32;
-    let pixel_bytes = (line_w as usize) * (line_h as usize) * 4;
+    // + RGBA pixel data (bm_w * bm_h * 4 bytes). The "ascent" field
+    // is the bitmap-internal baseline row index INCLUDING the top
+    // pad, so paintLayer's drawY = baselineY - ascent puts the
+    // bitmap's row 0 at the right canvas-Y for the glyph ink (at
+    // bitmap row pad + max_ascent - m.ymin - m.height) to land at
+    // baselineY - m.ymin - m.height — same as Rust.
+    let ascent_u32 = (max_ascent.max(0) as u32) + PAD;
+    let pixel_bytes = (bm_w as usize) * (bm_h as usize) * 4;
     let mut out = vec![0u8; 12 + pixel_bytes];
-    out[0..4].copy_from_slice(&line_w.to_le_bytes());
-    out[4..8].copy_from_slice(&line_h.to_le_bytes());
+    out[0..4].copy_from_slice(&bm_w.to_le_bytes());
+    out[4..8].copy_from_slice(&bm_h.to_le_bytes());
     out[8..12].copy_from_slice(&ascent_u32.to_le_bytes());
     let pixels = &mut out[12..];
 
     // Second pass: blit each glyph at its baseline-relative position.
-    // Baseline_y in bitmap coords = max_ascent (so glyphs with
-    // height < max_ascent + 0 descent leave the top rows blank).
+    // Baseline_y in bitmap coords = pad + max_ascent (so the top
+    // pad row stays alpha=0 above the glyph and the bottom pad row
+    // stays alpha=0 below the descender).
     let mut cursor_x = 0.0_f32;
     for (m, alpha) in &glyphs {
-        let glyph_x = (cursor_x + m.xmin as f32).round() as i32;
-        let glyph_top = max_ascent - m.ymin - m.height as i32;
+        let glyph_x = (cursor_x + m.xmin as f32).round() as i32 + PAD as i32;
+        let glyph_top = PAD as i32 + max_ascent - m.ymin - m.height as i32;
         for gy in 0..m.height as i32 {
             let dst_y = glyph_top + gy;
-            if dst_y < 0 || dst_y as u32 >= line_h {
+            if dst_y < 0 || dst_y as u32 >= bm_h {
                 continue;
             }
             for gx in 0..m.width as i32 {
                 let dst_x = glyph_x + gx;
-                if dst_x < 0 || dst_x as u32 >= line_w {
+                if dst_x < 0 || dst_x as u32 >= bm_w {
                     continue;
                 }
                 let cov = alpha[(gy as usize) * m.width + (gx as usize)];
                 if cov == 0 {
                     continue;
                 }
-                let idx = ((dst_y as usize) * (line_w as usize) + (dst_x as usize)) * 4;
+                let idx = ((dst_y as usize) * (bm_w as usize) + (dst_x as usize)) * 4;
                 // Coverage modulates the color's alpha. RGB stays as
                 // the requested color so anti-aliased edges sample
                 // the canvas underneath correctly (straight alpha
