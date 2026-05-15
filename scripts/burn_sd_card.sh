@@ -140,18 +140,33 @@ validate_target_disk() {
     local plist
     plist="$(diskutil info -plist "$target")"
 
-    local is_internal
-    is_internal="$(plutil -extract Internal raw -o - - <<<"$plist" 2>/dev/null || echo "true")"
-    if [ "$is_internal" != "false" ]; then
-        die "$target is an INTERNAL disk per diskutil. Refusing to flash internal storage."
-    fi
-
     local is_removable
     is_removable="$(plutil -extract RemovableMediaOrExternalDevice raw -o - - <<<"$plist" 2>/dev/null || echo "false")"
     local is_ejectable
     is_ejectable="$(plutil -extract Ejectable raw -o - - <<<"$plist" 2>/dev/null || echo "false")"
+
+    # 2026-05-15 fix: built-in Mac SD slot reports Internal=true even
+    # though the medium IS Removable+Ejectable. Internal SSD reports
+    # Internal=true + Removable=false + Ejectable=false. Discriminate
+    # by medium-removability, not slot-location -- SD-slot cards must
+    # not be falsely refused as "internal storage", while truly-
+    # internal storage (the Mac SSD) still gets rejected here since
+    # both Removable and Ejectable are false for it.
     if [ "$is_removable" != "true" ] && [ "$is_ejectable" != "true" ]; then
         die "$target is not flagged removable/ejectable per diskutil. Refusing for safety."
+    fi
+
+    # Size sanity: SD cards for Pi are typically 16-128 GB, max 512.
+    # Anything > 512 GB is almost certainly an external SSD/HDD the
+    # operator does NOT want to flash. 2026-05-15: added because the
+    # Internal-flag removal widened the set of accepted disks; this
+    # protects against accidentally targeting a Time Machine / backup
+    # external SSD.
+    local total_size_bytes
+    total_size_bytes="$(plutil -extract TotalSize raw -o - - <<<"$plist" 2>/dev/null || echo 0)"
+    local size_cap_bytes=$((512 * 1024 * 1024 * 1024))
+    if [ "$total_size_bytes" -gt "$size_cap_bytes" ]; then
+        die "$target is $((total_size_bytes / 1024 / 1024 / 1024)) GB which exceeds the 512 GB SD-card sanity cap. Refusing -- this is likely an external SSD/HDD, not an SD card."
     fi
 }
 
