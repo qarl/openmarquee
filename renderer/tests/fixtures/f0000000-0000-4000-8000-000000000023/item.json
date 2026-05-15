@@ -1,0 +1,62 @@
+{
+  "schema_version": 3,
+  "updated_at": "2026-05-13T00:00:00.000000+00:00",
+  "item": {
+    "type": "text_slide",
+    "id": "f0000000-0000-4000-8000-000000000023",
+    "name": "15 · Boot (parity fixture)",
+    "duration_ms": 2000,
+    "text_layers": [
+      {
+        "text": "> openMarquee v0.4.2 boot\n  panel-0 . . . . . . . . ok\n  motion-engine . . . . . ok\n  flock-mesh . . . . . . . ok\n  9.6V / 0.41A / 27°C\n  ready.",
+        "name": "log",
+        "font_family": "VT323",
+        "font_size_px": null,
+        "font_size_pct": 5.0,
+        "weight": null,
+        "text_color": "#FFB43C",
+        "text_align": "left",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {"x": 0.05, "y": 0.18, "w": 0.9, "h": 0.64}
+      },
+      {
+        "text": "● PANEL-0 OK",
+        "name": "badge",
+        "font_family": "VT323",
+        "font_size_px": null,
+        "font_size_pct": 12.0,
+        "weight": null,
+        "text_color": "#FFB43C",
+        "text_align": "center",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "breathe",
+        "motion_intensity": 45,
+        "motion_phase": 0.0,
+        "motion_speed": 0.7,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {"x": 0.55, "y": 0.05, "w": 0.4, "h": 0.1}
+      }
+    ],
+    "background_color": "#050608",
+    "background_pattern": null,
+    "transition": "scroll",
+    "transition_ms": 600
+  }
+}
