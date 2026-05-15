@@ -2691,8 +2691,16 @@ pub fn rays_uniforms(density: f32) -> RaysUniforms {
 /// v1-spec-delta #6 (slice d) -- bricks pattern uniforms. Brick
 /// width shrinks with density (lerp(140, 16)); brick height is
 /// half the width. 2-pixel mortar between bricks. Courses
-/// alternate offset by half-brick-width. Mirrors Python's
-/// `_render_pattern_bricks`.
+/// alternate offset by half-brick-width. Mirrors Canvas2D's
+/// `_render_pattern_bricks` (ui/src/bg-system.js:426).
+/// Phase 3u 2026-05-15: bh = round(bw/2), half = bw * 0.5 (NO
+/// floor). Same canonicalization as Phase 3t halftone: Canvas2D
+/// uses JS `Math.round` for bh and float `w / 2` for half;
+/// pre-3u Rust mirrored Python's `// 2` integer floor which
+/// diverged for odd bw (density-curve-effective bw=109 at
+/// density=0.5 -> JS bh=55/half=54.5 but Rust pre-3u bh=54/
+/// half=54, a 1-px brick-height and 0.5-px stagger offset
+/// per Phase 3u diag at qa/captures/parity-phase3u-...).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BricksUniforms {
     pub bw: f32,
@@ -2702,9 +2710,13 @@ pub struct BricksUniforms {
 
 pub fn bricks_uniforms(density: f32) -> BricksUniforms {
     let bw = pattern_lerp(140.0, 16.0, density).round().max(8.0);
-    // Python: bh = max(4, bw // 2). Mirror with floor.
-    let bh = (bw * 0.5).floor().max(4.0);
-    let half = (bw * 0.5).floor();
+    // Canvas2D: bh = Math.max(4, Math.round(w / 2)). Use round to
+    // match (was .floor() pre-3u, Python convention).
+    let bh = (bw * 0.5).round().max(4.0);
+    // Canvas2D: half = w / 2 (no round/floor; sub-pixel for odd bw
+    // matters because ctx.fillRect at fractional x AAs the mortar
+    // edge into adjacent pixels).
+    let half = bw * 0.5;
     BricksUniforms { bw, bh, half }
 }
 
@@ -4212,19 +4224,32 @@ mod tests {
     }
 
     #[test]
-    fn bricks_uniforms_match_python_anchors() {
+    fn bricks_uniforms_match_canvas2d_anchors() {
         // bw = max(8, round(lerp(140, 16, density))); bh = max(4,
-        // floor(bw/2)); half = floor(bw/2).
-        // density 0: bw=140, bh=70, half=70.
+        // round(bw/2)); half = bw * 0.5 (float, NO floor -- Phase 3u).
+        // density 0: bw=140, bh=70, half=70 (all integer).
         let u0 = bricks_uniforms(0.0);
         assert_eq!(u0.bw, 140.0);
         assert_eq!(u0.bh, 70.0);
         assert_eq!(u0.half, 70.0);
-        // density 1: bw=16, bh=8, half=8.
+        // density 1: bw=16, bh=8, half=8 (all integer).
         let u1 = bricks_uniforms(1.0);
         assert_eq!(u1.bw, 16.0);
         assert_eq!(u1.bh, 8.0);
         assert_eq!(u1.half, 8.0);
+        // Phase 3u: odd bw case. bricks_uniforms takes the
+        // already-curved density (curve is applied at the
+        // draw_pattern dispatch site in hdmi.rs, NOT inside the
+        // uniform fn). For the parity_bg_pattern_bricks fixture
+        // (raw density=0.5), pattern_density_curve(0.5)=0.25, so
+        // the uniform fn is called with 0.25. lerp(140, 16, 0.25)
+        // = 109 (ODD). Canvas2D bh=round(54.5)=55; half=54.5.
+        // Pre-3u Rust used floor -> bh=54, half=54, producing a
+        // 1-px brick-height + 0.5-px stagger offset vs Canvas2D.
+        let u_mid = bricks_uniforms(0.25);
+        assert_eq!(u_mid.bw, 109.0);
+        assert_eq!(u_mid.bh, 55.0);
+        assert_eq!(u_mid.half, 54.5);
     }
 
     #[test]
