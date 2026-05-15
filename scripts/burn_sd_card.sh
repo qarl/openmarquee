@@ -309,7 +309,7 @@ cleanup_on_interrupt() {
 
 if [ "$DRY_RUN" -eq 0 ]; then
     info "priming sudo (you may be prompted once for password)..."
-    sudo -v || die "sudo authentication failed"
+    sudo -n true 2>/dev/null || sudo -v || die "sudo authentication failed"
     trap cleanup_on_interrupt INT TERM
 fi
 
