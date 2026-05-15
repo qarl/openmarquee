@@ -295,6 +295,79 @@ else
     say "Skipping wheel download (--no-wheels); Pi will pip-install online"
 fi
 
+# --- 3b. Trixie .debs (vendored, arm64) ------------------------------------
+#
+# Stock Pi OS Lite arm64 trixie does NOT ship hostapd or iptables, but
+# install.sh on first boot calls both unconditionally (AP bring-up via
+# hostapd + captive-portal NAT via iptables). qarl has no ethernet at
+# first boot → apt-get is off the table. We vendor the .debs + transitive
+# dep closure here at build time so install.sh can `dpkg -i` them
+# offline.
+#
+# Closure computed by walking each apt Packages file for trixie/main
+# arm64 + filtering against /var/lib/dpkg/status from a known-good
+# Pi-OS-Lite-trixie rootfs. Only the four packages below are missing
+# from the base image (the rest of hostapd + iptables's Depends are
+# already installed). Total ~1.2 MB.
+#
+# Pinned filename + sha256 for reproducibility (same approach as the
+# setuptools/wheel/pip pinning above). Each .deb is fetched from
+# deb.debian.org and SHA256-verified before staging.
+#
+# Skipped on --no-wheels (dev-redeploy on a Pi that already has the
+# packages installed).
+if [ "$DO_WHEELS" -eq 1 ]; then
+    say "Vendoring trixie .debs (hostapd + iptables closure)"
+    mkdir -p "$ROOT/debs"
+    # Format: package|version|size_bytes|sha256|url
+    # Closure regeneration recipe (if Debian publishes security
+    # updates): mount a current Pi-OS-Lite-arm64-trixie rootfs, walk
+    # the trixie/main + trixie-security + trixie-updates apt Packages
+    # files for hostapd + iptables's transitive Depends/Pre-Depends,
+    # filter against /var/lib/dpkg/status to drop already-installed
+    # packages, replace the manifest below with the resulting
+    # name|version|size|sha256|url tuples.
+    DEB_MANIFEST="hostapd|2:2.10-24|801636|0e36fa2d6fe79ae7fc9718ad5f6531eb4e710418fa337543f17315154dc8ab64|http://deb.debian.org/debian/pool/main/w/wpa/hostapd_2.10-24_arm64.deb
+iptables|1.8.11-2|353592|441a3c4b202f83cb1c2609c9eff768229ce991c2f49bea37416168028bc23e95|http://deb.debian.org/debian/pool/main/i/iptables/iptables_1.8.11-2_arm64.deb
+libip4tc2|1.8.11-2|19552|e2d86b0b1b5d06b529cf60f3876970b02c1ae1147555bfcf1c5b17bfdae992ca|http://deb.debian.org/debian/pool/main/i/iptables/libip4tc2_1.8.11-2_arm64.deb
+libip6tc2|1.8.11-2|19800|3ab7581ae06d0b7109ec60907a063ef167446e492f30918dcb20faed810d172d|http://deb.debian.org/debian/pool/main/i/iptables/libip6tc2_1.8.11-2_arm64.deb"
+    while IFS='|' read -r name version size sha256 url ; do
+        [ -z "$name" ] && continue
+        deb_filename="$(basename "$url")"
+        deb_path="$ROOT/debs/$deb_filename"
+        say "  downloading $name $version"
+        # --fail = non-200 → curl exits non-zero → set -e aborts the build.
+        # --silent --show-error = no progress bar, but errors print.
+        # --location = follow redirects (deb.debian.org → CDN mirror).
+        curl --fail --silent --show-error --location --output "$deb_path" "$url"
+        # SHA256 verify against the indexed hash. Mac uses shasum -a 256;
+        # Linux build hosts use sha256sum — try both.
+        actual_sha=$(shasum -a 256 "$deb_path" 2>/dev/null | awk '{print $1}')
+        if [ -z "$actual_sha" ]; then
+            actual_sha=$(sha256sum "$deb_path" 2>/dev/null | awk '{print $1}')
+        fi
+        if [ "$actual_sha" != "$sha256" ]; then
+            echo "error: SHA256 mismatch for $deb_filename" >&2
+            echo "    expected: $sha256" >&2
+            echo "    actual:   $actual_sha" >&2
+            exit 7
+        fi
+        # Also size-check as a redundant guard against truncated downloads.
+        actual_size=$(stat -f%z "$deb_path" 2>/dev/null || stat -c%s "$deb_path")
+        if [ "$actual_size" != "$size" ]; then
+            echo "error: size mismatch for $deb_filename" >&2
+            echo "    expected: $size bytes" >&2
+            echo "    actual:   $actual_size bytes" >&2
+            exit 7
+        fi
+    done <<< "$DEB_MANIFEST"
+    DEB_COUNT=$(find "$ROOT/debs" -name '*.deb' | wc -l | tr -d ' ')
+    DEB_SIZE=$(du -sh "$ROOT/debs" | awk '{print $1}')
+    say "  vendored $DEB_COUNT .debs ($DEB_SIZE total)"
+else
+    say "Skipping .deb download (--no-wheels); Pi must have hostapd + iptables already"
+fi
+
 # --- 4. Top-level metadata --------------------------------------------------
 
 # pyproject.toml + requirements.lock at the bundle root so install.sh can
@@ -314,6 +387,9 @@ cp "$REPO_ROOT/backend/requirements.lock" "$ROOT/requirements.lock"
     echo
     if [ -d "$ROOT/wheels" ]; then
         echo "wheels: $(find "$ROOT/wheels" -name '*.whl' | wc -l | tr -d ' ')"
+    fi
+    if [ -d "$ROOT/debs" ]; then
+        echo "debs: $(find "$ROOT/debs" -name '*.deb' | wc -l | tr -d ' ')"
     fi
     if [ -f "$ROOT/bin/openmarquee-render" ]; then
         echo "rust-binary: present ($(stat -f%z "$ROOT/bin/openmarquee-render" 2>/dev/null || stat -c%s "$ROOT/bin/openmarquee-render") bytes)"
