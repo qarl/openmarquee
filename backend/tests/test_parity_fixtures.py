@@ -23,7 +23,7 @@ FIXTURE_DIR = REPO / "renderer" / "tests" / "fixtures"
 GOLDEN_DIR = REPO / "renderer" / "tests" / "golden"
 
 REQUIRED_TOP_KEYS = {"schema_version", "defaults", "fixtures"}
-REQUIRED_DEFAULTS = {"ssim_min", "max_delta_max"}
+REQUIRED_DEFAULTS = {"ssim_min", "mean_delta_max"}
 REQUIRED_FIXTURE_KEYS = {"name", "kind", "golden", "purpose"}
 SINGLE_KEYS = {"uuid", "tick"}
 TRANSITION_MID_KEYS = {"transition", "from_uuid", "to_uuid", "transition_t"}
@@ -48,7 +48,7 @@ def test_defaults_present(spec):
     missing = REQUIRED_DEFAULTS - set(spec["defaults"])
     assert not missing, f"fixtures.json defaults missing: {missing}"
     assert 0.0 < spec["defaults"]["ssim_min"] <= 1.0
-    assert 0 < spec["defaults"]["max_delta_max"] <= 255
+    assert 0 < spec["defaults"]["mean_delta_max"] <= 255
 
 
 def test_each_fixture_has_required_fields(spec):

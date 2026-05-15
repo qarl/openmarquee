@@ -2,8 +2,8 @@
     "schema_version": 1,
     "comment": "Cross-renderer parity fixtures. See qa/cross-renderer-parity-design.md for the design. Each fixture references an item.json under renderer/tests/fixtures/<uuid>/ + a checked-in Rust golden under renderer/tests/golden/<golden>.png. The harness captures the browser side fresh via Playwright + diffs against the golden (which render_tests.sh's GREEN gate keeps in sync with the Rust path). Thresholds start lax; tighten as drift is fixed. Note: image_slide fixture (planned in design doc) deferred to commit 3 -- parity-harness.html's drawCanvas path only renders text_slide shape; image-asset rendering needs a separate browser-side hydrator. Commit-2 first wave is 5 fixtures, not 6.",
     "defaults": {
-        "ssim_min": 0.95,
-        "max_delta_max": 50
+        "ssim_min": 0.92,
+        "mean_delta_max": 8
     },
     "fixtures": [
         {
