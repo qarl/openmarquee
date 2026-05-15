@@ -1624,13 +1624,18 @@ fn draw_pattern(
         }
         PatternKind::Scanlines => {
             let u = scanlines_uniforms(density);
-            // Phase 3x: precompute y-phase so shader doesn't have to
-            // do the large-magnitude `viewport.y - gl_FragCoord.y`
+            // Phase 3x/3ab: precompute y-phase so shader doesn't have
+            // to do the large-magnitude `viewport.y - gl_FragCoord.y`
             // subtraction (vc4 mediump precision-truncates it).
-            // u_y_phase = mod(viewport_h - 0.5, tile), where -0.5
-            // accounts for gl_FragCoord at pixel CENTER not corner.
+            // u_y_phase = mod(viewport_h, tile). Originally we used
+            // `mod(viewport_h - 0.5, tile)` (Phase 3x), but Phase 3aa
+            // GRID surfaced — and Phase 3ab audit at tile=4/9/15
+            // confirmed — that the -0.5 form only matched at the
+            // default tile=13 by coincidence: vc4 mediump mod() at
+            // large magnitudes behaves as if gl_FragCoord.y is
+            // round-half-up'd (same root behavior as vc4 int()).
             let y_phase = {
-                let v = (mode_h as f32) - 0.5;
+                let v = mode_h as f32;
                 ((v % u.tile) + u.tile) % u.tile
             };
             draw_full_screen_pattern(

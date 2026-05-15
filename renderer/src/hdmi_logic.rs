@@ -2334,12 +2334,19 @@ void main() {
     // resulting row math missed every scanline except y=0 -- see
     // qa/captures/parity-phase3w-scanlines-2026-05-15.md). Use
     // gl_FragCoord.y directly via mod; u_y_phase precomputed CPU-
-    // side = mod(viewport_h - 0.5, u_tile) so scanlines land at
+    // side = mod(viewport_h, u_tile) so scanlines land at
     // mod ~= u_y_phase. The +/-0.5 step tolerance accepts both
     // possible truncation outcomes of gl_FragCoord.y at every
     // pixel center. 3-way probe vs Cand A (int-domain, +1 px
     // shift bug like checker) and Cand C (vertex UV varying,
     // no fix): qa/captures/parity-phase3x-candidates-2026-05-15.md.
+    // Phase 3ab 2026-05-15: drop the -0.5 from the phase formula.
+    // The original `mod(viewport_h - 0.5, tile)` only matched at
+    // default tile=13 by coincidence; audit at tile=4/9/15 showed
+    // 2-px-wide bands at every period. vc4 mediump mod() at large
+    // magnitudes behaves as if gl_FragCoord.y is round-half-up'd
+    // (same root behavior as the vc4 int() rounding lesson from
+    // Phase 3z checker; cf. Phase 3aa GRID).
     float m = mod(gl_FragCoord.y, u_tile);
     float t = step(abs(m - u_y_phase), 0.5);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
@@ -2369,7 +2376,9 @@ void main() {
     //   `u_viewport.y - gl_FragCoord.y` subtraction (Phase 3w
     //   playbook). Instead use Cand B from scanlines: compare
     //   mod(gl_FragCoord.y, tile) against CPU-precomputed u_y_phase
-    //   = mod(viewport_h - 0.5, tile) with +/-0.5 step tolerance.
+    //   = mod(viewport_h, tile) with +/-0.5 step tolerance. (Phase
+    //   3aa derivation; cf. Phase 3ab scanlines audit confirming the
+    //   same formula generalizes across tile sizes.)
     float mx = mod(gl_FragCoord.x, u_tile);
     float my = mod(gl_FragCoord.y, u_tile);
     float dx = min(mx, u_tile - mx);
