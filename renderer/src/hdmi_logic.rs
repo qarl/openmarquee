@@ -2262,9 +2262,15 @@ uniform vec3 u_color_b;
 void main() {
     vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
     vec2 cell = mod(pos, u_tile) - vec2(u_tile * 0.5);
-    float d2 = dot(cell, cell);
-    float r2 = u_radius * u_radius;
-    float t = step(d2, r2);
+    // Phase 3s 2026-05-15: smoothstep AA at the circle boundary.
+    // Phase 3s-prep dots diag (qa/captures/parity-phase3s-dots-...) showed
+    // Canvas2D's ctx.arc + ctx.fill produces ~1-px bilinear AA at every
+    // dot edge while the prior `step(d2, r2)` hard-stepped. Diff was
+    // white rings at every dot boundary (max_delta=229, mean=4.06).
+    // smoothstep(r-0.5, r+0.5, length(cell)) gives a 1-px transition
+    // centered on the radius matching Canvas2D's filter response.
+    float d = length(cell);
+    float t = 1.0 - smoothstep(u_radius - 0.5, u_radius + 0.5, d);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
 }
 "#;
