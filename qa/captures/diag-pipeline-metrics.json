@@ -1,0 +1,74 @@
+{
+  "A vs B  (canvas2d suite vs canvas2d diag)": {
+    "per_channel_max_RGBA": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "per_channel_mean_RGBA": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rgb_max_delta": 0,
+    "pixels_with_any_diff": 0,
+    "total_pixels": 2073600,
+    "pct_pixels_diff": 0.0
+  },
+  "C vs D  (rust fresh   vs rust golden)": {
+    "per_channel_max_RGBA": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "per_channel_mean_RGBA": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rgb_max_delta": 0,
+    "pixels_with_any_diff": 0,
+    "total_pixels": 2073600,
+    "pct_pixels_diff": 0.0
+  },
+  "A vs C  (canvas2d     vs rust fresh)": {
+    "per_channel_max_RGBA": [
+      229,
+      229,
+      229,
+      0
+    ],
+    "per_channel_mean_RGBA": [
+      10.665939911265433,
+      10.665939911265433,
+      10.665939911265433,
+      0.0
+    ],
+    "rgb_max_delta": 229,
+    "pixels_with_any_diff": 106900,
+    "total_pixels": 2073600,
+    "pct_pixels_diff": 5.155285493827161
+  },
+  "A vs D  (canvas2d     vs rust golden)": {
+    "per_channel_max_RGBA": [
+      229,
+      229,
+      229,
+      0
+    ],
+    "per_channel_mean_RGBA": [
+      10.665939911265433,
+      10.665939911265433,
+      10.665939911265433,
+      0.0
+    ],
+    "rgb_max_delta": 229,
+    "pixels_with_any_diff": 106900,
+    "total_pixels": 2073600,
+    "pct_pixels_diff": 5.155285493827161
+  }
+}
