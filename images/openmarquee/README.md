@@ -122,8 +122,22 @@ sudo ./build-docker.sh
   Required for `iw dev wlan0 interface add ap0` (the ap0 bring-up). The
   old `crda` userspace daemon is folded into the kernel on trixie, so
   it's intentionally omitted.
-- **wpasupplicant**: station-mode WiFi join (wlan0). NetworkManager is
-  intentionally absent — we manage wpa_supplicant directly.
+- **wpasupplicant**: WiFi association supplicant. Pi OS Lite trixie's
+  base image ships NetworkManager as the network stack on this
+  release; NM uses wpa_supplicant as its association backend under
+  the hood. openmarquee does NOT manage wpa_supplicant directly --
+  station-mode WiFi runs through nmcli via `backend/openmarquee/wifi_station.py`
+  (post-AP-configure flow) and via the NM keyfile drop in Phase 4e-b
+  (`scripts/burn_sd_card.sh --wifi-ssid` pre-config flow). The ap0
+  interface used for hostapd's AP mode is created BEFORE NM starts
+  (`system/openmarquee-ap0.service` ordering); NM treats ap0 as
+  unmanaged and leaves it to hostapd.
+- **zstd**: bundle decompression at first boot (cloud-init runcmd
+  pipes `zstd -d -c openmarquee-bundle.tar.zst | tar -xf -`).
+- **v4l-utils**: H.264 decoder out-of-band debugging (`v4l2-ctl`).
+  Not load-bearing for the rendering path (Rust uses ioctls directly)
+  but field-debugging VideoSlide problems on a Pi without v4l2-ctl
+  is much harder.
 
 ## Why these specific RELEASE / TARGET_ARCH choices
 
