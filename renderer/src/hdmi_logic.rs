@@ -2209,9 +2209,24 @@ uniform vec3 u_color_a;
 uniform vec3 u_color_b;
 void main() {
     vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
-    float proj = (pos.x + pos.y) / 1.41421356;
+    // Phase 3l 2026-05-15: +7.56 along the 45deg axis aligns Rust's
+    // top-left-anchored stripe phase with Canvas2D's CSS
+    // repeating-linear-gradient(45deg) anchor. The constant comes
+    // from a 3-row multi-row probe (qa/captures/stripes-diag.json,
+    // commit 5264c8f): normalized x-offset = 10.70 +- 0.16 px
+    // across y=270/540/810; 7.56 = 10.70 / sqrt(2).
+    float proj = (pos.x + pos.y) / 1.41421356 + 7.56;
     float modv = mod(proj, u_tile);
-    float t = step(u_tile * 0.5, modv);
+    // smoothstep over a 1-px window around u_tile/2 anti-aliases the
+    // color_a -> color_b boundary to ~match Canvas2D's ramped edge
+    // (Phase 3k Cause 1, commit e14b3a8). A second smoothstep on the
+    // wrap-around distance handles the color_b -> color_a boundary at
+    // modv=0/u_tile -- without it, max_delta floor stays at 229 from
+    // single-pixel hairlines at every wrap point.
+    float ab = smoothstep(u_tile * 0.5 - 0.5, u_tile * 0.5 + 0.5, modv);
+    float wrap_dist = min(modv, u_tile - modv);
+    float wrap_blend = smoothstep(0.0, 0.5, wrap_dist);
+    float t = mix(0.5, ab, wrap_blend);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
 }
 "#;
