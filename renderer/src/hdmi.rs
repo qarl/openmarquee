@@ -1609,16 +1609,34 @@ fn draw_pattern(
         }
         PatternKind::Halftone => {
             let u = halftone_uniforms(density);
+            // Phase 3ag: precompute y-phase so shader avoids the
+            // `u_viewport.y - gl_FragCoord.y` precision trap. Mirrors
+            // Phase 3x scanlines + Phase 3aa grid. l1 phase = layer-1
+            // dot row centers (canvas_y = tile/2 + k*tile) in
+            // gl_FragCoord.y mod tile space. l2 phase = layer-2 dot
+            // row centers (canvas_y = k*tile) in same space.
+            let y_phase_l1 = {
+                let v = (mode_h as f32) - u.half;
+                ((v % u.tile) + u.tile) % u.tile
+            };
+            let y_phase_l2 = {
+                let v = mode_h as f32;
+                ((v % u.tile) + u.tile) % u.tile
+            };
             draw_full_screen_pattern(
                 gl, mode_w, mode_h, FS_PATTERN_HALFTONE, color_a, color_b,
-                |gl, program| unsafe {
+                move |gl, program| unsafe {
                     use glow::HasContext;
                     let u_tile = gl.get_uniform_location(program, "u_tile");
                     let u_radius = gl.get_uniform_location(program, "u_radius");
                     let u_half = gl.get_uniform_location(program, "u_half");
+                    let u_y_phase_l1 = gl.get_uniform_location(program, "u_y_phase_l1");
+                    let u_y_phase_l2 = gl.get_uniform_location(program, "u_y_phase_l2");
                     gl.uniform_1_f32(u_tile.as_ref(), u.tile);
                     gl.uniform_1_f32(u_radius.as_ref(), u.radius);
                     gl.uniform_1_f32(u_half.as_ref(), u.half);
+                    gl.uniform_1_f32(u_y_phase_l1.as_ref(), y_phase_l1);
+                    gl.uniform_1_f32(u_y_phase_l2.as_ref(), y_phase_l2);
                 },
             )
         }

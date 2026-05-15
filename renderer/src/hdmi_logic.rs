@@ -2295,23 +2295,48 @@ uniform vec2 u_viewport;
 uniform float u_tile;
 uniform float u_radius;
 uniform float u_half;
+uniform float u_y_phase_l1;
+uniform float u_y_phase_l2;
 uniform vec3 u_color_a;
 uniform vec3 u_color_b;
 void main() {
-    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
-    vec2 cell1 = mod(pos, u_tile) - vec2(u_tile * 0.5);
-    vec2 cell2 = mod(pos + vec2(u_half), u_tile) - vec2(u_tile * 0.5);
-    // Phase 3t 2026-05-15: smoothstep AA at the circle boundary (same
-    // Phase-3s playbook as FS_PATTERN_DOTS). Canvas2D's ctx.arc + fill
-    // bilinear-AAs each circle; the prior step(d_min2, r2) hard-stepped.
-    // Diff was white rings at every circle boundary (parity_bg_pattern_
-    // halftone: max=229, mean=14.135, pct_over_200=3.29%).
-    // smoothstep(r-0.5, r+0.5, length(min-distance)) gives a 1-px
-    // transition centered on the radius matching browser bilinear.
-    float d1 = length(cell1);
-    float d2 = length(cell2);
-    float d_min = min(d1, d2);
-    float t = 1.0 - smoothstep(u_radius - 0.5, u_radius + 0.5, d_min);
+    // Phase 3ag 2026-05-15: Cand-B precompute y-phase + linear-coverage
+    // AA + per-layer screen blend. Mirrors Phase 3x scanlines + Phase
+    // 3aa grid. Avoids `pos.y = u_viewport.y - gl_FragCoord.y` (vc4
+    // mediump precision trap: large-magnitude subtraction quantizes to
+    // ~1 px integer noise; that noise smears AA across the wrong row).
+    // u_y_phase_l1 = mod(viewport_h - tile/2, tile), the gl_FragCoord.y-
+    // mod-tile position of layer-1 dot rows (centers at canvas_y =
+    // tile/2 + k*tile). u_y_phase_l2 = mod(viewport_h, tile) similarly
+    // for layer-2 (centers at canvas_y = k*tile).
+    //
+    // X-axis: gl_FragCoord.x is canvas-x directly (no flip), so the
+    // original mod-and-subtract-half formulation has no precision
+    // issue and stays.
+    //
+    // Y-axis: instead of computing signed cell.y via the y-flip
+    // subtraction, compute |cell.y| (modular distance to nearest dot
+    // row) via abs(frag_y_mod - phase) wrapped to [0, tile/2].
+    // length(vec2(cell.x, cell.y)) is sign-invariant on cell.y, so |y|
+    // suffices for the circle distance.
+    //
+    // Linear-coverage AA: clamp(r + 0.5 - d, 0, 1) matches Canvas2D's
+    // pixel-coverage at pixel-center (Phase 3af f64 sim showed
+    // smoothstep over-saturated the mid-AA band by ~9%). Per-layer
+    // screen blend (c1 + c2 - c1*c2) matches Canvas2D's two-arc
+    // source-over composition (Phase 3af also derived this).
+    float cell1_x = mod(gl_FragCoord.x, u_tile) - u_tile * 0.5;
+    float cell2_x = mod(gl_FragCoord.x + u_half, u_tile) - u_tile * 0.5;
+    float frag_y_mod = mod(gl_FragCoord.y, u_tile);
+    float dy1 = abs(frag_y_mod - u_y_phase_l1);
+    float cell1_y_abs = min(dy1, u_tile - dy1);
+    float dy2 = abs(frag_y_mod - u_y_phase_l2);
+    float cell2_y_abs = min(dy2, u_tile - dy2);
+    float d1 = length(vec2(cell1_x, cell1_y_abs));
+    float d2 = length(vec2(cell2_x, cell2_y_abs));
+    float c1 = clamp(u_radius + 0.5 - d1, 0.0, 1.0);
+    float c2 = clamp(u_radius + 0.5 - d2, 0.0, 1.0);
+    float t = c1 + c2 - c1 * c2;
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
 }
 "#;
@@ -4049,7 +4074,9 @@ mod tests {
         assert!(FS_PATTERN_DOTS.contains("u_tile") && FS_PATTERN_DOTS.contains("u_radius"));
         assert!(FS_PATTERN_HALFTONE.contains("u_tile")
             && FS_PATTERN_HALFTONE.contains("u_radius")
-            && FS_PATTERN_HALFTONE.contains("u_half"));
+            && FS_PATTERN_HALFTONE.contains("u_half")
+            && FS_PATTERN_HALFTONE.contains("u_y_phase_l1")
+            && FS_PATTERN_HALFTONE.contains("u_y_phase_l2"));
         assert!(FS_PATTERN_SCANLINES.contains("u_tile"));
         assert!(FS_PATTERN_GRID.contains("u_tile"));
         assert!(FS_PATTERN_RINGS.contains("u_tile") && FS_PATTERN_RINGS.contains("u_half"));
