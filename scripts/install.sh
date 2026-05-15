@@ -153,6 +153,17 @@ if [ -d "$WHEELS_DIR" ] && [ -n "$(ls -A "$WHEELS_DIR" 2>/dev/null)" ]; then
 else
     say "  no vendored wheels at $WHEELS_DIR — falling back to online pip"
 fi
+# Bootstrap PEP-517 build backend into the venv. Python 3.13's
+# `python3 -m venv` no longer seeds setuptools+wheel; the editable
+# backend install below uses --no-build-isolation, so setuptools.build_meta
+# must already exist in the venv (pip will not fetch build deps offline).
+# setuptools+wheel are pure-Python py3-none-any wheels — they install via
+# zip-extract without needing a build backend themselves (no chicken-and-
+# egg). Unconditional: the online-fallback branch hits the same Python-
+# 3.13-venv-lacks-setuptools issue. pip is deliberately excluded —
+# upgrading pip in-place has known edge cases (rewriting its own console
+# script), and the ensurepip-bundled pip is sufficient for our use.
+run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} setuptools wheel
 if [ -f "${OPT_DIR}/backend/requirements.lock" ]; then
     run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} -r "${OPT_DIR}/backend/requirements.lock"
 fi
