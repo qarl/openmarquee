@@ -193,6 +193,98 @@ def test_handles_malformed_conf(tmp_path: Path):
     assert result is None
 
 
+def test_unescapes_quote_inside_psk(tmp_path: Path):
+    """wpa_supplicant.conf(5) permits \\" inside quoted PSK values
+    (operator's actual wifi password contains a `"`). Pre-fix, the
+    parser passed `\\"` through literally, producing a backslash +
+    quote in the prefilled SystemSettings — the operator's real
+    wifi password was `my"pass1` but the form showed `my\\"pass1`
+    and they had to manually clean it up. Verify the parser
+    unescapes."""
+    conf = _write_conf(tmp_path, '''
+network={
+    ssid="EscNet"
+    psk="my\\"pass1"
+}
+''')
+    result = read_system_wifi(
+        paths=(conf,),
+        get_active_ssid=lambda: "EscNet",
+    )
+    assert result == ("EscNet", 'my"pass1')
+
+
+def test_unescapes_backslash_inside_psk(tmp_path: Path):
+    """wpa_supplicant.conf(5) also permits \\\\ (literal backslash)
+    inside quoted PSK values. Pre-fix the parser passed both chars
+    through; post-fix it emits one literal backslash."""
+    conf = _write_conf(tmp_path, '''
+network={
+    ssid="BackslashNet"
+    psk="back\\\\slash"
+}
+''')
+    result = read_system_wifi(
+        paths=(conf,),
+        get_active_ssid=lambda: "BackslashNet",
+    )
+    assert result == ("BackslashNet", r"back\slash")
+
+
+def test_unescapes_quote_inside_ssid(tmp_path: Path):
+    """SSIDs (rarely) also use \\" escapes per wpa_supplicant.conf(5).
+    The active-SSID match check must compare against the unescaped
+    form since iwgetid -r emits the actual SSID bytes, not the
+    conf-file escape sequence."""
+    conf = _write_conf(tmp_path, '''
+network={
+    ssid="Joe\\"sNet"
+    psk="goodpass"
+}
+''')
+    result = read_system_wifi(
+        paths=(conf,),
+        get_active_ssid=lambda: 'Joe"sNet',
+    )
+    assert result == ('Joe"sNet', "goodpass")
+
+
+def test_psk_value_never_logged(tmp_path: Path, caplog):
+    """Audit dimension 1: PSK plaintext must NEVER appear in log
+    output, even after the escape-unescape rewrite. Verify by
+    rendering a noisy fixture (escaped + matched + mismatched) and
+    grepping the captured log for the PSK substring."""
+    secret = "topsecret!"
+    conf = _write_conf(tmp_path, f'''
+network={{
+    ssid="LogNet"
+    psk="{secret}"
+}}
+''')
+    with caplog.at_level("DEBUG", logger="openmarquee.wifi_prefill"):
+        result = read_system_wifi(
+            paths=(conf,),
+            get_active_ssid=lambda: "LogNet",
+        )
+    assert result == ("LogNet", secret)
+    # Every captured log message must NOT contain the PSK bytes.
+    # rec.getMessage() returns the args-formatted message; rec.msg
+    # is the format string. Check both since a future change might
+    # log the value via a different path.
+    for rec in caplog.records:
+        formatted = rec.getMessage()
+        assert secret not in formatted, (
+            f"PSK leaked to {rec.levelname} log (formatted): {formatted!r}"
+        )
+        assert secret not in str(rec.msg), (
+            f"PSK leaked to {rec.levelname} log (raw msg): {rec.msg!r}"
+        )
+        for arg in (rec.args or ()):
+            assert secret not in str(arg), (
+                f"PSK leaked to {rec.levelname} log (arg): {arg!r}"
+            )
+
+
 def test_handles_trailing_whitespace_in_conf(tmp_path: Path):
     """Operators sometimes hand-edit conf and leave trailing spaces
     inside the network={} block. The regex's `.+?\\s*$` handles it

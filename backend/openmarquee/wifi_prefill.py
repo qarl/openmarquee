@@ -82,6 +82,11 @@ _NETWORK_BLOCK_RE = re.compile(r"network\s*=\s*\{([^}]*)\}", re.DOTALL)
 # key=value lines inside a network block. Honors keys without leading
 # whitespace and with arbitrary trailing whitespace.
 _KEY_VALUE_RE = re.compile(r"^\s*(\w+)\s*=\s*(.+?)\s*$", re.MULTILINE)
+# Backslash-escape unescaper for quoted-string values. Handles \" → "
+# and \\ → \. Other wpa_supplicant escapes (\n \r \t \e \xHH) map
+# to non-printable characters that the downstream PSK validator
+# rejects anyway, so we don't bother decoding them.
+_ESCAPE_RE = re.compile(r'\\([\\"])')
 
 
 def read_system_wifi(
@@ -175,6 +180,14 @@ def _extract_creds(block: str) -> tuple[str, str] | None:
         # we only pre-fill the quoted-plaintext form.
         if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
             val = val[1:-1]
+            # wpa_supplicant.conf(5) permits backslash-escaped chars
+            # inside double-quoted strings. The only escapes that can
+            # appear in a valid 8-63 printable-ASCII PSK are \" and
+            # \\ — the others (\n \r \t \e \xHH) map to
+            # non-printables that the SystemSettings validator would
+            # reject anyway. Unescape so the prefilled password
+            # matches what wpa_supplicant actually negotiates.
+            val = _ESCAPE_RE.sub(r"\1", val)
             quoted = True
         else:
             quoted = False
