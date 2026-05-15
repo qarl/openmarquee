@@ -24,8 +24,9 @@ after) may use the network, but bootstrap to AP-ready does not.
 The apt packages required to run the AP + backend (hostapd, dnsmasq,
 iptables, python3-pip, python3-venv, ffmpeg, fonts-dejavu, qrencode,
 git, rsync, ca-certificates, cloud-init, wireless-regdb, iw,
-wireless-tools, wpasupplicant, python3 — 17 in total) are **baked
-into the Pi OS Lite image at pi-gen build time** via
+wireless-tools, wpasupplicant, python3, zstd, v4l-utils — list lives
+in `00-packages`) are **baked into the Pi OS Lite image at pi-gen
+build time** via
 `images/openmarquee/stage-openmarquee/00-install-packages/00-packages`.
 The builder machine (which DOES have network) runs pi-gen, which apt-
 installs those packages into the image. The image is shipped ready-

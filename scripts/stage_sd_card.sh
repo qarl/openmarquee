@@ -162,23 +162,15 @@ users:
     # include even when card access goes through DRM master grab.
     groups: [video, render]
 
-# packages cloud-init installs BEFORE runcmd. We need:
-#   - zstd to decompress the bundle tarball
-#   - python3-venv to bootstrap the venv (install.sh expects it)
-#   - hostapd + dnsmasq for AP mode (install.sh stages configs)
-#   - iptables for the captive-portal NAT rule
-#   - v4l-utils for diagnosing the H.264 decoder out-of-band; not
-#     load-bearing for the rendering path (rust uses ioctls directly)
-#     but a Pi without v4l2-ctl is a Pi where field-debugging
-#     VideoSlide problems is much harder
-package_update: true
-packages:
-  - zstd
-  - python3-venv
-  - hostapd
-  - dnsmasq
-  - iptables
-  - v4l-utils
+# Phase 4e-a 2026-05-15: NO apt at first boot -- factory-fresh promise
+# means the Pi must boot offline. The 6 packages this used to install
+# (zstd, python3-venv, hostapd, dnsmasq, iptables, v4l-utils) are ALL
+# already pre-baked into the image via pi-gen's 00-packages list. The
+# old `package_update: true + packages: [...]` triggered apt-update on
+# first boot, which fails without network and blocks runcmd entirely
+# (install.sh never runs, AP never comes up). See
+# qa/captures/parity-phase4e-cloud-init-network-config-2026-05-15.md.
+package_update: false
 
 runcmd:
   - [ systemctl, unmask, ssh.service ]

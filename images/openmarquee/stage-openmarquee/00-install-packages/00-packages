@@ -15,3 +15,5 @@ wireless-regdb
 iw
 wireless-tools
 wpasupplicant
+zstd
+v4l-utils
