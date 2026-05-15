@@ -47,7 +47,11 @@ describe("drawCanvas", () => {
         const canvas = mockCanvas(128, 96);
         drawCanvas(canvas, { text: "HI", textColor: "#fff", backgroundColor: "#000" });
         expect(canvas._ctx.textAlign).toBe("center");
-        expect(canvas._ctx.textBaseline).toBe("middle");
+        // 2026-05-14 parity follow-up: textBaseline pinned to
+        // "alphabetic" so the vertical anchor depends on actual glyph
+        // ink (matching Rust fontdue ascent/descent) rather than the
+        // font-bounding-box (engine-specific for tall em-box fonts).
+        expect(canvas._ctx.textBaseline).toBe("alphabetic");
         expect(canvas._ctx.fillText).toHaveBeenCalledTimes(1);
         const [line, x] = canvas._ctx.fillText.mock.calls[0];
         expect(line).toBe("HI");

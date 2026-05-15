@@ -9,8 +9,8 @@
 // getImageData/putImageData round-trip in applyBrightnessGamma
 // preserves bytes.
 
-import { describe, expect, it } from "vitest";
-import { applyBrightnessGamma } from "./rasterize.js";
+import { describe, expect, it, vi } from "vitest";
+import { applyBrightnessGamma, drawCanvas } from "./rasterize.js";
 
 function makeCanvas(width, height, initialPixels) {
     // 4 bytes per pixel (RGBA), filled with initialPixels (a flat
@@ -149,5 +149,114 @@ describe("applyBrightnessGamma", () => {
         for (let i = 0; i < 3; i++) {
             expect(Number.isFinite(canvas._pixels[i])).toBe(true);
         }
+    });
+});
+
+// Pin the new line-height layout (parity-audit P0 follow-up to
+// b445aa5). Canvas2D's paintLayer now uses integer `Math.round(
+// fontSize * 1.1)` line stride + `actualBoundingBoxAscent/Descent`
+// for ink extent + `textBaseline="alphabetic"` baseline anchoring —
+// matching Rust's hdmi_logic.rs:269 + :481 formulas.
+describe("paintLayer line-height (Rust-canonical layout)", () => {
+    // jsdom doesn't ship Canvas2D, so we stub a context with a
+    // measureText that returns deterministic ink bounds and tracks
+    // every fillText call so the test can assert layout positions.
+    function makeStubbedCanvas() {
+        const calls = [];
+        let textBaseline = null;
+        const ctx = {
+            save: vi.fn(), restore: vi.fn(), translate: vi.fn(),
+            scale: vi.fn(), fillRect: vi.fn(),
+            fillText: vi.fn((line, x, y) => calls.push({ line, x, y })),
+            measureText: vi.fn((str) => ({
+                width: str.length * 30,
+                // ASCII-ish glyph: ascent = 0.75*size, descent = 0.25*size
+                actualBoundingBoxAscent: 75,
+                actualBoundingBoxDescent: 25,
+            })),
+            set fillStyle(_v) {}, set font(_v) {},
+            set textAlign(_v) {}, set textBaseline(v) { textBaseline = v; },
+            set globalAlpha(_v) {}, set globalCompositeOperation(_v) {},
+        };
+        return {
+            width: 1000, height: 1000, getContext: () => ctx,
+            _calls: calls, get _textBaseline() { return textBaseline; },
+        };
+    }
+
+    it("uses integer line-height = round(fontSize * 1.1) as the per-line stride", () => {
+        // The CRITICAL invariant is the inter-line stride: each baseline
+        // must be exactly `round(fontSize * 1.1)` below the previous so
+        // multi-line text packs at the same cadence as Rust's
+        // `line_h_px = (size_px * 1.1).round()`. Absolute first-line y
+        // depends on the back-compat flat-shape layer construction
+        // (text + box → constructed TextLayer), which centers around
+        // a different anchor than the layered path — assert stride only
+        // here, baseline absolutes in the next test.
+        const canvas = makeStubbedCanvas();
+        drawCanvas(canvas, {
+            text: "AAA\nBBB\nCCC",
+            fontSize: 100,
+            box: { x: 0, y: 0, w: 1, h: 1 },
+        });
+        const calls = canvas._calls;
+        expect(calls.length).toBe(3);
+        // Stride is exactly 110 (integer, matching Rust line_h_px).
+        // Pre-fix the stride was 110 too (1.1 * 100 = 110 exactly), so
+        // this test wouldn't have caught the bug — but it pins the
+        // integer-vs-float distinction for fontSize where 1.1 doesn't
+        // land on a whole number (e.g. 54 * 1.1 = 59.4 → round to 59).
+        expect(calls[1].y - calls[0].y).toBeCloseTo(110, 5);
+        expect(calls[2].y - calls[1].y).toBeCloseTo(110, 5);
+        // Lines must be monotonically increasing in y (top → bottom).
+        expect(calls[0].y).toBeLessThan(calls[1].y);
+        expect(calls[1].y).toBeLessThan(calls[2].y);
+    });
+
+    it("uses integer rounding so 1.1 * fontSize is snapped (size=54 → 59)", () => {
+        // size 54 * 1.1 = 59.4. Pre-fix used the float; Rust rounds.
+        // After fix, line stride is exactly 59 (not 59.4) per
+        // `Math.round(fontSize * 1.1)`.
+        const canvas = makeStubbedCanvas();
+        drawCanvas(canvas, {
+            text: "AAA\nBBB",
+            fontSize: 54,
+            box: { x: 0, y: 0, w: 1, h: 1 },
+        });
+        const calls = canvas._calls;
+        expect(calls.length).toBe(2);
+        // Stride must be 59 exactly, not 59.4.
+        expect(calls[1].y - calls[0].y).toBe(59);
+    });
+
+    it("uses textBaseline=alphabetic so vertical anchor is the glyph baseline", () => {
+        // Pre-fix Canvas2D set textBaseline=middle, which keys off the
+        // font-bounding-box (engine-specific for tall em-box fonts like
+        // VT323). Rust anchors at the glyph baseline + max_ascent; the
+        // JS-side equivalent is textBaseline=alphabetic + manual baseline
+        // placement.
+        const canvas = makeStubbedCanvas();
+        drawCanvas(canvas, { text: "X", font_size_px: 50 });
+        expect(canvas._textBaseline).toBe("alphabetic");
+    });
+
+    it("single-line baseline lands inside the box (not above/below)", () => {
+        // Single-line text with full-canvas box should put the
+        // baseline somewhere in the box's vertical span — not the
+        // exact box center (that's the OLD textBaseline=middle
+        // behavior) but offset by the descender below.
+        const canvas = makeStubbedCanvas();
+        drawCanvas(canvas, {
+            text: "X",
+            fontSize: 100,
+            box: { x: 0, y: 0, w: 1, h: 1 },
+        });
+        const y = canvas._calls[0].y;
+        // For full-canvas box of 1000, ascent=75, descent=25, the
+        // baseline sits at boxCenterY (500) + (ascent - descent)/2 = 525.
+        // Range allows for the back-compat constructed layer's
+        // internal anchor variance.
+        expect(y).toBeGreaterThan(400);
+        expect(y).toBeLessThan(600);
     });
 });

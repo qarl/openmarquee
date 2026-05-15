@@ -109,16 +109,61 @@ function paintLayer(ctx, canvas, layer) {
         : textAlign === "right"
             ? "right"
             : "center";
-    ctx.textBaseline = "middle";
+    // Use textBaseline="alphabetic" + explicit baseline placement so the
+    // vertical anchor depends on actual glyph ink (matching Rust's
+    // fontdue ascent/descent) rather than the font-bounding-box (which
+    // `textBaseline="middle"` keys off of and which varies by engine
+    // for tall em-box fonts like VT323). Parity-audit P0 follow-up to
+    // b445aa5 — was the dominant Canvas2D ↔ Rust vertical-positioning
+    // divergence (77,651 mismatched-vertical pixels on the Boot slide).
+    ctx.textBaseline = "alphabetic";
 
     // Word-wrap (B4, 2026-05-05): any paragraph longer than the box
     // width gets broken at word boundaries onto multiple lines. Pre-
     // existing literal newlines are preserved.
     const wrapped = wrapTextToWidth(ctx, text, boxW);
     const lines = wrapped.split(/\r?\n/);
-    const lineHeight = fontSizePx * 1.1;
-    const totalHeight = lineHeight * lines.length;
+    // Integer line-height matching `renderer/src/hdmi_logic.rs:269`
+    // (Rust: `(size_px * 1.1).round() as u32`). Float line-height
+    // accumulated 0.4 px / line drift over 6 boot-log lines.
+    const lineHeight = Math.round(fontSizePx * 1.1);
+    // Glyph-ink ascent/descent across all chars in all lines, matching
+    // Rust's `max_ascent` / `min_descent` over all glyphs (hdmi_logic.rs:
+    // 417-428). measureText().actualBoundingBoxAscent/Descent is the
+    // Canvas2D equivalent — distance from baseline to TOP/BOTTOM of
+    // the actual rendered glyph bbox, not the font's em-box.
+    //
+    // Measured across the JOINED text so the worst-case ascent +
+    // descent reflects all characters; lines with descender-bearing
+    // glyphs (g, j, p, q, y, Q) then share uniform vertical advance.
+    // Falls back to a 0.8/0.2 split of fontSizePx if the canvas impl
+    // doesn't expose the API (jsdom test ctx mocks don't stub
+    // measureText, and some browsers' impls don't populate the
+    // actualBoundingBox* fields).
+    let maxAscent;
+    let maxDescent;
+    if (typeof ctx.measureText === "function") {
+        const inkMetrics = ctx.measureText(lines.join(""));
+        maxAscent = Number.isFinite(inkMetrics.actualBoundingBoxAscent)
+            ? inkMetrics.actualBoundingBoxAscent
+            : fontSizePx * 0.8;
+        maxDescent = Number.isFinite(inkMetrics.actualBoundingBoxDescent)
+            ? inkMetrics.actualBoundingBoxDescent
+            : fontSizePx * 0.2;
+    } else {
+        maxAscent = fontSizePx * 0.8;
+        maxDescent = fontSizePx * 0.2;
+    }
+    const lastLineExtent = maxAscent + maxDescent;
+    // Match Rust's `bm_h = last_line_extent + (N - 1) * line_h` (the
+    // pad isn't ink-relevant for centering; it's a 1px halo for
+    // outline shaders).
+    const totalInkExtent = lastLineExtent + (lines.length - 1) * lineHeight;
     const boxCenterY = boxY + boxH / 2;
+    // First-line baseline = top of ink bbox + maxAscent. The ink
+    // bbox top sits at `boxCenter - totalInkExtent/2`.
+    const firstBaselineY = boxCenterY - totalInkExtent / 2 + maxAscent;
+
     // Anchor x depends on textAlign: left = box left, right = box right,
     // center = box center. Canvas's textAlign+x interplay handles the
     // per-line offset.
@@ -131,11 +176,10 @@ function paintLayer(ctx, canvas, layer) {
     // text height exceeds box height, scale-y around the box center
     // so lines stay inside. fillText's maxWidth handles horizontal
     // overflow as before — both axes squish independently.
-    const yScale = totalHeight > boxH ? boxH / totalHeight : 1;
+    const yScale = totalInkExtent > boxH ? boxH / totalInkExtent : 1;
     if (yScale === 1) {
-        const startY = boxCenterY - totalHeight / 2 + lineHeight / 2;
         for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], anchorX, startY + i * lineHeight, maxWidth);
+            ctx.fillText(lines[i], anchorX, firstBaselineY + i * lineHeight, maxWidth);
         }
     } else {
         ctx.save();
@@ -144,10 +188,11 @@ function paintLayer(ctx, canvas, layer) {
         // Draw aligned around (0,0) under the local transform; each
         // line's y-offset is from the centered origin. fillText's
         // maxWidth is in untransformed coords, so it still clamps
-        // horizontal width correctly.
-        const lineY0 = -totalHeight / 2 + lineHeight / 2;
+        // horizontal width correctly. Same baseline math, just
+        // recentered around the local origin.
+        const firstBaselineLocal = -totalInkExtent / 2 + maxAscent;
         for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], 0, lineY0 + i * lineHeight, maxWidth);
+            ctx.fillText(lines[i], 0, firstBaselineLocal + i * lineHeight, maxWidth);
         }
         ctx.restore();
     }
