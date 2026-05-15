@@ -1,0 +1,33 @@
+{
+  "fixture": "parity_font_inter",
+  "image_size": [
+    1920,
+    1080
+  ],
+  "predicted_quad_rect": {
+    "left": 528.0,
+    "top": 431.7139072847682,
+    "right": 1392.0,
+    "bottom": 648.2860927152318
+  },
+  "loud_threshold": 50,
+  "edge_threshold": 60,
+  "near_radius_px": 2,
+  "loud_pixel_count": 3084,
+  "loud_pct": 0.14872685185185186,
+  "glyph_outline_pixel_count": 13902,
+  "quad_perimeter_pixel_count": 2160,
+  "frac_loud_near_glyph_outline": 1.0,
+  "frac_loud_near_quad_perimeter": 0.02172503242542153,
+  "outline_match_offset_0_0": 3084,
+  "outline_best_translation": {
+    "dx": 1,
+    "dy": -1,
+    "score": 3084,
+    "gain_vs_zero": 0
+  },
+  "verdict": "candidate_2_texture_filter_aa",
+  "reason": [
+    "100% of loud pixels within 2px of glyph outlines; 100% sit EXACTLY on outline pixels (no dilation); no translation (best offset gain = 0)"
+  ]
+}
