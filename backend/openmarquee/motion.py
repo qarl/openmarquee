@@ -217,7 +217,10 @@ def _apply_breathe(
     bx, by, bw, bh = box_px
     if bw <= 0 or bh <= 0:
         return layer_rgba
-    amplitude = (intensity / 100.0) * 0.20  # ±20 % at intensity=100
+    # Spec docs/text-layer-motion-spec.md:229: ±2 % → ±20 %. Matches
+    # Rust motion_breathe. Previous (intensity/100)*0.20 zeroed amp at
+    # intensity=0, missing the ±2 % baseline the spec calls for.
+    amplitude = 0.02 + 0.18 * (intensity / 100.0)
     s = 1.0 + amplitude * math.sin(2 * math.pi * phase)
     box_region = layer_rgba.crop((bx, by, bx + bw, by + bh))
     glyph_bbox = box_region.getbbox()
@@ -263,7 +266,11 @@ def _apply_pulse(
     bx, by, bw, bh = box_px
     if bw <= 0 or bh <= 0:
         return layer_rgba
-    min_a = 1.0 - intensity / 100.0
+    # Spec docs/text-layer-motion-spec.md:230: 70-100 % shallow at
+    # intensity=0 → 0-100 % deep at intensity=100. Matches Rust
+    # motion_pulse. Previous (1 - intensity/100) gave alpha=1 constant
+    # at intensity=0 (no pulse) instead of the shallow sweep.
+    min_a = 0.70 * (1.0 - intensity / 100.0)
     s = (math.sin(2 * math.pi * phase) + 1) / 2  # 0..1
     a = min_a + (1.0 - min_a) * s
     box_region = layer_rgba.crop((bx, by, bx + bw, by + bh))
@@ -296,7 +303,10 @@ def _apply_bounce(
     bx, by, bw, bh = box_px
     if bw <= 0 or bh <= 0:
         return layer_rgba
-    amplitude = (intensity / 100.0) * 0.10  # 0..10 % box height at 100
+    # Spec docs/text-layer-motion-spec.md:231: ±1 % → ±10 % of box
+    # height. Matches Rust motion_bounce. Previous (intensity/100)*0.10
+    # zeroed amp at intensity=0, missing the ±1 % baseline.
+    amplitude = 0.01 + 0.09 * (intensity / 100.0)
     offset_px = -int(round(amplitude * bh * abs(math.sin(2 * math.pi * phase))))
     box_region = layer_rgba.crop((bx, by, bx + bw, by + bh))
     out_box = _scratch_rgba((bw, bh))

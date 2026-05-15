@@ -184,13 +184,14 @@ def test_breathe_pivots_around_box_center_not_glyph_center():
 # --- _apply_pulse ---
 
 
-def test_pulse_at_phase_zero_returns_full_alpha():
-    """sin(0) = 0 → multiplier maps to mid of the 0..1 swing. At
-    intensity=0 there's no swing (multiplier always 1.0), full alpha."""
+def test_pulse_at_intensity_zero_uses_shallow_baseline():
+    """Spec docs/text-layer-motion-spec.md:230: 70-100 % shallow at
+    intensity=0. sin(0) = 0 → sin01 = 0.5 (mid of swing). At
+    intensity=0, min_a = 0.70 → a = 0.70 + 0.30*0.5 = 0.85. Output
+    alpha is 0.85*255 = 216.75 → uint8 truncates to 216."""
     img = _make_layer_rgba(40, 20, (10, 5, 20, 10), (255, 0, 0, 255))
     out = _apply_pulse(img, (10, 5, 20, 10), 0, 0.0)
-    # Glyph alpha unchanged.
-    assert out.getpixel((20, 10))[3] == 255
+    assert out.getpixel((20, 10))[3] == 216
 
 
 def test_pulse_at_phase_three_quarter_dims_layer():
