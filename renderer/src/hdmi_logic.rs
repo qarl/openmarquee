@@ -2291,9 +2291,17 @@ void main() {
     vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
     vec2 cell1 = mod(pos, u_tile) - vec2(u_tile * 0.5);
     vec2 cell2 = mod(pos + vec2(u_half), u_tile) - vec2(u_tile * 0.5);
-    float r2 = u_radius * u_radius;
-    float d_min2 = min(dot(cell1, cell1), dot(cell2, cell2));
-    float t = step(d_min2, r2);
+    // Phase 3t 2026-05-15: smoothstep AA at the circle boundary (same
+    // Phase-3s playbook as FS_PATTERN_DOTS). Canvas2D's ctx.arc + fill
+    // bilinear-AAs each circle; the prior step(d_min2, r2) hard-stepped.
+    // Diff was white rings at every circle boundary (parity_bg_pattern_
+    // halftone: max=229, mean=14.135, pct_over_200=3.29%).
+    // smoothstep(r-0.5, r+0.5, length(min-distance)) gives a 1-px
+    // transition centered on the radius matching browser bilinear.
+    float d1 = length(cell1);
+    float d2 = length(cell2);
+    float d_min = min(d1, d2);
+    float t = 1.0 - smoothstep(u_radius - 0.5, u_radius + 0.5, d_min);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
 }
 "#;
@@ -2583,8 +2591,15 @@ pub fn dots_uniforms(density: f32) -> DotsUniforms {
 
 /// v1-spec-delta #6 (slice c) -- halftone pattern uniforms. Two
 /// offset dot grids; second layer offset by half a tile. Mirrors
-/// Python's `_render_pattern_halftone`: tile = round(lerp(60, 6,
-/// density)); radius = round(tile * 0.34); half = tile // 2.
+/// Canvas2D's `_render_pattern_halftone` (ui/src/bg-system.js:286):
+/// tile = round(lerp(60, 6, density)); radius = round(tile * 0.34).
+/// Phase 3t 2026-05-15: half = tile * 0.5 (NO floor). Canvas2D's
+/// layer-0 anchor uses JS `tile / 2` which keeps the half-pixel
+/// for odd tiles (e.g. tile=33 -> half=16.5). The earlier Python
+/// convention `tile // 2 = 16` produced a 0.5-px grid offset that
+/// the Phase 3t diag (qa/captures/halftone-tile-crop.png)
+/// localized as the dominant cause of max_delta=229 even after
+/// smoothstep AA was applied to the shader.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HalftoneUniforms {
     pub tile: f32,
@@ -2595,9 +2610,10 @@ pub struct HalftoneUniforms {
 pub fn halftone_uniforms(density: f32) -> HalftoneUniforms {
     let tile = pattern_lerp(60.0, 6.0, density).round().max(2.0);
     let radius = (tile * 0.34).round().max(2.0);
-    // Python uses `tile // 2` (integer floor divide). Mirror with
-    // floor(tile / 2) to match exactly even at odd tile sizes.
-    let half = (tile * 0.5).floor();
+    // Phase 3t 2026-05-15: use float tile/2 (no floor). Canvas2D
+    // uses JS `tile / 2` which preserves the half-pixel offset for
+    // odd tiles (matches its ctx.arc + fill sub-pixel positioning).
+    let half = tile * 0.5;
     HalftoneUniforms { tile, radius, half }
 }
 
@@ -4123,19 +4139,27 @@ mod tests {
     // rings uniform helpers. Math mirrors Python anchors at
     // density 0/0.5/1.
     #[test]
-    fn halftone_uniforms_match_python_anchors() {
+    fn halftone_uniforms_match_canvas2d_anchors() {
         // tile = round(lerp(60, 6, density)); radius = round(tile *
-        // 0.34); half = floor(tile / 2).
-        // density 0: tile=60, radius=round(20.4)=20, half=30.
+        // 0.34); half = tile * 0.5 (float, NO floor -- Phase 3t).
+        // density 0: tile=60, radius=round(20.4)=20, half=30 (even).
         let u0 = halftone_uniforms(0.0);
         assert_eq!(u0.tile, 60.0);
         assert_eq!(u0.radius, 20.0);
         assert_eq!(u0.half, 30.0);
-        // density 1: tile=6, radius=round(2.04)=2, half=3.
+        // density 1: tile=6, radius=round(2.04)=2, half=3 (even).
         let u1 = halftone_uniforms(1.0);
         assert_eq!(u1.tile, 6.0);
         assert_eq!(u1.radius, 2.0);
         assert_eq!(u1.half, 3.0);
+        // density 0.5: tile=round(lerp(60,6,0.5))=33 (ODD).
+        // Phase 3t: half MUST be 16.5 (sub-pixel) to match Canvas2D's
+        // `tile / 2` layer-0 anchor. Pre-3t used floor(tile/2)=16
+        // which produced a 0.5-px grid offset vs Canvas2D.
+        let u_mid = halftone_uniforms(0.5);
+        assert_eq!(u_mid.tile, 33.0);
+        assert_eq!(u_mid.radius, 11.0);
+        assert_eq!(u_mid.half, 16.5);
     }
 
     #[test]
