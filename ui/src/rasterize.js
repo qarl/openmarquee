@@ -230,28 +230,40 @@ function paintLayer(ctx, canvas, layer) {
     // so lines stay inside. fillText's maxWidth handles horizontal
     // overflow as before — both axes squish independently.
     const yScale = totalInkExtent > boxH ? boxH / totalInkExtent : 1;
+    // Per-line baseline offset from the line-group's vertical center.
+    // Hoisted because both the WASM-path and the fillText-squish path
+    // need it; identical expression in both (review nit, Phase 3a).
+    const firstBaselineLocal = -totalInkExtent / 2 + maxAscent;
     // WASM-rasterize path: closes the per-engine glyph AA + per-glyph
-    // kerning divergence (Phase 1b 2026-05-14). Gated on (a) the
-    // wasm-renderer module initialized, (b) the font has been
-    // registered (paintLayer falls back to fillText for fonts not
-    // yet in the registry — incremental per-font roll-out), (c) no
-    // yScale squish active (putImageData ignores the canvas
-    // transform, so the squish branch keeps fillText). The
-    // gated-fallback design keeps the editor working at every step
-    // of the parity arc.
+    // kerning divergence (Phase 1b 2026-05-14) AND the +1 bitmap-pad
+    // shift (Phase 2 2026-05-14, f71734f). Gated only on (a) wasm
+    // initialized, (b) font registered, (c) color parses to RGBA.
+    // yScale<1 is HANDLED on the WASM path now (Phase 3a 2026-05-14):
+    // drawImage's 9-arg form downscales the rasterized bitmap on Y
+    // when totalInkExtent > boxH, mirroring fillText's ctx.scale(1,
+    // yScale) squish without the canvas-transform incompatibility
+    // that originally forced the fallback. drawImage uses the
+    // browser's image-smoothing resampling (typically bilinear);
+    // Rust's FS_GLYPH path uses GL_LINEAR — equivalent at the
+    // single-axis-downscale operation point, so parity is preserved.
     const colorRgba = parseCssColorRgba(textColor);
     const useWasm = (
-        yScale === 1
-        && colorRgba !== null
+        colorRgba !== null
         && isWasmReady()
         && isFontRegistered(fontFamily)
     );
 
     if (useWasm) {
+        // Per-line canvas-Y baseline under optional yScale squish.
+        // Centers the line group around boxCenterY exactly as the
+        // fillText squish branch does (ctx.translate(_, boxCenterY)
+        // + ctx.scale(1, yScale) + draw at firstBaselineLocal +
+        // i*lineHeight). For yScale=1 this reduces to the original
+        // firstBaselineY + i*lineHeight formula.
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             if (!line) continue;
-            const baselineY = firstBaselineY + i * lineHeight;
+            const baselineY = boxCenterY + (firstBaselineLocal + i * lineHeight) * yScale;
             const result = rasterizeText(line, fontFamily, fontSizePx, colorRgba);
             if (!result) continue; // empty / whitespace-only line.
             // Horizontal-overflow handling: fillText with `maxWidth`
@@ -263,6 +275,12 @@ function paintLayer(ctx, canvas, layer) {
             // then textAlign-derived drawX so the squished line stays
             // anchored to the configured edge.
             const targetW = Math.min(result.width, boxW);
+            // Vertical squish: target height = bitmap natural * yScale.
+            // baseline-relative drawY = baselineY - ascent*yScale so the
+            // glyph's baseline row lands ON the line's baselineY post-
+            // squish. Round to whole pixels so the bitmap snaps to the
+            // canvas grid (preserves the Phase 2 integer-X alignment).
+            const targetH = result.height * yScale;
             let drawX;
             if (textAlign === "left") drawX = boxX;
             else if (textAlign === "right") drawX = boxX + boxW - targetW;
@@ -270,14 +288,12 @@ function paintLayer(ctx, canvas, layer) {
             // drawImage performs source-over composition (vs
             // putImageData which OVERWRITES bg pixels in transparent
             // bitmap regions — Phase 1b found this as 17K black-pixel
-            // gaps in the Boot fixture's badge area). Position by
-            // baseline: y = baselineY - bitmap.ascent. Round to whole
-            // pixels so the bitmap snaps to the canvas grid.
-            const drawY = Math.round(baselineY - result.ascent);
+            // gaps in the Boot fixture's badge area).
+            const drawY = Math.round(baselineY - result.ascent * yScale);
             ctx.drawImage(
                 result.image,
                 0, 0, result.width, result.height,
-                Math.round(drawX), drawY, targetW, result.height,
+                Math.round(drawX), drawY, targetW, targetH,
             );
         }
     } else if (yScale === 1) {
@@ -292,10 +308,9 @@ function paintLayer(ctx, canvas, layer) {
         // line's y-offset is from the centered origin. fillText's
         // maxWidth is in untransformed coords, so it still clamps
         // horizontal width correctly. Same baseline math, just
-        // recentered around the local origin. The WASM path can't
-        // participate here because putImageData ignores canvas
-        // transforms; squish stays on fillText.
-        const firstBaselineLocal = -totalInkExtent / 2 + maxAscent;
+        // recentered around the local origin. This squish branch is
+        // now only reached when WASM isn't available OR the font
+        // isn't registered (Phase 3a removed the yScale==1 WASM gate).
         for (let i = 0; i < lines.length; i++) {
             ctx.fillText(lines[i], 0, firstBaselineLocal + i * lineHeight, maxWidth);
         }
