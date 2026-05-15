@@ -37,6 +37,12 @@
 
 set -euo pipefail
 
+# Suppress macOS AppleDouble (._*) sidecar files for any cp/rsync/tar
+# the script invokes downstream. Boot-5 forensics found 41 ._* metadata
+# files in the bundle's wheels/ dir. pip tolerated them but they're a
+# latent footgun for any downstream tool that doesn't.
+export COPYFILE_DISABLE=1
+
 # --- Locate the repo root regardless of caller's cwd. -----------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -258,17 +264,20 @@ if [ "$DO_WHEELS" -eq 1 ]; then
         --only-binary=:all: \
         --requirement "$REPO_ROOT/backend/requirements.lock" \
         2>&1 | tail -40
-    # Phase 4a 2026-05-15: also vendor setuptools + wheel + pip so that
-    # install.sh's `pip install -e backend --no-index --no-build-isolation`
-    # finds the PEP-517 build backend offline. Python 3.13's venv no
-    # longer installs setuptools by default, so without these, an offline
-    # `pip install -e .` would fail importing setuptools.build_meta.
-    # These three are pure-Python (py3-none-any wheels), arch-independent.
+    # Vendor setuptools + wheel + pip so that install.sh's
+    # `pip install -e backend --no-index --no-build-isolation` finds the
+    # PEP-517 build backend offline. Python 3.13's venv no longer installs
+    # setuptools by default, so without these, an offline `pip install -e .`
+    # would fail importing setuptools.build_meta. These three are pure-
+    # Python (py3-none-any wheels), arch-independent. Versions pinned so
+    # appliance bundles are reproducible across rebuilds — same versions
+    # currently in the known-good wheels dir on the failed boot-5 card
+    # (those wheels worked; the failure was install.sh not installing them).
     pip download \
         --dest "$ROOT/wheels" \
         --no-deps \
         --only-binary=:all: \
-        setuptools wheel pip \
+        "setuptools==82.0.1" "wheel==0.47.0" "pip==26.1.1" \
         2>&1 | tail -10
     WHEEL_COUNT=$(find "$ROOT/wheels" -name '*.whl' | wc -l | tr -d ' ')
     say "  vendored $WHEEL_COUNT wheels"
@@ -316,12 +325,18 @@ cp "$REPO_ROOT/backend/requirements.lock" "$ROOT/requirements.lock"
 # --- 5. Tar + zstd ----------------------------------------------------------
 
 mkdir -p "$(dirname "$OUTPUT")"
+# Belt-and-suspenders with COPYFILE_DISABLE=1 above: scrub any macOS
+# AppleDouble sidecars that snuck into the staging tree before they
+# enter the tar. find -delete is silent on no-match so this is a no-op
+# when the export already prevented them.
+find "$ROOT" -name '._*' -delete
 say "Compressing to $OUTPUT"
 # -C $STAGING then archive "openmarquee" so the tar's top-level entry is
 # "openmarquee/" -- extracting against /opt/ on the Pi lands at
-# /opt/openmarquee/, no rename step needed.
+# /opt/openmarquee/, no rename step needed. -f overrides zstd's default
+# refusal to overwrite — rebuilds are idempotent without a manual rm.
 tar -C "$STAGING" -cf - openmarquee \
-    | zstd --quiet -19 -o "$OUTPUT"
+    | zstd --quiet -19 -f -o "$OUTPUT"
 
 SIZE=$(stat -f%z "$OUTPUT" 2>/dev/null || stat -c%s "$OUTPUT")
 SIZE_HUMAN=$(echo "$SIZE" | awk '{
