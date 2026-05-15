@@ -1,0 +1,4 @@
+2c2
+<   "probe": "renderer/examples/composite_probe.rs",
+---
+>   "probe": "renderer-wasm/examples/composite_probe.rs",
