@@ -1,0 +1,46 @@
+{
+    "schema_version": 3,
+    "updated_at": "2026-05-14T00:00:00.000000+00:00",
+    "item": {
+        "type": "text_slide",
+        "id": "f0000000-0000-4000-8000-000000000099",
+        "name": "Phase 1c single-glyph diagnostic",
+        "duration_ms": 1000,
+        "text_layers": [
+            {
+                "text": "B",
+                "name": "glyph",
+                "font_family": "VT323",
+                "font_size_px": 32,
+                "font_size_pct": null,
+                "weight": null,
+                "text_color": "#FFFFFF",
+                "text_align": "left",
+                "outline": false,
+                "opacity": 1.0,
+                "anchor": "center",
+                "visible": true,
+                "locked": false,
+                "motion": "static",
+                "motion_intensity": 50,
+                "motion_phase": 0.0,
+                "motion_speed": 1.0,
+                "blend": "normal",
+                "auto_mode": null,
+                "auto_format": null,
+                "box": {
+                    "x": 0.125,
+                    "y": 0.125,
+                    "w": 0.125,
+                    "h": 0.0625
+                }
+            }
+        ],
+        "background_color": "#000000",
+        "background_pattern": null,
+        "background_image_id": null,
+        "background_video_slide_id": null,
+        "transition": "cut",
+        "duration_seconds": 1.0
+    }
+}
