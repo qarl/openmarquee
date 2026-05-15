@@ -1677,9 +1677,9 @@ fn draw_pattern(
                 |gl, program| unsafe {
                     use glow::HasContext;
                     let u_tile = gl.get_uniform_location(program, "u_tile");
-                    let u_threshold = gl.get_uniform_location(program, "u_threshold");
+                    let u_half = gl.get_uniform_location(program, "u_half");
                     gl.uniform_1_f32(u_tile.as_ref(), u.tile);
-                    gl.uniform_1_f32(u_threshold.as_ref(), u.threshold);
+                    gl.uniform_1_f32(u_half.as_ref(), u.half);
                 },
             )
         }

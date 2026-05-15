@@ -2390,22 +2390,28 @@ void main() {
 "#;
 
 /// v1-spec-delta #6 (slice c) -- concentric rings around the
-/// slide center. Period-`u_tile` repetition: each period has a
-/// color_a band of (half-2) pixels followed by a 2-pixel
-/// color_b ring. Center at viewport midpoint.
+/// slide center: solid color_a background with 2-pixel-wide color_b
+/// ring strokes at radii {u_half, u_half + u_tile, u_half + 2*u_tile,
+/// ...}. Mirrors Canvas2D's `bg-system.js:367-380` which fills color_a
+/// then strokes color_b circles at those radii with lineWidth=2.
 pub const FS_PATTERN_RINGS: &str = r#"#version 100
 precision mediump float;
 uniform vec2 u_viewport;
 uniform float u_tile;
-uniform float u_threshold;
+uniform float u_half;
 uniform vec3 u_color_a;
 uniform vec3 u_color_b;
 void main() {
+    // Phase 3ac 2026-05-15: thin rings (Option C: honor the
+    // docstring). Pre-fix shader used `step(u_threshold, period)`
+    // which produced alternating WIDE bands -- a long-standing
+    // semantic divergence from Canvas2D and the docstring above.
+    // qa/captures/parity-phase3ac-rings-candidates-2026-05-15.md.
     vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
     vec2 d = pos - u_viewport * 0.5;
     float dist = length(d);
-    float period = mod(dist, u_tile);
-    float t = step(u_threshold, period);
+    float p = mod(dist, u_tile) - u_half;
+    float t = step(abs(p), 1.0);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
 }
 "#;
@@ -2689,28 +2695,23 @@ pub fn grid_uniforms(density: f32) -> GridUniforms {
 }
 
 /// v1-spec-delta #6 (slice c) -- rings pattern uniforms.
-/// Concentric rings around the slide center. Mirrors Python's
-/// `_render_pattern_rings`: tile = max(4, round(lerp(120, 6,
-/// density))); half = tile // 2; ring of `2` pixels at period
-/// boundary, color_a band of half-2 pixels.
+/// Concentric rings around the slide center. Mirrors Canvas2D's
+/// `bg-system.js:367-380`: tile = max(4, round(lerp(120, 6,
+/// density))); half = tile / 2; ring strokes (color_b, ~2px wide)
+/// at radii {half, half + tile, half + 2*tile, ...} on a solid
+/// color_a background.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RingsUniforms {
     pub tile: f32,
-    /// Threshold within each period above which color_b shows.
-    /// Python: half - 2, where half = tile // 2.
-    pub threshold: f32,
+    /// First-ring radius (and offset of every subsequent ring within
+    /// a period). Canvas2D mirror: `tile / 2`.
+    pub half: f32,
 }
 
 pub fn rings_uniforms(density: f32) -> RingsUniforms {
     let tile = pattern_lerp(120.0, 6.0, density).round().max(4.0);
-    let half = (tile * 0.5).floor();
-    // Python clamps the band so threshold could be 0 at tile=4
-    // (half=2, half-2=0). At threshold=0, every pixel inside the
-    // ring period >= 0 is color_b -- which means the whole tile
-    // is color_b except the exact period-boundary pixel. Visually
-    // this is "very dense rings" -- correct per Python.
-    let threshold = (half - 2.0).max(0.0);
-    RingsUniforms { tile, threshold }
+    let half = tile * 0.5;
+    RingsUniforms { tile, half }
 }
 
 /// v1-spec-delta #6 (slice d) -- rays pattern uniforms. Conic
@@ -4051,7 +4052,7 @@ mod tests {
             && FS_PATTERN_HALFTONE.contains("u_half"));
         assert!(FS_PATTERN_SCANLINES.contains("u_tile"));
         assert!(FS_PATTERN_GRID.contains("u_tile"));
-        assert!(FS_PATTERN_RINGS.contains("u_tile") && FS_PATTERN_RINGS.contains("u_threshold"));
+        assert!(FS_PATTERN_RINGS.contains("u_tile") && FS_PATTERN_RINGS.contains("u_half"));
         assert!(FS_PATTERN_RAYS.contains("u_slices"));
         assert!(FS_PATTERN_BRICKS.contains("u_bw")
             && FS_PATTERN_BRICKS.contains("u_bh")
@@ -4239,17 +4240,17 @@ mod tests {
     }
 
     #[test]
-    fn rings_uniforms_match_python_anchors() {
-        // tile = max(4, round(lerp(120, 6, density))); half = floor
-        // (tile/2); threshold = max(0, half-2).
-        // density 0: tile=120, half=60, threshold=58.
+    fn rings_uniforms_match_canvas2d_anchors() {
+        // Phase 3ac 2026-05-15: thin-rings semantics (Option C).
+        // tile = max(4, round(lerp(120, 6, density))); half = tile/2.
+        // density 0: tile=120, half=60.
         let u0 = rings_uniforms(0.0);
         assert_eq!(u0.tile, 120.0);
-        assert_eq!(u0.threshold, 58.0);
-        // density 1: tile=6, half=3, threshold=1.
+        assert_eq!(u0.half, 60.0);
+        // density 1: tile=6, half=3.
         let u1 = rings_uniforms(1.0);
         assert_eq!(u1.tile, 6.0);
-        assert_eq!(u1.threshold, 1.0);
+        assert_eq!(u1.half, 3.0);
     }
 
     // v1-spec-delta #6 (slice d) -- rays / bricks / confetti
