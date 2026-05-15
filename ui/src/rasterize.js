@@ -258,26 +258,42 @@ function paintLayer(ctx, canvas, layer) {
         // squished pixel-size so fontdue produces a bitmap that's
         // already at the canvas pixel-dims. Eliminates the post-
         // rasterization downscale that Phase 3a relied on, which
-        // diverged from Rust's GL_LINEAR at extreme ratios (font_xxx
-        // fixtures stuck at max_delta=231 + UnifrakturCook +6.90
-        // mean regression).
+        // diverged from Rust's GL_LINEAR at extreme ratios.
         //
-        // effectiveSizePx = fontSizePx * yScale collapses to
-        // fontSizePx when yScale=1, so the non-squish path is
-        // bit-identical to Phase 2/3a. Cache key is text|font|size|
-        // color and includes effectiveSizePx implicitly via the size
-        // slot — different squish ratios cache as separate entries
-        // (LRU 256 entries holds the working set comfortably).
+        // Phase 3d (2026-05-14): derive baselineY math from
+        // EFFECTIVE-size quantities so the inter-line stride
+        // matches what fontdue's per-line rasterization would
+        // produce. Pre-3d used `round(fontSizePx * 1.1) * yScale`
+        // for the stride (full-size round, then proportional scale)
+        // while the natural stride at effective size is
+        // `round(effectiveSizePx * 1.1)`. Sub-pixel rounding
+        // asymmetry showed up as 1-px inter-line drift, surfacing
+        // as the 229/231 max_delta floor at glyph edges. Using
+        // effective-size lineHeight closes that floor for
+        // multi-line content.
         //
-        // Per-line canvas-Y baseline under optional yScale squish.
-        // Centers the line group around boxCenterY exactly as the
-        // fillText squish branch does. For yScale=1 this reduces
-        // to firstBaselineY + i*lineHeight.
+        // For yScale=1: effectiveSizePx === fontSizePx, all
+        // effective-size quantities reduce to their full-size
+        // equivalents, and the formula collapses to the original
+        // `firstBaselineY + i*lineHeight`. Single-line content is
+        // unaffected (i*lineHeight is 0 when lines.length==1).
+        //
+        // Cache key is text|font|size|color and includes
+        // effectiveSizePx implicitly via the size slot — different
+        // squish ratios cache as separate entries (LRU 256-entry
+        // capacity holds the working set comfortably).
         const effectiveSizePx = fontSizePx * yScale;
+        const lineHeightEff = Math.round(effectiveSizePx * 1.1);
+        const maxAscentEff = maxAscent * yScale;
+        const maxDescentEff = maxDescent * yScale;
+        const totalInkExtentEff =
+            (maxAscentEff + maxDescentEff)
+            + (lines.length - 1) * lineHeightEff;
+        const firstBaselineYEff = boxCenterY - totalInkExtentEff / 2 + maxAscentEff;
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             if (!line) continue;
-            const baselineY = boxCenterY + (firstBaselineLocal + i * lineHeight) * yScale;
+            const baselineY = firstBaselineYEff + i * lineHeightEff;
             const result = rasterizeText(line, fontFamily, effectiveSizePx, colorRgba);
             if (!result) continue; // empty / whitespace-only line.
             // Horizontal-overflow handling: even at squished font
