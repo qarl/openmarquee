@@ -35,8 +35,23 @@
 //! verifiable via host-side cargo test (this crate's tests run on the
 //! native target; the wasm target is artifact-only).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use fontdue::{Font, FontSettings};
 use wasm_bindgen::prelude::*;
+
+// Phase 1: named-font registry. JS calls `register_font(name, bytes)`
+// once per font at app boot; subsequent `rasterize_text_named(text,
+// name, ...)` calls look up the cached `Font`. Avoids passing TTF
+// bytes (often >100 KiB) on every per-frame rasterize call.
+//
+// thread_local + RefCell is the standard wasm32 pattern — wasm is
+// single-threaded so this is effectively a global with safe interior
+// mutability.
+thread_local! {
+    static FONT_REGISTRY: RefCell<HashMap<String, Font>> = RefCell::new(HashMap::new());
+}
 
 /// Rasterize a single line of `text` at `size_px` using the TTF/OTF
 /// font in `font_bytes`. Returns a flat RGBA8 buffer (row-major top-
@@ -48,10 +63,15 @@ use wasm_bindgen::prelude::*;
 /// renderer-side rounding at hdmi_logic.rs:245). Height = ascent +
 /// descent of the worst-case glyph in the line.
 ///
-/// Returns `Some(packed)` where the first 8 bytes are
-/// `[width_lo, width_hi, width_b2, width_b3, height_lo, height_hi,
-/// height_b2, height_b3]` (little-endian u32s) followed by the pixel
-/// data. Returns `None` if the text contains no inked glyphs (all
+/// Returns `Some(packed)` where the first 12 bytes are
+/// `[width u32 LE, height u32 LE, ascent u32 LE]` followed by the
+/// pixel data. `ascent` is the bitmap-internal baseline row index —
+/// the JS caller positions putImageData at `(x, lineBaselineY -
+/// ascent)` so the bitmap's baseline aligns with the layout's
+/// per-line baseline (paintLayer computes the latter via the
+/// 4cbd08b alphabetic-baseline math).
+///
+/// Returns `None` if the text contains no inked glyphs (all
 /// whitespace) — matches the Rust renderer's `has_ink` guard.
 ///
 /// Phase-0 simplification: single-line only. Multi-line + line-break
@@ -111,13 +131,17 @@ fn rasterize_inner(
     if line_w == 0 || line_h == 0 {
         return None;
     }
-    // Header (8 bytes: width u32 LE, height u32 LE) + RGBA pixel
-    // data (line_w * line_h * 4 bytes).
+    // Header (12 bytes: width u32 LE, height u32 LE, ascent u32 LE)
+    // + RGBA pixel data (line_w * line_h * 4 bytes). The ascent is
+    // the bitmap-internal baseline row index — needed by callers to
+    // align the rasterized bitmap to their layout's baseline.
+    let ascent_u32 = max_ascent.max(0) as u32;
     let pixel_bytes = (line_w as usize) * (line_h as usize) * 4;
-    let mut out = vec![0u8; 8 + pixel_bytes];
+    let mut out = vec![0u8; 12 + pixel_bytes];
     out[0..4].copy_from_slice(&line_w.to_le_bytes());
     out[4..8].copy_from_slice(&line_h.to_le_bytes());
-    let pixels = &mut out[8..];
+    out[8..12].copy_from_slice(&ascent_u32.to_le_bytes());
+    let pixels = &mut out[12..];
 
     // Second pass: blit each glyph at its baseline-relative position.
     // Baseline_y in bitmap coords = max_ascent (so glyphs with
@@ -172,6 +196,55 @@ fn rasterize_inner(
     Some(out)
 }
 
+/// Register a font in the wasm-side registry so subsequent
+/// `rasterize_text_named` calls can look it up by `name`. Idempotent
+/// — calling twice with the same name replaces the cached `Font`
+/// (cheap, fontdue Font is a few KiB of parsed tables).
+///
+/// Returns `true` on success, `false` if the bytes don't parse as
+/// a valid TTF / OTF font.
+#[wasm_bindgen]
+pub fn register_font(name: &str, font_bytes: &[u8]) -> bool {
+    match Font::from_bytes(font_bytes, FontSettings::default()) {
+        Ok(font) => {
+            FONT_REGISTRY.with(|reg| {
+                reg.borrow_mut().insert(name.to_string(), font);
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Rasterize a single line of `text` at `size_px` using the
+/// previously-registered font named `font_name`. Returns the same
+/// packed buffer shape as `rasterize_text` (12-byte header + RGBA
+/// pixels). Returns `None` if `font_name` isn't registered OR if
+/// the text has no inked glyphs.
+///
+/// This is the hot-path API the editor preview calls per-line:
+/// re-parsing the TTF on every call was wasteful at 60 Hz × N
+/// text layers.
+#[wasm_bindgen]
+pub fn rasterize_text_named(
+    text: &str,
+    font_name: &str,
+    size_px: f32,
+    color_r: u8,
+    color_g: u8,
+    color_b: u8,
+    color_a: u8,
+) -> Option<Vec<u8>> {
+    if text.is_empty() {
+        return None;
+    }
+    FONT_REGISTRY.with(|reg| {
+        let map = reg.borrow();
+        let font = map.get(font_name)?;
+        rasterize_inner(font, text, size_px, [color_r, color_g, color_b, color_a])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,15 +287,35 @@ mod tests {
             [255, 0, 0, 255],
         );
         let buf = result.expect("'A' should rasterize");
-        assert!(buf.len() >= 8, "header must be 8 bytes");
+        assert!(buf.len() >= 12, "header must be 12 bytes (w, h, ascent)");
         let w = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let h = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let ascent = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         assert!(w > 0 && h > 0, "non-empty bitmap");
+        assert!(ascent > 0, "ascent must be positive for inked glyph");
+        assert!(ascent <= h, "ascent within bitmap height");
         let pixel_bytes = (w as usize) * (h as usize) * 4;
-        assert_eq!(buf.len(), 8 + pixel_bytes, "header + RGBA buffer");
+        assert_eq!(buf.len(), 12 + pixel_bytes, "header + RGBA buffer");
         // At least one pixel should be inked (non-zero alpha).
-        let inked = buf[8..].chunks_exact(4).any(|p| p[3] > 0);
+        let inked = buf[12..].chunks_exact(4).any(|p| p[3] > 0);
         assert!(inked, "'A' produced no inked pixels");
+    }
+
+    #[test]
+    fn register_font_caches_and_serves_named_lookup() {
+        let path = ["../ui/fonts/vt323.ttf", "ui/fonts/vt323.ttf"]
+            .iter()
+            .find_map(|p| std::fs::read(p).ok())
+            .expect("no fixture font found");
+        assert!(register_font("vt323-test", &path));
+        let result = rasterize_text_named(
+            "X", "vt323-test", 24.0, 255, 255, 255, 255,
+        );
+        assert!(result.is_some(), "named-font lookup hit");
+        let missing = rasterize_text_named(
+            "X", "not-registered", 24.0, 255, 255, 255, 255,
+        );
+        assert!(missing.is_none(), "missing font returns None");
     }
 
     #[test]

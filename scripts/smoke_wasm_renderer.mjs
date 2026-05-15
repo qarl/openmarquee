@@ -39,14 +39,22 @@ const wasmBytes = readFileSync(resolve(REPO, "renderer-wasm/pkg/renderer_wasm_bg
 await mod.default({ module_or_path: wasmBytes });
 
 const fontBytes = readFileSync(FONT);
-const result = mod.rasterize_text("BOOT", fontBytes, 32.0, 255, 180, 60, 255);
-if (!result) die("rasterize_text returned null for 'BOOT'");
+// Phase 1: exercise the named-font registry. register_font caches
+// the parsed Font in the wasm side; subsequent rasterize_text_named
+// calls look it up by name without re-passing the TTF bytes.
+const registered = mod.register_font("vt323", fontBytes);
+if (!registered) die("register_font failed for VT323");
+
+const result = mod.rasterize_text_named("BOOT", "vt323", 32.0, 255, 180, 60, 255);
+if (!result) die("rasterize_text_named returned null for 'BOOT' / vt323");
 
 const w = new DataView(result.buffer, result.byteOffset, 4).getUint32(0, true);
 const h = new DataView(result.buffer, result.byteOffset + 4, 4).getUint32(0, true);
+const ascent = new DataView(result.buffer, result.byteOffset + 8, 4).getUint32(0, true);
 if (w === 0 || h === 0) die(`bitmap has zero dim: ${w}x${h}`);
+if (ascent === 0 || ascent > h) die(`ascent out of range: ${ascent} (bitmap ${w}x${h})`);
 
-const pixels = result.subarray(8);
+const pixels = result.subarray(12);
 const expected = w * h * 4;
 if (pixels.length !== expected) {
     die(`pixel buffer wrong size: got ${pixels.length}, expected ${expected}`);
@@ -60,4 +68,4 @@ if (inked === 0) die("no inked pixels — fontdue rendered an empty bitmap");
 
 const totalPixels = w * h;
 const inkPct = (100 * inked / totalPixels).toFixed(1);
-console.log(`PASS: rasterized 'BOOT' at 32 px in VT323 → ${w}×${h} bitmap, ${inked}/${totalPixels} pixels inked (${inkPct} %)`);
+console.log(`PASS: rasterized 'BOOT' at 32 px in VT323 → ${w}×${h} bitmap, ascent=${ascent}, ${inked}/${totalPixels} pixels inked (${inkPct} %)`);

@@ -24,6 +24,11 @@
 
 set -euo pipefail
 
+# rustup-managed cargo / wasm-bindgen aren't always on the default
+# PATH (e.g. invoked from a script subshell that doesn't source
+# ~/.cargo/env). Prepend it so the binaries resolve.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 CRATE_DIR="$REPO/renderer-wasm"
 OUT_DIR="$CRATE_DIR/pkg"
