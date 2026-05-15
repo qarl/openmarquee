@@ -130,7 +130,13 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
             return;
         }
         if (motion === "breathe") {
-            const amp = (intensity / 100.0) * 0.20;
+            // Spec range: ±2% → ±20% (docs/text-layer-motion-spec.md:229).
+            // amp = 0.02 + 0.18 * intensity_norm matches Rust
+            // motion_breathe exactly. Previous Canvas2D formula
+            // (intensity/100)*0.20 zeroed amp at intensity=0, missing
+            // the ±2% baseline the spec calls for.
+            const intensityNorm = intensity / 100.0;
+            const amp = 0.02 + 0.18 * intensityNorm;
             const s = 1.0 + amp * Math.sin(2 * Math.PI * phase);
             const cx = bx + bw / 2;
             const cy = by + bh / 2;
@@ -141,7 +147,14 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
             return;
         }
         if (motion === "pulse") {
-            const minA = 1.0 - intensity / 100.0;
+            // Spec range: 70-100% shallow → 0-100% deep (docs/text-
+            // layer-motion-spec.md:230). min_alpha = 0.70*(1-intensity_norm)
+            // matches Rust motion_pulse exactly. Previous Canvas2D
+            // formula (minA = 1 - intensity/100) gave alpha=1 constant
+            // at intensity=0 (no pulse) instead of the spec's 70-100%
+            // shallow sweep.
+            const intensityNorm = intensity / 100.0;
+            const minA = 0.70 * (1.0 - intensityNorm);
             const sin01 = (Math.sin(2 * Math.PI * phase) + 1) / 2;
             const a = minA + (1.0 - minA) * sin01;
             ctx.globalAlpha *= a;
@@ -149,7 +162,19 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
             return;
         }
         if (motion === "bounce") {
-            const amp = (intensity / 100.0) * 0.10;
+            // Spec range: ±1% → ±10% (docs/text-layer-motion-spec.md:231).
+            // amp = 0.01 + 0.09 * intensity_norm matches Rust
+            // motion_bounce. Previous Canvas2D formula (intensity/100)
+            // *0.10 zeroed amp at intensity=0 (no bounce), missing the
+            // ±1% baseline the spec specifies.
+            //
+            // Shape stays as symmetric sin() here in the editor preview;
+            // Rust device path uses abs(sin) for true ball-on-floor
+            // (qarl decision, see motion_bounce in hdmi_logic.rs). Per
+            // the editor-vs-device approximate-preview spec lock, the
+            // two are not required to be pixel-identical on shape.
+            const intensityNorm = intensity / 100.0;
+            const amp = 0.01 + 0.09 * intensityNorm;
             const offsetY = amp * bh * Math.sin(2 * Math.PI * phase);
             ctx.translate(0, offsetY);
             paintFn();

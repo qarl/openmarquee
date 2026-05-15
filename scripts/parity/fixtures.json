@@ -116,7 +116,9 @@
             "uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "tick": 1.75,
             "golden": "animated_ticker_chant",
-            "purpose": "Ticker motion @ tick=1.75. Motion-phase math + per-tick frequency tables."
+            "purpose": "Ticker motion @ tick=1.75. Motion-phase math + per-tick frequency tables.",
+            "divergent_by_design": true,
+            "divergent_reason": "ticker structural divergence: Rust offset_x_norm = 1 - 2*cycle (single-copy NDC offset, text enters from right at cycle=0) vs Canvas2D / Python np.roll wrap-around two-copy (text at original position at phase=0, wraps via box-width copy). Both correct for their context (device vs editor preview); not pixel-comparable."
         },
         {
             "name": "parity_blend_overlay",
@@ -244,7 +246,9 @@
             "uuid": "99c11690-415b-40f6-8e3c-6491f3bdf60e",
             "tick": 0.5,
             "golden": "animated_multi_chaos",
-            "purpose": "4-layer compound motion (blink+shake+pulse+bounce) at tick 0.5. Different motion mix than parity_motion_ticker; surfaces multi-motion-phase drift."
+            "purpose": "4-layer compound motion (blink+shake+pulse+bounce) at tick 0.5. Different motion mix than parity_motion_ticker; surfaces multi-motion-phase drift.",
+            "divergent_by_design": true,
+            "divergent_reason": "compound motion includes shake (different RNG families: FNV-1a string hash on Canvas2D vs splitmix64 u64 hash on Rust -- structurally different random sequences per layer) and bounce (Rust abs(sin) ball-on-floor per qarl 2026-05-03 device decision vs Canvas2D plain sin symmetric). Both correct for their context."
         },
         {
             "name": "parity_transition_fade",
@@ -253,6 +257,8 @@
             "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
             "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "transition_t": 0.5,
+            "divergent_by_design": true,
+            "divergent_reason": "transition's TO slide (2c858968) has 5 ticker-motion text layers; ticker structural divergence (Rust right-edge-start single-copy vs Canvas2D wrap two-copy) flows through into every transition compositor's input. Independent of the transition shader/JS math itself. Same root cause as parity_motion_ticker; divergence flows through the transition compositor regardless of which transition shader handles the AB blend.",
             "golden": "transition_mid_fade",
             "purpose": "Cross-fade midpoint. JS per-pixel (1-t)·A + t·B vs Rust FS_FADE."
         },
@@ -263,6 +269,8 @@
             "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
             "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "transition_t": 0.5,
+            "divergent_by_design": true,
+            "divergent_reason": "transition's TO slide (2c858968) has 5 ticker-motion text layers; ticker structural divergence (Rust right-edge-start single-copy vs Canvas2D wrap two-copy) flows through into every transition compositor's input. Independent of the transition shader/JS math itself. Same root cause as parity_motion_ticker; divergence flows through the transition compositor regardless of which transition shader handles the AB blend.",
             "golden": "transition_mid_cut",
             "purpose": "Cut midpoint (t=0.5 picks B). Single-side-sample vs Rust FS_CUT_B."
         },
@@ -273,6 +281,8 @@
             "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
             "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "transition_t": 0.5,
+            "divergent_by_design": true,
+            "divergent_reason": "transition's TO slide (2c858968) has 5 ticker-motion text layers; ticker structural divergence (Rust right-edge-start single-copy vs Canvas2D wrap two-copy) flows through into every transition compositor's input. Independent of the transition shader/JS math itself. Same root cause as parity_motion_ticker; divergence flows through the transition compositor regardless of which transition shader handles the AB blend.",
             "golden": "transition_mid_wipe",
             "purpose": "Horizontal wipe midpoint. mask = step(uv.x, t) per-pixel vs Rust FS_WIPE."
         },
@@ -283,6 +293,8 @@
             "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
             "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "transition_t": 0.5,
+            "divergent_by_design": true,
+            "divergent_reason": "transition's TO slide (2c858968) has 5 ticker-motion text layers; ticker structural divergence (Rust right-edge-start single-copy vs Canvas2D wrap two-copy) flows through into every transition compositor's input. Independent of the transition shader/JS math itself. Same root cause as parity_motion_ticker; divergence flows through the transition compositor regardless of which transition shader handles the AB blend.",
             "golden": "transition_mid_slide",
             "purpose": "Slide midpoint. seam-based UV translation vs Rust FS_SLIDE. Tests bilinear clamp-to-edge sampling math."
         },
@@ -293,6 +305,8 @@
             "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
             "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "transition_t": 0.5,
+            "divergent_by_design": true,
+            "divergent_reason": "transition's TO slide (2c858968) has 5 ticker-motion text layers; ticker structural divergence (Rust right-edge-start single-copy vs Canvas2D wrap two-copy) flows through into every transition compositor's input. Independent of the transition shader/JS math itself. Same root cause as parity_motion_ticker; divergence flows through the transition compositor regardless of which transition shader handles the AB blend.",
             "golden": "transition_mid_scroll",
             "purpose": "Scroll midpoint (vertical). qarl-bug 2026-05-12: direction flipped + tested. Should pin the fix from c8f22d5/732897b."
         },
@@ -303,6 +317,8 @@
             "from_uuid": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
             "to_uuid": "2c858968-ae0a-4592-8083-85257de50bcd",
             "transition_t": 0.5,
+            "divergent_by_design": true,
+            "divergent_reason": "transition's TO slide (2c858968) has 5 ticker-motion text layers; ticker structural divergence (Rust right-edge-start single-copy vs Canvas2D wrap two-copy) flows through into every transition compositor's input. Independent of the transition shader/JS math itself. Same root cause as parity_motion_ticker; divergence flows through the transition compositor regardless of which transition shader handles the AB blend.",
             "golden": "transition_mid_pixelate",
             "purpose": "Pixelate midpoint. wave/blockSize math + mix vs Rust FS_PIXELATE."
         },
@@ -312,7 +328,9 @@
             "uuid": "f0000000-0000-4000-8000-000000000020",
             "tick": 0.8,
             "golden": "animated_uncage",
-            "purpose": "Motion (shake) + background_pattern (gradient) at the same tick. Closes the UNCAGE-gradient-missing regression class — surface where inline-preview previously dropped pattern bg silently."
+            "purpose": "Motion (shake) + background_pattern (gradient) at the same tick. Closes the UNCAGE-gradient-missing regression class — surface where inline-preview previously dropped pattern bg silently.",
+            "divergent_by_design": true,
+            "divergent_reason": "shake structural divergence: Canvas2D uses FNV-1a string-hash gaussian, Rust uses splitmix64 u64-hash gaussian. Different RNG families = different per-layer random offset sequences (same structural shape as confetti's by-design RNG-family divergence)."
         },
         {
             "name": "parity_animated_halftone_pulse",

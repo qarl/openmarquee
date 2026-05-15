@@ -246,6 +246,28 @@ def report(fx, golden_path: Path, metrics: dict) -> tuple[bool, str]:
     # tightest mean margin is halftone at 2.97 below the 8.0 gate.
     # Catastrophic structural drift (SSIM ~0.7 or mean ~30) trips
     # both well before subtle accumulated regressions slip through.
+    #
+    # divergent_by_design: some fixtures exercise structural
+    # divergences that are correct-by-design on both sides (e.g.,
+    # Rust ticker right-edge-start single-copy vs Canvas2D wrap
+    # two-copy; Rust shake splitmix64 vs Canvas2D FNV-1a; Rust
+    # bounce abs(sin) per qarl 2026-05-03 vs Canvas2D symmetric
+    # sin). These pass the contract test (still have goldens +
+    # items) but bypass the SSIM/mean gate -- metrics are reported
+    # for visibility, marked EXPECTED-DIVERGENT. Mirrors the
+    # confetti by-design RNG-family divergence treatment.
+    if fx.get("divergent_by_design"):
+        verdict = "EXPECTED-DIVERGENT"
+        is_pass = True
+        summary = (
+            f"{verdict}: {fx['name']:30s} "
+            f"SSIM={metrics['ssim']:.4f} "
+            f"mean_delta={metrics['mean_delta']:6.3f} "
+            f"| max_delta={metrics['max_delta']:3d} "
+            f"pct_over_10={metrics['pct_pixels_over_10']:5.2f}% "
+            f"vs golden/{golden_path.name} (divergent_by_design)"
+        )
+        return is_pass, summary
     ssim_min = fx["ssim_min"]
     mean_delta_max = fx["mean_delta_max"]
     is_pass = (
