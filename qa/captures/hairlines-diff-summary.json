@@ -1,0 +1,53 @@
+{
+  "threshold": 50,
+  "fixtures": [
+    {
+      "name": "parity_bg_pattern_gradient",
+      "size": [
+        1920,
+        1080
+      ],
+      "max_delta_reported": 197,
+      "loud_pixel_count": 7291,
+      "loud_pixel_pct": 0.3516,
+      "loud_pixel_bbox": {
+        "left": 538,
+        "top": 432,
+        "right": 1387,
+        "bottom": 648
+      }
+    },
+    {
+      "name": "parity_bg_pattern_solid",
+      "size": [
+        1920,
+        1080
+      ],
+      "max_delta_reported": 221,
+      "loud_pixel_count": 2093,
+      "loud_pixel_pct": 0.1009,
+      "loud_pixel_bbox": {
+        "left": 710,
+        "top": 432,
+        "right": 1207,
+        "bottom": 648
+      }
+    },
+    {
+      "name": "parity_font_inter",
+      "size": [
+        1920,
+        1080
+      ],
+      "max_delta_reported": 231,
+      "loud_pixel_count": 3084,
+      "loud_pixel_pct": 0.1487,
+      "loud_pixel_bbox": {
+        "left": 581,
+        "top": 432,
+        "right": 1384,
+        "bottom": 648
+      }
+    }
+  ]
+}
