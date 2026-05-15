@@ -1646,12 +1646,22 @@ fn draw_pattern(
         }
         PatternKind::Grid => {
             let u = grid_uniforms(density);
+            // Phase 3aa: y_phase precomputed CPU-side so the shader
+            // sidesteps the large-magnitude y-flip subtraction.
+            // Uses mode_h (no -0.5) to align with vc4's round-half-up
+            // int behavior (Phase 3z lesson: vc4 rounds .5 up).
+            let y_phase = {
+                let v = mode_h as f32;
+                ((v % u.tile) + u.tile) % u.tile
+            };
             draw_full_screen_pattern(
                 gl, mode_w, mode_h, FS_PATTERN_GRID, color_a, color_b,
                 |gl, program| unsafe {
                     use glow::HasContext;
                     let u_tile = gl.get_uniform_location(program, "u_tile");
+                    let u_y_phase = gl.get_uniform_location(program, "u_y_phase");
                     gl.uniform_1_f32(u_tile.as_ref(), u.tile);
+                    gl.uniform_1_f32(u_y_phase.as_ref(), y_phase);
                 },
             )
         }

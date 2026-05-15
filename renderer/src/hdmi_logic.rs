@@ -2356,12 +2356,25 @@ pub const FS_PATTERN_GRID: &str = r#"#version 100
 precision mediump float;
 uniform vec2 u_viewport;
 uniform float u_tile;
+uniform float u_y_phase;
 uniform vec3 u_color_a;
 uniform vec3 u_color_b;
 void main() {
-    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
-    float on_x = step(mod(floor(pos.x), u_tile), 0.5);
-    float on_y = step(mod(floor(pos.y), u_tile), 0.5);
+    // Phase 3aa 2026-05-15: hybrid of Cand B's mod-direct approach.
+    // X axis: gl_FragCoord.x at small magnitudes (0..1919) doesn't
+    //   suffer mediump precision loss; mod() yields integer
+    //   pixel-from-edge directly. Detect "on line" via
+    //   min(mx, tile-mx) <= 0.5.
+    // Y axis: y-flip would lose precision via the original
+    //   `u_viewport.y - gl_FragCoord.y` subtraction (Phase 3w
+    //   playbook). Instead use Cand B from scanlines: compare
+    //   mod(gl_FragCoord.y, tile) against CPU-precomputed u_y_phase
+    //   = mod(viewport_h - 0.5, tile) with +/-0.5 step tolerance.
+    float mx = mod(gl_FragCoord.x, u_tile);
+    float my = mod(gl_FragCoord.y, u_tile);
+    float dx = min(mx, u_tile - mx);
+    float on_x = step(dx, 0.5);
+    float on_y = step(abs(my - u_y_phase), 0.5);
     float on_line = max(on_x, on_y);
     gl_FragColor = vec4(mix(u_color_b, u_color_a, on_line), 1.0);
 }
