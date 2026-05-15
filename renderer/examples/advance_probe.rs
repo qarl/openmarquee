@@ -19,6 +19,13 @@
 // per-glyph advance + cumulative cursor at integer rounding. Pipe to
 // qa/captures/advance-byte-compare-2026-05-15.json.
 
+// Phase 3j extension: also dump the screen-quad math for the
+// parity_font_inter fixture so it can be compared to Canvas2D's
+// drawImage rect (captured separately via Playwright in
+// scripts/parity/quad_rect_probe.py). Mirrors hdmi_logic::
+// box_to_ndc_quad's scale-down-only + centered halign + middle
+// valign math for the fixture's authored box.
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -84,6 +91,50 @@ fn main() {
             println!("    }}");
         }
     }
-    println!("  ]");
+    println!("  ],");
+
+    // Phase 3j: parity_font_inter screen-quad math.
+    // box.x=0.05, box.y=0.4, box.w=0.9, box.h=0.2; mode=1920x1080;
+    // halign=Center, valign=Middle (default for compute_layer_uv_rect_logic).
+    // Bitmap dims at size_px=1037: 2*pad + last_line_extent  for height,
+    // max_line_w + 2*pad for width. For "INTER" at 1037 the probe above
+    // emits ymin=0, height=755, total_advance_rounded=3018. So:
+    //   bm_w = 3018 + 2*pad(1) = 3020
+    //   bm_h = 2*pad(1) + (max_ascent - min_descent) = 2 + 755 = 757
+    let mode_w = 1920.0_f32;
+    let mode_h = 1080.0_f32;
+    let box_x = 0.05_f32;
+    let box_y = 0.4_f32;
+    let box_w = 0.9_f32;
+    let box_h = 0.2_f32;
+    let bm_w = 3020.0_f32;
+    let bm_h = 757.0_f32;
+    let box_left_px = box_x * mode_w;
+    let box_top_px = box_y * mode_h;
+    let box_w_px = (box_w * mode_w).max(1.0);
+    let box_h_px = (box_h * mode_h).max(1.0);
+    let s_w = if bm_w > box_w_px { box_w_px / bm_w } else { 1.0 };
+    let s_h = if bm_h > box_h_px { box_h_px / bm_h } else { 1.0 };
+    let scale = s_w.min(s_h);
+    let placed_w = bm_w * scale;
+    let placed_h = bm_h * scale;
+    let dst_left = box_left_px + (box_w_px - placed_w) * 0.5;
+    let dst_top = box_top_px + (box_h_px - placed_h) * 0.5;
+    let dst_right = dst_left + placed_w;
+    let dst_bottom = dst_top + placed_h;
+    println!("  \"phase3j_rust_quad_parity_font_inter\": {{");
+    println!("    \"inputs\": {{\"box_x\":{},\"box_y\":{},\"box_w\":{},\"box_h\":{},\"bm_w\":{},\"bm_h\":{},\"mode_w\":{},\"mode_h\":{}}},", box_x, box_y, box_w, box_h, bm_w as u32, bm_h as u32, mode_w as u32, mode_h as u32);
+    println!("    \"scale\": {:.10},", scale);
+    println!("    \"placed_w_px\": {:.6},", placed_w);
+    println!("    \"placed_h_px\": {:.6},", placed_h);
+    println!("    \"dst_left_px_unrounded\": {:.6},", dst_left);
+    println!("    \"dst_top_px_unrounded\": {:.6},", dst_top);
+    println!("    \"dst_right_px_unrounded\": {:.6},", dst_right);
+    println!("    \"dst_bottom_px_unrounded\": {:.6},", dst_bottom);
+    println!("    \"dst_left_px_rounded\": {},", dst_left.round() as i32);
+    println!("    \"dst_top_px_rounded\": {},", dst_top.round() as i32);
+    println!("    \"dst_right_px_rounded\": {},", dst_right.round() as i32);
+    println!("    \"dst_bottom_px_rounded\": {}", dst_bottom.round() as i32);
+    println!("  }}");
     println!("}}");
 }

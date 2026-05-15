@@ -64,5 +64,19 @@
       "total_advance_unrounded": 291.210938,
       "total_advance_rounded": 291
     }
-  ]
+  ],
+  "phase3j_rust_quad_parity_font_inter": {
+    "inputs": {"box_x":0.05,"box_y":0.4,"box_w":0.9,"box_h":0.2,"bm_w":3020,"bm_h":757,"mode_w":1920,"mode_h":1080},
+    "scale": 0.2853368521,
+    "placed_w_px": 861.717285,
+    "placed_h_px": 216.000000,
+    "dst_left_px_unrounded": 529.141357,
+    "dst_top_px_unrounded": 432.000000,
+    "dst_right_px_unrounded": 1390.858643,
+    "dst_bottom_px_unrounded": 648.000000,
+    "dst_left_px_rounded": 529,
+    "dst_top_px_rounded": 432,
+    "dst_right_px_rounded": 1391,
+    "dst_bottom_px_rounded": 648
+  }
 }

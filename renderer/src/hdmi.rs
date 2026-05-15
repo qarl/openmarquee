@@ -1883,6 +1883,7 @@ fn draw_text_layer(
             layer.r#box.h,
             bm.width,
             bm.height,
+            1, // bm_pad: layout_text_to_alpha pads each side by 1 px
             mode_w,
             mode_h,
             halign,

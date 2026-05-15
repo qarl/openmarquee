@@ -1,0 +1,31 @@
+{
+  "fixture": "parity_font_inter",
+  "fixture_uuid": "f0000000-0000-4000-8000-000000000015",
+  "viewport": {
+    "w": 1920,
+    "h": 1080
+  },
+  "drawImage_calls": [
+    {
+      "argc": 3,
+      "src_w": 867,
+      "src_h": 218,
+      "args_after_src": [
+        527,
+        431
+      ],
+      "font": "bold 1037px Inter, \"Noto Color Emoji\""
+    }
+  ],
+  "measureText_calls": [
+    {
+      "text": "INTER",
+      "font": "bold 1037px Inter, \"Noto Color Emoji\"",
+      "width": 2983.689453125,
+      "actualBoundingBoxAscent": 754.4580078125,
+      "actualBoundingBoxDescent": 0,
+      "fontBoundingBoxAscent": 1005,
+      "fontBoundingBoxDescent": 250
+    }
+  ]
+}

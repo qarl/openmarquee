@@ -3581,6 +3581,7 @@ pub fn box_to_ndc_quad(
     box_h: f32,
     bm_w: u32,
     bm_h: u32,
+    bm_pad: u32,
     mode_w: u32,
     mode_h: u32,
     halign: HAlign,
@@ -3593,11 +3594,30 @@ pub fn box_to_ndc_quad(
     let box_h_px = (box_h * mode_h as f32).max(1.0);
 
     // Scale-down-only: never upscale. If bitmap fits, scale=1.0.
+    // The ink content of the bitmap occupies (bm_w - 2*bm_pad) x
+    // (bm_h - 2*bm_pad) at the center, with bm_pad rows/cols of
+    // alpha=0 padding on each side for FS_GLYPH_OUTLINE dilation.
+    // Scale based on INK dims so the visible glyph ink fits the
+    // layer box exactly (matches Canvas2D's yScale = boxH /
+    // measureText.ink). Phase 3j fix 2026-05-15: pre-fix used the
+    // FULL bitmap dims, which shrunk the visible ink by
+    // (1 - 2*pad/bm) ≈ 0.3% and produced the 5.28-px width gap +
+    // 2-px height gap in the parity_font_inter rectangle compare
+    // (qa/captures/parity-phase3j-quad-rect-2026-05-15.md).
     let bm_w_f = bm_w as f32;
     let bm_h_f = bm_h as f32;
-    let s_w = if bm_w_f > box_w_px { box_w_px / bm_w_f } else { 1.0 };
-    let s_h = if bm_h_f > box_h_px { box_h_px / bm_h_f } else { 1.0 };
+    let pad2 = (2 * bm_pad) as f32;
+    let ink_w_f = (bm_w_f - pad2).max(1.0);
+    let ink_h_f = (bm_h_f - pad2).max(1.0);
+    let s_w = if ink_w_f > box_w_px { box_w_px / ink_w_f } else { 1.0 };
+    let s_h = if ink_h_f > box_h_px { box_h_px / ink_h_f } else { 1.0 };
     let scale = s_w.min(s_h);
+    // Quad covers the WHOLE bitmap (pad-inclusive) so the alpha=0
+    // pad rows still get textured + sampled by FS_GLYPH_OUTLINE
+    // for the dilation. Pad rows extend up to bm_pad*scale canvas-
+    // pixels OUTSIDE the layer box — they're alpha=0 so they paint
+    // nothing visible, but the quad geometry differs from pre-Phase
+    // -3j by ~0.5 px on each edge.
     let placed_w = bm_w_f * scale;
     let placed_h = bm_h_f * scale;
 
@@ -3687,6 +3707,7 @@ pub fn compute_layer_uv_rect_logic(
         inputs.box_h,
         bm_w,
         bm_h,
+        1, // bm_pad: layout_text_to_alpha pads each side by 1 px
         mode_w,
         mode_h,
         inputs.halign,
@@ -7645,7 +7666,7 @@ mod tests {
         // Box covers the full viewport, bitmap exactly fills it,
         // align top-left → NDC corners are -1..+1 on both axes.
         let q = box_to_ndc_quad(
-            0.0, 0.0, 1.0, 1.0, 1920, 1080, 1920, 1080, HAlign::Left, VAlign::Top,
+            0.0, 0.0, 1.0, 1.0, 1920, 1080, 0, 1920, 1080, HAlign::Left, VAlign::Top,
         );
         assert!(
             approx_ndc_eq(q, (-1.0, 1.0, 1.0, -1.0)),
@@ -7658,7 +7679,7 @@ mod tests {
         // 100x50 bitmap inside a 0.5x0.5 box on 1920x1080 viewport,
         // top-left aligned → bitmap sits at box top-left, no scaling.
         let q = box_to_ndc_quad(
-            0.0, 0.0, 0.5, 0.5, 100, 50, 1920, 1080, HAlign::Left, VAlign::Top,
+            0.0, 0.0, 0.5, 0.5, 100, 50, 0, 1920, 1080, HAlign::Left, VAlign::Top,
         );
         // Pixel rect: (0, 0) → (100, 50). NDC:
         //   left:   0/1920*2-1 = -1.0
@@ -7677,7 +7698,7 @@ mod tests {
         // on 1920px viewport, h-align center: bitmap NDC width is
         // 100/1920*2 = 0.10417, centered around 0 → -0.05208..0.05208.
         let q = box_to_ndc_quad(
-            0.0, 0.0, 1.0, 1.0, 100, 50, 1920, 1080, HAlign::Center, VAlign::Top,
+            0.0, 0.0, 1.0, 1.0, 100, 50, 0, 1920, 1080, HAlign::Center, VAlign::Top,
         );
         assert!(
             (q.0 + 0.05208).abs() < 1e-3 && (q.1 - 0.05208).abs() < 1e-3,
@@ -7691,7 +7712,7 @@ mod tests {
         // bitmap right edge at viewport right = 1.0; left edge at
         // 1.0 - 100/1920*2 = 0.89583.
         let q = box_to_ndc_quad(
-            0.0, 0.0, 1.0, 1.0, 100, 50, 1920, 1080, HAlign::Right, VAlign::Top,
+            0.0, 0.0, 1.0, 1.0, 100, 50, 0, 1920, 1080, HAlign::Right, VAlign::Top,
         );
         assert!(
             (q.1 - 1.0).abs() < 1e-3 && (q.0 - 0.89583).abs() < 1e-3,
@@ -7702,7 +7723,7 @@ mod tests {
     #[test]
     fn box_quad_centered_vertically() {
         let q = box_to_ndc_quad(
-            0.0, 0.0, 1.0, 1.0, 100, 50, 1920, 1080,
+            0.0, 0.0, 1.0, 1.0, 100, 50, 0, 1920, 1080,
             HAlign::Left, VAlign::Middle,
         );
         // 50px tall in 1080 viewport → NDC h = 50/1080*2 = 0.09259
@@ -7719,7 +7740,7 @@ mod tests {
         // so placed = 1000x500. Top-left at box origin.
         let q = box_to_ndc_quad(
             0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
-            4000, 2000, 1920, 1080,
+            4000, 2000, 0, 1920, 1080,
             HAlign::Left, VAlign::Top,
         );
         // Placed pixel rect: (0, 0) → (1000, 500).
@@ -7741,7 +7762,7 @@ mod tests {
         // scale = 0.333. Placed = 1000 x 33.3.
         let q = box_to_ndc_quad(
             0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
-            3000, 100, 1920, 1080,
+            3000, 100, 0, 1920, 1080,
             HAlign::Left, VAlign::Top,
         );
         let placed_h = 100.0 / 3.0;
@@ -7761,7 +7782,7 @@ mod tests {
         //                  y-offset = (1000-500)/2 = 250.
         let q = box_to_ndc_quad(
             0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
-            4000, 2000, 1920, 1080,
+            4000, 2000, 0, 1920, 1080,
             HAlign::Center, VAlign::Middle,
         );
         // x: placed fills box → -1 .. (1000/1920*2-1)
@@ -8077,31 +8098,40 @@ mod tests {
             font_size_pct: None,
         };
         // Box pixel size = 0.5 * 1920 = 960 wide, 0.5 * 1080 =
-        // 540 tall. Bitmap 1920x1080 is larger in both dims; the
-        // scale-down-to-fit branch applies. With bm 1920x1080 in
-        // 960x540 box, the binding dim is the smaller s_w=0.5 vs
-        // s_h=0.5 (equal) -> placed_w = 1920 * 0.5 = 960 = box
-        // width, placed_h = 1080 * 0.5 = 540 = box height.
-        // Identity motion: rect == box.
+        // 540 tall. Bitmap is 1922x1082 (ink 1920x1080 + 1-px pad
+        // on each side per layout_text_to_alpha). With ink dims
+        // 1920x1080 in 960x540 box, the binding dim is s_w=0.5 vs
+        // s_h=0.5 (equal) -> ink placed = 960x540 = box; the
+        // 1-px pad rows scale to ~0.5 canvas-px and sit just
+        // OUTSIDE the box (alpha=0, invisible). Identity motion:
+        // ink rect == box.
         let rect = compute_layer_uv_rect_logic(
             &inputs,
             MotionKind::Static,
             MotionState::IDENTITY,
-            1920, 1080, 1920, 1080,
+            1922, 1082, 1920, 1080,
         );
-        // Placed rect must NOT exceed box bounds in UV: box_x =
-        // 0.25 -> uv_l = 0.25; box_x+box_w = 0.75 -> uv_r = 0.75.
-        // box_y = 0.25 (top-down) -> uv_t = 0.75 (UV is bottom-
-        // up); box_y+box_h = 0.75 -> uv_b = 0.25.
-        assert!(rect[0] >= 0.25 - 1e-4, "uv_l outside box: {}", rect[0]);
-        assert!(rect[2] <= 0.75 + 1e-4, "uv_r outside box: {}", rect[2]);
-        assert!(rect[1] >= 0.25 - 1e-4, "uv_b outside box: {}", rect[1]);
-        assert!(rect[3] <= 0.75 + 1e-4, "uv_t outside box: {}", rect[3]);
-        // Equal-aspect-ratio scale-down -> placed rect IS the box.
-        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
-        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
-        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
-        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
+        // INK rect must match box bounds in UV: box_x = 0.25 ->
+        // uv_l_ink = 0.25; box_x+box_w = 0.75 -> uv_r_ink = 0.75.
+        // box_y = 0.25 (top-down) -> uv_t_ink = 0.75 (UV is bottom-
+        // up); box_y+box_h = 0.75 -> uv_b_ink = 0.25.
+        //
+        // Phase 3j 2026-05-15: the full quad (pad-inclusive) extends
+        // 1 px * scale OUTSIDE the box on each side, since
+        // box_to_ndc_quad now scales based on INK dims (bm - 2*pad)
+        // but places the full bitmap. With pad=1, scale=0.5, mode_w=
+        // 1920, the per-edge UV overshoot is 1*0.5/1920 ≈ 0.00026.
+        // Subtract that to recover the ink edges.
+        let pad_overshoot_x = 1.0 * 0.5 / 1920.0;
+        let pad_overshoot_y = 1.0 * 0.5 / 1080.0;
+        let uv_l_ink = rect[0] + pad_overshoot_x;
+        let uv_b_ink = rect[1] + pad_overshoot_y;
+        let uv_r_ink = rect[2] - pad_overshoot_x;
+        let uv_t_ink = rect[3] - pad_overshoot_y;
+        assert!((uv_l_ink - 0.25).abs() < 1e-4, "ink uv_l = {}", uv_l_ink);
+        assert!((uv_r_ink - 0.75).abs() < 1e-4, "ink uv_r = {}", uv_r_ink);
+        assert!((uv_b_ink - 0.25).abs() < 1e-4, "ink uv_b = {}", uv_b_ink);
+        assert!((uv_t_ink - 0.75).abs() < 1e-4, "ink uv_t = {}", uv_t_ink);
     }
 
     #[test]
