@@ -246,6 +246,33 @@ run mkdir -p "$(dirname "$DNSMASQ_DST")"
 # on every install.sh run is fine and even desirable (picks up changes).
 run cp "${OPT_DIR}/system/dnsmasq.conf" "$DNSMASQ_DST"
 
+# --- 5.5. Install vendored trixie packages ----------------------------------
+#
+# Stock Pi OS Lite arm64 trixie does NOT ship hostapd or iptables, but
+# the iptables + hostapd sections below assume both are on PATH. We
+# bundle .debs for both (+ transitive dep closure) at build time via
+# build_sd_bundle.sh's section 3b, and dpkg-install them here on first
+# boot. This preserves the factory-fresh-offline promise — no apt + no
+# network needed at first boot.
+#
+# /opt/openmarquee/debs/ may be absent in dev-redeploy bundles (where
+# the dev Pi already has the packages installed by a prior install.sh
+# run); skip silently in that case.
+say "Install vendored trixie packages"
+DEBS_DIR="${OPT_DIR}/debs"
+if [ -d "$DEBS_DIR" ] && [ -n "$(ls -A "$DEBS_DIR"/*.deb 2>/dev/null)" ]; then
+    say "  found vendored .debs at $DEBS_DIR — installing"
+    # dpkg -i resolves install order when all .debs are passed at once.
+    # Already-installed packages at same-or-newer version are silently
+    # skipped (idempotent on re-run). Glob expansion avoids hardcoding
+    # filenames; future closure additions don't need this step touched.
+    # The shell glob is intentional: $DEBS_DIR/*.deb expands to a list
+    # of individual paths, which dpkg accepts as positional args.
+    run dpkg -i "$DEBS_DIR"/*.deb
+else
+    say "  no vendored .debs at $DEBS_DIR — assuming hostapd + iptables already installed (dev-redeploy)"
+fi
+
 # --- 6. iptables redirect rules ---------------------------------------------
 
 say "Apply iptables captive-portal redirect"
@@ -348,14 +375,18 @@ fi
 
 say "Reload systemd + enable units"
 run systemctl daemon-reload
-# Pi OS Lite trixie ships hostapd.service MASKED to prevent accidental
-# AP-on-boot on images without an AP plan. Unmask before enable so
-# openmarquee-ap0.service's `Before=hostapd.service` ordering actually
-# pulls hostapd up at boot. dnsmasq.service ships unmasked-but-disabled;
-# enabling makes the captive-portal DHCP+DNS reach the boot critical
-# path. Both unmasks are idempotent (no-op on already-unmasked units).
-# Task #99 surfaced this gap (2026-05-14).
-run systemctl unmask hostapd.service dnsmasq.service
+# Pi OS Lite trixie stock image doesn't ship hostapd or iptables at
+# all; we install them via vendored .debs at step 5.5 above. After
+# dpkg-install, hostapd.service may land in a masked state (Debian's
+# default for the dual-mode wifi-stack packages); unmask before enable
+# so openmarquee-ap0.service's `Before=hostapd.service` ordering
+# actually pulls hostapd up at boot. dnsmasq.service ships unmasked-
+# but-disabled; enabling makes the captive-portal DHCP+DNS reach the
+# boot critical path. Both unmasks are idempotent (no-op on already-
+# unmasked units). `|| true` is defense-in-depth: if a future Debian
+# image leaves these unmasked, the no-op unmask shouldn't fail-stop
+# the install under set -e.
+run systemctl unmask hostapd.service dnsmasq.service || true
 run systemctl enable openmarquee-backend.service \
                     openmarquee-ap0.service \
                     hostapd.service \
