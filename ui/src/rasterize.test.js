@@ -105,6 +105,39 @@ describe("applyBrightnessGamma", () => {
         expect(() => applyBrightnessGamma(canvas, 1.0, 2.2)).not.toThrow();
     });
 
+    // -- Schema-default pin: brightness=0.8, gamma=2.2 (the deployed
+    //    HDMI default per settings.py:150-162). This is the
+    //    operator-visible default that the inline preview now
+    //    matches end-to-end (parity-audit #5 brightness-plumbing
+    //    follow-up to 8ef2e7f).
+    it("at schema defaults (brightness=0.8, gamma=2.2): white → ~232 (not 255)", () => {
+        const pixels = new Uint8ClampedArray([255, 255, 255, 255]);
+        const canvas = makeCanvas(1, 1, pixels);
+        applyBrightnessGamma(canvas, 0.8, 2.2);
+        // pow(clamp(1.0 * 0.8, 0, 1), 1/2.2) = pow(0.8, 0.4545)
+        //   ≈ 0.9036 → round(230.4) = 230. Allow ±2 LSB slack for
+        // float64-vs-float32 + rounding direction.
+        expect(canvas._pixels[0]).toBeGreaterThanOrEqual(228);
+        expect(canvas._pixels[0]).toBeLessThanOrEqual(232);
+        expect(canvas._pixels[0]).toBeLessThan(255); // not saturated.
+        expect(canvas._pixels[3]).toBe(255);
+    });
+
+    it("at schema defaults (brightness=0.8, gamma=2.2): mid-gray pins the curve", () => {
+        const pixels = new Uint8ClampedArray([128, 128, 128, 255]);
+        const canvas = makeCanvas(1, 1, pixels);
+        applyBrightnessGamma(canvas, 0.8, 2.2);
+        // pow(clamp((128/255)*0.8, 0, 1), 1/2.2)
+        //   = pow(0.4016, 0.4545) ≈ 0.6611 → round(168.6) = 169.
+        // Range allows for float rounding.
+        expect(canvas._pixels[0]).toBeGreaterThanOrEqual(167);
+        expect(canvas._pixels[0]).toBeLessThanOrEqual(170);
+        // Confirms brightness was applied BEFORE gamma (the math order
+        // that matches Rust): if we'd gamma'd first, mid-gray would
+        // lighten to ~186 then dim to ~149 — the opposite curve.
+        expect(canvas._pixels[0]).toBeGreaterThan(128); // gamma still lifts.
+    });
+
     it("clamps gamma to avoid divide-by-zero (matches Rust max(g, 0.001))", () => {
         // gamma=0 would give 1/0=Infinity exponent. Rust clamps to
         // 0.001; this mirror should too.

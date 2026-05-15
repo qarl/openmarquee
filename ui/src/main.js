@@ -87,8 +87,15 @@ async function resolvePanelDims() {
         const settings = await getSettings();
         const dims = effectiveDisplayDims(settings);
         const outputMode = settings.output_mode || "hdmi";
+        // Schema default is 80 (settings.py:150-155). Coerce to int +
+        // clamp to [0, 100] defensively so a malformed response can't
+        // wash out the preview gamma pass.
+        const brightnessRaw = Number(settings.brightness);
+        const brightness = Number.isFinite(brightnessRaw)
+            ? Math.max(0, Math.min(100, Math.round(brightnessRaw)))
+            : 80;
         if (dims !== null) {
-            return { width: dims.width, height: dims.height, outputMode };
+            return { width: dims.width, height: dims.height, outputMode, brightness };
         }
     } catch {
         // Fall through to fallback — editor still mounts even if the
@@ -98,6 +105,7 @@ async function resolvePanelDims() {
         width: FALLBACK_WIDTH,
         height: FALLBACK_HEIGHT,
         outputMode: "hdmi",
+        brightness: 80,
     };
 }
 
@@ -365,7 +373,7 @@ async function boot() {
      * Mount (or re-mount) every panel that depends on display dims.
      * Called once at boot + again whenever Settings emits a change.
      */
-    function mountDimensionedPanels({ width, height, outputMode }) {
+    function mountDimensionedPanels({ width, height, outputMode, brightness }) {
         // CSS variable picked up by every tile thumbnail + preview
         // wrapper (.pallet-tile-thumb, .track-block-thumb-wrap,
         // .slide-browser-tile-thumb) so the thumbs match the device's
@@ -415,11 +423,13 @@ async function boot() {
                 width,
                 height,
                 outputMode,
+                brightness,
                 mount: (slot, dims) => {
                     inlinePreviewHandle = mountInlinePreview(slot, {
                         width: dims.width,
                         height: dims.height,
                         outputMode: dims.outputMode,
+                        brightness: dims.brightness,
                         fetchPlaylist: () =>
                             fetchResolvedPlaylist(currentPlaylistId),
                     });

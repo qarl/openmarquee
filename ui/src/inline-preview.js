@@ -72,14 +72,21 @@ const ANIMATED_TRANSITIONS = new Set([
 // HDMI + composite outputs apply gamma=2.2 (sRGB display encoding); the
 // LED-driving output modes (hub75 + ws281x) have their own per-pixel
 // brightness pipelines elsewhere and skip the canvas gamma pass here.
-// brightness is held at 1.0 (the schema default is 80, but the editor
-// has no plumbing for per-sign brightness yet — follow-up).
+// Brightness is plumbed from sign settings (settings.py:150) via the
+// `brightness` option on mountInlinePreview — see the 2026-05-14
+// brightness-plumbing follow-up to 8ef2e7f.
 const PREVIEW_GAMMA_BY_OUTPUT_MODE = {
     hdmi: 2.2,
     composite: 2.2,
     hub75: 1.0,
     ws281x: 1.0,
 };
+
+// Output modes that participate in the canvas brightness scaling.
+// LED outputs do their own brightness in hardware (HUB75 scan rate,
+// WS281x per-pixel) so we leave brightness at identity (1.0) and let
+// those skins simulate their own dimming downstream.
+const PREVIEW_APPLIES_BRIGHTNESS = new Set(["hdmi", "composite"]);
 
 function pickSkin(outputMode) {
     if (outputMode === "hub75") return "hub75";
@@ -101,7 +108,17 @@ function pickSkin(outputMode) {
  * @returns {{ refresh: () => Promise<void>, stop: () => void }}
  */
 export function mountInlinePreview(container, options) {
-    const { width, height, outputMode = "hdmi", fetchPlaylist } = options;
+    const {
+        width,
+        height,
+        outputMode = "hdmi",
+        // Schema default at settings.py:150 — 0..100 int. Caller (main.js
+        // resolvePanelDims) already clamps + coerces, so we just guard
+        // null/undefined here and divide to the [0, 1] form drawCanvas
+        // expects.
+        brightness = 80,
+        fetchPlaylist,
+    } = options;
     container.innerHTML = TEMPLATE;
 
     const stage = container.querySelector(".inline-preview-stage");
@@ -121,6 +138,13 @@ export function mountInlinePreview(container, options) {
     stage.style.aspectRatio = `${width} / ${height}`;
     const skin = pickSkin(outputMode);
     const previewGamma = PREVIEW_GAMMA_BY_OUTPUT_MODE[outputMode] ?? 1.0;
+    // Schema brightness is [0, 100]; the gamma pass wants [0, 1]
+    // (matches Rust's `brightness as f32 / 100.0` at hdmi.rs:2490).
+    // Only HDMI/composite scale the canvas; LED outputs keep identity
+    // so the skin renderer downstream can apply its own dimming.
+    const previewBrightness = PREVIEW_APPLIES_BRIGHTNESS.has(outputMode)
+        ? Math.max(0, Math.min(1, brightness / 100))
+        : 1.0;
 
     // Playlist → ranged timeline. Each entry is { item, startSec, endSec,
     // transition, transition_ms }.
@@ -825,7 +849,7 @@ export function mountInlinePreview(container, options) {
         const state = stateFromItem(item, resolvedBg);
         drawCanvas(sampler, state, {
             elapsed_s,
-            brightness: 1.0,
+            brightness: previewBrightness,
             gamma: previewGamma,
         });
 
