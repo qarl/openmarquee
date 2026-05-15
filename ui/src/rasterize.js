@@ -14,6 +14,7 @@ import { paintPatternOnCanvas } from "./bg-system.js";
 import { paintLayerWithMotion } from "./canvas-motion.js";
 import { cssFontFamily, FONT_WEIGHT_BY_VALUE } from "./font-picker.js";
 import { canvasToBase64 } from "./image-upload.js";
+import { isFontRegistered, isWasmReady, rasterizeText } from "./wasm-renderer.js";
 
 const RASTERIZE_W = 3840;
 const RASTERIZE_H = 2160;
@@ -24,6 +25,58 @@ const RASTERIZE_H = 2160;
 // class canvas modes, parity with backend modulo anti-aliasing).
 // Keys MUST stay in sync with TextLayer.blend's Literal in
 // content/__init__.py and _BLEND_MODES in rendering/blend.py.
+// Parse a CSS color string to [r, g, b, a] (0-255 each). Supports
+// the formats paintLayer actually receives from the editor:
+// `#RGB`, `#RRGGBB`, `#RRGGBBAA`, `rgb(r, g, b)`, `rgba(r, g, b, a)`.
+// Anything unrecognized returns null so the caller can fall back to
+// ctx.fillText (which has its own CSS-color resolver). Hot-path
+// safe: no regex backtracking, no allocations on the common hex case.
+//
+// Phase 1b parity follow-up: the WASM rasterizer takes 4 u8s for
+// color; this fn produces them from the layer's `text_color` string.
+function parseCssColorRgba(css) {
+    if (typeof css !== "string") return null;
+    const s = css.trim();
+    if (s.startsWith("#")) {
+        const hex = s.slice(1);
+        if (hex.length === 3) {
+            const r = parseInt(hex[0] + hex[0], 16);
+            const g = parseInt(hex[1] + hex[1], 16);
+            const b = parseInt(hex[2] + hex[2], 16);
+            if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return null;
+            return [r, g, b, 255];
+        }
+        if (hex.length === 6) {
+            const r = parseInt(hex.slice(0, 2), 16);
+            const g = parseInt(hex.slice(2, 4), 16);
+            const b = parseInt(hex.slice(4, 6), 16);
+            if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return null;
+            return [r, g, b, 255];
+        }
+        if (hex.length === 8) {
+            const r = parseInt(hex.slice(0, 2), 16);
+            const g = parseInt(hex.slice(2, 4), 16);
+            const b = parseInt(hex.slice(4, 6), 16);
+            const a = parseInt(hex.slice(6, 8), 16);
+            if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b) || Number.isNaN(a)) {
+                return null;
+            }
+            return [r, g, b, a];
+        }
+        return null;
+    }
+    const rgbMatch = s.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?\s*\)$/);
+    if (rgbMatch) {
+        const r = parseInt(rgbMatch[1], 10);
+        const g = parseInt(rgbMatch[2], 10);
+        const b = parseInt(rgbMatch[3], 10);
+        const aFloat = rgbMatch[4] !== undefined ? parseFloat(rgbMatch[4]) : 1.0;
+        const a = Math.max(0, Math.min(255, Math.round(aFloat * 255)));
+        return [r, g, b, a];
+    }
+    return null;
+}
+
 const BLEND_TO_CANVAS = {
     normal: "source-over",
     multiply: "multiply",
@@ -177,7 +230,57 @@ function paintLayer(ctx, canvas, layer) {
     // so lines stay inside. fillText's maxWidth handles horizontal
     // overflow as before — both axes squish independently.
     const yScale = totalInkExtent > boxH ? boxH / totalInkExtent : 1;
-    if (yScale === 1) {
+    // WASM-rasterize path: closes the per-engine glyph AA + per-glyph
+    // kerning divergence (Phase 1b 2026-05-14). Gated on (a) the
+    // wasm-renderer module initialized, (b) the font has been
+    // registered (paintLayer falls back to fillText for fonts not
+    // yet in the registry — incremental per-font roll-out), (c) no
+    // yScale squish active (putImageData ignores the canvas
+    // transform, so the squish branch keeps fillText). The
+    // gated-fallback design keeps the editor working at every step
+    // of the parity arc.
+    const colorRgba = parseCssColorRgba(textColor);
+    const useWasm = (
+        yScale === 1
+        && colorRgba !== null
+        && isWasmReady()
+        && isFontRegistered(fontFamily)
+    );
+
+    if (useWasm) {
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line) continue;
+            const baselineY = firstBaselineY + i * lineHeight;
+            const result = rasterizeText(line, fontFamily, fontSizePx, colorRgba);
+            if (!result) continue; // empty / whitespace-only line.
+            // Horizontal-overflow handling: fillText with `maxWidth`
+            // SQUISHES the rendered text horizontally to fit; mirror
+            // that by drawImage'ing the bitmap into a target width of
+            // min(natural, boxW). Without this, long single words
+            // (wrapTextToWidth leaves them intact by design) would
+            // extend past the box edge. Target-width derived first,
+            // then textAlign-derived drawX so the squished line stays
+            // anchored to the configured edge.
+            const targetW = Math.min(result.width, boxW);
+            let drawX;
+            if (textAlign === "left") drawX = boxX;
+            else if (textAlign === "right") drawX = boxX + boxW - targetW;
+            else drawX = boxX + (boxW - targetW) / 2;
+            // drawImage performs source-over composition (vs
+            // putImageData which OVERWRITES bg pixels in transparent
+            // bitmap regions — Phase 1b found this as 17K black-pixel
+            // gaps in the Boot fixture's badge area). Position by
+            // baseline: y = baselineY - bitmap.ascent. Round to whole
+            // pixels so the bitmap snaps to the canvas grid.
+            const drawY = Math.round(baselineY - result.ascent);
+            ctx.drawImage(
+                result.image,
+                0, 0, result.width, result.height,
+                Math.round(drawX), drawY, targetW, result.height,
+            );
+        }
+    } else if (yScale === 1) {
         for (let i = 0; i < lines.length; i++) {
             ctx.fillText(lines[i], anchorX, firstBaselineY + i * lineHeight, maxWidth);
         }
@@ -189,7 +292,9 @@ function paintLayer(ctx, canvas, layer) {
         // line's y-offset is from the centered origin. fillText's
         // maxWidth is in untransformed coords, so it still clamps
         // horizontal width correctly. Same baseline math, just
-        // recentered around the local origin.
+        // recentered around the local origin. The WASM path can't
+        // participate here because putImageData ignores canvas
+        // transforms; squish stays on fillText.
         const firstBaselineLocal = -totalInkExtent / 2 + maxAscent;
         for (let i = 0; i < lines.length; i++) {
             ctx.fillText(lines[i], 0, firstBaselineLocal + i * lineHeight, maxWidth);

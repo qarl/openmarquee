@@ -38,9 +38,25 @@ import init, {
     rasterize_text_named as wasmRasterizeTextNamed,
 } from "../../renderer-wasm/pkg/renderer_wasm.js";
 
-// Inlined as Uint8Array via esbuild's --loader:.wasm=binary. The
-// import-by-extension hook avoids any runtime fetch for the wasm.
-import wasmBytes from "../../renderer-wasm/pkg/renderer_wasm_bg.wasm";
+// Runtime fetch of the .wasm artifact (NOT bundle-inlined).
+//
+// Original Phase 1a design tried esbuild's --loader:.wasm=binary to
+// inline the bytes as base64 in main.js. That works for bundled code
+// (main.js / welcome.js) but BREAKS the parity-harness.html path —
+// the harness loads ESM modules directly via the static file server,
+// and the browser rejects .wasm files as ES module imports under
+// strict MIME-type checking (HTML spec). Fetching at runtime works
+// for both: bundled main.js + unbundled parity-harness.html share
+// the same code path. Dev: served via SimpleHTTPRequestHandler at
+// REPO root. Production: copied to ui/dist/ by build script.
+//
+// Cost: one extra HTTP request at app boot (~100 KiB raw / 50 KiB
+// gzipped) instead of inlining into the bundle. With HTTP/2 + the
+// browser's HTTP cache, the steady-state cost is zero.
+const WASM_URL = new URL(
+    "../../renderer-wasm/pkg/renderer_wasm_bg.wasm",
+    import.meta.url,
+);
 
 let initialized = false;
 let initPromise = null;
@@ -56,7 +72,7 @@ const registeredFonts = new Set();
 export function initWasmRenderer() {
     if (initialized) return Promise.resolve();
     if (initPromise) return initPromise;
-    initPromise = init({ module_or_path: wasmBytes }).then(() => {
+    initPromise = init({ module_or_path: WASM_URL }).then(() => {
         initialized = true;
     });
     return initPromise;
@@ -148,22 +164,28 @@ function cacheSet(key, value) {
 
 /**
  * Rasterize `text` at `sizePx` in `fontName` with `colorRgba`.
- * Returns an ImageData ready for `ctx.putImageData(image, x, y)` plus
- * the bitmap's internal baseline offset (ascent in pixels) so the
- * caller can position by baseline rather than top-left.
+ * Returns an OffscreenCanvas-or-HTMLCanvasElement ready for
+ * `ctx.drawImage(canvas, x, y)`. The canvas internally holds the
+ * straight-alpha RGBA bitmap from the wasm rasterizer; drawImage
+ * performs proper source-over compositing onto the destination
+ * canvas (whereas `putImageData` would REPLACE the bg pixels with
+ * the bitmap's alpha=0 transparency in non-inked regions, blowing
+ * away the slide background — the Phase 1b boot_sxs surfaced this
+ * as 17,376 black pixels in the badge region).
  *
  * Returns `null` on (a) empty text, (b) all-whitespace text, (c)
  * font not registered.
  *
- * Color is `[r, g, b, a]` as 0-255 ints. Output ImageData has
- * STRAIGHT-alpha RGBA — putImageData on a Canvas2D context performs
- * source-over compositing automatically.
+ * Color is `[r, g, b, a]` as 0-255 ints. The wasm rasterizer emits
+ * STRAIGHT-alpha RGBA: text-color where coverage > 0, transparent
+ * elsewhere. drawImage's default source-over composition correctly
+ * preserves the destination's bg in transparent regions.
  *
  * @param {string} text
  * @param {string} fontName
  * @param {number} sizePx
  * @param {[number, number, number, number]} colorRgba
- * @returns {{ image: ImageData, width: number, height: number, ascent: number } | null}
+ * @returns {{ image: OffscreenCanvas | HTMLCanvasElement, width: number, height: number, ascent: number } | null}
  */
 export function rasterizeText(text, fontName, sizePx, colorRgba) {
     if (!initialized) return null;
@@ -186,20 +208,40 @@ export function rasterizeText(text, fontName, sizePx, colorRgba) {
     const height = dv.getUint32(4, true);
     const ascent = dv.getUint32(8, true);
     if (width === 0 || height === 0) return null;
+    // Chromium's Canvas2D backing-store cap is ~16384 px per side
+    // and ~268M total pixels; OffscreenCanvas throws synchronously
+    // past that. fontdue can emit arbitrarily wide bitmaps for long
+    // single-line text at high font_size_px. Guard with a generous
+    // 8192-per-side cap so paintLayer's null-result branch falls
+    // back to ctx.fillText for the rare oversized line.
+    if (width > 8192 || height > 8192) return null;
 
-    // ImageData wants a Uint8ClampedArray view over the pixel slice
-    // (NOT a copy — wasm-bindgen returns the Vec<u8> as a fresh
-    // Uint8Array, so this clamped view shares its backing buffer).
+    // Copy pixel bytes into an owned ImageData (the wasm Vec<u8> can
+    // be GC'd after this scope). The ImageData is then drawn into a
+    // dedicated offscreen canvas so drawImage can blit it with
+    // source-over composition.
     const pixelStart = buf.byteOffset + 12;
     const pixelLen = width * height * 4;
-    const pixels = new Uint8ClampedArray(buf.buffer, pixelStart, pixelLen);
-    // ImageData constructor copies the underlying data in some
-    // browsers; doing the copy explicitly is safer + makes the
-    // backing Uint8Array eligible for GC immediately.
-    const owned = new Uint8ClampedArray(pixels);
-    const image = new ImageData(owned, width, height);
+    const owned = new Uint8ClampedArray(
+        new Uint8ClampedArray(buf.buffer, pixelStart, pixelLen),
+    );
+    const imageData = new ImageData(owned, width, height);
 
-    const result = { image, width, height, ascent };
+    // Use OffscreenCanvas where available (most modern browsers + the
+    // Playwright Chromium the parity harness drives); fall back to a
+    // detached HTMLCanvasElement otherwise. Both expose getContext +
+    // putImageData and both work as drawImage sources.
+    let canvas;
+    if (typeof OffscreenCanvas === "function") {
+        canvas = new OffscreenCanvas(width, height);
+    } else {
+        canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+    }
+    canvas.getContext("2d").putImageData(imageData, 0, 0);
+
+    const result = { image: canvas, width, height, ascent };
     cacheSet(key, result);
     return result;
 }

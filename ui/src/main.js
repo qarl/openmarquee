@@ -65,6 +65,7 @@ import { mountSettings } from "./settings.js";
 import { mountSlidesShell } from "./slides.js";
 import { mountStreamPanel } from "./stream-panel.js";
 import { mountVideoUploader } from "./video-upload.js";
+import { initWasmRenderer, registerFont } from "./wasm-renderer.js";
 
 // Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
 // §3.4 defaults so the editor at least renders something usable in an
@@ -495,6 +496,46 @@ async function boot() {
             onSave: onSaveWithRefresh(saveVideo),
             onSaveExisting: onSaveWithRefresh(updateVideo),
         });
+    }
+
+    // Phase 1b parity fix (2026-05-14): init the fontdue-WASM
+    // rasterizer + register every editor-selectable font BEFORE the
+    // first mountDimensionedPanels call so paintLayer's wasm path is
+    // ready on the first frame. Names must match the @font-face
+    // family names in styles.css verbatim; paintLayer looks them up
+    // via `isFontRegistered(fontFamily)`. Any font NOT in this list
+    // falls back to ctx.fillText with a divergence-vs-Rust warning
+    // in the parity gate.
+    const WASM_FONTS = [
+        ["Inter",                "/fonts/inter.ttf"],
+        ["Oswald",               "/fonts/oswald.ttf"],
+        ["Bebas Neue",           "/fonts/bebas-neue.ttf"],
+        ["Roboto Slab",          "/fonts/roboto-slab.ttf"],
+        ["Caveat Brush",         "/fonts/caveat-brush.ttf"],
+        ["Permanent Marker",     "/fonts/permanent-marker.ttf"],
+        ["Cinzel",               "/fonts/cinzel.ttf"],
+        ["UnifrakturCook",       "/fonts/unifrakturcook.ttf"],
+        ["Rye",                  "/fonts/rye.ttf"],
+        ["Pacifico",             "/fonts/pacifico.ttf"],
+        ["Sedgwick Ave Display", "/fonts/sedgwick-ave-display.ttf"],
+        ["Bowlby One SC",        "/fonts/bowlby-one-sc.ttf"],
+        ["Anton",                "/fonts/anton.ttf"],
+        ["Archivo Black",        "/fonts/archivo-black.ttf"],
+        ["Alfa Slab One",        "/fonts/alfa-slab-one.ttf"],
+        ["Playfair Display",     "/fonts/playfair-display.ttf"],
+        ["DM Serif Display",     "/fonts/dm-serif-display.ttf"],
+        ["VT323",                "/fonts/vt323.ttf"],
+        ["JetBrains Mono",       "/fonts/jetbrains-mono.ttf"],
+        ["Space Mono",           "/fonts/space-mono.ttf"],
+    ];
+    try {
+        await initWasmRenderer();
+        await Promise.all(WASM_FONTS.map(([n, u]) => registerFont(n, u)));
+    } catch (err) {
+        // Don't block app boot on WASM failure — paintLayer falls
+        // back to ctx.fillText when isFontRegistered returns false.
+        // Log loud so a regression surfaces in dev console.
+        console.error("[main] wasm-renderer init failed; falling back to fillText:", err);
     }
 
     // Initial mount.

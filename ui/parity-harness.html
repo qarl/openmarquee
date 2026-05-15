@@ -23,6 +23,43 @@
         // diffs the result against renderer/tests/golden/<name>.png.
         import { drawCanvas } from "./src/rasterize.js";
         import { stateFromItem } from "./src/state-from-item.js";
+        import { initWasmRenderer, registerFont } from "./src/wasm-renderer.js";
+
+        // Phase 1b parity fix 2026-05-14: paintLayer's wasm path
+        // wants the rasterizer initialized + every CSS font registered
+        // by the same family name before the first capture. Keep this
+        // table in sync with the @font-face rules in styles.css —
+        // registerFont's `name` is the lookup key paintLayer hits via
+        // `isFontRegistered(fontFamily)`, so the names must match the
+        // CSS family names verbatim.
+        const __WASM_FONTS = [
+            ["Inter",                "./fonts/inter.ttf"],
+            ["Oswald",               "./fonts/oswald.ttf"],
+            ["Bebas Neue",           "./fonts/bebas-neue.ttf"],
+            ["Roboto Slab",          "./fonts/roboto-slab.ttf"],
+            ["Caveat Brush",         "./fonts/caveat-brush.ttf"],
+            ["Permanent Marker",     "./fonts/permanent-marker.ttf"],
+            ["Cinzel",               "./fonts/cinzel.ttf"],
+            ["UnifrakturCook",       "./fonts/unifrakturcook.ttf"],
+            ["Rye",                  "./fonts/rye.ttf"],
+            ["Pacifico",             "./fonts/pacifico.ttf"],
+            ["Sedgwick Ave Display", "./fonts/sedgwick-ave-display.ttf"],
+            ["Bowlby One SC",        "./fonts/bowlby-one-sc.ttf"],
+            ["Anton",                "./fonts/anton.ttf"],
+            ["Archivo Black",        "./fonts/archivo-black.ttf"],
+            ["Alfa Slab One",        "./fonts/alfa-slab-one.ttf"],
+            ["Playfair Display",     "./fonts/playfair-display.ttf"],
+            ["DM Serif Display",     "./fonts/dm-serif-display.ttf"],
+            ["VT323",                "./fonts/vt323.ttf"],
+            ["JetBrains Mono",       "./fonts/jetbrains-mono.ttf"],
+            ["Space Mono",           "./fonts/space-mono.ttf"],
+        ];
+        const __wasmReady = (async () => {
+            await initWasmRenderer();
+            await Promise.all(__WASM_FONTS.map(([n, u]) => registerFont(n, u)));
+        })().catch((err) => {
+            console.warn("[parity-harness] wasm init failed; fillText fallback:", err);
+        });
 
         const canvas = document.getElementById("parity-canvas");
         const status = document.getElementById("parity-status");
@@ -245,6 +282,7 @@
 
         window.__parityCapture = async function (params) {
             await window.__parityFontsReady;
+            await __wasmReady;
             const { kind } = params;
             if (kind === "single") {
                 captureSingle(params.item, params.tick || 0);

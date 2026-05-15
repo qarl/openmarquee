@@ -93,13 +93,15 @@ def load_item(uuid: str) -> dict:
     return blob["item"] if "item" in blob else blob
 
 
-def _start_static_server(ui_root: Path) -> tuple[socketserver.TCPServer, int]:
+def _start_static_server(doc_root: Path) -> tuple[socketserver.TCPServer, int]:
     """ES-module imports from file:// hit CORS in headless Chromium.
-    Serve ui/ over a localhost HTTP server on a free port so the
-    harness page can resolve `./src/rasterize.js` natively."""
+    Serve REPO root over a localhost HTTP server on a free port so the
+    harness page can resolve `./src/rasterize.js` AND the wasm-renderer
+    module's `../../renderer-wasm/pkg/renderer_wasm.js` import (which
+    escapes ui/ into REPO). Mirrors boot_sxs.py's docroot choice."""
     handler = functools.partial(
         http.server.SimpleHTTPRequestHandler,
-        directory=str(ui_root),
+        directory=str(doc_root),
     )
     # Bind to 0 to grab any free port.
     server = socketserver.TCPServer(("127.0.0.1", 0), handler, bind_and_activate=True)
@@ -112,7 +114,7 @@ def _start_static_server(ui_root: Path) -> tuple[socketserver.TCPServer, int]:
 async def capture_browser(playwright, fixtures, capture_dir: Path):
     """Launch Chromium, navigate to parity-harness.html, capture each
     fixture's browser PNG into capture_dir."""
-    server, port = _start_static_server(HARNESS_HTML.parent)
+    server, port = _start_static_server(REPO)
     try:
         return await _capture_with_server(playwright, fixtures, capture_dir, port)
     finally:
@@ -132,7 +134,7 @@ async def _capture_with_server(playwright, fixtures, capture_dir: Path, port: in
         "pageerror",
         lambda err: print(f"  [browser:error] {err}", file=sys.stderr),
     )
-    url = f"http://127.0.0.1:{port}/parity-harness.html"
+    url = f"http://127.0.0.1:{port}/ui/parity-harness.html"
     await page.goto(url)
     # The harness sets innerHTML on #parity-status when ready; wait for
     # that signal so we know the module-import + font-warmup completed.
