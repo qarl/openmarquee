@@ -2235,16 +2235,26 @@ void main() {
 /// color_a / color_b based on (floor(x/tile) + floor(y/tile)) %
 /// 2. y flipped to match Python's image-coord convention.
 pub const FS_PATTERN_CHECKER: &str = r#"#version 100
+precision highp int;
 precision mediump float;
 uniform vec2 u_viewport;
 uniform float u_tile;
 uniform vec3 u_color_a;
 uniform vec3 u_color_b;
 void main() {
-    vec2 pos = vec2(gl_FragCoord.x, u_viewport.y - gl_FragCoord.y);
-    float gx = floor(pos.x / u_tile);
-    float gy = floor(pos.y / u_tile);
-    float t = mod(gx + gy, 2.0);
+    // Phase 3z Cand E: integer-domain coord reconstruction.
+    // Phase 3z Cand E refinement: int() on vc4 appears to round
+    // (not truncate). Use `viewport_h - y_bot` (no -1) so the
+    // rounded-up y_bot still lands on the correct y_top.
+    int viewport_h = int(u_viewport.y);
+    int y_bot = int(gl_FragCoord.y);
+    int x_int = int(gl_FragCoord.x);
+    int tile_i = int(u_tile + 0.5);
+    int y_top = viewport_h - y_bot;
+    int gx = x_int / tile_i;
+    int gy = y_top / tile_i;
+    int parity = (gx + gy) - ((gx + gy) / 2) * 2;
+    float t = float(parity);
     gl_FragColor = vec4(mix(u_color_a, u_color_b, t), 1.0);
 }
 "#;
@@ -4004,6 +4014,8 @@ mod tests {
         ] {
             assert!(src.starts_with("#version 100\n"), "{name} missing #version 100");
             assert!(src.contains("precision mediump float"), "{name} missing precision");
+            // Phase 3z Cand E: FS_PATTERN_CHECKER may also declare
+            // highp int. Tolerate that.
             assert!(src.contains("u_color_a"), "{name} missing u_color_a");
             assert!(src.contains("u_color_b"), "{name} missing u_color_b");
             assert!(src.contains("u_viewport"), "{name} missing u_viewport");
