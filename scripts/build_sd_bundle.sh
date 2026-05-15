@@ -236,9 +236,21 @@ if [ "$DO_WHEELS" -eq 1 ]; then
     #   manylinux2014_aarch64 (covers the common case)
     #   linux_aarch64 (some packages tag this way too)
     # We request both; pip resolves the union.
+    # Pi OS Lite trixie ships glibc 2.36, so any manylinux tag with
+    # glibc <= 2.36 is compatible. List the modern manylinux variants
+    # explicitly: pip's platform matching is strict (no implicit
+    # backcompat), so packages that only ship newer-tagged wheels
+    # (e.g., argon2-cffi-bindings 25.1.0 ships manylinux_2_26/_2_28
+    # but NOT manylinux2014) would otherwise fail with "no matching
+    # distribution found." manylinux2014 stays in the list to cover
+    # older packages that haven't moved off the legacy tag yet.
     pip download \
         --dest "$ROOT/wheels" \
         --platform manylinux2014_aarch64 \
+        --platform manylinux_2_17_aarch64 \
+        --platform manylinux_2_28_aarch64 \
+        --platform manylinux_2_26_aarch64 \
+        --platform manylinux_2_31_aarch64 \
         --platform linux_aarch64 \
         --python-version "$PYTHON_VERSION" \
         --implementation cp \
