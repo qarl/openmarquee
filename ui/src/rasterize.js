@@ -254,47 +254,66 @@ function paintLayer(ctx, canvas, layer) {
     );
 
     if (useWasm) {
+        // Phase 3c (2026-05-14): when yScale<1, rasterize at the
+        // squished pixel-size so fontdue produces a bitmap that's
+        // already at the canvas pixel-dims. Eliminates the post-
+        // rasterization downscale that Phase 3a relied on, which
+        // diverged from Rust's GL_LINEAR at extreme ratios (font_xxx
+        // fixtures stuck at max_delta=231 + UnifrakturCook +6.90
+        // mean regression).
+        //
+        // effectiveSizePx = fontSizePx * yScale collapses to
+        // fontSizePx when yScale=1, so the non-squish path is
+        // bit-identical to Phase 2/3a. Cache key is text|font|size|
+        // color and includes effectiveSizePx implicitly via the size
+        // slot — different squish ratios cache as separate entries
+        // (LRU 256 entries holds the working set comfortably).
+        //
         // Per-line canvas-Y baseline under optional yScale squish.
         // Centers the line group around boxCenterY exactly as the
-        // fillText squish branch does (ctx.translate(_, boxCenterY)
-        // + ctx.scale(1, yScale) + draw at firstBaselineLocal +
-        // i*lineHeight). For yScale=1 this reduces to the original
-        // firstBaselineY + i*lineHeight formula.
+        // fillText squish branch does. For yScale=1 this reduces
+        // to firstBaselineY + i*lineHeight.
+        const effectiveSizePx = fontSizePx * yScale;
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             if (!line) continue;
             const baselineY = boxCenterY + (firstBaselineLocal + i * lineHeight) * yScale;
-            const result = rasterizeText(line, fontFamily, fontSizePx, colorRgba);
+            const result = rasterizeText(line, fontFamily, effectiveSizePx, colorRgba);
             if (!result) continue; // empty / whitespace-only line.
-            // Horizontal-overflow handling: fillText with `maxWidth`
-            // SQUISHES the rendered text horizontally to fit; mirror
-            // that by drawImage'ing the bitmap into a target width of
-            // min(natural, boxW). Without this, long single words
-            // (wrapTextToWidth leaves them intact by design) would
-            // extend past the box edge. Target-width derived first,
-            // then textAlign-derived drawX so the squished line stays
-            // anchored to the configured edge.
-            const targetW = Math.min(result.width, boxW);
-            // Vertical squish: target height = bitmap natural * yScale.
-            // baseline-relative drawY = baselineY - ascent*yScale so the
-            // glyph's baseline row lands ON the line's baselineY post-
-            // squish. Round to whole pixels so the bitmap snaps to the
-            // canvas grid (preserves the Phase 2 integer-X alignment).
-            const targetH = result.height * yScale;
+            // Horizontal-overflow handling: even at squished font
+            // size, a long single word (wrapTextToWidth leaves them
+            // intact by design) can still exceed boxW. Clamp via
+            // drawImage's 9-arg form ONLY if needed; the common
+            // post-Phase-3c case fits naturally and uses the 3-arg
+            // drawImage with no post-rasterization scaling.
             let drawX;
+            const targetW = Math.min(result.width, boxW);
             if (textAlign === "left") drawX = boxX;
             else if (textAlign === "right") drawX = boxX + boxW - targetW;
             else drawX = boxX + (boxW - targetW) / 2;
-            // drawImage performs source-over composition (vs
-            // putImageData which OVERWRITES bg pixels in transparent
-            // bitmap regions — Phase 1b found this as 17K black-pixel
-            // gaps in the Boot fixture's badge area).
-            const drawY = Math.round(baselineY - result.ascent * yScale);
-            ctx.drawImage(
-                result.image,
-                0, 0, result.width, result.height,
-                Math.round(drawX), drawY, targetW, targetH,
-            );
+            // result.ascent is at the effective (squished) size;
+            // baselineY is at the canvas-Y of the line's baseline.
+            // Subtract directly (no *yScale -- the bitmap already
+            // accounts for the squish). Round to whole pixels so
+            // the bitmap snaps to the canvas grid (preserves Phase 2
+            // integer-X alignment).
+            const drawY = Math.round(baselineY - result.ascent);
+            if (targetW < result.width) {
+                // Horizontal-only squish residual: rare (only when
+                // a single un-wrappable word still exceeds boxW
+                // after fontSize-squish). drawImage 9-arg for the X
+                // axis, natural Y dims.
+                ctx.drawImage(
+                    result.image,
+                    0, 0, result.width, result.height,
+                    Math.round(drawX), drawY, targetW, result.height,
+                );
+            } else {
+                // Common case: bitmap fits, 3-arg drawImage with no
+                // post-rasterization scaling. No bilinear-vs-GL_LINEAR
+                // resample divergence.
+                ctx.drawImage(result.image, Math.round(drawX), drawY);
+            }
         }
     } else if (yScale === 1) {
         for (let i = 0; i < lines.length; i++) {
