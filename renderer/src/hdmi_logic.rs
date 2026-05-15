@@ -3358,15 +3358,21 @@ fn motion_pulse(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) 
     }
 }
 
-/// Sine vertical bob. 1 Hz, amplitude ±1 % at intensity=0 → ±10 %
-/// at intensity=100, ±5.5 % at intensity=50 (close to spec's
-/// "±5 %"). Returns offset_y_norm in box-height units.
+/// Ball-on-floor bounce. 1 Hz, amplitude 1 % at intensity=0 → 10 %
+/// at intensity=100, 5.5 % at intensity=50. Returns offset_y_norm in
+/// box-height units. Uses `abs(sin)` (not plain `sin`) so the rest
+/// position is the FLOOR and the layer rebounds UP-and-back-down
+/// twice per cycle, never going below rest — matches
+/// `backend/openmarquee/motion.py:300` ("abs(sin) for true bouncing",
+/// qarl 2026-05-03). `offset_y_norm` is negated because the renderer
+/// treats +Y as DOWN (see the dy_ndc flip in motion_quad_uv), so
+/// negative offset = UP visually.
 fn motion_bounce(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) -> MotionState {
     let amp = 0.01 + 0.09 * intensity_norm;
     let phase_rad = 2.0 * std::f32::consts::PI
         * ((tick_seconds * speed as f64) as f32 + phase);
     MotionState {
-        offset_y_norm: amp * phase_rad.sin(),
+        offset_y_norm: -amp * phase_rad.sin().abs(),
         ..MotionState::IDENTITY
     }
 }
@@ -7151,8 +7157,48 @@ mod tests {
     #[test]
     fn motion_bounce_peak_at_quarter_period() {
         // 1 Hz, intensity=50 → amp = 0.01 + 0.09*0.5 = 0.055.
+        // abs(sin(π/2)) = 1 → peak = -amp (negative = UP visually).
         let m = compute_motion_state(MotionKind::Bounce, 50, 0.0, 1.0, 0, 0.25);
-        assert!((m.offset_y_norm - 0.055).abs() < 1e-3, "y was {}", m.offset_y_norm);
+        assert!((m.offset_y_norm + 0.055).abs() < 1e-3, "y was {}", m.offset_y_norm);
+    }
+
+    #[test]
+    fn motion_bounce_abs_sin_shape_matches_python() {
+        // Pin the abs(sin) wave shape against motion.py:300. The
+        // signature of abs(sin) vs plain sin is TWO peaks per cycle
+        // (at t=0.25 and t=0.75) and the offset NEVER crosses below
+        // the rest line (0). intensity=50 → amp=0.055.
+        //
+        // Sample at t = 0, π/4 (0.125), π/2 (0.25), 3π/4 (0.375),
+        // π (0.5), 5π/4 (0.625), 3π/2 (0.75), 7π/4 (0.875), 2π (1.0).
+        let amp = 0.055_f32;
+        let sqrt2_over_2 = (2.0_f32).sqrt() / 2.0; // sin(π/4) = sin(3π/4)
+        let cases: &[(f64, f32)] = &[
+            (0.0, 0.0),
+            (0.125, -amp * sqrt2_over_2),
+            (0.25, -amp),               // first peak UP
+            (0.375, -amp * sqrt2_over_2),
+            (0.5, 0.0),                  // crosses back to rest
+            (0.625, -amp * sqrt2_over_2),
+            (0.75, -amp),               // second peak UP — the abs(sin) signature
+            (0.875, -amp * sqrt2_over_2),
+            (1.0, 0.0),
+        ];
+        for (t, expected) in cases {
+            let m = compute_motion_state(MotionKind::Bounce, 50, 0.0, 1.0, 0, *t);
+            assert!(
+                (m.offset_y_norm - *expected).abs() < 1e-3,
+                "at t={t}: expected {expected}, got {}",
+                m.offset_y_norm
+            );
+            // The "ball-on-floor" invariant: offset is never below
+            // rest. Negative-or-zero means UP-or-rest, never DOWN.
+            assert!(
+                m.offset_y_norm <= 1e-6,
+                "bounce went BELOW rest at t={t}: {}",
+                m.offset_y_norm
+            );
+        }
     }
 
     #[test]
@@ -7312,7 +7358,8 @@ mod tests {
         let a = compute_motion_state(MotionKind::Bounce, 50, 0.25, 0.0, 0, 1.0);
         let b = compute_motion_state(MotionKind::Bounce, 50, 0.25, 0.0, 0, 99.0);
         assert!((a.offset_y_norm - b.offset_y_norm).abs() < 1e-9);
-        assert!((a.offset_y_norm - 0.055).abs() < 1e-3);
+        // abs(sin(π/2)) = 1 → frozen offset = -amp (UP).
+        assert!((a.offset_y_norm + 0.055).abs() < 1e-3);
     }
 
     #[test]
@@ -7365,7 +7412,8 @@ mod tests {
     fn motion_bounce_speed_two_halves_period() {
         let m =
             compute_motion_state(MotionKind::Bounce, 50, 0.0, 2.0, 0, 0.125);
-        assert!((m.offset_y_norm - 0.055).abs() < 1e-3);
+        // abs(sin(π/2)) = 1 → peak = -amp (UP).
+        assert!((m.offset_y_norm + 0.055).abs() < 1e-3);
     }
 
     #[test]
@@ -7413,9 +7461,12 @@ mod tests {
 
     #[test]
     fn motion_bounce_intensity_zero_still_animates() {
-        // amp = 0.01.
+        // amp = 0.01. abs(sin(π/2)) = 1 → offset = -0.01 (UP). Pins
+        // the deliberate Rust spec choice: intensity=0 != static
+        // (motion.py would return 0 here; this divergence is
+        // intentional per QA F3).
         let m = compute_motion_state(MotionKind::Bounce, 0, 0.0, 1.0, 0, 0.25);
-        assert!((m.offset_y_norm - 0.01).abs() < 1e-3);
+        assert!((m.offset_y_norm + 0.01).abs() < 1e-3);
     }
 
     #[test]
