@@ -55,11 +55,31 @@ const PANEL_OUTPUT_MODES = new Set(["hub75", "ws281x", "composite"]);
 // Transitions that animate over their transition_ms window. Hoisted to
 // module scope (Batch 8.2) -- renderOnce() runs at rAF cadence (60 Hz)
 // so reallocating this set every tick was ~60 Set instances/sec.
+//
+// "cut" included for parity-audit #2 (2026-05-14): "cut" is one of
+// the 16 transition kinds the device handles; including it here keeps
+// the editor preview's progress-window math symmetric with the device
+// even though the visual is instantaneous (transition_ms is honored
+// as a no-op hold).
 const ANIMATED_TRANSITIONS = new Set([
-    "fade", "wipe", "slide", "iris", "scroll", "flip",
+    "cut", "fade", "wipe", "slide", "iris", "scroll", "flip",
     "marquee", "dissolve", "pixelate", "halftone", "scanline",
     "glitch", "push", "blinds", "shutter",
 ]);
+
+// Brightness/gamma post-pass settings for the inline preview, matching
+// Rust's FS_BRIGHT_GAMMA defaults (parity-audit #5 fix 2026-05-14).
+// HDMI + composite outputs apply gamma=2.2 (sRGB display encoding); the
+// LED-driving output modes (hub75 + ws281x) have their own per-pixel
+// brightness pipelines elsewhere and skip the canvas gamma pass here.
+// brightness is held at 1.0 (the schema default is 80, but the editor
+// has no plumbing for per-sign brightness yet — follow-up).
+const PREVIEW_GAMMA_BY_OUTPUT_MODE = {
+    hdmi: 2.2,
+    composite: 2.2,
+    hub75: 1.0,
+    ws281x: 1.0,
+};
 
 function pickSkin(outputMode) {
     if (outputMode === "hub75") return "hub75";
@@ -100,6 +120,7 @@ export function mountInlinePreview(container, options) {
 
     stage.style.aspectRatio = `${width} / ${height}`;
     const skin = pickSkin(outputMode);
+    const previewGamma = PREVIEW_GAMMA_BY_OUTPUT_MODE[outputMode] ?? 1.0;
 
     // Playlist → ranged timeline. Each entry is { item, startSec, endSec,
     // transition, transition_ms }.
@@ -802,7 +823,11 @@ export function mountInlinePreview(container, options) {
             }
         }
         const state = stateFromItem(item, resolvedBg);
-        drawCanvas(sampler, state, { elapsed_s });
+        drawCanvas(sampler, state, {
+            elapsed_s,
+            brightness: 1.0,
+            gamma: previewGamma,
+        });
 
         const srcData = samplerCtx.getImageData(0, 0, srcW, srcH);
         drawForSkin(skin, canvasCtx, canvas.width, canvas.height, srcData, srcW, srcH);
@@ -1116,4 +1141,11 @@ function drawWs281x(ctx, w, h, srcData, signW, signH) {
 
 // --- exports for tests ---
 
-export { drawHub75, drawPlain, drawWs281x, formatSec, pickSkin };
+export {
+    ANIMATED_TRANSITIONS,
+    drawHub75,
+    drawPlain,
+    drawWs281x,
+    formatSec,
+    pickSkin,
+};

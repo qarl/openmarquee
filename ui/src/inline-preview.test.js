@@ -8,7 +8,12 @@ vi.mock("./rasterize.js", async (importOriginal) => {
     return { ...actual, drawCanvas: vi.fn() };
 });
 import { drawCanvas } from "./rasterize.js";
-import { formatSec, mountInlinePreview, pickSkin } from "./inline-preview.js";
+import {
+    ANIMATED_TRANSITIONS,
+    formatSec,
+    mountInlinePreview,
+    pickSkin,
+} from "./inline-preview.js";
 
 function tick() {
     return new Promise((r) => setTimeout(r, 0));
@@ -34,6 +39,32 @@ beforeEach(() => {
 
 afterEach(() => {
     vi.restoreAllMocks();
+});
+
+describe("ANIMATED_TRANSITIONS", () => {
+    // Parity-audit #2 fix (2026-05-14): "cut" is one of the 16
+    // transition kinds the device handles. Including it in the
+    // animated set keeps the preview's progress-window math symmetric
+    // with the device. Pin the membership so a future "trim the
+    // animated set" refactor can't silently drop it again.
+    it("includes 'cut' (parity-audit #2)", () => {
+        expect(ANIMATED_TRANSITIONS.has("cut")).toBe(true);
+    });
+
+    it("contains all 16 transition kinds the device supports", () => {
+        // Source of truth: renderer/src/hdmi_logic.rs:fs_for_transition_kind
+        // + backend/openmarquee/playback.py transition dispatch. Both
+        // ship 16 kinds total.
+        const expected = [
+            "cut", "fade", "wipe", "slide", "iris", "scroll", "flip",
+            "marquee", "dissolve", "pixelate", "halftone", "scanline",
+            "glitch", "push", "blinds", "shutter",
+        ];
+        expect(ANIMATED_TRANSITIONS.size).toBe(16);
+        for (const k of expected) {
+            expect(ANIMATED_TRANSITIONS.has(k)).toBe(true);
+        }
+    });
 });
 
 describe("pickSkin", () => {

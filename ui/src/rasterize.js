@@ -189,9 +189,49 @@ function wrapTextToWidth(ctx, text, maxWidth) {
     return out.join("\n");
 }
 
+// v1-spec-delta #10 (slice b, parity-audit follow-up 2026-05-14) —
+// pure-JS mirror of Rust's `apply_brightness_gamma_rgba` at
+// `renderer/src/hdmi_logic.rs:1974-1989`. Per-pixel transform
+// matching the FS_BRIGHT_GAMMA shader:
+//
+//   rgb' = pow(clamp(rgb * brightness, 0, 1), 1.0 / max(gamma, 0.001))
+//
+// `brightness` is in [0, 1] (caller pre-divides the schema's
+// [0, 100] value); `gamma` > 0. Alpha pass-through. Identity case
+// (brightness=1, gamma=1) is a no-op; callers should skip the
+// getImageData round-trip by checking before calling.
+//
+// Tolerance vs Rust CPU-mirror: 1 LSB per channel from float→u8
+// rounding; both sides use `round` then clamp to [0, 255].
+export function applyBrightnessGamma(canvas, brightness, gamma) {
+    if (canvas.width <= 0 || canvas.height <= 0) return;
+    const ctx = canvas.getContext("2d");
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = img.data;
+    const invGamma = 1.0 / Math.max(gamma, 0.001);
+    for (let i = 0; i < data.length; i += 4) {
+        for (let c = 0; c < 3; c++) {
+            const v = data[i + c] / 255;
+            const scaled = Math.min(1, Math.max(0, v * brightness));
+            const corrected = Math.pow(scaled, invGamma);
+            data[i + c] = Math.max(0, Math.min(255, Math.round(corrected * 255)));
+        }
+        // alpha (i+3) untouched.
+    }
+    ctx.putImageData(img, 0, 0);
+}
+
 /**
  * Draw the slide onto `canvas`. Pure: only reads `state` and writes
  * pixels — no DOM wiring, no event handlers.
+ *
+ * `opts.brightness` / `opts.gamma` (both default to 1.0 = identity)
+ * apply a brightness/gamma post-pass matching Rust's FS_BRIGHT_GAMMA
+ * (see `applyBrightnessGamma` above). Default identity is a no-op so
+ * existing callers (parity-harness, rasterizeAtTarget, tests) keep
+ * their pre-fix pixel output. The inline preview opts in with
+ * `gamma=2.2` for HDMI/composite output modes to match the deployed
+ * sign's default gamma encoding (parity-audit #5 fix 2026-05-14).
  */
 export function drawCanvas(canvas, state, opts) {
     const ctx = canvas.getContext("2d");
@@ -291,6 +331,14 @@ export function drawCanvas(canvas, state, opts) {
         }
     } finally {
         ctx.restore();
+    }
+    // Brightness/gamma post-pass. Identity (1.0, 1.0) → skip the
+    // getImageData round-trip so default callers pay no cost.
+    const brightness = opts && typeof opts.brightness === "number"
+        ? opts.brightness : 1.0;
+    const gamma = opts && typeof opts.gamma === "number" ? opts.gamma : 1.0;
+    if (brightness !== 1.0 || gamma !== 1.0) {
+        applyBrightnessGamma(canvas, brightness, gamma);
     }
 }
 
