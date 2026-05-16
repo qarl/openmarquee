@@ -736,20 +736,6 @@ fn validate_capture_inputs(item: &ContentItem) -> Result<(), &'static str> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn validate_paint_transition_endpoints(
-    from: &ContentItem,
-    to: &ContentItem,
-) -> Result<(), &'static str> {
-    if !matches!(from, ContentItem::Text(_)) {
-        return Err("paint_transition: from non-text slide TBD");
-    }
-    if !matches!(to, ContentItem::Text(_)) {
-        return Err("paint_transition: to non-text slide TBD");
-    }
-    Ok(())
-}
-
 /// Linux paint hook: translate PaintSlide / PaintTransition
 /// OpResults into actual paint_and_present_one_frame_* calls.
 /// Returns the original response on success, or an Err
@@ -894,18 +880,18 @@ fn run_paint_hook(
                 Some(i) => i,
                 None => return err(format!("paint_transition: to slide {to} not in cache")),
             };
-            // Phase 8 slice 4: the validator gate STAYS for this
-            // slice. The transition function now accepts
-            // &ContentItem endpoints (text + image branches wired;
-            // video branch bails pending slice 5's V4L2 decoder
-            // state plumbing). Slice 5 removes this gate AND
-            // replaces the dispatcher's video bail with the actual
-            // wiring. In slice 4 production, only text→text reaches
-            // the function (validator rejects everything else); the
-            // signature change is the structural lift.
-            if let Err(msg) = validate_paint_transition_endpoints(from_ci, to_ci) {
-                return err(msg);
-            }
+            // Phase 8 slice 5 (2026-05-16): the validator gate is
+            // gone — text/text, text/image, image/text, image/image
+            // route fully through the Rust shader transition now.
+            // Video endpoints reach `resolve_transition_endpoint`
+            // (hdmi.rs), which bails with a message containing
+            // "non-text slide TBD"; Python's `_classify_op_error`
+            // (backend/openmarquee/rendering/rust_renderer.py:227-
+            // 230) recognizes that substring and promotes to
+            // RustRendererUnsupportedSlideError, so the
+            // AutoFallbackRenderer hands the transition to PIL.
+            // Slice 6 wires V4L2 decoder state into
+            // SlideBakeInputs::Video and removes the bail.
             if let Err(e) = hdmi::paint_and_present_one_transition_frame(
                 session,
                 card,
@@ -1405,47 +1391,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_paint_transition_text_to_text_ok() {
-        assert!(validate_paint_transition_endpoints(&text_item(), &text_item()).is_ok());
-    }
-
-    #[test]
-    fn validate_paint_transition_from_image_errs_with_stable_string() {
-        let err_msg =
-            validate_paint_transition_endpoints(&image_item(), &text_item()).unwrap_err();
-        assert_eq!(err_msg, "paint_transition: from non-text slide TBD");
-    }
-
-    #[test]
-    fn validate_paint_transition_from_video_errs_with_stable_string() {
-        let err_msg =
-            validate_paint_transition_endpoints(&video_item(), &text_item()).unwrap_err();
-        assert_eq!(err_msg, "paint_transition: from non-text slide TBD");
-    }
-
-    #[test]
-    fn validate_paint_transition_to_image_errs_with_stable_string() {
-        let err_msg =
-            validate_paint_transition_endpoints(&text_item(), &image_item()).unwrap_err();
-        assert_eq!(err_msg, "paint_transition: to non-text slide TBD");
-    }
-
-    #[test]
-    fn validate_paint_transition_to_video_errs_with_stable_string() {
-        let err_msg =
-            validate_paint_transition_endpoints(&text_item(), &video_item()).unwrap_err();
-        assert_eq!(err_msg, "paint_transition: to non-text slide TBD");
-    }
-
-    #[test]
-    fn validate_paint_transition_from_takes_precedence_when_both_non_text() {
-        // If both endpoints are non-text, the "from" error fires
-        // first (matches the production code's check order).
-        let err_msg =
-            validate_paint_transition_endpoints(&image_item(), &video_item()).unwrap_err();
-        assert_eq!(err_msg, "paint_transition: from non-text slide TBD");
-    }
+    // Phase 8 slice 5 (2026-05-16): the previous 6 validator-level
+    // tests (`validate_paint_transition_text_to_text_ok` etc.) are
+    // gone alongside `validate_paint_transition_endpoints`. The
+    // gate is now removed in production: image/text/image-image
+    // endpoint pairs route fully through the Rust shader
+    // transition; video endpoints still bail in
+    // `hdmi::resolve_transition_endpoint` with a message
+    // containing "non-text slide TBD" (the
+    // `_UNSUPPORTED_SLIDE_WIRE_MARKERS` substring from
+    // backend/openmarquee/rendering/rust_renderer.py:227-230).
+    // Slice 6 removes that bail when the V4L2 decoder state is
+    // wired into SlideBakeInputs::Video.
+    //
+    // No unit test for the bail substring this slice because
+    // `crate::hdmi` is `#[cfg(target_os = "linux")]`-gated at the
+    // module level (main.rs L18-19) and exposing
+    // `resolve_transition_endpoint` (or `TransitionEndpointData`,
+    // whose `bg: BgKind` would also need to surface) widens
+    // pub(crate) for a slice-5-only test. The marker contract is
+    // documented inline at the bail site in hdmi.rs +
+    // ipc_main.rs's PaintTransition handler comment. Slice 6
+    // deletes the bail, so any test asserting its substring would
+    // delete with it — net churn.
 
     #[test]
     fn handle_close_resets_state() {

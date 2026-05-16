@@ -2947,18 +2947,24 @@ pub fn paint_one_image_slide_for_capture(
 /// Phase 8 slice 4 (2026-05-16): endpoints are now `&ContentItem`
 /// (text/image/video) rather than `&TextSlide`. Per-kind bake
 /// dispatched through `bake_slide_to_fbo`. Text and Image branches
-/// are fully wired in this slice; Video bails with an explicit
-/// "TBD - slice 5 wires V4L2 decoder state" because the dual-video
-/// `HashMap::get_disjoint_mut` API isn't stable on Rust 1.85 (the
-/// renderer's pinned toolchain). The IPC validator at
-/// `ipc_main.rs:validate_paint_transition_endpoints` still rejects
-/// non-text endpoints in production until slice 5 removes the
-/// gate, so the Video branch is structurally reachable but not
-/// production-reachable in slice 4. Slice 5 removes the gate AND
-/// replaces the Video branch's bail with the actual decoder state
-/// plumbing (the dispatch framed slice 5 as "gate removal + tests"
-/// — surfaced in the slice 4 commit / QA ping that the video
-/// plumbing rides along).
+/// route fully through the Rust shader transition.
+///
+/// Phase 8 slice 5 (2026-05-16): the IPC validator gate
+/// (`validate_paint_transition_endpoints`) is gone. Image/Image,
+/// Image/Text, Text/Image, and Text/Text endpoint pairs now reach
+/// this function in production. Video endpoints also reach this
+/// function but bail in `resolve_transition_endpoint`'s Video arm
+/// with a message containing the substring `"non-text slide TBD"`
+/// — Python's `_classify_op_error` (backend/openmarquee/rendering/
+/// rust_renderer.py:227-230) promotes that to
+/// `RustRendererUnsupportedSlideError`, which
+/// `AutoFallbackRenderer` routes through PIL. So a video-endpoint
+/// transition gracefully falls through to the legacy compositor
+/// rather than hard-failing. Slice 6 wires V4L2 decoder state
+/// into `SlideBakeInputs::Video` (deferred from slice 5 because
+/// the dual-video disjoint-mut HashMap workaround is non-trivial
+/// on Rust 1.85, the renderer's pinned toolchain) and removes
+/// the bail entirely.
 pub fn paint_and_present_one_transition_frame(
     session: &mut EglSession,
     card: &Card,
@@ -3171,6 +3177,7 @@ pub fn paint_and_present_one_transition_frame(
 /// the slide's `text_layers` Vec; image PathBuf is owned and could
 /// live with `'static` lifetime, but the variant inherits the
 /// enum's `'a` per Rust enum-with-lifetime-parameter rules.
+///
 enum TransitionEndpointData<'a> {
     Text {
         slide_id: uuid::Uuid,
@@ -3220,12 +3227,19 @@ impl<'a> TransitionEndpointData<'a> {
 /// errors explicitly if `None` (text-only paths can tolerate a
 /// None content_root, but Image cannot).
 ///
-/// For Video endpoints: bails. Slice 4 leaves the structural
-/// dispatch in place but defers actual V4L2 decoder state plumbing
-/// to slice 5 alongside the validator gate removal. Slice 5's
-/// scope grows by one item (the IPC handler's video-state lookup
-/// + the dispatcher's video bake) — surfaced in slice 4 commit
-/// message + QA ping.
+/// For Video endpoints: bails with a message containing
+/// `"non-text slide TBD"`. Phase 8 slice 5 removed the IPC
+/// validator gate, so Video endpoints now reach this function
+/// in production. The substring matches Python's
+/// `_UNSUPPORTED_SLIDE_WIRE_MARKERS` tuple in
+/// `backend/openmarquee/rendering/rust_renderer.py` — the proxy's
+/// `_classify_op_error` promotes any error containing it to
+/// `RustRendererUnsupportedSlideError`, which
+/// `AutoFallbackRenderer` routes through PIL. So a video-endpoint
+/// transition gracefully falls through to the legacy compositor
+/// rather than hard-failing as an opaque RustRendererOpError.
+/// Slice 6 wires V4L2 decoder state into `SlideBakeInputs::Video`
+/// and removes this bail entirely.
 fn resolve_transition_endpoint<'a>(
     item: &'a ContentItem,
     fonts: Option<&FontCatalog>,
@@ -3255,8 +3269,13 @@ fn resolve_transition_endpoint<'a>(
             })
         }
         ContentItem::Video(slide) => {
+            // Phase 8 slice 5: the "non-text slide TBD" substring
+            // is the load-bearing wire marker (see Python
+            // _UNSUPPORTED_SLIDE_WIRE_MARKERS). Slice 6 deletes
+            // this branch entirely once V4L2 decoder state is
+            // wired into SlideBakeInputs::Video.
             bail!(
-                "paint_transition: video endpoint TBD (slice 5 wires V4L2 decoder state + removes validate_paint_transition_endpoints gate); slide_id={}",
+                "paint_transition: video endpoint non-text slide TBD (slice 6 wires V4L2 decoder state); slide_id={}",
                 slide.id
             )
         }
@@ -4934,9 +4953,12 @@ enum SlideBakeInputs<'a> {
     Image {
         asset_path: &'a Path,
     },
-    /// Constructed by slice 5 once the validate_paint_transition_
-    /// endpoints gate is dropped + the IPC handler wires V4L2
-    /// decoder state into the transition path.
+    /// Constructed by slice 6 once the IPC handler wires V4L2
+    /// decoder state into the transition path. Slice 5 removed
+    /// the `validate_paint_transition_endpoints` gate, so the
+    /// Video branch is production-reachable now; it currently
+    /// bails in `resolve_transition_endpoint` via the
+    /// `"non-text slide TBD"` marker until slice 6 lands.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     Video {
