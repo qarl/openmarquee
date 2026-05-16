@@ -32,7 +32,17 @@
 # every openMarquee sign on the planet. Generating a 16-char
 # alphanumeric-with-symbol passphrase at first boot closes that.
 
-set -euo pipefail
+# `x` (xtrace) prints every executed line — with $VAR expansions — to
+# stderr → systemd journal → persistent under the journald drop-in
+# in install.sh §7c. Combined with the forensic prelude below, the
+# persistent journal carries an execution trace from start through
+# failure for any future restart-loop diagnosis. Tradeoff: xtrace
+# echoes ${PASSPHRASE} via assignment + sed templating + WIFI_URI
+# into the journal. Mitigated by journal being root-readable only
+# and the same passphrase landing at /var/openmarquee/wifi.json
+# (mode 0600, root-only) — same sudo-required reach, theoretical
+# leak only.
+set -euxo pipefail
 
 WIFI_JSON="${WIFI_JSON:-/var/openmarquee/wifi.json}"
 IDENTITY_JSON="${IDENTITY_JSON:-/var/openmarquee/identity.json}"
