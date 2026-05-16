@@ -206,6 +206,13 @@ impl IpcPaintMetrics {
 /// triggers the Python proxy's PIL fallback.
 struct SlideCache {
     items: std::collections::HashMap<uuid::Uuid, ContentItem>,
+    /// Bug 1 (qarl 2026-05-16): item.json mtime per cached slide.
+    /// `cache.load` short-circuits on `items.contains_key`, which means
+    /// a content edit (text change, image re-upload, etc.) never reaches
+    /// the running show — the sidecar serves the pre-edit cached copy
+    /// forever. Stamping the on-disk mtime here lets `load` detect drift
+    /// and evict before the cached copy is reused.
+    item_mtimes: std::collections::HashMap<uuid::Uuid, std::time::SystemTime>,
     video_demuxers: std::collections::HashMap<uuid::Uuid, Mp4Demuxer>,
     /// V4L2 piece 3c: Linux-only V4L2 decoder per Video slide id.
     /// cache.load primes the decoder once on first encounter; piece
@@ -225,10 +232,24 @@ impl SlideCache {
     fn new() -> Self {
         Self {
             items: std::collections::HashMap::new(),
+            item_mtimes: std::collections::HashMap::new(),
             video_demuxers: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             video_decoders: std::collections::HashMap::new(),
         }
+    }
+
+    /// Bug 1 helper: drop every cached artifact for `item_id`. Called
+    /// from `load` when the on-disk item.json mtime drifts so the
+    /// next load() pass re-reads from disk (text, layout, asset path)
+    /// AND re-primes the V4L2 decoder for the case where a Video
+    /// slide's asset.mp4 also rotated.
+    fn invalidate(&mut self, item_id: uuid::Uuid) {
+        self.items.remove(&item_id);
+        self.item_mtimes.remove(&item_id);
+        self.video_demuxers.remove(&item_id);
+        #[cfg(target_os = "linux")]
+        self.video_decoders.remove(&item_id);
     }
 
     /// Try to load + cache a slide by UUID. content_root is
@@ -242,15 +263,38 @@ impl SlideCache {
     /// without an entry; downstream paint paths fall back via
     /// the existing "video slides TBD" wire.
     fn load(&mut self, content_root: &std::path::Path, item_id: uuid::Uuid) -> Result<()> {
+        // Bug 1 (qarl 2026-05-16): on-disk mtime check defeats the
+        // contains_key short-circuit when the operator edits a slide.
+        // backend's PUT /api/content/{text-slides,images,videos}/{id}
+        // rewrites <content_root>/<item_id>/item.json with a fresh
+        // updated_at; that touches the file's mtime. Pre-fix the
+        // sidecar served the pre-edit cached copy forever (no
+        // invalidation IPC op, no mtime check). Stat() per BeginSlide
+        // is microseconds — negligible vs slide rasterization.
+        let item_json_path = content_root.join(item_id.to_string()).join("item.json");
+        let on_disk_mtime = std::fs::metadata(&item_json_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         if self.items.contains_key(&item_id) {
-            return Ok(());
+            if self.item_mtimes.get(&item_id).copied() == on_disk_mtime {
+                return Ok(());
+            }
+            eprintln!(
+                "ipc: slide {item_id} item.json drifted on disk; refreshing cache"
+            );
+            self.invalidate(item_id);
         }
-        if let Some(s) = find_text_slide(content_root, item_id)? {
+        let loaded = if let Some(s) = find_text_slide(content_root, item_id)? {
             self.items.insert(item_id, ContentItem::Text(s));
-            return Ok(());
-        }
-        if let Some(s) = find_image_slide(content_root, item_id)? {
+            true
+        } else if let Some(s) = find_image_slide(content_root, item_id)? {
             self.items.insert(item_id, ContentItem::Image(s));
+            true
+        } else { false };
+        if loaded {
+            if let Some(m) = on_disk_mtime {
+                self.item_mtimes.insert(item_id, m);
+            }
             return Ok(());
         }
         if let Some(s) = find_video_slide(content_root, item_id)? {
@@ -286,6 +330,9 @@ impl SlideCache {
                         asset_path.display(), item_id, e
                     );
                 }
+            }
+            if let Some(m) = on_disk_mtime {
+                self.item_mtimes.insert(item_id, m);
             }
             return Ok(());
         }
@@ -1510,6 +1557,113 @@ mod tests {
         // is resolved via the begin_slide content_root, not the
         // paint-time one.
         assert!(validate_paint_slide_inputs(&item, None).is_ok());
+    }
+
+    /// Bug 1 (qarl 2026-05-16): when the on-disk item.json mtime drifts
+    /// from the cached value, the next `cache.load` evicts + re-reads
+    /// the slide. Pre-fix the `contains_key` short-circuit served the
+    /// stale cached copy forever.
+    #[test]
+    fn cache_load_refreshes_on_item_json_mtime_drift() {
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(7);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("item.json");
+        // First write: name="v1".
+        std::fs::write(
+            &json_path,
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "text_slide",
+                "id": "07070707-0707-0707-0707-070707070707",
+                "name": "v1",
+                "duration_ms": 5000,
+                "text_layers": [],
+                "background_color": "#222222",
+                "background_pattern": null,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("first load");
+        match cache.items.get(&id).expect("cached after first load") {
+            crate::content::ContentItem::Text(s) => assert_eq!(s.name, "v1"),
+            _ => panic!("expected Text"),
+        }
+        // Rewrite item.json with a different mtime + payload. Sleep
+        // long enough that filesystems with second-resolution mtime
+        // (HFS+, FAT32) still record a delta.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            &json_path,
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "text_slide",
+                "id": "07070707-0707-0707-0707-070707070707",
+                "name": "v2",
+                "duration_ms": 5000,
+                "text_layers": [],
+                "background_color": "#222222",
+                "background_pattern": null,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        // Pre-bug-1 the cache would short-circuit and serve v1.
+        cache.load(td.path(), id).expect("second load after edit");
+        match cache.items.get(&id).expect("still cached") {
+            crate::content::ContentItem::Text(s) => {
+                assert_eq!(s.name, "v2", "mtime drift must trigger refresh");
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    /// Bug 1 sibling: a second `cache.load` with NO disk change must
+    /// still short-circuit (no spurious re-reads). Guards against a
+    /// regression where the mtime-aware path always refreshes.
+    #[test]
+    fn cache_load_short_circuits_when_mtime_unchanged() {
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(8);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("item.json"),
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "text_slide",
+                "id": "08080808-0808-0808-0808-080808080808",
+                "name": "stable",
+                "duration_ms": 5000,
+                "text_layers": [],
+                "background_color": "#222222",
+                "background_pattern": null,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("first load");
+        let mtime_after_first = cache.item_mtimes.get(&id).copied();
+        // Load again without touching disk. The cached entry stays put.
+        cache.load(td.path(), id).expect("second load");
+        assert_eq!(cache.item_mtimes.get(&id).copied(), mtime_after_first);
+        match cache.items.get(&id).unwrap() {
+            crate::content::ContentItem::Text(s) => assert_eq!(s.name, "stable"),
+            _ => panic!("expected Text"),
+        }
     }
 
     /// V4L2 piece 3b: when a VideoSlide loads + the asset.mp4 is
