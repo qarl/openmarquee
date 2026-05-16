@@ -47,6 +47,9 @@ set -euxo pipefail
 if [ "$DRY_RUN" -eq 0 ] && [ -z "$ROOT_PREFIX" ]; then
     exec {XTRACE_FD}>>/var/log/openmarquee-install-xtrace.log 2>/dev/null || XTRACE_FD=
     if [ -n "${XTRACE_FD:-}" ]; then
+        # 0600 for consistency with wifi.json — xtrace echoes any
+        # PASSPHRASE-equivalent secrets via expansion.
+        chmod 600 /var/log/openmarquee-install-xtrace.log 2>/dev/null || true
         BASH_XTRACEFD=$XTRACE_FD
         export BASH_XTRACEFD
     fi

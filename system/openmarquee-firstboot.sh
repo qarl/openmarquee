@@ -44,6 +44,25 @@
 # leak only.
 set -euxo pipefail
 
+# Redirect xtrace output to a dedicated persistent file so the full
+# execution trace survives even if systemd doesn't flush the journal
+# in time on a Restart=on-failure cycle. Real-device only — guarded
+# so test harness runs (ROOT_PREFIX set) don't try to open /var/log.
+# Default-init lets the gate evaluate before the ROOT_PREFIX line
+# below; that line then explicitly reassigns ROOT_PREFIX (idempotent
+# with the same value, so no race).
+: "${ROOT_PREFIX:=}"
+if [ -z "$ROOT_PREFIX" ]; then
+    exec {XTRACE_FD}>>/var/log/openmarquee-firstboot-xtrace.log 2>/dev/null || XTRACE_FD=
+    if [ -n "${XTRACE_FD:-}" ]; then
+        # 0600 for consistency with wifi.json — xtrace echoes PASSPHRASE
+        # via assignments + sed templating + WIFI_URI.
+        chmod 600 /var/log/openmarquee-firstboot-xtrace.log 2>/dev/null || true
+        BASH_XTRACEFD=$XTRACE_FD
+        export BASH_XTRACEFD
+    fi
+fi
+
 WIFI_JSON="${WIFI_JSON:-/var/openmarquee/wifi.json}"
 IDENTITY_JSON="${IDENTITY_JSON:-/var/openmarquee/identity.json}"
 HOSTAPD_CONF="${HOSTAPD_CONF:-/etc/hostapd/hostapd.conf}"
