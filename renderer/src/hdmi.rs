@@ -2748,205 +2748,62 @@ pub fn paint_and_present_one_video_slide_frame(
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
-    use glow::HasContext;
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
-    // V4L2 piece 4f first-frame profile gate (2026-05-14). When
-    // OPENMARQUEE_FIRSTFRAME_PROFILE=1 is set, the per-frame cost
-    // checkpoints below print to stderr exactly ONCE per slide
-    // (the first PaintSlide for each new decoder). Zero overhead
-    // when unset; one branch + a few Instant::now() calls when
-    // set. The trace lines are picked up by the smoke driver's
-    // stderr capture for offline analysis.
-    // Profile gate: prime_video_decoder sets next_sample_idx=1
-    // BEFORE the first paint (it feeds the SPS+PPS+IDR primer +
-    // sample[0]), and frames_decoded stays 0 across the codec-
-    // warmup advances that return None. So the right "first
-    // PaintSlide for this slide" signal is next_sample_idx==1
-    // AND frames_decoded==0.
-    let profile_first = *next_sample_idx == 1 && *frames_decoded == 0
-        && std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE").ok()
+    // V4L2 piece 4f first-frame profile gate. profile_first is
+    // captured BEFORE calling the bake helper because the helper
+    // increments next_sample_idx and frames_decoded on success,
+    // which would invalidate the (next=1, decoded=0) check. The
+    // helper handles the feed/dqbuf/blit timing internally;
+    // t_enter here bookends the call for the swap_commit + total
+    // log emitted below the swap (DMABUF path only; the MMAP path
+    // was always silent for the total log and Phase 8 slice 2
+    // preserves that asymmetry).
+    let profile_first = *next_sample_idx == 1
+        && *frames_decoded == 0
+        && std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE")
+            .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     let t_enter = if profile_first { Some(std::time::Instant::now()) } else { None };
-    // Feed the next sample if any remain. Codec is pipelined: a
-    // single feed may not produce a frame this tick; the EAGAIN
-    // retry below covers the latency. When samples are exhausted
-    // we send EOF on the first such tick.
-    if *next_sample_idx < samples.len() {
-        let s = &samples[*next_sample_idx];
-        decoder.feed(s)
-            .with_context(|| format!("feed sample {}", *next_sample_idx))?;
-        *next_sample_idx += 1;
-    } else if !decoder.is_output_eof_sent() {
-        // No more samples; signal end-of-stream.
-        decoder.feed(&[]).context("feed EOF")?;
-    }
-    if let Some(t) = t_enter {
-        eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
-    }
-    let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
-    // Drain a frame with a small EAGAIN budget so transient
-    // codec back-pressure doesn't lose us a frame. Budget of
-    // 5 retries × 2ms = 10ms max per paint; we have ~33ms total
-    // at 30fps so this leaves ample slack for the actual GL
-    // work.
-    let mut frame_opt: Option<crate::v4l2::Frame> = None;
-    for _ in 0..5 {
-        match decoder.next_frame() {
-            Ok(Some(f)) => { frame_opt = Some(f); break; }
-            Ok(None) => break,
-            Err(e) if e.to_string().contains("EAGAIN") => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            Err(e) => return Err(e).context("next_frame"),
-        }
-    }
-    if let Some(t) = t_dqbuf_start {
-        eprintln!("[firstframe] dqbuf={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
-    }
-    let Some(frame) = frame_opt else {
-        // No frame ready this tick. Don't error -- the next
-        // advance can try again. Leaves whatever's on screen
-        // (last decoded frame or black if never decoded).
+    // Phase 8 slice 2 (2026-05-16): per-frame video bake extracted
+    // into bake_video_slide_to_current_fbo. Hold-path scanout
+    // semantics unchanged -- the helper feeds+drains+blits into the
+    // default fb (the active framebuffer at entry) and returns the
+    // path label, then the caller does the swap+commit. Slice 4
+    // will reuse the helper from the transition path with an FBO
+    // bind in front of the call.
+    let painted = unsafe {
+        bake_video_slide_to_current_fbo(
+            session,
+            samples,
+            next_sample_idx,
+            frames_decoded,
+            decoder,
+            mode_w,
+            mode_h,
+        )?
+    };
+    let Some(path_label) = painted else {
+        // No frame ready this tick. Don't error -- the next advance
+        // can try again. Leaves whatever's on screen (last decoded
+        // frame or black if never decoded).
         return Ok(());
     };
-    let f_w = frame.width();
-    let f_h = frame.height();
-    // V4L2 piece 4d: branch on the Frame's transport mode. DmaBuf
-    // path (piece 4a-c) skips the per-frame Y/UV CPU upload + uses
-    // an EGLImage-bound external-OES sampler -- the perf win is
-    // the entire reason piece 4 exists. MMAP path (piece 3d-e) is
-    // the existing two-texture upload; kept as the fallback for
-    // hosts missing EGL_EXT_image_dma_buf_import / GL_OES_EGL_
-    // image_external (run_nv12_dmabuf_blit_pass returns Ok(false)
-    // in that case + we fall through to MMAP). Today the dispatch
-    // is env-var-gated (OPENMARQUEE_RENDERER_DMABUF=1 at decoder
-    // prime in ipc_main.rs); piece 4e flips the default after
-    // qarl-eyeball.
-    if let Some(fd) = frame.dma_buf_fd() {
-        let stride = frame.stride();
-        // SAFETY: gl + egl_lib + display are all session-owned;
-        // GL context is current via EGL make_current at session
-        // construction; fd is owned by the Decoder and outlives
-        // this call (Frame is alive until drop(frame) below).
-        let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
-        let took_dmabuf = unsafe {
-            let gl = session.gl;
-            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            run_nv12_dmabuf_blit_pass(
-                gl, session.egl_lib, session.display,
-                fd, f_w, f_h, stride,
-            )?
-        };
-        if let Some(t) = t_blit {
+    let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
+    let r = finish_video_slide_swap_and_commit(session, card);
+    if path_label == "DMABUF" {
+        if let (Some(tc), Some(te)) = (t_commit, t_enter) {
             eprintln!(
-                "[firstframe] dmabuf_blit_pass={:.2}ms",
-                t.elapsed().as_secs_f64() * 1000.0
+                "[firstframe] swap_commit={:.2}ms total={:.2}ms (DMABUF)",
+                tc.elapsed().as_secs_f64() * 1000.0,
+                te.elapsed().as_secs_f64() * 1000.0,
             );
         }
-        if took_dmabuf {
-            // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE
-            // the buffer swap (mirrors the MMAP-path discipline
-            // below: holding the Frame across the next advance
-            // would starve the codec of CAPTURE buffers).
-            drop(frame);
-            *frames_decoded += 1;
-            let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
-            let r = finish_video_slide_swap_and_commit(session, card);
-            if let Some(t) = t_commit {
-                eprintln!(
-                    "[firstframe] swap_commit={:.2}ms total={:.2}ms (DMABUF)",
-                    t.elapsed().as_secs_f64() * 1000.0,
-                    t_enter.unwrap().elapsed().as_secs_f64() * 1000.0,
-                );
-            }
-            return r;
-        }
-        // Extensions missing at runtime: fall through to the
-        // MMAP upload path below. Piece 4a-fix (2026-05-14) made
-        // this safe by keeping REQBUFS=V4L2_MEMORY_MMAP for both
-        // capture modes, so y_plane()/uv_plane() are populated
-        // regardless of capture_buffer_type. The dma_buf fd is
-        // an ADDITIONAL view used by run_nv12_dmabuf_blit_pass
-        // when extensions are present; when missing we transparently
-        // use the CPU-upload path on the same kernel buffers.
-        // No log here -- the cached extension check in
-        // dma_buf_egl_entry_points already prints once.
     }
-    // MMAP path (piece 3d-e). stride==width is a bcm2835-codec
-    // empirical fact; a future codec or alignment regime could
-    // surface stride > width here. Frame::stride() exposes the
-    // V4L2-reported bytesperline but the MMAP upload below
-    // doesn't use it (the plane bytes are already laid out at
-    // width bytes/row in the mmap region for bcm2835-codec). If a
-    // future stride > width surfaces, swap to GL_UNPACK_ROW_LENGTH
-    // (GLES3) here.
-    let y_plane = frame.y_plane();
-    let uv_plane = frame.uv_plane();
-    unsafe {
-        let gl = session.gl;
-        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-        gl.clear_color(0.0, 0.0, 0.0, 1.0);
-        gl.clear(glow::COLOR_BUFFER_BIT);
-        let y_tex = gl
-            .create_texture()
-            .map_err(|e| anyhow!("glGenTextures(video Y): {e}"))?;
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-        // Y plane: width=f_w, height=f_h, one byte per pixel,
-        // uploaded as GL_LUMINANCE. Pixel-store alignment 1
-        // because Y plane stride may be width (not 4-aligned).
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, glow::LUMINANCE as i32,
-            f_w as i32, f_h as i32, 0,
-            glow::LUMINANCE, glow::UNSIGNED_BYTE, Some(y_plane),
-        );
-        let uv_tex = gl
-            .create_texture()
-            .map_err(|e| anyhow!("glGenTextures(video UV): {e}"))?;
-        gl.active_texture(glow::TEXTURE1);
-        gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-        // UV plane: NV12 layout is 4:2:0 subsampled, width=f_w
-        // (U+V interleaved -> f_w/2 UV pairs across one row =
-        // f_w bytes/row), height=f_h/2. Uploaded as GL_LUMINANCE_
-        // ALPHA so each 2-byte UV pair lands in (L, A) of one
-        // texel; the FS_NV12_TO_RGB shader samples .ra to recover.
-        gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, glow::LUMINANCE_ALPHA as i32,
-            (f_w / 2) as i32, (f_h / 2) as i32, 0,
-            glow::LUMINANCE_ALPHA, glow::UNSIGNED_BYTE, Some(uv_plane),
-        );
-        // Reset active unit so run_nv12_blit_pass's own binding
-        // sequence starts from a clean slate.
-        gl.active_texture(glow::TEXTURE0);
-        let blit_result = run_nv12_blit_pass(gl, y_tex, uv_tex);
-        gl.delete_texture(y_tex);
-        gl.delete_texture(uv_tex);
-        // Restore GL_UNPACK_ALIGNMENT to the default (4). We
-        // bumped to 1 above for the NV12 upload; leaving it at 1
-        // is safe but unusual for non-NV12 callers downstream.
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-        blit_result?;
-    }
-    // Drop the Frame here so its Drop impl re-QBUFs the CAPTURE
-    // buffer back to the kernel before we yield to the next IPC
-    // tick. Critical: holding the Frame across the next advance
-    // call would starve the codec of CAPTURE buffers.
-    drop(frame);
-    *frames_decoded += 1;
-    finish_video_slide_swap_and_commit(session, card)
+    // MMAP path: pre-refactor function did not log a swap_commit/
+    // total line; Phase 8 slice 2 preserves the asymmetry.
+    r
 }
 
 /// V4L2 piece 4d (2026-05-14): shared scanout swap + commit tail
@@ -4632,6 +4489,233 @@ unsafe fn bake_image_slide_to_current_fbo(
     let blit_result = run_blit_pass(gl, tex);
     gl.delete_texture(tex);
     blit_result
+}
+
+/// Phase 8 slice 2 (2026-05-16) — drain one V4L2 NV12 frame and
+/// blit it via the BT.601 NV12→RGB shader into the currently-bound
+/// framebuffer. Mirrors `bake_image_slide_to_current_fbo`'s
+/// contract: caller binds the destination FBO (default fb or an
+/// FBO) before calling, and handles any post-pass / scanout /
+/// brightness-gamma routing.
+///
+/// Returns:
+///   - `Ok(Some("DMABUF"))` — frame painted via the dma_buf
+///     EGLImage path (piece 4a-c).
+///   - `Ok(Some("MMAP"))`   — frame painted via the MMAP
+///     CPU-upload path (piece 3d-e).
+///   - `Ok(None)`           — no frame ready this tick. FBO is
+///     left at whatever the caller cleared+left it as (the bake
+///     does not run viewport+clear in the no-frame path); caller
+///     should skip swap+commit. Matches the pre-refactor
+///     paint_and_present_one_video_slide_frame's behavior of
+///     leaving prior scanout untouched on no-frame.
+///   - `Err(_)`             — feed/drain/upload/blit failure.
+///
+/// The path label is the same string the `[firstframe]` log lines
+/// used pre-refactor, so callers can preserve the same total /
+/// swap_commit log shape (DmaBuf-only by convention; MMAP was
+/// always silent for the total/swap_commit line).
+///
+/// Decoder state. Per-call feeds ONE sample (if any remain) and
+/// drains ONE frame (with a 5×2ms EAGAIN retry budget). The
+/// caller chooses cadence:
+///   - Per-Advance (hold-path video paint, today): video plays.
+///   - Once-per-transition (Phase 8 slice 4, planned): video
+///     freezes at transition start, destination starts from its
+///     first frame at transition end (Option C in the slice 0
+///     recon doc).
+/// The phase 4v-3b "motion through transitions must keep advancing"
+/// rule applies to TEXT motion phase, not to video frame cadence;
+/// for video, the frame IS the motion and Option C vs Option D
+/// (snapshot-at-start vs play-through) is a separate semantic
+/// choice for slice 4.
+///
+/// Profile timing. When OPENMARQUEE_FIRSTFRAME_PROFILE=1 AND the
+/// (next_sample_idx, frames_decoded) pair matches the first-frame
+/// signature (next=1, decoded=0), prints the same `[firstframe]
+/// feed=/dqbuf=/dmabuf_blit_pass=` lines as the pre-refactor
+/// paint function. The `swap_commit=/total=` log stays in the
+/// caller because only the caller does the swap.
+#[cfg(target_os = "linux")]
+unsafe fn bake_video_slide_to_current_fbo(
+    session: &mut EglSession,
+    samples: &[crate::mp4_demux::Sample],
+    next_sample_idx: &mut usize,
+    frames_decoded: &mut usize,
+    decoder: &crate::v4l2::Decoder,
+    mode_w: u32,
+    mode_h: u32,
+) -> Result<Option<&'static str>> {
+    use glow::HasContext;
+    let profile_first = *next_sample_idx == 1
+        && *frames_decoded == 0
+        && std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let t_feed_start = if profile_first { Some(std::time::Instant::now()) } else { None };
+    // Feed the next sample if any remain. Codec is pipelined: a
+    // single feed may not produce a frame this tick; the EAGAIN
+    // retry below covers the latency. When samples are exhausted
+    // we send EOF on the first such tick.
+    if *next_sample_idx < samples.len() {
+        let s = &samples[*next_sample_idx];
+        decoder
+            .feed(s)
+            .with_context(|| format!("feed sample {}", *next_sample_idx))?;
+        *next_sample_idx += 1;
+    } else if !decoder.is_output_eof_sent() {
+        decoder.feed(&[]).context("feed EOF")?;
+    }
+    if let Some(t) = t_feed_start {
+        eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
+    // Drain a frame with a small EAGAIN budget so transient codec
+    // back-pressure doesn't lose us a frame. Budget of 5 retries
+    // × 2ms = 10ms max per paint; we have ~33ms total at 30fps so
+    // this leaves ample slack for the actual GL work.
+    let mut frame_opt: Option<crate::v4l2::Frame> = None;
+    for _ in 0..5 {
+        match decoder.next_frame() {
+            Ok(Some(f)) => {
+                frame_opt = Some(f);
+                break;
+            }
+            Ok(None) => break,
+            Err(e) if e.to_string().contains("EAGAIN") => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(e).context("next_frame"),
+        }
+    }
+    if let Some(t) = t_dqbuf_start {
+        eprintln!("[firstframe] dqbuf={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let Some(frame) = frame_opt else {
+        // No frame ready this tick. Caller should skip swap+commit.
+        return Ok(None);
+    };
+    let f_w = frame.width();
+    let f_h = frame.height();
+    // V4L2 piece 4d: branch on the Frame's transport mode. DmaBuf
+    // path (piece 4a-c) skips the per-frame Y/UV CPU upload + uses
+    // an EGLImage-bound external-OES sampler. MMAP path (piece
+    // 3d-e) is the two-texture upload fallback for hosts missing
+    // EGL_EXT_image_dma_buf_import / GL_OES_EGL_image_external
+    // (run_nv12_dmabuf_blit_pass returns Ok(false) in that case +
+    // we fall through to MMAP).
+    if let Some(fd) = frame.dma_buf_fd() {
+        let stride = frame.stride();
+        let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
+        let took_dmabuf = {
+            let gl = session.gl;
+            gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            run_nv12_dmabuf_blit_pass(
+                gl,
+                session.egl_lib,
+                session.display,
+                fd,
+                f_w,
+                f_h,
+                stride,
+            )?
+        };
+        if let Some(t) = t_blit {
+            eprintln!(
+                "[firstframe] dmabuf_blit_pass={:.2}ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        if took_dmabuf {
+            // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE the
+            // caller's buffer swap; holding the Frame across the next
+            // advance would starve the codec of CAPTURE buffers.
+            drop(frame);
+            *frames_decoded += 1;
+            return Ok(Some("DMABUF"));
+        }
+        // Extensions missing at runtime: fall through to the MMAP
+        // upload path below. Piece 4a-fix kept REQBUFS=V4L2_MEMORY_
+        // MMAP for both capture modes so y_plane()/uv_plane() are
+        // populated regardless of capture_buffer_type.
+    }
+    // MMAP path (piece 3d-e). stride==width is a bcm2835-codec
+    // empirical fact; a future codec or alignment regime could
+    // surface stride > width, which would require GL_UNPACK_ROW_
+    // LENGTH (GLES3) here.
+    let y_plane = frame.y_plane();
+    let uv_plane = frame.uv_plane();
+    let gl = session.gl;
+    gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    let y_tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(video Y): {e}"))?;
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    // Y plane: width=f_w, height=f_h, one byte/pixel, GL_LUMINANCE.
+    // UNPACK_ALIGNMENT=1 because Y stride may be width (not 4-aligned).
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::LUMINANCE as i32,
+        f_w as i32,
+        f_h as i32,
+        0,
+        glow::LUMINANCE,
+        glow::UNSIGNED_BYTE,
+        Some(y_plane),
+    );
+    let uv_tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(video UV): {e}"))?;
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    // UV plane: 4:2:0 subsampled, width=f_w (U+V interleaved →
+    // f_w/2 UV pairs × 2 bytes = f_w bytes/row), height=f_h/2.
+    // GL_LUMINANCE_ALPHA lands each (U,V) byte pair in (L,A); the
+    // FS_NV12_TO_RGB shader samples .ra to recover.
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::LUMINANCE_ALPHA as i32,
+        (f_w / 2) as i32,
+        (f_h / 2) as i32,
+        0,
+        glow::LUMINANCE_ALPHA,
+        glow::UNSIGNED_BYTE,
+        Some(uv_plane),
+    );
+    // Reset active unit so run_nv12_blit_pass's own binding
+    // sequence starts from a clean slate.
+    gl.active_texture(glow::TEXTURE0);
+    let blit_result = run_nv12_blit_pass(gl, y_tex, uv_tex);
+    gl.delete_texture(y_tex);
+    gl.delete_texture(uv_tex);
+    // Restore GL_UNPACK_ALIGNMENT to the default (4). Bumped to 1
+    // above for the NV12 upload; leaving it at 1 is safe but
+    // unusual for non-NV12 callers downstream.
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+    blit_result?;
+    // Drop the Frame so its Drop re-QBUFs CAPTURE before the
+    // caller's swap. Critical: holding the Frame across the next
+    // advance starves the codec of CAPTURE buffers.
+    drop(frame);
+    *frames_decoded += 1;
+    Ok(Some("MMAP"))
 }
 
 /// Phase 5-b — create an FBO + RGBA color texture sized to the
