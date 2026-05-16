@@ -15,6 +15,15 @@ Before=openmarquee-backend.service hostapd.service openmarquee-ap0.service
 # boots -- cleaner journal log + faster boot.
 ConditionPathExists=!/var/openmarquee/.bootstrapped
 
+# Cap retries: if the script keeps crashing, stop trying so journalctl
+# shows the cycle clearly. (Phase 4u: StartLimitIntervalSec and
+# StartLimitBurst belong in [Unit], not [Service] — both keys are
+# documented under [Unit] per `man systemd.unit`. Previously placed
+# in [Service]; systemd spammed "Unknown key 'StartLimitIntervalSec'
+# in section [Service], ignoring." once per boot per key.)
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
 [Service]
 Type=oneshot
 # RemainAfterExit=no: this is a fire-and-forget oneshot. Once it
@@ -48,12 +57,11 @@ ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
 ReadWritePaths=/etc /opt/openmarquee/ui /var/openmarquee
-# Restart only on failure -- a clean exit means we're done.
+# Restart only on failure -- a clean exit means we're done. The
+# accompanying retry cap (StartLimitIntervalSec + StartLimitBurst)
+# lives in [Unit] above — per systemd docs those keys belong there,
+# not in [Service].
 Restart=on-failure
-# But cap retries: if the script keeps crashing, stop trying so
-# journalctl shows the cycle clearly.
-StartLimitIntervalSec=300
-StartLimitBurst=3
 
 [Install]
 WantedBy=multi-user.target
