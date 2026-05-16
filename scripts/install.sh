@@ -123,6 +123,36 @@ already_done() {
     test "$@"
 }
 
+# Start-of-install pristine-state dump — captures the system BEFORE
+# install.sh changes anything. Helps separate "Pi shipped with a weird
+# state" from "install.sh broke something" in post-mortem. Inline (not
+# via snapshot_state since the function isn't defined yet); appends to
+# the same /var/log/openmarquee-debug.log the snapshot_state checkpoints
+# will use.
+if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
+    {
+        printf '\n=== install.sh START: %s ===\n' "$(date -Iseconds 2>/dev/null || date)"
+        printf '\n--- /proc/cmdline ---\n'
+        cat /proc/cmdline 2>&1 || true
+        printf '\n--- uname -a ---\n'
+        uname -a 2>&1 || true
+        printf '\n--- /etc/os-release ---\n'
+        cat /etc/os-release 2>&1 || true
+        printf '\n--- df -h ---\n'
+        df -h 2>&1 || true
+        printf '\n--- free -h ---\n'
+        free -h 2>&1 || true
+        printf '\n--- mount ---\n'
+        mount 2>&1 || true
+        printf '\n--- systemctl list-units --state=failed ---\n'
+        systemctl list-units --state=failed --no-pager 2>&1 || true
+        printf '\n--- ip link show ---\n'
+        ip link show 2>&1 || true
+        printf '\n=== end install.sh START dump ===\n'
+    } >> /var/log/openmarquee-debug.log 2>&1
+    chmod 600 /var/log/openmarquee-debug.log 2>/dev/null || true
+fi
+
 # snapshot_state TAG — append a comprehensive system-state snapshot to
 # /var/log/openmarquee-debug.log under a section header. Called at multiple
 # checkpoints during install (BEFORE_DEBS_INSTALL / AFTER_DEBS_INSTALL /
