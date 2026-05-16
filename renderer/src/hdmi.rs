@@ -2944,32 +2944,31 @@ pub fn paint_one_image_slide_for_capture(
 /// unchanged (the bake was per-call already). See audit doc at
 /// qa/captures/motion-through-transitions-audit-2026-05-16.md.
 ///
-/// Phase 8 slice 4 (2026-05-16): endpoints are now `&ContentItem`
-/// (text/image/video) rather than `&TextSlide`. Per-kind bake
-/// dispatched through `bake_slide_to_fbo`. Text and Image branches
-/// route fully through the Rust shader transition.
+/// Phase 8 slice 4-6 (2026-05-16): endpoints are
+/// `TransitionEndpoint<'_>` carrying per-kind state. Text/Image/
+/// Video all route through `bake_slide_to_fbo`. Slice 6 added the
+/// Video wiring: the IPC PaintTransition handler looks up V4L2
+/// decoder state from `cache.video_decoders` + demuxer samples
+/// from `cache.video_demuxers` and packs them into
+/// `TransitionEndpoint::Video`. The dispatcher's
+/// `SlideBakeInputs::Video` arm then routes through the slice-2
+/// `bake_video_slide_to_current_fbo` helper. Option D cadence per
+/// `feedback_motion_through_transitions_required`: video drains
+/// one V4L2 sample per Advance, so video frames keep playing
+/// THROUGH the transition window alongside Text motion phase.
 ///
-/// Phase 8 slice 5 (2026-05-16): the IPC validator gate
-/// (`validate_paint_transition_endpoints`) is gone. Image/Image,
-/// Image/Text, Text/Image, and Text/Text endpoint pairs now reach
-/// this function in production. Video endpoints also reach this
-/// function but bail in `resolve_transition_endpoint`'s Video arm
-/// with a message containing the substring `"non-text slide TBD"`
-/// — Python's `_classify_op_error` (backend/openmarquee/rendering/
-/// rust_renderer.py:227-230) promotes that to
-/// `RustRendererUnsupportedSlideError`, which
-/// `AutoFallbackRenderer` routes through PIL. So a video-endpoint
-/// transition gracefully falls through to the legacy compositor
-/// rather than hard-failing. Slice 6 wires V4L2 decoder state
-/// into `SlideBakeInputs::Video` (deferred from slice 5 because
-/// the dual-video disjoint-mut HashMap workaround is non-trivial
-/// on Rust 1.85, the renderer's pinned toolchain) and removes
-/// the bail entirely.
+/// Dual-video (Video→Video different slides) uses an `iter_mut`-
+/// based disjoint &mut lookup at the IPC handler — Rust 1.85
+/// doesn't have `HashMap::get_disjoint_mut` (stable in 1.86) and
+/// `iter_mut` is the safe-Rust polyfill. Same-id Video→Video is
+/// explicitly bailed at the IPC handler: it would need two &mut
+/// to one decoder entry (impossible in safe Rust) AND would
+/// semantically double-drain per Advance.
 pub fn paint_and_present_one_transition_frame(
     session: &mut EglSession,
     card: &Card,
-    item_a: &ContentItem,
-    item_b: &ContentItem,
+    mut endpoint_a: TransitionEndpoint<'_>,
+    mut endpoint_b: TransitionEndpoint<'_>,
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
     kind: &str,
@@ -2989,39 +2988,124 @@ pub fn paint_and_present_one_transition_frame(
     let mode_h_u32 = session.mode_h as u32;
     let tick_seconds = session.motion_tick_seconds();
 
-    // Phase 8 slice 4 per-endpoint resolution. Owned data
-    // (resolved text layers Vec, motion_states Vec, image
-    // PathBuf) lives in this stack frame; the dispatcher reads
-    // refs into it via `as_inputs()`. Resolution is identical
-    // for both endpoints; one helper.
-    //
-    // Phase 4v-3b motion-state plumbing flows through the Text
-    // arm of `TransitionEndpointData` — animated layers stay
-    // alive during the transition window. Image is static so no
-    // motion-state work. Video bails (slice 5 wires).
-    let endpoint_a = resolve_transition_endpoint(item_a, fonts, content_root, tick_seconds)?;
-    let endpoint_b = resolve_transition_endpoint(item_b, fonts, content_root, tick_seconds)?;
+    // Phase 8 slice 6 per-endpoint pre-resolve. Text/Image endpoints
+    // own derived data (resolved text layers Vec, motion_states Vec,
+    // image PathBuf) that needs to outlive the bake closure; Video
+    // endpoints carry refs on the `TransitionEndpoint::Video` value
+    // itself, so no pre-resolve. Each slot is `None` for the
+    // inapplicable kinds; the SlideBakeInputs builder inside the
+    // closure unwraps based on the endpoint variant.
+    type TextResolved<'a> = (
+        uuid::Uuid,
+        BgKind,
+        Vec<(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)>,
+        Vec<MotionState>,
+    );
+    let mut text_a: Option<TextResolved<'_>> = None;
+    let mut text_b: Option<TextResolved<'_>> = None;
+    let mut image_a: Option<PathBuf> = None;
+    let mut image_b: Option<PathBuf> = None;
+    match &endpoint_a {
+        TransitionEndpoint::Text(slide) => {
+            let (bg, _, layers) = resolve_slide_layers(slide, fonts, content_root)?;
+            let motion_states = motion_states_for_layers(slide.id, &layers, tick_seconds);
+            text_a = Some((slide.id, bg, layers, motion_states));
+        }
+        TransitionEndpoint::Image(slide) => {
+            let root = content_root.ok_or_else(|| {
+                anyhow!(
+                    "paint_transition: content_root required for image endpoint (slide_id={})",
+                    slide.id
+                )
+            })?;
+            image_a = Some(crate::content::image_slide_asset_path(root, slide.id));
+        }
+        TransitionEndpoint::Video { .. } => {}
+    }
+    match &endpoint_b {
+        TransitionEndpoint::Text(slide) => {
+            let (bg, _, layers) = resolve_slide_layers(slide, fonts, content_root)?;
+            let motion_states = motion_states_for_layers(slide.id, &layers, tick_seconds);
+            text_b = Some((slide.id, bg, layers, motion_states));
+        }
+        TransitionEndpoint::Image(slide) => {
+            let root = content_root.ok_or_else(|| {
+                anyhow!(
+                    "paint_transition: content_root required for image endpoint (slide_id={})",
+                    slide.id
+                )
+            })?;
+            image_b = Some(crate::content::image_slide_asset_path(root, slide.id));
+        }
+        TransitionEndpoint::Video { .. } => {}
+    }
 
     let work: Result<()> = (|| unsafe {
         // Two sequential bakes via the dispatcher. For Text
         // endpoints, `bake_slide_to_fbo` does the slide_caches
-        // prewarm + `get_mut` internally — formerly hand-rolled at
-        // this call site before slice 4. The `&mut session` reborrow
-        // ends with each bake call, so the same-id case (item_a.id
-        // == item_b.id for text/text) is fine: the second prewarm
-        // sees needs_new=false and reuses the warm cache.
-        let (fbo_a, tex_a) = bake_slide_to_fbo(
-            session,
-            mode_w_u32,
-            mode_h_u32,
-            endpoint_a.as_inputs(),
-        )?;
-        let (fbo_b, tex_b) = match bake_slide_to_fbo(
-            session,
-            mode_w_u32,
-            mode_h_u32,
-            endpoint_b.as_inputs(),
-        ) {
+        // prewarm + `get_mut` internally. The `&mut session`
+        // reborrow ends with each bake call, so same-id text/text
+        // is fine (second prewarm sees needs_new=false). For Video
+        // endpoints the bake helper drains ONE V4L2 sample per
+        // call — Option D cadence per `feedback_motion_through_
+        // transitions_required`, video plays through the transition
+        // alongside text motion phase and image still-frames.
+        let inputs_a = match &mut endpoint_a {
+            TransitionEndpoint::Text(_) => {
+                let (id, bg, layers, states) =
+                    text_a.as_ref().expect("text_a pre-resolved above");
+                SlideBakeInputs::Text {
+                    slide_id: *id,
+                    bg_kind: bg,
+                    text_layers: layers,
+                    motion_states: Some(states),
+                }
+            }
+            TransitionEndpoint::Image(_) => SlideBakeInputs::Image {
+                asset_path: image_a.as_deref().expect("image_a pre-resolved above"),
+            },
+            TransitionEndpoint::Video {
+                samples,
+                next_sample_idx,
+                frames_decoded,
+                decoder,
+                ..
+            } => SlideBakeInputs::Video {
+                samples: *samples,
+                next_sample_idx: &mut **next_sample_idx,
+                frames_decoded: &mut **frames_decoded,
+                decoder: *decoder,
+            },
+        };
+        let (fbo_a, tex_a) = bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_a)?;
+        let inputs_b = match &mut endpoint_b {
+            TransitionEndpoint::Text(_) => {
+                let (id, bg, layers, states) =
+                    text_b.as_ref().expect("text_b pre-resolved above");
+                SlideBakeInputs::Text {
+                    slide_id: *id,
+                    bg_kind: bg,
+                    text_layers: layers,
+                    motion_states: Some(states),
+                }
+            }
+            TransitionEndpoint::Image(_) => SlideBakeInputs::Image {
+                asset_path: image_b.as_deref().expect("image_b pre-resolved above"),
+            },
+            TransitionEndpoint::Video {
+                samples,
+                next_sample_idx,
+                frames_decoded,
+                decoder,
+                ..
+            } => SlideBakeInputs::Video {
+                samples: *samples,
+                next_sample_idx: &mut **next_sample_idx,
+                frames_decoded: &mut **frames_decoded,
+                decoder: *decoder,
+            },
+        };
+        let (fbo_b, tex_b) = match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_b) {
             Ok(p) => p,
             Err(e) => {
                 session.gl.delete_framebuffer(fbo_a);
@@ -3168,118 +3252,49 @@ pub fn paint_and_present_one_transition_frame(
     Ok(())
 }
 
-/// Phase 8 slice 4 — per-endpoint resolved data carried across
-/// the bake calls in `paint_and_present_one_transition_frame`.
-/// Holds owned data (resolved text layers Vec, motion_states Vec,
-/// image PathBuf) so the dispatcher's `SlideBakeInputs` refs stay
-/// valid through the bake call. Single lifetime parameter `'a` is
-/// tied to the source `&ContentItem` — text layers borrow from
-/// the slide's `text_layers` Vec; image PathBuf is owned and could
-/// live with `'static` lifetime, but the variant inherits the
-/// enum's `'a` per Rust enum-with-lifetime-parameter rules.
+/// Phase 8 slice 6 (2026-05-16) — per-endpoint kind-tagged input
+/// to `paint_and_present_one_transition_frame`. Replaces the
+/// slice-4 `&ContentItem` endpoint signature: callers (the IPC
+/// PaintTransition handler today) build a `TransitionEndpoint<'_>`
+/// per endpoint with any caller-provided per-kind state, and the
+/// transition function does the in-frame resolve + bake.
 ///
-enum TransitionEndpointData<'a> {
-    Text {
-        slide_id: uuid::Uuid,
-        bg: BgKind,
-        layers: Vec<(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)>,
-        motion_states: Vec<MotionState>,
+/// Per-kind:
+///   - `Text(&'a TextSlide)` — function resolves layers + motion
+///     states internally from `fonts` + `content_root` +
+///     `session.motion_tick_seconds()`.
+///   - `Image(&'a ImageSlide)` — function computes asset_path
+///     internally from `content_root`.
+///   - `Video { samples, next_sample_idx, frames_decoded,
+///     decoder }` — caller passes the V4L2 demuxer/decoder
+///     state (looked up from `cache.video_demuxers` +
+///     `cache.video_decoders` at the IPC handler). Function
+///     forwards directly into `SlideBakeInputs::Video`.
+///
+/// Option D cadence per `feedback_motion_through_transitions_
+/// required`: each per-Advance transition call drains ONE V4L2
+/// sample per Video endpoint, so video frames keep advancing
+/// THROUGH the transition window. Text motion phase also advances
+/// per call (Phase 4v-3b plumbing intact).
+pub enum TransitionEndpoint<'a> {
+    Text(&'a crate::content::TextSlide),
+    Image(&'a crate::content::ImageSlide),
+    /// Video endpoint state. Unlike Text/Image which only carry a
+    /// slide ref (function resolves the rest), Video needs caller-
+    /// supplied V4L2 decoder state because the demuxer + decoder
+    /// live on the IPC handler's `SlideCache`, not on the EglSession
+    /// the transition function holds. The `VideoSlide` ref isn't
+    /// carried: the bake helper at hdmi.rs:bake_video_slide_to_
+    /// current_fbo works off the decoder state alone, and the
+    /// caller already pattern-matched the slide kind to choose this
+    /// variant — adding it back would just produce a dead-code
+    /// warning.
+    Video {
+        samples: &'a [crate::mp4_demux::Sample],
+        next_sample_idx: &'a mut usize,
+        frames_decoded: &'a mut usize,
+        decoder: &'a crate::v4l2::Decoder,
     },
-    Image {
-        asset_path: PathBuf,
-    },
-}
-
-impl<'a> TransitionEndpointData<'a> {
-    /// Build a `SlideBakeInputs<'_>` whose lifetime is tied to
-    /// `&self`. Caller is responsible for keeping `self` alive
-    /// across the dispatcher call (the dispatcher reads through
-    /// the returned refs; data lives in the parent's stack frame).
-    fn as_inputs(&self) -> SlideBakeInputs<'_> {
-        match self {
-            Self::Text {
-                slide_id,
-                bg,
-                layers,
-                motion_states,
-            } => SlideBakeInputs::Text {
-                slide_id: *slide_id,
-                bg_kind: bg,
-                text_layers: layers.as_slice(),
-                motion_states: Some(motion_states.as_slice()),
-            },
-            Self::Image { asset_path } => SlideBakeInputs::Image {
-                asset_path: asset_path.as_path(),
-            },
-        }
-    }
-}
-
-/// Phase 8 slice 4 — resolve a transition endpoint's per-kind
-/// state up-front so the bake call site is uniform across kinds.
-///
-/// For Text endpoints: runs `resolve_slide_layers` + computes
-/// `motion_states_for_layers` at `tick_seconds`. Phase 4v-3b
-/// motion-through-transitions stays intact.
-///
-/// For Image endpoints: computes the asset_path via
-/// `content::image_slide_asset_path`. Requires `content_root`;
-/// errors explicitly if `None` (text-only paths can tolerate a
-/// None content_root, but Image cannot).
-///
-/// For Video endpoints: bails with a message containing
-/// `"non-text slide TBD"`. Phase 8 slice 5 removed the IPC
-/// validator gate, so Video endpoints now reach this function
-/// in production. The substring matches Python's
-/// `_UNSUPPORTED_SLIDE_WIRE_MARKERS` tuple in
-/// `backend/openmarquee/rendering/rust_renderer.py` — the proxy's
-/// `_classify_op_error` promotes any error containing it to
-/// `RustRendererUnsupportedSlideError`, which
-/// `AutoFallbackRenderer` routes through PIL. So a video-endpoint
-/// transition gracefully falls through to the legacy compositor
-/// rather than hard-failing as an opaque RustRendererOpError.
-/// Slice 6 wires V4L2 decoder state into `SlideBakeInputs::Video`
-/// and removes this bail entirely.
-fn resolve_transition_endpoint<'a>(
-    item: &'a ContentItem,
-    fonts: Option<&FontCatalog>,
-    content_root: Option<&Path>,
-    tick_seconds: f64,
-) -> Result<TransitionEndpointData<'a>> {
-    match item {
-        ContentItem::Text(slide) => {
-            let (bg, _, layers) = resolve_slide_layers(slide, fonts, content_root)?;
-            let motion_states = motion_states_for_layers(slide.id, &layers, tick_seconds);
-            Ok(TransitionEndpointData::Text {
-                slide_id: slide.id,
-                bg,
-                layers,
-                motion_states,
-            })
-        }
-        ContentItem::Image(slide) => {
-            let root = content_root.ok_or_else(|| {
-                anyhow!(
-                    "paint_transition: content_root required for image endpoint (slide_id={})",
-                    slide.id
-                )
-            })?;
-            Ok(TransitionEndpointData::Image {
-                asset_path: crate::content::image_slide_asset_path(root, slide.id),
-            })
-        }
-        ContentItem::Video(slide) => {
-            // Phase 8 slice 5: the "non-text slide TBD" substring
-            // is the load-bearing wire marker (see Python
-            // _UNSUPPORTED_SLIDE_WIRE_MARKERS). Slice 6 deletes
-            // this branch entirely once V4L2 decoder state is
-            // wired into SlideBakeInputs::Video.
-            bail!(
-                "paint_transition: video endpoint non-text slide TBD (slice 6 wires V4L2 decoder state); slide_id={}",
-                slide.id
-            )
-        }
-    }
 }
 
 /// Public adapter: open a fresh EglSession and run the
@@ -4953,14 +4968,14 @@ enum SlideBakeInputs<'a> {
     Image {
         asset_path: &'a Path,
     },
-    /// Constructed by slice 6 once the IPC handler wires V4L2
-    /// decoder state into the transition path. Slice 5 removed
-    /// the `validate_paint_transition_endpoints` gate, so the
-    /// Video branch is production-reachable now; it currently
-    /// bails in `resolve_transition_endpoint` via the
-    /// `"non-text slide TBD"` marker until slice 6 lands.
+    /// Constructed by `paint_and_present_one_transition_frame` from
+    /// a `TransitionEndpoint::Video` value the IPC handler assembled.
+    /// Option D cadence per `feedback_motion_through_transitions_
+    /// required`: each per-Advance call drains one V4L2 sample, so
+    /// video plays THROUGH the transition (animated layers don't
+    /// freeze). Slice 6 wired this; the slice-3 `#[allow(dead_code)]`
+    /// marker dropped here.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
     Video {
         samples: &'a [crate::mp4_demux::Sample],
         next_sample_idx: &'a mut usize,

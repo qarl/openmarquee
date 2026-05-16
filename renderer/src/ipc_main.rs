@@ -872,31 +872,155 @@ fn run_paint_hook(
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
-            let from_ci = match cache.items.get(from) {
-                Some(i) => i,
-                None => return err(format!("paint_transition: from slide {from} not in cache")),
+            // Phase 8 slice 6 (2026-05-16): build TransitionEndpoint
+            // per-kind from cache state. Video endpoints route their
+            // V4L2 decoder state from `cache.video_decoders` +
+            // demuxer samples from `cache.video_demuxers` into
+            // `TransitionEndpoint::Video`. The dispatcher inside
+            // `paint_and_present_one_transition_frame` then forwards
+            // into `SlideBakeInputs::Video` and the slice-2 bake
+            // helper drains one V4L2 sample per call (Option D
+            // cadence per `feedback_motion_through_transitions_
+            // required`: video plays through the transition).
+            let from_id = *from;
+            let to_id = *to;
+
+            // Determine endpoint kinds without holding borrows on
+            // cache.items past the kind discriminator (so the
+            // subsequent video-state lookups don't conflict).
+            let from_kind = match cache.items.get(&from_id) {
+                Some(ContentItem::Text(_)) => 't',
+                Some(ContentItem::Image(_)) => 'i',
+                Some(ContentItem::Video(_)) => 'v',
+                None => return err(format!("paint_transition: from slide {from_id} not in cache")),
             };
-            let to_ci = match cache.items.get(to) {
-                Some(i) => i,
-                None => return err(format!("paint_transition: to slide {to} not in cache")),
+            let to_kind = match cache.items.get(&to_id) {
+                Some(ContentItem::Text(_)) => 't',
+                Some(ContentItem::Image(_)) => 'i',
+                Some(ContentItem::Video(_)) => 'v',
+                None => return err(format!("paint_transition: to slide {to_id} not in cache")),
             };
-            // Phase 8 slice 5 (2026-05-16): the validator gate is
-            // gone — text/text, text/image, image/text, image/image
-            // route fully through the Rust shader transition now.
-            // Video endpoints reach `resolve_transition_endpoint`
-            // (hdmi.rs), which bails with a message containing
-            // "non-text slide TBD"; Python's `_classify_op_error`
-            // (backend/openmarquee/rendering/rust_renderer.py:227-
-            // 230) recognizes that substring and promotes to
-            // RustRendererUnsupportedSlideError, so the
-            // AutoFallbackRenderer hands the transition to PIL.
-            // Slice 6 wires V4L2 decoder state into
-            // SlideBakeInputs::Video and removes the bail.
+
+            // Same-id Video/Video transitions would need two &mut to
+            // the same `VideoDecoderState` entry — impossible in safe
+            // Rust AND semantically wrong (two drains per Advance
+            // call on the same decoder). Bail explicitly. Same-id
+            // text/text and image/image are fine (idempotent bakes).
+            if from_kind == 'v' && to_kind == 'v' && from_id == to_id {
+                return err(format!(
+                    "paint_transition: same-id video→video transition not supported (slide_id={from_id})",
+                ));
+            }
+
+            // Resolve V4L2 decoder state &muts up-front for video
+            // endpoints. Single get_mut for single-video; `iter_mut`
+            // for dual-video (Rust 1.85 lacks
+            // `HashMap::get_disjoint_mut` — stable in 1.86).
+            // `iter_mut` yields disjoint &mut per entry, which is
+            // what we need; safe-Rust alternative to the unsafe
+            // raw-pointer dance.
+            let (mut from_dec_state, mut to_dec_state): (
+                Option<&mut VideoDecoderState>,
+                Option<&mut VideoDecoderState>,
+            ) = match (from_kind, to_kind) {
+                ('v', 'v') => {
+                    let mut a = None;
+                    let mut b = None;
+                    for (k, v) in cache.video_decoders.iter_mut() {
+                        if *k == from_id {
+                            a = Some(v);
+                        } else if *k == to_id {
+                            b = Some(v);
+                        }
+                        if a.is_some() && b.is_some() {
+                            break;
+                        }
+                    }
+                    if a.is_none() {
+                        return err(format!(
+                            "paint_transition: from video {from_id} decoder state missing",
+                        ));
+                    }
+                    if b.is_none() {
+                        return err(format!(
+                            "paint_transition: to video {to_id} decoder state missing",
+                        ));
+                    }
+                    (a, b)
+                }
+                ('v', _) => {
+                    let a = cache.video_decoders.get_mut(&from_id);
+                    if a.is_none() {
+                        return err(format!(
+                            "paint_transition: from video {from_id} decoder state missing",
+                        ));
+                    }
+                    (a, None)
+                }
+                (_, 'v') => {
+                    let b = cache.video_decoders.get_mut(&to_id);
+                    if b.is_none() {
+                        return err(format!(
+                            "paint_transition: to video {to_id} decoder state missing",
+                        ));
+                    }
+                    (None, b)
+                }
+                _ => (None, None),
+            };
+
+            // Build TransitionEndpoints. ContentItem refs come from a
+            // shared borrow on cache.items (field-disjoint from the
+            // &mut video_decoders borrows above). Demuxer samples
+            // come from a shared borrow on cache.video_demuxers.
+            let endpoint_a = match cache.items.get(&from_id) {
+                Some(ContentItem::Text(s)) => hdmi::TransitionEndpoint::Text(s),
+                Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
+                Some(ContentItem::Video(_)) => {
+                    let demuxer = match cache.video_demuxers.get(&from_id) {
+                        Some(d) => d,
+                        None => return err(format!(
+                            "paint_transition: from video {from_id} demuxer missing",
+                        )),
+                    };
+                    let dec_state =
+                        from_dec_state.take().expect("from_dec_state set above for 'v' kind");
+                    hdmi::TransitionEndpoint::Video {
+                        samples: demuxer.samples.as_slice(),
+                        next_sample_idx: &mut dec_state.next_sample_idx,
+                        frames_decoded: &mut dec_state.frames_decoded,
+                        decoder: &dec_state.decoder,
+                    }
+                }
+                None => unreachable!("from_id presence verified above"),
+            };
+            let endpoint_b = match cache.items.get(&to_id) {
+                Some(ContentItem::Text(s)) => hdmi::TransitionEndpoint::Text(s),
+                Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
+                Some(ContentItem::Video(_)) => {
+                    let demuxer = match cache.video_demuxers.get(&to_id) {
+                        Some(d) => d,
+                        None => return err(format!(
+                            "paint_transition: to video {to_id} demuxer missing",
+                        )),
+                    };
+                    let dec_state =
+                        to_dec_state.take().expect("to_dec_state set above for 'v' kind");
+                    hdmi::TransitionEndpoint::Video {
+                        samples: demuxer.samples.as_slice(),
+                        next_sample_idx: &mut dec_state.next_sample_idx,
+                        frames_decoded: &mut dec_state.frames_decoded,
+                        decoder: &dec_state.decoder,
+                    }
+                }
+                None => unreachable!("to_id presence verified above"),
+            };
+
             if let Err(e) = hdmi::paint_and_present_one_transition_frame(
                 session,
                 card,
-                from_ci,
-                to_ci,
+                endpoint_a,
+                endpoint_b,
                 fonts,
                 content_root,
                 kind,
