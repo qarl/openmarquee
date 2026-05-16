@@ -408,8 +408,8 @@ def _b(x, y, w, h):
 # inside the box because _draw_text_into centers).
 _BOOT_LOG_TEXT = (
     "> openMarquee v0.4.2 boot\n"
-    "  panel-0 . . . . . . . . ok\n"
-    "  motion-engine . . . . . ok\n"
+    "  panel-0 . . . . . . . .  ok\n"
+    "  motion-engine . . . . .  ok\n"
     "  flock-mesh . . . . . . . ok\n"
     "  9.6V / 0.41A / 27°C\n"
     "  ready."
