@@ -393,3 +393,88 @@ def test_flock_peer_endpoints_whitelisted(client: TestClient):
     # 401 from middleware").
     response = client.get("/api/flock/manifest")
     assert response.status_code != 401
+
+
+# Bug 3+4 (qarl 2026-05-16) — `?token=...` query-param fallback for
+# media routes that bare <img>/<video> tags must reach. Authorization
+# header still wins when present; query-param is the additive escape
+# hatch for binary-blob endpoints only.
+
+
+def test_media_route_accepts_token_query_param(client: TestClient):
+    """`?token=<bearer>` works on /api/content/{id}/asset for an <img>
+    src that can't carry an Authorization header."""
+    import uuid
+
+    set_resp = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    token = set_resp.json()["token"]
+    # No content seeded in the test fixture, so the endpoint will 404 for
+    # an unknown UUID -- the load-bearing assertion is "not 401".
+    bogus = uuid.uuid4()
+    response = client.get(f"/api/content/{bogus}/asset?token={token}")
+    assert response.status_code != 401, (
+        f"middleware 401'd a valid token-query for media route "
+        f"(got {response.status_code})"
+    )
+    # Confirm a 404 (or other non-auth status) actually fires.
+    assert response.status_code in (404, 200)
+
+
+def test_media_route_query_token_with_bad_token_still_401(client: TestClient):
+    import uuid
+
+    client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    bogus = uuid.uuid4()
+    response = client.get(f"/api/content/{bogus}/asset?token=garbage")
+    assert response.status_code == 401
+
+
+def test_media_route_query_token_missing_still_401(client: TestClient):
+    import uuid
+
+    client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    bogus = uuid.uuid4()
+    response = client.get(f"/api/content/{bogus}/asset")
+    assert response.status_code == 401
+
+
+def test_non_media_route_rejects_token_query_param(client: TestClient):
+    """`?token=` works ONLY for the media-route suffixes (/asset, /video).
+    A protected metadata/list route stays bearer-only."""
+    set_resp = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    token = set_resp.json()["token"]
+    # /api/content (list) is gated; query-param should NOT auth here.
+    response = client.get(f"/api/content?token={token}")
+    assert response.status_code == 401
+
+
+def test_authorization_header_wins_when_both_supplied(client: TestClient):
+    """If both Authorization header and ?token= are present, the header
+    is consulted first and the query-param is ignored. Verifies the
+    ordering at AuthMiddleware:159-164."""
+    import uuid
+
+    set_resp = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    token = set_resp.json()["token"]
+    bogus = uuid.uuid4()
+    # Valid header + garbage query: should pass (header wins).
+    response = client.get(
+        f"/api/content/{bogus}/asset?token=garbage",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code != 401

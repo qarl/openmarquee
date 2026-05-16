@@ -94,6 +94,26 @@ _WHITELIST_PREFIX: tuple[str, ...] = (
     "/api/flock/asset/",
 )
 
+# Bug 3+4 (qarl 2026-05-16): media routes that the operator's browser
+# reaches via bare `<img src>` / `<video src>` tags. Those tags do NOT
+# carry an Authorization header (no fetch wrapper to inject one), so
+# the strict-bearer gate 401s every thumbnail + slide-asset request
+# in the dashboard. These routes ALSO accept a `?token=...` query-
+# string fallback (the UI helper appends it client-side). Header
+# auth still works; query-param is the additive escape hatch.
+#
+# Security note: tokens in URLs leak to browser history + server
+# logs + Referer headers. The threat model here is operator's
+# localhost / tailnet access — the trade-off was explicitly accepted
+# by QA on 2026-05-16. If this widens, revisit with cookie-based
+# session auth (option b in the original dispatch).
+#
+# Route shape match: prefix is exact, the rest is `/<uuid>/<suffix>`.
+# Suffix gate so we don't accept query-param auth for /api/content
+# (list) or /api/content/{id} (metadata) — only the binary blobs.
+_MEDIA_ROUTE_PREFIX: str = "/api/content/"
+_MEDIA_ROUTE_SUFFIXES: tuple[str, ...] = ("/asset", "/video")
+
 
 class AuthMiddleware:
     """Bearer-token gate. The whitelist above carves out UI assets +
@@ -137,6 +157,11 @@ class AuthMiddleware:
             return
 
         token = _bearer_from_headers(scope.get("headers") or [])
+        # Bug 3+4 query-param fallback for media routes: bare <img>/<video>
+        # src can't carry an Authorization header, so the UI appends
+        # ?token=<bearer>. Header auth still wins when both are present.
+        if not token and _is_media_route(path):
+            token = _token_from_query(scope.get("query_string") or b"")
         state = self.auth_resolver().load()
         if not verify_token(token, state):
             await _send_401(send, state is None)
@@ -149,6 +174,32 @@ def _is_whitelisted(path: str) -> bool:
     if path in _WHITELIST_EXACT:
         return True
     return any(path.startswith(p) for p in _WHITELIST_PREFIX)
+
+
+def _is_media_route(path: str) -> bool:
+    """True when `path` matches `/api/content/<uuid>/<suffix>` for a
+    suffix in `_MEDIA_ROUTE_SUFFIXES`. Restricts query-param token auth
+    to binary-blob endpoints; metadata + list routes still require the
+    Authorization header."""
+    if not path.startswith(_MEDIA_ROUTE_PREFIX):
+        return False
+    return any(path.endswith(s) for s in _MEDIA_ROUTE_SUFFIXES)
+
+
+def _token_from_query(query_string: bytes) -> str:
+    """Pull `token=<value>` from the URL-encoded query string. Returns
+    "" when missing/malformed. Uses urllib.parse so we don't have to
+    hand-roll percent-decoding."""
+    from urllib.parse import parse_qs
+
+    try:
+        decoded = query_string.decode("ascii")
+    except UnicodeDecodeError:
+        return ""
+    values = parse_qs(decoded, keep_blank_values=False).get("token")
+    if not values:
+        return ""
+    return values[0].strip()
 
 
 def _bearer_from_headers(headers: list[tuple[bytes, bytes]]) -> str:

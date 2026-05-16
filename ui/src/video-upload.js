@@ -44,6 +44,7 @@ const TEMPLATE = `
     </section>
 `;
 
+import { mediaSrc } from "./api.js";
 import { attachAutoSave } from "./auto-save.js";
 import { canvasToBase64, drawPlaceholderToCanvas } from "./image-upload.js";
 import {
@@ -341,12 +342,12 @@ export function mountVideoUploader(
         // file) and point the preview <video> at the server's MP4 so
         // they can play it back inline.
         try {
-            await drawUrlToCanvas(`/api/content/${slide.id}/asset`, canvas);
+            await drawUrlToCanvas(mediaSrc(`/api/content/${slide.id}/asset`), canvas);
         } catch (err) {
             statusEl.textContent = `Could not load thumbnail: ${err.message}`;
             statusEl.dataset.state = "error";
         }
-        setPreviewSrc(`/api/content/${slide.id}/video`, /* revokeOnSwap */ false);
+        setPreviewSrc(mediaSrc(`/api/content/${slide.id}/video`), /* revokeOnSwap */ false);
         // Loading is not an edit — drop any auto-save scheduled by the
         // field mutations above.
         autoSave.cancel();

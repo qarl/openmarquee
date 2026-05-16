@@ -24,6 +24,7 @@
 // across the editor + playlist bundles; lazy here lets esbuild collapse
 // the dep into a single shared chunk.
 
+import { mediaSrc } from "./api.js";
 import { attachAutoSave } from "./auto-save.js";
 import {
     PATTERN_NAMES,
@@ -1832,6 +1833,6 @@ function loadImageForSlide(slideId) {
         img.crossOrigin = "anonymous";
         img.onload = () => resolve(img);
         img.onerror = () => reject(new Error("could not load slide image"));
-        img.src = `/api/content/${slideId}/asset`;
+        img.src = mediaSrc(`/api/content/${slideId}/asset`);
     });
 }

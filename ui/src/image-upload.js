@@ -4,6 +4,7 @@
 // scales to panel dims at slide entry — so a panel resize never
 // degrades a stored asset.
 
+import { mediaSrc } from "./api.js";
 import { attachAutoSave } from "./auto-save.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
@@ -203,7 +204,7 @@ export function mountImageUploader(
             Math.max(1, (slide.duration_ms || 5000) / 1000),
         );
         try {
-            await drawUrlToCanvas(`/api/content/${slide.id}/asset`, canvas);
+            await drawUrlToCanvas(mediaSrc(`/api/content/${slide.id}/asset`), canvas);
         } catch (err) {
             clearCanvas();
             statusEl.textContent = `Could not load image: ${err.message}`;

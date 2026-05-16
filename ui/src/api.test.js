@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
     apiFetch,
     AUTH_TOKEN_KEY,
+    mediaSrc,
     deleteContent,
     effectiveDisplayDims,
     extractDetailMessage,
@@ -738,5 +739,29 @@ describe("apiFetch (20.3 wrapper)", () => {
         } finally {
             restore();
         }
+    });
+});
+
+describe("mediaSrc", () => {
+    it("returns the URL untouched when no token in localStorage", () => {
+        expect(mediaSrc("/api/content/abc/asset")).toBe("/api/content/abc/asset");
+    });
+
+    it("appends ?token=<bearer> to a URL without an existing query string", () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.deadbeef");
+        const out = mediaSrc("/api/content/abc/asset");
+        expect(out).toBe("/api/content/abc/asset?token=1.deadbeef");
+    });
+
+    it("appends &token=<bearer> when the URL already carries a query string", () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.deadbeef");
+        const out = mediaSrc("/api/content/abc/asset?v=2026-05-16T12");
+        expect(out).toBe("/api/content/abc/asset?v=2026-05-16T12&token=1.deadbeef");
+    });
+
+    it("URL-encodes tokens that contain reserved characters", () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.a/b+c=d");
+        const out = mediaSrc("/api/content/abc/asset");
+        expect(out).toBe("/api/content/abc/asset?token=1.a%2Fb%2Bc%3Dd");
     });
 });

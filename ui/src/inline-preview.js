@@ -23,6 +23,7 @@
 // - Transition "fade" between items: linear cross-fade over
 //   transition_ms at the boundary. "cut" is instant.
 
+import { mediaSrc } from "./api.js";
 import { formatAutoText } from "./auto-format.js";
 import { anyLayerAnimated } from "./canvas-motion.js";
 import { drawTextOnly } from "./editor.js";
@@ -935,7 +936,7 @@ export function mountInlinePreview(container, options) {
         const v = encodeURIComponent(
             item.updated_at || item.created_at || refreshVersion,
         );
-        img.src = `/api/content/${item.id}/asset?v=${v}`;
+        img.src = mediaSrc(`/api/content/${item.id}/asset?v=${v}`);
         imageCache.set(item.id, img);
         return img;
     }
@@ -957,7 +958,7 @@ export function mountInlinePreview(container, options) {
         video.playsInline = true;
         video.preload = "auto";
         const v = encodeURIComponent(stamp);
-        video.src = `/api/content/${videoId}/video?v=${v}`;
+        video.src = mediaSrc(`/api/content/${videoId}/video?v=${v}`);
         video.addEventListener("seeked", () => renderOnce());
         video.addEventListener("loadeddata", () => renderOnce());
         videoCache.set(key, video);

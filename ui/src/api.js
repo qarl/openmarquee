@@ -105,6 +105,30 @@ export async function apiFetch(input, init = {}) {
 }
 
 /**
+ * Bug 3+4 (qarl 2026-05-16): append `?token=<bearer>` to a media URL
+ * so a bare `<img src>` / `<video src>` reaches the auth-gated
+ * `/api/content/{id}/asset` and `/api/content/{id}/video` endpoints.
+ * AuthMiddleware accepts the query-param token for those routes
+ * specifically (see backend/openmarquee/auth_middleware.py).
+ *
+ * Handles URLs that already have a query string (e.g. `?v=...` cache
+ * buster) — appends `&token=...` instead of `?token=...`. When there
+ * is no token in localStorage (pre-auth), returns the URL untouched
+ * so the resulting 401 surfaces via the normal apiFetch redirect.
+ */
+export function mediaSrc(path) {
+    let token = "";
+    if (typeof localStorage !== "undefined") {
+        try {
+            token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
+        } catch { /* private-browsing localStorage throws; degrade */ }
+    }
+    if (!token) return path;
+    const sep = path.includes("?") ? "&" : "?";
+    return `${path}${sep}token=${encodeURIComponent(token)}`;
+}
+
+/**
  * 15.3: Best-effort "pull a one-line operator-friendly message out of a
  * non-OK response." Handles three shapes FastAPI emits:
  *   - 422 ValidationError -> `{detail: [{msg, loc, ...}, ...]}` (array)
