@@ -428,6 +428,20 @@ if [ -d "$DEBS_DIR" ] && [ -n "$(ls -A "$DEBS_DIR"/*.deb 2>/dev/null)" ]; then
     # reason (e.g. a warning surfaced as exit-1 by a future apt change),
     # we don't want set -e to fail-stop the install when the .debs are
     # already correctly applied.
+    #
+    # Phase 4u: mask hostapd + dnsmasq BEFORE the apt install so the .deb
+    # postinst auto-start does NOT fire before ap0 exists and before
+    # firstboot.service has templated their configs. Without this,
+    # hostapd retries on a nonexistent ap0, hits Restart=on-failure →
+    # StartLimitBurst → unit marked failed, then install.sh's
+    # `systemctl enable` (no --now) at section 8 does NOT activate
+    # ap0.service because multi-user.target is already reached during
+    # cloud-init. Result on boot 9 (2026-05-16 forensic logs): hostapd
+    # loops forever with `Could not read interface ap0 flags: No such
+    # device`. Mask only stops FUTURE invocations; the explicit start
+    # sequence in section 8 below resets the failed state and brings
+    # the units up against the now-extant ap0 and now-templated configs.
+    run systemctl mask hostapd.service dnsmasq.service || true
     run apt install -y --no-install-recommends "$DEBS_DIR"/*.deb || true
 else
     say "  no vendored .debs at $DEBS_DIR — assuming hostapd + iptables + dnsmasq already installed (dev-redeploy)"
@@ -611,6 +625,24 @@ run systemctl enable openmarquee-backend.service \
                     openmarquee-ap0.service \
                     hostapd.service \
                     dnsmasq.service
+
+# Phase 4u: explicit start sequence. `systemctl enable` alone does NOT
+# activate units when multi-user.target is already reached during
+# cloud-init -- the units are wired into next-boot's dependency graph,
+# but they don't get started this boot. Section 5.5's mask above stops
+# FUTURE invocations of hostapd / dnsmasq from the .deb postinst, but
+# any failed-state already queued before mask landed survives the
+# mask; reset-failed clears it. Then bring up ap0 explicitly (needed
+# for hostapd to find an interface to bind), then restart hostapd +
+# dnsmasq so they pick up the now-templated configs and the now-extant
+# ap0. `ip link set wlan0 up` is belt-and-braces (ap0-setup.sh handles
+# its own interface up, but a wlan0-down state would mean ap0 can't
+# create either).
+run systemctl reset-failed hostapd.service dnsmasq.service || true
+run ip link set wlan0 up || true
+run systemctl start openmarquee-ap0.service
+run systemctl restart hostapd.service
+run systemctl restart dnsmasq.service
 
 # Restart the backend so the new code takes effect on developer redeploy.
 # On first boot the unit isn't running; --no-block queues the restart and
