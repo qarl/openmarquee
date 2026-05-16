@@ -894,22 +894,23 @@ fn run_paint_hook(
                 Some(i) => i,
                 None => return err(format!("paint_transition: to slide {to} not in cache")),
             };
+            // Phase 8 slice 4: the validator gate STAYS for this
+            // slice. The transition function now accepts
+            // &ContentItem endpoints (text + image branches wired;
+            // video branch bails pending slice 5's V4L2 decoder
+            // state plumbing). Slice 5 removes this gate AND
+            // replaces the dispatcher's video bail with the actual
+            // wiring. In slice 4 production, only text→text reaches
+            // the function (validator rejects everything else); the
+            // signature change is the structural lift.
             if let Err(msg) = validate_paint_transition_endpoints(from_ci, to_ci) {
                 return err(msg);
             }
-            let from_item = match from_ci {
-                ContentItem::Text(s) => s,
-                _ => unreachable!("validator rejects non-text"),
-            };
-            let to_item = match to_ci {
-                ContentItem::Text(s) => s,
-                _ => unreachable!("validator rejects non-text"),
-            };
             if let Err(e) = hdmi::paint_and_present_one_transition_frame(
                 session,
                 card,
-                from_item,
-                to_item,
+                from_ci,
+                to_ci,
                 fonts,
                 content_root,
                 kind,

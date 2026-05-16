@@ -2943,11 +2943,27 @@ pub fn paint_one_image_slide_for_capture(
 /// is ~2 ms incremental (motion_states_for_layers); GPU cost
 /// unchanged (the bake was per-call already). See audit doc at
 /// qa/captures/motion-through-transitions-audit-2026-05-16.md.
+///
+/// Phase 8 slice 4 (2026-05-16): endpoints are now `&ContentItem`
+/// (text/image/video) rather than `&TextSlide`. Per-kind bake
+/// dispatched through `bake_slide_to_fbo`. Text and Image branches
+/// are fully wired in this slice; Video bails with an explicit
+/// "TBD - slice 5 wires V4L2 decoder state" because the dual-video
+/// `HashMap::get_disjoint_mut` API isn't stable on Rust 1.85 (the
+/// renderer's pinned toolchain). The IPC validator at
+/// `ipc_main.rs:validate_paint_transition_endpoints` still rejects
+/// non-text endpoints in production until slice 5 removes the
+/// gate, so the Video branch is structurally reachable but not
+/// production-reachable in slice 4. Slice 5 removes the gate AND
+/// replaces the Video branch's bail with the actual decoder state
+/// plumbing (the dispatch framed slice 5 as "gate removal + tests"
+/// — surfaced in the slice 4 commit / QA ping that the video
+/// plumbing rides along).
 pub fn paint_and_present_one_transition_frame(
     session: &mut EglSession,
     card: &Card,
-    slide_a: &TextSlide,
-    slide_b: &TextSlide,
+    item_a: &ContentItem,
+    item_b: &ContentItem,
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
     kind: &str,
@@ -2963,91 +2979,42 @@ pub fn paint_and_present_one_transition_frame(
             FS_CUT
         }
     };
-    let (bg_a, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
-    let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
     let mode_w_u32 = session.mode_w as u32;
     let mode_h_u32 = session.mode_h as u32;
-
-    // Phase 4v-3b (2026-05-16): per-frame motion states for both
-    // slides so the per-Advance bakes paint each slide at its CURRENT
-    // motion phase rather than the static first-frame pose. Mirrors
-    // hold-path renderer at L1236-1238. tick_seconds is session-
-    // global and advances continuously across hold/transition
-    // boundaries (motion phase doesn't jump when a transition starts
-    // or ends). Each IPC Advance fires one call with a fresh
-    // tick_seconds, so the bake captures the right phase per frame.
     let tick_seconds = session.motion_tick_seconds();
-    let states_a = motion_states_for_layers(slide_a.id, &layers_a, tick_seconds);
-    let states_b = motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
 
-    // QA-direct (2026-05-14 transition-cache wire, followup to
-    // 9e776e7): pre-warm slide_caches entries for both transition
-    // slides before the unsafe IIFE. The two make_slide_fbo bakes
-    // below pull from these caches (mirroring the hold-path fix in
-    // paint_and_present_one_frame_for_slide). Two sequential
-    // get_mut borrows -- one for slide_a's bake, then again for
-    // slide_b's -- so the &mut HashMap borrow lifetime is
-    // single-entry-scoped per bake call (no disjoint-mut needed).
-    // Same-id case (slide_a.id == slide_b.id) is fine: the second
-    // get-or-init sees needs_new=false and reuses the warm cache
-    // populated by the slide_a bake.
-    let layers_a_len = layers_a.len();
-    let layers_b_len = layers_b.len();
-    {
-        let needs_new = match session.slide_caches.get(&slide_a.id) {
-            Some(c) => c.glyph.len() != layers_a_len,
-            None => true,
-        };
-        if needs_new {
-            if let Some(old) = session.slide_caches.remove(&slide_a.id) {
-                free_slide_render_cache(session.gl, old);
-            }
-            session
-                .slide_caches
-                .insert(slide_a.id, SlideRenderCache::new(layers_a_len));
-        }
-    }
+    // Phase 8 slice 4 per-endpoint resolution. Owned data
+    // (resolved text layers Vec, motion_states Vec, image
+    // PathBuf) lives in this stack frame; the dispatcher reads
+    // refs into it via `as_inputs()`. Resolution is identical
+    // for both endpoints; one helper.
+    //
+    // Phase 4v-3b motion-state plumbing flows through the Text
+    // arm of `TransitionEndpointData` — animated layers stay
+    // alive during the transition window. Image is static so no
+    // motion-state work. Video bails (slice 5 wires).
+    let endpoint_a = resolve_transition_endpoint(item_a, fonts, content_root, tick_seconds)?;
+    let endpoint_b = resolve_transition_endpoint(item_b, fonts, content_root, tick_seconds)?;
 
     let work: Result<()> = (|| unsafe {
-        // Bake slide_a + slide_b into FBOs (same machinery as
-        // render_transition_animated_in_session's bake).
-        // First bake: slide_a's cache borrow ends with the call.
-        let cache_a = session
-            .slide_caches
-            .get_mut(&slide_a.id)
-            .expect("slide_caches entry for slide_a initialized above");
-        let (fbo_a, tex_a) = make_slide_fbo(
-            session.gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a,
-            Some(&states_a),
-            Some(&mut cache_a.glyph),
-            Some(&mut cache_a.tex),
+        // Two sequential bakes via the dispatcher. For Text
+        // endpoints, `bake_slide_to_fbo` does the slide_caches
+        // prewarm + `get_mut` internally — formerly hand-rolled at
+        // this call site before slice 4. The `&mut session` reborrow
+        // ends with each bake call, so the same-id case (item_a.id
+        // == item_b.id for text/text) is fine: the second prewarm
+        // sees needs_new=false and reuses the warm cache.
+        let (fbo_a, tex_a) = bake_slide_to_fbo(
+            session,
+            mode_w_u32,
+            mode_h_u32,
+            endpoint_a.as_inputs(),
         )?;
-        // slide_b cache get-or-init (must happen after cache_a's
-        // &mut borrow ends, which it does at the function-call
-        // boundary above).
-        {
-            let needs_new = match session.slide_caches.get(&slide_b.id) {
-                Some(c) => c.glyph.len() != layers_b_len,
-                None => true,
-            };
-            if needs_new {
-                if let Some(old) = session.slide_caches.remove(&slide_b.id) {
-                    free_slide_render_cache(session.gl, old);
-                }
-                session
-                    .slide_caches
-                    .insert(slide_b.id, SlideRenderCache::new(layers_b_len));
-            }
-        }
-        let cache_b = session
-            .slide_caches
-            .get_mut(&slide_b.id)
-            .expect("slide_caches entry for slide_b initialized above");
-        let (fbo_b, tex_b) = match make_slide_fbo(
-            session.gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b,
-            Some(&states_b),
-            Some(&mut cache_b.glyph),
-            Some(&mut cache_b.tex),
+        let (fbo_b, tex_b) = match bake_slide_to_fbo(
+            session,
+            mode_w_u32,
+            mode_h_u32,
+            endpoint_b.as_inputs(),
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -3193,6 +3160,107 @@ pub fn paint_and_present_one_transition_frame(
     session.scanout_current_bo = Some(new_bo);
     session.scanout_current_fb = Some(new_fb);
     Ok(())
+}
+
+/// Phase 8 slice 4 — per-endpoint resolved data carried across
+/// the bake calls in `paint_and_present_one_transition_frame`.
+/// Holds owned data (resolved text layers Vec, motion_states Vec,
+/// image PathBuf) so the dispatcher's `SlideBakeInputs` refs stay
+/// valid through the bake call. Single lifetime parameter `'a` is
+/// tied to the source `&ContentItem` — text layers borrow from
+/// the slide's `text_layers` Vec; image PathBuf is owned and could
+/// live with `'static` lifetime, but the variant inherits the
+/// enum's `'a` per Rust enum-with-lifetime-parameter rules.
+enum TransitionEndpointData<'a> {
+    Text {
+        slide_id: uuid::Uuid,
+        bg: BgKind,
+        layers: Vec<(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)>,
+        motion_states: Vec<MotionState>,
+    },
+    Image {
+        asset_path: PathBuf,
+    },
+}
+
+impl<'a> TransitionEndpointData<'a> {
+    /// Build a `SlideBakeInputs<'_>` whose lifetime is tied to
+    /// `&self`. Caller is responsible for keeping `self` alive
+    /// across the dispatcher call (the dispatcher reads through
+    /// the returned refs; data lives in the parent's stack frame).
+    fn as_inputs(&self) -> SlideBakeInputs<'_> {
+        match self {
+            Self::Text {
+                slide_id,
+                bg,
+                layers,
+                motion_states,
+            } => SlideBakeInputs::Text {
+                slide_id: *slide_id,
+                bg_kind: bg,
+                text_layers: layers.as_slice(),
+                motion_states: Some(motion_states.as_slice()),
+            },
+            Self::Image { asset_path } => SlideBakeInputs::Image {
+                asset_path: asset_path.as_path(),
+            },
+        }
+    }
+}
+
+/// Phase 8 slice 4 — resolve a transition endpoint's per-kind
+/// state up-front so the bake call site is uniform across kinds.
+///
+/// For Text endpoints: runs `resolve_slide_layers` + computes
+/// `motion_states_for_layers` at `tick_seconds`. Phase 4v-3b
+/// motion-through-transitions stays intact.
+///
+/// For Image endpoints: computes the asset_path via
+/// `content::image_slide_asset_path`. Requires `content_root`;
+/// errors explicitly if `None` (text-only paths can tolerate a
+/// None content_root, but Image cannot).
+///
+/// For Video endpoints: bails. Slice 4 leaves the structural
+/// dispatch in place but defers actual V4L2 decoder state plumbing
+/// to slice 5 alongside the validator gate removal. Slice 5's
+/// scope grows by one item (the IPC handler's video-state lookup
+/// + the dispatcher's video bake) — surfaced in slice 4 commit
+/// message + QA ping.
+fn resolve_transition_endpoint<'a>(
+    item: &'a ContentItem,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    tick_seconds: f64,
+) -> Result<TransitionEndpointData<'a>> {
+    match item {
+        ContentItem::Text(slide) => {
+            let (bg, _, layers) = resolve_slide_layers(slide, fonts, content_root)?;
+            let motion_states = motion_states_for_layers(slide.id, &layers, tick_seconds);
+            Ok(TransitionEndpointData::Text {
+                slide_id: slide.id,
+                bg,
+                layers,
+                motion_states,
+            })
+        }
+        ContentItem::Image(slide) => {
+            let root = content_root.ok_or_else(|| {
+                anyhow!(
+                    "paint_transition: content_root required for image endpoint (slide_id={})",
+                    slide.id
+                )
+            })?;
+            Ok(TransitionEndpointData::Image {
+                asset_path: crate::content::image_slide_asset_path(root, slide.id),
+            })
+        }
+        ContentItem::Video(slide) => {
+            bail!(
+                "paint_transition: video endpoint TBD (slice 5 wires V4L2 decoder state + removes validate_paint_transition_endpoints gate); slide_id={}",
+                slide.id
+            )
+        }
+    }
 }
 
 /// Public adapter: open a fresh EglSession and run the
@@ -4847,23 +4915,30 @@ unsafe fn make_slide_fbo(
 /// (glyph/tex caches, video sample/frame counters) are on disjoint
 /// objects so the compiler can prove non-overlap at the call site.
 ///
-/// Slice 4 wires this into `paint_and_present_one_transition_frame`
-/// so non-text endpoint transitions stop hitting the
-/// `"non-text slide TBD"` IPC error. `dead_code` allowance is
-/// scoped to this slice; slice 4's caller switch removes it.
-#[allow(dead_code)]
+/// Slice 4 (2026-05-16) revises slice 3's shape: the Text variant
+/// now carries `slide_id` instead of `&mut GlyphCache`/`&mut
+/// TextureCache` borrows. The cache prewarm + `get_mut` runs INSIDE
+/// `bake_slide_to_fbo`'s Text branch using the dispatcher's
+/// `&mut session.slide_caches` borrow. Carrying the cache &muts in
+/// the input enum would conflict with the dispatcher's outer
+/// `&mut session` parameter, since the caches are sub-borrows of
+/// `session.slide_caches`. Internalizing the lookup keeps the
+/// caller's transition-function body free of cache plumbing.
 enum SlideBakeInputs<'a> {
     Text {
+        slide_id: uuid::Uuid,
         bg_kind: &'a BgKind,
         text_layers: &'a [(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
         motion_states: Option<&'a [MotionState]>,
-        glyph_cache: Option<&'a mut GlyphCache>,
-        tex_cache: Option<&'a mut TextureCache>,
     },
     Image {
         asset_path: &'a Path,
     },
+    /// Constructed by slice 5 once the validate_paint_transition_
+    /// endpoints gate is dropped + the IPC handler wires V4L2
+    /// decoder state into the transition path.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     Video {
         samples: &'a [crate::mp4_demux::Sample],
         next_sample_idx: &'a mut usize,
@@ -4889,9 +4964,6 @@ enum SlideBakeInputs<'a> {
 /// propagating Err. Caller-side cleanup is needed only on a paint
 /// failure AFTER this returns Ok.
 ///
-/// `dead_code` allowance scoped to slice 3; slice 4 consumes via
-/// `bake_slide_to_fbo`.
-#[allow(dead_code)]
 unsafe fn create_slide_fbo_pair(
     gl: &glow::Context,
     mode_w: u32,
@@ -4988,9 +5060,6 @@ unsafe fn create_slide_fbo_pair(
 /// video frame IS the motion, and slice 4's caller cadence
 /// decides Option C vs D per slice 0 recon).
 ///
-/// `dead_code` allowance scoped to slice 3; slice 4's transition-
-/// path caller switch removes it.
-#[allow(dead_code)]
 unsafe fn bake_slide_to_fbo(
     session: &mut EglSession,
     mode_w: u32,
@@ -5000,21 +5069,46 @@ unsafe fn bake_slide_to_fbo(
     use glow::HasContext;
     match inputs {
         SlideBakeInputs::Text {
+            slide_id,
             bg_kind,
             text_layers,
             motion_states,
-            glyph_cache,
-            tex_cache,
-        } => make_slide_fbo(
-            session.gl,
-            mode_w,
-            mode_h,
-            bg_kind,
-            text_layers,
-            motion_states,
-            glyph_cache,
-            tex_cache,
-        ),
+        } => {
+            // Cache prewarm + lookup — moved out of the caller in
+            // slice 4 so the dispatcher's outer `&mut session` and
+            // the cache `&mut` (sub-borrow of session.slide_caches)
+            // don't conflict. Two-phase: ensure entry exists, then
+            // borrow it mutably for the make_slide_fbo call. Mirrors
+            // the prewarm shape at the pre-slice-4
+            // paint_and_present_one_transition_frame call site.
+            let layers_len = text_layers.len();
+            let needs_new = match session.slide_caches.get(&slide_id) {
+                Some(c) => c.glyph.len() != layers_len,
+                None => true,
+            };
+            if needs_new {
+                if let Some(old) = session.slide_caches.remove(&slide_id) {
+                    free_slide_render_cache(session.gl, old);
+                }
+                session
+                    .slide_caches
+                    .insert(slide_id, SlideRenderCache::new(layers_len));
+            }
+            let cache = session
+                .slide_caches
+                .get_mut(&slide_id)
+                .expect("slide_caches entry initialized above");
+            make_slide_fbo(
+                session.gl,
+                mode_w,
+                mode_h,
+                bg_kind,
+                text_layers,
+                motion_states,
+                Some(&mut cache.glyph),
+                Some(&mut cache.tex),
+            )
+        }
         SlideBakeInputs::Image { asset_path } => {
             let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
             // create_slide_fbo_pair leaves FBO bound; paint into it
