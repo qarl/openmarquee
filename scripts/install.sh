@@ -262,15 +262,21 @@ say "Install vendored trixie packages"
 DEBS_DIR="${OPT_DIR}/debs"
 if [ -d "$DEBS_DIR" ] && [ -n "$(ls -A "$DEBS_DIR"/*.deb 2>/dev/null)" ]; then
     say "  found vendored .debs at $DEBS_DIR — installing"
-    # dpkg -i resolves install order when all .debs are passed at once.
-    # Already-installed packages at same-or-newer version are silently
-    # skipped (idempotent on re-run). Glob expansion avoids hardcoding
-    # filenames; future closure additions don't need this step touched.
-    # The shell glob is intentional: $DEBS_DIR/*.deb expands to a list
-    # of individual paths, which dpkg accepts as positional args.
-    run dpkg -i "$DEBS_DIR"/*.deb
+    # apt install accepts local .deb paths and computes install order
+    # from each package's Depends: field — unlike `dpkg -i` which is
+    # argv-order-sensitive and would have iptables fail its first
+    # configure pass when libip4tc2 hasn't been configured yet (alphabetical
+    # glob expansion puts iptables before its libs). apt also gracefully
+    # accepts already-installed packages at same-or-newer version
+    # (idempotent on re-run). --no-install-recommends keeps the closure
+    # tight; no network needed when the closure is complete. `|| true`
+    # is defense-in-depth: if apt returns non-zero for a non-fatal
+    # reason (e.g. a warning surfaced as exit-1 by a future apt change),
+    # we don't want set -e to fail-stop the install when the .debs are
+    # already correctly applied.
+    run apt install -y --no-install-recommends "$DEBS_DIR"/*.deb || true
 else
-    say "  no vendored .debs at $DEBS_DIR — assuming hostapd + iptables already installed (dev-redeploy)"
+    say "  no vendored .debs at $DEBS_DIR — assuming hostapd + iptables + dnsmasq already installed (dev-redeploy)"
 fi
 
 # --- 6. iptables redirect rules ---------------------------------------------
@@ -402,5 +408,35 @@ run systemctl enable openmarquee-backend.service \
 # belts-and-braces against systemctl returning non-zero on edge cases
 # (unit masked, machine ID issues during cloud-init, etc.).
 run systemctl --no-block restart openmarquee-backend.service || true
+
+# Probe backend health so the operator gets an obvious signal if uvicorn
+# died on startup (import error, port-bind conflict, missing settings,
+# etc.) — without this, install.sh would exit 0 even when the AP comes
+# up but http://10.0.0.1/ hangs. /healthz is documented as the deploy
+# health gate (auth_middleware.py:52) and is no-auth + side-effect-free.
+# Loop is 30 × (curl --max-time 1 + sleep 1): ~30s when port 80 is
+# unbound (curl returns immediately), up to ~60s if uvicorn is bound
+# but hung. Failure does NOT fail-stop install.sh — the backend may
+# legitimately come up later when cloud-init finishes pulling in
+# deferred services. Failure leaves a sentinel file so next-boot
+# diagnosis has an obvious anchor.
+if [ "$DRY_RUN" -eq 0 ]; then
+    say "Probing backend health (~30s budget; up to ~60s if uvicorn hangs)"
+    backend_up=0
+    for _ in $(seq 1 30); do
+        if curl -fsS --max-time 1 http://127.0.0.1/healthz >/dev/null 2>&1; then
+            backend_up=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$backend_up" -eq 1 ]; then
+        say "  backend /healthz responded OK"
+        rm -f "${ROOT_PREFIX}/var/openmarquee-backend-startup-failed"
+    else
+        say "WARNING: backend did not respond to /healthz within 30s"
+        touch "${ROOT_PREFIX}/var/openmarquee-backend-startup-failed"
+    fi
+fi
 
 say "Done."
