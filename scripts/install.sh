@@ -32,7 +32,25 @@
 # --root flag lets the test suite redirect destination paths into a
 # tmpdir; in dry-run those paths are reported, not touched.
 
-set -euo pipefail
+set -euxo pipefail
+
+# Redirect xtrace output to a dedicated persistent file so the full
+# execution trace survives even if cloud-init-output.log is truncated
+# or journald state is lost on reboot. Real-device install only —
+# guarded so dry-run / --root test invocations don't try to open
+# /var/log on the build host. The default-init below lets the gate
+# below evaluate before argv parsing has run; argv parsing then
+# reassigns DRY_RUN / ROOT_PREFIX, which is fine: the xtrace FD is
+# already open and stays redirected for the rest of the script.
+: "${DRY_RUN:=0}"
+: "${ROOT_PREFIX:=}"
+if [ "$DRY_RUN" -eq 0 ] && [ -z "$ROOT_PREFIX" ]; then
+    exec {XTRACE_FD}>>/var/log/openmarquee-install-xtrace.log 2>/dev/null || XTRACE_FD=
+    if [ -n "${XTRACE_FD:-}" ]; then
+        BASH_XTRACEFD=$XTRACE_FD
+        export BASH_XTRACEFD
+    fi
+fi
 
 # --- Defaults / arg parsing -------------------------------------------------
 
@@ -100,6 +118,73 @@ already_done() {
         return 1
     fi
     test "$@"
+}
+
+# snapshot_state TAG — append a comprehensive system-state snapshot to
+# /var/log/openmarquee-debug.log under a section header. Called at multiple
+# checkpoints during install (BEFORE_DEBS_INSTALL / AFTER_DEBS_INSTALL /
+# AFTER_FIRSTBOOT / END_OF_INSTALL) to capture how state evolves. Pure
+# read-only diagnostics; no service restarts, no config changes. Gated to
+# real-device install (silent no-op on VM-test / dry-run).
+snapshot_state() {
+    local tag="$1"
+    [ -n "$ROOT_PREFIX" ] && return 0
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    local debug_log="/var/log/openmarquee-debug.log"
+    {
+        printf '\n\n================================================================\n'
+        printf '=== snapshot: %s at %s ===\n' "$tag" "$(date -Iseconds 2>/dev/null || date)"
+        printf '================================================================\n'
+        printf '\n--- systemctl status (relevant units) ---\n'
+        systemctl status hostapd dnsmasq NetworkManager openmarquee-backend openmarquee-firstboot openmarquee-ap0 2>&1 || true
+        printf '\n--- systemctl is-enabled / is-active / is-failed ---\n'
+        for u in hostapd dnsmasq NetworkManager openmarquee-backend openmarquee-firstboot openmarquee-ap0; do
+            printf '  %s: enabled=%s active=%s failed=%s\n' \
+                "$u" \
+                "$(systemctl is-enabled "$u" 2>&1 || echo unknown)" \
+                "$(systemctl is-active "$u" 2>&1 || echo unknown)" \
+                "$(systemctl is-failed "$u" 2>&1 || echo unknown)"
+        done
+        printf '\n--- ip link show ---\n'
+        ip link show wlan0 2>&1 || true
+        ip link show ap0 2>&1 || true
+        printf '\n--- ip addr show ---\n'
+        ip addr show wlan0 2>&1 || true
+        ip addr show ap0 2>&1 || true
+        printf '\n--- iw dev ---\n'
+        iw dev 2>&1 || true
+        printf '\n--- hostapd.conf (passphrase redacted) ---\n'
+        if [ -f /etc/hostapd/hostapd.conf ]; then
+            sed -E 's|^(wpa_passphrase=).*|\1REDACTED|' /etc/hostapd/hostapd.conf 2>&1 || true
+        else
+            printf '  (file not present)\n'
+        fi
+        printf '\n--- /etc/default/hostapd ---\n'
+        if [ -f /etc/default/hostapd ]; then
+            cat /etc/default/hostapd 2>&1 || true
+        else
+            printf '  (not present)\n'
+        fi
+        printf '\n--- stat /etc/hostapd/hostapd.conf ---\n'
+        if [ -e /etc/hostapd/hostapd.conf ]; then
+            stat /etc/hostapd/hostapd.conf 2>&1 || true
+        else
+            printf '  (not present)\n'
+        fi
+        printf '\n--- pgrep -af hostapd ---\n'
+        pgrep -af hostapd 2>&1 || echo "  (no hostapd process)"
+        printf '\n--- pgrep -af dnsmasq ---\n'
+        pgrep -af dnsmasq 2>&1 || echo "  (no dnsmasq process)"
+        printf '\n--- pgrep -af NetworkManager ---\n'
+        pgrep -af NetworkManager 2>&1 || echo "  (no NM process)"
+        printf '\n--- journalctl -b -u hostapd (tail 200) ---\n'
+        journalctl -b -u hostapd --no-pager 2>&1 | tail -200 || true
+        printf '\n--- journalctl -b -u openmarquee-ap0 (tail 100) ---\n'
+        journalctl -b -u openmarquee-ap0 --no-pager 2>&1 | tail -100 || true
+        printf '\n--- journalctl -b -u openmarquee-firstboot (tail 300) ---\n'
+        journalctl -b -u openmarquee-firstboot --no-pager 2>&1 | tail -300 || true
+    } >> "$debug_log" 2>&1
+    chmod 600 "$debug_log" 2>/dev/null || true
 }
 
 # --- 1. State directories ---------------------------------------------------
@@ -260,6 +345,7 @@ run cp "${OPT_DIR}/system/dnsmasq.conf" "$DNSMASQ_DST"
 # run); skip silently in that case.
 say "Install vendored trixie packages"
 DEBS_DIR="${OPT_DIR}/debs"
+snapshot_state "BEFORE_DEBS_INSTALL"
 if [ -d "$DEBS_DIR" ] && [ -n "$(ls -A "$DEBS_DIR"/*.deb 2>/dev/null)" ]; then
     say "  found vendored .debs at $DEBS_DIR — installing"
     # apt install accepts local .deb paths and computes install order
@@ -278,6 +364,7 @@ if [ -d "$DEBS_DIR" ] && [ -n "$(ls -A "$DEBS_DIR"/*.deb 2>/dev/null)" ]; then
 else
     say "  no vendored .debs at $DEBS_DIR — assuming hostapd + iptables + dnsmasq already installed (dev-redeploy)"
 fi
+snapshot_state "AFTER_DEBS_INSTALL"
 
 # --- 6. iptables redirect rules ---------------------------------------------
 
@@ -353,6 +440,7 @@ if [ ! -f "$BOOTSTRAP_MARKER" ] && [ "$DRY_RUN" -eq 0 ]; then
     # are templated by the time we move on to backend restart.
     say "First boot detected; running openmarquee-firstboot.service"
     run systemctl enable --now openmarquee-firstboot.service
+    snapshot_state "AFTER_FIRSTBOOT"
 elif [ "$DRY_RUN" -eq 1 ]; then
     # In real mode this block fires ONLY when marker is absent. Dry-run
     # prints unconditionally for test-coverage visibility -- the redeploy
@@ -374,6 +462,7 @@ if [ "$DRY_RUN" -eq 1 ] || [ -f "$BOOTSTRAP_MARKER" ]; then
         # a redeploy). Dry-run prints unconditionally for test coverage.
         say "Re-running firstboot.sh for redeploy templating (real mode: only when marker present; idempotent)"
         run bash "${OPT_DIR}/system/openmarquee-firstboot.sh"
+        snapshot_state "AFTER_FIRSTBOOT"
     fi
 fi
 
@@ -479,65 +568,28 @@ if [ "$DRY_RUN" -eq 0 ]; then
     fi
 fi
 
-# --- 8a. End-of-install diagnostic capture ----------------------------------
+# --- 8a. End-of-install snapshot + kernel/prev-boot capture -----------------
 #
-# Boot 8 produced an AP broadcasting empty SSID despite hostapd.conf on
-# disk having the correct templated `ssid=`/`wpa_passphrase=` values.
-# cloud-init-output.log confirmed sed templating ran. The question is
-# what hostapd is actually doing on the Pi — did it start with the
-# pre-template placeholder during .deb postinst, end up in failed/zombie
-# state, and never re-read the templated config? Or is something else
-# broadcasting? Current logs don't say.
-#
-# Pure read-only instrumentation. Capture service + interface + config
-# state at end of install.sh so the next burn's persistent journal
-# (the journald drop-in in §7c above) answers the question. No
-# behavior changes; every capture wrapped in `|| true` so a missing
-# tool doesn't abort under `set -e`. Gated to real-device install
-# (skip on ROOT_PREFIX/DRY_RUN).
+# Final checkpoint: append the END_OF_INSTALL snapshot to the debug log
+# alongside BEFORE_DEBS_INSTALL / AFTER_DEBS_INSTALL / AFTER_FIRSTBOOT.
+# Also dump dmesg + the previous-boot journal so a Restart=on-failure
+# cycle leaves a complete forensic trail. Pure read-only.
+
+snapshot_state "END_OF_INSTALL"
 
 if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
-    DEBUG_LOG="/var/log/openmarquee-debug.log"
-    {
-        printf '=== diagnostic capture: %s ===\n' "$(date -Iseconds 2>/dev/null || date)"
-        printf '\n--- systemctl status (relevant units) ---\n'
-        systemctl status hostapd dnsmasq NetworkManager openmarquee-backend openmarquee-firstboot openmarquee-ap0 2>&1 || true
-        printf '\n--- systemctl is-enabled / is-active / is-failed ---\n'
-        for u in hostapd dnsmasq NetworkManager openmarquee-backend openmarquee-firstboot openmarquee-ap0; do
-            printf '  %s: enabled=%s active=%s failed=%s\n' \
-                "$u" \
-                "$(systemctl is-enabled "$u" 2>&1 || echo unknown)" \
-                "$(systemctl is-active "$u" 2>&1 || echo unknown)" \
-                "$(systemctl is-failed "$u" 2>&1 || echo unknown)"
-        done
-        printf '\n--- ip link show (wlan0, ap0) ---\n'
-        ip link show wlan0 2>&1 || true
-        ip link show ap0 2>&1 || true
-        printf '\n--- ip addr show (wlan0, ap0) ---\n'
-        ip addr show wlan0 2>&1 || true
-        ip addr show ap0 2>&1 || true
-        printf '\n--- iw dev (interface info) ---\n'
-        iw dev 2>&1 || true
-        printf '\n--- hostapd.conf (passphrase redacted) ---\n'
-        sed -E 's|^(wpa_passphrase=).*|\1REDACTED|' /etc/hostapd/hostapd.conf 2>&1 || true
-        printf '\n--- /etc/default/hostapd ---\n'
-        cat /etc/default/hostapd 2>&1 || true
-        printf '\n--- /etc/hostapd/hostapd.conf stat ---\n'
-        stat /etc/hostapd/hostapd.conf 2>&1 || true
-        printf '\n--- pgrep -af hostapd ---\n'
-        pgrep -af hostapd 2>&1 || echo "  (no hostapd process)"
-        printf '\n--- journalctl -b -u hostapd (last 200) ---\n'
-        journalctl -b -u hostapd --no-pager 2>&1 | tail -200 || true
-        printf '\n--- journalctl -b -u openmarquee-ap0 (last 100) ---\n'
-        journalctl -b -u openmarquee-ap0 --no-pager 2>&1 | tail -100 || true
-        printf '\n--- journalctl -b -u openmarquee-firstboot (last 300) ---\n'
-        journalctl -b -u openmarquee-firstboot --no-pager 2>&1 | tail -300 || true
-        printf '\n=== end diagnostic capture ===\n'
-    } > "$DEBUG_LOG" 2>&1
-    chmod 600 "$DEBUG_LOG"
-    say "Wrote diagnostic capture to $DEBUG_LOG"
+    # dmesg: kernel ring buffer at end of install. Catches hostapd /
+    # iptables / NM kernel-side errors that don't surface to journald.
+    dmesg > /var/log/openmarquee-debug-dmesg.log 2>&1 || true
+    chmod 600 /var/log/openmarquee-debug-dmesg.log 2>/dev/null || true
+    # Previous-boot journal: empty on the very first boot, populated on
+    # any Restart=on-failure-cycled later boot. Catches the scenario
+    # where firstboot.service failed, was retried, qarl yanked the SD
+    # mid-retry, and the next boot's journal has the prior-boot failure.
+    journalctl --boot=-1 --no-pager > /var/log/openmarquee-debug-prevboot.log 2>&1 || true
+    chmod 600 /var/log/openmarquee-debug-prevboot.log 2>/dev/null || true
 elif [ "$DRY_RUN" -eq 1 ]; then
-    say "DRYRUN: would write diagnostic capture to /var/log/openmarquee-debug.log"
+    say "DRYRUN: would capture dmesg + previous-boot journal at /var/log/openmarquee-debug-{dmesg,prevboot}.log"
 fi
 
 say "Done."
