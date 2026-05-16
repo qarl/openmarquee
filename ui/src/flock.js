@@ -1,3 +1,5 @@
+import { apiFetch } from "./api.js";
+
 // Flock panel: the fleet dashboard. Per the 2026-04-28 design handoff
 // (claude.ai/design): one card per openMarquee device — this one first
 // (with a "this device" pulse pill, no Edit, no overflow), then every
@@ -336,14 +338,28 @@ export function mountFlock(
         statusEl.classList.toggle("error", !!error);
     }
 
-    async function loadThumbViaFetch(img, url) {
+    async function loadThumbViaFetch(img, url, { selfOrigin } = {}) {
         // Same blob-via-fetch pattern as the prior flock chrome — goes
         // through any in-page fetch wrapper (the demo's mock backend
         // intercepts here), and reads 204/404 as "not playing" without
-        // an onerror flicker. Cross-origin works because the peer's
-        // /api/playback/current-thumbnail sets ACAO: *.
+        // an onerror flicker. Cross-origin peer reads are allowed by
+        // the peer backend's CORS allowlist (cors_headers_for_origin in
+        // api_playback.py) — the operator's flock-membership list is
+        // the cross-origin auth boundary.
+        //
+        // Bug 5 (qarl 2026-05-16): self-origin reads need the bearer
+        // token (AuthMiddleware gates /api/playback/current-thumbnail).
+        // apiFetch stamps Authorization: Bearer <token> from
+        // localStorage, with skipAuth401Redirect so a stale token here
+        // shows the placeholder rather than bouncing the operator out
+        // of the flock panel to /login.html. Peer reads STILL use plain
+        // fetch — our token wouldn't authenticate against a peer's
+        // AuthState; the peer-side whitelist (auth_middleware.py's
+        // _WHITELIST_EXACT) is what lets cross-flock reads succeed.
         try {
-            const r = await fetch(url);
+            const r = selfOrigin
+                ? await apiFetch(url, { skipAuth401Redirect: true })
+                : await fetch(url);
             if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
             const blob = await r.blob();
             const prev = img.dataset.blobUrl;
@@ -366,9 +382,9 @@ export function mountFlock(
             const card = img.closest(".om-peer-card");
             if (!card) continue;
             if (card.dataset.origin === "self") {
-                loadThumbViaFetch(img, thumbnailUrl(null, true));
+                loadThumbViaFetch(img, thumbnailUrl(null, true), { selfOrigin: true });
             } else if (card.dataset.address && !card.classList.contains("offline")) {
-                loadThumbViaFetch(img, thumbnailUrl(card.dataset.address, false));
+                loadThumbViaFetch(img, thumbnailUrl(card.dataset.address, false), { selfOrigin: false });
             }
         }
     }

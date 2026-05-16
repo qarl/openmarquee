@@ -460,6 +460,34 @@ def test_non_media_route_rejects_token_query_param(client: TestClient):
     assert response.status_code == 401
 
 
+def test_playback_thumbnail_endpoints_whitelisted(client: TestClient):
+    """Bug 5 (qarl 2026-05-16): the flock panel renders peer tiles by
+    cross-origin GET against /api/playback/current-thumbnail and
+    /current-frame. Our local bearer token can't authenticate against
+    a peer's AuthState, so these endpoints rely on the CORS allowlist
+    + tailnet ACL instead of header-bearer auth. Middleware MUST
+    whitelist them; otherwise every peer-tile fetch 401s.
+    """
+    # Configure auth so we're testing the "with auth state" branch
+    # of the middleware (without a configured AuthState a "not
+    # configured" 401 would mask the whitelist test).
+    client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    for path in (
+        "/api/playback/current-thumbnail",
+        "/api/playback/current-frame",
+    ):
+        response = client.get(path)
+        # Whitelist enforced means status is NOT 401. The route handler
+        # may still 204 / 404 / 503 (no asset, nothing playing) — the
+        # load-bearing claim is "middleware doesn't reject this."
+        assert response.status_code != 401, (
+            f"middleware 401'd a whitelisted peer-callable path: {path}"
+        )
+
+
 def test_authorization_header_wins_when_both_supplied(client: TestClient):
     """If both Authorization header and ?token= are present, the header
     is consulted first and the query-param is ignored. Verifies the

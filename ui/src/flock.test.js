@@ -704,4 +704,106 @@ describe("mountFlock", () => {
             vi.unstubAllGlobals();
         }
     });
+
+    // Bug 5 (qarl 2026-05-16) — auth gap on the flock panel:
+    // /api/playback/current-thumbnail is bearer-gated by AuthMiddleware
+    // for same-origin reads, but the prior loadThumbViaFetch issued a
+    // raw fetch() without stamping the Authorization header — so post-
+    // login deploy, every self-tile fetch 401'd. The fix routes the
+    // self-tile fetch through apiFetch (which injects the bearer from
+    // localStorage) and keeps the peer fetch on plain fetch (our token
+    // can't authenticate against a peer's AuthState — peer-side
+    // middleware whitelist is what lets cross-flock reads through).
+
+    it("self card thumbnail carries Authorization: Bearer <token> when token in localStorage", async () => {
+        const headersSeen = [];
+        const fetchSpy = vi.fn(async (url, init) => {
+            const hdrs = new Headers(init?.headers || {});
+            headersSeen.push({
+                url: String(url),
+                authorization: hdrs.get("Authorization"),
+            });
+            return new Response(new Blob([new Uint8Array(0)], { type: "image/png" }));
+        });
+        vi.stubGlobal("fetch", fetchSpy);
+        try {
+            localStorage.setItem("openmarquee_auth_token", "1.deadbeef");
+            const container = document.createElement("div");
+            mount(container);
+            await tick();
+            await tick();
+            const selfFetch = headersSeen.find((c) =>
+                /^\/api\/playback\/current-thumbnail/.test(c.url),
+            );
+            expect(selfFetch).toBeDefined();
+            expect(selfFetch.authorization).toBe("Bearer 1.deadbeef");
+        } finally {
+            localStorage.removeItem("openmarquee_auth_token");
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it("peer card thumbnail does NOT carry Authorization header (cross-flock; peer auth is its own)", async () => {
+        const headersSeen = [];
+        const fetchSpy = vi.fn(async (url, init) => {
+            const hdrs = new Headers(init?.headers || {});
+            headersSeen.push({
+                url: String(url),
+                authorization: hdrs.get("Authorization"),
+            });
+            return new Response(new Blob([new Uint8Array(0)], { type: "image/png" }));
+        });
+        vi.stubGlobal("fetch", fetchSpy);
+        try {
+            localStorage.setItem("openmarquee_auth_token", "1.deadbeef");
+            const container = document.createElement("div");
+            const recent = new Date(Date.now() - 5_000).toISOString();
+            mount(container, {
+                peers: [PEER({ address: "lobby.ts.net", last_seen_at: recent })],
+            });
+            await tick();
+            await tick();
+            const peerFetch = headersSeen.find((c) =>
+                /^http:\/\/lobby\.ts\.net\/api\/playback\/current-thumbnail/.test(c.url),
+            );
+            expect(peerFetch).toBeDefined();
+            expect(peerFetch.authorization).toBeNull();
+        } finally {
+            localStorage.removeItem("openmarquee_auth_token");
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it("self card thumbnail 401 falls back to placeholder without redirecting to /login.html", async () => {
+        // skipAuth401Redirect: true ensures a stale token here renders
+        // the no-thumbnail placeholder rather than bouncing the operator
+        // out of the flock panel.
+        const fetchSpy = vi.fn(async () => new Response(null, { status: 401 }));
+        vi.stubGlobal("fetch", fetchSpy);
+        const replaceSpy = vi.fn();
+        const originalLocation = window.location;
+        Object.defineProperty(window, "location", {
+            configurable: true,
+            value: { ...originalLocation, replace: replaceSpy, pathname: "/" },
+        });
+        try {
+            localStorage.setItem("openmarquee_auth_token", "1.stale");
+            const container = document.createElement("div");
+            mount(container);
+            await tick();
+            await tick();
+            expect(replaceSpy).not.toHaveBeenCalled();
+            // Token stays in localStorage (skipAuth401Redirect leaves it
+            // alone — the 401 here means "stale token, hide the thumb,"
+            // not "expire the session").
+            expect(localStorage.getItem("openmarquee_auth_token")).toBe("1.stale");
+        } finally {
+            localStorage.removeItem("openmarquee_auth_token");
+            Object.defineProperty(window, "location", {
+                configurable: true,
+                value: originalLocation,
+            });
+            vi.unstubAllGlobals();
+        }
+    });
 });

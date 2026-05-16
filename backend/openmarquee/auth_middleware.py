@@ -76,6 +76,19 @@ _WHITELIST_EXACT: frozenset[str] = frozenset({
     "/api/flock/notify",
     "/api/flock/sync-announce",
     "/api/flock/hello",
+    # Bug 5 (qarl 2026-05-16): cross-flock readable thumbnails. The
+    # flock panel on each device renders one tile per peer with a
+    # live PNG of what that peer is currently playing — fetched
+    # directly from the peer's /api/playback/current-thumbnail
+    # (cover art) or /current-frame (live composite). The peer
+    # endpoint already implements an Origin allowlist (see
+    # cors_headers_for_origin + the operator's flock-membership
+    # list in api_playback.py); that CORS allowlist + tailnet
+    # ACL together are the auth boundary for cross-flock reads.
+    # Header-bearer auth doesn't apply: our local operator's
+    # token isn't signed against a peer's AuthState.
+    "/api/playback/current-thumbnail",
+    "/api/playback/current-frame",
 })
 
 # Prefix-match paths. Order doesn't matter; first-match wins on the
