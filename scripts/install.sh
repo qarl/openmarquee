@@ -411,6 +411,23 @@ if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-firstboot.service
            "${SYSTEMD_DIR}/openmarquee-firstboot.service"
 fi
 
+# Phase 4r drop-ins: append stdout+stderr of firstboot, openmarquee-ap0,
+# and hostapd to dedicated persistent log files alongside journal capture.
+# The hostapd drop-in additionally dumps the config DAEMON_CONF points
+# at on every start (passphrase redacted) — so boot-8-style "config on
+# disk is correct but hostapd broadcast empty SSID" mysteries are
+# answerable by inspecting /var/log/hostapd.log directly.
+say "Stage service-unit drop-in log redirects"
+for unit in openmarquee-firstboot openmarquee-ap0 hostapd; do
+    src="${OPT_DIR}/system/${unit}.service.d/log-to-file.conf"
+    dst_dir="${SYSTEMD_DIR}/${unit}.service.d"
+    dst="${dst_dir}/log-to-file.conf"
+    if [ "$DRY_RUN" -eq 1 ] || [ -f "$src" ]; then
+        run install -d -m 0755 "$dst_dir"
+        run install -m 0644 "$src" "$dst"
+    fi
+done
+
 # --- 7b. sudoers (wifi-station applier) -------------------------------------
 #
 # Drop the narrowly-scoped sudoers fragment that lets the openmarquee
