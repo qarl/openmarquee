@@ -186,6 +186,26 @@ snapshot_state() {
         journalctl -b -u openmarquee-ap0 --no-pager 2>&1 | tail -100 || true
         printf '\n--- journalctl -b -u openmarquee-firstboot (tail 300) ---\n'
         journalctl -b -u openmarquee-firstboot --no-pager 2>&1 | tail -300 || true
+        printf '\n--- nmcli device status ---\n'
+        nmcli device status 2>&1 || true
+        printf '\n--- nmcli connection show ---\n'
+        nmcli connection show 2>&1 || true
+        printf '\n--- nmcli connection show --active ---\n'
+        nmcli connection show --active 2>&1 || true
+        printf '\n--- nft list ruleset ---\n'
+        nft list ruleset 2>&1 || true
+        printf '\n--- iptables-save (if present) ---\n'
+        iptables-save 2>&1 || echo "  (iptables-save not available)"
+        printf '\n--- ss -tlnp (listening TCP sockets) ---\n'
+        ss -tlnp 2>&1 || true
+        printf '\n--- ss -ulnp (listening UDP sockets) ---\n'
+        ss -ulnp 2>&1 || true
+        printf '\n--- /proc/cmdline ---\n'
+        cat /proc/cmdline 2>&1 || true
+        printf '\n--- uname -a ---\n'
+        uname -a 2>&1 || true
+        printf '\n--- /etc/os-release ---\n'
+        cat /etc/os-release 2>&1 || true
     } >> "$debug_log" 2>&1
     chmod 600 "$debug_log" 2>/dev/null || true
 }
