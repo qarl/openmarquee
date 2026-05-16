@@ -38,11 +38,15 @@ NoNewPrivileges=yes
 # We DO need to write to /etc/hostapd, /etc/hostname, /etc/hosts,
 # /opt/openmarquee/ui, and /var/openmarquee. ProtectSystem=full
 # makes /usr + /boot read-only AND drops write on /etc by default,
-# so each writable file under /etc must be explicitly listed.
-# hostname + hosts are templated by firstboot.sh's setup_hostname()
-# step; without these entries hostnamectl + sed fail with "Read-only
-# file system" on the first run.
-ReadWritePaths=/etc/hostapd /etc/hostname /etc/hosts /opt/openmarquee/ui /var/openmarquee
+# but giving sed-in-place semantics what it needs is non-trivial:
+# `sed -i` creates a temp file in the PARENT directory (/etc/sedXXXX)
+# before atomic-rename, so listing individual files like /etc/hosts is
+# not enough — the parent dir must also be writable. Listing /etc
+# wholesale is the simplest path; this oneshot runs as root only at
+# first boot and the script only touches the specific paths anyway.
+# The NoNewPrivileges + ProtectHome + PrivateTmp hardening still
+# applies; the only relaxation is /etc directory-level write access.
+ReadWritePaths=/etc /opt/openmarquee/ui /var/openmarquee
 # Restart only on failure -- a clean exit means we're done.
 Restart=on-failure
 # But cap retries: if the script keeps crashing, stop trying so
