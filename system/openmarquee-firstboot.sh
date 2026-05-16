@@ -64,6 +64,34 @@ NM_SYSTEM_CONNECTIONS="${ROOT_PREFIX}${NM_SYSTEM_CONNECTIONS}"
 say() { printf '==> %s\n' "$*"; }
 fatal() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Replace contents of $file using sed expressions, with an empty-output
+# guard before clobbering the target. Boot 7 forensics showed `sed
+# -i.bak` silently producing 0-byte target files on the Pi's SD card
+# ext4 (cause not fully understood; possibly bind-mount + atomic-rename
+# interaction with PrivateTmp + ProtectSystem). This variant writes
+# the sed output to an explicit tmpfile in /var/tmp (NOT /tmp because
+# PrivateTmp=yes namespaces /tmp), refuses to overwrite the target if
+# the tmpfile is empty, then truncates + writes via `cat >` (no
+# rename, no .bak shadow). The non-empty original is preserved on any
+# failure path.
+sed_inplace_safe() {
+    local file="$1"; shift
+    local tmpfile
+    tmpfile=$(mktemp /var/tmp/firstboot.sed.XXXXXX) || fatal "mktemp failed"
+    if ! sed "$@" "$file" > "$tmpfile"; then
+        rm -f "$tmpfile"
+        fatal "sed failed on $file"
+    fi
+    if [ ! -s "$tmpfile" ]; then
+        local original_size
+        original_size=$(wc -c < "$file" 2>/dev/null || echo 0)
+        rm -f "$tmpfile"
+        fatal "sed produced empty output for $file (input was ${original_size} bytes)"
+    fi
+    cat "$tmpfile" > "$file" || { rm -f "$tmpfile"; fatal "cat $tmpfile > $file failed"; }
+    rm -f "$tmpfile"
+}
+
 # --- 1a. Generate or read MySignXXX device identifier -----------------------
 
 # MySign + 3 alphanumeric [A-Z0-9]. 36^3 = 46,656 IDs -- plenty for any
@@ -167,8 +195,7 @@ say "Setting hostname to ${DEVICE_ID}"
 echo "${DEVICE_ID}" > "$ETC_HOSTNAME"
 if [ -f "$ETC_HOSTS" ]; then
     if grep -q "^127\.0\.1\.1" "$ETC_HOSTS"; then
-        sed -i.bak "s/^127\.0\.1\.1.*/127.0.1.1\t${DEVICE_ID}/" "$ETC_HOSTS"
-        rm -f "${ETC_HOSTS}.bak"
+        sed_inplace_safe "$ETC_HOSTS" "s/^127\.0\.1\.1.*/127.0.1.1\t${DEVICE_ID}/"
     else
         printf '127.0.1.1\t%s\n' "${DEVICE_ID}" >> "$ETC_HOSTS"
     fi
@@ -188,11 +215,9 @@ say "Templating $HOSTAPD_CONF"
 if [ ! -f "$HOSTAPD_CONF" ]; then
     fatal "hostapd.conf not found at $HOSTAPD_CONF"
 fi
-sed -i.bak \
+sed_inplace_safe "$HOSTAPD_CONF" \
     -e "s/^ssid=.*/ssid=${SSID}/" \
-    -e "s|^wpa_passphrase=.*|wpa_passphrase=${PASSPHRASE}|" \
-    "$HOSTAPD_CONF"
-rm -f "${HOSTAPD_CONF}.bak"
+    -e "s|^wpa_passphrase=.*|wpa_passphrase=${PASSPHRASE}|"
 
 # --- 4. Template welcome.html -----------------------------------------------
 
@@ -203,11 +228,10 @@ fi
 
 # Substitute {{AP_SSID}}, {{AP_PASSWORD}}, {{DEVICE_ID}} placeholders.
 # Use a delimiter (|) that won't appear in our charset (no pipe).
-sed -i.bak \
+sed_inplace_safe "$WELCOME_HTML" \
     -e "s|{{AP_SSID}}|${SSID}|g" \
     -e "s|{{AP_PASSWORD}}|${PASSPHRASE}|g" \
-    -e "s|{{DEVICE_ID}}|${DEVICE_ID}|g" \
-    "$WELCOME_HTML"
+    -e "s|{{DEVICE_ID}}|${DEVICE_ID}|g"
 
 # --- 5. Generate QR-code SVG and substitute the fallback ---------------------
 
