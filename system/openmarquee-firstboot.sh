@@ -64,6 +64,37 @@ NM_SYSTEM_CONNECTIONS="${ROOT_PREFIX}${NM_SYSTEM_CONNECTIONS}"
 say() { printf '==> %s\n' "$*"; }
 fatal() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Forensic prelude — dump environment state to stderr so journalctl captures
+# it. Boot 7 failed somewhere in this script but the journal was runtime-only
+# (lost on reboot) and the SD-card forensics showed only the aftermath
+# (orphan inodes from mid-write yank), not the trigger. This prelude is
+# cheap (~few syscalls) and is the diagnostic anchor if a future boot stalls
+# in a restart loop.
+{
+    printf 'forensic: sed version: '; sed --version 2>/dev/null | head -1 || echo "(busybox sed?)"
+    if sed_path=$(command -v sed) && [ -n "$sed_path" ]; then
+        printf 'forensic: sed binary: %s sha=%s\n' "$sed_path" \
+            "$(sha256sum "$sed_path" 2>/dev/null | awk '{print $1}')"
+    fi
+    printf 'forensic: PWD=%s UID=%s EUID=%s\n' "$PWD" "${UID:-$(id -ru 2>/dev/null || echo unknown)}" "${EUID:-$(id -u 2>/dev/null || echo unknown)}"
+    printf 'forensic: mounts relevant:\n'
+    findmnt -no TARGET,SOURCE,FSTYPE,OPTIONS / /etc /opt/openmarquee/ui /var/openmarquee /boot/firmware 2>/dev/null \
+        || mount 2>/dev/null \
+        || echo "  (no findmnt/mount available)"
+    printf 'forensic: disk free:\n'
+    df -h / /boot/firmware 2>/dev/null || df -h 2>/dev/null || echo "  (no df available)"
+    printf 'forensic: file sizes pre-templating:\n'
+    for f in "$ETC_HOSTS" "$HOSTAPD_CONF" "$WELCOME_HTML" "$BOOTFS_NM_KEYFILE"; do
+        if [ -e "$f" ]; then
+            printf '  %s: %s bytes, perms %s\n' "$f" \
+                "$(stat -c '%s' "$f" 2>/dev/null || wc -c < "$f" 2>/dev/null || echo unknown)" \
+                "$(stat -c '%a' "$f" 2>/dev/null || echo unknown)"
+        else
+            printf '  %s: ABSENT\n' "$f"
+        fi
+    done
+} >&2
+
 # --- 1a. Generate or read MySignXXX device identifier -----------------------
 
 # MySign + 3 alphanumeric [A-Z0-9]. 36^3 = 46,656 IDs -- plenty for any
@@ -165,6 +196,7 @@ say "Setting hostname to ${DEVICE_ID}"
 # requires systemd which may not be running yet in test environments;
 # call it best-effort. Real devices have it.
 echo "${DEVICE_ID}" > "$ETC_HOSTNAME"
+sync
 if [ -f "$ETC_HOSTS" ]; then
     if grep -q "^127\.0\.1\.1" "$ETC_HOSTS"; then
         sed -i.bak "s/^127\.0\.1\.1.*/127.0.1.1\t${DEVICE_ID}/" "$ETC_HOSTS"
@@ -172,6 +204,7 @@ if [ -f "$ETC_HOSTS" ]; then
     else
         printf '127.0.1.1\t%s\n' "${DEVICE_ID}" >> "$ETC_HOSTS"
     fi
+    sync
 fi
 if command -v hostnamectl >/dev/null 2>&1 && [ -z "$ROOT_PREFIX" ]; then
     hostnamectl set-hostname "${DEVICE_ID}" 2>/dev/null || true
@@ -193,6 +226,7 @@ sed -i.bak \
     -e "s|^wpa_passphrase=.*|wpa_passphrase=${PASSPHRASE}|" \
     "$HOSTAPD_CONF"
 rm -f "${HOSTAPD_CONF}.bak"
+sync
 
 # --- 4. Template welcome.html -----------------------------------------------
 
@@ -208,6 +242,9 @@ sed -i.bak \
     -e "s|{{AP_PASSWORD}}|${PASSPHRASE}|g" \
     -e "s|{{DEVICE_ID}}|${DEVICE_ID}|g" \
     "$WELCOME_HTML"
+# sync happens after the QR-injection python step below — that's the
+# actual final state of welcome.html; syncing here would just flush an
+# intermediate state that's about to be rewritten.
 
 # --- 5. Generate QR-code SVG and substitute the fallback ---------------------
 
@@ -245,6 +282,7 @@ else
     say "qrencode not available; leaving QR placeholder (welcome.js generates QR dynamically)"
 fi
 rm -f "${WELCOME_HTML}.bak"
+sync
 
 # --- 5b. Widen wpa_supplicant.conf read access for wifi-prefill --------------
 
@@ -296,14 +334,26 @@ if [ -f "$BOOTFS_NM_KEYFILE" ]; then
             nmcli connection reload 2>/dev/null || true
         fi
     fi
-    rm -f "$BOOTFS_NM_KEYFILE"
-    say "  applied; bootfs copy removed"
+    # Pi OS Lite mounts /boot/firmware (FAT32 bootfs) rw by default, but
+    # some configurations or systemd auto-mount-units leave it ro. If the
+    # bootfs is ro, leave the keyfile in place — the wifi.json idempotency
+    # check protects subsequent runs from re-templating, and a leftover
+    # keyfile on bootfs is not a security concern (the same keyfile already
+    # exists at /etc/NetworkManager/system-connections/ with mode 0600).
+    # DO NOT fail firstboot for this cleanup step.
+    if rm -f "$BOOTFS_NM_KEYFILE" 2>/dev/null; then
+        say "  applied; bootfs copy removed"
+    else
+        say "  applied; could not remove bootfs copy (likely ro bootfs); leaving in place"
+    fi
 fi
+sync
 
 # --- 6. Touch bootstrap marker ----------------------------------------------
 
 say "Marking device as bootstrapped"
 touch "$BOOTSTRAP_MARKER"
+sync
 
 # --- 7. systemctl disable (best-effort; the unit's ExecStartPost also runs this)
 if command -v systemctl >/dev/null 2>&1 && [ -z "$ROOT_PREFIX" ]; then
