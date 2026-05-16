@@ -479,4 +479,65 @@ if [ "$DRY_RUN" -eq 0 ]; then
     fi
 fi
 
+# --- 8a. End-of-install diagnostic capture ----------------------------------
+#
+# Boot 8 produced an AP broadcasting empty SSID despite hostapd.conf on
+# disk having the correct templated `ssid=`/`wpa_passphrase=` values.
+# cloud-init-output.log confirmed sed templating ran. The question is
+# what hostapd is actually doing on the Pi — did it start with the
+# pre-template placeholder during .deb postinst, end up in failed/zombie
+# state, and never re-read the templated config? Or is something else
+# broadcasting? Current logs don't say.
+#
+# Pure read-only instrumentation. Capture service + interface + config
+# state at end of install.sh so the next burn's persistent journal
+# (the journald drop-in in §7c above) answers the question. No
+# behavior changes; every capture wrapped in `|| true` so a missing
+# tool doesn't abort under `set -e`. Gated to real-device install
+# (skip on ROOT_PREFIX/DRY_RUN).
+
+if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
+    DEBUG_LOG="/var/log/openmarquee-debug.log"
+    {
+        printf '=== diagnostic capture: %s ===\n' "$(date -Iseconds 2>/dev/null || date)"
+        printf '\n--- systemctl status (relevant units) ---\n'
+        systemctl status hostapd dnsmasq NetworkManager openmarquee-backend openmarquee-firstboot openmarquee-ap0 2>&1 || true
+        printf '\n--- systemctl is-enabled / is-active / is-failed ---\n'
+        for u in hostapd dnsmasq NetworkManager openmarquee-backend openmarquee-firstboot openmarquee-ap0; do
+            printf '  %s: enabled=%s active=%s failed=%s\n' \
+                "$u" \
+                "$(systemctl is-enabled "$u" 2>&1 || echo unknown)" \
+                "$(systemctl is-active "$u" 2>&1 || echo unknown)" \
+                "$(systemctl is-failed "$u" 2>&1 || echo unknown)"
+        done
+        printf '\n--- ip link show (wlan0, ap0) ---\n'
+        ip link show wlan0 2>&1 || true
+        ip link show ap0 2>&1 || true
+        printf '\n--- ip addr show (wlan0, ap0) ---\n'
+        ip addr show wlan0 2>&1 || true
+        ip addr show ap0 2>&1 || true
+        printf '\n--- iw dev (interface info) ---\n'
+        iw dev 2>&1 || true
+        printf '\n--- hostapd.conf (passphrase redacted) ---\n'
+        sed -E 's|^(wpa_passphrase=).*|\1REDACTED|' /etc/hostapd/hostapd.conf 2>&1 || true
+        printf '\n--- /etc/default/hostapd ---\n'
+        cat /etc/default/hostapd 2>&1 || true
+        printf '\n--- /etc/hostapd/hostapd.conf stat ---\n'
+        stat /etc/hostapd/hostapd.conf 2>&1 || true
+        printf '\n--- pgrep -af hostapd ---\n'
+        pgrep -af hostapd 2>&1 || echo "  (no hostapd process)"
+        printf '\n--- journalctl -b -u hostapd (last 200) ---\n'
+        journalctl -b -u hostapd --no-pager 2>&1 | tail -200 || true
+        printf '\n--- journalctl -b -u openmarquee-ap0 (last 100) ---\n'
+        journalctl -b -u openmarquee-ap0 --no-pager 2>&1 | tail -100 || true
+        printf '\n--- journalctl -b -u openmarquee-firstboot (last 300) ---\n'
+        journalctl -b -u openmarquee-firstboot --no-pager 2>&1 | tail -300 || true
+        printf '\n=== end diagnostic capture ===\n'
+    } > "$DEBUG_LOG" 2>&1
+    chmod 600 "$DEBUG_LOG"
+    say "Wrote diagnostic capture to $DEBUG_LOG"
+elif [ "$DRY_RUN" -eq 1 ]; then
+    say "DRYRUN: would write diagnostic capture to /var/log/openmarquee-debug.log"
+fi
+
 say "Done."
