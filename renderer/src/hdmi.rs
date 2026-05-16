@@ -4893,15 +4893,19 @@ unsafe fn make_slide_fbo(
     // so callers that want motion DURING the bake (the IPC sidecar's
     // paint_and_present_one_transition_frame, called once per
     // transition frame) can pass per-frame states computed from
-    // session.motion_tick_seconds(). The historical comment here
-    // said this path was the "static snapshot" because Slice (d) was
-    // meant to add motion through transitions inside a separate
-    // render_transition_animated path -- that follow-up never landed,
-    // and the IPC path inherited the static-snapshot bug. See
-    // qa/captures/motion-through-transitions-audit-2026-05-16.md.
-    // Legacy bake sites (render_fade_composite,
-    // render_transition_animated_in_session) still pass None and
-    // exhibit the known freeze; parked for 4w.
+    // session.motion_tick_seconds(). See qa/captures/motion-through-
+    // transitions-audit-2026-05-16.md.
+    // `render_fade_composite` still passes None (single-frame
+    // composite with no per-frame loop, so a static-snapshot bake is
+    // the correct behavior for that path).
+    // `render_transition_animated_in_session` ALSO passes None here,
+    // but only for pre-loop FBO allocation — its per-frame loop at
+    // L5717+ re-paints fbo_a / fbo_b via DIRECT paint_slide calls
+    // with fresh motion_states each frame, gated on
+    // any_animated_*||any_auto_* (added by commit 2b0cbef, May 7,
+    // 2026). Phase 4w regression-locked this in
+    // hdmi_logic::tests::legacy_3pass_transition_re_bakes_animated_
+    // layers_per_frame.
     // v1-spec-delta #3: pass current wall-clock so any auto_mode
     // layer in the FBO bake renders the right time-of-day.
     // QA-direct (2026-05-14 transition-cache wire): the IPC sidecar
@@ -5570,15 +5574,17 @@ fn render_transition_animated_in_session(
         use glow::HasContext;
         let gl = session.gl;
 
-        // -- Build slide_a and slide_b FBOs once.
-        // Phase 4v-3b: legacy 3-pass remains a static-snapshot bake
-        // (motion_states=None, bake-once-before-loop). Parked for 4w —
-        // see audit doc qa/captures/motion-through-transitions-audit-
-        // 2026-05-16.md. The IPC PaintTransition path now lives
-        // motion through transitions; this legacy path triggers only
-        // when SP+SB eligibility both fail (pattern bg / outline /
-        // non-normal blend / >6 layers per side) under direct-driver
-        // mode, not under the IPC sidecar.
+        // -- Build slide_a and slide_b FBOs.
+        // These make_slide_fbo calls bake with motion_states=None for
+        // FBO allocation only — for slides with any animated layer or
+        // auto_mode, the per-frame loop below (L5717+) re-paints fbo_a
+        // / fbo_b via direct paint_slide() calls with fresh
+        // motion_states_for_layers each frame. Motion + auto_mode
+        // (clock layers, etc.) advance through the transition per
+        // spec §11 / v1-spec-delta #2 (slice d, commit 2b0cbef).
+        // Path activates when SP+SB eligibility both fail (pattern
+        // bg / outline / non-normal blend / >6 layers per side) under
+        // direct-driver mode, not under the IPC sidecar.
         let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None, None)? };
         let (fbo_b, tex_b) = unsafe {
             match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None, None) {
@@ -10535,4 +10541,3 @@ impl ObjectProps {
             .ok_or_else(|| anyhow!("property {name:?} not found on object"))
     }
 }
-

@@ -178,3 +178,58 @@ QA to identify a motion-bearing slide pair for the live-fire verify on debug Pi 
 - Motion state helper: `motion_states_for_layers` defined at hdmi.rs:4555 (uses `layer_id_seed(slide_id, i)` — confirms the structural-identity-for-per-layer-seeds rule). Called from hdmi.rs:1238, 5816-5818, 6301-6306; the 4v-3b plumbing adds a fourth call site inside `paint_and_present_one_transition_frame`.
 - Canvas2D entry: `ui/src/inline-preview.js:713 drawSlot` → `L812 drawTextSlideAnimated` → `L825 elapsed_s`.
 - Subagent-audit miss: the Explore subagent claimed the Rust path was CORRECT on first pass. Direct file read invalidated that. Lesson: explore-style audits can miss "the function does what its comment says it does, not what its name suggests."
+
+---
+
+## Correction note (2026-05-16, post-Phase-4w investigation)
+
+The **Path #2 finding above is wrong**. The legacy 3-pass `render_transition_animated_in_session` was NOT a static-snapshot bake at audit-time. Per-frame live re-bake of fbo_a / fbo_b was added in commit `2b0cbef` ("v1-spec-delta #2 (slice d) -- motion through transitions", 2026-05-07) — nine days BEFORE this audit was written.
+
+What the audit got right (at audit-commit `bab99de`, hdmi.rs L5073-5084):
+
+```rust
+let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None)? };
+let (fbo_b, tex_b) = unsafe {
+    match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None) {
+        ...
+```
+
+This IS a `make_slide_fbo(... None, None)` call — but it's pre-loop FBO ALLOCATION. The `motion_states=None` here means "this initial bake produces a static frame for FBO setup"; nothing scans this initial bake to glass — it's immediately overwritten on frame 0 of the per-frame loop below.
+
+What the audit MISSED (at audit-commit `bab99de`, hdmi.rs L5197-5266, today L5717-5777):
+
+```rust
+for frame in 0..total_frames {
+    ...
+    let tick_seconds = session.motion_tick_seconds();
+    let wall_clock_unix = current_unix_seconds();
+    unsafe {
+        if any_animated_a || any_auto_a {
+            let states_a = motion_states_for_layers(slide_a.id, &layers_a, tick_seconds);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+            paint_slide(&gl, ..., Some(&states_a), wall_clock_unix, ..., Some(&mut cache_a.glyph), ..., Some(&mut cache_a.tex))?;
+        }
+        if any_animated_b || any_auto_b {
+            // same shape for B
+        }
+        // ... composite step reads tex_a / tex_b which were just re-painted ...
+    }
+}
+```
+
+The per-frame loop re-binds fbo_a (whose color attachment IS tex_a) and re-paints via DIRECT `paint_slide(..., Some(&states_*), ...)` — not through `make_slide_fbo`. The composite step then reads from tex_a / tex_b, which hold the live-baked content.
+
+**How the miss happened**: the audit grep'd `make_slide_fbo` call sites + saw `None, None` at the bake. Concluded "no motion plumbing." But the live re-bake doesn't go through `make_slide_fbo` (which would re-allocate the FBO + texture every frame — expensive). It goes through `paint_slide` directly, re-using the existing FBO. The grep didn't catch this path; only a read of the loop body does.
+
+**Phase 4w outcome**: no functional code change. The stale comment block at hdmi.rs:5574-5581 (which restated the audit's wrong finding inline) was rewritten to describe the actual behavior. A regression test at `renderer/src/hdmi_logic.rs::tests::legacy_3pass_transition_re_bakes_animated_layers_per_frame` reads the function source and asserts the live re-bake structure remains intact — so a future refactor that strips the re-bake fails CI immediately rather than only surfacing on glass.
+
+**Phase 4v-3b (commit `fff3ab8`) was still real + valuable.** Path #1 (IPC PaintTransition) was correctly diagnosed: `make_slide_fbo` did NOT take a `motion_states` param before fff3ab8, and the IPC handler's `paint_and_present_one_transition_frame` only invoked the bake helper (not paint_slide directly). 4v-3b threaded `motion_states` through `make_slide_fbo` and updated the IPC handler to compute + pass per-frame states. That fix is the canonical Pi-path fix; Path #2's pre-existing live re-bake just happened to use a different (also-correct) plumbing pattern that the audit's method missed.
+
+**For future auditors**: when looking at "does motion advance in this transition path?", trace the texture reads in the composite step backwards — find what writes those textures per frame. If it's `paint_slide(..., Some(&...), ...)` inside the per-frame loop, motion advances regardless of whether `make_slide_fbo` was called with `motion_states=None` for the initial allocation. The audit's `make_slide_fbo`-call-site grep is a partial check, not a complete one.
+
+**Total motion-through-transitions status across all 5 render paths**:
+- Path #1 IPC PaintTransition — fixed by Phase 4v-3b (commit fff3ab8, 2026-05-16).
+- Path #2 Legacy 3-pass — ALREADY fixed by `2b0cbef` (2026-05-07); audit miss documented above; regression-locked in Phase 4w.
+- Path #3 Single-pass — audit confirmed correct (hdmi.rs:5682, per-frame motion_states_for_layers + uniform writes).
+- Path #4 Scissored-bake — audit confirmed correct (hdmi.rs:6080, per-frame motion_states + re-bake gated on `any_animated_*`).
+- Path #5 Canvas2D inline preview — audit confirmed correct (ui/src/inline-preview.js drawSlot path).

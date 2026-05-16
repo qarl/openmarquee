@@ -8471,4 +8471,108 @@ mod tests {
             }
         }
     }
+
+    /// Phase 4w regression lock (qarl 2026-05-16). The Phase 4v-3a
+    /// audit's Path #2 finding claimed `render_transition_animated_in_
+    /// session` (the legacy 3-pass path) baked both slides ONCE before
+    /// the transition loop and never re-baked — "static-snapshot
+    /// bake." That finding was wrong: commit 2b0cbef (May 7, 2026,
+    /// "v1-spec-delta #2 (slice d) -- motion through transitions")
+    /// already added per-frame live re-bake of fbo_a/fbo_b via direct
+    /// `paint_slide(... Some(&states_*), ...)` calls inside the
+    /// per-frame loop. The auditor only scanned `make_slide_fbo` call
+    /// sites and missed the direct paint_slide path inside the loop.
+    ///
+    /// This test reads the hdmi.rs source and asserts the live re-bake
+    /// structure remains intact. A future refactor that strips the
+    /// re-bake (regressing to pre-2b0cbef static-snapshot behavior)
+    /// fails CI loudly here rather than only surfacing on glass during
+    /// the next Phase 4v-3c eyeball pass.
+    ///
+    /// Lives in hdmi_logic.rs (not hdmi.rs) because hdmi.rs is
+    /// `#[cfg(target_os = "linux")]`-gated and would skip this test on
+    /// the macOS dev box. The test is pure stdlib (reads a source file
+    /// as text) so cross-platform exposure is correct + cheap.
+    ///
+    /// We can't unit-test the function end-to-end (it needs a real
+    /// EglSession + DRM Card). Structural inspection of the source
+    /// is the cleanest equivalent to QA's "spy on paint_slide call
+    /// count" suggestion when the language doesn't support runtime
+    /// interception of free functions.
+    #[test]
+    fn legacy_3pass_transition_re_bakes_animated_layers_per_frame() {
+        // hdmi.rs lives next to this file under <crate>/src/. Build
+        // the path via CARGO_MANIFEST_DIR so the test works under any
+        // CWD (cargo test runs from the package dir but be defensive).
+        let hdmi_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hdmi.rs");
+        let source = std::fs::read_to_string(&hdmi_path)
+            .unwrap_or_else(|e| panic!("must read {} for Phase 4w structural check: {e}", hdmi_path.display()));
+
+        // Pin to the function NAME so a line-number drift doesn't break
+        // the test. The audit cited L4980; HEAD has it at L5480.
+        let fn_start = source
+            .find("fn render_transition_animated_in_session(")
+            .expect(
+                "render_transition_animated_in_session must exist — \
+                 Phase 4w's regression lock cannot run if the function was \
+                 renamed. If you renamed it, update this test to match.",
+            );
+
+        // Bound the function body. Find the next top-level `\nfn ` after
+        // fn_start; that's the next function. Slice the body between.
+        let body_search_start = fn_start + 1;
+        let body_end = source[body_search_start..]
+            .find("\nfn ")
+            .map(|i| body_search_start + i)
+            .unwrap_or(source.len());
+        let body = &source[fn_start..body_end];
+
+        // The live re-bake gate predicate must remain on both endpoints.
+        assert!(
+            body.contains("any_animated_a || any_auto_a"),
+            "render_transition_animated_in_session must gate slide-A re-bake \
+             on `any_animated_a || any_auto_a`. If the gate predicate changed \
+             intentionally, update this assertion — but DON'T silently delete \
+             it without QA sign-off. The Phase 4v-3a audit miss is locked here.",
+        );
+        assert!(
+            body.contains("any_animated_b || any_auto_b"),
+            "render_transition_animated_in_session must gate slide-B re-bake \
+             on `any_animated_b || any_auto_b`.",
+        );
+
+        // The transition window driver must still be a per-frame loop.
+        assert!(
+            body.contains("for frame in 0..total_frames"),
+            "render_transition_animated_in_session must drive the transition \
+             via the per-frame loop. If the loop shape changed, motion through \
+             transitions almost certainly regressed.",
+        );
+
+        // `motion_states_for_layers` must be called inside the function
+        // body — at least twice (once per endpoint, per-frame). If the
+        // count drops to 0 the live re-bake is gone.
+        let motion_states_calls = body.matches("motion_states_for_layers(").count();
+        assert!(
+            motion_states_calls >= 2,
+            "render_transition_animated_in_session must call \
+             motion_states_for_layers at least twice (once per endpoint, \
+             per-frame). Found {motion_states_calls} call(s). If 0, the live \
+             re-bake regressed to pre-2b0cbef static-snapshot behavior — \
+             motion freezes during transitions.",
+        );
+
+        // paint_slide must be called inside the function body for the
+        // per-frame GPU re-bake (separate from the make_slide_fbo
+        // allocation calls). Conservative lower-bound check: at least 2.
+        let paint_slide_calls = body.matches("paint_slide(").count();
+        assert!(
+            paint_slide_calls >= 2,
+            "render_transition_animated_in_session must call paint_slide at \
+             least twice for the per-frame re-bake. Found {paint_slide_calls} \
+             call(s).",
+        );
+    }
 }
