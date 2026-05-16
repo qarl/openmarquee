@@ -83,6 +83,112 @@ impl VideoDecoderState {
     }
 }
 
+/// Phase 9 Step 9a (2026-05-16) — IPC sidecar per-Advance paint
+/// metrics for soak readiness. Aggregates PaintSlide + PaintTransition
+/// wall-clock timings across a rolling window and emits one
+/// journald-tail-friendly summary line every `summary_window_s`
+/// seconds. Window stats reset on emit; cumulative stats live in
+/// `session_*` fields for the across-soak view.
+///
+/// Format contract (single line, key=value, monitored by the soak
+/// gate): `ipc.soak window_s=W frames=F transitions=T fps_avg=A
+/// paint_us=avg/U/max/M session_frames=SF session_transitions=ST`.
+/// New fields go on the right; soak parsers regex by key. Token
+/// "ipc.soak" is the anchor.
+///
+/// `record` is called from the IPC loop AFTER `run_paint_hook` on
+/// successful PaintSlide/PaintTransition responses (failure responses
+/// would skew avg/max with degenerate timings). `maybe_emit_summary`
+/// is called once per loop iteration; cost is one Instant::elapsed +
+/// branch when the window hasn't expired.
+#[cfg(target_os = "linux")]
+struct IpcPaintMetrics {
+    last_summary: std::time::Instant,
+    summary_window_s: u64,
+    // Window stats (reset on emit).
+    frames: u64,
+    transitions: u64,
+    total_paint_us: u128,
+    max_paint_us: u64,
+    // Session-cumulative stats (never reset).
+    session_frames: u64,
+    session_transitions: u64,
+}
+
+#[cfg(target_os = "linux")]
+enum IpcPaintKind {
+    Slide,
+    Transition,
+}
+
+#[cfg(target_os = "linux")]
+impl IpcPaintMetrics {
+    fn new() -> Self {
+        Self {
+            last_summary: std::time::Instant::now(),
+            summary_window_s: 30,
+            frames: 0,
+            transitions: 0,
+            total_paint_us: 0,
+            max_paint_us: 0,
+            session_frames: 0,
+            session_transitions: 0,
+        }
+    }
+
+    fn record(&mut self, kind: IpcPaintKind, elapsed_us: u64) {
+        match kind {
+            IpcPaintKind::Slide => {
+                self.frames += 1;
+                self.session_frames += 1;
+            }
+            IpcPaintKind::Transition => {
+                self.transitions += 1;
+                self.session_transitions += 1;
+            }
+        }
+        self.total_paint_us = self.total_paint_us.saturating_add(elapsed_us as u128);
+        if elapsed_us > self.max_paint_us {
+            self.max_paint_us = elapsed_us;
+        }
+    }
+
+    fn maybe_emit_summary(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_summary);
+        if elapsed.as_secs() < self.summary_window_s {
+            return;
+        }
+        let total_calls = self.frames + self.transitions;
+        let avg_us: u64 = if total_calls > 0 {
+            (self.total_paint_us / total_calls as u128) as u64
+        } else {
+            0
+        };
+        let fps_avg = if elapsed.as_secs_f64() > 0.0 {
+            total_calls as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        eprintln!(
+            "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} session_frames={} session_transitions={}",
+            elapsed.as_secs(),
+            self.frames,
+            self.transitions,
+            fps_avg,
+            avg_us,
+            self.max_paint_us,
+            self.session_frames,
+            self.session_transitions,
+        );
+        self.last_summary = now;
+        self.frames = 0;
+        self.transitions = 0;
+        self.total_paint_us = 0;
+        self.max_paint_us = 0;
+    }
+}
+
 /// Cached slide content keyed by UUID. Populated on BeginSlide
 /// + BeginTransition; consumed by Advance's actual-paint path
 /// in slice (d). Slice (c) populates the cache but doesn't
@@ -510,6 +616,12 @@ where
         let mut begin_slide_count = 0_u32;
         let mut state = PlaybackState::new();
         let mut cache = SlideCache::new();
+        // Phase 9 Step 9a: soak readiness instrumentation.
+        // Per-Advance paint timings aggregated into one journald-
+        // friendly summary line every 30s. The §11 acceptance test
+        // ("30 fps over 6h on FREE YOUR SIGN with shader transitions")
+        // is gated by parsing these lines from journald.
+        let mut paint_metrics = IpcPaintMetrics::new();
         // v1-spec-delta #10 (slice c): SettingsWatcher polls
         // /var/openmarquee/settings.json (canonical path on
         // dev Pi) for changes between IPC ticks. First check
@@ -560,6 +672,21 @@ where
 
             let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
 
+            // Phase 9 Step 9a: tag the paint kind (if any) BEFORE
+            // run_paint_hook so we can wrap the call in wall-clock
+            // timing. Non-paint responses (Open, BeginSlide, Idle,
+            // etc.) skip the timing wrap entirely.
+            let paint_kind = match &resp {
+                IpcResponse::Ok { result: OpResult::PaintSlide { .. } } => {
+                    Some(IpcPaintKind::Slide)
+                }
+                IpcResponse::Ok { result: OpResult::PaintTransition { .. } } => {
+                    Some(IpcPaintKind::Transition)
+                }
+                _ => None,
+            };
+            let paint_start = paint_kind.as_ref().map(|_| std::time::Instant::now());
+
             // Linux paint hook: when the dispatcher returned a
             // PaintSlide / PaintTransition OpResult, fire the
             // actual GL paint. If paint errors, override the
@@ -574,7 +701,21 @@ where
                 Some(content_root),
             );
 
+            // Phase 9 Step 9a: record per-Advance paint timing on
+            // successful paint. Skipping failures keeps avg/max from
+            // being skewed by error-path early returns (which carry
+            // no paint work).
+            if let (Some(kind), Some(t0)) = (paint_kind, paint_start) {
+                if matches!(resp, IpcResponse::Ok { .. }) {
+                    let elapsed_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    paint_metrics.record(kind, elapsed_us);
+                }
+            }
+
             emit_response(stdout, &resp)?;
+            // Phase 9 Step 9a: 30s soak summary emit. Cheap when the
+            // window hasn't expired (single Instant::elapsed + branch).
+            paint_metrics.maybe_emit_summary();
             if is_begin_slide {
                 crate::mem::log_mem_snapshot(
                     &format!("begin_slide={begin_slide_count}"),
