@@ -3078,6 +3078,14 @@ pub fn paint_one_image_slide_for_capture(
 /// Advance calls don't re-bake the inputs. Today's per-call
 /// rebake costs ~30 ms on vc4 at 1080p -- borderline 30 fps;
 /// acceptable for v1 demo posture, but flagged for follow-up.
+///
+/// Phase 4v-3b (2026-05-16): each per-Advance bake now paints
+/// with per-frame motion_states (computed from session.motion_
+/// tick_seconds), so animated layers keep moving DURING
+/// transitions instead of freezing at first-frame pose. CPU cost
+/// is ~2 ms incremental (motion_states_for_layers); GPU cost
+/// unchanged (the bake was per-call already). See audit doc at
+/// qa/captures/motion-through-transitions-audit-2026-05-16.md.
 pub fn paint_and_present_one_transition_frame(
     session: &mut EglSession,
     card: &Card,
@@ -3102,6 +3110,18 @@ pub fn paint_and_present_one_transition_frame(
     let (bg_b, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
     let mode_w_u32 = session.mode_w as u32;
     let mode_h_u32 = session.mode_h as u32;
+
+    // Phase 4v-3b (2026-05-16): per-frame motion states for both
+    // slides so the per-Advance bakes paint each slide at its CURRENT
+    // motion phase rather than the static first-frame pose. Mirrors
+    // hold-path renderer at L1236-1238. tick_seconds is session-
+    // global and advances continuously across hold/transition
+    // boundaries (motion phase doesn't jump when a transition starts
+    // or ends). Each IPC Advance fires one call with a fresh
+    // tick_seconds, so the bake captures the right phase per frame.
+    let tick_seconds = session.motion_tick_seconds();
+    let states_a = motion_states_for_layers(slide_a.id, &layers_a, tick_seconds);
+    let states_b = motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
 
     // QA-direct (2026-05-14 transition-cache wire, followup to
     // 9e776e7): pre-warm slide_caches entries for both transition
@@ -3141,6 +3161,7 @@ pub fn paint_and_present_one_transition_frame(
             .expect("slide_caches entry for slide_a initialized above");
         let (fbo_a, tex_a) = make_slide_fbo(
             session.gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a,
+            Some(&states_a),
             Some(&mut cache_a.glyph),
             Some(&mut cache_a.tex),
         )?;
@@ -3167,6 +3188,7 @@ pub fn paint_and_present_one_transition_frame(
             .expect("slide_caches entry for slide_b initialized above");
         let (fbo_b, tex_b) = match make_slide_fbo(
             session.gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b,
+            Some(&states_b),
             Some(&mut cache_b.glyph),
             Some(&mut cache_b.tex),
         ) {
@@ -4627,6 +4649,7 @@ unsafe fn make_slide_fbo(
     mode_h: u32,
     bg_kind: &BgKind,
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+    motion_states: Option<&[MotionState]>,
     glyph_cache: Option<&mut GlyphCache>,
     tex_cache: Option<&mut TextureCache>,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
@@ -4680,26 +4703,32 @@ unsafe fn make_slide_fbo(
         gl.delete_texture(tex);
         return Err(anyhow!("framebuffer incomplete (slide_fbo): status=0x{status:x}"));
     }
-    // v1-spec-delta #2 (slice c-1): FBO bake takes the static
-    // snapshot path. Slice (d) — motion through transitions —
-    // passes per-frame motion states inside render_transition_
-    // animated; this make_slide_fbo path is the initial bake, so
-    // None is correct.
+    // Phase 4v-3b (2026-05-16): motion_states is now caller-provided
+    // so callers that want motion DURING the bake (the IPC sidecar's
+    // paint_and_present_one_transition_frame, called once per
+    // transition frame) can pass per-frame states computed from
+    // session.motion_tick_seconds(). The historical comment here
+    // said this path was the "static snapshot" because Slice (d) was
+    // meant to add motion through transitions inside a separate
+    // render_transition_animated path -- that follow-up never landed,
+    // and the IPC path inherited the static-snapshot bug. See
+    // qa/captures/motion-through-transitions-audit-2026-05-16.md.
+    // Legacy bake sites (render_fade_composite,
+    // render_transition_animated_in_session) still pass None and
+    // exhibit the known freeze; parked for 4w.
     // v1-spec-delta #3: pass current wall-clock so any auto_mode
     // layer in the FBO bake renders the right time-of-day.
     // QA-direct (2026-05-14 transition-cache wire): the IPC sidecar
-    // transition path (paint_and_present_one_transition_frame)
-    // passes Some(&mut cache.{glyph,tex}) keyed by slide.id so the
-    // bake reuses rasterized bitmaps + GL textures across calls.
-    // Standalone bake sites (render_fade_composite,
-    // render_transition_animated_in_session) still pass None.
+    // transition path passes Some(&mut cache.{glyph,tex}) keyed by
+    // slide.id so the bake reuses rasterized bitmaps + GL textures
+    // across calls.
     let paint_result = paint_slide(
         gl,
         mode_w,
         mode_h,
         bg_kind,
         text_layers,
-        None,
+        motion_states,
         current_unix_seconds(),
         glyph_cache,
         None,  // image_bg_cache: standalone bake, no session
@@ -4810,8 +4839,11 @@ pub fn render_fade_composite(
         use glow::HasContext;
         unsafe {
             // -- Render each slide into its own FBO.
-            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None)?;
-            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None) {
+            // Phase 4v-3b: render_fade_composite remains a static-snapshot
+            // bake (motion_states=None); parked for 4w alongside the other
+            // legacy bake sites. See audit doc 2026-05-16.
+            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None, None)?;
+            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -5071,9 +5103,17 @@ fn render_transition_animated_in_session(
         let gl = session.gl;
 
         // -- Build slide_a and slide_b FBOs once.
-        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None)? };
+        // Phase 4v-3b: legacy 3-pass remains a static-snapshot bake
+        // (motion_states=None, bake-once-before-loop). Parked for 4w —
+        // see audit doc qa/captures/motion-through-transitions-audit-
+        // 2026-05-16.md. The IPC PaintTransition path now lives
+        // motion through transitions; this legacy path triggers only
+        // when SP+SB eligibility both fail (pattern bg / outline /
+        // non-normal blend / >6 layers per side) under direct-driver
+        // mode, not under the IPC sidecar.
+        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None, None)? };
         let (fbo_b, tex_b) = unsafe {
-            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None) {
+            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
