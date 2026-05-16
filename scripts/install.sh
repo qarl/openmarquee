@@ -643,8 +643,24 @@ if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
     # mid-retry, and the next boot's journal has the prior-boot failure.
     journalctl --boot=-1 --no-pager > /var/log/openmarquee-debug-prevboot.log 2>&1 || true
     chmod 600 /var/log/openmarquee-debug-prevboot.log 2>/dev/null || true
+    # systemd-analyze blame: which units took longest to start. Useful
+    # for diagnosing Restart=on-failure loops + startup ordering issues
+    # (a unit hitting StartLimitBurst will show as failed-fast here).
+    systemd-analyze blame --no-pager > /var/log/openmarquee-debug-systemd-blame.log 2>&1 || true
+    chmod 600 /var/log/openmarquee-debug-systemd-blame.log 2>/dev/null || true
+    # critical-chain: dependency graph of why each unit started in the
+    # order it did. Catches After=/Before= mis-orderings between ap0 /
+    # hostapd / NetworkManager.
+    systemd-analyze critical-chain --no-pager > /var/log/openmarquee-debug-systemd-critical.log 2>&1 || true
+    chmod 600 /var/log/openmarquee-debug-systemd-critical.log 2>/dev/null || true
+    # Full system journal for the current boot — catches anything not
+    # captured by the unit-specific tails in snapshot_state (kernel
+    # subsystem messages, udev events, dbus chatter that surfaces
+    # service-startup interactions).
+    journalctl --boot=0 --no-pager > /var/log/openmarquee-debug-fullboot.log 2>&1 || true
+    chmod 600 /var/log/openmarquee-debug-fullboot.log 2>/dev/null || true
 elif [ "$DRY_RUN" -eq 1 ]; then
-    say "DRYRUN: would capture dmesg + previous-boot journal at /var/log/openmarquee-debug-{dmesg,prevboot}.log"
+    say "DRYRUN: would capture dmesg + previous-boot journal + systemd-analyze blame/critical + full-boot journal under /var/log/openmarquee-debug-*.log"
 fi
 
 say "Done."
