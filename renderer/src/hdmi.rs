@@ -4827,6 +4827,259 @@ unsafe fn make_slide_fbo(
     Ok((fbo, tex))
 }
 
+/// Phase 8 slice 3 — kind-tagged per-slide inputs for the unified
+/// bake dispatcher. Wraps the differing argument sets of
+/// `make_slide_fbo` (Text), `bake_image_slide_to_current_fbo`
+/// (Image), and `bake_video_slide_to_current_fbo` (Video) under
+/// one type so the dispatcher can match on slide kind and forward.
+///
+/// Variant-by-variant:
+///   - `Text`: bg + resolved text layers + Phase 4v-3b motion
+///     states + per-slide glyph/texture caches (from
+///     session.slide_caches). Matches `make_slide_fbo`'s arg set.
+///   - `Image`: PNG asset path on disk. Matches
+///     `bake_image_slide_to_current_fbo`'s arg set.
+///   - `Video` (Linux only): V4L2 decoder state (samples queue +
+///     in-place advance counters + primed Decoder). Matches
+///     `bake_video_slide_to_current_fbo`'s arg set.
+///
+/// All borrows are scoped to the dispatcher call. Mutable borrows
+/// (glyph/tex caches, video sample/frame counters) are on disjoint
+/// objects so the compiler can prove non-overlap at the call site.
+///
+/// Slice 4 wires this into `paint_and_present_one_transition_frame`
+/// so non-text endpoint transitions stop hitting the
+/// `"non-text slide TBD"` IPC error. `dead_code` allowance is
+/// scoped to this slice; slice 4's caller switch removes it.
+#[allow(dead_code)]
+enum SlideBakeInputs<'a> {
+    Text {
+        bg_kind: &'a BgKind,
+        text_layers: &'a [(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+        motion_states: Option<&'a [MotionState]>,
+        glyph_cache: Option<&'a mut GlyphCache>,
+        tex_cache: Option<&'a mut TextureCache>,
+    },
+    Image {
+        asset_path: &'a Path,
+    },
+    #[cfg(target_os = "linux")]
+    Video {
+        samples: &'a [crate::mp4_demux::Sample],
+        next_sample_idx: &'a mut usize,
+        frames_decoded: &'a mut usize,
+        decoder: &'a crate::v4l2::Decoder,
+    },
+}
+
+/// Phase 8 slice 3 — create an empty (NativeFramebuffer,
+/// NativeTexture) pair sized to the mode. The texture is RGBA8 with
+/// LINEAR filter + CLAMP_TO_EDGE wrap, attached to the FBO's
+/// COLOR_ATTACHMENT0. FBO is LEFT BOUND on return; caller is
+/// expected to paint into it then unbind (the dispatcher handles
+/// the unbind on the non-text branches; make_slide_fbo on the text
+/// branch handles its own bind/unbind).
+///
+/// Mirrors the FBO setup inside `make_slide_fbo` (without the
+/// paint_slide call) so the non-text dispatcher branches can paint
+/// via the existing `..._to_current_fbo` helpers and still hand
+/// the caller a sample-ready (fbo, tex) pair.
+///
+/// On any failure, all created resources are freed before
+/// propagating Err. Caller-side cleanup is needed only on a paint
+/// failure AFTER this returns Ok.
+///
+/// `dead_code` allowance scoped to slice 3; slice 4 consumes via
+/// `bake_slide_to_fbo`.
+#[allow(dead_code)]
+unsafe fn create_slide_fbo_pair(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(create_slide_fbo_pair): {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        mode_w as i32,
+        mode_h as i32,
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        None,
+    );
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_S,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_T,
+        glow::CLAMP_TO_EDGE as i32,
+    );
+    let fbo = match gl.create_framebuffer() {
+        Ok(f) => f,
+        Err(e) => {
+            gl.delete_texture(tex);
+            return Err(anyhow!("glGenFramebuffers(create_slide_fbo_pair): {e}"));
+        }
+    };
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+    gl.framebuffer_texture_2d(
+        glow::FRAMEBUFFER,
+        glow::COLOR_ATTACHMENT0,
+        glow::TEXTURE_2D,
+        Some(tex),
+        0,
+    );
+    let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+    if status != glow::FRAMEBUFFER_COMPLETE {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.delete_framebuffer(fbo);
+        gl.delete_texture(tex);
+        return Err(anyhow!(
+            "framebuffer incomplete (create_slide_fbo_pair): status=0x{status:x}"
+        ));
+    }
+    Ok((fbo, tex))
+}
+
+/// Phase 8 slice 3 (2026-05-16) — unified per-kind slide-to-FBO
+/// bake dispatcher. Creates a (NativeFramebuffer, NativeTexture)
+/// pair sized to the mode, paints the slide into it via the
+/// kind-appropriate helper, and returns the pair for the caller
+/// to sample (and ultimately free).
+///
+/// Per-kind dispatch:
+///   - `SlideBakeInputs::Text` → `make_slide_fbo` (this branch
+///     creates+binds its own FBO via the existing helper; no
+///     `create_slide_fbo_pair` here). Motion-state plumbing per
+///     Phase 4v-3b stays intact.
+///   - `SlideBakeInputs::Image` → `create_slide_fbo_pair` +
+///     `bake_image_slide_to_current_fbo`.
+///   - `SlideBakeInputs::Video` (Linux only) →
+///     `create_slide_fbo_pair` + `bake_video_slide_to_current_fbo`.
+///     A `Ok(None)` from the video helper (no frame ready this
+///     tick) maps to an `Err` here — for the transition path
+///     slice 4 will route through, a "no frame ready" snapshot
+///     can't be honored as a transition input. Caller decides how
+///     to handle the error (retry, FS_CUT fallback, etc.).
+///
+/// Caller is responsible for `delete_framebuffer` + `delete_texture`
+/// on the returned pair after sampling. On any kind-specific
+/// failure, all resources are freed before propagating Err.
+///
+/// Slice 3 introduces the dispatcher; NO caller is updated to
+/// use it this slice. Slice 4 wires it into
+/// `paint_and_present_one_transition_frame` so the IPC
+/// PaintTransition path stops hardcoding `slide_a: &TextSlide`.
+///
+/// Per `feedback_motion_through_transitions_required`: motion
+/// states for text endpoints flow through the Text variant. Image
+/// and Video have no per-layer-motion analog (image is static;
+/// video frame IS the motion, and slice 4's caller cadence
+/// decides Option C vs D per slice 0 recon).
+///
+/// `dead_code` allowance scoped to slice 3; slice 4's transition-
+/// path caller switch removes it.
+#[allow(dead_code)]
+unsafe fn bake_slide_to_fbo(
+    session: &mut EglSession,
+    mode_w: u32,
+    mode_h: u32,
+    inputs: SlideBakeInputs<'_>,
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    match inputs {
+        SlideBakeInputs::Text {
+            bg_kind,
+            text_layers,
+            motion_states,
+            glyph_cache,
+            tex_cache,
+        } => make_slide_fbo(
+            session.gl,
+            mode_w,
+            mode_h,
+            bg_kind,
+            text_layers,
+            motion_states,
+            glyph_cache,
+            tex_cache,
+        ),
+        SlideBakeInputs::Image { asset_path } => {
+            let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
+            // create_slide_fbo_pair leaves FBO bound; paint into it
+            // via the existing slice-1 helper, then unbind to the
+            // default fb (mirrors make_slide_fbo's cleanup
+            // discipline on the text branch).
+            let paint_result =
+                bake_image_slide_to_current_fbo(session.gl, asset_path, mode_w, mode_h);
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if let Err(e) = paint_result {
+                session.gl.delete_framebuffer(fbo);
+                session.gl.delete_texture(tex);
+                return Err(e);
+            }
+            Ok((fbo, tex))
+        }
+        #[cfg(target_os = "linux")]
+        SlideBakeInputs::Video {
+            samples,
+            next_sample_idx,
+            frames_decoded,
+            decoder,
+        } => {
+            let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
+            let paint_result = bake_video_slide_to_current_fbo(
+                session,
+                samples,
+                next_sample_idx,
+                frames_decoded,
+                decoder,
+                mode_w,
+                mode_h,
+            );
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            match paint_result {
+                Ok(Some(_path_label)) => Ok((fbo, tex)),
+                Ok(None) => {
+                    // Helper signaled "no frame ready this tick"
+                    // (decoder not yet primed or back-pressured past
+                    // the 5×2ms retry budget). The FBO holds
+                    // GL-undefined storage from the
+                    // `tex_image_2d(..., None)` allocation in
+                    // `create_slide_fbo_pair` — the helper's
+                    // viewport+clear lives INSIDE the DmaBuf/MMAP
+                    // path, after the no-frame early-return, and
+                    // never ran. Free the pair and propagate an
+                    // explicit error so the transition-path caller
+                    // in slice 4 can decide between retry and
+                    // FS_CUT fallback.
+                    session.gl.delete_framebuffer(fbo);
+                    session.gl.delete_texture(tex);
+                    Err(anyhow!(
+                        "bake_slide_to_fbo (video): no frame ready (decoder warmup or EAGAIN saturation)"
+                    ))
+                }
+                Err(e) => {
+                    session.gl.delete_framebuffer(fbo);
+                    session.gl.delete_texture(tex);
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
 /// Resolve a slide's bg + visible non-empty text layers up-front,
 /// shared by render_slide / render_slide_via_fbo /
 /// render_fade_composite. Pre-EGL validation: malformed hex colors
