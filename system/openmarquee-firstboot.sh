@@ -63,6 +63,29 @@ if [ -z "$ROOT_PREFIX" ]; then
     fi
 fi
 
+# EXIT trap: dump failure context to stderr (→ journal + the firstboot
+# drop-in log) if firstboot.sh exits non-zero. set -e unwinds the stack
+# so BASH_LINENO[0] reports the line that triggered the failure;
+# BASH_COMMAND holds the command that was about to run. The `caller`
+# loop walks the function-call stack so failures inside helpers
+# (sed_inplace_safe et al) report the caller chain too.
+_firstboot_on_exit() {
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        {
+            printf '\n=== firstboot.sh EXIT trap fired: rc=%s line=%s ===\n' \
+                "$rc" "${BASH_LINENO[0]:-unknown}"
+            printf 'BASH_COMMAND was: %s\n' "${BASH_COMMAND:-unknown}"
+            printf 'PWD=%s\n' "$PWD"
+            printf 'caller chain:\n'
+            local i=0
+            while caller "$i" 2>/dev/null; do i=$((i+1)); done
+        } >&2
+    fi
+    return $rc
+}
+trap _firstboot_on_exit EXIT
+
 WIFI_JSON="${WIFI_JSON:-/var/openmarquee/wifi.json}"
 IDENTITY_JSON="${IDENTITY_JSON:-/var/openmarquee/identity.json}"
 HOSTAPD_CONF="${HOSTAPD_CONF:-/etc/hostapd/hostapd.conf}"

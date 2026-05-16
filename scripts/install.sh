@@ -190,6 +190,21 @@ snapshot_state() {
     chmod 600 "$debug_log" 2>/dev/null || true
 }
 
+# EXIT trap: snapshot final state on non-zero exit. Happy-path snapshots
+# happen at named checkpoints (BEFORE_DEBS / AFTER_DEBS / AFTER_FIRSTBOOT /
+# END_OF_INSTALL); this catches catastrophic mid-step failures that fire
+# set -e before reaching the next named checkpoint. BASH_LINENO[0] is the
+# line of the caller (set -e exit unwinds the stack so this reports the
+# line that triggered the failure).
+_install_on_exit() {
+    local rc=$?
+    if [ "$rc" -ne 0 ] && [ -z "${ROOT_PREFIX:-}" ] && [ "${DRY_RUN:-0}" -eq 0 ]; then
+        snapshot_state "EXIT_FAILED_RC_${rc}_LINE_${BASH_LINENO[0]:-unknown}"
+    fi
+    return $rc
+}
+trap _install_on_exit EXIT
+
 # --- 1. State directories ---------------------------------------------------
 
 say "Ensure state directories"
