@@ -268,14 +268,15 @@ if [ "$DO_WHEELS" -eq 1 ]; then
     # `pip install -e backend --no-index --no-build-isolation` finds the
     # PEP-517 build backend offline. Python 3.13's venv no longer installs
     # setuptools by default, so without these, an offline `pip install -e .`
-    # would fail importing setuptools.build_meta. These three are pure-
-    # Python (py3-none-any wheels), arch-independent. Versions pinned so
-    # appliance bundles are reproducible across rebuilds — same versions
-    # currently in the known-good wheels dir on the failed boot-5 card
-    # (those wheels worked; the failure was install.sh not installing them).
+    # would fail importing setuptools.build_meta. These are pure-Python
+    # (py3-none-any wheels), arch-independent. Top-level versions pinned
+    # for reproducibility; transitive deps (notably wheel's `packaging`
+    # requirement) are resolved by pip — DO NOT add --no-deps here, that
+    # causes the bootstrap install.sh step to fail with "No matching
+    # distribution found for packaging>=24.0" because pip with --no-index
+    # can't go to PyPI for the missing transitive.
     pip download \
         --dest "$ROOT/wheels" \
-        --no-deps \
         --only-binary=:all: \
         "setuptools==82.0.1" "wheel==0.47.0" "pip==26.1.1" \
         2>&1 | tail -10
@@ -297,40 +298,47 @@ fi
 
 # --- 3b. Trixie .debs (vendored, arm64) ------------------------------------
 #
-# Stock Pi OS Lite arm64 trixie does NOT ship hostapd or iptables, but
-# install.sh on first boot calls both unconditionally (AP bring-up via
-# hostapd + captive-portal NAT via iptables). qarl has no ethernet at
-# first boot → apt-get is off the table. We vendor the .debs + transitive
-# dep closure here at build time so install.sh can `dpkg -i` them
-# offline.
+# Stock Pi OS Lite arm64 trixie does NOT ship hostapd, iptables, or the
+# `dnsmasq` package (it has dnsmasq-base but NOT the systemd-unit-shipping
+# dnsmasq), but install.sh on first boot calls all three unconditionally
+# (AP bring-up via hostapd + captive-portal NAT via iptables + captive-
+# portal DHCP/DNS via dnsmasq). qarl has no ethernet at first boot →
+# apt-get is off the table. We vendor the .debs + transitive dep closure
+# here at build time so install.sh can install them offline.
 #
 # Closure computed by walking each apt Packages file for trixie/main
 # arm64 + filtering against /var/lib/dpkg/status from a known-good
-# Pi-OS-Lite-trixie rootfs. Only the four packages below are missing
-# from the base image (the rest of hostapd + iptables's Depends are
-# already installed). Total ~1.2 MB.
+# Pi-OS-Lite-trixie rootfs. Five packages below are the ones missing
+# from the base image (the rest of hostapd + iptables + dnsmasq's
+# Depends are already installed). Total ~1.3 MB.
+#
+# URLs point at snapshot.debian.org with an immutable timestamp so
+# future trixie point-releases don't 404 these URLs. The timestamp was
+# chosen at commit time; regenerating against a fresher snapshot is a
+# bundle-build operator decision (security update tracking).
 #
 # Pinned filename + sha256 for reproducibility (same approach as the
 # setuptools/wheel/pip pinning above). Each .deb is fetched from
-# deb.debian.org and SHA256-verified before staging.
+# snapshot.debian.org and SHA256-verified before staging.
 #
 # Skipped on --no-wheels (dev-redeploy on a Pi that already has the
 # packages installed).
 if [ "$DO_WHEELS" -eq 1 ]; then
-    say "Vendoring trixie .debs (hostapd + iptables closure)"
+    say "Vendoring trixie .debs (hostapd + iptables + dnsmasq closure)"
     mkdir -p "$ROOT/debs"
     # Format: package|version|size_bytes|sha256|url
     # Closure regeneration recipe (if Debian publishes security
     # updates): mount a current Pi-OS-Lite-arm64-trixie rootfs, walk
     # the trixie/main + trixie-security + trixie-updates apt Packages
-    # files for hostapd + iptables's transitive Depends/Pre-Depends,
-    # filter against /var/lib/dpkg/status to drop already-installed
-    # packages, replace the manifest below with the resulting
-    # name|version|size|sha256|url tuples.
-    DEB_MANIFEST="hostapd|2:2.10-24|801636|0e36fa2d6fe79ae7fc9718ad5f6531eb4e710418fa337543f17315154dc8ab64|http://deb.debian.org/debian/pool/main/w/wpa/hostapd_2.10-24_arm64.deb
-iptables|1.8.11-2|353592|441a3c4b202f83cb1c2609c9eff768229ce991c2f49bea37416168028bc23e95|http://deb.debian.org/debian/pool/main/i/iptables/iptables_1.8.11-2_arm64.deb
-libip4tc2|1.8.11-2|19552|e2d86b0b1b5d06b529cf60f3876970b02c1ae1147555bfcf1c5b17bfdae992ca|http://deb.debian.org/debian/pool/main/i/iptables/libip4tc2_1.8.11-2_arm64.deb
-libip6tc2|1.8.11-2|19800|3ab7581ae06d0b7109ec60907a063ef167446e492f30918dcb20faed810d172d|http://deb.debian.org/debian/pool/main/i/iptables/libip6tc2_1.8.11-2_arm64.deb"
+    # files for hostapd + iptables + dnsmasq's transitive Depends/
+    # Pre-Depends, filter against /var/lib/dpkg/status to drop already-
+    # installed packages, replace the manifest below with the resulting
+    # name|version|size|sha256|url tuples (snapshot URLs preferred).
+    DEB_MANIFEST="hostapd|2:2.10-24|801636|0e36fa2d6fe79ae7fc9718ad5f6531eb4e710418fa337543f17315154dc8ab64|https://snapshot.debian.org/archive/debian/20260515T000000Z/pool/main/w/wpa/hostapd_2.10-24_arm64.deb
+iptables|1.8.11-2|353592|441a3c4b202f83cb1c2609c9eff768229ce991c2f49bea37416168028bc23e95|https://snapshot.debian.org/archive/debian/20260515T000000Z/pool/main/i/iptables/iptables_1.8.11-2_arm64.deb
+libip4tc2|1.8.11-2|19552|e2d86b0b1b5d06b529cf60f3876970b02c1ae1147555bfcf1c5b17bfdae992ca|https://snapshot.debian.org/archive/debian/20260515T000000Z/pool/main/i/iptables/libip4tc2_1.8.11-2_arm64.deb
+libip6tc2|1.8.11-2|19800|3ab7581ae06d0b7109ec60907a063ef167446e492f30918dcb20faed810d172d|https://snapshot.debian.org/archive/debian/20260515T000000Z/pool/main/i/iptables/libip6tc2_1.8.11-2_arm64.deb
+dnsmasq|2.91-1|69476|91c35d23bae8c121bc066194b5531a5d4ef61af92424feb2efa6044f74048575|https://snapshot.debian.org/archive/debian/20260515T000000Z/pool/main/d/dnsmasq/dnsmasq_2.91-1_all.deb"
     while IFS='|' read -r name version size sha256 url ; do
         [ -z "$name" ] && continue
         deb_filename="$(basename "$url")"
@@ -338,7 +346,8 @@ libip6tc2|1.8.11-2|19800|3ab7581ae06d0b7109ec60907a063ef167446e492f30918dcb20fae
         say "  downloading $name $version"
         # --fail = non-200 → curl exits non-zero → set -e aborts the build.
         # --silent --show-error = no progress bar, but errors print.
-        # --location = follow redirects (deb.debian.org → CDN mirror).
+        # --location = follow redirects (snapshot.debian.org's 302 →
+        # static.debian.org or CDN mirror; deb.debian.org → CDN too).
         curl --fail --silent --show-error --location --output "$deb_path" "$url"
         # SHA256 verify against the indexed hash. Mac uses shasum -a 256;
         # Linux build hosts use sha256sum — try both.
@@ -365,7 +374,7 @@ libip6tc2|1.8.11-2|19800|3ab7581ae06d0b7109ec60907a063ef167446e492f30918dcb20fae
     DEB_SIZE=$(du -sh "$ROOT/debs" | awk '{print $1}')
     say "  vendored $DEB_COUNT .debs ($DEB_SIZE total)"
 else
-    say "Skipping .deb download (--no-wheels); Pi must have hostapd + iptables already"
+    say "Skipping .deb download (--no-wheels); Pi must have hostapd + iptables + dnsmasq already"
 fi
 
 # --- 4. Top-level metadata --------------------------------------------------
