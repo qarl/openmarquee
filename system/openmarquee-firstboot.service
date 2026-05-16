@@ -31,21 +31,22 @@ ExecStartPost=/bin/systemctl disable openmarquee-firstboot.service
 # similar shape.
 User=root
 Group=root
-ProtectSystem=full
+# ProtectSystem=true (NOT =full): firstboot.sh templates /etc/hostname,
+# /etc/hosts, /etc/hostapd via `sed -i` and `hostnamectl set-hostname`.
+# ProtectSystem=full mounts /etc as a read-only bind-mount at the
+# kernel namespace level — and that mount can't be cleanly overridden
+# by ReadWritePaths in trixie's systemd (empirically verified in QA's
+# Lima VM). ProtectSystem=true keeps /usr + /boot read-only (the
+# genuinely-protective surface where binaries live) without touching
+# /etc, so the templating succeeds. ProtectHome + PrivateTmp +
+# NoNewPrivileges hardening unchanged. ReadWritePaths below stays as
+# an explicit declaration of write intent for the maintainer reading
+# this file — under ProtectSystem=true the entries are effectively
+# documentation, not enforcement.
+ProtectSystem=true
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
-# We DO need to write to /etc/hostapd, /etc/hostname, /etc/hosts,
-# /opt/openmarquee/ui, and /var/openmarquee. ProtectSystem=full
-# makes /usr + /boot read-only AND drops write on /etc by default,
-# but giving sed-in-place semantics what it needs is non-trivial:
-# `sed -i` creates a temp file in the PARENT directory (/etc/sedXXXX)
-# before atomic-rename, so listing individual files like /etc/hosts is
-# not enough — the parent dir must also be writable. Listing /etc
-# wholesale is the simplest path; this oneshot runs as root only at
-# first boot and the script only touches the specific paths anyway.
-# The NoNewPrivileges + ProtectHome + PrivateTmp hardening still
-# applies; the only relaxation is /etc directory-level write access.
 ReadWritePaths=/etc /opt/openmarquee/ui /var/openmarquee
 # Restart only on failure -- a clean exit means we're done.
 Restart=on-failure
