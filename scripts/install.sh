@@ -377,6 +377,46 @@ if [ "$DRY_RUN" -eq 1 ] || [ -f "$BOOTSTRAP_MARKER" ]; then
     fi
 fi
 
+# --- 7c. Enable persistent journal ------------------------------------------
+#
+# Pi OS Lite default journald config is Storage=auto, which persists only
+# if /var/log/journal exists with correct perms. The directory ships empty
+# on stock Pi OS Lite — and a runtime-only journal disappears at reboot,
+# which is exactly the gap that masked boot 7's firstboot.service failure
+# mode and forced this whole forensic arc. Force persistence via a drop-in
+# so future failures of openmarquee-* services leave a recoverable trail
+# in `journalctl --boot=-1`.
+#
+# Gated to real-device install (skip in ROOT_PREFIX build / DRY_RUN). On
+# the build host: no systemd running, possibly no systemd-journal group.
+
+if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
+    say "Enable persistent journal"
+    JOURNALD_DROPIN="/etc/systemd/journald.conf.d/openmarquee-persistent.conf"
+    mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+    cat > "$JOURNALD_DROPIN" <<'JOURNALD_EOF'
+[Journal]
+Storage=persistent
+JOURNALD_EOF
+    mkdir -p /var/log/journal
+    # systemd-journal group exists on stock trixie. Resolve by NAME (not
+    # a hardcoded numeric GID) so the chown picks up the right GID on
+    # this image. If the group is somehow missing, log a warning and
+    # leave the directory with its default ownership — journald will
+    # fall back to runtime in that pathological case.
+    if getent group systemd-journal >/dev/null; then
+        chown root:systemd-journal /var/log/journal
+        chmod 2755 /var/log/journal
+    else
+        say "  WARN: systemd-journal group missing; journal directory perms not set"
+    fi
+    # Reload journald to pick up the new storage mode immediately. Best-
+    # effort; failure here is non-fatal (next reboot picks it up anyway).
+    systemctl restart systemd-journald 2>/dev/null || true
+elif [ "$DRY_RUN" -eq 1 ]; then
+    say "DRYRUN: would enable persistent journal at /var/log/journal"
+fi
+
 # --- 8. systemctl reload + enable -------------------------------------------
 
 say "Reload systemd + enable units"
