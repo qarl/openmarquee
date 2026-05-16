@@ -54,11 +54,12 @@ ip addr flush dev "$AP_IFACE"
 ip addr add "$AP_IPV4" dev "$AP_IFACE"
 ip link set dev "$AP_IFACE" up
 
-# 4. Hide ap0 from NetworkManager so NM only manages wlan0 (client mode).
-#    `nmcli` is present on Bookworm; older images with dhcpcd only won't
-#    have it and this is a no-op.
-if command -v nmcli >/dev/null 2>&1; then
-    nmcli dev set "$AP_IFACE" managed no || true
-fi
+# 4. (Phase 4u, 2026-05-16) Hiding ap0 from NetworkManager is now handled
+#    by /etc/NetworkManager/conf.d/openmarquee-unmanaged.conf (installed
+#    by install.sh §5a from system/NetworkManager-openmarquee-unmanaged.conf).
+#    The previous in-script `nmcli dev set ap0 managed no` ran while
+#    Before=NetworkManager and was silently lost — NM hadn't started yet
+#    to receive the command. The conf.d drop-in is read at NM startup
+#    so the directive is in place before NM ever sees ap0.
 
 echo "ap0 up: $AP_IPV4 on MAC $AP0_MAC (parent $PHY_IFACE mac $WLAN0_MAC)"

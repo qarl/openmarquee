@@ -87,6 +87,7 @@ LIB_DIR="${ROOT_PREFIX}/var/lib/openmarquee"
 SYSTEMD_DIR="${ROOT_PREFIX}/etc/systemd/system"
 HOSTAPD_DST="${ROOT_PREFIX}/etc/hostapd/hostapd.conf"
 DNSMASQ_DST="${ROOT_PREFIX}/etc/dnsmasq.d/openmarquee.conf"
+NM_UNMANAGED_DST="${ROOT_PREFIX}/etc/NetworkManager/conf.d/openmarquee-unmanaged.conf"
 BOOTSTRAP_MARKER="${VAR_DIR}/.bootstrapped"
 
 # --- Helpers ----------------------------------------------------------------
@@ -398,6 +399,25 @@ run mkdir -p "$(dirname "$DNSMASQ_DST")"
 # dnsmasq.conf is fully static -- no per-device templating -- so overwriting
 # on every install.sh run is fine and even desirable (picks up changes).
 run cp "${OPT_DIR}/system/dnsmasq.conf" "$DNSMASQ_DST"
+
+# --- 5a. NetworkManager unmanaged-devices for ap0 ---------------------------
+#
+# Phase 4u: keep ap0 out of NetworkManager's hands. The boot-9 forensic
+# logs (2026-05-16) showed NM discovering ap0 as a wifi device and trying
+# to activate the user's pre-configured WiFi keyfile on it (the keyfile
+# has no `interface-name=` pin to wlan0, so it matches the first wifi
+# iface NM sees). brcmfmac then panics with `setting AP mode failed -52`
+# while NM tries to flip ap0 from AP to STA mode; regulatory domain
+# thrashes to WORLD; both AP and STA collapse.
+#
+# The earlier in-script `nmcli dev set ap0 managed no` in
+# openmarquee-ap0-setup.sh fails silently when ap0-setup runs Before=
+# NetworkManager — NM is not yet up to receive the command. This conf.d
+# drop-in is read by NM at startup, so the directive is in place before
+# NM ever sees ap0.
+say "Stage NetworkManager unmanaged-devices drop-in"
+run mkdir -p "$(dirname "$NM_UNMANAGED_DST")"
+run cp "${OPT_DIR}/system/NetworkManager-openmarquee-unmanaged.conf" "$NM_UNMANAGED_DST"
 
 # --- 5.5. Install vendored trixie packages ----------------------------------
 #
