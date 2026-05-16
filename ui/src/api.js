@@ -22,11 +22,15 @@ export const AUTH_TOKEN_KEY = "openmarquee_auth_token";
  * doesn't match the current AuthState.token_version (change-password
  * bumped it, auth.json was wiped, etc.). We treat 401 as "this token
  * is dead": clear it from localStorage so the next reload doesn't
- * try the same dead token, bounce to /login.html so the operator can
- * re-authenticate, and `throw` so the caller's then-chain doesn't
- * try to proceed against a stale Response. The bounce is suppressed
- * when we're already on /login.html so the post-401 redirect doesn't
- * loop the login screen itself.
+ * try the same dead token, then bounce to one of two destinations
+ * based on the response's `detail` string. AuthMiddleware emits
+ * "authentication not configured -- visit /welcome" when there is
+ * no auth.json at all (fresh device) and "authentication required"
+ * otherwise; the former routes to /welcome.html (operator has no
+ * password to type yet), the latter to /login.html. `throw` so the
+ * caller's then-chain doesn't proceed against a stale Response. The
+ * bounce is suppressed when we're already on the destination page so
+ * the post-401 redirect doesn't loop.
  *
  * Caveats (acceptable for v1, called out in the 20.3 dispatch):
  *   - Background sync paths (autosave, flock pulls) lose any in-flight
@@ -63,18 +67,38 @@ export async function apiFetch(input, init = {}) {
         try {
             localStorage?.removeItem?.(AUTH_TOKEN_KEY);
         } catch { /* ignore */ }
+        // First-run carve-out: AuthMiddleware emits a distinct detail
+        // string when auth.json hasn't been created yet ("authentication
+        // not configured -- visit /welcome"; see backend/openmarquee/
+        // auth_middleware.py:174). Without this branch the fresh-Pi flow
+        // bounces to /login.html with no password to type, leaving the
+        // operator stuck (qarl caught on debug Pi 2026-05-16). The
+        // configured-but-stale-token case still routes to /login.html.
+        let dest = "/login.html";
+        try {
+            const peek = await response.clone().json();
+            if (
+                typeof peek?.detail === "string" &&
+                peek.detail.includes("not configured")
+            ) {
+                dest = "/welcome.html";
+            }
+        } catch {
+            // Response body not JSON, or clone() unavailable (some test
+            // mocks); fall back to /login.html.
+        }
         if (
             typeof window !== "undefined" &&
             window.location &&
-            window.location.pathname !== "/login.html"
+            window.location.pathname !== dest
         ) {
-            window.location.replace("/login.html");
+            window.location.replace(dest);
         }
         // Throw so the caller's response-handling code doesn't continue
         // against a stale Response. When the redirect fires the page
         // is gone so the throw doesn't surface; in the suppressed-
-        // redirect case (we're already on /login.html) the caller's
-        // catch block handles the failure inline.
+        // redirect case (we're already on /login.html or /welcome.html)
+        // the caller's catch block handles the failure inline.
         throw new Error("authentication required");
     }
     return response;

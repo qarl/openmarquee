@@ -667,6 +667,68 @@ describe("apiFetch (20.3 wrapper)", () => {
         expect(replace).not.toHaveBeenCalled();
     });
 
+    it("redirects to /welcome.html on 401 with 'authentication not configured' detail (first-run)", async () => {
+        mockFetch({
+            ok: false,
+            status: 401,
+            clone() {
+                return {
+                    json: async () => ({
+                        detail: "authentication not configured -- visit /welcome",
+                    }),
+                };
+            },
+        });
+        const { replace, restore } = stubLocation("/");
+        try {
+            await apiFetch("/api/settings").catch(() => {});
+        } finally {
+            restore();
+        }
+        expect(replace).toHaveBeenCalledWith("/welcome.html");
+    });
+
+    it("redirects to /login.html on 401 with 'authentication required' detail (configured, stale token)", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "1.stale");
+        mockFetch({
+            ok: false,
+            status: 401,
+            clone() {
+                return {
+                    json: async () => ({ detail: "authentication required" }),
+                };
+            },
+        });
+        const { replace, restore } = stubLocation("/");
+        try {
+            await apiFetch("/api/settings").catch(() => {});
+        } finally {
+            restore();
+        }
+        expect(replace).toHaveBeenCalledWith("/login.html");
+    });
+
+    it("does NOT redirect when already on /welcome.html with not-configured 401 (no loop)", async () => {
+        mockFetch({
+            ok: false,
+            status: 401,
+            clone() {
+                return {
+                    json: async () => ({
+                        detail: "authentication not configured -- visit /welcome",
+                    }),
+                };
+            },
+        });
+        const { replace, restore } = stubLocation("/welcome.html");
+        try {
+            await apiFetch("/api/settings").catch(() => {});
+        } finally {
+            restore();
+        }
+        expect(replace).not.toHaveBeenCalled();
+    });
+
     it("throws on 401 so the caller's then-chain doesn't proceed against a stale Response", async () => {
         localStorage.setItem(AUTH_TOKEN_KEY, "1.stale");
         mockFetch({ ok: false, status: 401 });
