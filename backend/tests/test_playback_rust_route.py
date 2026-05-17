@@ -445,6 +445,167 @@ async def test_fix_b_throttle_first_fail_error_subsequent_debug(caplog):
     assert bad.id in loop._failed_slide_ids
 
 
+@pytest.mark.asyncio
+async def test_ce225f3_broad_except_advances_past_failing_slide_to_next(caplog):
+    """Bug 8 ce225f3 gap-fix: the broad-except guard at the IPC call
+    site must let the outer loop ADVANCE to the next slide_id when
+    one slide raises a non-Unsupported exception. The existing
+    `test_fix_b_throttle_first_fail_error_subsequent_debug` uses a
+    1-slide playlist, so it only proves "doesn't crash in place" —
+    not "advances to next item." This test plays a 3-slide reel
+    where the MIDDLE slide raises RustRendererSubprocessError and
+    asserts begin_slide was called on the slide AFTER it (the loop
+    didn't stall on the failing one or break out entirely).
+
+    Regression-lock: would fail if ce225f3's `except Exception: ...
+    continue` were changed to `break`, or if the broad-except were
+    removed (RustRendererSubprocessError would propagate out and
+    kill the task — no third-slide begin_slide call would land).
+    """
+    import logging
+
+    good_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS)
+    bad = _text_slide(name="bad", text="bad", duration_ms=_FAST_DURATION_MS)
+    good_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS)
+
+    class _SelectivelyRaisingFake(_FakeRustRenderer):
+        """Begin_slide raises ONLY for the configured slide_id; other
+        slides flow through the normal path."""
+
+        def __init__(self, *args, raise_for: UUID, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._raise_for = raise_for
+
+        def begin_slide(
+            self, slide_id: UUID, t0_ms: int, duration_ms: int
+        ) -> None:
+            self.begin_slide_calls.append((slide_id, t0_ms, duration_ms))
+            if slide_id == self._raise_for:
+                raise RustRendererSubprocessError(
+                    "subprocess died (simulated for ce225f3 advance test)"
+                )
+            self._current_slide = slide_id
+            self._begin_t_ms = int(t0_ms)
+            self._duration_ms = int(duration_ms)
+
+    fake = _SelectivelyRaisingFake(
+        width=8, height=8, raise_for=bad.id,
+    )
+
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [good_a, bad, good_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="openmarquee.playback"):
+        await loop.start()
+        # Long enough for begin_slide on all three: ~100ms per slide
+        # for good_a + good_b at duration=100ms, plus 250ms throttle
+        # on bad. Generous margin for timing variance.
+        await asyncio.sleep(0.7)
+        await loop.stop()
+
+    # Begin_slide was called on all three in playlist order. The
+    # critical assertion is `good_b.id` appearing in the call log —
+    # that proves the loop reached the slide AFTER the failure.
+    slide_ids = [c[0] for c in fake.begin_slide_calls]
+    assert good_a.id in slide_ids, (
+        f"good_a never begin_slide'd; loop didn't start cleanly: {slide_ids}"
+    )
+    assert bad.id in slide_ids, (
+        f"bad.id never begin_slide'd; loop bailed before reaching it: "
+        f"{slide_ids}"
+    )
+    assert good_b.id in slide_ids, (
+        f"good_b never begin_slide'd; loop didn't advance past bad slide. "
+        f"Begin_slide call log: {slide_ids}. ce225f3's broad-except "
+        f"`continue` regressed to `break` or was removed."
+    )
+
+    # Order assertion: good_a → bad → good_b. (The loop iterates
+    # the playlist in order; any reordering would indicate the bug
+    # too.)
+    ord_a = slide_ids.index(good_a.id)
+    ord_bad = slide_ids.index(bad.id)
+    ord_b = slide_ids.index(good_b.id)
+    assert ord_a < ord_bad < ord_b, (
+        f"slides processed out of order: a@{ord_a} bad@{ord_bad} b@{ord_b}"
+    )
+
+
+def test_ce225f3_on_loop_task_done_logs_error_on_exception(caplog):
+    """Bug 8 ce225f3 gap-fix: the add_done_callback wired at start()
+    must surface task exceptions via log.error with exc_info attached
+    (so journalctl carries the traceback, not just a one-line label).
+
+    Tests the `_on_loop_task_done` static method directly with a
+    fake task. Regression-lock: would fail if the callback's
+    log.error were dropped, downgraded to debug, or the exc_info=exc
+    arg were stripped.
+    """
+    import logging
+    from unittest.mock import MagicMock
+
+    boom = RuntimeError("simulated _loop crash for callback test")
+
+    fake_task = MagicMock()
+    fake_task.cancelled.return_value = False
+    fake_task.exception.return_value = boom
+
+    with caplog.at_level(logging.ERROR, logger="openmarquee.playback"):
+        PlaybackLoop._on_loop_task_done(fake_task)
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(error_records) == 1, (
+        f"expected exactly 1 ERROR record on exceptional task done, "
+        f"got {len(error_records)}: {[r.getMessage() for r in caplog.records]}"
+    )
+    rec = error_records[0]
+    assert "_loop task crashed" in rec.getMessage(), (
+        f"error message missing 'crashed' breadcrumb: {rec.getMessage()!r}"
+    )
+    # exc_info attached so the traceback hits journalctl.
+    assert rec.exc_info is not None, (
+        "log.error was called without exc_info=exc; traceback won't "
+        "reach journalctl. Reverts to ce225f3's pre-fix silent-task-death."
+    )
+
+
+def test_ce225f3_on_loop_task_done_logs_info_on_cancellation(caplog):
+    """Bug 8 ce225f3 sibling check: a CANCELLED task (the normal
+    stop() path) logs INFO, not ERROR. Without this distinction,
+    every `stop()` would emit an ERROR line and operators couldn't
+    distinguish a deliberate shutdown from a crash."""
+    import logging
+    from unittest.mock import MagicMock
+
+    fake_task = MagicMock()
+    fake_task.cancelled.return_value = True
+
+    with caplog.at_level(logging.DEBUG, logger="openmarquee.playback"):
+        PlaybackLoop._on_loop_task_done(fake_task)
+
+    # Cancellation is INFO, not ERROR.
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    info_records = [
+        r for r in caplog.records
+        if r.levelname == "INFO" and "cancelled" in r.getMessage()
+    ]
+    assert error_records == [], (
+        f"cancellation must not log ERROR; got: "
+        f"{[r.getMessage() for r in error_records]}"
+    )
+    assert len(info_records) == 1, (
+        f"expected 1 INFO 'cancelled' record, got {len(info_records)}"
+    )
+    # task.exception() should NOT be invoked on a cancelled task
+    # (it raises CancelledError if called before .cancelled() check).
+    fake_task.exception.assert_not_called()
+
+
 def test_fix_b_throttle_clears_on_playlist_change(tmp_path):
     """Switching playlists clears the throttle so an operator who
     fixes a bad slide (e.g. swaps to a new playlist that includes
