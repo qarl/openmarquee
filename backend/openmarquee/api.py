@@ -388,6 +388,13 @@ def _decode_mp4_payload(b64: str) -> bytes:
     client-side in ffmpeg.wasm (future); here we just confirm the file
     starts with a well-formed MP4 `ftyp` box so we're not persisting
     text / images / random bytes under asset.mp4.
+
+    Bug 8 / Fix C (2026-05-17): also validates single-trak. The rust
+    sidecar's mp4_demux requires exactly one trak (single H.264
+    video, no audio); a multi-trak MP4 reaches cache.load, fails to
+    demux, gets skip-marked via Fix A, and the operator gets a
+    confusing "Unsupported" log instead of a clear upload-time
+    rejection. Rejecting at upload is the right surface.
     """
     try:
         mp4 = base64.b64decode(b64, validate=True)
@@ -404,7 +411,85 @@ def _decode_mp4_payload(b64: str) -> bytes:
             status_code=400,
             detail="mp4_base64 doesn't look like an MP4 (missing ftyp box)",
         )
+
+    trak_count = _count_traks_in_mp4(mp4)
+    if trak_count != 1:
+        # The rust sidecar (renderer/src/mp4_demux.rs L146-150) bails
+        # with "expected exactly 1 trak (single H.264 video); found N"
+        # if cache.load sees != 1 traks. Pre-Bug-8 this slipped past
+        # upload and surfaced as a paint-time OpError that hot-spun
+        # the playback loop. Reject at upload with an actionable
+        # ffmpeg command instead.
+        if trak_count == 0:
+            detail = (
+                "MP4 has no video trak. openMarquee requires single-"
+                "track H.264 in MP4. Re-export with audio stripped: "
+                "`ffmpeg -i input.mp4 -c:v copy -an output.mp4`"
+            )
+        elif trak_count < 0:
+            detail = (
+                "MP4 box structure is malformed (truncated or invalid "
+                "size fields). Re-export with: `ffmpeg -i input.mp4 "
+                "-c:v copy -an output.mp4`"
+            )
+        else:
+            detail = (
+                f"MP4 has {trak_count} traks; openMarquee requires "
+                "single-track H.264 (audio + video MP4s aren't "
+                "supported on the Pi's bcm2835-codec demuxer). Strip "
+                "audio with: "
+                "`ffmpeg -i input.mp4 -c:v copy -an output.mp4`"
+            )
+        raise HTTPException(status_code=400, detail=detail)
+
     return mp4
+
+
+def _count_traks_in_mp4(mp4: bytes) -> int:
+    """Walk top-level boxes to find `moov`, then count `trak` children.
+
+    Mirror of `renderer/src/mp4_demux.rs::find_boxes` so an upload
+    that the rust sidecar would reject at cache.load gets rejected
+    here at upload time with an actionable error message.
+
+    Returns:
+      - Non-negative integer: count of `trak` boxes found inside the
+        moov box.
+      - -1: malformed box structure (truncated header, size < 8,
+        size overflows parent, no moov box).
+
+    Box format: 4 bytes big-endian size, 4 bytes type tag, then
+    `size-8` bytes of payload. No 64-bit extended-size support
+    (mp4_demux.rs doesn't support it either — what rust would
+    reject at runtime, upload rejects here).
+    """
+    # Top-level scan for moov.
+    pos = 0
+    moov_payload: bytes | None = None
+    while pos + 8 <= len(mp4):
+        size = int.from_bytes(mp4[pos:pos + 4], "big")
+        kind = mp4[pos + 4:pos + 8]
+        if size < 8 or pos + size > len(mp4):
+            return -1
+        if kind == b"moov":
+            moov_payload = mp4[pos + 8:pos + size]
+            break
+        pos += size
+    if moov_payload is None:
+        return -1
+
+    # Count `trak` boxes inside moov.
+    pos = 0
+    n = 0
+    while pos + 8 <= len(moov_payload):
+        size = int.from_bytes(moov_payload[pos:pos + 4], "big")
+        kind = moov_payload[pos + 4:pos + 8]
+        if size < 8 or pos + size > len(moov_payload):
+            return -1
+        if kind == b"trak":
+            n += 1
+        pos += size
+    return n
 
 
 class VideoUpload(BaseModel):

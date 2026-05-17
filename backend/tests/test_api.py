@@ -511,9 +511,32 @@ def test_list_content_returns_items_in_playlist_order(
 # --- video upload ---
 
 
-def _fake_mp4() -> bytes:
-    """Smallest bytes that pass the ftyp-box sanity check."""
-    return b"\x00\x00\x00\x20ftypisom" + b"\x00" * 120
+def _mp4_box(tag: bytes, payload: bytes = b"") -> bytes:
+    """Build a single MP4 box: 4-byte big-endian size + 4-byte tag + payload.
+
+    Bug 8 / Fix C (2026-05-17): the upload validator counts `trak`
+    boxes inside `moov` to enforce single-track-H.264. Tests now
+    construct synthetic MP4 byte streams with the box structure the
+    validator walks. See `_count_traks_in_mp4` in api.py.
+    """
+    size = 8 + len(payload)
+    return size.to_bytes(4, "big") + tag + payload
+
+
+def _fake_mp4(n_traks: int = 1) -> bytes:
+    """Smallest valid MP4 byte stream that passes the ftyp + single-
+    trak checks. Default is 1 trak (the rust mp4_demux's required
+    shape). Pass `n_traks=0` or `n_traks=2+` to construct rejection
+    fixtures for Fix C's multi-trak negative tests.
+
+    Layout:
+      [ftyp box: size=16, 'isom' major brand, minor version 0]
+      [moov box containing N empty trak children]
+    """
+    ftyp = _mp4_box(b"ftyp", b"isom" + b"\x00\x00\x00\x00")
+    moov_payload = b"".join(_mp4_box(b"trak") for _ in range(n_traks))
+    moov = _mp4_box(b"moov", moov_payload)
+    return ftyp + moov
 
 
 def _video_payload(**overrides) -> dict:
@@ -559,6 +582,69 @@ def test_post_video_rejects_non_mp4_bytes(client: TestClient):
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 400
     assert "ftyp" in response.json()["detail"].lower()
+
+
+def test_post_video_rejects_multi_trak_mp4(client: TestClient):
+    """Bug 8 / Fix C: upload validation rejects multi-trak MP4 (audio
+    + video) with an actionable error message + ffmpeg strip command.
+    Pre-fix, a multi-trak file reached cache.load on the rust side,
+    failed Mp4Demuxer::open's single-trak invariant, and the playback
+    loop hot-spun the OpError until ce225f3 + Fix A landed. Rejecting
+    at upload is the right surface — operator sees the problem
+    immediately, not 10 minutes later when the slide hits playback."""
+    payload = _video_payload(
+        mp4_base64=base64.b64encode(_fake_mp4(n_traks=2)).decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    # Message mentions the trak count + the ffmpeg fix command.
+    assert "2 trak" in detail, f"detail missing trak count: {detail!r}"
+    assert "ffmpeg" in detail, f"detail missing ffmpeg command: {detail!r}"
+    assert "-an" in detail, f"detail missing -an flag: {detail!r}"
+
+
+def test_post_video_rejects_zero_trak_mp4(client: TestClient):
+    """Bug 8 / Fix C: an MP4 with a valid ftyp + moov but zero trak
+    children is also rejected (no video trak at all). Less common
+    than multi-trak but still a degenerate input the rust would fail
+    on at runtime."""
+    payload = _video_payload(
+        mp4_base64=base64.b64encode(_fake_mp4(n_traks=0)).decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "no video trak" in detail.lower()
+
+
+def test_post_video_rejects_malformed_box_structure(client: TestClient):
+    """Bug 8 / Fix C: a file that passes the ftyp check but has
+    truncated / corrupt box headers (no recoverable moov) gets a
+    distinct error message pointing operators at re-export."""
+    # ftyp followed by garbage bytes — the box walker hits an invalid
+    # size field and returns -1 (malformed).
+    payload = _video_payload(
+        mp4_base64=base64.b64encode(
+            _mp4_box(b"ftyp", b"isom" + b"\x00\x00\x00\x00")
+            + b"\x00\x00\x00\x01garbg"  # size=1 (below 8 → malformed)
+        ).decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "malformed" in detail.lower() or "no video trak" in detail.lower()
+
+
+def test_post_video_accepts_single_trak_mp4(client: TestClient):
+    """Bug 8 / Fix C inverse: a synthetic 1-trak MP4 (the rust-
+    sidecar's required shape) passes validation. Locks the
+    happy-path for the new check."""
+    payload = _video_payload(
+        mp4_base64=base64.b64encode(_fake_mp4(n_traks=1)).decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 200, response.json()
 
 
 def test_post_video_rejects_non_image_thumbnail(client: TestClient):
@@ -676,7 +762,11 @@ def test_put_video_with_new_assets_replaces_them(client: TestClient, storage: Co
     item_id = UUID(post.json()["id"])
 
     new_thumb = _real_png_bytes()
-    new_mp4 = b"\x00\x00\x00\x20ftypmp42" + b"\xab" * 120
+    # Bug 8 / Fix C: new MP4 must be valid single-trak to pass
+    # upload validation. _fake_mp4() builds the canonical 1-trak
+    # shape (different bytes than the original payload so the
+    # round-trip read_video() assertion still proves replacement).
+    new_mp4 = _fake_mp4(n_traks=1) + b"\xab\xcd"
 
     response = client.put(
         f"/api/content/videos/{item_id}",
