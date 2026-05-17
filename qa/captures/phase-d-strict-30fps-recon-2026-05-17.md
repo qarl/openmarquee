@@ -409,3 +409,10 @@ machinery; bundle later if needed.
   lockdown and is functionally done.
 - Four open questions for qarl listed in §5; defaults documented
   for each in case no answer arrives.
+
+---
+
+**Update 2026-05-17:** Phase D shipped on the documented defaults
+— implemented as slice 1 (8a2e043, IPC paint_us_p99 instrumentation)
+and slice 2 (f03ee91, parser gate p99 ≤ 33333us). Phase D complete;
+goes live on the Pi at next deploy.
