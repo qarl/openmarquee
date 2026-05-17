@@ -410,6 +410,16 @@ where
         .context("drmModeGetResources failed")?;
     let (connector_info, mode) = pick_connector_and_mode(card, &resources)
         .context("no connected HDMI connector with a usable mode")?;
+    // Bug 7 fix (2026-05-17): force `Broadcast RGB = Full` so vc4
+    // scanout emits full-range (0-255) RGB instead of limited-range
+    // (16-235). Pre-fix, the default vc4 path emitted limited-range
+    // and TVs in Full/Auto HDMI mode displayed (0,0,0) framebuffer
+    // pixels as elevated gray. Probe + diagnostic at
+    // qa/captures/bug-7-blacks-not-black-recon-2026-05-17.md.
+    //
+    // Forced full-range. If a Limited-mode TV regresses, settings-
+    // driven override is the follow-up; see Bug 7 recon (NEW-B).
+    try_force_full_range_rgb(card, connector_info.handle())?;
     let (mode_w, mode_h) = mode.size();
     eprintln!(
         "selected connector {:?} {:?} at {}x{}@{}",
@@ -10504,6 +10514,100 @@ fn find_primary_plane(card: &Card, crtc_handle: drm::control::crtc::Handle) -> R
         }
     }
     bail!("no PRIMARY plane found for CRTC {crtc_handle:?}");
+}
+
+/// Bug 7 fix (2026-05-17): set the HDMI connector's `Broadcast RGB`
+/// property to `Full` so vc4 scanout emits full-range (0-255) RGB
+/// instead of the default limited-range (16-235). Pre-fix, the
+/// framebuffer's (0,0,0) was being mapped to wire-level Y=16; TVs
+/// in Full/Auto HDMI mode interpreted that as elevated gray. Probe
+/// data + diagnostic at qa/captures/bug-7-blacks-not-black-recon-
+/// 2026-05-17.md.
+///
+/// Graceful degradation: any failure (property missing, "Full"
+/// enum value missing, set_property ioctl error) logs a warning
+/// and returns Ok. The renderer still works without the fix —
+/// it just doesn't lift the bug on that particular driver/board.
+///
+/// One-shot at session init per the dispatch's "Avoid adding it
+/// to every page-flip's property array" guidance. The legacy
+/// set_property ioctl persists until the next modeset or
+/// session teardown.
+///
+/// Caller note: this operates on whatever connector
+/// `pick_connector_and_mode` returned — empirically HDMI on the
+/// canonical Pi Zero 2 W target, but not type-filtered. On a
+/// driver that exposes `Broadcast RGB` on non-HDMI connectors
+/// (rare), the same property write fires. The graceful-degradation
+/// path makes this a no-op-with-warn when the property is absent.
+fn try_force_full_range_rgb(
+    card: &Card,
+    connector_handle: connector::Handle,
+) -> Result<()> {
+    let props = match ObjectProps::for_connector(card, connector_handle) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "warn: Broadcast RGB lookup failed (connector props read): {e:#}; skipping (Bug 7 fix inapplicable)"
+            );
+            return Ok(());
+        }
+    };
+    let prop_handle = match props.find("Broadcast RGB") {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!(
+                "note: connector has no 'Broadcast RGB' property; skipping full-range force (Bug 7 fix inapplicable on this driver)"
+            );
+            return Ok(());
+        }
+    };
+    let info = match card.get_property(prop_handle) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "warn: get_property('Broadcast RGB') failed: {e:#}; skipping (Bug 7 fix)"
+            );
+            return Ok(());
+        }
+    };
+    let full_value: u64 = match info.value_type() {
+        property::ValueType::Enum(values) => {
+            let (_, enums) = values.values();
+            match enums
+                .iter()
+                .find(|e| e.name().to_string_lossy() == "Full")
+            {
+                Some(e) => e.value(),
+                None => {
+                    eprintln!(
+                        "warn: 'Broadcast RGB' has no 'Full' enum value on this driver; skipping (Bug 7 fix)"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        other => {
+            eprintln!(
+                "warn: 'Broadcast RGB' value type is {other:?}, expected Enum; skipping (Bug 7 fix)"
+            );
+            return Ok(());
+        }
+    };
+    match card.set_property(connector_handle, prop_handle, full_value) {
+        Ok(()) => {
+            eprintln!(
+                "Bug 7 fix: Broadcast RGB = Full ({full_value}) on connector {:?}",
+                connector_handle
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "warn: set_property('Broadcast RGB' = Full) failed: {e:#}; carrying on (Bug 7 fix not applied on this connector)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Per-object property table — name → property ID lookup, built once
