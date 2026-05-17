@@ -315,7 +315,7 @@ function renderRule(rule, availableChoices) {
             </label>
             <label class="field">
                 <span>Playlist</span>
-                <select class="rule-playlist"></select>
+                <select class="om-select rule-playlist"></select>
             </label>
         </div>
     `;
