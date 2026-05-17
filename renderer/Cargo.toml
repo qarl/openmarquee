@@ -1,6 +1,6 @@
 [package]
 name = "openmarquee-render"
-version = "0.1.0"
+version = "0.5.0-beta"
 edition = "2021"
 rust-version = "1.85"
 description = "openMarquee renderer — Rust sidecar that drives HDMI/HUB75/WS2812B"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openmarquee"
-version = "0.0.0"
+version = "0.5.0-beta"
 description = "Self-contained, phone-controlled, no-subscription digital signage platform"
 license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11"
