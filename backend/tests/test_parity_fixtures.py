@@ -27,7 +27,16 @@ REQUIRED_DEFAULTS = {"ssim_min", "mean_delta_max"}
 REQUIRED_FIXTURE_KEYS = {"name", "kind", "golden", "purpose"}
 SINGLE_KEYS = {"uuid", "tick"}
 TRANSITION_MID_KEYS = {"transition", "from_uuid", "to_uuid", "transition_t"}
-TRANSITION_NAMES = {"cut", "fade", "wipe", "slide", "scroll", "pixelate"}
+TRANSITION_NAMES = {
+    # Canonical 16 transition kinds (mirror of ANIMATED_TRANSITIONS in
+    # ui/src/inline-preview.js and the Rust enum's variants). Expanded
+    # 2026-05-17 from the original 6-element subset; the original was
+    # the set covered by render_tests.sh's pre-Step-2a hand-curated
+    # fixture set, which made it look canonical but wasn't.
+    "cut", "fade", "wipe", "slide", "iris", "scroll", "flip",
+    "marquee", "dissolve", "pixelate", "halftone", "scanline",
+    "glitch", "push", "blinds", "shutter",
+}
 
 
 @pytest.fixture(scope="module")
