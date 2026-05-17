@@ -663,26 +663,21 @@ def compose_motion_frame(
             )
         # Apply per-layer opacity by scaling the RGBA's alpha channel
         # before compositing. opacity = 1.0 leaves the bitmap unchanged
-        # (B10, 2026-05-05). Done once here so both alpha_composite and
-        # composite_with_blend get the same upstream alpha. Note: 0.0
-        # is a legitimate value (fully invisible layer) -- the explicit
-        # `is None` check avoids the falsy-coalesce trap that would
-        # have promoted opacity=0 back to 1.0.
+        # (B10, 2026-05-05). 0.0 is a legitimate value (fully invisible
+        # layer) -- the explicit `is None` check avoids the falsy-
+        # coalesce trap that would have promoted opacity=0 back to 1.0.
         opacity_raw = getattr(layer, "opacity", 1.0)
         opacity = float(opacity_raw if opacity_raw is not None else 1.0)
         if opacity < 1.0 - 1e-6:
             r, g, b, a = layer_rgba.split()
             a = a.point(lambda v, o=opacity: max(0, min(255, int(v * o))))
             layer_rgba = Image.merge("RGBA", (r, g, b, a))
-        blend_mode = getattr(layer, "blend", "normal") or "normal"
-        if blend_mode == "normal":
-            base.alpha_composite(layer_rgba)
-        else:
-            # Lazy import (motion.py is on a hot per-frame software path
-            # for non-multi-plane renderers; the blend module pulls in
-            # numpy unconditionally so importing it here keeps motion.py
-            # leaner for callers that don't use blend modes).
-            from openmarquee.rendering.blend import composite_with_blend
-            base = composite_with_blend(base, layer_rgba, mode=blend_mode)
+        # Non-normal blend modes are handled natively by the Rust IPC
+        # sidecar on production. The dev/CI software path degrades any
+        # non-normal blend to alpha_composite (normal) -- correct
+        # visually for non-overlapping layers, slightly off for
+        # overlapping ones, but acceptable for the dev preview given
+        # the Rust path is the source of truth.
+        base.alpha_composite(layer_rgba)
 
     return base.convert("RGB")
