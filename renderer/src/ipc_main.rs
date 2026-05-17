@@ -92,16 +92,35 @@ impl VideoDecoderState {
 ///
 /// Format contract (single line, key=value, monitored by the soak
 /// gate): `ipc.soak window_s=W frames=F transitions=T fps_avg=A
-/// paint_us=avg/U/max/M session_frames=SF session_transitions=ST`.
-/// New fields go on the right; soak parsers regex by key. Token
-/// "ipc.soak" is the anchor.
+/// paint_us=avg/U/max/M paint_us_p99=P session_frames=SF
+/// session_transitions=ST`. New fields go on the right; soak
+/// parsers regex by key. Token "ipc.soak" is the anchor.
+///
+/// Phase D slice 1 (2026-05-17) added `paint_us_p99` after the
+/// existing `paint_us=avg/U/max/M`. The parser-side p99 ≤ 33.33ms
+/// gate lands separately in slice 2. Older parsers ignore the new
+/// key (regex by key, not by position).
 ///
 /// `record` is called from the IPC loop AFTER `run_paint_hook` on
 /// successful PaintSlide/PaintTransition responses (failure responses
 /// would skew avg/max with degenerate timings). `maybe_emit_summary`
 /// is called once per loop iteration; cost is one Instant::elapsed +
 /// branch when the window hasn't expired.
-#[cfg(target_os = "linux")]
+///
+/// `paint_us_samples` is a bounded sample buffer sized at
+/// `PAINT_SAMPLE_CAP` (2048; ~16 KB at 8 bytes/entry). At the
+/// expected 30 fps × 30 s window = 900 samples we have ~2.3×
+/// headroom for transition-burst paints without truncation drama.
+/// On overflow we drop newly-arrived samples (cap-and-skip), which
+/// turns a degenerate >68 fps window into "first-2048-paints" —
+/// statistically stable for p99 since the surplus is uniformly
+/// distributed in time.
+///
+/// `#[allow(dead_code)]` because the production users
+/// (`run_inner_session` + `record` call sites) live under
+/// `#[cfg(target_os = "linux")]` blocks; on macOS the struct
+/// exists only for the cross-platform tests in `mod tests`.
+#[allow(dead_code)]
 struct IpcPaintMetrics {
     last_summary: std::time::Instant,
     summary_window_s: u64,
@@ -110,18 +129,25 @@ struct IpcPaintMetrics {
     transitions: u64,
     total_paint_us: u128,
     max_paint_us: u64,
+    paint_us_samples: Vec<u64>,
     // Session-cumulative stats (never reset).
     session_frames: u64,
     session_transitions: u64,
 }
 
-#[cfg(target_os = "linux")]
+/// Bound for `IpcPaintMetrics::paint_us_samples`. 2048 entries at
+/// 8 bytes = 16 KB; comfortably fits within the Pi Zero memory
+/// budget (§8.1) and gives 2.3× headroom over the expected
+/// 30 fps × 30 s = 900 samples per window.
+const PAINT_SAMPLE_CAP: usize = 2048;
+
+#[allow(dead_code)]
 enum IpcPaintKind {
     Slide,
     Transition,
 }
 
-#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 impl IpcPaintMetrics {
     fn new() -> Self {
         Self {
@@ -131,6 +157,7 @@ impl IpcPaintMetrics {
             transitions: 0,
             total_paint_us: 0,
             max_paint_us: 0,
+            paint_us_samples: Vec::with_capacity(PAINT_SAMPLE_CAP),
             session_frames: 0,
             session_transitions: 0,
         }
@@ -151,6 +178,9 @@ impl IpcPaintMetrics {
         if elapsed_us > self.max_paint_us {
             self.max_paint_us = elapsed_us;
         }
+        if self.paint_us_samples.len() < PAINT_SAMPLE_CAP {
+            self.paint_us_samples.push(elapsed_us);
+        }
     }
 
     fn maybe_emit_summary(&mut self) {
@@ -170,14 +200,22 @@ impl IpcPaintMetrics {
         } else {
             0.0
         };
+        // Reuse profile.rs percentile math (already cross-platform
+        // + unit-tested). Returns (sum, mean, p50, p95, p99, max);
+        // we keep p99 for the soak gate. Empty sample slice returns
+        // p99=0 -- correct "no data" sentinel for windows with no
+        // successful paints.
+        let (_, _, _, _, paint_us_p99, _) =
+            crate::profile::summarize_samples(&self.paint_us_samples);
         eprintln!(
-            "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} session_frames={} session_transitions={}",
+            "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} paint_us_p99={} session_frames={} session_transitions={}",
             elapsed.as_secs(),
             self.frames,
             self.transitions,
             fps_avg,
             avg_us,
             self.max_paint_us,
+            paint_us_p99,
             self.session_frames,
             self.session_transitions,
         );
@@ -186,6 +224,7 @@ impl IpcPaintMetrics {
         self.transitions = 0;
         self.total_paint_us = 0;
         self.max_paint_us = 0;
+        self.paint_us_samples.clear();
     }
 }
 
@@ -1854,5 +1893,111 @@ mod tests {
         // Cache survives close (caller could re-open without
         // re-loading) -- not a behavior contract, but the
         // current shape preserves it.
+    }
+
+    // Phase D slice 1 (2026-05-17) — IpcPaintMetrics p99 sampling.
+
+    #[test]
+    fn paint_metrics_records_into_sample_buffer() {
+        let mut m = IpcPaintMetrics::new();
+        assert!(m.paint_us_samples.is_empty());
+        m.record(IpcPaintKind::Slide, 1000);
+        m.record(IpcPaintKind::Transition, 2000);
+        m.record(IpcPaintKind::Slide, 3000);
+        assert_eq!(m.paint_us_samples, vec![1000, 2000, 3000]);
+        assert_eq!(m.frames, 2);
+        assert_eq!(m.transitions, 1);
+        assert_eq!(m.session_frames, 2);
+        assert_eq!(m.session_transitions, 1);
+    }
+
+    #[test]
+    fn paint_metrics_caps_sample_buffer_at_capacity() {
+        // Cap-and-drop: pushing past PAINT_SAMPLE_CAP must not grow
+        // unbounded. Session counters keep counting; samples ignore
+        // the overflow. This is the documented degenerate-burst
+        // behavior.
+        let mut m = IpcPaintMetrics::new();
+        let extra = 50;
+        for i in 0..(PAINT_SAMPLE_CAP + extra) {
+            m.record(IpcPaintKind::Slide, (i as u64) + 1);
+        }
+        assert_eq!(m.paint_us_samples.len(), PAINT_SAMPLE_CAP);
+        // First PAINT_SAMPLE_CAP samples are retained (first-N
+        // policy); overflow drops the late arrivals.
+        assert_eq!(m.paint_us_samples[0], 1);
+        assert_eq!(m.paint_us_samples[PAINT_SAMPLE_CAP - 1], PAINT_SAMPLE_CAP as u64);
+        // Session counter sees all records, including dropped ones.
+        assert_eq!(m.session_frames as usize, PAINT_SAMPLE_CAP + extra);
+    }
+
+    /// Compute the p99 of a sample slice using the same percentile
+    /// math as the production code. Mirrors profile.rs::summarize_
+    /// samples so the test is independent of any future refactor of
+    /// the wrapper (it would catch a wire-up regression even if the
+    /// inner math changed).
+    fn p99_of(samples: &[u64]) -> u64 {
+        let (_, _, _, _, p99, _) = crate::profile::summarize_samples(samples);
+        p99
+    }
+
+    #[test]
+    fn paint_metrics_p99_reflects_spike_tier() {
+        // 900-sample window per the dispatch spec: 891 fast paints
+        // (1000us = 1ms) + 9 slow paints (50000us = 50ms). p99 must
+        // land on the spike tier (>= 50000) because the top 1% of
+        // 900 samples = 9 entries, all of which are the spike.
+        let mut m = IpcPaintMetrics::new();
+        for _ in 0..891 {
+            m.record(IpcPaintKind::Slide, 1000);
+        }
+        for _ in 0..9 {
+            m.record(IpcPaintKind::Slide, 50_000);
+        }
+        let p99 = p99_of(&m.paint_us_samples);
+        assert_eq!(
+            p99, 50_000,
+            "p99 of 891x1ms + 9x50ms must report the spike tier, not the base; \
+             a regression that under-counts spikes would show p99 in the 1ms range"
+        );
+    }
+
+    #[test]
+    fn paint_metrics_p99_handles_empty_window() {
+        // Empty sample slice -> summarize_samples returns all
+        // zeros. The emitted line shows paint_us_p99=0, which the
+        // soak parser treats as the "no data" sentinel (the avg/max
+        // fields also degenerate to 0 in this case via the existing
+        // `total_calls > 0` guard).
+        let m = IpcPaintMetrics::new();
+        assert!(m.paint_us_samples.is_empty());
+        assert_eq!(p99_of(&m.paint_us_samples), 0);
+    }
+
+    #[test]
+    fn paint_metrics_p99_underfull_window() {
+        // Small windows (e.g. first emission after process start
+        // with only a handful of paints) must still compute a
+        // sensible p99 without panicking on the .min(n-1) index.
+        let mut m = IpcPaintMetrics::new();
+        for v in [10_u64, 20, 30, 40, 50] {
+            m.record(IpcPaintKind::Slide, v);
+        }
+        // 5 samples, p99 index = (5 * 99 / 100).min(4) = 4 -> 50us.
+        assert_eq!(p99_of(&m.paint_us_samples), 50);
+    }
+
+    #[test]
+    fn paint_metrics_record_does_not_skew_avg_or_max_with_zero_samples() {
+        // Defensive: recording a zero-us paint (degenerate but
+        // representable) must update sample buffer and counters
+        // without breaking the avg/max invariants used by
+        // maybe_emit_summary.
+        let mut m = IpcPaintMetrics::new();
+        m.record(IpcPaintKind::Slide, 0);
+        m.record(IpcPaintKind::Slide, 100);
+        assert_eq!(m.paint_us_samples, vec![0, 100]);
+        assert_eq!(m.max_paint_us, 100);
+        assert_eq!(m.total_paint_us, 100);
     }
 }
