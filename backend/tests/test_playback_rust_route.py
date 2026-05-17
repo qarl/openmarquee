@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import patch
 from uuid import UUID
 
 import pytest
@@ -203,13 +202,12 @@ class _FakeRustRenderer:
 @pytest.mark.asyncio
 async def test_text_slide_reel_renders_via_rust_route_no_pil():
     """Inject a TextSlide reel + a Rust-shaped renderer; assert the
-    loop drives begin_slide + advance for each slide AND never
-    invokes compose_motion_frame (the PIL hot path).
+    loop drives begin_slide + advance for each slide.
 
-    Pins the slice-4 cutover invariant: when the IPC ops are present
-    on the renderer, PIL rasterization is skipped entirely. PIL
-    imports stay in the module (image fallbacks, transitions) but no
-    INVOCATION on this hot path.
+    Pins the post-DELETE-PIL invariant: there is no PIL hot path
+    left to patch -- `compose_motion_frame` and `_safe_load_image`
+    were deleted in slice 12. begin_slide_calls + advance_calls are
+    the only observable signals that playback drove the renderer.
     """
     fake = _FakeRustRenderer(width=8, height=8)
     slides = [
@@ -226,24 +224,11 @@ async def test_text_slide_reel_renders_via_rust_route_no_pil():
         auto_tick_seconds=0.02,
     )
 
-    # Patch the PIL-path entry points at the playback module level.
-    # If either is called, the rust route was bypassed -- test fails.
-    with patch(
-        "openmarquee.playback.compose_motion_frame"
-    ) as mock_compose, patch.object(
-        loop, "_safe_load_image"
-    ) as mock_load:
-        mock_compose.side_effect = AssertionError(
-            "compose_motion_frame called -- rust route bypassed"
-        )
-        mock_load.side_effect = AssertionError(
-            "_safe_load_image called -- rust route bypassed"
-        )
-        await loop.start()
-        # Let the loop chew through the 3-slide reel + start a 4th
-        # iteration. 3 slides * 100ms = 300ms minimum.
-        await asyncio.sleep(0.35)
-        await loop.stop()
+    await loop.start()
+    # Let the loop chew through the 3-slide reel + start a 4th
+    # iteration. 3 slides * 100ms = 300ms minimum.
+    await asyncio.sleep(0.35)
+    await loop.stop()
 
     # Three begin_slide calls (one per slide in playlist order).
     assert len(fake.begin_slide_calls) >= 3, (

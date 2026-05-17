@@ -1,60 +1,39 @@
-"""Background playback loop that drives a renderer with content items.
+"""Background playback loop that drives a renderer via IPC ops.
 
 The loop runs as an asyncio task. On each iteration it:
 
 - fetches the current list of items (via an injected callable)
 - if empty, sleeps briefly and rechecks
-- otherwise advances through them in order, decoding each item's PNG
-  to RGB and pushing it to the renderer for the item's duration
+- otherwise drives each item through the renderer's IPC contract
+  (begin_slide / advance / begin_transition / capture) until the
+  sidecar's state machine reports SlideComplete
 
-VideoSlide note: the loop treats videos as still thumbnails today —
-`asset.png` is the first-frame thumbnail saved at upload time, so a
-VideoSlide in the playlist shows the thumbnail for `duration_ms` and
-advances. Real video playback (decoding asset.mp4 to frames on the Pi's
-hardware H.264 decoder) lands with the HDMI renderer (Phase 6).
+Post-DELETE-PIL (slices 1-12, 2026-05-17): there is no Python
+rasterization path. The Rust IPC sidecar (`RustRenderer`,
+`AutoFallbackRenderer`) owns rendering on production; `MockRenderer`
+satisfies the same IPC ops contract for dev/CI. The loop never
+composes pixels itself; it sends ops and waits for completion.
 
-Phase 5b deferral: TextSlides can reference a VideoSlide via
-`background_video_slide_id` (SYSTEM_SPEC §5.10). The browser-side
-inline preview already composites the slide's text over the live video
-frames at this commit. The device-side composite path — alpha-blend
-text PNG over .rgb panel frames + ffmpeg `overlay` filter for HDMI —
-is the same shape but needs a real video frame stream first, which
-arrives in Phase 6. Tracking as Phase 5c. Until then this loop also
-treats Text-over-Video slides as still thumbnails (the editor saves
-a flattened text-over-thumbnail PNG as a fallback — see
-content/__init__.py::TextSlide::background_video_slide_id docstring).
-
-Items are re-fetched between iterations, so adding/deleting slides while
-playing takes effect on the next cycle without restarting the loop. A
-failed render (missing asset, corrupt PNG) is logged and skipped — one
-bad slide doesn't kill the loop.
-
-Replaced the Phase 2 manual `/dev/play/{id}` poke (the dev endpoint
-has since been removed). The dev preview now updates continuously
-while playback is running, like a real sign.
+Items are re-fetched between iterations, so adding/deleting slides
+while playing takes effect on the next cycle without restarting the
+loop. A failed render is logged and skipped — one bad slide doesn't
+kill the loop (per-slide error throttle prevents log spam from a
+permanently broken slide).
 """
 
 import asyncio
 import contextlib
-import io
 import logging
+import tempfile
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 
-from openmarquee.auto_render import resolve_timezone
 from openmarquee.content import ContentItem
-from openmarquee.motion import (
-    compose_motion_frame,
-    load_motion_background,
-    prerender_layer_bitmaps,
-    slide_has_dynamic_content,
-    slide_has_motion,
-)
 from openmarquee.rendering import Renderer
 
 if TYPE_CHECKING:
@@ -63,11 +42,6 @@ if TYPE_CHECKING:
     from openmarquee.schedule import ScheduleStorage
 
 log = logging.getLogger(__name__)
-
-# Frame rate for fade transitions. 30fps is the playback target on both HDMI
-# and HUB75; ~15 frames over a default 500ms fade is plenty smooth.
-_FADE_FPS = 30
-
 
 class PlaybackLoop:
     """Cycles content items through a renderer until told to stop.
@@ -354,185 +328,63 @@ class PlaybackLoop:
                     self._current_auto_mode = None
                     self._current_auto_format = None
 
-                # Slice 4 gate: when the renderer is the Rust IPC
-                # sidecar proxy (or AutoFallbackRenderer wrapping one),
-                # the per-tick PIL composite + render_frame(bytes) hot
-                # path doesn't fit -- the sidecar owns rasterization
-                # AND DRM page-flip. Drive it via begin_slide + advance
-                # IPC ops instead.
-                #
-                # Slice-4-followup (rust transitions): after the current
-                # slide's duration loop ends, drive begin_transition +
-                # advance through the transition window into the next
-                # slide -- the sidecar's state machine internally
-                # promotes from PaintTransition to PaintSlide(next), so
-                # the next iteration's begin_slide just re-anchors the
-                # to-slide's clock (idempotent visible-state-wise).
-                if self._renderer_supports_ipc_ops():
-                    # Compute next item for the transition handoff.
-                    # Playlist wraps: at end-of-list, transition into
-                    # items[0] to mirror the existing PIL transition
-                    # path's behavior.
-                    next_for_transition = (
-                        items[(i + 1) % len(items)] if len(items) > 1 else None
-                    )
-                    # 2026-05-17 frozen-sign guard. The TODO at
-                    # _play_via_rust_ipc's docstring (L1004) flagged
-                    # that RustRendererRespawnedError /
-                    # AutoFallbackInMockError / generally any non-
-                    # Unsupported* IPC error propagates uncaught and
-                    # kills the outer _loop. That's exactly what
-                    # happened on 192.168.1.67: slide 0 begin_slide
-                    # fired, an advance op (or its response) blew up,
-                    # the task died silently, sign stayed frozen on
-                    # boot slide for 10+ min with zero log surface.
-                    # Catch broadly here so a single-slide IPC fault
-                    # doesn't take the whole sign down; log full
-                    # traceback so the journal carries the diagnosis.
-                    try:
-                        rendered = await self._play_via_rust_ipc(
-                            item,
-                            next_item=next_for_transition,
-                            transition_kind=(item.transition or "cut"),
-                            transition_ms=int(item.transition_ms or 0),
-                        )
-                    except Exception as e:
-                        # Bug 8 / Fix B: per-slide throttle. First fail
-                        # per id logs ERROR with traceback; subsequent
-                        # fails for the SAME id log DEBUG only. Avoids
-                        # journal-spam when a bad slide sits in a
-                        # 1-item playlist (frozen-sign incident @
-                        # 192.168.1.67 hot-spun at 3.4 Hz with full
-                        # tracebacks until ce225f3 + Fix A landed).
-                        if item.id in self._failed_slide_ids:
-                            log.debug(
-                                "playback: IPC playback failed for "
-                                "slide id=%s (throttled; first fail "
-                                "carried the traceback): %s",
-                                item.id, e,
-                            )
-                        else:
-                            self._failed_slide_ids.add(item.id)
-                            log.exception(
-                                "playback: IPC playback failed for slide "
-                                "id=%s type=%s; advancing to next item "
-                                "(subsequent fails for this id will be "
-                                "throttled to DEBUG)",
-                                item.id, item.type,
-                            )
-                        # Brief settle so a hot-loop of failing slides
-                        # doesn't burn CPU. 250ms is short enough that
-                        # one bad slide adds barely-visible delay,
-                        # long enough to avoid a tight crash-loop.
-                        await self._wait(0.25)
-                        continue
-                    if self._stop_event.is_set():
-                        break
-                    if self._pause_event.is_set():
-                        self._resume_at_index = i
-                        break
-                    # Whether the slide rendered or was skipped (e.g.,
-                    # VideoSlide on a video-less sidecar build), move
-                    # to the next item. `rendered=False` means
-                    # UnsupportedSlideError fired and was logged by
-                    # _play_via_rust_ipc; the sidecar is healthy.
-                    _ = rendered
-                    continue
-
-                is_dynamic = (
-                    item.type == "text_slide"
-                    and slide_has_dynamic_content(item)
+                # IPC route. After the DELETE-PIL purge (slices 1-12)
+                # there is no PIL fallback: every renderer the loop is
+                # given satisfies the begin_slide / advance / begin_
+                # transition contract (MockRenderer became IPC-shaped
+                # in slice 11). The sidecar owns rasterization + DRM
+                # page-flip; we send ops and wait for SlideComplete +
+                # the transition state machine to promote into the
+                # to-slide.
+                next_for_transition = (
+                    items[(i + 1) % len(items)] if len(items) > 1 else None
                 )
-                if is_dynamic:
-                    # Unified per-tick composer (docs/text-layer-motion-
-                    # spec.md): any visible layer with motion != static OR
-                    # auto_mode set drives a per-tick re-composition. The
-                    # composer handles both in one pass — a clock that
-                    # bounces gets its text refreshed AND its bitmap
-                    # bounced each tick. Tick rate adapts: 30 Hz when
-                    # motion is present, 1 Hz when only auto (avoids
-                    # burning 30 fps for clock-only slides).
-                    current_image = await self._play_dynamic_slide(item)
-                    if current_image is None:
-                        continue
-                else:
-                    current_image = self._safe_load_image(item)
-                    if current_image is None:
-                        continue
-                    self._render_image(current_image)
-                    await self._wait(item.duration_ms / 1000)
-
+                # 2026-05-17 frozen-sign guard: catch broadly so a
+                # single-slide IPC fault doesn't take the whole sign
+                # down; log full traceback so the journal carries
+                # the diagnosis.
+                try:
+                    rendered = await self._play_via_rust_ipc(
+                        item,
+                        next_item=next_for_transition,
+                        transition_kind=(item.transition or "cut"),
+                        transition_ms=int(item.transition_ms or 0),
+                    )
+                except Exception as e:
+                    # Bug 8 / Fix B: per-slide throttle. First fail
+                    # per id logs ERROR with traceback; subsequent
+                    # fails for the SAME id log DEBUG only.
+                    if item.id in self._failed_slide_ids:
+                        log.debug(
+                            "playback: IPC playback failed for "
+                            "slide id=%s (throttled; first fail "
+                            "carried the traceback): %s",
+                            item.id, e,
+                        )
+                    else:
+                        self._failed_slide_ids.add(item.id)
+                        log.exception(
+                            "playback: IPC playback failed for slide "
+                            "id=%s type=%s; advancing to next item "
+                            "(subsequent fails for this id will be "
+                            "throttled to DEBUG)",
+                            item.id, item.type,
+                        )
+                    # Brief settle so a hot-loop of failing slides
+                    # doesn't burn CPU.
+                    await self._wait(0.25)
+                    continue
                 if self._stop_event.is_set():
                     break
-
-                # If the wait was woken by a pause request mid-slide,
-                # skip the transition and resume at the same index so
-                # the user sees the same slide when stream stops.
                 if self._pause_event.is_set():
                     self._resume_at_index = i
                     break
-
-                # Transition into the next slide (wraps to first). "cut"
-                # is instant → no-op. single-item playlists also no-op
-                # (next == current). Honors the current item's setting
-                # all the way through the last-to-first wrap so the
-                # inline preview and the device stay consistent.
-                if (
-                    item.transition
-                    in (
-                        "fade",
-                        "wipe",
-                        "slide",
-                        "iris",
-                        "scroll",
-                        "flip",
-                        "marquee",
-                        "dissolve",
-                        "pixelate",
-                        "halftone",
-                        "scanline",
-                        "glitch",
-                        "push",
-                        "blinds",
-                        "shutter",
-                    )
-                    and item.transition_ms > 0
-                    and len(items) > 1
-                ):
-                    next_item = items[(i + 1) % len(items)]
-                    next_image = self._safe_load_image(next_item)
-                    if next_image is not None:
-                        kind = item.transition
-                        if kind == "fade":
-                            await self._fade(current_image, next_image, item.transition_ms)
-                        elif kind == "wipe":
-                            await self._wipe(current_image, next_image, item.transition_ms)
-                        elif kind == "slide":
-                            await self._slide(current_image, next_image, item.transition_ms)
-                        elif kind == "iris":
-                            await self._iris(current_image, next_image, item.transition_ms)
-                        elif kind == "scroll":
-                            await self._scroll(current_image, next_image, item.transition_ms)
-                        elif kind == "flip":
-                            await self._flip(current_image, next_image, item.transition_ms)
-                        elif kind == "marquee":
-                            await self._marquee(current_image, next_image, item.transition_ms)
-                        elif kind == "dissolve":
-                            await self._dissolve(current_image, next_image, item.transition_ms)
-                        elif kind == "pixelate":
-                            await self._pixelate(current_image, next_image, item.transition_ms)
-                        elif kind == "halftone":
-                            await self._halftone(current_image, next_image, item.transition_ms)
-                        elif kind == "scanline":
-                            await self._scanline(current_image, next_image, item.transition_ms)
-                        elif kind == "glitch":
-                            await self._glitch(current_image, next_image, item.transition_ms)
-                        elif kind == "push":
-                            await self._push(current_image, next_image, item.transition_ms)
-                        elif kind == "blinds":
-                            await self._blinds(current_image, next_image, item.transition_ms)
-                        elif kind == "shutter":
-                            await self._shutter(current_image, next_image, item.transition_ms)
+                # Whether the slide rendered or was skipped (e.g.,
+                # VideoSlide on a video-less sidecar build), move
+                # to the next item. `rendered=False` means
+                # UnsupportedSlideError fired and was logged by
+                # _play_via_rust_ipc; the sidecar is healthy.
+                _ = rendered
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -798,128 +650,6 @@ class PlaybackLoop:
                 await self._wait(min(tick_period, remaining))
         return True
 
-    async def _play_dynamic_slide(self, item: ContentItem) -> Image.Image | None:
-        """Tick-render a slide with auto-mode and/or motion layers for
-        its full duration. Per-tick `compose_motion_frame` builds an
-        RGB frame and pushes it through `render_frame`. Tick cadence
-        is 30 Hz when motion is present, 1 Hz when only auto.
-
-        Returns the last-composed frame so the caller's transition has
-        something to fade from. Stop / pause exit early — a stream
-        takeover shouldn't keep painting frames over live video.
-        """
-        return await self._play_dynamic_slide_software(item)
-
-    async def _play_dynamic_slide_software(
-        self, item: ContentItem
-    ) -> Image.Image | None:
-        """Software path: per-tick compose_motion_frame → render_frame.
-        The original implementation that has shipped since 5e75cf5."""
-        tz = resolve_timezone(self._get_timezone())
-        total = item.duration_ms / 1000
-        loop = asyncio.get_event_loop()
-        t0 = loop.time()
-        # Stamp for capture_current_frame() so its compose at "now"
-        # shares the same elapsed_s clock as the live tick.
-        self._slot_t0 = t0
-        end_at = t0 + total
-        # 30 Hz when motion is present, 1 Hz for auto-only — preserves
-        # the prior _play_auto_slide cadence and avoids burning 29
-        # frames of work per second for clock-only slides.
-        if slide_has_motion(item):
-            tick_period = 1.0 / max(1, _FADE_FPS)
-        else:
-            tick_period = max(0.1, self._auto_tick)
-        last: Image.Image | None = None
-        # Pre-load the background once. Pre-rasterize static layers
-        # once. Auto layers leave None placeholders in the cache —
-        # they re-render text each tick from `now`.
-        try:
-            background_cache: Image.Image | None = load_motion_background(
-                item, self._renderer.width, self._renderer.height, self._read_asset,
-            )
-        except Exception:
-            background_cache = None
-        try:
-            layer_bitmap_cache: list[Image.Image | None] | None = prerender_layer_bitmaps(
-                item, self._renderer.width, self._renderer.height,
-            )
-        except Exception:
-            layer_bitmap_cache = None
-        while True:
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return last
-            elapsed = loop.time() - t0
-            now = datetime.now(tz)
-            try:
-                frame = compose_motion_frame(
-                    item,
-                    elapsed,
-                    self._renderer.width,
-                    self._renderer.height,
-                    read_asset=self._read_asset,
-                    background_cache=background_cache,
-                    layer_bitmap_cache=layer_bitmap_cache,
-                    now=now,
-                )
-            except Exception:
-                log.exception("playback: compose_motion_frame failed for %s", item.id)
-                return None
-            self._render_image(frame)
-            last = frame
-
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return last
-
-            remaining = end_at - loop.time()
-            if remaining <= 0:
-                return last
-            await self._wait(min(tick_period, remaining))
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return last
-            if loop.time() >= end_at:
-                return last
-
-    def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
-        """Load + resize an item's PNG to renderer dimensions.
-
-        Returns None on missing asset / corrupt PNG / any other render-time
-        failure — playback continues with the next item.
-        """
-        try:
-            asset_bytes = self._read_asset(item.id)
-        except FileNotFoundError:
-            log.warning("playback: asset missing for %s, skipping", item.id)
-            return None
-        except Exception:
-            log.exception("playback: failed to read asset for %s", item.id)
-            return None
-
-        try:
-            image = Image.open(io.BytesIO(asset_bytes)).convert("RGB")
-        except UnidentifiedImageError:
-            log.warning("playback: corrupt asset for %s, skipping", item.id)
-            return None
-
-        target_w = self._renderer.width
-        target_h = self._renderer.height
-        if image.size != (target_w, target_h):
-            image = _cover_fit(image, target_w, target_h)
-        return image
-
-    def _render_image(self, image: Image.Image) -> None:
-        """Push an already-loaded, correctly-sized image to the renderer.
-
-        Wrapped in try/except so a renderer crash doesn't kill the loop —
-        same survival contract _safe_render had.
-        """
-        try:
-            self._renderer.render_frame(image.tobytes())
-        except Exception:
-            log.exception("playback: renderer raised on render_frame")
-
     @property
     def current_playlist_id(self) -> UUID | None:
         """The playlist id the loop is currently sourcing items from.
@@ -964,21 +694,17 @@ class PlaybackLoop:
           - age < 5 minutes since last capture, AND
           - current_playlist_id matches the captured slot
 
-        Otherwise: capture fresh (compose_motion_frame at the live
-        elapsed_s, or the asset PNG for image slides), store, return.
-        Concurrent callers serialize behind a lock so a burst of
-        requests issues exactly one capture; subsequent waiters get
-        the freshly cached frame.
+        Otherwise: ask the renderer for a fresh PNG via the IPC
+        `capture` op, store, return. Concurrent callers serialize
+        behind a lock so a burst of requests issues exactly one
+        capture; subsequent waiters get the freshly cached frame.
 
         Returns None when nothing is currently playing or capture
-        otherwise fails (the API layer maps None to 503). For image
-        slides the asset PNG IS the current frame -- no recompose
-        needed. For text slides we re-run compose_motion_frame at the
-        live elapsed_s so motion + auto-mode (clock, etc.) reflect
-        the actual on-screen state, not a stale rasterize. Video
-        slides return None today (writeback from the hardware decoder
-        path isn't wired up; not a regression because nothing was
-        capturing video frames before).
+        otherwise fails (the API layer maps None to 503). The
+        renderer owns on-screen state -- the sidecar paints into
+        its own EGL session and the capture op writes that exact
+        framebuffer to disk -- so this is the canonical snapshot
+        primitive. No Python-side composition involved.
         """
         loop = asyncio.get_event_loop()
         now_mono = loop.time()
@@ -1027,793 +753,39 @@ class PlaybackLoop:
 
     def _capture_current_frame_sync(self, elapsed_s: float) -> bytes | None:
         """Synchronous worker for cached_current_frame_png. Runs on a
-        thread -- compose_motion_frame is CPU-bound PIL work and
-        shouldn't block the event loop. Caller passes elapsed_s
-        because asyncio's loop.time() can't be read from a worker
-        thread."""
-        item_id = self._current_id
-        if item_id is None:
+        worker thread because the IPC capture roundtrip can stall on
+        sidecar I/O and shouldn't block the event loop.
+
+        Delegates to the renderer's `capture(path)` IPC op which writes
+        a PNG containing whatever the sidecar last painted. We read the
+        bytes back from the temp file and discard it. `elapsed_s` is
+        kept in the signature for the caller's tracking but isn't
+        threaded into the IPC op -- the sidecar's state machine is the
+        source of truth for what's on screen, not a wall-clock anchor.
+        """
+        del elapsed_s  # see docstring -- sidecar owns timing now
+        if self._current_id is None:
             return None
+        if not hasattr(self._renderer, "capture"):
+            return None
+        with tempfile.NamedTemporaryFile(
+            suffix=".png", delete=False
+        ) as tf:
+            tmp_path = Path(tf.name)
         try:
-            items = self._fetch_items()
-        except Exception:
-            log.exception("playback: capture fetch_items failed")
-            return None
-        item = next((it for it in items if it.id == item_id), None)
-        if item is None:
-            return None
-        if item.type == "text_slide":
-            tz = resolve_timezone(self._get_timezone())
             try:
-                background_cache = load_motion_background(
-                    item, self._renderer.width, self._renderer.height,
-                    self._read_asset,
-                )
+                self._renderer.capture(tmp_path)
             except Exception:
-                background_cache = None
-            try:
-                layer_bitmap_cache = prerender_layer_bitmaps(
-                    item, self._renderer.width, self._renderer.height,
-                )
-            except Exception:
-                layer_bitmap_cache = None
-            img = compose_motion_frame(
-                item,
-                elapsed_s,
-                self._renderer.width,
-                self._renderer.height,
-                read_asset=self._read_asset,
-                now=datetime.now(tz),
-                background_cache=background_cache,
-                layer_bitmap_cache=layer_bitmap_cache,
-            )
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
-        if item.type == "image":
-            # The asset PNG already IS the rendered frame -- images
-            # don't have motion / auto-mode -- so just relay it.
-            try:
-                return self._read_asset(item.id)
-            except Exception:
-                log.exception("playback: capture image asset read failed")
+                log.exception("playback: renderer.capture failed")
                 return None
-        # Video and any future type: no readback path yet.
-        return None
-
-    async def _fade(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Alpha-blend from `from_image` to `to_image` over `transition_ms`.
-
-        Returns early on stop OR pause request -- pause-awareness keeps
-        the transition from painting playlist frames over an in-flight
-        stream takeover.
-        """
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            alpha = i / n_frames
-            blended = Image.blend(from_image, to_image, alpha)
-            self._render_image(blended)
-            await self._wait(frame_period)
-
-    async def _slide(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Push transition: `from_image` slides off to the left while
-        `to_image` slides in from the right at the same rate. Distinct
-        from wipe in that BOTH frames move (rather than to_image
-        revealing under a stationary from_image)."""
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        width, height = from_image.size
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            offset = max(0, min(width, int(round(width * i / n_frames))))
-            frame = Image.new("RGB", (width, height))
-            # from_image: shifted left by `offset`, so columns [offset, width)
-            # of the source go to columns [0, width - offset) of the frame.
-            if offset < width:
-                frame.paste(from_image.crop((offset, 0, width, height)), (0, 0))
-            # to_image: enters from the right edge — its leftmost
-            # `offset` columns go to columns [width - offset, width).
-            if offset > 0:
-                frame.paste(to_image.crop((0, 0, offset, height)), (width - offset, 0))
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _iris(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Iris transition: `to_image` reveals through a circular mask
-        that grows from a center pinpoint to fully cover the canvas.
-        Reads as a film-projector aperture opening — distinct enough
-        from fade and wipe at small panel sizes that it stays legible."""
-        from PIL import ImageDraw
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        width, height = from_image.size
-        # Final radius covers the whole canvas — corner-to-center distance.
-        max_r = int(((width / 2) ** 2 + (height / 2) ** 2) ** 0.5) + 1
-        cx, cy = width // 2, height // 2
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            radius = int(round(max_r * i / n_frames))
-            mask = Image.new("L", (width, height), 0)
-            ImageDraw.Draw(mask).ellipse(
-                (cx - radius, cy - radius, cx + radius, cy + radius),
-                fill=255,
-            )
-            frame = Image.composite(to_image, from_image, mask)
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _scroll(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Vertical scroll: `from_image` rolls up off the top while
-        `to_image` rolls in from the bottom at the same rate. Reads as
-        a stadium scoreboard advancing rows. Distinct from slide in
-        that the motion is vertical — natural on tall WS281x columns
-        and ticker-style HUB75 strips."""
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        width, height = from_image.size
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            offset = max(0, min(height, int(round(height * i / n_frames))))
-            frame = Image.new("RGB", (width, height))
-            # from_image: shifted up by `offset`, so rows [offset, height)
-            # of the source go to rows [0, height - offset) of the frame.
-            if offset < height:
-                frame.paste(from_image.crop((0, offset, width, height)), (0, 0))
-            # to_image: enters from the bottom edge — its topmost
-            # `offset` rows go to rows [height - offset, height).
-            if offset > 0:
-                frame.paste(to_image.crop((0, 0, width, offset)), (0, height - offset))
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _flip(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Card-flip: from_image scaleX-shrinks to a center column over the
-        first half, then to_image scaleX-grows from a center column over
-        the second half. 2D approximation of a 3D card-flip — at small
-        panel sizes the suggestion of "flipping" carries even without
-        perspective.
-
-        Strip-graceful: a horizontal scaleX flip on a width<2 panel has
-        no visible motion (the only column collapses to itself), so we
-        fall back to fade. Per QA's 2026-04-28 transition-palette spec:
-        "flip on a strip is meaningless — fall back to fade."
-        """
-        width, height = from_image.size
-        if width < 2:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            # First half: from_image shrinks 1.0 → 0.0 width.
-            # Second half: to_image grows 0.0 → 1.0 width.
-            if progress < 0.5:
-                scale = 1.0 - 2.0 * progress
-                source = from_image
-            else:
-                scale = 2.0 * progress - 1.0
-                source = to_image
-            new_w = max(1, int(round(width * scale)))
-            # Horizontal squish only — height is preserved so the card
-            # reads as flipping around a vertical axis, not collapsing.
-            resized = source.resize((new_w, height))
-            frame = Image.new("RGB", (width, height))
-            frame.paste(resized, ((width - new_w) // 2, 0))
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _marquee(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Tickertape wraparound: from_image scrolls off to the left, a
-        gap with a centered dot separator passes through, and to_image
-        arrives from the right. Native to the openMarquee brand identity
-        — the same "ticker" reading that the wordmark evokes.
-
-        Implemented by composing a wide [from | gap | to] strip and
-        sliding a width-sized window across it. Cleaner than tracking
-        three independent paste offsets per frame.
-
-        Strip-graceful: width<2 → no horizontal motion is meaningful,
-        fall back to fade. Per QA's spec for strip rendering.
-        """
-        from PIL import ImageDraw
-
-        width, height = from_image.size
-        if width < 2:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        # Gap is ~1/8 of canvas width, min 4px so the dot stays visible
-        # on small panels. The compound is [from | gap | to] = total
-        # 2*width + gap_w wide; the visible window is `width` wide so
-        # the scroll distance over transition_ms is width + gap_w (after
-        # which to_image is fully revealed).
-        gap_w = max(4, width // 8)
-        gap_panel = Image.new("RGB", (gap_w, height))
-        # Centered dot — small filled circle. dot_radius bounded by both
-        # gap width and panel height so it never bleeds the gap or
-        # crowds a thin row. Falls to 1px on a 1-row strip.
-        dot_radius = max(1, min(gap_w // 3, height // 3))
-        cx, cy = gap_w // 2, height // 2
-        ImageDraw.Draw(gap_panel).ellipse(
-            (cx - dot_radius, cy - dot_radius, cx + dot_radius, cy + dot_radius),
-            fill=(255, 255, 255),
-        )
-        compound = Image.new("RGB", (2 * width + gap_w, height))
-        compound.paste(from_image, (0, 0))
-        compound.paste(gap_panel, (width, 0))
-        compound.paste(to_image, (width + gap_w, 0))
-
-        scroll_total = width + gap_w
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            offset = max(0, min(scroll_total, int(round(scroll_total * i / n_frames))))
-            frame = compound.crop((offset, 0, offset + width, height))
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _dissolve(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Random per-pixel reveal: each pixel of `to_image` is gated by
-        a per-pixel threshold sampled uniformly from [0, 1). As progress
-        crosses each pixel's threshold, that pixel switches from
-        `from_image` to `to_image`. Reads as a noise-driven crossfade
-        — the first of the dot-matrix-family transitions per the
-        2026-04-28 palette spec.
-
-        Strip-graceful: works at any width or height — the per-pixel
-        randomization doesn't depend on geometry, so a 1×N strip just
-        sees its individual pixels reveal independently. No fallback.
-        """
-        width, height = from_image.size
-        # Per-pixel reveal thresholds. Generated once per transition so
-        # pixels reveal in a stable random order across frames; using a
-        # fresh rng each call means no two transitions share a pattern.
-        thresholds = np.random.default_rng().random((height, width))
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            # Binary L-mode mask: 255 wherever a pixel has been
-            # revealed (threshold < progress), 0 elsewhere.
-            # Image.composite picks to_image where mask==255, from_image
-            # where mask==0 — exactly the per-pixel switch we want.
-            mask_arr = (thresholds < progress).astype(np.uint8) * 255
-            mask = Image.fromarray(mask_arr, mode="L")
-            frame = Image.composite(to_image, from_image, mask)
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _pixelate(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Chunky-pixel cross-fade: both images pixelate to a peak block
-        size at the midpoint then sharpen back to native resolution as
-        the alpha-blend progresses from-image to to-image. Reads as the
-        slide is "rendering" into the next at progressively coarser
-        then finer dot-matrix resolution — second of the dot-matrix-
-        family transitions per the 2026-04-28 palette spec.
-
-        Strip-graceful: with width<2 or height<2 there's no room to
-        pixelate (block_size collapses to 1 → identity), so delegate
-        to fade. Cleaner than emitting frames identical to fade under
-        a different name.
-        """
-        width, height = from_image.size
-        if width < 2 or height < 2:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        # Peak block size: ~quarter of the smaller dimension. Bounded
-        # so even tall-skinny strips (e.g. 4×64) don't try to pixelate
-        # into a single super-pixel that erases all content.
-        max_block = max(2, min(width, height) // 4)
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            # Triangular: 0 → 1 → 0 over [0, 0.5, 1]. Block size grows
-            # then shrinks. Linear cross-fade over the same window.
-            triangular = 1.0 - abs(2.0 * progress - 1.0)
-            block_size = max(1, int(round(1 + triangular * (max_block - 1))))
-            small_w = max(1, width // block_size)
-            small_h = max(1, height // block_size)
-            # NEAREST resample twice = pixelation. Down-sample first to
-            # reduce detail, then up-sample to reproduce as blocky
-            # squares.
-            pix_from = from_image.resize(
-                (small_w, small_h), Image.NEAREST
-            ).resize((width, height), Image.NEAREST)
-            pix_to = to_image.resize(
-                (small_w, small_h), Image.NEAREST
-            ).resize((width, height), Image.NEAREST)
-            frame = Image.blend(pix_from, pix_to, progress)
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _halftone(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Halftone-dot reveal: to_image emerges through a regular grid
-        of growing circular dots, one per cell. Reads as the next slide
-        is "printing in" through a dot-matrix screen — closes the
-        dot-matrix family per the 2026-04-28 palette spec.
-
-        Cell pitch = max(2, min(width, height) // 8) — gives roughly an
-        8-cell row across the smaller dimension. Per-cell dot radius
-        grows linearly 0 → max_r over transition_ms. max_r is the
-        cell's half-diagonal (≈ pitch * 0.71), so by progress=1 every
-        circle covers its cell entirely → fully revealed to_image.
-
-        Strip-graceful: width<4 or height<4 leaves nothing for the dot
-        grid to cohere into (a single column of cells just degenerates
-        to a stripe), so delegate to fade.
-        """
-        from PIL import ImageDraw
-
-        width, height = from_image.size
-        if width < 4 or height < 4:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        pitch = max(2, min(width, height) // 8)
-        # Half-diagonal of a square cell: pitch * sqrt(2)/2 ≈ 0.707 *
-        # pitch. +1 ensures rounding never leaves a hairline gap at
-        # progress=1.
-        max_r = int(round(pitch * 0.71)) + 1
-
-        # Cell centers — staggered grid offset by half-pitch so cells
-        # are inset from canvas edges. Computed once per transition.
-        cell_centers: list[tuple[int, int]] = []
-        cy = pitch // 2
-        while cy < height:
-            cx = pitch // 2
-            while cx < width:
-                cell_centers.append((cx, cy))
-                cx += pitch
-            cy += pitch
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            radius = int(round(progress * max_r))
-            mask = Image.new("L", (width, height), 0)
-            draw = ImageDraw.Draw(mask)
-            for cx, cy in cell_centers:
-                draw.ellipse(
-                    (cx - radius, cy - radius, cx + radius, cy + radius),
-                    fill=255,
-                )
-            frame = Image.composite(to_image, from_image, mask)
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _scanline(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """CRT scanline sweep: a bright horizontal band sweeps top-to-
-        bottom over transition_ms. Above the line is to_image; below
-        stays from_image. Reads as a vintage tube reveal where the
-        electron beam is "scanning in" the new frame. First of the CRT-
-        family transitions per the 2026-04-28 palette spec.
-
-        Strip-graceful: scanline on a 1-row strip (height<2) has no
-        room to sweep — the line would cover the entire panel for the
-        duration. Fall back to fade. Per QA's spec ("scanline on a 1×N
-        strip is just a fade"); we make it explicit here so the
-        operator's pulldown choice doesn't silently degrade.
-        """
-        from PIL import ImageDraw
-
-        width, height = from_image.size
-        if height < 2:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        # Sweep band thickness: ~3% of panel height, min 1px. Gives a
-        # visible CRT-glow trail without dominating short canvases.
-        band_height = max(1, height // 32)
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            sweep_y = int(round(progress * height))
-            frame = from_image.copy()
-            # Above the sweep: paint to_image rows.
-            if sweep_y > 0:
-                frame.paste(to_image.crop((0, 0, width, sweep_y)), (0, 0))
-            # Bright glow band centered on the sweep line — clamped so
-            # it doesn't extend past the canvas at progress=0 or 1.
-            band_top = max(0, sweep_y - band_height // 2)
-            band_bot = min(height, band_top + band_height)
-            if band_bot > band_top:
-                ImageDraw.Draw(frame).rectangle(
-                    (0, band_top, width - 1, band_bot - 1),
-                    fill=(255, 255, 255),
-                )
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _glitch(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Digital-corruption-style transition: per-row horizontal jitter
-        + linear cross-fade + occasional cyan "tear" rows that simulate
-        broken video signal. Closes the CRT family per the 2026-04-28
-        palette spec.
-
-        Per-frame randomization (jitter + tear-row positions are
-        regenerated each frame, not stable across frames like dissolve)
-        is what gives the transition its "glitchy" animated quality —
-        the screen-tearing effect can't read as broken if the breakage
-        sits still.
-
-        Strip-graceful: works at any geometry. Per-row jitter is
-        shape-agnostic; even a 1×N strip just sees its single row jitter
-        each frame. No fallback needed (and none added). Per QA's spec.
-        """
-        width, height = from_image.size
-        rng = np.random.default_rng()
-        # Jitter ceiling ~10% of canvas width, min 1. Bigger jitter
-        # makes the glitch read more "broken"; small enough that the
-        # underlying image stays mostly recognizable.
-        max_jitter = max(1, width // 10)
-        # Tear-row count ~5% of canvas height, min 1. Empirically the
-        # smallest count that reads as "consistent corruption" rather
-        # than "occasional artifact"; tunable later if QA wants more.
-        n_tears = max(1, height // 20)
-
-        from_arr = np.asarray(from_image, dtype=np.uint8)
-        to_arr = np.asarray(to_image, dtype=np.uint8)
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            # Per-row x-shift, regenerated this frame.
-            shifts = rng.integers(-max_jitter, max_jitter + 1, size=height)
-            shifted_from = np.empty_like(from_arr)
-            for y in range(height):
-                shifted_from[y] = np.roll(from_arr[y], shifts[y], axis=0)
-            # Linear cross-fade.
-            blended = (
-                shifted_from.astype(np.float32) * (1.0 - progress)
-                + to_arr.astype(np.float32) * progress
-            ).astype(np.uint8)
-            # Inject cyan tear rows. The exact (0, 255, 255) triplet is
-            # the test-time discriminator — R=0 + G=255 + B=255 all
-            # simultaneously is impossible from a red↔blue cross-fade
-            # (which stays in the R-B plane: G=0 always). Marquee and
-            # scanline DO paint G=255 elsewhere — but as white (255,
-            # 255, 255), not cyan — so the full triplet stays unique
-            # to glitch's tear-row injection.
-            tear_rows = rng.choice(
-                height, size=min(n_tears, height), replace=False
-            )
-            for ty in tear_rows:
-                blended[ty] = (0, 255, 255)
-            frame = Image.fromarray(blended, mode="RGB")
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _push(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Classic-display push: to_image enters from the LEFT, pushing
-        from_image off the right edge. Both images move together at the
-        same rate (no gap). A 1-px bright vertical separator paints at
-        the seam between them — gives the mechanical-projector "blade"
-        feel that distinguishes push from `_slide`'s gap-less but
-        bare-edge motion.
-
-        Direction (left-entry) is the mirror of `_slide` (right-entry),
-        so the operator-visible difference between the two pulldown
-        choices is direction PLUS the projector-blade separator. First
-        of the classic-display family per the 2026-04-28 palette spec.
-
-        Strip-graceful: width<2 -> fall back to fade. Same shape as
-        flip/marquee/pixelate strip fallbacks.
-        """
-        from PIL import ImageDraw
-
-        width, height = from_image.size
-        if width < 2:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            offset = max(0, min(width, int(round(width * progress))))
-            frame = Image.new("RGB", (width, height))
-            # to_image enters from left: source columns [width-offset,
-            # width) go to frame columns [0, offset). I.e. to_image is
-            # translated to x = -width + offset, so its rightmost
-            # `offset` columns are visible at the left.
-            if offset > 0:
-                frame.paste(
-                    to_image.crop((width - offset, 0, width, height)), (0, 0)
-                )
-            # from_image exits to right: source columns [0, width-offset)
-            # go to frame columns [offset, width). I.e. from_image is
-            # translated to x = +offset, its leftmost `width-offset`
-            # columns visible.
-            if offset < width:
-                frame.paste(
-                    from_image.crop((0, 0, width - offset, height)),
-                    (offset, 0),
-                )
-            # Bright projector-blade separator at the seam (column
-            # offset). Skipped at offset=0 and offset=width (no seam
-            # visible — full from or full to). 1px wide for legibility
-            # on small panels; reads as a clean cut on bigger ones.
-            if 0 < offset < width:
-                ImageDraw.Draw(frame).rectangle(
-                    (offset - 1, 0, offset - 1, height - 1),
-                    fill=(255, 255, 255),
-                )
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _blinds(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Venetian-blind reveal: horizontal slats open to expose
-        to_image. Each slat has its own midline; the visible band
-        within each slat grows from a horizontal hairline at the
-        midline outward, until at progress=1 every slat is fully open
-        and the entire to_image is revealed.
-
-        n_slats = max(2, height // 8) — slats are roughly 8px tall,
-        clamped to at least two so the blind effect reads as a blind
-        even on small panels. Same Image.composite-mask pattern that
-        _halftone uses, just with rectangles instead of ellipses.
-
-        Strip-graceful: height<4 leaves no room for two slats with
-        meaningful midline-spread bands, so delegate to fade.
-        """
-        from PIL import ImageDraw
-
-        width, height = from_image.size
-        if height < 4:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        n_slats = max(2, height // 8)
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            mask = Image.new("L", (width, height), 0)
-            draw = ImageDraw.Draw(mask)
-            # Per-slat midline-out reveal. Use float arithmetic for the
-            # slat boundaries so non-integer division (e.g. 32 / 5 =
-            # 6.4 px slats) doesn't accumulate rounding error across
-            # slats — each pair of integer top/bot rounds back from
-            # the floating boundary.
-            slat_h = height / n_slats
-            for s in range(n_slats):
-                slat_top = int(round(s * slat_h))
-                slat_bot = int(round((s + 1) * slat_h))
-                slat_height = slat_bot - slat_top
-                band_height = int(round(slat_height * progress))
-                if band_height <= 0:
-                    continue
-                band_top = slat_top + (slat_height - band_height) // 2
-                band_bot = band_top + band_height
-                draw.rectangle(
-                    (0, band_top, width - 1, band_bot - 1), fill=255
-                )
-            frame = Image.composite(to_image, from_image, mask)
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _shutter(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Hexagonal-aperture shutter: a 6-sided regular polygon centered
-        on the canvas grows from a point at progress=0 to fully covering
-        the canvas at progress=1. Inside the polygon = to_image; outside
-        = from_image. Distinct from `_iris` (circle, rotation-symmetric)
-        by the polygon's six straight edges — at mid-transition the
-        hexagon's vertices reach further than its edge-midpoints, giving
-        the aperture-blade silhouette the operator expects from a
-        camera-shutter UI.
-
-        Closes the classic-display family AND the 16-transition palette
-        batch per the 2026-04-28 spec.
-
-        Strip-graceful: width<4 or height<4 leaves no room for the
-        hexagon to read as anything other than a stripe (six vertices
-        overlap at low resolution), so delegate to fade. Same shape as
-        halftone's strip fallback.
-        """
-        from math import cos, pi, sin
-
-        from PIL import ImageDraw
-
-        width, height = from_image.size
-        if width < 4 or height < 4:
-            await self._fade(from_image, to_image, transition_ms)
-            return
-
-        cx, cy = width / 2.0, height / 2.0
-        # Max vertex radius for full canvas coverage at progress=1.
-        # The hexagon's tightest direction (edge midpoint, angle π/6
-        # from a vertex) sits at R·cos(π/6) from center — only ~0.866R
-        # — so a vertex radius equal to the corner distance leaves a
-        # sliver of from_image at every canvas corner that lands
-        # between vertex angles. Dividing by cos(π/6) = √3/2 inflates
-        # the vertex radius enough that the hexagon's narrowest
-        # direction still reaches the canvas corner. +2px safety
-        # margin handles per-frame rounding.
-        corner_dist = (cx * cx + cy * cy) ** 0.5
-        max_r = (corner_dist + 2.0) / cos(pi / 6)
-
-        # Vertex angles (regular hexagon, "pointy-right" orientation —
-        # vertex at angle 0 points along +x).
-        vertex_angles = [pi / 3.0 * k for k in range(6)]
-
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            progress = i / n_frames
-            radius = progress * max_r
-            vertices = [
-                (cx + radius * cos(a), cy + radius * sin(a))
-                for a in vertex_angles
-            ]
-            mask = Image.new("L", (width, height), 0)
-            ImageDraw.Draw(mask).polygon(vertices, fill=255)
-            frame = Image.composite(to_image, from_image, mask)
-            self._render_image(frame)
-            await self._wait(frame_period)
-
-    async def _wipe(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        transition_ms: int,
-    ) -> None:
-        """Left-to-right wipe: `to_image` reveals from the left edge,
-        pushing `from_image` out of the way over `transition_ms`.
-
-        Returns early on stop. Same frame cadence as _fade so the two
-        transitions feel like the same smoothness at equal transition_ms.
-        """
-        n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-        frame_period = (transition_ms / 1000) / n_frames
-        width, height = from_image.size
-        for i in range(1, n_frames + 1):
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            if self._stop_event.is_set() or self._pause_event.is_set():
-                return
-            split = max(0, min(width, int(round(width * i / n_frames))))
-            # Compose: left `split` columns from to_image, rest from from_image.
-            frame = from_image.copy()
-            if split > 0:
-                frame.paste(to_image.crop((0, 0, split, height)), (0, 0))
-            self._render_image(frame)
-            await self._wait(frame_period)
+            try:
+                return tmp_path.read_bytes()
+            except Exception:
+                log.exception("playback: capture readback failed")
+                return None
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
 
 
 def scheduled_fetch_items(
@@ -1850,6 +822,10 @@ def _cover_fit(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
     down to exactly match the target, and the overflow on the other axis
     is cropped evenly on both sides. Mirrors the browser-side editor
     previews so what the operator sees IS what the device renders.
+
+    Used by the stream takeover path (`stream.py`) to fit camera frames
+    onto the renderer's dimensions. Outside the DELETE-PIL slide-render
+    hot path -- camera frames still arrive as PIL Images upstream.
     """
     src_w, src_h = image.size
     scale = max(target_w / src_w, target_h / src_h)
@@ -1862,3 +838,4 @@ def _cover_fit(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
     left = (new_w - target_w) // 2
     top = (new_h - target_h) // 2
     return resized.crop((left, top, left + target_w, top + target_h))
+

@@ -502,11 +502,12 @@ def test_scheduled_fetch_stamps_loop_with_active_playlist_id(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_slide_ticks_and_reemits_frames(renderer):
-    """Auto-mode text slides should push multiple frames to the renderer
-    during their duration — one per auto_tick_seconds. Proves the
-    re-composition path is wired and the stored PNG is NOT just
-    forwarded once."""
+async def test_auto_mode_slide_drives_renderer_until_complete(renderer):
+    """Auto-mode text slides drive the IPC renderer through begin_slide
+    + multiple advance ticks until the slide's duration elapses. Post-
+    DELETE-PIL the sidecar owns per-tick auto-mode redraw -- Python no
+    longer re-pushes frames -- so the observable Python signal is the
+    advance-call cadence."""
     slide = _text_slide(
         name="clock",
         text="placeholder",
@@ -514,7 +515,6 @@ async def test_auto_mode_slide_ticks_and_reemits_frames(renderer):
         auto_format="time_hms",
         duration_ms=200,
     )
-    rendered = _track_frames(renderer)
 
     loop = _new_loop(
         renderer,
@@ -528,8 +528,10 @@ async def test_auto_mode_slide_ticks_and_reemits_frames(renderer):
     await asyncio.sleep(0.3)
     await loop.stop()
 
-    # Multiple frames emitted for the single slide.
-    assert len(rendered) >= 3
+    # begin_slide fired once, advance ticked multiple times across the
+    # slide's duration window.
+    assert len(renderer.begin_slide_calls) >= 1
+    assert len(renderer.advance_calls) >= 3
 
 
 @pytest.mark.asyncio
