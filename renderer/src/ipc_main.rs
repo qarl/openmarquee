@@ -253,6 +253,17 @@ struct SlideCache {
     /// and evict before the cached copy is reused.
     item_mtimes: std::collections::HashMap<uuid::Uuid, std::time::SystemTime>,
     video_demuxers: std::collections::HashMap<uuid::Uuid, Mp4Demuxer>,
+    /// Bug 8 / Fix A (2026-05-17): video slide ids whose cache.load
+    /// could NOT register a demuxer (multi-trak MP4, malformed file,
+    /// missing asset, etc.). Subsequent BeginSlide/BeginTransition
+    /// for these ids returns the UnsupportedSlide wire marker so
+    /// Python's existing `RustRendererUnsupportedSlideError` rail
+    /// catches them cleanly (log INFO + skip + continue) instead of
+    /// failing later at paint_slide with a generic OpError that hot-
+    /// spins the playback loop. Cleared by `invalidate()` so an
+    /// item.json mtime drift (e.g. asset rotation) gets a fresh
+    /// load attempt.
+    video_skip: std::collections::HashSet<uuid::Uuid>,
     /// V4L2 piece 3c: Linux-only V4L2 decoder per Video slide id.
     /// cache.load primes the decoder once on first encounter; piece
     /// 3d's paint_slide drains frames per advance tick.
@@ -273,6 +284,7 @@ impl SlideCache {
             items: std::collections::HashMap::new(),
             item_mtimes: std::collections::HashMap::new(),
             video_demuxers: std::collections::HashMap::new(),
+            video_skip: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
             video_decoders: std::collections::HashMap::new(),
         }
@@ -287,6 +299,7 @@ impl SlideCache {
         self.items.remove(&item_id);
         self.item_mtimes.remove(&item_id);
         self.video_demuxers.remove(&item_id);
+        self.video_skip.remove(&item_id);
         #[cfg(target_os = "linux")]
         self.video_decoders.remove(&item_id);
     }
@@ -368,6 +381,15 @@ impl SlideCache {
                         "ipc: warning -- failed to open MP4 {} for video slide {}: {:#}",
                         asset_path.display(), item_id, e
                     );
+                    // Bug 8 / Fix A: record a skip marker so future
+                    // BeginSlide for this id short-circuits to the
+                    // UnsupportedSlide rail instead of letting the
+                    // begin_slide accept + paint_slide fail with a
+                    // generic OpError. Without this, a single bad
+                    // MP4 hot-spins the Python loop at ~3.4 Hz with
+                    // ERROR-level tracebacks (Bug 8 frozen-sign
+                    // incident, 2026-05-17 @ 192.168.1.67).
+                    self.video_skip.insert(item_id);
                 }
             }
             if let Some(m) = on_disk_mtime {
@@ -1280,12 +1302,41 @@ fn handle_inner_request(
             if let Err(e) = cache.load(content_root, p.slide_id) {
                 return err(format!("begin_slide load failed: {e:#}"));
             }
+            // Bug 8 / Fix A (2026-05-17): cache.load succeeded
+            // populating ContentItem::Video, but the underlying
+            // MP4 demuxer failed (e.g. multi-trak input rejected
+            // by mp4_demux's single-trak invariant). The wire
+            // marker "video slide unsupported (load failed)"
+            // matches `_UNSUPPORTED_SLIDE_WIRE_MARKERS` in
+            // backend/openmarquee/rendering/rust_renderer.py so
+            // Python raises `RustRendererUnsupportedSlideError`,
+            // which `_play_via_rust_ipc`'s existing handler skips
+            // gracefully (log INFO + return False + outer-loop
+            // continues to next item).
+            if cache.video_skip.contains(&p.slide_id) {
+                return err(format!(
+                    "video slide unsupported (load failed): {} — \
+                     asset.mp4 missing or malformed (multi-trak? \
+                     see piece-3a demuxer single-trak invariant)",
+                    p.slide_id
+                ));
+            }
             state.begin_slide(p.slide_id, p.t0_ms, p.duration_ms);
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
             if let Err(e) = cache.load(content_root, p.to_slide_id) {
                 return err(format!("begin_transition load failed: {e:#}"));
+            }
+            // Bug 8 / Fix A: same skip-marker check as BeginSlide,
+            // applied to the to-slide of a transition.
+            if cache.video_skip.contains(&p.to_slide_id) {
+                return err(format!(
+                    "video slide unsupported (load failed): {} — \
+                     asset.mp4 missing or malformed (multi-trak? \
+                     see piece-3a demuxer single-trak invariant)",
+                    p.to_slide_id
+                ));
             }
             match state.begin_transition(
                 p.to_slide_id,
@@ -1427,6 +1478,59 @@ mod tests {
         // State should reflect the slide.
         assert!(state.current.is_some());
         assert_eq!(state.current.as_ref().unwrap().slide_id, uuid(1));
+    }
+
+    #[test]
+    fn handle_begin_slide_emits_unsupported_marker_when_video_demuxer_fails() {
+        // Bug 8 / Fix A regression-lock. A VideoSlide whose
+        // item.json is valid but whose asset.mp4 is missing
+        // (or malformed -- the failure path is the same) must
+        // result in BeginSlide returning an err carrying the
+        // wire marker `_UNSUPPORTED_SLIDE_WIRE_MARKERS` recognizes
+        // so Python's catch promotes to RustRendererUnsupportedSlideError
+        // rather than the generic OpError that hot-spun the loop.
+        let mut state = PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(7);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        // Valid video item.json, but no asset.mp4 alongside -- the
+        // Mp4Demuxer::open call in cache.load returns Err, which
+        // populates `video_skip` with `id`.
+        let item_json = format!(
+            r##"{{
+              "schema_version": 3,
+              "item": {{
+                "type": "video",
+                "id": "07070707-0707-0707-0707-070707070707",
+                "name": "missing-asset",
+                "duration_ms": 5000,
+                "transition": "cut",
+                "transition_ms": 500
+              }}
+            }}"##
+        );
+        std::fs::write(dir.join("item.json"), item_json).unwrap();
+        let req = IpcRequest::BeginSlide(BeginSlideParams {
+            slide_id: id,
+            t0_ms: 0,
+            duration_ms: 5000,
+        });
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        match resp {
+            IpcResponse::Err { error } => {
+                assert!(
+                    error.contains("video slide unsupported (load failed)"),
+                    "expected UnsupportedSlide wire marker, got: {error}"
+                );
+            }
+            other => panic!("expected Err with UnsupportedSlide marker, got {other:?}"),
+        }
+        // Skip marker recorded.
+        assert!(cache.video_skip.contains(&id));
+        // State NOT updated -- we returned err BEFORE state.begin_slide.
+        assert!(state.current.is_none());
     }
 
     #[test]

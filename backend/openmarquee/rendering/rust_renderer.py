@@ -227,6 +227,15 @@ class RustRendererUnsupportedTransitionError(RustRendererOpError):
 _UNSUPPORTED_SLIDE_WIRE_MARKERS: tuple[str, ...] = (
     "VideoSlide capture not implemented",
     "non-text slide TBD",
+    # Bug 8 / Fix A (2026-05-17): rust sidecar's cache.load skip-
+    # marker rail. When an MP4 demuxer fails to open (multi-trak,
+    # malformed, missing), BeginSlide returns an err carrying this
+    # substring so _classify_op_error promotes to UnsupportedSlide
+    # and _play_via_rust_ipc's existing skip path handles it (log
+    # INFO + return False + outer loop advances). Without this, a
+    # bad video hot-spun the loop with ERROR tracebacks (frozen-
+    # sign incident @ 192.168.1.67).
+    "video slide unsupported (load failed)",
 )
 
 
