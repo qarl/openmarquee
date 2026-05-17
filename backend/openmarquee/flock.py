@@ -121,8 +121,8 @@ class FlockPeer(BaseModel):
         default=None,
         max_length=32,
         description="Peer's output mode + display dims as a slug "
-        "(e.g. 'hub75-128x64', 'hdmi-1080', 'ws2812-strip'). Used "
-        "by the flock UI's stats grid for the aspect-ratio label.",
+        "(e.g. 'hdmi-1080'). Used by the flock UI's stats grid for "
+        "the aspect-ratio label.",
     )
     signal: int | None = Field(
         default=None,

@@ -52,13 +52,21 @@ def test_defaults_roundtrip_through_json():
 # --- Field validation ---
 
 
-def test_output_mode_accepts_all_four_spec_modes():
-    for mode in ("hdmi", "hub75", "ws281x", "composite"):
-        s = SystemSettings(output_mode=mode)
-        assert s.output_mode == mode
+def test_output_mode_accepts_hdmi():
+    s = SystemSettings(output_mode="hdmi")
+    assert s.output_mode == "hdmi"
 
 
-def test_output_mode_rejects_unknown_mode():
+def test_output_mode_legacy_led_values_coerce_to_hdmi():
+    """DELETE-PIL purge collapsed OutputMode to ["hdmi"] only. Legacy
+    settings.json files that stored "hub75" / "ws281x" / "composite"
+    must coerce silently rather than fail validation."""
+    for legacy in ("hub75", "ws281x", "composite"):
+        s = SystemSettings.model_validate({"output_mode": legacy})
+        assert s.output_mode == "hdmi"
+
+
+def test_output_mode_rejects_unknown_non_legacy_mode():
     with pytest.raises(ValidationError):
         SystemSettings(output_mode="vga")  # type: ignore[arg-type]
 
@@ -371,9 +379,9 @@ def test_storage_save_then_load_roundtrip(tmp_path: Path):
     storage = SettingsStorage(tmp_path / "settings.json")
     settings = SystemSettings(
         sign_name="Lobby Sign",
-        output_mode="hub75",
-        display_width=192,
-        display_height=64,
+        output_mode="hdmi",
+        display_width=1920,
+        display_height=1080,
         brightness=40,
         wifi_ssid="Lobby-WiFi",
         wifi_password="correct-horse-battery",

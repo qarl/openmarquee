@@ -52,30 +52,9 @@ def client(storage: SettingsStorage) -> TestClient:
 # --- _format_mode (pure function) ---
 
 
-def test_format_mode_hub75_uses_widthxheight():
-    assert _format_mode("hub75", 128, 64) == "hub75-128x64"
-
-
 def test_format_mode_hdmi_uses_height_only():
     """HDMI is operator-spoken in resolution-class terms (1080p)."""
     assert _format_mode("hdmi", 1920, 1080) == "hdmi-1080"
-
-
-def test_format_mode_ws281x_strip_when_one_dimension_is_one():
-    """1×N or N×1 is a strip; the dim-pair is operator-noise."""
-    assert _format_mode("ws281x", 1, 64) == "ws281x-strip"
-    assert _format_mode("ws281x", 64, 1) == "ws281x-strip"
-
-
-def test_format_mode_ws281x_matrix_keeps_dims():
-    """A 16×16 matrix wired from a strip is still ws281x but not a strip."""
-    assert _format_mode("ws281x", 16, 16) == "ws281x-16x16"
-
-
-def test_format_mode_composite_uses_widthxheight():
-    """Composite analog out — small enough that operators care about both
-    dims, so the WxH form sticks."""
-    assert _format_mode("composite", 720, 480) == "composite-720x480"
 
 
 # --- _format_uptime (pure function) ---
@@ -203,30 +182,17 @@ def test_info_returns_fallback_payload_on_dev_box(client: TestClient):
 
 
 def test_info_mode_reflects_settings_changes(client: TestClient):
-    """Save settings to a hub75 panel; /info's mode follows."""
+    """Save settings; /info's mode follows display dims."""
     payload = SystemSettings(
-        output_mode="hub75",
-        display_width=128,
-        display_height=64,
+        output_mode="hdmi",
+        display_width=1280,
+        display_height=720,
     ).model_dump(mode="json")
     put = client.put("/api/settings", json=payload)
     assert put.status_code == 200
 
     info = client.get("/api/system/info").json()
-    assert info["mode"] == "hub75-128x64"
-
-
-def test_info_mode_reflects_ws281x_strip_settings(client: TestClient):
-    """1×64 ws281x strip → 'ws281x-strip', not 'ws281x-1x64'."""
-    payload = SystemSettings(
-        output_mode="ws281x",
-        display_width=1,
-        display_height=64,
-    ).model_dump(mode="json")
-    client.put("/api/settings", json=payload)
-
-    info = client.get("/api/system/info").json()
-    assert info["mode"] == "ws281x-strip"
+    assert info["mode"] == "hdmi-720"
 
 
 def test_info_exposes_rotation_applied_display_dims(client: TestClient):
@@ -261,16 +227,16 @@ def test_info_no_cors_header_for_same_origin(client: TestClient):
 
 def test_info_passes_unrotated_dims_through_when_rotation_is_zero(client: TestClient):
     payload = SystemSettings(
-        output_mode="hub75",
-        display_width=128,
-        display_height=64,
+        output_mode="hdmi",
+        display_width=1280,
+        display_height=720,
         display_rotation=0,
     ).model_dump(mode="json")
     client.put("/api/settings", json=payload)
 
     info = client.get("/api/system/info").json()
-    assert info["display_width"] == 128
-    assert info["display_height"] == 64
+    assert info["display_width"] == 1280
+    assert info["display_height"] == 720
     assert info["display_rotation"] == 0
 
 

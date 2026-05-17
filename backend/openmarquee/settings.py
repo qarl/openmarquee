@@ -9,13 +9,11 @@ are *persisted now but acted on later*:
 
 - Changing `wifi_ssid` / `wifi_password` in production needs a hostapd
   rewrite + restart — that lives in Phase 7. Today we just store.
-- `output_mode` picks which renderer the playback loop uses. Until
-  Phase 6 (HDMI), Phase 8 (HUB75), and Phase 10 (WS2812B / composite)
-  land, the playback loop is always wired to MockRenderer and the stored
-  mode is advisory.
-- `brightness` is renderer-specific (HUB75 has scan-rate brightness,
-  HDMI has framebuffer gamma, WS2812B has per-pixel scaling). The stored
-  value is read by the active renderer at playback time.
+- `output_mode` is HDMI-only on HEAD. Legacy on-disk values from the
+  HUB75 / WS2812B / composite era are coerced to "hdmi" on load (see
+  `_coerce_legacy_output_mode`); the Rust IPC sidecar owns HDMI scanout
+  on production and is the only path the playback loop drives.
+- `brightness` is read by the active renderer at playback time.
 
 Storing today means operators can configure their device once, and
 each phase's hardware work just reads the already-validated value out
@@ -37,7 +35,7 @@ from openmarquee._storage_recovery import quarantine_corrupt_file
 # `openmarquee.content.storage`.
 SETTINGS_SCHEMA_VERSION = 1
 
-OutputMode = Literal["hdmi", "hub75", "ws281x", "composite"]
+OutputMode = Literal["hdmi"]
 
 # IEEE 802.11 SSIDs are up to 32 octets. We accept printable ASCII to sidestep
 # the hostapd escaping dance — operators who want emoji SSIDs are outside the
@@ -161,18 +159,6 @@ class SystemSettings(BaseModel):
         description="Display gamma correction. 1.0 is identity (no second gamma applied; assets arrive sRGB-encoded). Operator can dial up if the TV's HDMI pipeline isn't gamma-correct on its own.",
     )
 
-    # WS2812B strip / matrix wiring. Physical order of LEDs in a matrix
-    # built from a strip rarely matches raster order; the operator picks
-    # the wiring style here. Only meaningful when output_mode == "ws281x".
-    # Mirror of the pixel_map arg on WS2812BRenderer.
-    ws281x_pixel_order: Literal["row_major", "serpentine"] = Field(
-        default="row_major",
-        description=(
-            "Physical LED order for the WS2812B strip / matrix. "
-            "row_major = raster order; serpentine = rows alternate direction."
-        ),
-    )
-
     # Captive-portal access point — this is how phones connect during
     # setup. Default on; disabling requires station mode to be on
     # instead so the device isn't network-isolated.
@@ -241,6 +227,36 @@ class SystemSettings(BaseModel):
             "Defaults to the operating-system hostname when unset."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_output_mode(cls, data: object) -> object:
+        """Coerce legacy on-disk output_mode values to "hdmi".
+
+        DELETE-PIL purge collapsed OutputMode to ["hdmi"] only. A
+        settings.json saved before this purge may carry output_mode
+        in {"hub75", "ws281x", "composite"}; without coercion,
+        Pydantic would reject the file at load and the device would
+        boot into a fresh-default state (losing wifi/Tailscale/etc.).
+        Coerce silently -- LED hardware is offline regardless of the
+        stored value; the Rust IPC sidecar drives HDMI on production.
+
+        Other unknown values (e.g. "vga", "displayport") still raise
+        ValidationError -- this migration is scoped to the specific
+        legacy set, not a universal coerce-all.
+        """
+        _LEGACY_LED_OUTPUT_MODES = {"hub75", "ws281x", "composite"}
+        if isinstance(data, dict):
+            mode = data.get("output_mode")
+            if mode in _LEGACY_LED_OUTPUT_MODES:
+                data = {**data, "output_mode": "hdmi"}
+            # Strip the dropped ws281x_pixel_order field if a legacy
+            # settings.json still carries it. Pydantic's default
+            # extra="ignore" would silently drop it anyway, but we
+            # are explicit here so the migration is grep-able.
+            if "ws281x_pixel_order" in data:
+                data = {k: v for k, v in data.items() if k != "ws281x_pixel_order"}
+        return data
 
     @field_validator("wifi_ssid")
     @classmethod

@@ -165,25 +165,26 @@ class TestRealRendererFactory:
         renderer = factory()
         assert isinstance(renderer, MockRenderer)
 
-    def test_renderer_default_auto_resolves_unchanged_with_non_hdmi_settings(
-        self, monkeypatch
+    def test_renderer_default_auto_with_legacy_led_mode_coerces_and_routes_to_rust(
+        self, monkeypatch, tmp_path
     ):
-        """Pre-existing behavior: with the default env (auto) AND non-HDMI
-        output_mode, the factory returns MockRenderer. This is the test
-        that pins "auto behavior is unchanged by the slice-2 patch"."""
+        """DELETE-PIL: legacy on-disk LED output_mode values coerce to
+        "hdmi" at settings load, so the default auto path lands on the
+        Rust IPC sidecar -- not Mock. Pins the migration + dispatch
+        contract together."""
         monkeypatch.delenv("OPENMARQUEE_RENDERER", raising=False)
-        # SystemSettings default output_mode is "mock" (set by the
-        # _isolated_singletons fixture's tmp_path settings save). Use
-        # the dev MockRenderer path.
-        from openmarquee.rendering.mock import MockRenderer
+        monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(tmp_path))
+        from openmarquee.dependencies import AutoFallbackRenderer
 
+        # Save a legacy hub75 settings file; the migration coerces it
+        # to "hdmi" on load.
         SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
             SystemSettings(output_mode="hub75")
         )
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
-        assert isinstance(renderer, MockRenderer)
+        assert isinstance(renderer, AutoFallbackRenderer)
 
     def test_renderer_rust_sidecar_env_returns_auto_fallback_wrapper(
         self, monkeypatch, tmp_path
@@ -261,23 +262,24 @@ class TestRealRendererFactory:
         assert renderer._primary._content_root == str(my_cr)
 
     def test_renderer_rust_sidecar_unknown_value_falls_through_to_auto(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         """Sanity check: a typo in OPENMARQUEE_RENDERER (e.g. "rust-side"
-        without the "-car") does NOT silently route to the sidecar.
-        Unknown values fall through to settings-based auto resolution."""
-        from openmarquee.rendering.mock import MockRenderer
+        without the "-car") falls through to the settings-based auto
+        path. DELETE-PIL: settings.output_mode is always "hdmi" post-
+        migration, so the auto path routes to the Rust IPC sidecar
+        (production default)."""
+        from openmarquee.dependencies import AutoFallbackRenderer
 
         monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidec")  # typo
+        monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(tmp_path))
         SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
-            SystemSettings(output_mode="hub75")
+            SystemSettings(output_mode="hdmi")
         )
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
-        # Typo'd value isn't recognized so we fall through to the
-        # settings-driven auto path; non-hdmi output_mode returns Mock.
-        assert isinstance(renderer, MockRenderer)
+        assert isinstance(renderer, AutoFallbackRenderer)
 
 
 # ============================================================

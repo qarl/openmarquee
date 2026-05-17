@@ -490,15 +490,15 @@ def _format_mode(output_mode: str, width: int, height: int) -> str:
     """Format the device's output mode + display dims as the slug
     convention FlockPeer.mode expects.
 
-    - hub75 / composite: f"{mode}-{w}x{h}" (e.g. "hub75-128x64")
-    - ws281x: "ws281x-strip" when min(w, h) == 1, else "ws281x-{w}x{h}"
     - hdmi: "hdmi-{h}" — operators talk about HDMI in resolution-
       class terms (720p/1080p) rather than literal dimensions.
+
+    Legacy LED modes (hub75 / ws281x / composite) are no longer a
+    valid output_mode (settings.py coerces them to "hdmi" on load);
+    the fallback path handles any unexpected mode literal by
+    falling back to "{mode}-{w}x{h}" so a future format-mode slug
+    has a sensible default.
     """
-    if output_mode == "ws281x":
-        if min(width, height) <= 1:
-            return "ws281x-strip"
-        return f"ws281x-{width}x{height}"
     if output_mode == "hdmi":
         return f"hdmi-{height}"
     return f"{output_mode}-{width}x{height}"
