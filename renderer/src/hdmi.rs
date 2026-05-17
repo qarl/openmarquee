@@ -48,7 +48,7 @@ use crate::hdmi_logic::{
     hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
-    rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize,
+    rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize, wrap_text_to_width,
     classify_prewarm_pair, compute_layer_uv_rect_logic,
     fs_transition_sp_source, gradient_density_is_degenerate,
     is_transition_kind_single_pass, prefer_scissored_bake, sp_kind_static,
@@ -6104,19 +6104,28 @@ fn prepare_layers_for_single_pass(
             layer.r#box.w,
             mode_w,
         );
-        if should_rerasterize(glyph_cache[i].as_ref(), resolved_text, size_px) {
+        let max_width_px = (layer.r#box.w * mode_w as f32).max(1.0);
+        if should_rerasterize(glyph_cache[i].as_ref(), resolved_text, size_px, max_width_px) {
             if let Some(old_tex) = tex_cache[i].take() {
                 unsafe { gl.delete_texture(old_tex); }
             }
-            let bm = layout_text_to_alpha(font.as_ref(), resolved_text, size_px)
+            // 2026-05-17 wrap port: insert \n at word boundaries so
+            // prose that exceeds the layer's box width flows onto
+            // multiple lines instead of running off the right edge.
+            // Mirrors ui/src/rasterize.js:wrapTextToWidth and
+            // backend/openmarquee/seed.py:_wrap_text_to_width.
+            let wrapped =
+                wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
+            let bm = layout_text_to_alpha(font.as_ref(), &wrapped, size_px)
                 .ok_or_else(|| {
                     anyhow!(
-                        "layout_text_to_alpha returned None for text={resolved_text:?} size={size_px}"
+                        "layout_text_to_alpha returned None for text={wrapped:?} size={size_px}"
                     )
                 })?;
             glyph_cache[i] = Some(CachedGlyph {
                 text: resolved_cow.into_owned(),
                 size_px,
+                max_width_px,
                 bitmap: bm,
             });
         }
@@ -8549,7 +8558,9 @@ fn paint_slide_with_viewport(
                 layer.r#box.w,
                 mode_w,
             );
-            let needs_raster = should_rerasterize(cache_ref[i].as_ref(), resolved_text, size_px);
+            let max_width_px = (layer.r#box.w * mode_w as f32).max(1.0);
+            let needs_raster =
+                should_rerasterize(cache_ref[i].as_ref(), resolved_text, size_px, max_width_px);
             if needs_raster {
                 if let Some(tc) = tex_cache.as_deref_mut() {
                     if i < tc.len() {
@@ -8558,10 +8569,16 @@ fn paint_slide_with_viewport(
                         }
                     }
                 }
-                let bm = layout_text_to_alpha(font.as_ref(), resolved_text, size_px)
+                // 2026-05-17 wrap port: mirror the per-paragraph greedy
+                // wrap from ui/src/rasterize.js + backend seed.py so
+                // prose exceeding the layer's box width flows to
+                // additional lines instead of overflowing.
+                let wrapped =
+                    wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
+                let bm = layout_text_to_alpha(font.as_ref(), &wrapped, size_px)
                     .ok_or_else(|| {
                         anyhow!(
-                            "layout_text_to_alpha returned None for text={resolved_text:?} size={size_px}"
+                            "layout_text_to_alpha returned None for text={wrapped:?} size={size_px}"
                         )
                     })?;
                 eprintln!(
@@ -8571,6 +8588,7 @@ fn paint_slide_with_viewport(
                 cache_ref[i] = Some(CachedGlyph {
                     text: resolved_cow.into_owned(),
                     size_px,
+                    max_width_px,
                     bitmap: bm,
                 });
                 if trace_sub {

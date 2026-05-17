@@ -146,6 +146,13 @@ pub struct CachedGlyph {
     /// CachedGlyph level invalidates them in lockstep via
     /// paint_slide's existing rasterize-stage logic.
     pub size_px: f32,
+    /// 2026-05-17 wrap port: cache the max_width that drove
+    /// wrap_text_to_width so a box-width change OR a mode_w change
+    /// (when the layer uses font_size_px instead of font_size_pct,
+    /// where size_px wouldn't catch the geometry change on its own)
+    /// invalidates the bitmap. Without this, a wider box wouldn't
+    /// re-flow the wrap.
+    pub max_width_px: f32,
     pub bitmap: AlphaBitmap,
 }
 
@@ -167,9 +174,14 @@ pub fn should_rerasterize(
     cache_entry: Option<&CachedGlyph>,
     resolved_text: &str,
     size_px: f32,
+    max_width_px: f32,
 ) -> bool {
     match cache_entry {
-        Some(cached) => cached.text != resolved_text || cached.size_px != size_px,
+        Some(cached) => {
+            cached.text != resolved_text
+                || cached.size_px != size_px
+                || cached.max_width_px != max_width_px
+        }
         None => true,
     }
 }
@@ -194,6 +206,73 @@ pub fn should_rerasterize(
 /// deterministically. Author-side text gets slightly smaller than
 /// requested; the warn line surfaces the clamp to operators.
 pub const MAX_RASTERIZED_BITMAP_DIM: u32 = 2048;
+
+/// Insert `\n` at word boundaries so each line measures within
+/// `max_width_px` via the same fontdue advance-width metric that
+/// `layout_text_to_alpha` uses to paint. Preserves existing literal
+/// newlines as hard breaks (wrap is applied per-paragraph). Single
+/// words wider than `max_width_px` are left intact on their own line
+/// — the rasterize bitmap-cap + horizontal squish handle that case.
+///
+/// Mirrors the JS path at `ui/src/rasterize.js:wrapTextToWidth` and
+/// the Python path at `backend/openmarquee/seed.py:_wrap_text_to_width`
+/// (the existing reference implementations). The measurement uses
+/// the same per-glyph `m.advance_width.round()` that
+/// `layout_text_to_alpha` sums to determine bitmap width, so a
+/// wrap-fits line is guaranteed to paint within the rasterized
+/// bitmap (no measure-vs-paint drift inside the Rust renderer).
+///
+/// Returns `text` unchanged when empty or `max_width_px <= 0` (matches
+/// the JS/Python early-out so the renderer can call this on every
+/// layer without a guard).
+pub fn wrap_text_to_width(
+    font: &fontdue::Font,
+    text: &str,
+    size_px: f32,
+    max_width_px: f32,
+) -> String {
+    if text.is_empty() || max_width_px <= 0.0 {
+        return text.to_string();
+    }
+    let space_w = font.metrics(' ', size_px).advance_width.round();
+    let measure_word = |w: &str| -> f32 {
+        w.chars()
+            .map(|c| font.metrics(c, size_px).advance_width.round())
+            .sum::<f32>()
+    };
+    let mut out_lines: Vec<String> = Vec::new();
+    // JS reference uses `text.split(/\r?\n/)`; mirror by stripping a
+    // trailing `\r` from each split-on-`\n` segment so `\r\n` (Windows)
+    // input produces the same paragraph set as `\n` (Unix).
+    for paragraph in text.split('\n').map(|p| p.strip_suffix('\r').unwrap_or(p)) {
+        if paragraph.is_empty() {
+            out_lines.push(String::new());
+            continue;
+        }
+        let mut line_text = String::new();
+        let mut line_w = 0.0_f32;
+        for word in paragraph.split(' ') {
+            let word_w = measure_word(word);
+            if line_text.is_empty() {
+                line_text.push_str(word);
+                line_w = word_w;
+                continue;
+            }
+            let candidate_w = line_w + space_w + word_w;
+            if candidate_w > max_width_px {
+                out_lines.push(std::mem::take(&mut line_text));
+                line_text.push_str(word);
+                line_w = word_w;
+            } else {
+                line_text.push(' ');
+                line_text.push_str(word);
+                line_w = candidate_w;
+            }
+        }
+        out_lines.push(line_text);
+    }
+    out_lines.join("\n")
+}
 
 /// Predict the rasterized bitmap's pixel dimensions for `(font, text,
 /// size_px)` WITHOUT performing the full rasterization. fontdue's
@@ -6922,8 +7001,8 @@ mod tests {
     #[test]
     fn should_rerasterize_misses_on_none_entry() {
         // First-frame paint: cache slot empty -> miss, rasterize.
-        assert!(should_rerasterize(None, "hello", 100.0));
-        assert!(should_rerasterize(None, "", 100.0));
+        assert!(should_rerasterize(None, "hello", 100.0, 500.0));
+        assert!(should_rerasterize(None, "", 100.0, 500.0));
     }
 
     #[test]
@@ -6933,9 +7012,10 @@ mod tests {
         let cached = CachedGlyph {
             text: "hello".to_string(),
             size_px: 100.0,
+            max_width_px: 500.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(!should_rerasterize(Some(&cached), "hello", 100.0));
+        assert!(!should_rerasterize(Some(&cached), "hello", 100.0, 500.0));
     }
 
     #[test]
@@ -6945,9 +7025,10 @@ mod tests {
         let cached = CachedGlyph {
             text: "14:35:09".to_string(),
             size_px: 100.0,
+            max_width_px: 500.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(should_rerasterize(Some(&cached), "14:35:10", 100.0));
+        assert!(should_rerasterize(Some(&cached), "14:35:10", 100.0, 500.0));
     }
 
     #[test]
@@ -6959,9 +7040,10 @@ mod tests {
         let cached = CachedGlyph {
             text: String::new(),
             size_px: 100.0,
+            max_width_px: 500.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(!should_rerasterize(Some(&cached), "", 100.0));
+        assert!(!should_rerasterize(Some(&cached), "", 100.0, 500.0));
     }
 
     #[test]
@@ -6972,9 +7054,10 @@ mod tests {
         let cached = CachedGlyph {
             text: String::new(),
             size_px: 100.0,
+            max_width_px: 500.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(should_rerasterize(Some(&cached), "anything", 100.0));
+        assert!(should_rerasterize(Some(&cached), "anything", 100.0, 500.0));
     }
 
     #[test]
@@ -6988,11 +7071,12 @@ mod tests {
             // "café" in NFC (U+00E9)
             text: "caf\u{00E9}".to_string(),
             size_px: 100.0,
+            max_width_px: 500.0,
             bitmap: dummy_bitmap(),
         };
         // Same string in NFD: "cafe" + combining acute (U+0301).
         let nfd = "cafe\u{0301}";
-        assert!(should_rerasterize(Some(&cached), nfd, 100.0));
+        assert!(should_rerasterize(Some(&cached), nfd, 100.0, 500.0));
     }
 
     #[test]
@@ -7004,21 +7088,41 @@ mod tests {
         let cached = CachedGlyph {
             text: "hello".to_string(),
             size_px: 100.0,
+            max_width_px: 500.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(should_rerasterize(Some(&cached), "hello", 80.0));
-        assert!(should_rerasterize(Some(&cached), "hello", 120.0));
+        assert!(should_rerasterize(Some(&cached), "hello", 80.0, 500.0));
+        assert!(should_rerasterize(Some(&cached), "hello", 120.0, 500.0));
     }
 
     #[test]
     fn should_rerasterize_hits_on_exact_size_match() {
-        // Same text + same size_px -> hit. Bitmap is reusable.
+        // Same text + same size_px + same max_width -> hit. Bitmap is reusable.
         let cached = CachedGlyph {
             text: "hello".to_string(),
             size_px: 100.0,
+            max_width_px: 500.0,
             bitmap: dummy_bitmap(),
         };
-        assert!(!should_rerasterize(Some(&cached), "hello", 100.0));
+        assert!(!should_rerasterize(Some(&cached), "hello", 100.0, 500.0));
+    }
+
+    #[test]
+    fn should_rerasterize_misses_on_max_width_change() {
+        // 2026-05-17 wrap port: same text + same size_px, but the
+        // layer's box width changed (so max_width_px changes). With
+        // wrap active, the line breaks may differ -> bitmap must
+        // re-rasterize. Catches the editor-narrow-the-box flow.
+        let cached = CachedGlyph {
+            text: "hello world that wraps".to_string(),
+            size_px: 100.0,
+            max_width_px: 500.0,
+            bitmap: dummy_bitmap(),
+        };
+        assert!(should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 300.0));
+        assert!(should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 700.0));
+        // Sanity: unchanged max_width still hits.
+        assert!(!should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 500.0));
     }
 
     // -- auto-mode (v1-spec-delta #3) ---------------------------
@@ -8577,5 +8681,197 @@ mod tests {
              least twice for the per-frame re-bake. Found {paint_slide_calls} \
              call(s).",
         );
+    }
+
+    // wrap_text_to_width — 2026-05-17 port of the JS+Python helpers.
+    // Each test pins one branch of the greedy line-fill algorithm; the
+    // max_width is computed from the actual rasterized advance widths
+    // so the assertions don't depend on absolute pixel values (the
+    // font's per-glyph metrics drift across fontdue revisions).
+
+    fn measure(font: &fontdue::Font, text: &str, size_px: f32) -> f32 {
+        text.chars()
+            .map(|c| font.metrics(c, size_px).advance_width.round())
+            .sum::<f32>()
+    }
+
+    #[test]
+    fn wrap_empty_returns_empty() {
+        let font = load_anton();
+        assert_eq!(wrap_text_to_width(&font, "", 64.0, 500.0), "");
+    }
+
+    #[test]
+    fn wrap_zero_or_negative_max_width_returns_input() {
+        // Mirrors the JS+Python early-out: max_width <= 0 → no wrap
+        // attempted. Renderer can call wrap unconditionally without a
+        // guard.
+        let font = load_anton();
+        assert_eq!(wrap_text_to_width(&font, "hello world", 64.0, 0.0), "hello world");
+        assert_eq!(wrap_text_to_width(&font, "hello world", 64.0, -10.0), "hello world");
+    }
+
+    #[test]
+    fn wrap_single_word_fits() {
+        let font = load_anton();
+        let huge = measure(&font, "Hello", 64.0) * 4.0;
+        assert_eq!(wrap_text_to_width(&font, "Hello", 64.0, huge), "Hello");
+    }
+
+    #[test]
+    fn wrap_single_word_too_long() {
+        // Single unbreakable word wider than max_width must stay on
+        // one line (no mid-word break). The renderer's bitmap-cap +
+        // squish path handles the visual overflow downstream.
+        let font = load_anton();
+        let w = measure(&font, "supercalifragilistic", 64.0);
+        // Half the width — well below the word's width.
+        let too_narrow = w * 0.5;
+        assert_eq!(
+            wrap_text_to_width(&font, "supercalifragilistic", 64.0, too_narrow),
+            "supercalifragilistic",
+        );
+    }
+
+    #[test]
+    fn wrap_greedy_two_lines() {
+        // Greedy line-fill: pack as many tokens as fit, break when
+        // adding the next would exceed max_width. Width chosen to be
+        // exactly wide enough for "say what you mean. mean" but not
+        // "say what you mean. mean what", so the break lands between
+        // "mean" and "what".
+        let font = load_anton();
+        let line1 = "say what you mean. mean";
+        let line1_w = measure(&font, line1, 64.0);
+        let space_w = font.metrics(' ', 64.0).advance_width.round();
+        let what_w = measure(&font, "what", 64.0);
+        // Pick max_width strictly between [line1_w] and [line1_w + space + what_w]
+        // so the candidate "...mean what" overflows.
+        let max_w = line1_w + space_w + what_w * 0.5;
+        let wrapped = wrap_text_to_width(
+            &font,
+            "say what you mean. mean what you say.",
+            64.0,
+            max_w,
+        );
+        assert_eq!(wrapped, "say what you mean. mean\nwhat you say.");
+    }
+
+    #[test]
+    fn wrap_preserves_hard_linebreak() {
+        // Each side of a \n hard break is wrapped independently;
+        // if each side fits, the output preserves the hard break.
+        let font = load_anton();
+        let max_w = measure(&font, "line two", 64.0) + 100.0;
+        let wrapped = wrap_text_to_width(&font, "line one\nline two", 64.0, max_w);
+        assert_eq!(wrapped, "line one\nline two");
+    }
+
+    #[test]
+    fn wrap_hardbreak_then_wraps_each_segment() {
+        // Hard \n divides the input into segments; each is greedy-
+        // wrapped independently. Verifies a short first segment is
+        // emitted intact, then the second segment is wrapped into
+        // multiple lines.
+        let font = load_anton();
+        let line2_a = "long sentence";
+        let line2_w = measure(&font, line2_a, 64.0);
+        let space_w = font.metrics(' ', 64.0).advance_width.round();
+        let that_w = measure(&font, "that", 64.0);
+        let max_w = line2_w + space_w + that_w * 0.5;
+        let wrapped = wrap_text_to_width(
+            &font,
+            "short\nlong sentence that needs wrap",
+            64.0,
+            max_w,
+        );
+        assert_eq!(wrapped, "short\nlong sentence\nthat needs wrap");
+    }
+
+    fn load_playfair() -> fontdue::Font {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("ui/fonts/playfair-display.ttf");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+            .expect("parse Playfair Display TTF")
+    }
+
+    #[test]
+    fn wrap_the_sentence_fixture_subtitle_breaks_to_multiple_lines() {
+        // Integration test for the 2026-05-17 wrap port: load The
+        // Sentence fixture's subtitle layer params, compute size_px +
+        // max_width_px the way the paint path does, and assert wrap
+        // produces a multi-line result. Then layout-rasterize the
+        // wrapped text and confirm the bitmap is meaningfully taller
+        // than the no-wrap baseline (= more than one line of glyphs).
+        //
+        // The Sentence subtitle is the on-glass bug qarl flagged:
+        // "say what you mean. mean what you say." in a box at
+        // box.w=0.4415 (847px @ 1920 mode) with font_size_pct=8.0
+        // (~67.8 px) ran off the right edge pre-fix.
+        let font = load_playfair();
+        let text = "say what you mean. mean what you say.";
+        let box_w = 0.4415_f32;
+        let mode_w = 1920_u32;
+        let font_size_pct = 8.0_f32;
+        let size_px = effective_font_size_px(None, Some(font_size_pct), box_w, mode_w);
+        let max_width_px = (box_w * mode_w as f32).max(1.0);
+        let wrapped = wrap_text_to_width(&font, text, size_px, max_width_px);
+        assert!(
+            wrapped.contains('\n'),
+            "The Sentence subtitle should wrap (got single-line {wrapped:?})",
+        );
+        let line_count = wrapped.split('\n').count();
+        assert!(
+            line_count >= 2,
+            "expected >=2 lines, got {line_count} for {wrapped:?}",
+        );
+        // Confirm the wrapped layout actually paints taller than the
+        // no-wrap version (which would clip horizontally — the visible
+        // bug we're fixing). 2 lines should be ~2x as tall as 1.
+        let bm_wrapped =
+            layout_text_to_alpha(&font, &wrapped, size_px).expect("wrapped layout");
+        let bm_single =
+            layout_text_to_alpha(&font, text, size_px).expect("single-line layout");
+        assert!(
+            bm_wrapped.height >= bm_single.height + (size_px as u32),
+            "wrapped bitmap height {} should exceed single-line {} by at least one line ({size_px})",
+            bm_wrapped.height,
+            bm_single.height,
+        );
+    }
+
+    #[test]
+    fn wrap_output_paints_within_max_width() {
+        // Internal-consistency guarantee: every wrapped line's rendered
+        // width via layout_text_to_alpha is ≤ the max_width passed to
+        // wrap_text_to_width (modulo the per-glyph round() that both
+        // measure + paint share). Catches measure-vs-paint drift inside
+        // the Rust pipeline.
+        let font = load_anton();
+        let max_w = 600.0;
+        let wrapped = wrap_text_to_width(
+            &font,
+            "the quick brown fox jumps over the lazy dog repeatedly",
+            48.0,
+            max_w,
+        );
+        for line in wrapped.split('\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let line_w = measure(&font, line, 48.0);
+            // Allow single-token-too-long lines (no mid-word break),
+            // otherwise every wrapped line must fit within max_w.
+            let single_token = !line.contains(' ');
+            assert!(
+                single_token || line_w <= max_w,
+                "wrapped line {:?} measured {line_w}px > max_w {max_w}px",
+                line,
+            );
+        }
     }
 }
