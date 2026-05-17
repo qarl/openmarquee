@@ -1952,9 +1952,11 @@ varying vec2 v_uv;
 void main() {
     vec4 c = texture2D(u_src, v_uv);
     vec3 rgb = c.rgb * u_brightness;
-    // Avoid pow(0, x) edge cases via a tiny epsilon. GLSL's
-    // pow is undefined for negative bases; clamping rgb to
-    // [0, 1+eps] keeps it well-defined.
+    // Clamp to [0, 1] so pow's base is well-defined (GLSL ES 1.00
+    // §8.2: pow is undefined for negative bases). pow(0.0, 1/2.2)
+    // returns exact zero on vc4 GLES2 — verified via single-frame
+    // FBO-readback probe 2026-05-17 (see qa/captures/bug-7-blacks-
+    // not-black-recon-2026-05-17.md). No epsilon needed.
     rgb = clamp(rgb, vec3(0.0), vec3(1.0));
     rgb = pow(rgb, vec3(1.0 / max(u_gamma, 0.001)));
     gl_FragColor = vec4(rgb, c.a);
