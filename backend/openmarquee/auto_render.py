@@ -45,10 +45,11 @@ def render_auto_text_for_layer(layer, now: datetime) -> str:
     string for one TextLayer at `now` — handles auto-mode formatting
     if the layer has it set, otherwise returns `layer.text`.
 
-    Hoisted out so the unified per-tick composer (motion.py) can drive
-    auto-mode rendering for ANY layer in a multi-layer slide, not just
-    text_layers[0]. The slide-level wrapper `render_auto_text` is kept
-    as a compat shim for the older single-layer callers.
+    Returns the formatted string for one TextLayer at `now`. Post-
+    DELETE-PIL the Rust sidecar reads each layer's auto_mode +
+    auto_format via begin_slide and renders the formatted string
+    itself; Python's role here is the auto-format spec, not the
+    composite.
 
     `now` is expected to already be in the target timezone — this fn
     doesn't convert. Callers should pass `datetime.now(ZoneInfo(tz))`.
@@ -89,9 +90,8 @@ def render_auto_text(slide: TextSlide, now: datetime) -> str:
 
     Reads text_layers[0] only — single-layer behavior preserved for
     test_auto_render.py + any ad-hoc string-only callers. Multi-
-    layer auto-mode rendering goes through
-    `render_auto_text_for_layer` directly via the unified composer
-    (motion.compose_motion_frame).
+    layer auto-mode rendering is the Rust sidecar's job; this helper
+    is kept only for legacy tests + diagnostic callers.
     """
     return render_auto_text_for_layer(slide.text_layers[0], now)
 
@@ -132,12 +132,11 @@ def stats_snapshot() -> dict[str, int]:
 
 
 # Image-bg LRU (Batch 8.6). Keyed by (slide_id, width, height).
-# Compose_motion_frame ALREADY has a per-slide background_cache
-# parameter that caches the loaded bg across the frames of one
-# slide; the LRU here covers the seam BETWEEN slides -- when the
-# playback loop swaps between two slides that both reference the
-# same image-bg (e.g. all clock slides share a brick-wall bg), each
-# slide entry hits this cache instead of re-decoding the PNG.
+# Used by the Python `load_background` helper (whose callers are now
+# legacy / diagnostic only post-DELETE-PIL -- the Rust sidecar reads
+# image backgrounds itself via its own asset loader). Kept for the
+# auto_render tests + any ad-hoc tooling that still pulls slide
+# backgrounds through Python.
 #
 # 4 entries (Batch 8.fix). Sweep review note: typical reels carry
 # 2-5 distinct image-bg references. 4 covers the median + leaves a

@@ -26,7 +26,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
-from openmarquee import auto_render, identity, motion, tailscale
+from openmarquee import auto_render, identity, tailscale
 from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_flock_storage, get_settings_storage
@@ -561,11 +561,16 @@ class PerfStats(BaseModel):
     settings_storage: dict[str, int]
     schedule_storage: dict[str, int]
     font_cache: dict[str, int]
-    # Render-path counters (Batch 8.1) -- exercised when auto-mode,
-    # motion, or image-bg slides actually fire through the playback
-    # loop. The synthetic-testclient baseline doesn't hit these; the
+    # Render-path counters (Batch 8.1) -- exercised when auto-mode
+    # or image-bg slides actually fire through the playback loop.
+    # The synthetic-testclient baseline doesn't hit these; the
     # autorender baseline (qa/perf-baseline-autorender-2026-05-10
     # .json) does.
+    #
+    # Post-DELETE-PIL (slice 13): `motion` is permanently empty --
+    # the Rust sidecar owns motion composition and Python no longer
+    # has a per-frame composer to count against. Kept in the schema
+    # so dashboards keying off this key don't 404.
     motion: dict[str, int] = {}
     auto_render: dict[str, int] = {}
     request_log: list[dict[str, object]] | None = None
@@ -587,7 +592,7 @@ async def perf_stats() -> PerfStats:
             "maxsize": cache.maxsize,
             "currsize": cache.currsize,
         },
-        motion=motion.stats_snapshot(),
+        motion={},
         auto_render=auto_render.stats_snapshot(),
         request_log=recent_requests(),
     )

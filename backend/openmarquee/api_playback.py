@@ -159,8 +159,8 @@ async def get_current_frame(
 
     Backed by an in-memory cache in the playback loop with a 5-minute
     TTL plus immediate playlist-change invalidation. The cache caps
-    capture cost at ~one compose_motion_frame per 5 minutes per
-    distinct playlist; concurrent callers serialize behind a single
+    capture cost at ~one renderer-capture IPC roundtrip per 5 minutes
+    per distinct playlist; concurrent callers serialize behind a single
     lock so a burst of requests issues at most one capture.
 
     Returns 503 when nothing is playing OR the current slide type
