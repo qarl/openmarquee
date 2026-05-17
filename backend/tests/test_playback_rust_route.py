@@ -363,6 +363,122 @@ def test_ipc_renderer_dispatch_gate_evaluates_true():
 
 
 # ============================================================
+# Bug 8 / Fix B (2026-05-17): per-slide IPC-failure throttle.
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_fix_b_throttle_first_fail_error_subsequent_debug(caplog):
+    """A slide that raises a non-Unsupported exception at begin_slide
+    must log ERROR with full traceback on the FIRST failure and DEBUG
+    one-liner on SUBSEQUENT failures of the same slide_id. Prevents
+    journal-spam when a permanently-broken slide sits in the playlist
+    (frozen-sign incident 2026-05-17 @ 192.168.1.67 was a 1-slide
+    bad-video playlist hot-spinning at ~3.4 Hz with ERROR tracebacks).
+    """
+    import logging
+
+    bad = _text_slide(name="bad", text="bad", duration_ms=_FAST_DURATION_MS)
+
+    class _RaisingFake(_FakeRustRenderer):
+        """Begin_slide always raises a non-Unsupported error. Forces
+        the playback loop's broad-except guard (NOT the Unsupported
+        rail) so the Fix B throttle is exercised."""
+
+        def begin_slide(
+            self, slide_id: UUID, t0_ms: int, duration_ms: int
+        ) -> None:
+            # Record the call before raising (sanity for assertions).
+            self.begin_slide_calls.append((slide_id, t0_ms, duration_ms))
+            raise RustRendererSubprocessError(
+                "subprocess died (simulated for Fix B throttle test)"
+            )
+
+    fake = _RaisingFake(width=8, height=8)
+
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [bad],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+
+    # Capture both ERROR and DEBUG levels on the playback logger.
+    with caplog.at_level(logging.DEBUG, logger="openmarquee.playback"):
+        await loop.start()
+        # Run long enough for the loop to attempt begin_slide ≥3 times
+        # (250ms throttle between attempts → 3 attempts in ~800ms).
+        await asyncio.sleep(0.85)
+        await loop.stop()
+
+    # Multiple attempts hit the bad slide.
+    assert len(fake.begin_slide_calls) >= 3, (
+        f"expected ≥3 begin_slide attempts on the bad slide, got "
+        f"{len(fake.begin_slide_calls)}"
+    )
+
+    # Exactly ONE ERROR record per slide_id (the first failure carries
+    # the traceback). Subsequent failures of the SAME id are DEBUG.
+    error_records_for_bad = [
+        r for r in caplog.records
+        if r.levelname == "ERROR"
+        and "IPC playback failed" in r.getMessage()
+        and str(bad.id) in r.getMessage()
+    ]
+    debug_records_for_bad = [
+        r for r in caplog.records
+        if r.levelname == "DEBUG"
+        and "throttled" in r.getMessage()
+        and str(bad.id) in r.getMessage()
+    ]
+
+    assert len(error_records_for_bad) == 1, (
+        f"expected exactly 1 ERROR record (first fail carries the "
+        f"traceback), got {len(error_records_for_bad)}"
+    )
+    assert len(debug_records_for_bad) >= 1, (
+        f"expected ≥1 DEBUG throttled record after the first fail, "
+        f"got {len(debug_records_for_bad)}"
+    )
+    # The throttle set holds the failed id.
+    assert bad.id in loop._failed_slide_ids
+
+
+def test_fix_b_throttle_clears_on_playlist_change(tmp_path):
+    """Switching playlists clears the throttle so an operator who
+    fixes a bad slide (e.g. swaps to a new playlist that includes
+    the same id with a fresh asset) gets ERROR-level visibility on
+    the next failure, not DEBUG-suppressed silence."""
+    from uuid import uuid4
+
+    mock = MockRenderer(8, 8, tmp_path / "out.png")
+    loop = PlaybackLoop(
+        mock,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+    )
+    pid_a = uuid4()
+    pid_b = uuid4()
+    slide_a = uuid4()
+    slide_b = uuid4()
+
+    loop._stamp_playlist_id(pid_a)
+    loop._failed_slide_ids.add(slide_a)
+    loop._failed_slide_ids.add(slide_b)
+    assert loop._failed_slide_ids == {slide_a, slide_b}
+
+    # Same playlist id → no clear.
+    loop._stamp_playlist_id(pid_a)
+    assert loop._failed_slide_ids == {slide_a, slide_b}
+
+    # Different playlist id → clear.
+    loop._stamp_playlist_id(pid_b)
+    assert loop._failed_slide_ids == set()
+
+
+# ============================================================
 # Slice-4-followup: rust-route transitions wired via begin_transition.
 # ============================================================
 

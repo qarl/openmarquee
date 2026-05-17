@@ -304,6 +304,17 @@ class PlaybackLoop:
         # concurrent captures racing the readback path.
         self._frame_cache: tuple[bytes, float, UUID | None] | None = None
         self._frame_capture_lock: asyncio.Lock | None = None
+        # Bug 8 / Fix B (2026-05-17): per-slide IPC-failure throttle.
+        # Without this, a permanently-broken slide (e.g. multi-trak
+        # MP4 that the rust sidecar can't demux) makes the catch-and-
+        # continue path log ERROR + full traceback at ~3.4 Hz, spamming
+        # journalctl + spinning disk IO. First failure per slide_id
+        # still logs ERROR with traceback (operator must see the
+        # cause); subsequent failures for the SAME id log DEBUG one-
+        # liner only. Reset on playlist-id change so an operator who
+        # fixes the bad slide and switches playlists gets a fresh
+        # ERROR if the fix didn't take.
+        self._failed_slide_ids: set[UUID] = set()
 
     @property
     def is_running(self) -> bool:
@@ -755,12 +766,30 @@ class PlaybackLoop:
                             transition_kind=(item.transition or "cut"),
                             transition_ms=int(item.transition_ms or 0),
                         )
-                    except Exception:
-                        log.exception(
-                            "playback: IPC playback failed for slide "
-                            "id=%s type=%s; advancing to next item",
-                            item.id, item.type,
-                        )
+                    except Exception as e:
+                        # Bug 8 / Fix B: per-slide throttle. First fail
+                        # per id logs ERROR with traceback; subsequent
+                        # fails for the SAME id log DEBUG only. Avoids
+                        # journal-spam when a bad slide sits in a
+                        # 1-item playlist (frozen-sign incident @
+                        # 192.168.1.67 hot-spun at 3.4 Hz with full
+                        # tracebacks until ce225f3 + Fix A landed).
+                        if item.id in self._failed_slide_ids:
+                            log.debug(
+                                "playback: IPC playback failed for "
+                                "slide id=%s (throttled; first fail "
+                                "carried the traceback): %s",
+                                item.id, e,
+                            )
+                        else:
+                            self._failed_slide_ids.add(item.id)
+                            log.exception(
+                                "playback: IPC playback failed for slide "
+                                "id=%s type=%s; advancing to next item "
+                                "(subsequent fails for this id will be "
+                                "throttled to DEBUG)",
+                                item.id, item.type,
+                            )
                         # Brief settle so a hot-loop of failing slides
                         # doesn't burn CPU. 250ms is short enough that
                         # one bad slide adds barely-visible delay,
@@ -1514,7 +1543,21 @@ class PlaybackLoop:
 
     def _stamp_playlist_id(self, playlist_id: UUID | None) -> None:
         """Hook for the scheduled fetch fn to publish which playlist is
-        currently active. Test-only setter is just self._current_playlist_id."""
+        currently active. Test-only setter is just self._current_playlist_id.
+
+        Bug 8 / Fix B (2026-05-17): on playlist change, clear the per-
+        slide IPC-failure throttle set so an operator who fixed a
+        broken slide (e.g. by switching to a healthier playlist OR by
+        re-uploading a single-trak asset) gets ERROR-level visibility
+        on the next attempt, not DEBUG-suppressed silence.
+        """
+        if playlist_id != self._current_playlist_id and self._failed_slide_ids:
+            log.info(
+                "playback: playlist changed (%s → %s); clearing %d failed-"
+                "slide throttle entries",
+                self._current_playlist_id, playlist_id, len(self._failed_slide_ids),
+            )
+            self._failed_slide_ids.clear()
         self._current_playlist_id = playlist_id
 
     # --- /api/playback/current-frame capture (added 2026-05-06) ----------
