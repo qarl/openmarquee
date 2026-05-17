@@ -56,47 +56,6 @@ from openmarquee.motion import (
     slide_has_motion,
 )
 from openmarquee.rendering import Renderer
-from openmarquee.rendering.gpu_compositor import (
-    GPUSlideCompositor,
-    MultiPlaneRenderer,
-    SlideAssetCache,
-    classify_layer,
-)
-
-def _slide_has_animated_blend_mode_layer(item: ContentItem) -> bool:
-    """True iff the slide has at least one layer with motion (or
-    auto_mode) AND a non-normal blend mode. Such a layer can't run
-    on the multi-plane DRM path -- vc4 HVS overlay planes only do
-    alpha-blend (PREMULTI), not Photoshop blend modes -- so the GPU
-    path is skipped and the slide drops to compose_motion_frame
-    software path where blend modes are applied per-tick.
-    Per-tick-blend at 1080p is heavy (one composite_with_blend call
-    per tick = ~10 ms) but for the rare animated-blend-mode case it's
-    the right trade-off."""
-    if getattr(item, "type", None) != "text_slide":
-        return False
-    for layer in getattr(item, "text_layers", []):
-        if classify_layer(layer) != "animated":
-            continue
-        blend = getattr(layer, "blend", None) or "normal"
-        if blend != "normal":
-            return True
-    return False
-
-
-def _count_animated_layers(item: ContentItem) -> int:
-    """How many of `item`'s text layers will consume a DRM overlay
-    plane on the GPU path. Mirrors GPUSlideCompositor's animated
-    classification (motion non-static OR auto_mode set) — used by
-    PlaybackLoop to decide whether the slide fits the renderer's
-    plane budget. Returns 0 for non-text-slide content (image /
-    video / etc.) so the GPU path is skipped naturally."""
-    if getattr(item, "type", None) != "text_slide":
-        return 0
-    return sum(
-        1 for layer in getattr(item, "text_layers", [])
-        if classify_layer(layer) == "animated"
-    )
 
 if TYPE_CHECKING:
     from openmarquee.content.storage import ContentStorage
@@ -140,12 +99,6 @@ class PlaybackLoop:
         # cadence for a ticking-seconds display; tests override to a
         # much smaller value to keep runtime fast.
         self._auto_tick = auto_tick_seconds
-        # Cross-slide PIL output cache for the GPU compositor's hot
-        # path. First time through the playlist pays the bg+static
-        # composite + glyph rasterization cost; subsequent reps reuse
-        # the cached bytes and skip the 50-200 ms attach stall at
-        # 1080p. Cleared on stop() so a new playlist gets fresh state.
-        self._gpu_slide_cache = SlideAssetCache()
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
@@ -324,29 +277,6 @@ class PlaybackLoop:
             # asyncio.run() rounds against the same PlaybackLoop hit
             # "RuntimeError: ... attached to a different loop".
             self._frame_capture_lock = None
-            # Drop GPU compositor PIL caches so a fresh start()
-            # doesn't reuse stale (slide_id, updated_at) entries
-            # against a content store that may have changed.
-            self._gpu_slide_cache.clear()
-
-    def _evict_caches_to_window(self, keep_ids: set[UUID]) -> None:
-        """Drop the asset cache's entries whose slide_id isn't in
-        `keep_ids`. The play loop calls this once per iteration with
-        {current, next} so the cache stays bounded on a circular
-        playlist (where plain LRU is 0% hit-rate).
-
-        Coordinates with DRMRenderer's per-slide primary buffer pool:
-        SlideAssetCache.evict_except passes the renderer through so
-        the kernel-side dumb buffer for an evicted slide gets released
-        too -- otherwise userspace shrinks but kernel memory stays
-        held.
-        """
-        try:
-            self._gpu_slide_cache.evict_except(
-                keep_ids, renderer=self._renderer,
-            )
-        except Exception:
-            log.exception("playback: asset cache eviction failed")
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
@@ -423,21 +353,6 @@ class PlaybackLoop:
                 else:
                     self._current_auto_mode = None
                     self._current_auto_format = None
-
-                next_item = items[(i + 1) % len(items)] if len(items) > 1 else None
-
-                # Cycle-aware cache eviction (2026-05-06 OOM fix). A
-                # circular playlist's working set is "all of it," so
-                # plain LRU has 0% hit rate when the cache size is
-                # below playlist size -- the wrap-around always cold-
-                # misses. The right bound is "current + next-prefetched
-                # only"; everything else is dead weight at ~12 MB
-                # userspace per slide × 32 slides => 400 MB on a 416 MB
-                # Pi Zero 2 W.
-                keep_ids: set[UUID] = {item.id}
-                if next_item is not None:
-                    keep_ids.add(next_item.id)
-                self._evict_caches_to_window(keep_ids)
 
                 # Slice 4 gate: when the renderer is the Rust IPC
                 # sidecar proxy (or AutoFallbackRenderer wrapping one),
@@ -883,51 +798,14 @@ class PlaybackLoop:
 
     async def _play_dynamic_slide(self, item: ContentItem) -> Image.Image | None:
         """Tick-render a slide with auto-mode and/or motion layers for
-        its full duration.
-
-        Two paths share this entrypoint:
-
-        - **GPU path** (HDMI 1080p target, qarl 2026-05-02): when the
-          renderer satisfies the MultiPlaneRenderer protocol AND has
-          enough animated-plane budget for the slide, route through
-          `GPUSlideCompositor` — bg + every static layer software-
-          composite into the primary plane once at slide entry, each
-          animated layer takes its own DRM overlay plane, per-tick
-          motion is one atomic ioctl. Zero per-pixel CPU work in the
-          inner loop.
-        - **Software path** (LED matrices, dev mock, anything without
-          multi-plane): per-tick `compose_motion_frame` builds an
-          RGB frame and pushes it through `render_frame`. Same code
-          path that has shipped since 5e75cf5.
-
-        Selection is capability + budget gated. Slides that exceed the
-        plane budget (rare; default vc4 budget is well above any real
-        slide's animated count) fall back to software so playback
-        keeps working. Tick cadence (30 Hz motion / 1 Hz auto-only) is
-        identical across paths.
+        its full duration. Per-tick `compose_motion_frame` builds an
+        RGB frame and pushes it through `render_frame`. Tick cadence
+        is 30 Hz when motion is present, 1 Hz when only auto.
 
         Returns the last-composed frame so the caller's transition has
-        something to fade from. Stop / pause exit early — same
-        rationale as the prior split functions: a stream takeover
-        shouldn't keep painting frames over live video.
+        something to fade from. Stop / pause exit early — a stream
+        takeover shouldn't keep painting frames over live video.
         """
-        if (
-            item.type == "text_slide"
-            and isinstance(self._renderer, MultiPlaneRenderer)
-            and _count_animated_layers(item)
-            <= getattr(self._renderer, "max_animated_planes", 0)
-            and not _slide_has_animated_blend_mode_layer(item)
-        ):
-            try:
-                return await self._play_dynamic_slide_gpu(item)
-            except Exception:
-                # Hard-fail in the GPU path falls back to software so a
-                # broken plane attach (e.g. transient kernel error on
-                # the dev Pi) doesn't take playback down with it.
-                log.exception(
-                    "playback: GPU compositor failed for %s, falling back",
-                    item.id,
-                )
         return await self._play_dynamic_slide_software(item)
 
     async def _play_dynamic_slide_software(
@@ -1001,97 +879,6 @@ class PlaybackLoop:
                 return last
             if loop.time() >= end_at:
                 return last
-
-    async def _play_dynamic_slide_gpu(
-        self, item: ContentItem
-    ) -> Image.Image | None:
-        """GPU path: GPUSlideCompositor lifecycle (attach → tick* →
-        detach). Per-tick = one atomic ioctl with the changed plane
-        properties; zero per-pixel CPU work in the inner loop.
-
-        Transition handoff: the loop exits and we run a single
-        compose_motion_frame at the slide's final state to give the
-        caller's transition function a "from" frame. That final
-        compose costs ~10-30 ms at 1080p, paid once per slide exit.
-        We paint it to the primary plane BEFORE detaching the
-        animated planes so the transition starts from the same
-        pixels the user just saw on the GPU path (modulo a brief
-        single-vblank period where motion text appears in both the
-        primary composite and the still-attached overlay planes —
-        visually the text agrees with itself, so no flicker)."""
-        tz = resolve_timezone(self._get_timezone())
-        total = item.duration_ms / 1000
-        loop = asyncio.get_event_loop()
-        t0 = loop.time()
-        end_at = t0 + total
-        if slide_has_motion(item):
-            tick_period = 1.0 / max(1, _FADE_FPS)
-        else:
-            tick_period = max(0.1, self._auto_tick)
-
-        compositor = GPUSlideCompositor(
-            item, self._renderer,
-            width=self._renderer.width,
-            height=self._renderer.height,
-            read_asset=self._read_asset,
-            cache=self._gpu_slide_cache,
-        )
-        compositor.attach(now=datetime.now(tz))
-        # Stamp for capture_current_frame() so its compose shares the
-        # same elapsed_s clock as the live tick.
-        self._slot_t0 = t0
-        try:
-            while True:
-                assert self._stop_event is not None
-                assert self._pause_event is not None
-                if self._stop_event.is_set() or self._pause_event.is_set():
-                    break
-                elapsed = loop.time() - t0
-                now = datetime.now(tz)
-                try:
-                    compositor.tick(elapsed, now=now)
-                except Exception:
-                    log.exception(
-                        "playback: GPU compositor tick failed for %s", item.id,
-                    )
-                    break
-                if self._stop_event.is_set() or self._pause_event.is_set():
-                    break
-                remaining = end_at - loop.time()
-                if remaining <= 0:
-                    break
-                await self._wait(min(tick_period, remaining))
-                if self._stop_event.is_set() or self._pause_event.is_set():
-                    break
-                if loop.time() >= end_at:
-                    break
-
-            # End-of-slide handoff. The transition's frame loop reads
-            # `current_image` and paints it directly, so we need a
-            # motion-accurate final frame here for the transition to
-            # start from the right pixels.
-            elapsed = loop.time() - t0
-            try:
-                last = compose_motion_frame(
-                    item, elapsed,
-                    self._renderer.width, self._renderer.height,
-                    read_asset=self._read_asset,
-                    now=datetime.now(tz),
-                )
-                self._render_image(last)
-                return last
-            except Exception:
-                log.exception(
-                    "playback: GPU final-frame compose failed for %s", item.id,
-                )
-                return None
-        finally:
-            try:
-                compositor.detach()
-            except Exception:
-                log.exception(
-                    "playback: GPU compositor detach failed for %s", item.id,
-                )
 
     def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
         """Load + resize an item's PNG to renderer dimensions.
