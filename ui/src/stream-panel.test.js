@@ -548,6 +548,98 @@ describe("mountStreamPanel", () => {
         expect(fakePc.closed).toBe(true);
     });
 
+    it("Bug 6: cancelTakeover stays idle even when mountInit resolves AFTER cancel", async () => {
+        // Regression for the stream-panel cancelTakeover race (2026-05-17):
+        // a deferred mountInit() rAF could resume after cancelTakeover()
+        // restored state.phase = "idle", walk through "requesting-camera"
+        // and silently land us in "preview" — violating the L817-823
+        // "operator chose Cancel = I want out" contract.
+        //
+        // Determinism: by holding mountInit's awaited promises with
+        // manual `resolve` controllers and releasing them ONLY after
+        // the cancel click, we force the race window open every run.
+        // If a fix regresses, this test fails 100%, not 20%.
+        const container = document.createElement("div");
+        const conflict = Object.assign(new Error("stream_already_active"), {
+            code: "stream_already_active",
+            activeSessionId: "44",
+            status: 409,
+        });
+        // Pending controllers for mountInit's two awaits: apiGetStatus
+        // and getUserMedia. mountInit awaits these; until we resolve
+        // them, mountInit is suspended at its first/second `await`.
+        let resolveMountStatus;
+        let resolveMountGUM;
+        const mountStatusPromise = new Promise((r) => {
+            resolveMountStatus = r;
+        });
+        const mountGUMPromise = new Promise((r) => {
+            resolveMountGUM = r;
+        });
+        let statusCallCount = 0;
+        let getUserMediaCallCount = 0;
+        const fakePc = makeFakePc();
+        const fakeStream = makeFakeStream();
+        const opts = defaultMounts({
+            apiGetStatus: vi.fn(async () => {
+                statusCallCount++;
+                // Call #1 is goLive's own pre-flight (mountInit's rAF
+                // hasn't fired yet — goLive skips its mountInitPromise
+                // await because the promise is null at click time).
+                // Call #2 is mountInit's, fired after rAF; that's the
+                // one we hold so its resumption races cancelTakeover.
+                if (statusCallCount === 2) {
+                    await mountStatusPromise;
+                }
+                return {
+                    state: "idle",
+                    session_id: null,
+                    tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
+                };
+            }),
+            apiStartStream: vi.fn(async () => {
+                throw conflict;
+            }),
+            getUserMedia: vi.fn(async () => {
+                getUserMediaCallCount++;
+                // Call #1 is goLive's (opens camera before negotiate);
+                // call #2 is mountInit's. Hold #2 so mountInit is
+                // suspended at openLocalCamera when cancel fires.
+                if (getUserMediaCallCount === 2) {
+                    await mountGUMPromise;
+                }
+                return fakeStream;
+            }),
+            createPeerConnection: vi.fn(() => fakePc),
+        });
+        const handle = mountStreamPanel(container, opts);
+
+        // Reach take-over-prompt via goLive (which does its own
+        // pre-flight + 409). mountInit is suspended at its first await.
+        container.querySelector(".stream-go-live").click();
+        await waitFor(() => handle.getState() === "take-over-prompt");
+
+        // Cancel — synchronously sets phase = "idle" AND latches the
+        // mountInitCancelled flag (the Option A fix).
+        container.querySelector(".stream-cancel-takeover").click();
+        expect(handle.getState()).toBe("idle");
+
+        // NOW release mountInit's two awaits. Pre-fix this would walk:
+        //   apiGetStatus (idle) → L862 gate sees phase==="idle", continues
+        //   → state.phase = "requesting-camera" → openLocalCamera
+        //   → state.phase = "preview"
+        // Post-fix: the flag-set in cancelTakeover blocks L862, and
+        // even if mountInit had already passed L862, the flag also
+        // blocks L874 + the camera-fail catch at L910.
+        resolveMountStatus();
+        resolveMountGUM();
+        // Pump enough ticks for both awaits + any downstream microtasks
+        // to complete. 5 ticks is overkill but cheap.
+        for (let i = 0; i < 5; i++) await tick();
+
+        expect(handle.getState()).toBe("idle");
+    });
+
     it("Take over → live: hits the takeover endpoint", async () => {
         const container = document.createElement("div");
         const opts = defaultMounts({

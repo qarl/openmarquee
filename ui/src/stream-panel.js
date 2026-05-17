@@ -814,6 +814,17 @@ export function mountStreamPanel(container, options = {}) {
         // when there's nothing to tear down.
         teardownPC();
         state.sessionId = null;
+        // Bug 6 fix (2026-05-17): set the cancel flag BEFORE flipping
+        // phase. If mountInit() is currently suspended at an await
+        // and resumes between these two statements, its post-status
+        // gate would otherwise see phase==="idle" (the prior
+        // contract-documented state, since cancel hasn't fired yet
+        // from that observer's POV) and proceed to revive the panel
+        // into "preview". Setting the flag first means a racing
+        // mountInit's resumption observes mountInitCancelled=true
+        // and bails — regardless of whether it observes the new
+        // "idle" phase or the prior "take-over-prompt" phase.
+        mountInitCancelled = true;
         // TODO(qarl-confirm): Cancel from a mount-time take-over-prompt
         // currently drops to plain idle — no viewfinder. With preview-
         // on-mount, the alternative is to re-run mountInit() so /status
@@ -850,6 +861,17 @@ export function mountStreamPanel(container, options = {}) {
     // fire two /status pre-flights. Settled (set to null) when mount-
     // init returns either via success or via a swallowed error.
     let mountInitPromise = null;
+    // Bug 6 (stream-panel cancelTakeover race, 2026-05-17): once the
+    // operator clicks Cancel from a 409-mid-flight take-over-prompt,
+    // a still-pending mountInit() must NOT walk back through "idle"
+    // → "requesting-camera" → "preview" and silently revive the
+    // panel. The L817-823 contract is "operator chose Cancel = I
+    // want out"; this flag latches that decision so mountInit's
+    // resumption (after its awaited apiGetStatus / openLocalCamera
+    // microtasks resolve) bails. Per-handle scope, never reset
+    // within a handle's lifecycle — a fresh mount yields a fresh
+    // flag.
+    let mountInitCancelled = false;
     async function mountInit() {
         let status;
         try {
@@ -859,7 +881,7 @@ export function mountStreamPanel(container, options = {}) {
             // on first click and handle its own errors from there.
             return;
         }
-        if (destroyed || state.phase !== "idle") return;
+        if (destroyed || mountInitCancelled || state.phase !== "idle") return;
         if (status.state === "active") {
             state.phase = "take-over-prompt";
             setMessage("Someone else is streaming to this screen.");
@@ -871,19 +893,21 @@ export function mountStreamPanel(container, options = {}) {
             setMessage("Requesting camera access…");
             render();
             await openLocalCamera();
-            if (destroyed || state.phase !== "requesting-camera") {
-                // Operator clicked Go live (or destroyed the panel)
-                // before getUserMedia resolved — the click handler
-                // takes over from here. If destroyed, drop the
-                // stream we just opened.
-                if (destroyed) teardownPC();
+            if (destroyed || mountInitCancelled || state.phase !== "requesting-camera") {
+                // Operator clicked Go live (or destroyed the panel,
+                // or cancelled the take-over-prompt) before
+                // getUserMedia resolved — the click handler / cancel
+                // takes over from here. If destroyed OR cancelled,
+                // drop the stream we just opened so the camera light
+                // turns off promptly.
+                if (destroyed || mountInitCancelled) teardownPC();
                 return;
             }
             state.phase = "preview";
             setMessage("");
             render();
         } catch {
-            if (destroyed || state.phase !== "requesting-camera") return;
+            if (destroyed || mountInitCancelled || state.phase !== "requesting-camera") return;
             // Camera unavailable (permission denied, no device, OS
             // policy). Drop back to idle silently — the operator
             // can click Go live to retry; goLive's own error path
