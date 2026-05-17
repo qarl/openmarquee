@@ -312,17 +312,10 @@ async def test_gpu_path_renders_primary_for_transition_handoff(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_fade_falls_back_to_software_when_shader_unavailable(tmp_path):
-    """MockRenderer doesn't expose drm_fd → _run_shader_transition
-    refuses; _fade falls through to the PIL Image.blend path. After
-    the unification cleanup that deleted _fade_gpu / _wipe_gpu, the
-    PIL fallback is the ONLY non-shader code path for fade.
-
-    Verified indirectly: no AttributeError calling shader-only
-    methods (the PIL path doesn't touch the renderer's overlay
-    surface at all), and the renderer's last_frame keeps getting
-    written via render_frame (the software path's _render_image
-    call)."""
+async def test_fade_writes_blended_frames_to_renderer(tmp_path):
+    """_fade walks the PIL Image.blend path, writing per-step blended
+    frames to the renderer via render_frame. Smoke-tests that no
+    AttributeError is raised and that last_frame is populated."""
     from PIL import Image
     renderer = MockRenderer(64, 48, tmp_path / "out.png")
     loop = _new_loop(renderer, items=[])

@@ -38,8 +38,6 @@ import asyncio
 import contextlib
 import io
 import logging
-import math
-import os
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -51,9 +49,7 @@ from PIL import Image, UnidentifiedImageError
 from openmarquee.auto_render import resolve_timezone
 from openmarquee.content import ContentItem
 from openmarquee.motion import (
-    _effect_freq,
     compose_motion_frame,
-    compute_phase,
     load_motion_background,
     prerender_layer_bitmaps,
     slide_has_dynamic_content,
@@ -67,36 +63,6 @@ from openmarquee.rendering.gpu_compositor import (
     classify_layer,
 )
 
-# Transition kinds with a fragment shader implementation in
-# rendering.shader_compositor._TRANSITION_SHADERS. When the
-# OPENMARQUEE_SHADER_TRANSITIONS env var is "1" AND the renderer
-# exposes drm_fd (DRMRenderer in multi-plane mode), the dispatcher
-# routes these kinds through ShaderRenderer instead of the PIL
-# software path. All 14 kinds in qarl's transition palette go
-# through here -- fade and wipe used to have their own
-# plane-property animation paths (_fade_gpu / _wipe_gpu) but those
-# were deleted in the cleanup that unified all transitions on the
-# shader path so motion-through-transitions (#206) works
-# uniformly across every kind.
-_SHADER_TRANSITION_KINDS = frozenset({
-    "fade",
-    "wipe",
-    "iris",
-    "dissolve",
-    "pixelate",
-    "scanline",
-    "halftone",
-    "glitch",
-    "slide",
-    "push",
-    "scroll",
-    "blinds",
-    "flip",
-    "marquee",
-    "shutter",
-})
-
-
 def _slide_has_animated_blend_mode_layer(item: ContentItem) -> bool:
     """True iff the slide has at least one layer with motion (or
     auto_mode) AND a non-normal blend mode. Such a layer can't run
@@ -106,7 +72,7 @@ def _slide_has_animated_blend_mode_layer(item: ContentItem) -> bool:
     software path where blend modes are applied per-tick.
     Per-tick-blend at 1080p is heavy (one composite_with_blend call
     per tick = ~10 ms) but for the rare animated-blend-mode case it's
-    the right trade-off until shader-path blend mode work lands."""
+    the right trade-off."""
     if getattr(item, "type", None) != "text_slide":
         return False
     for layer in getattr(item, "text_layers", []):
@@ -133,10 +99,8 @@ def _count_animated_layers(item: ContentItem) -> int:
     )
 
 if TYPE_CHECKING:
-    from openmarquee.content import TextLayer, TextSlide
     from openmarquee.content.storage import ContentStorage
     from openmarquee.playlist import PlaylistStorage
-    from openmarquee.rendering.shader_compositor import ShaderRenderer
     from openmarquee.schedule import ScheduleStorage
 
 log = logging.getLogger(__name__)
@@ -182,77 +146,6 @@ class PlaybackLoop:
         # the cached bytes and skip the 50-200 ms attach stall at
         # 1080p. Cleared on stop() so a new playlist gets fresh state.
         self._gpu_slide_cache = SlideAssetCache()
-        # Snapshot cache for the shader-transition path (#205): a
-        # transition's u_from + u_to RGBA snapshots are ~600 ms each
-        # to compose at 1080p (PIL bg load + alpha_composite per
-        # layer + blend math). Caching keyed by (slide.id, updated_at)
-        # makes the second pass through a playlist instant. Slides
-        # with auto-mode layers (clocks) skip the cache.
-        from openmarquee.rendering.snapshot import SlideSnapshotCache
-        self._snapshot_cache = SlideSnapshotCache()
-        # Lazily-constructed shader compositor for slide-to-slide
-        # transitions (iris/dissolve/etc.). Built on first use, reused
-        # across every transition for the lifetime of the loop --
-        # EGL/GL init is ~5 s on a cold mesa cache. None until either
-        # _get_or_create_shader_renderer() succeeds or the feature is
-        # disabled (env var unset, renderer lacks drm_fd, init failed).
-        self._shader_renderer: ShaderRenderer | None = None
-        # Lazily-flipped sentinel so we don't repeatedly attempt
-        # ShaderRenderer construction after a failure (e.g. on dev hosts
-        # without libdrm/libegl).
-        self._shader_renderer_disabled: bool = False
-        # Outgoing slide's GPUSlideCompositor, held alive across the
-        # transition so animated text overlays keep moving (#206)
-        # rather than freezing while the shader transitions the
-        # bg+statics layer underneath. Set by _play_dynamic_slide_gpu
-        # when shader transitions are enabled; consumed (and detached)
-        # by _run_shader_transition or by _drain_outgoing_compositor
-        # if the shader path turned out to be unavailable.
-        #
-        # The outgoing compositor owns its overlay slots [0..N-1] until
-        # drain. Future symmetric "fade-in for incoming compositor"
-        # work must NOT pre-attach the next compositor before this one
-        # drains -- they'd collide on slot indices. Either drain first
-        # (sacrifice continuous incoming-side motion) or split the
-        # plane budget statically (incoming gets [N/2..N-1]).
-        self._outgoing_compositor: GPUSlideCompositor | None = None
-        self._outgoing_slide: TextSlide | None = None
-        # Incoming slide reference set by the dispatcher BEFORE the
-        # transition method fires; consumed by _run_shader_transition
-        # to compose u_to as bg+statics-only (excluding animated
-        # layers, parallel to u_from). Without this, slide B's
-        # animated text would appear as a frozen ghost in the
-        # iris-revealed area of the shader output -- overlapping with
-        # slide A's live-moving ticker on the overlay plane until the
-        # incoming compositor attaches after the transition.
-        self._incoming_slide: TextSlide | None = None
-        # Last steady-tick elapsed for the outgoing slide (#218).
-        # Stashed in _play_dynamic_slide_gpu's finally as the elapsed
-        # at slide-end. _run_shader_transition uses this as the
-        # OUTGOING ANCHOR: shader-anim's first frame stages the ticker
-        # at this elapsed, then advances naturally. The "lost time"
-        # between last steady tick and first shader frame (texture
-        # upload + drain) is FROZEN -- the clock pauses during the
-        # gap, so ticker doesn't snap forward when the screen
-        # un-freezes.
-        self._outgoing_slide_last_elapsed: float | None = None
-        # Frozen elapsed for the incoming slide at the moment shader-
-        # anim stops painting (#217 v2). Captured at end of frame loop
-        # in _run_shader_transition. _play_dynamic_slide_gpu reads it
-        # to set compositor's t0 such that the FIRST tick fires at
-        # this exact elapsed -- ticker resumes from shader-anim's last
-        # painted position with no jump, even though the compositor
-        # .attach gap freeze duration is variable. The clock pauses
-        # during the gap; subsequent ticks advance from the freeze
-        # point.
-        self._incoming_slide_freeze_elapsed: float | None = None
-        # Background prerender tasks for the shader-transition snapshot
-        # cache (#216). Each task warms bg_statics + anim_layer for one
-        # slide via asyncio.to_thread during the slide's display window
-        # so the upcoming transition pays no rasterize cost. Tracked so
-        # stop() can cancel them; tasks self-discard from the set on
-        # completion via add_done_callback.
-        self._prerender_tasks: set[asyncio.Task] = set()
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
@@ -375,23 +268,6 @@ class PlaybackLoop:
         # the inverse signal — set means "yield."
         self._resume_event.set()
         self._resume_at_index = None
-        # Eager-warm the shader renderer (#217 follow-on). 5-6s of
-        # GL/EGL/GBM init + 15-shader compile happens once at loop
-        # start instead of stalling the FIRST shader transition mid-
-        # playback. After this, every transition gets sr=0ms init
-        # cost. Synchronous on the asyncio main thread is fine here:
-        # it runs ONCE before the loop starts iterating, and the
-        # primary plane keeps showing whatever was last on it
-        # (welcome-loop frame, stream takeover frame, etc.) until
-        # the loop's first slide attaches.
-        if self._shader_transitions_enabled():
-            try:
-                self._get_or_create_shader_renderer()
-            except Exception:
-                log.exception(
-                    "playback: eager shader-renderer warmup at start "
-                    "failed; falling back to lazy init at first transition",
-                )
         self._task = asyncio.create_task(self._loop())
         # 2026-05-17 frozen-sign incident on 192.168.1.67: an unhandled
         # exception inside _loop() silently killed the playback task,
@@ -448,139 +324,16 @@ class PlaybackLoop:
             # asyncio.run() rounds against the same PlaybackLoop hit
             # "RuntimeError: ... attached to a different loop".
             self._frame_capture_lock = None
-            # Cancel any in-flight prerender tasks (#216). Cancel is
-            # best-effort: PIL rasterize is CPU-bound and cancel() can
-            # only fire when the thread checks; in practice the task
-            # finishes the current rasterize (~100ms) and exits. We
-            # do NOT await them here -- letting them complete in the
-            # background while the loop tears down keeps stop()
-            # responsive. They write to the cache which gets cleared
-            # below; any race writes are wasted but not corrupt.
-            for task in list(self._prerender_tasks):
-                task.cancel()
-            self._prerender_tasks.clear()
             # Drop GPU compositor PIL caches so a fresh start()
             # doesn't reuse stale (slide_id, updated_at) entries
             # against a content store that may have changed.
             self._gpu_slide_cache.clear()
-            self._snapshot_cache.clear()
-            # Tear down the shader compositor if it was lazily built.
-            # ShaderRenderer holds DRM/EGL/GL state that survives
-            # individual transitions but should be released alongside
-            # the loop's lifecycle. close() is idempotent and safe in
-            # shared-fd mode (won't blank the CRTC; caller's DRMRenderer
-            # keeps owning master + scanout).
-            if self._shader_renderer is not None:
-                try:
-                    self._shader_renderer.close()
-                except Exception:
-                    log.exception(
-                        "playback: shader renderer close during stop failed"
-                    )
-                self._shader_renderer = None
-            self._shader_renderer_disabled = False
-            self._incoming_slide_freeze_elapsed = None
-            self._drain_outgoing_compositor()
-
-    def _schedule_prerender(self, item: ContentItem | None) -> None:
-        """Fire-and-forget background warm of `item`'s shader-transition
-        snapshot cache (#216). Runs PIL bg+statics composite + first-
-        animated-layer rasterize off the event loop via
-        asyncio.to_thread, so by the time the slide is the outgoing /
-        incoming side of a transition the cache is already populated
-        and the transition starts with no rasterize stall.
-
-        Skips:
-          - shader path disabled (no env flag, or test renderers
-            without drm_fd). The cache isn't read in that world, so
-            prerender is pure waste, AND keeps the test event loop
-            free of background to_thread activity that would
-            destabilize timing-sensitive playback tests.
-          - non-text-slide items (image/video have no animated layers
-            and no compose_slide_bg_statics_rgba path).
-
-        Auto-mode slides skip cache (recompute every transition since
-        clock text changes), so the prerender does work that gets
-        discarded. Acceptable -- auto slides are rarely the source of
-        real stall since their compose path was already paid by the
-        steady-state attach."""
-        if not self._shader_transitions_enabled():
-            return
-        if item is None or getattr(item, "type", None) != "text_slide":
-            return
-        renderer = self._renderer
-        if not hasattr(renderer, "width") or not hasattr(renderer, "height"):
-            return
-        width = renderer.width
-        height = renderer.height
-        cache = self._snapshot_cache
-        read_asset = self._read_asset
-        # Stringify the slide id so the pool key matches what
-        # GPUSlideCompositor uses (`str(slide.id)`) at attach time --
-        # otherwise UUID vs str mismatch silently misses the pool.
-        raw_id = getattr(item, "id", None)
-        slide_id = str(raw_id) if raw_id is not None else None
-        # If renderer supports the per-slide primary buffer pool
-        # (#218 part 2 - DRMRenderer in shader-transition mode), also
-        # warm the slide's dedicated primary fb in the same to_thread
-        # task. By the time this slide's compositor.attach runs, the
-        # buffer is already painted; attach just flips FB_ID atomically.
-        # ZERO memcpy on the seam.
-        supports_pool = (
-            slide_id is not None
-            and hasattr(renderer, "prepare_primary_buffer")
-        )
-
-        async def _run() -> None:
-            try:
-                await asyncio.to_thread(
-                    cache.prerender_for_transition,
-                    item, width, height, read_asset=read_asset,
-                )
-                if supports_pool:
-                    # Snapshot cache now has bg+statics RGBA. Convert
-                    # to RGB and pre-paint the slide's pool buffer.
-                    # All on this worker thread so the asyncio main
-                    # thread stays free. content_version = updated_at
-                    # so an edit to the slide invalidates the pool's
-                    # cached pixels and we repaint in place (#218
-                    # SHOULD-FIX from pre-commit review).
-                    try:
-                        rgba = cache.get_bg_statics(
-                            item, width, height, read_asset=read_asset,
-                        )
-                        rgb = (
-                            Image.frombytes("RGBA", (width, height), rgba)
-                            .convert("RGB")
-                            .tobytes()
-                        )
-                        await asyncio.to_thread(
-                            renderer.prepare_primary_buffer,
-                            slide_id, rgb,
-                            content_version=getattr(item, "updated_at", None),
-                        )
-                    except Exception:
-                        log.exception(
-                            "playback: pool buffer prerender failed "
-                            "for slide %s", slide_id,
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception(
-                    "playback: prerender task crashed for slide %s",
-                    getattr(item, "id", "<no-id>"),
-                )
-
-        task = asyncio.create_task(_run())
-        self._prerender_tasks.add(task)
-        task.add_done_callback(self._prerender_tasks.discard)
 
     def _evict_caches_to_window(self, keep_ids: set[UUID]) -> None:
-        """Drop both the snapshot and asset caches' entries whose
-        slide_id isn't in `keep_ids`. The play loop calls this once
-        per iteration with {current, next} so the caches stay bounded
-        on a circular playlist (where plain LRU is 0% hit-rate).
+        """Drop the asset cache's entries whose slide_id isn't in
+        `keep_ids`. The play loop calls this once per iteration with
+        {current, next} so the cache stays bounded on a circular
+        playlist (where plain LRU is 0% hit-rate).
 
         Coordinates with DRMRenderer's per-slide primary buffer pool:
         SlideAssetCache.evict_except passes the renderer through so
@@ -589,33 +342,11 @@ class PlaybackLoop:
         held.
         """
         try:
-            self._snapshot_cache.evict_except(keep_ids)
-        except Exception:
-            log.exception("playback: snapshot cache eviction failed")
-        try:
             self._gpu_slide_cache.evict_except(
                 keep_ids, renderer=self._renderer,
             )
         except Exception:
             log.exception("playback: asset cache eviction failed")
-
-    def _drain_outgoing_compositor(self) -> None:
-        """Detach the outgoing slide's compositor (#206 cleanup) if one
-        is being held alive across a transition. Idempotent. Called
-        AFTER any transition that didn't claim the compositor itself
-        and on stop(). With every transition kind now shader-routed,
-        the BEFORE-transition drain that used to fire for
-        non-shader transitions is no longer needed."""
-        c = self._outgoing_compositor
-        self._outgoing_compositor = None
-        self._outgoing_slide = None
-        self._outgoing_slide_last_elapsed = None
-        if c is None:
-            return
-        try:
-            c.detach()
-        except Exception:
-            log.exception("playback: outgoing compositor detach failed")
 
     async def _loop(self) -> None:
         assert self._stop_event is not None
@@ -693,18 +424,7 @@ class PlaybackLoop:
                     self._current_auto_mode = None
                     self._current_auto_format = None
 
-                # Background prerender (#216): warm the snapshot cache
-                # for both the CURRENT item (it'll be the outgoing side
-                # in ~duration_ms) and the NEXT item (it'll be the
-                # incoming side at the same time). Both rasterizes
-                # finish well within the duration_ms window typically
-                # used (>=1s), so transition start pays no PIL cost.
-                # Schedules via asyncio.to_thread so the rasterize
-                # runs off the event loop.
-                self._schedule_prerender(item)
                 next_item = items[(i + 1) % len(items)] if len(items) > 1 else None
-                if next_item is not None:
-                    self._schedule_prerender(next_item)
 
                 # Cycle-aware cache eviction (2026-05-06 OOM fix). A
                 # circular playlist's working set is "all of it," so
@@ -713,12 +433,7 @@ class PlaybackLoop:
                 # misses. The right bound is "current + next-prefetched
                 # only"; everything else is dead weight at ~12 MB
                 # userspace per slide × 32 slides => 400 MB on a 416 MB
-                # Pi Zero 2 W. Done here (after prerender scheduling)
-                # so the prerender's cache writes for current + next
-                # don't get evicted by the same call. Per-iteration
-                # rather than per-transition so a schedule-rule mid-
-                # cycle naturally drops the prior playlist's stale
-                # prerender.
+                # Pi Zero 2 W.
                 keep_ids: set[UUID] = {item.id}
                 if next_item is not None:
                     keep_ids.add(next_item.id)
@@ -873,22 +588,6 @@ class PlaybackLoop:
                     next_image = self._safe_load_image(next_item)
                     if next_image is not None:
                         kind = item.transition
-                        # Stash next_item so _run_shader_transition can
-                        # compose u_to as bg+statics-only (parallel to
-                        # u_from). TextSlides only -- ImageSlide /
-                        # VideoSlide don't have animated layers to skip
-                        # so their full composite IS bg+statics anyway.
-                        self._incoming_slide = (
-                            next_item if next_item.type == "text_slide"
-                            else None
-                        )
-                        # Every transition kind is shader-routed since
-                        # the unification cleanup. Shader path drains
-                        # outgoing internally; if shader is unavailable
-                        # (env off, dev host without libdrm, etc.)
-                        # _run_shader_transition drains BEFORE
-                        # returning False so the PIL fallback below
-                        # sees clean overlay slots.
                         if kind == "fade":
                             await self._fade(current_image, next_image, item.transition_ms)
                         elif kind == "wipe":
@@ -919,19 +618,6 @@ class PlaybackLoop:
                             await self._blinds(current_image, next_image, item.transition_ms)
                         elif kind == "shutter":
                             await self._shutter(current_image, next_image, item.transition_ms)
-
-                # Catch-all: drain any compositor still alive after the
-                # transition. Shader-routed transitions normally detach
-                # inside _run_shader_transition, but if shader was
-                # unavailable (env off, exception, fall-through to PIL)
-                # the compositor stays here and would otherwise leak
-                # into the next slide. Idempotent.
-                self._drain_outgoing_compositor()
-                # Same housekeeping for the incoming-slide stash --
-                # _run_shader_transition reads it on entry; clear it
-                # so a future transition without a known incoming
-                # slide doesn't stale-read a previous next_item.
-                self._incoming_slide = None
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -1336,19 +1022,6 @@ class PlaybackLoop:
         tz = resolve_timezone(self._get_timezone())
         total = item.duration_ms / 1000
         loop = asyncio.get_event_loop()
-        # Freeze-resume from prior shader transition (#217 v2). If
-        # the outgoing transition stashed an incoming-side freeze
-        # elapsed, the compositor.attach() will stage motion at that
-        # elapsed (frozen from shader-anim's last frame), and we set
-        # t0 AFTER attach so the first while-loop tick computes
-        # elapsed = freeze_elapsed + tiny -- ticker resumes from the
-        # frozen position with no jump. The compositor.attach gap
-        # itself (~150-300ms) is FROZEN: clock pauses, no advance.
-        # If no stash (fresh slide / non-shader path), fall through
-        # to fresh t0 = loop.time().
-        freeze_elapsed = self._incoming_slide_freeze_elapsed
-        self._incoming_slide_freeze_elapsed = None
-        # t0 placeholder for end_at; updated after attach if freeze.
         t0 = loop.time()
         end_at = t0 + total
         if slide_has_motion(item):
@@ -1362,26 +1035,10 @@ class PlaybackLoop:
             height=self._renderer.height,
             read_asset=self._read_asset,
             cache=self._gpu_slide_cache,
-            snapshot_cache=self._snapshot_cache,
         )
-        # If we're inheriting a freeze elapsed from the just-ended
-        # shader transition (#217 v2), pass it to attach(). Compositor
-        # will stage motion at that exact elapsed (FROZEN clock; the
-        # ticker stays where shader-anim left it). After attach, we
-        # set t0 such that elapsed-now = freeze_elapsed -- subsequent
-        # while-loop ticks then advance smoothly from that position.
-        # The 150-300ms attach gap is invisible motion-wise: clock
-        # paused; no jump on un-freeze.
-        compositor.attach(
-            now=datetime.now(tz), freeze_at_elapsed=freeze_elapsed,
-        )
-        if freeze_elapsed is not None:
-            # Reset t0 + end_at so subsequent ticks resume from the
-            # frozen position (NOT from real-time-since-transition).
-            t0 = loop.time() - freeze_elapsed
-            end_at = t0 + total
+        compositor.attach(now=datetime.now(tz))
         # Stamp for capture_current_frame() so its compose shares the
-        # same elapsed_s clock as the live tick (post-freeze adjusted).
+        # same elapsed_s clock as the live tick.
         self._slot_t0 = t0
         try:
             while True:
@@ -1409,49 +1066,11 @@ class PlaybackLoop:
                 if loop.time() >= end_at:
                     break
 
-            # End-of-slide handoff. Two cases:
-            #
-            # (a) Shader transitions enabled: the next transition reads
-            #     bg+statics from snapshot cache, so the dispatcher's
-            #     "current_image" return value isn't visually scanned
-            #     out. Painting compose_motion_frame here would write a
-            #     WRAP-visual ticker (np.roll) to the primary plane,
-            #     visible for one vblank between the last steady-state
-            #     tick (TRANSLATE position) and the shader's first
-            #     frame (TRANSLATE position) -- a TRANSLATE -> WRAP ->
-            #     TRANSLATE jump (#217). Skip that paint; return the
-            #     cached bg+statics as a PIL Image so the dispatcher
-            #     contract holds. The visible primary plane stays at
-            #     whatever the steady-state tick last committed until
-            #     the shader takes it over.
-            #
-            # (b) Shader transitions disabled (PIL-fallback path): the
-            #     transition's frame loop reads `current_image` and
-            #     paints it directly. We need a motion-accurate final
-            #     frame here so the transition starts from the right
-            #     pixels. compose_motion_frame is correct for that
-            #     path; the WRAP/TRANSLATE divergence doesn't matter
-            #     because the entire transition runs through the same
-            #     PIL math.
+            # End-of-slide handoff. The transition's frame loop reads
+            # `current_image` and paints it directly, so we need a
+            # motion-accurate final frame here for the transition to
+            # start from the right pixels.
             elapsed = loop.time() - t0
-            if self._shader_transitions_enabled():
-                try:
-                    rgba = self._snapshot_cache.get_bg_statics(
-                        item,
-                        self._renderer.width, self._renderer.height,
-                        read_asset=self._read_asset,
-                    )
-                    return Image.frombytes(
-                        "RGBA",
-                        (self._renderer.width, self._renderer.height),
-                        rgba,
-                    ).convert("RGB")
-                except Exception:
-                    log.exception(
-                        "playback: bg+statics fetch failed for shader "
-                        "handoff -- returning None will skip transition",
-                    )
-                    return None
             try:
                 last = compose_motion_frame(
                     item, elapsed,
@@ -1467,32 +1086,12 @@ class PlaybackLoop:
                 )
                 return None
         finally:
-            # When shader transitions are enabled, hand the compositor
-            # to the loop so the next transition can keep its overlays
-            # ticking through the transition window (#206). The loop
-            # is responsible for eventual detach: _run_shader_transition
-            # detaches at transition end on success, or via
-            # _drain_outgoing_compositor on the shader-unavailable
-            # fall-through (so the PIL fallback paints onto a clean
-            # overlay state). Otherwise (shader path off): detach
-            # immediately, no #206 work.
-            if self._shader_transitions_enabled():
-                self._outgoing_compositor = compositor
-                self._outgoing_slide = item  # type: ignore[assignment]
-                # Stash the slide's last-tick elapsed so the next
-                # transition can FREEZE the motion clock at this value
-                # during the upload+drain gap (#218). Without freeze,
-                # shader-anim's first frame would compute elapsed via
-                # real time and ticker would snap forward by the
-                # gap_ms * velocity at the seam.
-                self._outgoing_slide_last_elapsed = elapsed
-            else:
-                try:
-                    compositor.detach()
-                except Exception:
-                    log.exception(
-                        "playback: GPU compositor detach failed for %s", item.id,
-                    )
+            try:
+                compositor.detach()
+            except Exception:
+                log.exception(
+                    "playback: GPU compositor detach failed for %s", item.id,
+                )
 
     def _safe_load_image(self, item: ContentItem) -> Image.Image | None:
         """Load + resize an item's PNG to renderer dimensions.
@@ -1693,494 +1292,6 @@ class PlaybackLoop:
         # Video and any future type: no readback path yet.
         return None
 
-    def _shader_transitions_enabled(self) -> bool:
-        """Feature flag for the shader compositor transition path.
-        Off by default; flip OPENMARQUEE_SHADER_TRANSITIONS=1 in the
-        environment to opt the welcome loop in. Designed as an env
-        var (rather than settings.json) for now so operators can A/B
-        the path on a single device without edits across surfaces."""
-        return os.environ.get("OPENMARQUEE_SHADER_TRANSITIONS") == "1"
-
-    def _get_or_create_shader_renderer(self) -> object | None:
-        """Lazily construct the shader compositor on first transition
-        that wants it. Reused for the lifetime of the loop. Returns
-        None when:
-          - the env flag is off,
-          - a prior construction attempt already failed,
-          - the renderer doesn't expose drm_fd (MockRenderer, fb0,
-            DRMRenderer in pre-shared-fd build, etc.),
-          - ShaderRenderer construction itself raises (libdrm/libegl
-            missing on a Mac dev host, the most common case).
-
-        On any failure we set _shader_renderer_disabled so the next
-        transition doesn't pay the same cold-import cost again."""
-        if self._shader_renderer is not None:
-            return self._shader_renderer
-        if self._shader_renderer_disabled:
-            return None
-        if not self._shader_transitions_enabled():
-            self._shader_renderer_disabled = True
-            return None
-        drm_fd = getattr(self._renderer, "drm_fd", None)
-        if drm_fd is None:
-            log.info(
-                "playback: shader transitions requested but renderer "
-                "doesn't expose drm_fd; falling back to software path"
-            )
-            self._shader_renderer_disabled = True
-            return None
-        # restage_primary_fb is load-bearing for the post-transition
-        # handoff: without it the shader's last fb stays on screen
-        # indefinitely (kernel implicit-pin keeps it; commit() with
-        # empty _pending_props is a no-op). Better to refuse the path
-        # at construction time than to discover the freeze 15 s into
-        # the first iris.
-        if not hasattr(self._renderer, "restage_primary_fb"):
-            log.warning(
-                "playback: renderer exposes drm_fd but lacks "
-                "restage_primary_fb; shader transitions disabled "
-                "(would silently freeze the screen post-transition)"
-            )
-            self._shader_renderer_disabled = True
-            return None
-        try:
-            from openmarquee.rendering.shader_compositor import ShaderRenderer
-            sr = ShaderRenderer(drm_fd=drm_fd)
-            sr.__enter__()
-        except Exception:
-            log.exception(
-                "playback: ShaderRenderer construction failed; "
-                "shader transitions disabled for this session"
-            )
-            self._shader_renderer_disabled = True
-            return None
-        self._shader_renderer = sr
-        log.info(
-            "playback: shader compositor up via shared fd=%d, %dx%d",
-            drm_fd, sr.width, sr.height,
-        )
-        return sr
-
-    async def _run_shader_transition(
-        self,
-        from_image: Image.Image,
-        to_image: Image.Image,
-        kind: str,
-        transition_ms: int,
-    ) -> bool:
-        """Drive one slide-to-slide transition through the shader
-        compositor. Returns True iff it ran via shader; False means
-        the caller must fall back to its own (PIL) transition path.
-
-        Animated text on either side is composited in-shader via
-        per-side anim texture units (#215): the outgoing slide's first
-        animated layer (and the incoming slide's first) are rasterized
-        once at transition start, uploaded, and updated per frame with
-        motion math (ticker / breathe / pulse / bounce / blink). The
-        transition shader's per-pixel mask then clips the composited
-        anim+base correctly -- iris, wipe, dissolve etc. all separate
-        the two slides cleanly even with motion. Pre-#215 this was
-        attempted via HVS overlay planes layered ON TOP of the shader
-        primary, but HVS can only do plane-uniform alpha (no per-pixel
-        shape clip), so motion bled through the iris boundary. Pulling
-        motion INTO the shader's primary plane is the fix.
-
-        Shape:
-          1. Compose u_from / u_to bg+statics-only RGBA snapshots.
-          2. Extract one animated layer per side (if present),
-             rasterize glyph bbox, set_X_anim().
-          3. Detach outgoing compositor (its overlay slots are about
-             to be re-claimed by the next slide's GPUSlideCompositor;
-             motion now lives in the shader, not on overlays).
-          4. set_kind(kind), set_from(...), set_to(...).
-          5. Frame loop: per-frame motion math -> update_X_anim;
-             set_transition_t(t in [0,1]) + commit_frame +
-             cooperative-pause-aware sleep.
-          6. Hand the primary plane back to multi-plane DRMRenderer in
-             one atomic commit: render_frame(to_image), restage_primary
-             _fb(), commit.
-        """
-        import time as _time
-        _enter_t = _time.monotonic()
-        if kind not in _SHADER_TRANSITION_KINDS:
-            # Shouldn't be reached today (every kind is in the set);
-            # kept for forward-compat if a future kind is wired into
-            # a dispatcher before its fragment shader exists.
-            self._drain_outgoing_compositor()
-            return False
-        sr = self._get_or_create_shader_renderer()
-        if sr is None:
-            # Shader unavailable (env flag off, dev host without
-            # libdrm/libegl, or construction failed). Drain outgoing
-            # so the caller's PIL fallback paints onto a clean
-            # overlay-slot state -- otherwise the still-attached
-            # outgoing overlays would double-paint with the PIL
-            # transition's render_image output.
-            self._drain_outgoing_compositor()
-            return False
-        renderer = self._renderer
-        width, height = sr.width, sr.height
-
-        _post_sr_t = _time.monotonic()
-        # u_from / u_to: bg+statics-only snapshots of each side. The
-        # animated layers are pulled out separately and uploaded to
-        # the per-side anim texture units below; this two-channel
-        # split is what lets the transition mask clip motion correctly
-        # per-pixel.
-        outgoing_slide = self._outgoing_slide
-        from_rgba: bytes
-        if outgoing_slide is not None:
-            try:
-                # Cached snapshot path (#205): microseconds on the
-                # second+ visit, ~600ms first time.
-                from_rgba = self._snapshot_cache.get_bg_statics(
-                    outgoing_slide, width, height,
-                    read_asset=self._read_asset,
-                )
-            except Exception:
-                log.exception(
-                    "playback: bg+statics compose failed for outgoing "
-                    "slide; falling back to full from_image"
-                )
-                from_rgba = self._image_to_rgba_bytes(from_image, width, height)
-        else:
-            from_rgba = self._image_to_rgba_bytes(from_image, width, height)
-
-        to_rgba: bytes
-        incoming_slide = self._incoming_slide
-        if incoming_slide is not None:
-            try:
-                to_rgba = self._snapshot_cache.get_bg_statics(
-                    incoming_slide, width, height,
-                    read_asset=self._read_asset,
-                )
-            except Exception:
-                log.exception(
-                    "playback: bg+statics compose failed for incoming "
-                    "slide; falling back to full to_image"
-                )
-                to_rgba = self._image_to_rgba_bytes(to_image, width, height)
-        else:
-            to_rgba = self._image_to_rgba_bytes(to_image, width, height)
-
-        # Extract first animated layer per side (#215). Cached on
-        # SlideSnapshotCache (#216): warm-cache hits in microseconds,
-        # cold path pays ~100ms PIL rasterize. Background prerender
-        # at slide-attach time fills the cache before the transition
-        # fires so even cold-cache transitions start instantly.
-        _post_bg_t = _time.monotonic()
-        outgoing_anim = (
-            self._snapshot_cache.get_anim_layer(
-                outgoing_slide, width, height,
-            ) if outgoing_slide is not None else None
-        )
-        incoming_anim = (
-            self._snapshot_cache.get_anim_layer(
-                incoming_slide, width, height,
-            ) if incoming_slide is not None else None
-        )
-        _post_anim_t = _time.monotonic()
-        log.info(
-            "playback: transition setup timing -- sr=%.0fms, bg=%.0fms, "
-            "anim=%.0fms (anim cache: out=%s, in=%s)",
-            (_post_sr_t - _enter_t) * 1000,
-            (_post_bg_t - _post_sr_t) * 1000,
-            (_post_anim_t - _post_bg_t) * 1000,
-            "hit" if outgoing_anim is not None else "miss/none",
-            "hit" if incoming_anim is not None else "miss/none",
-        )
-
-        # Capture outgoing motion-clock anchor BEFORE drain (#217 v2).
-        # _drain_outgoing_compositor clears self._outgoing_slide_*
-        # state. The OUTGOING ANCHOR is (anchor_elapsed, anchor_time):
-        # shader-anim's elapsed = anchor_elapsed + (now - anchor_time).
-        # anchor_elapsed = the elapsed value the slide had at its
-        # last steady tick (so shader-anim's ticker resumes from the
-        # SAME position the user just saw on the overlay plane).
-        # anchor_time will be set right at frame loop start so the
-        # texture upload + drain gap doesn't count as motion -- the
-        # clock pauses during the freeze, no jump on screen un-freeze.
-        outgoing_anchor_elapsed = (
-            self._outgoing_slide_last_elapsed
-            if self._outgoing_slide_last_elapsed is not None
-            else 0.0
-        )
-
-        # Track why we exit the frame loop. Pause means a stream
-        # takeover is becoming the new owner of render_frame/commit
-        # (SYSTEM_SPEC §5.11) -- racing it with our handoff would
-        # double-commit the primary plane. Skip the handoff in that
-        # case and let the takeover own the plane. On stop or normal
-        # completion the handoff is correct and required.
-        paused = False
-        try:
-            # Texture uploads BEFORE drain (#217). 1080p RGBA u_from +
-            # u_to are ~8MB each and the upload to GPU on Pi Zero 2 W
-            # is ~30-80ms per texture. If we drain first then upload,
-            # the outgoing slide's overlay text vanishes for ~70-170ms
-            # (no overlay, primary unchanged at bg+statics, ticker
-            # invisible). Reordering keeps overlays alive (frozen at
-            # T_last position) during the upload window so the only
-            # "no ticker" gap is between drain and the first shader
-            # commit -- ~10ms, imperceptible.
-            sr.set_kind(kind)
-            sr.set_from(from_rgba, width, height)
-            sr.set_to(to_rgba, width, height)
-            sr.clear_anim()
-            if outgoing_anim is not None:
-                _, _, rgba, gbbox, _ = outgoing_anim
-                sr.set_from_anim(rgba, gbbox[2], gbbox[3])
-            if incoming_anim is not None:
-                _, _, rgba, gbbox, _ = incoming_anim
-                sr.set_to_anim(rgba, gbbox[2], gbbox[3])
-            _post_upload_t = _time.monotonic()
-
-            # Drain outgoing overlays now that shader is loaded and
-            # the next commit_frame is microseconds away. Without
-            # shader-side anim (#215) the overlay-plane scanout was
-            # the canonical motion source; now overlays are obsolete
-            # the moment shader takes the primary plane.
-            self._drain_outgoing_compositor()
-            _post_drain_t = _time.monotonic()
-
-            n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
-            frame_period = (transition_ms / 1000) / n_frames
-            assert self._stop_event is not None
-            assert self._pause_event is not None
-            # Anchor times for both motion clocks (#217 v2). The
-            # texture-upload + drain gap that just ran is FROZEN --
-            # not counted toward motion. anchor_time = NOW; anchors
-            # advance from here as wall-clock time progresses inside
-            # the frame loop.
-            transition_start = _time.monotonic()
-            outgoing_anchor_time = transition_start
-            incoming_anchor_time = transition_start
-            incoming_anchor_elapsed = 0.0  # incoming enters fresh
-            log.info(
-                "playback: transition phase timing -- upload=%.0fms "
-                "drain=%.0fms (now entering frame loop, %d frames @ %.0fms)",
-                (_post_upload_t - _post_anim_t) * 1000,
-                (_post_drain_t - _post_upload_t) * 1000,
-                n_frames, frame_period * 1000,
-            )
-            frames_drawn = 0
-            has_motion = (
-                outgoing_anim is not None or incoming_anim is not None
-            )
-            # Track incoming's last elapsed so we can stash it on
-            # success for the next compositor.attach to inherit
-            # (freeze-resume: ticker resumes from this exact position
-            # without a jump even though attach takes ~150-300ms).
-            last_elapsed_in = incoming_anchor_elapsed
-            for i in range(1, n_frames + 1):
-                if self._pause_event.is_set():
-                    paused = True
-                    break
-                if self._stop_event.is_set():
-                    break
-                t = i / n_frames
-                sr.set_transition_t(t)
-                # Anchor-based clock: elapsed = anchor_elapsed +
-                # (now - anchor_time). Outgoing resumes from its
-                # last-steady-tick elapsed; incoming starts at 0
-                # and advances. The pre-frame-loop gap (texture
-                # upload + drain) is FROZEN -- doesn't count.
-                _now = _time.monotonic()
-                if outgoing_anim is not None:
-                    _, layer, _, gbbox, bx = outgoing_anim
-                    elapsed_out = (
-                        outgoing_anchor_elapsed
-                        + (_now - outgoing_anchor_time)
-                    )
-                    box_uv, alpha = self._anim_uv_for_frame(
-                        layer, bx, gbbox, width, height, elapsed_out,
-                    )
-                    sr.update_from_anim(box_uv, alpha)
-                if incoming_anim is not None:
-                    _, layer, _, gbbox, bx = incoming_anim
-                    elapsed_in = (
-                        incoming_anchor_elapsed
-                        + (_now - incoming_anchor_time)
-                    )
-                    last_elapsed_in = elapsed_in
-                    box_uv, alpha = self._anim_uv_for_frame(
-                        layer, bx, gbbox, width, height, elapsed_in,
-                    )
-                    sr.update_to_anim(box_uv, alpha)
-                sr.commit_frame()
-                frames_drawn += 1
-                # Skip the wait after the LAST frame -- it's pure
-                # dead air before the next slide's compositor.attach,
-                # adding ~one frame_period (~33ms at 30fps) to the
-                # seam freeze for no benefit. Pacing matters between
-                # frames; after the last frame the loop's done (#218).
-                if i < n_frames:
-                    await self._wait(frame_period)
-            transition_elapsed = _time.monotonic() - transition_start
-            achieved_fps = (
-                frames_drawn / transition_elapsed if transition_elapsed > 0 else 0.0
-            )
-            log.info(
-                "playback: shader transition %r %s: %d/%d frames in "
-                "%.2fs (%.1f fps achieved, target %.1f)",
-                kind,
-                "with-motion" if has_motion else "snapshot-only",
-                frames_drawn, n_frames,
-                transition_elapsed, achieved_fps, _FADE_FPS,
-            )
-            if not paused and not self._stop_event.is_set():
-                # The frame loop's last iteration (i=n_frames) already
-                # fires at t = n_frames/n_frames = 1.0, so the prior
-                # post-loop "land at t=1.0" frame was redundant -- the
-                # shader's final commit already had t=1.0 content.
-                # Removed (#218): saves ~50ms per transition (one full
-                # commit_frame + atomic ioctl) of dead work that
-                # showed visually identical pixels.
-                #
-                # Stash for #217 v2: the incoming slide's compositor
-                # will FREEZE-RESUME at this elapsed when it attaches.
-                # The compositor.attach gap is invisible motion-wise
-                # -- ticker stays at last_elapsed_in's position
-                # through the freeze, then resumes naturally from
-                # there. Set ONLY on success: a paused / stopped /
-                # exception transition shouldn't leak stale state
-                # into the next slide's compositor.
-                self._incoming_slide_freeze_elapsed = last_elapsed_in
-        except Exception:
-            log.exception(
-                "playback: shader transition %r failed mid-flight; "
-                "primary plane will be reset to multi-plane content",
-                kind,
-            )
-            # Fall through to the handoff dance anyway (unless paused)
-            # so the screen recovers cleanly after a shader-side error.
-
-        if paused:
-            # Stream takeover owns the plane now. Don't fight it.
-            return True
-
-        # For TextSlide-incoming: don't restage primary here. The
-        # incoming compositor.attach() will paint slide B's bg+statics
-        # into the multi-plane dumb buffer AND stage primary FB_ID +
-        # overlays + motion-derived crtc_x in a single atomic commit.
-        # Until that commit fires, the shader's last fb stays on
-        # primary -- continuous motion at the seam (#217).
-        #
-        # For non-TextSlide incoming (image/video): no compositor
-        # attaches. _safe_load_image + _render_image paints the multi-
-        # plane dumb buffer but doesn't stage FB_ID, so without a
-        # restage here the kernel keeps showing shader's last fb for
-        # the entire next slide's duration -- the image/video would
-        # be invisible. Paint to_image (full composite, RGB) and
-        # restage primary FB_ID so the image actually appears.
-        if incoming_slide is None:
-            try:
-                handoff_rgb = (
-                    Image.frombytes("RGBA", (width, height), to_rgba)
-                    .convert("RGB")
-                    .tobytes()
-                )
-                renderer.render_frame(handoff_rgb)
-                renderer.restage_primary_fb()
-                renderer.commit()
-            except Exception:
-                log.exception(
-                    "playback: post-shader-transition handoff to "
-                    "multi-plane failed for non-text-slide incoming; "
-                    "screen may stay on shader's last frame",
-                )
-        return True
-
-    def _image_to_rgba_bytes(
-        self, image: Image.Image, width: int, height: int,
-    ) -> bytes:
-        """Resize + RGBA-convert a PIL image to width*height*4 bytes."""
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
-        if image.size != (width, height):
-            image = image.resize((width, height), Image.NEAREST)
-        return image.tobytes()
-
-    def _anim_uv_for_frame(
-        self,
-        layer: "TextLayer",
-        box_px: tuple[int, int, int, int],
-        glyph_bbox_px: tuple[int, int, int, int],
-        sign_w: int,
-        sign_h: int,
-        elapsed_s: float,
-    ) -> tuple[tuple[float, float, float, float], float]:
-        """Compute per-frame (box_uv, alpha) for `layer` at `elapsed_s`
-        on the slide's tick clock. Mirrors GPUSlideCompositor._stage_
-        motion's per-effect math but emits SCREEN-UV box rect + 0..1
-        alpha instead of CRTC pixel coords + 16-bit plane alpha. The
-        two paths share `compute_phase` + `_effect_freq` so phase math
-        on slide A's overlay-plane motion (pre-transition) is
-        identical to slide A's shader-anim motion (during transition)
-        -- continuous animation across the seam.
-
-        Returns ((x, y, w, h), alpha) where x/y/w/h ∈ [0, 1] in
-        screen-UV (top-down origin) and alpha ∈ [0, 1]."""
-        motion = getattr(layer, "motion", "static") or "static"
-        intensity = int(getattr(layer, "motion_intensity", 50))
-        motion_phase_offset = float(getattr(layer, "motion_phase", 0.0))
-        # B2 (2026-05-05): motion_speed multiplies the effect's frequency.
-        # Mirrors the same scaling on the software + multi-plane paths so
-        # all three render surfaces tick at the operator-set speed.
-        speed_raw = getattr(layer, "motion_speed", 1.0)
-        speed = max(0.0, min(2.0, float(speed_raw if speed_raw is not None else 1.0)))
-        phase = compute_phase(
-            elapsed_s, _effect_freq(motion, intensity) * speed, motion_phase_offset,
-        )
-        bx, by, bw, bh = box_px
-        gx, gy, gw, gh = glyph_bbox_px
-        # Defaults: glyph at rest position, fully opaque.
-        crtc_x, crtc_y, crtc_w, crtc_h = gx, gy, gw, gh
-        alpha = 1.0
-        if motion == "ticker":
-            # Sweep glyph leftward across the box. Mirrors
-            # _stage_motion's ticker. Same snap-then-restart behavior.
-            sweep_total = bw + gw
-            crtc_x = bx + bw - int(round(phase * sweep_total))
-        elif motion == "breathe":
-            amplitude = (intensity / 100.0) * 0.20
-            s = 1.0 + amplitude * math.sin(2 * math.pi * phase)
-            new_w = max(1, int(round(gw * s)))
-            new_h = max(1, int(round(gh * s)))
-            box_cx = bx + bw / 2.0
-            box_cy = by + bh / 2.0
-            glyph_cx = gx + gw / 2.0
-            glyph_cy = gy + gh / 2.0
-            new_cx = box_cx + s * (glyph_cx - box_cx)
-            new_cy = box_cy + s * (glyph_cy - box_cy)
-            crtc_x = int(round(new_cx - new_w / 2.0))
-            crtc_y = int(round(new_cy - new_h / 2.0))
-            crtc_w = new_w
-            crtc_h = new_h
-        elif motion == "pulse":
-            min_a = 1.0 - intensity / 100.0
-            s = (math.sin(2 * math.pi * phase) + 1.0) / 2.0
-            alpha = min_a + (1.0 - min_a) * s
-        elif motion == "bounce":
-            amp = (intensity / 100.0) * 0.10
-            offset_px = -int(round(amp * bh * abs(math.sin(2 * math.pi * phase))))
-            crtc_y = gy + offset_px
-        elif motion == "blink":
-            # Square wave: half cycle on, half off. Matches blink's
-            # alpha pattern in _stage_motion.
-            alpha = 1.0 if phase < 0.5 else 0.0
-        # Other kinds (shake / unknown): freeze at rest position --
-        # acceptable since transition windows are short (200-1000ms)
-        # and shake's deterministic-Gaussian step counter would need
-        # to thread layer.id through here.
-        return (
-            (
-                crtc_x / sign_w, crtc_y / sign_h,
-                crtc_w / sign_w, crtc_h / sign_h,
-            ),
-            max(0.0, min(1.0, alpha)),
-        )
-
     async def _fade(
         self,
         from_image: Image.Image,
@@ -2189,23 +1300,10 @@ class PlaybackLoop:
     ) -> None:
         """Alpha-blend from `from_image` to `to_image` over `transition_ms`.
 
-        Routes through the shader compositor when available -- same
-        pattern every other transition kind uses since the unification
-        cleanup. The shader's mix(u_from, u_to, t) is mathematically
-        identical to the prior _fade_gpu's HVS plane.alpha animation
-        but goes through the same orchestration so motion-through-
-        transitions (#206) works for fade as well. PIL Image.blend
-        is the fallback for non-DRM renderers (MockRenderer, LED
-        matrices, fb0).
-
         Returns early on stop OR pause request -- pause-awareness keeps
         the transition from painting playlist frames over an in-flight
         stream takeover.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "fade", transition_ms,
-        ):
-            return
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         for i in range(1, n_frames + 1):
@@ -2227,13 +1325,7 @@ class PlaybackLoop:
         """Push transition: `from_image` slides off to the left while
         `to_image` slides in from the right at the same rate. Distinct
         from wipe in that BOTH frames move (rather than to_image
-        revealing under a stationary from_image).
-
-        Routes through the shader compositor when available."""
-        if await self._run_shader_transition(
-            from_image, to_image, "slide", transition_ms,
-        ):
-            return
+        revealing under a stationary from_image)."""
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         width, height = from_image.size
@@ -2264,17 +1356,7 @@ class PlaybackLoop:
         """Iris transition: `to_image` reveals through a circular mask
         that grows from a center pinpoint to fully cover the canvas.
         Reads as a film-projector aperture opening — distinct enough
-        from fade and wipe at small panel sizes that it stays legible.
-
-        Routes through the shader compositor when available (env flag
-        OPENMARQUEE_SHADER_TRANSITIONS=1 + renderer.drm_fd present).
-        That hits 30 fps stable on Pi Zero 2 W at 1080p; the PIL
-        software path below is the fallback for non-DRM renderers
-        (LED-matrix, fb0, MockRenderer) and dev hosts."""
-        if await self._run_shader_transition(
-            from_image, to_image, "iris", transition_ms,
-        ):
-            return
+        from fade and wipe at small panel sizes that it stays legible."""
         from PIL import ImageDraw
 
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
@@ -2308,13 +1390,7 @@ class PlaybackLoop:
         `to_image` rolls in from the bottom at the same rate. Reads as
         a stadium scoreboard advancing rows. Distinct from slide in
         that the motion is vertical — natural on tall WS281x columns
-        and ticker-style HUB75 strips.
-
-        Routes through the shader compositor when available."""
-        if await self._run_shader_transition(
-            from_image, to_image, "scroll", transition_ms,
-        ):
-            return
+        and ticker-style HUB75 strips."""
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         width, height = from_image.size
@@ -2352,13 +1428,7 @@ class PlaybackLoop:
         no visible motion (the only column collapses to itself), so we
         fall back to fade. Per QA's 2026-04-28 transition-palette spec:
         "flip on a strip is meaningless — fall back to fade."
-
-        Routes through the shader compositor when available.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "flip", transition_ms,
-        ):
-            return
         width, height = from_image.size
         if width < 2:
             await self._fade(from_image, to_image, transition_ms)
@@ -2406,13 +1476,7 @@ class PlaybackLoop:
 
         Strip-graceful: width<2 → no horizontal motion is meaningful,
         fall back to fade. Per QA's spec for strip rendering.
-
-        Routes through the shader compositor when available.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "marquee", transition_ms,
-        ):
-            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -2470,16 +1534,7 @@ class PlaybackLoop:
         Strip-graceful: works at any width or height — the per-pixel
         randomization doesn't depend on geometry, so a 1×N strip just
         sees its individual pixels reveal independently. No fallback.
-
-        Routes through the shader compositor when available. Hashes
-        v_uv per fragment for the threshold (deterministic per pixel,
-        same shape as the np.random thresholds below — different RNG,
-        same visual class).
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "dissolve", transition_ms,
-        ):
-            return
         width, height = from_image.size
         # Per-pixel reveal thresholds. Generated once per transition so
         # pixels reveal in a stable random order across frames; using a
@@ -2521,16 +1576,7 @@ class PlaybackLoop:
         pixelate (block_size collapses to 1 → identity), so delegate
         to fade. Cleaner than emitting frames identical to fade under
         a different name.
-
-        Routes through the shader compositor when available. The
-        shader version uses a UV-space block-quantize on both samplers
-        with a wave that peaks at t=0.5 — same visual class as the
-        PIL path's PIL.Image.resize(NEAREST) chunk-blur.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "pixelate", transition_ms,
-        ):
-            return
         width, height = from_image.size
         if width < 2 or height < 2:
             await self._fade(from_image, to_image, transition_ms)
@@ -2588,13 +1634,7 @@ class PlaybackLoop:
         Strip-graceful: width<4 or height<4 leaves nothing for the dot
         grid to cohere into (a single column of cells just degenerates
         to a stripe), so delegate to fade.
-
-        Routes through the shader compositor when available.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "halftone", transition_ms,
-        ):
-            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -2656,16 +1696,7 @@ class PlaybackLoop:
         duration. Fall back to fade. Per QA's spec ("scanline on a 1×N
         strip is just a fade"); we make it explicit here so the
         operator's pulldown choice doesn't silently degrade.
-
-        Routes through the shader compositor when available. The
-        shader version uses smoothstep around the sweep line for the
-        glow band — slightly softer than the PIL path's solid white
-        rectangle but reads as the same CRT-beam look.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "scanline", transition_ms,
-        ):
-            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -2722,13 +1753,7 @@ class PlaybackLoop:
         Strip-graceful: works at any geometry. Per-row jitter is
         shape-agnostic; even a 1×N strip just sees its single row jitter
         each frame. No fallback needed (and none added). Per QA's spec.
-
-        Routes through the shader compositor when available.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "glitch", transition_ms,
-        ):
-            return
         width, height = from_image.size
         rng = np.random.default_rng()
         # Jitter ceiling ~10% of canvas width, min 1. Bigger jitter
@@ -2797,13 +1822,7 @@ class PlaybackLoop:
 
         Strip-graceful: width<2 -> fall back to fade. Same shape as
         flip/marquee/pixelate strip fallbacks.
-
-        Routes through the shader compositor when available.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "push", transition_ms,
-        ):
-            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -2869,13 +1888,7 @@ class PlaybackLoop:
 
         Strip-graceful: height<4 leaves no room for two slats with
         meaningful midline-spread bands, so delegate to fade.
-
-        Routes through the shader compositor when available.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "blinds", transition_ms,
-        ):
-            return
         from PIL import ImageDraw
 
         width, height = from_image.size
@@ -2939,13 +1952,7 @@ class PlaybackLoop:
         hexagon to read as anything other than a stripe (six vertices
         overlap at low resolution), so delegate to fade. Same shape as
         halftone's strip fallback.
-
-        Routes through the shader compositor when available.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "shutter", transition_ms,
-        ):
-            return
         from math import cos, pi, sin
 
         from PIL import ImageDraw
@@ -3000,22 +2007,9 @@ class PlaybackLoop:
         """Left-to-right wipe: `to_image` reveals from the left edge,
         pushing `from_image` out of the way over `transition_ms`.
 
-        Routes through the shader compositor when available -- same
-        pattern every other transition kind uses since the unification
-        cleanup. The shader's per-fragment x-coordinate threshold is
-        equivalent to the prior _wipe_gpu's HVS CRTC_W animation but
-        goes through the same orchestration so motion-through-
-        transitions (#206) works for wipe as well. PIL paste-and-crop
-        is the fallback for non-DRM renderers (MockRenderer, LED
-        matrices, fb0).
-
         Returns early on stop. Same frame cadence as _fade so the two
         transitions feel like the same smoothness at equal transition_ms.
         """
-        if await self._run_shader_transition(
-            from_image, to_image, "wipe", transition_ms,
-        ):
-            return
         n_frames = max(1, int(transition_ms / 1000 * _FADE_FPS))
         frame_period = (transition_ms / 1000) / n_frames
         width, height = from_image.size

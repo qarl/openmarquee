@@ -74,8 +74,6 @@ pyee==13.0.1
     # via aiortc
 pylibsrtp==1.0.0
     # via aiortc
-pyopengl==3.1.10
-    # via openmarquee (pyproject.toml)
 pyopenssl==26.2.0
     # via aiortc
 python-dotenv==1.2.2

@@ -501,9 +501,7 @@ async def test_scroll_transition_emits_split_frames(renderer):
     # the NEW slide (B = blue) should appear at the BOTTOM of the
     # frame while the OLD slide (A = red) sits on top -- scroll UP,
     # not scroll DOWN. Inspect every split frame; the bottom rows
-    # must be blue, top rows must be red. PIL fallback path is what
-    # runs in this test (no EGL on the runner); same direction
-    # contract as the shader path's _FRAGMENT_SCROLL.
+    # must be blue, top rows must be red.
     red_row = bytes((255, 0, 0)) * width
     blue_row = bytes((0, 0, 255)) * width
     split_frames = [
