@@ -43,6 +43,11 @@ from typing import List, Optional
 # right per the format contract documented at IpcPaintMetrics in
 # renderer/src/ipc_main.rs; regex is non-positional + non-greedy so
 # unknown trailing tokens are ignored.
+#
+# Phase D slice 2 (2026-05-17) adds the optional `paint_us_p99` group.
+# Optional so pre-slice-1 captures (no p99 field) still parse; the
+# p99 gate skips with a one-line warning in that backward-compat
+# path.
 PAT_IPC_SOAK = re.compile(
     r"ipc\.soak\s+"
     r"window_s=(?P<window_s>\d+)\s+"
@@ -50,6 +55,7 @@ PAT_IPC_SOAK = re.compile(
     r"transitions=(?P<transitions>\d+)\s+"
     r"fps_avg=(?P<fps_avg>[\d.]+)\s+"
     r"paint_us=avg/(?P<paint_us_avg>\d+)/max/(?P<paint_us_max>\d+)\s+"
+    r"(?:paint_us_p99=(?P<paint_us_p99>\d+)\s+)?"
     r"session_frames=(?P<session_frames>\d+)\s+"
     r"session_transitions=(?P<session_transitions>\d+)"
 )
@@ -75,6 +81,7 @@ def parse_log(path: str) -> dict:
             line = line.rstrip("\n")
             m = PAT_IPC_SOAK.search(line)
             if m:
+                p99_raw = m.group("paint_us_p99")
                 samples.append({
                     "window_s": int(m.group("window_s")),
                     "frames": int(m.group("frames")),
@@ -82,6 +89,7 @@ def parse_log(path: str) -> dict:
                     "fps_avg": float(m.group("fps_avg")),
                     "paint_us_avg": int(m.group("paint_us_avg")),
                     "paint_us_max": int(m.group("paint_us_max")),
+                    "paint_us_p99": int(p99_raw) if p99_raw is not None else None,
                     "session_frames": int(m.group("session_frames")),
                     "session_transitions": int(m.group("session_transitions")),
                 })
@@ -134,7 +142,52 @@ def rolling_min_fps(samples: List[dict], window_min: int) -> Optional[dict]:
     return best
 
 
-def summarize(parsed: dict, min_fps: float, rolling_window_min: int) -> dict:
+def rolling_max_p99(samples: List[dict], window_min: int) -> Optional[dict]:
+    """Sliding window over consecutive samples; return the window with
+    the highest per-sample paint_us_p99 (the worst-case sliding
+    window for the slice-2 p99 gate). Modeled after rolling_min_fps.
+
+    Samples missing paint_us_p99 (pre-slice-1 captures) are skipped
+    in the per-window max. If ALL samples lack the field, returns
+    None — the caller treats this as "no p99 data, skip the gate"
+    for backward compatibility.
+
+    Returns dict with start_idx, end_idx, max_p99, elapsed_s, or
+    None if no qualifying window exists or no samples carry p99.
+    """
+    if not samples:
+        return None
+    if not any(s.get("paint_us_p99") is not None for s in samples):
+        return None
+    target_s = window_min * 60
+    best: Optional[dict] = None
+    n = len(samples)
+    for start in range(n):
+        elapsed = 0
+        window_max_p99 = 0
+        for end in range(start, n):
+            elapsed += samples[end]["window_s"]
+            p99 = samples[end].get("paint_us_p99")
+            if p99 is not None and p99 > window_max_p99:
+                window_max_p99 = p99
+            if elapsed >= target_s:
+                if best is None or window_max_p99 > best["max_p99"]:
+                    best = {
+                        "start_idx": start,
+                        "end_idx": end,
+                        "max_p99": window_max_p99,
+                        "elapsed_s": elapsed,
+                    }
+                break
+    return best
+
+
+def summarize(
+    parsed: dict,
+    min_fps: float,
+    rolling_window_min: int,
+    max_p99_paint_us: int,
+) -> dict:
     samples = parsed["samples"]
     oom_hits = parsed["oom_hits"]
     crash_hits = parsed["crash_hits"]
@@ -143,10 +196,17 @@ def summarize(parsed: dict, min_fps: float, rolling_window_min: int) -> dict:
 
     if not samples:
         failures.append("no ipc.soak samples found in log (sidecar not running, or window <30s)")
+        # Preserve the additive-keys invariant on the empty-samples
+        # early-return path so callers iterating the JSON don't
+        # KeyError on the new Phase D slice 2 fields.
         return {
             "pass": False,
             "failures": failures,
+            "warnings": [],
             "samples": 0,
+            "paint_us_p99_max": None,
+            "paint_us_p99_violations": 0,
+            "rolling_max_p99": None,
             "oom_hits": oom_hits,
             "crash_hits": crash_hits,
         }
@@ -184,6 +244,35 @@ def summarize(parsed: dict, min_fps: float, rolling_window_min: int) -> dict:
                 f"(window samples [{rolling['start_idx']}..{rolling['end_idx']}], "
                 f"{rolling['total_frames']} paints over {rolling['elapsed_s']}s)"
             )
+    # Phase D slice 2: p99 gate. Sample-level p99 absent on
+    # pre-slice-1 captures; rolling_max_p99 returns None in that
+    # path. Backward-compat: skip the p99 gate with a warning
+    # surfaced to the human report (not a failure).
+    rolling_p99 = rolling_max_p99(samples, rolling_window_min)
+    p99_warnings: List[str] = []
+    p99_max_observed = max(
+        (s["paint_us_p99"] for s in samples if s.get("paint_us_p99") is not None),
+        default=None,
+    )
+    p99_violations = sum(
+        1
+        for s in samples
+        if s.get("paint_us_p99") is not None and s["paint_us_p99"] > max_p99_paint_us
+    )
+    if rolling_p99 is None:
+        p99_warnings.append(
+            "paint_us_p99 absent in all ipc.soak samples — running "
+            "fps-only gate; pre-Phase-D-slice-1 binary"
+        )
+    else:
+        if rolling_p99["max_p99"] > max_p99_paint_us:
+            failures.append(
+                f"max rolling p99 paint_us over {rolling_window_min}min window "
+                f"= {rolling_p99['max_p99']} > {max_p99_paint_us} budget "
+                f"(window samples [{rolling_p99['start_idx']}..{rolling_p99['end_idx']}], "
+                f"{rolling_p99['elapsed_s']}s)"
+            )
+
     if oom_hits:
         failures.append(
             f"OOM signal detected ({len(oom_hits)} hits); first: {oom_hits[0]!r}"
@@ -196,15 +285,19 @@ def summarize(parsed: dict, min_fps: float, rolling_window_min: int) -> dict:
     return {
         "pass": not failures,
         "failures": failures,
+        "warnings": p99_warnings,
         "samples": len(samples),
         "total_window_s": total_window_s,
         "total_frames": total_frames,
         "total_transitions": total_transitions,
         "overall_fps": overall_fps,
         "max_paint_us": max_paint_us,
+        "paint_us_p99_max": p99_max_observed,
+        "paint_us_p99_violations": p99_violations,
         "session_frames": last_session_frames,
         "session_transitions": last_session_transitions,
         "rolling_min_fps": rolling,
+        "rolling_max_p99": rolling_p99,
         "oom_hits": oom_hits,
         "crash_hits": crash_hits,
     }
@@ -233,6 +326,21 @@ def print_human_report(summary: dict, min_fps: float, rolling_window_min: int) -
         )
     else:
         print(f"  rolling window: N/A (soak shorter than {rolling_window_min}min)")
+    rolling_p99 = summary.get("rolling_max_p99")
+    if rolling_p99:
+        print(
+            f"  rolling_max_p99 ({rolling_window_min}min): "
+            f"{rolling_p99['max_p99']}us "
+            f"(samples [{rolling_p99['start_idx']}..{rolling_p99['end_idx']}], "
+            f"{rolling_p99['elapsed_s']}s)"
+        )
+        if summary.get("paint_us_p99_max") is not None:
+            print(
+                f"  paint_us_p99_max={summary['paint_us_p99_max']} "
+                f"paint_us_p99_violations={summary['paint_us_p99_violations']}"
+            )
+    for warn in summary.get("warnings", []):
+        print(f"  WARN: {warn}")
     if summary["oom_hits"]:
         print(f"  OOM hits: {len(summary['oom_hits'])}")
     if summary["crash_hits"]:
@@ -248,9 +356,16 @@ def main() -> int:
     )
     ap.add_argument(
         "--rolling-window-min", type=int, default=10,
-        help="rolling window length in minutes for the min-fps gate. "
-             "Default 10. A single bad 30s window doesn't fail; a 10-min "
-             "sag does.",
+        help="rolling window length in minutes for the min-fps + max-p99 "
+             "gates. Default 10. A single bad 30s window doesn't fail; "
+             "a 10-min sag does.",
+    )
+    ap.add_argument(
+        "--max-p99-paint-us", type=int, default=33333,
+        help="Phase D slice 2 (2026-05-17): per-frame p99 paint budget "
+             "in microseconds. Default 33333 = the literal 30 fps "
+             "frame budget (1s / 30 = 33.33ms). Pre-slice-1 captures "
+             "without paint_us_p99 skip this gate with a warning.",
     )
     ap.add_argument(
         "--json", type=str, default=None,
@@ -259,7 +374,12 @@ def main() -> int:
     args = ap.parse_args()
 
     parsed = parse_log(args.log)
-    summary = summarize(parsed, args.min_fps_avg, args.rolling_window_min)
+    summary = summarize(
+        parsed,
+        args.min_fps_avg,
+        args.rolling_window_min,
+        args.max_p99_paint_us,
+    )
 
     print_human_report(summary, args.min_fps_avg, args.rolling_window_min)
 
