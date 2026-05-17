@@ -613,8 +613,8 @@ class PlaybackLoop:
 
         Gates the slice-4 Rust route. Duck-typed on `begin_slide` +
         `advance` so a test stub doesn't need to be a real RustRenderer
-        subclass. False for DRMRenderer / MockRenderer / LED-matrix
-        adapters -- those paths stay on the existing PIL hot path."""
+        subclass. False for MockRenderer -- that path stays on the
+        existing PIL hot path."""
         return (
             hasattr(self._renderer, "begin_slide")
             and hasattr(self._renderer, "advance")

@@ -341,17 +341,14 @@ def _real_renderer_singleton():
     """Pick + construct (but don't open) the production renderer based
     on settings.output_mode and OPENMARQUEE_RENDERER env override.
 
-    output_mode=hdmi -> DRMRenderer (multi-plane KMS, vc4 HVS scanout).
-    Anything else (or DRM init failure) -> MockRenderer.
+    output_mode=hdmi -> Rust IPC sidecar (RustRenderer wrapped in
+    AutoFallbackRenderer). Anything else -> MockRenderer.
 
     Opt-in levers:
-      OPENMARQUEE_RENDERER=mock          -> always mock
-      OPENMARQUEE_RENDERER=drm           -> always try DRM (override settings)
-      OPENMARQUEE_RENDERER=rust-sidecar  -> Phase 7 slice 2: use the Rust
-        IPC sidecar proxy (backend/openmarquee/rendering/rust_renderer.py).
-        Construction-only here; the proxy launches the subprocess on
-        open(). Binary path defaults to /usr/local/bin/openmarquee-render
-        overridable via OPENMARQUEE_RENDERER_BINARY.
+      OPENMARQUEE_RENDERER=mock          -> always mock (CI, dev)
+      OPENMARQUEE_RENDERER=rust-sidecar  -> always rust sidecar (explicit)
+      OPENMARQUEE_RENDERER=drm           -> legacy alias for rust-sidecar
+        (kept for back-compat with operator scripts that still set drm)
 
     The renderer is constructed eagerly here but opened by app.py's
     lifespan so a __enter__ failure surfaces at startup, not first
@@ -361,55 +358,13 @@ def _real_renderer_singleton():
     override = os.environ.get("OPENMARQUEE_RENDERER", "auto").lower()
     if override == "mock":
         return _mock_renderer_singleton()
-    if override == "rust-sidecar":
+    if override in ("rust-sidecar", "drm"):
         return _rust_sidecar_renderer_or_fallback()
 
     settings = _settings_storage_singleton().load()
-    output_mode = settings.output_mode
-
-    want_drm = override == "drm" or (override == "auto" and output_mode == "hdmi")
-    if not want_drm:
-        return _mock_renderer_singleton()
-
-    try:
-        from openmarquee.rendering.drm_kms import DRMRenderer
-    except Exception:
-        log.exception("DRM module import failed; falling back to mock")
-        return _mock_renderer_singleton()
-
-    width = int(settings.display_width)
-    height = int(settings.display_height)
-    # vc4 on Pi Zero 2 W has 3+ overlay planes; default 2 keeps GL
-    # context overhead modest. Slides with more animated layers fall
-    # back to compose_motion_frame software via the play loop's
-    # gating in _play_dynamic_slide. Override via env on bigger Pis.
-    max_animated_planes = int(
-        os.environ.get("OPENMARQUEE_MAX_ANIMATED_PLANES", "2")
-    )
-    # Per-slide primary buffer pool size. Each entry is a kernel
-    # dumb buffer at width*height*bytes_per_pixel (~4 MB at 1080p
-    # RGB565). 20 was the original default but the 32-slide welcome
-    # reel saturated all 20 entries in steady state -- 80 MB of
-    # kernel memory left no room for ShaderRenderer's GBM/EGL
-    # buffers and the system OOM'd uvicorn on a 416 MB Pi Zero 2 W
-    # (caught 2026-05-06). 6 keeps recently-visited slides warm
-    # (single-fb-flip attach) while bounding kernel memory at ~24 MB
-    # so shader transitions fit. Raise on bigger Pis via env.
-    max_pool_buffers = int(
-        os.environ.get("OPENMARQUEE_MAX_POOL_BUFFERS", "6")
-    )
-    try:
-        return DRMRenderer(
-            width=width,
-            height=height,
-            display_width=width,
-            display_height=height,
-            max_animated_planes=max_animated_planes,
-            max_pool_buffers=max_pool_buffers,
-        )
-    except Exception:
-        log.exception("DRMRenderer construction failed; falling back to mock")
-        return _mock_renderer_singleton()
+    if settings.output_mode == "hdmi":
+        return _rust_sidecar_renderer_or_fallback()
+    return _mock_renderer_singleton()
 
 
 def _rust_sidecar_renderer_or_fallback():
@@ -428,17 +383,10 @@ def _rust_sidecar_renderer_or_fallback():
       OPENMARQUEE_CONTENT_ROOT      already used elsewhere; threaded
         through to the sidecar via the Open op's content_root param.
 
-    Dims come from SystemSettings (display_width / display_height) just
-    like the DRMRenderer path. The sidecar may negotiate a different mode
-    on HDMI mode-set; RustRenderer.open() refreshes width/height to the
-    negotiated values at __enter__ time.
-
-    NOTE: this branch does NOT change the default. Production Pi behavior
-    is unchanged until an operator sets OPENMARQUEE_RENDERER=rust-sidecar.
-    Slice 4 will teach playback.py to use the proxy's IPC ops instead of
-    render_frame; until then, even an opted-in caller will hit the
-    NotImplementedError on the first frame (the wrapper forwards
-    render_frame to the proxy, which refuses push-frame rendering).
+    Dims come from SystemSettings (display_width / display_height).
+    The sidecar may negotiate a different mode on HDMI mode-set;
+    RustRenderer.open() refreshes width/height to the negotiated
+    values at __enter__ time.
     """
     try:
         from openmarquee.rendering.rust_renderer import RustRenderer
@@ -758,9 +706,9 @@ def _playback_loop_singleton() -> PlaybackLoop:
     from openmarquee.playback import scheduled_fetch_items
 
     storage = _content_storage_singleton()
-    # Real renderer (DRM/HDMI on the device, mock in dev). Was hardwired
-    # to mock; now selects on settings.output_mode + env override and
-    # falls back to mock on init failure.
+    # Real renderer (Rust IPC sidecar on the device, mock in dev).
+    # Selects on settings.output_mode + env override and falls back
+    # to mock on init failure.
     renderer = _real_renderer_singleton()
     playlist_storage = _playlist_storage_singleton()
     schedule_storage = _schedule_storage_singleton()

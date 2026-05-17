@@ -265,7 +265,7 @@ class TestRealRendererFactory:
     ):
         """Sanity check: a typo in OPENMARQUEE_RENDERER (e.g. "rust-side"
         without the "-car") does NOT silently route to the sidecar.
-        Unknown values fall through to the default auto/drm path."""
+        Unknown values fall through to settings-based auto resolution."""
         from openmarquee.rendering.mock import MockRenderer
 
         monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidec")  # typo
@@ -275,8 +275,8 @@ class TestRealRendererFactory:
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
-        # Typo'd value isn't "rust-sidecar" so we fall through to the
-        # want_drm branch; with output_mode=mock that returns Mock.
+        # Typo'd value isn't recognized so we fall through to the
+        # settings-driven auto path; non-hdmi output_mode returns Mock.
         assert isinstance(renderer, MockRenderer)
 
 

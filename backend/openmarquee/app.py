@@ -118,12 +118,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         log.exception("startup playlist prune failed")
 
-    # Open the production renderer if it's a context manager (DRMRenderer
-    # acquires the DRM master fd, allocates the dumb buffer, and mode-sets
-    # the connector here -- failure should surface at startup, not on the
-    # first render_frame call). MockRenderer is a plain class with no
-    # __enter__; check before calling. On failure we fall back to mock so
-    # the service still serves the UI even with a misconfigured display.
+    # Open the production renderer if it's a context manager (RustRenderer
+    # spawns the openmarquee-render subprocess, negotiates the HDMI mode,
+    # and opens the IPC handshake here -- failure should surface at
+    # startup, not on the first render_frame call). MockRenderer is a
+    # plain class with no __enter__; check before calling. On failure
+    # we fall back to mock so the service still serves the UI even with
+    # a misconfigured display.
     renderer = get_renderer()
     if hasattr(renderer, "__enter__"):
         try:
