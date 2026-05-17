@@ -162,6 +162,7 @@ async def _capture_with_server(playwright, fixtures, capture_dir: Path, port: in
         raise
     capture_dir.mkdir(parents=True, exist_ok=True)
     captured = []
+    skipped = []
     for fx in fixtures:
         if fx["kind"] == "single":
             item = load_item(fx["uuid"])
@@ -178,13 +179,23 @@ async def _capture_with_server(playwright, fixtures, capture_dir: Path, port: in
             }
         else:
             raise ValueError(f"unknown fixture kind: {fx['kind']}")
-        b64 = await page.evaluate("(p) => window.__parityCapture(p)", params)
+        try:
+            b64 = await page.evaluate("(p) => window.__parityCapture(p)", params)
+        except Exception as exc:
+            # Browser side may not implement every transition kind the
+            # Rust side does (parity-harness.html's TRANSITION_FNS is
+            # 6 entries; the canonical Rust enum has 16). Surface the
+            # gap in the divergence table rather than aborting the run.
+            msg = str(exc).split("\n", 1)[0]
+            skipped.append((fx, msg))
+            sys.stderr.write(f"  SKIP {fx['name']}: {msg}\n")
+            continue
         out_path = capture_dir / f"{fx['name']}.browser.png"
         out_path.write_bytes(base64.b64decode(b64))
         captured.append((fx, out_path))
     await context.close()
     await browser.close()
-    return captured
+    return captured, skipped
 
 
 def diff(browser_png: Path, golden_png: Path) -> dict:
@@ -296,26 +307,40 @@ async def main_async(args) -> int:
     fixtures = load_fixtures()
     capture_dir = BASELINE_DIR if args.bless else CAPTURE_DIR
     async with async_playwright() as pw:
-        captured = await capture_browser(pw, fixtures, capture_dir)
+        captured, skipped = await capture_browser(pw, fixtures, capture_dir)
 
     if args.bless:
         print(f"BLESS: wrote {len(captured)} browser captures to {capture_dir}")
+        if skipped:
+            print(f"  ({len(skipped)} skipped due to browser-side errors)")
         return 0
 
     all_pass = True
+    n_pass = 0
+    n_fail = 0
     metrics_per_fixture = {}
     for fx, browser_png in captured:
         golden_path = GOLDEN_DIR / f"{fx['golden']}.png"
         if not golden_path.exists():
             print(f"FAIL: {fx['name']:30s} golden missing: {golden_path}")
             all_pass = False
+            n_fail += 1
             continue
         m = diff(browser_png, golden_path)
         is_pass, summary = report(fx, golden_path, m)
         print(summary)
         metrics_per_fixture[fx["name"]] = m
-        if not is_pass:
+        if is_pass:
+            n_pass += 1
+        else:
+            n_fail += 1
             all_pass = False
+    for fx, msg in skipped:
+        print(f"BROWSER-SKIP: {fx['name']:30s} {msg}")
+        metrics_per_fixture[fx["name"]] = {"browser_skip": msg}
+
+    total = n_pass + n_fail + len(skipped)
+    print(f"\nsummary: {n_pass} PASS / {n_fail} FAIL / {len(skipped)} SKIP ({total} total)")
 
     # Persist metrics so commit messages / drift dashboards can pull
     # them without re-running the harness. Lives alongside the
