@@ -105,12 +105,13 @@ describe("applyBrightnessGamma", () => {
         expect(() => applyBrightnessGamma(canvas, 1.0, 2.2)).not.toThrow();
     });
 
-    // -- Schema-default pin: brightness=0.8, gamma=2.2 (the deployed
-    //    HDMI default per settings.py:150-162). This is the
-    //    operator-visible default that the inline preview now
-    //    matches end-to-end (parity-audit #5 brightness-plumbing
-    //    follow-up to 8ef2e7f).
-    it("at schema defaults (brightness=0.8, gamma=2.2): white → ~232 (not 255)", () => {
+    // -- Operator-set anchors (brightness=0.8 still matches the
+    //    schema default; gamma=2.2 is an explicit operator dial
+    //    after the gamma default flipped from 2.2 → 1.0). These
+    //    two cases pin the function's response at one of the
+    //    realistic operator-chosen working points; they don't
+    //    claim to mirror schema defaults anymore.
+    it("at brightness=0.8 + gamma=2.2: white → ~232 (not 255)", () => {
         const pixels = new Uint8ClampedArray([255, 255, 255, 255]);
         const canvas = makeCanvas(1, 1, pixels);
         applyBrightnessGamma(canvas, 0.8, 2.2);
@@ -123,7 +124,7 @@ describe("applyBrightnessGamma", () => {
         expect(canvas._pixels[3]).toBe(255);
     });
 
-    it("at schema defaults (brightness=0.8, gamma=2.2): mid-gray pins the curve", () => {
+    it("at brightness=0.8 + gamma=2.2: mid-gray pins the curve", () => {
         const pixels = new Uint8ClampedArray([128, 128, 128, 255]);
         const canvas = makeCanvas(1, 1, pixels);
         applyBrightnessGamma(canvas, 0.8, 2.2);

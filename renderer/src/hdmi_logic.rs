@@ -1934,10 +1934,10 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
 ///
 /// Identity case: brightness == 1.0 AND gamma == 1.0 means the
 /// caller can skip this pass entirely (bind FS_BLIT instead).
-/// At spec defaults (brightness=100/gamma=2.2 in the schema's
-/// 100-scale + 2.2 anchor) the renderer applies a real
-/// sRGB-ish gamma correction; operators can dim via
-/// brightness in [0, 100].
+/// At schema defaults (brightness=100/gamma=1.0) the post-pass
+/// is identity and the caller skips it; operators dial gamma
+/// up if the downstream HDMI/TV pipeline isn't gamma-correct
+/// on its own, and dim via brightness in [0, 100].
 ///
 /// brightness uniform is the schema value DIVIDED BY 100 (so
 /// the shader sees [0, 1]); gamma is the schema value

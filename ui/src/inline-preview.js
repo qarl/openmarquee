@@ -69,16 +69,17 @@ const ANIMATED_TRANSITIONS = new Set([
 ]);
 
 // Brightness/gamma post-pass settings for the inline preview, matching
-// Rust's FS_BRIGHT_GAMMA defaults (parity-audit #5 fix 2026-05-14).
-// HDMI + composite outputs apply gamma=2.2 (sRGB display encoding); the
-// LED-driving output modes (hub75 + ws281x) have their own per-pixel
-// brightness pipelines elsewhere and skip the canvas gamma pass here.
-// Brightness is plumbed from sign settings (settings.py:150) via the
-// `brightness` option on mountInlinePreview — see the 2026-05-14
-// brightness-plumbing follow-up to 8ef2e7f.
+// Rust's FS_BRIGHT_GAMMA defaults (parity-audit #5 fix 2026-05-14;
+// 2026-05-17 schema default flipped 2.2 → 1.0 to stop double-gamma
+// lifting near-black source pixels on the scanout). HDMI + composite
+// preview at gamma=1.0 (identity) to match the new sign default; the
+// LED-driving output modes (hub75 + ws281x) also keep identity and
+// skip the canvas gamma pass (they have their own per-pixel brightness
+// pipelines downstream). Brightness is plumbed from sign settings
+// (settings.py:150) via the `brightness` option on mountInlinePreview.
 const PREVIEW_GAMMA_BY_OUTPUT_MODE = {
-    hdmi: 2.2,
-    composite: 2.2,
+    hdmi: 1.0,
+    composite: 1.0,
     hub75: 1.0,
     ws281x: 1.0,
 };

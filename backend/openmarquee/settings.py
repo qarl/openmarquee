@@ -155,10 +155,10 @@ class SystemSettings(BaseModel):
     )
 
     gamma: float = Field(
-        default=2.2,
+        default=1.0,
         ge=0.1,
         le=3.0,
-        description="Display gamma correction. 2.2 is the sRGB default.",
+        description="Display gamma correction. 1.0 is identity (no second gamma applied; assets arrive sRGB-encoded). Operator can dial up if the TV's HDMI pipeline isn't gamma-correct on its own.",
     )
 
     # WS2812B strip / matrix wiring. Physical order of LEDs in a matrix

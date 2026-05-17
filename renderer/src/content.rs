@@ -465,7 +465,10 @@ pub struct Settings {
     /// final RGB by brightness / 100. Spec §6.3.
     #[serde(default = "default_brightness")]
     pub brightness: u32,
-    /// Gamma in (0.0, 4.0]. Default 2.2 (sRGB-ish). Applied
+    /// Gamma in (0.0, 4.0]. Default 1.0 (identity — the scanout
+    /// post-pass is a no-op blit and gets skipped via
+    /// `is_color_identity`). Operators can dial up if the TV's
+    /// HDMI pipeline isn't gamma-correct on its own. Applied
     /// in a per-pixel post-pass at scanout time (slice b).
     #[serde(default = "default_gamma")]
     pub gamma: f32,
@@ -481,7 +484,7 @@ fn default_brightness() -> u32 {
     100
 }
 fn default_gamma() -> f32 {
-    2.2
+    1.0
 }
 
 /// v1-spec-delta #10 (slice a) -- read settings.json from disk
@@ -985,18 +988,18 @@ mod tests {
         assert_eq!(s.display_height, 1080);
         assert_eq!(s.display_rotation, 0);
         assert_eq!(s.brightness, 100);
-        assert!((s.gamma - 2.2).abs() < 0.001);
+        assert!((s.gamma - 1.0).abs() < 0.001);
     }
 
     #[test]
-    fn settings_is_color_identity_at_default_anchors_is_false() {
-        // The schema default is brightness=100 + gamma=2.2,
-        // which is NOT identity (gamma=2.2 applies sRGB-like
-        // correction). The renderer's post-pass fires at the
-        // schema defaults; operators get identity by setting
-        // gamma=1.0 explicitly.
+    fn settings_is_color_identity_at_default_anchors_is_true() {
+        // The schema default is brightness=100 + gamma=1.0,
+        // which IS identity (the post-pass is a no-op blit and
+        // the renderer can skip the FBO ping-pong). Operators
+        // who want the renderer to apply a second gamma curve
+        // dial gamma above 1.0 explicitly.
         let s = Settings::default();
-        assert!(!s.is_color_identity(), "default is not identity (gamma=2.2)");
+        assert!(s.is_color_identity(), "default is identity (gamma=1.0)");
     }
 
     #[test]
@@ -1021,7 +1024,7 @@ mod tests {
         assert_eq!(s.schema_version, 1);
         assert_eq!(s.brightness, 50);
         assert_eq!(s.display_width, 1920);  // default
-        assert!((s.gamma - 2.2).abs() < 0.001);  // default
+        assert!((s.gamma - 1.0).abs() < 0.001);  // default
     }
 
     #[test]

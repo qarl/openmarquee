@@ -729,7 +729,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             heightEl.value = String(settings.display_height ?? 1080);
             rotationEl.value = String(settings.display_rotation ?? 0);
             brightnessEl.value = String(settings.brightness ?? 80);
-            gammaEl.value = String(settings.gamma ?? 2.2);
+            gammaEl.value = String(settings.gamma ?? 1.0);
             apEnabledEl.checked = settings.wifi_ap_enabled !== false; // default on
             ssidEl.value = settings.wifi_ssid ?? "";
             // Batch 20.4: GET returns "<set>" / null for the 3 secret

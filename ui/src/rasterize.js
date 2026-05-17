@@ -429,9 +429,10 @@ export function applyBrightnessGamma(canvas, brightness, gamma) {
  * apply a brightness/gamma post-pass matching Rust's FS_BRIGHT_GAMMA
  * (see `applyBrightnessGamma` above). Default identity is a no-op so
  * existing callers (parity-harness, rasterizeAtTarget, tests) keep
- * their pre-fix pixel output. The inline preview opts in with
- * `gamma=2.2` for HDMI/composite output modes to match the deployed
- * sign's default gamma encoding (parity-audit #5 fix 2026-05-14).
+ * their pre-fix pixel output. The inline preview opts in with the
+ * operator's configured gamma for HDMI/composite output modes; the
+ * sign's schema default is 1.0 (identity) post the 2026-05-17 flip
+ * from 2.2 (parity-audit #5 fix 2026-05-14).
  */
 export function drawCanvas(canvas, state, opts) {
     const ctx = canvas.getContext("2d");
