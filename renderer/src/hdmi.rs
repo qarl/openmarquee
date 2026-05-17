@@ -10118,6 +10118,15 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
         mode_h,
         mode.vrefresh(),
     );
+    // Bug 7 follow-up (2026-05-17): mirror of with_egl_session's
+    // call at L422 — atomic-commit path needs the same Broadcast
+    // RGB = Full property write so --animate visual probes don't
+    // see lifted blacks. The legacy `card.set_property` ioctl
+    // coexists with atomic-commit property tracking: it's an
+    // immediate property write on the connector, separate from
+    // the AtomicModeReq accumulation below. Same one-shot at
+    // session init.
+    try_force_full_range_rgb(card, connector_info.handle())?;
 
     let encoder_handle = connector_info
         .current_encoder()
