@@ -20,6 +20,23 @@ function mockCanvas(width, height) {
         restore: vi.fn(),
         translate: vi.fn(),
         scale: vi.fn(),
+        // jsdom doesn't ship Canvas2D; rasterize.js wrapTextToWidth
+        // calls measureText unconditionally. Width is deterministic
+        // so wrap math is reproducible. Ink bounds are NaN so
+        // rasterize.js:200-205 falls back to its fontSizePx*0.8/0.2
+        // split (the path the editor tests' layout expectations
+        // were calibrated against pre-mock-fix).
+        measureText: vi.fn((_str) => ({
+            // Width=1 keeps rasterize.js wrapTextToWidth from
+            // splitting any candidate (every word fits). Editor
+            // tests assert call-counts that match the input's
+            // explicit \n splits; none of them want soft-wrap to
+            // fire. (rasterize.test.js uses *30 because IT
+            // specifically tests wrap behavior.)
+            width: 1,
+            actualBoundingBoxAscent: NaN,
+            actualBoundingBoxDescent: NaN,
+        })),
     };
     return {
         width,
@@ -286,6 +303,25 @@ function patchCanvasPrototype() {
         clip: vi.fn(),
         clearRect: vi.fn(),
         drawImage: vi.fn(),
+        // jsdom canvas gap: rasterize.js wrapTextToWidth calls
+        // measureText during the editor's syncLayerFromForm rAF
+        // path. Without it, textarea-input handlers throw
+        // unhandled and downstream spies never fire (caught when
+        // Phase 5b video-bg submit-flow test failed at HEAD with
+        // an uncaught `ctx.measureText is not a function`).
+        // Ink bounds are NaN so rasterize.js:200-205 keeps its
+        // fontSizePx*0.8/0.2 fallback path.
+        measureText: vi.fn((_str) => ({
+            // Width=1 keeps rasterize.js wrapTextToWidth from
+            // splitting any candidate (every word fits). Editor
+            // tests assert call-counts that match the input's
+            // explicit \n splits; none of them want soft-wrap to
+            // fire. (rasterize.test.js uses *30 because IT
+            // specifically tests wrap behavior.)
+            width: 1,
+            actualBoundingBoxAscent: NaN,
+            actualBoundingBoxDescent: NaN,
+        })),
     };
     const proto = HTMLCanvasElement.prototype;
     proto.getContext = vi.fn(() => fakeCtx);
@@ -1713,6 +1749,13 @@ describe("mountEditor — visual font picker", () => {
                 translate: () => {}, scale: () => {},
                 beginPath: () => {}, rect: () => {}, clip: () => {},
                 drawImage: () => {},
+                // jsdom canvas gap — see patchCanvasPrototype above
+                // (line 268) for the cascading-failure rationale.
+                measureText: (_str) => ({
+                    width: 1,
+                    actualBoundingBoxAscent: NaN,
+                    actualBoundingBoxDescent: NaN,
+                }),
             };
         };
         HTMLCanvasElement.prototype.toDataURL = () => "data:image/png;base64,STUBDATA";
