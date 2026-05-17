@@ -652,7 +652,7 @@ class RustRenderer:
         try:
             for line in iter(proc.stderr.readline, ""):
                 if line:
-                    log.debug("rust-sidecar stderr: %s", line.rstrip())
+                    log.info("rust-sidecar stderr: %s", line.rstrip())
         except Exception:
             # Pipe closed on teardown; readline returns "" and the
             # for-loop exits cleanly. Other exceptions (e.g., decode
