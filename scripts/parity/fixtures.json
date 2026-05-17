@@ -353,7 +353,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000001",
             "tick": 0.5,
-            "golden": "fys_01_free",
+            "golden": "parity_fys_01_free",
             "purpose": "FYS reel slide 1 '01 · FREE'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -361,7 +361,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000002",
             "tick": 0.5,
-            "golden": "fys_02_your",
+            "golden": "parity_fys_02_your",
             "purpose": "FYS reel slide 2 '02 · YOUR'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -369,7 +369,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000003",
             "tick": 0.5,
-            "golden": "fys_03_sign",
+            "golden": "parity_fys_03_sign",
             "purpose": "FYS reel slide 3 '03 · SIGN'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -377,7 +377,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000004",
             "tick": 0.5,
-            "golden": "fys_04_the_sentence",
+            "golden": "parity_fys_04_the_sentence",
             "purpose": "FYS reel slide 4 '04 · The Sentence'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -385,7 +385,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000005",
             "tick": 0.5,
-            "golden": "fys_05_liberate",
+            "golden": "parity_fys_05_liberate",
             "purpose": "FYS reel slide 5 '05 · Liberate'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -393,7 +393,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000006",
             "tick": 0.5,
-            "golden": "fys_06_uncage",
+            "golden": "parity_fys_06_uncage",
             "purpose": "FYS reel slide 6 '06 · Uncage!!'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -401,7 +401,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000007",
             "tick": 0.5,
-            "golden": "fys_07_07a_typo_oops",
+            "golden": "parity_fys_07_07a_typo_oops",
             "purpose": "FYS reel slide 7 '07a · Typo (oops)'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -409,7 +409,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000008",
             "tick": 0.5,
-            "golden": "fys_08_07b_typo_mid_fix",
+            "golden": "parity_fys_08_07b_typo_mid_fix",
             "purpose": "FYS reel slide 8 '07b · Typo (mid-fix)'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -417,7 +417,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000009",
             "tick": 0.5,
-            "golden": "fys_09_07c_typo_fixed",
+            "golden": "parity_fys_09_07c_typo_fixed",
             "purpose": "FYS reel slide 9 '07c · Typo (fixed)'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -425,7 +425,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f1500000000a",
             "tick": 0.5,
-            "golden": "fys_10_tile_chaos",
+            "golden": "parity_fys_10_tile_chaos",
             "purpose": "FYS reel slide 10 '08 · Tile Chaos'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -433,7 +433,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f1500000000b",
             "tick": 0.5,
-            "golden": "fys_11_chant_wall",
+            "golden": "parity_fys_11_chant_wall",
             "purpose": "FYS reel slide 11 '09 · Chant Wall'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -441,7 +441,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f1500000000c",
             "tick": 0.5,
-            "golden": "fys_12_scream",
+            "golden": "parity_fys_12_scream",
             "purpose": "FYS reel slide 12 '10 · Scream'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -449,7 +449,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f1500000000d",
             "tick": 0.5,
-            "golden": "fys_13_silence",
+            "golden": "parity_fys_13_silence",
             "purpose": "FYS reel slide 13 '11 · Silence'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -457,7 +457,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f1500000000e",
             "tick": 0.5,
-            "golden": "fys_14_stadium",
+            "golden": "parity_fys_14_stadium",
             "purpose": "FYS reel slide 14 '12 · Stadium'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -465,7 +465,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f1500000000f",
             "tick": 0.5,
-            "golden": "fys_15_13a_panic_1",
+            "golden": "parity_fys_15_13a_panic_1",
             "purpose": "FYS reel slide 15 '13a · Panic 1'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -473,7 +473,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000010",
             "tick": 0.5,
-            "golden": "fys_16_13b_panic_2",
+            "golden": "parity_fys_16_13b_panic_2",
             "purpose": "FYS reel slide 16 '13b · Panic 2'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -481,7 +481,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000011",
             "tick": 0.5,
-            "golden": "fys_17_13c_panic_3",
+            "golden": "parity_fys_17_13c_panic_3",
             "purpose": "FYS reel slide 17 '13c · Panic 3'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -489,7 +489,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000012",
             "tick": 0.5,
-            "golden": "fys_18_cooldown",
+            "golden": "parity_fys_18_cooldown",
             "purpose": "FYS reel slide 18 '14 · Cooldown'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -497,7 +497,7 @@
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-f15000000013",
             "tick": 0.5,
-            "golden": "fys_19_boot",
+            "golden": "parity_fys_19_boot",
             "purpose": "FYS reel slide 19 '15 · Boot'. Snapshot of the live Demo playlist as of 2026-05-17 for parity audit. Mid-motion tick 0.5 catches motion-bearing layers (breathe/pulse/bounce/shake/ticker) at a non-zero phase. Not pre-fixed for any known divergences (word-wrap, atlas font-clamp, etc.) — this is the divergence catalog, not the fix."
         },
         {
@@ -507,7 +507,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000001",
             "to_uuid": "f0000000-0000-4000-8000-f15000000002",
             "transition_t": 0.5,
-            "golden": "fys_t01_wipe_free_to_your",
+            "golden": "parity_fys_t01_wipe_free_to_your",
             "purpose": "FYS reel transition 'wipe' from slide 1 '01 · FREE' to slide 2 '02 · YOUR' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -517,7 +517,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000002",
             "to_uuid": "f0000000-0000-4000-8000-f15000000003",
             "transition_t": 0.5,
-            "golden": "fys_t02_slide_your_to_sign",
+            "golden": "parity_fys_t02_slide_your_to_sign",
             "purpose": "FYS reel transition 'slide' from slide 2 '02 · YOUR' to slide 3 '03 · SIGN' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -527,7 +527,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000003",
             "to_uuid": "f0000000-0000-4000-8000-f15000000004",
             "transition_t": 0.5,
-            "golden": "fys_t03_fade_sign_to_the_sentence",
+            "golden": "parity_fys_t03_fade_sign_to_the_sentence",
             "purpose": "FYS reel transition 'fade' from slide 3 '03 · SIGN' to slide 4 '04 · The Sentence' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -537,7 +537,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000004",
             "to_uuid": "f0000000-0000-4000-8000-f15000000005",
             "transition_t": 0.5,
-            "golden": "fys_t04_cut_the_sentence_to_liberate",
+            "golden": "parity_fys_t04_cut_the_sentence_to_liberate",
             "purpose": "FYS reel transition 'cut' from slide 4 '04 · The Sentence' to slide 5 '05 · Liberate' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -547,7 +547,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000005",
             "to_uuid": "f0000000-0000-4000-8000-f15000000006",
             "transition_t": 0.5,
-            "golden": "fys_t05_push_liberate_to_uncage",
+            "golden": "parity_fys_t05_push_liberate_to_uncage",
             "purpose": "FYS reel transition 'push' from slide 5 '05 · Liberate' to slide 6 '06 · Uncage!!' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -557,7 +557,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000006",
             "to_uuid": "f0000000-0000-4000-8000-f15000000007",
             "transition_t": 0.5,
-            "golden": "fys_t06_flip_uncage_to_07a_typo_oops",
+            "golden": "parity_fys_t06_flip_uncage_to_07a_typo_oops",
             "purpose": "FYS reel transition 'flip' from slide 6 '06 · Uncage!!' to slide 7 '07a · Typo (oops)' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -567,7 +567,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000007",
             "to_uuid": "f0000000-0000-4000-8000-f15000000008",
             "transition_t": 0.5,
-            "golden": "fys_t07_cut_07a_typo_oops_to_07b_typo_mid_fix",
+            "golden": "parity_fys_t07_cut_07a_typo_oops_to_07b_typo_mid_fix",
             "purpose": "FYS reel transition 'cut' from slide 7 '07a · Typo (oops)' to slide 8 '07b · Typo (mid-fix)' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -577,7 +577,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000008",
             "to_uuid": "f0000000-0000-4000-8000-f15000000009",
             "transition_t": 0.5,
-            "golden": "fys_t08_cut_07b_typo_mid_fix_to_07c_typo_fixed",
+            "golden": "parity_fys_t08_cut_07b_typo_mid_fix_to_07c_typo_fixed",
             "purpose": "FYS reel transition 'cut' from slide 8 '07b · Typo (mid-fix)' to slide 9 '07c · Typo (fixed)' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -587,7 +587,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000009",
             "to_uuid": "f0000000-0000-4000-8000-f1500000000a",
             "transition_t": 0.5,
-            "golden": "fys_t09_shutter_07c_typo_fixed_to_tile_chaos",
+            "golden": "parity_fys_t09_shutter_07c_typo_fixed_to_tile_chaos",
             "purpose": "FYS reel transition 'shutter' from slide 9 '07c · Typo (fixed)' to slide 10 '08 · Tile Chaos' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -597,7 +597,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f1500000000a",
             "to_uuid": "f0000000-0000-4000-8000-f1500000000b",
             "transition_t": 0.5,
-            "golden": "fys_t10_pixelate_tile_chaos_to_chant_wall",
+            "golden": "parity_fys_t10_pixelate_tile_chaos_to_chant_wall",
             "purpose": "FYS reel transition 'pixelate' from slide 10 '08 · Tile Chaos' to slide 11 '09 · Chant Wall' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -607,7 +607,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f1500000000b",
             "to_uuid": "f0000000-0000-4000-8000-f1500000000c",
             "transition_t": 0.5,
-            "golden": "fys_t11_marquee_chant_wall_to_scream",
+            "golden": "parity_fys_t11_marquee_chant_wall_to_scream",
             "purpose": "FYS reel transition 'marquee' from slide 11 '09 · Chant Wall' to slide 12 '10 · Scream' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -617,7 +617,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f1500000000c",
             "to_uuid": "f0000000-0000-4000-8000-f1500000000d",
             "transition_t": 0.5,
-            "golden": "fys_t12_cut_scream_to_silence",
+            "golden": "parity_fys_t12_cut_scream_to_silence",
             "purpose": "FYS reel transition 'cut' from slide 12 '10 · Scream' to slide 13 '11 · Silence' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -627,7 +627,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f1500000000d",
             "to_uuid": "f0000000-0000-4000-8000-f1500000000e",
             "transition_t": 0.5,
-            "golden": "fys_t13_scanline_silence_to_stadium",
+            "golden": "parity_fys_t13_scanline_silence_to_stadium",
             "purpose": "FYS reel transition 'scanline' from slide 13 '11 · Silence' to slide 14 '12 · Stadium' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -637,7 +637,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f1500000000e",
             "to_uuid": "f0000000-0000-4000-8000-f1500000000f",
             "transition_t": 0.5,
-            "golden": "fys_t14_glitch_stadium_to_13a_panic_1",
+            "golden": "parity_fys_t14_glitch_stadium_to_13a_panic_1",
             "purpose": "FYS reel transition 'glitch' from slide 14 '12 · Stadium' to slide 15 '13a · Panic 1' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -647,7 +647,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f1500000000f",
             "to_uuid": "f0000000-0000-4000-8000-f15000000010",
             "transition_t": 0.5,
-            "golden": "fys_t15_cut_13a_panic_1_to_13b_panic_2",
+            "golden": "parity_fys_t15_cut_13a_panic_1_to_13b_panic_2",
             "purpose": "FYS reel transition 'cut' from slide 15 '13a · Panic 1' to slide 16 '13b · Panic 2' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -657,7 +657,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000010",
             "to_uuid": "f0000000-0000-4000-8000-f15000000011",
             "transition_t": 0.5,
-            "golden": "fys_t16_cut_13b_panic_2_to_13c_panic_3",
+            "golden": "parity_fys_t16_cut_13b_panic_2_to_13c_panic_3",
             "purpose": "FYS reel transition 'cut' from slide 16 '13b · Panic 2' to slide 17 '13c · Panic 3' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -667,7 +667,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000011",
             "to_uuid": "f0000000-0000-4000-8000-f15000000012",
             "transition_t": 0.5,
-            "golden": "fys_t17_iris_13c_panic_3_to_cooldown",
+            "golden": "parity_fys_t17_iris_13c_panic_3_to_cooldown",
             "purpose": "FYS reel transition 'iris' from slide 17 '13c · Panic 3' to slide 18 '14 · Cooldown' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         },
         {
@@ -677,7 +677,7 @@
             "from_uuid": "f0000000-0000-4000-8000-f15000000012",
             "to_uuid": "f0000000-0000-4000-8000-f15000000013",
             "transition_t": 0.5,
-            "golden": "fys_t18_scroll_cooldown_to_boot",
+            "golden": "parity_fys_t18_scroll_cooldown_to_boot",
             "purpose": "FYS reel transition 'scroll' from slide 18 '14 · Cooldown' to slide 19 '15 · Boot' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
         }
     ]
