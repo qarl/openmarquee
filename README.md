@@ -16,11 +16,12 @@ your SD card.
 
 ## Status
 
-**v0.5.0-beta** (commit 7457068, 2026-05-17). Release-candidate work
-in progress; first tagged GitHub release lands after the §11 soak
-gate fires and the operator quickstart docs land (sub-slices 4b/c/d
-+ slice 5 per
-[`qa/captures/phase-e-release-prep-recon-2026-05-17.md`](qa/captures/phase-e-release-prep-recon-2026-05-17.md)).
+**v0.6.0-beta** (DELETE-PIL purge, 2026-05-17). The Python rendering
+subsystem is gone; the Rust IPC sidecar at `renderer/` is the only
+production rendering path. Release-candidate work continues; first
+tagged GitHub release lands after the §11 soak gate fires and the
+operator quickstart docs land
+([`qa/captures/phase-e-release-prep-recon-2026-05-17.md`](qa/captures/phase-e-release-prep-recon-2026-05-17.md)).
 
 What works at HEAD:
 
@@ -68,17 +69,17 @@ access from anywhere at zero ongoing cost.
 - **Contributor docs:** [`docs/`](docs/).
 - **Public site:** [openmarquee.com](https://openmarquee.com).
 
-## What's NOT in v0.5.0-beta
+## What's NOT in v0.6.0-beta
 
 Honest list of gaps so nobody is surprised:
 
-- **HUB75 LED matrix output** — scaffolding present
-  (`backend/openmarquee/rendering/hub75.py`, 288 LOC), hardware-wire
-  path stubbed per spec §11. Functional on HDMI mode only at this
-  release.
-- **WS2812B LED strip output** — same shape as HUB75: scaffolding at
-  `backend/openmarquee/rendering/ws2812b.py` (211 LOC), hardware-wire
-  path stubbed.
+- **HUB75 LED matrix output** — not supported on HEAD. The Python
+  HUB75 renderer was deleted in the DELETE-PIL purge (2026-05-17);
+  the Rust IPC sidecar is HDMI-only at this release. Rust LED
+  outputs are planned for a follow-up arc.
+- **WS2812B LED strip output** — same shape as HUB75: Python
+  implementation deleted in the DELETE-PIL purge; awaiting Rust
+  port.
 - **Composite (NTSC/PAL) video output** — not implemented at this
   release. Post-v1 per the project plan.
 - **AI background generation** — runtime / on-demand generation

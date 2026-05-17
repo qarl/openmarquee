@@ -16,6 +16,64 @@ component locations for cross-ecosystem readability.
 
 ## [Unreleased]
 
+## [0.6.0-beta] — 2026-05-17
+
+### Removed — DELETE-PIL purge
+
+The Python rendering subsystem has been deleted. The Rust IPC
+sidecar (`renderer/`, binary `openmarquee-render`) is now the only
+production rendering path. Eight slice-commits landed in this purge:
+
+- `67cea75` DELETE-PIL 10a: HUB75 + WS2812B LED renderers
+  (`backend/openmarquee/rendering/{hub75,ws2812b}.py`, ~500 LOC).
+  LED output OFFLINE on HEAD until Rust LED ports land.
+- `70a4865` DELETE-PIL 10b: shader compositor + snapshot cache
+  (`shader_compositor.py` 1560 LOC + `snapshot.py` 446 LOC +
+  playback.py shader/snapshot path, ~3200 LOC total). Shader
+  transitions OFFLINE; PIL fallback transitions still render the
+  same visual at ~10 fps instead of 30.
+- `b320dfd` DELETE-PIL 10c: multi-plane GPU compositor
+  (`gpu_compositor.py` 901 LOC + playback.py GPU dispatch path,
+  ~2200 LOC total). DRMRenderer slides fall through to PIL
+  software path.
+- `53b5c30` DELETE-PIL 10d: DRMRenderer + DRM/KMS Python primitives
+  (`drm_kms.py` 2073 LOC + dependencies.py rework, ~2350 LOC).
+  Production now routes through the Rust IPC sidecar by default.
+- `6b3ee6a` DELETE-PIL 10e: HDMI framebuffer + composite renderers
+  (`hdmi.py` 268 LOC + `composite.py` 81 LOC + tests, 797 LOC total).
+- `fb47da5` DELETE-PIL 10f: PIL strip from MockRenderer via
+  stdlib zlib PNG encoder. Live-preview dev path preserved.
+- `b3bf9c6` DELETE-PIL 10g: blend.py + motion.py blend code path
+  (198 + 168 LOC). Non-normal blend modes degrade to
+  `alpha_composite` on the dev/CI software path; Rust IPC sidecar
+  handles them natively on production.
+- `adea339` DELETE-PIL 10h: settings.py / api_system.py / flock.py
+  LED-mode scrub. `OutputMode` Literal collapsed to `["hdmi"]`;
+  legacy on-disk `output_mode in {"hub75", "ws281x", "composite"}`
+  values coerce silently to "hdmi" on settings load.
+
+**Cumulative deletion:** ~10000 LOC of Python rendering subsystem
+removed. The PyOpenGL dependency is gone.
+
+### Deferred to next arc
+
+- playback.py PIL fallback paths (`_play_dynamic_slide_software`,
+  `_safe_load_image`, `_render_image`, transition methods).
+- MockRenderer IPC-shape conversion.
+- bake.py `compose_motion_frame` PIL usage.
+- These three lift together once MockRenderer adopts the IPC ops
+  contract; doing the playback teardown without it would break
+  the dev/CI fallback path.
+
+### Docs
+
+- `docs/historical/` directory created. Moved superseded design
+  docs (shader compositor, multi-plane GPU compositor, original
+  Phase 1 plan + spike data + status log) under it.
+- README, docs/README, renderer-rewrite-plan-rust, renderer-rewrite-
+  requirements, phase-7-as-built-2026-05-14 updated with DELETE-PIL
+  banners pointing at the historical archive.
+
 ## [0.5.0-beta] — 2026-05-17
 
 First tagged release. Tag fires after slice 4 (README rewrite) +

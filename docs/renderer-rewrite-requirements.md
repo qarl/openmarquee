@@ -1,12 +1,16 @@
 # Renderer Rewrite — Requirements
 
-**Status:** draft, awaiting qarl review.
-**Audience:** the agent that will design and implement the new renderer
-from a clean slate.
-**Goal:** capture *what* the renderer must do. Not *how*. The
-implementing agent owns architecture, data structures, IPC, scheduling,
-and buffer management. They are free to ignore every line of code under
-`backend/openmarquee/rendering/` and start over.
+**Status:** SHIPPED via the Rust IPC sidecar (`renderer/`). The
+DELETE-PIL purge (2026-05-17) deleted every Python renderer this
+doc described as "to be replaced"; the requirements captured here
+are still the contract the Rust sidecar implements.
+**Audience:** the agent reading this for the rendering contract.
+**Goal:** capture *what* the renderer must do. Not *how*. References
+below to deleted Python modules (HUB75Renderer, WS2812BRenderer,
+ShaderRenderer, CompositeRenderer, DRMRenderer, GPUSlideCompositor,
+shader_compositor.py, hub75.py, ws2812b.py) describe the legacy
+implementation set this rewrite replaced; they no longer exist
+under `backend/openmarquee/rendering/`.
 
 ---
 

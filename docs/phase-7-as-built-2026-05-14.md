@@ -1,11 +1,17 @@
 # Phase 7 as-built — 2026-05-14
 
+**Post-DELETE-PIL note (2026-05-17):** the PIL-side comparison points
+in this doc (PIL GPUSlideCompositor baseline, DRMRenderer dispatch
+diagram, OPENMARQUEE_RENDERER=drm route) reference the Python
+rendering subsystem that was deleted in the DELETE-PIL purge (commits
+67cea75..adea339). The Rust sidecar described here is now the only
+rendering path. The diagrams + comparisons below are preserved as a
+2026-05-14 architectural snapshot.
+
 Snapshot of the Rust IPC sidecar architecture **as it actually shipped**
 through the night of 2026-05-13 → 2026-05-14. Complements (does not
 replace) `docs/renderer-rewrite-plan-rust.md`, which is the
-forward-looking spec. Where the two disagree, this doc reflects the
-code; the spec has drifted in places that are now load-bearing
-(see §3).
+forward-looking spec.
 
 Audience: a future maintainer (or qarl, when picking up the slice 4
 design call) who needs the current state without reverse-engineering

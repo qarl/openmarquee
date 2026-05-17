@@ -1,8 +1,14 @@
 # Renderer Rewrite — Rust Implementation Plan
 
-**Status:** draft, awaiting qarl review.
-**Companion to:** `renderer-rewrite-requirements.md` (spec) and `renderer-rewrite-plan.md` (prior Python plan, superseded).
-**Grounded in:** `renderer-rewrite-spike-data.md` (measured, 2026-05-06).
+**Status:** core rewrite SHIPPED (DELETE-PIL purge, 2026-05-17,
+commits 67cea75..adea339). The Python rendering subsystem is gone;
+the Rust IPC sidecar at `renderer/` is the only production renderer.
+Forward-looking sections of this doc (Step 8 HUB75/WS2812B reach,
+Step 10 multi-renderer dispatch) describe work for a follow-up arc.
+**Companion to:** `renderer-rewrite-requirements.md` (spec). Prior
+Python plan is at `historical/renderer-rewrite-plan.md`.
+**Grounded in:** `historical/renderer-rewrite-spike-data.md`
+(measured, 2026-05-06).
 
 > **Plan vs reality.** This doc is forward-looking. The empirical
 > state of Phase 7 as actually shipped lives at
