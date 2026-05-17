@@ -249,27 +249,35 @@ pub fn wrap_text_to_width(
             out_lines.push(String::new());
             continue;
         }
-        let mut line_text = String::new();
+        // 2026-05-17 leading-whitespace fix: JS uses `line.length === 0`
+        // to decide "first token of a line". The earlier `line_text
+        // .is_empty()` check matched on STRING contents, so an empty
+        // first token (from leading whitespace producing `""` in
+        // `split(" ")`) re-fired the first-token branch on every
+        // subsequent empty token, swallowing the space separators
+        // and stripping leading whitespace. Tokens go into a Vec so
+        // `.is_empty()` is the equivalent of `line.length === 0`.
+        let mut line: Vec<&str> = Vec::new();
         let mut line_w = 0.0_f32;
         for word in paragraph.split(' ') {
             let word_w = measure_word(word);
-            if line_text.is_empty() {
-                line_text.push_str(word);
+            if line.is_empty() {
+                line.push(word);
                 line_w = word_w;
                 continue;
             }
             let candidate_w = line_w + space_w + word_w;
             if candidate_w > max_width_px {
-                out_lines.push(std::mem::take(&mut line_text));
-                line_text.push_str(word);
+                out_lines.push(line.join(" "));
+                line.clear();
+                line.push(word);
                 line_w = word_w;
             } else {
-                line_text.push(' ');
-                line_text.push_str(word);
+                line.push(word);
                 line_w = candidate_w;
             }
         }
-        out_lines.push(line_text);
+        out_lines.push(line.join(" "));
     }
     out_lines.join("\n")
 }
@@ -8755,6 +8763,73 @@ mod tests {
             max_w,
         );
         assert_eq!(wrapped, "say what you mean. mean\nwhat you say.");
+    }
+
+    #[test]
+    fn wrap_preserves_leading_whitespace_on_hardbreak_segments() {
+        // 2026-05-17 bug fix: the Boot slide (seed.py:_BOOT_LOG_TEXT)
+        // uses "  " indent on lines 2-6 to format the boot log
+        // output. The first wrap port stripped those leading spaces
+        // because the inner is_empty() check treated the empty
+        // token from leading-whitespace tokenization as a "first
+        // word". Mirror JS: empty tokens stay in the line so the
+        // final join(" ") reconstructs the leading spaces.
+        let font = load_anton();
+        // Wide enough that no segment wraps further — pure hard-break
+        // preservation test.
+        let max_w = measure(&font, "  ok foo bar baz", 64.0) + 200.0;
+        let wrapped = wrap_text_to_width(&font, "a\n  b", 64.0, max_w);
+        assert_eq!(wrapped, "a\n  b");
+    }
+
+    #[test]
+    fn wrap_preserves_leading_whitespace_through_wrap() {
+        // Leading whitespace on the FIRST line stays attached even
+        // when the same segment also wraps. Subsequent wrapped lines
+        // start at the left edge (no leading whitespace inherited).
+        // Matches the JS algorithm — line.join(" ") rebuilds with
+        // whatever tokens accumulated, and a wrap-break starts the
+        // new line with just the breaking token.
+        let font = load_anton();
+        // Pick max_w so the first line fits "  hello world" and the
+        // next "foo bar baz" wraps onto a second line. measure() of
+        // "  hello world" + a sliver of "foo" overflows; before
+        // "foo" we break.
+        let first = "  hello world";
+        let space_w = font.metrics(' ', 64.0).advance_width.round();
+        let foo_w = measure(&font, "foo", 64.0);
+        let max_w = measure(&font, first, 64.0) + space_w + foo_w * 0.5;
+        let wrapped =
+            wrap_text_to_width(&font, "  hello world foo bar baz", 64.0, max_w);
+        // First line keeps the leading "  "; second line starts
+        // flush-left at "foo" (no inherited indent).
+        assert_eq!(wrapped, "  hello world\nfoo bar baz");
+    }
+
+    #[test]
+    fn wrap_empty_paragraph_between_non_empty_preserves_leading_whitespace() {
+        // Confirms that a blank paragraph between non-empty paragraphs
+        // doesn't bleed state across the hard breaks. The per-paragraph
+        // `let mut line = Vec::new()` resets between paragraphs so the
+        // leading "  " on "  b" still survives.
+        let font = load_anton();
+        let max_w = measure(&font, "  b", 64.0) + 200.0;
+        let wrapped = wrap_text_to_width(&font, "a\n\n  b", 64.0, max_w);
+        assert_eq!(wrapped, "a\n\n  b");
+    }
+
+    #[test]
+    fn wrap_preserves_internal_consecutive_spaces() {
+        // Double spaces inside a paragraph (e.g. "  ok" after the
+        // dot column in the Boot slide) survive wrap. JS' empty-token
+        // tokenization produces ["", "ok"] for "  ok", and the
+        // join(" ") puts them back together as " " + " " + "ok" =
+        // "  ok".
+        let font = load_anton();
+        let max_w = measure(&font, "panel-0 . . . . . . . .  ok", 64.0) + 100.0;
+        let wrapped =
+            wrap_text_to_width(&font, "panel-0 . . . . . . . .  ok", 64.0, max_w);
+        assert_eq!(wrapped, "panel-0 . . . . . . . .  ok");
     }
 
     #[test]
