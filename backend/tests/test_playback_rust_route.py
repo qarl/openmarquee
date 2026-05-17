@@ -328,12 +328,12 @@ async def test_video_slide_unsupported_logs_and_advances(caplog):
 # ============================================================
 
 
-def test_non_ipc_renderer_dispatch_gate_evaluates_false(tmp_path):
-    """Regression guard: when the renderer doesn't expose begin_slide
-    + advance, the dispatch gate evaluates False so the loop stays
-    on the existing PIL path. MockRenderer is the canonical non-IPC
-    renderer (its Protocol surface is just width/height/render_frame).
-    """
+def test_mock_renderer_is_ipc_shaped_post_delete_pil(tmp_path):
+    """DELETE-PIL slice 11: MockRenderer was converted to satisfy the
+    same IPC ops contract as RustRenderer / AutoFallbackRenderer. The
+    dispatch gate evaluates True now -- the playback loop routes mock
+    through `_play_via_rust_ipc` instead of the (about to be deleted)
+    PIL `_play_dynamic_slide_software` fork."""
     mock = MockRenderer(8, 8, tmp_path / "out.png")
     loop = PlaybackLoop(
         mock,
@@ -341,11 +341,98 @@ def test_non_ipc_renderer_dispatch_gate_evaluates_false(tmp_path):
         read_asset=lambda _id: b"",
         empty_playlist_poll_seconds=0.01,
     )
-    # The gate is the only thing that decides which route runs.
-    assert loop._renderer_supports_ipc_ops() is False
-    # MockRenderer really doesn't have these attrs (sanity).
-    assert not hasattr(mock, "begin_slide")
-    assert not hasattr(mock, "advance")
+    assert loop._renderer_supports_ipc_ops() is True
+    assert hasattr(mock, "begin_slide")
+    assert hasattr(mock, "advance")
+    assert hasattr(mock, "begin_transition")
+    assert hasattr(mock, "capture")
+
+
+def test_mock_renderer_advance_returns_canonical_ipc_dataclasses(tmp_path):
+    """Regression guard against the slice-11 review-flagged isinstance
+    bug. MockRenderer.advance() MUST return instances of the canonical
+    PaintSlide / PaintTransition / SlideComplete / Idle dataclasses
+    from rust_renderer -- not local re-declarations. playback.py's
+    `isinstance(result, SlideComplete)` and
+    `isinstance(result, PaintTransition)` checks rely on class identity;
+    a local re-declaration with the same field shape silently fails the
+    isinstance check and misroutes transitions to instant cuts."""
+    import uuid
+
+    mock = MockRenderer(8, 8, tmp_path / "out.png")
+    with mock:
+        sid = uuid.uuid4()
+        mock.begin_slide(sid, 0, 1000)
+        # Mid-slide: PaintSlide.
+        result = mock.advance(500)
+        assert isinstance(result, PaintSlide), (
+            f"mid-slide must return canonical PaintSlide, got {type(result)}"
+        )
+        # End-of-slide: SlideComplete.
+        result = mock.advance(1500)
+        assert isinstance(result, SlideComplete), (
+            f"end-of-slide must return canonical SlideComplete, got {type(result)}"
+        )
+
+        # Transition window: PaintTransition.
+        sid2 = uuid.uuid4()
+        mock.begin_transition(sid2, 2000, "fade", 500, 1500)
+        result = mock.advance(1700)
+        assert isinstance(result, PaintTransition), (
+            f"mid-transition must return canonical PaintTransition, "
+            f"got {type(result)}"
+        )
+        # Post-transition: promoted PaintSlide.
+        result = mock.advance(2100)
+        assert isinstance(result, PaintSlide), (
+            f"post-transition must return canonical PaintSlide, got {type(result)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_mock_renderer_drives_transition_via_playback_loop(tmp_path):
+    """End-to-end: PlaybackLoop drives MockRenderer through a fade
+    transition between two slides. Asserts begin_transition fires AND
+    advance is called multiple times during the transition window
+    (would-be-zero if the canonical-class isinstance check misfires
+    and the transition collapses to a cut on the first tick)."""
+    from openmarquee.content import TextLayer, TextSlide
+
+    mock = MockRenderer(8, 8, tmp_path / "out.png")
+    slide_a = TextSlide(
+        name="A",
+        text_layers=[TextLayer(text="A")],
+        duration_ms=100,
+        transition="fade",
+        transition_ms=200,
+    )
+    slide_b = TextSlide(
+        name="B",
+        text_layers=[TextLayer(text="B")],
+        duration_ms=100,
+        transition="fade",
+        transition_ms=200,
+    )
+    loop = PlaybackLoop(
+        mock,
+        fetch_items=lambda: [slide_a, slide_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+    )
+    await loop.start()
+    # 100ms A + 200ms fade + 100ms B + 200ms fade + slack.
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    # The loop drove both slides.
+    assert any(c[0] == slide_a.id for c in mock.begin_slide_calls)
+    assert any(c[0] == slide_b.id for c in mock.begin_slide_calls)
+    # The loop drove at least one transition window.
+    assert len(mock.begin_transition_calls) >= 1
+    # Advance was called multiple times during each transition window.
+    # If the isinstance check misfired the transition loop would break
+    # on the very first tick.
+    assert len(mock.advance_calls) > len(mock.begin_slide_calls)
 
 
 def test_ipc_renderer_dispatch_gate_evaluates_true():

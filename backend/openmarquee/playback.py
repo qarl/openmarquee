@@ -608,13 +608,15 @@ class PlaybackLoop:
         self._resume_event.set()
 
     def _renderer_supports_ipc_ops(self) -> bool:
-        """True when the injected renderer drives the Rust IPC sidecar
-        (RustRenderer or AutoFallbackRenderer wrapping one).
+        """True when the injected renderer satisfies the IPC ops
+        contract (begin_slide + advance + begin_transition + capture).
 
-        Gates the slice-4 Rust route. Duck-typed on `begin_slide` +
-        `advance` so a test stub doesn't need to be a real RustRenderer
-        subclass. False for MockRenderer -- that path stays on the
-        existing PIL hot path."""
+        Gates the IPC route. Duck-typed on `begin_slide` + `advance`
+        so a test stub doesn't need to be a real RustRenderer
+        subclass. Returns True for RustRenderer, AutoFallbackRenderer,
+        and MockRenderer (DELETE-PIL slice 11 converted MockRenderer
+        to the IPC shape so playback can route mock through the same
+        rails as production)."""
         return (
             hasattr(self._renderer, "begin_slide")
             and hasattr(self._renderer, "advance")
