@@ -11,10 +11,41 @@ takes effect without a restart). Rotation-aware via `get_dims`: the
 caller decides whether portrait rotations swap dims, not this module.
 """
 
+import struct
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 
-from PIL import Image
+
+def _encode_png_rgb(width: int, height: int, rgb_bytes: bytes) -> bytes:
+    """Encode width*height*3 RGB888 bytes to a PNG byte string.
+
+    Pure-stdlib (struct + zlib). Replaces the prior PIL.Image.save
+    dependency so this module no longer pulls in PIL — the Rust IPC
+    sidecar owns all real rendering on production; MockRenderer's PNG
+    output is just a serialization step for the dev live-preview page.
+    """
+    def chunk(name: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + name
+            + data
+            + struct.pack(">I", zlib.crc32(name + data) & 0xFFFFFFFF)
+        )
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = chunk(
+        b"IHDR",
+        struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0),
+    )
+    row_stride = width * 3
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # filter type: None
+        raw.extend(rgb_bytes[y * row_stride : (y + 1) * row_stride])
+    idat = chunk(b"IDAT", zlib.compress(bytes(raw)))
+    iend = chunk(b"IEND", b"")
+    return signature + ihdr + idat + iend
 
 
 class MockRenderer:
@@ -79,5 +110,4 @@ class MockRenderer:
             )
         self.last_frame = frame
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        image = Image.frombytes("RGB", (width, height), frame)
-        image.save(self.output_path, "PNG")
+        self.output_path.write_bytes(_encode_png_rgb(width, height, frame))
