@@ -382,6 +382,29 @@ class PlaybackLoop:
                     "failed; falling back to lazy init at first transition",
                 )
         self._task = asyncio.create_task(self._loop())
+        # 2026-05-17 frozen-sign incident on 192.168.1.67: an unhandled
+        # exception inside _loop() silently killed the playback task,
+        # leaving the sign on the boot slide with ZERO log surface.
+        # asyncio.create_task swallows exceptions until the task is
+        # awaited or GC'd. Surface them at task-done time so future
+        # crashes hit journalctl instead of freezing the sign blind.
+        self._task.add_done_callback(self._on_loop_task_done)
+
+    @staticmethod
+    def _on_loop_task_done(task: "asyncio.Task[None]") -> None:
+        """Surface _loop task exceptions via the logger. Without this,
+        a silent crash leaves the sign frozen with no diagnostic
+        breadcrumb. Cancellation is the normal stop path (stop() awaits
+        the task after setting _stop_event), so log it at INFO only."""
+        if task.cancelled():
+            log.info("playback: _loop task cancelled (normal stop path)")
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error(
+                "playback: _loop task crashed -- sign will be frozen "
+                "until restart. Cause: %r", exc, exc_info=exc,
+            )
 
     async def stop(self) -> None:
         """Signal the loop to stop and wait for it to exit. No-op if not running."""
@@ -712,12 +735,38 @@ class PlaybackLoop:
                     next_for_transition = (
                         items[(i + 1) % len(items)] if len(items) > 1 else None
                     )
-                    rendered = await self._play_via_rust_ipc(
-                        item,
-                        next_item=next_for_transition,
-                        transition_kind=(item.transition or "cut"),
-                        transition_ms=int(item.transition_ms or 0),
-                    )
+                    # 2026-05-17 frozen-sign guard. The TODO at
+                    # _play_via_rust_ipc's docstring (L1004) flagged
+                    # that RustRendererRespawnedError /
+                    # AutoFallbackInMockError / generally any non-
+                    # Unsupported* IPC error propagates uncaught and
+                    # kills the outer _loop. That's exactly what
+                    # happened on 192.168.1.67: slide 0 begin_slide
+                    # fired, an advance op (or its response) blew up,
+                    # the task died silently, sign stayed frozen on
+                    # boot slide for 10+ min with zero log surface.
+                    # Catch broadly here so a single-slide IPC fault
+                    # doesn't take the whole sign down; log full
+                    # traceback so the journal carries the diagnosis.
+                    try:
+                        rendered = await self._play_via_rust_ipc(
+                            item,
+                            next_item=next_for_transition,
+                            transition_kind=(item.transition or "cut"),
+                            transition_ms=int(item.transition_ms or 0),
+                        )
+                    except Exception:
+                        log.exception(
+                            "playback: IPC playback failed for slide "
+                            "id=%s type=%s; advancing to next item",
+                            item.id, item.type,
+                        )
+                        # Brief settle so a hot-loop of failing slides
+                        # doesn't burn CPU. 250ms is short enough that
+                        # one bad slide adds barely-visible delay,
+                        # long enough to avoid a tight crash-loop.
+                        await self._wait(0.25)
+                        continue
                     if self._stop_event.is_set():
                         break
                     if self._pause_event.is_set():
