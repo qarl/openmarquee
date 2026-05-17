@@ -2103,14 +2103,15 @@ void main() {
 ///     BT.601 math. (Compared to FS_NV12_TO_RGB which samples two
 ///     separate Y + UV textures and does the matrix in-shader.)
 ///
-/// **Documented assumption to verify in piece 4e:** on the Pi 4
-/// dev board's vc4 + Mesa stack, color output from this shader
-/// matches FS_NV12_TO_RGB output side-by-side. If the on-Pi smoke
-/// shows a color cast or wrong range (e.g. dark-shadow elevated),
-/// fall back to manually applying the BT.601 transform on the
-/// .r/.g/.b channels here. Most BT.601-tagged EGLImages on Mesa
-/// hit the driver fast-path correctly; a known regression vector
-/// is when the V4L2 quantization metadata is missing or mis-set.
+/// **Verified in piece 4e (2026-05-14, qa/captures/v4l2-piece4e-
+/// dmabuf-smoke-2026-05-14.md):** on the Pi dev board's vc4 + Mesa
+/// stack, color output from this shader matches FS_NV12_TO_RGB
+/// side-by-side. Mesa hit the BT.601 fast-path correctly; no
+/// fallback to manual BT.601 transform was needed. (A known
+/// regression vector remains: if V4L2 quantization metadata is
+/// missing or mis-set on a future codec or content rotation, a
+/// color cast may resurface; the manual-BT.601 fallback in
+/// .r/.g/.b stays a viable forward-fix shape.)
 ///
 /// Extension requirements (checked at runtime in piece 4c):
 ///   - EGL: `EGL_EXT_image_dma_buf_import`

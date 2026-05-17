@@ -71,10 +71,11 @@ use crate::Card;
 // note for the shader infrastructure that text glyphs + remaining
 // patterns will build on):
 //
-//   * Shader sources: inline raw strings for now. Phase 4.1b ships
-//     ONE fragment shader (gradient) so a `shaders/` dir +
-//     include_str! is premature. Move to a directory when the
-//     count grows past ~3.
+//   * Shader sources: inline raw strings (36 `pub const FS_*` in
+//     hdmi_logic.rs as of 2026-05-17). The original threshold for
+//     moving to a `shaders/` dir + include_str! was ~3; that's been
+//     blown past 12× without action, but the inline-string pattern
+//     has held — revisit only if grep-discovery starts breaking.
 //   * Uniform passing: individual glow `uniform_*` calls. UBOs are
 //     GLES3-only; vc4 only exposes GLES2. No alternative.
 //   * Vertex shader: ONE shared shader for all bg-pattern + future
@@ -960,11 +961,12 @@ fn end_of_in_session_render_call(
 /// `effective_hold_secs`'s `/1000` truncation.
 ///
 /// v1-spec-delta #5 (slice a, 2026-05-08): the EGL/GBM bring-up
-/// + teardown is now extracted into `with_egl_session`. This
-/// function still does its own session per call (no behavior
-/// change vs slice 0); slice (b)+ will let the reel driver hold
-/// one session across the slide loop and skip the ~500 ms
-/// bring-up cost per slide.
+/// + teardown is extracted into `with_egl_session`. This function
+/// still does its own session per call (diagnostic-only path now);
+/// the IPC sidecar's `hdmi::run_in_egl_session` closure at
+/// ipc_main.rs:688 holds one session across all Advance ops in
+/// the production reel path, which closed out the "skip the ~500 ms
+/// bring-up cost per slide" goal originally framed as slice (b)+.
 ///
 /// Phase 4.1c — extracted from `render_solid_color` and the
 /// (then-public) gradient-render path now that we have two callers.
@@ -4629,18 +4631,15 @@ unsafe fn bake_image_slide_to_current_fbo(
 /// always silent for the total/swap_commit line).
 ///
 /// Decoder state. Per-call feeds ONE sample (if any remain) and
-/// drains ONE frame (with a 5×2ms EAGAIN retry budget). The
-/// caller chooses cadence:
-///   - Per-Advance (hold-path video paint, today): video plays.
-///   - Once-per-transition (Phase 8 slice 4, planned): video
-///     freezes at transition start, destination starts from its
-///     first frame at transition end (Option C in the slice 0
-///     recon doc).
+/// drains ONE frame (with a 5×2ms EAGAIN retry budget). Callers:
+///   - Per-Advance hold-path video paint: video plays.
+///   - Phase 8 slice 6 (2026-05-16, 1c61747) transition path:
+///     video drains one V4L2 sample per Advance through the
+///     transition window (Option D play-through; see hdmi.rs
+///     L2966 for the dispatcher-level documentation).
 /// The phase 4v-3b "motion through transitions must keep advancing"
 /// rule applies to TEXT motion phase, not to video frame cadence;
-/// for video, the frame IS the motion and Option C vs Option D
-/// (snapshot-at-start vs play-through) is a separate semantic
-/// choice for slice 4.
+/// slice 6's Option D choice extends the same principle to video.
 ///
 /// Profile timing. When OPENMARQUEE_FIRSTFRAME_PROFILE=1 AND the
 /// (next_sample_idx, frames_decoded) pair matches the first-frame
@@ -5091,25 +5090,25 @@ unsafe fn create_slide_fbo_pair(
 ///   - `SlideBakeInputs::Video` (Linux only) →
 ///     `create_slide_fbo_pair` + `bake_video_slide_to_current_fbo`.
 ///     A `Ok(None)` from the video helper (no frame ready this
-///     tick) maps to an `Err` here — for the transition path
-///     slice 4 will route through, a "no frame ready" snapshot
-///     can't be honored as a transition input. Caller decides how
-///     to handle the error (retry, FS_CUT fallback, etc.).
+///     tick) maps to an `Err` here — the slice-4-wired transition
+///     path can't honor a "no frame ready" snapshot as a transition
+///     input. The Err propagates up to the IPC PaintTransition
+///     handler at the call site.
 ///
 /// Caller is responsible for `delete_framebuffer` + `delete_texture`
 /// on the returned pair after sampling. On any kind-specific
 /// failure, all resources are freed before propagating Err.
 ///
-/// Slice 3 introduces the dispatcher; NO caller is updated to
-/// use it this slice. Slice 4 wires it into
-/// `paint_and_present_one_transition_frame` so the IPC
-/// PaintTransition path stops hardcoding `slide_a: &TextSlide`.
+/// Slice 3 introduced the dispatcher; slice 4 (4dcc7b2, 2026-05-16)
+/// wired it into `paint_and_present_one_transition_frame` so the
+/// IPC PaintTransition path no longer hardcodes `slide_a:
+/// &TextSlide`.
 ///
 /// Per `feedback_motion_through_transitions_required`: motion
 /// states for text endpoints flow through the Text variant. Image
 /// and Video have no per-layer-motion analog (image is static;
-/// video frame IS the motion, and slice 4's caller cadence
-/// decides Option C vs D per slice 0 recon).
+/// video frame IS the motion, and slice 6 chose Option D play-
+/// through per the slice 0 recon — see hdmi.rs L2966).
 ///
 unsafe fn bake_slide_to_fbo(
     session: &mut EglSession,
@@ -5206,9 +5205,10 @@ unsafe fn bake_slide_to_fbo(
                     // viewport+clear lives INSIDE the DmaBuf/MMAP
                     // path, after the no-frame early-return, and
                     // never ran. Free the pair and propagate an
-                    // explicit error so the transition-path caller
-                    // in slice 4 can decide between retry and
-                    // FS_CUT fallback.
+                    // explicit error; the slice-4-wired transition
+                    // caller (paint_and_present_one_transition_
+                    // frame) propagates the Err via `?` up to the
+                    // IPC PaintTransition handler.
                     session.gl.delete_framebuffer(fbo);
                     session.gl.delete_texture(tex);
                     Err(anyhow!(
@@ -5321,9 +5321,12 @@ pub fn render_fade_composite(
         use glow::HasContext;
         unsafe {
             // -- Render each slide into its own FBO.
-            // Phase 4v-3b: render_fade_composite remains a static-snapshot
-            // bake (motion_states=None); parked for 4w alongside the other
-            // legacy bake sites. See audit doc 2026-05-16.
+            // Phase 4v-3b: render_fade_composite intentionally passes
+            // motion_states=None — it's a single-frame composite with no
+            // per-frame loop, so a static-snapshot bake is correct here.
+            // Phase 4w (831f471, 2026-05-16) audit confirmed this site
+            // needs no change (the legacy 3-pass path was already
+            // motion-correct since 2b0cbef).
             let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None, None)?;
             let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None, None) {
                 Ok(pair) => pair,
