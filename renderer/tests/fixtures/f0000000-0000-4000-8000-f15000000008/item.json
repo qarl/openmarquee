@@ -1,0 +1,75 @@
+{
+  "schema_version": 3,
+  "updated_at": "2026-05-16T17:18:14.545456+00:00",
+  "item": {
+    "type": "text_slide",
+    "id": "f0000000-0000-4000-8000-f15000000008",
+    "name": "07b · Typo (mid-fix)",
+    "duration_ms": 350,
+    "text_layers": [
+      {
+        "text": "FREE YOUR S?IN!!",
+        "name": "",
+        "font_family": "Bowlby One SC",
+        "font_size_px": null,
+        "font_size_pct": 14.0,
+        "weight": null,
+        "text_color": "#FFFFFF",
+        "text_align": "center",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "pulse",
+        "motion_intensity": 80,
+        "motion_phase": 0.0,
+        "motion_speed": 1.4,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.05,
+          "y": 0.25,
+          "w": 0.9,
+          "h": 0.45
+        }
+      },
+      {
+        "text": "// fixing...",
+        "name": "",
+        "font_family": "VT323",
+        "font_size_px": null,
+        "font_size_pct": 5.0,
+        "weight": null,
+        "text_color": "#5AF095",
+        "text_align": "left",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.1,
+          "y": 0.78,
+          "w": 0.8,
+          "h": 0.1
+        }
+      }
+    ],
+    "background_color": "#050608",
+    "background_image_slide_id": null,
+    "background_video_slide_id": null,
+    "background_pattern": null,
+    "transition": "cut",
+    "transition_ms": 500,
+    "created_at": "2026-05-16T17:18:14.544823Z"
+  }
+}

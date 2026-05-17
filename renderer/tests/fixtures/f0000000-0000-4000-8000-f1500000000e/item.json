@@ -1,0 +1,103 @@
+{
+  "schema_version": 3,
+  "updated_at": "2026-05-16T17:18:14.613771+00:00",
+  "item": {
+    "type": "text_slide",
+    "id": "f0000000-0000-4000-8000-f1500000000e",
+    "name": "12 · Stadium",
+    "duration_ms": 2100,
+    "text_layers": [
+      {
+        "text": "> chant.start()",
+        "name": "",
+        "font_family": "JetBrains Mono",
+        "font_size_px": null,
+        "font_size_pct": 5.0,
+        "weight": null,
+        "text_color": "#7A5418",
+        "text_align": "left",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.1,
+          "y": 0.18,
+          "w": 0.8,
+          "h": 0.1
+        }
+      },
+      {
+        "text": "FREE YOUR SIGN_",
+        "name": "",
+        "font_family": "JetBrains Mono",
+        "font_size_px": null,
+        "font_size_pct": 8.0,
+        "weight": null,
+        "text_color": "#FFB43C",
+        "text_align": "center",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.0555,
+          "y": 0.3298,
+          "w": 0.9,
+          "h": 0.3418
+        }
+      },
+      {
+        "text": "free your sign",
+        "name": "",
+        "font_family": "Bowlby One SC",
+        "font_size_px": null,
+        "font_size_pct": 8.0,
+        "weight": null,
+        "text_color": "#FFFFFF",
+        "text_align": "center",
+        "outline": false,
+        "opacity": 0.4,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "ticker",
+        "motion_intensity": 60,
+        "motion_phase": 0.0,
+        "motion_speed": 1.4,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.05,
+          "y": 0.7,
+          "w": 0.9,
+          "h": 0.18
+        }
+      }
+    ],
+    "background_color": "#050608",
+    "background_image_slide_id": null,
+    "background_video_slide_id": null,
+    "background_pattern": null,
+    "transition": "cut",
+    "transition_ms": 500,
+    "created_at": "2026-05-16T17:18:14.613038Z"
+  }
+}

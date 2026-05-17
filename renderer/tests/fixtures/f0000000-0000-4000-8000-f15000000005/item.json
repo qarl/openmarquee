@@ -1,0 +1,75 @@
+{
+  "schema_version": 3,
+  "updated_at": "2026-05-16T17:18:14.511377+00:00",
+  "item": {
+    "type": "text_slide",
+    "id": "f0000000-0000-4000-8000-f15000000005",
+    "name": "05 · Liberate",
+    "duration_ms": 1400,
+    "text_layers": [
+      {
+        "text": "// thesaurus.next()",
+        "name": "",
+        "font_family": "VT323",
+        "font_size_px": null,
+        "font_size_pct": 4.0,
+        "weight": null,
+        "text_color": "#7A6A4E",
+        "text_align": "left",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.1,
+          "y": 0.15,
+          "w": 0.8,
+          "h": 0.1
+        }
+      },
+      {
+        "text": "Liberate\nyour sign.",
+        "name": "",
+        "font_family": "Playfair Display",
+        "font_size_px": null,
+        "font_size_pct": 16.0,
+        "weight": null,
+        "text_color": "#1A1610",
+        "text_align": "center",
+        "outline": false,
+        "opacity": 1.0,
+        "anchor": "center",
+        "visible": true,
+        "locked": false,
+        "motion": "static",
+        "motion_intensity": 50,
+        "motion_phase": 0.0,
+        "motion_speed": 1.0,
+        "blend": "normal",
+        "auto_mode": null,
+        "auto_format": null,
+        "box": {
+          "x": 0.05,
+          "y": 0.27,
+          "w": 0.9,
+          "h": 0.6
+        }
+      }
+    ],
+    "background_color": "#FBF3DC",
+    "background_image_slide_id": null,
+    "background_video_slide_id": null,
+    "background_pattern": null,
+    "transition": "cut",
+    "transition_ms": 500,
+    "created_at": "2026-05-16T17:18:14.510725Z"
+  }
+}
