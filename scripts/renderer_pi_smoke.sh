@@ -1248,22 +1248,39 @@ fi
 # proves the slope-test machinery works end-to-end. Operators
 # bump SMOKE_SOAK_DURATION_SECS or call scripts/renderer_pi_soak.
 # sh directly for the long-form §8.2 acceptance test.
-echo "==> Phase d-smoke -- soak gate (short ~4min slope test)"
-SMOKE_SOAK_DURATION_SECS="${SMOKE_SOAK_DURATION_SECS:-240}"
-SOAK_SMOKE_LOG="$LOG_DIR/soak-smoke.log"
-SOAK_DURATION_SECS="$SMOKE_SOAK_DURATION_SECS" \
-SOAK_MAX_RSS_MB=120.0 \
-SOAK_MAX_CMA_MB=220.0 \
-SOAK_MAX_SLOPE_MBH=300.0 \
-SOAK_HOLD_SECS=1 \
-SOAK_WARMUP_PASSES=2 \
-`# 300 MB/h slope ceiling tolerates system-wide CMA noise on short` \
-`# runs (cma_used reads /proc/meminfo, includes peer processes).` \
-`# Production §8.2 6h gate uses the soak script's tight 5 MB/h.` \
-bash "$(dirname "$0")/renderer_pi_soak.sh" "$TARGET" > "$SOAK_SMOKE_LOG" 2>&1 || \
-    { echo "FAIL: soak gate"; tail -30 "$SOAK_SMOKE_LOG"; exit 1; }
-SOAK_SAMPLES=$(grep -oE 'samples=[0-9]+ passes=[0-9]+\.\.[0-9]+' "$SOAK_SMOKE_LOG" | head -1)
-echo "    soak gate ok ($SOAK_SAMPLES)"
+#
+# SDF arc slice D.0b (2026-05-18) -- skipped in dev by default per
+# feedback_no_soak_during_dev (synthetic soaks are work-avoidance;
+# §8.2 gate runs only when qarl explicitly opens release-candidate).
+# Setting SMOKE_SOAK_DURATION_SECS=0 (the default) skips the phase;
+# any nonzero value (or the historical 240s) re-enables it for
+# release-candidate verification.
+#
+# Pre-existing TODO when re-enabled at RC: the §4 cma_used hard
+# ceiling (currently 220 MB) needs revisiting against the post-
+# arc-C atlas memory floor (~29 MB MSDF + ~64 MB emoji RGBA on
+# GPU = ~93 MB structural baseline). qarl picks bumped-ceiling
+# vs lazy-emoji-upload at RC time.
+SMOKE_SOAK_DURATION_SECS="${SMOKE_SOAK_DURATION_SECS:-0}"
+if [ "$SMOKE_SOAK_DURATION_SECS" -gt 0 ]; then
+    echo "==> Phase d-smoke -- soak gate (short ~$((SMOKE_SOAK_DURATION_SECS / 60))min slope test)"
+    SOAK_SMOKE_LOG="$LOG_DIR/soak-smoke.log"
+    SOAK_DURATION_SECS="$SMOKE_SOAK_DURATION_SECS" \
+    SOAK_MAX_RSS_MB=120.0 \
+    SOAK_MAX_CMA_MB=220.0 \
+    SOAK_MAX_SLOPE_MBH=300.0 \
+    SOAK_HOLD_SECS=1 \
+    SOAK_WARMUP_PASSES=2 \
+    `# 300 MB/h slope ceiling tolerates system-wide CMA noise on short` \
+    `# runs (cma_used reads /proc/meminfo, includes peer processes).` \
+    `# Production §8.2 6h gate uses the soak script's tight 5 MB/h.` \
+    bash "$(dirname "$0")/renderer_pi_soak.sh" "$TARGET" > "$SOAK_SMOKE_LOG" 2>&1 || \
+        { echo "FAIL: soak gate"; tail -30 "$SOAK_SMOKE_LOG"; exit 1; }
+    SOAK_SAMPLES=$(grep -oE 'samples=[0-9]+ passes=[0-9]+\.\.[0-9]+' "$SOAK_SMOKE_LOG" | head -1)
+    echo "    soak gate ok ($SOAK_SAMPLES)"
+else
+    echo "    soak gate skipped (SMOKE_SOAK_DURATION_SECS=0; release-candidate-only)"
+fi
 
 # Phase 6 reel assertion: completion + slide count + transition
 # count + no panics. The reel logs "reel: resolved N items" once
