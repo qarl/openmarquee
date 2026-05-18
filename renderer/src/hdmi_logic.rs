@@ -712,6 +712,11 @@ pub fn layout_text_to_quads(
     // Pass 2: emit quads at baseline-aware positions.
     let atlas_w = manifest.atlas_w as f32;
     let atlas_h = manifest.atlas_h as f32;
+    // Bug 2 (2026-05-19): 0.5-texel UV inset constant. Used by both
+    // the MSDF and Emoji per-glyph UV computations below. See the
+    // per-call site comment for the median-of-mixed-encodings
+    // mechanism this guards against.
+    const INSET_PX: f32 = 0.5;
     // Emoji-atlas geometry (only used when an entry is hit). cell_em
     // = cell_px / source_ppem; atlas_dim is the page dimension for
     // UV normalization. Pre-computed once outside the loop.
@@ -765,10 +770,26 @@ pub fn layout_text_to_quads(
                     // build.rs flip; matches our atlas tex upload), so
                     // uv_top = glyph.y / atlas_h, uv_bottom = (glyph.y
                     // + cell_px) / atlas_h.
-                    let uv_l = g.x as f32 / atlas_w;
-                    let uv_r = (g.x as f32 + cell_px) / atlas_w;
-                    let uv_t = g.y as f32 / atlas_h;
-                    let uv_b = (g.y as f32 + cell_px) / atlas_h;
+                    //
+                    // Bug 2 (2026-05-19): 0.5 atlas-pixel UV inset on
+                    // all four sides. GL_LINEAR at the exact cell
+                    // boundary mixes THIS cell's "outside" SDF RGB
+                    // with the NEIGHBOR cell's "outside" SDF RGB.
+                    // MSDF's three-channel edge-coloring assigns
+                    // DIFFERENT RGB encodings to each glyph's
+                    // outside region (one cell's outside pixel might
+                    // be (0,0,255), neighbor's (0,255,0)). Bilinear
+                    // average (0,127,127) has median=127 -- mid-range,
+                    // crosses smoothstep's 0.5 threshold, produces
+                    // visible amber hairlines above caps and below
+                    // baselines for glyphs whose neighbor encoding
+                    // happens to combine incompatibly. Inset by half
+                    // a texel keeps GL_LINEAR sampling strictly
+                    // within this cell.
+                    let uv_l = (g.x as f32 + INSET_PX) / atlas_w;
+                    let uv_r = (g.x as f32 + cell_px - INSET_PX) / atlas_w;
+                    let uv_t = (g.y as f32 + INSET_PX) / atlas_h;
+                    let uv_b = (g.y as f32 + cell_px - INSET_PX) / atlas_h;
                     quads.push(MsdfQuad {
                         px_left: px_l,
                         px_top: px_t,
@@ -801,10 +822,17 @@ pub fn layout_text_to_quads(
                     let px_r = center_x + cell_size_px * 0.5;
                     let px_t = center_y - cell_size_px * 0.5;
                     let px_b = center_y + cell_size_px * 0.5;
-                    let uv_l = ee.x as f32 / emoji_atlas_dim_f;
-                    let uv_r = (ee.x as f32 + emoji_cell_px_f) / emoji_atlas_dim_f;
-                    let uv_t = ee.y as f32 / emoji_atlas_dim_f;
-                    let uv_b = (ee.y as f32 + emoji_cell_px_f) / emoji_atlas_dim_f;
+                    // Bug 2 (2026-05-19): same 0.5-px UV inset as MSDF path.
+                    // Emoji atlas is RGBA8 not three-channel MSDF, so the
+                    // exact median-mixing mechanism doesn't apply, but
+                    // GL_LINEAR at the cell boundary still bilinearly mixes
+                    // this glyph's edge pixels with the NEIGHBOR glyph's
+                    // edge pixels -- visible as colored fringes between
+                    // adjacent emoji glyphs at large scales. Same fix.
+                    let uv_l = (ee.x as f32 + INSET_PX) / emoji_atlas_dim_f;
+                    let uv_r = (ee.x as f32 + emoji_cell_px_f - INSET_PX) / emoji_atlas_dim_f;
+                    let uv_t = (ee.y as f32 + INSET_PX) / emoji_atlas_dim_f;
+                    let uv_b = (ee.y as f32 + emoji_cell_px_f - INSET_PX) / emoji_atlas_dim_f;
                     quads.push(MsdfQuad {
                         px_left: px_l,
                         px_top: px_t,
@@ -4255,6 +4283,69 @@ mod tests {
             assert!(q.uv_bottom > q.uv_top);
         }
         assert_eq!(group.font_stem, "anton");
+    }
+
+    #[test]
+    fn layout_text_to_quads_uv_inset_avoids_cell_edges() {
+        // Bug 2 (2026-05-19) regression lock: every MSDF glyph quad's
+        // UVs must be inset by 0.5 atlas-pixels from the cell boundary
+        // so GL_LINEAR sampling never reaches the neighbor-cell's
+        // outside-SDF region. Pre-Bug-2 the UVs went edge-to-edge
+        // (g.x..g.x+cell_px / atlas_w) — bilinear at the boundary
+        // mixed this cell's "outside-RGB" with the neighbor cell's
+        // (often differently-encoded) "outside-RGB", producing
+        // median > 0.5 alpha = visible amber hairlines above caps
+        // and below baselines.
+        //
+        // The inset constant in layout_text_to_quads is 0.5 atlas
+        // pixels. This test asserts the UVs deviate from the
+        // cell-edge values by exactly 0.5 / atlas_w (or _h).
+        let atlas = load_anton_atlas();
+        let cell_px = atlas.manifest.cell_px as f32;
+        let atlas_w = atlas.manifest.atlas_w as f32;
+        let atlas_h = atlas.manifest.atlas_h as f32;
+        let inset_x = 0.5 / atlas_w;
+        let inset_y = 0.5 / atlas_h;
+
+        let group = layout_text_to_quads(&atlas, None, "A", 100.0)
+            .expect("A lays out");
+        let q = &group.quads[0];
+        let a_glyph = atlas.manifest.glyph_for(b'A' as u32)
+            .expect("Anton has 'A' baked");
+
+        let expected_uv_l = (a_glyph.x as f32 + 0.5) / atlas_w;
+        let expected_uv_r = (a_glyph.x as f32 + cell_px - 0.5) / atlas_w;
+        let expected_uv_t = (a_glyph.y as f32 + 0.5) / atlas_h;
+        let expected_uv_b = (a_glyph.y as f32 + cell_px - 0.5) / atlas_h;
+
+        let eps = 1e-6;
+        assert!((q.uv_left - expected_uv_l).abs() < eps,
+            "Bug 2: uv_left {} should equal {} (= (g.x + 0.5) / atlas_w)",
+            q.uv_left, expected_uv_l);
+        assert!((q.uv_right - expected_uv_r).abs() < eps,
+            "Bug 2: uv_right {} should equal {} (= (g.x + cell_px - 0.5) / atlas_w)",
+            q.uv_right, expected_uv_r);
+        assert!((q.uv_top - expected_uv_t).abs() < eps,
+            "Bug 2: uv_top {} should equal {} (= (g.y + 0.5) / atlas_h)",
+            q.uv_top, expected_uv_t);
+        assert!((q.uv_bottom - expected_uv_b).abs() < eps,
+            "Bug 2: uv_bottom {} should equal {} (= (g.y + cell_px - 0.5) / atlas_h)",
+            q.uv_bottom, expected_uv_b);
+
+        // Sanity: the inset really is non-zero (i.e. UV is strictly
+        // inside the cell rect, not at the edge).
+        let cell_edge_l = a_glyph.x as f32 / atlas_w;
+        let cell_edge_r = (a_glyph.x as f32 + cell_px) / atlas_w;
+        assert!(q.uv_left > cell_edge_l,
+            "uv_left {} should be > cell_edge_l {}", q.uv_left, cell_edge_l);
+        assert!(q.uv_right < cell_edge_r,
+            "uv_right {} should be < cell_edge_r {}", q.uv_right, cell_edge_r);
+        // Inset magnitude matches 0.5 / atlas_w within float precision.
+        assert!((q.uv_left - cell_edge_l - inset_x).abs() < eps);
+        assert!((cell_edge_r - q.uv_right - inset_x).abs() < eps);
+        // y-axis inset is verified by `expected_uv_t / _b` already; the
+        // inset_y local was for parallel-construction readability.
+        let _ = inset_y;
     }
 
     #[test]
