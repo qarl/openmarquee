@@ -110,25 +110,13 @@ impl FontCatalog {
     }
 }
 
-/// 8-bit grayscale-alpha bitmap. Output of the text-layout pass; the
-/// renderer uploads it as a GL_ALPHA texture for the glyph fragment
-/// shader to sample.
-#[derive(Debug, Clone)]
-pub struct AlphaBitmap {
-    pub width: u32,
-    pub height: u32,
-    /// Row-major, top-left-origin. Length = width * height. Each
-    /// byte is 0..=255 = transparent..=opaque.
-    pub data: Vec<u8>,
-}
-
-/// v1-spec-delta #3 (slice b cache): per-layer rasterized-bitmap
-/// cache. Each entry holds the (resolved_text, AlphaBitmap) for
-/// one layer. When the resolved text is unchanged across frames
+/// v1-spec-delta #3 (slice b cache): per-layer MSDF layout cache.
+/// Each entry holds the (resolved_text, MsdfQuadGroup) for one
+/// layer. When the resolved text is unchanged across frames
 /// (motion-only animations or the 29 frames between auto_mode
-/// second-bucket boundaries), the expensive fontdue rasterization
-/// is skipped and the cached bitmap is reused. Cache miss = text
-/// changed = re-rasterize.
+/// second-bucket boundaries), `layout_text_to_quads` is skipped
+/// and the cached group is reused. Cache miss = text changed =
+/// re-lay-out.
 ///
 /// Vec parallel to text_layers; len matches. Initialized to None
 /// at slide-render entry; populated lazily on first paint.
@@ -138,20 +126,12 @@ pub type GlyphCache = Vec<Option<CachedGlyph>>;
 pub struct CachedGlyph {
     pub text: String,
     /// qarl-direct perf-profile (2026-05-08): cache the size we
-    /// rasterized/laid out at, so a size change invalidates the
-    /// cache.
+    /// laid out at, so a size change invalidates the cache.
     pub size_px: f32,
     /// 2026-05-17 wrap port: cache the max_width that drove
     /// wrap_text_to_width so a box-width change OR a mode_w change
     /// invalidates the layout.
     pub max_width_px: f32,
-    /// AlphaBitmap raster -- legacy single-pass transition path
-    /// (prepare_layers_for_single_pass / FS_FADE_SP). The SDF arc
-    /// slice B.2 cutover moved the multi-pass paint_slide draw to
-    /// the MSDF `group` field below; the single-pass transition
-    /// shaders still consume this AlphaBitmap until a follow-up
-    /// slice ports them to MSDF sampling.
-    pub bitmap: AlphaBitmap,
     /// SDF arc slice B.2 -- per-glyph MSDF quad layout used by the
     /// production text path (`draw_text_layer_msdf`). `None` when
     /// the text laid out to no ink (empty / whitespace only); the
@@ -188,27 +168,6 @@ pub fn should_rerasterize(
         None => true,
     }
 }
-
-/// Lay out a single line of `text` rasterized at `size_px`. Each glyph
-/// is rasterized via `fontdue` and blitted onto a single grayscale
-/// bitmap whose width is the sum of glyph advances and whose height
-/// is the max ascent + descent across the line. No wrapping, no
-/// kerning beyond the font's natural metrics, no bidi.
-///
-/// Returns `None` if the resulting bitmap would be empty (e.g. empty
-/// text, or every char rasterized to a 0×0 box like a single space).
-///
-/// Phase 4.2a: simple single-line layout. Phase 4.2c will pull in
-/// multiline + alignment when the FYS slides that need them land.
-/// Maximum rasterized text bitmap dimension (per side). vc4 V3D 2.1
-/// has GL_MAX_TEXTURE_SIZE=2048; oversize bitmaps fail texture upload
-/// with GL_INVALID_VALUE (0x501) AND have unbounded fragment-fill
-/// cost via the per-layer texture sampler. Per the 2026-05-09 synth
-/// bench (Option E in qa-synth-motion-bench.md): clamping `size_px`
-/// down at the rasterize stage closes both classes of issue
-/// deterministically. Author-side text gets slightly smaller than
-/// requested; the warn line surfaces the clamp to operators.
-pub const MAX_RASTERIZED_BITMAP_DIM: u32 = 2048;
 
 /// SDF arc slice B -- process-wide AA mode for the MSDF fragment
 /// shaders. main.rs calls `set_aa_mode` at startup; the shader-
@@ -305,91 +264,6 @@ pub fn wrap_text_to_width(
     out_lines.join("\n")
 }
 
-/// Predict the rasterized bitmap's pixel dimensions for `(font, text,
-/// size_px)` WITHOUT performing the full rasterization. fontdue's
-/// `metrics(ch, size_px)` returns glyph bbox + advance from a cached
-/// outline lookup; orders of magnitude cheaper than a full rasterize.
-///
-/// Mirrors layout_text_to_alpha's bbox math: per-line width is the sum
-/// of per-glyph advance widths; output width is the MAX line width;
-/// line height is `max(ymin+height) - min(ymin)` across ALL glyphs in
-/// ALL lines (ascent above + descent below baseline) so all lines
-/// share a uniform vertical advance. Padding (1px each side) added to
-/// match the rasterized output.
-///
-/// Newline handling (qarl-flag 2026-05-10): `\r\n` is normalized to
-/// `\n`; bare `\r` is also treated as a line break. Each `\n` starts
-/// a new line; empty lines contribute one line-height of vertical
-/// space. Pre-fix the rasterizer fed `\n` to `font.rasterize` like
-/// any other char, getting fontdue's missing-glyph tofu and
-/// concatenating "Liberate\nyour sign." onto one line with a tofu
-/// in the middle.
-///
-/// Returns `(width, height)` as the rasterized bitmap WOULD be at
-/// `size_px`. Empty text or text yielding zero-width content returns
-/// `(0, 0)`.
-pub fn predict_alpha_bitmap_dims(font: &fontdue::Font, text: &str, size_px: f32) -> (u32, u32) {
-    if text.is_empty() {
-        return (0, 0);
-    }
-    let lines = split_text_into_lines(text);
-    let mut max_line_w = 0.0_f32;
-    let mut max_ascent = 0_i32;
-    let mut min_descent = 0_i32;
-    let mut any_glyph = false;
-    for line in &lines {
-        let mut line_advance = 0.0_f32;
-        for ch in line.chars() {
-            let m = font.metrics(ch, size_px);
-            let ascent = m.ymin + m.height as i32;
-            max_ascent = max_ascent.max(ascent);
-            min_descent = min_descent.min(m.ymin);
-            // qarl-direct 2026-05-13 (Bug A): round per-glyph advance
-            // so monospace fonts (VT323) produce integer-aligned
-            // column stride. fontdue can report fractional advances
-            // (e.g. 9.5px at request size 86.4px) which compound
-            // with cursor_x rounding into a visible 9/10 alternation
-            // pattern. Round-per-step keeps stride uniform; bounded
-            // 0.5px-per-glyph error for proportional fonts is
-            // visually invisible.
-            line_advance += m.advance_width.round();
-            any_glyph = true;
-        }
-        if line_advance > max_line_w {
-            max_line_w = line_advance;
-        }
-    }
-    // qarl-direct 2026-05-13 (Bug B): an ink-bearing glyph has both
-    // a non-zero ascent and a non-zero glyph height — if neither
-    // happens (e.g. " ", "   ", "\n"), the bitmap is empty. Detect
-    // here via max_ascent (which only goes positive when a glyph
-    // contributes ink) so the None-on-whitespace contract holds
-    // even after we pinned line_h to round(size*1.1) (which would
-    // otherwise leave line_h non-zero for any non-empty input).
-    let has_ink = max_ascent > 0 || min_descent < 0;
-    if !any_glyph || !has_ink {
-        return (0, 0);
-    }
-    let pad: u32 = 1;
-    // qarl-direct 2026-05-13 (Bug B): line stride pinned to
-    // round(size_px * 1.1) to match Canvas2D rasterize.js (the
-    // canonical reference). Was: max_ascent - min_descent (font's
-    // intrinsic ascent+descent), which produced different line
-    // packing than JS at the same nominal font size.
-    let line_h_px = (size_px * 1.1).round() as u32;
-    let bm_w = max_line_w as u32 + 2 * pad;
-    // bm_h: stride between baselines is line_h_px (Canvas2D parity).
-    // The LAST line's glyphs still extend up by max_ascent and down
-    // by -min_descent from its baseline — pad bm_h to capture that
-    // ink rather than clipping descenders. For single-line text
-    // this reduces to (max_ascent - min_descent) + 2*pad which
-    // matches the pre-2026-05-13 contract exactly. For N>1, lines
-    // are spaced at line_h_px but the bitmap grows by the last
-    // line's full extent at the bottom.
-    let last_line_extent = (max_ascent - min_descent).max(0) as u32;
-    let bm_h = 2 * pad + last_line_extent + (lines.len() as u32 - 1) * line_h_px;
-    (bm_w, bm_h)
-}
 
 /// Split text on newline boundaries. `\r\n` (Windows) is treated as
 /// one break; bare `\r` (legacy Mac) also as one break. Split is
@@ -424,208 +298,6 @@ pub fn split_text_into_lines(text: &str) -> Vec<&str> {
     out
 }
 
-/// Compute the largest `size_px` whose rasterized bitmap fits within
-/// `MAX_RASTERIZED_BITMAP_DIM` in both dims. Returns `Some(clamped)`
-/// when the input `size_px` would exceed the cap, `None` otherwise.
-/// Bitmap dims scale linearly with `size_px` (per-glyph advance and
-/// ascent/descent are both proportional), so the clamp is one
-/// multiply against the binding-dim ratio.
-///
-/// Floors at `8.0` (matches `effective_font_size_px`) so clamped text
-/// never disappears entirely.
-pub fn clamp_size_px_to_bitmap_cap(
-    font: &fontdue::Font,
-    text: &str,
-    size_px: f32,
-) -> Option<f32> {
-    if text.is_empty() || size_px <= 0.0 {
-        return None;
-    }
-    let (pred_w, pred_h) = predict_alpha_bitmap_dims(font, text, size_px);
-    let cap = MAX_RASTERIZED_BITMAP_DIM;
-    if pred_w <= cap && pred_h <= cap {
-        return None;
-    }
-    // Initial scale: linear extrapolation. Bitmap dims scale
-    // linearly with size_px, but advance.ceil() + 2*pad can each
-    // round one pixel up after the rescale, so the linear-
-    // extrapolation answer overshoots by 1-2px in practice.
-    let scale_w = cap as f32 / pred_w as f32;
-    let scale_h = cap as f32 / pred_h as f32;
-    let mut clamped = (size_px * scale_w.min(scale_h)).max(8.0);
-
-    // Tighten in one or two 1px steps until both predicted dims
-    // are at-or-under cap. Bounded by the 8.0 floor; iteration
-    // count is < 5 in practice (the rounding overshoot is O(1)px
-    // regardless of input scale).
-    while clamped > 8.0 {
-        let (w, h) = predict_alpha_bitmap_dims(font, text, clamped);
-        if w <= cap && h <= cap {
-            break;
-        }
-        clamped = (clamped - 1.0).max(8.0);
-    }
-    Some(clamped)
-}
-
-pub fn layout_text_to_alpha(font: &fontdue::Font, text: &str, size_px: f32) -> Option<AlphaBitmap> {
-    if text.is_empty() {
-        return None;
-    }
-
-    // Option E (rasterize-side cap, 2026-05-09): pre-measure the
-    // bitmap dims via cheap font.metrics() lookups and clamp size_px
-    // down if the rasterized output would exceed
-    // MAX_RASTERIZED_BITMAP_DIM. Closes the multi-line >2048px
-    // capture-side 0x501 bug AND deterministically caps per-layer
-    // texture upload size on vc4 (GL_MAX_TEXTURE_SIZE=2048). Single-
-    // line text at typical authored sizes (<= 500px) is unaffected;
-    // very large authored sizes get clamped with a warn surface.
-    let effective_size_px = match clamp_size_px_to_bitmap_cap(font, text, size_px) {
-        Some(clamped) => {
-            // Best-effort log surface for the editor / smoke runs.
-            // Single line per clamp event (text is the natural key
-            // for de-dup once the editor wires this up via IPC).
-            eprintln!(
-                "warn: rasterize bitmap cap engaged -- requested size_px={size_px:.1} \
-                 exceeded {MAX_RASTERIZED_BITMAP_DIM}px max bitmap dim, clamping to \
-                 size_px={clamped:.1} (text len={})",
-                text.chars().count(),
-            );
-            clamped
-        }
-        None => size_px,
-    };
-
-    // Newline handling (qarl-flag 2026-05-10): split into lines on
-    // \n / \r / \r\n. Pre-fix the rasterizer fed \n to font.rasterize
-    // like any other char, getting fontdue's missing-glyph tofu;
-    // multi-line text (e.g. "Liberate\nyour sign.") was getting
-    // squashed onto one line with a tofu in the middle.
-    let lines = split_text_into_lines(text);
-
-    // First pass: rasterize each glyph in each line + measure global
-    // bbox. We measure ascent/descent in the font's own units.
-    // fontdue exposes BOTH a float OutlineBounds (`m.bounds`) and
-    // integer pixel offsets (`m.xmin`, `m.ymin`); the latter are
-    // pre-snapped to the bitmap rows the rasterizer actually wrote,
-    // so using bounds + .round() introduces an off-by-one between
-    // the placement and the bitmap (descender hairline gaps,
-    // ascender AA-edge clip). Phase 4.2b QA-flagged R1 fix.
-    //
-    // `m.ymin` semantics: distance from baseline to the BOTTOM of
-    // the glyph bitmap, in pixels, with y-up. Negative for
-    // descenders (g, j, p, q, y) — the bottom of the bitmap sits
-    // below the baseline.
-    //
-    // ALL lines share the same line-height = max_ascent - min_descent
-    // computed across every glyph in every line so vertical advance
-    // is uniform.
-    let mut all_lines: Vec<(Vec<(fontdue::Metrics, Vec<u8>)>, f32)> =
-        Vec::with_capacity(lines.len());
-    let mut max_line_w = 0.0_f32;
-    let mut max_ascent = 0_i32;
-    let mut min_descent = 0_i32;
-    let mut any_glyph = false;
-    for line in &lines {
-        let mut line_glyphs: Vec<(fontdue::Metrics, Vec<u8>)> =
-            Vec::with_capacity(line.chars().count());
-        let mut line_advance = 0.0_f32;
-        for ch in line.chars() {
-            let (m, alpha) = font.rasterize(ch, effective_size_px);
-            let ascent = m.ymin + m.height as i32;
-            max_ascent = max_ascent.max(ascent);
-            min_descent = min_descent.min(m.ymin);
-            // Bug A fix: round per-step (see predict_alpha_bitmap_dims).
-            line_advance += m.advance_width.round();
-            line_glyphs.push((m, alpha));
-            any_glyph = true;
-        }
-        if line_advance > max_line_w {
-            max_line_w = line_advance;
-        }
-        all_lines.push((line_glyphs, line_advance));
-    }
-    // Bug B fix: an ink-bearing glyph has either positive ascent or
-    // negative descent (see predict_alpha_bitmap_dims for the
-    // matching whitespace check).
-    let has_ink = max_ascent > 0 || min_descent < 0;
-    if !any_glyph || !has_ink {
-        return None;
-    }
-    let line_w = max_line_w as u32;
-    // Bug B fix: pin to fontSize * 1.1 (see predict_alpha_bitmap_dims).
-    let line_h = (effective_size_px * 1.1).round() as u32;
-    if line_w == 0 || line_h == 0 {
-        return None;
-    }
-
-    // v1-spec-delta #4 (slice b/d, QA review fix): pad the output
-    // bitmap by 1 pixel on all four sides. The padding rows stay
-    // alpha=0 -- invisible to FS_GLYPH (which only samples the
-    // center texel). FS_GLYPH_OUTLINE dilates the alpha mask by
-    // 1 pixel via 4-neighbor sampling; without padding, the
-    // boundary texels' neighbors clip via CLAMP_TO_EDGE which
-    // returns the edge inked texel and produces dilated == center
-    // at the bitmap edges (no visible exterior outline ring,
-    // outline only on INTERIOR shapes like the counter of an "O").
-    // Padding gives the dilation room to grow into transparent
-    // pixels and produce the visible exterior ring.
-    let pad: u32 = 1;
-    let bm_w = line_w + 2 * pad;
-    // Bug B fix: bm_h grows by line_h per additional line (stride
-    // matches Canvas2D) but the last line's full vertical extent
-    // (max_ascent - min_descent) is captured in the bitmap so
-    // descenders on the last line aren't clipped. Mirrors
-    // predict_alpha_bitmap_dims.
-    let last_line_extent = (max_ascent - min_descent).max(0) as u32;
-    let bm_h = 2 * pad + last_line_extent + (lines.len() as u32 - 1) * line_h;
-
-    // Second pass: blit each line's glyphs at the correct baseline.
-    // Line N's baseline = pad + max_ascent + N * line_h. cursor_x
-    // resets to pad at the start of each line; per-line layout is
-    // left-aligned within the bitmap (caller's halign in
-    // box_to_ndc_quad places the WHOLE bitmap within the layer box).
-    let mut data = vec![0u8; (bm_w * bm_h) as usize];
-    for (line_idx, (line_glyphs, _)) in all_lines.iter().enumerate() {
-        let baseline_y = pad as i32 + max_ascent + (line_idx as i32) * line_h as i32;
-        let mut cursor_x = 0.0_f32;
-        for (m, alpha) in line_glyphs {
-            let glyph_x = (cursor_x + m.xmin as f32).round() as i32 + pad as i32;
-            let glyph_top = baseline_y - m.ymin - m.height as i32;
-            for gy in 0..m.height as i32 {
-                let dst_y = glyph_top + gy;
-                if dst_y < 0 || dst_y as u32 >= bm_h {
-                    continue;
-                }
-                for gx in 0..m.width as i32 {
-                    let dst_x = glyph_x + gx;
-                    if dst_x < 0 || dst_x as u32 >= bm_w {
-                        continue;
-                    }
-                    let src = alpha[(gy as usize) * m.width + gx as usize];
-                    if src == 0 {
-                        continue;
-                    }
-                    let idx = (dst_y as u32 * bm_w + dst_x as u32) as usize;
-                    // Glyphs in a single line don't overlap (fontdue
-                    // emits non-overlapping bboxes per glyph) and
-                    // separate lines don't share rows (uniform line
-                    // height advances baseline by exactly line_h),
-                    // so a direct write is safe -- no max/saturate.
-                    data[idx] = src;
-                }
-            }
-            // Bug A fix: round per-step.
-            cursor_x += m.advance_width.round();
-        }
-    }
-    Some(AlphaBitmap {
-        width: bm_w,
-        height: bm_h,
-        data,
-    })
-}
 
 // =====================================================================
 // Shader sources (cross-platform — pure GLSL strings).
@@ -1142,6 +814,34 @@ pub fn fs_msdf_outline_for_aa_mode() -> &'static str {
         crate::AaMode::Fixed => FS_MSDF_OUTLINE_FIXED,
     }
 }
+
+/// SDF arc slice B.3 -- tofu fragment shader. Renders missing-
+/// codepoint quads as a deterministic 50% gray rectangle with a
+/// thin black outline ring. v_uv spans [0, 1] across each tofu
+/// quad (NOT atlas UV — `draw_text_layer_msdf` emits unit UVs for
+/// tofu quads), so we use it directly as the "position within
+/// rect" coordinate for the outline test.
+///
+/// Outline width is fixed at 8% of the quad side — gives a visible
+/// outline at the smallest font sizes (5% pct text) without
+/// devouring the gray fill at large sizes. Output is premultiplied
+/// alpha to match the FS_MSDF blend func contract.
+pub const FS_TOFU: &str = r#"#version 100
+precision mediump float;
+uniform float u_opacity;
+varying vec2 v_uv;
+void main() {
+    float bw = 0.08;
+    float in_border = step(v_uv.x, bw)
+                    + step(1.0 - bw, v_uv.x)
+                    + step(v_uv.y, bw)
+                    + step(1.0 - bw, v_uv.y);
+    in_border = clamp(in_border, 0.0, 1.0);
+    vec3 color = mix(vec3(0.5), vec3(0.0), in_border);
+    float a = u_opacity;
+    gl_FragColor = vec4(color * a, a);
+}
+"#;
 
 /// Fragment shader: hard cut between two textures at t=0.5. Doesn't
 /// exist as a shader in the Python ref (cut is a playback-level
@@ -1934,19 +1634,19 @@ pub fn transition_eligible_for_single_pass_logic(
     if !bg_a_solid || !bg_b_solid {
         return false;
     }
-    if layer_props_a.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
+    // SDF arc slice B.3 (font-clamp deletion): SP-tier was designed
+    // around per-layer LUMINANCE bitmap textures (one tex + rect per
+    // layer, sampled via `apply_layer()` in fs_transition_sp_source).
+    // The MSDF cutover replaces that bitmap shape with per-glyph
+    // atlas quads, which don't map onto SP's "1 tex per layer" data
+    // contract. Rather than re-architecting SP for per-glyph sampling
+    // (or reintroducing a softer FBO-clamp), we gate SP off for any
+    // text-bearing transition. Text routes through the scissored-
+    // bake tier (which uses paint_slide_with_viewport, already on
+    // MSDF post-B.2) or the legacy 3-pass path. SP-tier stays alive
+    // for image/bg-only transitions where there's no text.
+    if !layer_props_a.is_empty() || !layer_props_b.is_empty() {
         return false;
-    }
-    if layer_props_b.len() > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
-        return false;
-    }
-    for p in layer_props_a.iter().chain(layer_props_b.iter()) {
-        if p.outline {
-            return false;
-        }
-        if !matches!(p.blend, BlendMode::Normal) {
-            return false;
-        }
     }
     true
 }
@@ -6094,107 +5794,65 @@ mod tests {
     }
 
     #[test]
-    fn sp_eligibility_admits_minimal_solid_bg_normal_layers() {
-        // Smallest case that should pass: SP-portable kind + solid
-        // bg both sides + 1 normal layer per side.
-        let layers = [lp_normal()];
+    fn sp_eligibility_admits_zero_layers_per_side() {
+        // SDF arc slice B.3: SP-tier admits ONLY bg-only transitions
+        // (zero text layers either side). Text-bearing transitions
+        // route through SB or legacy 3-pass per the gate. Bg-only
+        // transition with SP-portable kind + solid bg both sides
+        // is the canonical admit case.
         for kind in ["fade", "wipe", "cut", "marquee", "pixelate"] {
             assert!(
                 transition_eligible_for_single_pass_logic(
-                    kind, true, true, &layers, &layers,
+                    kind, true, true, &[], &[],
                 ),
-                "{kind} 1L+1L solid normal should be SP-eligible",
+                "{kind} bg-only solid+solid should be SP-eligible",
             );
         }
     }
 
     #[test]
-    fn sp_eligibility_admits_zero_layers_per_side() {
-        // Bg-only slides (no text) are valid input. Zero layers
-        // is within the SP per-side cap and the loop body just
-        // doesn't execute.
-        assert!(transition_eligible_for_single_pass_logic(
-            "fade", true, true, &[], &[],
+    fn sp_eligibility_rejects_any_text_layer() {
+        // SDF arc slice B.3 gate: ANY text layer on either side
+        // disqualifies SP-tier so text-bearing transitions route
+        // through SB (paint_slide_with_viewport, on MSDF post-B.2).
+        let one_layer = [lp_normal()];
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, true, &one_layer, &[],
+        ));
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, true, &[], &one_layer,
+        ));
+        assert!(!transition_eligible_for_single_pass_logic(
+            "fade", true, true, &one_layer, &one_layer,
         ));
     }
 
     #[test]
     fn sp_eligibility_rejects_non_sp_kind() {
-        let layers = [lp_normal()];
+        // Even bg-only transitions reject if the kind isn't SP-
+        // portable. Tier dispatch then falls through to legacy 3-pass.
         assert!(!transition_eligible_for_single_pass_logic(
-            "glitch", true, true, &layers, &layers,
+            "glitch", true, true, &[], &[],
         ));
         assert!(!transition_eligible_for_single_pass_logic(
-            "unknown", true, true, &layers, &layers,
+            "unknown", true, true, &[], &[],
         ));
     }
 
     #[test]
     fn sp_eligibility_rejects_non_solid_bg() {
-        let layers = [lp_normal()];
+        // Gradient/pattern/image bg on either side rejects SP-tier
+        // (the SP shader only accepts solid bg per fs_transition_sp_
+        // source's contract).
         assert!(!transition_eligible_for_single_pass_logic(
-            "fade", false, true, &layers, &layers,
-        ));
-        assert!(!transition_eligible_for_single_pass_logic(
-            "fade", true, false, &layers, &layers,
-        ));
-        assert!(!transition_eligible_for_single_pass_logic(
-            "fade", false, false, &layers, &layers,
-        ));
-    }
-
-    #[test]
-    fn sp_eligibility_rejects_above_per_side_cap() {
-        // SP per-side cap is SINGLE_PASS_MAX_LAYERS_PER_SLIDE = 4.
-        // 5 layers on either side rejects the pair.
-        let five = vec![lp_normal(); 5];
-        let four = vec![lp_normal(); 4];
-        assert_eq!(SINGLE_PASS_MAX_LAYERS_PER_SLIDE, 4);
-        assert!(!transition_eligible_for_single_pass_logic(
-            "fade", true, true, &five, &four,
+            "fade", false, true, &[], &[],
         ));
         assert!(!transition_eligible_for_single_pass_logic(
-            "fade", true, true, &four, &five,
+            "fade", true, false, &[], &[],
         ));
-        // 4+4 still admits (the tier-routing decision between SP
-        // and SB happens via prefer_scissored_bake, not here).
-        assert!(transition_eligible_for_single_pass_logic(
-            "fade", true, true, &four, &four,
-        ));
-    }
-
-    #[test]
-    fn sp_eligibility_rejects_outline_layer() {
-        let normal = lp_normal();
-        let outlined = LayerCompositeProps { outline: true, blend: BlendMode::Normal };
-        // Outline on side A.
         assert!(!transition_eligible_for_single_pass_logic(
-            "fade", true, true, &[normal, outlined], &[normal],
+            "fade", false, false, &[], &[],
         ));
-        // Outline on side B.
-        assert!(!transition_eligible_for_single_pass_logic(
-            "fade", true, true, &[normal], &[normal, outlined],
-        ));
-    }
-
-    #[test]
-    fn sp_eligibility_rejects_non_normal_blend() {
-        let normal = lp_normal();
-        for blend in [BlendMode::Multiply, BlendMode::Screen, BlendMode::Overlay] {
-            let l = LayerCompositeProps { outline: false, blend };
-            assert!(
-                !transition_eligible_for_single_pass_logic(
-                    "fade", true, true, &[normal, l], &[normal],
-                ),
-                "blend {blend:?} on side A must reject SP",
-            );
-            assert!(
-                !transition_eligible_for_single_pass_logic(
-                    "fade", true, true, &[normal], &[normal, l],
-                ),
-                "blend {blend:?} on side B must reject SP",
-            );
-        }
     }
 
     #[test]
@@ -6597,124 +6255,10 @@ mod tests {
             .expect("parse VT323 TTF")
     }
 
-    #[test]
-    fn line_height_pinned_to_size_times_1_1() {
-        // qarl-direct 2026-05-13 Bug B: Rust line STRIDE between
-        // baselines MUST match Canvas2D's `lineHeight = fontSize *
-        // 1.1` (rasterize.js:119). The bm_h formula keeps the last
-        // line's full vertical extent intact (descenders don't
-        // clip) but successive lines stack at exactly line_h
-        // pixels. So h_N - h_1 must equal (N-1) * round(size * 1.1).
-        let font = load_anton();
-        for size_px in [24.0_f32, 48.0, 96.0, 200.0] {
-            let expected_line_h = (size_px * 1.1).round() as u32;
-            let (_, h1) = predict_alpha_bitmap_dims(&font, "HELLO", size_px);
-            let (_, h3) = predict_alpha_bitmap_dims(&font, "A\nB\nC", size_px);
-            // Stride between lines is exactly line_h: h3 - h1 = 2 * line_h.
-            assert_eq!(
-                h3 - h1,
-                2 * expected_line_h,
-                "stride @ size={size_px}: got h3-h1={} (h1={h1}, h3={h3}), want 2 * {expected_line_h}",
-                h3 - h1,
-            );
-        }
-    }
 
-    #[test]
-    fn predict_descender_bm_h_exceeds_caps_only() {
-        // Companion to layout_descender_with_caps_extends_below:
-        // pin the predictor's bm_h to match the rasterizer's
-        // last-line-descender-aware formula. "Pgy" must yield a
-        // taller bm_h than "PPP" even though both are single-line.
-        let font = load_anton();
-        let (_, caps_h) = predict_alpha_bitmap_dims(&font, "PPP", 64.0);
-        let (_, mixed_h) = predict_alpha_bitmap_dims(&font, "Pgy", 64.0);
-        assert!(
-            mixed_h > caps_h,
-            "mixed h={mixed_h} should be > all-caps h={caps_h} (descender padding)",
-        );
-    }
 
-    #[test]
-    fn monospace_advance_is_uniform_after_rounding() {
-        // qarl-direct 2026-05-13 Bug A: VT323 (monospace) reports
-        // fractional advance_width from fontdue at non-integer sizes
-        // (e.g. 86.4px → ~9.5 px/glyph). Without per-step rounding,
-        // cursor_x drifts and rounded glyph_x positions alternate
-        // 9 / 10 / 9 / 10 — a visible non-uniform column stride.
-        //
-        // The fix: round per-step. With the fix, predicting a line
-        // of N identical glyphs produces a line width that's an
-        // exact multiple of round(advance_width). This test pins
-        // that invariant for VT323 at the Boot-slide-y size 86.4px.
-        let font = load_vt323();
-        let size = 86.4_f32;
-        let (w1, _) = predict_alpha_bitmap_dims(&font, ".", size);
-        let (w5, _) = predict_alpha_bitmap_dims(&font, ".....", size);
-        let (w10, _) = predict_alpha_bitmap_dims(&font, "..........", size);
-        // Strip the 2*pad from each width to isolate the per-line
-        // advance accumulator.
-        let pad: u32 = 1;
-        let inner1 = w1 - 2 * pad;
-        let inner5 = w5 - 2 * pad;
-        let inner10 = w10 - 2 * pad;
-        // 5 dots' width should be exactly 5 * single-dot stride.
-        assert_eq!(
-            inner5,
-            5 * inner1,
-            "5 dots @ {size}px should be 5x single-dot stride (single={inner1}, 5dots={inner5})",
-        );
-        // 10 dots: 10x. Bounds the cumulative drift to zero.
-        assert_eq!(
-            inner10,
-            10 * inner1,
-            "10 dots @ {size}px should be 10x single-dot stride (single={inner1}, 10dots={inner10})",
-        );
-    }
 
-    #[test]
-    fn layout_has_one_pixel_transparent_margin() {
-        // v1-spec-delta #4 (slice b/d, QA review fix): layout
-        // pads the output bitmap by 1 pixel on all sides so the
-        // FS_GLYPH_OUTLINE shader's 4-neighbor dilation has room
-        // to grow beyond the inked extent. Verify the outermost
-        // row + col of pixels are all alpha=0.
-        let font = load_anton();
-        let bm = layout_text_to_alpha(&font, "F", 64.0).expect("F bitmap");
-        // Top + bottom rows
-        for x in 0..bm.width {
-            assert_eq!(
-                bm.data[x as usize], 0,
-                "top-row pixel ({x}, 0) must be padding (alpha=0)"
-            );
-            let bottom_idx = ((bm.height - 1) * bm.width + x) as usize;
-            assert_eq!(
-                bm.data[bottom_idx], 0,
-                "bottom-row pixel ({x}, {}) must be padding (alpha=0)",
-                bm.height - 1
-            );
-        }
-        // Left + right columns
-        for y in 0..bm.height {
-            let left = (y * bm.width) as usize;
-            assert_eq!(
-                bm.data[left], 0,
-                "left-col pixel (0, {y}) must be padding (alpha=0)"
-            );
-            let right = (y * bm.width + bm.width - 1) as usize;
-            assert_eq!(
-                bm.data[right], 0,
-                "right-col pixel ({}, {y}) must be padding (alpha=0)",
-                bm.width - 1
-            );
-        }
-    }
 
-    #[test]
-    fn layout_empty_text_returns_none() {
-        let font = load_anton();
-        assert!(layout_text_to_alpha(&font, "", 64.0).is_none());
-    }
 
     // Newline handling (qarl-flag 2026-05-10): pre-fix, the
     // rasterizer fed \n to font.rasterize like any other char,
@@ -6754,122 +6298,11 @@ mod tests {
         assert_eq!(split_text_into_lines("\n\n"), vec!["", "", ""]);
     }
 
-    #[test]
-    fn layout_two_lines_taller_than_one_line() {
-        // Per the bug: pre-fix, "Liberate\nyour sign." came out
-        // ~229 px tall (single line height) with a tofu glyph
-        // at the \n position. Post-fix it must be substantially
-        // taller (two lines stacked vertically).
-        //
-        // "your sign." alone has descenders ('y', 'g') so its
-        // line height ≈ the global line height of the two-line
-        // version; "Liberate" alone has no descenders so its
-        // height is shorter. Compare against the descender-
-        // bearing line for the 2x check.
-        let font = load_anton();
-        let your_sign = layout_text_to_alpha(&font, "your sign.", 64.0).unwrap();
-        let two_lines = layout_text_to_alpha(&font, "Liberate\nyour sign.", 64.0).unwrap();
-        // Two lines should be ~2x as tall as the descender-bearing
-        // single line. Allow ±4 px for padding.
-        let expected_h = your_sign.height * 2;
-        assert!(
-            (two_lines.height as i32 - expected_h as i32).abs() <= 4,
-            "two-line h={} should be ~2x your_sign h={} (expected ~{})",
-            two_lines.height, your_sign.height, expected_h,
-        );
-        // Sanity: two-line is materially taller than the
-        // single-line "Liberate" baseline (which would be the
-        // pre-fix tofu-on-one-line height).
-        let liberate = layout_text_to_alpha(&font, "Liberate", 64.0).unwrap();
-        assert!(
-            two_lines.height > liberate.height + 50,
-            "two-line h={} should dwarf liberate h={} (pre-fix would have matched)",
-            two_lines.height, liberate.height,
-        );
-    }
 
-    #[test]
-    fn layout_two_lines_width_is_max_of_lines() {
-        // Bitmap width should be the LONGER line's width, not
-        // the SUM. "your sign." is wider than "Liberate" at
-        // Anton 64px (more chars including descenders).
-        let font = load_anton();
-        let liberate = layout_text_to_alpha(&font, "Liberate", 64.0).unwrap();
-        let your_sign = layout_text_to_alpha(&font, "your sign.", 64.0).unwrap();
-        let two_lines = layout_text_to_alpha(&font, "Liberate\nyour sign.", 64.0).unwrap();
-        let expected_w = liberate.width.max(your_sign.width);
-        assert!(
-            (two_lines.width as i32 - expected_w as i32).abs() <= 2,
-            "two-line w={} should match max(liberate {}, your_sign {}) = {}",
-            two_lines.width, liberate.width, your_sign.width, expected_w,
-        );
-        // And NOT the sum.
-        let summed = liberate.width + your_sign.width;
-        assert!(
-            two_lines.width < summed,
-            "two-line w={} should be less than summed-line w={} \
-             (would be the pre-fix tofu-on-one-line behavior)",
-            two_lines.width, summed,
-        );
-    }
 
-    #[test]
-    fn layout_crlf_treated_as_single_break() {
-        // CRLF (Windows) and LF should produce identical output
-        // shape -- both are one line break.
-        let font = load_anton();
-        let lf = layout_text_to_alpha(&font, "a\nb", 64.0).unwrap();
-        let crlf = layout_text_to_alpha(&font, "a\r\nb", 64.0).unwrap();
-        assert_eq!((lf.width, lf.height), (crlf.width, crlf.height));
-    }
 
-    #[test]
-    fn layout_no_tofu_glyph_for_newline() {
-        // Smoke check: rasterize "a\nb" and "ab" at the same
-        // size. Two-line "a\nb" has the SAME width as "a" alone
-        // (longest line is 1 char), NOT the width of "ab" or
-        // "ab + tofu". Pre-fix the \n produced a tofu glyph
-        // wider than nothing, making "a\nb" wider than "a" by
-        // ~tofu_width.
-        let font = load_anton();
-        let single_a = layout_text_to_alpha(&font, "a", 64.0).unwrap();
-        let two_lines_ab = layout_text_to_alpha(&font, "a\nb", 64.0).unwrap();
-        // "a" and "b" are similar widths in Anton at 64px;
-        // treat them as effectively equal +/- 4px.
-        assert!(
-            (two_lines_ab.width as i32 - single_a.width as i32).abs() <= 6,
-            "two-line 'a\\nb' w={} should match single-line 'a' w={} (no tofu)",
-            two_lines_ab.width, single_a.width,
-        );
-    }
 
-    #[test]
-    fn layout_only_newlines_returns_none() {
-        // No glyph content -> None (matches empty-text contract).
-        let font = load_anton();
-        assert!(layout_text_to_alpha(&font, "\n", 64.0).is_none());
-        assert!(layout_text_to_alpha(&font, "\n\n\n", 64.0).is_none());
-        assert!(layout_text_to_alpha(&font, "\r\n\r\n", 64.0).is_none());
-    }
 
-    #[test]
-    fn predict_dims_match_rasterize_for_multi_line() {
-        // The cap math (clamp_size_px_to_bitmap_cap) relies on
-        // predict_alpha_bitmap_dims being byte-equal to the
-        // actual rasterized output dims. Pin parity for multi-
-        // line input.
-        let font = load_anton();
-        for text in ["a\nb", "Liberate\nyour sign.", "Hello\nWorld\n!"] {
-            let (pred_w, pred_h) = predict_alpha_bitmap_dims(&font, text, 64.0);
-            let bm = layout_text_to_alpha(&font, text, 64.0)
-                .unwrap_or_else(|| panic!("rasterize {text:?}"));
-            assert_eq!(
-                (pred_w, pred_h),
-                (bm.width, bm.height),
-                "{text:?}: predict vs rasterize disagree",
-            );
-        }
-    }
 
     // E (rasterize-side bitmap cap, 2026-05-09): predict +
     // clamp helpers for keeping rasterized bitmap dims within
@@ -6877,273 +6310,20 @@ mod tests {
     // capture-side 0x501 bug AND deterministically caps per-
     // layer texture upload size on vc4.
 
-    #[test]
-    fn predict_alpha_bitmap_dims_matches_rasterize_at_64px() {
-        // Pin: predict_alpha_bitmap_dims agrees with the actual
-        // rasterized output of layout_text_to_alpha at the same
-        // size_px (when below the cap). If the prediction drifts
-        // from the rasterizer, the cap math becomes non-load-
-        // bearing.
-        let font = load_anton();
-        for text in ["F", "FREE", "Tile Chaos 08", "abcdefghij"] {
-            let (pred_w, pred_h) = predict_alpha_bitmap_dims(&font, text, 64.0);
-            let bm = layout_text_to_alpha(&font, text, 64.0)
-                .unwrap_or_else(|| panic!("rasterize {text:?}"));
-            assert_eq!(
-                (pred_w, pred_h),
-                (bm.width, bm.height),
-                "{text:?}: predict vs rasterize disagree",
-            );
-        }
-    }
 
-    #[test]
-    fn predict_alpha_bitmap_dims_empty_returns_zero() {
-        let font = load_anton();
-        assert_eq!(predict_alpha_bitmap_dims(&font, "", 64.0), (0, 0));
-    }
 
-    #[test]
-    fn predict_alpha_bitmap_dims_scales_linearly_with_size() {
-        // size_px doubles -> predicted dims roughly double (within
-        // rounding from the per-glyph integer pixel snap). Pins
-        // the linearity assumption that clamp_size_px_to_bitmap_
-        // cap relies on for its single-multiply scale factor.
-        let font = load_anton();
-        let (w_64, h_64) = predict_alpha_bitmap_dims(&font, "FYS Tile Chaos", 64.0);
-        let (w_128, h_128) = predict_alpha_bitmap_dims(&font, "FYS Tile Chaos", 128.0);
-        // Allow ±1px rounding tolerance per side per glyph; 14
-        // chars + 2 padding = up to 16px slack on width. Height
-        // tolerance is ±max_ascent_diff + ±min_descent_diff +
-        // 2*pad rounding ≈ up to 5px in practice.
-        assert!((w_128 as i32 - 2 * w_64 as i32).abs() < 16,
-            "doubling size: w_64={w_64} w_128={w_128}");
-        assert!((h_128 as i32 - 2 * h_64 as i32).abs() <= 6,
-            "doubling size: h_64={h_64} h_128={h_128}");
-    }
 
-    #[test]
-    fn clamp_returns_none_when_under_cap() {
-        // Typical authored sizes fall well under the 2048-pixel
-        // cap. clamp returns None to signal no clamp needed.
-        let font = load_anton();
-        assert!(clamp_size_px_to_bitmap_cap(&font, "F", 64.0).is_none());
-        assert!(clamp_size_px_to_bitmap_cap(&font, "Tile Chaos 08", 128.0).is_none());
-        assert!(clamp_size_px_to_bitmap_cap(&font, "Hello world", 200.0).is_none());
-    }
 
-    #[test]
-    fn clamp_returns_none_for_empty_text() {
-        // Empty text has no rasterizable content; cap math is
-        // undefined. Return None (no clamp) and let the rasterize
-        // path handle the empty case via its own short-circuit.
-        let font = load_anton();
-        assert!(clamp_size_px_to_bitmap_cap(&font, "", 64.0).is_none());
-    }
 
-    #[test]
-    fn clamp_engages_when_size_exceeds_cap() {
-        // A 2000-px font on a longer string blows past the 2048
-        // dim cap. clamp returns Some(scaled) where scaled keeps
-        // the rasterized output within bounds.
-        let font = load_anton();
-        let text = "OPEN MARQUEE";
-        let clamped = clamp_size_px_to_bitmap_cap(&font, text, 2000.0)
-            .expect("expected clamp engagement at size_px=2000 for 12-char text");
-        assert!(clamped < 2000.0, "clamped {clamped} should be < 2000");
-        assert!(clamped >= 8.0, "clamped {clamped} should be >= 8 (size floor)");
-        // Verify the clamped size_px actually keeps both dims
-        // within the cap.
-        let (w, h) = predict_alpha_bitmap_dims(&font, text, clamped);
-        assert!(
-            w <= MAX_RASTERIZED_BITMAP_DIM,
-            "clamped width {w} > cap {MAX_RASTERIZED_BITMAP_DIM}",
-        );
-        assert!(
-            h <= MAX_RASTERIZED_BITMAP_DIM,
-            "clamped height {h} > cap {MAX_RASTERIZED_BITMAP_DIM}",
-        );
-    }
 
-    #[test]
-    fn clamp_floors_at_8_px() {
-        // Pathological inputs (extremely long text at huge sizes)
-        // could otherwise scale below the 8-px floor. clamp must
-        // never return Some(x) with x < 8.0.
-        let font = load_anton();
-        // 300-char string at 5000-px font would scale to ~tiny.
-        let text = "A".repeat(500);
-        if let Some(clamped) = clamp_size_px_to_bitmap_cap(&font, &text, 5000.0) {
-            assert!(clamped >= 8.0, "clamped {clamped} below 8-px floor");
-        }
-    }
 
-    #[test]
-    fn layout_text_to_alpha_caps_oversize_bitmap() {
-        // End-to-end: a request that would overflow the cap is
-        // clamped INSIDE layout_text_to_alpha; the returned
-        // AlphaBitmap is within the cap in both dims. Reaching
-        // the rasterize path uncapped would either crash on
-        // GL_INVALID_VALUE at upload time or burn fragment-fill
-        // cost unboundedly.
-        let font = load_anton();
-        let bm = layout_text_to_alpha(&font, "OPEN MARQUEE", 2000.0)
-            .expect("expected clamped rasterize result");
-        assert!(
-            bm.width <= MAX_RASTERIZED_BITMAP_DIM,
-            "clamped bm width {} > cap {}",
-            bm.width, MAX_RASTERIZED_BITMAP_DIM,
-        );
-        assert!(
-            bm.height <= MAX_RASTERIZED_BITMAP_DIM,
-            "clamped bm height {} > cap {}",
-            bm.height, MAX_RASTERIZED_BITMAP_DIM,
-        );
-        // Bitmap should still have ink in it (clamp doesn't
-        // reduce to zero).
-        assert!(bm.data.iter().any(|&p| p > 0));
-    }
 
-    #[test]
-    fn layout_text_to_alpha_passes_through_when_under_cap() {
-        // Sanity: the cap is engaged ONLY when needed. A typical
-        // authored size produces the same bitmap with or without
-        // the cap pre-check.
-        let font = load_anton();
-        let bm = layout_text_to_alpha(&font, "FYS Tile Chaos 08", 96.0).unwrap();
-        assert!(bm.width < MAX_RASTERIZED_BITMAP_DIM);
-        assert!(bm.height < MAX_RASTERIZED_BITMAP_DIM);
-        // Output dims match the un-clamped prediction at this
-        // size_px (no clamp applied).
-        let (pred_w, pred_h) = predict_alpha_bitmap_dims(&font, "FYS Tile Chaos 08", 96.0);
-        assert_eq!((bm.width, bm.height), (pred_w, pred_h));
-    }
 
-    #[test]
-    fn layout_single_char_produces_nonempty_bitmap() {
-        let font = load_anton();
-        let bm = layout_text_to_alpha(&font, "F", 64.0).expect("F bitmap");
-        assert!(bm.width > 0, "F width should be > 0");
-        assert!(bm.height > 0, "F height should be > 0");
-        assert_eq!(
-            bm.data.len() as u32,
-            bm.width * bm.height,
-            "data length must equal width*height"
-        );
-        // At 64px Anton, F should be roughly half as wide as tall —
-        // sanity check on order of magnitude.
-        assert!(bm.height >= 30 && bm.height <= 80, "h={}", bm.height);
-        // F has ink. The rasterized bitmap should have at least
-        // *some* non-zero pixels.
-        assert!(
-            bm.data.iter().any(|&p| p > 0),
-            "F should have at least one non-zero pixel"
-        );
-    }
 
-    #[test]
-    fn layout_multi_char_widens_with_advance() {
-        let font = load_anton();
-        let f = layout_text_to_alpha(&font, "F", 64.0).unwrap();
-        let free = layout_text_to_alpha(&font, "FREE", 64.0).unwrap();
-        // "FREE" must be wider than "F" alone — at least 2x for a
-        // 4-letter word with no kerning weirdness.
-        assert!(
-            free.width > 2 * f.width,
-            "FREE width {} should be at least 2x F width {}",
-            free.width,
-            f.width
-        );
-        // Heights should be in the same ballpark — both lines have
-        // ascender + maybe descender from the wider variant.
-        assert!(
-            (free.height as i32 - f.height as i32).abs() <= 2,
-            "FREE h={} F h={} should match within ±2px",
-            free.height,
-            f.height
-        );
-    }
 
-    #[test]
-    fn layout_descender_taller_than_non_descender() {
-        // Phase 4.2b R1: a descender (g/j/p/q/y) extends below the
-        // baseline. Its bitmap height should be strictly greater
-        // than a non-descender of the same nominal size, AND the
-        // ink should land in the lower portion of the canvas.
-        // Using m.bounds.ymin + .round() (pre-fix) loses up to
-        // 1px of descender vs the integer m.ymin path; this test
-        // pins the integer-snapped behavior.
-        let font = load_anton();
-        let f = layout_text_to_alpha(&font, "F", 64.0).expect("F bitmap");
-        // Anton's lowercase descenders are tame compared to a
-        // serif font, but g/p still descend below the baseline.
-        for ch in ["g", "p", "y"] {
-            let bm = layout_text_to_alpha(&font, ch, 64.0)
-                .unwrap_or_else(|| panic!("descender {ch:?} bitmap"));
-            assert!(
-                bm.height >= f.height,
-                "descender {ch:?} h={} should be >= F h={} (descender extends below baseline)",
-                bm.height, f.height,
-            );
-            // Ink should appear in the bottom half of the canvas
-            // (descender body sits below F's baseline).
-            let bottom_half_has_ink = bm
-                .data
-                .iter()
-                .skip((bm.width * bm.height / 2) as usize)
-                .any(|&p| p > 0);
-            assert!(
-                bottom_half_has_ink,
-                "descender {ch:?} should have ink in bottom half of bitmap",
-            );
-        }
-    }
 
-    #[test]
-    fn layout_descender_with_caps_extends_below() {
-        // Mixed-case word: "Pgy" combines a cap (P, full ascender)
-        // with two descenders (g, y). The bitmap height should
-        // exceed the cap-only width "PPP" since descenders push
-        // the canvas down beyond the baseline.
-        let font = load_anton();
-        let caps = layout_text_to_alpha(&font, "PPP", 64.0).unwrap();
-        let mixed = layout_text_to_alpha(&font, "Pgy", 64.0).unwrap();
-        assert!(
-            mixed.height > caps.height,
-            "mixed h={} should be > all-caps h={} (descenders extend canvas)",
-            mixed.height, caps.height,
-        );
-    }
 
-    #[test]
-    fn layout_whitespace_only_returns_none() {
-        // R4: a space-only string has zero ink and should yield
-        // None — caller falls back / skips the layer rather than
-        // uploading a 0-byte texture. (Tab glyphs are font-
-        // dependent — Anton rasterizes \t to a non-empty bitmap;
-        // we don't assert anything about non-space whitespace.)
-        let font = load_anton();
-        assert!(layout_text_to_alpha(&font, " ", 64.0).is_none());
-        assert!(layout_text_to_alpha(&font, "   ", 64.0).is_none());
-    }
 
-    #[test]
-    fn layout_size_scales_bitmap() {
-        let font = load_anton();
-        let small = layout_text_to_alpha(&font, "F", 32.0).unwrap();
-        let big = layout_text_to_alpha(&font, "F", 128.0).unwrap();
-        // 4x size should yield ~4x dimensions (within ±5% rounding).
-        let ratio_w = big.width as f32 / small.width as f32;
-        let ratio_h = big.height as f32 / small.height as f32;
-        assert!(
-            (3.5..=4.5).contains(&ratio_w),
-            "width ratio {ratio_w} should be ~4"
-        );
-        assert!(
-            (3.5..=4.5).contains(&ratio_h),
-            "height ratio {ratio_h} should be ~4"
-        );
-    }
 
     #[test]
     fn gradient_fys_canonical_density_zero() {
@@ -7506,13 +6686,6 @@ mod tests {
 
     // -- glyph cache hit/miss (v1-spec-delta #3 QA F2) ----------
 
-    fn dummy_bitmap() -> AlphaBitmap {
-        AlphaBitmap {
-            width: 1,
-            height: 1,
-            data: vec![0],
-        }
-    }
 
     #[test]
     fn should_rerasterize_misses_on_none_entry() {
@@ -7521,133 +6694,13 @@ mod tests {
         assert!(should_rerasterize(None, "", 100.0, 500.0));
     }
 
-    #[test]
-    fn should_rerasterize_hits_on_matching_text() {
-        // Steady-state on a motion-only path: resolved_text doesn't
-        // change between frames, cache hit, skip fontdue.
-        let cached = CachedGlyph {
-            text: "hello".to_string(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        assert!(!should_rerasterize(Some(&cached), "hello", 100.0, 500.0));
-    }
 
-    #[test]
-    fn should_rerasterize_misses_on_differing_text() {
-        // auto_mode=time second-bucket boundary: text changes from
-        // "14:35:09" to "14:35:10", cache miss, re-rasterize.
-        let cached = CachedGlyph {
-            text: "14:35:09".to_string(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        assert!(should_rerasterize(Some(&cached), "14:35:10", 100.0, 500.0));
-    }
 
-    #[test]
-    fn should_rerasterize_handles_empty_string_match() {
-        // Degenerate but valid: empty text on both sides -> hit.
-        // (layout_text_to_alpha returns None for empty input so
-        // this case is unreachable in practice, but the helper is
-        // pure and shouldn't special-case it.)
-        let cached = CachedGlyph {
-            text: String::new(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        assert!(!should_rerasterize(Some(&cached), "", 100.0, 500.0));
-    }
 
-    #[test]
-    fn should_rerasterize_handles_empty_to_nonempty_transition() {
-        // Cached empty, resolved non-empty -> miss. Catches a
-        // degenerate edge where a paint happened with empty text
-        // and the next frame has real content.
-        let cached = CachedGlyph {
-            text: String::new(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        assert!(should_rerasterize(Some(&cached), "anything", 100.0, 500.0));
-    }
 
-    #[test]
-    fn should_rerasterize_distinguishes_unicode_canonical_forms() {
-        // Pure byte-comparison: NFC vs NFD of the same character
-        // are different cache keys (renders differently if fontdue
-        // shapes them differently). Pinning the byte-equality
-        // semantic so a future "smart" comparator that normalizes
-        // doesn't silently change behavior.
-        let cached = CachedGlyph {
-            // "café" in NFC (U+00E9)
-            text: "caf\u{00E9}".to_string(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        // Same string in NFD: "cafe" + combining acute (U+0301).
-        let nfd = "cafe\u{0301}";
-        assert!(should_rerasterize(Some(&cached), nfd, 100.0, 500.0));
-    }
 
-    #[test]
-    fn should_rerasterize_misses_on_size_change() {
-        // qarl-direct perf-profile (2026-05-08): same text, smaller
-        // size_px (e.g. box.w shrunk by an editor edit). Pre-fix
-        // the cache hit silently — rendering the old large bitmap
-        // at the new small layout. Now correctly invalidates.
-        let cached = CachedGlyph {
-            text: "hello".to_string(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        assert!(should_rerasterize(Some(&cached), "hello", 80.0, 500.0));
-        assert!(should_rerasterize(Some(&cached), "hello", 120.0, 500.0));
-    }
 
-    #[test]
-    fn should_rerasterize_hits_on_exact_size_match() {
-        // Same text + same size_px + same max_width -> hit. Bitmap is reusable.
-        let cached = CachedGlyph {
-            text: "hello".to_string(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        assert!(!should_rerasterize(Some(&cached), "hello", 100.0, 500.0));
-    }
 
-    #[test]
-    fn should_rerasterize_misses_on_max_width_change() {
-        // 2026-05-17 wrap port: same text + same size_px, but the
-        // layer's box width changed (so max_width_px changes). With
-        // wrap active, the line breaks may differ -> bitmap must
-        // re-rasterize. Catches the editor-narrow-the-box flow.
-        let cached = CachedGlyph {
-            text: "hello world that wraps".to_string(),
-            size_px: 100.0,
-            max_width_px: 500.0,
-            bitmap: dummy_bitmap(),
-            group: None,
-        };
-        assert!(should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 300.0));
-        assert!(should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 700.0));
-        // Sanity: unchanged max_width still hits.
-        assert!(!should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 500.0));
-    }
 
     // -- auto-mode (v1-spec-delta #3) ---------------------------
 
@@ -8856,57 +7909,6 @@ mod tests {
         assert!((rect[0] - 0.5).abs() < 1e-4, "uv_l should match right-flush bitmap width, got {}", rect[0]);
     }
 
-    #[test]
-    fn compute_layer_uv_rect_bitmap_larger_than_box_scales_down_to_fit() {
-        // QA gap #2: bitmap-larger-than-box scale-down-fit branch
-        // of box_to_ndc_quad was not exercised. The placed rect
-        // must NOT exceed the box bounds even when bm dimensions
-        // are larger than box * mode dimensions.
-        let inputs = LayerGeomInputs {
-            box_x: 0.25,
-            box_y: 0.25,
-            box_w: 0.5,
-            box_h: 0.5,
-            halign: HAlign::Center,
-            font_size_px: Some(64.0),
-            font_size_pct: None,
-        };
-        // Box pixel size = 0.5 * 1920 = 960 wide, 0.5 * 1080 =
-        // 540 tall. Bitmap is 1922x1082 (ink 1920x1080 + 1-px pad
-        // on each side per layout_text_to_alpha). With ink dims
-        // 1920x1080 in 960x540 box, the binding dim is s_w=0.5 vs
-        // s_h=0.5 (equal) -> ink placed = 960x540 = box; the
-        // 1-px pad rows scale to ~0.5 canvas-px and sit just
-        // OUTSIDE the box (alpha=0, invisible). Identity motion:
-        // ink rect == box.
-        let rect = compute_layer_uv_rect_logic(
-            &inputs,
-            MotionKind::Static,
-            MotionState::IDENTITY,
-            1922, 1082, 1920, 1080,
-        );
-        // INK rect must match box bounds in UV: box_x = 0.25 ->
-        // uv_l_ink = 0.25; box_x+box_w = 0.75 -> uv_r_ink = 0.75.
-        // box_y = 0.25 (top-down) -> uv_t_ink = 0.75 (UV is bottom-
-        // up); box_y+box_h = 0.75 -> uv_b_ink = 0.25.
-        //
-        // Phase 3j 2026-05-15: the full quad (pad-inclusive) extends
-        // 1 px * scale OUTSIDE the box on each side, since
-        // box_to_ndc_quad now scales based on INK dims (bm - 2*pad)
-        // but places the full bitmap. With pad=1, scale=0.5, mode_w=
-        // 1920, the per-edge UV overshoot is 1*0.5/1920 ≈ 0.00026.
-        // Subtract that to recover the ink edges.
-        let pad_overshoot_x = 1.0 * 0.5 / 1920.0;
-        let pad_overshoot_y = 1.0 * 0.5 / 1080.0;
-        let uv_l_ink = rect[0] + pad_overshoot_x;
-        let uv_b_ink = rect[1] + pad_overshoot_y;
-        let uv_r_ink = rect[2] - pad_overshoot_x;
-        let uv_t_ink = rect[3] - pad_overshoot_y;
-        assert!((uv_l_ink - 0.25).abs() < 1e-4, "ink uv_l = {}", uv_l_ink);
-        assert!((uv_r_ink - 0.75).abs() < 1e-4, "ink uv_r = {}", uv_r_ink);
-        assert!((uv_b_ink - 0.25).abs() < 1e-4, "ink uv_b = {}", uv_b_ink);
-        assert!((uv_t_ink - 0.75).abs() < 1e-4, "ink uv_t = {}", uv_t_ink);
-    }
 
     #[test]
     fn compute_layer_uv_rect_y_translate_negates_dy_ndc() {
@@ -9390,79 +8392,5 @@ mod tests {
             .expect("parse Playfair Display TTF")
     }
 
-    #[test]
-    fn wrap_the_sentence_fixture_subtitle_breaks_to_multiple_lines() {
-        // Integration test for the 2026-05-17 wrap port: load The
-        // Sentence fixture's subtitle layer params, compute size_px +
-        // max_width_px the way the paint path does, and assert wrap
-        // produces a multi-line result. Then layout-rasterize the
-        // wrapped text and confirm the bitmap is meaningfully taller
-        // than the no-wrap baseline (= more than one line of glyphs).
-        //
-        // The Sentence subtitle is the on-glass bug qarl flagged:
-        // "say what you mean. mean what you say." in a box at
-        // box.w=0.4415 (847px @ 1920 mode) with font_size_pct=8.0
-        // (~67.8 px) ran off the right edge pre-fix.
-        let font = load_playfair();
-        let text = "say what you mean. mean what you say.";
-        let box_w = 0.4415_f32;
-        let mode_w = 1920_u32;
-        let font_size_pct = 8.0_f32;
-        let size_px = effective_font_size_px(None, Some(font_size_pct), box_w, mode_w);
-        let max_width_px = (box_w * mode_w as f32).max(1.0);
-        let wrapped = wrap_text_to_width(&font, text, size_px, max_width_px);
-        assert!(
-            wrapped.contains('\n'),
-            "The Sentence subtitle should wrap (got single-line {wrapped:?})",
-        );
-        let line_count = wrapped.split('\n').count();
-        assert!(
-            line_count >= 2,
-            "expected >=2 lines, got {line_count} for {wrapped:?}",
-        );
-        // Confirm the wrapped layout actually paints taller than the
-        // no-wrap version (which would clip horizontally — the visible
-        // bug we're fixing). 2 lines should be ~2x as tall as 1.
-        let bm_wrapped =
-            layout_text_to_alpha(&font, &wrapped, size_px).expect("wrapped layout");
-        let bm_single =
-            layout_text_to_alpha(&font, text, size_px).expect("single-line layout");
-        assert!(
-            bm_wrapped.height >= bm_single.height + (size_px as u32),
-            "wrapped bitmap height {} should exceed single-line {} by at least one line ({size_px})",
-            bm_wrapped.height,
-            bm_single.height,
-        );
-    }
 
-    #[test]
-    fn wrap_output_paints_within_max_width() {
-        // Internal-consistency guarantee: every wrapped line's rendered
-        // width via layout_text_to_alpha is ≤ the max_width passed to
-        // wrap_text_to_width (modulo the per-glyph round() that both
-        // measure + paint share). Catches measure-vs-paint drift inside
-        // the Rust pipeline.
-        let font = load_anton();
-        let max_w = 600.0;
-        let wrapped = wrap_text_to_width(
-            &font,
-            "the quick brown fox jumps over the lazy dog repeatedly",
-            48.0,
-            max_w,
-        );
-        for line in wrapped.split('\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let line_w = measure(&font, line, 48.0);
-            // Allow single-token-too-long lines (no mid-word break),
-            // otherwise every wrapped line must fit within max_w.
-            let single_token = !line.contains(' ');
-            assert!(
-                single_token || line_w <= max_w,
-                "wrapped line {:?} measured {line_w}px > max_w {max_w}px",
-                line,
-            );
-        }
-    }
 }

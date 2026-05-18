@@ -45,7 +45,7 @@ use crate::hdmi_logic::{
     clamp_transition_ms, compute_motion_state, confetti_uniforms, dots_uniforms,
     effective_font_size_px, effective_hold_ms, format_auto_text, fourcc_for_argb_family,
     fs_for_transition_kind, gradient_uniforms, grid_uniforms, halftone_uniforms,
-    hex_to_rgba, hsv_to_rgb, layout_text_to_alpha, motion_offset_to_px,
+    hex_to_rgba, hsv_to_rgb, motion_offset_to_px,
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize, wrap_text_to_width,
@@ -54,9 +54,9 @@ use crate::hdmi_logic::{
     is_transition_kind_single_pass, layout_text_to_quads, prefer_scissored_bake,
     sp_kind_static, stripes_uniforms, transition_eligible_for_scissored_bake_logic,
     transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
-    AlphaBitmap, BlendMode, FontCatalog, MsdfQuadGroup, PrewarmTier,
+    BlendMode, FontCatalog, MsdfQuadGroup, PrewarmTier,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
-    FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
+    FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND, FS_TOFU,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
     FS_PATTERN_GRID, FS_PATTERN_HALFTONE, FS_PATTERN_RAYS, FS_PATTERN_RINGS,
     FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES, SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE,
@@ -1850,346 +1850,14 @@ where
     Ok(())
 }
 
-/// Phase 4.2 — rasterize and draw a single text layer's text on top
-/// of whatever's already in the framebuffer. Premultiplied-alpha
-/// blend so the glyph composites cleanly over the bg pass.
-///
-/// `text_color` is the layer's `text_color` already parsed from hex
-/// (caller does it once outside the closure for early error
-/// reporting). `opacity` is the layer's opacity in [0, 1] —
-/// multiplied into the rgb channel so antialiased edges still
-/// resolve via the glyph alpha.
-///
-/// Resource discipline matches `draw_gradient_pattern`'s pattern:
-/// every early-return path frees the right subset (texture /
-/// texture+program / texture+program+vbo); happy path frees all
-/// three.
-fn draw_text_layer(
-    gl: &glow::Context,
-    mode_w: u32,
-    mode_h: u32,
-    layer: &crate::content::TextLayer,
-    text_color: [f32; 4],
-    motion_kind: MotionKind,
-    motion_state: MotionState,
-    bm: &AlphaBitmap,
-    tex_slot: Option<&mut Option<glow::NativeTexture>>,
-    // Atlas SB Phase 2.7 (E): when Some, set glScissor to the
-    // layer's framebuffer-pixel rect (NDC-final quad mapped via
-    // the supplied viewport) before draw_arrays. Restricts the
-    // rasterizer's tile-coverage to the layer's destination area,
-    // dropping fragment work on tiles outside the layer rect.
-    // (vp_x_off, vp_y_off, vp_w, vp_h) is the current GL viewport.
-    tighten_scissor: Option<(u32, u32, u32, u32)>,
-) -> Result<()> {
-    use glow::HasContext;
-
-    // Phase 4.2c: real Python-model semantics via the
-    // host-tested `effective_font_size_px` helper. font_size_pct =
-    // percent-of-box-WIDTH.
-    let size_px = effective_font_size_px(
-        layer.font_size_px,
-        layer.font_size_pct,
-        layer.r#box.w,
-        mode_w,
-    );
-
-    // v1-spec-delta #3 (slice b cache, QA followup): the alpha
-    // bitmap is pre-rasterized by paint_slide via the
-    // (resolved_text -> bitmap) cache. draw_text_layer is now
-    // GPU-only -- no fontdue calls per frame on cache hits.
-
-    // v1-spec-delta #2 (slice c-1): apply per-layer motion.
-    // alpha_mul folds in pulse / blink. A fully transparent layer
-    // (e.g. blink off-half) skips the GPU work entirely.
-    let opacity =
-        (layer.opacity.clamp(0.0, 1.0) * motion_state.alpha_mul.clamp(0.0, 1.0))
-            .clamp(0.0, 1.0);
-    if opacity < 1e-3 {
-        return Ok(());
-    }
-    let halign = parse_h_align(&layer.text_align);
-    // The Python content model has no v-align field. Phase 4.2c
-    // matches the Python auto_render reference behavior of vertical-
-    // centering text inside the box. If a v-align field lands later,
-    // route through `parse_v_align(layer.v_align)`.
-    let valign = VAlign::Middle;
-
-    unsafe {
-        // -- Glyph atlas as a LUMINANCE texture. GLES2 doesn't
-        // expose GL_RED; LUMINANCE is the analog for single-channel
-        // grayscale and returns the value in r/g/b/a on sample
-        // (FS_GLYPH reads `.r`).
-        //
-        // v1-spec-delta perf-profile (qarl-direct 2026-05-08): when
-        // tex_slot has a cached texture, just bind + skip the
-        // create+upload (~3.5 MB / 1080p alpha bitmap). Slot empty
-        // = create + upload + (optionally) store back. Slot None
-        // (caller didn't pass cache) = legacy create+upload+delete
-        // path, freed at end of this function.
-        let (tex, owns_tex) = match tex_slot.as_deref() {
-            Some(Some(t)) => {
-                crate::profile::record_phase("draw_tex_hit", 1);
-                gl.bind_texture(glow::TEXTURE_2D, Some(*t));
-                (*t, false)
-            }
-            _ => {
-                crate::profile::record_phase("draw_tex_miss", 1);
-                let t_upload = std::time::Instant::now();
-                let t = gl
-                    .create_texture()
-                    .map_err(|e| anyhow!("glGenTextures: {e}"))?;
-                gl.bind_texture(glow::TEXTURE_2D, Some(t));
-                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-                gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::LUMINANCE as i32,
-                    bm.width as i32,
-                    bm.height as i32,
-                    0,
-                    glow::LUMINANCE,
-                    glow::UNSIGNED_BYTE,
-                    Some(&bm.data),
-                );
-                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-                crate::profile::record_phase("tex_upload", t_upload.elapsed().as_nanos() as u64);
-                (t, true)
-            }
-        };
-
-        // -- Build the textured quad in NDC via the host-tested
-        // `box_to_ndc_quad` helper. Scale-down-only (no upscaling),
-        // aligned per `halign`/`valign` inside the box.
-        let (mut ndc_l, mut ndc_r, mut ndc_t, mut ndc_b) = box_to_ndc_quad(
-            layer.r#box.x,
-            layer.r#box.y,
-            layer.r#box.w,
-            layer.r#box.h,
-            bm.width,
-            bm.height,
-            1, // bm_pad: layout_text_to_alpha pads each side by 1 px
-            mode_w,
-            mode_h,
-            halign,
-            valign,
-        );
-
-        // v1-spec-delta #2 (slice c-1): breathe scales the rendered
-        // quad around the box center (not the glyph bbox center —
-        // see motion-spec.md §"breathe pivot"). Operator-authored
-        // offset within the box is preserved because we scale the
-        // already-aligned quad about the box center.
-        let scale = motion_state.scale.max(0.05);
-        if (scale - 1.0).abs() > 1e-4 {
-            let box_cx_ndc = (layer.r#box.x + layer.r#box.w * 0.5) * 2.0 - 1.0;
-            let box_cy_ndc = 1.0 - (layer.r#box.y + layer.r#box.h * 0.5) * 2.0;
-            ndc_l = box_cx_ndc + scale * (ndc_l - box_cx_ndc);
-            ndc_r = box_cx_ndc + scale * (ndc_r - box_cx_ndc);
-            ndc_t = box_cy_ndc + scale * (ndc_t - box_cy_ndc);
-            ndc_b = box_cy_ndc + scale * (ndc_b - box_cy_ndc);
-        }
-
-        // v1-spec-delta #2 (slice c-1): translation for ticker /
-        // bounce / shake. motion_offset_to_px applies the spec's
-        // per-effect unit convention (box-width / box-height /
-        // glyph-height). Convert the resulting pixel offset into
-        // NDC and shift the quad. Note: NDC y is up, screen y is
-        // down, hence the negation.
-        let box_w_px = (layer.r#box.w * mode_w as f32).max(1.0);
-        let box_h_px = (layer.r#box.h * mode_h as f32).max(1.0);
-        let (dx_px, dy_px) =
-            motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px);
-        if dx_px.abs() > 1e-4 || dy_px.abs() > 1e-4 {
-            let dx_ndc = (dx_px / mode_w as f32) * 2.0;
-            let dy_ndc = -(dy_px / mode_h as f32) * 2.0;
-            ndc_l += dx_ndc;
-            ndc_r += dx_ndc;
-            ndc_t += dy_ndc;
-            ndc_b += dy_ndc;
-        }
-        // Verts: TRIANGLE_STRIP order BL, BR, TL, TR. Each vert is
-        // [x, y, u, v]. UV (0,0) is top-left of the bitmap, which
-        // matches our row-major top-down `data`.
-        let verts: [f32; 16] = [
-            ndc_l, ndc_b, 0.0, 1.0,
-            ndc_r, ndc_b, 1.0, 1.0,
-            ndc_l, ndc_t, 0.0, 0.0,
-            ndc_r, ndc_t, 1.0, 0.0,
-        ];
-
-        // v1-spec-delta #4 (b): outline=true picks the dilated-
-        // alpha shader; outline=false uses FS_GLYPH (cheap path).
-        // Both write premultiplied-alpha output.
-        //
-        // qarl-direct perf-profile (2026-05-08): glyph programs
-        // are cached in thread-local Cells across paint_slide
-        // calls within the same EGL session.
-        //
-        // P2-F (2026-05-10): the cache now also holds resolved
-        // attribute + uniform locations (cgp.a_pos / .u_atlas /
-        // etc.), eliminating ~5 driver string lookups per layer
-        // per frame (~1500/sec at 5L+30fps).
-        //
-        // (P2-F also TRIED reusing the VBO across layers via
-        // STREAM_DRAW + buffer_data_u8_slice, but Pi bench at
-        // @60 showed a ~1 fps regression on flip transitions --
-        // suspected vc4 driver sync stall on rebinding a
-        // recently-streamed buffer. Reverted: per-call create_
-        // buffer + destroy_buffer remains. The driver-string
-        // lookup elimination is the bulk of the win regardless.)
-        let t_link = std::time::Instant::now();
-        let cgp = match cached_glyph_program(gl, layer.outline) {
-            Ok(c) => c,
-            Err(e) => {
-                if owns_tex {
-                    gl.delete_texture(tex);
-                }
-                return Err(e);
-            }
-        };
-        crate::profile::record_phase("link_program", t_link.elapsed().as_nanos() as u64);
-        let t_vbo = std::time::Instant::now();
-        let vbo = match gl.create_buffer() {
-            Ok(b) => b,
-            Err(e) => {
-                if owns_tex {
-                    gl.delete_texture(tex);
-                }
-                return Err(anyhow!("glGenBuffers: {e}"));
-            }
-        };
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        crate::profile::record_phase("create_vbo", t_vbo.elapsed().as_nanos() as u64);
-        let bytes = std::slice::from_raw_parts(
-            verts.as_ptr() as *const u8,
-            std::mem::size_of_val(&verts),
-        );
-        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-
-        gl.use_program(Some(cgp.program));
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        gl.uniform_1_i32(cgp.u_atlas.as_ref(), 0);
-        // v1-spec-delta #4: opacity goes through u_opacity uniform
-        // so the shader multiplies BOTH RGB and the output alpha
-        // by it. Pre-fix this code multiplied only the RGB
-        // channels into u_text_color, leaving the output alpha at
-        // `a` regardless of opacity -- which made an opacity=0.5
-        // glyph fully cover the bg instead of letting half through.
-        gl.uniform_3_f32(cgp.u_text_color.as_ref(), text_color[0], text_color[1], text_color[2]);
-        gl.uniform_1_f32(cgp.u_opacity.as_ref(), opacity);
-        if layer.outline {
-            // v1-spec-delta #4 (b): hardcoded 1px black outline,
-            // matching the Python convention at backend/openmarquee/
-            // motion.py:341 ('outline_color = #000000'). The schema
-            // is just `outline: bool`; future schema growth could
-            // expose color + width through these uniforms without
-            // a shader rewrite.
-            gl.uniform_3_f32(cgp.u_outline_color.as_ref(), 0.0, 0.0, 0.0);
-            gl.uniform_2_f32(
-                cgp.u_pixel_size.as_ref(),
-                1.0 / bm.width as f32,
-                1.0 / bm.height as f32,
-            );
-        }
-        let a_pos = cgp.a_pos;
-        let a_uv = cgp.a_uv;
-
-        // BLEND state is set by the caller (render_slide) once
-        // around the layer loop — same blend func for every layer,
-        // so toggling per-layer would just churn driver state.
-
-        let stride = (4 * std::mem::size_of::<f32>()) as i32;
-        gl.enable_vertex_attrib_array(a_pos);
-        gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
-        gl.enable_vertex_attrib_array(a_uv);
-        gl.vertex_attrib_pointer_f32(
-            a_uv,
-            2,
-            glow::FLOAT,
-            false,
-            stride,
-            (2 * std::mem::size_of::<f32>()) as i32,
-        );
-
-        // Atlas SB Phase 2.7 (E): tighten scissor to this layer's
-        // framebuffer-pixel rect. vc4 is a tile-based renderer
-        // (tile=64x64); without scissor, the rasterizer covers
-        // every tile that intersects the quad's bbox even though
-        // the fragment shader will only emit coverage inside
-        // visible glyph areas. Tightening scissor to the quad's
-        // rect drops uncovered tiles entirely, removing the per-
-        // tile load/store overhead on tiles the layer doesn't
-        // actually fill.
-        //
-        // Caller already has GL_SCISSOR_TEST enabled (atlas SB
-        // sets region scissor before bake) and is responsible
-        // for re-establishing scissor after the layer batch.
-        if let Some((vp_x_off, vp_y_off, vp_w, vp_h)) = tighten_scissor {
-            // NDC -> framebuffer pixel coords via current
-            // viewport. NDC y=+1 (top) maps to fb_y_top =
-            // vp_y_off + vp_h; NDC y=-1 (bottom) maps to
-            // vp_y_off. Quad's NDC top is ndc_t (the larger y),
-            // bottom is ndc_b (smaller).
-            let to_fb_x = |ndc: f32| {
-                vp_x_off as f32 + (ndc + 1.0) * 0.5 * vp_w as f32
-            };
-            let to_fb_y = |ndc: f32| {
-                vp_y_off as f32 + (ndc + 1.0) * 0.5 * vp_h as f32
-            };
-            // Clamp to viewport bounds: motion translation can
-            // push the rect past the layer's box, and GL will
-            // clamp anyway, but reporting a tighter box up front
-            // makes the intent legible (sw / sh tests below now
-            // mean what they say). Also skip the scissor entirely
-            // when the rect collapses to empty.
-            let vp_x_max = (vp_x_off + vp_w) as f32;
-            let vp_y_max = (vp_y_off + vp_h) as f32;
-            let fb_l = to_fb_x(ndc_l).floor().clamp(vp_x_off as f32, vp_x_max) as i32;
-            let fb_r = to_fb_x(ndc_r).ceil().clamp(vp_x_off as f32, vp_x_max) as i32;
-            let fb_b = to_fb_y(ndc_b).floor().clamp(vp_y_off as f32, vp_y_max) as i32;
-            let fb_t = to_fb_y(ndc_t).ceil().clamp(vp_y_off as f32, vp_y_max) as i32;
-            let sw = (fb_r - fb_l).max(0);
-            let sh = (fb_t - fb_b).max(0);
-            if sw > 0 && sh > 0 {
-                gl.scissor(fb_l, fb_b, sw, sh);
-            }
-        }
-        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-        gl.disable_vertex_attrib_array(a_pos);
-        gl.disable_vertex_attrib_array(a_uv);
-        gl.delete_buffer(vbo);
-        // P2-F (2026-05-10): program comes from session-lived
-        // FS_GLYPH(_OUTLINE)_PROGRAM thread_local; never freed
-        // here. Cleanup happens in clear_glyph_program_cache at
-        // session teardown.
-        // Texture lifecycle: if caller passed a slot AND we created
-        // the texture this call, store it back so the next draw
-        // reuses it. If caller didn't pass a slot, the texture is
-        // ours to free now (legacy one-shot paint path). If we
-        // bound a pre-cached texture (owns_tex=false), the slot
-        // already owns it; do nothing.
-        if owns_tex {
-            match tex_slot {
-                Some(slot) => *slot = Some(tex),
-                None => gl.delete_texture(tex),
-            }
-        }
-    }
-    Ok(())
-}
 
 /// SDF arc slice B.2 -- MSDF text layer draw. Per-glyph quad VBO
 /// (TRIANGLES, 6 verts per glyph) sampled against the session-lived
-/// MSDF atlas. Replaces the AlphaBitmap path on the text-render
-/// route.
+/// MSDF atlas. The only text-rendering path on the renderer post-B.3
+/// (the legacy AlphaBitmap-based `draw_text_layer` was deleted in B.3
+/// once SP-tier was gated off for text-bearing transitions).
 ///
-/// Geometry mirrors `draw_text_layer`:
+/// Geometry:
 ///   1. `box_to_ndc_quad` maps the group's per-layer pixel-space
 ///      bbox (group.width x group.height) into NDC against the
 ///      layer's box (scale-down-only + halign/valign placement).
@@ -2290,125 +1958,177 @@ fn draw_text_layer_msdf(
     let to_ndc_x = |px: f32| ndc_l + (px / gw) * (ndc_r - ndc_l);
     let to_ndc_y = |py: f32| ndc_t + (py / gh) * (ndc_b - ndc_t);
 
-    // Build interleaved [x, y, u, v] verts: 6 per ink glyph
-    // (TRIANGLES winding BL, BR, TL, BR, TL, TR). Tofu quads
-    // skipped at this slice (task #592).
-    let mut verts: Vec<f32> = Vec::with_capacity(group.quads.len() * 24);
+    // Build interleaved [x, y, u, v] verts. Per-glyph TRIANGLES
+    // winding BL, BR, TL, BR, TL, TR (6 verts per glyph). Split into
+    // two vertex streams:
+    //   - `ink_verts`: glyphs with real atlas UVs; drawn with the
+    //     cached_msdf_program (sampling the font atlas).
+    //   - `tofu_verts`: missing-codepoint quads; drawn with FS_TOFU
+    //     in a second batch. UVs span [0,1] across each tofu quad so
+    //     FS_TOFU can use them as in-rect coordinates for the
+    //     outline test.
+    let mut ink_verts: Vec<f32> = Vec::with_capacity(group.quads.len() * 24);
+    let mut tofu_verts: Vec<f32> = Vec::new();
     for q in &group.quads {
-        if q.tofu {
-            continue;
-        }
         let xl = to_ndc_x(q.px_left);
         let xr = to_ndc_x(q.px_right);
         let yt = to_ndc_y(q.px_top);
         let yb = to_ndc_y(q.px_bottom);
-        let ul = q.uv_left;
-        let ur = q.uv_right;
-        let ut = q.uv_top;
-        let ub = q.uv_bottom;
-        // BL, BR, TL, BR, TL, TR.
-        verts.extend_from_slice(&[
-            xl, yb, ul, ub,
-            xr, yb, ur, ub,
-            xl, yt, ul, ut,
-            xr, yb, ur, ub,
-            xl, yt, ul, ut,
-            xr, yt, ur, ut,
-        ]);
+        if q.tofu {
+            // Per-quad UVs [0, 1] for FS_TOFU's in-rect test. Atlas
+            // UVs on the quad are zero per layout_text_to_quads;
+            // ignored here.
+            tofu_verts.extend_from_slice(&[
+                xl, yb, 0.0, 1.0,
+                xr, yb, 1.0, 1.0,
+                xl, yt, 0.0, 0.0,
+                xr, yb, 1.0, 1.0,
+                xl, yt, 0.0, 0.0,
+                xr, yt, 1.0, 0.0,
+            ]);
+        } else {
+            let ul = q.uv_left;
+            let ur = q.uv_right;
+            let ut = q.uv_top;
+            let ub = q.uv_bottom;
+            ink_verts.extend_from_slice(&[
+                xl, yb, ul, ub,
+                xr, yb, ur, ub,
+                xl, yt, ul, ut,
+                xr, yb, ur, ub,
+                xl, yt, ul, ut,
+                xr, yt, ur, ut,
+            ]);
+        }
     }
-    if verts.is_empty() {
+    if ink_verts.is_empty() && tofu_verts.is_empty() {
         return Ok(());
     }
 
+    // Shared scissor box derived once from the OUTER NDC rect.
+    let scissor_box: Option<(i32, i32, i32, i32)> = tighten_scissor.map(|(vp_x_off, vp_y_off, vp_w, vp_h)| {
+        let to_fb_x = |ndc: f32| {
+            vp_x_off as f32 + (ndc + 1.0) * 0.5 * vp_w as f32
+        };
+        let to_fb_y = |ndc: f32| {
+            vp_y_off as f32 + (ndc + 1.0) * 0.5 * vp_h as f32
+        };
+        let vp_x_max = (vp_x_off + vp_w) as f32;
+        let vp_y_max = (vp_y_off + vp_h) as f32;
+        let fb_l =
+            to_fb_x(ndc_l).floor().clamp(vp_x_off as f32, vp_x_max) as i32;
+        let fb_r =
+            to_fb_x(ndc_r).ceil().clamp(vp_x_off as f32, vp_x_max) as i32;
+        let fb_b =
+            to_fb_y(ndc_b).floor().clamp(vp_y_off as f32, vp_y_max) as i32;
+        let fb_t =
+            to_fb_y(ndc_t).ceil().clamp(vp_y_off as f32, vp_y_max) as i32;
+        (fb_l, fb_b, (fb_r - fb_l).max(0), (fb_t - fb_b).max(0))
+    });
+
     unsafe {
-        let cgp = cached_msdf_program(gl, layer.outline)?;
-        let vbo = gl
-            .create_buffer()
-            .map_err(|e| anyhow!("glGenBuffers (msdf): {e}"))?;
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        let bytes = std::slice::from_raw_parts(
-            verts.as_ptr() as *const u8,
-            verts.len() * std::mem::size_of::<f32>(),
-        );
-        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-
-        gl.use_program(Some(cgp.program));
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
-        gl.uniform_1_i32(cgp.u_atlas.as_ref(), 0);
-        gl.uniform_3_f32(
-            cgp.u_text_color.as_ref(),
-            text_color[0],
-            text_color[1],
-            text_color[2],
-        );
-        gl.uniform_1_f32(cgp.u_opacity.as_ref(), opacity);
-        // FIXED variants only: aa_width in SDF units. 0.05 is a
-        // mild softening; the shader smoothsteps over
-        // 0.5 +/- u_aa_width. Picked to match fwidth() output at
-        // a "typical" on-screen size (~64 px); operator can
-        // override later via a CLI knob if larger sizes need a
-        // softer falloff.
-        if cgp.u_aa_width.is_some() {
-            gl.uniform_1_f32(cgp.u_aa_width.as_ref(), 0.05);
-        }
-        if layer.outline {
-            // Python convention (motion.py:341): 1-px black
-            // outline. SDF outline_distance of 0.10 ~ 10% of the
-            // SDF range = ~0.4 px stroke at our 4-px-range / 48-px
-            // cell baking. Matches the visual weight of the Python
-            // 1-px stroke at moderate font sizes.
-            gl.uniform_3_f32(cgp.u_outline_color.as_ref(), 0.0, 0.0, 0.0);
-            gl.uniform_1_f32(cgp.u_outline_distance.as_ref(), 0.10);
-        }
-
-        let a_pos = cgp.a_pos;
-        let a_uv = cgp.a_uv;
-        let stride = (4 * std::mem::size_of::<f32>()) as i32;
-        gl.enable_vertex_attrib_array(a_pos);
-        gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
-        gl.enable_vertex_attrib_array(a_uv);
-        gl.vertex_attrib_pointer_f32(
-            a_uv,
-            2,
-            glow::FLOAT,
-            false,
-            stride,
-            (2 * std::mem::size_of::<f32>()) as i32,
-        );
-
-        // Same scissor-tightening logic as draw_text_layer: clip to
-        // the outer NDC quad's framebuffer-pixel rect. Per-glyph
-        // quads fit inside this bbox, so a single clip works for
-        // the whole batch.
-        if let Some((vp_x_off, vp_y_off, vp_w, vp_h)) = tighten_scissor {
-            let to_fb_x = |ndc: f32| {
-                vp_x_off as f32 + (ndc + 1.0) * 0.5 * vp_w as f32
-            };
-            let to_fb_y = |ndc: f32| {
-                vp_y_off as f32 + (ndc + 1.0) * 0.5 * vp_h as f32
-            };
-            let vp_x_max = (vp_x_off + vp_w) as f32;
-            let vp_y_max = (vp_y_off + vp_h) as f32;
-            let fb_l =
-                to_fb_x(ndc_l).floor().clamp(vp_x_off as f32, vp_x_max) as i32;
-            let fb_r =
-                to_fb_x(ndc_r).ceil().clamp(vp_x_off as f32, vp_x_max) as i32;
-            let fb_b =
-                to_fb_y(ndc_b).floor().clamp(vp_y_off as f32, vp_y_max) as i32;
-            let fb_t =
-                to_fb_y(ndc_t).ceil().clamp(vp_y_off as f32, vp_y_max) as i32;
-            let sw = (fb_r - fb_l).max(0);
-            let sh = (fb_t - fb_b).max(0);
+        // Apply scissor once (covers both ink and tofu sub-batches;
+        // their NDC quads share the outer rect by construction).
+        if let Some((fb_l, fb_b, sw, sh)) = scissor_box {
             if sw > 0 && sh > 0 {
                 gl.scissor(fb_l, fb_b, sw, sh);
             }
         }
-        let vert_count = (verts.len() / 4) as i32;
-        gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
-        gl.disable_vertex_attrib_array(a_pos);
-        gl.disable_vertex_attrib_array(a_uv);
-        gl.delete_buffer(vbo);
+
+        // Batch 1: MSDF-ink glyphs.
+        if !ink_verts.is_empty() {
+            let cgp = cached_msdf_program(gl, layer.outline)?;
+            let vbo = gl
+                .create_buffer()
+                .map_err(|e| anyhow!("glGenBuffers (msdf): {e}"))?;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let bytes = std::slice::from_raw_parts(
+                ink_verts.as_ptr() as *const u8,
+                ink_verts.len() * std::mem::size_of::<f32>(),
+            );
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+            gl.use_program(Some(cgp.program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
+            gl.uniform_1_i32(cgp.u_atlas.as_ref(), 0);
+            gl.uniform_3_f32(
+                cgp.u_text_color.as_ref(),
+                text_color[0],
+                text_color[1],
+                text_color[2],
+            );
+            gl.uniform_1_f32(cgp.u_opacity.as_ref(), opacity);
+            // FIXED variants only: aa_width in SDF units. 0.05 is a
+            // mild softening; the shader smoothsteps over
+            // 0.5 +/- u_aa_width. Picked to match fwidth() output at
+            // a "typical" on-screen size (~64 px); operator can
+            // override later via a CLI knob if larger sizes need a
+            // softer falloff.
+            if cgp.u_aa_width.is_some() {
+                gl.uniform_1_f32(cgp.u_aa_width.as_ref(), 0.05);
+            }
+            if layer.outline {
+                gl.uniform_3_f32(cgp.u_outline_color.as_ref(), 0.0, 0.0, 0.0);
+                gl.uniform_1_f32(cgp.u_outline_distance.as_ref(), 0.10);
+            }
+
+            let a_pos = cgp.a_pos;
+            let a_uv = cgp.a_uv;
+            let stride = (4 * std::mem::size_of::<f32>()) as i32;
+            gl.enable_vertex_attrib_array(a_pos);
+            gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+            gl.enable_vertex_attrib_array(a_uv);
+            gl.vertex_attrib_pointer_f32(
+                a_uv,
+                2,
+                glow::FLOAT,
+                false,
+                stride,
+                (2 * std::mem::size_of::<f32>()) as i32,
+            );
+            let vert_count = (ink_verts.len() / 4) as i32;
+            gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
+            gl.disable_vertex_attrib_array(a_pos);
+            gl.disable_vertex_attrib_array(a_uv);
+            gl.delete_buffer(vbo);
+        }
+
+        // Batch 2: tofu quads (deterministic gray rect + black
+        // outline for missing-codepoint glyphs).
+        if !tofu_verts.is_empty() {
+            let tgp = cached_tofu_program(gl)?;
+            let vbo = gl
+                .create_buffer()
+                .map_err(|e| anyhow!("glGenBuffers (tofu): {e}"))?;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let bytes = std::slice::from_raw_parts(
+                tofu_verts.as_ptr() as *const u8,
+                tofu_verts.len() * std::mem::size_of::<f32>(),
+            );
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+            gl.use_program(Some(tgp.program));
+            gl.uniform_1_f32(tgp.u_opacity.as_ref(), opacity);
+
+            let stride = (4 * std::mem::size_of::<f32>()) as i32;
+            gl.enable_vertex_attrib_array(tgp.a_pos);
+            gl.vertex_attrib_pointer_f32(tgp.a_pos, 2, glow::FLOAT, false, stride, 0);
+            gl.enable_vertex_attrib_array(tgp.a_uv);
+            gl.vertex_attrib_pointer_f32(
+                tgp.a_uv,
+                2,
+                glow::FLOAT,
+                false,
+                stride,
+                (2 * std::mem::size_of::<f32>()) as i32,
+            );
+            let vert_count = (tofu_verts.len() / 4) as i32;
+            gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
+            gl.disable_vertex_attrib_array(tgp.a_pos);
+            gl.disable_vertex_attrib_array(tgp.a_uv);
+            gl.delete_buffer(vbo);
+        }
     }
     Ok(())
 }
@@ -6284,35 +6004,6 @@ fn effective_solid_bg(bg: &BgKind) -> Option<[f32; 4]> {
     }
 }
 
-/// QA-mandated single-pass transition (2026-05-08): compute a
-/// layer's destination rect in v_uv space ([0,1] bottom-up) after
-/// applying halign/valign + scale-around-box-center + motion-
-/// translate. CPU-side; the FS just does a per-fragment in-rect
-/// test + alpha sample. Mirrors the geometry math in
-/// draw_text_layer so the visual result is identical to the
-/// legacy bake path.
-fn compute_layer_uv_rect(
-    layer: &crate::content::TextLayer,
-    motion_kind: MotionKind,
-    motion_state: MotionState,
-    bm: &AlphaBitmap,
-    mode_w: u32,
-    mode_h: u32,
-) -> [f32; 4] {
-    let inputs = crate::hdmi_logic::LayerGeomInputs {
-        box_x: layer.r#box.x,
-        box_y: layer.r#box.y,
-        box_w: layer.r#box.w,
-        box_h: layer.r#box.h,
-        halign: parse_h_align(&layer.text_align),
-        font_size_px: layer.font_size_px,
-        font_size_pct: layer.font_size_pct,
-    };
-    compute_layer_uv_rect_logic(
-        &inputs, motion_kind, motion_state, bm.width, bm.height, mode_w, mode_h,
-    )
-}
-
 /// QA-mandated single-pass transition (2026-05-08): rasterize +
 /// upload + pack uniforms for one slide's text layers. Mirrors
 /// paint_slide's stage-1 (rasterize-or-reuse) and stage-2 (texture
@@ -6324,16 +6015,20 @@ fn compute_layer_uv_rect(
 /// SlideRenderCache) and survive across transitions; cache hits
 /// skip both rasterization and GL upload.
 fn prepare_layers_for_single_pass(
-    gl: &glow::Context,
-    mode_w: u32,
-    mode_h: u32,
+    _gl: &glow::Context,
+    _mode_w: u32,
+    _mode_h: u32,
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     motion_states: &[MotionState],
-    wall_clock_unix: i64,
-    glyph_cache: &mut GlyphCache,
-    tex_cache: &mut TextureCache,
+    _wall_clock_unix: i64,
+    _glyph_cache: &mut GlyphCache,
+    _tex_cache: &mut TextureCache,
 ) -> Result<(Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<glow::NativeTexture>)> {
-    use glow::HasContext;
+    // SDF arc slice B.3: SP-tier no longer handles text-bearing
+    // transitions (gated off in transition_eligible_for_single_pass_
+    // logic). With text_layers empty, the rasterize + texture-upload
+    // stages have nothing to do; return empty result vectors. The
+    // motion_states sanity check is kept to surface caller bugs.
     if motion_states.len() != text_layers.len() {
         bail!(
             "prepare_layers_for_single_pass: motion_states len {} != layers len {}",
@@ -6341,135 +6036,14 @@ fn prepare_layers_for_single_pass(
             text_layers.len(),
         );
     }
-    let cal = unix_to_calendar_utc(wall_clock_unix);
-    if glyph_cache.len() != text_layers.len() {
-        glyph_cache.clear();
-        glyph_cache.resize_with(text_layers.len(), || None);
-    }
-    if tex_cache.len() != text_layers.len() {
-        // Free any existing textures before resizing -- the slot
-        // count is changing so old slot mapping is invalid.
-        for slot in tex_cache.drain(..) {
-            if let Some(t) = slot {
-                unsafe { gl.delete_texture(t); }
-            }
-        }
-        tex_cache.resize_with(text_layers.len(), || None);
-    }
-    // Stage 1: rasterize-or-reuse.
-    for (i, (layer, _, font)) in text_layers.iter().enumerate() {
-        let resolved_cow = resolve_layer_text(layer, cal);
-        let resolved_text: &str = &resolved_cow;
-        let size_px = effective_font_size_px(
-            layer.font_size_px,
-            layer.font_size_pct,
-            layer.r#box.w,
-            mode_w,
+    if !text_layers.is_empty() {
+        bail!(
+            "prepare_layers_for_single_pass called with {} text layers; \
+             SP-tier is gated to bg-only transitions per B.3",
+            text_layers.len(),
         );
-        let max_width_px = (layer.r#box.w * mode_w as f32).max(1.0);
-        if should_rerasterize(glyph_cache[i].as_ref(), resolved_text, size_px, max_width_px) {
-            if let Some(old_tex) = tex_cache[i].take() {
-                unsafe { gl.delete_texture(old_tex); }
-            }
-            // 2026-05-17 wrap port: insert \n at word boundaries so
-            // prose that exceeds the layer's box width flows onto
-            // multiple lines instead of running off the right edge.
-            // Mirrors ui/src/rasterize.js:wrapTextToWidth and
-            // backend/openmarquee/seed.py:_wrap_text_to_width.
-            let wrapped =
-                wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
-            let bm = layout_text_to_alpha(font.as_ref(), &wrapped, size_px)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "layout_text_to_alpha returned None for text={wrapped:?} size={size_px}"
-                    )
-                })?;
-            // SDF arc slice B.2: also populate the MSDF group so the
-            // production text path (via paint_slide_with_viewport)
-            // hits cache. Single-pass transitions still consume the
-            // AlphaBitmap below.
-            let family = layer.font_family.as_deref().unwrap_or("Inter");
-            let group = msdf_atlas_for_family(family)
-                .or_else(|| msdf_atlas_for_family("Inter"))
-                .and_then(|(_atlas_tex, atlas)| {
-                    crate::hdmi_logic::layout_text_to_quads(
-                        atlas, &wrapped, size_px,
-                    )
-                });
-            glyph_cache[i] = Some(CachedGlyph {
-                text: resolved_cow.into_owned(),
-                size_px,
-                max_width_px,
-                bitmap: bm,
-                group,
-            });
-        }
     }
-    // Stage 2: upload-or-reuse + pack rect/rgba.
-    let mut rects: Vec<[f32; 4]> = Vec::with_capacity(text_layers.len());
-    let mut rgbas: Vec<[f32; 4]> = Vec::with_capacity(text_layers.len());
-    let mut texs: Vec<glow::NativeTexture> = Vec::with_capacity(text_layers.len());
-    for (i, (layer, color, _)) in text_layers.iter().enumerate() {
-        let cached = glyph_cache[i].as_ref().expect("cache populated above");
-        let bm = &cached.bitmap;
-        let tex = if let Some(t) = tex_cache[i] {
-            t
-        } else {
-            let t = unsafe {
-                let t = gl
-                    .create_texture()
-                    .map_err(|e| anyhow!("glGenTextures(single_pass_layer): {e}"))?;
-                gl.bind_texture(glow::TEXTURE_2D, Some(t));
-                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-                gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::LUMINANCE as i32,
-                    bm.width as i32,
-                    bm.height as i32,
-                    0,
-                    glow::LUMINANCE,
-                    glow::UNSIGNED_BYTE,
-                    Some(&bm.data),
-                );
-                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_MIN_FILTER,
-                    glow::LINEAR as i32,
-                );
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_MAG_FILTER,
-                    glow::LINEAR as i32,
-                );
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_WRAP_S,
-                    glow::CLAMP_TO_EDGE as i32,
-                );
-                gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_WRAP_T,
-                    glow::CLAMP_TO_EDGE as i32,
-                );
-                t
-            };
-            tex_cache[i] = Some(t);
-            t
-        };
-        let motion_state = motion_states[i];
-        let motion_kind = parse_motion_kind(&layer.motion);
-        let rect = compute_layer_uv_rect(layer, motion_kind, motion_state, bm, mode_w, mode_h);
-        let opacity = (layer.opacity.clamp(0.0, 1.0)
-            * motion_state.alpha_mul.clamp(0.0, 1.0))
-        .clamp(0.0, 1.0);
-        let rgba = [color[0], color[1], color[2], opacity];
-        rects.push(rect);
-        rgbas.push(rgba);
-        texs.push(tex);
-    }
-    Ok((rects, rgbas, texs))
+    Ok((Vec::new(), Vec::new(), Vec::new()))
 }
 
 /// QA-mandated single-pass transition (2026-05-08, step 3): per-
@@ -7584,6 +7158,47 @@ fn clear_msdf_program_cache(gl: &glow::Context) {
             unsafe { gl.delete_program(cgp.program); }
         }
     });
+    FS_TOFU_PROGRAM.with(|c| {
+        if let Some(tgp) = c.replace(None) {
+            unsafe { gl.delete_program(tgp.program); }
+        }
+    });
+}
+
+/// SDF arc slice B.3 -- cached FS_TOFU program for missing-
+/// codepoint quad rendering. Simpler than CachedMsdfProgram (no
+/// atlas/text_color/outline uniforms; just opacity + the standard
+/// VS_TEXTURED_QUAD attribs).
+#[derive(Copy, Clone)]
+struct CachedTofuProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_opacity: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static FS_TOFU_PROGRAM: std::cell::Cell<Option<CachedTofuProgram>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_tofu_program(gl: &glow::Context) -> Result<CachedTofuProgram> {
+    use glow::HasContext;
+    FS_TOFU_PROGRAM.with(|c| {
+        if let Some(tgp) = c.get() {
+            return Ok(tgp);
+        }
+        let program = link_program(gl, crate::hdmi_logic::VS_TEXTURED_QUAD, FS_TOFU)
+            .with_context(|| "link FS_TOFU")?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (FS_TOFU)"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (FS_TOFU)"))?;
+        let u_opacity = unsafe { gl.get_uniform_location(program, "u_opacity") };
+        let tgp = CachedTofuProgram { program, a_pos, a_uv, u_opacity };
+        c.set(Some(tgp));
+        Ok(tgp)
+    })
 }
 
 /// SDF arc slice B.2 -- session-scoped MSDF atlas lookup table.
@@ -9016,11 +8631,12 @@ fn paint_slide_with_viewport(
             let needs_raster =
                 should_rerasterize(cache_ref[i].as_ref(), resolved_text, size_px, max_width_px);
             if needs_raster {
-                // SDF arc slice B.2: tex_cache is vestigial (MSDF
+                // SDF arc slice B.3: tex_cache fully vestigial (MSDF
                 // uses session-lived atlas textures, not per-layer
-                // uploads). Still drain stale slots to keep teardown
-                // honest if the slot ever got populated by a pre-
-                // cutover binary.
+                // uploads). Drain stale slots if any pre-MSDF
+                // binary left them populated. tex_cache is itself
+                // scheduled for deletion in a follow-up cleanup
+                // slice; kept here only to drain pre-existing state.
                 if let Some(tc) = tex_cache.as_deref_mut() {
                     if i < tc.len() {
                         if let Some(old_tex) = tc[i].take() {
@@ -9030,19 +8646,6 @@ fn paint_slide_with_viewport(
                 }
                 let wrapped =
                     wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
-                // SDF arc slice B.2: dual raster -- AlphaBitmap stays
-                // alive for prepare_layers_for_single_pass / FS_FADE_SP
-                // (transition single-pass shaders, not yet ported to
-                // MSDF sampling); MsdfQuadGroup feeds the production
-                // multi-pass text draw (draw_text_layer_msdf). A
-                // follow-up slice retires the AlphaBitmap raster once
-                // the single-pass path is on MSDF.
-                let bm = layout_text_to_alpha(font.as_ref(), &wrapped, size_px)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "layout_text_to_alpha returned None for text={wrapped:?} size={size_px}"
-                        )
-                    })?;
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
                 let group = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
@@ -9055,7 +8658,6 @@ fn paint_slide_with_viewport(
                     text: resolved_cow.into_owned(),
                     size_px,
                     max_width_px,
-                    bitmap: bm,
                     group,
                 });
                 if trace_sub {
