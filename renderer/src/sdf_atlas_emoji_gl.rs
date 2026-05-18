@@ -177,7 +177,7 @@ pub fn delete_all(gl: &glow::Context, atlases: &mut Vec<EmojiAtlasGl>) {
 /// Find an uploaded atlas page by page number. Returns None if the
 /// page wasn't uploaded (e.g. trimmed empty placeholder slot or a
 /// page index out of range).
-#[allow(dead_code)] // wired by C.3
+#[allow(dead_code)] // optional helper; the C.3 draw side uses EMOJI_ATLAS_LOOKUP directly
 pub fn atlas_for_page<'a>(
     atlases: &'a [EmojiAtlasGl],
     page: u32,

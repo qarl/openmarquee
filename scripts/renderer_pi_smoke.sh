@@ -614,16 +614,21 @@ assert_anim_transition() {
         cat "$log"
         exit 1
     fi
-    # Wall-clock upper bound: transition_ms + 2000ms slack for ssh
+    # Wall-clock upper bound: transition_ms + 12000ms slack for ssh
     # roundtrip + EGL bring-up + cleanup. Catches GPU saturation
     # (loop emits the expected frame count but each frame missed
     # its 33ms budget, so wall-clock blows past transition_ms).
-    # Bumped from 1500ms after 5-c-1 verify saw 27ms margin on the
-    # 800ms wipe (2273ms vs 2300ms cap) — ssh latency wobble alone
-    # could false-fail. Tightens to a per-frame budget assertion
-    # once 1080p bring-up happens (where GPU saturation becomes
-    # the real risk vs ssh wobble).
-    local cap_ms=$((transition_ms + 2000))
+    # Bumped from 2000ms to 12000ms after SDF arc slice C.2 added
+    # the Noto Color Emoji atlas upload (~64 MB GL_RGBA8 across 4
+    # pages + 4 PNG decodes); empirical bring-up on the dev Pi adds
+    # ~7-9s to every per-invocation phase. The slack accounts for
+    # that plus existing ssh wobble. Per-frame budget is independently
+    # gated by the renderer's own "effective N.N fps" log line which
+    # this script greps separately; the cap here is purely a wall-
+    # clock sanity bound. Tightens to a per-frame budget assertion
+    # once 1080p bring-up happens (where GPU saturation becomes the
+    # real risk vs bring-up overhead).
+    local cap_ms=$((transition_ms + 12000))
     if [ "$wall_ms" -gt "$cap_ms" ]; then
         echo "FAIL: --animate-fade --transition $kind wall-clock too high (got ${wall_ms}ms, cap ${cap_ms}ms)"
         echo "      possible GPU saturation — frames missed their per-frame budget"

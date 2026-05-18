@@ -422,6 +422,29 @@ void main() {
 /// Atlas UVs are normalized to [0, 1] over the font's MSDF atlas
 /// (`atlas_w` x `atlas_h`); the V axis is top-down (matches
 /// `build.rs`'s Y-flipped atlas write).
+/// SDF arc slice C.3 -- per-glyph dispatch kind. Replaces the
+/// boolean `tofu` field on MsdfQuad. The draw side matches on
+/// this to pick a shader + texture per quad:
+///
+///   Msdf  -> cached_msdf_program, font's MSDF atlas texture.
+///   Emoji -> cached_emoji_program, emoji atlas page texture.
+///   Tofu  -> cached_tofu_program, no texture (procedural fill).
+///
+/// Layout side picks the kind per codepoint via:
+///   1. emoji atlas (if provided + codepoint in entries) -> Emoji
+///   2. MSDF font atlas (glyph_for hit) -> Msdf
+///   3. whitespace -> no quad emitted
+///   4. otherwise -> Tofu
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GlyphKind {
+    Msdf,
+    /// Emoji atlas page index. The draw side resolves page -> GL
+    /// texture via the GL-side emoji lookup; UVs on the quad are
+    /// atlas-space within that page (2048x2048 in C.1's bake).
+    Emoji { page: u32 },
+    Tofu,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MsdfQuad {
     /// Per-layer pixel-space quad bounds (top-left origin, y-down).
@@ -434,12 +457,11 @@ pub struct MsdfQuad {
     pub uv_top: f32,
     pub uv_right: f32,
     pub uv_bottom: f32,
-    /// True for the deterministic tofu glyph rendered when a
-    /// codepoint isn't in the font's baked atlas. The draw path
-    /// uses this to swap shaders (a 50% gray fill + thin outline)
-    /// so missing-glyph cases are visibly + consistently shown
-    /// across fonts.
-    pub tofu: bool,
+    /// Per-glyph dispatch kind. SDF arc slice C.3 split the old
+    /// `tofu: bool` into a three-variant enum so the emoji color
+    /// path can carry its own atlas-page identifier alongside the
+    /// existing MSDF + tofu paths.
+    pub kind: GlyphKind,
 }
 
 /// SDF arc slice B.2 -- output of `layout_text_to_quads`.
@@ -482,6 +504,7 @@ pub struct MsdfQuadGroup {
 /// branchy reshape).
 pub fn layout_text_to_quads(
     atlas: &crate::sdf_atlas::MsdfAtlas,
+    emoji: Option<&crate::sdf_atlas_emoji::EmojiAtlas>,
     text: &str,
     size_px: f32,
 ) -> Option<MsdfQuadGroup> {
@@ -495,8 +518,11 @@ pub fn layout_text_to_quads(
     //     the output rect (same as AlphaBitmap path).
     //  2. Emit quads positioned by baseline + cursor_x.
     //
-    // Glyph entry lookup is per char; missing codepoints get
-    // tofu treatment in the second pass.
+    // Per-char entry covers the four dispatch outcomes:
+    //   Emoji     -- emoji color-bitmap atlas hit (slice C.3)
+    //   Msdf      -- font's MSDF atlas hit
+    //   Whitespace-- skip emit, just advance cursor
+    //   Tofu      -- deterministic missing-glyph rect
     let manifest = &atlas.manifest;
     let cell_px = manifest.cell_px as f32;
 
@@ -522,43 +548,86 @@ pub fn layout_text_to_quads(
     // Pass 1: per-line layout. Compute advance per line and the
     // overall vertical extent. fontdue-equivalent line layout uses
     // ascent + descent in em units.
+    //
+    // SDF arc slice C.3 -- per-char dispatch:
+    //   1. emoji atlas (when provided + cp matches an entry)
+    //   2. font MSDF atlas (glyph_for hit)
+    //   3. whitespace -- skip emit, just advance cursor
+    //   4. tofu -- deterministic missing-glyph rect
+    #[derive(Clone)]
+    enum CharKind {
+        Emoji(crate::sdf_atlas_emoji::EmojiAtlasEntry),
+        Msdf(crate::sdf_atlas::GlyphEntry),
+        Whitespace,
+        Tofu,
+    }
     struct LineLayout {
-        // (codepoint, advance_em, glyph_entry_opt). None on the
-        // entry means tofu.
-        chars: Vec<(u32, f32, Option<crate::sdf_atlas::GlyphEntry>)>,
+        // (codepoint, advance_em, char_kind).
+        chars: Vec<(u32, f32, CharKind)>,
         advance_em: f32,
     }
+    // Emoji-atlas source PPEM as f32 for advance scaling. None when
+    // no emoji atlas supplied (host tests / pre-C.3 callers).
+    let emoji_ppem: Option<f32> = emoji.map(|a| a.manifest.source_ppem as f32);
     let mut layouts: Vec<LineLayout> = Vec::with_capacity(lines.len());
     let mut max_line_advance_em = 0.0_f32;
     let mut any_glyph = false;
     let mut any_ink = false;
     for line in &lines {
-        let mut entries: Vec<(u32, f32, Option<crate::sdf_atlas::GlyphEntry>)> =
+        let mut entries: Vec<(u32, f32, CharKind)> =
             Vec::with_capacity(line.chars().count());
         let mut advance_em = 0.0_f32;
         for ch in line.chars() {
             let cp = ch as u32;
-            let glyph = manifest.glyph_for(cp).cloned();
-            // Tofu advance: half an em is a reasonable fallback
-            // matching ttf "missing glyph" widths. Used only when
-            // the font's atlas doesn't carry the codepoint.
-            let adv = glyph.as_ref().map(|g| g.advance_em).unwrap_or(0.5);
-            // Ink: a glyph is "visible" iff EITHER its plane bounds
-            // are non-degenerate OR it's a missing codepoint that
-            // will get tofu treatment (deterministic rect). Pure
-            // whitespace (space, NBSP, etc.) is neither -- skip
-            // empty-layer draw work.
             let is_whitespace = matches!(cp, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0);
-            let has_glyph_ink = glyph
-                .as_ref()
-                .map(|g| g.pl_right > g.pl_left && g.pl_top > g.pl_bottom)
-                .unwrap_or(false);
-            let tofu_visible = glyph.is_none() && !is_whitespace;
-            if has_glyph_ink || tofu_visible {
+
+            // Emoji dispatch (Q4 step 1): codepoint in the emoji
+            // ranges AND in the atlas's entries. Skipped variants
+            // (U+FE0F, skin-tone modifiers, ZWJ compounds) have no
+            // entry and fall through to MSDF/tofu.
+            let emoji_entry = if !is_whitespace {
+                match (emoji, crate::sdf_atlas_emoji::codepoint_is_emoji_range(cp)) {
+                    (Some(a), true) => {
+                        crate::sdf_atlas_emoji::atlas_entry_for_codepoint(a, cp).copied()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let (kind, adv) = if let Some(ee) = emoji_entry {
+                // Emoji advance in em: CBDT advance_px at source_ppem,
+                // normalized to em (1 em = source_ppem px in the CBDT
+                // bake). Browser-matching default per design Q3.
+                let ppem = emoji_ppem.unwrap_or(1.0).max(1.0);
+                let adv_em = ee.advance_px as f32 / ppem;
                 any_ink = true;
-            }
+                (CharKind::Emoji(ee), adv_em)
+            } else if let Some(g) = manifest.glyph_for(cp).cloned() {
+                // MSDF path: existing semantics.
+                let adv_em = g.advance_em;
+                let has_ink = g.pl_right > g.pl_left && g.pl_top > g.pl_bottom;
+                if has_ink {
+                    any_ink = true;
+                }
+                (CharKind::Msdf(g), adv_em)
+            } else if is_whitespace {
+                // Whitespace NOT in the MSDF atlas (rare -- e.g. a
+                // font without baked U+00A0 NBSP). Half-em fallback
+                // advance, no quad emitted. Most whitespace lands in
+                // the MSDF branch above with a baked space-glyph
+                // advance + degenerate plane bounds, which pass 2
+                // skips without emitting.
+                (CharKind::Whitespace, 0.5)
+            } else {
+                // Tofu: deterministic missing-glyph rect counts as ink.
+                any_ink = true;
+                (CharKind::Tofu, 0.5)
+            };
+
             any_glyph = true;
-            entries.push((cp, adv, glyph));
+            entries.push((cp, adv, kind));
             advance_em += adv;
         }
         max_line_advance_em = max_line_advance_em.max(advance_em);
@@ -598,6 +667,17 @@ pub fn layout_text_to_quads(
     // Pass 2: emit quads at baseline-aware positions.
     let atlas_w = manifest.atlas_w as f32;
     let atlas_h = manifest.atlas_h as f32;
+    // Emoji-atlas geometry (only used when an entry is hit). cell_em
+    // = cell_px / source_ppem; atlas_dim is the page dimension for
+    // UV normalization. Pre-computed once outside the loop.
+    let (emoji_cell_em, emoji_atlas_dim_f, emoji_cell_px_f) = match emoji {
+        Some(a) => (
+            a.manifest.cell_px as f32 / (a.manifest.source_ppem as f32).max(1.0),
+            a.manifest.atlas_dim as f32,
+            a.manifest.cell_px as f32,
+        ),
+        None => (0.0, 1.0, 0.0),
+    };
     let mut quads: Vec<MsdfQuad> = Vec::new();
     for (line_idx, layout) in layouts.iter().enumerate() {
         // Baseline y in pixel-space, y-down. Each line's baseline
@@ -607,68 +687,110 @@ pub fn layout_text_to_quads(
         let baseline_y =
             pad as f32 + (line_idx as f32) * line_h_px as f32 + ascent_em * size_px;
         let mut cursor_x = pad as f32;
-        for (_cp, adv_em, glyph_opt) in &layout.chars {
+        for (_cp, adv_em, char_kind) in &layout.chars {
             let adv_px = adv_em * size_px;
-            if let Some(g) = glyph_opt {
-                // Skip glyphs with no ink (e.g. space, '\u{a0}'):
-                // advance cursor but don't emit a quad.
-                if g.pl_right <= g.pl_left || g.pl_top <= g.pl_bottom {
-                    cursor_x += adv_px;
-                    continue;
-                }
-                // pl_* are em-relative to the glyph origin. Convert
-                // to pixel-space relative to the cursor.
-                //
-                // pl_top is em above baseline (positive); on-screen
-                // y is down, so quad top = baseline_y - pl_top * size_px.
-                // pl_bottom is em below baseline (negative for
-                // descenders); quad bottom = baseline_y - pl_bottom * size_px.
-                let px_l = cursor_x + g.pl_left * size_px;
-                let px_r = cursor_x + g.pl_right * size_px;
-                let px_t = baseline_y - g.pl_top * size_px;
-                let px_b = baseline_y - g.pl_bottom * size_px;
+            match char_kind {
+                CharKind::Msdf(g) => {
+                    // Skip glyphs with no ink (e.g. space, '\u{a0}'):
+                    // advance cursor but don't emit a quad.
+                    if g.pl_right <= g.pl_left || g.pl_top <= g.pl_bottom {
+                        cursor_x += adv_px;
+                        continue;
+                    }
+                    // pl_* are em-relative to the glyph origin. Convert
+                    // to pixel-space relative to the cursor.
+                    //
+                    // pl_top is em above baseline (positive); on-screen
+                    // y is down, so quad top = baseline_y - pl_top * size_px.
+                    // pl_bottom is em below baseline (negative for
+                    // descenders); quad bottom = baseline_y - pl_bottom * size_px.
+                    let px_l = cursor_x + g.pl_left * size_px;
+                    let px_r = cursor_x + g.pl_right * size_px;
+                    let px_t = baseline_y - g.pl_top * size_px;
+                    let px_b = baseline_y - g.pl_bottom * size_px;
 
-                // Atlas UVs: glyph's cell in atlas pixels normalized
-                // to [0, 1]. Note: atlas y-axis is top-down (the
-                // build.rs flip; matches our atlas tex upload), so
-                // uv_top = glyph.y / atlas_h, uv_bottom = (glyph.y
-                // + cell_px) / atlas_h.
-                let uv_l = g.x as f32 / atlas_w;
-                let uv_r = (g.x as f32 + cell_px) / atlas_w;
-                let uv_t = g.y as f32 / atlas_h;
-                let uv_b = (g.y as f32 + cell_px) / atlas_h;
-                quads.push(MsdfQuad {
-                    px_left: px_l,
-                    px_top: px_t,
-                    px_right: px_r,
-                    px_bottom: px_b,
-                    uv_left: uv_l,
-                    uv_top: uv_t,
-                    uv_right: uv_r,
-                    uv_bottom: uv_b,
-                    tofu: false,
-                });
-            } else {
-                // Tofu glyph: deterministic ~half-em rectangle at
-                // baseline. UVs are inert (draw path uses a fixed
-                // gray-with-outline fragment shader path keyed on
-                // `tofu: true`). Pixel-space bounds: roughly
-                // ascent_em x 0.5 em, baselined like a normal glyph.
-                let px_l = cursor_x + 0.05 * size_px;
-                let px_r = cursor_x + (adv_em - 0.05).max(0.1) * size_px;
-                let px_t = baseline_y - ascent_em * 0.85 * size_px;
-                let px_b = baseline_y;
-                quads.push(MsdfQuad {
-                    px_left: px_l,
-                    px_top: px_t,
-                    px_right: px_r,
-                    px_bottom: px_b,
-                    uv_left: 0.0,
-                    uv_top: 0.0,
-                    uv_right: 0.0,
-                    uv_bottom: 0.0,
-                    tofu: true,
-                });
+                    // Atlas UVs: glyph's cell in atlas pixels normalized
+                    // to [0, 1]. Note: atlas y-axis is top-down (the
+                    // build.rs flip; matches our atlas tex upload), so
+                    // uv_top = glyph.y / atlas_h, uv_bottom = (glyph.y
+                    // + cell_px) / atlas_h.
+                    let uv_l = g.x as f32 / atlas_w;
+                    let uv_r = (g.x as f32 + cell_px) / atlas_w;
+                    let uv_t = g.y as f32 / atlas_h;
+                    let uv_b = (g.y as f32 + cell_px) / atlas_h;
+                    quads.push(MsdfQuad {
+                        px_left: px_l,
+                        px_top: px_t,
+                        px_right: px_r,
+                        px_bottom: px_b,
+                        uv_left: uv_l,
+                        uv_top: uv_t,
+                        uv_right: uv_r,
+                        uv_bottom: uv_b,
+                        kind: GlyphKind::Msdf,
+                    });
+                }
+                CharKind::Emoji(ee) => {
+                    // Slice C.3 geometry (design Q3):
+                    //   * quad w/h on screen = cell_em * size_px (square)
+                    //   * centered horizontally within the advance
+                    //   * centered vertically on the em-height (matches
+                    //     browser engines' typical emoji baseline)
+                    //
+                    // The full atlas cell (96x96 incl. letterboxing) is
+                    // mapped to the quad: the bake's letterboxing
+                    // already preserves the glyph's natural aspect
+                    // ratio, so using the full cell is the simplest
+                    // path without re-deriving src_w/src_h on screen.
+                    let cell_size_px = emoji_cell_em * size_px;
+                    let center_x = cursor_x + adv_px * 0.5;
+                    let center_y =
+                        baseline_y - (ascent_em + descent_em) * 0.5 * size_px;
+                    let px_l = center_x - cell_size_px * 0.5;
+                    let px_r = center_x + cell_size_px * 0.5;
+                    let px_t = center_y - cell_size_px * 0.5;
+                    let px_b = center_y + cell_size_px * 0.5;
+                    let uv_l = ee.x as f32 / emoji_atlas_dim_f;
+                    let uv_r = (ee.x as f32 + emoji_cell_px_f) / emoji_atlas_dim_f;
+                    let uv_t = ee.y as f32 / emoji_atlas_dim_f;
+                    let uv_b = (ee.y as f32 + emoji_cell_px_f) / emoji_atlas_dim_f;
+                    quads.push(MsdfQuad {
+                        px_left: px_l,
+                        px_top: px_t,
+                        px_right: px_r,
+                        px_bottom: px_b,
+                        uv_left: uv_l,
+                        uv_top: uv_t,
+                        uv_right: uv_r,
+                        uv_bottom: uv_b,
+                        kind: GlyphKind::Emoji { page: ee.page },
+                    });
+                }
+                CharKind::Whitespace => {
+                    // Pure advance, no quad emitted.
+                }
+                CharKind::Tofu => {
+                    // Tofu glyph: deterministic ~half-em rectangle at
+                    // baseline. UVs are inert (draw path uses a fixed
+                    // gray-with-outline fragment shader keyed on
+                    // GlyphKind::Tofu). Pixel-space bounds: roughly
+                    // ascent_em x 0.5 em, baselined like a normal glyph.
+                    let px_l = cursor_x + 0.05 * size_px;
+                    let px_r = cursor_x + (adv_em - 0.05).max(0.1) * size_px;
+                    let px_t = baseline_y - ascent_em * 0.85 * size_px;
+                    let px_b = baseline_y;
+                    quads.push(MsdfQuad {
+                        px_left: px_l,
+                        px_top: px_t,
+                        px_right: px_r,
+                        px_bottom: px_b,
+                        uv_left: 0.0,
+                        uv_top: 0.0,
+                        uv_right: 0.0,
+                        uv_bottom: 0.0,
+                        kind: GlyphKind::Tofu,
+                    });
+                }
             }
             cursor_x += adv_px;
         }
@@ -4145,22 +4267,22 @@ mod tests {
     #[test]
     fn layout_text_to_quads_returns_none_for_empty() {
         let atlas = load_anton_atlas();
-        assert!(layout_text_to_quads(&atlas, "", 100.0).is_none());
+        assert!(layout_text_to_quads(&atlas, None, "", 100.0).is_none());
         // Spaces only -- no ink, returns None.
-        assert!(layout_text_to_quads(&atlas, "   ", 100.0).is_none());
+        assert!(layout_text_to_quads(&atlas, None, "   ", 100.0).is_none());
     }
 
     #[test]
     fn layout_text_to_quads_emits_one_quad_per_ink_glyph() {
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, "AB", 100.0)
+        let group = layout_text_to_quads(&atlas, None, "AB", 100.0)
             .expect("AB at 100px lays out");
         assert_eq!(group.quads.len(), 2);
         // Quads are in left-to-right order.
         assert!(group.quads[0].px_left < group.quads[1].px_left);
-        // No tofu for ASCII.
-        assert!(!group.quads[0].tofu);
-        assert!(!group.quads[1].tofu);
+        // No tofu / no emoji for ASCII.
+        assert_eq!(group.quads[0].kind, GlyphKind::Msdf);
+        assert_eq!(group.quads[1].kind, GlyphKind::Msdf);
         // UVs land inside the atlas (sub-1.0).
         for q in &group.quads {
             assert!(q.uv_left >= 0.0 && q.uv_right <= 1.0);
@@ -4174,8 +4296,8 @@ mod tests {
     #[test]
     fn layout_text_to_quads_scales_with_size_px() {
         let atlas = load_anton_atlas();
-        let small = layout_text_to_quads(&atlas, "A", 50.0).expect("A@50");
-        let large = layout_text_to_quads(&atlas, "A", 500.0).expect("A@500");
+        let small = layout_text_to_quads(&atlas, None, "A", 50.0).expect("A@50");
+        let large = layout_text_to_quads(&atlas, None, "A", 500.0).expect("A@500");
         // Pixel-space quad scales linearly with size_px (10x size_px
         // -> ~10x quad width).
         let small_w = small.quads[0].px_right - small.quads[0].px_left;
@@ -4186,7 +4308,7 @@ mod tests {
     #[test]
     fn layout_text_to_quads_multi_line_uses_two_baselines() {
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, "A\nB", 100.0)
+        let group = layout_text_to_quads(&atlas, None, "A\nB", 100.0)
             .expect("two-line lays out");
         assert_eq!(group.quads.len(), 2);
         // Second line's quad sits below the first line's quad in
@@ -4199,10 +4321,125 @@ mod tests {
         let atlas = load_anton_atlas();
         // U+2603 (snowman) isn't in anton's Basic-Latin + Latin-1
         // baked set; we expect a tofu quad.
-        let group = layout_text_to_quads(&atlas, "\u{2603}", 100.0)
+        //
+        // SDF arc slice C.3: when no emoji atlas is supplied, U+2603
+        // falls through to MSDF (miss) then tofu. With an emoji atlas
+        // supplied AND U+2603 in its entries the result would differ;
+        // see layout_text_to_quads_emits_emoji_for_baked_codepoint.
+        let group = layout_text_to_quads(&atlas, None, "\u{2603}", 100.0)
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
-        assert!(group.quads[0].tofu);
+        assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
+    }
+
+    // SDF arc slice C.3 -- emoji segmentation tests.
+    //
+    // Use the baked emoji atlas (slice C.1 artifact, ~1360
+    // codepoints). Test codepoints picked to land inside the
+    // baked ranges declared in ui/styles.css (U+1F000-1FFFF +
+    // U+2600-27BF):
+    //   U+1F31F = 🌟 (glowing star, supplementary plane)
+    //   U+2728  = ✨ (sparkles, Dingbats block)
+    // Codepoints outside these ranges (e.g. U+2B50 ⭐ in Misc
+    // Symbols and Arrows) fall through to MSDF/tofu, matching the
+    // browser's font-fallback behavior with the same
+    // unicode-range declaration.
+    fn load_emoji_atlas_for_test() -> crate::sdf_atlas_emoji::EmojiAtlas {
+        crate::sdf_atlas_emoji::load_emoji_atlas()
+            .expect("baked emoji atlas parses")
+    }
+
+    #[test]
+    fn layout_text_to_quads_emits_emoji_for_baked_codepoint() {
+        let atlas = load_anton_atlas();
+        let emoji = load_emoji_atlas_for_test();
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", 100.0)
+            .expect("emoji-only string lays out");
+        assert_eq!(group.quads.len(), 1);
+        match group.quads[0].kind {
+            GlyphKind::Emoji { page } => {
+                // Page index is whatever the bake assigned (typically 0
+                // for low-range codepoints). Just sanity: < the
+                // manifest's page count.
+                assert!(
+                    page < emoji.manifest.pages,
+                    "emoji page {page} out of range vs manifest pages {}",
+                    emoji.manifest.pages,
+                );
+            }
+            other => panic!("expected GlyphKind::Emoji, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_text_to_quads_falls_through_to_tofu_when_no_emoji_atlas() {
+        let atlas = load_anton_atlas();
+        // Same codepoint as above but no emoji atlas supplied -- the
+        // dispatch should hit the MSDF-miss path and emit tofu,
+        // identical to pre-C.3 behavior.
+        let group = layout_text_to_quads(&atlas, None, "\u{1F31F}", 100.0)
+            .expect("tofu lays out");
+        assert_eq!(group.quads.len(), 1);
+        assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
+    }
+
+    #[test]
+    fn layout_text_to_quads_mixed_msdf_emoji_tofu_runs() {
+        let atlas = load_anton_atlas();
+        let emoji = load_emoji_atlas_for_test();
+        // "A🌟B" -- two MSDF glyphs flanking an emoji.
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "A\u{1F31F}B", 100.0)
+            .expect("mixed run lays out");
+        assert_eq!(group.quads.len(), 3);
+        assert_eq!(group.quads[0].kind, GlyphKind::Msdf);
+        match group.quads[1].kind {
+            GlyphKind::Emoji { .. } => {}
+            other => panic!("expected emoji in middle, got {other:?}"),
+        }
+        assert_eq!(group.quads[2].kind, GlyphKind::Msdf);
+        // Order: left-to-right by px_left.
+        assert!(group.quads[0].px_left < group.quads[1].px_left);
+        assert!(group.quads[1].px_left < group.quads[2].px_left);
+    }
+
+    #[test]
+    fn layout_text_to_quads_emoji_quad_is_square_and_em_sized() {
+        let atlas = load_anton_atlas();
+        let emoji = load_emoji_atlas_for_test();
+        let size_px = 100.0;
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", size_px)
+            .expect("emoji lays out");
+        let q = &group.quads[0];
+        let w = q.px_right - q.px_left;
+        let h = q.px_bottom - q.px_top;
+        // Square cell.
+        assert!(
+            (w - h).abs() < 0.5,
+            "emoji quad not square: {w} x {h}"
+        );
+        // Geometry per design Q3: cell_em * size_px. cell_em
+        // = cell_px / source_ppem (typically 96/128 = 0.75).
+        let expected_em =
+            emoji.manifest.cell_px as f32 / emoji.manifest.source_ppem as f32;
+        let expected_px = expected_em * size_px;
+        assert!(
+            (w - expected_px).abs() < 1.0,
+            "emoji quad width {w} != expected {expected_px}"
+        );
+    }
+
+    #[test]
+    fn layout_text_to_quads_out_of_range_codepoint_falls_to_tofu() {
+        let atlas = load_anton_atlas();
+        let emoji = load_emoji_atlas_for_test();
+        // U+2B50 ⭐ is in Misc Symbols + Arrows (U+2B00-2BFF),
+        // OUTSIDE the ui/styles.css declared ranges. The browser
+        // wouldn't render this from Noto Color Emoji either; we
+        // mirror that fallback for parity.
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{2B50}", 100.0)
+            .expect("tofu lays out");
+        assert_eq!(group.quads.len(), 1);
+        assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
     }
 
     #[test]

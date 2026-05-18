@@ -54,7 +54,7 @@ use crate::hdmi_logic::{
     is_transition_kind_single_pass, layout_text_to_quads, prefer_scissored_bake,
     sp_kind_static, stripes_uniforms, transition_eligible_for_scissored_bake_logic,
     transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
-    BlendMode, FontCatalog, MsdfQuadGroup, PrewarmTier,
+    BlendMode, FontCatalog, GlyphKind, MsdfQuadGroup, PrewarmTier,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_EMOJI, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND, FS_TOFU,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
@@ -1996,48 +1996,73 @@ fn draw_text_layer_msdf(
 
     // Build interleaved [x, y, u, v] verts. Per-glyph TRIANGLES
     // winding BL, BR, TL, BR, TL, TR (6 verts per glyph). Split into
-    // two vertex streams:
-    //   - `ink_verts`: glyphs with real atlas UVs; drawn with the
-    //     cached_msdf_program (sampling the font atlas).
-    //   - `tofu_verts`: missing-codepoint quads; drawn with FS_TOFU
-    //     in a second batch. UVs span [0,1] across each tofu quad so
-    //     FS_TOFU can use them as in-rect coordinates for the
-    //     outline test.
+    // THREE vertex streams (SDF arc slice C.3):
+    //   - `ink_verts`: MSDF glyphs; drawn with cached_msdf_program
+    //     against the font atlas texture.
+    //   - `tofu_verts`: missing-codepoint quads; drawn with FS_TOFU.
+    //     UVs span [0,1] across each tofu quad so FS_TOFU can use
+    //     them as in-rect coordinates for the outline test.
+    //   - `emoji_per_page`: color-emoji quads, keyed by emoji-atlas
+    //     page. Each page produces one draw call with that page's
+    //     bound texture (a single text run can touch >1 page).
     let mut ink_verts: Vec<f32> = Vec::with_capacity(group.quads.len() * 24);
     let mut tofu_verts: Vec<f32> = Vec::new();
+    // BTreeMap (not HashMap) so multi-page emoji draws iterate in
+    // page-index order -- gives goldens a deterministic draw order
+    // when an emoji-bearing text touches multiple atlas pages.
+    let mut emoji_per_page: std::collections::BTreeMap<u32, Vec<f32>> =
+        std::collections::BTreeMap::new();
     for q in &group.quads {
         let xl = to_ndc_x(q.px_left);
         let xr = to_ndc_x(q.px_right);
         let yt = to_ndc_y(q.px_top);
         let yb = to_ndc_y(q.px_bottom);
-        if q.tofu {
-            // Per-quad UVs [0, 1] for FS_TOFU's in-rect test. Atlas
-            // UVs on the quad are zero per layout_text_to_quads;
-            // ignored here.
-            tofu_verts.extend_from_slice(&[
-                xl, yb, 0.0, 1.0,
-                xr, yb, 1.0, 1.0,
-                xl, yt, 0.0, 0.0,
-                xr, yb, 1.0, 1.0,
-                xl, yt, 0.0, 0.0,
-                xr, yt, 1.0, 0.0,
-            ]);
-        } else {
-            let ul = q.uv_left;
-            let ur = q.uv_right;
-            let ut = q.uv_top;
-            let ub = q.uv_bottom;
-            ink_verts.extend_from_slice(&[
-                xl, yb, ul, ub,
-                xr, yb, ur, ub,
-                xl, yt, ul, ut,
-                xr, yb, ur, ub,
-                xl, yt, ul, ut,
-                xr, yt, ur, ut,
-            ]);
+        match q.kind {
+            GlyphKind::Tofu => {
+                // Per-quad UVs [0, 1] for FS_TOFU's in-rect test.
+                // Atlas UVs on the quad are zero per
+                // layout_text_to_quads; ignored here.
+                tofu_verts.extend_from_slice(&[
+                    xl, yb, 0.0, 1.0,
+                    xr, yb, 1.0, 1.0,
+                    xl, yt, 0.0, 0.0,
+                    xr, yb, 1.0, 1.0,
+                    xl, yt, 0.0, 0.0,
+                    xr, yt, 1.0, 0.0,
+                ]);
+            }
+            GlyphKind::Msdf => {
+                let ul = q.uv_left;
+                let ur = q.uv_right;
+                let ut = q.uv_top;
+                let ub = q.uv_bottom;
+                ink_verts.extend_from_slice(&[
+                    xl, yb, ul, ub,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yt, ur, ut,
+                ]);
+            }
+            GlyphKind::Emoji { page } => {
+                let ul = q.uv_left;
+                let ur = q.uv_right;
+                let ut = q.uv_top;
+                let ub = q.uv_bottom;
+                let bucket = emoji_per_page.entry(page).or_insert_with(Vec::new);
+                bucket.extend_from_slice(&[
+                    xl, yb, ul, ub,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yt, ur, ut,
+                ]);
+            }
         }
     }
-    if ink_verts.is_empty() && tofu_verts.is_empty() {
+    if ink_verts.is_empty() && tofu_verts.is_empty() && emoji_per_page.is_empty() {
         return Ok(());
     }
 
@@ -2164,6 +2189,64 @@ fn draw_text_layer_msdf(
             gl.disable_vertex_attrib_array(tgp.a_pos);
             gl.disable_vertex_attrib_array(tgp.a_uv);
             gl.delete_buffer(vbo);
+        }
+
+        // Batch 3 (SDF arc slice C.3): emoji color-bitmap quads,
+        // one draw call per atlas page. Empty when no emoji in
+        // this layer. Pages with no GL-side texture (e.g. emoji
+        // atlas failed to upload at bring-up) are silently dropped.
+        if !emoji_per_page.is_empty() {
+            let egp = cached_emoji_program(gl)?;
+            let stride = (4 * std::mem::size_of::<f32>()) as i32;
+            for (page, verts) in emoji_per_page.iter() {
+                let tex = EMOJI_ATLAS_LOOKUP.with(|c| {
+                    c.borrow()
+                        .iter()
+                        .find(|(p, _)| *p == *page)
+                        .map(|(_, t)| *t)
+                });
+                let Some(emoji_tex) = tex else {
+                    // No GL texture for this page (atlas failed to
+                    // upload at bring-up). Skip rather than fall
+                    // through to tofu -- the layout side already
+                    // committed to emoji geometry for this quad,
+                    // and emitting tofu now would have the wrong
+                    // bounds.
+                    continue;
+                };
+                let vbo = gl
+                    .create_buffer()
+                    .map_err(|e| anyhow!("glGenBuffers (emoji page {page}): {e}"))?;
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let bytes = std::slice::from_raw_parts(
+                    verts.as_ptr() as *const u8,
+                    verts.len() * std::mem::size_of::<f32>(),
+                );
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+                gl.use_program(Some(egp.program));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(emoji_tex));
+                gl.uniform_1_i32(egp.u_atlas.as_ref(), 0);
+                gl.uniform_1_f32(egp.u_opacity.as_ref(), opacity);
+
+                gl.enable_vertex_attrib_array(egp.a_pos);
+                gl.vertex_attrib_pointer_f32(egp.a_pos, 2, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(egp.a_uv);
+                gl.vertex_attrib_pointer_f32(
+                    egp.a_uv,
+                    2,
+                    glow::FLOAT,
+                    false,
+                    stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
+                );
+                let vert_count = (verts.len() / 4) as i32;
+                gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
+                gl.disable_vertex_attrib_array(egp.a_pos);
+                gl.disable_vertex_attrib_array(egp.a_uv);
+                gl.delete_buffer(vbo);
+            }
         }
     }
     Ok(())
@@ -7249,7 +7332,6 @@ fn cached_tofu_program(gl: &glow::Context) -> Result<CachedTofuProgram> {
 /// quad rendering. Same shape as CachedTofuProgram with an extra
 /// `u_atlas` sampler binding for the color-bitmap page.
 #[derive(Copy, Clone)]
-#[allow(dead_code)] // wired by C.3
 struct CachedEmojiProgram {
     program: glow::NativeProgram,
     a_pos: u32,
@@ -7263,7 +7345,6 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[allow(dead_code)] // wired by C.3
 fn cached_emoji_program(gl: &glow::Context) -> Result<CachedEmojiProgram> {
     use glow::HasContext;
     FS_EMOJI_PROGRAM.with(|c| {
@@ -7414,24 +7495,6 @@ fn populate_emoji_lookup(
 
 fn clear_emoji_lookup() {
     EMOJI_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
-}
-
-/// Find the (GL texture, atlas entry) pair for a codepoint. Returns
-/// `None` for codepoints not in the baked set (the caller falls
-/// back to tofu via the existing layout_text_to_quads path).
-#[allow(dead_code)] // wired by C.3
-fn emoji_atlas_for_codepoint(
-    cp: u32,
-) -> Option<(glow::NativeTexture, &'static crate::sdf_atlas_emoji::EmojiAtlasEntry)> {
-    let cpu = EMOJI_ATLAS_CPU.get()?;
-    let entry = crate::sdf_atlas_emoji::atlas_entry_for_codepoint(cpu, cp)?;
-    let tex = EMOJI_ATLAS_LOOKUP.with(|c| {
-        c.borrow()
-            .iter()
-            .find(|(page, _)| *page == entry.page)
-            .map(|(_, t)| *t)
-    })?;
-    Some((tex, entry))
 }
 
 /// qarl-direct perf-profile (2026-05-08): transition shader cache.
@@ -8797,13 +8860,32 @@ fn paint_slide_with_viewport(
                 let wrapped =
                     wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
+                let emoji_atlas_cpu = EMOJI_ATLAS_CPU.get();
                 let group = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
                     .and_then(|(_atlas_tex, atlas)| {
                         crate::hdmi_logic::layout_text_to_quads(
-                            atlas, &wrapped, size_px,
+                            atlas,
+                            emoji_atlas_cpu,
+                            &wrapped,
+                            size_px,
                         )
                     });
+                if let Some(g) = group.as_ref() {
+                    // SDF arc slice C.3 -- restore the smoke-script
+                    // marker that B.3 inadvertently dropped along with
+                    // the AlphaBitmap retirement. Format mirrors the
+                    // pre-B.3 line shape so renderer_pi_smoke.sh's
+                    // `grep -q 'rasterized text'` assertion still fires
+                    // on MSDF-layout misses. Per-codepoint quad count is
+                    // the new equivalent of the old WxH bitmap dim.
+                    eprintln!(
+                        "rasterized text {resolved_text:?} @ {size_px:.1}px -> {} quads ({}x{} bbox)",
+                        g.quads.len(),
+                        g.width,
+                        g.height,
+                    );
+                }
                 cache_ref[i] = Some(CachedGlyph {
                     text: resolved_cow.into_owned(),
                     size_px,

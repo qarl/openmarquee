@@ -122,7 +122,6 @@ pub fn atlas_entry_for_codepoint<'a>(
 /// holes in Noto's coverage); use [`atlas_entry_for_codepoint`]
 /// for the strict per-glyph hit test. Used by the C.3 layout
 /// segmentation to decide which path a run goes through.
-#[allow(dead_code)] // wired by C.3
 pub fn codepoint_is_emoji_range(cp: u32) -> bool {
     (0x1F000..=0x1FFFF).contains(&cp) || (0x2600..=0x27BF).contains(&cp)
 }
