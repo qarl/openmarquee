@@ -296,14 +296,30 @@ function paintLayer(ctx, canvas, layer) {
             const baselineY = firstBaselineYEff + i * lineHeightEff;
             const result = rasterizeText(line, fontFamily, effectiveSizePx, colorRgba);
             if (!result) continue; // empty / whitespace-only line.
-            // Horizontal-overflow handling: even at squished font
-            // size, a long single word (wrapTextToWidth leaves them
-            // intact by design) can still exceed boxW. Clamp via
-            // drawImage's 9-arg form ONLY if needed; the common
-            // post-Phase-3c case fits naturally and uses the 3-arg
-            // drawImage with no post-rasterization scaling.
+            // Bug 4 (2026-05-19): per-line X-squish at ORIGINAL
+            // fontSize scale. Pre-Bug-4 the targetW comparison used
+            // result.width (Y-squished width) vs boxW, so X-squish
+            // only fired for un-wrappable words that exceeded boxW
+            // EVEN AFTER yScale-induced font shrink. Per spec §5.10a
+            // ("both axes squish independently when both overflow")
+            // each line's natural width AT ORIGINAL fontSize is the
+            // right comparison. We recover natural_w_orig by
+            // dividing result.width by yScale (since the rasterizer
+            // ran at effectiveSizePx = fontSizePx * yScale).
+            //
+            // Final canvas dst_w = min(natural_w_orig, boxW). For
+            // lines that fit boxW at ORIGINAL fontSize, dst_w =
+            // natural_w_orig (1/yScale UPSCALE of the bitmap on X)
+            // — Y stays at bitmap height. For lines that overflow,
+            // dst_w = boxW (combined Y-induced + X-squish via
+            // bilinear interp). The Phase 3c rasterize-at-effective
+            // path is preserved for Y-axis AA quality (qa-Jimmy
+            // greenlight choice (a)); the X-axis bilinear blur is
+            // the acceptable trade for matching Rust's per-line
+            // ndc-quad scaling without two-pass rasterization.
+            const naturalWOrig = result.width / yScale;
+            const targetW = Math.min(naturalWOrig, boxW);
             let drawX;
-            const targetW = Math.min(result.width, boxW);
             if (textAlign === "left") drawX = boxX;
             else if (textAlign === "right") drawX = boxX + boxW - targetW;
             else drawX = boxX + (boxW - targetW) / 2;
@@ -314,22 +330,16 @@ function paintLayer(ctx, canvas, layer) {
             // the bitmap snaps to the canvas grid (preserves Phase 2
             // integer-X alignment).
             const drawY = Math.round(baselineY - result.ascent);
-            if (targetW < result.width) {
-                // Horizontal-only squish residual: rare (only when
-                // a single un-wrappable word still exceeds boxW
-                // after fontSize-squish). drawImage 9-arg for the X
-                // axis, natural Y dims.
-                ctx.drawImage(
-                    result.image,
-                    0, 0, result.width, result.height,
-                    Math.round(drawX), drawY, targetW, result.height,
-                );
-            } else {
-                // Common case: bitmap fits, 3-arg drawImage with no
-                // post-rasterization scaling. No bilinear-vs-GL_LINEAR
-                // resample divergence.
-                ctx.drawImage(result.image, Math.round(drawX), drawY);
-            }
+            // Always 9-arg drawImage now — even no-overflow lines
+            // get the 1/yScale X-upscale applied so the rendered
+            // glyph X is at NATURAL-original-size scale, NOT
+            // yScale-effective scale. Pre-Bug-4 3-arg path
+            // implicitly applied yScale to X via the smaller bitmap.
+            ctx.drawImage(
+                result.image,
+                0, 0, result.width, result.height,
+                Math.round(drawX), drawY, targetW, result.height,
+            );
         }
     } else if (yScale === 1) {
         for (let i = 0; i < lines.length; i++) {
