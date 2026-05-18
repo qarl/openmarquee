@@ -16,6 +16,61 @@ component locations for cross-ecosystem readability.
 
 ## [Unreleased]
 
+### SDF arc — text rendering refactor (2026-05-17 → 2026-05-18)
+
+Replaced the per-frame AlphaBitmap font raster with build-time-baked
+MSDF atlases + Noto Color Emoji CBDT pages. Resolves the font-clamp
+bug (renderer/src/hdmi.rs's `MAX_RASTERIZED_BITMAP_DIM=2048` ceiling
+that capped large text on vc4) and unlocks per-codepoint color
+emoji rendering. Cross-pair commits:
+
+- `a362a75` parity: re-bless 23 FYS goldens post-wrap (12 fixtures
+  improved) — preparatory work before the SDF arc proper.
+- `ce4457c` SDF A (atlas generation): `build.rs` bakes per-font
+  MSDF atlases at build time.
+- `ae39fe6` SDF B.1 (infrastructure): `AaMode` CLI flag + MSDF
+  shaders + `sdf_atlas` module.
+- `85982aa` SDF B.2 (cutover): MSDF text path wired through
+  `paint_slide`. vc4-aware default = `FIXED` (no
+  `GL_OES_standard_derivatives`).
+- `c09bdad` SDF B.3 (AlphaBitmap retirement + SP-text gate-off
+  + tofu): the AlphaBitmap renderer path is gone; missing-codepoint
+  glyphs fall through to `FS_TOFU`.
+- `9b3c772` SDF C.1 (emoji atlas bake): `build.rs` extracts Noto
+  CBDT into multi-page RGBA8 atlases. Covers `U+1F000-1FFFF` plus
+  `U+2600-27BF` per `ui/styles.css`'s @font-face unicode-range.
+- `d6fe65d` SDF C.2 (emoji atlas runtime): GL upload + `FS_EMOJI`
+  shader. 4 atlas pages × 2048×2048 RGBA8 (~64 MB on GPU,
+  PNG-compressed in-binary).
+- `b8443b2` SDF C.3 (emoji layout segmentation): `GlyphKind` enum
+  per-codepoint dispatch + 3-batch draw with per-page emoji
+  batching via `BTreeMap`. Visible-behavior slice.
+- `0fd1435` SDF C.4 (parity baseline): `parity_text_emoji_basic`
+  cross-renderer fixture with `Hi! 🌟` exercising mixed MSDF +
+  emoji. Outer-repo companion: `920bc70` SYSTEM_SPEC §5.10a
+  documenting the text rendering pipeline.
+- `abf6092` SDF D.0 (smoke): brightness reactivity threshold
+  `0.85 → 0.90` (architectural baseline per bisect) + bash 3.2
+  portability fix in `renderer_pi_soak.sh`.
+- `a5d7759` SDF D.0b (smoke): soak gate skipped in dev
+  (`SMOKE_SOAK_DURATION_SECS=0` default; release-candidate-only)
+  per `feedback_no_soak_during_dev`.
+- `5c750b7` SDF D (parity re-bless): 46 fixtures re-blessed against
+  the MSDF binary. Drift profile 2.6–53% across all text-bearing
+  fixtures; 3 (image_slide, video_slide, text_emoji_basic) were
+  bit-identical pre/post.
+
+DEPLOYED to FYS Pi (qarl@192.168.1.67) 2026-05-18 in slice E.
+Binary md5 `af0ca88f32bfba4de38fe418b9d0ee1b` (42 895 376 bytes)
+deployed to both `/usr/local/bin/openmarquee-render` and
+`/opt/openmarquee/bin/openmarquee-render`. The 37-slide FYS reel
+runs cleanly post-deploy; 36 of 37 cross-renderer `parity_fys_*`
+goldens re-blessed against the SDF binary (1 deferred:
+`parity_fys_t14` uses the `glitch` transition kind, which the
+SP-portable set doesn't support via `--capture-sb-mid`).
+
+THE FONT-CLAMP BUG IS RESOLVED IN PRODUCTION as of this deploy.
+
 ## [0.6.0-beta] — 2026-05-17
 
 ### Removed — DELETE-PIL purge
