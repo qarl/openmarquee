@@ -649,13 +649,58 @@ pub fn layout_text_to_quads(
     let line_gap_em = manifest.line_gap_em;
     let line_h_em = ascent_em - descent_em + line_gap_em;
 
+    // Bug 1c (2026-05-19): vertical extent is derived from the
+    // actual GLYPH INK bbox across the run, not the font's EM
+    // metrics. Matches Canvas2D's measureText(lines.join("")) which
+    // returns actualBoundingBoxAscent / actualBoundingBoxDescent
+    // (ui/src/rasterize.js:199-209). Pre-Bug-1c used (ascent_em -
+    // descent_em) * size_px (typically 1.0-1.4em); ink is typically
+    // 0.74-1.0em for caps + descender, so the EM extent shrunk
+    // visible ink to ~62-83% of boxH where Canvas2D fills ~100%.
+    //
+    // GROUP-level (max-ascent / min-descent across all glyphs in
+    // all lines) -- mirrors Canvas2D's `inkMetrics =
+    // ctx.measureText(lines.join(""))` which joins all lines into
+    // one measurement and applies uniform metrics to every line.
+    //
+    // Emoji + tofu both conceptually fill the em-box in Canvas2D's
+    // measureText, so contribute (ascent_em, descent_em) -- this
+    // also matches the on-screen emoji centering math at L747-748
+    // which uses ascent_em / descent_em (not ink-bbox).
+    //
+    // The fallback at the end is defensive: if no ink contributed
+    // (shouldn't happen since `any_ink` guards entry above), revert
+    // to em metrics so the computation degrades gracefully rather
+    // than producing a 0-extent bm_h.
+    let mut ink_ascent_em: f32 = 0.0;
+    let mut ink_descent_em: f32 = 0.0;
+    for ll in &layouts {
+        for (_, _, kind) in &ll.chars {
+            let (top_em, bot_em) = match kind {
+                CharKind::Msdf(g) if g.pl_top > g.pl_bottom => (g.pl_top, g.pl_bottom),
+                CharKind::Emoji(_) | CharKind::Tofu => (ascent_em, descent_em),
+                _ => continue,
+            };
+            if top_em > ink_ascent_em {
+                ink_ascent_em = top_em;
+            }
+            if bot_em < ink_descent_em {
+                ink_descent_em = bot_em;
+            }
+        }
+    }
+    if ink_ascent_em <= 0.0 && ink_descent_em >= 0.0 {
+        ink_ascent_em = ascent_em;
+        ink_descent_em = descent_em;
+    }
+
     // Pixel-space dims. Match the AlphaBitmap path:
     //   line_w = ceil(max_line_advance_em * size_px)
     //   line_h_px = round(size_px * 1.1)   -- BUT we know better
     //                                          metrics from the
     //                                          atlas, so use them
     let pad: u32 = 1;
-    let last_extent_px = ((ascent_em - descent_em) * size_px).ceil() as u32;
+    let last_extent_px = ((ink_ascent_em - ink_descent_em) * size_px).ceil() as u32;
     let line_h_px = (line_h_em * size_px).round().max(1.0) as u32;
     let bm_w =
         2 * pad + ((max_line_advance_em * size_px).ceil() as u32).max(1);
@@ -681,11 +726,17 @@ pub fn layout_text_to_quads(
     let mut quads: Vec<MsdfQuad> = Vec::new();
     for (line_idx, layout) in layouts.iter().enumerate() {
         // Baseline y in pixel-space, y-down. Each line's baseline
-        // is `pad + line_idx * line_h_px + ascent_em * size_px`
-        // -- ascent is positive, so adding it moves DOWN from the
-        // line's top in pixel-y-down space.
+        // is `pad + line_idx * line_h_px + ink_ascent_em * size_px`
+        // -- ink_ascent_em is positive, so adding it moves DOWN
+        // from the line's top in pixel-y-down space.
+        //
+        // Bug 1c (2026-05-19): was `ascent_em * size_px`. Anchoring
+        // on `ink_ascent_em` puts the first line's CAP TOP at exactly
+        // `pad` (the new bm_h hugs the ink-bbox, not the em-extent).
+        // Inter-line spacing stays em-based via `line_h_px` -- only
+        // the first-line anchor + bm_h shrink to ink-based.
         let baseline_y =
-            pad as f32 + (line_idx as f32) * line_h_px as f32 + ascent_em * size_px;
+            pad as f32 + (line_idx as f32) * line_h_px as f32 + ink_ascent_em * size_px;
         let mut cursor_x = pad as f32;
         for (_cp, adv_em, char_kind) in &layout.chars {
             let adv_px = adv_em * size_px;
@@ -4227,6 +4278,119 @@ mod tests {
         // Second line's quad sits below the first line's quad in
         // pixel-y-down space.
         assert!(group.quads[1].px_top > group.quads[0].px_top);
+    }
+
+    // Bug 1c (2026-05-19) tests -- ink-bbox vertical metric semantics
+    // in `layout_text_to_quads`. The ink-bbox loop derives `last_extent_px`
+    // and `baseline_y` from the actual glyph plane bounds (matching
+    // Canvas2D's measureText().actualBoundingBoxAscent + Descent) rather
+    // than the font's full em metrics. Pre-Bug-1c, bm_h ≈ em-extent ×
+    // size_px (~1.0-1.4 em); post-Bug-1c, bm_h ≈ ink-extent × size_px
+    // (~0.74-1.0 em for typical caps + descender).
+
+    #[test]
+    fn layout_text_to_quads_caps_only_bm_h_uses_ink_extent_under_em() {
+        let atlas = load_anton_atlas();
+        let size_px = 100.0_f32;
+        // Anton hhea metrics: ascent_em ~= 1.0, descent_em ~= -0.2;
+        // em_extent = 1.2. Anton's cap-height is < ascent (about 0.74
+        // for typical narrow display fonts), and lowercase glyphs in
+        // Anton (an all-caps display font) are typically shaped without
+        // descenders. For "ABC" (caps-only), ink_descent_em should be
+        // ~0 and ink_ascent_em ~= cap height -- much less than the
+        // 1.2 em-extent. bm_h should be visibly smaller than the
+        // pre-Bug-1c em-based 1.2 * size_px = ~120 px.
+        let group = layout_text_to_quads(&atlas, None, "ABC", size_px)
+            .expect("ABC lays out");
+        let em_extent_px = (atlas.manifest.ascent_em
+            - atlas.manifest.descent_em)
+            * size_px;
+        // 2 * pad = 2 baked into bm_h. Subtract for a fair compare.
+        let bm_h_ink = group.height as f32 - 2.0;
+        assert!(
+            bm_h_ink < em_extent_px,
+            "Bug 1c: bm_h_ink={bm_h_ink} should be LESS than em-extent={em_extent_px}; pre-Bug-1c they were equal."
+        );
+        // Sanity: bm_h shouldn't shrink to zero either.
+        assert!(
+            bm_h_ink > 0.4 * em_extent_px,
+            "bm_h_ink={bm_h_ink} shrunk too aggressively vs em-extent={em_extent_px}; typical cap-height/em is 0.7-0.85."
+        );
+    }
+
+    #[test]
+    fn layout_text_to_quads_descender_widens_bm_h_vs_caps_only() {
+        // Bug 1c GROUP-max semantics: ink_descent_em = min(pl_bottom)
+        // across all glyphs. Compare a caps-only run to a run that
+        // adds a descender-bearing glyph; the latter's bm_h should be
+        // strictly bigger because ink_descent_em moves negative.
+        //
+        // Anton may not have a true-descender lowercase 'p' (it's an
+        // all-caps display font). Try inter — it's Basic-Latin baked
+        // for every font in build.rs and is a humanist sans with
+        // proper descenders on p/q/y. Load via the standard atlas
+        // lookup path so the test works whichever font has p with
+        // descender ink.
+        let atlases = crate::sdf_atlas::load_all_atlases()
+            .expect("baked atlases parse");
+        let inter = crate::sdf_atlas::atlas_for_stem(&atlases, "inter")
+            .expect("inter present");
+        let atlas = crate::sdf_atlas::MsdfAtlas {
+            manifest: inter.manifest.clone(),
+            atlas_rgb: inter.atlas_rgb,
+        };
+        let size_px = 100.0_f32;
+        let group_caps = layout_text_to_quads(&atlas, None, "ABC", size_px)
+            .expect("caps lays out");
+        let group_desc = layout_text_to_quads(&atlas, None, "Apy", size_px)
+            .expect("desc lays out");
+        // Bug 1c: ink_descent_em from 'p' / 'y' descender lowers the
+        // min, widening bm_h. Single-pixel rounding tolerance.
+        assert!(
+            group_desc.height > group_caps.height,
+            "Bug 1c: bm_h with descender ({}) should be > caps-only ({})",
+            group_desc.height,
+            group_caps.height,
+        );
+    }
+
+    #[test]
+    fn layout_text_to_quads_multi_line_takes_group_max_ink_extent() {
+        // Bug 1c is GROUP-level (not per-line): one max-ascent +
+        // one min-descent across all glyphs in all lines. Mirrors
+        // Canvas2D's measureText(lines.join("")). A multi-line run
+        // where ONE line has a descender (line B = "py") and the
+        // OTHER is caps-only (line A = "ABC") should produce a bm_h
+        // that reflects MAX_INK_ASCENT from line A's caps AND
+        // MIN_INK_DESCENT from line B's descenders.
+        //
+        // Test: bm_h for "ABC\npy" should be larger than bm_h for
+        // "ABC\nABC" by exactly the descender contribution (modulo
+        // 1-px ceil rounding), because both runs have the same
+        // ink_ascent_em (from caps) but the first has ink_descent_em
+        // from p/y's descenders.
+        let atlases = crate::sdf_atlas::load_all_atlases()
+            .expect("baked atlases parse");
+        let inter = crate::sdf_atlas::atlas_for_stem(&atlases, "inter")
+            .expect("inter present");
+        let atlas = crate::sdf_atlas::MsdfAtlas {
+            manifest: inter.manifest.clone(),
+            atlas_rgb: inter.atlas_rgb,
+        };
+        let size_px = 100.0_f32;
+        let group_caps_caps = layout_text_to_quads(&atlas, None, "ABC\nABC", size_px)
+            .expect("caps/caps lays out");
+        let group_caps_desc = layout_text_to_quads(&atlas, None, "ABC\npy", size_px)
+            .expect("caps/desc lays out");
+        // The caps_desc variant has the SAME line stacking math
+        // (two lines × line_h_px + last_extent) but last_extent is
+        // larger because ink_descent_em reflects the p/y descender.
+        assert!(
+            group_caps_desc.height > group_caps_caps.height,
+            "Bug 1c group-max: caps/desc bm_h ({}) should be > caps/caps bm_h ({})",
+            group_caps_desc.height,
+            group_caps_caps.height,
+        );
     }
 
     #[test]
