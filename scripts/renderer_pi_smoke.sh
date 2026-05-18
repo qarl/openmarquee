@@ -1219,8 +1219,16 @@ except ValueError:
 else:
     if a < 100:
         print(f'fail (a={a} too small for ratio test; capture bug?)')
-    elif b > a * 0.85:
-        print(f'fail (a={a} b={b} ratio={b/a:.2f}; expected b ≤ 0.85×a)')
+    elif b > a * 0.90:
+        # SDF arc slice D.0 (2026-05-18): threshold bumped 0.85 -> 0.90
+        # after bisect proved the post-MSDF distribution is structural.
+        # Observed ratio = 0.87 post-MSDF (deterministic across C.1/C.2/
+        # C.3 binaries). MSDF smoothstep produces sharper intensity
+        # transitions than AlphaBitmap's gradient AA -- fewer mid-bright
+        # pixels survive the brightness=20 scaling near threshold=50.
+        # See project_msdf_brightness_threshold for the architectural
+        # cause + bisect details.
+        print(f'fail (a={a} b={b} ratio={b/a:.2f}; expected b ≤ 0.90×a)')
     else:
         print('ok')
 " 2>&1)

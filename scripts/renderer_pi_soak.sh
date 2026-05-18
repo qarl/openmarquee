@@ -142,7 +142,7 @@ if ! python3 "$PARSER" "$SOAK_LOG" \
     --max-cma-mb "$MAX_CMA" \
     --max-rss-mb "$MAX_RSS" \
     --warmup-passes "$WARMUP_PASSES" \
-    "${PER_SIGNAL_ARGS[@]}"; then
+    ${PER_SIGNAL_ARGS[@]+"${PER_SIGNAL_ARGS[@]}"}; then
     echo "FAIL: soak slope/budget gate"
     exit 1
 fi
