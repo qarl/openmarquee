@@ -433,13 +433,9 @@ ssh "$TARGET" "$BIN_PI --output hdmi --play-reel --hold-secs 1 --fps 30" \
 echo "==> Phase 5-c -- --animate-fade --transition nonexistent (unknown→cut fallback)"
 ANUNK_LOG="$LOG_DIR/animate-unknown.log"
 ANUNK_EXIT=0
-ANUNK_WALL_MS=0
 if [ -n "${FADE_FROM:-}" ] && [ -n "${FADE_TO:-}" ]; then
-    ANUNK_START=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
     ssh "$TARGET" "$BIN_PI --output hdmi --fade-from $FADE_FROM --fade-to $FADE_TO --animate-fade --transition nonexistent --transition-ms 500 --fps 30" \
         > "$ANUNK_LOG" 2>&1 || ANUNK_EXIT=$?
-    ANUNK_END=$(python3 -c 'import time; print(int(time.monotonic()*1000))')
-    ANUNK_WALL_MS=$((ANUNK_END - ANUNK_START))
 fi
 
 # Always try to bring the backend back up before we assert anything.
