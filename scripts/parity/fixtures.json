@@ -15,6 +15,14 @@
             "purpose": "Text-only static slide. Canvas2D vs fontdue text AA + word-wrap parity."
         },
         {
+            "name": "parity_text_emoji_basic",
+            "kind": "single",
+            "uuid": "f0000000-0000-4000-8000-000000000025",
+            "tick": 0.0,
+            "golden": "text_emoji_basic",
+            "purpose": "SDF arc slice C.3 -- mixed MSDF + color-emoji text. 'Hi! 🌟' exercises the layout-side codepoint segmentation (U+1F31F is in the baked U+1F000-1FFFF range) and the per-page emoji draw batch. Canvas2D side renders via ui/styles.css's @font-face for Noto Color Emoji using the same unicode-range; Rust side renders via FS_EMOJI sampling the build-time-baked CBDT atlas."
+        },
+        {
             "name": "parity_bg_pattern_dots",
             "kind": "single",
             "uuid": "f0000000-0000-4000-8000-000000000003",

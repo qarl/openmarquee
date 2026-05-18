@@ -230,6 +230,14 @@ FIXTURES=(
     # No new renderer flag needed -- 17.2's plumbing already
     # forces auto_mode evaluation through a pinned wall_clock.
     "auto_mode_date|animated_slide|f0000000-0000-4000-8000-000000000007,0.0|$PI_FIXTURE_ROOT"
+    # --- SDF arc slice C.4 (2026-05-18): emoji parity baseline ---
+    # Mixed MSDF + color-emoji text "Hi! 🌟". U+1F31F is in our
+    # baked emoji range (U+1F000-1FFFF per ui/styles.css). Exercises
+    # the C.3 codepoint-segmentation dispatch + per-page emoji draw
+    # batch. Cross-renderer parity: ui/styles.css declares the same
+    # unicode-range so the canvas2d preview and Rust device renderer
+    # make the same emoji-vs-MSDF choices.
+    "text_emoji_basic|slide|f0000000-0000-4000-8000-000000000025|$PI_FIXTURE_ROOT"
 )
 
 echo "==> deploying binary to $TARGET:$BIN_PI"
