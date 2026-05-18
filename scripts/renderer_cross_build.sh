@@ -67,6 +67,15 @@ echo "==> rsync renderer/ -> $BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 rsync -a --delete --exclude target "$REPO/renderer/" "$BUILD_DIR/"
 
+# SDF arc slice A: build.rs walks ../ui/fonts/*.ttf relative to the
+# renderer crate root. The cross-build BUILD_DIR is /tmp/renderer-
+# build so we also need /tmp/ui/fonts to exist (sibling, same as the
+# repo layout). Without this the atlas bake fails with cryptic
+# include_bytes! errors at link time.
+echo "==> rsync ui/fonts -> $(dirname "$BUILD_DIR")/ui/fonts"
+mkdir -p "$(dirname "$BUILD_DIR")/ui"
+rsync -a --delete "$REPO/ui/fonts/" "$(dirname "$BUILD_DIR")/ui/fonts/"
+
 echo "==> cargo zigbuild --target $TARGET --$PROFILE"
 BUILD_FLAGS=""
 [ "$PROFILE" = "release" ] && BUILD_FLAGS="--release"

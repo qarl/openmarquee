@@ -51,10 +51,10 @@ use crate::hdmi_logic::{
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize, wrap_text_to_width,
     classify_prewarm_pair, compute_layer_uv_rect_logic,
     fs_transition_sp_source, gradient_density_is_degenerate,
-    is_transition_kind_single_pass, prefer_scissored_bake, sp_kind_static,
-    stripes_uniforms, transition_eligible_for_scissored_bake_logic,
+    is_transition_kind_single_pass, layout_text_to_quads, prefer_scissored_bake,
+    sp_kind_static, stripes_uniforms, transition_eligible_for_scissored_bake_logic,
     transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
-    AlphaBitmap, BlendMode, FontCatalog, PrewarmTier,
+    AlphaBitmap, BlendMode, FontCatalog, MsdfQuadGroup, PrewarmTier,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
@@ -365,6 +365,15 @@ pub struct EglSession<'a> {
     /// See ATLAS_FBO_W / ATLAS_FBO_H / ATLAS_REGION_W /
     /// ATLAS_REGION_H in hdmi_logic.rs for the geometry.
     scissored_bake_atlas: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
+    /// SDF arc slice B.2 -- session-wide MSDF atlases. 23 RGB888
+    /// textures uploaded once at session bring-up (immediately
+    /// after `make_current`), bound per-layer at draw time keyed
+    /// on the layer's font stem. Freed at session teardown while
+    /// the GL context is still bound. The CPU-side parsed
+    /// manifests live in the `manifest` field of each entry so the
+    /// quad-layout pass + atlas-lookup don't re-parse JSON per
+    /// draw.
+    msdf_atlases: Vec<crate::sdf_atlas_gl::MsdfAtlasGl>,
     /// v1-spec-delta #5 (slice d, refined slice e + Bug 2 fix
     /// 2026-05-09): tracks whether the kernel CRTC currently has
     /// an alive (set_crtc'd) FB attached. The first commit per
@@ -547,7 +556,25 @@ where
         slide_caches: std::collections::HashMap::new(),
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
+        msdf_atlases: Vec::new(),
     };
+
+    // SDF arc slice B.2 -- one-shot atlas upload after the GL
+    // context is current. 23 atlases x ~1.3 MB each = ~30 MB GPU
+    // memory, all RGB8. The Vec is freed at session teardown.
+    //
+    // Failure semantics: if atlas loading fails, the session
+    // CAN'T render MSDF text (which is now the only text path).
+    // Bubble up the error -- the operator will see the failure
+    // immediately rather than getting silently-broken text on
+    // every slide.
+    {
+        let parsed = crate::sdf_atlas::load_all_atlases()
+            .map_err(|e| anyhow!("msdf atlas load failed: {e}"))?;
+        session.msdf_atlases = crate::sdf_atlas_gl::upload_all(&gl, &parsed)?;
+        populate_msdf_lookup(&session.msdf_atlases);
+    }
+
     let work_result = work(&mut session);
 
     // v1-spec-delta #8 (F-image-bg-cache): free per-session
@@ -588,6 +615,12 @@ where
     // within the process; clearing here keeps them in sync with
     // the GL context lifecycle.
     clear_glyph_program_cache(&gl);
+    clear_msdf_program_cache(&gl);
+    // SDF arc slice B.2: free msdf atlas textures while context
+    // is still bound. Clear the lookup table first so a paint after
+    // teardown can't dereference dead texture handles.
+    clear_msdf_lookup();
+    crate::sdf_atlas_gl::delete_all(&gl, &mut session.msdf_atlases);
     clear_transition_program_cache(&gl);
     clear_transition_sp_program_cache(&gl);
     clear_composite_program_cache(&gl);
@@ -2147,6 +2180,235 @@ fn draw_text_layer(
                 None => gl.delete_texture(tex),
             }
         }
+    }
+    Ok(())
+}
+
+/// SDF arc slice B.2 -- MSDF text layer draw. Per-glyph quad VBO
+/// (TRIANGLES, 6 verts per glyph) sampled against the session-lived
+/// MSDF atlas. Replaces the AlphaBitmap path on the text-render
+/// route.
+///
+/// Geometry mirrors `draw_text_layer`:
+///   1. `box_to_ndc_quad` maps the group's per-layer pixel-space
+///      bbox (group.width x group.height) into NDC against the
+///      layer's box (scale-down-only + halign/valign placement).
+///   2. Each glyph's per-layer pixel rect maps linearly inside that
+///      NDC rect.
+///   3. Motion (breathe scale around box center + translate)
+///      applied to the OUTER NDC rect, then propagated to each
+///      glyph via the same affine.
+///
+/// Shader: cached_msdf_program(outline) -> FS_MSDF_{FWIDTH,FIXED}
+/// or FS_MSDF_OUTLINE_{FWIDTH,FIXED} per `aa_mode()` + `layer.outline`.
+/// Uniforms set: u_atlas, u_text_color, u_opacity. FIXED variants
+/// additionally take u_aa_width (~0.05 SDF units); outline variants
+/// take u_outline_color (black per Python convention) +
+/// u_outline_distance (0.1 SDF units).
+///
+/// Tofu quads (group.quads[i].tofu == true) are skipped in this
+/// slice. Task #592 wires up a dedicated tofu fill shader; until
+/// then unknown codepoints render as blank gaps. With Basic Latin
+/// + Latin-1 Supplement baked, this is rare in practice.
+fn draw_text_layer_msdf(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    layer: &crate::content::TextLayer,
+    text_color: [f32; 4],
+    motion_kind: MotionKind,
+    motion_state: MotionState,
+    group: &MsdfQuadGroup,
+    atlas_tex: glow::NativeTexture,
+    tighten_scissor: Option<(u32, u32, u32, u32)>,
+) -> Result<()> {
+    use glow::HasContext;
+
+    let opacity = (layer.opacity.clamp(0.0, 1.0)
+        * motion_state.alpha_mul.clamp(0.0, 1.0))
+        .clamp(0.0, 1.0);
+    if opacity < 1e-3 {
+        return Ok(());
+    }
+
+    let size_px = effective_font_size_px(
+        layer.font_size_px,
+        layer.font_size_pct,
+        layer.r#box.w,
+        mode_w,
+    );
+    let halign = parse_h_align(&layer.text_align);
+    let valign = VAlign::Middle;
+
+    // Stage 1: outer NDC rect for the WHOLE laid-out text (matches
+    // `box_to_ndc_quad` contract; pad-inclusive). bm_pad = 1 to
+    // match layout_text_to_quads's `pad: u32 = 1`.
+    let (mut ndc_l, mut ndc_r, mut ndc_t, mut ndc_b) = box_to_ndc_quad(
+        layer.r#box.x,
+        layer.r#box.y,
+        layer.r#box.w,
+        layer.r#box.h,
+        group.width,
+        group.height,
+        1,
+        mode_w,
+        mode_h,
+        halign,
+        valign,
+    );
+
+    // Stage 2: motion scale around box center.
+    let scale = motion_state.scale.max(0.05);
+    if (scale - 1.0).abs() > 1e-4 {
+        let box_cx_ndc = (layer.r#box.x + layer.r#box.w * 0.5) * 2.0 - 1.0;
+        let box_cy_ndc = 1.0 - (layer.r#box.y + layer.r#box.h * 0.5) * 2.0;
+        ndc_l = box_cx_ndc + scale * (ndc_l - box_cx_ndc);
+        ndc_r = box_cx_ndc + scale * (ndc_r - box_cx_ndc);
+        ndc_t = box_cy_ndc + scale * (ndc_t - box_cy_ndc);
+        ndc_b = box_cy_ndc + scale * (ndc_b - box_cy_ndc);
+    }
+
+    // Stage 3: motion translate.
+    let box_w_px = (layer.r#box.w * mode_w as f32).max(1.0);
+    let box_h_px = (layer.r#box.h * mode_h as f32).max(1.0);
+    let (dx_px, dy_px) =
+        motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px);
+    if dx_px.abs() > 1e-4 || dy_px.abs() > 1e-4 {
+        let dx_ndc = (dx_px / mode_w as f32) * 2.0;
+        let dy_ndc = -(dy_px / mode_h as f32) * 2.0;
+        ndc_l += dx_ndc;
+        ndc_r += dx_ndc;
+        ndc_t += dy_ndc;
+        ndc_b += dy_ndc;
+    }
+
+    // Per-glyph quad -> NDC affine. Pixel-space (0,0) lands on
+    // (ndc_l, ndc_t); pixel-space (group.width, group.height) lands
+    // on (ndc_r, ndc_b). Linear interp in both dims.
+    let gw = group.width.max(1) as f32;
+    let gh = group.height.max(1) as f32;
+    let to_ndc_x = |px: f32| ndc_l + (px / gw) * (ndc_r - ndc_l);
+    let to_ndc_y = |py: f32| ndc_t + (py / gh) * (ndc_b - ndc_t);
+
+    // Build interleaved [x, y, u, v] verts: 6 per ink glyph
+    // (TRIANGLES winding BL, BR, TL, BR, TL, TR). Tofu quads
+    // skipped at this slice (task #592).
+    let mut verts: Vec<f32> = Vec::with_capacity(group.quads.len() * 24);
+    for q in &group.quads {
+        if q.tofu {
+            continue;
+        }
+        let xl = to_ndc_x(q.px_left);
+        let xr = to_ndc_x(q.px_right);
+        let yt = to_ndc_y(q.px_top);
+        let yb = to_ndc_y(q.px_bottom);
+        let ul = q.uv_left;
+        let ur = q.uv_right;
+        let ut = q.uv_top;
+        let ub = q.uv_bottom;
+        // BL, BR, TL, BR, TL, TR.
+        verts.extend_from_slice(&[
+            xl, yb, ul, ub,
+            xr, yb, ur, ub,
+            xl, yt, ul, ut,
+            xr, yb, ur, ub,
+            xl, yt, ul, ut,
+            xr, yt, ur, ut,
+        ]);
+    }
+    if verts.is_empty() {
+        return Ok(());
+    }
+
+    unsafe {
+        let cgp = cached_msdf_program(gl, layer.outline)?;
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("glGenBuffers (msdf): {e}"))?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            verts.len() * std::mem::size_of::<f32>(),
+        );
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+        gl.use_program(Some(cgp.program));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
+        gl.uniform_1_i32(cgp.u_atlas.as_ref(), 0);
+        gl.uniform_3_f32(
+            cgp.u_text_color.as_ref(),
+            text_color[0],
+            text_color[1],
+            text_color[2],
+        );
+        gl.uniform_1_f32(cgp.u_opacity.as_ref(), opacity);
+        // FIXED variants only: aa_width in SDF units. 0.05 is a
+        // mild softening; the shader smoothsteps over
+        // 0.5 +/- u_aa_width. Picked to match fwidth() output at
+        // a "typical" on-screen size (~64 px); operator can
+        // override later via a CLI knob if larger sizes need a
+        // softer falloff.
+        if cgp.u_aa_width.is_some() {
+            gl.uniform_1_f32(cgp.u_aa_width.as_ref(), 0.05);
+        }
+        if layer.outline {
+            // Python convention (motion.py:341): 1-px black
+            // outline. SDF outline_distance of 0.10 ~ 10% of the
+            // SDF range = ~0.4 px stroke at our 4-px-range / 48-px
+            // cell baking. Matches the visual weight of the Python
+            // 1-px stroke at moderate font sizes.
+            gl.uniform_3_f32(cgp.u_outline_color.as_ref(), 0.0, 0.0, 0.0);
+            gl.uniform_1_f32(cgp.u_outline_distance.as_ref(), 0.10);
+        }
+
+        let a_pos = cgp.a_pos;
+        let a_uv = cgp.a_uv;
+        let stride = (4 * std::mem::size_of::<f32>()) as i32;
+        gl.enable_vertex_attrib_array(a_pos);
+        gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(a_uv);
+        gl.vertex_attrib_pointer_f32(
+            a_uv,
+            2,
+            glow::FLOAT,
+            false,
+            stride,
+            (2 * std::mem::size_of::<f32>()) as i32,
+        );
+
+        // Same scissor-tightening logic as draw_text_layer: clip to
+        // the outer NDC quad's framebuffer-pixel rect. Per-glyph
+        // quads fit inside this bbox, so a single clip works for
+        // the whole batch.
+        if let Some((vp_x_off, vp_y_off, vp_w, vp_h)) = tighten_scissor {
+            let to_fb_x = |ndc: f32| {
+                vp_x_off as f32 + (ndc + 1.0) * 0.5 * vp_w as f32
+            };
+            let to_fb_y = |ndc: f32| {
+                vp_y_off as f32 + (ndc + 1.0) * 0.5 * vp_h as f32
+            };
+            let vp_x_max = (vp_x_off + vp_w) as f32;
+            let vp_y_max = (vp_y_off + vp_h) as f32;
+            let fb_l =
+                to_fb_x(ndc_l).floor().clamp(vp_x_off as f32, vp_x_max) as i32;
+            let fb_r =
+                to_fb_x(ndc_r).ceil().clamp(vp_x_off as f32, vp_x_max) as i32;
+            let fb_b =
+                to_fb_y(ndc_b).floor().clamp(vp_y_off as f32, vp_y_max) as i32;
+            let fb_t =
+                to_fb_y(ndc_t).ceil().clamp(vp_y_off as f32, vp_y_max) as i32;
+            let sw = (fb_r - fb_l).max(0);
+            let sh = (fb_t - fb_b).max(0);
+            if sw > 0 && sh > 0 {
+                gl.scissor(fb_l, fb_b, sw, sh);
+            }
+        }
+        let vert_count = (verts.len() / 4) as i32;
+        gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
+        gl.disable_vertex_attrib_array(a_pos);
+        gl.disable_vertex_attrib_array(a_uv);
+        gl.delete_buffer(vbo);
     }
     Ok(())
 }
@@ -6122,11 +6384,24 @@ fn prepare_layers_for_single_pass(
                         "layout_text_to_alpha returned None for text={wrapped:?} size={size_px}"
                     )
                 })?;
+            // SDF arc slice B.2: also populate the MSDF group so the
+            // production text path (via paint_slide_with_viewport)
+            // hits cache. Single-pass transitions still consume the
+            // AlphaBitmap below.
+            let family = layer.font_family.as_deref().unwrap_or("Inter");
+            let group = msdf_atlas_for_family(family)
+                .or_else(|| msdf_atlas_for_family("Inter"))
+                .and_then(|(_atlas_tex, atlas)| {
+                    crate::hdmi_logic::layout_text_to_quads(
+                        atlas, &wrapped, size_px,
+                    )
+                });
             glyph_cache[i] = Some(CachedGlyph {
                 text: resolved_cow.into_owned(),
                 size_px,
                 max_width_px,
                 bitmap: bm,
+                group,
             });
         }
     }
@@ -7209,6 +7484,189 @@ fn clear_glyph_program_cache(gl: &glow::Context) {
             unsafe { gl.delete_program(cgp.program); }
         }
     });
+}
+
+/// SDF arc slice B.2 -- cached compiled MSDF program + resolved
+/// attrib/uniform locations. Same shape as `CachedGlyphProgram`;
+/// adds `u_aa_width` (Some for FIXED variant, None for FWIDTH)
+/// and `u_outline_distance` (Some for outline variants).
+#[derive(Copy, Clone)]
+struct CachedMsdfProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_atlas: Option<glow::NativeUniformLocation>,
+    u_text_color: Option<glow::NativeUniformLocation>,
+    u_opacity: Option<glow::NativeUniformLocation>,
+    /// FIXED variant only.
+    u_aa_width: Option<glow::NativeUniformLocation>,
+    /// outline variants only.
+    u_outline_color: Option<glow::NativeUniformLocation>,
+    /// outline variants only.
+    u_outline_distance: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static FS_MSDF_PROGRAM: std::cell::Cell<Option<CachedMsdfProgram>> =
+        const { std::cell::Cell::new(None) };
+    static FS_MSDF_OUTLINE_PROGRAM: std::cell::Cell<Option<CachedMsdfProgram>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_msdf_program(gl: &glow::Context, outline: bool) -> Result<CachedMsdfProgram> {
+    use glow::HasContext;
+    let cell = if outline { &FS_MSDF_OUTLINE_PROGRAM } else { &FS_MSDF_PROGRAM };
+    cell.with(|c| {
+        if let Some(cgp) = c.get() {
+            return Ok(cgp);
+        }
+        // Variant selection at compile time: aa_mode() picks
+        // FWIDTH vs FIXED. First call wins per the OnceLock
+        // contract; if aa_mode is set later, the program cache
+        // would have to be cleared + rebuilt -- but the CLI flag
+        // is read once at main entry so this isn't an issue in
+        // practice.
+        let fs = if outline {
+            crate::hdmi_logic::fs_msdf_outline_for_aa_mode()
+        } else {
+            crate::hdmi_logic::fs_msdf_for_aa_mode()
+        };
+        let label = if outline { "FS_MSDF_OUTLINE" } else { "FS_MSDF" };
+        let program = link_program(gl, crate::hdmi_logic::VS_TEXTURED_QUAD, fs)
+            .with_context(|| format!("link {label}"))?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos ({label})"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv ({label})"))?;
+        let u_atlas = unsafe { gl.get_uniform_location(program, "u_atlas") };
+        let u_text_color = unsafe { gl.get_uniform_location(program, "u_text_color") };
+        let u_opacity = unsafe { gl.get_uniform_location(program, "u_opacity") };
+        // u_aa_width exists only on the FIXED variants; FWIDTH
+        // variants don't declare it. get_uniform_location returns
+        // None for non-existent uniforms (no error), so we always
+        // try and store None if absent.
+        let u_aa_width = unsafe { gl.get_uniform_location(program, "u_aa_width") };
+        let (u_outline_color, u_outline_distance) = if outline {
+            unsafe {
+                (
+                    gl.get_uniform_location(program, "u_outline_color"),
+                    gl.get_uniform_location(program, "u_outline_distance"),
+                )
+            }
+        } else {
+            (None, None)
+        };
+        let cgp = CachedMsdfProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_atlas,
+            u_text_color,
+            u_opacity,
+            u_aa_width,
+            u_outline_color,
+            u_outline_distance,
+        };
+        c.set(Some(cgp));
+        Ok(cgp)
+    })
+}
+
+fn clear_msdf_program_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    FS_MSDF_PROGRAM.with(|c| {
+        if let Some(cgp) = c.replace(None) {
+            unsafe { gl.delete_program(cgp.program); }
+        }
+    });
+    FS_MSDF_OUTLINE_PROGRAM.with(|c| {
+        if let Some(cgp) = c.replace(None) {
+            unsafe { gl.delete_program(cgp.program); }
+        }
+    });
+}
+
+/// SDF arc slice B.2 -- session-scoped MSDF atlas lookup table.
+///
+/// Populated by `populate_msdf_lookup` after `upload_all` lands the
+/// 23 atlas textures on the GL context; cleared by
+/// `clear_msdf_lookup` at session teardown BEFORE
+/// `sdf_atlas_gl::delete_all` so a stale lookup can't outlive the
+/// underlying NativeTexture handles.
+///
+/// Why a thread_local instead of threading `&[MsdfAtlasGl]` through
+/// paint_slide's signature: ~14 call sites would each need a new
+/// parameter. The atlas set is process-singleton (baked at compile
+/// time, identical across sessions), single-threaded by the GL
+/// context lifecycle. A thread_local keeps the API surface stable.
+///
+/// Tuple shape: (font_stem, atlas_tex, atlas_w, atlas_h). We don't
+/// stash the full AtlasManifest -- callers that need the manifest
+/// for glyph lookup go through `crate::sdf_atlas::atlas_for_stem`
+/// against the cross-platform Vec<MsdfAtlas> (separate from the
+/// GL-side Vec<MsdfAtlasGl>). The tex + dims are all this lookup
+/// needs to feed `draw_text_layer_msdf`.
+std::thread_local! {
+    static MSDF_ATLAS_LOOKUP: std::cell::RefCell<Vec<(String, glow::NativeTexture)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Process-wide parsed atlas set (CPU-side; `atlas_rgb` is 'static
+/// because the bytes come from `include_bytes!`). Loaded once on
+/// the first session bring-up; reused thereafter. Decoupling from
+/// the GL-side `MSDF_ATLAS_LOOKUP` lets host tests + layout-only
+/// paths (which don't need a GL context) reach the same data.
+static MSDF_ATLASES_CPU: std::sync::OnceLock<Vec<crate::sdf_atlas::MsdfAtlas>> =
+    std::sync::OnceLock::new();
+
+fn populate_msdf_lookup(atlases: &[crate::sdf_atlas_gl::MsdfAtlasGl]) {
+    MSDF_ATLAS_LOOKUP.with(|c| {
+        let mut v = c.borrow_mut();
+        v.clear();
+        for a in atlases {
+            v.push((a.stem.clone(), a.tex));
+        }
+    });
+    // First session populates the CPU-side cache; subsequent
+    // sessions skip (OnceLock semantics).
+    let _ = MSDF_ATLASES_CPU.get_or_init(|| {
+        crate::sdf_atlas::load_all_atlases().unwrap_or_default()
+    });
+}
+
+fn clear_msdf_lookup() {
+    MSDF_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
+    // MSDF_ATLASES_CPU is process-lifetime + only references 'static
+    // bytes; intentionally not cleared.
+}
+
+/// Resolve a `font_family` string (schema-level) to its baked atlas
+/// stem (e.g. "Anton" -> "anton"). Returns `None` for families not
+/// in the catalog (caller falls back to the default family).
+fn font_family_to_atlas_stem(family: &str) -> Option<&'static str> {
+    let filename = crate::hdmi_logic::font_family_to_filename(family)?;
+    Some(filename.trim_end_matches(".ttf"))
+}
+
+/// Look up the (GL atlas texture, CPU-side atlas manifest) pair for
+/// a `font_family`. Returns `None` if the family isn't in the
+/// catalog OR the atlas hasn't been uploaded yet (e.g. headless
+/// host tests that bypass `with_egl_session`). Production paths
+/// fall back to the catalog's default family ("Inter") when the
+/// requested family is missing.
+fn msdf_atlas_for_family(
+    family: &str,
+) -> Option<(glow::NativeTexture, &'static crate::sdf_atlas::MsdfAtlas)> {
+    let stem = font_family_to_atlas_stem(family)?;
+    let cpu = MSDF_ATLASES_CPU.get()?;
+    let atlas = crate::sdf_atlas::atlas_for_stem(cpu, stem)?;
+    let tex = MSDF_ATLAS_LOOKUP.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(s, _)| s == stem)
+            .map(|(_, t)| *t)
+    })?;
+    Some((tex, atlas))
 }
 
 /// qarl-direct perf-profile (2026-05-08): transition shader cache.
@@ -8548,10 +9006,6 @@ fn paint_slide_with_viewport(
         for (i, (layer, _, font)) in text_layers.iter().enumerate() {
             let resolved_cow = resolve_layer_text(layer, cal);
             let resolved_text: &str = &resolved_cow;
-            // Compute size_px first so should_rerasterize can key
-            // on (text, size_px). Pre-fix the cache keyed only on
-            // text — a layout-changing edit (box.w / mode_w shrink)
-            // silently kept the stale bitmap + texture.
             let size_px = effective_font_size_px(
                 layer.font_size_px,
                 layer.font_size_pct,
@@ -8562,6 +9016,11 @@ fn paint_slide_with_viewport(
             let needs_raster =
                 should_rerasterize(cache_ref[i].as_ref(), resolved_text, size_px, max_width_px);
             if needs_raster {
+                // SDF arc slice B.2: tex_cache is vestigial (MSDF
+                // uses session-lived atlas textures, not per-layer
+                // uploads). Still drain stale slots to keep teardown
+                // honest if the slot ever got populated by a pre-
+                // cutover binary.
                 if let Some(tc) = tex_cache.as_deref_mut() {
                     if i < tc.len() {
                         if let Some(old_tex) = tc[i].take() {
@@ -8569,27 +9028,35 @@ fn paint_slide_with_viewport(
                         }
                     }
                 }
-                // 2026-05-17 wrap port: mirror the per-paragraph greedy
-                // wrap from ui/src/rasterize.js + backend seed.py so
-                // prose exceeding the layer's box width flows to
-                // additional lines instead of overflowing.
                 let wrapped =
                     wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
+                // SDF arc slice B.2: dual raster -- AlphaBitmap stays
+                // alive for prepare_layers_for_single_pass / FS_FADE_SP
+                // (transition single-pass shaders, not yet ported to
+                // MSDF sampling); MsdfQuadGroup feeds the production
+                // multi-pass text draw (draw_text_layer_msdf). A
+                // follow-up slice retires the AlphaBitmap raster once
+                // the single-pass path is on MSDF.
                 let bm = layout_text_to_alpha(font.as_ref(), &wrapped, size_px)
                     .ok_or_else(|| {
                         anyhow!(
                             "layout_text_to_alpha returned None for text={wrapped:?} size={size_px}"
                         )
                     })?;
-                eprintln!(
-                    "rasterized text {resolved_text:?} @ {size_px:.1}px → {}x{} alpha bitmap",
-                    bm.width, bm.height,
-                );
+                let family = layer.font_family.as_deref().unwrap_or("Inter");
+                let group = msdf_atlas_for_family(family)
+                    .or_else(|| msdf_atlas_for_family("Inter"))
+                    .and_then(|(_atlas_tex, atlas)| {
+                        crate::hdmi_logic::layout_text_to_quads(
+                            atlas, &wrapped, size_px,
+                        )
+                    });
                 cache_ref[i] = Some(CachedGlyph {
                     text: resolved_cow.into_owned(),
                     size_px,
                     max_width_px,
                     bitmap: bm,
+                    group,
                 });
                 if trace_sub {
                     raster_misses += 1;
@@ -8684,10 +9151,20 @@ fn paint_slide_with_viewport(
                 let cached = cache_ref[i]
                     .as_ref()
                     .expect("cache entry populated above");
-                let tex_slot = tex_cache.as_deref_mut().and_then(|tc| {
-                    if i < tc.len() { Some(&mut tc[i]) } else { None }
-                });
-                draw_text_layer(
+                let Some(group) = cached.group.as_ref() else {
+                    // Empty / whitespace-only laid out to no ink;
+                    // nothing to draw for this layer.
+                    continue;
+                };
+                let family = layer.font_family.as_deref().unwrap_or("Inter");
+                let (atlas_tex, _) = msdf_atlas_for_family(family)
+                    .or_else(|| msdf_atlas_for_family("Inter"))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "MSDF atlas missing at draw time for family {family:?}"
+                        )
+                    })?;
+                draw_text_layer_msdf(
                     gl,
                     mode_w,
                     mode_h,
@@ -8695,8 +9172,8 @@ fn paint_slide_with_viewport(
                     *tc,
                     motion_kind,
                     motion_state,
-                    &cached.bitmap,
-                    tex_slot,
+                    group,
+                    atlas_tex,
                     Some((vp_x_off, vp_y_off, vp_w, vp_h)),
                 )?;
             }
@@ -8823,6 +9300,17 @@ fn paint_layers_via_overlay_route(
                 .as_ref()
                 .expect("cache entry populated above");
 
+            let Some(group) = cached.group.as_ref() else {
+                continue;
+            };
+            let family = layer.font_family.as_deref().unwrap_or("Inter");
+            let (atlas_tex, _) = msdf_atlas_for_family(family)
+                .or_else(|| msdf_atlas_for_family("Inter"))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "MSDF atlas missing at overlay-route draw for family {family:?}"
+                    )
+                })?;
             if !matches!(blend_mode, BlendMode::Overlay) {
                 // Direct-draw into current_scene_fbo with the slice
                 // (b) blend-func dispatch. Same as the non-overlay
@@ -8842,7 +9330,7 @@ fn paint_layers_via_overlay_route(
                     }
                     BlendMode::Overlay => unreachable!(),
                 }
-                draw_text_layer(
+                draw_text_layer_msdf(
                     gl,
                     mode_w,
                     mode_h,
@@ -8850,9 +9338,9 @@ fn paint_layers_via_overlay_route(
                     *tc,
                     motion_kind,
                     motion_state,
-                    &cached.bitmap,
-                    None,  // tex_slot: overlay route is not hot path
-                    None,  // tighten_scissor: overlay route uses ping-pong FBOs at full mode-res
+                    group,
+                    atlas_tex,
+                    None,
                 )?;
             } else {
                 // Overlay: render text to layer_fbo (premultiplied
@@ -8864,7 +9352,7 @@ fn paint_layers_via_overlay_route(
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
                 gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                draw_text_layer(
+                draw_text_layer_msdf(
                     gl,
                     mode_w,
                     mode_h,
@@ -8872,9 +9360,9 @@ fn paint_layers_via_overlay_route(
                     *tc,
                     motion_kind,
                     motion_state,
-                    &cached.bitmap,
-                    None,  // tex_slot: overlay route is not hot path
-                    None,  // tighten_scissor: overlay route writes full mode-res FBOs
+                    group,
+                    atlas_tex,
+                    None,
                 )?;
 
                 // Composite layer_tex over current_scene_tex into

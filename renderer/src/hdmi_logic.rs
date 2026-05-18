@@ -138,22 +138,25 @@ pub type GlyphCache = Vec<Option<CachedGlyph>>;
 pub struct CachedGlyph {
     pub text: String,
     /// qarl-direct perf-profile (2026-05-08): cache the size we
-    /// rasterized at, so a size change (box.w / mode_w shrink)
-    /// invalidates the cache. Pre-fix the cache keyed only on
-    /// text — a layout-changing edit silently kept the stale
-    /// bitmap. With the parallel TextureCache landing, the GL
-    /// texture would also stay stale; fixing both at the
-    /// CachedGlyph level invalidates them in lockstep via
-    /// paint_slide's existing rasterize-stage logic.
+    /// rasterized/laid out at, so a size change invalidates the
+    /// cache.
     pub size_px: f32,
     /// 2026-05-17 wrap port: cache the max_width that drove
     /// wrap_text_to_width so a box-width change OR a mode_w change
-    /// (when the layer uses font_size_px instead of font_size_pct,
-    /// where size_px wouldn't catch the geometry change on its own)
-    /// invalidates the bitmap. Without this, a wider box wouldn't
-    /// re-flow the wrap.
+    /// invalidates the layout.
     pub max_width_px: f32,
+    /// AlphaBitmap raster -- legacy single-pass transition path
+    /// (prepare_layers_for_single_pass / FS_FADE_SP). The SDF arc
+    /// slice B.2 cutover moved the multi-pass paint_slide draw to
+    /// the MSDF `group` field below; the single-pass transition
+    /// shaders still consume this AlphaBitmap until a follow-up
+    /// slice ports them to MSDF sampling.
     pub bitmap: AlphaBitmap,
+    /// SDF arc slice B.2 -- per-glyph MSDF quad layout used by the
+    /// production text path (`draw_text_layer_msdf`). `None` when
+    /// the text laid out to no ink (empty / whitespace only); the
+    /// draw stage skips the layer.
+    pub group: Option<MsdfQuadGroup>,
 }
 
 /// v1-spec-delta #3 (slice b cache, QA F2): the cache hit/miss
@@ -734,6 +737,278 @@ void main() {
     gl_FragColor = vec4(color * alpha, alpha);
 }
 "#;
+
+/// SDF arc slice B.2 -- per-glyph quad emitted by `layout_text_to_quads`.
+///
+/// Each quad covers one glyph's atlas cell, positioned in
+/// **per-layer logical pixel space** (top-left = (0, 0), y down,
+/// matching the AlphaBitmap convention layout_text_to_alpha used).
+/// The caller maps this rect into NDC via `box_to_ndc_quad` against
+/// the layer's box, applying scale-down + halign + valign in the
+/// same way as the old single-quad path.
+///
+/// Atlas UVs are normalized to [0, 1] over the font's MSDF atlas
+/// (`atlas_w` x `atlas_h`); the V axis is top-down (matches
+/// `build.rs`'s Y-flipped atlas write).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MsdfQuad {
+    /// Per-layer pixel-space quad bounds (top-left origin, y-down).
+    pub px_left: f32,
+    pub px_top: f32,
+    pub px_right: f32,
+    pub px_bottom: f32,
+    /// Atlas UV bounds (top-down).
+    pub uv_left: f32,
+    pub uv_top: f32,
+    pub uv_right: f32,
+    pub uv_bottom: f32,
+    /// True for the deterministic tofu glyph rendered when a
+    /// codepoint isn't in the font's baked atlas. The draw path
+    /// uses this to swap shaders (a 50% gray fill + thin outline)
+    /// so missing-glyph cases are visibly + consistently shown
+    /// across fonts.
+    pub tofu: bool,
+}
+
+/// SDF arc slice B.2 -- output of `layout_text_to_quads`.
+///
+/// Holds the per-glyph quads + the overall pixel-space dimensions
+/// of the laid-out text. The dims feed `box_to_ndc_quad` (same as
+/// AlphaBitmap.{width,height} did for the bitmap path) so the
+/// downstream draw call's fit-to-box transform is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MsdfQuadGroup {
+    pub quads: Vec<MsdfQuad>,
+    /// Overall pixel-space width of the laid-out text (incl. a
+    /// 1-pixel padding margin on each side, matching the AlphaBitmap
+    /// path's padding).
+    pub width: u32,
+    /// Overall pixel-space height (incl. 1-pixel padding on each
+    /// side + descender extent for the last line).
+    pub height: u32,
+    /// Font stem used for atlas lookup at draw time. The caller
+    /// resolves font_family -> stem upstream; we just forward it
+    /// so the draw path can bind the right GL texture.
+    pub font_stem: String,
+}
+
+/// SDF arc slice B.2 -- per-glyph quad layout. Replaces
+/// `layout_text_to_alpha` on the MSDF path.
+///
+/// Same line-splitting + per-line-baseline + cursor_x layout math
+/// as the AlphaBitmap path. The only difference is that we emit
+/// quads carrying atlas UVs instead of blitting alpha pixels into
+/// a per-layer bitmap.
+///
+/// `size_px` is the requested on-screen font size in pixels. The
+/// MSDF atlas is normalized to em units (1 em = `size_px`) so we
+/// multiply em-relative plane bounds + advances by `size_px` to
+/// land them in pixel space.
+///
+/// Returns `None` for empty text or no-ink-bearing text (matches
+/// the AlphaBitmap path's None-semantics so callers don't need
+/// branchy reshape).
+pub fn layout_text_to_quads(
+    atlas: &crate::sdf_atlas::MsdfAtlas,
+    text: &str,
+    size_px: f32,
+) -> Option<MsdfQuadGroup> {
+    if text.is_empty() || size_px <= 0.0 {
+        return None;
+    }
+    let lines = split_text_into_lines(text);
+
+    // Per-line glyph list. We need TWO passes:
+    //  1. Compute per-line advance + overall bbox so we can size
+    //     the output rect (same as AlphaBitmap path).
+    //  2. Emit quads positioned by baseline + cursor_x.
+    //
+    // Glyph entry lookup is per char; missing codepoints get
+    // tofu treatment in the second pass.
+    let manifest = &atlas.manifest;
+    let cell_px = manifest.cell_px as f32;
+
+    // Atlas cell size in em (cell_px / 1 em-in-cell-px). The
+    // build.rs baking uses CELL_PX=48 with autoframe -- the
+    // glyph fits inside the cell at its natural em scale. Plane
+    // bounds are em-relative offsets from baseline origin.
+    //
+    // The 1 em on-screen = size_px px. The atlas cell on-screen
+    // = cell_em * size_px. Computing cell_em from plane bounds:
+    //   cell_em_x = pl_right - pl_left  (per glyph; uniform across the cell)
+    //   cell_em_y = pl_top - pl_bottom
+    // But pl_* are em-relative to the glyph baseline, NOT to the
+    // cell. The atlas cell spans (pl_left .. pl_right) em on each
+    // glyph, but the cell size in em is the same for all glyphs
+    // (the autoframe in build.rs uses the SAME CELL_PX for all).
+    //
+    // We don't actually need cell_em -- the per-glyph quad's
+    // pixel-space extent is (pl_* * size_px), and the UVs are
+    // the cell's pixel position in atlas pixels normalized to
+    // [0, 1].
+
+    // Pass 1: per-line layout. Compute advance per line and the
+    // overall vertical extent. fontdue-equivalent line layout uses
+    // ascent + descent in em units.
+    struct LineLayout {
+        // (codepoint, advance_em, glyph_entry_opt). None on the
+        // entry means tofu.
+        chars: Vec<(u32, f32, Option<crate::sdf_atlas::GlyphEntry>)>,
+        advance_em: f32,
+    }
+    let mut layouts: Vec<LineLayout> = Vec::with_capacity(lines.len());
+    let mut max_line_advance_em = 0.0_f32;
+    let mut any_glyph = false;
+    let mut any_ink = false;
+    for line in &lines {
+        let mut entries: Vec<(u32, f32, Option<crate::sdf_atlas::GlyphEntry>)> =
+            Vec::with_capacity(line.chars().count());
+        let mut advance_em = 0.0_f32;
+        for ch in line.chars() {
+            let cp = ch as u32;
+            let glyph = manifest.glyph_for(cp).cloned();
+            // Tofu advance: half an em is a reasonable fallback
+            // matching ttf "missing glyph" widths. Used only when
+            // the font's atlas doesn't carry the codepoint.
+            let adv = glyph.as_ref().map(|g| g.advance_em).unwrap_or(0.5);
+            // Ink: a glyph is "visible" iff EITHER its plane bounds
+            // are non-degenerate OR it's a missing codepoint that
+            // will get tofu treatment (deterministic rect). Pure
+            // whitespace (space, NBSP, etc.) is neither -- skip
+            // empty-layer draw work.
+            let is_whitespace = matches!(cp, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0);
+            let has_glyph_ink = glyph
+                .as_ref()
+                .map(|g| g.pl_right > g.pl_left && g.pl_top > g.pl_bottom)
+                .unwrap_or(false);
+            let tofu_visible = glyph.is_none() && !is_whitespace;
+            if has_glyph_ink || tofu_visible {
+                any_ink = true;
+            }
+            any_glyph = true;
+            entries.push((cp, adv, glyph));
+            advance_em += adv;
+        }
+        max_line_advance_em = max_line_advance_em.max(advance_em);
+        layouts.push(LineLayout {
+            chars: entries,
+            advance_em,
+        });
+    }
+    if !any_glyph || !any_ink {
+        return None;
+    }
+
+    // Per-line vertical metrics. ascent_em is the typographic
+    // ascent for this font; descent_em is negative (baseline ->
+    // bottom-of-descender, negative-going). line_gap_em is the
+    // extra space between consecutive lines (often 0).
+    let ascent_em = manifest.ascent_em;
+    let descent_em = manifest.descent_em;
+    let line_gap_em = manifest.line_gap_em;
+    let line_h_em = ascent_em - descent_em + line_gap_em;
+
+    // Pixel-space dims. Match the AlphaBitmap path:
+    //   line_w = ceil(max_line_advance_em * size_px)
+    //   line_h_px = round(size_px * 1.1)   -- BUT we know better
+    //                                          metrics from the
+    //                                          atlas, so use them
+    let pad: u32 = 1;
+    let last_extent_px = ((ascent_em - descent_em) * size_px).ceil() as u32;
+    let line_h_px = (line_h_em * size_px).round().max(1.0) as u32;
+    let bm_w =
+        2 * pad + ((max_line_advance_em * size_px).ceil() as u32).max(1);
+    let bm_h = 2 * pad + last_extent_px + (lines.len() as u32 - 1) * line_h_px;
+    if bm_w == 0 || bm_h == 0 {
+        return None;
+    }
+
+    // Pass 2: emit quads at baseline-aware positions.
+    let atlas_w = manifest.atlas_w as f32;
+    let atlas_h = manifest.atlas_h as f32;
+    let mut quads: Vec<MsdfQuad> = Vec::new();
+    for (line_idx, layout) in layouts.iter().enumerate() {
+        // Baseline y in pixel-space, y-down. Each line's baseline
+        // is `pad + line_idx * line_h_px + ascent_em * size_px`
+        // -- ascent is positive, so adding it moves DOWN from the
+        // line's top in pixel-y-down space.
+        let baseline_y =
+            pad as f32 + (line_idx as f32) * line_h_px as f32 + ascent_em * size_px;
+        let mut cursor_x = pad as f32;
+        for (_cp, adv_em, glyph_opt) in &layout.chars {
+            let adv_px = adv_em * size_px;
+            if let Some(g) = glyph_opt {
+                // Skip glyphs with no ink (e.g. space, '\u{a0}'):
+                // advance cursor but don't emit a quad.
+                if g.pl_right <= g.pl_left || g.pl_top <= g.pl_bottom {
+                    cursor_x += adv_px;
+                    continue;
+                }
+                // pl_* are em-relative to the glyph origin. Convert
+                // to pixel-space relative to the cursor.
+                //
+                // pl_top is em above baseline (positive); on-screen
+                // y is down, so quad top = baseline_y - pl_top * size_px.
+                // pl_bottom is em below baseline (negative for
+                // descenders); quad bottom = baseline_y - pl_bottom * size_px.
+                let px_l = cursor_x + g.pl_left * size_px;
+                let px_r = cursor_x + g.pl_right * size_px;
+                let px_t = baseline_y - g.pl_top * size_px;
+                let px_b = baseline_y - g.pl_bottom * size_px;
+
+                // Atlas UVs: glyph's cell in atlas pixels normalized
+                // to [0, 1]. Note: atlas y-axis is top-down (the
+                // build.rs flip; matches our atlas tex upload), so
+                // uv_top = glyph.y / atlas_h, uv_bottom = (glyph.y
+                // + cell_px) / atlas_h.
+                let uv_l = g.x as f32 / atlas_w;
+                let uv_r = (g.x as f32 + cell_px) / atlas_w;
+                let uv_t = g.y as f32 / atlas_h;
+                let uv_b = (g.y as f32 + cell_px) / atlas_h;
+                quads.push(MsdfQuad {
+                    px_left: px_l,
+                    px_top: px_t,
+                    px_right: px_r,
+                    px_bottom: px_b,
+                    uv_left: uv_l,
+                    uv_top: uv_t,
+                    uv_right: uv_r,
+                    uv_bottom: uv_b,
+                    tofu: false,
+                });
+            } else {
+                // Tofu glyph: deterministic ~half-em rectangle at
+                // baseline. UVs are inert (draw path uses a fixed
+                // gray-with-outline fragment shader path keyed on
+                // `tofu: true`). Pixel-space bounds: roughly
+                // ascent_em x 0.5 em, baselined like a normal glyph.
+                let px_l = cursor_x + 0.05 * size_px;
+                let px_r = cursor_x + (adv_em - 0.05).max(0.1) * size_px;
+                let px_t = baseline_y - ascent_em * 0.85 * size_px;
+                let px_b = baseline_y;
+                quads.push(MsdfQuad {
+                    px_left: px_l,
+                    px_top: px_t,
+                    px_right: px_r,
+                    px_bottom: px_b,
+                    uv_left: 0.0,
+                    uv_top: 0.0,
+                    uv_right: 0.0,
+                    uv_bottom: 0.0,
+                    tofu: true,
+                });
+            }
+            cursor_x += adv_px;
+        }
+    }
+
+    Some(MsdfQuadGroup {
+        quads,
+        width: bm_w,
+        height: bm_h,
+        font_stem: manifest.font.clone(),
+    })
+}
 
 // =====================================================================
 // SDF arc slice B -- MSDF fragment shaders.
@@ -4128,6 +4403,86 @@ pub fn fourcc_for_argb_family(name: &str) -> Option<[u8; 4]> {
 mod tests {
     use super::*;
 
+    // SDF arc slice B.2 -- layout_text_to_quads smoke tests.
+    // Uses the baked anton atlas (slice A artifact) so we don't
+    // need to spin up fontdue + a TTF blob inside the test.
+    fn load_anton_atlas() -> crate::sdf_atlas::MsdfAtlas {
+        let atlases = crate::sdf_atlas::load_all_atlases()
+            .expect("baked atlases parse");
+        // Cloning the manifest is fine (small) -- the atlas_rgb
+        // slice is 'static so we can borrow without lifetime
+        // gymnastics by re-loading per test.
+        let anton = crate::sdf_atlas::atlas_for_stem(&atlases, "anton")
+            .expect("anton present");
+        crate::sdf_atlas::MsdfAtlas {
+            manifest: anton.manifest.clone(),
+            atlas_rgb: anton.atlas_rgb,
+        }
+    }
+
+    #[test]
+    fn layout_text_to_quads_returns_none_for_empty() {
+        let atlas = load_anton_atlas();
+        assert!(layout_text_to_quads(&atlas, "", 100.0).is_none());
+        // Spaces only -- no ink, returns None.
+        assert!(layout_text_to_quads(&atlas, "   ", 100.0).is_none());
+    }
+
+    #[test]
+    fn layout_text_to_quads_emits_one_quad_per_ink_glyph() {
+        let atlas = load_anton_atlas();
+        let group = layout_text_to_quads(&atlas, "AB", 100.0)
+            .expect("AB at 100px lays out");
+        assert_eq!(group.quads.len(), 2);
+        // Quads are in left-to-right order.
+        assert!(group.quads[0].px_left < group.quads[1].px_left);
+        // No tofu for ASCII.
+        assert!(!group.quads[0].tofu);
+        assert!(!group.quads[1].tofu);
+        // UVs land inside the atlas (sub-1.0).
+        for q in &group.quads {
+            assert!(q.uv_left >= 0.0 && q.uv_right <= 1.0);
+            assert!(q.uv_top >= 0.0 && q.uv_bottom <= 1.0);
+            assert!(q.uv_right > q.uv_left);
+            assert!(q.uv_bottom > q.uv_top);
+        }
+        assert_eq!(group.font_stem, "anton");
+    }
+
+    #[test]
+    fn layout_text_to_quads_scales_with_size_px() {
+        let atlas = load_anton_atlas();
+        let small = layout_text_to_quads(&atlas, "A", 50.0).expect("A@50");
+        let large = layout_text_to_quads(&atlas, "A", 500.0).expect("A@500");
+        // Pixel-space quad scales linearly with size_px (10x size_px
+        // -> ~10x quad width).
+        let small_w = small.quads[0].px_right - small.quads[0].px_left;
+        let large_w = large.quads[0].px_right - large.quads[0].px_left;
+        assert!(large_w > 9.0 * small_w && large_w < 11.0 * small_w);
+    }
+
+    #[test]
+    fn layout_text_to_quads_multi_line_uses_two_baselines() {
+        let atlas = load_anton_atlas();
+        let group = layout_text_to_quads(&atlas, "A\nB", 100.0)
+            .expect("two-line lays out");
+        assert_eq!(group.quads.len(), 2);
+        // Second line's quad sits below the first line's quad in
+        // pixel-y-down space.
+        assert!(group.quads[1].px_top > group.quads[0].px_top);
+    }
+
+    #[test]
+    fn layout_text_to_quads_emits_tofu_for_unknown_codepoint() {
+        let atlas = load_anton_atlas();
+        // U+2603 (snowman) isn't in anton's Basic-Latin + Latin-1
+        // baked set; we expect a tofu quad.
+        let group = layout_text_to_quads(&atlas, "\u{2603}", 100.0)
+            .expect("tofu lays out");
+        assert_eq!(group.quads.len(), 1);
+        assert!(group.quads[0].tofu);
+    }
+
     #[test]
     fn pick_largest_returns_none_for_empty() {
         assert_eq!(pick_largest_mode_index(&[]), None);
@@ -7175,6 +7530,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         assert!(!should_rerasterize(Some(&cached), "hello", 100.0, 500.0));
     }
@@ -7188,6 +7544,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         assert!(should_rerasterize(Some(&cached), "14:35:10", 100.0, 500.0));
     }
@@ -7203,6 +7560,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         assert!(!should_rerasterize(Some(&cached), "", 100.0, 500.0));
     }
@@ -7217,6 +7575,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         assert!(should_rerasterize(Some(&cached), "anything", 100.0, 500.0));
     }
@@ -7234,6 +7593,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         // Same string in NFD: "cafe" + combining acute (U+0301).
         let nfd = "cafe\u{0301}";
@@ -7251,6 +7611,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         assert!(should_rerasterize(Some(&cached), "hello", 80.0, 500.0));
         assert!(should_rerasterize(Some(&cached), "hello", 120.0, 500.0));
@@ -7264,6 +7625,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         assert!(!should_rerasterize(Some(&cached), "hello", 100.0, 500.0));
     }
@@ -7279,6 +7641,7 @@ mod tests {
             size_px: 100.0,
             max_width_px: 500.0,
             bitmap: dummy_bitmap(),
+            group: None,
         };
         assert!(should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 300.0));
         assert!(should_rerasterize(Some(&cached), "hello world that wraps", 100.0, 700.0));

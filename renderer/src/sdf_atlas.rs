@@ -66,9 +66,12 @@ pub struct AtlasManifest {
     pub font: String,
     /// MSDF cell side length in atlas pixels.
     pub cell_px: u32,
-    /// SDF range in atlas pixels. Forwarded to the runtime mostly
-    /// for diagnostics; the shader's `fwidth()`-driven AA doesn't
-    /// need to know.
+    /// SDF range in atlas pixels (typically 4 -- see build.rs's
+    /// SDF_RANGE_PX). Used by build-time baking; runtime shaders
+    /// (both FWIDTH and FIXED variants) don't sample this directly
+    /// -- FWIDTH derives AA from screen-space gradient, FIXED uses
+    /// a uniform aa_width. Kept on the manifest for diagnostics
+    /// and parity with msdfgen's atlas-info conventions.
     pub range_px: f64,
     /// Atlas dimensions in pixels.
     pub atlas_w: u32,
@@ -114,8 +117,7 @@ pub struct MsdfAtlas {
 /// color-bitmap atlas in slice C).
 ///
 /// Built into the binary via `include_bytes!` / `include_str!` from
-/// `OUT_DIR/sdf-atlases/`. Order matches `build.rs::collect_fonts`'s
-/// alphabetical sort.
+/// `OUT_DIR/sdf-atlases/`.
 ///
 /// The literal `concat!(env!("OUT_DIR"), ...)` paths resolve at
 /// `cargo build` time per-target, so cross-compile to aarch64 picks
@@ -145,6 +147,11 @@ macro_rules! include_atlas {
 /// `build.rs` emits these to OUT_DIR; cargo guarantees both the
 /// build script and the main crate share the same OUT_DIR for the
 /// target being built. No filesystem walk at runtime.
+///
+/// Order is lexicographic by font stem to match `build.rs::collect_fonts`
+/// (which sorts by filename so the bake order is deterministic). The
+/// `atlas_for_stem` lookup is linear; sorting matters only for the
+/// `eprintln!` ordering in `upload_all`.
 pub const RAW_ATLASES: &[(&str, &str, &'static [u8])] = &[
     include_atlas!("alfa-slab-one"),
     include_atlas!("anton"),

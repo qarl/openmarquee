@@ -28,9 +28,13 @@ mod mp4_demux;
 mod playback;
 mod profile;
 /// SDF arc slice B -- compile-time-baked MSDF atlas pipeline.
-/// Cross-platform; the GL-upload + draw side lives in hdmi.rs
-/// (Linux-only) and gets wired in slice B.2.
+/// Cross-platform parsing + per-glyph lookup.
 mod sdf_atlas;
+/// SDF arc slice B.2 -- GL-side of the MSDF atlas pipeline. Linux-
+/// only (depends on `glow`); uploads parsed atlases as GL_RGB
+/// textures at EGL bring-up.
+#[cfg(target_os = "linux")]
+mod sdf_atlas_gl;
 // V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
 // M2M decoder client. Open + capability query are wired; format-set,
 // REQBUFS, STREAMON, and the decode loop are stubbed for piece 2b.
@@ -152,11 +156,15 @@ struct Args {
     output: OutputMode,
 
     /// SDF arc slice B -- which AA path the MSDF fragment shaders use.
-    /// Default `fwidth` is recon §3 best-guess (mediump precision is
-    /// probably workable for SDF AA on vc4); the slice-D parity test
-    /// flips this empirically. `fixed` is the deterministic fallback
-    /// when vc4 derivatives turn out unusable.
-    #[arg(long, value_enum, default_value_t = AaMode::Fwidth)]
+    /// Default `fixed` is empirically required: vc4 (Pi Zero 2 W /
+    /// VideoCore IV) does NOT support `GL_OES_standard_derivatives`
+    /// so the fwidth() variant fails to compile with
+    /// "error: no function with name 'fwidth'". The fixed-AA variant
+    /// uses a uniform aa_width and works on every GLES2 driver.
+    /// Slice B.2 Pi captures (2026-05-17) confirmed fwidth shader
+    /// failure on vc4 + fixed variant pixel-correct rendering across
+    /// 4 representative FYS slides.
+    #[arg(long, value_enum, default_value_t = AaMode::Fixed)]
     aa_mode: AaMode,
 
     /// DRM card path. Defaults to scanning /dev/dri/card1 then /dev/dri/card0.
