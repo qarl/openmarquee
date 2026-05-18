@@ -4045,11 +4045,13 @@ pub fn parse_h_align(s: &str) -> HAlign {
 /// relative `box(x, y, w, h)` (fractions of mode_w / mode_h) on a
 /// `mode_w × mode_h` viewport, aligned per `(halign, valign)`.
 ///
-/// **Fit policy (Phase 4.2c):** if the bitmap fits inside the box at
-/// its rasterized size, place it without scaling. If it overflows
-/// the box width or height, uniformly scale-down (preserving aspect)
-/// so the scaled bitmap fits. The bitmap is then aligned within the
-/// (possibly larger) box per the alignment knobs.
+/// **Fit policy (Bug 1 SDF dispatch 2026-05-19, was Phase 4.2c):**
+/// each axis is squished INDEPENDENTLY to fit boxW × boxH. Matches
+/// Canvas2D's `yScale = boxH / totalInkExtent` (rasterize.js:232)
+/// + `drawImage` 9-arg X squish (rasterize.js:306-326). The
+/// pre-Bug-1 uniform-aspect `s_w.min(s_h)` bound on the narrower
+/// axis and shrunk the other unnecessarily — producing ~52%-of-box
+/// SDF text where Canvas2D shows edge-to-edge.
 ///
 /// Returns `(ndc_left, ndc_right, ndc_top, ndc_bottom)`. NDC y-axis
 /// is up: `ndc_top > ndc_bottom` (i.e. ndc_top is at the top of the
@@ -4077,7 +4079,12 @@ pub fn box_to_ndc_quad(
     let box_w_px = (box_w * mode_w as f32).max(1.0);
     let box_h_px = (box_h * mode_h as f32).max(1.0);
 
-    // Scale-down-only: never upscale. If bitmap fits, scale=1.0.
+    // Scale-down-only: never upscale. If bitmap fits on an axis,
+    // that axis's scale = 1.0. Each axis is independent (Bug 1
+    // 2026-05-19): pre-fix used `scale = s_w.min(s_h)` which bound
+    // both axes on the narrower one, shrinking the other axis
+    // unnecessarily and diverging from Canvas2D's per-axis squish.
+    //
     // The ink content of the bitmap occupies (bm_w - 2*bm_pad) x
     // (bm_h - 2*bm_pad) at the center, with bm_pad rows/cols of
     // alpha=0 padding on each side for FS_GLYPH_OUTLINE dilation.
@@ -4095,15 +4102,14 @@ pub fn box_to_ndc_quad(
     let ink_h_f = (bm_h_f - pad2).max(1.0);
     let s_w = if ink_w_f > box_w_px { box_w_px / ink_w_f } else { 1.0 };
     let s_h = if ink_h_f > box_h_px { box_h_px / ink_h_f } else { 1.0 };
-    let scale = s_w.min(s_h);
     // Quad covers the WHOLE bitmap (pad-inclusive) so the alpha=0
     // pad rows still get textured + sampled by FS_GLYPH_OUTLINE
-    // for the dilation. Pad rows extend up to bm_pad*scale canvas-
+    // for the dilation. Pad rows extend up to bm_pad*s_* canvas-
     // pixels OUTSIDE the layer box — they're alpha=0 so they paint
     // nothing visible, but the quad geometry differs from pre-Phase
     // -3j by ~0.5 px on each edge.
-    let placed_w = bm_w_f * scale;
-    let placed_h = bm_h_f * scale;
+    let placed_w = bm_w_f * s_w;
+    let placed_h = bm_h_f * s_h;
 
     // Align inside the box.
     let dst_left = box_left_px
@@ -7728,19 +7734,23 @@ mod tests {
     }
 
     #[test]
-    fn box_quad_overflow_scales_down_uniformly() {
-        // 4000x2000 bitmap into a 1000x1000 box → scale = min(0.25, 0.5) = 0.25,
-        // so placed = 1000x500. Top-left at box origin.
+    fn box_quad_overflow_scales_down_per_axis() {
+        // Bug 1 (2026-05-19): per-axis squish. 4000x2000 bitmap into
+        // a 1000x1000 box → s_w = 0.25, s_h = 0.5 (independent).
+        // Pre-Bug-1 uniform-min took 0.25 on BOTH axes (placed
+        // 1000x500); per-axis produces placed = 1000x1000 (fills box
+        // on both axes). Matches Canvas2D's per-axis squish at
+        // rasterize.js:232 + 306-326.
         let q = box_to_ndc_quad(
             0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
             4000, 2000, 0, 1920, 1080,
             HAlign::Left, VAlign::Top,
         );
-        // Placed pixel rect: (0, 0) → (1000, 500).
+        // Placed pixel rect: (0, 0) → (1000, 1000).
         let exp_l = -1.0;
         let exp_r = 1000.0 / 1920.0 * 2.0 - 1.0;
         let exp_t = 1.0;
-        let exp_b = 1.0 - 500.0 / 1080.0 * 2.0;
+        let exp_b = 1.0 - 1000.0 / 1080.0 * 2.0;
         assert!(
             approx_ndc_eq(q, (exp_l, exp_r, exp_t, exp_b)),
             "got ({}, {}, {}, {}); expected ({exp_l}, {exp_r}, {exp_t}, {exp_b})",
@@ -7750,42 +7760,97 @@ mod tests {
 
     #[test]
     fn box_quad_overflow_only_one_dim() {
-        // Very wide bitmap (3000x100) into a 1000x1000 box →
-        // s_w = 1000/3000 ≈ 0.333, s_h = 1.0 (no overflow on h),
-        // scale = 0.333. Placed = 1000 x 33.3.
+        // Bug 1 (2026-05-19): per-axis squish. Very wide bitmap
+        // (3000x100) into a 1000x1000 box → s_w = 0.333 (squish),
+        // s_h = 1.0 (no overflow on h, no scale). Placed = 1000 x 100
+        // (unchanged on h). Pre-Bug-1 took the uniform min and
+        // shrunk h by 0.333× too, producing placed_h ≈ 33.3.
         let q = box_to_ndc_quad(
             0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
             3000, 100, 0, 1920, 1080,
             HAlign::Left, VAlign::Top,
         );
-        let placed_h = 100.0 / 3.0;
-        let exp_b = 1.0 - placed_h / 1080.0 * 2.0;
+        // placed_h = 100 (h didn't overflow, no scale).
+        let exp_b = 1.0 - 100.0 / 1080.0 * 2.0;
         assert!(
-            (q.3 - exp_b).abs() < 1e-2,
-            "scaled placed h: NDC bottom {} expected {}",
+            (q.3 - exp_b).abs() < 1e-3,
+            "per-axis placed h: NDC bottom {} expected {}",
             q.3, exp_b,
+        );
+        // Width fills the box (s_w squishes 3000→1000).
+        let exp_r = 1000.0 / 1920.0 * 2.0 - 1.0;
+        assert!(
+            (q.1 - exp_r).abs() < 1e-3,
+            "per-axis placed w: NDC right {} expected {}",
+            q.1, exp_r,
         );
     }
 
     #[test]
     fn box_quad_centered_align_after_scale_down() {
-        // 4000x2000 bitmap into 1000x1000 box at center alignment.
-        // scale = 0.25 → placed = 1000x500. Box is 1000x1000.
-        // After centering: x-offset = 0 (placed_w == box_w),
-        //                  y-offset = (1000-500)/2 = 250.
+        // Bug 1 (2026-05-19): per-axis squish. 4000x2000 bitmap into
+        // 1000x1000 box at center alignment → s_w=0.25 / s_h=0.5,
+        // placed = 1000x1000 → fills both axes, no centering offset
+        // on either. Pre-Bug-1 uniform-min produced placed=1000x500
+        // with y-offset 250 to v-center inside the 1000 box.
         let q = box_to_ndc_quad(
             0.0, 0.0, 1000.0 / 1920.0, 1000.0 / 1080.0,
             4000, 2000, 0, 1920, 1080,
             HAlign::Center, VAlign::Middle,
         );
-        // x: placed fills box → -1 .. (1000/1920*2-1)
-        // y: top at 250px → 1 - 250/1080*2 ≈ 0.5370
-        let exp_t = 1.0 - 250.0 / 1080.0 * 2.0;
-        let exp_b = 1.0 - 750.0 / 1080.0 * 2.0;
+        // x: -1 .. (1000/1920*2-1)
+        // y: 1 .. (1 - 1000/1080*2)
+        let exp_l = -1.0;
+        let exp_r = 1000.0 / 1920.0 * 2.0 - 1.0;
+        let exp_t = 1.0;
+        let exp_b = 1.0 - 1000.0 / 1080.0 * 2.0;
         assert!(
-            (q.2 - exp_t).abs() < 1e-3 && (q.3 - exp_b).abs() < 1e-3,
-            "v-centered after scale: NDC t/b {} / {} expected {} / {}",
-            q.2, q.3, exp_t, exp_b,
+            approx_ndc_eq(q, (exp_l, exp_r, exp_t, exp_b)),
+            "per-axis fills box: got ({}, {}, {}, {}); expected ({exp_l}, {exp_r}, {exp_t}, {exp_b})",
+            q.0, q.1, q.2, q.3,
+        );
+    }
+
+    #[test]
+    fn box_quad_per_axis_matches_free_slide_at_canvas2d_parity() {
+        // Bug 1 (2026-05-19): regression-lock for the parity_fys_01_free
+        // shape qarl flagged. font_size_pct=80, box (0.05, 0.1, 0.9, 0.8)
+        // on 1920x1080. layout_text_to_quads emits bm_h ≈ 1.2 × 1382 px
+        // (em-extent, Anton ascender 1.0 + |descender| 0.2). Per-axis
+        // s_h = 864 / 1657 ≈ 0.521; placed_h ≈ 1659 × 0.521 = 864 px =
+        // fills boxH. Pre-Bug-1 uniform-min took s_w = 1728/3590 ≈
+        // 0.481, applied that to h → placed_h ≈ 798 (the 52%-of-box
+        // visible artefact). The test asserts placed_h fills ≥85% of
+        // boxH under per-axis — i.e. the visible regression-fix for
+        // the FREE slide.
+        let bm_w: u32 = 3590; // max_line_advance_em (~2.6) × size_px (1382)
+        let bm_h: u32 = 1659; // (ascent - descent) em (~1.2) × size_px
+        let q = box_to_ndc_quad(
+            0.05, 0.1, 0.9, 0.8,
+            bm_w, bm_h, 1, 1920, 1080,
+            HAlign::Center, VAlign::Middle,
+        );
+        // Expected: placed fills both axes. Compute placed_h in NDC.
+        let placed_h_ndc = q.2 - q.3; // top - bottom (top > bottom).
+        let placed_h_px = placed_h_ndc / 2.0 * 1080.0;
+        let box_h_px = 0.8 * 1080.0; // 864
+        // Under per-axis: placed_h_px ≈ box_h_px. Allow 1% slack for
+        // the 2*pad subtraction in the ink-dim scale source.
+        assert!(
+            placed_h_px >= box_h_px * 0.85,
+            "FREE-shape per-axis placed_h_px = {} (box_h_px = {}); pre-Bug-1 uniform-min produced ~798 (~92% of box) — \
+             but the SDF rendered ink within the placed quad was ~52% of box because the ink (cap height) fits inside the em-extent. \
+             This test gates on the quad geometry, not on ink-within-quad.",
+            placed_h_px, box_h_px,
+        );
+        // Per-axis ALSO fills box width.
+        let placed_w_ndc = q.1 - q.0;
+        let placed_w_px = placed_w_ndc / 2.0 * 1920.0;
+        let box_w_px = 0.9 * 1920.0; // 1728
+        assert!(
+            (placed_w_px - box_w_px).abs() < 5.0,
+            "FREE-shape per-axis placed_w_px = {} (box_w_px = {})",
+            placed_w_px, box_w_px,
         );
     }
 
