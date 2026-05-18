@@ -207,6 +207,26 @@ pub fn should_rerasterize(
 /// requested; the warn line surfaces the clamp to operators.
 pub const MAX_RASTERIZED_BITMAP_DIM: u32 = 2048;
 
+/// SDF arc slice B -- process-wide AA mode for the MSDF fragment
+/// shaders. main.rs calls `set_aa_mode` at startup; the shader-
+/// compile path reads `aa_mode()` when picking which FS_MSDF
+/// variant to compile. OnceLock first-call-wins semantics matches
+/// the CLI-flag-set-once contract; cross-platform so host tests
+/// can exercise the shader-selection logic without DRM/EGL.
+static AA_MODE: std::sync::OnceLock<crate::AaMode> = std::sync::OnceLock::new();
+
+pub fn set_aa_mode(mode: crate::AaMode) {
+    let _ = AA_MODE.set(mode);
+}
+
+/// Returns the configured AA mode, or `Fwidth` (the recon's
+/// best-guess default) if main.rs hasn't called `set_aa_mode` yet
+/// — handles direct cargo-test invocations that don't go through
+/// main.rs's arg parse.
+pub fn aa_mode() -> crate::AaMode {
+    AA_MODE.get().copied().unwrap_or(crate::AaMode::Fwidth)
+}
+
 /// Insert `\n` at word boundaries so each line measures within
 /// `max_width_px` via the same fontdue advance-width metric that
 /// `layout_text_to_alpha` uses to paint. Preserves existing literal
@@ -714,6 +734,139 @@ void main() {
     gl_FragColor = vec4(color * alpha, alpha);
 }
 "#;
+
+// =====================================================================
+// SDF arc slice B -- MSDF fragment shaders.
+//
+// Two body shaders (FS_MSDF_FWIDTH / FS_MSDF_FIXED) and two outline
+// shaders (FS_MSDF_OUTLINE_FWIDTH / FS_MSDF_OUTLINE_FIXED). The
+// "fwidth" variants use GLES2's GL_OES_standard_derivatives builtin
+// to compute a per-fragment AA half-width; the "fixed" variants
+// take a uniform AA width.
+//
+// `aa_mode()` (above) picks which variant the runtime compiles.
+// Both pairs have matching uniforms so the CPU side is mode-
+// agnostic except for the program ID.
+//
+// Sampling: median-of-three on RGB MSDF channels (per Chlumsky's
+// MSDF reconstruction), then smoothstep against 0.5. Output is
+// premultiplied-alpha (matches the existing blend func
+// GL_ONE / GL_ONE_MINUS_SRC_ALPHA).
+//
+// All four shaders consume the same VS_TEXTURED_QUAD vertex
+// attribs (a_pos vec2, a_uv vec2). The MSDF atlas is sampled in
+// `.rgb`; slice B's atlases are uploaded as GL_RGB / RGB888.
+// =====================================================================
+
+/// MSDF body shader, fwidth() AA variant. Adaptive across scale.
+pub const FS_MSDF_FWIDTH: &str = r#"#version 100
+#extension GL_OES_standard_derivatives : enable
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform vec3 u_text_color;
+uniform float u_opacity;
+varying vec2 v_uv;
+void main() {
+    vec3 s = texture2D(u_atlas, v_uv).rgb;
+    float d = max(min(s.r, s.g), min(max(s.r, s.g), s.b));
+    float aa = fwidth(d);
+    float a = smoothstep(0.5 - aa, 0.5 + aa, d) * u_opacity;
+    gl_FragColor = vec4(u_text_color * a, a);
+}
+"#;
+
+/// MSDF body shader, fixed-pixel-AA variant. Uses a uniform AA
+/// width supplied per-draw by the CPU (typically 1.0 / quad_height
+/// in UV space). Deterministic, no derivative dependency.
+pub const FS_MSDF_FIXED: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform vec3 u_text_color;
+uniform float u_opacity;
+uniform float u_aa_width;
+varying vec2 v_uv;
+void main() {
+    vec3 s = texture2D(u_atlas, v_uv).rgb;
+    float d = max(min(s.r, s.g), min(max(s.r, s.g), s.b));
+    float a = smoothstep(0.5 - u_aa_width, 0.5 + u_aa_width, d) * u_opacity;
+    gl_FragColor = vec4(u_text_color * a, a);
+}
+"#;
+
+/// MSDF outline shader, fwidth() AA variant.
+///
+/// Dual-threshold: anything inside `outline_threshold..0.5` is the
+/// outline ring; `>= 0.5` is the body. Smoothstepped on both edges
+/// for AA, mixed by `body_alpha` to keep the inside-the-letter
+/// pixels showing through as body color.
+///
+/// `u_outline_distance` is the outline ring's half-width measured
+/// in SDF units (0.0..0.5). A reasonable default is 0.1 (~10% of
+/// the SDF range). The runtime can vary it without recompiling.
+pub const FS_MSDF_OUTLINE_FWIDTH: &str = r#"#version 100
+#extension GL_OES_standard_derivatives : enable
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform vec3 u_text_color;
+uniform vec3 u_outline_color;
+uniform float u_outline_distance;
+uniform float u_opacity;
+varying vec2 v_uv;
+void main() {
+    vec3 s = texture2D(u_atlas, v_uv).rgb;
+    float d = max(min(s.r, s.g), min(max(s.r, s.g), s.b));
+    float aa = fwidth(d);
+    float body  = smoothstep(0.5 - aa, 0.5 + aa, d);
+    float ring  = smoothstep(0.5 - u_outline_distance - aa,
+                             0.5 - u_outline_distance + aa, d);
+    vec3 color = mix(u_outline_color, u_text_color, body);
+    float a = ring * u_opacity;
+    gl_FragColor = vec4(color * a, a);
+}
+"#;
+
+/// MSDF outline shader, fixed-pixel-AA variant. Same shape as
+/// FS_MSDF_OUTLINE_FWIDTH; AA half-width comes from `u_aa_width`
+/// instead of `fwidth(d)`.
+pub const FS_MSDF_OUTLINE_FIXED: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform vec3 u_text_color;
+uniform vec3 u_outline_color;
+uniform float u_outline_distance;
+uniform float u_aa_width;
+uniform float u_opacity;
+varying vec2 v_uv;
+void main() {
+    vec3 s = texture2D(u_atlas, v_uv).rgb;
+    float d = max(min(s.r, s.g), min(max(s.r, s.g), s.b));
+    float body  = smoothstep(0.5 - u_aa_width, 0.5 + u_aa_width, d);
+    float ring  = smoothstep(0.5 - u_outline_distance - u_aa_width,
+                             0.5 - u_outline_distance + u_aa_width, d);
+    vec3 color = mix(u_outline_color, u_text_color, body);
+    float a = ring * u_opacity;
+    gl_FragColor = vec4(color * a, a);
+}
+"#;
+
+/// Pick the MSDF body shader source based on the configured AA
+/// mode. Slice B.2's shader-compile path calls this once per
+/// program-cache miss.
+pub fn fs_msdf_for_aa_mode() -> &'static str {
+    match aa_mode() {
+        crate::AaMode::Fwidth => FS_MSDF_FWIDTH,
+        crate::AaMode::Fixed => FS_MSDF_FIXED,
+    }
+}
+
+/// Pick the MSDF outline shader source based on the configured AA
+/// mode.
+pub fn fs_msdf_outline_for_aa_mode() -> &'static str {
+    match aa_mode() {
+        crate::AaMode::Fwidth => FS_MSDF_OUTLINE_FWIDTH,
+        crate::AaMode::Fixed => FS_MSDF_OUTLINE_FIXED,
+    }
+}
 
 /// Fragment shader: hard cut between two textures at t=0.5. Doesn't
 /// exist as a shader in the Python ref (cut is a playback-level

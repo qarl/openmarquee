@@ -27,6 +27,10 @@ mod mem;
 mod mp4_demux;
 mod playback;
 mod profile;
+/// SDF arc slice B -- compile-time-baked MSDF atlas pipeline.
+/// Cross-platform; the GL-upload + draw side lives in hdmi.rs
+/// (Linux-only) and gets wired in slice B.2.
+mod sdf_atlas;
 // V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
 // M2M decoder client. Open + capability query are wired; format-set,
 // REQBUFS, STREAMON, and the decode loop are stubbed for piece 2b.
@@ -86,6 +90,38 @@ impl Card {
     }
 }
 
+/// SDF arc slice B -- AA mode for MSDF text rendering.
+///
+/// `Fwidth` uses GLES2's `GL_OES_standard_derivatives` `fwidth()`
+/// builtin to compute screen-space AA width per fragment -- correct
+/// across arbitrary on-screen scale, no per-call uniforms. The vc4
+/// driver advertises the extension but Mesa documents a "wrong
+/// precision" warning; whether that's noise or unusable for SDF AA
+/// is the open empirical question (recon §3, QA dispatch accepted
+/// "test by deploy-time parity" path).
+///
+/// `Fixed` skips derivatives, uses a per-draw uniform AA width set
+/// from the on-screen quad height. Cheaper, more deterministic, but
+/// the AA width doesn't track per-fragment scale (won't compensate
+/// for rotation / non-uniform scale; we don't currently use those).
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum AaMode {
+    /// Adaptive: smoothstep half-width = fwidth(d) per fragment.
+    Fwidth,
+    /// Fixed-pixel: smoothstep half-width = uniform from CPU.
+    Fixed,
+}
+
+impl AaMode {
+    /// Human-readable form for the slice-D parity HUD line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AaMode::Fwidth => "fwidth",
+            AaMode::Fixed => "fixed",
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum OutputMode {
     Hdmi,
@@ -114,6 +150,14 @@ struct Args {
     /// scaffolded for the standalone mode that comes after pixels-on-screen.
     #[arg(long, value_enum, default_value_t = OutputMode::Hdmi)]
     output: OutputMode,
+
+    /// SDF arc slice B -- which AA path the MSDF fragment shaders use.
+    /// Default `fwidth` is recon §3 best-guess (mediump precision is
+    /// probably workable for SDF AA on vc4); the slice-D parity test
+    /// flips this empirically. `fixed` is the deterministic fallback
+    /// when vc4 derivatives turn out unusable.
+    #[arg(long, value_enum, default_value_t = AaMode::Fwidth)]
+    aa_mode: AaMode,
 
     /// DRM card path. Defaults to scanning /dev/dri/card1 then /dev/dri/card0.
     #[arg(long)]
@@ -1047,6 +1091,12 @@ fn main() -> Result<()> {
     {
         let _ = forced_mode;
     }
+
+    // SDF arc slice B: process-wide AA mode for MSDF fragment
+    // shaders. Slice-D parity bake picks the empirical winner;
+    // until then the operator can flip via --aa-mode.
+    hdmi_logic::set_aa_mode(args.aa_mode);
+    eprintln!("openmarquee-render: aa_mode={}", args.aa_mode.as_str());
 
     // v1-spec-delta #9 (slice c): IPC sidecar mode short-circuits
     // the standalone CLI dispatch. The dispatcher loop opens DRM
