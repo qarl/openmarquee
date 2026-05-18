@@ -9069,11 +9069,17 @@ fn paint_slide_with_viewport(
                 let group = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
                     .and_then(|(_atlas_tex, atlas)| {
+                        // Bug 4 (2026-05-19): per-line X-squish gate.
+                        // `max_width_px` is the same boxW used for
+                        // wrap_text_to_width above — natural-overflow
+                        // lines get squished to boxW; lines that fit
+                        // pass through unchanged.
                         crate::hdmi_logic::layout_text_to_quads(
                             atlas,
                             emoji_atlas_cpu,
                             &wrapped,
                             size_px,
+                            max_width_px,
                         )
                     });
                 if let Some(g) = group.as_ref() {
