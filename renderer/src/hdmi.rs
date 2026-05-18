@@ -49,7 +49,7 @@ use crate::hdmi_logic::{
     parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize, wrap_text_to_width,
-    classify_prewarm_pair, compute_layer_uv_rect_logic,
+    classify_prewarm_pair,
     fs_transition_sp_source, gradient_density_is_degenerate,
     is_transition_kind_single_pass, layout_text_to_quads, prefer_scissored_bake,
     sp_kind_static, stripes_uniforms, transition_eligible_for_scissored_bake_logic,
@@ -6371,24 +6371,16 @@ fn effective_solid_bg(bg: &BgKind) -> Option<[f32; 4]> {
 /// returns the per-layer rect/rgba/tex tuples so the caller can
 /// drive a single FS_FADE_SP draw.
 ///
-/// The glyph_cache + tex_cache are session-owned (via
-/// SlideRenderCache) and survive across transitions; cache hits
-/// skip both rasterization and GL upload.
+/// SDF arc B.3 (cleanup follow-up): SP-tier is gated to bg-only
+/// transitions (the SP composite shader can't sample the per-glyph
+/// MSDF atlas post-cutover). The function survives as a sanity
+/// gate — any caller that hands it text_layers is bypassing the
+/// `transition_eligible_for_single_pass_logic` gate and would
+/// silently render without text. The bail surfaces the caller bug.
 fn prepare_layers_for_single_pass(
-    _gl: &glow::Context,
-    _mode_w: u32,
-    _mode_h: u32,
     text_layers: &[(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
     motion_states: &[MotionState],
-    _wall_clock_unix: i64,
-    _glyph_cache: &mut GlyphCache,
-    _tex_cache: &mut TextureCache,
 ) -> Result<(Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<glow::NativeTexture>)> {
-    // SDF arc slice B.3: SP-tier no longer handles text-bearing
-    // transitions (gated off in transition_eligible_for_single_pass_
-    // logic). With text_layers empty, the rasterize + texture-upload
-    // stages have nothing to do; return empty result vectors. The
-    // motion_states sanity check is kept to surface caller bugs.
     if motion_states.len() != text_layers.len() {
         bail!(
             "prepare_layers_for_single_pass: motion_states len {} != layers len {}",
@@ -6563,43 +6555,15 @@ fn render_transition_single_pass_in_session(
                     motion_states_for_layers(slide_b.id, &layers_b, tick_seconds);
 
                 let t_prep_a = Instant::now();
-                let (rects_a, rgbas_a, texs_a) = {
-                    let cache_a = session
-                        .slide_caches
-                        .get_mut(&slide_a_id)
-                        .expect("slide_caches[slide_a] init above");
-                    prepare_layers_for_single_pass(
-                        gl,
-                        mode_w_u32,
-                        mode_h_u32,
-                        &layers_a,
-                        &states_a,
-                        wall_clock_unix,
-                        &mut cache_a.glyph,
-                        &mut cache_a.tex,
-                    )?
-                };
+                let (rects_a, rgbas_a, texs_a) =
+                    prepare_layers_for_single_pass(&layers_a, &states_a)?;
                 crate::profile::record_phase(
                     "sp_prep_a",
                     t_prep_a.elapsed().as_nanos() as u64,
                 );
                 let t_prep_b = Instant::now();
-                let (rects_b, rgbas_b, texs_b) = {
-                    let cache_b = session
-                        .slide_caches
-                        .get_mut(&slide_b_id)
-                        .expect("slide_caches[slide_b] init above");
-                    prepare_layers_for_single_pass(
-                        gl,
-                        mode_w_u32,
-                        mode_h_u32,
-                        &layers_b,
-                        &states_b,
-                        wall_clock_unix,
-                        &mut cache_b.glyph,
-                        &mut cache_b.tex,
-                    )?
-                };
+                let (rects_b, rgbas_b, texs_b) =
+                    prepare_layers_for_single_pass(&layers_b, &states_b)?;
                 crate::profile::record_phase(
                     "sp_prep_b",
                     t_prep_b.elapsed().as_nanos() as u64,
@@ -9951,28 +9915,16 @@ fn prewarm_sp_session(
                 .insert(slide_id, SlideRenderCache::new(n));
         }
 
-        // Rasterize + upload all text layers for this slide.
-        // Uses motion=identity (tick=0) since we're pre-warming
-        // for the cold first frame; per-frame motion paths still
-        // re-rasterize when text changes.
+        // B.3 cleanup follow-up: prepare_layers_for_single_pass is
+        // now a thin sanity gate (SP-tier is bg-only post-MSDF
+        // cutover). The text bail surfaces caller bugs but does no
+        // rasterize/upload work — that's all done by the slice-
+        // resident MSDF atlas + paint_slide path now. Empty-layer
+        // case returns Ok with empty Vecs, so prewarm is effectively
+        // a no-op for the text path; bg-cache prewarm below is what
+        // still matters here.
         let states = motion_states_for_layers(slide.id, &layers, 0.0);
-        let wall_clock_unix = current_unix_seconds();
-        let mode_w = session.mode_w as u32;
-        let mode_h = session.mode_h as u32;
-        let cache_entry = session
-            .slide_caches
-            .get_mut(&slide_id)
-            .expect("slide_caches[slide_id] inserted above");
-        if let Err(e) = prepare_layers_for_single_pass(
-            session.gl,
-            mode_w,
-            mode_h,
-            &layers,
-            &states,
-            wall_clock_unix,
-            &mut cache_entry.glyph,
-            &mut cache_entry.tex,
-        ) {
+        if let Err(e) = prepare_layers_for_single_pass(&layers, &states) {
             eprintln!(
                 "reel: prewarm skipping slide {} text raster: {e:#}",
                 slide.id,

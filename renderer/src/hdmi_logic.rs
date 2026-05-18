@@ -1709,14 +1709,13 @@ pub enum PrewarmTier {
 ///   1. kind in SP-portable set? if no -> `NotSinglePass`.
 ///   2. either side > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE (6)?
 ///      if yes -> `ExceedsBakeCap`.
-///   3. SP-cheaper-by-bench (`!prefer_scissored_bake(n_a, n_b)
+///   3. SDF arc B.3: SP-tier gated to bg-only transitions
+///      (`transition_eligible_for_single_pass_logic` rejects any
+///      non-empty layer_props). If either side has text layers ->
+///      `ScissoredBake` (prewarm-compiles the SB composite, not SP).
+///   4. SP-cheaper-by-bench (`!prefer_scissored_bake(n_a, n_b)
 ///      && both sides within SP cap`)? if yes -> `SinglePass`,
 ///      else -> `ScissoredBake`.
-///
-/// The third arm's per-side <= SP cap check is defensive: when
-/// `prefer_scissored_bake` returns false it already implies both
-/// sides <= 4 (since the predicate is OR-of-{>4 OR sum>4}). Kept
-/// for parity with the runtime call site.
 pub fn classify_prewarm_pair(kind: &str, n_a: usize, n_b: usize) -> PrewarmTier {
     if !is_transition_kind_single_pass(kind) {
         return PrewarmTier::NotSinglePass;
@@ -1726,10 +1725,15 @@ pub fn classify_prewarm_pair(kind: &str, n_a: usize, n_b: usize) -> PrewarmTier 
     {
         return PrewarmTier::ExceedsBakeCap;
     }
-    if !prefer_scissored_bake(n_a, n_b)
-        && n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-        && n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-    {
+    // B.3 SP-tier text gate: SP composite shader can't sample the
+    // per-glyph MSDF atlas (post-MSDF cutover; pre-B.3 it sampled
+    // per-layer alpha bitmaps). Any text-bearing transition routes
+    // through SB. Mirrors `transition_eligible_for_single_pass_logic`
+    // at hdmi_logic.rs:1792.
+    if n_a > 0 || n_b > 0 {
+        return PrewarmTier::ScissoredBake;
+    }
+    if !prefer_scissored_bake(n_a, n_b) {
         PrewarmTier::SinglePass
     } else {
         PrewarmTier::ScissoredBake
@@ -4125,103 +4129,6 @@ pub fn box_to_ndc_quad(
         to_ndc_y(dst_top),
         to_ndc_y(dst_bottom),
     )
-}
-
-/// Per-layer geometry inputs the single-pass layer-uv-rect math
-/// needs. Resolved from `crate::content::TextLayer` at the call
-/// site; matches the fields `compute_layer_uv_rect_logic`
-/// touches. Lets the pure-logic function stay independent of the
-/// envelope schema.
-#[derive(Clone, Copy, Debug)]
-pub struct LayerGeomInputs {
-    pub box_x: f32,
-    pub box_y: f32,
-    pub box_w: f32,
-    pub box_h: f32,
-    pub halign: HAlign,
-    /// Mirrors TextLayer.font_size_px (None means defer to pct).
-    pub font_size_px: Option<f32>,
-    /// Mirrors TextLayer.font_size_pct (None means use the
-    /// schema fallback inside effective_font_size_px).
-    pub font_size_pct: Option<f32>,
-}
-
-/// Compute a layer's destination rect in v_uv space ([0,1]
-/// bottom-up) after applying halign/valign + scale-around-box-
-/// center + motion-translate. CPU-side; the FS just does a
-/// per-fragment in-rect test + alpha sample. Mirrors the
-/// geometry math in `draw_text_layer` so the visual result is
-/// identical to the legacy bake path.
-///
-/// Stages (all in NDC = clip space [-1, 1]):
-///   1. box_to_ndc_quad: aligned-bitmap rect (handles
-///      scale-down-only fit + halign/valign placement).
-///   2. Per-frame `motion_state.scale` applied around the BOX
-///      CENTER (not the bitmap center) -- keeps the layer's
-///      origin stable while pulse/breathe scale the visible
-///      glyphs around their authored anchor.
-///   3. Per-frame `motion_offset_to_px` translation, converted
-///      from pixels back to NDC (Y inverted because NDC is
-///      bottom-up while the rest of the pipeline thinks top-
-///      down).
-///   4. NDC -> UV affine (c -> (c+1)/2). Output ordering is
-///      `[uv_left, uv_bottom, uv_right, uv_top]` matching the
-///      single-pass shader's per-layer rect uniform.
-///
-/// Output shape matches FS_FADE_SP / FS_<KIND>_SP `u_*_rectN`:
-/// vec4(uv_l, uv_b, uv_r, uv_t).
-pub fn compute_layer_uv_rect_logic(
-    inputs: &LayerGeomInputs,
-    motion_kind: MotionKind,
-    motion_state: MotionState,
-    bm_w: u32,
-    bm_h: u32,
-    mode_w: u32,
-    mode_h: u32,
-) -> [f32; 4] {
-    let valign = VAlign::Middle;
-    let (mut ndc_l, mut ndc_r, mut ndc_t, mut ndc_b) = box_to_ndc_quad(
-        inputs.box_x,
-        inputs.box_y,
-        inputs.box_w,
-        inputs.box_h,
-        bm_w,
-        bm_h,
-        1, // bm_pad: layout_text_to_alpha pads each side by 1 px
-        mode_w,
-        mode_h,
-        inputs.halign,
-        valign,
-    );
-    let scale = motion_state.scale.max(0.05);
-    if (scale - 1.0).abs() > 1e-4 {
-        let box_cx_ndc = (inputs.box_x + inputs.box_w * 0.5) * 2.0 - 1.0;
-        let box_cy_ndc = 1.0 - (inputs.box_y + inputs.box_h * 0.5) * 2.0;
-        ndc_l = box_cx_ndc + scale * (ndc_l - box_cx_ndc);
-        ndc_r = box_cx_ndc + scale * (ndc_r - box_cx_ndc);
-        ndc_t = box_cy_ndc + scale * (ndc_t - box_cy_ndc);
-        ndc_b = box_cy_ndc + scale * (ndc_b - box_cy_ndc);
-    }
-    let box_w_px = (inputs.box_w * mode_w as f32).max(1.0);
-    let box_h_px = (inputs.box_h * mode_h as f32).max(1.0);
-    let size_px = effective_font_size_px(
-        inputs.font_size_px,
-        inputs.font_size_pct,
-        inputs.box_w,
-        mode_w,
-    );
-    let (dx_px, dy_px) =
-        motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px);
-    if dx_px.abs() > 1e-4 || dy_px.abs() > 1e-4 {
-        let dx_ndc = (dx_px / mode_w as f32) * 2.0;
-        let dy_ndc = -(dy_px / mode_h as f32) * 2.0;
-        ndc_l += dx_ndc;
-        ndc_r += dx_ndc;
-        ndc_t += dy_ndc;
-        ndc_b += dy_ndc;
-    }
-    let to_uv = |c: f32| (c + 1.0) * 0.5;
-    [to_uv(ndc_l), to_uv(ndc_b), to_uv(ndc_r), to_uv(ndc_t)]
 }
 
 /// Map a fourcc code (the four-byte ASCII encoding the DRM/GBM specs
@@ -7974,263 +7881,6 @@ mod tests {
             assert_eq!(n_b, 1, "{name}: expected 1 leftover texture2D(u_src_b (in _sb helper); got {n_b}");
         }
     }
-
-    // P2-I (continued): compute_layer_uv_rect_logic. The function
-    // composes box_to_ndc_quad + scale-around-box-center + motion
-    // translate, then converts NDC -> UV. Tests cover the four
-    // stages independently against pinned numeric outputs.
-
-    fn centered_full_box() -> LayerGeomInputs {
-        // Layer fills the entire mode rect, anchored top-left at
-        // (0, 0). Halign center makes the rect symmetric so
-        // identity-motion outputs centered around UV=(0.5, 0.5).
-        LayerGeomInputs {
-            box_x: 0.0,
-            box_y: 0.0,
-            box_w: 1.0,
-            box_h: 1.0,
-            halign: HAlign::Center,
-            font_size_px: Some(64.0),
-            font_size_pct: None,
-        }
-    }
-
-    #[test]
-    fn compute_layer_uv_rect_identity_motion_full_box_full_bitmap() {
-        // 1920x1080 mode, bitmap exactly 1920x1080, box covers
-        // the whole mode -> the placed rect IS the full mode.
-        // NDC -> UV: full mode maps to UV [0, 1] x [0, 1].
-        let rect = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Static,
-            MotionState::IDENTITY,
-            1920, 1080, 1920, 1080,
-        );
-        // Output ordering: [uv_l, uv_b, uv_r, uv_t].
-        assert!((rect[0] - 0.0).abs() < 1e-5, "uv_l = {}", rect[0]);
-        assert!((rect[1] - 0.0).abs() < 1e-5, "uv_b = {}", rect[1]);
-        assert!((rect[2] - 1.0).abs() < 1e-5, "uv_r = {}", rect[2]);
-        assert!((rect[3] - 1.0).abs() < 1e-5, "uv_t = {}", rect[3]);
-    }
-
-    #[test]
-    fn compute_layer_uv_rect_smaller_bitmap_centers_in_box() {
-        // Box is the full mode; bitmap is half-width and half-
-        // height of the mode. Center halign + middle valign
-        // place the bitmap at the mode center.
-        let rect = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Static,
-            MotionState::IDENTITY,
-            960, 540, 1920, 1080,
-        );
-        // 960x540 bitmap centered in 1920x1080 box -> uv
-        // [0.25, 0.25] to [0.75, 0.75].
-        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
-        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
-        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
-        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
-    }
-
-    #[test]
-    fn compute_layer_uv_rect_scale_around_box_center() {
-        // motion_state.scale = 0.5 around box-center (= mode
-        // center for centered_full_box). The placed rect
-        // [0, 1]x[0, 1] in UV should shrink to [0.25, 0.75] in
-        // both dims. Box-center NDC = (0, 0); UV center = (0.5,
-        // 0.5).
-        let mut state = MotionState::IDENTITY;
-        state.scale = 0.5;
-        let rect = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Static,
-            state,
-            1920, 1080, 1920, 1080,
-        );
-        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
-        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
-        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
-        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
-    }
-
-    #[test]
-    fn compute_layer_uv_rect_scale_floor_at_005() {
-        // Pathological scale=0 must clamp to 0.05 (the floor in
-        // compute_layer_uv_rect_logic). Without the floor, scale=0
-        // collapses the rect to a point at box-center; with the
-        // floor it stays a small but non-degenerate rect.
-        let mut state = MotionState::IDENTITY;
-        state.scale = 0.0;
-        let rect = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Static,
-            state,
-            1920, 1080, 1920, 1080,
-        );
-        // Width of placed rect: 0.05 in both UV dims, centered
-        // at 0.5 -> [0.475, 0.525].
-        assert!((rect[0] - 0.475).abs() < 1e-4, "uv_l = {}", rect[0]);
-        assert!((rect[2] - 0.525).abs() < 1e-4, "uv_r = {}", rect[2]);
-    }
-
-    #[test]
-    fn compute_layer_uv_rect_motion_translate_y_inverted() {
-        // Ticker motion at offset_x_norm = 0.25, offset_y_norm =
-        // 0 produces dx_px > 0 (rightward). Box width is full
-        // mode, so dx_px = 0.25 * mode_w = 480; dx_ndc = 0.5;
-        // dx_uv = 0.25. The placed rect [0, 1] -> [0.25, 1.25]
-        // (clipping into >1 is fine, the FS does an in-rect
-        // test). Y stays at [0, 1] because offset_y_norm = 0.
-        //
-        // The Y-invert step (`dy_ndc = -...`) only applies when
-        // offset_y_norm != 0; this test pins the X-translate
-        // path AND that y-rect is unchanged when only x moves.
-        let mut state = MotionState::IDENTITY;
-        state.offset_x_norm = 0.25;
-        let rect = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Ticker,
-            state,
-            1920, 1080, 1920, 1080,
-        );
-        assert!(rect[0] > 0.0, "uv_l should have moved right; got {}", rect[0]);
-        assert!(rect[2] > 1.0, "uv_r should overflow right; got {}", rect[2]);
-        assert!((rect[1] - 0.0).abs() < 1e-4, "uv_b unchanged; got {}", rect[1]);
-        assert!((rect[3] - 1.0).abs() < 1e-4, "uv_t unchanged; got {}", rect[3]);
-    }
-
-    #[test]
-    fn compute_layer_uv_rect_offset_box_within_mode() {
-        // Authored box at (0.25, 0.25) sized 0.5x0.5 of the mode,
-        // bitmap exactly fills the box. With identity motion the
-        // placed rect = the authored box. UV space is bottom-up
-        // so uv_b corresponds to the LARGER y-pixel, uv_t to the
-        // smaller.
-        let inputs = LayerGeomInputs {
-            box_x: 0.25,
-            box_y: 0.25,
-            box_w: 0.5,
-            box_h: 0.5,
-            halign: HAlign::Left,
-            font_size_px: Some(64.0),
-            font_size_pct: None,
-        };
-        let rect = compute_layer_uv_rect_logic(
-            &inputs,
-            MotionKind::Static,
-            MotionState::IDENTITY,
-            960, 540, 1920, 1080,
-        );
-        // Box = [0.25, 0.25] -> [0.75, 0.75] in normalized
-        // top-down, bitmap exactly fills it. Placed rect in NDC
-        // = box * 2 - 1 = [-0.5, 0.5]. UV = (NDC + 1)/2 =
-        // [0.25, 0.75].
-        assert!((rect[0] - 0.25).abs() < 1e-4, "uv_l = {}", rect[0]);
-        assert!((rect[2] - 0.75).abs() < 1e-4, "uv_r = {}", rect[2]);
-        // Y INVERTS: top of box (top-down y=0.25) maps to UV top
-        // 0.75 (large UV y). Bottom of box (top-down y=0.75) maps
-        // to UV bottom 0.25.
-        assert!((rect[1] - 0.25).abs() < 1e-4, "uv_b = {}", rect[1]);
-        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {}", rect[3]);
-    }
-
-    // P2-I.3.fix (QA-relayed qarl-direct 2026-05-09): three coverage
-    // gaps QA flagged on the original P2-I.3 (commit 3dc2bdf). The
-    // mechanical extraction was line-by-line GREEN; these tests pin
-    // additional invariants the extraction preserves but the
-    // original test set didn't exercise.
-
-    #[test]
-    fn compute_layer_uv_rect_halign_right_flushes_right() {
-        // QA gap #1: HAlign::Right was not exercised by the
-        // initial test set (only Center and Left). Smaller bitmap
-        // in a wider box with HAlign::Right should land flush
-        // against the right edge of the box.
-        let inputs = LayerGeomInputs {
-            box_x: 0.0,
-            box_y: 0.0,
-            box_w: 1.0,
-            box_h: 1.0,
-            halign: HAlign::Right,
-            font_size_px: Some(64.0),
-            font_size_pct: None,
-        };
-        // 960x540 bitmap (half mode dims); right-aligned in full
-        // mode box. Right edge of placed bitmap = right edge of
-        // box -> uv_r = 1.0, uv_l = 1.0 - 0.5 = 0.5.
-        let rect = compute_layer_uv_rect_logic(
-            &inputs,
-            MotionKind::Static,
-            MotionState::IDENTITY,
-            960, 540, 1920, 1080,
-        );
-        assert!((rect[2] - 1.0).abs() < 1e-4, "uv_r should be flush right, got {}", rect[2]);
-        assert!((rect[0] - 0.5).abs() < 1e-4, "uv_l should match right-flush bitmap width, got {}", rect[0]);
-    }
-
-
-    #[test]
-    fn compute_layer_uv_rect_y_translate_negates_dy_ndc() {
-        // QA gap #3 (highest-risk): the dy_ndc sign-inversion at
-        //   `let dy_ndc = -(dy_px / mode_h as f32) * 2.0;`
-        // If a future refactor drops the negation, the rect would
-        // shift UP in UV instead of DOWN for positive
-        // offset_y_norm; this test must fail loudly in that case.
-        //
-        // Bounce motion + offset_y_norm = 0.25 + box_h = 1.0
-        // (full mode) -> dy_px = 0.25 * 1080 = 270 -> dy_ndc =
-        // -270/1080 * 2 = -0.5 -> dy_uv (the affine output is
-        // halved during NDC->UV) = -0.25. Both uv_b and uv_t
-        // shift by -0.25.
-        let mut state = MotionState::IDENTITY;
-        state.offset_y_norm = 0.25;
-        let rect = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Bounce,
-            state,
-            1920, 1080, 1920, 1080,
-        );
-        // Identity-motion baseline: uv_b = 0.0, uv_t = 1.0.
-        // Y-translated: uv_b = -0.25, uv_t = 0.75. Sign-inverted
-        // path would produce uv_b = 0.25, uv_t = 1.25 instead --
-        // very different observed values.
-        assert!((rect[1] - (-0.25)).abs() < 1e-4, "uv_b = {} (expected -0.25 with negated dy_ndc)", rect[1]);
-        assert!((rect[3] - 0.75).abs() < 1e-4, "uv_t = {} (expected 0.75 with negated dy_ndc)", rect[3]);
-        // X must stay pinned (Bounce only translates in y).
-        assert!((rect[0] - 0.0).abs() < 1e-4, "uv_l should be unchanged, got {}", rect[0]);
-        assert!((rect[2] - 1.0).abs() < 1e-4, "uv_r should be unchanged, got {}", rect[2]);
-    }
-
-    #[test]
-    fn compute_layer_uv_rect_static_motion_does_not_translate() {
-        // QA bonus: Static layers do NOT translate, regardless of
-        // motion_state.offset_x_norm / offset_y_norm. The skip-
-        // when-zero check `if dx_px.abs() > 1e-4 || dy_px.abs() >
-        // 1e-4` should short-circuit because motion_offset_to_px
-        // returns (0, 0) for kind=Static. Pins the SP-path
-        // "Static layers don't translate" contract: even if a
-        // future MotionState carries non-zero offsets from a stale
-        // previous frame, the kind=Static path must remain
-        // translation-free.
-        let mut state = MotionState::IDENTITY;
-        state.offset_x_norm = 0.5;
-        state.offset_y_norm = 0.5;
-        let rect_static = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Static,
-            state,
-            1920, 1080, 1920, 1080,
-        );
-        let rect_identity = compute_layer_uv_rect_logic(
-            &centered_full_box(),
-            MotionKind::Static,
-            MotionState::IDENTITY,
-            1920, 1080, 1920, 1080,
-        );
-        assert_eq!(rect_static, rect_identity,
-            "Static motion must produce same rect regardless of state offsets");
-    }
-
     // P2-I (continued): classify_prewarm_pair. The function is the
     // pure-logic mirror of the decision tree in
     // prewarm_sp_session::consider_pair (hdmi.rs); these tests pin
@@ -8275,13 +7925,27 @@ mod tests {
     }
 
     #[test]
-    fn classify_prewarm_pair_low_count_returns_single_pass() {
-        // Combined <= 4 AND each side <= SP cap -> SP tier.
-        for (na, nb) in [(0, 0), (1, 1), (2, 2), (4, 0), (3, 1)] {
+    fn classify_prewarm_pair_zero_layers_returns_single_pass() {
+        // B.3 (post-MSDF cutover): SP-tier is bg-only. Only the
+        // (0, 0) layer combo can prewarm SP; any text-bearing pair
+        // routes SB even within the old per-side SP cap.
+        assert_eq!(
+            classify_prewarm_pair("fade", 0, 0),
+            PrewarmTier::SinglePass,
+        );
+    }
+
+    #[test]
+    fn classify_prewarm_pair_any_text_layers_returns_scissored_bake() {
+        // B.3 SP text gate: any layer on either side forces SB.
+        // Mirrors `transition_eligible_for_single_pass_logic`'s
+        // `if !layer_props_a.is_empty() || !layer_props_b.is_empty()`
+        // rejection.
+        for (na, nb) in [(1, 0), (0, 1), (1, 1), (2, 2), (4, 0), (3, 1)] {
             assert_eq!(
                 classify_prewarm_pair("fade", na, nb),
-                PrewarmTier::SinglePass,
-                "({na}, {nb}) should be SP-eligible",
+                PrewarmTier::ScissoredBake,
+                "({na}, {nb}) text-bearing should route SB post-B.3",
             );
         }
     }
@@ -8289,8 +7953,9 @@ mod tests {
     #[test]
     fn classify_prewarm_pair_above_combined_returns_scissored_bake() {
         // Combined > 4 with both sides within SP cap STILL goes
-        // SB (the prefer_scissored_bake heuristic). 5L+5L all-
-        // motion is the documented FYS heavy case here.
+        // SB. 5L+5L all-motion is the documented FYS heavy case here.
+        // (Also now caught earlier by the B.3 text gate, but kept
+        // for explicit coverage of the prefer_scissored_bake arm.)
         for (na, nb) in [(3, 2), (4, 1), (1, 4), (4, 4), (5, 0)] {
             assert_eq!(
                 classify_prewarm_pair("fade", na, nb),
@@ -8345,15 +8010,17 @@ mod tests {
                     let tier = classify_prewarm_pair(kind, n_a, n_b);
                     let exceeds_bake = n_a > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
                         || n_b > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE;
-                    let prefer_sb = prefer_scissored_bake(n_a, n_b);
-                    let within_sp = n_a <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE
-                        && n_b <= SINGLE_PASS_MAX_LAYERS_PER_SLIDE;
+                    // B.3: SP only takes (0, 0). Any text-bearing
+                    // pair routes SB. Mirrors transition_eligible_
+                    // for_single_pass_logic's empty-layers gate.
+                    let text_bearing = n_a > 0 || n_b > 0;
                     let expected = if exceeds_bake {
                         PrewarmTier::ExceedsBakeCap
-                    } else if !prefer_sb && within_sp {
-                        PrewarmTier::SinglePass
-                    } else {
+                    } else if text_bearing {
                         PrewarmTier::ScissoredBake
+                    } else {
+                        // (0, 0) within both caps + bg-only.
+                        PrewarmTier::SinglePass
                     };
                     assert_eq!(
                         tier, expected,
