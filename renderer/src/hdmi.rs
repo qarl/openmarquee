@@ -3519,8 +3519,17 @@ pub fn capture_sb_transition_mid_to_png(
 ) -> Result<()> {
     use crate::hdmi_logic::rgba_to_png_bytes;
     use glow::HasContext;
+    // 2026-05-18: kinds outside the SP-portable set (currently only
+    // `glitch`) delegate to the legacy-3pass capture path. The atlas
+    // SB shader doesn't exist for those kinds; the legacy path bakes
+    // both slides full-res into per-slide FBOs and runs the
+    // standalone fs_for_transition_kind(kind) shader, matching the
+    // runtime IPC PaintTransition path bit-for-bit.
     if !is_transition_kind_single_pass(kind) {
-        bail!("capture_sb_mid: kind {kind:?} not in SP-portable set");
+        return capture_legacy_3pass_transition_mid_to_png(
+            card, slide_a, slide_b, fonts, content_root, kind, t, png_path,
+            motion_tick_override,
+        );
     }
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
@@ -3776,6 +3785,231 @@ pub fn capture_sb_transition_mid_to_png(
     })
 }
 
+/// 2026-05-18 — legacy-3pass fallback capture for transition kinds
+/// outside the SP-portable set (currently only `glitch`). Both
+/// `capture_sb_transition_mid_to_png` and `capture_fullres_transition_
+/// mid_to_png` delegate here when `!is_transition_kind_single_pass(kind)`.
+///
+/// Pipeline mirrors `paint_and_present_one_transition_frame`'s bake +
+/// composite at fixed progress `t`:
+///   1. Bake slide_a + slide_b into per-slide full-res FBOs via
+///      `make_fullres_slide_fbo_with_motion` (same helper the
+///      capture_fullres path uses). Motion states evaluated at
+///      `motion_tick_override` if Some, else 0.0 — same pin
+///      semantics as the SP-portable capture paths.
+///   2. Allocate a full-res capture FBO (cap_tex + cap_fbo).
+///   3. Link `link_program(VS_TEXTURED_QUAD, fs_for_transition_kind(kind))`
+///      — the SAME shader used by the legacy 3-pass runtime path and
+///      the IPC `paint_and_present_one_transition_frame` for non-SP
+///      kinds. Output is bit-identical to production scanout.
+///   4. Draw the composite with u_src_a=tex_a, u_src_b=tex_b, u_t=t.
+///      Standalone transition shaders (FS_GLITCH, FS_FADE, etc.) all
+///      expose this 3-uniform contract — same as the legacy 3-pass
+///      composite in `render_transition_animated_in_session` and the
+///      IPC PaintTransition path.
+///   5. `capture_fbo_to_rgba` → `rgba_to_png_bytes` → `std::fs::write`.
+///      Atomic-write semantics match the SP-portable capture paths.
+///
+/// Glitch determinism: FS_GLITCH's `frame_seed = floor(u_t * 30.0)`
+/// is deterministic at fixed t. At t=0.5 the seed is floor(15.0) = 15;
+/// the per-row hash is fully reproducible. The Rust-side golden gates
+/// Rust regressions. Canvas2D's glitch uses `Math.random()` (see
+/// ui/src/inline-preview.js:489-493) by design, so cross-renderer
+/// SSIM parity is `divergent_by_design`.
+fn capture_legacy_3pass_transition_mid_to_png(
+    card: &Card,
+    slide_a: &TextSlide,
+    slide_b: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    kind: &str,
+    t: f32,
+    png_path: &Path,
+    motion_tick_override: Option<f64>,
+) -> Result<()> {
+    use crate::hdmi_logic::{fs_for_transition_kind, rgba_to_png_bytes};
+    use glow::HasContext;
+    let fs = fs_for_transition_kind(kind).ok_or_else(|| {
+        anyhow!("capture_legacy_3pass_mid: kind {kind:?} has no fragment shader")
+    })?;
+    let t = t.clamp(0.0, 1.0);
+    let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
+    let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    with_egl_session(card, |session| {
+        let mode_w = session.mode_w as u32;
+        let mode_h = session.mode_h as u32;
+        let gl = session.gl;
+
+        // Same tick + wall_clock pin as capture_fullres_mid: motion at
+        // the override (or phase 0 by default), wall_clock at epoch.
+        let motion_tick = motion_tick_override.unwrap_or(0.0);
+        let states_a = motion_states_for_layers(slide_a.id, &layers_a, motion_tick);
+        let states_b = motion_states_for_layers(slide_b.id, &layers_b, motion_tick);
+        let wall_clock_unix: i64 = 0;
+
+        // Per-slide full-res bakes — same helper as capture_fullres_mid.
+        let (fbo_a, tex_a) = unsafe {
+            make_fullres_slide_fbo_with_motion(
+                gl, mode_w, mode_h, &bg_a_kind, &layers_a,
+                Some(&states_a), wall_clock_unix,
+            )?
+        };
+        let (fbo_b, tex_b) = match unsafe {
+            make_fullres_slide_fbo_with_motion(
+                gl, mode_w, mode_h, &bg_b_kind, &layers_b,
+                Some(&states_b), wall_clock_unix,
+            )
+        } {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                }
+                return Err(e);
+            }
+        };
+
+        // Capture FBO (full-res, RGBA8).
+        let cap_tex = unsafe {
+            let t_ = gl
+                .create_texture()
+                .map_err(|e| {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                    gl.delete_framebuffer(fbo_b);
+                    gl.delete_texture(tex_b);
+                    anyhow!("capture tex: {e}")
+                })?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t_));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA as i32, mode_w as i32, mode_h as i32, 0,
+                glow::RGBA, glow::UNSIGNED_BYTE, None,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+            );
+            t_
+        };
+        let cap_fbo = unsafe {
+            let f = gl.create_framebuffer().map_err(|e| {
+                gl.delete_texture(cap_tex);
+                gl.delete_framebuffer(fbo_a);
+                gl.delete_texture(tex_a);
+                gl.delete_framebuffer(fbo_b);
+                gl.delete_texture(tex_b);
+                anyhow!("capture fbo: {e}")
+            })?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(cap_tex), 0,
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                gl.delete_framebuffer(f);
+                gl.delete_texture(cap_tex);
+                gl.delete_framebuffer(fbo_a);
+                gl.delete_texture(tex_a);
+                gl.delete_framebuffer(fbo_b);
+                gl.delete_texture(tex_b);
+                bail!("capture fbo incomplete: status=0x{status:x}");
+            }
+            f
+        };
+
+        let work_result: Result<()> = (|| {
+            // Link the legacy transition shader (FS_GLITCH for glitch,
+            // etc.) against VS_TEXTURED_QUAD. Same pattern as
+            // render_transition_animated_in_session at hdmi.rs:~5447
+            // and paint_and_present_one_transition_frame at ~3236.
+            let program = link_program(gl, VS_TEXTURED_QUAD, fs)?;
+            let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+                .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (legacy capture)"))?;
+            let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+                .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (legacy capture)"))?;
+            let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
+            let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
+            let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+
+            // Textured-quad VBO with full-screen NDC + identity UV.
+            // Same vertex layout as VS_TEXTURED_QUAD callers across
+            // the file.
+            let vbo = unsafe { gl.create_buffer() }
+                .map_err(|e| anyhow!("glGenBuffers(legacy capture): {e}"))?;
+            let verts: [f32; 16] = [
+                -1.0, -1.0, 0.0, 0.0,
+                 1.0, -1.0, 1.0, 0.0,
+                -1.0,  1.0, 0.0, 1.0,
+                 1.0,  1.0, 1.0, 1.0,
+            ];
+            unsafe {
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let bytes = std::slice::from_raw_parts(
+                    verts.as_ptr() as *const u8,
+                    std::mem::size_of_val(&verts),
+                );
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(cap_fbo));
+                gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                gl.disable(glow::BLEND);
+                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+                gl.use_program(Some(program));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_a));
+                gl.uniform_1_i32(u_src_a.as_ref(), 0);
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
+                gl.uniform_1_i32(u_src_b.as_ref(), 1);
+                gl.uniform_1_f32(u_t.as_ref(), t);
+
+                let stride = (4 * std::mem::size_of::<f32>()) as i32;
+                gl.enable_vertex_attrib_array(a_pos);
+                gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(a_uv);
+                gl.vertex_attrib_pointer_f32(
+                    a_uv, 2, glow::FLOAT, false, stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
+                );
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                gl.disable_vertex_attrib_array(a_pos);
+                gl.disable_vertex_attrib_array(a_uv);
+                gl.flush();
+
+                gl.delete_buffer(vbo);
+                gl.delete_program(program);
+            }
+
+            let rgba = capture_fbo_to_rgba(gl, Some(cap_fbo), mode_w, mode_h)?;
+            let png_bytes = rgba_to_png_bytes(&rgba, mode_w, mode_h)?;
+            std::fs::write(png_path, &png_bytes)
+                .with_context(|| format!("write png {}", png_path.display()))?;
+            eprintln!(
+                "captured LEGACY-3PASS transition kind={kind:?} slide_a={} slide_b={} t={t:.3} -> {} ({} bytes)",
+                slide_a.id, slide_b.id, png_path.display(), png_bytes.len(),
+            );
+            Ok(())
+        })();
+
+        // Unconditional cleanup — mirrors capture_fullres_mid.
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(cap_fbo);
+            gl.delete_texture(cap_tex);
+            gl.delete_framebuffer(fbo_a);
+            gl.delete_texture(tex_a);
+            gl.delete_framebuffer(fbo_b);
+            gl.delete_texture(tex_b);
+        }
+        work_result
+    })
+}
+
 /// QA-direct (2026-05-13) Atlas SB visual-sanity counterpart.
 /// Mirrors capture_sb_transition_mid_to_png's machinery but bakes
 /// slide_a + slide_b into full-mode-resolution per-slide FBOs
@@ -3809,8 +4043,15 @@ pub fn capture_fullres_transition_mid_to_png(
 ) -> Result<()> {
     use crate::hdmi_logic::rgba_to_png_bytes;
     use glow::HasContext;
+    // 2026-05-18: same legacy-3pass delegation as capture_sb_mid.
+    // Kinds outside the SP-portable set fall through to the
+    // standalone fs_for_transition_kind(kind) composite over per-
+    // slide full-res FBOs.
     if !is_transition_kind_single_pass(kind) {
-        bail!("capture_fullres_mid: kind {kind:?} not in SP-portable set");
+        return capture_legacy_3pass_transition_mid_to_png(
+            card, slide_a, slide_b, fonts, content_root, kind, t, png_path,
+            motion_tick_override,
+        );
     }
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;

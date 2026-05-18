@@ -646,7 +646,9 @@
             "to_uuid": "f0000000-0000-4000-8000-f1500000000f",
             "transition_t": 0.5,
             "golden": "parity_fys_t14_glitch_stadium_to_13a_panic_1",
-            "purpose": "FYS reel transition 'glitch' from slide 14 '12 · Stadium' to slide 15 '13a · Panic 1' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch."
+            "purpose": "FYS reel transition 'glitch' from slide 14 '12 · Stadium' to slide 15 '13a · Panic 1' at midpoint t=0.5. Snapshot for parity audit; divergences expected and catalogued, not fixed in this dispatch.",
+            "divergent_by_design": true,
+            "divergent_reason": "glitch RNG-family divergence: Rust FS_GLITCH (hdmi_logic.rs:1210-1232) uses a deterministic GLSL sin-hash seeded by floor(u_t*30), Canvas2D _glitch (ui/src/inline-preview.js:489-493) uses Math.random() per design comment 'Per-frame randomness is what makes the breakage read as alive'. Same structural shape as confetti/shake's by-design RNG-family divergence. Rust-side golden gates Rust regressions; cross-renderer SSIM gate is acknowledged-and-skipped."
         },
         {
             "name": "parity_fys_t15_13a_panic_1_to_13b_panic_2",
