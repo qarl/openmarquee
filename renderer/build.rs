@@ -282,8 +282,15 @@ fn bake_one_font(ttf_path: &Path, codepoints: &[u32]) -> Option<(Vec<u8>, AtlasM
 /// f32 -> u8, clamping into [0, 255]. msdfgen emits f32 distance
 /// values centered roughly on 0.5; the conventional unorm8 mapping
 /// is `(v * 255).clamp(0, 255)`.
+///
+/// SDF arc slice A follow-up: matches msdfgen-atlas-gen's truncating
+/// `clamp(int(v * 256), 0, 255)` for bit-exact parity with the
+/// canonical reference encoder. Sub-LSB difference vs the prior
+/// round-to-nearest `(v*255+0.5).floor()` — irrelevant for AA
+/// quality but useful if QA later wants to diff our atlas bytes
+/// against an msdfgen-atlas-gen-produced one.
 fn unorm8(v: f32) -> u8 {
-    let scaled = (v * 255.0 + 0.5).floor();
+    let scaled = (v * 256.0).floor();
     if scaled < 0.0 { 0 } else if scaled > 255.0 { 255 } else { scaled as u8 }
 }
 
@@ -445,6 +452,7 @@ fn bake_emoji_atlas(
         .map_err(|e| format!("read noto: {e}"))?;
     let face = ttf_parser::Face::parse(&bytes, 0)
         .map_err(|e| format!("parse noto: {e:?}"))?;
+    let upem = face.units_per_em() as u32;
 
     let tiles_per_side: u32 = EMOJI_ATLAS_DIM / EMOJI_CELL_PX;     // 21
     let tiles_per_page: u32 = tiles_per_side * tiles_per_side;     // 441
@@ -510,6 +518,21 @@ fn bake_emoji_atlas(
                 EMOJI_CELL_PX, EMOJI_ATLAS_DIM, x_px, y_px,
             );
 
+            // SDF arc C.1 follow-up: derive advance_px from
+            // face.glyph_hor_advance (font-canonical) instead of
+            // src_w (the CBDT PNG width, which is approximately
+            // but not exactly the glyph advance for many emoji).
+            // Falls back to src_w if the font reports a 0 advance
+            // for this glyph (defensive; Noto entries always have
+            // non-zero advances). Scaled font-units -> CBDT pixels:
+            //   adv_px = (adv_units * EMOJI_NOTO_PPEM + upem/2) / upem
+            // (the +upem/2 rounds half-up before integer division).
+            let adv_units = face.glyph_hor_advance(gid).unwrap_or(0) as u32;
+            let advance_px = if adv_units > 0 {
+                (adv_units * EMOJI_NOTO_PPEM as u32 + upem / 2) / upem
+            } else {
+                src_w as u32
+            };
             entries.push(EmojiAtlasEntry {
                 cp,
                 page,
@@ -517,7 +540,7 @@ fn bake_emoji_atlas(
                 y: y_px,
                 src_w: src_w as u32,
                 src_h: src_h as u32,
-                advance_px: src_w as u32,  // Noto's CBDT advance ~= src_w
+                advance_px,
             });
         }
     }
@@ -653,8 +676,14 @@ fn decode_png_rgba(data: &[u8]) -> Result<(Vec<u8>, u16, u16), String> {
 /// Resample a source RGBA buffer to a `cell` x `cell` RGBA tile
 /// with uniform-scale fit + transparent letterboxing. Preserves
 /// aspect ratio so wide emoji (~136x128) don't visually distort.
-/// Box-filter (averaging) for downscale -- bilinear quality but
-/// simpler to write and adequate for the 128->96 scale step.
+///
+/// SDF arc slice C.1 follow-up: bilinear sampler (was box-filter
+/// averaging). Bilinear handles both downscale (96 cell from 128
+/// source, ~1.33x) and upscale (small symbols from the U+2600
+/// range) cleanly. Box-filter averages all source pixels overlapping
+/// each destination cell, which is correct for downscale but
+/// degenerates to nearest-neighbor on upscale. Bilinear is the
+/// safe single-implementation choice across both directions.
 fn resample_to_cell(src: &[u8], src_w: u16, src_h: u16, cell: u32) -> Vec<u8> {
     let cell_px = cell as i32;
     let sw = src_w as i32;
@@ -667,42 +696,56 @@ fn resample_to_cell(src: &[u8], src_w: u16, src_h: u16, cell: u32) -> Vec<u8> {
     let off_y = (cell_px - dst_h) / 2;
     let mut out = vec![0u8; (cell * cell * 4) as usize];
 
+    let sample = |sx: i32, sy: i32| -> [u32; 4] {
+        let sx = sx.clamp(0, sw - 1);
+        let sy = sy.clamp(0, sh - 1);
+        let si = ((sy * sw + sx) * 4) as usize;
+        [
+            src[si] as u32,
+            src[si + 1] as u32,
+            src[si + 2] as u32,
+            src[si + 3] as u32,
+        ]
+    };
+
     for dy in 0..dst_h {
-        let sy0 = ((dy as f32 / dst_h as f32) * sh as f32) as i32;
-        let sy1 = (((dy + 1) as f32 / dst_h as f32) * sh as f32) as i32;
-        let sy1 = sy1.max(sy0 + 1).min(sh);
+        // Map destination pixel CENTER to source space. The -0.5
+        // shift centers each pixel within its area instead of at
+        // its top-left corner; standard bilinear convention.
+        let sy_f = (dy as f32 + 0.5) * sh as f32 / dst_h as f32 - 0.5;
+        let sy0 = sy_f.floor() as i32;
+        let sy1 = sy0 + 1;
+        let fy = sy_f - sy0 as f32;
         for dx in 0..dst_w {
-            let sx0 = ((dx as f32 / dst_w as f32) * sw as f32) as i32;
-            let sx1 = (((dx + 1) as f32 / dst_w as f32) * sw as f32) as i32;
-            let sx1 = sx1.max(sx0 + 1).min(sw);
-            // Average all source pixels in this destination cell.
-            let mut sum = [0u32; 4];
-            let mut count = 0u32;
-            for sy in sy0..sy1 {
-                for sx in sx0..sx1 {
-                    let si = ((sy * sw + sx) * 4) as usize;
-                    sum[0] += src[si] as u32;
-                    sum[1] += src[si + 1] as u32;
-                    sum[2] += src[si + 2] as u32;
-                    sum[3] += src[si + 3] as u32;
-                    count += 1;
-                }
+            let sx_f = (dx as f32 + 0.5) * sw as f32 / dst_w as f32 - 0.5;
+            let sx0 = sx_f.floor() as i32;
+            let sx1 = sx0 + 1;
+            let fx = sx_f - sx0 as f32;
+
+            let p00 = sample(sx0, sy0);
+            let p10 = sample(sx1, sy0);
+            let p01 = sample(sx0, sy1);
+            let p11 = sample(sx1, sy1);
+
+            let mut out_px = [0u8; 4];
+            for c in 0..4 {
+                let top = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
+                let bot = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
+                let val = top * (1.0 - fy) + bot * fy;
+                out_px[c] = val.round().clamp(0.0, 255.0) as u8;
             }
-            if count == 0 { continue; }
-            let r = (sum[0] / count) as u8;
-            let g = (sum[1] / count) as u8;
-            let b = (sum[2] / count) as u8;
-            let a = (sum[3] / count) as u8;
+
             let dx_atlas = off_x + dx;
             let dy_atlas = off_y + dy;
-            if dx_atlas < 0 || dx_atlas >= cell_px || dy_atlas < 0 || dy_atlas >= cell_px {
+            if dx_atlas < 0
+                || dx_atlas >= cell_px
+                || dy_atlas < 0
+                || dy_atlas >= cell_px
+            {
                 continue;
             }
             let di = ((dy_atlas * cell_px + dx_atlas) * 4) as usize;
-            out[di] = r;
-            out[di + 1] = g;
-            out[di + 2] = b;
-            out[di + 3] = a;
+            out[di..di + 4].copy_from_slice(&out_px);
         }
     }
     out
