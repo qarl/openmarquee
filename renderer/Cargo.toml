@@ -96,6 +96,10 @@ msdfgen = { version = "0.2", features = ["ttf-parser"] }
 # Using 0.19 here gets a separate Face type and the FontExt trait
 # doesn't apply -- build.rs won't compile.
 ttf-parser = "0.18"
+# Slice C.1: decode CBDT PNG payloads + re-encode packed emoji atlases
+# at build time. Pinned to runtime's 0.17 so build-host and target
+# decoder agree (PNG round-trips should be bit-stable).
+png = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

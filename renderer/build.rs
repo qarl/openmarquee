@@ -339,6 +339,358 @@ fn main() {
     let index_path = atlases_dir.join("index.json");
     let index_json = serde_json::to_string_pretty(&index).expect("serialize index");
     fs::write(&index_path, &index_json).expect("write index.json");
+
+    // SDF arc slice C.1 -- emoji color-bitmap atlas. Bake Noto Color
+    // Emoji CBDT into RGBA8 atlas pages alongside the MSDF atlases.
+    // Skips on missing noto-color-emoji.ttf (graceful: the runtime
+    // emoji path simply has no atlas to bind and renders tofu).
+    let noto_path = fonts_dir.join("noto-color-emoji.ttf");
+    if noto_path.exists() {
+        println!("cargo:rerun-if-changed={}", noto_path.display());
+        match bake_emoji_atlas(&noto_path, &atlases_dir) {
+            Ok(report) => {
+                println!(
+                    "cargo:warning=EMOJI: baked {} codepoints across {} atlas pages ({}x{} tiles)",
+                    report.codepoints, report.pages, EMOJI_CELL_PX, EMOJI_CELL_PX,
+                );
+            }
+            Err(e) => {
+                println!("cargo:warning=EMOJI: bake FAILED: {e}");
+            }
+        }
+    } else {
+        println!(
+            "cargo:warning=EMOJI: noto-color-emoji.ttf not at {} (skipping bake)",
+            noto_path.display()
+        );
+    }
+}
+
+// =====================================================================
+// SDF arc slice C.1 -- emoji color-bitmap atlas.
+//
+// Noto Color Emoji ships CBDT (Color Bitmap Data) at PPEM 109 with
+// most glyphs at 128x128 and a few wider (~136x128). We extract each
+// codepoint in U+1F000-1FFFF + U+2600-27BF (the Unicode ranges the
+// editor's @font-face rule covers, per ui/styles.css:46-47), skip
+// U+FE0F + skin-tone modifiers (U+1F3FB-1F3FF) + ZWJ sequences
+// (handled by iterating single codepoints only), decode each PNG,
+// resample to a 96x96 RGBA cell, and pack cells into 2048x2048
+// RGBA8 atlas pages. Pages are PNG-encoded for binary size: raw
+// ~64 MB vs ~25 MB compressed.
+//
+// Runtime side (slice C.2): include_bytes! each .epng + the index
+// JSON; decode at session bring-up into GL_RGBA8 textures; the
+// layout-side (slice C.3) maps codepoint -> (page, row, col) and
+// emits a quad per glyph keyed by per-emoji aspect-ratio + advance
+// from the index.
+// =====================================================================
+
+const EMOJI_CELL_PX: u32 = 96;
+const EMOJI_ATLAS_DIM: u32 = 2048;
+const EMOJI_NOTO_PPEM: u16 = 128;
+
+#[derive(serde::Serialize)]
+struct EmojiAtlasEntry {
+    cp: u32,
+    page: u32,
+    /// Top-left atlas-pixel position of this codepoint's 96x96 cell.
+    x: u32,
+    y: u32,
+    /// Source raster's natural width/height (pre-resample), in
+    /// CBDT pixels at EMOJI_NOTO_PPEM. Runtime layout uses the
+    /// aspect ratio to position the glyph in its on-screen box.
+    src_w: u32,
+    src_h: u32,
+    /// CBDT-reported advance width in CBDT pixels. Most Noto emoji
+    /// are square-ish (advance == src_w) but the wider strikes
+    /// (~136 px wide on 128 ppem) need this for proper text-run
+    /// layout.
+    advance_px: u32,
+}
+
+#[derive(serde::Serialize)]
+struct EmojiAtlasManifest {
+    /// Stem of the source font ("noto-color-emoji"). Matches the
+    /// runtime stem used by font_family_to_filename for emoji
+    /// resolution.
+    font: String,
+    cell_px: u32,
+    atlas_dim: u32,
+    pages: u32,
+    /// CBDT bitmap strike (ppem) we resampled from. Recorded for
+    /// diagnostics; the runtime doesn't need it post-resample.
+    source_ppem: u16,
+    entries: Vec<EmojiAtlasEntry>,
+}
+
+struct EmojiBakeReport {
+    codepoints: usize,
+    pages: u32,
+}
+
+fn bake_emoji_atlas(
+    ttf_path: &Path,
+    atlases_dir: &Path,
+) -> Result<EmojiBakeReport, String> {
+    let bytes = fs::read(ttf_path)
+        .map_err(|e| format!("read noto: {e}"))?;
+    let face = ttf_parser::Face::parse(&bytes, 0)
+        .map_err(|e| format!("parse noto: {e:?}"))?;
+
+    let tiles_per_side: u32 = EMOJI_ATLAS_DIM / EMOJI_CELL_PX;     // 21
+    let tiles_per_page: u32 = tiles_per_side * tiles_per_side;     // 441
+
+    // Per-page RGBA byte buffer. Pages allocated lazily as we fill.
+    let mut pages: Vec<Vec<u8>> = Vec::new();
+    let mut entries: Vec<EmojiAtlasEntry> = Vec::new();
+
+    // Iterate the two emoji codepoint ranges from ui/styles.css.
+    // Skip variation selector + skin-tone modifiers per slice C
+    // Q4 (acceptable for v1; documented as a follow-up in
+    // SYSTEM_SPEC slice C.4).
+    let ranges = [(0x1F000u32, 0x1FFFFu32), (0x2600u32, 0x27BFu32)];
+    let should_skip = |cp: u32| -> bool {
+        cp == 0xFE0F                              // text-vs-emoji presentation
+            || (0x1F3FB..=0x1F3FF).contains(&cp)  // skin-tone modifiers
+        // NOTE: regional-indicator letters (U+1F1E6-1F1FF) are NOT skipped;
+        // they're 26 standalone "boxed letter" glyphs in Noto and the
+        // dispatch's "skip compound sequences" rule applies to ZWJ /
+        // flag-pair compounds, not to the indicators themselves. Baking
+        // them costs ~6% of one atlas page and avoids tofu when a user
+        // types a bare regional indicator (e.g. testing flag rendering
+        // before ZWJ support lands).
+    };
+
+    for (lo, hi) in ranges {
+        for cp in lo..=hi {
+            if should_skip(cp) { continue; }
+            let Some(ch) = char::from_u32(cp) else { continue; };
+            let Some(gid) = face.glyph_index(ch) else { continue; };
+            let Some(raster) = face.glyph_raster_image(gid, EMOJI_NOTO_PPEM) else {
+                // Codepoint exists in cmap but has no CBDT strike (rare).
+                continue;
+            };
+            if !matches!(raster.format, ttf_parser::RasterImageFormat::PNG) {
+                continue;
+            }
+
+            // Decode the PNG payload.
+            let (decoded_rgba, src_w, src_h) = decode_png_rgba(raster.data)
+                .map_err(|e| format!("decode PNG cp={cp:04X}: {e}"))?;
+
+            // Resample to EMOJI_CELL_PX x EMOJI_CELL_PX with uniform
+            // scale + transparent letterboxing so non-square emoji
+            // (~136x128 wide ones) keep aspect.
+            let tile = resample_to_cell(
+                &decoded_rgba, src_w, src_h, EMOJI_CELL_PX,
+            );
+            let idx = entries.len() as u32;
+            let page = idx / tiles_per_page;
+            let local = idx % tiles_per_page;
+            let cell_row = local / tiles_per_side;
+            let cell_col = local % tiles_per_side;
+            let x_px = cell_col * EMOJI_CELL_PX;
+            let y_px = cell_row * EMOJI_CELL_PX;
+
+            // Ensure the destination page exists + blit.
+            while pages.len() as u32 <= page {
+                pages.push(vec![0u8; (EMOJI_ATLAS_DIM * EMOJI_ATLAS_DIM * 4) as usize]);
+            }
+            blit_cell_into_atlas(
+                &tile, &mut pages[page as usize],
+                EMOJI_CELL_PX, EMOJI_ATLAS_DIM, x_px, y_px,
+            );
+
+            entries.push(EmojiAtlasEntry {
+                cp,
+                page,
+                x: x_px,
+                y: y_px,
+                src_w: src_w as u32,
+                src_h: src_h as u32,
+                advance_px: src_w as u32,  // Noto's CBDT advance ~= src_w
+            });
+        }
+    }
+
+    // Encode each page as PNG + write to OUT_DIR. PNG compression
+    // turns the ~16 MB raw RGBA pages into 4-8 MB on disk; the
+    // runtime decodes at session bring-up (one-shot cost).
+    for (page_idx, page_rgba) in pages.iter().enumerate() {
+        let png_path = atlases_dir
+            .join(format!("noto-color-emoji-{page_idx}.epng"));
+        let mut png_out: Vec<u8> = Vec::new();
+        {
+            let mut enc = png::Encoder::new(
+                &mut png_out, EMOJI_ATLAS_DIM, EMOJI_ATLAS_DIM,
+            );
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header()
+                .map_err(|e| format!("png header page {page_idx}: {e}"))?;
+            writer.write_image_data(page_rgba)
+                .map_err(|e| format!("png data page {page_idx}: {e}"))?;
+        }
+        fs::write(&png_path, &png_out)
+            .map_err(|e| format!("write {}: {e}", png_path.display()))?;
+    }
+
+    // Write the codepoint -> (page, x, y, src_*) index.
+    let manifest = EmojiAtlasManifest {
+        font: "noto-color-emoji".to_string(),
+        cell_px: EMOJI_CELL_PX,
+        atlas_dim: EMOJI_ATLAS_DIM,
+        pages: pages.len() as u32,
+        source_ppem: EMOJI_NOTO_PPEM,
+        entries,
+    };
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("serialize emoji manifest: {e}"))?;
+    let manifest_path = atlases_dir.join("noto-color-emoji.json");
+    fs::write(&manifest_path, &manifest_json)
+        .map_err(|e| format!("write emoji manifest: {e}"))?;
+
+    Ok(EmojiBakeReport {
+        codepoints: manifest.entries.len(),
+        pages: pages.len() as u32,
+    })
+}
+
+/// Decode a PNG payload into RGBA8 bytes + dims. Uses the same
+/// `png` crate the runtime uses for PNG-related work so the
+/// decode behavior matches.
+fn decode_png_rgba(data: &[u8]) -> Result<(Vec<u8>, u16, u16), String> {
+    let mut decoder = png::Decoder::new(data);
+    // Empirically Noto Color Emoji ships its CBDT payloads as indexed-
+    // color PNGs with a tRNS alpha chunk (one entry per palette index).
+    // EXPAND tells the png decoder to expand any sub-RGBA format
+    // (indexed / 1-2-4 bit grayscale / etc.) up to 8-bit; ALPHA adds
+    // an alpha channel where the source has none. Together they
+    // normalize every Noto glyph payload to RGBA8 in one decode pass.
+    decoder.set_transformations(
+        png::Transformations::EXPAND | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info()
+        .map_err(|e| format!("png read_info: {e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf)
+        .map_err(|e| format!("png next_frame: {e}"))?;
+    buf.truncate(info.buffer_size());
+
+    let w = info.width as u16;
+    let h = info.height as u16;
+    // Post-transformation color_type should be Rgba (palette/indexed
+    // expanded; alpha synthesized for non-alpha sources). Grayscale
+    // sources EXPAND to RGB then ALPHA adds the channel; indexed
+    // EXPAND yields RGB (or RGBA when tRNS is present) and ALPHA
+    // ensures we end at RGBA.
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => {
+            // ALPHA should have added alpha; defensive fallback.
+            let mut out = Vec::with_capacity(buf.len() * 4 / 3);
+            for px in buf.chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            out
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut out = Vec::with_capacity(buf.len() * 2);
+            for px in buf.chunks_exact(2) {
+                out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+            out
+        }
+        png::ColorType::Grayscale => {
+            let mut out = Vec::with_capacity(buf.len() * 4);
+            for &v in &buf {
+                out.extend_from_slice(&[v, v, v, 255]);
+            }
+            out
+        }
+        png::ColorType::Indexed => {
+            // EXPAND should have unpacked this; if it didn't, the
+            // png crate API changed. Fail loud.
+            return Err(
+                "indexed PNG survived EXPAND transformation (png crate API drift?)"
+                    .to_string()
+            );
+        }
+    };
+    Ok((rgba, w, h))
+}
+
+/// Resample a source RGBA buffer to a `cell` x `cell` RGBA tile
+/// with uniform-scale fit + transparent letterboxing. Preserves
+/// aspect ratio so wide emoji (~136x128) don't visually distort.
+/// Box-filter (averaging) for downscale -- bilinear quality but
+/// simpler to write and adequate for the 128->96 scale step.
+fn resample_to_cell(src: &[u8], src_w: u16, src_h: u16, cell: u32) -> Vec<u8> {
+    let cell_px = cell as i32;
+    let sw = src_w as i32;
+    let sh = src_h as i32;
+    // Uniform scale: fit longest side to cell.
+    let scale = (cell_px as f32 / sw.max(sh) as f32).min(1.0);
+    let dst_w = ((sw as f32 * scale).round() as i32).max(1);
+    let dst_h = ((sh as f32 * scale).round() as i32).max(1);
+    let off_x = (cell_px - dst_w) / 2;
+    let off_y = (cell_px - dst_h) / 2;
+    let mut out = vec![0u8; (cell * cell * 4) as usize];
+
+    for dy in 0..dst_h {
+        let sy0 = ((dy as f32 / dst_h as f32) * sh as f32) as i32;
+        let sy1 = (((dy + 1) as f32 / dst_h as f32) * sh as f32) as i32;
+        let sy1 = sy1.max(sy0 + 1).min(sh);
+        for dx in 0..dst_w {
+            let sx0 = ((dx as f32 / dst_w as f32) * sw as f32) as i32;
+            let sx1 = (((dx + 1) as f32 / dst_w as f32) * sw as f32) as i32;
+            let sx1 = sx1.max(sx0 + 1).min(sw);
+            // Average all source pixels in this destination cell.
+            let mut sum = [0u32; 4];
+            let mut count = 0u32;
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    let si = ((sy * sw + sx) * 4) as usize;
+                    sum[0] += src[si] as u32;
+                    sum[1] += src[si + 1] as u32;
+                    sum[2] += src[si + 2] as u32;
+                    sum[3] += src[si + 3] as u32;
+                    count += 1;
+                }
+            }
+            if count == 0 { continue; }
+            let r = (sum[0] / count) as u8;
+            let g = (sum[1] / count) as u8;
+            let b = (sum[2] / count) as u8;
+            let a = (sum[3] / count) as u8;
+            let dx_atlas = off_x + dx;
+            let dy_atlas = off_y + dy;
+            if dx_atlas < 0 || dx_atlas >= cell_px || dy_atlas < 0 || dy_atlas >= cell_px {
+                continue;
+            }
+            let di = ((dy_atlas * cell_px + dx_atlas) * 4) as usize;
+            out[di] = r;
+            out[di + 1] = g;
+            out[di + 2] = b;
+            out[di + 3] = a;
+        }
+    }
+    out
+}
+
+/// Blit a `cell` x `cell` RGBA tile into the atlas at (x, y).
+fn blit_cell_into_atlas(
+    tile: &[u8], atlas: &mut [u8],
+    cell_px: u32, atlas_dim: u32, x: u32, y: u32,
+) {
+    for row in 0..cell_px {
+        let src_off = (row * cell_px * 4) as usize;
+        let dst_off = (((y + row) * atlas_dim + x) * 4) as usize;
+        let len = (cell_px * 4) as usize;
+        atlas[dst_off..dst_off + len]
+            .copy_from_slice(&tile[src_off..src_off + len]);
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
