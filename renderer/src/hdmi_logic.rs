@@ -843,6 +843,28 @@ void main() {
 }
 "#;
 
+/// SDF arc slice C.2 -- color-emoji fragment shader. Samples the
+/// emoji atlas page (RGBA8, straight-alpha as decoded from the CBDT
+/// PNG) and emits premultiplied alpha so the standard
+/// (GL_ONE, GL_ONE_MINUS_SRC_ALPHA) blend func matches the rest of
+/// the text path.
+///
+/// No outline / no recoloring — emoji are color bitmaps, not SDFs,
+/// so the body color is whatever Noto baked. `u_opacity` modulates
+/// for fade transitions + per-layer opacity. Pairs with
+/// VS_TEXTURED_QUAD; v_uv is atlas-space.
+pub const FS_EMOJI: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_atlas;
+uniform float u_opacity;
+varying vec2 v_uv;
+void main() {
+    vec4 c = texture2D(u_atlas, v_uv);
+    float a = c.a * u_opacity;
+    gl_FragColor = vec4(c.rgb * a, a);
+}
+"#;
+
 /// Fragment shader: hard cut between two textures at t=0.5. Doesn't
 /// exist as a shader in the Python ref (cut is a playback-level
 /// instant switch) but adding it here keeps the transition dispatch

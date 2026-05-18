@@ -35,6 +35,15 @@ mod sdf_atlas;
 /// textures at EGL bring-up.
 #[cfg(target_os = "linux")]
 mod sdf_atlas_gl;
+/// SDF arc slice C.2 -- emoji color-bitmap atlas. Cross-platform
+/// side: parses the build-time-baked manifest + holds page PNG
+/// byte slices.
+mod sdf_atlas_emoji;
+/// SDF arc slice C.2 -- GL-side of the emoji atlas pipeline.
+/// Linux-only; decodes each PNG page at session bring-up + uploads
+/// as a GL_RGBA8 texture.
+#[cfg(target_os = "linux")]
+mod sdf_atlas_emoji_gl;
 // V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
 // M2M decoder client. Open + capability query are wired; format-set,
 // REQBUFS, STREAMON, and the decode loop are stubbed for piece 2b.

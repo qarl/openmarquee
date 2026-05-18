@@ -389,6 +389,14 @@ fn main() {
 const EMOJI_CELL_PX: u32 = 96;
 const EMOJI_ATLAS_DIM: u32 = 2048;
 const EMOJI_NOTO_PPEM: u16 = 128;
+/// Maximum atlas pages the runtime is willing to include_bytes!.
+/// Must match `crate::sdf_atlas_emoji::MAX_EMOJI_PAGES`. Sized for
+/// the recon's worst-case ~3500 codepoint estimate (8 pages * 441
+/// cells = 3528). When fewer pages are actually used, build.rs
+/// emits empty placeholder files for the unused slots so
+/// include_bytes! always resolves; the runtime trims via
+/// `manifest.pages`.
+const EMOJI_MAX_PAGES: u32 = 8;
 
 #[derive(serde::Serialize)]
 struct EmojiAtlasEntry {
@@ -514,9 +522,19 @@ fn bake_emoji_atlas(
         }
     }
 
-    // Encode each page as PNG + write to OUT_DIR. PNG compression
-    // turns the ~16 MB raw RGBA pages into 4-8 MB on disk; the
-    // runtime decodes at session bring-up (one-shot cost).
+    if pages.len() as u32 > EMOJI_MAX_PAGES {
+        return Err(format!(
+            "emoji bake produced {} pages but EMOJI_MAX_PAGES is {}; \
+             grow the constant + the parallel array in \
+             sdf_atlas_emoji.rs and try again",
+            pages.len(),
+            EMOJI_MAX_PAGES,
+        ));
+    }
+
+    // Encode each used page as PNG + write to OUT_DIR. PNG
+    // compression turns ~16 MB raw RGBA pages into 2-3 MB on disk;
+    // the runtime decodes at session bring-up.
     for (page_idx, page_rgba) in pages.iter().enumerate() {
         let png_path = atlases_dir
             .join(format!("noto-color-emoji-{page_idx}.epng"));
@@ -534,6 +552,17 @@ fn bake_emoji_atlas(
         }
         fs::write(&png_path, &png_out)
             .map_err(|e| format!("write {}: {e}", png_path.display()))?;
+    }
+
+    // include_bytes! resolves at compile time and needs every slot
+    // to point at a real file. Emit empty .epng files for unused
+    // slots so the runtime's parallel array resolves consistently
+    // regardless of how many pages the actual bake used.
+    for page_idx in (pages.len() as u32)..EMOJI_MAX_PAGES {
+        let png_path = atlases_dir
+            .join(format!("noto-color-emoji-{page_idx}.epng"));
+        fs::write(&png_path, b"")
+            .map_err(|e| format!("write empty placeholder {}: {e}", png_path.display()))?;
     }
 
     // Write the codepoint -> (page, x, y, src_*) index.

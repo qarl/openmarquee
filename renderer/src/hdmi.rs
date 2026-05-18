@@ -56,7 +56,7 @@ use crate::hdmi_logic::{
     transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
     BlendMode, FontCatalog, MsdfQuadGroup, PrewarmTier,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
-    FS_CUT, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND, FS_TOFU,
+    FS_CUT, FS_EMOJI, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND, FS_TOFU,
     FS_PATTERN_BRICKS, FS_PATTERN_CHECKER, FS_PATTERN_CONFETTI, FS_PATTERN_DOTS,
     FS_PATTERN_GRID, FS_PATTERN_HALFTONE, FS_PATTERN_RAYS, FS_PATTERN_RINGS,
     FS_PATTERN_SCANLINES, FS_PATTERN_STRIPES, SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE,
@@ -374,6 +374,13 @@ pub struct EglSession<'a> {
     /// quad-layout pass + atlas-lookup don't re-parse JSON per
     /// draw.
     msdf_atlases: Vec<crate::sdf_atlas_gl::MsdfAtlasGl>,
+    /// SDF arc slice C.2 -- session-wide emoji color-bitmap atlases.
+    /// One GL_RGBA8 texture per atlas page (up to 8 pages, ~3 pages
+    /// in practice for Noto's coverage of our codepoint ranges).
+    /// Uploaded once at session bring-up by `sdf_atlas_emoji_gl::
+    /// upload_all`; freed at teardown by `delete_all`. C.3 wires the
+    /// codepoint-segmented layout path that consumes these.
+    emoji_atlases: Vec<crate::sdf_atlas_emoji_gl::EmojiAtlasGl>,
     /// v1-spec-delta #5 (slice d, refined slice e + Bug 2 fix
     /// 2026-05-09): tracks whether the kernel CRTC currently has
     /// an alive (set_crtc'd) FB attached. The first commit per
@@ -557,6 +564,7 @@ where
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
         msdf_atlases: Vec::new(),
+        emoji_atlases: Vec::new(),
     };
 
     // SDF arc slice B.2 -- one-shot atlas upload after the GL
@@ -573,6 +581,28 @@ where
             .map_err(|e| anyhow!("msdf atlas load failed: {e}"))?;
         session.msdf_atlases = crate::sdf_atlas_gl::upload_all(&gl, &parsed)?;
         populate_msdf_lookup(&session.msdf_atlases);
+    }
+
+    // SDF arc slice C.2 -- decode + upload the Noto Color Emoji
+    // color-bitmap atlas pages. ~3 pages at ~16 MB RGBA each
+    // (4 baked + 4 placeholders that load_emoji_atlas trims).
+    // Failure semantics: emoji-side failure is non-fatal (slides
+    // without emoji render fine without the atlas); log + continue.
+    match crate::sdf_atlas_emoji::load_emoji_atlas() {
+        Ok(emoji_atlas) => {
+            match crate::sdf_atlas_emoji_gl::upload_all(&gl, &emoji_atlas) {
+                Ok(uploaded) => {
+                    session.emoji_atlases = uploaded;
+                    populate_emoji_lookup(&emoji_atlas, &session.emoji_atlases);
+                }
+                Err(e) => {
+                    eprintln!("warn: emoji atlas upload failed: {e}; emoji will render as tofu");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("warn: emoji atlas load failed: {e}; emoji will render as tofu");
+        }
     }
 
     let work_result = work(&mut session);
@@ -621,6 +651,12 @@ where
     // teardown can't dereference dead texture handles.
     clear_msdf_lookup();
     crate::sdf_atlas_gl::delete_all(&gl, &mut session.msdf_atlases);
+    // SDF arc slice C.2 -- free emoji atlas textures while GL is
+    // still bound. Clear lookup table BEFORE delete_all so a stale
+    // lookup can't outlive the NativeTexture handles (parallels
+    // the MSDF teardown ordering).
+    clear_emoji_lookup();
+    crate::sdf_atlas_emoji_gl::delete_all(&gl, &mut session.emoji_atlases);
     clear_transition_program_cache(&gl);
     clear_transition_sp_program_cache(&gl);
     clear_composite_program_cache(&gl);
@@ -7163,6 +7199,14 @@ fn clear_msdf_program_cache(gl: &glow::Context) {
             unsafe { gl.delete_program(tgp.program); }
         }
     });
+    // SDF arc slice C.2 -- free the FS_EMOJI program (only present
+    // once a session has paint_slide'd an emoji quad via C.3; on
+    // sessions that never see emoji this no-ops).
+    FS_EMOJI_PROGRAM.with(|c| {
+        if let Some(egp) = c.replace(None) {
+            unsafe { gl.delete_program(egp.program); }
+        }
+    });
 }
 
 /// SDF arc slice B.3 -- cached FS_TOFU program for missing-
@@ -7198,6 +7242,45 @@ fn cached_tofu_program(gl: &glow::Context) -> Result<CachedTofuProgram> {
         let tgp = CachedTofuProgram { program, a_pos, a_uv, u_opacity };
         c.set(Some(tgp));
         Ok(tgp)
+    })
+}
+
+/// SDF arc slice C.2 -- cached FS_EMOJI program for color-emoji
+/// quad rendering. Same shape as CachedTofuProgram with an extra
+/// `u_atlas` sampler binding for the color-bitmap page.
+#[derive(Copy, Clone)]
+#[allow(dead_code)] // wired by C.3
+struct CachedEmojiProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_atlas: Option<glow::NativeUniformLocation>,
+    u_opacity: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static FS_EMOJI_PROGRAM: std::cell::Cell<Option<CachedEmojiProgram>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[allow(dead_code)] // wired by C.3
+fn cached_emoji_program(gl: &glow::Context) -> Result<CachedEmojiProgram> {
+    use glow::HasContext;
+    FS_EMOJI_PROGRAM.with(|c| {
+        if let Some(egp) = c.get() {
+            return Ok(egp);
+        }
+        let program = link_program(gl, crate::hdmi_logic::VS_TEXTURED_QUAD, FS_EMOJI)
+            .with_context(|| "link FS_EMOJI")?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (FS_EMOJI)"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (FS_EMOJI)"))?;
+        let u_atlas = unsafe { gl.get_uniform_location(program, "u_atlas") };
+        let u_opacity = unsafe { gl.get_uniform_location(program, "u_opacity") };
+        let egp = CachedEmojiProgram { program, a_pos, a_uv, u_atlas, u_opacity };
+        c.set(Some(egp));
+        Ok(egp)
     })
 }
 
@@ -7282,6 +7365,73 @@ fn msdf_atlas_for_family(
             .map(|(_, t)| *t)
     })?;
     Some((tex, atlas))
+}
+
+// =====================================================================
+// SDF arc slice C.2 -- emoji color-bitmap atlas lookup
+// =====================================================================
+//
+// Parallel to the MSDF lookup above. Emoji atlas is process-singleton
+// (built from one TTF), multi-page; the lookup maps page number to
+// the uploaded GL texture for that page. Codepoint -> page resolution
+// lives in the manifest (CPU-side), kept in a OnceLock for the same
+// reason the MSDF CPU-side parsed Vec is.
+
+std::thread_local! {
+    /// Vec<(page, NativeTexture)> indexed by the manifest's page
+    /// number. Populated at session bring-up; cleared at teardown
+    /// BEFORE the GL textures are deleted.
+    static EMOJI_ATLAS_LOOKUP: std::cell::RefCell<Vec<(u32, glow::NativeTexture)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Process-wide parsed emoji atlas. Loaded once at first session
+/// bring-up; subsequent sessions reuse. Matches MSDF_ATLASES_CPU's
+/// pattern.
+static EMOJI_ATLAS_CPU: std::sync::OnceLock<crate::sdf_atlas_emoji::EmojiAtlas> =
+    std::sync::OnceLock::new();
+
+fn populate_emoji_lookup(
+    cpu_atlas: &crate::sdf_atlas_emoji::EmojiAtlas,
+    gl_atlases: &[crate::sdf_atlas_emoji_gl::EmojiAtlasGl],
+) {
+    // First session populates the CPU-side cache; subsequent
+    // sessions skip via OnceLock semantics.
+    let _ = EMOJI_ATLAS_CPU.get_or_init(|| crate::sdf_atlas_emoji::EmojiAtlas {
+        manifest: cpu_atlas.manifest.clone(),
+        pages_png: cpu_atlas.pages_png.clone(),
+    });
+    // GL-side lookup is rebuilt every session because the
+    // NativeTexture handles are session-scoped.
+    EMOJI_ATLAS_LOOKUP.with(|c| {
+        let mut v = c.borrow_mut();
+        v.clear();
+        for a in gl_atlases {
+            v.push((a.page, a.tex));
+        }
+    });
+}
+
+fn clear_emoji_lookup() {
+    EMOJI_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
+}
+
+/// Find the (GL texture, atlas entry) pair for a codepoint. Returns
+/// `None` for codepoints not in the baked set (the caller falls
+/// back to tofu via the existing layout_text_to_quads path).
+#[allow(dead_code)] // wired by C.3
+fn emoji_atlas_for_codepoint(
+    cp: u32,
+) -> Option<(glow::NativeTexture, &'static crate::sdf_atlas_emoji::EmojiAtlasEntry)> {
+    let cpu = EMOJI_ATLAS_CPU.get()?;
+    let entry = crate::sdf_atlas_emoji::atlas_entry_for_codepoint(cpu, cp)?;
+    let tex = EMOJI_ATLAS_LOOKUP.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(page, _)| *page == entry.page)
+            .map(|(_, t)| *t)
+    })?;
+    Some((tex, entry))
 }
 
 /// qarl-direct perf-profile (2026-05-08): transition shader cache.
