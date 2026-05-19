@@ -419,7 +419,7 @@ _BOOT_LOG_TEXT = (
 # never shows a gap. The motion engine wraps within the box.
 # qarl 2026-05-06 reel edits: shortened to single-instance strings —
 # the motion-engine ticker handles repetition visually as it scrolls.
-_SCREAM_TEXT = "FREE YOUR SIGN!!!!!  "
+_SCREAM_TEXT = "🔓 🫵 🪧  "
 _CHANT_TEXT = "FREE  YOUR  SIGN  "
 
 
