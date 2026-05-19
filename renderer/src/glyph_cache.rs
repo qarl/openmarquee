@@ -59,6 +59,43 @@ use crate::atlas_page::AtlasPage;
 /// the dispatch (hdmi_logic) can derive UVs at layout time without
 /// re-stashing the constant on every SlotState::Ready.
 pub const CELL_PX: u32 = 48;
+
+/// Bug 3 Slice 2D: ordered list of fallback font stems the dispatch
+/// hook iterates when the primary font has SlotState::FontMissing
+/// for a codepoint. Stems are the TTF filename without the `.ttf`
+/// extension; the cache resolves them via `<fonts_dir>/<stem>.ttf`.
+///
+/// Chain: primary -> DejaVu Sans -> Tofu.
+///
+/// DejaVu Sans covers 5918 codepoints (Geometric Shapes, Mathematical
+/// Operators, Box Drawing, Block Elements, Arrows, etc.) -- substantially
+/// broader than Noto Sans Regular's Latin-only Google Fonts subset.
+/// One stem in the chain is sufficient for the FYS reel's coverage gap
+/// (● U+25CF on the Boot slide); more stems can be appended as the
+/// operator-typed codepoint set grows.
+///
+/// The dispatch hook stops at the first fallback that resolves to
+/// SlotState::Ready. Subsequent fallbacks (none today) would only
+/// fire if DejaVu also reports FontMissing, which would mean the
+/// codepoint is truly exotic.
+pub const FALLBACK_FONT_STEMS: &[&str] = &["dejavu-sans"];
+
+/// Bug 3 Slice 2D: derive a font_family_id from a font stem via
+/// FNV-1a's low 32 bits. Matches the dispatch hook's identity-keying
+/// at hdmi_logic.rs (which hashes atlas.manifest.font the same way),
+/// so a fallback stem and a primary stem with the same low-32 hash
+/// would collide -- but the static catalog is ~24 entries plus 1
+/// fallback, so collisions are vanishingly rare. Slice 3+ can swap
+/// to a Vec<String>-indexed registry if a future operator-added
+/// font collides; today's 25-entry catalog has zero collisions.
+pub fn font_family_id_from_stem(stem: &str) -> u32 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in stem.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h as u32
+}
 const RANGE_PX: f64 = 4.0;
 const EDGE_COLORING_ANGLE_THRESHOLD: f64 = 3.0;
 const EDGE_COLORING_SEED: u64 = 0;
@@ -783,5 +820,86 @@ mod tests {
         assert_eq!(map.get(&k(0x41)), Some(&1));
         assert_eq!(map.get(&k(0x42)), Some(&2));
         assert_eq!(map.get(&k(0x43)), None);
+    }
+
+    #[test]
+    fn font_family_id_from_stem_is_deterministic() {
+        let a = font_family_id_from_stem("vt323");
+        let b = font_family_id_from_stem("vt323");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn font_family_id_differs_across_stems() {
+        // Bug 3 Slice 2D collision sanity: the production catalog
+        // (~24 fonts + 1 fallback) should have zero FNV-1a low-32
+        // collisions. Spot-check a few critical pairs.
+        let pairs: &[(&str, &str)] = &[
+            ("vt323", "dejavu-sans"),
+            ("anton", "dejavu-sans"),
+            ("inter", "dejavu-sans"),
+            ("vt323", "anton"),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                font_family_id_from_stem(a),
+                font_family_id_from_stem(b),
+                "stems {:?} / {:?} collide on FNV-1a low 32 bits",
+                a, b,
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_chain_contains_dejavu_sans() {
+        // Bug 3 Slice 2D: the fallback chain must include DejaVu
+        // Sans as the canonical Geometric Shapes / Mathematical
+        // Operators / Box Drawing fallback. Empty chain would
+        // silently revert Slice 2D to permanent-Tofu behavior.
+        assert!(!FALLBACK_FONT_STEMS.is_empty());
+        assert!(FALLBACK_FONT_STEMS.contains(&"dejavu-sans"));
+    }
+
+    #[test]
+    fn worker_rasterizes_geometric_shape_via_dejavu_sans() {
+        // Bug 3 Slice 2D: confirm the bundled DejaVu Sans TTF can
+        // rasterize a Geometric Shape codepoint (● U+25CF -- the
+        // FYS Boot slide gap). End-to-end worker test: read TTF
+        // -> ttf-parser -> msdfgen -> Completion via channel.
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let font_path = manifest_dir
+            .parent()
+            .expect("renderer parent dir")
+            .join("ui/fonts/dejavu-sans.ttf");
+        if !font_path.exists() {
+            eprintln!("skip: {:?} not present", font_path);
+            return;
+        }
+        let cache = GlyphCache::new(1);
+        cache.get_or_request(k(0x25CF), font_path); // ●
+        let mut got = None;
+        for _ in 0..400 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if let Ok(c) = cache.completion_rx.try_recv() {
+                got = Some(c);
+                break;
+            }
+        }
+        let c = got.expect("DejaVu Sans worker should produce ● Completion within 2s");
+        assert_eq!(c.cell_px, 48);
+        assert_eq!(c.rgba_bytes.len(), 48 * 48 * 4);
+        for i in (0..c.rgba_bytes.len()).step_by(4) {
+            assert_eq!(c.rgba_bytes[i + 3], 255);
+        }
+        assert!(c.advance_em > 0.0);
+        // ● is a filled circle; both plane bounds should have ink.
+        assert!(
+            c.plane_bounds.pl_right > c.plane_bounds.pl_left,
+            "● plane bounds inverted",
+        );
+        assert!(
+            c.plane_bounds.pl_top > c.plane_bounds.pl_bottom,
+            "● plane bounds inverted",
+        );
     }
 }

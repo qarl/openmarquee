@@ -29,6 +29,18 @@ set without needing internet at runtime.
 | `caveat.ttf` | Caveat | SIL OFL-1.1 | https://fonts.google.com/specimen/Caveat |
 | `reenie-beanie.ttf` | Reenie Beanie | SIL OFL-1.1 | https://fonts.google.com/specimen/Reenie+Beanie |
 | `shadows-into-light.ttf` | Shadows Into Light | SIL OFL-1.1 | https://fonts.google.com/specimen/Shadows+Into+Light |
+| `dejavu-sans.ttf` | DejaVu Sans | Bitstream Vera + Public Domain | https://github.com/dejavu-fonts/dejavu-fonts |
 
 SIL OFL-1.1: https://openfontlicense.org/
 Apache-2.0: http://www.apache.org/licenses/LICENSE-2.0
+Bitstream Vera license: see the DejaVu fonts repo for the upstream
+LICENSE file — permits redistribution + modification (with rename)
+without royalty. DejaVu's modifications are public domain.
+
+`dejavu-sans.ttf` is the fallback font for the runtime glyph cache
+(Bug 3 Slice 2D). Codepoints absent from the primary font (e.g. ●
+U+25CF on VT323) fall through to DejaVu Sans, which covers Geometric
+Shapes, Mathematical Operators, Box Drawing, Block Elements, and
+Arrows. Picked over Noto Sans because Noto Sans Regular ships
+without Geometric Shapes; DejaVu Sans covers 5918 codepoints in one
+~750 KB TTF.

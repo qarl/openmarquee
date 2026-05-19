@@ -681,43 +681,85 @@ pub fn layout_text_to_quads(
                 // skips without emitting.
                 (CharKind::Whitespace, 0.5)
             } else {
-                // Bug 3 Slice 2B (2026-05-19): static atlas missed
+                // Bug 3 Slice 2D (2026-05-19): static atlas missed
                 // this codepoint and it's not whitespace. Dispatch
-                // the dynamic-cache lookup.
-                // Branches:
-                //   Some(Ready) -> CharKind::DynamicMsdf (visible
-                //     glyph, sourced from dynamic atlas page).
-                //   Some(FontMissing) -> CharKind::Tofu permanently
-                //     (font genuinely lacks this codepoint).
-                //   Some(Requested|Generating) -> CharKind::Tofu
-                //     placeholder this layout pass; next layout call
-                //     (triggered by slide_caches invalidation when
-                //     poll_completions uploads a new slot) will see
-                //     Ready and emit DynamicMsdf.
-                //   None (first encounter) -> CharKind::Tofu; the
-                //     get_or_request call also enqueued a MissRequest
-                //     so the worker is now rasterizing.
-                let dispatch = runtime_glyph_cache.as_ref().map(|rt| {
-                    let font_path = rt
-                        .fonts_dir
-                        .join(format!("{}.ttf", atlas.manifest.font));
-                    rt.cache.get_or_request(
-                        crate::glyph_cache::GlyphKey {
-                            font_family_id,
-                            codepoint: cp,
-                            render_mode: crate::glyph_cache::RenderMode::Msdf,
-                        },
-                        font_path,
-                    )
+                // the dynamic-cache lookup, iterating through the
+                // configured fallback chain on FontMissing.
+                //
+                // Per-stem branches (loop body):
+                //   Some(Ready)                   -> resolve via this stem
+                //   Some(FontMissing)             -> continue to next stem
+                //   Some(Requested|Generating)    -> stop (Tofu placeholder
+                //                                     this frame; next layout
+                //                                     after slide_caches drain
+                //                                     will re-dispatch with
+                //                                     the now-known outcome)
+                //   None (first encounter)        -> stop (MissRequest just
+                //                                     enqueued; Tofu now)
+                //
+                // Loop termination:
+                //   - first Ready hit                       -> DynamicMsdf
+                //   - first pending state (Requested/Gen/None)
+                //                                           -> Tofu (this frame)
+                //   - chain exhausted, all FontMissing      -> Tofu (permanent)
+                let resolution = runtime_glyph_cache.as_ref().and_then(|rt| {
+                    // Build the chain inline: primary first, then any
+                    // fallback stems that differ from primary. Up to
+                    // 1 + FALLBACK_FONT_STEMS.len() iterations.
+                    let primary_stem = atlas.manifest.font.as_str();
+                    let stems_iter = std::iter::once(primary_stem).chain(
+                        crate::glyph_cache::FALLBACK_FONT_STEMS
+                            .iter()
+                            .copied()
+                            .filter(|&s| s != primary_stem),
+                    );
+                    let mut resolved: Option<(
+                        crate::atlas_page::SlotPos,
+                        f32,
+                        crate::glyph_cache::PlaneBounds,
+                    )> = None;
+                    for stem in stems_iter {
+                        let font_id = if stem == primary_stem {
+                            font_family_id
+                        } else {
+                            crate::glyph_cache::font_family_id_from_stem(stem)
+                        };
+                        let font_path = rt.fonts_dir.join(format!("{}.ttf", stem));
+                        let state = rt.cache.get_or_request(
+                            crate::glyph_cache::GlyphKey {
+                                font_family_id: font_id,
+                                codepoint: cp,
+                                render_mode: crate::glyph_cache::RenderMode::Msdf,
+                            },
+                            font_path,
+                        );
+                        match state {
+                            Some(crate::glyph_cache::SlotState::Ready {
+                                slot,
+                                advance_em,
+                                plane_bounds,
+                            }) => {
+                                resolved = Some((slot, advance_em, plane_bounds));
+                                break;
+                            }
+                            Some(crate::glyph_cache::SlotState::FontMissing) => {
+                                continue;
+                            }
+                            // Worker is pending on THIS stem; don't
+                            // race ahead to fallback (the worker may
+                            // resolve Ready next round). Frame is Tofu
+                            // for now; next layout will retry.
+                            Some(crate::glyph_cache::SlotState::Requested)
+                            | Some(crate::glyph_cache::SlotState::Generating)
+                            | None => {
+                                break;
+                            }
+                        }
+                    }
+                    resolved
                 });
-                match dispatch {
-                    Some(Some(crate::glyph_cache::SlotState::Ready {
-                        slot,
-                        advance_em,
-                        plane_bounds,
-                    })) => {
-                        // Has ink (the cell is a real rasterized
-                        // glyph, not a placeholder).
+                match resolution {
+                    Some((slot, advance_em, plane_bounds)) => {
                         any_ink = true;
                         (
                             CharKind::DynamicMsdf {
@@ -729,11 +771,11 @@ pub fn layout_text_to_quads(
                             advance_em,
                         )
                     }
-                    _ => {
-                        // Tofu: placeholder (worker pending) OR
-                        // permanent (FontMissing / no-cache-supplied).
-                        // Deterministic missing-glyph rect counts as
-                        // ink either way.
+                    None => {
+                        // Tofu: placeholder (worker pending on some
+                        // stem) OR permanent (entire chain FontMissing
+                        // / no-cache-supplied). Deterministic missing-
+                        // glyph rect counts as ink either way.
                         any_ink = true;
                         (CharKind::Tofu, 0.5)
                     }
@@ -3726,6 +3768,12 @@ pub fn font_family_to_filename(family: &str) -> Option<&'static str> {
         "Space Mono" => Some("space-mono.ttf"),
         "UnifrakturCook" => Some("unifrakturcook.ttf"),
         "VT323" => Some("vt323.ttf"),
+        // Bug 3 Slice 2D: DejaVu Sans is the runtime fallback font.
+        // Operators can also pick it directly; the layout dispatch
+        // routes the same way either way (primary -> runtime cache,
+        // then DejaVu fallback if missing -- a no-op if DejaVu is
+        // already the primary).
+        "DejaVu Sans" => Some("dejavu-sans.ttf"),
         _ => None,
     }
 }

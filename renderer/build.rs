@@ -80,6 +80,12 @@ fn collect_fonts(fonts_dir: &Path) -> Vec<PathBuf> {
         };
         if !name.ends_with(".ttf") { continue; }
         if name.contains("noto-color-emoji") { continue; }
+        // Bug 3 Slice 2D: DejaVu Sans is the runtime fallback font.
+        // Skipping the static bake keeps the build-time atlas size
+        // unchanged (5918 codepoints would balloon the bake by ~30x).
+        // Fallback codepoints reach the GPU via the runtime cache
+        // (dynamic atlas page) on first encounter.
+        if name == "dejavu-sans.ttf" { continue; }
         out.push(path);
     }
     out.sort();
