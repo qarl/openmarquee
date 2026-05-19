@@ -254,51 +254,91 @@ function paintLayer(ctx, canvas, layer) {
     );
 
     if (useWasm) {
-        // Bug 4b (2026-05-19): rasterize at NATURAL fontSizePx; let
-        // drawImage 9-arg DOWNSCALE both axes — Y by yScale, X by
-        // per-line cap to boxW. Replaces the Phase 3c rasterize-at-
-        // effective-size path. Browser bilinear DOWNSAMPLE preserves
-        // glyph detail far better than the prior UPSCALE-from-tiny-
-        // bitmap path, closing the bilinear-vs-MSDF AA divergence on
-        // extreme-yScale fixtures (parity_fys_06_uncage was SSIM 0.79
-        // pre-refactor — bilinear-upscale-from-220px-tall bitmap to
-        // 1728px-wide canvas blurred glyph edges relative to Rust's
-        // MSDF-at-NDC-quad path).
+        // Phase 3c (2026-05-14): when yScale<1, rasterize at the
+        // squished pixel-size so fontdue produces a bitmap that's
+        // already at the canvas pixel-dims. Eliminates the post-
+        // rasterization downscale that Phase 3a relied on, which
+        // diverged from Rust's GL_LINEAR at extreme ratios.
         //
-        // For yScale === 1: dst.h === src.h so drawImage operates at
-        // 1:1 on Y. For lines that fit boxW: dst.w === src.w so X is
-        // also 1:1. Common path is regression-free. Cache footprint
-        // grows by ~1/yScale^2 vs Phase 3c (bitmaps at natural size
-        // instead of effective size); 256-entry LRU absorbs the
-        // working set in practice.
-        const totalInkExtentScaled = totalInkExtent * yScale;
-        const firstBaselineYScaled =
-            boxCenterY - totalInkExtentScaled / 2 + maxAscent * yScale;
-        const lineStrideScaled = lineHeight * yScale;
+        // Phase 3d (2026-05-14): derive baselineY math from
+        // EFFECTIVE-size quantities so the inter-line stride
+        // matches what fontdue's per-line rasterization would
+        // produce. Pre-3d used `round(fontSizePx * 1.1) * yScale`
+        // for the stride (full-size round, then proportional scale)
+        // while the natural stride at effective size is
+        // `round(effectiveSizePx * 1.1)`. Sub-pixel rounding
+        // asymmetry showed up as 1-px inter-line drift, surfacing
+        // as the 229/231 max_delta floor at glyph edges. Using
+        // effective-size lineHeight closes that floor for
+        // multi-line content.
+        //
+        // For yScale=1: effectiveSizePx === fontSizePx, all
+        // effective-size quantities reduce to their full-size
+        // equivalents, and the formula collapses to the original
+        // `firstBaselineY + i*lineHeight`. Single-line content is
+        // unaffected (i*lineHeight is 0 when lines.length==1).
+        //
+        // Cache key is text|font|size|color and includes
+        // effectiveSizePx implicitly via the size slot — different
+        // squish ratios cache as separate entries (LRU 256-entry
+        // capacity holds the working set comfortably).
+        const effectiveSizePx = fontSizePx * yScale;
+        const lineHeightEff = Math.round(effectiveSizePx * 1.1);
+        const maxAscentEff = maxAscent * yScale;
+        const maxDescentEff = maxDescent * yScale;
+        const totalInkExtentEff =
+            (maxAscentEff + maxDescentEff)
+            + (lines.length - 1) * lineHeightEff;
+        const firstBaselineYEff = boxCenterY - totalInkExtentEff / 2 + maxAscentEff;
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             if (!line) continue;
-            const baselineY = firstBaselineYScaled + i * lineStrideScaled;
-            const result = rasterizeText(line, fontFamily, fontSizePx, colorRgba);
+            const baselineY = firstBaselineYEff + i * lineHeightEff;
+            const result = rasterizeText(line, fontFamily, effectiveSizePx, colorRgba);
             if (!result) continue; // empty / whitespace-only line.
-            // Per-line X-squish (spec §5.10a). result.width is at
-            // NATURAL fontSize, so targetW directly = min(natural,
-            // boxW). For fitting lines targetW === result.width
-            // (no X resample); for overflow targetW === boxW
-            // (browser DOWNSAMPLE on X).
-            const targetW = Math.min(result.width, boxW);
+            // Bug 4 (2026-05-19): per-line X-squish at ORIGINAL
+            // fontSize scale. Pre-Bug-4 the targetW comparison used
+            // result.width (Y-squished width) vs boxW, so X-squish
+            // only fired for un-wrappable words that exceeded boxW
+            // EVEN AFTER yScale-induced font shrink. Per spec §5.10a
+            // ("both axes squish independently when both overflow")
+            // each line's natural width AT ORIGINAL fontSize is the
+            // right comparison. We recover natural_w_orig by
+            // dividing result.width by yScale (since the rasterizer
+            // ran at effectiveSizePx = fontSizePx * yScale).
+            //
+            // Final canvas dst_w = min(natural_w_orig, boxW). For
+            // lines that fit boxW at ORIGINAL fontSize, dst_w =
+            // natural_w_orig (1/yScale UPSCALE of the bitmap on X)
+            // — Y stays at bitmap height. For lines that overflow,
+            // dst_w = boxW (combined Y-induced + X-squish via
+            // bilinear interp). The Phase 3c rasterize-at-effective
+            // path is preserved for Y-axis AA quality (qa-Jimmy
+            // greenlight choice (a)); the X-axis bilinear blur is
+            // the acceptable trade for matching Rust's per-line
+            // ndc-quad scaling without two-pass rasterization.
+            const naturalWOrig = result.width / yScale;
+            const targetW = Math.min(naturalWOrig, boxW);
             let drawX;
             if (textAlign === "left") drawX = boxX;
             else if (textAlign === "right") drawX = boxX + boxW - targetW;
             else drawX = boxX + (boxW - targetW) / 2;
-            // dst.h = result.height * yScale (Y-shrink). drawY anchors
-            // the (proportionally-scaled) ascent at canvas-Y baseline.
-            const dstH = result.height * yScale;
-            const drawY = Math.round(baselineY - result.ascent * yScale);
+            // result.ascent is at the effective (squished) size;
+            // baselineY is at the canvas-Y of the line's baseline.
+            // Subtract directly (no *yScale -- the bitmap already
+            // accounts for the squish). Round to whole pixels so
+            // the bitmap snaps to the canvas grid (preserves Phase 2
+            // integer-X alignment).
+            const drawY = Math.round(baselineY - result.ascent);
+            // Always 9-arg drawImage now — even no-overflow lines
+            // get the 1/yScale X-upscale applied so the rendered
+            // glyph X is at NATURAL-original-size scale, NOT
+            // yScale-effective scale. Pre-Bug-4 3-arg path
+            // implicitly applied yScale to X via the smaller bitmap.
             ctx.drawImage(
                 result.image,
                 0, 0, result.width, result.height,
-                Math.round(drawX), drawY, targetW, dstH,
+                Math.round(drawX), drawY, targetW, result.height,
             );
         }
     } else if (yScale === 1) {
