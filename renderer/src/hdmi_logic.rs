@@ -443,6 +443,13 @@ pub enum GlyphKind {
     /// atlas-space within that page (2048x2048 in C.1's bake).
     Emoji { page: u32 },
     Tofu,
+    /// Bug 3 Slice 2B: runtime-MSDF glyph from the dynamic atlas
+    /// page. UVs on the quad are atlas-space within the 2048×2048
+    /// dynamic page (the only page in Slice 2; Slice 1.x will add
+    /// LRU eviction when this page fills). Draw side resolves the
+    /// dynamic-atlas texture via a thread_local (mirrors the static
+    /// MSDF atlas lookup pattern in hdmi.rs).
+    DynamicMsdf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -588,6 +595,17 @@ pub fn layout_text_to_quads(
         Msdf(crate::sdf_atlas::GlyphEntry),
         Whitespace,
         Tofu,
+        /// Bug 3 Slice 2B: runtime-cached MSDF glyph. The slot
+        /// position (in dynamic-atlas pixels) + per-glyph metrics
+        /// come from the cache's SlotState::Ready. Pass-2 emits
+        /// MsdfQuad with kind=GlyphKind::DynamicMsdf and UVs
+        /// computed from slot.{x,y} / ATLAS_DIM.
+        DynamicMsdf {
+            slot: crate::atlas_page::SlotPos,
+            advance_em: f32,
+            plane_bounds: crate::glyph_cache::PlaneBounds,
+            cell_px: u32,
+        },
     }
     struct LineLayout {
         // (codepoint, advance_em, char_kind).
@@ -663,35 +681,63 @@ pub fn layout_text_to_quads(
                 // skips without emitting.
                 (CharKind::Whitespace, 0.5)
             } else {
-                // Bug 3 Slice 1 part B (2026-05-19): static atlas
-                // missed this codepoint and it's not whitespace.
-                // Hand off to the runtime cache (if provided); the
-                // worker pool will rasterize asynchronously. Result
-                // is discarded for Slice 1 (worker stub never
-                // produces Ready) → fall through to Tofu. Slice 2
-                // will return CharKind::DynamicMsdf(slot) when the
-                // cache resolves to Ready.
-                if let Some(rt) = runtime_glyph_cache.as_ref() {
-                    // Resolve TTF path: fonts_dir/{stem}.ttf. The
-                    // stem comes from the static atlas manifest's
-                    // `font` field (build.rs:266 sets this from the
-                    // TTF file's stem -- matches the runtime layout
-                    // under /opt/openmarquee/ui/fonts/).
+                // Bug 3 Slice 2B (2026-05-19): static atlas missed
+                // this codepoint and it's not whitespace. Dispatch
+                // the dynamic-cache lookup.
+                // Branches:
+                //   Some(Ready) -> CharKind::DynamicMsdf (visible
+                //     glyph, sourced from dynamic atlas page).
+                //   Some(FontMissing) -> CharKind::Tofu permanently
+                //     (font genuinely lacks this codepoint).
+                //   Some(Requested|Generating) -> CharKind::Tofu
+                //     placeholder this layout pass; next layout call
+                //     (triggered by slide_caches invalidation when
+                //     poll_completions uploads a new slot) will see
+                //     Ready and emit DynamicMsdf.
+                //   None (first encounter) -> CharKind::Tofu; the
+                //     get_or_request call also enqueued a MissRequest
+                //     so the worker is now rasterizing.
+                let dispatch = runtime_glyph_cache.as_ref().map(|rt| {
                     let font_path = rt
                         .fonts_dir
                         .join(format!("{}.ttf", atlas.manifest.font));
-                    let _ = rt.cache.get_or_request(
+                    rt.cache.get_or_request(
                         crate::glyph_cache::GlyphKey {
                             font_family_id,
                             codepoint: cp,
                             render_mode: crate::glyph_cache::RenderMode::Msdf,
                         },
                         font_path,
-                    );
+                    )
+                });
+                match dispatch {
+                    Some(Some(crate::glyph_cache::SlotState::Ready {
+                        slot,
+                        advance_em,
+                        plane_bounds,
+                    })) => {
+                        // Has ink (the cell is a real rasterized
+                        // glyph, not a placeholder).
+                        any_ink = true;
+                        (
+                            CharKind::DynamicMsdf {
+                                slot,
+                                advance_em,
+                                plane_bounds,
+                                cell_px: crate::glyph_cache::CELL_PX,
+                            },
+                            advance_em,
+                        )
+                    }
+                    _ => {
+                        // Tofu: placeholder (worker pending) OR
+                        // permanent (FontMissing / no-cache-supplied).
+                        // Deterministic missing-glyph rect counts as
+                        // ink either way.
+                        any_ink = true;
+                        (CharKind::Tofu, 0.5)
+                    }
                 }
-                // Tofu: deterministic missing-glyph rect counts as ink.
-                any_ink = true;
-                (CharKind::Tofu, 0.5)
             };
 
             any_glyph = true;
@@ -748,6 +794,11 @@ pub fn layout_text_to_quads(
         for (_, _, kind) in &ll.chars {
             let (top_em, bot_em) = match kind {
                 CharKind::Msdf(g) if g.pl_top > g.pl_bottom => (g.pl_top, g.pl_bottom),
+                CharKind::DynamicMsdf { plane_bounds, .. }
+                    if plane_bounds.pl_top > plane_bounds.pl_bottom =>
+                {
+                    (plane_bounds.pl_top, plane_bounds.pl_bottom)
+                }
                 CharKind::Emoji(_) | CharKind::Tofu => (ascent_em, descent_em),
                 _ => continue,
             };
@@ -904,6 +955,42 @@ pub fn layout_text_to_quads(
                         uv_right: uv_r,
                         uv_bottom: uv_b,
                         kind: GlyphKind::Msdf,
+                    });
+                }
+                CharKind::DynamicMsdf { slot, advance_em: _, plane_bounds, cell_px: dyn_cell_px } => {
+                    // Bug 3 Slice 2B: identical math to CharKind::Msdf
+                    // above, but sourcing UVs from the dynamic atlas
+                    // page (2048×2048 fixed, see atlas_page::ATLAS_DIM)
+                    // and plane bounds from the cache's SlotState::Ready.
+                    let pb = plane_bounds;
+                    if pb.pl_right <= pb.pl_left || pb.pl_top <= pb.pl_bottom {
+                        cursor_x += adv_px;
+                        continue;
+                    }
+                    let px_l = cursor_x + pb.pl_left * x_size_px;
+                    let px_r = cursor_x + pb.pl_right * x_size_px;
+                    let px_t = baseline_y - pb.pl_top * size_px;
+                    let px_b = baseline_y - pb.pl_bottom * size_px;
+                    // Dynamic atlas page is 2048×2048 (atlas_page::ATLAS_DIM).
+                    // Hardcoded since the page count is fixed at 1 for
+                    // Slice 2; Slice 1.x will revisit when LRU eviction
+                    // adds multi-page support.
+                    let atlas_dim_f = crate::atlas_page::ATLAS_DIM as f32;
+                    let cp_f = *dyn_cell_px as f32;
+                    let uv_l = (slot.x as f32 + INSET_PX) / atlas_dim_f;
+                    let uv_r = (slot.x as f32 + cp_f - INSET_PX) / atlas_dim_f;
+                    let uv_t = (slot.y as f32 + INSET_PX) / atlas_dim_f;
+                    let uv_b = (slot.y as f32 + cp_f - INSET_PX) / atlas_dim_f;
+                    quads.push(MsdfQuad {
+                        px_left: px_l,
+                        px_top: px_t,
+                        px_right: px_r,
+                        px_bottom: px_b,
+                        uv_left: uv_l,
+                        uv_top: uv_t,
+                        uv_right: uv_r,
+                        uv_bottom: uv_b,
+                        kind: GlyphKind::DynamicMsdf,
                     });
                 }
                 CharKind::Emoji(ee) => {

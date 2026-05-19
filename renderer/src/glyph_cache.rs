@@ -55,8 +55,10 @@ use crate::atlas_page::AtlasPage;
 /// MSDF cell dimensions + range. MUST match build.rs's CELL_PX +
 /// RANGE_PX so the runtime FS_MSDF_FIXED shader gets identical SDF
 /// reconstruction across static + dynamic atlas slots. Changing
-/// either of these here only is a parity break.
-const CELL_PX: u32 = 48;
+/// either of these here only is a parity break. CELL_PX is pub so
+/// the dispatch (hdmi_logic) can derive UVs at layout time without
+/// re-stashing the constant on every SlotState::Ready.
+pub const CELL_PX: u32 = 48;
 const RANGE_PX: f64 = 4.0;
 const EDGE_COLORING_ANGLE_THRESHOLD: f64 = 3.0;
 const EDGE_COLORING_SEED: u64 = 0;

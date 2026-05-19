@@ -401,6 +401,14 @@ pub struct EglSession<'a> {
     /// glyphs after a ~250 ms p99 first-encounter latency.
     dynamic_glyph_cache: crate::glyph_cache::GlyphCache,
     dynamic_atlas_page: crate::atlas_page::AtlasPage,
+    /// Bug 3 Slice 2B: directory the cache worker reads TTF bytes
+    /// from. Defaults to the FYS deploy path
+    /// (`/opt/openmarquee/ui/fonts`) which matches the IPC sidecar's
+    /// hardcoded font catalog dir at ipc_main.rs ~line 699. Test
+    /// callers that don't have fonts there pass None for
+    /// runtime_glyph_ctx and skip the dispatch entirely; the
+    /// hardcoded default never gets touched on those paths.
+    dynamic_fonts_dir: std::path::PathBuf,
     /// v1-spec-delta #5 (slice d, refined slice e + Bug 2 fix
     /// 2026-05-09): tracks whether the kernel CRTC currently has
     /// an alive (set_crtc'd) FB attached. The first commit per
@@ -594,6 +602,7 @@ where
         // 2048×2048 RGBA8 backing texture.
         dynamic_glyph_cache: crate::glyph_cache::GlyphCache::new(4),
         dynamic_atlas_page: crate::atlas_page::AtlasPage::new(48),
+        dynamic_fonts_dir: std::path::PathBuf::from("/opt/openmarquee/ui/fonts"),
     };
 
     // SDF arc slice B.2 -- one-shot atlas upload after the GL
@@ -622,6 +631,12 @@ where
             "warn: dynamic atlas page texture alloc failed: {e}; \
              runtime glyph cache disabled this session",
         );
+    } else if let Some(tex) = session.dynamic_atlas_page.texture() {
+        // Bug 3 Slice 2B: publish the texture handle so
+        // draw_text_layer_msdf can bind it for GlyphKind::DynamicMsdf
+        // quads. Cleared in the teardown block below before the
+        // texture is deleted.
+        populate_dynamic_atlas_lookup(tex);
     }
 
     // SDF arc slice C.2 -- decode + upload the Noto Color Emoji
@@ -702,6 +717,11 @@ where
     // page texture while GL is still bound. dynamic_glyph_cache's
     // Drop signals + joins the worker pool on session-struct drop
     // (right after this fn returns).
+    //
+    // Slice 2B: clear the thread_local BEFORE delete so the draw
+    // path can't bind a stale NativeTexture handle on a subsequent
+    // session bring-up before populate_dynamic_atlas_lookup re-fires.
+    clear_dynamic_atlas_lookup();
     session.dynamic_atlas_page.delete(&gl);
     clear_transition_program_cache(&gl);
     clear_transition_sp_program_cache(&gl);
@@ -1386,6 +1406,14 @@ fn render_animated_slide_in_session(
                 // frame re-decode regression QA flagged.
                 Some(&mut session.image_bg_cache),
                 Some(&mut cache.tex),
+                // Bug 3 Slice 2B: thread the runtime glyph cache +
+                // fonts_dir so the layout dispatch can resolve
+                // static-atlas misses (●/∞ on FYS) to dynamic-MSDF
+                // cells rasterized by the worker pool.
+                Some(crate::glyph_cache::RuntimeGlyphCtx {
+                    cache: &session.dynamic_glyph_cache,
+                    fonts_dir: &session.dynamic_fonts_dir,
+                }),
             )?;
             // eglSwapBuffers implicitly flushes; the explicit gl.flush()
             // that used to be here forced an extra tile-store on vc4
@@ -2053,6 +2081,13 @@ fn draw_text_layer_msdf(
     //     bound texture (a single text run can touch >1 page).
     let mut ink_verts: Vec<f32> = Vec::with_capacity(group.quads.len() * 24);
     let mut tofu_verts: Vec<f32> = Vec::new();
+    // Bug 3 Slice 2B: dynamic-MSDF quads. Same vert layout as
+    // ink_verts but UVs are atlas-space within the 2048×2048
+    // dynamic atlas page. Drawn against DYNAMIC_ATLAS_LOOKUP's
+    // texture in a separate batch (FS_MSDF_FIXED program shared
+    // with the static-MSDF batch -- the SDF math is identical;
+    // only the bound texture differs).
+    let mut dynamic_ink_verts: Vec<f32> = Vec::new();
     // BTreeMap (not HashMap) so multi-page emoji draws iterate in
     // page-index order -- gives goldens a deterministic draw order
     // when an emoji-bearing text touches multiple atlas pages.
@@ -2106,9 +2141,27 @@ fn draw_text_layer_msdf(
                     xr, yt, ur, ut,
                 ]);
             }
+            GlyphKind::DynamicMsdf => {
+                let ul = q.uv_left;
+                let ur = q.uv_right;
+                let ut = q.uv_top;
+                let ub = q.uv_bottom;
+                dynamic_ink_verts.extend_from_slice(&[
+                    xl, yb, ul, ub,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yt, ur, ut,
+                ]);
+            }
         }
     }
-    if ink_verts.is_empty() && tofu_verts.is_empty() && emoji_per_page.is_empty() {
+    if ink_verts.is_empty()
+        && tofu_verts.is_empty()
+        && emoji_per_page.is_empty()
+        && dynamic_ink_verts.is_empty()
+    {
         return Ok(());
     }
 
@@ -2291,6 +2344,67 @@ fn draw_text_layer_msdf(
                 gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
                 gl.disable_vertex_attrib_array(egp.a_pos);
                 gl.disable_vertex_attrib_array(egp.a_uv);
+                gl.delete_buffer(vbo);
+            }
+        }
+
+        // Batch 4 (Bug 3 Slice 2B): dynamic-MSDF glyphs. Same
+        // FS_MSDF_FIXED program as the static-MSDF batch (the SDF
+        // reconstruction is identical -- only the bound texture
+        // differs). If the dynamic atlas texture isn't bound this
+        // session (allocate_texture failed at bring-up), skip the
+        // draw rather than fall through -- layout side already
+        // committed to dynamic geometry for these quads.
+        if !dynamic_ink_verts.is_empty() {
+            if let Some(dyn_tex) = dynamic_atlas_tex() {
+                let cgp = cached_msdf_program(gl, layer.outline)?;
+                let vbo = gl
+                    .create_buffer()
+                    .map_err(|e| anyhow!("glGenBuffers (dynamic msdf): {e}"))?;
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let bytes = std::slice::from_raw_parts(
+                    dynamic_ink_verts.as_ptr() as *const u8,
+                    dynamic_ink_verts.len() * std::mem::size_of::<f32>(),
+                );
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+                gl.use_program(Some(cgp.program));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(dyn_tex));
+                gl.uniform_1_i32(cgp.u_atlas.as_ref(), 0);
+                gl.uniform_3_f32(
+                    cgp.u_text_color.as_ref(),
+                    text_color[0],
+                    text_color[1],
+                    text_color[2],
+                );
+                gl.uniform_1_f32(cgp.u_opacity.as_ref(), opacity);
+                if cgp.u_aa_width.is_some() {
+                    gl.uniform_1_f32(cgp.u_aa_width.as_ref(), 0.05);
+                }
+                if layer.outline {
+                    gl.uniform_3_f32(cgp.u_outline_color.as_ref(), 0.0, 0.0, 0.0);
+                    gl.uniform_1_f32(cgp.u_outline_distance.as_ref(), 0.10);
+                }
+
+                let a_pos = cgp.a_pos;
+                let a_uv = cgp.a_uv;
+                let stride = (4 * std::mem::size_of::<f32>()) as i32;
+                gl.enable_vertex_attrib_array(a_pos);
+                gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(a_uv);
+                gl.vertex_attrib_pointer_f32(
+                    a_uv,
+                    2,
+                    glow::FLOAT,
+                    false,
+                    stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
+                );
+                let vert_count = (dynamic_ink_verts.len() / 4) as i32;
+                gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
+                gl.disable_vertex_attrib_array(a_pos);
+                gl.disable_vertex_attrib_array(a_uv);
                 gl.delete_buffer(vbo);
             }
         }
@@ -2611,18 +2725,30 @@ pub fn paint_and_present_one_frame_for_slide(
     // sidecar smoke driver's stderr thread for offline analysis.
     let trace = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
     let t_start = if trace { Some(std::time::Instant::now()) } else { None };
-    // Bug 3 Slice 1 Part B: drain any glyph-cache completions at
-    // frame start. Slice 1 worker is a stub (no completions emitted)
-    // so this is a no-op at runtime; the call closes the Part B API
-    // surface contract. Slice 2 wires the real msdfgen worker and
-    // this path begins delivering uploaded slots. Bound = 4 matches
-    // the worker-pool size; avoids unbounded upload bursts at first
-    // encounter when Slice 2 ships.
-    let _ = session.dynamic_glyph_cache.poll_completions(
+    // Bug 3 Slice 2B: drain glyph-cache completions at frame start.
+    // The worker pool rasterizes new MSDF cells asynchronously; this
+    // call uploads any ready cells into the dynamic atlas page +
+    // transitions slots to Ready. Bound = 4 matches the worker-pool
+    // size to keep per-frame upload work bounded.
+    //
+    // Slide-cache invalidation: when poll uploads new cells, slides
+    // whose previous layout pass cached Tofu placeholders (because
+    // their codepoints were Requested/Generating at that pass) need
+    // a fresh layout to pick up the new Ready states. Bulk-clearing
+    // slide_caches forces the next paint to re-layout; the cost is
+    // bounded (uploads happen only on first encounter per codepoint
+    // per session, so a few cache rebuilds per session at most).
+    let uploaded = session.dynamic_glyph_cache.poll_completions(
         session.gl,
         &mut session.dynamic_atlas_page,
         4,
     );
+    if uploaded > 0 {
+        let drained: Vec<_> = session.slide_caches.drain().collect();
+        for (_id, entry) in drained {
+            free_slide_render_cache(session.gl, entry);
+        }
+    }
     let (bg_kind, _pattern_label, text_layers) =
         resolve_slide_layers(slide, fonts, content_root)?;
     // Bug 1 fix extension (qarl-flag 2026-05-09, applied 2026-05-13):
@@ -2694,6 +2820,14 @@ pub fn paint_and_present_one_frame_for_slide(
         Some(&mut cache.glyph),
         Some(&mut session.image_bg_cache),
         Some(&mut cache.tex),
+        // Bug 3 Slice 2B: runtime glyph cache + fonts_dir from the
+        // session so the layout dispatch can resolve static-atlas
+        // misses to dynamic-MSDF cells. The IPC sidecar's per-frame
+        // entry on FYS production hits this path.
+        Some(crate::glyph_cache::RuntimeGlyphCtx {
+            cache: &session.dynamic_glyph_cache,
+            fonts_dir: &session.dynamic_fonts_dir,
+        }),
     )?;
     unsafe { session.gl.flush(); }
     let t_after_paint = if trace { Some(std::time::Instant::now()) } else { None };
@@ -3746,6 +3880,7 @@ pub fn capture_sb_transition_mid_to_png(
                 Some(&mut cache_a.glyph),
                 Some(&mut session.image_bg_cache),
                 Some(&mut cache_a.tex),
+                None, // capture path; no runtime glyph cache needed
             )?;
         }
         unsafe {
@@ -3779,6 +3914,7 @@ pub fn capture_sb_transition_mid_to_png(
                 Some(&mut cache_b.glyph),
                 Some(&mut session.image_bg_cache),
                 Some(&mut cache_b.tex),
+                None, // capture path; no runtime glyph cache needed
             )?;
         }
 
@@ -4317,6 +4453,7 @@ unsafe fn make_fullres_slide_fbo_with_motion(
         None,
         None,
         None,
+        None, // capture-to-fullres-fbo; no runtime glyph cache
     );
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
@@ -4367,6 +4504,7 @@ pub fn capture_slide_to_png(
             None,
             Some(&mut session.image_bg_cache),
             None,  // tex_cache: one-shot path, no caching needed
+            None,  // one-shot path; no runtime glyph cache needed
         )?;
         unsafe {
             use glow::HasContext;
@@ -4785,6 +4923,7 @@ pub fn paint_one_for_capture(
         None,
         Some(&mut session.image_bg_cache),
         None,  // tex_cache: one-shot path, no caching needed
+        None,  // one-shot path; no runtime glyph cache needed
     )?;
     unsafe { session.gl.flush(); }
 
@@ -4876,6 +5015,7 @@ fn render_slide_in_session(
                 None,
                 None,  // image_bg_cache: closure-captured, no session access
                 None,  // tex_cache: one-shot path, no caching needed
+                None,  // closure captures gl only; no session-reachable runtime cache
             )?;
             // eglSwapBuffers (called in render_one_frame_in_session)
             // implicitly flushes; the explicit gl.flush() forced an
@@ -5332,6 +5472,7 @@ unsafe fn make_slide_fbo(
         glyph_cache,
         None,  // image_bg_cache: standalone bake, no session
         tex_cache,
+        None,  // bake path: no runtime glyph cache (session-bound)
     );
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
@@ -6168,6 +6309,14 @@ fn render_transition_animated_in_session(
                         Some(&mut cache_a.glyph),
                         Some(&mut session.image_bg_cache),
                         Some(&mut cache_a.tex),
+                        // Bug 3 Slice 2B: transition-bake path also
+                        // routes through layout_text_to_quads; pass
+                        // the runtime cache so a transition during
+                        // a slide with ●/∞ honors the dynamic atlas.
+                        Some(crate::glyph_cache::RuntimeGlyphCtx {
+                            cache: &session.dynamic_glyph_cache,
+                            fonts_dir: &session.dynamic_fonts_dir,
+                        }),
                     )?;
                 }
                 crate::profile::record_phase("bake_a", t_bake_a.elapsed().as_nanos() as u64);
@@ -6192,6 +6341,12 @@ fn render_transition_animated_in_session(
                         Some(&mut cache_b.glyph),
                         Some(&mut session.image_bg_cache),
                         Some(&mut cache_b.tex),
+                        // Bug 3 Slice 2B: same rationale as the bake_a
+                        // arm above.
+                        Some(crate::glyph_cache::RuntimeGlyphCtx {
+                            cache: &session.dynamic_glyph_cache,
+                            fonts_dir: &session.dynamic_fonts_dir,
+                        }),
                     )?;
                 }
                 crate::profile::record_phase("bake_b", t_bake_b.elapsed().as_nanos() as u64);
@@ -7125,6 +7280,13 @@ fn render_transition_scissored_bake_in_session(
                         Some(&mut cache_a.glyph),
                         Some(&mut session.image_bg_cache),
                         Some(&mut cache_a.tex),
+                        // Bug 3 Slice 2B: SB transition bake; pass
+                        // session runtime cache so the bake honors
+                        // any dynamic atlas slots.
+                        Some(crate::glyph_cache::RuntimeGlyphCtx {
+                            cache: &session.dynamic_glyph_cache,
+                            fonts_dir: &session.dynamic_fonts_dir,
+                        }),
                     )?;
                 }
                 crate::profile::record_phase("sb_bake_a", t_bake_a.elapsed().as_nanos() as u64);
@@ -7166,6 +7328,12 @@ fn render_transition_scissored_bake_in_session(
                         Some(&mut cache_b.glyph),
                         Some(&mut session.image_bg_cache),
                         Some(&mut cache_b.tex),
+                        // Bug 3 Slice 2B: same rationale as the sb_bake_a
+                        // arm above.
+                        Some(crate::glyph_cache::RuntimeGlyphCtx {
+                            cache: &session.dynamic_glyph_cache,
+                            fonts_dir: &session.dynamic_fonts_dir,
+                        }),
                     )?;
                 }
                 crate::profile::record_phase("sb_bake_b", t_bake_b.elapsed().as_nanos() as u64);
@@ -7680,6 +7848,33 @@ fn clear_msdf_lookup() {
     MSDF_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
     // MSDF_ATLASES_CPU is process-lifetime + only references 'static
     // bytes; intentionally not cleared.
+}
+
+// =====================================================================
+// Bug 3 Slice 2B -- dynamic MSDF atlas lookup (one page in Slice 2)
+// =====================================================================
+//
+// Mirrors MSDF_ATLAS_LOOKUP's thread_local pattern for the runtime-
+// rasterized atlas page. Populated at session bring-up after the
+// EglSession's `dynamic_atlas_page.allocate_texture(&gl)` succeeds;
+// cleared at session teardown BEFORE `dynamic_atlas_page.delete(&gl)`
+// so a stale handle can't outlive its NativeTexture. Slice 1.x will
+// extend to a Vec when LRU eviction adds multi-page support.
+std::thread_local! {
+    static DYNAMIC_ATLAS_LOOKUP: std::cell::RefCell<Option<glow::NativeTexture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn populate_dynamic_atlas_lookup(tex: glow::NativeTexture) {
+    DYNAMIC_ATLAS_LOOKUP.with(|c| *c.borrow_mut() = Some(tex));
+}
+
+fn clear_dynamic_atlas_lookup() {
+    DYNAMIC_ATLAS_LOOKUP.with(|c| *c.borrow_mut() = None);
+}
+
+fn dynamic_atlas_tex() -> Option<glow::NativeTexture> {
+    DYNAMIC_ATLAS_LOOKUP.with(|c| *c.borrow())
 }
 
 /// Resolve a `font_family` string (schema-level) to its baked atlas
@@ -8929,10 +9124,12 @@ fn paint_slide(
     glyph_cache: Option<&mut GlyphCache>,
     mut image_bg_cache: Option<&mut ImageBgCache>,
     mut tex_cache: Option<&mut TextureCache>,
+    runtime_glyph_ctx: Option<crate::glyph_cache::RuntimeGlyphCtx<'_>>,
 ) -> Result<()> {
     paint_slide_with_viewport(
         gl, mode_w, mode_h, 0, 0, mode_w, mode_h, Some(bg_kind), text_layers,
         motion_states, wall_clock_unix, glyph_cache, image_bg_cache, tex_cache,
+        runtime_glyph_ctx,
     )
 }
 
@@ -8959,6 +9156,7 @@ fn paint_slide_with_viewport(
     glyph_cache: Option<&mut GlyphCache>,
     mut image_bg_cache: Option<&mut ImageBgCache>,
     mut tex_cache: Option<&mut TextureCache>,
+    runtime_glyph_ctx: Option<crate::glyph_cache::RuntimeGlyphCtx<'_>>,
 ) -> Result<()> {
     // bg_kind = None signals the caller has ALREADY filled the
     // bg (e.g. atlas SB blit-from-bg-cache or pre-baked region).
@@ -9132,13 +9330,23 @@ fn paint_slide_with_viewport(
                         // wrap_text_to_width above — natural-overflow
                         // lines get squished to boxW; lines that fit
                         // pass through unchanged.
+                        // Bug 3 Slice 2B: borrow `runtime_glyph_ctx` for
+                        // this layout pass. The dispatch hook inside
+                        // layout_text_to_quads handles None opt-out
+                        // (test sites + standalone callers without a
+                        // session pass None upstream).
                         crate::hdmi_logic::layout_text_to_quads(
                             atlas,
                             emoji_atlas_cpu,
                             &wrapped,
                             size_px,
                             max_width_px,
-                            None,
+                            runtime_glyph_ctx.as_ref().map(|rt| {
+                                crate::glyph_cache::RuntimeGlyphCtx {
+                                    cache: rt.cache,
+                                    fonts_dir: rt.fonts_dir,
+                                }
+                            }),
                         )
                     });
                 if let Some(g) = group.as_ref() {
@@ -9755,6 +9963,7 @@ pub fn render_slide_via_fbo(
                 None,
                 None,  // image_bg_cache: standalone debug bake, no session
                 None,  // tex_cache: standalone debug bake, no caching
+                None,  // standalone debug bake; no runtime glyph cache
             );
             // Always rebind default FBO before propagating Err so
             // cleanup/teardown doesn't operate on the offscreen one.
