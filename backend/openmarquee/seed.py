@@ -587,7 +587,11 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_family="Alfa Slab One",
                 text_color="#FFF1B0",
                 box=_b(0.05, 0.15, 0.9, 0.65),
-                font_size_pct=33.0,
+                # Bug 4 (2026-05-19): bumped from 33 → 100 so every wrapped
+                # line naturally overflows boxW and triggers the per-line
+                # X-squish-to-boxW. Achieves "each line fills boxW edge-to-
+                # edge" intent via content, not renderer stretch-up.
+                font_size_pct=100.0,
                 motion="shake",
                 motion_intensity=70,
             ),
