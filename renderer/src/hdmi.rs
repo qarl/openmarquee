@@ -2611,6 +2611,18 @@ pub fn paint_and_present_one_frame_for_slide(
     // sidecar smoke driver's stderr thread for offline analysis.
     let trace = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
     let t_start = if trace { Some(std::time::Instant::now()) } else { None };
+    // Bug 3 Slice 1 Part B: drain any glyph-cache completions at
+    // frame start. Slice 1 worker is a stub (no completions emitted)
+    // so this is a no-op at runtime; the call closes the Part B API
+    // surface contract. Slice 2 wires the real msdfgen worker and
+    // this path begins delivering uploaded slots. Bound = 4 matches
+    // the worker-pool size; avoids unbounded upload bursts at first
+    // encounter when Slice 2 ships.
+    let _ = session.dynamic_glyph_cache.poll_completions(
+        session.gl,
+        &mut session.dynamic_atlas_page,
+        4,
+    );
     let (bg_kind, _pattern_label, text_layers) =
         resolve_slide_layers(slide, fonts, content_root)?;
     // Bug 1 fix extension (qarl-flag 2026-05-09, applied 2026-05-13):
