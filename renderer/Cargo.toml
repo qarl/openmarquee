@@ -29,6 +29,11 @@ uuid = { version = "1", default-features = false, features = ["serde"] }
 # if we hit a slide that needs shaping/bidi/ligatures.
 fontdue = "0.9"
 
+# Bug 3 Slice 1 (2026-05-19) — runtime glyph cache mpsc channel.
+# crossbeam-channel's select! macro is the work-distribution
+# primitive for the worker thread pool. Pure Rust, cross-platform.
+crossbeam-channel = "0.5"
+
 # v1-spec-delta #8 (slice a) — ImageSlide rendering. The browser
 # pre-scales operator uploads to PNG at the panel's native
 # resolution (per backend ImageSlide docstring), so the renderer

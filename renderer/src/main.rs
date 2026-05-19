@@ -50,6 +50,20 @@ mod sdf_atlas_emoji_gl;
 /// will be deleted once Slice 1 lands + is exercised by real loads.
 #[cfg(target_os = "linux")]
 mod gl_subtexture_smoke;
+/// Bug 3 Slice 1 (2026-05-19) -- runtime glyph cache infrastructure.
+/// HYBRID architecture per qa-Jimmy option D: static MSDF atlas
+/// (sdf_atlas) covers build-time-baked codepoints; this dynamic
+/// cache covers everything else. Slice 1 lands the infrastructure
+/// + stub worker; Slice 2 wires the msdfgen-based real worker that
+/// rasterizes ●/∞/etc. on cache-miss.
+///
+/// Modules are cross-platform-compiled (CPU-side state machine + slot
+/// allocation tests run on Mac via cargo test); GL-touching fns
+/// (allocate_texture / upload_slot / poll_completions) are
+/// individually cfg-gated to target_os="linux" so Mac builds don't
+/// need glow at link time.
+mod atlas_page;
+mod glyph_cache;
 // V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
 // M2M decoder client. Open + capability query are wired; format-set,
 // REQBUFS, STREAMON, and the decode loop are stubbed for piece 2b.
