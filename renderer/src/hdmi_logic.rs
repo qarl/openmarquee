@@ -519,20 +519,22 @@ pub fn layout_text_to_quads(
     // Pass `f32::INFINITY` to opt out of capping (host tests + any
     // caller that wants legacy "natural per-line width" behavior).
     box_w_px: f32,
-    // Bug 3 Slice 1 part B (2026-05-19): runtime glyph cache for
-    // codepoints not in the static MSDF atlas. On static-miss +
-    // non-whitespace, dispatch sends a MissRequest to the cache's
-    // worker pool. Slice 1 worker is a stub (drains + discards), so
-    // SlotState stays Requested and this layout call falls through
-    // to Tofu — preserving pre-Bug-3 behavior. Slice 2 swaps the
-    // stub for real msdfgen rasterization, at which point
-    // subsequent layout calls for the same codepoint see Ready
-    // and the dispatch will emit CharKind::DynamicMsdf (variant +
-    // render path land in Slice 2).
+    // Bug 3 Slice 2A (2026-05-19): runtime glyph cache context for
+    // codepoints not in the static MSDF atlas. The bundle (cache +
+    // fonts_dir) replaces Slice 1B's bare `Option<&GlyphCache>` so
+    // the dispatch hook can resolve a font_path the worker reads
+    // TTF bytes from. None = opt out (host tests + any caller
+    // without an EglSession reference).
     //
-    // Pass `None` to opt out (host tests + any caller that doesn't
-    // have access to the EglSession's runtime cache).
-    runtime_glyph_cache: Option<&crate::glyph_cache::GlyphCache>,
+    // Behavior on static-miss + non-whitespace:
+    //   - cache.get_or_request returns the slot state; on first
+    //     encounter it enqueues a MissRequest.
+    //   - Slice 2A worker (real msdfgen) → SlotState::Ready arrives
+    //     a few hundred ms later via poll_completions.
+    //   - Slice 2B will route Ready → CharKind::DynamicMsdf; until
+    //     then this dispatch records the lookup and falls through
+    //     to Tofu (preserving pre-Bug-3 visible behavior).
+    runtime_glyph_cache: Option<crate::glyph_cache::RuntimeGlyphCtx<'_>>,
 ) -> Option<MsdfQuadGroup> {
     if text.is_empty() || size_px <= 0.0 {
         return None;
@@ -596,18 +598,19 @@ pub fn layout_text_to_quads(
     // no emoji atlas supplied (host tests / pre-C.3 callers).
     let emoji_ppem: Option<f32> = emoji.map(|a| a.manifest.source_ppem as f32);
 
-    // Bug 3 Slice 1 part B (2026-05-19): font_family_id derived from
-    // the static atlas's font name via FNV-1a → u8. Collisions are
-    // possible (256-way) but acceptable for Slice 1 since the worker
-    // discards requests anyway. Slice 2 will revisit when the
-    // worker actually consumes the font ID to load font bytes.
-    let font_family_id: u8 = {
+    // Bug 3 Slice 2A (2026-05-19): font_family_id is FNV-1a low 32
+    // bits of the font stem. u32 widens the u8 used in Slice 1B's
+    // dormant-API scaffolding so cross-font collisions are
+    // astronomically rare across a ~24-font catalog (vs 1/256
+    // pre-widening, which would cross-key two fonts hashing to the
+    // same low byte once Slice 2 actually rasterizes per-font).
+    let font_family_id: u32 = {
         let mut h: u64 = 0xcbf29ce484222325;
         for &b in atlas.manifest.font.as_bytes() {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
-        (h & 0xff) as u8
+        h as u32
     };
     let mut layouts: Vec<LineLayout> = Vec::with_capacity(lines.len());
     let mut any_glyph = false;
@@ -668,12 +671,23 @@ pub fn layout_text_to_quads(
                 // produces Ready) → fall through to Tofu. Slice 2
                 // will return CharKind::DynamicMsdf(slot) when the
                 // cache resolves to Ready.
-                if let Some(cache) = runtime_glyph_cache {
-                    let _ = cache.get_or_request(crate::glyph_cache::GlyphKey {
-                        font_family_id,
-                        codepoint: cp,
-                        render_mode: crate::glyph_cache::RenderMode::Msdf,
-                    });
+                if let Some(rt) = runtime_glyph_cache.as_ref() {
+                    // Resolve TTF path: fonts_dir/{stem}.ttf. The
+                    // stem comes from the static atlas manifest's
+                    // `font` field (build.rs:266 sets this from the
+                    // TTF file's stem -- matches the runtime layout
+                    // under /opt/openmarquee/ui/fonts/).
+                    let font_path = rt
+                        .fonts_dir
+                        .join(format!("{}.ttf", atlas.manifest.font));
+                    let _ = rt.cache.get_or_request(
+                        crate::glyph_cache::GlyphKey {
+                            font_family_id,
+                            codepoint: cp,
+                            render_mode: crate::glyph_cache::RenderMode::Msdf,
+                        },
+                        font_path,
+                    );
                 }
                 // Tofu: deterministic missing-glyph rect counts as ink.
                 any_ink = true;
