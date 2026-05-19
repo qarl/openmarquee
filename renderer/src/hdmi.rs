@@ -4532,29 +4532,32 @@ pub fn capture_slide_to_png(
             )?;
             // Drain pending worker output. Per-iteration poll
             // uploads any Ready completions into the atlas page;
-            // FontMissing direct-inserts happen worker-side so
-            // they're observable on the next paint's dispatch.
+            // FontMissing direct-inserts happen worker-side
+            // outside the completion channel and are observable
+            // only on the next paint's dispatch.
+            //
+            // FIXED-DURATION WAIT: bail-on-2-empty-polls is unsafe
+            // here because FontMissing never produces channel
+            // traffic. A primary that's about to FontMissing
+            // would idle the channel for the full ~482ms p99
+            // worker time, and a "wait until channel is idle"
+            // bail would exit ~40ms in -- before the worker has
+            // finished its TTF parse + msdfgen pass. Sleep the
+            // full deadline so dispatch on the next paint round
+            // sees the resolved (Ready or FontMissing) state.
+            //
+            // 800ms = bench's 482ms p99 single-thread + headroom.
+            // With 4-worker concurrency the actual completion is
+            // ~250ms p99, so this is conservative.
             let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(1500);
+                + std::time::Duration::from_millis(800);
             while std::time::Instant::now() < deadline {
-                let n = session.dynamic_glyph_cache.poll_completions(
+                let _n = session.dynamic_glyph_cache.poll_completions(
                     session.gl,
                     &mut session.dynamic_atlas_page,
                     4,
                 );
-                if n == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    let n2 = session.dynamic_glyph_cache.poll_completions(
-                        session.gl,
-                        &mut session.dynamic_atlas_page,
-                        4,
-                    );
-                    if n2 == 0 {
-                        break;
-                    }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
         // Final paint: layout sees all slots resolved to terminal
