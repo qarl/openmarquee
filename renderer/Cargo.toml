@@ -47,6 +47,31 @@ crossbeam-channel = "0.5"
 msdfgen = { version = "0.2", features = ["ttf-parser"] }
 ttf-parser = "0.18"
 
+# Bug 3 Slice 3A.rev (2026-05-19) — runtime COLRv1 vector emoji
+# rasterizer. Initial Slice 3A surface bounced after discovering
+# swash 0.2.7 (the dispatch's suggested dep) only implements the
+# COLRv0 layer record format; NotoColorEmoji-Regular is COLRv1,
+# so swash's color path returns no layers. QA-approved Path A:
+# skrifa (Google's pure-Rust font reader; full COLRv1 paint-tree
+# traversal via the ColorPainter trait) + tiny-skia (pure-Rust
+# Skia subset; gradients, transforms, clip stacks, blend modes).
+# Both cross-build cleanly to aarch64 via zigbuild — no system
+# deps.
+#
+# Replaces the static build-time CBDT emoji atlas (sdf_atlas_
+# emoji.rs) over Slices 3B-3D. 3A is module skeleton + worker
+# RenderMode dispatch only; no caller emits RenderMode::Colr yet
+# (layout dispatch hook lands in 3B).
+skrifa = "0.40"
+# `png-format` enables image loading from PNG which we don't use
+# (we paint into a Pixmap directly and read pixels back as RGBA).
+# Dropping it avoids pulling png 0.18 alongside our existing png
+# 0.17 dep used by ImageSlide. `simd` stays on — it gates NEON-
+# accelerated raster paths on aarch64 (Pi target enables
+# target_feature="neon" by default) and SSE2/AVX2 on x86_64 host
+# builds; codepaths are cfg-gated so non-SIMD targets still build.
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
+
 # v1-spec-delta #8 (slice a) — ImageSlide rendering. The browser
 # pre-scales operator uploads to PNG at the panel's native
 # resolution (per backend ImageSlide docstring), so the renderer

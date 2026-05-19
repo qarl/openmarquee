@@ -80,6 +80,9 @@ renderer/tests/parity/baseline/
 # alongside the in-repo @font-face fonts (Inter, Reenie Beanie, ...)
 # so editor preview and device renderer use the same color glyphs.
 ui/fonts/noto-color-emoji.ttf
+# Bug 3 Slice 3 COLRv1 vector variant — fetched + SVG-stripped at build
+# time by scripts/download-emoji-font-colrv1.sh. ~4.8 MB stripped.
+ui/fonts/noto-color-emoji-colrv1.ttf
 
 # Editor
 .vscode/

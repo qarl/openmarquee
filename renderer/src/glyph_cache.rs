@@ -118,8 +118,9 @@ pub enum RenderMode {
     /// Build-time-style MSDF (matching the static atlas's
     /// FS_MSDF_FIXED shader). Used for text.
     Msdf,
-    /// COLRv1 vector emoji — Slice 3 will wire the colr crate
-    /// behind this variant. Slice 1 stubs it.
+    /// COLRv1 vector emoji — rasterized at runtime via skrifa
+    /// (paint-tree traversal) + tiny-skia (vector raster). See
+    /// `crate::glyph_cache_colr::rasterize_colr_cell`.
     Colr,
 }
 
@@ -269,7 +270,33 @@ impl GlyphCache {
                                             slots.insert(req.key, SlotState::Generating);
                                         }
                                     }
-                                    match rasterize_msdf_cell(&req.font_path, req.key.codepoint) {
+                                    // Bug 3 Slice 3A (2026-05-19): dispatch by
+                                    // RenderMode. Msdf goes through the build-
+                                    // time-symmetric msdfgen path; Colr goes
+                                    // through skrifa's ColorPainter trait +
+                                    // tiny-skia for COLRv1 paint trees. Both
+                                    // produce a `RasterOutput` with rgba_bytes
+                                    // + cell_px + advance_em + plane_bounds,
+                                    // so the Completion::Ready
+                                    // shape is identical across modes. The
+                                    // dynamic atlas page is mode-agnostic at
+                                    // the slot level (8-bit-RGBA cells); the
+                                    // draw side disambiguates via the per-quad
+                                    // GlyphKind tag (DynamicMsdf vs
+                                    // DynamicEmoji in Slice 3B).
+                                    let raster_result = match req.key.render_mode {
+                                        RenderMode::Msdf => rasterize_msdf_cell(
+                                            &req.font_path,
+                                            req.key.codepoint,
+                                        ),
+                                        RenderMode::Colr => {
+                                            crate::glyph_cache_colr::rasterize_colr_cell(
+                                                &req.font_path,
+                                                req.key.codepoint,
+                                            )
+                                        }
+                                    };
+                                    match raster_result {
                                         Ok(Some(out)) => {
                                             let _ = completion_tx.send(Completion::Ready {
                                                 key: req.key,
@@ -483,11 +510,11 @@ impl GlyphCache {
 /// cell + metrics so the runtime FS_MSDF_FIXED shader path sees
 /// identical SDF reconstruction across static-baked + dynamic-
 /// cached slots.
-struct RasterOutput {
-    rgba_bytes: Vec<u8>,
-    cell_px: u32,
-    advance_em: f32,
-    plane_bounds: PlaneBounds,
+pub(crate) struct RasterOutput {
+    pub(crate) rgba_bytes: Vec<u8>,
+    pub(crate) cell_px: u32,
+    pub(crate) advance_em: f32,
+    pub(crate) plane_bounds: PlaneBounds,
 }
 
 /// Rasterize one codepoint to a CELL_PX^2 MSDF cell. Returns:

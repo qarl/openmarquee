@@ -62,16 +62,19 @@ fi
 # the download script. Idempotent: re-running setup.sh is cheap.
 echo "==> ensuring Noto Color Emoji is installed"
 bash "$OPENMARQUEE_SRC/scripts/download-emoji-font.sh"
+bash "$OPENMARQUEE_SRC/scripts/download-emoji-font-colrv1.sh"
 mkdir -p "$OPENMARQUEE_BUILD_DIR/ui/fonts"
 # Atomic copy via .tmp + mv so a partial write on a network-mounted
 # BUILD_DIR (NFS / SMB / rclone-fuse) doesn't leave a truncated TTF
 # that the dev server would serve as garbage. Plain `cp` on the
 # default local BUILD_DIR is fine, but the .tmp/mv cost is negligible
 # and covers the edge case.
-cp "$OPENMARQUEE_SRC/ui/fonts/noto-color-emoji.ttf" \
-    "$OPENMARQUEE_BUILD_DIR/ui/fonts/noto-color-emoji.ttf.tmp"
-mv "$OPENMARQUEE_BUILD_DIR/ui/fonts/noto-color-emoji.ttf.tmp" \
-    "$OPENMARQUEE_BUILD_DIR/ui/fonts/noto-color-emoji.ttf"
+for f in noto-color-emoji.ttf noto-color-emoji-colrv1.ttf; do
+    cp "$OPENMARQUEE_SRC/ui/fonts/$f" \
+        "$OPENMARQUEE_BUILD_DIR/ui/fonts/$f.tmp"
+    mv "$OPENMARQUEE_BUILD_DIR/ui/fonts/$f.tmp" \
+        "$OPENMARQUEE_BUILD_DIR/ui/fonts/$f"
+done
 
 cat <<EOF
 

@@ -64,6 +64,10 @@ mod gl_subtexture_smoke;
 /// need glow at link time.
 mod atlas_page;
 mod glyph_cache;
+// Bug 3 Slice 3A (2026-05-19): runtime COLRv1 vector emoji raster.
+// Skeleton + worker dispatch only — no caller emits RenderMode::Colr
+// requests until Slice 3B wires the layout_text_to_quads hook.
+mod glyph_cache_colr;
 // V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
 // M2M decoder client. Open + capability query are wired; format-set,
 // REQBUFS, STREAMON, and the decode loop are stubbed for piece 2b.
