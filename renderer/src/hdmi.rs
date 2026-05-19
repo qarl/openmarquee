@@ -1376,6 +1376,30 @@ fn render_animated_slide_in_session(
                 break;
             }
             let frame_start = std::time::Instant::now();
+            // Bug 3 Slice 2D follow-up 2 extension (2026-05-19):
+            // drain runtime glyph cache completions per frame. The
+            // dispatch hook in layout_text_to_quads inserts Tofu
+            // placeholders for codepoints whose slot is Requested/
+            // Generating/FontMissing-mid-chain; without per-frame
+            // poll+invalidate, the per-slide cache holds the Tofu
+            // layout for the entire hold and the eventual Ready
+            // (or terminal FontMissing) transition is never re-laid.
+            // Mirrors paint_and_present_one_frame_for_slide's pattern
+            // (hdmi.rs ~2741). FYS Boot's ● (motion=breathe routes
+            // through this function) is the qarl-visible case.
+            let uploaded = session.dynamic_glyph_cache.poll_completions(
+                session.gl,
+                &mut session.dynamic_atlas_page,
+                4,
+            );
+            if uploaded > 0 {
+                if let Some(old) = session.slide_caches.remove(&slide_id) {
+                    free_slide_render_cache(session.gl, old);
+                }
+                session
+                    .slide_caches
+                    .insert(slide_id, SlideRenderCache::new(text_layers.len()));
+            }
             // Bug 1 fix (2026-05-09): tick_seconds is session-
             // global, NOT call-local. Motion phase stays continuous
             // across hold/transition boundaries. `elapsed` (call-
