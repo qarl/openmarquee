@@ -178,16 +178,35 @@ struct MissRequest {
 }
 
 /// Internal: a completion pushed back to the render thread by a
-/// worker. Carries the rasterized MSDF cell + the per-glyph metrics
-/// the dispatch hook needs to position the quad. The FontMissing
-/// path does NOT flow through this channel — workers insert that
-/// directly into the slots map since it needs no GL upload work.
-struct Completion {
-    key: GlyphKey,
-    rgba_bytes: Vec<u8>,
-    cell_px: u32,
-    advance_em: f32,
-    plane_bounds: PlaneBounds,
+/// worker. Two variants:
+///   Ready       — successful rasterization; the render thread's
+///                 poll uploads the cell to the atlas page +
+///                 transitions the slot to SlotState::Ready.
+///   FontMissing — worker confirmed the font lacks this codepoint
+///                 (or I/O failure). The worker has ALREADY
+///                 direct-inserted SlotState::FontMissing into the
+///                 slots map (so tests + immediate get_or_request
+///                 lookups see it without waiting for poll). The
+///                 channel-side notification is purely a signal so
+///                 the render thread can drain slide_caches on
+///                 transition -- without it, the production reel's
+///                 layout cache holds stale Tofu placeholders
+///                 across the entire session for keys whose chain
+///                 lookups depend on observing the primary's
+///                 FontMissing state (Bug 3 Slice 2D follow-up
+///                 2026-05-19).
+#[derive(Debug)]
+enum Completion {
+    Ready {
+        key: GlyphKey,
+        rgba_bytes: Vec<u8>,
+        cell_px: u32,
+        advance_em: f32,
+        plane_bounds: PlaneBounds,
+    },
+    FontMissing {
+        key: GlyphKey,
+    },
 }
 
 pub struct GlyphCache {
@@ -252,7 +271,7 @@ impl GlyphCache {
                                     }
                                     match rasterize_msdf_cell(&req.font_path, req.key.codepoint) {
                                         Ok(Some(out)) => {
-                                            let _ = completion_tx.send(Completion {
+                                            let _ = completion_tx.send(Completion::Ready {
                                                 key: req.key,
                                                 rgba_bytes: out.rgba_bytes,
                                                 cell_px: out.cell_px,
@@ -261,20 +280,39 @@ impl GlyphCache {
                                             });
                                         }
                                         Ok(None) => {
-                                            // Font genuinely lacks this
-                                            // codepoint; record permanent
-                                            // miss so dispatch stops
-                                            // re-enqueueing.
-                                            let mut slots = slots_for_worker.lock().unwrap();
-                                            slots.insert(req.key, SlotState::FontMissing);
+                                            // Direct-insert so tests +
+                                            // immediate get_or_request
+                                            // lookups see FontMissing
+                                            // without waiting for poll.
+                                            {
+                                                let mut slots = slots_for_worker.lock().unwrap();
+                                                slots.insert(req.key, SlotState::FontMissing);
+                                            }
+                                            // Channel signal for render-
+                                            // thread poll: paint_and_
+                                            // present invalidates
+                                            // slide_caches on completion
+                                            // count > 0. Without this,
+                                            // FontMissing state changes
+                                            // would only be observed on
+                                            // the next natural slide_
+                                            // caches eviction.
+                                            let _ = completion_tx.send(
+                                                Completion::FontMissing { key: req.key },
+                                            );
                                         }
                                         Err(e) => {
                                             eprintln!(
                                                 "glyph_cache worker: rasterize {:?} cp=U+{:04X}: {e}",
                                                 req.font_path, req.key.codepoint,
                                             );
-                                            let mut slots = slots_for_worker.lock().unwrap();
-                                            slots.insert(req.key, SlotState::FontMissing);
+                                            {
+                                                let mut slots = slots_for_worker.lock().unwrap();
+                                                slots.insert(req.key, SlotState::FontMissing);
+                                            }
+                                            let _ = completion_tx.send(
+                                                Completion::FontMissing { key: req.key },
+                                            );
                                         }
                                     }
                                 }
@@ -331,10 +369,22 @@ impl GlyphCache {
     /// by `max_uploads_per_call` so a backlog doesn't blow the 16 ms
     /// frame budget at first encounter.
     ///
-    /// FontMissing doesn't flow through this path — the worker
-    /// inserts it directly into slots since no GL upload is needed.
-    /// This drain only handles Success completions (cell rasterized,
-    /// allocate-slot + glTexSubImage2D + transition to Ready).
+    /// Two completion variants are drained:
+    ///   Ready       — Allocates an atlas slot, uploads via
+    ///                 glTexSubImage2D, transitions SlotState to
+    ///                 Ready in the slots map. Counted toward the
+    ///                 return value so the caller can invalidate
+    ///                 slide_caches.
+    ///   FontMissing — Slot is ALREADY in SlotState::FontMissing
+    ///                 (worker direct-inserted before sending the
+    ///                 channel notification). Counted toward the
+    ///                 return value so paint_and_present invalidates
+    ///                 slide_caches — without this, the production
+    ///                 reel's layout cache would hold stale Tofu
+    ///                 placeholders for the entire session on keys
+    ///                 whose chain depends on the FontMissing state.
+    ///                 No GL work performed (no slot allocation, no
+    ///                 upload).
     #[cfg(target_os = "linux")]
     pub fn poll_completions(
         &mut self,
@@ -342,39 +392,50 @@ impl GlyphCache {
         page: &mut AtlasPage,
         max_uploads_per_call: usize,
     ) -> usize {
-        let mut uploaded = 0;
+        let mut count = 0;
         for _ in 0..max_uploads_per_call {
             match self.completion_rx.try_recv() {
-                Ok(c) => {
+                Ok(Completion::Ready {
+                    key,
+                    rgba_bytes,
+                    cell_px,
+                    advance_em,
+                    plane_bounds,
+                }) => {
                     let Some(slot_pos) = page.allocate_slot() else {
                         // Page full; Slice 1.x will add eviction.
                         // For now, drop the completion; the slot
-                        // entry stays in its prior state (Requested
-                        // in Slice 1; Generating once Slice 2 wires
-                        // the worker-side state transition) until
+                        // entry stays Requested/Generating until
                         // restart.
-                        eprintln!("glyph_cache: atlas page full; dropping completion for {:?}", c.key);
+                        eprintln!("glyph_cache: atlas page full; dropping completion for {:?}", key);
                         continue;
                     };
                     if let Err(e) = page.upload_slot(
-                        gl, slot_pos.x, slot_pos.y, c.cell_px, c.cell_px, &c.rgba_bytes,
+                        gl, slot_pos.x, slot_pos.y, cell_px, cell_px, &rgba_bytes,
                     ) {
-                        eprintln!("glyph_cache: upload_slot failed for {:?}: {e}", c.key);
+                        eprintln!("glyph_cache: upload_slot failed for {:?}: {e}", key);
                         continue;
                     }
                     let mut slots = self.slots.lock().unwrap();
-                    slots.insert(c.key, SlotState::Ready {
+                    slots.insert(key, SlotState::Ready {
                         slot: slot_pos,
-                        advance_em: c.advance_em,
-                        plane_bounds: c.plane_bounds,
+                        advance_em,
+                        plane_bounds,
                     });
                     *self.completion_count.lock().unwrap() += 1;
-                    uploaded += 1;
+                    count += 1;
+                }
+                Ok(Completion::FontMissing { key: _ }) => {
+                    // Slot is already FontMissing (worker direct-
+                    // inserted before sending this notification).
+                    // Count it so the caller invalidates slide_caches.
+                    *self.completion_count.lock().unwrap() += 1;
+                    count += 1;
                 }
                 Err(_) => break, // nothing pending
             }
         }
-        uploaded
+        count
     }
 
     /// Diagnostic: how many MissRequests have been received by workers.
@@ -718,23 +779,33 @@ mod tests {
             }
         }
         let c = got.expect("worker should produce a Completion within 2s");
-        assert_eq!(c.cell_px, 48);
-        assert_eq!(c.rgba_bytes.len(), 48 * 48 * 4);
-        // Every fourth byte (alpha) must be 255.
-        for i in (0..c.rgba_bytes.len()).step_by(4) {
-            assert_eq!(c.rgba_bytes[i + 3], 255, "alpha not 255 at byte {i}");
+        match c {
+            Completion::Ready {
+                key: _,
+                rgba_bytes,
+                cell_px,
+                advance_em,
+                plane_bounds,
+            } => {
+                assert_eq!(cell_px, 48);
+                assert_eq!(rgba_bytes.len(), 48 * 48 * 4);
+                for i in (0..rgba_bytes.len()).step_by(4) {
+                    assert_eq!(rgba_bytes[i + 3], 255, "alpha not 255 at byte {i}");
+                }
+                assert!(advance_em > 0.0, "advance_em should be positive for 'A'");
+                assert!(
+                    plane_bounds.pl_right > plane_bounds.pl_left,
+                    "plane bounds inverted",
+                );
+                assert!(
+                    plane_bounds.pl_top > plane_bounds.pl_bottom,
+                    "plane bounds inverted",
+                );
+            }
+            Completion::FontMissing { .. } => {
+                panic!("expected Completion::Ready for 'A' in inter.ttf, got FontMissing");
+            }
         }
-        // 'A' has positive advance.
-        assert!(c.advance_em > 0.0, "advance_em should be positive for 'A'");
-        // 'A' has positive ink extent.
-        assert!(
-            c.plane_bounds.pl_right > c.plane_bounds.pl_left,
-            "plane bounds inverted",
-        );
-        assert!(
-            c.plane_bounds.pl_top > c.plane_bounds.pl_bottom,
-            "plane bounds inverted",
-        );
     }
 
     #[test]
@@ -886,20 +957,61 @@ mod tests {
             }
         }
         let c = got.expect("DejaVu Sans worker should produce ● Completion within 2s");
-        assert_eq!(c.cell_px, 48);
-        assert_eq!(c.rgba_bytes.len(), 48 * 48 * 4);
-        for i in (0..c.rgba_bytes.len()).step_by(4) {
-            assert_eq!(c.rgba_bytes[i + 3], 255);
+        match c {
+            Completion::Ready {
+                key: _,
+                rgba_bytes,
+                cell_px,
+                advance_em,
+                plane_bounds,
+            } => {
+                assert_eq!(cell_px, 48);
+                assert_eq!(rgba_bytes.len(), 48 * 48 * 4);
+                for i in (0..rgba_bytes.len()).step_by(4) {
+                    assert_eq!(rgba_bytes[i + 3], 255);
+                }
+                assert!(advance_em > 0.0);
+                assert!(
+                    plane_bounds.pl_right > plane_bounds.pl_left,
+                    "● plane bounds inverted",
+                );
+                assert!(
+                    plane_bounds.pl_top > plane_bounds.pl_bottom,
+                    "● plane bounds inverted",
+                );
+            }
+            Completion::FontMissing { .. } => {
+                panic!("expected Completion::Ready for ● in dejavu-sans.ttf, got FontMissing");
+            }
         }
-        assert!(c.advance_em > 0.0);
-        // ● is a filled circle; both plane bounds should have ink.
-        assert!(
-            c.plane_bounds.pl_right > c.plane_bounds.pl_left,
-            "● plane bounds inverted",
-        );
-        assert!(
-            c.plane_bounds.pl_top > c.plane_bounds.pl_bottom,
-            "● plane bounds inverted",
-        );
+    }
+
+    #[test]
+    fn worker_sends_font_missing_via_channel() {
+        // Bug 3 Slice 2D follow-up (2026-05-19): when the worker
+        // direct-inserts SlotState::FontMissing into the slots
+        // map (font lacks codepoint OR I/O failure), it ALSO sends
+        // a Completion::FontMissing notification through the
+        // completion channel so the render-thread's poll can
+        // observe the transition and invalidate slide_caches.
+        let cache = GlyphCache::new(1);
+        cache.get_or_request(k(0x25CF), nonexistent_font_path());
+        let mut got = None;
+        for _ in 0..400 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if let Ok(c) = cache.completion_rx.try_recv() {
+                got = Some(c);
+                break;
+            }
+        }
+        let c = got.expect("worker should send Completion::FontMissing within 2s");
+        match c {
+            Completion::FontMissing { key } => {
+                assert_eq!(key.codepoint, 0x25CF);
+            }
+            Completion::Ready { .. } => {
+                panic!("expected FontMissing notification, got Ready");
+            }
+        }
     }
 }
