@@ -44,6 +44,12 @@ mod sdf_atlas_emoji;
 /// as a GL_RGBA8 texture.
 #[cfg(target_os = "linux")]
 mod sdf_atlas_emoji_gl;
+/// Bug 3 Slice 1 prep (2026-05-19) -- standalone glTexSubImage2D
+/// smoke test. Verifies vc4 driver behavior before committing the
+/// runtime glyph cache infrastructure that depends on it. Module
+/// will be deleted once Slice 1 lands + is exercised by real loads.
+#[cfg(target_os = "linux")]
+mod gl_subtexture_smoke;
 // V4L2 piece 2a (2026-05-14): scaffold for the bcm2835-codec H.264
 // M2M decoder client. Open + capability query are wired; format-set,
 // REQBUFS, STREAMON, and the decode loop are stubbed for piece 2b.
@@ -437,6 +443,14 @@ struct Args {
     /// presence of a 1-px black ring around the glyphs.
     #[arg(long, default_value_t = false)]
     play_outline_test: bool,
+
+    /// Bug 3 Slice 1 prep (2026-05-19) -- run the glTexSubImage2D
+    /// smoke test. Creates a 2048×2048 RGBA8 texture, writes a
+    /// 48×48 sub-region via glTexSubImage2D, reads back via FBO,
+    /// verifies pixel integrity. Exits with code 0 on PASS, non-
+    /// zero on FAIL. Prints per-check report to stdout.
+    #[arg(long, default_value_t = false)]
+    gl_subtexture_smoke: bool,
 
     /// When `--play-reel` is set, loop the reel forever (wrapping
     /// from last slide back to first via the first slide's
@@ -1329,6 +1343,17 @@ fn main() -> Result<()> {
                         args.transition_ms,
                         args.fps,
                     )?;
+                    return Ok(());
+                }
+                if args.gl_subtexture_smoke {
+                    // Bug 3 Slice 1 prep (2026-05-19): verify
+                    // glTexSubImage2D semantics on vc4 before
+                    // committing the runtime glyph cache infra.
+                    let report = gl_subtexture_smoke::run(&card)?;
+                    print!("{}", gl_subtexture_smoke::format_report(&report));
+                    if !report.all_pass() {
+                        bail!("gl-subtexture-smoke FAIL");
+                    }
                     return Ok(());
                 }
                 if let Some(pattern_name) = args.play_pattern_test.as_deref() {
