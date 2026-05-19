@@ -519,6 +519,20 @@ pub fn layout_text_to_quads(
     // Pass `f32::INFINITY` to opt out of capping (host tests + any
     // caller that wants legacy "natural per-line width" behavior).
     box_w_px: f32,
+    // Bug 3 Slice 1 part B (2026-05-19): runtime glyph cache for
+    // codepoints not in the static MSDF atlas. On static-miss +
+    // non-whitespace, dispatch sends a MissRequest to the cache's
+    // worker pool. Slice 1 worker is a stub (drains + discards), so
+    // SlotState stays Requested and this layout call falls through
+    // to Tofu — preserving pre-Bug-3 behavior. Slice 2 swaps the
+    // stub for real msdfgen rasterization, at which point
+    // subsequent layout calls for the same codepoint see Ready
+    // and the dispatch will emit CharKind::DynamicMsdf (variant +
+    // render path land in Slice 2).
+    //
+    // Pass `None` to opt out (host tests + any caller that doesn't
+    // have access to the EglSession's runtime cache).
+    runtime_glyph_cache: Option<&crate::glyph_cache::GlyphCache>,
 ) -> Option<MsdfQuadGroup> {
     if text.is_empty() || size_px <= 0.0 {
         return None;
@@ -581,6 +595,20 @@ pub fn layout_text_to_quads(
     // Emoji-atlas source PPEM as f32 for advance scaling. None when
     // no emoji atlas supplied (host tests / pre-C.3 callers).
     let emoji_ppem: Option<f32> = emoji.map(|a| a.manifest.source_ppem as f32);
+
+    // Bug 3 Slice 1 part B (2026-05-19): font_family_id derived from
+    // the static atlas's font name via FNV-1a → u8. Collisions are
+    // possible (256-way) but acceptable for Slice 1 since the worker
+    // discards requests anyway. Slice 2 will revisit when the
+    // worker actually consumes the font ID to load font bytes.
+    let font_family_id: u8 = {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in atlas.manifest.font.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        (h & 0xff) as u8
+    };
     let mut layouts: Vec<LineLayout> = Vec::with_capacity(lines.len());
     let mut any_glyph = false;
     let mut any_ink = false;
@@ -632,6 +660,21 @@ pub fn layout_text_to_quads(
                 // skips without emitting.
                 (CharKind::Whitespace, 0.5)
             } else {
+                // Bug 3 Slice 1 part B (2026-05-19): static atlas
+                // missed this codepoint and it's not whitespace.
+                // Hand off to the runtime cache (if provided); the
+                // worker pool will rasterize asynchronously. Result
+                // is discarded for Slice 1 (worker stub never
+                // produces Ready) → fall through to Tofu. Slice 2
+                // will return CharKind::DynamicMsdf(slot) when the
+                // cache resolves to Ready.
+                if let Some(cache) = runtime_glyph_cache {
+                    let _ = cache.get_or_request(crate::glyph_cache::GlyphKey {
+                        font_family_id,
+                        codepoint: cp,
+                        render_mode: crate::glyph_cache::RenderMode::Msdf,
+                    });
+                }
                 // Tofu: deterministic missing-glyph rect counts as ink.
                 any_ink = true;
                 (CharKind::Tofu, 0.5)
@@ -4316,15 +4359,15 @@ mod tests {
     #[test]
     fn layout_text_to_quads_returns_none_for_empty() {
         let atlas = load_anton_atlas();
-        assert!(layout_text_to_quads(&atlas, None, "", 100.0, f32::INFINITY).is_none());
+        assert!(layout_text_to_quads(&atlas, None, "", 100.0, f32::INFINITY, None).is_none());
         // Spaces only -- no ink, returns None.
-        assert!(layout_text_to_quads(&atlas, None, "   ", 100.0, f32::INFINITY).is_none());
+        assert!(layout_text_to_quads(&atlas, None, "   ", 100.0, f32::INFINITY, None).is_none());
     }
 
     #[test]
     fn layout_text_to_quads_emits_one_quad_per_ink_glyph() {
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "AB", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, None, "AB", 100.0, f32::INFINITY, None)
             .expect("AB at 100px lays out");
         assert_eq!(group.quads.len(), 2);
         // Quads are in left-to-right order.
@@ -4364,7 +4407,7 @@ mod tests {
         let inset_x = 0.5 / atlas_w;
         let inset_y = 0.5 / atlas_h;
 
-        let group = layout_text_to_quads(&atlas, None, "A", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, None, "A", 100.0, f32::INFINITY, None)
             .expect("A lays out");
         let q = &group.quads[0];
         let a_glyph = atlas.manifest.glyph_for(b'A' as u32)
@@ -4408,8 +4451,8 @@ mod tests {
     #[test]
     fn layout_text_to_quads_scales_with_size_px() {
         let atlas = load_anton_atlas();
-        let small = layout_text_to_quads(&atlas, None, "A", 50.0, f32::INFINITY).expect("A@50");
-        let large = layout_text_to_quads(&atlas, None, "A", 500.0, f32::INFINITY).expect("A@500");
+        let small = layout_text_to_quads(&atlas, None, "A", 50.0, f32::INFINITY, None).expect("A@50");
+        let large = layout_text_to_quads(&atlas, None, "A", 500.0, f32::INFINITY, None).expect("A@500");
         // Pixel-space quad scales linearly with size_px (10x size_px
         // -> ~10x quad width).
         let small_w = small.quads[0].px_right - small.quads[0].px_left;
@@ -4420,7 +4463,7 @@ mod tests {
     #[test]
     fn layout_text_to_quads_multi_line_uses_two_baselines() {
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "A\nB", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, None, "A\nB", 100.0, f32::INFINITY, None)
             .expect("two-line lays out");
         assert_eq!(group.quads.len(), 2);
         // Second line's quad sits below the first line's quad in
@@ -4448,7 +4491,7 @@ mod tests {
         // ~0 and ink_ascent_em ~= cap height -- much less than the
         // 1.2 em-extent. bm_h should be visibly smaller than the
         // pre-Bug-1c em-based 1.2 * size_px = ~120 px.
-        let group = layout_text_to_quads(&atlas, None, "ABC", size_px, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, None, "ABC", size_px, f32::INFINITY, None)
             .expect("ABC lays out");
         let em_extent_px = (atlas.manifest.ascent_em
             - atlas.manifest.descent_em)
@@ -4488,9 +4531,9 @@ mod tests {
             atlas_rgb: inter.atlas_rgb,
         };
         let size_px = 100.0_f32;
-        let group_caps = layout_text_to_quads(&atlas, None, "ABC", size_px, f32::INFINITY)
+        let group_caps = layout_text_to_quads(&atlas, None, "ABC", size_px, f32::INFINITY, None)
             .expect("caps lays out");
-        let group_desc = layout_text_to_quads(&atlas, None, "Apy", size_px, f32::INFINITY)
+        let group_desc = layout_text_to_quads(&atlas, None, "Apy", size_px, f32::INFINITY, None)
             .expect("desc lays out");
         // Bug 1c: ink_descent_em from 'p' / 'y' descender lowers the
         // min, widening bm_h. Single-pixel rounding tolerance.
@@ -4526,9 +4569,9 @@ mod tests {
             atlas_rgb: inter.atlas_rgb,
         };
         let size_px = 100.0_f32;
-        let group_caps_caps = layout_text_to_quads(&atlas, None, "ABC\nABC", size_px, f32::INFINITY)
+        let group_caps_caps = layout_text_to_quads(&atlas, None, "ABC\nABC", size_px, f32::INFINITY, None)
             .expect("caps/caps lays out");
-        let group_caps_desc = layout_text_to_quads(&atlas, None, "ABC\npy", size_px, f32::INFINITY)
+        let group_caps_desc = layout_text_to_quads(&atlas, None, "ABC\npy", size_px, f32::INFINITY, None)
             .expect("caps/desc lays out");
         // The caps_desc variant has the SAME line stacking math
         // (two lines × line_h_px + last_extent) but last_extent is
@@ -4555,7 +4598,7 @@ mod tests {
         // bm_w would have been the full natural advance (since
         // group-level squish was deferred to box_to_ndc_quad).
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "ABCDE", 200.0, 100.0)
+        let group = layout_text_to_quads(&atlas, None, "ABCDE", 200.0, 100.0, None)
             .expect("ABCDE lays out");
         // pad=1 on each side; bm_w should be ~100 + 2.
         // Allow 1 px slack for ceil rounding.
@@ -4578,7 +4621,7 @@ mod tests {
         let atlas = load_anton_atlas();
         let size_px = 100.0_f32;
         // Get the per-line natural widths first (with infinity box).
-        let baseline = layout_text_to_quads(&atlas, None, "ABCDE\nAB", size_px, f32::INFINITY)
+        let baseline = layout_text_to_quads(&atlas, None, "ABCDE\nAB", size_px, f32::INFINITY, None)
             .expect("baseline 2-line lays out");
         let baseline_w = baseline.width;
         // Pick a box_w between AB's natural width and ABCDE's natural
@@ -4586,7 +4629,7 @@ mod tests {
         // floor to a round number; this should leave AB un-capped
         // (it's shorter than half-ABCDE for typical fonts).
         let box_w = baseline_w as f32 * 0.6;
-        let group = layout_text_to_quads(&atlas, None, "ABCDE\nAB", size_px, box_w)
+        let group = layout_text_to_quads(&atlas, None, "ABCDE\nAB", size_px, box_w, None)
             .expect("capped 2-line lays out");
         // bm_w should equal the larger of (capped ABCDE = box_w) and
         // (uncapped AB natural). For a typical font where AB <
@@ -4613,7 +4656,7 @@ mod tests {
         // as pre-Bug-4 layout. This preserves the host-test opt-out
         // contract.
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "ABCDE\nAB", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, None, "ABCDE\nAB", 100.0, f32::INFINITY, None)
             .expect("inf lays out");
         // Width should be > 0 and stable. Test mostly guards against
         // any future regression that decouples INFINITY from the
@@ -4621,7 +4664,7 @@ mod tests {
         assert!(group.width > 10);
         // bm_w with INFINITY equals bm_w with a very large finite
         // box_w (e.g. 1e7). Same layout regardless.
-        let huge = layout_text_to_quads(&atlas, None, "ABCDE\nAB", 100.0, 1e7_f32)
+        let huge = layout_text_to_quads(&atlas, None, "ABCDE\nAB", 100.0, 1e7_f32, None)
             .expect("huge lays out");
         assert_eq!(group.width, huge.width);
     }
@@ -4636,7 +4679,7 @@ mod tests {
         // falls through to MSDF (miss) then tofu. With an emoji atlas
         // supplied AND U+2603 in its entries the result would differ;
         // see layout_text_to_quads_emits_emoji_for_baked_codepoint.
-        let group = layout_text_to_quads(&atlas, None, "\u{2603}", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, None, "\u{2603}", 100.0, f32::INFINITY, None)
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
         assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
@@ -4663,7 +4706,7 @@ mod tests {
     fn layout_text_to_quads_emits_emoji_for_baked_codepoint() {
         let atlas = load_anton_atlas();
         let emoji = load_emoji_atlas_for_test();
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", 100.0, f32::INFINITY, None)
             .expect("emoji-only string lays out");
         assert_eq!(group.quads.len(), 1);
         match group.quads[0].kind {
@@ -4687,7 +4730,7 @@ mod tests {
         // Same codepoint as above but no emoji atlas supplied -- the
         // dispatch should hit the MSDF-miss path and emit tofu,
         // identical to pre-C.3 behavior.
-        let group = layout_text_to_quads(&atlas, None, "\u{1F31F}", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, None, "\u{1F31F}", 100.0, f32::INFINITY, None)
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
         assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
@@ -4698,7 +4741,7 @@ mod tests {
         let atlas = load_anton_atlas();
         let emoji = load_emoji_atlas_for_test();
         // "A🌟B" -- two MSDF glyphs flanking an emoji.
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "A\u{1F31F}B", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "A\u{1F31F}B", 100.0, f32::INFINITY, None)
             .expect("mixed run lays out");
         assert_eq!(group.quads.len(), 3);
         assert_eq!(group.quads[0].kind, GlyphKind::Msdf);
@@ -4717,7 +4760,7 @@ mod tests {
         let atlas = load_anton_atlas();
         let emoji = load_emoji_atlas_for_test();
         let size_px = 100.0;
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", size_px, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", size_px, f32::INFINITY, None)
             .expect("emoji lays out");
         let q = &group.quads[0];
         let w = q.px_right - q.px_left;
@@ -4746,7 +4789,7 @@ mod tests {
         // OUTSIDE the ui/styles.css declared ranges. The browser
         // wouldn't render this from Noto Color Emoji either; we
         // mirror that fallback for parity.
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{2B50}", 100.0, f32::INFINITY)
+        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{2B50}", 100.0, f32::INFINITY, None)
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
         assert_eq!(group.quads[0].kind, GlyphKind::Tofu);

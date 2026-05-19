@@ -9126,6 +9126,7 @@ fn paint_slide_with_viewport(
                             &wrapped,
                             size_px,
                             max_width_px,
+                            None,
                         )
                     });
                 if let Some(g) = group.as_ref() {

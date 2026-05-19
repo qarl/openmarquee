@@ -81,16 +81,21 @@ impl AtlasPage {
                 .create_texture()
                 .map_err(|e| anyhow!("create_texture: {e}"))?;
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            // Allocate texture storage with transparent-black pixels.
-            // For 2048×2048×4 bytes = 16 MB; allocated once per page
-            // lifetime; subsequent updates use glTexSubImage2D.
-            let zero = vec![0u8; (ATLAS_DIM * ATLAS_DIM * 4) as usize];
+            // Allocate texture storage without uploading initial
+            // pixels (GLES2 lets pixels=NULL just reserve driver-
+            // side storage). 16 MB CPU heap + 16 MB upload at
+            // bring-up was eating 150-300 ms per EglSession on Pi
+            // Zero 2 W (smoke regression caught 2026-05-19, slice
+            // 1 part B). Uninitialized contents are fine: every
+            // dynamic slot is written via glTexSubImage2D before
+            // it's sampled, and unwritten slots are never sampled
+            // (allocate_slot tracks the high-water mark).
             gl.tex_image_2d(
                 glow::TEXTURE_2D, 0,
                 glow::RGBA as i32,
                 ATLAS_DIM as i32, ATLAS_DIM as i32, 0,
                 glow::RGBA, glow::UNSIGNED_BYTE,
-                Some(&zero),
+                None,
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
