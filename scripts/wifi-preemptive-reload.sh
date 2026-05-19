@@ -34,18 +34,37 @@ ts() { date -Iseconds; }
 
 echo "$(ts): start preemptive brcmfmac reload" >> "$LOG"
 
-# modprobe -r (rather than plain rmmod) recursively unloads
-# dependent modules. On modern Pi OS (kernel 6.x), brcmfmac has
-# a brcmfmac_wcc dependent for worldwide-regulatory compliance;
-# plain rmmod fails with "Module brcmfmac is in use by:
-# brcmfmac_wcc". modprobe -r walks the dep tree.
+# Three-step unload sequence:
+#   (1) ip link set wlan0 down — releases NetworkManager's hold on
+#       the interface so the kernel module's refcount drops.
+#   (2) modprobe -r brcmfmac — recursively unloads brcmfmac plus
+#       its dependent brcmfmac_wcc (worldwide regulatory compliance,
+#       pins brcmfmac on modern Pi OS kernels).
+#   (3) modprobe brcmfmac — reload; NM picks up the fresh wlan0 +
+#       re-associates per its saved connection profile.
 #
-# No -f (force); a stuck firmware can hang the kernel on forced
-# unload on vc4.
+# No -f on modprobe -r; forced unload of a stuck firmware can hang
+# the kernel on vc4. If the unload fails, exit non-zero so cron
+# logs it; watchdog (option 1) will catch any resulting
+# connectivity loss within ~3 min.
+
+if ip link set wlan0 down 2>>"$LOG"; then
+    echo "$(ts): ip link set wlan0 down OK" >> "$LOG"
+else
+    echo "$(ts): ip link set wlan0 down FAILED" >> "$LOG"
+    exit 1
+fi
+
+# Brief pause for NetworkManager to release the wlan0 ref. NM's
+# inotify-driven state machine usually sees the link-down within
+# a few hundred ms.
+sleep 1
+
 if modprobe -r brcmfmac 2>>"$LOG"; then
     echo "$(ts): modprobe -r brcmfmac OK" >> "$LOG"
 else
-    echo "$(ts): modprobe -r brcmfmac FAILED; module may be busy" >> "$LOG"
+    echo "$(ts): modprobe -r brcmfmac FAILED; bringing wlan0 back up + exiting" >> "$LOG"
+    ip link set wlan0 up 2>>"$LOG" || true
     exit 1
 fi
 
