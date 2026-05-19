@@ -80,6 +80,13 @@ pub const CELL_PX: u32 = 48;
 /// codepoint is truly exotic.
 pub const FALLBACK_FONT_STEMS: &[&str] = &["dejavu-sans"];
 
+/// Bug 3 Slice 3B: stem of the COLRv1 emoji font for the runtime
+/// cache dispatch (hdmi_logic.rs's layout_text_to_quads). Pairs
+/// with `RenderMode::Colr` on the GlyphKey. The TTF lives at
+/// `<fonts_dir>/<stem>.ttf` (gitignored, fetched at setup time
+/// via scripts/download-emoji-font-colrv1.sh).
+pub const COLR_EMOJI_FONT_STEM: &str = "noto-color-emoji-colrv1";
+
 /// Bug 3 Slice 2D: derive a font_family_id from a font stem via
 /// FNV-1a's low 32 bits. Matches the dispatch hook's identity-keying
 /// at hdmi_logic.rs (which hashes atlas.manifest.font the same way),
@@ -416,7 +423,8 @@ impl GlyphCache {
     pub fn poll_completions(
         &mut self,
         gl: &glow::Context,
-        page: &mut AtlasPage,
+        msdf_page: &mut AtlasPage,
+        colr_page: &mut AtlasPage,
         max_uploads_per_call: usize,
     ) -> usize {
         let mut count = 0;
@@ -429,12 +437,25 @@ impl GlyphCache {
                     advance_em,
                     plane_bounds,
                 }) => {
+                    // Bug 3 Slice 3B (2026-05-19): route the upload
+                    // to the page matching this completion's render
+                    // mode. MSDF cells are 48 px on the msdf_page;
+                    // COLRv1 cells are 96 px on the colr_page (the
+                    // two pages have different cell_px so cells
+                    // cannot share a slot allocator). The completion
+                    // already carries cell_px so we trust the worker's
+                    // size match rather than re-deriving from the
+                    // page's cell_px.
+                    let page = match key.render_mode {
+                        RenderMode::Msdf => &mut *msdf_page,
+                        RenderMode::Colr => &mut *colr_page,
+                    };
                     let Some(slot_pos) = page.allocate_slot() else {
                         // Page full; Slice 1.x will add eviction.
                         // For now, drop the completion; the slot
                         // entry stays Requested/Generating until
                         // restart.
-                        eprintln!("glyph_cache: atlas page full; dropping completion for {:?}", key);
+                        eprintln!("glyph_cache: atlas page full ({:?}); dropping completion for {:?}", key.render_mode, key);
                         continue;
                     };
                     if let Err(e) = page.upload_slot(

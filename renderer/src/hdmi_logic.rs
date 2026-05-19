@@ -450,6 +450,13 @@ pub enum GlyphKind {
     /// dynamic-atlas texture via a thread_local (mirrors the static
     /// MSDF atlas lookup pattern in hdmi.rs).
     DynamicMsdf,
+    /// Bug 3 Slice 3B: runtime-COLRv1 emoji glyph from the dynamic
+    /// COLR atlas page (separate from DynamicMsdf — 96 px cells vs
+    /// 48 px for MSDF). Same UV semantics as DynamicMsdf relative
+    /// to the dynamic page; draw side binds the COLR page texture
+    /// via a parallel thread_local + uses the FS_EMOJI fragment
+    /// shader (RGBA passthrough — same as the static CBDT path).
+    DynamicEmoji,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -606,11 +613,34 @@ pub fn layout_text_to_quads(
             plane_bounds: crate::glyph_cache::PlaneBounds,
             cell_px: u32,
         },
+        /// Bug 3 Slice 3B: runtime-cached COLRv1 emoji glyph. The
+        /// slot position (in dynamic-COLR-atlas pixels) + per-glyph
+        /// metrics come from the cache's SlotState::Ready. Pass-2
+        /// emits MsdfQuad with kind=GlyphKind::DynamicEmoji using
+        /// the same em-cell-centered geometry as the static Emoji
+        /// path (square cell, centered on the em-height). UVs come
+        /// from slot.{x,y} / ATLAS_DIM, mirroring DynamicMsdf.
+        DynamicEmoji {
+            slot: crate::atlas_page::SlotPos,
+            advance_em: f32,
+            cell_px: u32,
+        },
     }
     struct LineLayout {
         // (codepoint, advance_em, char_kind).
         chars: Vec<(u32, f32, CharKind)>,
         advance_em: f32,
+    }
+    // Bug 3 Slice 3B: COLR cache resolution sentinel. Ready carries
+    // the atlas slot + advance for emit; Pending means the worker
+    // is mid-rasterization and we should render Tofu this frame
+    // (next layout re-dispatches after slide_caches drain).
+    enum ColrResolution {
+        Ready {
+            slot: crate::atlas_page::SlotPos,
+            advance_em: f32,
+        },
+        Pending,
     }
     // Emoji-atlas source PPEM as f32 for advance scaling. None when
     // no emoji atlas supplied (host tests / pre-C.3 callers).
@@ -656,6 +686,62 @@ pub fn layout_text_to_quads(
                 None
             };
 
+            // Bug 3 Slice 3B (2026-05-19): runtime COLRv1 dispatch.
+            // After static-CBDT miss, before static-MSDF, try the
+            // runtime cache for codepoints in the emoji range. The
+            // COLRv1 font (NotoColorEmoji-COLRv1) covers a different
+            // codepoint set than the static CBDT bake (which is
+            // build-time-pinned to a subset for binary-size
+            // reasons), so this fires for the long tail of emoji
+            // codepoints that the bake doesn't carry. On COLR
+            // FontMissing (font lacks the cp) we fall through to
+            // the existing static MSDF + DynamicMsdf fallback chain
+            // -- so non-emoji-range chars never reach this branch
+            // and emoji-range chars not in the COLRv1 font end up
+            // on the MSDF DejaVu fallback.
+            //
+            // Pending state (Requested/Generating/None on first
+            // encounter): render Tofu THIS frame; the worker's
+            // FontMissing or Ready completion will invalidate
+            // slide_caches and the next layout will resolve.
+            let colr_dispatch = if is_whitespace {
+                None
+            } else if !crate::sdf_atlas_emoji::codepoint_is_emoji_range(cp) {
+                None
+            } else {
+                runtime_glyph_cache.as_ref().and_then(|rt| {
+                    let stem = crate::glyph_cache::COLR_EMOJI_FONT_STEM;
+                    let font_id =
+                        crate::glyph_cache::font_family_id_from_stem(stem);
+                    let font_path = rt.fonts_dir.join(format!("{}.ttf", stem));
+                    let state = rt.cache.get_or_request(
+                        crate::glyph_cache::GlyphKey {
+                            font_family_id: font_id,
+                            codepoint: cp,
+                            render_mode: crate::glyph_cache::RenderMode::Colr,
+                        },
+                        font_path,
+                    );
+                    match state {
+                        Some(crate::glyph_cache::SlotState::Ready {
+                            slot,
+                            advance_em,
+                            plane_bounds: _,
+                        }) => Some(ColrResolution::Ready { slot, advance_em }),
+                        Some(crate::glyph_cache::SlotState::FontMissing) => {
+                            // Fall through to MSDF fallback chain.
+                            None
+                        }
+                        Some(crate::glyph_cache::SlotState::Requested)
+                        | Some(crate::glyph_cache::SlotState::Generating)
+                        | None => {
+                            // Worker pending — render Tofu this frame.
+                            Some(ColrResolution::Pending)
+                        }
+                    }
+                })
+            };
+
             let (kind, adv) = if let Some(ee) = emoji_entry {
                 // Emoji advance in em: CBDT advance_px at source_ppem,
                 // normalized to em (1 em = source_ppem px in the CBDT
@@ -664,6 +750,27 @@ pub fn layout_text_to_quads(
                 let adv_em = ee.advance_px as f32 / ppem;
                 any_ink = true;
                 (CharKind::Emoji(ee), adv_em)
+            } else if let Some(ColrResolution::Ready { slot, advance_em }) = colr_dispatch {
+                // Bug 3 Slice 3B: COLRv1 cache hit (Ready). Advance
+                // is the COLRv1 font's hmtx-derived advance in em
+                // (units_per_em normalized). Cell px = COLR_CELL_PX
+                // (96, matches the CBDT cell size so the on-screen
+                // emoji geometry matches the static path).
+                any_ink = true;
+                (
+                    CharKind::DynamicEmoji {
+                        slot,
+                        advance_em,
+                        cell_px: crate::glyph_cache_colr::COLR_CELL_PX,
+                    },
+                    advance_em,
+                )
+            } else if matches!(colr_dispatch, Some(ColrResolution::Pending)) {
+                // Bug 3 Slice 3B: COLRv1 worker pending. Render
+                // Tofu this frame; slide_caches drains on completion
+                // and the next layout re-dispatches.
+                any_ink = true;
+                (CharKind::Tofu, 0.5)
             } else if let Some(g) = manifest.glyph_for(cp).cloned() {
                 // MSDF path: existing semantics.
                 let adv_em = g.advance_em;
@@ -841,7 +948,9 @@ pub fn layout_text_to_quads(
                 {
                     (plane_bounds.pl_top, plane_bounds.pl_bottom)
                 }
-                CharKind::Emoji(_) | CharKind::Tofu => (ascent_em, descent_em),
+                CharKind::Emoji(_)
+                | CharKind::DynamicEmoji { .. }
+                | CharKind::Tofu => (ascent_em, descent_em),
                 _ => continue,
             };
             if top_em > ink_ascent_em {
@@ -1083,6 +1192,45 @@ pub fn layout_text_to_quads(
                         uv_right: uv_r,
                         uv_bottom: uv_b,
                         kind: GlyphKind::Emoji { page: ee.page },
+                    });
+                }
+                CharKind::DynamicEmoji { slot, advance_em: _, cell_px: dyn_cell_px } => {
+                    // Bug 3 Slice 3B (2026-05-19): same on-screen
+                    // geometry as the static Emoji branch (square
+                    // cell at em-height, centered horizontally +
+                    // vertically) but with UVs sourced from the
+                    // dynamic-COLR atlas page (2048×2048, see
+                    // atlas_page::ATLAS_DIM) and cell_px = 96
+                    // (COLR_CELL_PX matches build.rs EMOJI_CELL_PX
+                    // exactly so the on-screen size matches the
+                    // CBDT path one-to-one). Slice 3D will retire
+                    // the static path; this geometry already
+                    // matches so no resize ripple.
+                    let cell_w_px = emoji_cell_em * x_size_px;
+                    let cell_h_px = emoji_cell_em * size_px;
+                    let center_x = cursor_x + adv_px * 0.5;
+                    let center_y =
+                        baseline_y - (ascent_em + descent_em) * 0.5 * size_px;
+                    let px_l = center_x - cell_w_px * 0.5;
+                    let px_r = center_x + cell_w_px * 0.5;
+                    let px_t = center_y - cell_h_px * 0.5;
+                    let px_b = center_y + cell_h_px * 0.5;
+                    let atlas_dim_f = crate::atlas_page::ATLAS_DIM as f32;
+                    let cp_f = *dyn_cell_px as f32;
+                    let uv_l = (slot.x as f32 + INSET_PX) / atlas_dim_f;
+                    let uv_r = (slot.x as f32 + cp_f - INSET_PX) / atlas_dim_f;
+                    let uv_t = (slot.y as f32 + INSET_PX) / atlas_dim_f;
+                    let uv_b = (slot.y as f32 + cp_f - INSET_PX) / atlas_dim_f;
+                    quads.push(MsdfQuad {
+                        px_left: px_l,
+                        px_top: px_t,
+                        px_right: px_r,
+                        px_bottom: px_b,
+                        uv_left: uv_l,
+                        uv_top: uv_t,
+                        uv_right: uv_r,
+                        uv_bottom: uv_b,
+                        kind: GlyphKind::DynamicEmoji,
                     });
                 }
                 CharKind::Whitespace => {

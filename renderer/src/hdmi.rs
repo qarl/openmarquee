@@ -400,7 +400,17 @@ pub struct EglSession<'a> {
     /// dynamic_atlas_page, and ●/∞/etc. start resolving to real
     /// glyphs after a ~250 ms p99 first-encounter latency.
     dynamic_glyph_cache: crate::glyph_cache::GlyphCache,
-    dynamic_atlas_page: crate::atlas_page::AtlasPage,
+    /// Bug 3 Slice 2B: dynamic atlas page for runtime-MSDF glyphs
+    /// (48 px cells matching CELL_PX). Drawn by GlyphKind::DynamicMsdf.
+    dynamic_atlas_page_msdf: crate::atlas_page::AtlasPage,
+    /// Bug 3 Slice 3B: dynamic atlas page for COLRv1-rasterized emoji
+    /// (96 px cells matching COLR_CELL_PX + the static CBDT bake's
+    /// EMOJI_CELL_PX). Different cell_px from the MSDF page so the
+    /// two cannot share a slot allocator; the poll_completions upload
+    /// dispatch routes Ready completions by GlyphKey::render_mode.
+    /// Drawn by GlyphKind::DynamicEmoji using the FS_EMOJI shader
+    /// (same RGBA passthrough as the static CBDT path).
+    dynamic_atlas_page_colr: crate::atlas_page::AtlasPage,
     /// Bug 3 Slice 2B: directory the cache worker reads TTF bytes
     /// from. Defaults to the FYS deploy path
     /// (`/opt/openmarquee/ui/fonts`) which matches the IPC sidecar's
@@ -601,7 +611,16 @@ where
         // (after GL context is current) to set up the GPU-resident
         // 2048×2048 RGBA8 backing texture.
         dynamic_glyph_cache: crate::glyph_cache::GlyphCache::new(4),
-        dynamic_atlas_page: crate::atlas_page::AtlasPage::new(48),
+        dynamic_atlas_page_msdf: crate::atlas_page::AtlasPage::new(
+            crate::glyph_cache::CELL_PX,
+        ),
+        // Bug 3 Slice 3B: 96 px matches both CBDT (build.rs
+        // EMOJI_CELL_PX) and the COLRv1 rasterizer's COLR_CELL_PX so
+        // Slice 3D's CBDT retirement can drop into the same page
+        // shape without a re-layout of the dynamic-emoji UV math.
+        dynamic_atlas_page_colr: crate::atlas_page::AtlasPage::new(
+            crate::glyph_cache_colr::COLR_CELL_PX,
+        ),
         dynamic_fonts_dir: std::path::PathBuf::from("/opt/openmarquee/ui/fonts"),
     };
 
@@ -626,17 +645,30 @@ where
     // Failure semantics: non-fatal — if the dynamic atlas can't
     // initialize, Slice 2's runtime cache-miss path will just keep
     // returning Tofu (the existing pre-Bug-3 behavior). Log + continue.
-    if let Err(e) = session.dynamic_atlas_page.allocate_texture(&gl) {
+    if let Err(e) = session.dynamic_atlas_page_msdf.allocate_texture(&gl) {
         eprintln!(
-            "warn: dynamic atlas page texture alloc failed: {e}; \
-             runtime glyph cache disabled this session",
+            "warn: dynamic MSDF atlas page texture alloc failed: {e}; \
+             runtime MSDF cache disabled this session",
         );
-    } else if let Some(tex) = session.dynamic_atlas_page.texture() {
+    } else if let Some(tex) = session.dynamic_atlas_page_msdf.texture() {
         // Bug 3 Slice 2B: publish the texture handle so
         // draw_text_layer_msdf can bind it for GlyphKind::DynamicMsdf
         // quads. Cleared in the teardown block below before the
         // texture is deleted.
         populate_dynamic_atlas_lookup(tex);
+    }
+
+    // Bug 3 Slice 3B (2026-05-19): parallel allocation for the
+    // COLRv1-rasterized emoji page. Same failure semantics — if
+    // alloc fails, runtime emoji rasterization yields Tofu (Slice 1
+    // pre-cache behavior); static CBDT path keeps working.
+    if let Err(e) = session.dynamic_atlas_page_colr.allocate_texture(&gl) {
+        eprintln!(
+            "warn: dynamic COLR atlas page texture alloc failed: {e}; \
+             runtime COLRv1 emoji cache disabled this session",
+        );
+    } else if let Some(tex) = session.dynamic_atlas_page_colr.texture() {
+        populate_dynamic_atlas_colr_lookup(tex);
     }
 
     // SDF arc slice C.2 -- decode + upload the Noto Color Emoji
@@ -722,7 +754,11 @@ where
     // path can't bind a stale NativeTexture handle on a subsequent
     // session bring-up before populate_dynamic_atlas_lookup re-fires.
     clear_dynamic_atlas_lookup();
-    session.dynamic_atlas_page.delete(&gl);
+    session.dynamic_atlas_page_msdf.delete(&gl);
+    // Bug 3 Slice 3B: same lookup-clear-before-delete ordering for
+    // the COLRv1 page.
+    clear_dynamic_atlas_colr_lookup();
+    session.dynamic_atlas_page_colr.delete(&gl);
     clear_transition_program_cache(&gl);
     clear_transition_sp_program_cache(&gl);
     clear_composite_program_cache(&gl);
@@ -1389,7 +1425,8 @@ fn render_animated_slide_in_session(
             // through this function) is the qarl-visible case.
             let uploaded = session.dynamic_glyph_cache.poll_completions(
                 session.gl,
-                &mut session.dynamic_atlas_page,
+                &mut session.dynamic_atlas_page_msdf,
+                &mut session.dynamic_atlas_page_colr,
                 4,
             );
             if uploaded > 0 {
@@ -2112,6 +2149,13 @@ fn draw_text_layer_msdf(
     // with the static-MSDF batch -- the SDF math is identical;
     // only the bound texture differs).
     let mut dynamic_ink_verts: Vec<f32> = Vec::new();
+    // Bug 3 Slice 3B (2026-05-19): runtime COLRv1 emoji quads. Same
+    // vert layout as ink_verts but UVs are atlas-space within the
+    // 2048×2048 dynamic-COLR atlas page. Drawn against
+    // DYNAMIC_ATLAS_COLR_LOOKUP's texture in a separate batch
+    // (FS_EMOJI program — same shader the static CBDT path uses;
+    // only the bound texture differs).
+    let mut dynamic_emoji_verts: Vec<f32> = Vec::new();
     // BTreeMap (not HashMap) so multi-page emoji draws iterate in
     // page-index order -- gives goldens a deterministic draw order
     // when an emoji-bearing text touches multiple atlas pages.
@@ -2179,12 +2223,32 @@ fn draw_text_layer_msdf(
                     xr, yt, ur, ut,
                 ]);
             }
+            GlyphKind::DynamicEmoji => {
+                // Bug 3 Slice 3B (2026-05-19): emit into the dynamic-
+                // COLR vertex buffer (drawn against the COLR atlas
+                // page texture via FS_EMOJI shader — same RGBA
+                // passthrough as the static Emoji path; only the
+                // bound texture differs).
+                let ul = q.uv_left;
+                let ur = q.uv_right;
+                let ut = q.uv_top;
+                let ub = q.uv_bottom;
+                dynamic_emoji_verts.extend_from_slice(&[
+                    xl, yb, ul, ub,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yb, ur, ub,
+                    xl, yt, ul, ut,
+                    xr, yt, ur, ut,
+                ]);
+            }
         }
     }
     if ink_verts.is_empty()
         && tofu_verts.is_empty()
         && emoji_per_page.is_empty()
         && dynamic_ink_verts.is_empty()
+        && dynamic_emoji_verts.is_empty()
     {
         return Ok(());
     }
@@ -2429,6 +2493,53 @@ fn draw_text_layer_msdf(
                 gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
                 gl.disable_vertex_attrib_array(a_pos);
                 gl.disable_vertex_attrib_array(a_uv);
+                gl.delete_buffer(vbo);
+            }
+        }
+
+        // Batch 5 (Bug 3 Slice 3B, 2026-05-19): runtime COLRv1
+        // emoji glyphs. Same FS_EMOJI program as the static-CBDT
+        // batch (RGBA passthrough — only the bound texture differs).
+        // If the dynamic-COLR atlas texture isn't bound this session
+        // (allocate_texture failed at bring-up), skip the draw
+        // rather than fall through — layout side already committed
+        // to dynamic-emoji geometry for these quads, and emitting
+        // tofu now would have the wrong bounds.
+        if !dynamic_emoji_verts.is_empty() {
+            if let Some(dyn_colr_tex) = dynamic_atlas_colr_tex() {
+                let egp = cached_emoji_program(gl)?;
+                let vbo = gl
+                    .create_buffer()
+                    .map_err(|e| anyhow!("glGenBuffers (dynamic emoji): {e}"))?;
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let bytes = std::slice::from_raw_parts(
+                    dynamic_emoji_verts.as_ptr() as *const u8,
+                    dynamic_emoji_verts.len() * std::mem::size_of::<f32>(),
+                );
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+
+                gl.use_program(Some(egp.program));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(dyn_colr_tex));
+                gl.uniform_1_i32(egp.u_atlas.as_ref(), 0);
+                gl.uniform_1_f32(egp.u_opacity.as_ref(), opacity);
+
+                let stride = (4 * std::mem::size_of::<f32>()) as i32;
+                gl.enable_vertex_attrib_array(egp.a_pos);
+                gl.vertex_attrib_pointer_f32(egp.a_pos, 2, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(egp.a_uv);
+                gl.vertex_attrib_pointer_f32(
+                    egp.a_uv,
+                    2,
+                    glow::FLOAT,
+                    false,
+                    stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
+                );
+                let vert_count = (dynamic_emoji_verts.len() / 4) as i32;
+                gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
+                gl.disable_vertex_attrib_array(egp.a_pos);
+                gl.disable_vertex_attrib_array(egp.a_uv);
                 gl.delete_buffer(vbo);
             }
         }
@@ -2764,7 +2875,8 @@ pub fn paint_and_present_one_frame_for_slide(
     // per session, so a few cache rebuilds per session at most).
     let uploaded = session.dynamic_glyph_cache.poll_completions(
         session.gl,
-        &mut session.dynamic_atlas_page,
+        &mut session.dynamic_atlas_page_msdf,
+        &mut session.dynamic_atlas_page_colr,
         4,
     );
     if uploaded > 0 {
@@ -4578,7 +4690,8 @@ pub fn capture_slide_to_png(
             while std::time::Instant::now() < deadline {
                 let _n = session.dynamic_glyph_cache.poll_completions(
                     session.gl,
-                    &mut session.dynamic_atlas_page,
+                    &mut session.dynamic_atlas_page_msdf,
+                    &mut session.dynamic_atlas_page_colr,
                     4,
                 );
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -8000,13 +8113,19 @@ fn clear_msdf_lookup() {
 // =====================================================================
 //
 // Mirrors MSDF_ATLAS_LOOKUP's thread_local pattern for the runtime-
-// rasterized atlas page. Populated at session bring-up after the
-// EglSession's `dynamic_atlas_page.allocate_texture(&gl)` succeeds;
-// cleared at session teardown BEFORE `dynamic_atlas_page.delete(&gl)`
-// so a stale handle can't outlive its NativeTexture. Slice 1.x will
-// extend to a Vec when LRU eviction adds multi-page support.
+// rasterized atlas pages. Two pages: MSDF cells (48 px) and COLRv1
+// cells (96 px). Populated at session bring-up after each AtlasPage's
+// `allocate_texture(&gl)` succeeds; cleared at session teardown
+// BEFORE the corresponding `delete(&gl)` so a stale handle can't
+// outlive its NativeTexture. Slice 1.x will extend to Vec when LRU
+// eviction adds multi-page support.
 std::thread_local! {
     static DYNAMIC_ATLAS_LOOKUP: std::cell::RefCell<Option<glow::NativeTexture>> =
+        const { std::cell::RefCell::new(None) };
+    // Bug 3 Slice 3B (2026-05-19): separate page for COLRv1-rasterized
+    // emoji cells. Same thread_local pattern; the draw path picks
+    // between LOOKUPs by GlyphKind::DynamicMsdf vs DynamicEmoji.
+    static DYNAMIC_ATLAS_COLR_LOOKUP: std::cell::RefCell<Option<glow::NativeTexture>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -8020,6 +8139,18 @@ fn clear_dynamic_atlas_lookup() {
 
 fn dynamic_atlas_tex() -> Option<glow::NativeTexture> {
     DYNAMIC_ATLAS_LOOKUP.with(|c| *c.borrow())
+}
+
+fn populate_dynamic_atlas_colr_lookup(tex: glow::NativeTexture) {
+    DYNAMIC_ATLAS_COLR_LOOKUP.with(|c| *c.borrow_mut() = Some(tex));
+}
+
+fn clear_dynamic_atlas_colr_lookup() {
+    DYNAMIC_ATLAS_COLR_LOOKUP.with(|c| *c.borrow_mut() = None);
+}
+
+fn dynamic_atlas_colr_tex() -> Option<glow::NativeTexture> {
+    DYNAMIC_ATLAS_COLR_LOOKUP.with(|c| *c.borrow())
 }
 
 /// Resolve a `font_family` string (schema-level) to its baked atlas
