@@ -5485,6 +5485,13 @@ unsafe fn make_slide_fbo(
     motion_states: Option<&[MotionState]>,
     glyph_cache: Option<&mut GlyphCache>,
     tex_cache: Option<&mut TextureCache>,
+    // Bug 3 Slice 2D-fp4 (2026-05-19): runtime glyph cache + fonts
+    // dir, threaded through so the bake-time layout dispatch can
+    // resolve static-atlas misses (●/∞ on FYS Boot, etc.) to the
+    // dynamic-MSDF cache. None opt-out for standalone HDMI helpers
+    // (render_fade_composite, render_transition_animated_in_session
+    // legacy 3-pass path) which run outside a session.
+    runtime_glyph_ctx: Option<crate::glyph_cache::RuntimeGlyphCtx<'_>>,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
     let tex = gl
@@ -5570,7 +5577,18 @@ unsafe fn make_slide_fbo(
         glyph_cache,
         None,  // image_bg_cache: standalone bake, no session
         tex_cache,
-        None,  // bake path: no runtime glyph cache (session-bound)
+        // Bug 3 Slice 2D-fp4 (2026-05-19): thread the runtime
+        // glyph cache so the bake-time layout dispatch can
+        // resolve ●/∞-style static-atlas-miss codepoints to
+        // dynamic-MSDF cells. Pre-fp4 passed None here with a
+        // "session-bound" rationale — that was wrong; the IPC
+        // sidecar's bake path (paint_and_present_one_transition_
+        // frame → bake_slide_to_fbo → make_slide_fbo) IS
+        // session-bound and was silently caching Tofu placeholders
+        // for every dynamic-cache codepoint, never enqueuing the
+        // MissRequest the drain machinery in paint_and_present
+        // needs to invalidate.
+        runtime_glyph_ctx,
     );
     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
     if let Err(e) = paint_result {
@@ -5783,6 +5801,21 @@ unsafe fn bake_slide_to_fbo(
                     .slide_caches
                     .insert(slide_id, SlideRenderCache::new(layers_len));
             }
+            // Bug 3 Slice 2D-fp4 (2026-05-19): construct the runtime
+            // glyph cache context BEFORE the mutable borrow of
+            // session.slide_caches below. RuntimeGlyphCtx holds
+            // shared refs into session.dynamic_glyph_cache +
+            // session.dynamic_fonts_dir; the mutable borrow of
+            // session.slide_caches is a DIFFERENT field, so Rust's
+            // disjoint-field-borrow checking lets both live
+            // simultaneously. Threading from the caller would
+            // require splitting session into per-field args; this
+            // inline construction is identical in effect with less
+            // signature churn.
+            let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
+                cache: &session.dynamic_glyph_cache,
+                fonts_dir: &session.dynamic_fonts_dir,
+            });
             let cache = session
                 .slide_caches
                 .get_mut(&slide_id)
@@ -5796,6 +5829,7 @@ unsafe fn bake_slide_to_fbo(
                 motion_states,
                 Some(&mut cache.glyph),
                 Some(&mut cache.tex),
+                runtime_glyph_ctx,
             )
         }
         SlideBakeInputs::Image { asset_path } => {
@@ -5966,8 +6000,15 @@ pub fn render_fade_composite(
             // Phase 4w (831f471, 2026-05-16) audit confirmed this site
             // needs no change (the legacy 3-pass path was already
             // motion-correct since 2b0cbef).
-            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None, None)?;
-            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None, None) {
+            // fp4 NOTE: render_fade_composite is a standalone HDMI
+            // helper with no session in scope. The dynamic glyph
+            // cache is session-owned, so this path opts out (None).
+            // Slides with codepoints outside the static MSDF atlas
+            // will Tofu here — acceptable since this helper is
+            // exercised by direct-mode CLI invocations + tests, not
+            // the IPC sidecar production reel.
+            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None, None, None)?;
+            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -6237,9 +6278,15 @@ fn render_transition_animated_in_session(
         // Path activates when SP+SB eligibility both fail (pattern
         // bg / outline / non-normal blend / >6 layers per side) under
         // direct-driver mode, not under the IPC sidecar.
-        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None, None)? };
+        // fp4 NOTE: this is the direct-driver legacy 3-pass
+        // fallback inside render_transition_animated_in_session
+        // — does NOT activate under the IPC sidecar. Production
+        // reel transition baking goes through bake_slide_to_fbo
+        // which DOES thread runtime_glyph_ctx (above). Leaving
+        // None here preserves the legacy path's behavior.
+        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None, None, None)? };
         let (fbo_b, tex_b) = unsafe {
-            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None, None) {
+            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
