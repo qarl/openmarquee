@@ -34,15 +34,18 @@ ts() { date -Iseconds; }
 
 echo "$(ts): start preemptive brcmfmac reload" >> "$LOG"
 
-# rmmod will fail if the module is in use by an active interface.
-# In practice wlan0 is always up; the rmmod -f path isn't safe on
-# vc4 (kernel can hang on a stuck firmware). Standard rmmod handles
-# the normal case where wpa_supplicant + NetworkManager release
-# their handles cleanly.
-if rmmod brcmfmac 2>>"$LOG"; then
-    echo "$(ts): rmmod brcmfmac OK" >> "$LOG"
+# modprobe -r (rather than plain rmmod) recursively unloads
+# dependent modules. On modern Pi OS (kernel 6.x), brcmfmac has
+# a brcmfmac_wcc dependent for worldwide-regulatory compliance;
+# plain rmmod fails with "Module brcmfmac is in use by:
+# brcmfmac_wcc". modprobe -r walks the dep tree.
+#
+# No -f (force); a stuck firmware can hang the kernel on forced
+# unload on vc4.
+if modprobe -r brcmfmac 2>>"$LOG"; then
+    echo "$(ts): modprobe -r brcmfmac OK" >> "$LOG"
 else
-    echo "$(ts): rmmod brcmfmac FAILED; module may be busy" >> "$LOG"
+    echo "$(ts): modprobe -r brcmfmac FAILED; module may be busy" >> "$LOG"
     exit 1
 fi
 
