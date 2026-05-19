@@ -77,6 +77,13 @@ nix = { version = "0.29", features = ["ioctl"], default-features = false }
 [dev-dependencies]
 # Integration tests for content.rs's file-IO wrappers.
 tempfile = "3"
+# Bug 3 Slice 2 prep (2026-05-19): bench_msdfgen example uses
+# msdfgen + ttf-parser to time per-glyph SDF generation at runtime.
+# Mirrors the [build-dependencies] versions so the example exercises
+# the same code path build.rs uses. Dev-only — not linked into the
+# runtime binary.
+msdfgen = { version = "0.2", features = ["ttf-parser"] }
+ttf-parser = "0.18"
 
 # SDF arc slice A — build-time MSDF atlas generation. msdfgen is a
 # safe Rust wrapper around Chlumsky's C++ msdfgen (vendored in
