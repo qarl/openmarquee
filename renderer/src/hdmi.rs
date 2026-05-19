@@ -4493,6 +4493,26 @@ pub fn capture_slide_to_png(
     with_egl_session(card, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
+        // Bug 3 Slice 2C: pre-warm pass + worker drain. First
+        // paint_slide invocation enqueues any dynamic-cache misses
+        // (e.g. ● U+25CF on parity_fys_19_boot, ∞ U+221E on
+        // parity_fys_18_cooldown) and renders Tofu placeholders.
+        // Bounded wait + per-iteration poll_completions drains
+        // worker output into the dynamic atlas page. Final
+        // paint_slide re-runs layout against the now-Ready slots
+        // and renders the real glyphs. Without this, the parity
+        // golden captures all stay as Tofu — the production reel
+        // shows the fix on glass but the parity tests can't see
+        // it.
+        //
+        // The deadline (1500 ms) is well past msdfgen's 482 ms p99
+        // single-threaded ceiling. Captures of slides with no
+        // misses (all codepoints in the static atlas) exit the
+        // loop on the first iteration since no completions arrive.
+        let ctx = crate::glyph_cache::RuntimeGlyphCtx {
+            cache: &session.dynamic_glyph_cache,
+            fonts_dir: &session.dynamic_fonts_dir,
+        };
         paint_slide(
             session.gl,
             mode_w,
@@ -4504,7 +4524,54 @@ pub fn capture_slide_to_png(
             None,
             Some(&mut session.image_bg_cache),
             None,  // tex_cache: one-shot path, no caching needed
-            None,  // one-shot path; no runtime glyph cache needed
+            Some(ctx),
+        )?;
+        // Drain pending worker output. Per-iteration poll uploads
+        // any completions into the atlas page; the slide_caches
+        // drain (paint_and_present-style) isn't needed here because
+        // capture_slide_to_png doesn't use slide_caches and we
+        // re-layout from scratch on the second paint_slide below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline {
+            let n = session.dynamic_glyph_cache.poll_completions(
+                session.gl,
+                &mut session.dynamic_atlas_page,
+                4,
+            );
+            if n == 0 {
+                // First poll empty AFTER a sleep means the worker
+                // pool is idle. Bail early.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let n2 = session.dynamic_glyph_cache.poll_completions(
+                    session.gl,
+                    &mut session.dynamic_atlas_page,
+                    4,
+                );
+                if n2 == 0 {
+                    break;
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        // Second paint: layout re-runs with cache hits for any
+        // newly-Ready slots, emits CharKind::DynamicMsdf.
+        let ctx2 = crate::glyph_cache::RuntimeGlyphCtx {
+            cache: &session.dynamic_glyph_cache,
+            fonts_dir: &session.dynamic_fonts_dir,
+        };
+        paint_slide(
+            session.gl,
+            mode_w,
+            mode_h,
+            &bg_kind,
+            &text_layers,
+            Some(&motion_states),
+            wall_clock_unix,
+            None,
+            Some(&mut session.image_bg_cache),
+            None,
+            Some(ctx2),
         )?;
         unsafe {
             use glow::HasContext;
