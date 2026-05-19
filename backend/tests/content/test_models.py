@@ -366,35 +366,90 @@ def test_text_slide_default_layer_box_matches():
     assert (box.x, box.y, box.w, box.h) == (0.1, 0.1, 0.8, 0.8)
 
 
-def test_text_box_rejects_w_below_min():
+def test_text_box_rejects_w_below_widened_min():
+    """qarl 2026-05-19 widened schema: w_min lowered from 0.1 to 0.01
+    so animated thin captions are expressible without zero-width
+    degenerates. 0.005 is below the new floor."""
     with pytest.raises(ValidationError):
-        TextBox(w=0.05)
+        TextBox(w=0.005)
 
 
-def test_text_box_rejects_h_above_max():
+def test_text_box_rejects_h_above_widened_max():
+    """Widened schema: h_max raised from 0.9 to 5.0 so an oversized
+    layer can intentionally extend past the viewport for marquee-
+    scrolling effects. 6.0 is past the new ceiling."""
     with pytest.raises(ValidationError):
-        TextBox(h=0.95)
+        TextBox(h=6.0)
 
 
-def test_text_box_rejects_x_negative():
+def test_text_box_rejects_x_below_widened_min():
+    """Widened schema: x_min lowered from 0.0 to -2.0 so a layer can
+    be positioned up to 2 slide widths off the left edge for
+    animated entrance from off-screen. -3.0 is past the new floor."""
     with pytest.raises(ValidationError):
-        TextBox(x=-0.1)
+        TextBox(x=-3.0)
 
 
-def test_text_box_rejects_extending_past_right_edge():
-    """w=0.9 + x=0.5 → 1.4, off the slide on the right."""
-    with pytest.raises(ValidationError, match="right edge"):
-        TextBox(x=0.5, w=0.9)
+def test_text_box_rejects_x_above_widened_max():
+    """Widened schema: x_max raised from 1.0 to 3.0 so a layer can
+    be positioned up to 2 slide widths off the right edge."""
+    with pytest.raises(ValidationError):
+        TextBox(x=4.0)
 
 
-def test_text_box_rejects_extending_past_bottom_edge():
-    with pytest.raises(ValidationError, match="bottom edge"):
-        TextBox(y=0.5, h=0.9)
+def test_text_box_accepts_off_canvas_negative_origin():
+    """Widened schema (qarl 2026-05-19): x = -1.0 + y = -0.5 is now
+    valid — the renderer's GL viewport clips the off-canvas portion
+    at draw time. Pre-widen this raised ValidationError; new bound
+    is [-2.0, 3.0]."""
+    box = TextBox(x=-1.0, y=-0.5, w=0.8, h=0.8)
+    assert (box.x, box.y) == (-1.0, -0.5)
+
+
+def test_text_box_accepts_oversized_layer():
+    """Widened schema: w = 2.0 (twice the slide width) is now valid
+    for marquee/scrolling layouts. Pre-widen this raised
+    ValidationError; new bound is [0.01, 5.0]."""
+    box = TextBox(w=2.0, h=1.5)
+    assert (box.w, box.h) == (2.0, 1.5)
+
+
+def test_text_box_accepts_offending_pre_widen_combo():
+    """The synth_thin_5L_a item that wedged FYS on 2026-05-19 had
+    box.w = 1.0 (just past the old 0.9 ceiling). New schema accepts
+    it — the FYS recovery hinges on this passing."""
+    box = TextBox(w=1.0)
+    assert box.w == 1.0
+
+
+def test_text_box_accepts_offending_pre_widen_thin_h():
+    """The other wedged item had box.h = 0.05 (just below the old
+    0.1 floor). New 0.01 floor accepts it."""
+    box = TextBox(h=0.05)
+    assert box.h == 0.05
+
+
+def test_text_box_default_still_centered_after_widen():
+    """Defaults are intentionally UNCHANGED across the widen so the
+    editor's default-Box flow stays identical for the operator."""
+    box = TextBox()
+    assert (box.x, box.y, box.w, box.h) == (0.1, 0.1, 0.8, 0.8)
+
+
+def test_text_box_no_longer_enforces_stays_inside_slide():
+    """Pre-widen had a _stays_inside_slide model_validator that
+    rejected x + w > 1.0. The schema-widen removed that validator
+    because off-canvas placement is now a feature. Confirms the
+    validator is genuinely gone, not just bypassed by the wider
+    Field bounds."""
+    box = TextBox(x=0.5, w=0.9)  # x+w = 1.4 — was rejected, now OK
+    assert (box.x, box.w) == (0.5, 0.9)
 
 
 def test_text_box_accepts_edge_aligned_box():
-    """x=0.1, w=0.9 sums to exactly 1.0 — should NOT trip the
-    'past the right edge' check."""
+    """x=0.1, w=0.9 sums to exactly 1.0 — the historical case the
+    pre-widen edge-alignment test covered. Still valid (and now
+    trivially valid since the off-edge constraint is gone)."""
     box = TextBox(x=0.1, y=0.1, w=0.9, h=0.9)
     assert box.x == 0.1
 

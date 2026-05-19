@@ -8281,6 +8281,63 @@ mod tests {
     }
 
     #[test]
+    fn box_quad_handles_negative_origin_without_panic() {
+        // qarl 2026-05-19 TextBox schema-widen: x, y now allowed
+        // [-2.0, 3.0] (was [0.0, 1.0]) so a layer can animate in
+        // from off-screen. Verify the NDC math handles negative
+        // box origin without overflow / panic and produces NDC
+        // coords past -1.0 (which GL viewport then clips). The
+        // visible portion of the box still maps in-bounds.
+        let q = box_to_ndc_quad(
+            -0.5, -0.25, 1.0, 1.0, 1920, 1080, 0, 1920, 1080,
+            HAlign::Left, VAlign::Top,
+        );
+        // box_left_px = -0.5 * 1920 = -960; NDC l = -960/1920*2 - 1 = -2.0.
+        // box_top_px = -0.25 * 1080 = -270; NDC t = 1 - (-270)/1080*2 = 1.5.
+        // box_right_px = (-0.5 + 1.0) * 1920 = 960; NDC r = 960/1920*2 - 1 = 0.
+        // box_bottom_px = (-0.25 + 1.0) * 1080 = 810; NDC b = 1 - 810/1080*2 ≈ -0.5.
+        assert!(
+            approx_ndc_eq(q, (-2.0, 0.0, 1.5, -0.5)),
+            "negative-origin NDC: ({}, {}, {}, {})", q.0, q.1, q.2, q.3,
+        );
+    }
+
+    #[test]
+    fn box_quad_handles_oversized_box_without_panic() {
+        // Schema-widen: w, h now allowed up to 5.0. The scale-down-
+        // only pass-2 logic means oversized boxes don't actually
+        // produce oversized NDC (the bitmap content fits at its
+        // natural pixel size inside the larger box). Verify the
+        // function doesn't panic, produces a well-ordered NDC
+        // quad, and that all components stay finite.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 2.0, 1.5, 1920, 1080, 0, 1920, 1080,
+            HAlign::Left, VAlign::Top,
+        );
+        assert!(
+            q.0.is_finite() && q.1.is_finite() && q.2.is_finite() && q.3.is_finite(),
+            "oversized-box NDC not finite: {:?}", q,
+        );
+        assert!(q.1 > q.0, "ndc x range degenerate: {:?}", q);
+        assert!(q.2 > q.3, "ndc y range degenerate: {:?}", q);
+    }
+
+    #[test]
+    fn box_quad_handles_tiny_dimensions_via_min_floor() {
+        // Schema-widen: w, h now allowed down to 0.01. Verify the
+        // .max(1.0) px floor in box_to_ndc_quad prevents zero-px
+        // dimensions (which would cause a divide-by-zero downstream)
+        // without erroring on the otherwise-valid 0.01 box.
+        let q = box_to_ndc_quad(
+            0.0, 0.0, 0.01, 0.01, 1920, 1080, 0, 1920, 1080,
+            HAlign::Left, VAlign::Top,
+        );
+        // box_w_px = max(0.01*1920, 1.0) = 19.2px. No panic; the
+        // resulting NDC is a small but non-degenerate rect.
+        assert!(q.1 > q.0 && q.2 > q.3, "tiny-box NDC degenerate: {:?}", q);
+    }
+
+    #[test]
     fn box_quad_centered_horizontally() {
         // 100px-wide bitmap inside a 1.0-wide (full-screen) box
         // on 1920px viewport, h-align center: bitmap NDC width is

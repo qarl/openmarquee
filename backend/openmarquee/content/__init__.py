@@ -28,40 +28,34 @@ def _utcnow() -> datetime:
 
 class TextBox(BaseModel):
     """Where text renders inside a TextSlide — a rectangle in slide-relative
-    fractions (0..1). Storing as fractions instead of pixels keeps the same
-    slide visually consistent across rotation flips and resolution changes:
-    a `{x: 0.1, y: 0.1, w: 0.9, h: 0.9}` box looks the same on a 1920×1080
+    fractions. Storing as fractions instead of pixels keeps the same slide
+    visually consistent across rotation flips and resolution changes: a
+    `{x: 0.1, y: 0.1, w: 0.8, h: 0.8}` box looks the same on a 1920×1080
     HDMI panel as on a 64×32 HUB75 grid (per SYSTEM_SPEC §5.10a).
 
-    Validators enforce that w,h stay in [0.1, 0.9] (min so the box can't
-    shrink to invisible; max so there's always a margin to grab and
-    resize from) and that x+w / y+h stay inside the slide.
+    Bounds (qarl 2026-05-19, schema-widen for animated entrance/exit +
+    edge-peeking captions):
+      x, y ∈ [-2.0, 3.0]: the box origin can sit up to 2x slide widths
+        / heights off the edge for animated slide-ins / partial reveals
+        the renderer clips off-canvas portions at draw time (GL viewport
+        clipping handles it without crashing).
+      w, h ∈ [0.01, 5.0]: minimum prevents zero-width degenerates;
+        maximum supports oversized boxes that intentionally extend
+        beyond the viewport.
+
+    Defaults stay at (0.1, 0.1, 0.8, 0.8) — symmetric 10% margin on
+    all four sides — so the editor-default centered box is unchanged.
+
+    NOTE: pre-2026-05-19 versions enforced a `_stays_inside_slide`
+    model_validator (x+w <= 1.0, y+h <= 1.0). That validator is now
+    intentionally absent — off-canvas placement is a feature, not an
+    error.
     """
 
-    x: float = Field(default=0.1, ge=0.0, le=1.0)
-    y: float = Field(default=0.1, ge=0.0, le=1.0)
-    # Default 0.8 (was 0.9) so the centered box has 10% margin on ALL
-    # four sides — qarl 2026-04-30. The clamp range still allows up to
-    # 0.9 so the operator can drag wider; just the default is symmetric.
-    w: float = Field(default=0.8, ge=0.1, le=0.9)
-    h: float = Field(default=0.8, ge=0.1, le=0.9)
-
-    @model_validator(mode="after")
-    def _stays_inside_slide(self) -> "TextBox":
-        # Use a small epsilon so float-math drift on operator drag doesn't
-        # spuriously trip validation when the box snaps to the slide edge.
-        eps = 1e-6
-        if self.x + self.w > 1.0 + eps:
-            raise ValueError(
-                f"box.x ({self.x}) + box.w ({self.w}) > 1.0 — "
-                f"box extends past the right edge of the slide"
-            )
-        if self.y + self.h > 1.0 + eps:
-            raise ValueError(
-                f"box.y ({self.y}) + box.h ({self.h}) > 1.0 — "
-                f"box extends past the bottom edge of the slide"
-            )
-        return self
+    x: float = Field(default=0.1, ge=-2.0, le=3.0)
+    y: float = Field(default=0.1, ge=-2.0, le=3.0)
+    w: float = Field(default=0.8, ge=0.01, le=5.0)
+    h: float = Field(default=0.8, ge=0.01, le=5.0)
 
 
 class TextLayer(BaseModel):
