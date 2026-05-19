@@ -381,6 +381,26 @@ pub struct EglSession<'a> {
     /// upload_all`; freed at teardown by `delete_all`. C.3 wires the
     /// codepoint-segmented layout path that consumes these.
     emoji_atlases: Vec<crate::sdf_atlas_emoji_gl::EmojiAtlasGl>,
+    /// Bug 3 Slice 1 part B (2026-05-19): dynamic runtime glyph
+    /// cache for codepoints not in the static build-time-baked
+    /// MSDF atlas (e.g. ●, ∞). Cache + atlas page created at session
+    /// bring-up; dropped at session tear-down.
+    ///
+    /// SLICE 1 STATE (CURRENT): the cache + page exist but no caller
+    /// queries the cache — there is no dispatch hook yet. Worker
+    /// threads are a stub (Part A glyph_cache.rs:117-131) that
+    /// drains + discards MissRequest. Behavior is identical to
+    /// pre-Bug-3: unbaked codepoints render as Tofu via the existing
+    /// fallthrough in layout_text_to_quads.
+    ///
+    /// SLICE 2 (FORTHCOMING): layout_text_to_quads will gain a
+    /// CharKind::DynamicMsdf branch that queries this cache on
+    /// static-miss. The stub worker swaps for real msdfgen
+    /// rasterization, completions feed glTexSubImage2D uploads into
+    /// dynamic_atlas_page, and ●/∞/etc. start resolving to real
+    /// glyphs after a ~250 ms p99 first-encounter latency.
+    dynamic_glyph_cache: crate::glyph_cache::GlyphCache,
+    dynamic_atlas_page: crate::atlas_page::AtlasPage,
     /// v1-spec-delta #5 (slice d, refined slice e + Bug 2 fix
     /// 2026-05-09): tracks whether the kernel CRTC currently has
     /// an alive (set_crtc'd) FB attached. The first commit per
@@ -565,6 +585,15 @@ where
         scissored_bake_atlas: None,
         msdf_atlases: Vec::new(),
         emoji_atlases: Vec::new(),
+        // Bug 3 Slice 1 part B (2026-05-19): construct the dynamic
+        // glyph cache + its backing atlas page upfront. GlyphCache
+        // spawns 4 std::thread workers via crossbeam-channel mpsc;
+        // for Slice 1 those workers are stubs that drain + discard
+        // MissRequest. AtlasPage::allocate_texture is called below
+        // (after GL context is current) to set up the GPU-resident
+        // 2048×2048 RGBA8 backing texture.
+        dynamic_glyph_cache: crate::glyph_cache::GlyphCache::new(4),
+        dynamic_atlas_page: crate::atlas_page::AtlasPage::new(48),
     };
 
     // SDF arc slice B.2 -- one-shot atlas upload after the GL
@@ -581,6 +610,18 @@ where
             .map_err(|e| anyhow!("msdf atlas load failed: {e}"))?;
         session.msdf_atlases = crate::sdf_atlas_gl::upload_all(&gl, &parsed)?;
         populate_msdf_lookup(&session.msdf_atlases);
+    }
+
+    // Bug 3 Slice 1 part B (2026-05-19): allocate the dynamic atlas
+    // page's GPU texture (2048×2048 RGBA8 ~ 16 MB GPU memory).
+    // Failure semantics: non-fatal — if the dynamic atlas can't
+    // initialize, Slice 2's runtime cache-miss path will just keep
+    // returning Tofu (the existing pre-Bug-3 behavior). Log + continue.
+    if let Err(e) = session.dynamic_atlas_page.allocate_texture(&gl) {
+        eprintln!(
+            "warn: dynamic atlas page texture alloc failed: {e}; \
+             runtime glyph cache disabled this session",
+        );
     }
 
     // SDF arc slice C.2 -- decode + upload the Noto Color Emoji
@@ -657,6 +698,11 @@ where
     // the MSDF teardown ordering).
     clear_emoji_lookup();
     crate::sdf_atlas_emoji_gl::delete_all(&gl, &mut session.emoji_atlases);
+    // Bug 3 Slice 1 part B (2026-05-19): free the dynamic atlas
+    // page texture while GL is still bound. dynamic_glyph_cache's
+    // Drop signals + joins the worker pool on session-struct drop
+    // (right after this fn returns).
+    session.dynamic_atlas_page.delete(&gl);
     clear_transition_program_cache(&gl);
     clear_transition_sp_program_cache(&gl);
     clear_composite_program_cache(&gl);
