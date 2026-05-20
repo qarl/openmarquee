@@ -4246,31 +4246,39 @@ pub fn compute_motion_state(
     }
 }
 
-/// Linear horizontal travel, LTR (text enters from the right edge,
-/// exits left). Period at intensity=50 is ~3.5 s; ranges from 6 s
-/// slow to 1 s fast over 0..100. Returns offset_x_norm in
-/// [-1, +1] units of the box width — the renderer converts to
-/// pixels using the actual box dim.
+/// Tiling marquee scroll, LTR (the text scrolls leftward).
+///
+/// Density-parity rewrite (2026-05-20): the ticker draws the text
+/// TILED — repeated every box-width — so the stripe reads as a
+/// continuous marquee (the tiling happens in `draw_text_layer_
+/// msdf`; the two-copy wrap matches the Canvas2D editor ticker
+/// that qarl picked as authoritative). The pre-rewrite ticker slid
+/// a SINGLE copy across a ±box-width sweep, which showed the text
+/// once per 2×box-width of travel — half the density, twice the
+/// whitespace.
+///
+/// `offset_x_norm` is the scroll position WITHIN one tile pitch,
+/// in [0, 1): 0 = rest, approaching 1 = scrolled almost a full
+/// box-width left, then wrapping seamlessly because the next tiled
+/// copy has taken its place. Period at intensity=50 is ~3.5 s
+/// (6 s slow @ 0 → 1 s fast @ 100) — `6 - 0.05*intensity`, the
+/// same formula the Canvas ticker uses, so device + editor scroll
+/// at the same rate.
 fn motion_ticker(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) -> MotionState {
-    // Period: 6 s @ 0  →  1 s @ 100. At 50: 3.5 s (close to spec's
-    // ~3 s). Linear interp keeps the math obvious; the spec
-    // explicitly tolerates approximate timing because operators
-    // can't perceive sub-second period differences.
     let base_period = 6.0 - 5.0 * intensity_norm;
     if speed == 0.0 {
-        // Frozen: hold at phase=0 visual state (entry edge).
+        // Frozen: hold at the phase's scroll position.
         return MotionState {
-            offset_x_norm: 1.0 - 2.0 * phase,
+            offset_x_norm: phase,
             ..MotionState::IDENTITY
         };
     }
     let period = (base_period / speed).max(0.05);
     let t = tick_seconds + (phase as f64) * period as f64;
+    // cycle in [0, 1) — the scroll fraction of one tile pitch.
     let cycle = (t.rem_euclid(period as f64)) / (period as f64);
-    // Offset goes +1 → -1 over one cycle (right-edge → left-edge).
-    let offset_x = 1.0 - 2.0 * cycle as f32;
     MotionState {
-        offset_x_norm: offset_x,
+        offset_x_norm: cycle as f32,
         ..MotionState::IDENTITY
     }
 }
@@ -4399,7 +4407,8 @@ fn motion_blink(intensity_norm: f32, phase: f32, speed: f32, tick_seconds: f64) 
 /// Convert a `MotionState`'s normalized translate offsets to
 /// screen-space pixels, using the spec's per-effect unit
 /// convention:
-///   - `Ticker` -> offset_x in box-width units
+///   - `Ticker` -> leftward scroll: offset_x_norm in [0,1) of one
+///     box-width tile pitch, returned NEGATIVE (translate left).
 ///   - `Bounce` -> offset_y in box-height units
 ///   - `Shake`  -> offset_x/y in glyph-height units (spec line 274)
 ///   - other modes return (0, 0); they don't translate.
@@ -4417,7 +4426,7 @@ pub fn motion_offset_to_px(
     font_size_px: f32,
 ) -> (f32, f32) {
     match kind {
-        MotionKind::Ticker => (state.offset_x_norm * box_w_px, 0.0),
+        MotionKind::Ticker => (-state.offset_x_norm * box_w_px, 0.0),
         MotionKind::Bounce => (0.0, state.offset_y_norm * box_h_px),
         MotionKind::Shake => (
             state.offset_x_norm * font_size_px,
@@ -7916,38 +7925,39 @@ mod tests {
     }
 
     #[test]
-    fn motion_ticker_starts_right_at_phase_zero() {
-        // t=0, phase=0 → offset_x_norm = +1.0 (text positioned at
-        // the right edge, about to enter from there per LTR).
+    fn motion_ticker_starts_at_rest_at_phase_zero() {
+        // Density-parity rewrite (2026-05-20): offset_x_norm is the
+        // scroll fraction of one box-width tile pitch, in [0, 1).
+        // t=0, phase=0 → 0.0 (rest — the tiled text un-scrolled).
         let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 0.0);
-        assert!((m.offset_x_norm - 1.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn motion_ticker_sawtooth_zero_at_half_cycle() {
-        // Sawtooth offset: +1 → -1 over one period (linear), wraps
-        // back to +1 at period boundary. At intensity=50 the period
-        // is 6 - 5*0.5 = 3.5 s; halfway through, offset_x_norm = 0
-        // (text centered between entry and exit).
-        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 1.75);
         assert!(m.offset_x_norm.abs() < 1e-3, "offset was {}", m.offset_x_norm);
     }
 
     #[test]
-    fn motion_ticker_sawtooth_near_minus_one_just_before_wrap() {
-        // Just before the period boundary, offset is asymptotically
-        // approaching -1 (text fully exited left). Period = 3.5 s;
-        // sample at t = 0.999 * period.
-        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 3.5 * 0.999);
-        assert!(m.offset_x_norm < -0.99, "offset was {}", m.offset_x_norm);
+    fn motion_ticker_half_pitch_at_half_cycle() {
+        // Sawtooth 0 → 1 over one period. At intensity=50 the period
+        // is 6 - 5*0.5 = 3.5 s; halfway, offset_x_norm = 0.5 (the
+        // tiled text scrolled half a box-width left).
+        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 1.75);
+        assert!((m.offset_x_norm - 0.5).abs() < 1e-3, "offset was {}", m.offset_x_norm);
     }
 
     #[test]
-    fn motion_ticker_wraps_back_to_right_at_period_boundary() {
-        // At t = period exactly, the cycle wraps and offset jumps
-        // back to +1 (text re-enters from right edge).
+    fn motion_ticker_near_one_just_before_wrap() {
+        // Just before the period boundary the scroll fraction
+        // approaches 1.0 (the text scrolled almost a full box-width;
+        // the next tiled copy has all but taken its place).
+        let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 3.5 * 0.999);
+        assert!(m.offset_x_norm > 0.99, "offset was {}", m.offset_x_norm);
+    }
+
+    #[test]
+    fn motion_ticker_wraps_back_to_rest_at_period_boundary() {
+        // At t = period exactly the cycle wraps and the scroll
+        // fraction returns to 0 — seamless because the tiling has
+        // an identical copy one pitch over.
         let m = compute_motion_state(MotionKind::Ticker, 50, 0.0, 1.0, 0, 3.5);
-        assert!((m.offset_x_norm - 1.0).abs() < 1e-3);
+        assert!(m.offset_x_norm.abs() < 1e-3, "offset was {}", m.offset_x_norm);
     }
 
     #[test]
@@ -8237,11 +8247,11 @@ mod tests {
     #[test]
     fn motion_ticker_speed_two_halves_period() {
         // intensity=50 → period=3.5s. speed=2 → effective 1.75s.
-        // At t=0.875 (= half of effective period), expect cycle=0.5
-        // → offset=0.0.
+        // At t=0.875 (= half of the effective period), the scroll
+        // fraction is cycle=0.5 (half a tile pitch).
         let m =
             compute_motion_state(MotionKind::Ticker, 50, 0.0, 2.0, 0, 0.875);
-        assert!(m.offset_x_norm.abs() < 1e-3, "off was {}", m.offset_x_norm);
+        assert!((m.offset_x_norm - 0.5).abs() < 1e-3, "off was {}", m.offset_x_norm);
     }
 
     #[test]
@@ -8360,12 +8370,15 @@ mod tests {
 
     #[test]
     fn motion_offset_to_px_ticker_uses_box_width() {
+        // offset_x_norm is the [0,1) scroll fraction of one box-
+        // width tile pitch; the px result is NEGATIVE (the ticker
+        // scrolls left). 0.5 of an 800px box -> -400px.
         let s = MotionState {
             offset_x_norm: 0.5,
             ..MotionState::IDENTITY
         };
         let (dx, dy) = motion_offset_to_px(MotionKind::Ticker, s, 800.0, 200.0, 64.0);
-        assert!((dx - 400.0).abs() < 1e-3);
+        assert!((dx - (-400.0)).abs() < 1e-3, "dx was {dx}");
         assert!(dy.abs() < 1e-6);
     }
 

@@ -2131,9 +2131,23 @@ fn draw_text_layer_msdf(
     // (FS_EMOJI program — same shader the static CBDT path uses;
     // only the bound texture differs).
     let mut dynamic_emoji_verts: Vec<f32> = Vec::new();
+    // Ticker tiling (density-parity rewrite 2026-05-20): a ticker
+    // layer draws the laid-out text TWICE, one box-width (the tile
+    // pitch, = box.w * 2 in NDC) apart, so as one copy scrolls off
+    // the left edge the next is already entering from the right —
+    // a continuous marquee matching the Canvas2D editor ticker that
+    // qarl picked as authoritative. Stage 3 translated the rest
+    // rect left by the scroll offset; copy 0 is that rect, copy 1
+    // sits one box-width to its right. The box scissor (below)
+    // clips the spill. Every other motion draws exactly one copy.
+    let is_ticker = motion_kind == MotionKind::Ticker;
+    let tile_dx_ndc: [f32; 2] = [0.0, layer.r#box.w * 2.0];
+    let tile_copies: &[f32] =
+        if is_ticker { &tile_dx_ndc[..] } else { &tile_dx_ndc[..1] };
+    for &copy_dx in tile_copies {
     for q in &group.quads {
-        let xl = to_ndc_x(q.px_left);
-        let xr = to_ndc_x(q.px_right);
+        let xl = to_ndc_x(q.px_left) + copy_dx;
+        let xr = to_ndc_x(q.px_right) + copy_dx;
         let yt = to_ndc_y(q.px_top);
         let yb = to_ndc_y(q.px_bottom);
         match q.kind {
@@ -2199,6 +2213,7 @@ fn draw_text_layer_msdf(
             }
         }
     }
+    }
     if ink_verts.is_empty()
         && tofu_verts.is_empty()
         && dynamic_ink_verts.is_empty()
@@ -2207,7 +2222,23 @@ fn draw_text_layer_msdf(
         return Ok(());
     }
 
-    // Shared scissor box derived once from the OUTER NDC rect.
+    // Scissor source rect. A ticker clips to the LAYER BOX — its
+    // tiled copies + scroll spill must not bleed past the box
+    // (matching the Canvas ticker's ctx.clip()). Every other layer
+    // keeps the historical text-rect scissor, which after the
+    // stage-2/3 motion transform IS the displaced text —
+    // effectively unclipped, so shake/breathe/bounce spill past the
+    // box on purpose (parity Bug 3).
+    let (sc_l, sc_r, sc_t, sc_b) = if is_ticker {
+        (
+            layer.r#box.x * 2.0 - 1.0,
+            (layer.r#box.x + layer.r#box.w) * 2.0 - 1.0,
+            1.0 - layer.r#box.y * 2.0,
+            1.0 - (layer.r#box.y + layer.r#box.h) * 2.0,
+        )
+    } else {
+        (ndc_l, ndc_r, ndc_t, ndc_b)
+    };
     let scissor_box: Option<(i32, i32, i32, i32)> = tighten_scissor.map(|(vp_x_off, vp_y_off, vp_w, vp_h)| {
         let to_fb_x = |ndc: f32| {
             vp_x_off as f32 + (ndc + 1.0) * 0.5 * vp_w as f32
@@ -2218,23 +2249,36 @@ fn draw_text_layer_msdf(
         let vp_x_max = (vp_x_off + vp_w) as f32;
         let vp_y_max = (vp_y_off + vp_h) as f32;
         let fb_l =
-            to_fb_x(ndc_l).floor().clamp(vp_x_off as f32, vp_x_max) as i32;
+            to_fb_x(sc_l).floor().clamp(vp_x_off as f32, vp_x_max) as i32;
         let fb_r =
-            to_fb_x(ndc_r).ceil().clamp(vp_x_off as f32, vp_x_max) as i32;
+            to_fb_x(sc_r).ceil().clamp(vp_x_off as f32, vp_x_max) as i32;
         let fb_b =
-            to_fb_y(ndc_b).floor().clamp(vp_y_off as f32, vp_y_max) as i32;
+            to_fb_y(sc_b).floor().clamp(vp_y_off as f32, vp_y_max) as i32;
         let fb_t =
-            to_fb_y(ndc_t).ceil().clamp(vp_y_off as f32, vp_y_max) as i32;
+            to_fb_y(sc_t).ceil().clamp(vp_y_off as f32, vp_y_max) as i32;
         (fb_l, fb_b, (fb_r - fb_l).max(0), (fb_t - fb_b).max(0))
     });
 
+    // A ticker REQUIRES a live scissor (its tiled copies spill past
+    // the box). Enable GL_SCISSOR_TEST for the ticker draw, then
+    // restore the prior state afterward — so the scissored-bake
+    // path, which holds SCISSOR_TEST on for its region clip across
+    // these layer draws, is not disturbed. Non-ticker layers keep
+    // the historical no-op `gl.scissor` set with the test off.
+    let ticker_clip = is_ticker && scissor_box.is_some();
+
     unsafe {
-        // Apply scissor once (covers both ink and tofu sub-batches;
-        // their NDC quads share the outer rect by construction).
+        // Apply scissor once (covers all sub-batches; their NDC
+        // quads share the same source rect by construction).
         if let Some((fb_l, fb_b, sw, sh)) = scissor_box {
             if sw > 0 && sh > 0 {
                 gl.scissor(fb_l, fb_b, sw, sh);
             }
+        }
+        let scissor_was_enabled =
+            ticker_clip && gl.is_enabled(glow::SCISSOR_TEST);
+        if ticker_clip {
+            gl.enable(glow::SCISSOR_TEST);
         }
 
         // Batch 1: MSDF-ink glyphs.
@@ -2444,6 +2488,11 @@ fn draw_text_layer_msdf(
                 gl.disable_vertex_attrib_array(egp.a_uv);
                 gl.delete_buffer(vbo);
             }
+        }
+        // Restore GL_SCISSOR_TEST to its pre-ticker state so the
+        // scissored-bake region clip (if active) survives.
+        if ticker_clip && !scissor_was_enabled {
+            gl.disable(glow::SCISSOR_TEST);
         }
     }
     Ok(())
@@ -9805,7 +9854,10 @@ fn paint_layers_via_overlay_route(
                     motion_state,
                     group,
                     atlas_tex,
-                    None,
+                    // Full-size FBO viewport — lets a ticker layer's
+                    // box scissor clip correctly on the overlay route
+                    // (these draws target mode_w x mode_h FBOs).
+                    Some((0, 0, mode_w, mode_h)),
                 )?;
             } else {
                 // Overlay: render text to layer_fbo (premultiplied
@@ -9827,7 +9879,10 @@ fn paint_layers_via_overlay_route(
                     motion_state,
                     group,
                     atlas_tex,
-                    None,
+                    // Full-size FBO viewport — lets a ticker layer's
+                    // box scissor clip correctly on the overlay route
+                    // (these draws target mode_w x mode_h FBOs).
+                    Some((0, 0, mode_w, mode_h)),
                 )?;
 
                 // Composite layer_tex over current_scene_tex into

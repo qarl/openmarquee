@@ -23,7 +23,7 @@ Seven enum values (six effects + `static`):
 | value     | category | what it does |
 |-----------|----------|--------------|
 | `static`  | none     | no animation (default; current behavior) |
-| `ticker`  | translate | text travels horizontally through the box, wrapping when it leaves the trailing edge |
+| `ticker`  | translate | tiled marquee — the text repeats every box-width and scrolls left continuously, so the box always shows text |
 | `breathe` | scale    | text grows and shrinks rhythmically around the box center |
 | `pulse`   | alpha    | text fades up and down in opacity |
 | `bounce`  | translate | text bobs vertically inside the box |
@@ -247,8 +247,14 @@ waveforms:
 - `breathe`, `pulse`, `bounce` — **sine** of the shared clock
   (smooth, no implementation-defined easing differences).
 - `blink` — **square** wave, 50 % duty (already specified above).
-- `ticker` — **linear** travel, wraps when text fully clears the
-  trailing edge.
+- `ticker` — **linear** travel of a TILED marquee: the text is
+  drawn repeated every box-width and scrolls left continuously, so
+  the box always shows text (no single-copy gap). Density-parity
+  rewrite (2026-05-20): the device renderer now matches the Canvas
+  editor ticker's two-copy tiling wrap at a 1×-box-width repeat
+  pitch — so for `ticker` the device/editor match is density-exact,
+  not the "visually approximate" the Q3 lock grants the CSS-keyframe
+  effects.
 - `shake` — **per-frame Gaussian** translate offsets, seeded
   deterministically per layer (see below).
 
