@@ -245,6 +245,57 @@ async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
     assert captured[0] == bytes([128] * (8 * 8 * 3))
 
 
+@pytest.mark.asyncio
+async def test_session_pump_stops_and_logs_once_on_render_failure(
+    tmp_path, caplog
+):
+    """If render_frame raises (a Rust sidecar without the push-frames
+    IPC op), the pump logs ONCE and stops — it does NOT log a
+    traceback per frame at the stream's frame rate. Guards against the
+    per-frame-logging flood that regressed FPS on the production
+    sign."""
+    renderer = MockRenderer(8, 8, tmp_path / "out.png")
+    loop = PlaybackLoop(
+        renderer=renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
+    )
+    await loop.start()
+    try:
+        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = StreamSession(loop)
+            render_calls = {"n": 0}
+
+            def boom(_data):
+                render_calls["n"] += 1
+                raise NotImplementedError("renderer can't push-render")
+
+            renderer.render_frame = boom
+
+            await session.start_webrtc("v=0\r\noffer\r\n")
+            on_track = session._pc.handlers["track"]
+            # A 5-frame track: without the once-and-stop guard the
+            # pump would call render_frame (and log) all 5 times.
+            on_track(_FakeTrack([_video_frame(8, 8) for _ in range(5)]))
+            assert session._pump_task is not None
+            await session._pump_task
+            await session.close()
+    finally:
+        await loop.stop()
+
+    # render_frame raised on the first frame; the pump stopped — it
+    # did NOT keep calling render_frame for the remaining 4 frames.
+    assert render_calls["n"] == 1
+    # Exactly one error line about the rejected frame — not five.
+    rejected_logs = [
+        r
+        for r in caplog.records
+        if r.levelname == "ERROR" and "rejected a pushed frame" in r.message
+    ]
+    assert len(rejected_logs) == 1
+
+
 # --- 2. Single-publisher ---------------------------------------------------
 
 

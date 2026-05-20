@@ -247,9 +247,18 @@ class StreamSession:
         """Drive the source: push each yielded frame to the renderer.
 
         Runs until the source's iterator is exhausted (track ended,
-        session closed) or the task is cancelled. A per-frame renderer
-        failure is logged and skipped — one bad frame doesn't kill the
-        takeover. Decode/scale errors are handled inside the source.
+        session closed) or the task is cancelled. Decode/scale errors
+        are handled inside the source.
+
+        If `render_frame` raises, the pump logs ONCE and stops. A
+        renderer rejecting a pushed frame is not a transient
+        per-frame glitch — it means the renderer cannot accept
+        push-frame rendering at all (a Rust sidecar without the
+        push-frames IPC op). Logging per frame at the stream's frame
+        rate floods the journal — that per-frame-logging shape caused
+        a measured fps regression on the production sign. The session
+        stays "active" holding the last frame; close() still tears it
+        down normally.
         """
         renderer = self._playback.renderer
         try:
@@ -257,7 +266,13 @@ class StreamSession:
                 try:
                     renderer.render_frame(frame_bytes)
                 except Exception:
-                    log.exception("stream: dropped frame")
+                    log.error(
+                        "stream: renderer rejected a pushed frame — "
+                        "push-frame rendering is unavailable; stopping "
+                        "the frame pump. The takeover session stays "
+                        "active holding the last frame."
+                    )
+                    return
         except asyncio.CancelledError:
             raise
 
