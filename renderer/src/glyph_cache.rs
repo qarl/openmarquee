@@ -636,6 +636,25 @@ impl GlyphCache {
         });
         *self.completion_count.lock().unwrap() += 1;
     }
+
+    /// Test seam: directly stamp a `Ready` slot into the state map.
+    /// Like `inject_completion_for_test` but `pub` so cross-module
+    /// tests (e.g. the `hdmi_logic` layout suite) can exercise the
+    /// COLR / DynamicMsdf dispatch path without a worker pool, a GL
+    /// context, or a real TTF on disk. Live runtime never uses this.
+    #[cfg(test)]
+    pub fn insert_ready_slot_for_test(
+        &self,
+        key: GlyphKey,
+        slot: SlotPos,
+        advance_em: f32,
+        plane_bounds: PlaneBounds,
+    ) {
+        self.slots.lock().unwrap().insert(
+            key,
+            SlotState::Ready { slot, advance_em, plane_bounds },
+        );
+    }
 }
 
 /// Worker-side raster output. Mirrors build.rs's per-glyph atlas

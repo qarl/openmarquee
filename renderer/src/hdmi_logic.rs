@@ -980,13 +980,22 @@ pub fn layout_text_to_quads(
     // per-call site comment for the median-of-mixed-encodings
     // mechanism this guards against.
     const INSET_PX: f32 = 0.5;
-    // Slice 3D (2026-05-19): emoji cell-em ratio preserved from the
-    // retired CBDT bake so the on-screen emoji size is unchanged
-    // across the cutover. 96 px cell at 128 ppem = 0.75 em; the
-    // COLR runtime rasterizer in glyph_cache_colr.rs uses the same
-    // 96 px cell, so the DynamicEmoji draw path can keep the same
-    // emoji_cell_em constant.
-    let emoji_cell_em: f32 = crate::glyph_cache_colr::COLR_CELL_PX as f32 / 128.0;
+    // Parity Bug 2 (2026-05-20): on-screen em-size of a COLR emoji
+    // cell. The COLR runtime rasterizer (glyph_cache_colr.rs)
+    // renders each emoji at `ppem = COLR_CELL_PX` into a
+    // COLR_CELL_PX-square pixmap — the font's em-box [0, upem] maps
+    // onto the FULL [0, COLR_CELL_PX] cell, so the cell spans
+    // exactly ONE em. The DynamicEmoji draw must therefore size the
+    // cell at 1.0 em of the layer's font.
+    //
+    // The Slice 3D cutover wrongly carried the RETIRED CBDT bake's
+    // ratio here (`COLR_CELL_PX / 128.0` = 0.75 — the CBDT bake
+    // rendered emoji at 128 ppem into a 96 px cell, capturing only
+    // 0.75 em). That shrank every COLR emoji to 0.75x its true
+    // size — visibly smaller than the Canvas2D editor preview,
+    // which draws emoji at the native ~1 em via ctx.fillText.
+    // 1.0 restores cross-renderer parity.
+    let emoji_cell_em: f32 = 1.0;
     let mut quads: Vec<MsdfQuad> = Vec::new();
     for (line_idx, layout) in layouts.iter().enumerate() {
         // Baseline y in pixel-space, y-down. Each line's baseline
@@ -5004,6 +5013,87 @@ mod tests {
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
         assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
+    }
+
+    #[test]
+    fn layout_text_to_quads_colr_emoji_cell_spans_one_em() {
+        // Parity Bug 2 (2026-05-20): a COLR emoji must render at
+        // exactly 1.0 em of the layer's font size. The COLR runtime
+        // rasterizer maps the font em-box onto the FULL
+        // COLR_CELL_PX cell, so the cell is one em square. The
+        // retired-CBDT 0.75-em ratio (carried wrongly through the
+        // Slice 3D cutover) shrank emoji to 75% on glass vs the
+        // Canvas2D preview's native ~1-em ctx.fillText emoji.
+        let atlas = load_anton_atlas();
+        let cache = crate::glyph_cache::GlyphCache::new(0);
+        // 🔓 U+1F513 — a SCREAM-slide codepoint, absent from anton's
+        // MSDF atlas, so the COLR dispatch path fires.
+        let cp: u32 = 0x1F513;
+        let key = crate::glyph_cache::GlyphKey {
+            font_family_id: crate::glyph_cache::font_family_id_from_stem(
+                crate::glyph_cache::COLR_EMOJI_FONT_STEM,
+            ),
+            codepoint: cp,
+            render_mode: crate::glyph_cache::RenderMode::Colr,
+        };
+        cache.insert_ready_slot_for_test(
+            key,
+            crate::atlas_page::SlotPos { x: 0, y: 0 },
+            1.0, // advance_em
+            crate::glyph_cache::PlaneBounds::default(),
+        );
+        let fonts_dir = std::env::temp_dir();
+        let ctx = crate::glyph_cache::RuntimeGlyphCtx {
+            cache: &cache,
+            fonts_dir: &fonts_dir,
+        };
+        let size_px = 100.0_f32;
+        let group =
+            layout_text_to_quads(&atlas, "\u{1F513}", size_px, f32::INFINITY, Some(ctx))
+                .expect("emoji lays out");
+        assert_eq!(group.quads.len(), 1);
+        let q = &group.quads[0];
+        assert_eq!(q.kind, GlyphKind::DynamicEmoji);
+        let w = q.px_right - q.px_left;
+        let h = q.px_bottom - q.px_top;
+        // 1 em == size_px. The Bug-2 regression (0.75 em) gave 75.0.
+        assert!(
+            (w - size_px).abs() < 0.01,
+            "emoji quad width {w} should be 1 em ({size_px}px), not 0.75 em",
+        );
+        assert!(
+            (h - size_px).abs() < 0.01,
+            "emoji quad height {h} should be 1 em ({size_px}px), not 0.75 em",
+        );
+    }
+
+    #[test]
+    fn ticker_motion_never_resizes_glyphs() {
+        // Parity Bug 2 (2026-05-20) guard: a ticker-motion layer and
+        // a static layer with the same font_size_pct + box must
+        // resolve to the SAME effective glyph size. font sizing
+        // (effective_font_size_px) + glyph layout (layout_text_to_
+        // quads) take no motion input, and a Ticker MotionState
+        // carries scale == 1.0 (it only translates horizontally) —
+        // identical to Static's IDENTITY. So motion=ticker can
+        // never make text larger or smaller than motion=static.
+        let static_scale =
+            compute_motion_state(MotionKind::Static, 85, 0.0, 1.0, 0, 0.0).scale;
+        assert_eq!(static_scale, 1.0);
+        // Sweep ticks across multiple ticker cycles + intensities.
+        for &intensity in &[0u8, 50, 85, 100] {
+            for step in 0..24 {
+                let tick = step as f64 * 0.25;
+                let ms = compute_motion_state(
+                    MotionKind::Ticker, intensity, 0.0, 1.0, 0, tick,
+                );
+                assert_eq!(
+                    ms.scale, static_scale,
+                    "ticker scale must equal static scale (no resize) \
+                     at intensity={intensity} tick={tick}",
+                );
+            }
+        }
     }
 
     #[test]
