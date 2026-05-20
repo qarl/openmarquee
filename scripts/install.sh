@@ -468,6 +468,30 @@ else
 fi
 snapshot_state "AFTER_DEBS_INSTALL"
 
+# --- 5.6. ffmpeg availability check (STREAM/VLC feature) --------------------
+#
+# ffmpeg is a runtime dependency of the STREAM/VLC feature — the VLC
+# takeover and the vlc_stream playlist slide both shell out to it
+# (backend/openmarquee/vlc_rtsp_consumer.py). It ships in the pi-gen
+# base-image package list (images/openmarquee/.../00-packages), so
+# factory-flashed cards have it. But a Pi provisioned BEFORE ffmpeg
+# landed in that list won't — and install.sh runs offline (no apt), so
+# it cannot fix that here. Warn loudly + actionably instead. Absence is
+# non-fatal: every non-VLC feature still works.
+say "Check ffmpeg availability (STREAM/VLC feature)"
+if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
+    if command -v ffmpeg >/dev/null 2>&1; then
+        say "  ffmpeg present: $(command -v ffmpeg)"
+    else
+        say "  WARNING: ffmpeg not found on PATH — VLC stream slides and the"
+        say "           RTSP takeover will not render. This Pi predates ffmpeg"
+        say "           in the image package list; run 'sudo apt install ffmpeg'"
+        say "           (needs network) to enable the STREAM/VLC feature."
+    fi
+else
+    say "DRYRUN: would check ffmpeg availability (warn if absent)"
+fi
+
 # --- 6. iptables redirect rules ---------------------------------------------
 
 say "Apply iptables captive-portal redirect"

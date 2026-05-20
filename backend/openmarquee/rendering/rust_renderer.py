@@ -28,12 +28,12 @@ what the code actually emits.
 
 ## Relationship to the Renderer Protocol
 
-The Rust sidecar owns GPU-side composition; frame bytes never cross the
-process boundary. `RustRenderer.render_frame` raises `NotImplementedError`
-— it exists only to satisfy the `Renderer` Protocol's nominal shape so a
-dependency injection that types as `Renderer` doesn't have to special-case
-us at the type level. Real callers (slice 4's playback.py bypass) will
-use the IPC ops directly.
+The Rust sidecar owns GPU-side composition; slide/transition frame bytes
+never cross the process boundary — playback.py drives those via the IPC
+ops directly. The one exception is the STREAM/VLC push-frames path
+(slice 2.5): `render_frame` flips the sidecar into pump-mode and streams
+externally-produced RGB888 frames (a VLC takeover, a vlc_stream slide)
+down a dedicated binary pipe; `end_external_frames` ends the pump.
 
 ## Failure model (slice 1 baseline + 2026-05-14 reconnect/watchdog)
 
