@@ -503,15 +503,19 @@ async def test_pull_from_peer_applies_tombstones(tmp_path: Path):
     sync, content, tombstones, _ = _build_sync(
         tmp_path, httpx.MockTransport(lambda r: _pull_tombstone_handler(r))
     )
-    # Local content that the remote has tombstoned.
+    # Dates are anchored to "now" so the test never goes stale: the
+    # remote delete must land inside TombstoneStorage's 30-day TTL
+    # window, or list_active() (the final assert) drops it. A
+    # hardcoded 2026-04 date aged out of that window — the time-bomb
+    # this replaces.
+    remote_delete_at = datetime.now(timezone.utc) - timedelta(days=2)
+    local_updated_at = remote_delete_at - timedelta(days=5)
+    # Local content the remote has tombstoned. updated_at is OLDER
+    # than the delete, so the pull's last-write-wins rule applies the
+    # tombstone instead of keeping the local copy.
     local_cid = uuid4()
     local_slide = TextSlide(id=local_cid, name="Gone", text="g")
-    content.save(
-        local_slide,
-        _make_png_bytes(),
-        updated_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
-    )
-    remote_delete_at = datetime(2026, 4, 15, tzinfo=timezone.utc)
+    content.save(local_slide, _make_png_bytes(), updated_at=local_updated_at)
 
     # Rebuild the handler with the actual data bound in.
     def handler(request: httpx.Request) -> httpx.Response:
@@ -522,11 +526,7 @@ async def test_pull_from_peer_applies_tombstones(tmp_path: Path):
         return httpx.Response(404)
 
     sync, content, tombstones, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
-    content.save(
-        local_slide,
-        _make_png_bytes(),
-        updated_at=datetime(2026, 4, 10, tzinfo=timezone.utc),
-    )
+    content.save(local_slide, _make_png_bytes(), updated_at=local_updated_at)
 
     await sync.pull_from_peer("peer.ts.net")
     assert not content.exists(local_cid)
