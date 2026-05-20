@@ -43,7 +43,7 @@ pub fn run(card: &Card) -> Result<SmokeReport> {
     // Caller is responsible for stopping the openmarquee-backend
     // systemd unit before running the smoke so DRM master is free,
     // same convention as --play-pattern-test in the smoke harness.
-    hdmi::run_in_egl_session(card, |session| {
+    hdmi::run_in_egl_session(card, 0, |session| {
         let gl = session.gl();
         let mut report = SmokeReport { steps: Vec::new() };
 
