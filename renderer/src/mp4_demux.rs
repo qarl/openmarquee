@@ -1,17 +1,19 @@
 //! Minimal MP4 demuxer for H.264-in-MP4 video.
 //!
 //! Hand-rolled, ~250 LOC, no external deps. Covers the subset
-//! openMarquee needs: single-track baseline-profile H.264 video
-//! authored by ffmpeg's libx264 output (the dominant case for
-//! VideoSlide content per project_single_mp4_consolidation).
+//! openMarquee needs: baseline-profile H.264 video authored by
+//! ffmpeg's libx264 output (the dominant case for VideoSlide
+//! content per project_single_mp4_consolidation). The container
+//! may carry extra traks (audio, timecode) -- the demuxer picks
+//! the video trak and ignores the rest.
 //!
 //! ## Why hand-rolled vs a crate
 //!
 //! The dispatch listed `mp4`, `mp4parse`, `symphonia`, and
 //! hand-roll as options. Hand-roll wins for openMarquee's case:
 //!
-//! 1. Single-track H.264 baseline is ~200 LOC of MP4 box
-//!    walking; not worth a multi-thousand-LOC dep.
+//! 1. Baseline H.264 box walking + video-trak selection is
+//!    ~200 LOC; not worth a multi-thousand-LOC dep.
 //! 2. No external unsafe to audit (per QA charter's subagent
 //!    checklist for piece 3).
 //! 3. Bounds-checking every length read is straightforward
@@ -22,8 +24,9 @@
 //!    surface we don't use.
 //!
 //! Coverage limits (refuses cleanly, doesn't OOB):
-//! - One video track per MP4 (multi-track refuses with a clean
-//!   error pointing at the count).
+//! - The first 'vide'-handler trak is decoded; audio / timecode
+//!   / extra video traks are ignored. A file with no video trak
+//!   refuses with a clean error.
 //! - Sample data inside `mdat` (the dominant case).
 //! - 32-bit chunk offsets (`stco`, not `co64`); 32-bit sample
 //!   sizes (`stsz`). 4 GiB+ files would need co64 / 64-bit
@@ -78,7 +81,8 @@ const TAG_VIDE: [u8; 4] = *b"vide";
 /// codes). Multiple NALs may be concatenated.
 pub type Sample = Vec<u8>;
 
-/// MP4 demuxer for a single H.264 video track.
+/// MP4 demuxer for the H.264 video track of an MP4. The container
+/// may carry extra traks (audio, timecode) -- they are ignored.
 pub struct Mp4Demuxer {
     /// SPS NAL bytes (without start code -- caller prepends one).
     pub sps: Vec<u8>,
@@ -141,29 +145,8 @@ impl Mp4Demuxer {
         let moov = moov_data.ok_or_else(|| anyhow!("no moov box found"))?;
         let mdat_off = mdat_offset.ok_or_else(|| anyhow!("no mdat box found"))?;
 
-        // Walk moov -> trak -> mdia -> hdlr (=vide) -> minf -> stbl.
-        let traks = find_boxes(&moov, TAG_TRAK)?;
-        if traks.len() != 1 {
-            bail!(
-                "expected exactly 1 trak (single H.264 video); found {}",
-                traks.len()
-            );
-        }
-        let trak = traks[0];
-        let mdia = first_box(trak, TAG_MDIA)?;
-        let hdlr = first_box(mdia, TAG_HDLR)?;
-        // hdlr structure: 1-byte version + 3-byte flags + 4-byte
-        // pre_defined + 4-byte handler_type + 12-byte reserved + name.
-        if hdlr.len() < 12 {
-            bail!("hdlr too short");
-        }
-        let handler_type = [hdlr[8], hdlr[9], hdlr[10], hdlr[11]];
-        if handler_type != TAG_VIDE {
-            bail!(
-                "first trak's handler_type is {:?}; need 'vide'",
-                std::str::from_utf8(&handler_type).unwrap_or("??")
-            );
-        }
+        // Walk moov -> (video) trak -> mdia -> minf -> stbl.
+        let mdia = select_video_mdia(&moov)?;
         let minf = first_box(mdia, TAG_MINF)?;
         let stbl = first_box(minf, TAG_STBL)?;
 
@@ -463,6 +446,40 @@ fn find_boxes(parent: &[u8], tag: [u8; 4]) -> Result<Vec<&[u8]>> {
     Ok(out)
 }
 
+/// Pick the `mdia` box body of the first 'vide'-handler trak
+/// inside a `moov` body.
+///
+/// A single-trak file is the common case, but plenty of real
+/// .mp4s carry a video trak plus audio (+ sometimes a timecode
+/// or text trak). Rather than refusing the whole container, this
+/// walks each trak's mdia/hdlr and returns the first whose
+/// handler_type is 'vide'. Signs play the video and mute audio
+/// anyway, so dropping the non-video traks is exactly right. A
+/// file with no video trak bails cleanly.
+fn select_video_mdia(moov: &[u8]) -> Result<&[u8]> {
+    let traks = find_boxes(moov, TAG_TRAK)?;
+    if traks.is_empty() {
+        bail!("no trak boxes in moov");
+    }
+    for &trak in &traks {
+        let mdia = first_box(trak, TAG_MDIA)?;
+        let hdlr = first_box(mdia, TAG_HDLR)?;
+        // hdlr: 1-byte version + 3-byte flags + 4-byte pre_defined
+        // + 4-byte handler_type + 12-byte reserved + name.
+        if hdlr.len() < 12 {
+            bail!("hdlr too short");
+        }
+        let handler_type = [hdlr[8], hdlr[9], hdlr[10], hdlr[11]];
+        if handler_type == TAG_VIDE {
+            return Ok(mdia);
+        }
+    }
+    bail!(
+        "no video trak among {} trak(s) (need a 'vide' handler)",
+        traks.len()
+    )
+}
+
 /// Find the first child box with the given tag, or Err.
 fn first_box(parent: &[u8], tag: [u8; 4]) -> Result<&[u8]> {
     find_boxes(parent, tag)?
@@ -647,5 +664,81 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb,
             0x00, 0x00, 0x00, 0x01, 0x68, 0xcc,
         ]);
+    }
+
+    // --- multi-trak video-track selection ---------------------
+
+    /// Build an ISO BMFF box: [size:u32 BE][tag][body].
+    fn mp4box(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A `trak` box whose mdia/hdlr advertises `handler`. The mdia
+    /// body also carries `marker` inside a throwaway `free` box so
+    /// a test can tell which trak select_video_mdia returned.
+    fn trak_with_handler(handler: &[u8; 4], marker: u8) -> Vec<u8> {
+        // hdlr body: version+flags (4) + pre_defined (4) +
+        // handler_type (4) == 12 bytes, the minimum the parser
+        // requires.
+        let mut hdlr_body = vec![0u8; 8];
+        hdlr_body.extend_from_slice(handler);
+        let mut mdia_body = mp4box(b"hdlr", &hdlr_body);
+        mdia_body.extend(mp4box(b"free", &[marker]));
+        mp4box(b"trak", &mp4box(b"mdia", &mdia_body))
+    }
+
+    #[test]
+    fn select_video_mdia_single_video_trak() {
+        let moov = trak_with_handler(b"vide", 0x11);
+        let mdia = select_video_mdia(&moov).expect("video trak found");
+        assert_eq!(*mdia.last().unwrap(), 0x11);
+    }
+
+    #[test]
+    fn select_video_mdia_picks_video_after_audio() {
+        // Audio trak first, video second -- the demuxer must skip
+        // the audio trak and select the video one.
+        let mut moov = trak_with_handler(b"soun", 0xAA);
+        moov.extend(trak_with_handler(b"vide", 0x22));
+        let mdia = select_video_mdia(&moov).expect("video trak found");
+        assert_eq!(*mdia.last().unwrap(), 0x22,
+            "selected the audio trak instead of the video trak");
+    }
+
+    #[test]
+    fn select_video_mdia_picks_video_before_audio() {
+        let mut moov = trak_with_handler(b"vide", 0x33);
+        moov.extend(trak_with_handler(b"soun", 0xBB));
+        let mdia = select_video_mdia(&moov).expect("video trak found");
+        assert_eq!(*mdia.last().unwrap(), 0x33);
+    }
+
+    #[test]
+    fn select_video_mdia_first_of_two_video_traks_wins() {
+        let mut moov = trak_with_handler(b"vide", 0x44);
+        moov.extend(trak_with_handler(b"vide", 0xDD));
+        let mdia = select_video_mdia(&moov).expect("video trak found");
+        assert_eq!(*mdia.last().unwrap(), 0x44);
+    }
+
+    #[test]
+    fn select_video_mdia_no_video_trak_bails() {
+        // Audio-only container: no 'vide' handler anywhere.
+        let moov = trak_with_handler(b"soun", 0xCC);
+        let err = select_video_mdia(&moov).unwrap_err().to_string();
+        assert!(err.contains("no video trak"),
+            "unexpected error: {err}");
+    }
+
+    #[test]
+    fn select_video_mdia_no_traks_bails() {
+        let err = select_video_mdia(&[]).unwrap_err().to_string();
+        assert!(err.contains("no trak boxes"),
+            "unexpected error: {err}");
     }
 }

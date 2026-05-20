@@ -389,12 +389,15 @@ def _decode_mp4_payload(b64: str) -> bytes:
     starts with a well-formed MP4 `ftyp` box so we're not persisting
     text / images / random bytes under asset.mp4.
 
-    Bug 8 / Fix C (2026-05-17): also validates single-trak. The rust
-    sidecar's mp4_demux requires exactly one trak (single H.264
-    video, no audio); a multi-trak MP4 reaches cache.load, fails to
-    demux, gets skip-marked via Fix A, and the operator gets a
-    confusing "Unsupported" log instead of a clear upload-time
-    rejection. Rejecting at upload is the right surface.
+    Bug 8 / Fix C (2026-05-17): also validates the file carries an
+    H.264 video trak. Multi-trak (2026-05-20): the rust sidecar now
+    SELECTS the video trak out of a multi-trak container, so a
+    video+audio MP4 is fully supported -- the audio trak is simply
+    ignored. The upload gate therefore rejects only a file with NO
+    video trak (or a malformed container): such a file reaches
+    cache.load, fails to demux, gets skip-marked via Fix A, and the
+    operator gets a confusing "Unsupported" log instead of a clear
+    upload-time rejection. Rejecting at upload is the right surface.
     """
     try:
         mp4 = base64.b64decode(b64, validate=True)
@@ -412,84 +415,110 @@ def _decode_mp4_payload(b64: str) -> bytes:
             detail="mp4_base64 doesn't look like an MP4 (missing ftyp box)",
         )
 
-    trak_count = _count_traks_in_mp4(mp4)
-    if trak_count != 1:
-        # The rust sidecar (renderer/src/mp4_demux.rs L146-150) bails
-        # with "expected exactly 1 trak (single H.264 video); found N"
-        # if cache.load sees != 1 traks. Pre-Bug-8 this slipped past
-        # upload and surfaced as a paint-time OpError that hot-spun
-        # the playback loop. Reject at upload with an actionable
-        # ffmpeg command instead.
-        if trak_count == 0:
-            detail = (
-                "MP4 has no video trak. openMarquee requires single-"
-                "track H.264 in MP4. Re-export with audio stripped: "
-                "`ffmpeg -i input.mp4 -c:v copy -an output.mp4`"
-            )
-        elif trak_count < 0:
-            detail = (
+    video_trak_count = _count_video_traks_in_mp4(mp4)
+    if video_trak_count == 0:
+        # The rust sidecar (renderer/src/mp4_demux.rs ::
+        # select_video_mdia) bails with "no video trak ..." if
+        # cache.load sees a container with no 'vide'-handler trak.
+        # Pre-Bug-8 a non-playable file slipped past upload and
+        # surfaced as a paint-time OpError that hot-spun the
+        # playback loop. Reject at upload with an actionable
+        # message instead.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "MP4 has no H.264 video trak. openMarquee plays the "
+                "video trak of an MP4 (an audio trak is fine and is "
+                "ignored). Re-export a real H.264 video, e.g. "
+                "`ffmpeg -i input -c:v libx264 output.mp4`"
+            ),
+        )
+    if video_trak_count < 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
                 "MP4 box structure is malformed (truncated or invalid "
                 "size fields). Re-export with: `ffmpeg -i input.mp4 "
-                "-c:v copy -an output.mp4`"
-            )
-        else:
-            detail = (
-                f"MP4 has {trak_count} traks; openMarquee requires "
-                "single-track H.264 (audio + video MP4s aren't "
-                "supported on the Pi's bcm2835-codec demuxer). Strip "
-                "audio with: "
-                "`ffmpeg -i input.mp4 -c:v copy -an output.mp4`"
-            )
-        raise HTTPException(status_code=400, detail=detail)
+                "-c:v libx264 output.mp4`"
+            ),
+        )
 
     return mp4
 
 
-def _count_traks_in_mp4(mp4: bytes) -> int:
-    """Walk top-level boxes to find `moov`, then count `trak` children.
+def _count_video_traks_in_mp4(mp4: bytes) -> int:
+    """Walk top-level boxes to find `moov`, then count `trak`
+    children whose `mdia`/`hdlr` advertises a 'vide' handler.
 
-    Mirror of `renderer/src/mp4_demux.rs::find_boxes` so an upload
-    that the rust sidecar would reject at cache.load gets rejected
-    here at upload time with an actionable error message.
+    Mirror of `renderer/src/mp4_demux.rs::select_video_mdia` so an
+    upload the rust sidecar would reject at cache.load gets rejected
+    here at upload time with an actionable error message. The
+    renderer demuxes the first video trak and ignores audio /
+    timecode traks, so a video+audio MP4 is fully supported; only a
+    file with *no* video trak (or a malformed container) fails.
 
     Returns:
-      - Non-negative integer: count of `trak` boxes found inside the
-        moov box.
+      - Non-negative integer: count of video traks inside the moov
+        box. Audio / timecode traks are not counted.
       - -1: malformed box structure (truncated header, size < 8,
-        size overflows parent, no moov box).
+        size overflows parent, or no moov box).
 
     Box format: 4 bytes big-endian size, 4 bytes type tag, then
     `size-8` bytes of payload. No 64-bit extended-size support
     (mp4_demux.rs doesn't support it either — what rust would
     reject at runtime, upload rejects here).
     """
-    # Top-level scan for moov.
-    pos = 0
-    moov_payload: bytes | None = None
-    while pos + 8 <= len(mp4):
-        size = int.from_bytes(mp4[pos:pos + 4], "big")
-        kind = mp4[pos + 4:pos + 8]
-        if size < 8 or pos + size > len(mp4):
-            return -1
-        if kind == b"moov":
-            moov_payload = mp4[pos + 8:pos + size]
-            break
-        pos += size
-    if moov_payload is None:
-        return -1
 
-    # Count `trak` boxes inside moov.
-    pos = 0
-    n = 0
-    while pos + 8 <= len(moov_payload):
-        size = int.from_bytes(moov_payload[pos:pos + 4], "big")
-        kind = moov_payload[pos + 4:pos + 8]
-        if size < 8 or pos + size > len(moov_payload):
+    class _Malformed(Exception):
+        """Raised on any invalid box size field."""
+
+    def _child_boxes(payload: bytes) -> list[tuple[bytes, int, int]]:
+        """`(tag, body_start, body_end)` for each direct child box;
+        offsets index into `payload`. Records offsets rather than
+        slicing so a large `mdat` is never copied."""
+        boxes: list[tuple[bytes, int, int]] = []
+        pos = 0
+        while pos + 8 <= len(payload):
+            size = int.from_bytes(payload[pos:pos + 4], "big")
+            kind = payload[pos + 4:pos + 8]
+            if size < 8 or pos + size > len(payload):
+                raise _Malformed
+            boxes.append((kind, pos + 8, pos + size))
+            pos += size
+        return boxes
+
+    def _first_child(payload: bytes, tag: bytes) -> bytes | None:
+        for kind, start, end in _child_boxes(payload):
+            if kind == tag:
+                return payload[start:end]
+        return None
+
+    try:
+        moov = _first_child(mp4, b"moov")
+        if moov is None:
             return -1
-        if kind == b"trak":
-            n += 1
-        pos += size
-    return n
+        n = 0
+        for kind, start, end in _child_boxes(moov):
+            if kind != b"trak":
+                continue
+            # A trak with no mdia/hdlr is skipped here, not counted.
+            # The rust select_video_mdia is stricter (it bails on a
+            # trak missing those children) -- this asymmetry only
+            # affects hand-crafted malformed input: the renderer
+            # stays the authority, so nothing unplayable slips to
+            # playback; the upload error is just less precise.
+            mdia = _first_child(moov[start:end], b"mdia")
+            if mdia is None:
+                continue
+            hdlr = _first_child(mdia, b"hdlr")
+            # hdlr body: 1-byte version + 3-byte flags + 4-byte
+            # pre_defined + 4-byte handler_type. handler_type is
+            # at offset 8..12.
+            if hdlr is not None and len(hdlr) >= 12 and hdlr[8:12] == b"vide":
+                n += 1
+        return n
+    except _Malformed:
+        return -1
 
 
 class VideoUpload(BaseModel):

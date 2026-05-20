@@ -751,7 +751,7 @@ class PlaybackLoop:
         Bug 8 / Fix B (2026-05-17): on playlist change, clear the per-
         slide IPC-failure throttle set so an operator who fixed a
         broken slide (e.g. by switching to a healthier playlist OR by
-        re-uploading a single-trak asset) gets ERROR-level visibility
+        re-uploading a valid video asset) gets ERROR-level visibility
         on the next attempt, not DEBUG-suppressed silence.
 
         Bug 8 gap (2026-05-20): the unsupported-kind skip throttle

@@ -1304,10 +1304,10 @@ fn handle_inner_request(
             }
             // Bug 8 / Fix A (2026-05-17): cache.load succeeded
             // populating ContentItem::Video, but the underlying
-            // MP4 demuxer failed (e.g. multi-trak input rejected
-            // by mp4_demux's single-trak invariant). The wire
-            // marker "video slide unsupported (load failed)"
-            // matches `_UNSUPPORTED_SLIDE_WIRE_MARKERS` in
+            // MP4 demuxer failed (asset.mp4 missing, malformed, or
+            // carrying no H.264 video trak). The wire marker
+            // "video slide unsupported (load failed)" matches
+            // `_UNSUPPORTED_SLIDE_WIRE_MARKERS` in
             // backend/openmarquee/rendering/rust_renderer.py so
             // Python raises `RustRendererUnsupportedSlideError`,
             // which `_play_via_rust_ipc`'s existing handler skips
@@ -1316,8 +1316,8 @@ fn handle_inner_request(
             if cache.video_skip.contains(&p.slide_id) {
                 return err(format!(
                     "video slide unsupported (load failed): {} — \
-                     asset.mp4 missing or malformed (multi-trak? \
-                     see piece-3a demuxer single-trak invariant)",
+                     asset.mp4 missing, malformed, or has no \
+                     H.264 video trak",
                     p.slide_id
                 ));
             }
@@ -1333,8 +1333,8 @@ fn handle_inner_request(
             if cache.video_skip.contains(&p.to_slide_id) {
                 return err(format!(
                     "video slide unsupported (load failed): {} — \
-                     asset.mp4 missing or malformed (multi-trak? \
-                     see piece-3a demuxer single-trak invariant)",
+                     asset.mp4 missing, malformed, or has no \
+                     H.264 video trak",
                     p.to_slide_id
                 ));
             }

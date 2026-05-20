@@ -512,29 +512,38 @@ def test_list_content_returns_items_in_playlist_order(
 
 
 def _mp4_box(tag: bytes, payload: bytes = b"") -> bytes:
-    """Build a single MP4 box: 4-byte big-endian size + 4-byte tag + payload.
-
-    Bug 8 / Fix C (2026-05-17): the upload validator counts `trak`
-    boxes inside `moov` to enforce single-track-H.264. Tests now
-    construct synthetic MP4 byte streams with the box structure the
-    validator walks. See `_count_traks_in_mp4` in api.py.
-    """
+    """Build a single MP4 box: 4-byte big-endian size + 4-byte tag + payload."""
     size = 8 + len(payload)
     return size.to_bytes(4, "big") + tag + payload
 
 
-def _fake_mp4(n_traks: int = 1) -> bytes:
-    """Smallest valid MP4 byte stream that passes the ftyp + single-
-    trak checks. Default is 1 trak (the rust mp4_demux's required
-    shape). Pass `n_traks=0` or `n_traks=2+` to construct rejection
-    fixtures for Fix C's multi-trak negative tests.
+def _trak_box(handler: bytes = b"vide") -> bytes:
+    """A `trak` box carrying the mdia/hdlr structure the upload
+    validator walks. `handler` is the 4-byte hdlr handler_type:
+    `b"vide"` for a video trak, `b"soun"` for audio. See
+    `_count_video_traks_in_mp4` in api.py.
+    """
+    # hdlr body: 1-byte version + 3-byte flags + 4-byte pre_defined
+    # + 4-byte handler_type. 12 bytes is the minimum the validator
+    # (and the rust demuxer) require.
+    hdlr = _mp4_box(b"hdlr", b"\x00" * 8 + handler)
+    return _mp4_box(b"trak", _mp4_box(b"mdia", hdlr))
+
+
+def _fake_mp4(handlers: tuple[bytes, ...] = (b"vide",)) -> bytes:
+    """Smallest valid MP4 byte stream that passes the ftyp +
+    video-trak upload checks. Default is a single video trak (the
+    minimal playable shape). Pass e.g. `(b"vide", b"soun")` for a
+    video+audio multi-trak file, or `(b"soun",)` / `()` to build
+    rejection fixtures.
 
     Layout:
-      [ftyp box: size=16, 'isom' major brand, minor version 0]
-      [moov box containing N empty trak children]
+      [ftyp box: 'isom' major brand, minor version 0]
+      [moov box: one trak per entry in `handlers`, each
+       trak -> mdia -> hdlr advertising that handler_type]
     """
     ftyp = _mp4_box(b"ftyp", b"isom" + b"\x00\x00\x00\x00")
-    moov_payload = b"".join(_mp4_box(b"trak") for _ in range(n_traks))
+    moov_payload = b"".join(_trak_box(h) for h in handlers)
     moov = _mp4_box(b"moov", moov_payload)
     return ftyp + moov
 
@@ -584,38 +593,48 @@ def test_post_video_rejects_non_mp4_bytes(client: TestClient):
     assert "ftyp" in response.json()["detail"].lower()
 
 
-def test_post_video_rejects_multi_trak_mp4(client: TestClient):
-    """Bug 8 / Fix C: upload validation rejects multi-trak MP4 (audio
-    + video) with an actionable error message + ffmpeg strip command.
-    Pre-fix, a multi-trak file reached cache.load on the rust side,
-    failed Mp4Demuxer::open's single-trak invariant, and the playback
-    loop hot-spun the OpError until ce225f3 + Fix A landed. Rejecting
-    at upload is the right surface — operator sees the problem
-    immediately, not 10 minutes later when the slide hits playback."""
+def test_post_video_accepts_video_plus_audio_mp4(client: TestClient):
+    """Multi-trak (2026-05-20): a video+audio MP4 is now fully
+    supported — the rust demuxer's select_video_mdia picks the
+    video trak and ignores the audio. The upload gate must accept
+    it (it previously rejected any non-single-trak file). The
+    'coffee' clip qarl tried failed exactly here."""
     payload = _video_payload(
-        mp4_base64=base64.b64encode(_fake_mp4(n_traks=2)).decode("ascii"),
+        mp4_base64=base64.b64encode(
+            _fake_mp4((b"vide", b"soun"))
+        ).decode("ascii"),
+    )
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 200, response.json()
+
+
+def test_post_video_rejects_audio_only_mp4(client: TestClient):
+    """An MP4 with traks but no 'vide'-handler trak (e.g. an
+    audio-only file) has nothing to play and is rejected — the
+    rust select_video_mdia would bail with 'no video trak'."""
+    payload = _video_payload(
+        mp4_base64=base64.b64encode(
+            _fake_mp4((b"soun", b"soun"))
+        ).decode("ascii"),
     )
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 400
     detail = response.json()["detail"]
-    # Message mentions the trak count + the ffmpeg fix command.
-    assert "2 trak" in detail, f"detail missing trak count: {detail!r}"
-    assert "ffmpeg" in detail, f"detail missing ffmpeg command: {detail!r}"
-    assert "-an" in detail, f"detail missing -an flag: {detail!r}"
+    assert "video trak" in detail.lower(), f"detail: {detail!r}"
 
 
 def test_post_video_rejects_zero_trak_mp4(client: TestClient):
-    """Bug 8 / Fix C: an MP4 with a valid ftyp + moov but zero trak
-    children is also rejected (no video trak at all). Less common
-    than multi-trak but still a degenerate input the rust would fail
-    on at runtime."""
+    """An MP4 with a valid ftyp + moov but zero trak children is
+    rejected (no video trak at all). Less common than the audio-
+    only case but still a degenerate input the rust would fail on
+    at runtime."""
     payload = _video_payload(
-        mp4_base64=base64.b64encode(_fake_mp4(n_traks=0)).decode("ascii"),
+        mp4_base64=base64.b64encode(_fake_mp4(())).decode("ascii"),
     )
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 400
     detail = response.json()["detail"]
-    assert "no video trak" in detail.lower()
+    assert "video trak" in detail.lower()
 
 
 def test_post_video_rejects_malformed_box_structure(client: TestClient):
@@ -637,11 +656,10 @@ def test_post_video_rejects_malformed_box_structure(client: TestClient):
 
 
 def test_post_video_accepts_single_trak_mp4(client: TestClient):
-    """Bug 8 / Fix C inverse: a synthetic 1-trak MP4 (the rust-
-    sidecar's required shape) passes validation. Locks the
-    happy-path for the new check."""
+    """A synthetic single-video-trak MP4 passes validation. Locks
+    the happy-path for the upload check."""
     payload = _video_payload(
-        mp4_base64=base64.b64encode(_fake_mp4(n_traks=1)).decode("ascii"),
+        mp4_base64=base64.b64encode(_fake_mp4((b"vide",))).decode("ascii"),
     )
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 200, response.json()
@@ -762,11 +780,12 @@ def test_put_video_with_new_assets_replaces_them(client: TestClient, storage: Co
     item_id = UUID(post.json()["id"])
 
     new_thumb = _real_png_bytes()
-    # Bug 8 / Fix C: new MP4 must be valid single-trak to pass
-    # upload validation. _fake_mp4() builds the canonical 1-trak
-    # shape (different bytes than the original payload so the
-    # round-trip read_video() assertion still proves replacement).
-    new_mp4 = _fake_mp4(n_traks=1) + b"\xab\xcd"
+    # The new MP4 must carry a video trak to pass upload validation.
+    # The 2 trailing bytes (< an 8-byte box header) are ignored by
+    # the box walker but make the bytes differ from the original
+    # payload so the round-trip read_video() assertion still proves
+    # replacement.
+    new_mp4 = _fake_mp4() + b"\xab\xcd"
 
     response = client.put(
         f"/api/content/videos/{item_id}",
