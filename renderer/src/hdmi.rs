@@ -5569,19 +5569,31 @@ unsafe fn bake_video_slide_to_current_fbo(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     let t_feed_start = if profile_first { Some(std::time::Instant::now()) } else { None };
-    // Feed the next sample if any remain. Codec is pipelined: a
-    // single feed may not produce a frame this tick; the EAGAIN
-    // retry below covers the latency. When samples are exhausted
-    // we send EOF on the first such tick.
-    if *next_sample_idx < samples.len() {
-        let s = &samples[*next_sample_idx];
-        decoder
-            .feed(s)
-            .with_context(|| format!("feed sample {}", *next_sample_idx))?;
-        *next_sample_idx += 1;
-    } else if !decoder.is_output_eof_sent() {
-        decoder.feed(&[]).context("feed EOF")?;
+    // Feed the next sample. Codec is pipelined: a single feed may
+    // not produce a frame this tick; the EAGAIN retry below covers
+    // the latency.
+    //
+    // FYS bug 3: when the samples are exhausted, LOOP — reset to
+    // sample 0 and keep feeding — instead of feeding EOF and
+    // freezing on the last frame. A video clip shorter than the
+    // slide's slot must replay for the full slot, not stall.
+    // samples[0] is the clip's opening IDR; the V4L2 decoder
+    // retains the SPS/PPS fed at priming (it decoded every
+    // mid-stream P/B sample off that same SPS/PPS), so a bare IDR
+    // is a valid in-stream refresh point — no flush/reinit needed.
+    if samples.is_empty() {
+        // Defensive: prime_video_decoder bails on a zero-sample
+        // MP4, so a decoder with no samples shouldn't reach here.
+        return Ok(None);
     }
+    if *next_sample_idx >= samples.len() {
+        *next_sample_idx = 0;
+    }
+    let s = &samples[*next_sample_idx];
+    decoder
+        .feed(s)
+        .with_context(|| format!("feed sample {}", *next_sample_idx))?;
+    *next_sample_idx += 1;
     if let Some(t) = t_feed_start {
         eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
