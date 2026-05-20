@@ -19,6 +19,13 @@ import { isFontRegistered, isWasmReady, rasterizeText } from "./wasm-renderer.js
 const RASTERIZE_W = 3840;
 const RASTERIZE_H = 2160;
 
+// FYS bug 8: the WASM/fontdue rasterizer is monochrome — it renders
+// emoji codepoints as tofu. Extended_Pictographic is the Unicode
+// property for emoji pictographs (😱, ☃, …); it deliberately does
+// NOT match plain digits / shapes, so only genuine color emoji
+// trip the fillText fallback. Non-global so `.test()` is stateless.
+const EMOJI_RE = /\p{Extended_Pictographic}/u;
+
 // Map TextLayer.blend -> Canvas2D globalCompositeOperation so the
 // editor preview matches the backend's PIL composite_with_blend
 // math (W3C compositing spec: multiply/screen/overlay are first-
@@ -247,10 +254,18 @@ function paintLayer(ctx, canvas, layer) {
     // Rust's FS_GLYPH path uses GL_LINEAR — equivalent at the
     // single-axis-downscale operation point, so parity is preserved.
     const colorRgba = parseCssColorRgba(textColor);
+    // FYS bug 8: when the text contains an emoji codepoint, fall the
+    // whole block back to ctx.fillText — the WASM/fontdue path is
+    // monochrome and tofus emoji, while fillText renders color emoji
+    // natively (much closer to the on-glass COLR render than a tofu
+    // box). A preview block with emoji can't pixel-match the Rust
+    // renderer anyway, so the WASM-parity path has nothing to lose.
+    const hasEmoji = lines.some((line) => EMOJI_RE.test(line));
     const useWasm = (
         colorRgba !== null
         && isWasmReady()
         && isFontRegistered(fontFamily)
+        && !hasEmoji
     );
 
     if (useWasm) {
