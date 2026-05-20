@@ -188,3 +188,48 @@ def test_takeover_with_no_active_session_starts_one(client: TestClient):
     )
     assert response.status_code == 200
     assert "session_id" in response.json()
+
+
+# --- STREAM/VLC slice 3: tier table ---------------------------------------
+
+
+def test_hardware_tier_json_round_trips():
+    """HardwareTier survives a model_dump -> model_validate round trip
+    for both the basic and good tiers — the /status wire shape and any
+    persisted form stay stable."""
+    from openmarquee.api_stream import HardwareTier
+
+    for tier in (
+        HardwareTier(name="basic", max_width=854, max_height=480, max_fps=30),
+        HardwareTier(name="good", max_width=1920, max_height=1080, max_fps=30),
+    ):
+        restored = HardwareTier.model_validate(tier.model_dump())
+        assert restored == tier
+
+
+def test_good_tier_is_pi4_1080p():
+    """The `good` tier (Pi 4/5) is 1920×1080/30 per STREAM_VLC §7."""
+    from openmarquee.api_stream import _GOOD_TIER
+
+    assert _GOOD_TIER.name == "good"
+    assert (_GOOD_TIER.max_width, _GOOD_TIER.max_height) == (1920, 1080)
+    assert _GOOD_TIER.max_fps == 30
+
+
+def test_source_tier_table_covers_both_sources():
+    """The per-source tier table has an entry for each stream source
+    (webrtc + rtsp); both are basic today."""
+    from openmarquee.api_stream import _BASIC_TIER, _SOURCE_TIERS
+
+    assert set(_SOURCE_TIERS) == {"webrtc", "rtsp"}
+    assert all(tier == _BASIC_TIER for tier in _SOURCE_TIERS.values())
+
+
+def test_status_tier_shape_is_complete(client: TestClient):
+    """/status reports a fully-formed tier object (name + all three
+    caps) — the phone reads every field to clamp its capture."""
+    body = client.get("/api/stream/status").json()
+    tier = body["tier"]
+    assert set(tier) == {"name", "max_width", "max_height", "max_fps"}
+    assert tier["name"] in ("basic", "good", "future")
+    assert all(isinstance(tier[k], int) for k in ("max_width", "max_height", "max_fps"))

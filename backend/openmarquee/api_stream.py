@@ -60,12 +60,13 @@ class StreamStopRequest(BaseModel):
 
 
 class HardwareTier(BaseModel):
-    """What the phone should clamp getUserMedia constraints to.
+    """The capture / decode caps a stream source should clamp to.
 
-    Today this is a static report keyed off the §5.11 basic-tier row
-    (Pi Zero 2 W, 480p/30). Phase 12.3 live-fire replaces the constant
-    with real hardware detection — if the tier needs to drop to 360p,
-    that change is local to this struct.
+    `basic` = Pi Zero 2 W (854×480/30), `good` = Pi 4/5
+    (1920×1080/30); `future` is reserved for the Phase 12.3 hardware
+    live-fire row. Today /status reports a static tier; STREAM/VLC
+    slice 9 live-fire adds real per-device detection — if a tier
+    number needs to change, that change stays local to this module.
     """
 
     name: Literal["basic", "good", "future"]
@@ -93,10 +94,22 @@ class StreamStatus(BaseModel):
     tier: HardwareTier
 
 
-# §5.11 basic tier. Phase 12.3 hardware live-fire validates the
-# 480p/30 number; if SW VP8/H.264 decode in aiortc can't sustain it on
-# Pi Zero 2 W, the tier drops to 360p/30 and only this constant changes.
+# Stream hardware tiers (SYSTEM_SPEC §5.11 + STREAM_VLC_PROPOSAL §7).
+# Phase 12.3 hardware live-fire (STREAM/VLC slice 9) validates these
+# numbers and adds real per-device detection; until then /status
+# reports a static tier. If SW H.264 decode can't sustain a number on
+# the target Pi, only these constants change.
 _BASIC_TIER = HardwareTier(name="basic", max_width=854, max_height=480, max_fps=30)
+_GOOD_TIER = HardwareTier(name="good", max_width=1920, max_height=1080, max_fps=30)
+
+# Per-source tier table. Both the phone-camera (webrtc) and the VLC
+# (rtsp) sources run at the basic tier today; lifting the single
+# constant into this table lets later profiling give the two sources
+# distinct caps without touching call sites.
+_SOURCE_TIERS: dict[str, HardwareTier] = {
+    "webrtc": _BASIC_TIER,
+    "rtsp": _BASIC_TIER,
+}
 
 
 @router.post("/start", response_model=StreamStartResponse)
@@ -177,5 +190,7 @@ async def stream_status(streams: StreamDep) -> StreamStatus:
         state="active" if streams.is_active else "idle",
         session_id=streams.active_session_id,
         started_at=streams.active_session_started_at,
-        tier=_BASIC_TIER,
+        # /status is polled by the phone before Go Live, so it reports
+        # the webrtc (phone-camera) source's tier.
+        tier=_SOURCE_TIERS["webrtc"],
     )
