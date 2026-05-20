@@ -159,7 +159,7 @@ const EDITOR_TEMPLATE = `
                     </label>
                     <label class="om-field editor-bg-slide-wrap" hidden>
                         <span>Saved image slide</span>
-                        <select class="om-select field-bg-slide"><option value="">(pick a slide)</option></select>
+                        <select class="om-pulldown om-pulldown-cased field-bg-slide"><option value="">(pick a slide)</option></select>
                     </label>
                     <label class="om-row" style="gap: 8px; cursor: pointer;">
                         <input type="radio" name="editor-bg-source" class="field-bg-source" value="video">
@@ -167,7 +167,7 @@ const EDITOR_TEMPLATE = `
                     </label>
                     <label class="om-field editor-bg-video-wrap" hidden>
                         <span>Saved video slide</span>
-                        <select class="om-select field-bg-video"><option value="">(pick a video)</option></select>
+                        <select class="om-pulldown om-pulldown-cased field-bg-video"><option value="">(pick a video)</option></select>
                     </label>
                     <div class="editor-bg-generate" hidden>
                         <label class="om-field">
@@ -267,7 +267,7 @@ const LAYER_GROUP_TEMPLATE = `
         </div>
         <label class="om-field field-auto-format-wrap" hidden>
             <span>Format</span>
-            <select class="om-select field-auto-format"></select>
+            <select class="om-pulldown om-pulldown-cased field-auto-format"></select>
         </label>
         <p class="field-hint field-auto-mode-hint" hidden style="margin: 0; color: var(--om-text-dim); font-size: 12.5px;">
             When Dynamic Text is set, the typed text is a preview-only

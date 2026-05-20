@@ -78,7 +78,7 @@ const SECTION_TEMPLATE = `
                     </label>
                     <label class="field om-field">
                         <span>Output mode</span>
-                        <select class="om-select field-output-mode"></select>
+                        <select class="om-pulldown om-pulldown-cased field-output-mode"></select>
                     </label>
                     <div class="row" style="gap: 10px;">
                         <label class="field om-field" style="flex: 1;">
@@ -91,7 +91,7 @@ const SECTION_TEMPLATE = `
                         </label>
                         <label class="field om-field" style="flex: 1;">
                             <span>Rotation</span>
-                            <select class="om-select field-display-rotation"></select>
+                            <select class="om-pulldown om-pulldown-cased field-display-rotation"></select>
                         </label>
                     </div>
                     <div>
@@ -112,7 +112,7 @@ const SECTION_TEMPLATE = `
                     </div>
                     <label class="field om-field settings-ws281x-pixel-order-wrap" hidden>
                         <span>Addressable strip ordering</span>
-                        <select class="om-select field-ws281x-pixel-order">
+                        <select class="om-pulldown om-pulldown-cased field-ws281x-pixel-order">
                             <option value="row_major">Row-major (wired raster-order)</option>
                             <option value="serpentine">Serpentine (rows alternate direction)</option>
                         </select>
@@ -168,7 +168,7 @@ const SECTION_TEMPLATE = `
                         <div class="row" style="gap: 10px;">
                             <label class="field om-field" style="flex: 1;">
                                 <span>WiFi SSID</span>
-                                <select class="om-select field-wifi-station-ssid-picker">
+                                <select class="om-pulldown om-pulldown-cased field-wifi-station-ssid-picker">
                                     <option value="__other__">(type manually)</option>
                                 </select>
                                 <input type="text" class="om-input field-wifi-station-ssid" maxlength="32" placeholder="SSID">
@@ -260,7 +260,7 @@ const SECTION_TEMPLATE = `
                 <div ${CARD_EYEBROW}>Time</div>
                 <label class="field om-field">
                     <span>Timezone</span>
-                    <select class="om-select field-timezone">
+                    <select class="om-pulldown om-pulldown-cased field-timezone">
                         <option value="">Device local (no explicit timezone)</option>
                     </select>
                 </label>

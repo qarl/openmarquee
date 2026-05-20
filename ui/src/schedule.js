@@ -35,7 +35,7 @@ const SECTION_TEMPLATE = `
         <div class="om-card" style="margin-bottom: 12px;">
             <label class="om-field">
                 <span>Default playlist (when no rule matches)</span>
-                <select class="om-select field-default-playlist"></select>
+                <select class="om-pulldown om-pulldown-cased field-default-playlist"></select>
             </label>
         </div>
 
@@ -315,7 +315,7 @@ function renderRule(rule, availableChoices) {
             </label>
             <label class="field">
                 <span>Playlist</span>
-                <select class="om-select rule-playlist"></select>
+                <select class="om-pulldown om-pulldown-cased rule-playlist"></select>
             </label>
         </div>
     `;

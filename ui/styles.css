@@ -658,6 +658,22 @@ header h1 {
     outline: 2px solid var(--om-accent);
     outline-offset: 1px;
 }
+/* Case-preserving modifier (2026-05-20). The base .om-pulldown
+   force-lowercases its text — correct for the short single-token
+   enum menus it was born on (Transition / Blend / Motion: cut,
+   fade, normal, ticker...). Menus whose option text carries
+   MEANINGFUL case must opt out: acronyms (HDMI, HUB75, WS2812B),
+   case-sensitive identifiers (Wi-Fi SSIDs, IANA timezones like
+   America/Los_Angeles), format tokens (HH:MM, YYYY-MM-DD), and
+   operator-supplied names (slide / video / playlist names). They
+   wear `.om-pulldown-cased` to keep their text as-authored while
+   still sharing the pill chrome / mono font / chevron / hover.
+   See the pingback note: long-term this default could flip to
+   opt-in, but that would mean re-touching the accepted Bug 4
+   commit, so the modifier is the conservative path for now. */
+.om-pulldown-cased {
+    text-transform: none;
+}
 
 /* The Playlists-panel transition chip (.track-block-transition)
    carries no CSS of its own — its visual chrome is .om-pulldown.
