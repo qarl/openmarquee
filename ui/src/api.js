@@ -246,6 +246,45 @@ export async function updateTextSlide(id, payload) {
 }
 
 /**
+ * Create a VLC-stream slide. `payload` matches the backend
+ * `VlcStreamUpload` schema (api.py) — pure metadata (name, rtsp_url,
+ * duration_ms, on_unreachable, transition). There is no asset upload:
+ * the video is a live RTSP feed and the thumbnail card is synthesised
+ * server-side.
+ */
+export async function saveVlcStream(payload) {
+    const response = await apiFetch("/api/content/vlc-streams", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(`Save failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
+ * Update an existing VLC-stream slide (metadata only; the UUID is
+ * preserved so playlist + schedule references hold).
+ */
+export async function updateVlcStream(id, payload) {
+    const response = await apiFetch(`/api/content/vlc-streams/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(
+            `Update VLC stream failed (${response.status}): ${detail}`,
+        );
+    }
+    return await response.json();
+}
+
+/**
  * Update an existing image slide. `png_base64` may be null to keep the
  * stored PNG untouched (metadata-only update).
  */

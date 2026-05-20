@@ -23,6 +23,7 @@ from openmarquee.content import (
     TextBox,
     TextSlide,
     VideoSlide,
+    VlcStreamSlide,
 )
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
@@ -657,6 +658,87 @@ async def update_image(
         else storage.read_asset(item_id)
     )
     storage.save_image(updated, image_bytes)
+    background.add_task(flock_sync.notify_peers, updated.id, "updated")
+    return updated
+
+
+class VlcStreamUpload(BaseModel):
+    """Wire format for POST /api/content/vlc-streams.
+
+    A VLC-stream slide has no operator-uploaded asset — the video is a
+    live RTSP feed and the thumbnail card is synthesised at save time
+    (storage.save_vlc_stream). The payload is therefore pure metadata.
+    `on_unreachable` / `transition` are plain strings here; the
+    VlcStreamSlide model does the Literal validation (a bad value
+    surfaces as a 422), mirroring how VideoUpload.transition works.
+    """
+
+    name: str
+    rtsp_url: str
+    duration_ms: int = 10_000
+    on_unreachable: str = "hold_last_frame"
+    transition: str = "cut"
+    transition_ms: int = 500
+
+
+@router.post("/vlc-streams", response_model=VlcStreamSlide)
+async def upload_vlc_stream(
+    payload: VlcStreamUpload,
+    storage: StorageDep,
+    playlist_storage: PlaylistDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
+) -> VlcStreamSlide:
+    try:
+        slide = VlcStreamSlide(**payload.model_dump())
+    except ValidationError as exc:
+        raise _validation_error_422(exc) from exc
+    storage.save_vlc_stream(slide)
+    _append_to_playlist(playlist_storage, slide.id)
+    background.add_task(flock_sync.notify_peers, slide.id, "updated")
+    return slide
+
+
+class VlcStreamUpdate(BaseModel):
+    """Wire format for PUT /api/content/vlc-streams/{id}. All metadata;
+    the UUID is preserved so playlist + schedule references hold."""
+
+    name: str
+    rtsp_url: str
+    duration_ms: int = 10_000
+    on_unreachable: str = "hold_last_frame"
+    transition: str = "cut"
+    transition_ms: int = 500
+
+
+@router.put("/vlc-streams/{item_id}", response_model=VlcStreamSlide)
+async def update_vlc_stream(
+    item_id: UUID,
+    payload: VlcStreamUpdate,
+    storage: StorageDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
+) -> VlcStreamSlide:
+    try:
+        existing = storage.load(item_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"no vlc stream {item_id}"
+        ) from exc
+    if existing.type != "vlc_stream":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item_id} is a {existing.type}, not a vlc_stream",
+        )
+    try:
+        updated = VlcStreamSlide(
+            id=item_id,
+            created_at=existing.created_at,
+            **payload.model_dump(),
+        )
+    except ValidationError as exc:
+        raise _validation_error_422(exc) from exc
+    storage.save_vlc_stream(updated)
     background.add_task(flock_sync.notify_peers, updated.id, "updated")
     return updated
 

@@ -4165,6 +4165,59 @@ html, body { margin: 0; padding: 0; height: 100%; }
     opacity: 0.85;
 }
 
+/* --- VLC-stream slide editor (STREAM/VLC slice 8) -------------------- */
+
+/* The "If the stream isn't running" radio group. Reset the fieldset's
+   default border/padding, stack the options. */
+.vlc-unreachable {
+    border: 0;
+    margin: 0;
+    padding: 0;
+}
+.vlc-unreachable > span {
+    display: block;
+    margin-bottom: 6px;
+}
+.vlc-unreachable label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 14px;
+    color: var(--om-text, var(--text));
+    cursor: pointer;
+}
+
+/* Placeholder preview card — a VLC slide has no operator image; this
+   stands in for the live feed inside the editor. */
+.vlc-stream-preview-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 28px 16px;
+    border-radius: var(--om-radius, 0.5rem);
+    background: var(--om-led-bg, #000);
+    border: 1px solid var(--om-line, var(--panel-border));
+}
+.vlc-stream-preview-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--om-accent);
+}
+.vlc-stream-preview-url {
+    font-family: var(--om-mono, monospace);
+    font-size: 13px;
+    color: var(--om-text, var(--text));
+    word-break: break-all;
+}
+.vlc-stream-preview-note {
+    font-size: 12px;
+    color: var(--om-text-dim, var(--text));
+}
+
 
 /* --- Flock panel — om-flock-grid + om-peer-card (per the 2026-04-28
    design handoff). The prior flock-tile-* rules above are deprecated

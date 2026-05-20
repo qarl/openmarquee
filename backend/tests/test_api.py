@@ -812,3 +812,113 @@ def test_put_video_404s_on_unknown_id(client: TestClient):
         },
     )
     assert response.status_code == 404
+
+
+# --- vlc stream (STREAM/VLC slice 8) ---------------------------------------
+
+
+def test_post_vlc_stream_creates_slide_and_appends_to_playlist(
+    client: TestClient, playlist_storage: PlaylistStorage
+):
+    response = client.post(
+        "/api/content/vlc-streams",
+        json={
+            "name": "Q3 Live",
+            "rtsp_url": "rtsp://laptop:8554/live",
+            "duration_ms": 15_000,
+            "on_unreachable": "black",
+            "transition": "fade",
+            "transition_ms": 300,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "vlc_stream"
+    assert body["rtsp_url"] == "rtsp://laptop:8554/live"
+    assert body["on_unreachable"] == "black"
+    # Appended to the default playlist like every other slide type.
+    assert UUID(body["id"]) in playlist_storage.load().item_ids
+
+
+def test_post_vlc_stream_uses_defaults_for_omitted_fields(client: TestClient):
+    response = client.post(
+        "/api/content/vlc-streams",
+        json={"name": "Minimal", "rtsp_url": "rtsp://h:8554/x"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["duration_ms"] == 10_000
+    assert body["on_unreachable"] == "hold_last_frame"
+    assert body["transition"] == "cut"
+
+
+def test_post_vlc_stream_rejects_bad_on_unreachable(client: TestClient):
+    """An invalid on_unreachable value is caught by the VlcStreamSlide
+    model and surfaced as a 422 (not a 500)."""
+    response = client.post(
+        "/api/content/vlc-streams",
+        json={
+            "name": "Bad",
+            "rtsp_url": "rtsp://h/x",
+            "on_unreachable": "explode",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_get_vlc_stream_thumbnail_is_a_png(client: TestClient):
+    """The synthetic 'VLC stream' card is reachable via the standard
+    asset endpoint so the editor tile renders like any other slide."""
+    post = client.post(
+        "/api/content/vlc-streams",
+        json={"name": "Live", "rtsp_url": "rtsp://h:8554/x"},
+    )
+    item_id = post.json()["id"]
+    asset = client.get(f"/api/content/{item_id}/asset")
+    assert asset.status_code == 200
+    assert asset.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_put_vlc_stream_updates_metadata_preserving_id(client: TestClient):
+    post = client.post(
+        "/api/content/vlc-streams",
+        json={"name": "Before", "rtsp_url": "rtsp://h:8554/old"},
+    )
+    item_id = post.json()["id"]
+    response = client.put(
+        f"/api/content/vlc-streams/{item_id}",
+        json={
+            "name": "After",
+            "rtsp_url": "rtsp://h:8554/new",
+            "duration_ms": 20_000,
+            "on_unreachable": "skip",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == item_id  # UUID preserved
+    assert body["name"] == "After"
+    assert body["rtsp_url"] == "rtsp://h:8554/new"
+    assert body["on_unreachable"] == "skip"
+
+
+def test_put_vlc_stream_wrong_type_returns_409(client: TestClient):
+    """Updating a non-vlc_stream id via the vlc-streams route is a 409."""
+    text = client.post(
+        "/api/content/text-slides",
+        json=_upload_payload(name="a-text-slide"),
+    )
+    text_id = text.json()["id"]
+    response = client.put(
+        f"/api/content/vlc-streams/{text_id}",
+        json={"name": "x", "rtsp_url": "rtsp://h/x"},
+    )
+    assert response.status_code == 409
+
+
+def test_put_vlc_stream_unknown_id_returns_404(client: TestClient):
+    response = client.put(
+        f"/api/content/vlc-streams/{uuid4()}",
+        json={"name": "ghost", "rtsp_url": "rtsp://h/x"},
+    )
+    assert response.status_code == 404

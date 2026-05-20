@@ -42,10 +42,12 @@ import {
     saveSettings,
     saveTextSlide,
     saveVideo,
+    saveVlcStream,
     updateFlockPeer,
     updateImage,
     updateTextSlide,
     updateVideo,
+    updateVlcStream,
 } from "./api.js";
 import { setSignTimezone } from "./auto-format.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
@@ -66,6 +68,7 @@ import { mountSettings } from "./settings.js";
 import { mountSlidesShell } from "./slides.js";
 import { mountStreamPanel } from "./stream-panel.js";
 import { mountVideoUploader } from "./video-upload.js";
+import { mountVlcStreamUploader } from "./vlc-stream-upload.js";
 import { initWasmRenderer, registerFont } from "./wasm-renderer.js";
 
 // Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
@@ -259,6 +262,9 @@ async function boot() {
             <div class="tab-pane" data-tab="video" hidden>
                 <div class="video-upload-slot"></div>
             </div>
+            <div class="tab-pane" data-tab="vlc" hidden>
+                <div class="vlc-stream-upload-slot"></div>
+            </div>
         </section>
         <section data-section="playlists" class="panel">
             <div class="playlist-track-slot"></div>
@@ -285,6 +291,7 @@ async function boot() {
     let editor = null;
     let imageUploader = null;
     let videoUploader = null;
+    let vlcUploader = null;
     // Inline preview runs a requestAnimationFrame loop + caches
     // <img>/<video> elements; stop() before dropping its DOM.
     let inlinePreviewHandle = null;
@@ -330,6 +337,7 @@ async function boot() {
         await editor?.refreshBrowser?.();
         await imageUploader?.refreshBrowser?.();
         await videoUploader?.refreshBrowser?.();
+        await vlcUploader?.refreshBrowser?.();
         // Slides shell tab counts + sidebar totals.
         await slidesShell?.refreshCounts?.();
         await refreshSidebarCounts();
@@ -504,6 +512,17 @@ async function boot() {
             onSave: onSaveWithRefresh(saveVideo),
             onSaveExisting: onSaveWithRefresh(updateVideo),
         });
+
+        // VLC-stream slide editor — pure metadata, no canvas, so it
+        // ignores width/height (mounted here alongside the others for
+        // a consistent re-mount lifecycle).
+        const vlcSlot = root.querySelector(".vlc-stream-upload-slot");
+        vlcSlot.innerHTML = "";
+        vlcUploader = mountVlcStreamUploader(vlcSlot, {
+            fetchItems: listContent,
+            onSave: onSaveWithRefresh(saveVlcStream),
+            onSaveExisting: onSaveWithRefresh(updateVlcStream),
+        });
     }
 
     // Phase 1b parity fix (2026-05-14): init the fontdue-WASM
@@ -566,6 +585,7 @@ async function boot() {
                 if (tabKey === "text") editor?.createNew?.();
                 else if (tabKey === "image") imageUploader?.createNew?.();
                 else if (tabKey === "video") videoUploader?.createNew?.();
+                else if (tabKey === "vlc") vlcUploader?.createNew?.();
             },
         },
     );
@@ -708,6 +728,7 @@ async function boot() {
         "slides/text": "Text slides",
         "slides/image": "Image slides",
         "slides/video": "Video slides",
+        "slides/vlc": "VLC streams",
         playlists: "Playlists",
         stream: "Stream",
         flock: "Flock",
@@ -881,6 +902,10 @@ async function boot() {
             section: "slides/video",
             load: (slide) => videoUploader.loadForEdit(slide),
         },
+        vlc_stream: {
+            section: "slides/vlc",
+            load: (slide) => vlcUploader.loadForEdit(slide),
+        },
     };
     document.addEventListener("openmarquee:edit-slide", async (event) => {
         const { id, type } = event.detail || {};
@@ -916,6 +941,7 @@ async function boot() {
             editor?.refreshBrowser?.(),
             imageUploader?.refreshBrowser?.(),
             videoUploader?.refreshBrowser?.(),
+            vlcUploader?.refreshBrowser?.(),
             slidesShell?.refreshCounts?.(),
             refreshSidebarCounts(),
             inlinePreviewHandle?.refresh?.(),
