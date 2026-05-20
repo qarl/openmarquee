@@ -762,11 +762,21 @@ def _playback_loop_singleton() -> PlaybackLoop:
         # changing the tz in Settings is reflected on the next tick.
         return settings_storage.load().timezone
 
+    def active_playlist_id():
+        # Bug 1 (2026-05-20): cheap "which playlist is active now"
+        # probe the loop re-evaluates each slot so a schedule switch
+        # preempts the running playlist. Just the schedule file read +
+        # the pure schedule eval — no content/playlist load.
+        from openmarquee.schedule import evaluate_schedule
+
+        return evaluate_schedule(datetime.now(), schedule_storage.load())
+
     loop = PlaybackLoop(
         renderer=renderer,
         fetch_items=fetch,
         read_asset=storage.read_asset,
         get_timezone=current_timezone,
+        active_playlist_id=active_playlist_id,
     )
     loop_holder["loop"] = loop
     return loop

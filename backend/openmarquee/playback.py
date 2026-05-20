@@ -67,10 +67,17 @@ class PlaybackLoop:
         get_timezone: Callable[[], str | None] | None = None,
         auto_tick_seconds: float = 1.0,
         stuck_backoff_seconds: float = 3.0,
+        active_playlist_id: Callable[[], UUID | None] | None = None,
     ):
         self._renderer = renderer
         self._fetch_items = fetch_items
         self._read_asset = read_asset
+        # Bug 1 (2026-05-20): a cheap "which playlist is active right
+        # now per the schedule" probe, re-evaluated once per slot so a
+        # schedule/playlist switch preempts the running playlist
+        # instead of waiting for it to finish its loop. None in tests
+        # that don't exercise mid-loop preemption.
+        self._active_playlist_id_fn = active_playlist_id
         self._empty_poll = empty_playlist_poll_seconds
         # Bug 8 gap (2026-05-20): backoff floor when a full playlist
         # pass yields ZERO playable slides (every slide skipped as an
@@ -338,6 +345,29 @@ class PlaybackLoop:
                 if self._pause_event.is_set():
                     self._resume_at_index = i
                     break
+
+                # Bug 1 (2026-05-20): a schedule/playlist switch must
+                # preempt the running playlist, not wait for it to
+                # finish its loop. Re-evaluate the active playlist each
+                # slot; if it changed, break to the outer while, which
+                # re-fetches and plays the new playlist from index 0
+                # (no _resume_at_index — this is a switch, not a pause).
+                if self._active_playlist_id_fn is not None:
+                    try:
+                        active_now = self._active_playlist_id_fn()
+                    except Exception:
+                        log.exception(
+                            "playback: active-playlist re-check failed"
+                        )
+                        active_now = self._current_playlist_id
+                    if active_now != self._current_playlist_id:
+                        log.info(
+                            "playback: active playlist changed mid-loop "
+                            "(%s → %s); preempting",
+                            self._current_playlist_id,
+                            active_now,
+                        )
+                        break
 
                 item = items[i]
                 self._current_id = item.id

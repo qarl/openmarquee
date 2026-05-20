@@ -2,7 +2,7 @@ import asyncio
 import functools
 import io
 from datetime import datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from PIL import Image
@@ -46,6 +46,7 @@ def _new_loop(
     read_asset,
     get_timezone=None,
     auto_tick_seconds=0.02,
+    active_playlist_id=None,
 ):
     return PlaybackLoop(
         renderer,
@@ -54,6 +55,7 @@ def _new_loop(
         empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
         get_timezone=get_timezone,
         auto_tick_seconds=auto_tick_seconds,
+        active_playlist_id=active_playlist_id,
     )
 
 
@@ -192,6 +194,48 @@ async def test_items_change_between_iterations_takes_effect(renderer):
     await asyncio.sleep(0.05)  # next iteration picks it up
     assert any(c[0] == slide.id for c in renderer.begin_slide_calls)
     await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_schedule_switch_preempts_running_playlist(renderer):
+    """Bug 1: switching the active playlist mid-loop preempts the
+    running playlist instead of waiting for it to finish its loop."""
+    pl_a, pl_b = uuid4(), uuid4()
+    a_slides = [
+        _text_slide(name=f"a{i}", text=f"a{i}", duration_ms=300)
+        for i in range(3)
+    ]
+    b0 = _text_slide(name="b0", text="b0", duration_ms=100)
+    png = _png_bytes(8, 8, (10, 20, 30))
+    assets = {s.id: png for s in (*a_slides, b0)}
+    playlists = {pl_a: a_slides, pl_b: [b0]}
+    active = {"id": pl_a}
+    holder: dict = {}
+
+    def fetch():
+        # Mirror scheduled_fetch_items: stamp the active playlist id.
+        holder["loop"]._stamp_playlist_id(active["id"])
+        return list(playlists[active["id"]])
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=fetch,
+        read_asset=lambda i: assets[i],
+        active_playlist_id=lambda: active["id"],
+    )
+    holder["loop"] = loop
+    await loop.start()
+    await asyncio.sleep(0.15)  # a0 (300ms) mid-play
+    active["id"] = pl_b  # operator switches the active schedule
+    await asyncio.sleep(0.75)  # a0 finishes (~0.3s), preempt, b0 cycles
+    await loop.stop()
+
+    seen = [c[0] for c in renderer.begin_slide_calls]
+    assert b0.id in seen, "new playlist's slide must render after the switch"
+    # Preemption: the old playlist's later slides must NOT have played —
+    # the switch broke the pass before reaching them.
+    assert a_slides[1].id not in seen
+    assert a_slides[2].id not in seen
 
 
 @pytest.mark.asyncio
