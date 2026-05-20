@@ -462,6 +462,51 @@ class VideoSlide(BaseModel):
     updated_at: datetime | None = None
 
 
+class VlcStreamSlide(BaseModel):
+    """A scheduled VLC stream — a playlist slide that plays an RTSP
+    stream the operator's VLC is publishing (docs/STREAM_VLC_PROPOSAL.md
+    §6).
+
+    Unlike VideoSlide there is NO stored asset.mp4: the video bytes
+    arrive live over RTSP at playback time. The only stored file is a
+    synthetic asset.png thumbnail card, generated at save time (see
+    content/storage.py) so the slide tile has something to show in the
+    editor's saved-slides list — the renderer never paints that PNG.
+
+    `duration_ms` is the fixed slot length, like every other slide type
+    (proposal Q8 default — a "play until the stream ends" option is a
+    later follow-up). `on_unreachable` (proposal Q12) decides what the
+    playback loop does when the RTSP URL can't be reached when the slot
+    fires.
+    """
+
+    type: Literal["vlc_stream"] = "vlc_stream"
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(max_length=200)
+    # The RTSP URL the operator's VLC publishes
+    # (e.g. rtsp://laptop:8554/live).
+    rtsp_url: str = Field(max_length=2000)
+    # Fixed slot length, capped at 24h.
+    duration_ms: int = Field(default=10_000, ge=100, le=24 * 60 * 60 * 1000)
+    # Fallback when the RTSP URL is unreachable at slot-fire time.
+    on_unreachable: Literal["hold_last_frame", "black", "skip"] = (
+        "hold_last_frame"
+    )
+
+    # Same transition contract as the other slide types.
+    transition: Literal[
+        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
+    ] = "cut"
+    transition_ms: int = Field(default=500, ge=0, le=5000)
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    # See TextSlide.updated_at — output-only mirror of the storage envelope.
+    updated_at: datetime | None = None
+
+
 # Discriminated union of content variants. Pydantic uses the `type` literal to
 # route to the right subclass on deserialize.
-ContentItem = Annotated[TextSlide | ImageSlide | VideoSlide, Field(discriminator="type")]
+ContentItem = Annotated[
+    TextSlide | ImageSlide | VideoSlide | VlcStreamSlide,
+    Field(discriminator="type"),
+]

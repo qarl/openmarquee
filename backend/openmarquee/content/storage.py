@@ -27,13 +27,21 @@ edit bumps it.
 import json
 import shutil
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import TypeAdapter
 
 from openmarquee._atomic import atomic_write_bytes, atomic_write_text
-from openmarquee.content import ContentItem, ImageSlide, TextSlide, VideoSlide
+from openmarquee.content import (
+    ContentItem,
+    ImageSlide,
+    TextSlide,
+    VideoSlide,
+    VlcStreamSlide,
+)
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
 # way. load() will refuse to read older versions until a migration is written.
@@ -54,6 +62,74 @@ _VIDEO_FILENAME = "asset.mp4"
 # Pydantic adapter for the discriminated ContentItem union; routes to the
 # right subclass on deserialize based on the `type` literal.
 _CONTENT_ADAPTER: TypeAdapter[ContentItem] = TypeAdapter(ContentItem)
+
+# The synthetic thumbnail card drawn for a VlcStreamSlide (16:9).
+_VLC_PLACEHOLDER_SIZE = (640, 360)
+
+
+def _placeholder_font(size: int) -> ImageFont.ImageFont:
+    """A scalable font for the VLC placeholder card. Pillow's bundled
+    default font is used at the requested size; the bare-default
+    fallback covers any Pillow too old for the size argument."""
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _draw_centered(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    width: int,
+    y: int,
+    fill: tuple[int, int, int],
+) -> None:
+    """Draw `text` horizontally centred within `width` at vertical `y`."""
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    draw.text(((width - text_w) / 2, y), text, font=font, fill=fill)
+
+
+def render_vlc_placeholder_png(slide: VlcStreamSlide) -> bytes:
+    """Draw the synthetic 'VLC stream' thumbnail card for a
+    VlcStreamSlide.
+
+    A VlcStreamSlide carries no operator-supplied image — the video is
+    a live RTSP feed. This card just gives the editor's saved-slides
+    tile something to render; the device renderer never paints it.
+    Per docs/STREAM_VLC_PROPOSAL.md §6 recommendation (b).
+    """
+    width, height = _VLC_PLACEHOLDER_SIZE
+    img = Image.new("RGB", (width, height), (24, 24, 28))
+    draw = ImageDraw.Draw(img)
+
+    # A play triangle inside an accent disc, slightly above centre.
+    cx, cy, radius = width // 2, height // 2 - 24, 46
+    draw.ellipse(
+        (cx - radius, cy - radius, cx + radius, cy + radius),
+        fill=(255, 138, 0),
+    )
+    draw.polygon(
+        [(cx - 14, cy - 22), (cx - 14, cy + 22), (cx + 24, cy)],
+        fill=(24, 24, 28),
+    )
+
+    _draw_centered(
+        draw, "VLC stream", _placeholder_font(30), width, cy + radius + 26,
+        (235, 235, 235),
+    )
+    url = slide.rtsp_url
+    if len(url) > 54:
+        url = url[:51] + "…"
+    _draw_centered(
+        draw, url, _placeholder_font(18), width, cy + radius + 64,
+        (150, 150, 156),
+    )
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class ContentStorage:
@@ -178,6 +254,30 @@ class ContentStorage:
             if not preexisting and item_dir.exists():
                 shutil.rmtree(item_dir, ignore_errors=True)
             raise
+
+    def save_vlc_stream(
+        self,
+        slide: VlcStreamSlide,
+        *,
+        updated_at: datetime | None = None,
+    ) -> None:
+        """Persist a VLC-stream slide.
+
+        Unlike the other slide types there is no operator-supplied
+        asset — the video arrives live over RTSP. A synthetic 'VLC
+        stream' thumbnail card is generated here and handed to save()
+        as the asset.png, so the editor's saved-slides tile renders
+        consistently with every other slide type (proposal §6).
+
+        `updated_at` semantics match save() — defaults to now() for a
+        local edit, accepts an explicit value so peer-ingest preserves
+        the originating stamp.
+        """
+        self.save(
+            slide,
+            render_vlc_placeholder_png(slide),
+            updated_at=updated_at,
+        )
 
     def video_path(self, item_id: UUID) -> Path:
         """Filesystem path to an item's video payload (no IO)."""

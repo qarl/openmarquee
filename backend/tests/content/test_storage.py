@@ -1,12 +1,20 @@
 import json
 import os
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from PIL import Image
 
-from openmarquee.content import ImageSlide, TextLayer, TextSlide, VideoSlide
+from openmarquee.content import (
+    ImageSlide,
+    TextLayer,
+    TextSlide,
+    VideoSlide,
+    VlcStreamSlide,
+)
 from openmarquee.content.storage import SCHEMA_VERSION, ContentStorage
 
 
@@ -479,3 +487,49 @@ def test_delete_invalidates_cache_entry(tmp_path: Path):
     storage.delete(slide.id)
     with pytest.raises(FileNotFoundError):
         storage.load(slide.id)
+
+
+# --- vlc stream (STREAM/VLC slice 6) ---------------------------------------
+
+
+def test_save_vlc_stream_writes_envelope_and_placeholder(tmp_path: Path):
+    """save_vlc_stream generates a synthetic 'VLC stream' thumbnail
+    card (the slide carries no operator-supplied image) and persists
+    it as the standard asset.png."""
+    storage = ContentStorage(tmp_path)
+    slide = VlcStreamSlide(name="Q3 Live", rtsp_url="rtsp://laptop:8554/live")
+    storage.save_vlc_stream(slide)
+
+    png = storage.asset_path(slide.id).read_bytes()
+    # A valid PNG (signature) decodable to the placeholder card dims.
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert Image.open(BytesIO(png)).size == (640, 360)
+
+
+def test_load_roundtrips_vlc_stream_slide(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    slide = VlcStreamSlide(
+        name="Q3 Live",
+        rtsp_url="rtsp://laptop:8554/live",
+        duration_ms=15_000,
+        on_unreachable="black",
+        transition="fade",
+        transition_ms=300,
+    )
+    storage.save_vlc_stream(slide)
+    loaded = storage.load(slide.id)
+    assert isinstance(loaded, VlcStreamSlide)
+    assert loaded.model_copy(update={"updated_at": None}) == slide
+    assert loaded.updated_at is not None
+
+
+def test_list_all_surfaces_vlc_stream_items(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    text = TextSlide(name="t", text="t")
+    vlc = VlcStreamSlide(name="v", rtsp_url="rtsp://h:8554/x")
+    storage.save_text_slide(text, b"\x89PNG_text")
+    storage.save_vlc_stream(vlc)
+
+    by_type = {item.type: item for item in storage.list_all()}
+    assert isinstance(by_type["vlc_stream"], VlcStreamSlide)
+    assert isinstance(by_type["text_slide"], TextSlide)
