@@ -67,13 +67,21 @@ def _load_item(slide_path: Path) -> dict:
     return blob
 
 
-def _start_static_server(ui_root: Path) -> tuple[socketserver.TCPServer, int]:
-    """Serve ui/ over localhost so the harness page can resolve its
-    ES-module imports (./src/rasterize.js etc.) -- ES-modules over
-    file:// trigger CORS errors in headless Chromium."""
+def _start_static_server(root: Path) -> tuple[socketserver.TCPServer, int]:
+    """Serve `root` over localhost so the harness page can resolve
+    its ES-module imports -- ES-modules over file:// trigger CORS
+    errors in headless Chromium.
+
+    `root` must be the REPO root, not ui/. parity-harness.html's
+    module graph reaches ui/src/*.js (./src/...) AND, via
+    wasm-renderer.js, ../../renderer-wasm/pkg/* -- that second import
+    escapes ui/, so serving ui/ alone 404s the WASM module and the
+    harness never reaches its 'ready' state (a 10s wait_for_function
+    timeout). The page is opened at /ui/parity-harness.html.
+    """
     handler = functools.partial(
         http.server.SimpleHTTPRequestHandler,
-        directory=str(ui_root),
+        directory=str(root),
     )
     server = socketserver.TCPServer(
         ("127.0.0.1", 0), handler, bind_and_activate=True
@@ -89,7 +97,10 @@ async def bake(slide_path: Path, out_path: Path, tick: float) -> int:
     from playwright.async_api import async_playwright
 
     item = _load_item(slide_path)
-    server, port = _start_static_server(HARNESS_HTML.parent)
+    # Serve the repo root (not ui/) so the harness's wasm-renderer.js
+    # import of ../../renderer-wasm/pkg/* resolves -- see
+    # _start_static_server.
+    server, port = _start_static_server(REPO)
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch()
@@ -107,7 +118,7 @@ async def bake(slide_path: Path, out_path: Path, tick: float) -> int:
                 "pageerror",
                 lambda err: print(f"  [browser:error] {err}", file=sys.stderr),
             )
-            url = f"http://127.0.0.1:{port}/parity-harness.html"
+            url = f"http://127.0.0.1:{port}/ui/parity-harness.html"
             await page.goto(url)
             await page.wait_for_function(
                 "document.getElementById('parity-status')"
