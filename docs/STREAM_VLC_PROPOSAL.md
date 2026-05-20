@@ -653,3 +653,30 @@ Related memory:
 - `[[project_pi_rust_binary_path]]` — Pi runtime layout.
 - `[[feedback_md5_verify_after_fleet_deploy]]` — applies to any
   binary touch in Slice 9 live-fire.
+
+## 10. Future: webpage slide type (not in this arc)
+
+qarl (2026-05-20) wants a future slide type that displays a
+**webpage** on the sign — a headless browser renders a URL and
+its frames go to the screen. It is **not** part of this 9-slice
+arc and must not expand or slow it; recorded here only so the
+arc leaves the right seams.
+
+Structurally a webpage slide is the *same shape* as the VLC
+video path: an external frame producer feeding RGB frames to the
+renderer. It reuses, unchanged, two things this arc builds:
+
+- the **slice-2.5 push-frames transport** — that sidecar op is
+  defined as "paint an RGB888 frame from an external producer";
+  it is deliberately source-agnostic and does not know or care
+  whether the producer is ffmpeg/RTSP or a headless browser.
+- the **`StreamSource` Protocol** (slice 1, `stream_source.py`)
+  — `frames()` yields RGB bytes; a future `BrowserSource`
+  (headless Chromium → frames) implements it exactly like
+  `WebRtcStreamSource` / `RtspStreamSource`, no rewrite.
+
+Constraint qarl has already accepted: **low-CPU pages only** —
+a headless browser on a Pi Zero 2 W (512 MB) cannot sustain
+heavy animated pages; the feature will be scoped to static
+dashboards / simple pages. Sequencing: a follow-up after the
+VLC arc completes.
