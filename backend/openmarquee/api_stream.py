@@ -1,17 +1,25 @@
-"""REST API for live stream takeover (SYSTEM_SPEC §5.11 + §6).
+"""REST API for live stream takeover (SYSTEM_SPEC §5.11 + §6 +
+docs/STREAM_VLC_PROPOSAL.md).
 
-Phone publishes a WebRTC video track; the backend's StreamManager
-negotiates one round-trip (offer in, answer out), pauses the playback
-loop, and starts pushing decoded frames to the renderer. Endpoints:
+A takeover preempts the playlist with a live source. The request body
+is a `kind`-tagged union (StreamStartRequest):
+
+- kind="webrtc" — a phone publishes a WebRTC video track; the backend
+  negotiates one SDP round trip (offer in, answer out).
+- kind="rtsp"   — the operator's VLC publishes an RTSP URL; the Pi
+  pulls it with ffmpeg. No SDP, so the response's sdp_answer is null.
+
+Either way StreamManager pauses the playback loop and pushes decoded
+frames to the renderer. Endpoints:
 
 POST /api/stream/start    — start a new session (409 if one's active)
 POST /api/stream/stop     — tear down a session by id (404 if gone)
 GET  /api/stream/status   — idle | active + active session_id + tier
 POST /api/stream/takeover — force-stop the active session and start fresh
 
-Non-trickle ICE for v1: all candidates are baked into the SDP answer,
-so /start does the full SDP round trip in a single response. The phone
-hands the answer to its RTCPeerConnection and frames flow.
+Non-trickle ICE for the WebRTC path: all candidates are baked into the
+SDP answer, so /start does the full SDP round trip in a single
+response. The phone hands the answer to its RTCPeerConnection.
 """
 
 import logging
@@ -23,7 +31,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from openmarquee.dependencies import get_stream_manager
-from openmarquee.stream import StreamAlreadyActive, StreamManager, StreamNotActive
+from openmarquee.stream import (
+    StreamAlreadyActive,
+    StreamManager,
+    StreamNotActive,
+    StreamStartRequest,
+)
 
 log = logging.getLogger(__name__)
 
@@ -32,17 +45,10 @@ router = APIRouter(prefix="/api/stream", tags=["stream"])
 StreamDep = Annotated[StreamManager, Depends(get_stream_manager)]
 
 
-class StreamStartRequest(BaseModel):
-    """Phone-published SDP offer. v1 only carries video — `audio: false`
-    at getUserMedia (§5.11), so the offer's audio m-section is rejected
-    by the answer side and never decoded."""
-
-    sdp_offer: str
-
-
 class StreamStartResponse(BaseModel):
-    """SDP answer + session id. Phone applies the answer to its
-    RTCPeerConnection and the WebRTC handshake completes.
+    """Session id (+ SDP answer for a WebRTC start). The phone applies
+    the answer to its RTCPeerConnection to complete the handshake; an
+    RTSP start has no answer, so `sdp_answer` is null there.
 
     `started_at` is the wall-clock UTC timestamp the device assigned
     when the session was created — the phone's Elapsed counter ticks
@@ -51,7 +57,7 @@ class StreamStartResponse(BaseModel):
     mid-stream (Phase A.2)."""
 
     session_id: UUID
-    sdp_answer: str
+    sdp_answer: str | None = None
     started_at: datetime
 
 
@@ -118,7 +124,7 @@ async def start_stream(
     streams: StreamDep,
 ) -> StreamStartResponse:
     try:
-        session_id, answer = await streams.start(payload.sdp_offer)
+        session_id, answer = await streams.start(payload)
     except StreamAlreadyActive as exc:
         # 409 carries the active session id so the phone can offer
         # "Take over" without a second round trip to /status.
@@ -169,7 +175,7 @@ async def takeover_stream(
     request. Phone hits this when the user ack'd the "someone else
     is streaming" warning and tapped Take Over."""
     try:
-        session_id, answer = await streams.takeover(payload.sdp_offer)
+        session_id, answer = await streams.takeover(payload)
     except Exception as exc:
         # 11.2: don't reflect the exception string. Log + opaque 400.
         log.exception("stream takeover failed")

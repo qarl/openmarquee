@@ -33,10 +33,12 @@ from openmarquee.content import TextSlide
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
 from openmarquee.stream import (
+    RtspStartRequest,
     StreamAlreadyActive,
     StreamManager,
     StreamNotActive,
     StreamSession,
+    WebRtcStartRequest,
 )
 from openmarquee.stream_source import WebRtcStreamSource
 
@@ -226,7 +228,7 @@ async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
             original_render = renderer.render_frame
             renderer.render_frame = lambda data: captured.append(data) or original_render(data)
 
-            await session.start("v=0\r\noffer\r\n")
+            await session.start_webrtc("v=0\r\noffer\r\n")
             # Fire the captured on_track handler — the fake PC records
             # it but never invokes it (no real ICE/DTLS/SRTP).
             on_track = session._pc.handlers["track"]
@@ -256,11 +258,11 @@ async def test_second_start_while_active_raises_stream_already_active(tmp_path):
     try:
         with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
             manager = StreamManager(loop)
-            session_id, _answer = await manager.start("v=0\r\noffer-1\r\n")
+            session_id, _answer = await manager.start(WebRtcStartRequest(sdp_offer="v=0\r\noffer-1\r\n"))
             assert manager.is_active
 
             with pytest.raises(StreamAlreadyActive) as exc_info:
-                await manager.start("v=0\r\noffer-2\r\n")
+                await manager.start(WebRtcStartRequest(sdp_offer="v=0\r\noffer-2\r\n"))
             assert exc_info.value.active_session_id == session_id
 
             # First session is still the active one — refused start
@@ -283,11 +285,11 @@ async def test_takeover_replaces_active_session_with_new_id(tmp_path):
     try:
         with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
             manager = StreamManager(loop)
-            first_id, _ = await manager.start("v=0\r\noffer-1\r\n")
+            first_id, _ = await manager.start(WebRtcStartRequest(sdp_offer="v=0\r\noffer-1\r\n"))
             first_session = manager._session
             assert first_session is not None
 
-            second_id, _ = await manager.takeover("v=0\r\noffer-2\r\n")
+            second_id, _ = await manager.takeover(WebRtcStartRequest(sdp_offer="v=0\r\noffer-2\r\n"))
 
             assert second_id != first_id
             assert first_session.closed
@@ -308,7 +310,7 @@ async def test_takeover_with_no_active_session_just_starts(tmp_path):
         with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
             manager = StreamManager(loop)
             assert not manager.is_active
-            session_id, _ = await manager.takeover("v=0\r\noffer\r\n")
+            session_id, _ = await manager.takeover(WebRtcStartRequest(sdp_offer="v=0\r\noffer\r\n"))
             assert manager.is_active
             assert manager.active_session_id == session_id
     finally:
@@ -411,7 +413,7 @@ async def test_phantom_session_watchdog_closes_on_no_track(tmp_path, monkeypatch
     try:
         with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
             session = StreamSession(loop)
-            await session.start("v=0\r\nbogus-no-media\r\n")
+            await session.start_webrtc("v=0\r\nbogus-no-media\r\n")
             assert not session.closed
             # Wait past the watchdog timeout. on_track never fires
             # (the fake PC doesn't actually negotiate media), so the
@@ -439,7 +441,7 @@ async def test_phantom_watchdog_canceled_on_normal_close(tmp_path, monkeypatch):
     try:
         with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
             session = StreamSession(loop)
-            await session.start("v=0\r\noffer\r\n")
+            await session.start_webrtc("v=0\r\noffer\r\n")
             # Close before the 5s timeout would fire.
             await session.close()
             assert session.closed
@@ -453,20 +455,106 @@ async def test_phantom_watchdog_canceled_on_normal_close(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_streamsession_start_pauses_playback_close_resumes(tmp_path):
-    """Direct integration: StreamSession.start() pauses the loop,
-    StreamSession.close() resumes. This is the contract StreamManager
-    relies on — verified separately from the manager so a manager-side
-    bug doesn't mask a session-side regression."""
+    """Direct integration: StreamSession.start_webrtc() pauses the
+    loop, StreamSession.close() resumes. This is the contract
+    StreamManager relies on — verified separately from the manager so
+    a manager-side bug doesn't mask a session-side regression."""
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
         with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
             session = StreamSession(loop)
-            await session.start("v=0\r\noffer\r\n")
+            await session.start_webrtc("v=0\r\noffer\r\n")
             await _wait_until(lambda: loop.is_paused)
             assert loop.is_paused
 
             await session.close()
             assert not loop.is_paused
+    finally:
+        await loop.stop()
+
+
+# --- 5. RTSP takeover (STREAM/VLC slice 4) ---------------------------------
+
+
+def _empty_loop(tmp_path) -> tuple[PlaybackLoop, MockRenderer]:
+    """A running-able loop with an empty playlist — it renders nothing
+    on its own, so a test's render_frame capture sees only stream
+    frames."""
+    renderer = MockRenderer(8, 8, tmp_path / "out.png")
+    loop = PlaybackLoop(
+        renderer=renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
+    )
+    return loop, renderer
+
+
+def _patch_mock_ffmpeg(monkeypatch, tmp_path, *, n_frames: int, frame_size: int):
+    """Point RtspStreamSource's VlcRtspConsumer at a mock-ffmpeg
+    binary that emits `n_frames` frames of `frame_size` bytes."""
+    import functools
+
+    from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
+    from tests.test_vlc_rtsp_consumer import _write_mock_ffmpeg
+
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=n_frames
+    )
+    monkeypatch.setattr(
+        "openmarquee.stream_source.VlcRtspConsumer",
+        functools.partial(VlcRtspConsumer, ffmpeg_bin=mock),
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
+    """End-to-end: StreamManager.start() with an RtspStartRequest
+    spawns an RtspStreamSource, pumps the (mock) ffmpeg's frames to
+    the renderer, and pauses the playlist. The slice-4 gate."""
+    frame_size = 8 * 8 * 3
+    _patch_mock_ffmpeg(monkeypatch, tmp_path, n_frames=4, frame_size=frame_size)
+    loop, renderer = _empty_loop(tmp_path)
+    await loop.start()
+    captured: list[bytes] = []
+    original_render = renderer.render_frame
+    renderer.render_frame = lambda data: captured.append(data) or original_render(data)
+    try:
+        manager = StreamManager(loop)
+        session_id, answer = await manager.start(
+            RtspStartRequest(url="rtsp://laptop:8554/live")
+        )
+        # RTSP has no SDP answer to hand back.
+        assert answer is None
+        assert manager.is_active
+        assert manager.active_session_id == session_id
+        # The takeover paused the playlist.
+        assert await _wait_until(lambda: loop.is_paused)
+        # The pump drains the mock ffmpeg's 4 frames to the renderer.
+        assert await _wait_until(lambda: len(captured) >= 4)
+        assert len(captured) == 4
+        assert all(len(f) == frame_size for f in captured)
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+    # close() resumed playback.
+    assert not loop.is_paused
+
+
+@pytest.mark.asyncio
+async def test_rtsp_session_has_no_peer_connection(tmp_path, monkeypatch):
+    """An RTSP takeover uses no RTCPeerConnection and arms no
+    phantom-track watchdog — that machinery is WebRTC-only."""
+    _patch_mock_ffmpeg(monkeypatch, tmp_path, n_frames=1, frame_size=8 * 8 * 3)
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    try:
+        session = StreamSession(loop)
+        await session.start_rtsp("rtsp://laptop:8554/live")
+        assert session._pc is None
+        assert session._watchdog_task is None
+        await session.close()
+        assert not loop.is_paused
     finally:
         await loop.stop()

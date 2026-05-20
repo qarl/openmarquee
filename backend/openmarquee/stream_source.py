@@ -29,6 +29,7 @@ from typing import Protocol, runtime_checkable
 from PIL import Image
 
 from openmarquee.rendering import Renderer
+from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
 
 log = logging.getLogger(__name__)
 
@@ -148,3 +149,30 @@ class WebRtcStreamSource:
         # Unblock frames() if it is still waiting for a track that
         # will now never arrive.
         self._track_ready.set()
+
+
+class RtspStreamSource:
+    """`StreamSource` backed by a VlcRtspConsumer — the VLC takeover.
+
+    Wraps the shared RTSP-via-ffmpeg consumer (the slice-2 module) so
+    an operator-triggered VLC stream plugs into StreamSession exactly
+    like the phone-camera WebRtcStreamSource. ffmpeg already cover-
+    fits to the renderer dimensions, so `frames()` simply relays the
+    consumer's output.
+
+    The renderer dimensions are read once, at construction — the
+    ffmpeg filter graph is fixed for the life of the subprocess, and
+    a display mode does not change while a takeover is up (§3).
+    """
+
+    def __init__(self, renderer: Renderer, rtsp_url: str):
+        self._consumer = VlcRtspConsumer(
+            rtsp_url, renderer.width, renderer.height
+        )
+
+    def frames(self) -> AsyncIterator[bytes]:
+        return self._consumer.frames()
+
+    async def close(self) -> None:
+        """Stop the source + reap ffmpeg. Idempotent."""
+        await self._consumer.close()

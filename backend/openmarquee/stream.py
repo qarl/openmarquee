@@ -1,9 +1,14 @@
-"""WebRTC stream takeover (SYSTEM_SPEC §5.11).
+"""Stream takeover (SYSTEM_SPEC §5.11 + docs/STREAM_VLC_PROPOSAL.md).
 
-A single phone publishes its camera live to the device's screen,
-preempting the active playlist. The WebRTC subscriber lives in the
-Python playback engine via aiortc — no Chromium on the device.
-Decoded video frames flow through the existing renderer wire format
+A live source preempts the active playlist on the device's screen.
+Two transports:
+
+- WebRTC — a phone publishes its camera via aiortc (no Chromium on
+  the device). SDP is negotiated in one round trip.
+- RTSP — the operator's VLC publishes an RTSP stream; the Pi pulls
+  it with ffmpeg (the slice-2 VlcRtspConsumer).
+
+Either way the decoded frames flow through the renderer wire format
 (§7.6); the playback loop pauses while a session is active and
 resumes the same slide it was on when the session ends.
 
@@ -11,12 +16,13 @@ Two classes:
 
 - StreamManager — process-singleton holding at most one StreamSession
   at a time. /api/stream/start refuses if one's already active;
-  /api/stream/takeover force-stops + restarts.
+  /api/stream/takeover force-stops + restarts. start()/takeover()
+  dispatch on the request's `kind`.
 
-- StreamSession — one RTCPeerConnection. Lifecycle: start(offer)
-  negotiates SDP and pauses the playback loop, then incoming video
-  frames are scaled and pushed to the renderer; close() tears down
-  the PC and resumes the loop.
+- StreamSession — one takeover. It owns a StreamSource and a pump
+  task draining it to the renderer; the WebRTC transport additionally
+  owns an RTCPeerConnection + a phantom-track watchdog. close() tears
+  down whichever transport is in use and resumes the loop.
 """
 
 from __future__ import annotations
@@ -25,14 +31,42 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime
+from typing import Literal, Union
 from uuid import UUID, uuid4
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
+from pydantic import BaseModel
 
 from openmarquee.playback import PlaybackLoop
-from openmarquee.stream_source import WebRtcStreamSource
+from openmarquee.stream_source import RtspStreamSource, WebRtcStreamSource
 
 log = logging.getLogger(__name__)
+
+
+class WebRtcStartRequest(BaseModel):
+    """Start a phone-camera takeover. `sdp_offer` is the phone's
+    WebRTC offer; v1 carries video only (audio: false at
+    getUserMedia, §5.11)."""
+
+    kind: Literal["webrtc"] = "webrtc"
+    sdp_offer: str
+
+
+class RtspStartRequest(BaseModel):
+    """Start a VLC takeover. `url` is the RTSP URL the operator's VLC
+    is publishing (e.g. rtsp://laptop:8554/live)."""
+
+    kind: Literal["rtsp"] = "rtsp"
+    url: str
+
+
+# The /api/stream/start + /takeover request body. A plain (non-
+# discriminated) union, so Pydantic's smart matching applies: each
+# variant's `kind` has a default, which means a legacy body with no
+# `kind` ({"sdp_offer": ...}) still validates as a WebRtcStartRequest
+# — the deployed phone client predates the VLC work and must keep
+# working until its UI bundle is refreshed.
+StreamStartRequest = Union[WebRtcStartRequest, RtspStartRequest]
 
 
 class StreamAlreadyActive(Exception):
@@ -60,19 +94,28 @@ class StreamNotActive(Exception):
 
 
 class StreamSession:
-    """One WebRTC peer connection feeding the playback engine.
+    """One takeover feeding the playback engine.
 
-    The session owns its RTCPeerConnection and a pump task that
-    drives a `StreamSource` — for a phone takeover that is a
-    `WebRtcStreamSource` wrapping the inbound video track. The source
-    yields RGB888 frames already cover-fit-scaled to the renderer's
-    native dimensions; the pump hands each to `renderer.render_frame`
-    — same wire format the playlist source uses (§7.6).
+    The session owns a `StreamSource` and a pump task that drains it
+    to the renderer. Two transports:
+
+    - `start_webrtc()` — a phone-camera takeover: negotiate SDP on an
+      RTCPeerConnection, wrap the inbound track in a
+      `WebRtcStreamSource`, and arm a phantom-track watchdog.
+    - `start_rtsp()` — a VLC takeover: wrap an `RtspStreamSource`
+      (ffmpeg pulling the RTSP URL); no peer connection, no SDP, no
+      watchdog.
+
+    Either way the source yields RGB888 frames cover-fit-scaled to
+    the renderer's native dimensions and the pump hands each to
+    `renderer.render_frame` — same wire format the playlist source
+    uses (§7.6). close() tears down whichever transport is in use.
     """
 
     # Phase 12.1 Finding #2 mitigation — phantom-session watchdog
-    # timeout. If no on_track event fires within this window after
-    # session.start() returns, the session is auto-closed. Catches
+    # timeout (WebRTC transport only). If no on_track event fires
+    # within this window after start_webrtc() returns, the session is
+    # auto-closed. Catches
     # bogus SDPs that parse + answer cleanly but never deliver a
     # real media track, plus phones that crash mid-handshake. Set
     # comfortably above the worst-case real-network handshake time
@@ -105,12 +148,13 @@ class StreamSession:
         # UTC explicit so the JSON response is unambiguous; the phone
         # subtracts wall-clock-now in the same UTC frame.
         self.started_at: datetime = datetime.now(UTC)
-        self._pc = RTCPeerConnection()
-        # The takeover frame source. The track it needs arrives later,
-        # via the on_track callback in start().
-        self._source = WebRtcStreamSource(playback.renderer)
+        # The frame source + pump are created by whichever start_*
+        # transport method runs.
+        self._source: WebRtcStreamSource | RtspStreamSource | None = None
         self._pump_task: asyncio.Task | None = None
         self._closed = False
+        # WebRTC-transport-only state (stays None for an RTSP session).
+        self._pc: RTCPeerConnection | None = None
         # Phase 12.1 Finding #2: signaled when the first on_track
         # event fires. The phantom-session watchdog awaits this with
         # a timeout; if it never resolves, the session was never
@@ -122,13 +166,17 @@ class StreamSession:
     def closed(self) -> bool:
         return self._closed
 
-    async def start(self, sdp_offer: str) -> str:
-        """Set the remote offer, create an answer, pause playback.
+    async def start_webrtc(self, sdp_offer: str) -> str:
+        """WebRTC takeover: set the remote offer, create an answer,
+        pause playback.
 
         Returns the SDP answer (with ICE candidates baked in — non-trickle
         for v1 per §5.11). The caller hands this back to the phone in the
         same /api/stream/start response.
         """
+        self._pc = RTCPeerConnection()
+        source = WebRtcStreamSource(self._playback.renderer)
+        self._source = source
         offer = RTCSessionDescription(sdp=sdp_offer, type="offer")
 
         @self._pc.on("track")
@@ -136,7 +184,7 @@ class StreamSession:
             # Only video for v1 — audio is muted at capture per §5.11.
             if track.kind == "video":
                 self._first_track_event.set()
-                self._source.set_track(track)
+                source.set_track(track)
                 self._pump_task = asyncio.create_task(self._pump())
 
         await self._pc.setRemoteDescription(offer)
@@ -157,6 +205,19 @@ class StreamSession:
         # setLocalDescription may rewrite the SDP with gathered ICE
         # candidates; read the canonical form back from the PC.
         return self._pc.localDescription.sdp
+
+    async def start_rtsp(self, rtsp_url: str) -> None:
+        """VLC takeover: pause playback and start pumping the RTSP
+        source.
+
+        There is no SDP, no peer connection, and no phantom-track
+        watchdog — ffmpeg either delivers frames or it doesn't, and
+        the operator sees the result on glass. The pump starts
+        immediately (unlike WebRTC, there is no track to wait for).
+        """
+        self._source = RtspStreamSource(self._playback.renderer, rtsp_url)
+        await self._playback.pause()
+        self._pump_task = asyncio.create_task(self._pump())
 
     async def _watch_for_first_track(self) -> None:
         """Phase 12.1 Finding #2: auto-close if no track materializes
@@ -201,7 +262,9 @@ class StreamSession:
             raise
 
     async def close(self) -> None:
-        """Tear down the PC and resume the playback loop. Idempotent."""
+        """Tear down whichever transport is in use and resume the
+        playback loop. Idempotent; None-safe if no transport ever
+        started (e.g. a start_* that raised before wiring anything)."""
         if self._closed:
             return
         self._closed = True
@@ -211,7 +274,8 @@ class StreamSession:
         # when the watchdog is the caller (TimeoutError path → close()
         # → here), since that task is itself currently running and
         # cancelling it would self-cancel awkwardly. Self-cancel is
-        # detected via `asyncio.current_task()`.
+        # detected via `asyncio.current_task()`. (RTSP sessions have
+        # no watchdog — _watchdog_task stays None.)
         if (
             self._watchdog_task is not None
             and not self._watchdog_task.done()
@@ -221,16 +285,19 @@ class StreamSession:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._watchdog_task
         # Close the source first so its frames() iterator stops, then
-        # cancel the pump in case it is blocked mid-recv inside the
+        # cancel the pump in case it is blocked mid-read inside the
         # source's iterator (close() alone can't interrupt a pending
-        # track.recv()).
-        await self._source.close()
+        # track.recv() / ffmpeg stdout read).
+        if self._source is not None:
+            await self._source.close()
         if self._pump_task is not None and not self._pump_task.done():
             self._pump_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._pump_task
         try:
-            await self._pc.close()
+            # The RTCPeerConnection exists only for a WebRTC session.
+            if self._pc is not None:
+                await self._pc.close()
         finally:
             # Resume playback even if PC close raised — the alternative
             # is leaving the loop paused forever, which is worse than
@@ -272,8 +339,23 @@ class StreamManager:
         """
         return self._session.started_at if self.is_active else None
 
-    async def start(self, sdp_offer: str) -> tuple[UUID, str]:
-        """Negotiate a new session. Returns (session_id, sdp_answer).
+    @staticmethod
+    async def _start_session(
+        session: StreamSession, request: StreamStartRequest
+    ) -> str | None:
+        """Run the transport-specific start for `request`'s kind.
+
+        Returns the SDP answer for a WebRTC start, or None for an RTSP
+        start (there is no answer to hand back)."""
+        if isinstance(request, WebRtcStartRequest):
+            return await session.start_webrtc(request.sdp_offer)
+        return await session.start_rtsp(request.url)
+
+    async def start(
+        self, request: StreamStartRequest
+    ) -> tuple[UUID, str | None]:
+        """Negotiate a new session. Returns (session_id, sdp_answer);
+        sdp_answer is None for an RTSP start.
 
         Raises StreamAlreadyActive if a session is already running —
         the phone should switch to the take-over affordance.
@@ -284,16 +366,18 @@ class StreamManager:
                 raise StreamAlreadyActive(self._session.id)
             session = StreamSession(self._playback)
             try:
-                answer_sdp = await session.start(sdp_offer)
+                answer_sdp = await self._start_session(session, request)
             except Exception:
-                # Negotiation failed — make sure we don't leak a half-open
-                # PC and that playback resumes if pause already fired.
+                # Start failed — make sure we don't leak a half-open
+                # transport and that playback resumes if pause fired.
                 await session.close()
                 raise
             self._session = session
             return (session.id, answer_sdp)
 
-    async def takeover(self, sdp_offer: str) -> tuple[UUID, str]:
+    async def takeover(
+        self, request: StreamStartRequest
+    ) -> tuple[UUID, str | None]:
         """Force-stop any active session, then start a new one.
 
         No-op-but-still-creates if nothing was active — the user got to
@@ -304,7 +388,7 @@ class StreamManager:
                 await self._stop_locked()
             session = StreamSession(self._playback)
             try:
-                answer_sdp = await session.start(sdp_offer)
+                answer_sdp = await self._start_session(session, request)
             except Exception:
                 await session.close()
                 raise

@@ -233,3 +233,51 @@ def test_status_tier_shape_is_complete(client: TestClient):
     assert set(tier) == {"name", "max_width", "max_height", "max_fps"}
     assert tier["name"] in ("basic", "good", "future")
     assert all(isinstance(tier[k], int) for k in ("max_width", "max_height", "max_fps"))
+
+
+# --- STREAM/VLC slice 4: RTSP takeover via the start-request union --------
+
+
+def test_start_legacy_body_without_kind_still_works(client: TestClient):
+    """A start body with no `kind` ({"sdp_offer": ...}) still validates
+    as a WebRTC start — the deployed phone client predates the VLC
+    work and must not break."""
+    response = client.post(
+        "/api/stream/start", json={"sdp_offer": "v=0\r\noffer\r\n"}
+    )
+    assert response.status_code == 200
+    assert response.json()["sdp_answer"]  # WebRTC start has an answer
+
+
+def test_start_rtsp_returns_session_without_sdp_answer(
+    client: TestClient, monkeypatch, tmp_path
+):
+    """POST /start with a kind=rtsp body starts an RTSP takeover and
+    returns a session whose sdp_answer is null (RTSP has no SDP)."""
+    import functools
+
+    from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
+    from tests.test_vlc_rtsp_consumer import _write_mock_ffmpeg
+
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=2)
+    monkeypatch.setattr(
+        "openmarquee.stream_source.VlcRtspConsumer",
+        functools.partial(VlcRtspConsumer, ffmpeg_bin=mock),
+    )
+
+    response = client.post(
+        "/api/stream/start",
+        json={"kind": "rtsp", "url": "rtsp://laptop:8554/live"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "session_id" in body
+    assert body["sdp_answer"] is None
+    assert client.get("/api/stream/status").json()["state"] == "active"
+    # Stop the session so the real ffmpeg subprocess is reaped inside
+    # this test's event loop (the WebRTC tests use a fake PC and have
+    # no subprocess to clean up).
+    stop = client.post(
+        "/api/stream/stop", json={"session_id": body["session_id"]}
+    )
+    assert stop.status_code == 204
