@@ -5,10 +5,19 @@
 // approximate, not pixel-identical (per docs/text-layer-motion-spec.md
 // Q3 lock).
 //
-// Six effects + static. All effects are box-bounded — the layer's
-// `box` rect clips the motion via ctx.clip(). Phase comes from a
-// shared monotonic clock (the rAF loop's `elapsed_s`) plus the layer's
-// `motion_phase` offset, so two layers in the same slide stay coherent.
+// Six effects + static. Phase comes from a shared monotonic clock
+// (the rAF loop's `elapsed_s`) plus the layer's `motion_phase`
+// offset, so two layers in the same slide stay coherent.
+//
+// Parity Bug 3 (2026-05-19): displacement effects (shake, breathe/
+// scale, bounce) are NOT box-clipped — the Rust device renderer
+// never clips text to the layer box (only to the screen viewport),
+// so displaced text spills past the box on glass; the editor
+// preview now matches. The box clip survives for the TICKER effect
+// only, where it is a rendering MECHANISM (not a containment
+// policy): ticker draws the text twice and the clip creates the
+// scroll-wrap illusion. blink/pulse don't displace text, so a clip
+// would be a no-op for them — they run unclipped too.
 
 const _DEFAULT_BOX = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
 
@@ -72,13 +81,16 @@ export function anyLayerAnimated(layers) {
     return false;
 }
 
-// Wrap a paint call with motion transforms + box clip. `paintFn` is
-// the actual layer-rendering closure (typically a paintLayer call
-// bound to this layer's data); the wrapper sets up ctx.save / clip /
-// transform / alpha, invokes paintFn one or two times depending on
-// the motion (twice for ticker so the wrap shows BOTH copies as the
-// shift transitions), and ctx.restores. paintFn must NOT call
-// ctx.save/ctx.restore externally — this wrapper owns the save stack.
+// Wrap a paint call with motion transforms. `paintFn` is the actual
+// layer-rendering closure (typically a paintLayer call bound to this
+// layer's data); the wrapper sets up ctx.save / transform / alpha,
+// invokes paintFn one or two times depending on the motion (twice
+// for ticker so the wrap shows BOTH copies as the shift transitions),
+// and ctx.restores. Only the ticker branch installs a box clip (its
+// two-copy wrap needs it); displacement effects run unclipped to
+// match the Rust device renderer (parity Bug 3). paintFn must NOT
+// call ctx.save/ctx.restore externally — this wrapper owns the
+// save stack.
 export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
     const motion = (layer && layer.motion) || "static";
     const elapsed = opts && opts.elapsed_s;
@@ -107,17 +119,22 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
 
     ctx.save();
     try {
-        // Box-bounded clip — every effect respects the layer's box.
-        ctx.beginPath();
-        ctx.rect(bx, by, bw, bh);
-        ctx.clip();
-
         if (motion === "blink") {
-            // Square wave 50% duty.
+            // Square wave 50% duty. No displacement — unclipped.
             if (phase < 0.5) paintFn();
             return;
         }
         if (motion === "ticker") {
+            // Box-bounded clip — REQUIRED by the ticker mechanism:
+            // the text is drawn TWICE (one copy exiting the left
+            // edge while the second enters from the right) and the
+            // clip is what makes that read as a single scrolling
+            // wrap instead of two visible copies. This is the only
+            // effect that clips (parity Bug 3) — it's a rendering
+            // mechanism, not a containment policy.
+            ctx.beginPath();
+            ctx.rect(bx, by, bw, bh);
+            ctx.clip();
             // Linear horizontal travel inside box, drawn TWICE so the
             // wrap is visible (text exits the left edge while the
             // second copy is entering from the right). This is the

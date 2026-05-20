@@ -261,16 +261,17 @@ describe("paintLayerWithMotion", () => {
             paintFn,
             { elapsed_s: 0.5 },
         );
-        // Set up clip then drew once (the fallback path).
+        // Unknown motion falls through to a single static paint
+        // (no clip — only ticker clips post-parity-Bug-3).
         expect(paintFn).toHaveBeenCalledTimes(1);
     });
 
-    it("box-clip is set up before any motion transform (rect + clip in ctx call sequence)", () => {
+    it("ticker installs the box clip (its two-copy wrap mechanism needs it)", () => {
         const ctx = fakeCtx();
         paintLayerWithMotion(
             ctx, fakeCanvas(100, 50),
             {
-                motion: "breathe",
+                motion: "ticker",
                 motion_intensity: 50,
                 motion_phase: 0,
                 box: { x: 0.1, y: 0.2, w: 0.5, h: 0.6 },
@@ -278,10 +279,33 @@ describe("paintLayerWithMotion", () => {
             vi.fn(),
             { elapsed_s: 0 },
         );
-        // Find the rect call — it should match the box's pixel rect.
+        // The rect call should match the box's pixel rect.
         const rectCall = ctx.rect.mock.calls[0];
         expect(rectCall).toEqual([10, 10, 50, 30]); // 0.1*100, 0.2*50, 0.5*100, 0.6*50
         expect(ctx.clip).toHaveBeenCalled();
+    });
+
+    it("displacement effects do NOT clip to the box (parity Bug 3)", () => {
+        // Parity Bug 3 (2026-05-19): the Rust device renderer never
+        // clips text to the layer box — displaced text spills past
+        // the box, bounded only by the screen. shake / breathe /
+        // bounce in the editor preview must match that: no clip.
+        // Only ticker keeps the clip (its wrap mechanism needs it).
+        for (const motion of ["shake", "breathe", "bounce"]) {
+            const ctx = fakeCtx();
+            paintLayerWithMotion(
+                ctx, fakeCanvas(100, 50),
+                {
+                    motion,
+                    motion_intensity: 80,
+                    motion_phase: 0,
+                    box: { x: 0.1, y: 0.2, w: 0.5, h: 0.6 },
+                },
+                vi.fn(),
+                { elapsed_s: 0.3 },
+            );
+            expect(ctx.clip, `${motion} must not clip`).not.toHaveBeenCalled();
+        }
     });
 
     it("shake at intensity=0 produces no translate (regression)", () => {
