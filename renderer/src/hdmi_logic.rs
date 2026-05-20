@@ -3968,7 +3968,11 @@ pub fn unix_to_calendar_utc(unix_seconds: i64) -> CalendarUtc {
 /// date_long/date_medium / day_long/day_short. When `auto_format`
 /// is None despite auto_mode being set (shouldn't happen post-
 /// validator but defensive against IPC edge cases), each mode
-/// has a sensible default: time_hm / date_medium / day_long.
+/// has a sensible default: time_hm / date_iso / day_long. These
+/// defaults match the Canvas2D mirror (ui/src/auto-format.js
+/// `defaultFormatFor`) + the Python spec
+/// (openmarquee.auto_render `_DEFAULT_FORMAT`) exactly — parity
+/// fix 2026-05-19, the date default was previously date_medium.
 pub fn format_auto_text(
     auto_mode: Option<&str>,
     auto_format: Option<&str>,
@@ -3980,7 +3984,7 @@ pub fn format_auto_text(
         ("date", Some(f)) if f.starts_with("date_") => f,
         ("day", Some(f)) if f.starts_with("day_") => f,
         ("time", _) => "time_hm",
-        ("date", _) => "date_medium",
+        ("date", _) => "date_iso",
         ("day", _) => "day_long",
         _ => return None,
     };
@@ -7602,8 +7606,11 @@ mod tests {
             "14:35"
         );
         assert_eq!(
+            // Parity fix 2026-05-19: date default is date_iso
+            // (matches auto-format.js + auto_render.py), was
+            // previously date_medium.
             format_auto_text(Some("date"), None, c).unwrap(),
-            "Apr 21"
+            "2026-04-21"
         );
         assert_eq!(
             format_auto_text(Some("day"), None, c).unwrap(),
@@ -7623,8 +7630,9 @@ mod tests {
             "14:35"
         );
         assert_eq!(
+            // date default is date_iso post-parity-fix 2026-05-19.
             format_auto_text(Some("date"), Some("time_hm"), c).unwrap(),
-            "Apr 21"
+            "2026-04-21"
         );
     }
 

@@ -5938,7 +5938,17 @@ fn resolve_slide_layers<'a>(
             slide
                 .text_layers
                 .iter()
-                .filter(|l| l.visible && !l.text.is_empty())
+                // Parity Bug 1 (2026-05-19): TextLayer::is_renderable
+                // keeps auto_mode layers even when `text` is empty.
+                // An auto_mode layer (time / date / day clock)
+                // carries text="" by design — its visible string is
+                // resolved at paint time by resolve_layer_text. The
+                // old `!l.text.is_empty()` filter dropped such
+                // layers BEFORE resolution ever ran, so the Boot
+                // time-clock layer never reached the glass (it
+                // rendered fine in the Canvas2D previewer, which
+                // has no equivalent pre-filter).
+                .filter(|l| l.is_renderable())
                 .filter_map(|l| {
                     let family = l
                         .font_family

@@ -199,6 +199,21 @@ pub struct TextLayer {
     pub r#box: TextBox,
 }
 
+impl TextLayer {
+    /// Parity Bug 1 (2026-05-19): is this layer worth laying out?
+    ///
+    /// A layer is renderable when it's visible AND it carries
+    /// something to draw — either a non-empty static `text`, OR
+    /// an `auto_mode` (time / date / day clock) whose visible
+    /// string is resolved at paint time. An auto_mode layer's
+    /// `text` field is empty BY DESIGN, so a naive
+    /// `!text.is_empty()` filter wrongly drops it before the
+    /// resolver ever runs — that was the Boot time-clock bug.
+    pub fn is_renderable(&self) -> bool {
+        self.visible && (!self.text.is_empty() || self.auto_mode.is_some())
+    }
+}
+
 /// Position + size of a text layer relative to the slide. All four
 /// fields are 0..1 fractions of slide dimensions.
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -1190,6 +1205,60 @@ mod tests {
         }"##;
         let layer: TextLayer = serde_json::from_str(json).unwrap();
         assert_eq!(layer.motion, "ticker");
+    }
+
+    #[test]
+    fn auto_mode_layer_with_empty_text_is_renderable() {
+        // Parity Bug 1 (2026-05-19): the Boot time-clock layer
+        // carries text="" + auto_mode="time". It MUST survive the
+        // resolve_slide_layers renderability filter — its visible
+        // string is resolved at paint time by resolve_layer_text.
+        // Before the fix a `!text.is_empty()` filter dropped it.
+        let clock = r##"{
+            "text": "",
+            "auto_mode": "time",
+            "auto_format": "time_hms",
+            "box": {"x": 0.7, "y": 0.6, "w": 0.2, "h": 0.1}
+        }"##;
+        let layer: TextLayer = serde_json::from_str(clock).unwrap();
+        assert!(
+            layer.is_renderable(),
+            "auto_mode layer with empty text must be renderable",
+        );
+
+        // A genuinely empty static layer (no auto_mode) is still
+        // skipped — nothing to draw.
+        let blank = r##"{
+            "text": "",
+            "box": {"x": 0, "y": 0, "w": 1, "h": 1}
+        }"##;
+        let blank_layer: TextLayer = serde_json::from_str(blank).unwrap();
+        assert!(
+            !blank_layer.is_renderable(),
+            "empty static layer should not be renderable",
+        );
+
+        // An invisible auto_mode layer is skipped — visibility
+        // gates everything.
+        let hidden = r##"{
+            "text": "",
+            "auto_mode": "time",
+            "visible": false,
+            "box": {"x": 0, "y": 0, "w": 1, "h": 1}
+        }"##;
+        let hidden_layer: TextLayer = serde_json::from_str(hidden).unwrap();
+        assert!(
+            !hidden_layer.is_renderable(),
+            "invisible auto_mode layer should not be renderable",
+        );
+
+        // A normal static layer with text is renderable.
+        let normal = r##"{
+            "text": "FREE",
+            "box": {"x": 0, "y": 0, "w": 1, "h": 1}
+        }"##;
+        let normal_layer: TextLayer = serde_json::from_str(normal).unwrap();
+        assert!(normal_layer.is_renderable());
     }
 
     #[test]
