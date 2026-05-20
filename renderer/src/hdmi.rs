@@ -53,7 +53,7 @@ use crate::hdmi_logic::{
     fs_transition_sp_source, gradient_density_is_degenerate,
     is_transition_kind_single_pass, layout_text_to_quads, prefer_scissored_bake,
     sp_kind_static, stripes_uniforms, transition_eligible_for_scissored_bake_logic,
-    transition_eligible_for_single_pass_logic, unix_to_calendar_utc,
+    transition_eligible_for_single_pass_logic, unix_to_calendar_local,
     BlendMode, FontCatalog, GlyphKind, MsdfQuadGroup, PrewarmTier,
     ModeSpec, MotionKind, MotionState, PatternKind, VAlign, FS_BLIT,
     FS_CUT, FS_EMOJI, FS_FADE, FS_GLYPH, FS_GLYPH_OUTLINE, FS_GRADIENT, FS_OVERLAY_BLEND, FS_TOFU,
@@ -5168,7 +5168,7 @@ fn current_unix_seconds() -> i64 {
 /// were a measurable per-frame allocation tax.
 fn resolve_layer_text<'a>(
     layer: &'a crate::content::TextLayer,
-    cal: crate::hdmi_logic::CalendarUtc,
+    cal: crate::hdmi_logic::Calendar,
 ) -> std::borrow::Cow<'a, str> {
     match layer.auto_mode.as_deref() {
         None => std::borrow::Cow::Borrowed(layer.text.as_str()),
@@ -9414,7 +9414,12 @@ fn paint_slide_with_viewport(
             gl.enable(glow::BLEND);
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
         }
-        let cal = unix_to_calendar_utc(wall_clock_unix);
+        // Bug 1 follow-up (2026-05-20): the auto_mode clock resolves
+        // in LOCAL time (libc localtime_r, TZ from the sidecar env)
+        // — a sign clock must show the sign's physical-location
+        // time, not UTC. Covers every auto_format (date rollover at
+        // local midnight, not UTC midnight, included).
+        let cal = unix_to_calendar_local(wall_clock_unix);
         // v1-spec-delta #3 (slice b QA followup): rasterize through
         // the per-layer cache. On cache hit (text unchanged), skip
         // the fontdue call entirely -- this is what limits the

@@ -13,6 +13,15 @@ publish = false
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 
+# libc — POSIX bindings. UNCONDITIONAL (was Linux-only): Bug 1
+# follow-up (2026-05-20) added `unix_to_calendar_local` in the
+# host-testable hdmi_logic.rs, which calls libc localtime_r /
+# tzset. libc is pure bindings — zero link-time deps, compiles
+# clean on macOS — so the tz resolver + its unit tests run on
+# the Mac `cargo test` gate. The Linux-only HW deps (drm/gbm/
+# EGL) still gate hdmi.rs separately below.
+libc = "0.2"
+
 # Phase 4 — playlist + content JSON. Pre-approved in plan §2.
 # Pure Rust, no link deps; works fine on Mac for tests.
 serde = { version = "1.0", features = ["derive"] }
@@ -94,11 +103,9 @@ glow = "0.14"
 # v1-spec-delta F1d (V1-GA-blocker, 2026-05-08): poll(2) syscall
 # wrapper for the page-flip-event drain timeout. drm-rs's
 # receive_events is not non-blocking; without a poll-gated wrapper
-# the renderer hangs forever on a HW vblank miss. libc is already
-# in the dep tree transitively (drm-rs pulls it via rustix); this
-# direct declaration just exposes the API. Linux-only since the
-# whole hdmi.rs module is.
-libc = "0.2"
+# the renderer hangs forever on a HW vblank miss. libc itself is
+# now declared unconditionally up in [dependencies] (Bug 1
+# follow-up) — hdmi.rs's poll(2) use is covered by that.
 # v1-spec-delta #17 (slice b, 2026-05-08): drm-ffi exposes
 # drm_mode_modeinfo so we can synthesize a CEA-861 1920x1080 Mode
 # for --force-mode (project-memory: dev Pi EDID is 0 bytes; safe-

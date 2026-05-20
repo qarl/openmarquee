@@ -88,6 +88,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -395,6 +396,7 @@ class RustRenderer:
         drm_card: str | None = None,
         output: str = "hdmi",
         extra_args: list[str] | None = None,
+        get_timezone: Callable[[], str | None] | None = None,
         reconnect_max_retries: int = DEFAULT_RECONNECT_MAX_RETRIES,
         reconnect_window_s: float = DEFAULT_RECONNECT_WINDOW_S,
         watchdog_enabled: bool = True,
@@ -414,6 +416,12 @@ class RustRenderer:
         self._drm_card = drm_card
         self._output = output
         self._extra_args = list(extra_args or [])
+        # Bug 1 follow-up (2026-05-20): resolves the operator's
+        # configured IANA timezone (settings.timezone) so the
+        # sidecar's auto_mode clock renders local time. Read at
+        # each (re)spawn — a Settings tz change followed by a
+        # backend restart re-spawns the sidecar with the new TZ.
+        self._get_timezone = get_timezone or (lambda: None)
 
         self._proc: subprocess.Popen[str] | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -623,7 +631,27 @@ class RustRenderer:
         # Production: extra_args is empty so this is just
         # `openmarquee-render --ipc-sidecar`.
         args = [self._binary_path, *self._extra_args, "--ipc-sidecar"]
-        log.info("RustRenderer launching subprocess: %s", " ".join(args))
+        # Bug 1 follow-up (2026-05-20): hand the sidecar the operator's
+        # configured timezone via the TZ env var. The renderer's
+        # auto_mode clock calls libc localtime_r, which honors TZ
+        # (full IANA zoneinfo + DST). When settings.timezone is unset
+        # ("Device local"), TZ is left untouched and the sidecar
+        # falls back to the system /etc/localtime. Resolved fresh at
+        # each (re)spawn.
+        env = dict(os.environ)
+        tz = self._get_timezone()
+        if tz:
+            env["TZ"] = tz
+        else:
+            # Don't carry a stale TZ inherited from the backend's own
+            # env into the sidecar — drop it so localtime_r uses the
+            # system zone.
+            env.pop("TZ", None)
+        log.info(
+            "RustRenderer launching subprocess: %s (TZ=%s)",
+            " ".join(args),
+            env.get("TZ", "<system>"),
+        )
         try:
             self._proc = subprocess.Popen(
                 args,
@@ -636,6 +664,7 @@ class RustRenderer:
                 bufsize=1,
                 text=True,
                 encoding="utf-8",
+                env=env,
             )
         except FileNotFoundError as e:
             raise RustRendererSubprocessError(

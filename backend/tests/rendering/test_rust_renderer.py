@@ -64,6 +64,14 @@ import sys
 log_path = os.environ.get("FAKE_SIDECAR_REQUEST_LOG")
 log = open(log_path, "w") if log_path else None
 
+# Optional: dump our own inherited TZ env to a path, so tests can
+# assert the proxy threaded settings.timezone into the subprocess
+# env (Bug 1 follow-up). Written once at startup.
+tz_probe = os.environ.get("FAKE_SIDECAR_TZ_PROBE")
+if tz_probe:
+    with open(tz_probe, "w") as _f:
+        _f.write(os.environ.get("TZ", "<unset>"))
+
 # Optional: exit with this returncode after the next request
 # (simulates subprocess death mid-session).
 DIE_AFTER_OP = os.environ.get("FAKE_SIDECAR_DIE_AFTER_OP")
@@ -211,6 +219,46 @@ def test_render_frame_raises_not_implemented(make_renderer):
     r = make_renderer()
     with pytest.raises(NotImplementedError):
         r.render_frame(b"\x00" * 1920 * 1080 * 3)
+
+
+# ============================================================
+# Timezone env-threading (Bug 1 follow-up, 2026-05-20).
+# ============================================================
+
+
+def test_sidecar_receives_configured_timezone_in_env(make_renderer, tmp_path):
+    """settings.timezone is handed to the sidecar via the TZ env var
+    so the renderer's auto_mode clock (libc localtime_r) resolves the
+    sign's local time, not UTC."""
+    probe = tmp_path / "tz_probe.txt"
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_TZ_PROBE": str(probe)},
+        get_timezone=lambda: "Asia/Tokyo",
+    )
+    try:
+        r.open()
+        assert probe.read_text() == "Asia/Tokyo"
+    finally:
+        r.close()
+
+
+def test_sidecar_tz_unset_when_timezone_is_none(make_renderer, tmp_path, monkeypatch):
+    """When settings.timezone is None ('Device local'), the proxy does
+    NOT force a TZ — it's dropped from the sidecar env so libc
+    localtime_r falls back to the system /etc/localtime. A stale TZ
+    inherited from the backend's own env must not leak through."""
+    probe = tmp_path / "tz_probe.txt"
+    # Even with a TZ in the backend's env, the None case must drop it.
+    monkeypatch.setenv("TZ", "Europe/Paris")
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_TZ_PROBE": str(probe)},
+        get_timezone=lambda: None,
+    )
+    try:
+        r.open()
+        assert probe.read_text() == "<unset>"
+    finally:
+        r.close()
 
 
 # ============================================================

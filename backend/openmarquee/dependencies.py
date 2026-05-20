@@ -407,6 +407,12 @@ def _rust_sidecar_renderer_or_fallback():
             height=height,
             binary_path=binary_path,
             content_root=str(content_root),
+            # Bug 1 follow-up (2026-05-20): the sidecar's auto_mode
+            # clock renders local time; hand it the operator's
+            # configured IANA tz so it sets TZ for libc localtime_r.
+            # Callable (not a snapshot) so a respawn re-reads the
+            # current setting.
+            get_timezone=lambda: _settings_storage_singleton().load().timezone,
         )
     except Exception:
         log.exception("RustRenderer construction failed; falling back to mock")

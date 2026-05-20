@@ -3905,11 +3905,13 @@ pub fn effective_hold_ms(slide_duration_ms: u32, override_secs: Option<u64>) -> 
 // supported; pure helpers, host-testable.
 // ---------------------------------------------------------------
 
-/// Calendar fields decomposed from a Unix timestamp (seconds
-/// since 1970-01-01 UTC). Naive UTC math; future slices can layer
-/// timezone awareness on top.
+/// Broken-down calendar fields. Timezone-agnostic — just the
+/// y/m/d/h/m/s/weekday a timestamp decomposes into. Produced by
+/// `unix_to_calendar_utc` (pure UTC math) OR `unix_to_calendar_
+/// local` (libc localtime_r, honors TZ / DST). The struct itself
+/// carries no zone; the producer decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CalendarUtc {
+pub struct Calendar {
     pub year: i32,
     pub month: u8,        // 1..=12
     pub day: u8,          // 1..=31
@@ -3923,7 +3925,13 @@ pub struct CalendarUtc {
 /// no system-clock side effects. Howard Hinnant's "civil from
 /// days" algorithm (CC0) for y/m/d; modular arithmetic for h/m/s
 /// and Sakamoto-style weekday from days.
-pub fn unix_to_calendar_utc(unix_seconds: i64) -> CalendarUtc {
+///
+/// Bug 1 follow-up (2026-05-20): no longer the auto_mode clock's
+/// resolver — that's `unix_to_calendar_local`. This is kept as
+/// the libc-failure fallback for that function AND remains
+/// independently unit-tested (it's the reference the local
+/// resolver's date-rollover tests check against).
+pub fn unix_to_calendar_utc(unix_seconds: i64) -> Calendar {
     // Split seconds-of-day from days-since-epoch. rem_euclid keeps
     // sub-day fields well-defined for negative epochs (pre-1970).
     let secs_in_day = 86_400_i64;
@@ -3948,7 +3956,7 @@ pub fn unix_to_calendar_utc(unix_seconds: i64) -> CalendarUtc {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u8;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
     let year = (y + (m <= 2) as i64) as i32;
-    CalendarUtc {
+    Calendar {
         year,
         month: m,
         day: d,
@@ -3956,6 +3964,62 @@ pub fn unix_to_calendar_utc(unix_seconds: i64) -> CalendarUtc {
         minute,
         second,
         weekday,
+    }
+}
+
+/// Decompose a Unix timestamp into LOCAL calendar fields, via
+/// libc `localtime_r`. This is the auto_mode clock's resolver
+/// (Bug 1 follow-up, 2026-05-20) — a sign clock must show the
+/// sign's physical-location local time, not UTC.
+///
+/// `localtime_r` consults the `TZ` environment variable (the
+/// backend sets it on the sidecar process from
+/// settings.timezone) and falls back to `/etc/localtime`. It
+/// does the full IANA zoneinfo + DST conversion — we hand-roll
+/// none of it. `tzset()` is called per invocation so the
+/// inherited TZ is always picked up (cheap: a stat of the
+/// zoneinfo file; this resolver runs at most ~30x/s). Mid-
+/// process TZ changes are intentionally NOT a concern — a
+/// Settings timezone change re-spawns the sidecar via a backend
+/// restart, and the fresh process inherits the new TZ.
+///
+/// On the (astronomically unlikely) `localtime_r` failure —
+/// EOVERFLOW for a year outside `c_int` — falls back to
+/// `unix_to_calendar_utc` rather than panicking the render path.
+pub fn unix_to_calendar_local(unix_seconds: i64) -> Calendar {
+    // `tzset` lives in the system libc on every POSIX platform but
+    // the `libc` crate doesn't bind it portably (it's absent from
+    // the macOS bindings) — declare it directly. It re-reads the
+    // `TZ` env into libc's tz state; glibc/macOS `localtime_r`
+    // only re-evaluates TZ when tzset has run, so calling it here
+    // guarantees the inherited TZ is honored (and makes the unit
+    // tests, which set TZ per-case, deterministic).
+    extern "C" {
+        fn tzset();
+    }
+    let t = unix_seconds as libc::time_t;
+    // SAFETY: tzset() + localtime_r are libc FFI. localtime_r is
+    // the reentrant variant (writes into our own `tm`); the
+    // render path calls this single-threaded. tzset() mutates
+    // libc global tz state — only ever called from this one
+    // render thread.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        tzset();
+        libc::localtime_r(&t, &mut tm)
+    };
+    if result.is_null() {
+        // localtime_r could not convert — fall back to UTC.
+        return unix_to_calendar_utc(unix_seconds);
+    }
+    Calendar {
+        year: tm.tm_year + 1900,         // tm_year is years-since-1900
+        month: (tm.tm_mon + 1) as u8,    // tm_mon is 0..=11
+        day: tm.tm_mday as u8,           // 1..=31
+        hour: tm.tm_hour as u8,          // 0..=23
+        minute: tm.tm_min as u8,         // 0..=59
+        second: tm.tm_sec as u8,         // 0..=60 (leap sec) — clamp not needed downstream
+        weekday: tm.tm_wday as u8,       // 0=Sunday — matches Calendar's convention
     }
 }
 
@@ -3976,7 +4040,7 @@ pub fn unix_to_calendar_utc(unix_seconds: i64) -> CalendarUtc {
 pub fn format_auto_text(
     auto_mode: Option<&str>,
     auto_format: Option<&str>,
-    cal: CalendarUtc,
+    cal: Calendar,
 ) -> Option<String> {
     let mode = auto_mode?;
     let fmt = match (mode, auto_format) {
@@ -7513,10 +7577,75 @@ mod tests {
         assert_eq!(c.weekday, 3);
     }
 
+    #[test]
+    fn unix_to_calendar_local_resolves_in_tz() {
+        // Bug 1 follow-up (2026-05-20): the auto_mode clock resolves
+        // LOCAL time via libc localtime_r honoring TZ. All cases run
+        // in ONE test fn (sequentially) — libc tz state is process-
+        // global, so parallel tz-mutating tests would race.
+        //
+        // For a FIXED-OFFSET zone, local(t) is exactly utc(t+offset)
+        // — so the trusted unix_to_calendar_utc is the reference.
+
+        // --- Case 1: TZ=UTC — local == UTC, no shift.
+        std::env::set_var("TZ", "UTC");
+        let t = 1_776_782_109; // 2026-04-21 14:35:09 UTC
+        assert_eq!(
+            unix_to_calendar_local(t),
+            unix_to_calendar_utc(t),
+            "TZ=UTC: local must equal UTC",
+        );
+
+        // --- Case 2: Asia/Tokyo (UTC+9, no DST) — DATE ROLLOVER.
+        // 2026-04-21 18:35:09 UTC -> Tokyo 2026-04-22 03:35:09:
+        // the calendar DAY rolls at LOCAL midnight, not UTC's.
+        std::env::set_var("TZ", "Asia/Tokyo");
+        let t_eve = 1_776_796_509; // 2026-04-21 18:35:09 UTC
+        let utc_eve = unix_to_calendar_utc(t_eve);
+        let tokyo_eve = unix_to_calendar_local(t_eve);
+        assert_eq!(utc_eve.day, 21, "UTC side is still the 21st");
+        assert_eq!(tokyo_eve.day, 22, "Tokyo has rolled to the 22nd");
+        assert_eq!(
+            tokyo_eve,
+            unix_to_calendar_utc(t_eve + 9 * 3600),
+            "Tokyo = UTC+9 exactly",
+        );
+        // The rollover is visible through the date formatter too:
+        assert_eq!(
+            format_auto_text(Some("date"), Some("date_iso"), tokyo_eve).unwrap(),
+            "2026-04-22",
+        );
+        assert_eq!(
+            format_auto_text(Some("date"), Some("date_iso"), utc_eve).unwrap(),
+            "2026-04-21",
+        );
+
+        // --- Case 3+4: Europe/London — DST is per-DATE, proving
+        // libc applies the zoneinfo rules (not a fixed offset).
+        std::env::set_var("TZ", "Europe/London");
+        // Summer: 2026-07-15 12:00:00 UTC -> BST (UTC+1).
+        let t_jul = 1_784_116_800;
+        assert_eq!(
+            unix_to_calendar_local(t_jul),
+            unix_to_calendar_utc(t_jul + 3600),
+            "London in July is BST (+1)",
+        );
+        // Winter: 2026-01-15 12:00:00 UTC -> GMT (UTC+0).
+        let t_jan = 1_768_478_400;
+        assert_eq!(
+            unix_to_calendar_local(t_jan),
+            unix_to_calendar_utc(t_jan),
+            "London in January is GMT (+0)",
+        );
+
+        // Restore so later tests / the process see a clean env.
+        std::env::remove_var("TZ");
+    }
+
     /// Pinned reference point for format tests: April 21, 2026 at
     /// 14:35:09 UTC = Tuesday. unix = 1776_782_109
     /// (= 20564 days * 86400 + 14*3600 + 35*60 + 9).
-    fn pinned_calendar() -> CalendarUtc {
+    fn pinned_calendar() -> Calendar {
         let c = unix_to_calendar_utc(1_776_782_109);
         assert_eq!(c.year, 2026);
         assert_eq!(c.month, 4);
