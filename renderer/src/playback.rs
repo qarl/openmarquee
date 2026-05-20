@@ -276,6 +276,13 @@ pub struct OpenParams {
     /// video.
     #[serde(default)]
     pub content_root: Option<String>,
+    /// FYS bug 5 -- display rotation in degrees. One of
+    /// 0 / 90 / 180 / 270; any other value is treated as 0 by
+    /// the open handler (with a warning). `#[serde(default)]`
+    /// makes it 0 when absent, so pre-rotation Python callers
+    /// stay wire-compatible.
+    #[serde(default)]
+    pub rotation: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -584,6 +591,7 @@ mod tests {
             output: "hdmi".to_string(),
             drm_card: Some("/dev/dri/card1".to_string()),
             content_root: Some("/var/openmarquee/content".to_string()),
+            rotation: 0,
         });
         roundtrip_request(&req);
         // Pin wire format (op + params shape).
@@ -596,17 +604,34 @@ mod tests {
     fn ipc_request_open_decodes_with_omitted_optional_fields() {
         // drm_card and content_root are Option<String> with
         // serde default; they should decode to None when
-        // missing.
+        // missing. rotation is i32 with serde default; absent
+        // -> 0 (FYS bug 5: backward-compatible with pre-rotation
+        // Python callers).
         let json = r#"{"op":"open","params":{"output":"hdmi"}}"#;
         let req: IpcRequest = serde_json::from_str(json).unwrap();
         match req {
-            IpcRequest::Open(OpenParams { output, drm_card, content_root }) => {
+            IpcRequest::Open(OpenParams { output, drm_card, content_root, rotation }) => {
                 assert_eq!(output, "hdmi");
                 assert!(drm_card.is_none());
                 assert!(content_root.is_none());
+                assert_eq!(rotation, 0);
             }
             other => panic!("expected Open, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ipc_request_open_round_trips_with_rotation() {
+        // FYS bug 5: rotation is part of the wire contract.
+        let req = IpcRequest::Open(OpenParams {
+            output: "hdmi".to_string(),
+            drm_card: None,
+            content_root: Some("/var/openmarquee/content".to_string()),
+            rotation: 90,
+        });
+        roundtrip_request(&req);
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert!(encoded.contains(r#""rotation":90"#));
     }
 
     #[test]
@@ -760,6 +785,7 @@ mod tests {
             ("req_open", serde_json::to_string(&IpcRequest::Open(OpenParams {
                 output: "hdmi".into(), drm_card: None,
                 content_root: Some("/tmp".into()),
+                rotation: 0,
             })).unwrap()),
             ("req_begin_slide", serde_json::to_string(&IpcRequest::BeginSlide(BeginSlideParams {
                 slide_id: u, t0_ms: 100, duration_ms: 5000,

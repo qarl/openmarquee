@@ -254,8 +254,21 @@ pub struct EglSession<'a> {
     crtc_handle: crtc::Handle,
     connector_handle: connector::Handle,
     mode: drm::control::Mode,
+    /// FYS bug 5 -- LOGICAL (content) dimensions. For 90/270 these
+    /// are the panel dims with width/height SWAPPED (portrait); for
+    /// 0/180 they equal the panel dims. The content pipeline reads
+    /// `mode_w`/`mode_h` everywhere, so making them logical means
+    /// text/image/video/transition layout auto-adapts to portrait
+    /// with NO content-pipeline changes. The PHYSICAL panel dims
+    /// (the scanout buffer size) come from `mode.size()`, NOT from
+    /// these fields -- see `phys_mode_size()`.
     mode_w: u16,
     mode_h: u16,
+    /// FYS bug 5 -- display rotation in degrees, one of 0/90/180/270.
+    /// Validated by the open handler (any other value is coerced to
+    /// 0). The final present pass rotates the logical render onto the
+    /// panel-native scanout buffer by this many degrees clockwise.
+    rotation: i32,
     /// v1-spec-delta #8 (F-image-bg-cache): per-session cache of
     /// decoded + uploaded image-bg textures. See ImageBgCache
     /// docs. The reel driver passes &mut self.image_bg_cache
@@ -460,7 +473,7 @@ pub struct EglSession<'a> {
 /// extraction so slice (b)+ can compose multiple draws under one
 /// session. The cleanup is warn-on-Err so the original error
 /// propagates via the closure's return.
-fn with_egl_session<F, R>(card: &Card, work: F) -> Result<R>
+fn with_egl_session<F, R>(card: &Card, rotation: i32, work: F) -> Result<R>
 where
     F: FnOnce(&mut EglSession) -> Result<R>,
 {
@@ -479,14 +492,30 @@ where
     // Forced full-range. If a Limited-mode TV regresses, settings-
     // driven override is the follow-up; see Bug 7 recon (NEW-B).
     try_force_full_range_rgb(card, connector_info.handle())?;
-    let (mode_w, mode_h) = mode.size();
+    // FYS bug 5 -- the PHYSICAL panel dims are always the negotiated
+    // DRM mode size; the scanout buffer (GBM/EGL surface) is panel-
+    // native. The LOGICAL (content) dims are the physical dims with
+    // width/height SWAPPED for 90/270 (portrait layout), identical
+    // for 0/180. The EglSession stores the LOGICAL dims in mode_w/
+    // mode_h so the content pipeline lays out at portrait with no
+    // per-call changes; the final present pass rotates the logical
+    // render onto the physical scanout buffer.
+    let (phys_w, phys_h) = mode.size();
+    let (mode_w, mode_h) = if rotation == 90 || rotation == 270 {
+        (phys_h, phys_w)
+    } else {
+        (phys_w, phys_h)
+    };
     eprintln!(
-        "selected connector {:?} {:?} at {}x{}@{}",
+        "selected connector {:?} {:?} at {}x{}@{} (rotation={}, logical {}x{})",
         connector_info.handle(),
         connector_info.interface(),
+        phys_w,
+        phys_h,
+        mode.vrefresh(),
+        rotation,
         mode_w,
         mode_h,
-        mode.vrefresh(),
     );
 
     let encoder_handle = connector_info
@@ -508,10 +537,13 @@ where
     if gbm_dev_ptr.is_null() {
         bail!("gbm_device raw pointer is null");
     }
+    // FYS bug 5 -- the scanout buffer is PANEL-NATIVE, so the GBM +
+    // EGL surfaces are created at PHYSICAL dims, never the logical
+    // (possibly swapped) dims.
     let mut gbm_surface = gbm_dev
         .create_surface::<()>(
-            mode_w as u32,
-            mode_h as u32,
+            phys_w as u32,
+            phys_h as u32,
             GbmFormat::Argb8888,
             BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
         )
@@ -589,6 +621,7 @@ where
         mode,
         mode_w,
         mode_h,
+        rotation,
         modeset_done: false,
         flip_pending: false,
         image_bg_cache: ImageBgCache::with_capacity(IMAGE_BG_CACHE_CAPACITY),
@@ -1141,7 +1174,7 @@ fn render_one_frame_to_hdmi<F>(card: &Card, hold_ms: u64, draw: F) -> Result<()>
 where
     F: FnOnce(&glow::Context, u32, u32) -> Result<()>,
 {
-    with_egl_session(card, |session| render_one_frame_in_session(session, card, hold_ms, draw))
+    with_egl_session(card, 0, |session| render_one_frame_in_session(session, card, hold_ms, draw))
 }
 
 /// v1-spec-delta #5 (slice b, 2026-05-08): per-frame work given an
@@ -1251,7 +1284,7 @@ fn render_animated_slide(
     hold_ms: u64,
     fps: u32,
 ) -> Result<()> {
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         render_animated_slide_in_session(
             session, card, bg_kind, text_layers, slide_id, hold_ms, fps,
         )
@@ -2657,7 +2690,7 @@ pub fn render_slide(
     content_root: Option<&Path>,
     hold_ms: u64,
 ) -> Result<()> {
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         render_slide_in_session(session, card, slide, fonts, content_root, hold_ms)
     })
 }
@@ -2671,7 +2704,7 @@ pub fn render_image_slide(
     asset_path: &Path,
     hold_ms: u64,
 ) -> Result<()> {
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         render_image_slide_in_session(session, card, asset_path, hold_ms)
     })
 }
@@ -2870,10 +2903,17 @@ pub fn paint_and_present_one_frame_for_slide(
     // session-cached scene FBO + post-pass blit. Identity
     // settings (brightness=100 + gamma=1.0) take the direct-
     // to-default-fb path with zero post-pass cost.
+    //
+    // FYS bug 5: the scene FBO is ALSO needed for any non-zero
+    // display rotation -- content renders into the logical-sized
+    // scene FBO and the present pass rotates it onto the panel.
+    // mode_w/mode_h are the LOGICAL dims; the scene FBO is sized
+    // to them so content lays out at portrait for 90/270.
     let identity = session.current_settings.is_color_identity();
+    let rotation = session.rotation;
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
-    let scene_fbo_handle = if !identity {
+    let scene_fbo_handle = if !identity || rotation != 0 {
         Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
     } else {
         None
@@ -2934,17 +2974,20 @@ pub fn paint_and_present_one_frame_for_slide(
     unsafe { session.gl.flush(); }
     let t_after_paint = if trace { Some(std::time::Instant::now()) } else { None };
 
-    // v1-spec-delta #10 (slice c): if non-identity, the scene
-    // is in scene_fbo. Bind default fb + run FS_BRIGHT_GAMMA
-    // from scene_tex. Brightness divides by 100 to turn
-    // schema [0, 100] into shader [0, 1].
+    // v1-spec-delta #10 (slice c): if non-identity OR rotated, the
+    // scene is in scene_fbo. Bind default fb + run the present pass
+    // from scene_tex. Brightness divides by 100 to turn schema
+    // [0, 100] into shader [0, 1]. FYS bug 5: the present-pass
+    // viewport is the PHYSICAL panel size (the scanout buffer), and
+    // the pass rotates the logical scene onto it.
     if let Some((_fbo, tex)) = scene_fbo_handle {
         let brightness = (session.current_settings.brightness as f32) / 100.0;
         let gamma = session.current_settings.gamma;
+        let (phys_w, phys_h) = session.phys_mode_size();
         unsafe {
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
     }
     let t_after_postpass = if trace { Some(std::time::Instant::now()) } else { None };
@@ -3057,8 +3100,13 @@ pub fn paint_and_present_one_image_slide_frame(
     // routes the bake through the scene FBO + post-pass blit. Mirrors
     // paint_and_present_one_frame_for_slide's pattern so ImageSlide
     // honors the operator's color settings on glass.
+    // FYS bug 5: the scene FBO is needed for non-identity color OR
+    // any non-zero rotation. mode_w/mode_h are LOGICAL dims; the
+    // image bake fills the logical-sized FBO and the present pass
+    // rotates it onto the panel.
     let identity = session.current_settings.is_color_identity();
-    let scene_fbo_handle = if !identity {
+    let rotation = session.rotation;
+    let scene_fbo_handle = if !identity || rotation != 0 {
         Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
     } else {
         None
@@ -3072,15 +3120,17 @@ pub fn paint_and_present_one_image_slide_frame(
     unsafe {
         bake_image_slide_to_current_fbo(session.gl, &asset_path, mode_w, mode_h)?;
     }
-    // v1-spec-delta #10 (slice c): non-identity path runs the
-    // brightness/gamma post-pass from scene FBO to default fb.
+    // v1-spec-delta #10 (slice c) + FYS bug 5: the scene-FBO route
+    // runs the rotation-aware present pass from scene FBO to the
+    // panel-native default fb (viewport = PHYSICAL dims).
     if let Some((_fbo, tex)) = scene_fbo_handle {
         let brightness = (session.current_settings.brightness as f32) / 100.0;
         let gamma = session.current_settings.gamma;
+        let (phys_w, phys_h) = session.phys_mode_size();
         unsafe {
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
     }
     // Mirror paint_and_present_one_frame_for_slide's scanout
@@ -3149,8 +3199,11 @@ pub fn paint_and_present_external_frame(
     // Non-identity brightness/gamma routes through the scene FBO +
     // post-pass blit, exactly as the image-slide path does — so a
     // VLC frame honors the operator's color settings on glass.
+    // FYS bug 5: the scene FBO is likewise needed for any non-zero
+    // display rotation. mode_w/mode_h are the LOGICAL dims.
     let identity = session.current_settings.is_color_identity();
-    let scene_fbo_handle = if !identity {
+    let rotation = session.rotation;
+    let scene_fbo_handle = if !identity || rotation != 0 {
         Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
     } else {
         None
@@ -3175,10 +3228,11 @@ pub fn paint_and_present_external_frame(
     if let Some((_fbo, tex)) = scene_fbo_handle {
         let brightness = (session.current_settings.brightness as f32) / 100.0;
         let gamma = session.current_settings.gamma;
+        let (phys_w, phys_h) = session.phys_mode_size();
         unsafe {
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
     }
     // Scanout swap / lock / addFB / commit / pair-rotation — verbatim
@@ -3271,13 +3325,32 @@ pub fn paint_and_present_one_video_slide_frame(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     let t_enter = if profile_first { Some(std::time::Instant::now()) } else { None };
+    // FYS bug 5: for a non-zero display rotation, the video frame
+    // must bake into the logical-sized scene FBO and then be
+    // rotated onto the panel by the present pass. With rotation==0
+    // the helper bakes straight into the default fb (the active
+    // framebuffer at entry) -- byte-identical to the legacy path,
+    // no scene FBO. (Brightness/gamma are intentionally NOT applied
+    // to the video path; that matches pre-rotation behavior.)
+    let rotation = session.rotation;
+    let scene_fbo_handle = if rotation != 0 {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        use glow::HasContext;
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        }
+    }
     // Phase 8 slice 2 (2026-05-16): per-frame video bake extracted
     // into bake_video_slide_to_current_fbo. Hold-path scanout
     // semantics unchanged -- the helper feeds+drains+blits into the
-    // default fb (the active framebuffer at entry) and returns the
-    // path label, then the caller does the swap+commit. Slice 4
-    // will reuse the helper from the transition path with an FBO
-    // bind in front of the call.
+    // active framebuffer (scene FBO when rotated, else default fb)
+    // and returns the path label, then the caller does the
+    // swap+commit. Slice 4 reuses the helper from the transition
+    // path with an FBO bind in front of the call.
     let painted = unsafe {
         bake_video_slide_to_current_fbo(
             session,
@@ -3292,9 +3365,28 @@ pub fn paint_and_present_one_video_slide_frame(
     let Some(path_label) = painted else {
         // No frame ready this tick. Don't error -- the next advance
         // can try again. Leaves whatever's on screen (last decoded
-        // frame or black if never decoded).
+        // frame or black if never decoded). Re-bind the default fb
+        // so a rotation-routed skip doesn't leave the scene FBO
+        // bound for the next op.
+        if scene_fbo_handle.is_some() {
+            use glow::HasContext;
+            unsafe { session.gl.bind_framebuffer(glow::FRAMEBUFFER, None); }
+        }
         return Ok(());
     };
+    // FYS bug 5: rotated route -- present the logical scene FBO onto
+    // the panel-native default fb with the rotating present pass.
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let (phys_w, phys_h) = session.phys_mode_size();
+        use glow::HasContext;
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            // brightness/gamma identity (1.0/1.0): the video path
+            // does not apply color settings -- present is rotate-only.
+            run_present_pass(session.gl, tex, 1.0, 1.0, rotation)?;
+        }
+    }
     let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
     let r = finish_video_slide_swap_and_commit(session, card);
     if path_label == "DMABUF" {
@@ -3367,6 +3459,12 @@ fn finish_video_slide_swap_and_commit(
 /// Used by the IPC Capture op's re-paint pattern: paint into the
 /// surface, glReadPixels back from the default framebuffer.
 /// Counterpart to paint_one_for_capture (which handles TextSlide).
+///
+/// Rotation note: capture paths deliberately render at LOGICAL
+/// (un-rotated) dims and are NOT routed through the present-pass
+/// rotation — the captured PNG is the content in its authored
+/// orientation. Rotated-thumbnail handling is the UI's job (FYS
+/// bug 7). Don't "fix" this to rotate.
 pub fn paint_one_image_slide_for_capture(
     session: &mut EglSession,
     slide: &ImageSlide,
@@ -3668,8 +3766,14 @@ pub fn paint_and_present_one_transition_frame(
         // output through the session's scene FBO + FS_BRIGHT_GAMMA
         // post-pass before scanout. Identity skips the FBO bind +
         // post-pass.
+        //
+        // FYS bug 5: the scene FBO is ALSO needed for any non-zero
+        // display rotation. The transition shader composes both
+        // logical-sized slide FBOs into the logical-sized scene FBO,
+        // and the present pass rotates it onto the panel.
         let identity = session.current_settings.is_color_identity();
-        let scene_for_post_pass = if !identity {
+        let rotation = session.rotation;
+        let scene_for_post_pass = if !identity || rotation != 0 {
             Some(ensure_scene_fbo(session, mode_w_u32, mode_h_u32)?)
         } else {
             None
@@ -3701,16 +3805,18 @@ pub fn paint_and_present_one_transition_frame(
         cleanup_static(session.gl, Some(vbo));
         session.gl.delete_program(program);
 
-        // v1-spec-delta #10 (slice c-2): post-pass blit from
-        // scene FBO to default fb when non-identity. Mirrors
-        // paint_and_present_one_frame_for_slide's slice-c
-        // dispatch.
+        // v1-spec-delta #10 (slice c-2) + FYS bug 5: present pass
+        // from the logical scene FBO to the panel-native default fb
+        // when non-identity OR rotated. Viewport = PHYSICAL dims;
+        // the pass applies brightness/gamma AND the display
+        // rotation. Mirrors paint_and_present_one_frame_for_slide.
         if let Some((_fbo, tex)) = scene_for_post_pass {
             let brightness = (session.current_settings.brightness as f32) / 100.0;
             let gamma = session.current_settings.gamma;
+            let (phys_w, phys_h) = session.phys_mode_size();
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
-            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
         Ok(())
     })();
@@ -3805,11 +3911,16 @@ pub enum TransitionEndpoint<'a> {
 /// Public adapter: open a fresh EglSession and run the
 /// supplied closure with it. The IPC sidecar's Open op uses
 /// this so the inner loop runs inside a held session.
-pub fn run_in_egl_session<F, R>(card: &Card, work: F) -> Result<R>
+///
+/// FYS bug 5 -- `rotation` is the display rotation in degrees
+/// (0/90/180/270); the IPC Open handler passes `params.rotation`
+/// (already validated). The session lays content out at logical
+/// dims and the present pass rotates onto the panel.
+pub fn run_in_egl_session<F, R>(card: &Card, rotation: i32, work: F) -> Result<R>
 where
     F: FnOnce(&mut EglSession) -> Result<R>,
 {
-    with_egl_session(card, work)
+    with_egl_session(card, rotation, work)
 }
 
 /// v1-spec-delta #11 (slice a, 2026-05-08) -- read back the
@@ -3931,7 +4042,7 @@ pub fn capture_sb_transition_mid_to_png(
     {
         bail!("capture_sb_mid: layer count exceeds cap");
     }
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
         let slide_a_id = slide_a.id;
@@ -4229,7 +4340,7 @@ fn capture_legacy_3pass_transition_mid_to_png(
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
         let gl = session.gl;
@@ -4450,7 +4561,7 @@ pub fn capture_fullres_transition_mid_to_png(
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
 
@@ -4690,7 +4801,7 @@ pub fn capture_slide_to_png(
     } else {
         current_unix_seconds()
     };
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
         // Bug 3 Slice 2D: multi-round pre-warm to resolve any
@@ -4813,7 +4924,7 @@ pub fn capture_image_slide_to_png(
 ) -> Result<()> {
     use crate::hdmi_logic::rgba_to_png_bytes;
     let (rgba, img_w, img_h) = load_png_rgba(asset_path)?;
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
         unsafe {
@@ -4927,6 +5038,16 @@ impl<'a> EglSession<'a> {
     /// own from a call-local clock.
     pub fn motion_tick_seconds(&self) -> f64 {
         self.session_start.elapsed().as_secs_f64()
+    }
+
+    /// FYS bug 5 -- the PHYSICAL panel dims (the scanout buffer
+    /// size). For 0/180 these equal `mode_w`/`mode_h`; for 90/270
+    /// they are the swap of the logical dims. The present pass uses
+    /// these for the default-framebuffer viewport; the content
+    /// pipeline keeps using the logical `mode_w`/`mode_h`.
+    fn phys_mode_size(&self) -> (u32, u32) {
+        let (pw, ph) = self.mode.size();
+        (pw as u32, ph as u32)
     }
 }
 
@@ -5111,6 +5232,12 @@ fn clear_bright_gamma_cache(gl: &glow::Context) {
             unsafe { gl.delete_buffer(vbo); }
         }
     });
+    // FYS bug 5 -- free the present-pass rotated quad VBO.
+    PRESENT_QUAD_VBO.with(|c| {
+        if let Some((vbo, _rot)) = c.replace(None) {
+            unsafe { gl.delete_buffer(vbo); }
+        }
+    });
 }
 
 /// v1-spec-delta #10 (slice c) -- final blit from scene FBO
@@ -5148,6 +5275,91 @@ unsafe fn run_bright_gamma_pass(
     Ok(())
 }
 
+std::thread_local! {
+    /// FYS bug 5 -- per-rotation present-pass quad VBO. The present
+    /// pass blits the logical scene FBO to the panel-native default
+    /// framebuffer; for a non-zero rotation the quad's vertex
+    /// POSITIONS are rotated while the UVs stay fixed, so the
+    /// sampled content lands rotated on the panel. Rotation is fixed
+    /// for the session lifetime, so a single VBO (one per process /
+    /// thread, since the session is single-threaded) suffices.
+    /// Lazily (re)built when the requested rotation changes; freed
+    /// in clear_bright_gamma_cache at session teardown.
+    static PRESENT_QUAD_VBO: std::cell::Cell<Option<(glow::NativeBuffer, i32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// FYS bug 5 -- get-or-rebuild the present-pass quad VBO for the
+/// requested rotation. STATIC_DRAW; the geometry only changes if
+/// the caller's rotation differs from the cached one (it never
+/// does within a session, but rebuild-on-mismatch keeps the helper
+/// correct if a future caller varies it).
+unsafe fn present_quad_vbo(gl: &glow::Context, rotation: i32) -> Result<glow::NativeBuffer> {
+    use glow::HasContext;
+    PRESENT_QUAD_VBO.with(|c| {
+        if let Some((vbo, cached_rot)) = c.get() {
+            if cached_rot == rotation {
+                return Ok(vbo);
+            }
+            gl.delete_buffer(vbo);
+        }
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("glGenBuffers(present_quad): {e}"))?;
+        // FYS bug 5 -- the rotation geometry is the host-testable
+        // pure function in hdmi_logic (the rotation-direction
+        // convention is documented there).
+        let verts = crate::hdmi_logic::present_quad_verts(rotation);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            std::mem::size_of_val(&verts),
+        );
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+        c.set(Some((vbo, rotation)));
+        Ok(vbo)
+    })
+}
+
+/// FYS bug 5 -- the rotation-aware present pass. Blits the logical
+/// scene FBO texture to the bound (panel-native) framebuffer,
+/// applying brightness/gamma AND the display rotation in a single
+/// fullscreen blit. Reuses the FS_BRIGHT_GAMMA program (so identity
+/// brightness/gamma is still correct); the rotation is baked into
+/// the quad's vertex positions (see `present_quad_verts`).
+///
+/// Caller is responsible for binding the default framebuffer and
+/// setting the viewport to the PHYSICAL panel dims before calling.
+/// For `rotation == 0` this is geometrically identical to
+/// `run_bright_gamma_pass`.
+unsafe fn run_present_pass(
+    gl: &glow::Context,
+    src_tex: glow::NativeTexture,
+    brightness: f32,
+    gamma: f32,
+    rotation: i32,
+) -> Result<()> {
+    use glow::HasContext;
+    let cgp = cached_bright_gamma_program(gl)?;
+    let vbo = present_quad_vbo(gl, rotation)?;
+    gl.use_program(Some(cgp.program));
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
+    gl.uniform_1_i32(cgp.u_src.as_ref(), 0);
+    gl.uniform_1_f32(cgp.u_brightness.as_ref(), brightness);
+    gl.uniform_1_f32(cgp.u_gamma.as_ref(), gamma);
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.enable_vertex_attrib_array(cgp.a_pos);
+    gl.vertex_attrib_pointer_f32(cgp.a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(cgp.a_uv);
+    gl.vertex_attrib_pointer_f32(cgp.a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    gl.disable_vertex_attrib_array(cgp.a_pos);
+    gl.disable_vertex_attrib_array(cgp.a_uv);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    Ok(())
+}
+
 /// v1-spec-delta #9 (slice e -- Capture) + #10 (slice d) --
 /// paint a slide into the EGL window surface for capture.
 /// No swap_buffers, no commit_fb, no scanout.
@@ -5158,6 +5370,12 @@ unsafe fn run_bright_gamma_pass(
 /// the captured PNG reflects the same tonemapping as live
 /// scanout. Caller's subsequent capture_fbo_to_rgba on the
 /// default framebuffer reads the post-pass output.
+///
+/// Rotation note: capture paths deliberately render at LOGICAL
+/// (un-rotated) dims and are NOT routed through the present-pass
+/// rotation — the captured PNG is the content in its authored
+/// orientation. Rotated-thumbnail handling is the UI's job (FYS
+/// bug 7). Don't "fix" this to rotate.
 pub fn paint_one_for_capture(
     session: &mut EglSession,
     slide: &TextSlide,
@@ -6442,7 +6660,7 @@ pub fn render_transition_animated(
     transition_ms: u32,
     fps: u32,
 ) -> Result<u32> {
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         render_transition_animated_in_session(
             session, card, slide_a, slide_b, fonts, content_root, kind, transition_ms, fps,
         )
@@ -10863,7 +11081,7 @@ pub fn render_playlist_reel(
     // reused across calls. Each render_*_in_session holds its own
     // (BO, FB) rotation across its own frames and releases all of
     // it on exit -- no BO/FB state leaks between calls.
-    with_egl_session(card, |session| {
+    with_egl_session(card, 0, |session| {
         // v1-spec-delta #10 (slice c-2-b): SettingsWatcher in
         // standalone reel. When --settings is provided, poll
         // between slides and apply changes to the session;

@@ -846,6 +846,22 @@ where
     let card = Card::open(&card_path)
         .map_err(|e| anyhow!("DRM open {} failed: {e:#}", card_path.display()))?;
 
+    // FYS bug 5 -- validate the display rotation. Settings.display_
+    // rotation is constrained to {0,90,180,270} upstream, but a
+    // malformed Open payload could still carry something else; treat
+    // any out-of-set value as 0 (no rotation) and warn rather than
+    // failing the whole open.
+    let rotation = match params.rotation {
+        0 | 90 | 180 | 270 => params.rotation,
+        other => {
+            eprintln!(
+                "warn: ipc_sidecar open rotation={other} is not one of \
+                 0/90/180/270; treating as 0"
+            );
+            0
+        }
+    };
+
     // Font catalog -- needed by paint_slide for the text-layer
     // rasterization. Use the same defaults as the standalone
     // CLI.
@@ -862,7 +878,7 @@ where
         None
     };
 
-    hdmi::run_in_egl_session(&card, |session| {
+    hdmi::run_in_egl_session(&card, rotation, |session| {
         let (mw, mh) = hdmi::egl_session_mode_size(session);
         emit_response(
             stdout,
@@ -1651,6 +1667,7 @@ mod tests {
             output: "hdmi".to_string(),
             drm_card: None,
             content_root: Some(td.path().to_str().unwrap().to_string()),
+            rotation: 0,
         });
         let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
         match resp {

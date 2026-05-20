@@ -349,6 +349,61 @@ void main() {
 }
 "#;
 
+/// FYS bug 5 -- compute the present-pass fullscreen-quad vertices
+/// for a given display rotation. The returned 16-float array is 4
+/// verts of interleaved `[x, y, u, v]` in TRIANGLE_STRIP order,
+/// consumed by `VS_TEXTURED_QUAD` (a_pos at offset 0, a_uv at
+/// offset 2, stride 4 floats).
+///
+/// ROTATION DIRECTION CONVENTION (defined HERE, the single source
+/// of truth): `rotation` is the CLOCKWISE rotation, in degrees, of
+/// the rendered content as a viewer looking at the panel sees it.
+/// This matches `Settings.display_rotation` -- the operator dials
+/// in how the physical panel is mounted (rotated clockwise), and
+/// the renderer composes the logical-portrait render so it reads
+/// upright on that physically-rotated panel.
+///
+/// Implementation: the UVs are held FIXED and the vertex POSITIONS
+/// are rotated clockwise. In GL's y-up NDC a clockwise screen
+/// rotation by angle θ is `(x', y') = (x·cosθ + y·sinθ,
+/// −x·sinθ + y·cosθ)`. Rotating the +/-1 quad's positions rotates
+/// the displayed image in the same direction. 90 and 270 are exact
+/// opposites (270 == 90 counter-clockwise). For 90/270 the logical
+/// scene texture is portrait while the default framebuffer is
+/// landscape; the +/-1 NDC quad rotated 90° still spans +/-1, and
+/// the anisotropic NDC->pixel mapping stretches the portrait
+/// texture to fill the landscape panel exactly.
+///
+/// `rotation == 0` returns the legacy direct-blit quad byte-for-
+/// byte (UV maps straight to NDC), so the 0° present path is
+/// unchanged. Any unrecognized value is treated as 0.
+pub fn present_quad_verts(rotation: i32) -> [f32; 16] {
+    // Base quad: UV (u,v) maps straight to NDC (x,y). Same geometry
+    // and ordering as the `cached_textured_quad_vbo` in hdmi.rs.
+    let base: [(f32, f32, f32, f32); 4] = [
+        (-1.0, -1.0, 0.0, 0.0),
+        ( 1.0, -1.0, 1.0, 0.0),
+        (-1.0,  1.0, 0.0, 1.0),
+        ( 1.0,  1.0, 1.0, 1.0),
+    ];
+    // Clockwise rotation in y-up NDC: (cos, sin) for the angle.
+    let (c, s): (f32, f32) = match rotation {
+        90 => (0.0, 1.0),
+        180 => (-1.0, 0.0),
+        270 => (0.0, -1.0),
+        _ => (1.0, 0.0), // 0 (and any unexpected value): identity
+    };
+    let mut out = [0.0f32; 16];
+    for (i, (x, y, u, v)) in base.iter().enumerate() {
+        // Clockwise position rotation: x' = x·c + y·s, y' = −x·s + y·c.
+        out[i * 4] = x * c + y * s;
+        out[i * 4 + 1] = -x * s + y * c;
+        out[i * 4 + 2] = *u;
+        out[i * 4 + 3] = *v;
+    }
+    out
+}
+
 /// Fragment shader for glyph rendering. The atlas/bitmap stores
 /// alpha as a single channel (LUMINANCE-or-ALPHA in GLES2; we use
 /// LUMINANCE because GLES2 ALPHA-only sampling returns the alpha
@@ -5853,6 +5908,90 @@ mod tests {
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_pos"));
         assert!(VS_TEXTURED_QUAD.contains("attribute vec2 a_uv"));
         assert!(VS_TEXTURED_QUAD.contains("varying vec2 v_uv"));
+    }
+
+    // ============================================================
+    // FYS bug 5 -- display-rotation present-quad geometry tests.
+    // present_quad_verts is the single source of truth for the
+    // rotation-direction convention; these lock it.
+    // ============================================================
+
+    #[test]
+    fn present_quad_rotation_zero_is_identity_quad() {
+        // 0° must produce the legacy direct-blit quad byte-for-byte
+        // (UV maps straight to NDC) so the 0° present path is
+        // unchanged from pre-bug-5.
+        let v = present_quad_verts(0);
+        let expected: [f32; 16] = [
+            -1.0, -1.0, 0.0, 0.0,
+             1.0, -1.0, 1.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+        ];
+        assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn present_quad_unknown_rotation_falls_back_to_identity() {
+        // The open handler already coerces out-of-set values, but
+        // the geometry helper is robust regardless.
+        assert_eq!(present_quad_verts(45), present_quad_verts(0));
+    }
+
+    #[test]
+    fn present_quad_keeps_uvs_fixed_across_rotations() {
+        // UVs are NEVER rotated -- only vertex positions move. Each
+        // rotation keeps the same four UV pairs in the same vertex
+        // slots; the texture content rotates because each UV is
+        // drawn at a rotated position.
+        for rot in [0, 90, 180, 270] {
+            let v = present_quad_verts(rot);
+            assert_eq!((v[2], v[3]), (0.0, 0.0), "rot={rot}");
+            assert_eq!((v[6], v[7]), (1.0, 0.0), "rot={rot}");
+            assert_eq!((v[10], v[11]), (0.0, 1.0), "rot={rot}");
+            assert_eq!((v[14], v[15]), (1.0, 1.0), "rot={rot}");
+        }
+    }
+
+    #[test]
+    fn present_quad_90_rotates_clockwise() {
+        // Pins the rotation DIRECTION so a future edit can't
+        // silently flip 90 vs 270. Clockwise-90 in y-up NDC is
+        // (x', y') = (y, -x). Vert 0 carries UV (0,0) at base
+        // position (-1,-1) -> (-1, 1). Vert 3 carries UV (1,1) at
+        // base (1,1) -> (1,-1).
+        let q90 = present_quad_verts(90);
+        assert_eq!((q90[0], q90[1]), (-1.0, 1.0));
+        assert_eq!((q90[12], q90[13]), (1.0, -1.0));
+    }
+
+    #[test]
+    fn present_quad_90_and_270_are_opposite() {
+        // 90 and 270 are exact opposites: a clockwise-90 vertex
+        // position, rotated a further 270 clockwise (= a full
+        // turn), returns to its rotation-0 origin. Clockwise-270 in
+        // y-up NDC is (x', y') = (-y, x).
+        let q0 = present_quad_verts(0);
+        let q90 = present_quad_verts(90);
+        for i in 0..4 {
+            let (x90, y90) = (q90[i * 4], q90[i * 4 + 1]);
+            let (rx, ry) = (-y90, x90); // clockwise-270 of the 90 pos
+            assert!(
+                (rx - q0[i * 4]).abs() < 1e-6 && (ry - q0[i * 4 + 1]).abs() < 1e-6,
+                "90 then 270 must be identity at vert {i}",
+            );
+        }
+    }
+
+    #[test]
+    fn present_quad_180_negates_positions() {
+        // 180° negates every position (UVs unchanged).
+        let q0 = present_quad_verts(0);
+        let q180 = present_quad_verts(180);
+        for i in 0..4 {
+            assert!((q180[i * 4] + q0[i * 4]).abs() < 1e-6, "x vert {i}");
+            assert!((q180[i * 4 + 1] + q0[i * 4 + 1]).abs() < 1e-6, "y vert {i}");
+        }
     }
 
     #[test]
