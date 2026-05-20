@@ -79,9 +79,10 @@ export async function saveTextSlide(page, name, opts = {}) {
     await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.fill(".editor .field-name", name);
     await page.fill(".editor .field-text", text);
-    // 900ms debounce + network round-trip + fade window; 5s ceiling is plenty.
+    // Autosave is implicit (FYS bug 6 — no "Saved" copy); sync on the
+    // status pill's data-state. 900ms debounce + round-trip; 5s ceiling.
     await expect(page.locator(".editor .editor-status"))
-        .toContainText(/Saved/, { timeout: 5_000 });
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 }
 
 // Click the +New affordance in the slides shell page-head to reset the editor

@@ -30,7 +30,7 @@ test("auto-mode time slide ticks in the live preview overlay", async ({ page }) 
     // Keep slide short so the e2e runs fast; 3s is plenty for two ticks.
     await page.locator(".editor .field-duration").fill("3");
     await expect(page.locator(".editor .editor-status"))
-        .toContainText(/Saved/, { timeout: 5_000 });
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 
     // 2) Put the slide in the default playlist.
     const content = await (await page.request.get("/api/content")).json();

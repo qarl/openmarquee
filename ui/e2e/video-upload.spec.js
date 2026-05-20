@@ -77,8 +77,8 @@ test("video uploader transcodes a picked file via ffmpeg.wasm and autosaves", as
 
     // Once transcode + thumbnail are ready, autosave's canSave gate flips
     // true, the form-input listener kicks the debounce, and the slide
-    // round-trips to the server. Verify via /api/content (avoids racing
-    // the status pill, which transitions through Saving… → Saved → idle).
+    // round-trips to the server. Verify via /api/content (the status
+    // pill shows no save-confirmation copy — FYS bug 6).
     await expect.poll(
         async () => {
             const items = await (await page.request.get("/api/content")).json();

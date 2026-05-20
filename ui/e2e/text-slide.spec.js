@@ -23,7 +23,7 @@ test("save a text slide → it shows up in the Playlists pallet + the asset serv
     });
 
     await expect(page.locator(".editor-status"))
-        .toContainText(/Saved/, { timeout: 5_000 });
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 
     // Over on the Playlists subpage, the new slide is in the pallet.
     await page.locator('.nav-link[data-section="playlists"]').click();

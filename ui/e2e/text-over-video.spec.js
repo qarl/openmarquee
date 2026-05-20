@@ -95,7 +95,7 @@ test("operator picks a video as bg, types text, autosave persists background_vid
     await page.fill(".editor .field-name", "Happy Hour");
     await page.fill(".editor .field-text", "4PM-6PM");
     await expect(page.locator(".editor .editor-status"))
-        .toContainText(/Saved/, { timeout: 5_000 });
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 
     // Verify the canonical save: GET /api/content shows a TextSlide
     // whose background_video_slide_id points at the seeded VideoSlide.

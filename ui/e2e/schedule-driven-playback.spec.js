@@ -50,9 +50,9 @@ test("schedule-driven playback: API-built lunch playlist + always-on rule → pl
     await rule.locator(".rule-playlist").selectOption({ label: "lunch" });
 
     // Schedule editor auto-saves (no explicit Save button); wait for the
-    // round-trip via the status pill.
+    // round-trip via the status pill's data-state (FYS bug 6 — no copy).
     await expect(page.locator(".schedule-status"))
-        .toContainText(/Saved/, { timeout: 5_000 });
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 
     // 4. Hardware playback is autonomous — kick the loop directly.
     //    (The UI no longer has a Play-all button; e2e config disables

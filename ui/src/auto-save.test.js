@@ -6,10 +6,10 @@
 // message; in-flight coalescing re-enqueues; flush() drains
 // pending+in-flight; cancel() drops without firing.
 //
-// State surfaces:
+// State surfaces (FYS bug 6 — saving is implicit, no success/in-
+// progress copy):
 //   * status.dataset.state -> "saving" / "saved" / "error" / "idle"
-//   * status.textContent  -> "Saving…" / "Saved" / "Couldn't save · <msg>" / message / ""
-//   * SAVED_STICKY_MS = 2400 (status drops back to "idle" after 2.4s)
+//   * status.textContent  -> the error message on "error", "" otherwise
 //   * DEFAULT_DEBOUNCE_MS = 600
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -143,7 +143,7 @@ describe("attachAutoSave -- canSave / validate gates", () => {
 });
 
 describe("attachAutoSave -- status transitions", () => {
-    it("paints 'saving' -> 'saved' on success", async () => {
+    it("cycles data-state 'saving' -> 'saved' with NO visible copy (FYS bug 6)", async () => {
         const form = makeForm();
         const status = makeStatus();
         let resolveSave;
@@ -152,28 +152,14 @@ describe("attachAutoSave -- status transitions", () => {
 
         form.dispatchEvent(new Event("input"));
         await vi.advanceTimersByTimeAsync(80);
+        // saving is implicit: data-state cycles, but no "Saving…" copy.
         expect(status.dataset.state).toBe("saving");
-        expect(status.textContent).toBe("Saving…");
+        expect(status.textContent).toBe("");
 
         resolveSave();
         await vi.advanceTimersByTimeAsync(0);
+        // success: data-state="saved" but no "Saved" confirmation copy.
         expect(status.dataset.state).toBe("saved");
-        expect(status.textContent).toBe("Saved");
-    });
-
-    it("'saved' state fades to 'idle' after SAVED_STICKY_MS", async () => {
-        const form = makeForm();
-        const status = makeStatus();
-        const save = vi.fn().mockResolvedValue(undefined);
-        attachAutoSave(form, { save, status, debounceMs: 50 });
-
-        form.dispatchEvent(new Event("input"));
-        await vi.advanceTimersByTimeAsync(80);
-        expect(status.dataset.state).toBe("saved");
-
-        // SAVED_STICKY_MS is 2400; advance just past it.
-        await vi.advanceTimersByTimeAsync(2500);
-        expect(status.dataset.state).toBe("idle");
         expect(status.textContent).toBe("");
     });
 

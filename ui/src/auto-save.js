@@ -12,12 +12,12 @@
 // away from an unsaved-but-incomplete form), and `handle.kick()` to
 // trigger a save outside the form-event path (drag-end, file pick, etc.).
 //
-// Status indicator: pass an `HTMLElement` `status` and the helper paints
-// it through 3 states — saving · saved · error — with a fade-out timer
-// so the operator sees green long enough to register but the chrome
-// settles back to neutral.
+// Status indicator: pass an `HTMLElement` `status`. Saving is implicit
+// (FYS bug 6) — the helper shows NO "Saving…" / "Saved" copy; it only
+// renders an error message when a save fails. The `data-state`
+// attribute still cycles (saving · saved · error · idle) for CSS
+// error-colouring and for e2e save-completion sync.
 
-const SAVED_STICKY_MS = 2400;
 const DEFAULT_DEBOUNCE_MS = 600;
 
 /**
@@ -46,26 +46,16 @@ export function attachAutoSave(form, { save, status, debounceMs, canSave, valida
     let timer = null;
     let pending = false;
     let inFlight = null;
-    let stickyTimer = null;
 
+    // FYS bug 6 — saving is implicit: no "Saving…" / "Saved"
+    // confirmation copy on any panel (qarl: no save-confirmation
+    // messages anywhere). Only an error keeps visible text; the
+    // data-state attribute still cycles so CSS can colour an error
+    // and e2e can sync on save completion.
     const setStatus = (state, text) => {
         if (!status) return;
-        if (stickyTimer) {
-            clearTimeout(stickyTimer);
-            stickyTimer = null;
-        }
         status.dataset.state = state;
-        status.textContent = text;
-        // Drop the "Saved" copy after a beat so the chrome doesn't shout.
-        if (state === "saved") {
-            stickyTimer = setTimeout(() => {
-                if (status.dataset.state === "saved") {
-                    status.textContent = "";
-                    status.dataset.state = "idle";
-                }
-                stickyTimer = null;
-            }, SAVED_STICKY_MS);
-        }
+        status.textContent = state === "error" ? (text || "") : "";
     };
 
     async function attempt() {
@@ -94,11 +84,11 @@ export function attachAutoSave(form, { save, status, debounceMs, canSave, valida
             return;
         }
         pending = false;
-        setStatus("saving", "Saving…");
+        setStatus("saving");
         inFlight = (async () => {
             try {
                 await save();
-                setStatus("saved", "Saved");
+                setStatus("saved");
             } catch (err) {
                 setStatus("error", `Couldn't save · ${err?.message || err}`);
             } finally {

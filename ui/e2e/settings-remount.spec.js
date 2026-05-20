@@ -26,7 +26,8 @@ test("saving a new display_width re-mounts the editor with the fresh canvas size
     await page.locator(".field-display-width").fill("192");
     await page.locator(".field-display-height").fill("64");
     await page.locator(".settings-save").click();
-    await expect(page.locator(".settings-status")).toHaveText("Saved.");
+    await expect(page.locator(".settings-status"))
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 
     // Back to the text subpage — the editor should have been
     // re-mounted. Its canvas attribute reflects the new dims.
@@ -50,7 +51,8 @@ test("re-mount wipes the editor's in-progress draft", async ({ page }) => {
     await page.locator(".field-display-width").fill("64");
     await page.locator(".field-display-height").fill("32");
     await page.locator(".settings-save").click();
-    await expect(page.locator(".settings-status")).toHaveText("Saved.");
+    await expect(page.locator(".settings-status"))
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 
     await page.locator('.nav-link[data-section="slides"]').click();
     await page.locator('.om-subnav button[data-tab="text"]').click();
@@ -64,7 +66,8 @@ test("image + video uploader canvases also pick up the new dims", async ({ page 
     await page.locator(".field-display-width").fill("256");
     await page.locator(".field-display-height").fill("128");
     await page.locator(".settings-save").click();
-    await expect(page.locator(".settings-status")).toHaveText("Saved.");
+    await expect(page.locator(".settings-status"))
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
 
     await page.locator('.nav-link[data-section="slides"]').click();
     await page.locator('.om-subnav button[data-tab="image"]').click();

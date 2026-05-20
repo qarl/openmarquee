@@ -44,7 +44,7 @@ test("autosave is suppressed on a fresh editor until text is entered", async ({ 
     // Type text → autosave fires → exactly one slide lands on the server.
     await page.fill(".editor .field-text", "Hi");
     await expect(page.locator(".editor .editor-status"))
-        .toContainText(/Saved/, { timeout: 5_000 });
+        .toHaveAttribute("data-state", "saved", { timeout: 5_000 });
     items = await (await page.request.get("/api/content")).json();
     expect(items).toHaveLength(1);
 });
