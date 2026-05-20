@@ -321,6 +321,17 @@ pub struct EglSession<'a> {
     /// paint targets default fb directly (zero overhead).
     scene_fbo: Option<glow::NativeFramebuffer>,
     scene_tex: Option<glow::NativeTexture>,
+    /// STREAM/VLC slice-9 follow-up: persistent texture for the
+    /// external-frame push-paint path. Allocated once with
+    /// glTexImage2D and thereafter updated in place with
+    /// glTexSubImage2D — per-frame glGen/glTexImage2D/glDelete churn
+    /// was a measured paint-cost tax on the Pi Zero 2 W push-paint
+    /// path (slice-9 live-fire, ~60ms/frame). The tuple is
+    /// (texture, width, height); reallocated only when the frame
+    /// dimensions change (a source resolution switch). Lazy-
+    /// allocated on the first external frame, freed at session
+    /// teardown.
+    external_frame_tex: Option<(glow::NativeTexture, u32, u32)>,
     /// v1-spec-delta #10 (slice c): caller-applied settings.
     /// Default = identity (Settings::default); apply_settings
     /// updates. paint_and_present_one_frame uses
@@ -590,6 +601,7 @@ where
         session_start: std::time::Instant::now(),
         scene_fbo: None,
         scene_tex: None,
+        external_frame_tex: None,
         current_settings: crate::content::Settings::default(),
         slide_caches: std::collections::HashMap::new(),
         transition_sp_quad_vbo: None,
@@ -788,6 +800,9 @@ where
             gl.delete_framebuffer(fbo);
         }
         if let Some(tex) = session.scene_tex.take() {
+            gl.delete_texture(tex);
+        }
+        if let Some((tex, _, _)) = session.external_frame_tex.take() {
             gl.delete_texture(tex);
         }
         if let Some(vbo) = session.transition_sp_quad_vbo.take() {
@@ -3148,7 +3163,13 @@ pub fn paint_and_present_external_frame(
     }
     unsafe {
         bake_external_rgb_to_current_fbo(
-            session.gl, rgb, frame_w, frame_h, mode_w, mode_h,
+            session.gl,
+            &mut session.external_frame_tex,
+            rgb,
+            frame_w,
+            frame_h,
+            mode_w,
+            mode_h,
         )?;
     }
     if let Some((_fbo, tex)) = scene_fbo_handle {
@@ -5401,13 +5422,23 @@ unsafe fn bake_image_slide_to_current_fbo(
 
 /// STREAM/VLC slice 2.5 — upload one raw RGB888 frame as a texture
 /// and FS_BLIT it to fill the currently-bound framebuffer. The
-/// raw-bytes analogue of bake_image_slide_to_current_fbo: same
-/// transient-texture + FS_BLIT shape, no PNG decode.
+/// raw-bytes analogue of bake_image_slide_to_current_fbo, no PNG
+/// decode.
 ///
 /// `rgb` must be exactly `frame_w * frame_h * 3` bytes. Caller binds
 /// the destination framebuffer and handles post-pass / scanout.
+///
+/// Slice-9 follow-up: the texture is session-persistent (`frame_tex`).
+/// It is allocated once with glTexImage2D and thereafter updated in
+/// place with glTexSubImage2D; the per-frame
+/// glGen/glTexImage2D/glDelete the slice-2.5 version did was a
+/// measured paint-cost tax on the Pi Zero 2 W. Reallocation happens
+/// only when the frame dimensions change (a source resolution
+/// switch). Source-agnostic — any RGB888 producer (VLC today, a
+/// future webpage slide) drives this unchanged.
 unsafe fn bake_external_rgb_to_current_fbo(
     gl: &glow::Context,
+    frame_tex: &mut Option<(glow::NativeTexture, u32, u32)>,
     rgb: &[u8],
     frame_w: u32,
     frame_h: u32,
@@ -5428,29 +5459,54 @@ unsafe fn bake_external_rgb_to_current_fbo(
     gl.viewport(0, 0, mode_w as i32, mode_h as i32);
     gl.clear_color(0.0, 0.0, 0.0, 1.0);
     gl.clear(glow::COLOR_BUFFER_BIT);
-    let tex = gl
-        .create_texture()
-        .map_err(|e| anyhow!("glGenTextures(bake_external_rgb): {e}"))?;
-    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+
     // RGB888 rows are frame_w*3 bytes — not 4-aligned for widths
     // that aren't multiples of 4 (the basic tier is 854 px wide,
     // 854*3 = 2562, not 4-aligned). GL's default UNPACK_ALIGNMENT
     // is 4, which would shear every such frame; force 1 for the
     // upload and restore the default after.
-    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-    gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, glow::RGB as i32,
-        frame_w as i32, frame_h as i32, 0,
-        glow::RGB, glow::UNSIGNED_BYTE, Some(rgb),
-    );
-    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-    let blit_result = run_blit_pass(gl, tex);
-    gl.delete_texture(tex);
-    blit_result
+    let dims_changed = match *frame_tex {
+        Some((_, w, h)) => w != frame_w || h != frame_h,
+        None => true,
+    };
+    if dims_changed {
+        // First external frame, or a resolution switch — (re)allocate
+        // the persistent texture. glTexImage2D both sizes the texture
+        // and uploads this frame's pixels.
+        if let Some((old, _, _)) = frame_tex.take() {
+            gl.delete_texture(old);
+        }
+        let tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(bake_external_rgb): {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::RGB as i32,
+            frame_w as i32, frame_h as i32, 0,
+            glow::RGB, glow::UNSIGNED_BYTE, Some(rgb),
+        );
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        *frame_tex = Some((tex, frame_w, frame_h));
+    } else {
+        // Steady state — texture already sized; update pixels in place.
+        let (tex, _, _) = frame_tex.expect("dims_changed==false implies Some");
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D, 0, 0, 0,
+            frame_w as i32, frame_h as i32,
+            glow::RGB, glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(rgb),
+        );
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+    }
+    let tex = frame_tex.expect("frame_tex is Some after the branch above").0;
+    run_blit_pass(gl, tex)
 }
 
 /// Phase 8 slice 2 (2026-05-16) — drain one V4L2 NV12 frame and
