@@ -28,6 +28,7 @@ def _write_mock_ffmpeg(
     stderr_text: str = "",
     exit_code: int = 0,
     hang: bool = False,
+    continuous: bool = False,
 ) -> str:
     """Write an executable mock-ffmpeg script and return its path.
 
@@ -37,22 +38,34 @@ def _write_mock_ffmpeg(
     optionally emits a `trailing_partial`-byte short final frame,
     then exits `exit_code` -- or hangs forever if `hang` is set, so a
     teardown test can verify close() reaps it.
+
+    `continuous`: instead of a fixed `n_frames` run, emit frames in an
+    endless ~50 fps loop until killed -- for tests that need a
+    steadily-streaming source (e.g. pause-preemption).
     """
     body = f"#!{sys.executable}\n"
     body += "import sys, time\n"
     body += f"sys.stderr.write({stderr_text!r})\n"
     body += "sys.stderr.flush()\n"
     body += "out = sys.stdout.buffer\n"
-    body += f"for i in range({n_frames}):\n"
-    body += f"    out.write(bytes([i % 256]) * {frame_size})\n"
-    body += "    out.flush()\n"
-    if trailing_partial:
-        body += f"out.write(bytes({trailing_partial}))\n"
-        body += "out.flush()\n"
-    if hang:
-        body += "while True:\n    time.sleep(0.05)\n"
+    if continuous:
+        body += "i = 0\n"
+        body += "while True:\n"
+        body += f"    out.write(bytes([i % 256]) * {frame_size})\n"
+        body += "    out.flush()\n"
+        body += "    i += 1\n"
+        body += "    time.sleep(0.02)\n"
     else:
-        body += f"sys.exit({exit_code})\n"
+        body += f"for i in range({n_frames}):\n"
+        body += f"    out.write(bytes([i % 256]) * {frame_size})\n"
+        body += "    out.flush()\n"
+        if trailing_partial:
+            body += f"out.write(bytes({trailing_partial}))\n"
+            body += "out.flush()\n"
+        if hang:
+            body += "while True:\n    time.sleep(0.05)\n"
+        else:
+            body += f"sys.exit({exit_code})\n"
     path.write_text(body)
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(path)

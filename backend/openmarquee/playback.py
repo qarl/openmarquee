@@ -31,8 +31,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from openmarquee.content import ContentItem
+from openmarquee.content import ContentItem, VlcStreamSlide
 from openmarquee.rendering import Renderer
+from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
 
 if TYPE_CHECKING:
     from openmarquee.content.storage import ContentStorage
@@ -40,6 +41,14 @@ if TYPE_CHECKING:
     from openmarquee.schedule import ScheduleStorage
 
 log = logging.getLogger(__name__)
+
+# STREAM/VLC Mode B (docs/STREAM_VLC_PROPOSAL.md §6 / Q13): how long to
+# wait for the first frame from a VlcStreamSlide's RTSP source before
+# treating the URL as unreachable and applying the slide's
+# on_unreachable policy. Short enough that a dead URL doesn't dominate
+# a 10-second slot.
+_VLC_CONNECT_TIMEOUT_S = 3.0
+
 
 class PlaybackLoop:
     """Cycles content items through a renderer until told to stop.
@@ -353,6 +362,45 @@ class PlaybackLoop:
                 else:
                     self._current_auto_mode = None
                     self._current_auto_format = None
+
+                # STREAM/VLC Mode B: a VlcStreamSlide can't go through
+                # the sidecar — the Rust ContentItem enum has no
+                # vlc_stream envelope kind. Intercept it here, BEFORE
+                # _play_via_rust_ipc, and run the direct-render RTSP
+                # pump instead (docs/STREAM_VLC_PROPOSAL.md §6). The
+                # slot bookkeeping above (_current_*/_slot_t0) is
+                # already stamped, so /api/playback/state still reports
+                # this slot correctly.
+                if item.type == "vlc_stream":
+                    try:
+                        played = await self._play_vlc_stream_slide(item)
+                    except Exception as e:
+                        # Same per-slide failure throttle as the IPC
+                        # path: first fail per id carries the
+                        # traceback, repeats drop to DEBUG.
+                        if item.id in self._failed_slide_ids:
+                            log.debug(
+                                "playback: vlc_stream playback failed "
+                                "for slide id=%s (throttled): %s",
+                                item.id, e,
+                            )
+                        else:
+                            self._failed_slide_ids.add(item.id)
+                            log.exception(
+                                "playback: vlc_stream playback failed "
+                                "for slide id=%s; advancing to next "
+                                "item", item.id,
+                            )
+                        await self._wait(0.25)
+                        continue
+                    if self._stop_event.is_set():
+                        break
+                    if self._pause_event.is_set():
+                        self._resume_at_index = i
+                        break
+                    if played:
+                        any_played = True
+                    continue
 
                 # IPC route. After the DELETE-PIL purge (slices 1-12)
                 # there is no PIL fallback: every renderer the loop is
@@ -732,6 +780,123 @@ class PlaybackLoop:
                     break
                 await self._wait(min(tick_period, remaining))
         return True
+
+    async def _play_vlc_stream_slide(self, item: VlcStreamSlide) -> bool:
+        """Play a VlcStreamSlide — Mode B of STREAM/VLC (proposal §6).
+
+        Pumps the operator's RTSP stream straight to the renderer for
+        the slide's duration, bypassing the Rust sidecar (the sidecar's
+        ContentItem enum has no vlc_stream kind). When the URL is
+        unreachable, the stream ends early, or the renderer can't take
+        external frames, the slide's on_unreachable policy fills the
+        rest of the slot. Returns True if at least one frame rendered.
+
+        Known limitations carried from the proposal:
+        - No transition: a vlc_stream slot is a hard cut in and out. A
+          real fade/wipe would need the sidecar's 2-input transition
+          machinery, which this direct-render pump bypasses; the
+          slide's transition fields are schema parity for now.
+        - On the Rust sidecar render_frame() is not yet implemented
+          (the push-frames IPC op is "slice 2.5"). The pump catches
+          the first render failure, logs once, and falls back to
+          on_unreachable — so a vlc_stream slide is a no-op slot on
+          the real Pi until slice 2.5. Fully exercised on MockRenderer.
+        - /api/playback/current-frame's capture reads the sidecar's
+          last framebuffer, which the pump does not feed — a
+          vlc_stream slot's live preview is therefore stale.
+        """
+        renderer = self._renderer
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + item.duration_ms / 1000.0
+        consumer = VlcRtspConsumer(
+            item.rtsp_url, renderer.width, renderer.height
+        )
+        frames = consumer.frames()
+        rendered_any = False
+        renderer_broken = False
+        try:
+            while True:
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                now = loop.time()
+                if now >= deadline:
+                    break
+                # Before the first frame the wait is bounded by the
+                # connect timeout (a dead URL must not eat the whole
+                # slot); after, by the remaining slot time.
+                if rendered_any:
+                    budget = deadline - now
+                else:
+                    budget = min(_VLC_CONNECT_TIMEOUT_S, deadline - now)
+                try:
+                    rgb = await asyncio.wait_for(
+                        frames.__anext__(), timeout=budget
+                    )
+                except StopAsyncIteration:
+                    break  # ffmpeg EOF / RTSP disconnect
+                except TimeoutError:
+                    break  # connect timeout, or the stream stalled
+                try:
+                    renderer.render_frame(rgb)
+                except Exception:
+                    # The renderer can't take external frames — a Rust
+                    # sidecar without the slice-2.5 push-frames op. Log
+                    # ONCE (per-frame logging at 30fps would flood the
+                    # journal) and fall back to on_unreachable.
+                    log.warning(
+                        "playback: renderer rejected a vlc_stream "
+                        "frame (slide id=%s) — the push-frames sidecar "
+                        "op is unavailable; skipping the rest of this "
+                        "slot", item.id,
+                    )
+                    renderer_broken = True
+                    break
+                rendered_any = True
+        finally:
+            await consumer.close()
+            with contextlib.suppress(Exception):
+                await frames.aclose()
+        # Fill the remainder of the slot if the stream never delivered,
+        # ended before the deadline, or the renderer rejected frames.
+        if not (self._stop_event.is_set() or self._pause_event.is_set()):
+            remaining = deadline - loop.time()
+            if remaining > 0:
+                await self._apply_vlc_on_unreachable(
+                    item, remaining, renderer_broken=renderer_broken
+                )
+        return rendered_any
+
+    async def _apply_vlc_on_unreachable(
+        self,
+        item: VlcStreamSlide,
+        remaining_s: float,
+        *,
+        renderer_broken: bool = False,
+    ) -> None:
+        """Fill the rest of a VlcStreamSlide's slot when its RTSP
+        stream is unreachable / ended early / un-renderable. Applies
+        the slide's on_unreachable policy (proposal Q12):
+
+        - skip: return immediately so the loop advances now.
+        - black: paint one black frame, then hold it for the
+          remainder of the slot.
+        - hold_last_frame (default): paint nothing — the framebuffer
+          keeps whatever was last on screen — and wait the slot out.
+        """
+        if item.on_unreachable == "skip":
+            return
+        if item.on_unreachable == "black" and not renderer_broken:
+            # All-zero RGB888 == black. Suppressed because the same
+            # render path that just failed (renderer_broken) could
+            # fail here too; the wait below still preserves slot
+            # timing either way.
+            black = bytes(self._renderer.width * self._renderer.height * 3)
+            with contextlib.suppress(Exception):
+                self._renderer.render_frame(black)
+        # hold_last_frame, or black after its paint: wait the slot
+        # out. _wait returns early on stop/pause so a takeover still
+        # preempts a held VLC slot.
+        await self._wait(remaining_s)
 
     @property
     def current_playlist_id(self) -> UUID | None:

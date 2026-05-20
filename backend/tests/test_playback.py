@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import io
 from datetime import datetime
 from uuid import UUID
@@ -6,7 +7,7 @@ from uuid import UUID
 import pytest
 from PIL import Image
 
-from openmarquee.content import ImageSlide, TextLayer, TextSlide
+from openmarquee.content import ImageSlide, TextLayer, TextSlide, VlcStreamSlide
 
 
 def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
@@ -29,6 +30,8 @@ def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
     )
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
+from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
+from tests.test_vlc_rtsp_consumer import _write_mock_ffmpeg
 
 # 100ms is the model's minimum duration. Tests use it directly; the
 # total runtime stays under a second.
@@ -659,3 +662,196 @@ async def test_auto_mode_exposes_metadata_on_playback_state(renderer):
     # On stop, fields clear.
     assert loop.current_item_auto_mode is None
     assert loop.current_item_auto_format is None
+
+
+# --- STREAM/VLC Mode B: VlcStreamSlide playback (slice 7) ------------------
+
+
+def _patch_vlc_ffmpeg(monkeypatch, ffmpeg_bin: str) -> None:
+    """Point the playback loop's VlcRtspConsumer at a mock-ffmpeg
+    binary (or a missing path, to simulate an unreachable stream)."""
+    monkeypatch.setattr(
+        "openmarquee.playback.VlcRtspConsumer",
+        functools.partial(VlcRtspConsumer, ffmpeg_bin=ffmpeg_bin),
+    )
+
+
+@pytest.mark.asyncio
+async def test_vlc_stream_slide_pumps_frames_to_renderer(
+    renderer, tmp_path, monkeypatch
+):
+    """A VlcStreamSlide in the playlist is intercepted before the IPC
+    path; its (mock) RTSP frames are pushed straight to the renderer."""
+    frame_size = 8 * 8 * 3
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5
+    )
+    _patch_vlc_ffmpeg(monkeypatch, mock)
+    captured: list[bytes] = []
+    original = renderer.render_frame
+    renderer.render_frame = lambda d: captured.append(d) or original(d)
+
+    # 2s duration: the first-frame wait is bounded by min(connect-
+    # timeout, slot remaining), so a too-short slot would starve the
+    # budget below the mock python-interpreter's spawn time.
+    slide = VlcStreamSlide(
+        name="live", rtsp_url="rtsp://h:8554/x", duration_ms=2000
+    )
+    loop = _new_loop(
+        renderer, fetch_items=lambda: [slide], read_asset=lambda _id: b""
+    )
+    await loop.start()
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    assert len(captured) >= 5
+    assert all(len(f) == frame_size for f in captured)
+    # The mock fills frame i with the byte value i — confirms ordering
+    # and that the renderer received the RTSP frames intact.
+    assert captured[0] == bytes([0]) * frame_size
+    assert captured[4] == bytes([4]) * frame_size
+
+
+@pytest.mark.asyncio
+async def test_vlc_stream_unreachable_skip_advances_immediately(
+    renderer, tmp_path, monkeypatch
+):
+    """on_unreachable='skip' — an unreachable VlcStreamSlide is
+    abandoned at once; the loop reaches the next slide rather than
+    holding the dead slot for its full duration."""
+    # A missing ffmpeg binary == spawn fails == zero frames.
+    _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
+    vlc = VlcStreamSlide(
+        name="dead",
+        rtsp_url="rtsp://h/x",
+        duration_ms=10_000,
+        on_unreachable="skip",
+    )
+    text, png = _make_slide("after", (0, 255, 0))
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [vlc, text],
+        read_asset=lambda _id: png,
+    )
+    await loop.start()
+    await asyncio.sleep(0.3)
+    seen = [c[0] for c in renderer.begin_slide_calls]
+    await loop.stop()
+    # The 10s VLC slide was skipped near-instantly — the text slide
+    # after it was reached well inside 0.3s.
+    assert text.id in seen
+
+
+@pytest.mark.asyncio
+async def test_vlc_stream_unreachable_hold_waits_out_the_slot(
+    renderer, tmp_path, monkeypatch
+):
+    """on_unreachable='hold_last_frame' — an unreachable VlcStreamSlide
+    still occupies its full slot; the loop does NOT advance early."""
+    _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
+    vlc = VlcStreamSlide(
+        name="dead",
+        rtsp_url="rtsp://h/x",
+        duration_ms=10_000,
+        on_unreachable="hold_last_frame",
+    )
+    text, png = _make_slide("after", (0, 255, 0))
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [vlc, text],
+        read_asset=lambda _id: png,
+    )
+    await loop.start()
+    await asyncio.sleep(0.3)
+    seen = [c[0] for c in renderer.begin_slide_calls]
+    await loop.stop()
+    # The VLC slot is being held for its 10s duration — the text slide
+    # after it is NOT reached.
+    assert text.id not in seen
+
+
+@pytest.mark.asyncio
+async def test_vlc_stream_unreachable_black_paints_a_black_frame(
+    renderer, tmp_path, monkeypatch
+):
+    """on_unreachable='black' paints one all-zero RGB frame before
+    holding the slot."""
+    _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
+    captured: list[bytes] = []
+    original = renderer.render_frame
+    renderer.render_frame = lambda d: captured.append(d) or original(d)
+    vlc = VlcStreamSlide(
+        name="dead",
+        rtsp_url="rtsp://h/x",
+        duration_ms=300,
+        on_unreachable="black",
+    )
+    loop = _new_loop(
+        renderer, fetch_items=lambda: [vlc], read_asset=lambda _id: b""
+    )
+    await loop.start()
+    await asyncio.sleep(0.2)
+    await loop.stop()
+    assert bytes(8 * 8 * 3) in captured
+
+
+@pytest.mark.asyncio
+async def test_vlc_stream_connect_timeout_falls_back(
+    renderer, tmp_path, monkeypatch
+):
+    """If ffmpeg spawns but delivers no frame within the connect
+    timeout, the slide falls back to on_unreachable rather than
+    blocking on the dead stream for the whole slot."""
+    monkeypatch.setattr("openmarquee.playback._VLC_CONNECT_TIMEOUT_S", 0.2)
+    # hang mock: spawns, emits 0 frames, then sleeps — ffmpeg is up but
+    # never produces video, exactly how an unreachable RTSP URL behaves.
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, hang=True
+    )
+    _patch_vlc_ffmpeg(monkeypatch, mock)
+    vlc = VlcStreamSlide(
+        name="stuck",
+        rtsp_url="rtsp://h/x",
+        duration_ms=10_000,
+        on_unreachable="skip",
+    )
+    text, png = _make_slide("after", (0, 255, 0))
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [vlc, text],
+        read_asset=lambda _id: png,
+    )
+    await loop.start()
+    await asyncio.sleep(0.6)
+    seen = [c[0] for c in renderer.begin_slide_calls]
+    await loop.stop()
+    # The 0.2s connect timeout fired, skip advanced — the text slide
+    # was reached well inside 0.6s despite the 10s nominal duration.
+    assert text.id in seen
+
+
+@pytest.mark.asyncio
+async def test_vlc_stream_slide_preempted_by_pause(
+    renderer, tmp_path, monkeypatch
+):
+    """A pause() during a VlcStreamSlide slot is honored — the loop
+    yields the renderer and saves the resume index, so a stream
+    takeover can preempt a VLC slot."""
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, continuous=True
+    )
+    _patch_vlc_ffmpeg(monkeypatch, mock)
+    vlc = VlcStreamSlide(
+        name="live", rtsp_url="rtsp://h/x", duration_ms=10_000
+    )
+    loop = _new_loop(
+        renderer, fetch_items=lambda: [vlc], read_asset=lambda _id: b""
+    )
+    await loop.start()
+    await asyncio.sleep(0.15)  # let the pump start streaming frames
+    await loop.pause()
+    await asyncio.sleep(0.1)
+    assert loop.is_paused
+    assert loop._resume_at_index == 0
+    await loop.resume()
+    await loop.stop()
