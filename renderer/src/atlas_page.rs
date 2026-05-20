@@ -10,11 +10,13 @@
 // 48×48 sub-region @ (40,40) and 47×48 sub-region @ (200,200) with
 // UNPACK_ALIGNMENT=1).
 //
-// Slot allocation is a simple bump allocator for Slice 1; once a page
-// fills, allocate_slot returns None. LRU eviction is a Slice 1.x
-// follow-up triggered by first observed cache pressure (the projected
-// working set for FYS is <50 dynamic codepoints, well under one
-// 1764-slot page's capacity, so eviction is non-urgent).
+// Slot allocation (Slice 3C, 2026-05-20): a bump allocator backed by
+// a free-list. allocate_slot pops a recycled index from the free-list
+// first, else bumps the high-water cursor; free_slot returns an index
+// to the free-list. The GlyphCache's LRU eviction (glyph_cache.rs)
+// drives free_slot when a page fills — so a slide with enough distinct
+// emoji codepoints to exhaust the 441-slot COLR page (or the 1764-slot
+// MSDF page) recycles cold cells instead of wedging.
 
 use anyhow::Result;
 #[cfg(target_os = "linux")]
@@ -44,9 +46,13 @@ pub struct AtlasPage {
     cell_px: u32,
     cols: u32,
     rows: u32,
-    /// Bump allocator cursor. Next slot is at index `next_slot_idx`.
-    /// allocate_slot returns None when next_slot_idx == cols * rows.
+    /// Bump allocator high-water cursor. The next never-yet-used
+    /// slot is at index `next_slot_idx`; the cursor only ever rises.
     next_slot_idx: u32,
+    /// Slice 3C: recycled slot indices. allocate_slot pops here
+    /// before bumping the cursor; free_slot pushes here. Drained
+    /// LIFO — order doesn't matter, every free index is equivalent.
+    free_list: Vec<u32>,
 }
 
 impl AtlasPage {
@@ -64,6 +70,15 @@ impl AtlasPage {
             cols,
             rows,
             next_slot_idx: 0,
+            free_list: Vec::new(),
+        }
+    }
+
+    /// Index → (x, y) top-left in atlas pixels, row-major.
+    fn slot_pos_for_index(&self, idx: u32) -> SlotPos {
+        SlotPos {
+            x: (idx % self.cols) * self.cell_px,
+            y: (idx / self.cols) * self.cell_px,
         }
     }
 
@@ -129,19 +144,37 @@ impl AtlasPage {
         }
     }
 
-    /// Reserve the next free slot in the page. Returns None when the
-    /// page is full (cols * rows slots claimed). Caller is responsible
-    /// for actually uploading pixels via upload_slot.
+    /// Reserve a slot. Recycled (freed) slots are handed out first;
+    /// otherwise the high-water cursor bumps. Returns None only when
+    /// every slot is occupied AND none is free — the caller (Slice
+    /// 3C: GlyphCache::poll_completions) responds by evicting an LRU
+    /// slot via free_slot and retrying. Caller uploads pixels via
+    /// upload_slot.
     pub fn allocate_slot(&mut self) -> Option<SlotPos> {
+        if let Some(idx) = self.free_list.pop() {
+            return Some(self.slot_pos_for_index(idx));
+        }
         if self.next_slot_idx >= self.cols * self.rows {
             return None;
         }
         let idx = self.next_slot_idx;
         self.next_slot_idx += 1;
-        Some(SlotPos {
-            x: (idx % self.cols) * self.cell_px,
-            y: (idx / self.cols) * self.cell_px,
-        })
+        Some(self.slot_pos_for_index(idx))
+    }
+
+    /// Return a slot to the free pool so a future allocate_slot can
+    /// reuse its cell. Slice 3C eviction calls this on the LRU
+    /// victim's slot. The cell's stale pixels are left as-is — every
+    /// slot is fully overwritten by upload_slot before it is next
+    /// sampled, so the garbage is never visible.
+    ///
+    /// Contract: `slot` must be a position previously returned by
+    /// allocate_slot and not already freed. Double-freeing would
+    /// hand the same cell to two glyphs; the GlyphCache guarantees
+    /// one free per evicted Ready slot.
+    pub fn free_slot(&mut self, slot: SlotPos) {
+        let idx = (slot.y / self.cell_px) * self.cols + (slot.x / self.cell_px);
+        self.free_list.push(idx);
     }
 
     /// Upload `rgba_bytes` (width*height*4 bytes, top-left origin) into
@@ -198,14 +231,17 @@ impl AtlasPage {
         Ok(())
     }
 
-    /// True if every slot is claimed.
+    /// True if every slot is occupied AND none is free — the next
+    /// allocate_slot would return None. False whenever a freed slot
+    /// is available for recycling.
     pub fn is_full(&self) -> bool {
-        self.next_slot_idx >= self.cols * self.rows
+        self.next_slot_idx >= self.cols * self.rows && self.free_list.is_empty()
     }
 
-    /// How many slots have been allocated.
+    /// How many slots are currently occupied (high-water cursor
+    /// minus the recycled-but-not-yet-reused free pool).
     pub fn allocated_count(&self) -> u32 {
-        self.next_slot_idx
+        self.next_slot_idx - self.free_list.len() as u32
     }
 
     /// Total slot capacity (cols * rows).
@@ -291,6 +327,45 @@ mod tests {
     // context because they error before touching gl.tex_sub_image_2d.
     // Skipping the actual-upload tests; those need an EGL session and
     // are covered by gl_subtexture_smoke + the runtime integration.
+
+    #[test]
+    fn free_slot_recycles_for_next_allocate() {
+        // Slice 3C: a freed slot is handed back by the next
+        // allocate_slot before the high-water cursor bumps.
+        let mut page = AtlasPage::new(96);
+        let s0 = page.allocate_slot().unwrap();
+        let s1 = page.allocate_slot().unwrap();
+        assert_eq!(page.allocated_count(), 2);
+        // Free the first slot; allocate again -> reuses s0's cell.
+        page.free_slot(s0);
+        assert_eq!(page.allocated_count(), 1);
+        let reused = page.allocate_slot().unwrap();
+        assert_eq!(reused, s0, "allocate must recycle the freed cell");
+        assert_eq!(page.allocated_count(), 2);
+        // s1 was never freed and must not be re-handed-out.
+        let s2 = page.allocate_slot().unwrap();
+        assert_ne!(s2, s1);
+        assert_ne!(s2, s0);
+    }
+
+    #[test]
+    fn full_page_unwedges_after_a_free() {
+        // The Slice 3C core promise: a full page is not a dead end.
+        let mut page = AtlasPage::new(96); // 21x21 = 441 slots
+        let mut slots = Vec::new();
+        for _ in 0..page.capacity() {
+            slots.push(page.allocate_slot().unwrap());
+        }
+        assert!(page.is_full());
+        assert!(page.allocate_slot().is_none());
+        // Free one cold slot -> page is no longer full -> allocate
+        // succeeds, handing back exactly the freed cell.
+        let victim = slots[100];
+        page.free_slot(victim);
+        assert!(!page.is_full());
+        assert_eq!(page.allocate_slot().unwrap(), victim);
+        assert!(page.is_full());
+    }
 
     #[test]
     fn slot_pos_inequality_works() {

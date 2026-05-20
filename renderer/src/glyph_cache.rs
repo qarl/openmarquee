@@ -217,9 +217,24 @@ enum Completion {
     },
 }
 
+/// Slice 3C (2026-05-20): LRU recency bookkeeping for atlas
+/// eviction. `clock` is a monotonically-rising tick; `last_used`
+/// maps each Ready glyph to the tick of its most recent use.
+/// Render-thread-only — the worker pool never touches it, so the
+/// `slots`-then-`recency` lock order used by `evict_lru_ready`
+/// has no second contender and cannot deadlock.
+struct RecencyState {
+    clock: u64,
+    last_used: HashMap<GlyphKey, u64>,
+}
+
 pub struct GlyphCache {
     /// state map; locked on every get / insert / completion drain.
     slots: Arc<Mutex<HashMap<GlyphKey, SlotState>>>,
+    /// Slice 3C: per-Ready-glyph LRU recency. Separate Mutex (not
+    /// shared with workers) so it stays private bookkeeping and
+    /// SlotState remains a pure public state-machine type.
+    recency: Mutex<RecencyState>,
     work_tx: Sender<MissRequest>,
     completion_rx: Receiver<Completion>,
     workers: Vec<JoinHandle<()>>,
@@ -361,6 +376,10 @@ impl GlyphCache {
 
         Self {
             slots,
+            recency: Mutex::new(RecencyState {
+                clock: 0,
+                last_used: HashMap::new(),
+            }),
             work_tx,
             completion_rx,
             workers,
@@ -368,6 +387,68 @@ impl GlyphCache {
             request_count,
             completion_count: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Slice 3C: stamp `key` as used-now in the LRU recency map.
+    /// Called on a Ready cache hit (dispatch path) and when a Ready
+    /// completion lands (a freshly-uploaded glyph starts hot, not
+    /// instantly the coldest). A rising `clock` orders all uses.
+    fn touch_recency(&self, key: GlyphKey) {
+        let mut r = self.recency.lock().unwrap();
+        r.clock += 1;
+        let tick = r.clock;
+        r.last_used.insert(key, tick);
+    }
+
+    /// Slice 3C: evict the least-recently-used `Ready` slot of the
+    /// given `render_mode`, freeing its atlas cell. Returns true if
+    /// a slot was freed (the caller retries allocate_slot), false
+    /// if there was no eligible victim.
+    ///
+    /// IN-FLIGHT SAFETY — the subtle correctness point: only
+    /// `SlotState::Ready` entries are eviction candidates.
+    /// Requested / Generating entries hold NO atlas slot (a slot is
+    /// allocated only when a Ready completion is processed in
+    /// poll_completions), so a worker mid-rasterization can never
+    /// have its target cell reused out from under it — it has no
+    /// cell yet. FontMissing entries likewise hold no slot. The
+    /// invariant: atlas-slot occupancy is 1:1 with Ready entries,
+    /// and only Ready entries are ever freed.
+    ///
+    /// An evicted glyph needed again later is a plain cache miss:
+    /// get_or_request returns None, re-enqueues a MissRequest, and
+    /// the worker re-rasterizes into a fresh slot. That re-raster
+    /// cost is the expected, correct price of a bounded atlas.
+    ///
+    /// Lock order: `slots` then `recency`. Workers only ever lock
+    /// `slots`, never `recency`, so this nesting cannot deadlock.
+    fn evict_lru_ready(
+        &self,
+        page: &mut crate::atlas_page::AtlasPage,
+        render_mode: RenderMode,
+    ) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        let mut recency = self.recency.lock().unwrap();
+        // Coldest Ready entry of this render_mode: the one with the
+        // smallest last-used tick. A Ready key with no recency
+        // entry (shouldn't happen — poll stamps one on Ready) is
+        // treated as tick 0 = coldest, so it evicts first.
+        let victim: Option<(GlyphKey, SlotPos)> = slots
+            .iter()
+            .filter_map(|(k, st)| match st {
+                SlotState::Ready { slot, .. } if k.render_mode == render_mode => {
+                    Some((*k, *slot))
+                }
+                _ => None,
+            })
+            .min_by_key(|(k, _)| recency.last_used.get(k).copied().unwrap_or(0));
+        let Some((victim_key, victim_slot)) = victim else {
+            return false;
+        };
+        page.free_slot(victim_slot);
+        slots.remove(&victim_key);
+        recency.last_used.remove(&victim_key);
+        true
     }
 
     /// Look up a glyph by key. Returns:
@@ -387,8 +468,17 @@ impl GlyphCache {
     /// the renderer's fonts_dir.
     pub fn get_or_request(&self, key: GlyphKey, font_path: PathBuf) -> Option<SlotState> {
         let mut slots = self.slots.lock().unwrap();
-        if let Some(state) = slots.get(&key) {
-            return Some(state.clone());
+        if let Some(state) = slots.get(&key).cloned() {
+            drop(slots);
+            // Slice 3C: a Ready hit on the dispatch/layout path is a
+            // USE — refresh recency so LRU eviction keeps hot glyphs
+            // and discards cold ones. Requested / Generating /
+            // FontMissing hold no atlas slot, so recency is moot for
+            // them (they are never eviction candidates).
+            if matches!(state, SlotState::Ready { .. }) {
+                self.touch_recency(key);
+            }
+            return Some(state);
         }
         slots.insert(key, SlotState::Requested);
         // Send is unbounded so this never blocks; ignore the result
@@ -450,13 +540,29 @@ impl GlyphCache {
                         RenderMode::Msdf => &mut *msdf_page,
                         RenderMode::Colr => &mut *colr_page,
                     };
-                    let Some(slot_pos) = page.allocate_slot() else {
-                        // Page full; Slice 1.x will add eviction.
-                        // For now, drop the completion; the slot
-                        // entry stays Requested/Generating until
-                        // restart.
-                        eprintln!("glyph_cache: atlas page full ({:?}); dropping completion for {:?}", key.render_mode, key);
-                        continue;
+                    // Slice 3C: on a full page, evict the LRU Ready
+                    // slot of this render_mode and retry. A free
+                    // immediately follows a successful eviction so
+                    // the retry cannot fail; the .expect() asserts
+                    // that invariant. Only if there is NO Ready slot
+                    // to evict (page somehow full of non-Ready — not
+                    // reachable: slots are allocated solely for
+                    // Ready completions of this mode) do we drop.
+                    let slot_pos = match page.allocate_slot() {
+                        Some(s) => s,
+                        None => {
+                            if self.evict_lru_ready(page, key.render_mode) {
+                                page.allocate_slot().expect(
+                                    "allocate_slot must succeed right after a successful eviction",
+                                )
+                            } else {
+                                eprintln!(
+                                    "glyph_cache: atlas page full ({:?}), no Ready slot to evict; dropping completion for {:?}",
+                                    key.render_mode, key,
+                                );
+                                continue;
+                            }
+                        }
                     };
                     if let Err(e) = page.upload_slot(
                         gl, slot_pos.x, slot_pos.y, cell_px, cell_px, &rgba_bytes,
@@ -470,6 +576,11 @@ impl GlyphCache {
                         advance_em,
                         plane_bounds,
                     });
+                    drop(slots);
+                    // Slice 3C: a just-uploaded glyph starts HOT —
+                    // stamp recency now so it is not instantly the
+                    // coldest candidate on the very next eviction.
+                    self.touch_recency(key);
                     *self.completion_count.lock().unwrap() += 1;
                     count += 1;
                 }
@@ -1061,5 +1172,166 @@ mod tests {
                 panic!("expected FontMissing notification, got Ready");
             }
         }
+    }
+
+    // ---- Slice 3C: LRU atlas eviction --------------------------------
+
+    fn colr_key(cp: u32) -> GlyphKey {
+        GlyphKey {
+            font_family_id: 7,
+            codepoint: cp,
+            render_mode: RenderMode::Colr,
+        }
+    }
+
+    /// Inject a Ready entry straight into the cache's private maps:
+    /// allocate a real slot on `page`, record SlotState::Ready,
+    /// stamp recency. Lets the eviction tests build a known cache
+    /// state without spinning up workers + real fonts.
+    fn inject_ready(
+        cache: &GlyphCache,
+        page: &mut crate::atlas_page::AtlasPage,
+        key: GlyphKey,
+    ) -> SlotPos {
+        let slot = page
+            .allocate_slot()
+            .expect("page has room for the test fixture");
+        cache.slots.lock().unwrap().insert(
+            key,
+            SlotState::Ready {
+                slot,
+                advance_em: 1.0,
+                plane_bounds: PlaneBounds::default(),
+            },
+        );
+        cache.touch_recency(key);
+        slot
+    }
+
+    #[test]
+    fn evict_lru_ready_removes_the_coldest_ready_slot() {
+        let cache = GlyphCache::new(0);
+        let mut page = crate::atlas_page::AtlasPage::new(96);
+        // 3 Ready COLR glyphs; recency rises 1,2,3 as injected.
+        let a = colr_key(0xA);
+        let b = colr_key(0xB);
+        let c = colr_key(0xC);
+        let slot_a = inject_ready(&cache, &mut page, a);
+        inject_ready(&cache, &mut page, b);
+        inject_ready(&cache, &mut page, c);
+        // Touch B and C again so A is unambiguously the LRU.
+        cache.touch_recency(b);
+        cache.touch_recency(c);
+        // Evict — A (coldest) must go; its cell must be freed.
+        assert!(cache.evict_lru_ready(&mut page, RenderMode::Colr));
+        {
+            let slots = cache.slots.lock().unwrap();
+            assert!(!slots.contains_key(&a), "coldest key A must be evicted");
+            assert!(slots.contains_key(&b), "B was used more recently — keep");
+            assert!(slots.contains_key(&c), "C was used most recently — keep");
+        }
+        assert!(
+            !cache.recency.lock().unwrap().last_used.contains_key(&a),
+            "evicted key must be dropped from recency too",
+        );
+        // A's freed cell is handed back by the next allocate.
+        assert_eq!(page.allocate_slot().unwrap(), slot_a);
+    }
+
+    #[test]
+    fn evict_lru_ready_never_touches_in_flight_or_fontmissing_slots() {
+        // THE subtle correctness point: only Ready entries are
+        // eviction candidates. Requested / Generating hold no atlas
+        // slot — a worker mid-rasterize must never have its target
+        // cell reused. FontMissing holds no slot either.
+        let cache = GlyphCache::new(0);
+        let mut page = crate::atlas_page::AtlasPage::new(96);
+        let ready = colr_key(0x1);
+        let requested = colr_key(0x2);
+        let generating = colr_key(0x3);
+        let missing = colr_key(0x4);
+        inject_ready(&cache, &mut page, ready);
+        {
+            let mut slots = cache.slots.lock().unwrap();
+            slots.insert(requested, SlotState::Requested);
+            slots.insert(generating, SlotState::Generating);
+            slots.insert(missing, SlotState::FontMissing);
+        }
+        // Only the single Ready entry is eligible.
+        assert!(cache.evict_lru_ready(&mut page, RenderMode::Colr));
+        {
+            let slots = cache.slots.lock().unwrap();
+            assert!(!slots.contains_key(&ready), "the Ready slot was evicted");
+            assert!(
+                matches!(slots.get(&requested), Some(SlotState::Requested)),
+                "in-flight Requested slot must NOT be evicted",
+            );
+            assert!(
+                matches!(slots.get(&generating), Some(SlotState::Generating)),
+                "in-flight Generating slot must NOT be evicted",
+            );
+            assert!(
+                matches!(slots.get(&missing), Some(SlotState::FontMissing)),
+                "FontMissing slot must NOT be evicted",
+            );
+        }
+        // With no Ready entries left, a further eviction finds no
+        // victim and reports false (caller then drops the completion).
+        assert!(!cache.evict_lru_ready(&mut page, RenderMode::Colr));
+    }
+
+    #[test]
+    fn evict_lru_ready_only_evicts_the_matching_render_mode() {
+        // The 48 px MSDF page and the 96 px COLR page evict
+        // independently — a full COLR page must not steal an MSDF
+        // slot, and vice versa.
+        let cache = GlyphCache::new(0);
+        let mut msdf_page = crate::atlas_page::AtlasPage::new(48);
+        let mut colr_page = crate::atlas_page::AtlasPage::new(96);
+        let msdf_glyph = GlyphKey {
+            font_family_id: 1,
+            codepoint: 0x41,
+            render_mode: RenderMode::Msdf,
+        };
+        let colr_glyph = colr_key(0x1F600);
+        inject_ready(&cache, &mut msdf_page, msdf_glyph);
+        inject_ready(&cache, &mut colr_page, colr_glyph);
+        // Evicting for COLR takes the COLR glyph, leaves MSDF intact.
+        assert!(cache.evict_lru_ready(&mut colr_page, RenderMode::Colr));
+        let slots = cache.slots.lock().unwrap();
+        assert!(!slots.contains_key(&colr_glyph));
+        assert!(
+            slots.contains_key(&msdf_glyph),
+            "an MSDF glyph must survive a COLR-page eviction",
+        );
+    }
+
+    #[test]
+    fn evicted_glyph_re_requests_on_next_lookup() {
+        // An evicted glyph needed again is a plain cache miss:
+        // get_or_request returns None and re-enqueues a MissRequest
+        // — the worker re-rasterizes it. Expected, correct cost.
+        let cache = GlyphCache::new(0);
+        let mut page = crate::atlas_page::AtlasPage::new(96);
+        let key = colr_key(0x2764);
+        inject_ready(&cache, &mut page, key);
+        // Pre-eviction: a lookup is a Ready hit.
+        assert!(matches!(
+            cache.get_or_request(key, nonexistent_font_path()),
+            Some(SlotState::Ready { .. }),
+        ));
+        // Evict it.
+        assert!(cache.evict_lru_ready(&mut page, RenderMode::Colr));
+        // Post-eviction: the lookup misses → None → re-Requested.
+        assert!(
+            cache
+                .get_or_request(key, nonexistent_font_path())
+                .is_none(),
+            "an evicted glyph must miss + re-request",
+        );
+        assert!(matches!(
+            cache.slots.lock().unwrap().get(&key),
+            Some(SlotState::Requested),
+        ));
     }
 }
