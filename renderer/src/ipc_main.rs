@@ -304,6 +304,28 @@ impl SlideCache {
         self.video_decoders.remove(&item_id);
     }
 
+    /// FYS bug 9 (2026-05-20): drop the V4L2 decoder + demuxer
+    /// state for every video slide except `keep`.
+    ///
+    /// A V4L2 hardware decoder is a scarce resource — it holds
+    /// ~8 frame-sized DMA buffers + a codec context. Before this,
+    /// decoders were released only on item.json mtime-drift
+    /// (`invalidate`), so a playlist cycling N video slides
+    /// accumulated N open decoders — a latent OOM on a 426 MB Pi.
+    ///
+    /// Called from the BeginSlide handler so the previous video's
+    /// decoder is freed before the next slide loads. Re-entry into
+    /// the same video slide keeps its decoder (no re-prime churn).
+    /// BeginTransition deliberately does NOT call this: a
+    /// video->video transition needs both the from- and to-slide
+    /// decoders live; the next BeginSlide (on the to-slide, after
+    /// the transition completes) is what evicts the from-slide.
+    fn evict_other_video_state(&mut self, keep: uuid::Uuid) {
+        self.video_demuxers.retain(|k, _| *k == keep);
+        #[cfg(target_os = "linux")]
+        self.video_decoders.retain(|k, _| *k == keep);
+    }
+
     /// Try to load + cache a slide by UUID. content_root is
     /// required for the find_*_slide chain. Tries text -> image
     /// -> video. Returns Err with a message if all three return
@@ -1463,6 +1485,11 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
+            // FYS bug 9 (2026-05-20): release the previous video
+            // slide's V4L2 decoder before loading this slide —
+            // decoders were otherwise never freed on a normal
+            // slide change and accumulated toward OOM.
+            cache.evict_other_video_state(p.slide_id);
             if let Err(e) = cache.load(content_root, p.slide_id) {
                 return err(format!("begin_slide load failed: {e:#}"));
             }
