@@ -2820,10 +2820,15 @@ uniform sampler2D u_tex_y;
 uniform sampler2D u_tex_uv;
 varying vec2 v_uv;
 void main() {
+    // FYS bug 2: the V4L2 codec delivers the NV12 frame bottom-up
+    // relative to the top-down convention the image / external-RGB
+    // paths use (all share VS_TEXTURED_QUAD + the same quad VBO),
+    // so video rendered upside down. Sample with v flipped.
+    vec2 uv_t = vec2(v_uv.x, 1.0 - v_uv.y);
     // Limited-range Y: [16/255, 235/255] -> [0, 1].
-    float y = (texture2D(u_tex_y, v_uv).r - (16.0/255.0)) * (255.0/219.0);
+    float y = (texture2D(u_tex_y, uv_t).r - (16.0/255.0)) * (255.0/219.0);
     // GLES2 LUMINANCE_ALPHA: r=L (U here), a=A (V here).
-    vec2 uv_sample = texture2D(u_tex_uv, v_uv).ra;
+    vec2 uv_sample = texture2D(u_tex_uv, uv_t).ra;
     // Limited-range UV: [16/255, 240/255] -> [-0.5, 0.5].
     vec2 uv = (uv_sample - vec2(128.0/255.0)) * (255.0/224.0);
     // ITU-R BT.709 Annex B coefficients (limited-range scaling above
@@ -2877,10 +2882,13 @@ precision mediump float;
 uniform samplerExternalOES u_tex_external;
 varying vec2 v_uv;
 void main() {
+    // FYS bug 2: V4L2 delivers the frame bottom-up vs the top-down
+    // image / external-RGB paths; flip v to render right-side up.
+    vec2 uv_t = vec2(v_uv.x, 1.0 - v_uv.y);
     // The Mesa driver decodes NV12 -> RGB for the external-OES
     // sample on the Pi's vc4. Output is RGB in [0,1]; alpha
     // forced to opaque (NV12 has no alpha channel).
-    vec3 rgb = texture2D(u_tex_external, v_uv).rgb;
+    vec3 rgb = texture2D(u_tex_external, uv_t).rgb;
     gl_FragColor = vec4(rgb, 1.0);
 }
 "#;
