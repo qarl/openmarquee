@@ -259,6 +259,72 @@ async def test_loop_recovers_from_renderer_op_failure(renderer):
     assert saw_b_via_original
 
 
+@pytest.mark.asyncio
+async def test_all_unplayable_playlist_backs_off_and_recovers(renderer):
+    """Bug 8 gap (2026-05-20): a playlist whose every slide is
+    unplayable — here a 1-item playlist of an unsupported-kind slide,
+    qarl's "coffe" one-bad-video playlist — must NOT hot-spin. The
+    skip rail "advance to the next slide" lands back on the same bad
+    slide, so without a floor the loop re-fetches + re-iterates at
+    render-thread speed and freezes the sign.
+
+    Assert: the loop is rate-limited to the stuck-backoff floor while
+    stuck, and recovers when playable content returns."""
+    from openmarquee.rendering.rust_renderer import (
+        RustRendererUnsupportedSlideError,
+    )
+
+    bad_slide, bad_png = _make_slide("bad", (10, 20, 30))
+    good_slide, good_png = _make_slide("good", (40, 50, 60))
+    assets = {bad_slide.id: bad_png, good_slide.id: good_png}
+    state = {"playlist": [bad_slide]}
+
+    begin_calls: list[UUID] = []
+    original_begin = renderer.begin_slide
+
+    def begin(slide_id, t0_ms, duration_ms):
+        begin_calls.append(slide_id)
+        if slide_id == bad_slide.id:
+            raise RustRendererUnsupportedSlideError(
+                "video slide unsupported (load failed)"
+            )
+        original_begin(slide_id, t0_ms, duration_ms)
+
+    renderer.begin_slide = begin  # type: ignore[method-assign]
+    backoff = 0.1
+    loop = PlaybackLoop(
+        renderer,
+        fetch_items=lambda: state["playlist"],
+        read_asset=lambda i: assets[i],
+        empty_playlist_poll_seconds=_FAST_EMPTY_POLL,
+        auto_tick_seconds=0.02,
+        stuck_backoff_seconds=backoff,
+    )
+
+    await loop.start()
+    # Stuck phase: the playlist holds only the unplayable slide.
+    await asyncio.sleep(0.55)
+    stuck_calls = len(begin_calls)
+    # With a 0.1s backoff floor, ~0.55s of stuck loop is at most a
+    # handful of passes. Pre-fix the loop spun at render-thread speed
+    # (hundreds-to-thousands of begin_slide calls). The generous
+    # ceiling cleanly separates fixed from broken.
+    assert stuck_calls <= 12, (
+        f"hot-spin: {stuck_calls} begin_slide calls in 0.55s — the "
+        f"{backoff}s backoff floor should bound this to ~5-6"
+    )
+
+    # Recovery: a playable slide appears in the playlist. The loop
+    # re-fetches every iteration (just rate-limited while stuck), so
+    # it must pick the good slide up and play it.
+    state["playlist"] = [good_slide]
+    await asyncio.sleep(0.4)
+    await loop.stop()
+    assert good_slide.id in begin_calls, (
+        "loop did not recover when playable content returned"
+    )
+
+
 def _track_frames(renderer):
     """Wrap renderer.render_frame so the test can inspect every frame the loop
     pushes (not just the last one)."""

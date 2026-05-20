@@ -474,14 +474,20 @@ async def test_fix_b_throttle_first_fail_error_subsequent_debug(caplog):
         read_asset=lambda _id: b"",
         empty_playlist_poll_seconds=0.01,
         auto_tick_seconds=0.02,
+        # This is a 1-slide all-IPC-fail playlist, so the Bug-8-gap
+        # zero-playable backoff floor also applies. Use a small floor
+        # (production default 3.0s) so the loop still re-attempts
+        # begin_slide several times within the test window.
+        stuck_backoff_seconds=0.05,
     )
 
     # Capture both ERROR and DEBUG levels on the playback logger.
     with caplog.at_level(logging.DEBUG, logger="openmarquee.playback"):
         await loop.start()
-        # Run long enough for the loop to attempt begin_slide ≥3 times
-        # (250ms throttle between attempts → 3 attempts in ~800ms).
-        await asyncio.sleep(0.85)
+        # Run long enough for the loop to attempt begin_slide ≥3
+        # times. Each pass ≈ 250ms per-fail settle + 50ms zero-
+        # playable backoff ≈ 300ms; ~1.2s yields ~4 attempts.
+        await asyncio.sleep(1.2)
         await loop.stop()
 
     # Multiple attempts hit the bad slide.

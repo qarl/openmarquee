@@ -59,11 +59,19 @@ class PlaybackLoop:
         empty_playlist_poll_seconds: float = 1.0,
         get_timezone: Callable[[], str | None] | None = None,
         auto_tick_seconds: float = 1.0,
+        stuck_backoff_seconds: float = 3.0,
     ):
         self._renderer = renderer
         self._fetch_items = fetch_items
         self._read_asset = read_asset
         self._empty_poll = empty_playlist_poll_seconds
+        # Bug 8 gap (2026-05-20): backoff floor when a full playlist
+        # pass yields ZERO playable slides (every slide skipped as an
+        # unsupported kind, or failed IPC). Without it the outer loop
+        # re-fetches + re-iterates at render-thread speed and starves
+        # the sign (qarl's one-bad-video "coffe" playlist froze FYS).
+        # Tests override to a small value.
+        self._stuck_backoff = stuck_backoff_seconds
         # Returns an IANA timezone name (e.g. "America/Los_Angeles") so
         # auto-mode text slides render in the operator-configured zone.
         # Returning None falls back to UTC. Tests inject a fixed value
@@ -135,6 +143,20 @@ class PlaybackLoop:
         # fixes the bad slide and switches playlists gets a fresh
         # ERROR if the fix didn't take.
         self._failed_slide_ids: set[UUID] = set()
+        # Bug 8 gap (2026-05-20): per-slide throttle for the
+        # unsupported-KIND skip log. Fix B's _failed_slide_ids only
+        # throttles the IPC-FAILURE path; the unsupported-kind
+        # pre-flight skip (begin_slide / advance raising
+        # UnsupportedSlideError, caught inside _play_via_rust_ipc)
+        # was unthrottled and spammed ~50 lines/sec on an all-bad
+        # playlist. Same shape as _failed_slide_ids: first skip per
+        # id logs INFO, subsequent log DEBUG. Reset on playlist
+        # change by _stamp_playlist_id.
+        self._skipped_slide_ids: set[UUID] = set()
+        # True while the active playlist has zero playable slides —
+        # gates the zero-playable warning to one line per stuck
+        # episode (then DEBUG), and a recovery INFO when it clears.
+        self._all_unplayable: bool = False
 
     @property
     def is_running(self) -> bool:
@@ -293,6 +315,12 @@ class PlaybackLoop:
             # Pre-load images lazily inside the per-item iteration so a
             # mid-cycle add/delete is reflected on the next pass without
             # ballooning memory for a hundred-slide playlist.
+            #
+            # Bug 8 gap (2026-05-20): track whether ANY slide played
+            # this pass. If a full pass (no stop/pause break) plays
+            # nothing — every slide skipped/failed — the `for ... else`
+            # below applies the zero-playable backoff floor.
+            any_played = False
             for i in range(start_idx, len(items)):
                 if self._stop_event.is_set():
                     break
@@ -379,12 +407,49 @@ class PlaybackLoop:
                 if self._pause_event.is_set():
                     self._resume_at_index = i
                     break
-                # Whether the slide rendered or was skipped (e.g.,
-                # VideoSlide on a video-less sidecar build), move
-                # to the next item. `rendered=False` means
+                # `rendered` True = the slide played out; False =
                 # UnsupportedSlideError fired and was logged by
-                # _play_via_rust_ipc; the sidecar is healthy.
-                _ = rendered
+                # _play_via_rust_ipc (sidecar healthy, slide skipped).
+                if rendered:
+                    any_played = True
+            else:
+                # Zero-playable-slides floor (Bug 8 gap, 2026-05-20).
+                # `for ... else`: this runs only when the loop ran a
+                # FULL pass with no break — i.e. NOT a stop/pause exit.
+                # If nothing played, every slide was skipped (an
+                # unsupported kind) or failed (IPC). Without a floor
+                # the outer `while` re-fetches + re-iterates at render-
+                # thread speed, starving the render thread and freezing
+                # the sign — qarl's one-bad-video "coffe" playlist
+                # incident. Back off so we re-fetch at most once per
+                # `_stuck_backoff` while stuck. The per-iteration
+                # re-fetch still happens (just rate-limited), so a
+                # schedule edit that brings playable content in
+                # recovers on the next pass. The sidecar holds its
+                # last framebuffer while we back off — the last good
+                # frame stays on glass, not a frozen-hard sign.
+                if items and not any_played:
+                    if not self._all_unplayable:
+                        self._all_unplayable = True
+                        log.warning(
+                            "playback: active playlist has no playable "
+                            "slides (%d item(s), all skipped/failed) — "
+                            "holding last frame, re-checking every %.1fs",
+                            len(items), self._stuck_backoff,
+                        )
+                    else:
+                        log.debug(
+                            "playback: still no playable slides "
+                            "(%d item(s)); backing off %.1fs",
+                            len(items), self._stuck_backoff,
+                        )
+                    await self._wait(self._stuck_backoff)
+                elif any_played and self._all_unplayable:
+                    self._all_unplayable = False
+                    log.info(
+                        "playback: playable content returned — "
+                        "resuming normal cadence",
+                    )
 
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
@@ -540,10 +605,22 @@ class PlaybackLoop:
         try:
             self._renderer.begin_slide(item.id, t0_ms, duration_ms)
         except RustRendererUnsupportedSlideError as e:
-            log.info(
-                "playback: skipping slide %s (Rust sidecar doesn't yet "
-                "support this kind): %s", item.id, e.message,
-            )
+            # Bug 8 gap (2026-05-20): throttle per slide id. First skip
+            # logs INFO; subsequent skips for the SAME id log DEBUG —
+            # an all-unsupported playlist would otherwise spam this
+            # line every loop pass.
+            if item.id in self._skipped_slide_ids:
+                log.debug(
+                    "playback: skipping slide %s (unsupported kind; "
+                    "throttled): %s", item.id, e.message,
+                )
+            else:
+                self._skipped_slide_ids.add(item.id)
+                log.info(
+                    "playback: skipping slide %s (Rust sidecar doesn't yet "
+                    "support this kind; further skips for this id throttled "
+                    "to DEBUG): %s", item.id, e.message,
+                )
             return False
         # 30 Hz tick. Matches the auto_tick_seconds-aware cadence the
         # other paths use; the sidecar's internal state machine clamps
@@ -560,11 +637,19 @@ class PlaybackLoop:
             except RustRendererUnsupportedSlideError as e:
                 # Begin_slide accepted the slide but advance hit the
                 # unsupported-kind rail (happens for video on the very
-                # first paint_slide). Skip gracefully.
-                log.info(
-                    "playback: slide %s became unsupported mid-play: %s",
-                    item.id, e.message,
-                )
+                # first paint_slide). Skip gracefully — throttled per
+                # slide id, same as the begin_slide skip above.
+                if item.id in self._skipped_slide_ids:
+                    log.debug(
+                        "playback: slide %s unsupported mid-play "
+                        "(throttled): %s", item.id, e.message,
+                    )
+                else:
+                    self._skipped_slide_ids.add(item.id)
+                    log.info(
+                        "playback: slide %s became unsupported mid-play: %s",
+                        item.id, e.message,
+                    )
                 return False
             if isinstance(result, SlideComplete):
                 # Sidecar's state machine signaled duration-end. Slide
@@ -668,14 +753,22 @@ class PlaybackLoop:
         broken slide (e.g. by switching to a healthier playlist OR by
         re-uploading a single-trak asset) gets ERROR-level visibility
         on the next attempt, not DEBUG-suppressed silence.
+
+        Bug 8 gap (2026-05-20): the unsupported-kind skip throttle
+        (_skipped_slide_ids) is cleared on the same event, for the
+        same reason — a fixed/replaced slide should log fresh.
         """
-        if playlist_id != self._current_playlist_id and self._failed_slide_ids:
+        if playlist_id != self._current_playlist_id and (
+            self._failed_slide_ids or self._skipped_slide_ids
+        ):
             log.info(
-                "playback: playlist changed (%s → %s); clearing %d failed-"
-                "slide throttle entries",
-                self._current_playlist_id, playlist_id, len(self._failed_slide_ids),
+                "playback: playlist changed (%s → %s); clearing %d failed "
+                "+ %d skipped-slide throttle entries",
+                self._current_playlist_id, playlist_id,
+                len(self._failed_slide_ids), len(self._skipped_slide_ids),
             )
             self._failed_slide_ids.clear()
+            self._skipped_slide_ids.clear()
         self._current_playlist_id = playlist_id
 
     # --- /api/playback/current-frame capture (added 2026-05-06) ----------
