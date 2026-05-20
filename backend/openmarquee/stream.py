@@ -275,6 +275,15 @@ class StreamSession:
                     return
         except asyncio.CancelledError:
             raise
+        finally:
+            # STREAM/VLC slice 2.5: end the sidecar's frame-pump
+            # session on EVERY exit path (track end, render failure,
+            # cancellation) so the sidecar can't hang blocked in
+            # pump-mode waiting for a frame that will never come.
+            try:
+                renderer.end_external_frames()
+            except Exception:
+                log.exception("stream: end_external_frames failed")
 
     async def close(self) -> None:
         """Tear down whichever transport is in use and resume the

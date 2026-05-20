@@ -655,6 +655,138 @@ where
     Ok(())
 }
 
+/// STREAM/VLC slice 2.5 — open the dedicated binary frame channel.
+///
+/// The Python backend (rust_renderer.py) creates a pipe, passes its
+/// read end to this sidecar as an inherited FD, and tells us the FD
+/// number via the OPENMARQUEE_FRAME_FD env var. Returns None when
+/// the var is unset — a backend that predates 2.5 — in which case
+/// begin_external_frames errors cleanly instead of painting.
+#[cfg(target_os = "linux")]
+fn open_external_frame_channel() -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let raw = std::env::var("OPENMARQUEE_FRAME_FD").ok()?;
+    let fd: i32 = match raw.trim().parse() {
+        Ok(n) if n >= 0 => n,
+        _ => {
+            eprintln!("warn: OPENMARQUEE_FRAME_FD={raw:?} is not a valid fd");
+            return None;
+        }
+    };
+    // SAFETY: the Python backend created this pipe and handed us the
+    // read end as an inherited FD (subprocess pass_fds). We take
+    // ownership for the sidecar's lifetime.
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// STREAM/VLC slice 2.5 — the external-frame pump.
+///
+/// Runs AFTER the caller has already emitted the begin_external_
+/// frames response — begin_external_frames is a normal request/
+/// response op (an immediate ack), so this pump produces NO
+/// response: it just paints until the end sentinel and returns to
+/// the JSON-op loop.
+///
+/// Reads length-prefixed RGB888 frames off the binary channel —
+/// `[u32-BE length][payload]` — painting each one fullscreen until
+/// a length of 0 (the end sentinel). A paint failure is persistent
+/// (a GL/DRM fault), so it is logged ONCE and the pump then just
+/// DRAINS the channel (no per-frame log flood) so the Python writer
+/// never blocks; the held last frame stays on glass. The summary
+/// line carries the frame-pacing numbers slice 9's live-fire parses.
+#[cfg(target_os = "linux")]
+fn run_external_frame_pump(
+    session: &mut crate::hdmi::EglSession,
+    card: &crate::Card,
+    reader: &mut std::fs::File,
+    width: u32,
+    height: u32,
+) {
+    use std::io::Read;
+    let frame_bytes = (width as usize) * (height as usize) * 3;
+    let mut len_buf = [0u8; 4];
+    let mut frame: Vec<u8> = vec![0u8; frame_bytes];
+    let mut painted: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut paint_us_total: u64 = 0;
+    let mut paint_us_max: u64 = 0;
+    let mut paint_broken = false;
+    loop {
+        if let Err(e) = reader.read_exact(&mut len_buf) {
+            // EOF / error before a length prefix: the Python writer
+            // vanished without a sentinel (a crash). Leave pump-mode;
+            // the JSON-op loop then hits its own stdin EOF and exits.
+            eprintln!(
+                "ipc_sidecar: external-frame channel closed after \
+                 {painted} frames: {e}"
+            );
+            return;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        // Sanity cap. The channel is an internal trusted pipe, but a
+        // corrupt length must not drive a multi-GB allocation. 64 MiB
+        // comfortably covers 4K RGB888 (~25 MiB).
+        const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+        if len > MAX_FRAME_BYTES {
+            eprintln!(
+                "ipc_sidecar: external-frame length {len} exceeds the \
+                 {MAX_FRAME_BYTES}-byte cap; leaving pump-mode"
+            );
+            return;
+        }
+        if len == 0 {
+            eprintln!(
+                "ipc_sidecar: external-frame pump done — {painted} painted, \
+                 {skipped} skipped, avg {:.2}ms, max {:.2}ms",
+                if painted > 0 {
+                    paint_us_total as f64 / painted as f64 / 1000.0
+                } else {
+                    0.0
+                },
+                paint_us_max as f64 / 1000.0,
+            );
+            return;
+        }
+        if frame.len() != len {
+            frame.resize(len, 0);
+        }
+        if let Err(e) = reader.read_exact(&mut frame) {
+            eprintln!(
+                "ipc_sidecar: external-frame channel closed mid-frame \
+                 after {painted} frames: {e}"
+            );
+            return;
+        }
+        if len != frame_bytes || paint_broken {
+            // Dimension desync, or a prior paint already failed: the
+            // frame is fully drained so the pipe stays in sync — just
+            // skip the paint.
+            skipped += 1;
+            continue;
+        }
+        let t0 = std::time::Instant::now();
+        match crate::hdmi::paint_and_present_external_frame(
+            session, card, &frame, width, height,
+        ) {
+            Ok(()) => {
+                let us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                paint_us_total += us;
+                paint_us_max = paint_us_max.max(us);
+                painted += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "ipc_sidecar: external-frame paint failed; holding last \
+                     frame + draining until sentinel (further errors \
+                     silenced): {e:#}"
+                );
+                paint_broken = true;
+                skipped += 1;
+            }
+        }
+    }
+}
+
 /// Linux build: open the DRM card, enter run_in_egl_session,
 /// and run the inner loop inside the closure. Each Advance op
 /// that produces PaintSlide / PaintTransition triggers an
@@ -725,6 +857,10 @@ where
         let mut begin_slide_count = 0_u32;
         let mut state = PlaybackState::new();
         let mut cache = SlideCache::new();
+        // STREAM/VLC slice 2.5: the dedicated binary frame channel
+        // (None when the backend predates 2.5). begin_external_frames
+        // pumps RGB888 frames off this until its end sentinel.
+        let mut frame_reader = open_external_frame_channel();
         // Phase 9 Step 9a: soak readiness instrumentation.
         // Per-Advance paint timings aggregated into one journald-
         // friendly summary line every 30s. The §11 acceptance test
@@ -776,6 +912,34 @@ where
                     session, &cache, &state, fonts, content_root, &path,
                 );
                 emit_response(stdout, &resp)?;
+                continue;
+            }
+
+            // STREAM/VLC slice 2.5: begin_external_frames is
+            // intercepted here (like Capture) BEFORE the standard
+            // dispatch — it needs session + card + the binary frame
+            // channel. It is a normal request/response op: ACK it
+            // immediately, then run the pump loop (which produces no
+            // further response) until the end sentinel returns us to
+            // the JSON-op loop.
+            if let IpcRequest::BeginExternalFrames(ref p) = req {
+                match frame_reader.as_mut() {
+                    None => {
+                        emit_response(
+                            stdout,
+                            &err(
+                                "begin_external_frames: no frame \
+                                 channel (OPENMARQUEE_FRAME_FD unset)",
+                            ),
+                        )?;
+                    }
+                    Some(reader) => {
+                        emit_response(stdout, &ok_empty())?;
+                        run_external_frame_pump(
+                            session, &card, reader, p.width, p.height,
+                        );
+                    }
+                }
                 continue;
             }
 
@@ -1364,6 +1528,14 @@ fn handle_inner_request(
         }
         IpcRequest::Reconfigure(_) => {
             err("Reconfigure not yet implemented (slice e)")
+        }
+        IpcRequest::BeginExternalFrames(_) => {
+            // The Linux HDMI inner loop intercepts this op before
+            // handle_inner_request (see run_open_and_inner_loop_
+            // linux) and runs the frame pump. Reaching here means
+            // begin_external_frames was sent to a non-HDMI / state-
+            // only sidecar build, which has no frame channel.
+            err("begin_external_frames requires the Linux HDMI sidecar")
         }
         IpcRequest::Close => {
             state.reset();

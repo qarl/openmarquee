@@ -3109,6 +3109,98 @@ pub fn paint_and_present_one_image_slide_frame(
     Ok(())
 }
 
+/// STREAM/VLC slice 2.5 — paint + present one external RGB888 frame.
+///
+/// `rgb` is `frame_w * frame_h * 3` bytes of row-major RGB888 from an
+/// external producer (the Python backend's ffmpeg/RTSP pump today; a
+/// headless browser later — STREAM_VLC_PROPOSAL §10). This function
+/// is deliberately SOURCE-AGNOSTIC: it knows nothing about where the
+/// bytes came from.
+///
+/// Structurally identical to paint_and_present_one_image_slide_frame
+/// — same scene-FBO brightness/gamma routing and the same scanout-
+/// rotation discipline — the only difference is the body: a raw
+/// RGB-texture upload + FS_BLIT instead of a PNG-from-disk decode.
+pub fn paint_and_present_external_frame(
+    session: &mut EglSession,
+    card: &Card,
+    rgb: &[u8],
+    frame_w: u32,
+    frame_h: u32,
+) -> Result<()> {
+    use glow::HasContext;
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    // Non-identity brightness/gamma routes through the scene FBO +
+    // post-pass blit, exactly as the image-slide path does — so a
+    // VLC frame honors the operator's color settings on glass.
+    let identity = session.current_settings.is_color_identity();
+    let scene_fbo_handle = if !identity {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        }
+    }
+    unsafe {
+        bake_external_rgb_to_current_fbo(
+            session.gl, rgb, frame_w, frame_h, mode_w, mode_h,
+        )?;
+    }
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = (session.current_settings.brightness as f32) / 100.0;
+        let gamma = session.current_settings.gamma;
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            run_bright_gamma_pass(session.gl, tex, brightness, gamma)?;
+        }
+    }
+    // Scanout swap / lock / addFB / commit / pair-rotation — verbatim
+    // from paint_and_present_one_image_slide_frame.
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers (external_frame) failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer (external_frame) failed")?
+    };
+    let fb_buf =
+        GbmBufferAdapter::new(&new_bo).context("read GBM bo metadata (external_frame)")?;
+    let new_fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB (external_frame) failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card, new_fb) {
+        if let Err(de) = card.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail (external_frame): {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev, external_frame): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+    Ok(())
+}
+
 /// V4L2 piece 3e (2026-05-14) -- per-advance VideoSlide paint.
 /// Feeds the next H.264 sample (if any) into a primed v4l2::Decoder,
 /// drains the next decoded NV12 Frame (with a short EAGAIN retry
@@ -5302,6 +5394,60 @@ unsafe fn bake_image_slide_to_current_fbo(
         img_w as i32, img_h as i32, 0,
         glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
     );
+    let blit_result = run_blit_pass(gl, tex);
+    gl.delete_texture(tex);
+    blit_result
+}
+
+/// STREAM/VLC slice 2.5 — upload one raw RGB888 frame as a texture
+/// and FS_BLIT it to fill the currently-bound framebuffer. The
+/// raw-bytes analogue of bake_image_slide_to_current_fbo: same
+/// transient-texture + FS_BLIT shape, no PNG decode.
+///
+/// `rgb` must be exactly `frame_w * frame_h * 3` bytes. Caller binds
+/// the destination framebuffer and handles post-pass / scanout.
+unsafe fn bake_external_rgb_to_current_fbo(
+    gl: &glow::Context,
+    rgb: &[u8],
+    frame_w: u32,
+    frame_h: u32,
+    mode_w: u32,
+    mode_h: u32,
+) -> Result<()> {
+    use glow::HasContext;
+    let expected = (frame_w as usize) * (frame_h as usize) * 3;
+    if rgb.len() != expected {
+        return Err(anyhow!(
+            "external frame is {} bytes, expected {}x{}x3 = {}",
+            rgb.len(),
+            frame_w,
+            frame_h,
+            expected,
+        ));
+    }
+    gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("glGenTextures(bake_external_rgb): {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    // RGB888 rows are frame_w*3 bytes — not 4-aligned for widths
+    // that aren't multiples of 4 (the basic tier is 854 px wide,
+    // 854*3 = 2562, not 4-aligned). GL's default UNPACK_ALIGNMENT
+    // is 4, which would shear every such frame; force 1 for the
+    // upload and restore the default after.
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D, 0, glow::RGB as i32,
+        frame_w as i32, frame_h as i32, 0,
+        glow::RGB, glow::UNSIGNED_BYTE, Some(rgb),
+    );
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
     let blit_result = run_blit_pass(gl, tex);
     gl.delete_texture(tex);
     blit_result

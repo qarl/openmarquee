@@ -147,6 +147,7 @@ class MockRenderer:
         ] = []
         self.advance_calls: list[int] = []
         self.render_frame_calls: int = 0
+        self.end_external_frames_calls: int = 0
         self.capture_calls: list[str] = []
 
         # State machine mirror -- same shape as the Rust sidecar's
@@ -302,6 +303,13 @@ class MockRenderer:
         self.last_frame = frame
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.output_path.write_bytes(_encode_png_rgb(width, height, frame))
+
+    def end_external_frames(self) -> None:
+        """No-op for the mock — render_frame() paints in-process, so
+        there is no out-of-process pump session to close. Present so
+        MockRenderer satisfies the Renderer protocol and the VLC
+        pumps can call it unconditionally. Counted for tests."""
+        self.end_external_frames_calls += 1
 
     # ------------------------------------------------------------------
     # Internals

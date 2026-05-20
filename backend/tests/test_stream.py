@@ -243,6 +243,9 @@ async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
     assert captured, "pump didn't push any frame to the renderer"
     assert len(captured[0]) == 8 * 8 * 3
     assert captured[0] == bytes([128] * (8 * 8 * 3))
+    # STREAM/VLC slice 2.5: the pump ends the renderer's frame-pump
+    # session on exit (here, track-end) — exactly once.
+    assert renderer.end_external_frames_calls == 1
 
 
 @pytest.mark.asyncio

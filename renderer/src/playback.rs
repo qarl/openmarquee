@@ -246,6 +246,16 @@ pub enum IpcRequest {
     /// Currently scopes to rotation / brightness / gamma per
     /// spec §6.3.
     Reconfigure(ReconfigureParams),
+    /// Op 8 (STREAM/VLC slice 2.5): flip the sidecar into
+    /// external-frame pump mode. After this op the sidecar reads
+    /// length-prefixed RGB888 frames off the dedicated binary FD
+    /// (OPENMARQUEE_FRAME_FD) — [u32-BE length][payload], a
+    /// length of 0 is the end sentinel — painting each one
+    /// fullscreen until the sentinel returns it to the JSON-op
+    /// loop. Source-agnostic: the frames are "RGB from some
+    /// external producer" (the Python ffmpeg/RTSP pump today, a
+    /// headless browser later — see STREAM_VLC_PROPOSAL §10).
+    BeginExternalFrames(BeginExternalFramesParams),
     /// Op 7: release everything. Caller is expected to close
     /// the IPC pipe after receiving the response.
     Close,
@@ -294,6 +304,17 @@ pub struct CaptureParams {
     /// Filesystem path to write the PNG. Caller is responsible
     /// for the directory existing + write permissions.
     pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BeginExternalFramesParams {
+    /// Width of each pushed RGB888 frame, in pixels. Every frame
+    /// on the binary channel is exactly `width * height * 3`
+    /// bytes; the sidecar uploads it as a `width x height` RGB
+    /// texture and blits it to fill the panel.
+    pub width: u32,
+    /// Height of each pushed RGB888 frame, in pixels.
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -602,6 +623,22 @@ mod tests {
     fn ipc_request_advance_round_trips() {
         let req = IpcRequest::Advance(AdvanceParams { t_ms: 9876543 });
         roundtrip_request(&req);
+    }
+
+    #[test]
+    fn ipc_request_begin_external_frames_round_trips() {
+        // STREAM/VLC slice 2.5 — the push-frames op. The Python
+        // RustRenderer encodes exactly this shape on the first
+        // render_frame() call.
+        let req = IpcRequest::BeginExternalFrames(BeginExternalFramesParams {
+            width: 1920,
+            height: 1080,
+        });
+        roundtrip_request(&req);
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert!(encoded.contains(r#""op":"begin_external_frames""#));
+        assert!(encoded.contains(r#""width":1920"#));
+        assert!(encoded.contains(r#""height":1080"#));
     }
 
     #[test]

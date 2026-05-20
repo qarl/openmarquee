@@ -425,6 +425,14 @@ class RustRenderer:
 
         self._proc: subprocess.Popen[str] | None = None
         self._stderr_thread: threading.Thread | None = None
+        # STREAM/VLC slice 2.5: the dedicated binary frame channel.
+        # _frame_pipe is the write end of a pipe whose read end the
+        # sidecar inherits; render_frame() pushes length-prefixed
+        # RGB888 frames down it. _external_frames_active tracks
+        # whether we have sent the begin_external_frames op (whose
+        # JSON response is deferred until end_external_frames()).
+        self._frame_pipe: object | None = None  # BufferedWriter
+        self._external_frames_active = False
         # RLock so reconnect can call _send_op (which re-acquires the
         # lock) from within an already-locked _send_op scope without
         # deadlocking. Watchdog is a separate thread and uses
@@ -597,15 +605,72 @@ class RustRenderer:
     # ------------------------------------------------------------------
 
     def render_frame(self, frame: bytes) -> None:
-        """The Rust sidecar owns GPU-side composition; frames never cross the
-        process boundary. Use the IPC ops (begin_slide / advance / capture)
-        instead. Slice 4 will teach playback.py to bypass render_frame for
-        RustRenderer instances.
+        """Push one RGB888 frame to the sidecar (STREAM/VLC slice 2.5).
+
+        `frame` is row-major RGB888, `width * height * 3` bytes. The
+        first call lazy-sends the `begin_external_frames` op (a normal
+        request/response op the sidecar acks immediately, flipping
+        itself into pump-mode); every call then writes the frame
+        length-prefixed onto the dedicated binary frame channel and
+        the sidecar paints it fullscreen.
+
+        Source-agnostic: this is "an RGB frame from some producer" —
+        used by the VLC takeover + VlcStreamSlide pumps today, and the
+        future webpage-slide path (STREAM_VLC_PROPOSAL §10).
         """
-        raise NotImplementedError(
-            "RustRenderer doesn't accept push-frame rendering; use begin_slide/"
-            "advance/capture IPC ops. Slice 4 will wire playback.py's bypass."
-        )
+        with self._lock:
+            if self._proc is None or self._frame_pipe is None:
+                raise RustRendererError("RustRenderer not opened")
+            if not self._external_frames_active:
+                # Lazy-begin: flip the sidecar into pump-mode. This is
+                # a normal write+read op — the sidecar acks at once,
+                # so a sidecar that can't pump-render surfaces its
+                # error here rather than desyncing the channel.
+                # _send_op_locked (not _send_op) is deliberate: it
+                # runs under the already-held _lock, and the auto-
+                # reconnect path is bypassed — a mid-pump reconnect
+                # would lose pump state anyway, and the VLC pumps
+                # already catch the raised error.
+                self._send_op_locked(
+                    "begin_external_frames",
+                    {"width": self.width, "height": self.height},
+                )
+                self._external_frames_active = True
+            header = len(frame).to_bytes(4, "big")
+            try:
+                self._frame_pipe.write(header)
+                self._frame_pipe.write(frame)
+                self._frame_pipe.flush()
+            except (BrokenPipeError, OSError) as e:
+                raise RustRendererSubprocessError(
+                    f"frame-channel write failed: {e}"
+                ) from e
+
+    def end_external_frames(self) -> None:
+        """End a run of `render_frame()` pushes (STREAM/VLC slice 2.5).
+
+        Writes the 0-length end sentinel onto the binary frame channel
+        — which returns the sidecar to its JSON-op loop. There is no
+        response: the begin op was already acked, and the sentinel
+        carries no reply.
+
+        Idempotent and a no-op when no run is active: the VLC pumps
+        call this on every exit path (stop / pause / deadline / EOF),
+        including ones that pushed zero frames.
+        """
+        with self._lock:
+            if not self._external_frames_active:
+                return
+            self._external_frames_active = False
+            if self._frame_pipe is None:
+                return
+            try:
+                self._frame_pipe.write((0).to_bytes(4, "big"))
+                self._frame_pipe.flush()
+            except (BrokenPipeError, OSError) as e:
+                raise RustRendererSubprocessError(
+                    f"frame-channel sentinel write failed: {e}"
+                ) from e
 
     # ------------------------------------------------------------------
     # Liveness.
@@ -652,6 +717,12 @@ class RustRenderer:
             " ".join(args),
             env.get("TZ", "<system>"),
         )
+        # STREAM/VLC slice 2.5: the dedicated binary frame channel.
+        # A pipe whose read end the sidecar inherits (pass_fds) and
+        # finds via the OPENMARQUEE_FRAME_FD env var; the write end
+        # stays with us for render_frame() to push RGB888 frames.
+        frame_read_fd, frame_write_fd = os.pipe()
+        env["OPENMARQUEE_FRAME_FD"] = str(frame_read_fd)
         try:
             self._proc = subprocess.Popen(
                 args,
@@ -665,15 +736,28 @@ class RustRenderer:
                 text=True,
                 encoding="utf-8",
                 env=env,
+                # Inherit the frame-pipe read end into the sidecar.
+                pass_fds=(frame_read_fd,),
             )
         except FileNotFoundError as e:
+            os.close(frame_read_fd)
+            os.close(frame_write_fd)
             raise RustRendererSubprocessError(
                 f"Rust binary not found at {self._binary_path}: {e}"
             ) from e
         except OSError as e:
+            os.close(frame_read_fd)
+            os.close(frame_write_fd)
             raise RustRendererSubprocessError(
                 f"Failed to launch Rust subprocess: {e}"
             ) from e
+        # The sidecar holds the read end now; the parent drops it.
+        # Wrap the write end in a BufferedWriter — its flush() writes
+        # the whole buffer (looping over partial pipe writes), so
+        # render_frame() can hand it a full multi-MB frame.
+        os.close(frame_read_fd)
+        self._frame_pipe = os.fdopen(frame_write_fd, "wb")
+        self._external_frames_active = False
         # Stderr drainer thread. Prevents pipe-buffer-deadlock if the
         # subprocess writes more stderr than ~64 KB before we read.
         self._stderr_thread = threading.Thread(
@@ -868,6 +952,17 @@ class RustRenderer:
         proc = self._proc
         if proc is None:
             return
+        # STREAM/VLC slice 2.5: close the binary frame channel first.
+        # If the sidecar is mid-pump (blocked reading frames), this
+        # EOFs that read so it leaves pump-mode and returns to the
+        # JSON loop — where the stdin close below then EOFs it out.
+        try:
+            if self._frame_pipe is not None:
+                self._frame_pipe.close()
+        except Exception:
+            log.debug("frame-pipe close failed during teardown", exc_info=True)
+        self._frame_pipe = None
+        self._external_frames_active = False
         # Close stdin so the sidecar's outer loop hits EOF and exits
         # cleanly. (The sidecar returns Ok(()) at end-of-stream per
         # `renderer/src/ipc_main.rs::run_ipc_sidecar`.)

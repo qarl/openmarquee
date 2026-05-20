@@ -814,55 +814,76 @@ class PlaybackLoop:
         frames = consumer.frames()
         rendered_any = False
         renderer_broken = False
+        # Outer try: end_external_frames() in its finally runs AFTER
+        # every render_frame() call for this slot — the pump frames
+        # AND any on_unreachable "black" frame. Ending pump-mode
+        # before the on_unreachable paint would let that paint re-arm
+        # a pump-mode session with no closer, hanging the sidecar.
         try:
-            while True:
-                if self._stop_event.is_set() or self._pause_event.is_set():
-                    break
-                now = loop.time()
-                if now >= deadline:
-                    break
-                # Before the first frame the wait is bounded by the
-                # connect timeout (a dead URL must not eat the whole
-                # slot); after, by the remaining slot time.
-                if rendered_any:
-                    budget = deadline - now
-                else:
-                    budget = min(_VLC_CONNECT_TIMEOUT_S, deadline - now)
-                try:
-                    rgb = await asyncio.wait_for(
-                        frames.__anext__(), timeout=budget
+            try:
+                while True:
+                    if self._stop_event.is_set() or self._pause_event.is_set():
+                        break
+                    now = loop.time()
+                    if now >= deadline:
+                        break
+                    # Before the first frame the wait is bounded by
+                    # the connect timeout (a dead URL must not eat the
+                    # whole slot); after, by the remaining slot time.
+                    if rendered_any:
+                        budget = deadline - now
+                    else:
+                        budget = min(_VLC_CONNECT_TIMEOUT_S, deadline - now)
+                    try:
+                        rgb = await asyncio.wait_for(
+                            frames.__anext__(), timeout=budget
+                        )
+                    except StopAsyncIteration:
+                        break  # ffmpeg EOF / RTSP disconnect
+                    except TimeoutError:
+                        break  # connect timeout, or the stream stalled
+                    try:
+                        renderer.render_frame(rgb)
+                    except Exception:
+                        # The renderer can't take external frames — a
+                        # Rust sidecar without the slice-2.5 push-
+                        # frames op. Log ONCE (per-frame logging at
+                        # 30fps would flood the journal) and fall back
+                        # to on_unreachable.
+                        log.warning(
+                            "playback: renderer rejected a vlc_stream "
+                            "frame (slide id=%s) — the push-frames "
+                            "sidecar op is unavailable; skipping the "
+                            "rest of this slot", item.id,
+                        )
+                        renderer_broken = True
+                        break
+                    rendered_any = True
+            finally:
+                await consumer.close()
+                with contextlib.suppress(Exception):
+                    await frames.aclose()
+            # Fill the remainder of the slot if the stream never
+            # delivered, ended before the deadline, or the renderer
+            # rejected frames. Inside the outer try so a "black"
+            # render_frame() is still covered by the finally below.
+            if not (self._stop_event.is_set() or self._pause_event.is_set()):
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    await self._apply_vlc_on_unreachable(
+                        item, remaining, renderer_broken=renderer_broken
                     )
-                except StopAsyncIteration:
-                    break  # ffmpeg EOF / RTSP disconnect
-                except TimeoutError:
-                    break  # connect timeout, or the stream stalled
-                try:
-                    renderer.render_frame(rgb)
-                except Exception:
-                    # The renderer can't take external frames — a Rust
-                    # sidecar without the slice-2.5 push-frames op. Log
-                    # ONCE (per-frame logging at 30fps would flood the
-                    # journal) and fall back to on_unreachable.
-                    log.warning(
-                        "playback: renderer rejected a vlc_stream "
-                        "frame (slide id=%s) — the push-frames sidecar "
-                        "op is unavailable; skipping the rest of this "
-                        "slot", item.id,
-                    )
-                    renderer_broken = True
-                    break
-                rendered_any = True
         finally:
-            await consumer.close()
-            with contextlib.suppress(Exception):
-                await frames.aclose()
-        # Fill the remainder of the slot if the stream never delivered,
-        # ended before the deadline, or the renderer rejected frames.
-        if not (self._stop_event.is_set() or self._pause_event.is_set()):
-            remaining = deadline - loop.time()
-            if remaining > 0:
-                await self._apply_vlc_on_unreachable(
-                    item, remaining, renderer_broken=renderer_broken
+            # STREAM/VLC slice 2.5: end the sidecar's frame-pump
+            # session AFTER every render_frame() for this slot, on
+            # every exit path (deadline, EOF, stop, pause, render
+            # failure) so the sidecar can't hang in pump-mode.
+            try:
+                renderer.end_external_frames()
+            except Exception:
+                log.exception(
+                    "playback: end_external_frames failed for "
+                    "vlc_stream slide id=%s", item.id,
                 )
         return rendered_any
 

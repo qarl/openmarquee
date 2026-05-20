@@ -163,6 +163,30 @@ class AutoFallbackRenderer:
             mock = self._swap_to_mock(f"render_frame: {e}")
             mock.render_frame(frame)
 
+    def end_external_frames(self) -> None:
+        """Forward to the active renderer (STREAM/VLC slice 2.5).
+
+        Mirrors render_frame's active-renderer selection. The VLC
+        pumps call this in their finally after a run of render_frame()
+        pushes; a subprocess death here swaps to Mock (consistent with
+        render_frame's recovery), whose end_external_frames is a
+        no-op.
+        """
+        if self._mock is not None:
+            self._mock.end_external_frames()
+            return
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererRespawnedError,
+            RustRendererSubprocessError,
+        )
+        try:
+            self._primary.end_external_frames()
+        except RustRendererRespawnedError:
+            raise
+        except RustRendererSubprocessError as e:
+            mock = self._swap_to_mock(f"end_external_frames: {e}")
+            mock.end_external_frames()
+
     # --- Lifecycle ---
 
     def open(self):

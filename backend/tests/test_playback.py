@@ -710,6 +710,9 @@ async def test_vlc_stream_slide_pumps_frames_to_renderer(
     # and that the renderer received the RTSP frames intact.
     assert captured[0] == bytes([0]) * frame_size
     assert captured[4] == bytes([4]) * frame_size
+    # STREAM/VLC slice 2.5: the vlc_stream pump ends the renderer's
+    # frame-pump session on every slot exit (once per playlist cycle).
+    assert renderer.end_external_frames_calls >= 1
 
 
 @pytest.mark.asyncio

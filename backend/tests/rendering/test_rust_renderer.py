@@ -90,6 +90,13 @@ MALFORMED_NEXT = os.environ.get("FAKE_SIDECAR_MALFORMED_NEXT")
 MODE_W = int(os.environ.get("FAKE_SIDECAR_MODE_W", "1920"))
 MODE_H = int(os.environ.get("FAKE_SIDECAR_MODE_H", "1080"))
 
+# STREAM/VLC slice 2.5: the inherited binary frame channel. The
+# real sidecar reads this on begin_external_frames; we mirror that
+# so render_frame() / end_external_frames() are testable on the
+# actual pipe path.
+_frame_fd = os.environ.get("OPENMARQUEE_FRAME_FD")
+frame_reader = os.fdopen(int(_frame_fd), "rb") if _frame_fd else None
+
 for i in range(STDERR_BURST):
     print(f"fake_sidecar stderr line {i}", file=sys.stderr, flush=True)
 
@@ -138,6 +145,30 @@ for raw in sys.stdin:
         })
     elif op == "begin_transition":
         ok({"command": "empty"})
+    elif op == "begin_external_frames":
+        # Mirror the real sidecar: ack immediately (begin_external_
+        # frames is a normal request/response op), THEN enter
+        # pump-mode — read length-prefixed frames off the binary
+        # channel until the 0-length sentinel. No second response.
+        if log:
+            log.write(
+                f"begin_external_frames:{params.get('width')}x"
+                f"{params.get('height')}\n"
+            )
+            log.flush()
+        ok({"command": "empty"})
+        if frame_reader is not None:
+            while True:
+                hdr = frame_reader.read(4)
+                if len(hdr) < 4:
+                    break  # channel closed
+                flen = int.from_bytes(hdr, "big")
+                if flen == 0:
+                    break  # end sentinel
+                payload = frame_reader.read(flen)
+                if log:
+                    log.write(f"external_frame:{len(payload)}\n")
+                    log.flush()
     elif op == "capture":
         ok({"command": "capture_ok", "path": params.get("path", ""), "bytes": 184})
     elif op == "reconfigure":
@@ -204,21 +235,56 @@ def make_renderer(fake_sidecar, monkeypatch):
 
 
 def test_rust_renderer_satisfies_renderer_protocol(make_renderer):
-    """The proxy nominally satisfies the Renderer protocol (width / height /
-    render_frame) so dependency-injection sites that type as `Renderer`
-    don't need to special-case us at the type level. Actual frame rendering
-    raises NotImplementedError; slice 4 will rewire playback.py to skip
-    render_frame when it's a RustRenderer."""
+    """The proxy satisfies the Renderer protocol (width / height /
+    render_frame / end_external_frames) so dependency-injection sites
+    that type as `Renderer` don't need to special-case it."""
     r = make_renderer()
     assert isinstance(r, Renderer)
     assert r.width == 1920
     assert r.height == 1080
 
 
-def test_render_frame_raises_not_implemented(make_renderer):
+def test_render_frame_pushes_length_prefixed_frames_to_the_binary_channel(
+    make_renderer, tmp_path
+):
+    """STREAM/VLC slice 2.5: render_frame() lazy-sends the
+    begin_external_frames op on the JSON channel, then writes each
+    frame length-prefixed onto the dedicated binary channel;
+    end_external_frames() writes the 0-length end sentinel."""
+    log_path = tmp_path / "sidecar.log"
+    r = make_renderer(env_extra={"FAKE_SIDECAR_REQUEST_LOG": str(log_path)})
+    r.open()
+    frame_size = 1920 * 1080 * 3
+    try:
+        frame = b"\x00" * frame_size
+        r.render_frame(frame)
+        r.render_frame(frame)
+        r.render_frame(frame)
+        r.end_external_frames()
+    finally:
+        r.close()
+    lines = log_path.read_text().splitlines()
+    # The begin op went on the JSON channel (raw request logged).
+    assert any('"op":"begin_external_frames"' in ln for ln in lines)
+    # Three frames of the exact RGB888 size came through the binary
+    # channel — and the 0-length sentinel ended the pump (the sidecar
+    # only logs frames before the sentinel break).
+    frame_lines = [ln for ln in lines if ln.startswith("external_frame:")]
+    assert frame_lines == [f"external_frame:{frame_size}"] * 3
+
+
+def test_end_external_frames_without_any_frame_is_a_noop(make_renderer):
+    """end_external_frames() with no prior render_frame() must be a
+    no-op — the VLC pumps call it on every exit path, including ones
+    that pushed zero frames. (If it weren't, it would write a
+    sentinel + block reading a response for an op never sent.)"""
     r = make_renderer()
-    with pytest.raises(NotImplementedError):
-        r.render_frame(b"\x00" * 1920 * 1080 * 3)
+    r.open()
+    try:
+        r.end_external_frames()
+        r.end_external_frames()  # idempotent
+    finally:
+        r.close()
 
 
 # ============================================================
