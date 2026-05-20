@@ -35,15 +35,12 @@ mod sdf_atlas;
 /// textures at EGL bring-up.
 #[cfg(target_os = "linux")]
 mod sdf_atlas_gl;
-/// SDF arc slice C.2 -- emoji color-bitmap atlas. Cross-platform
-/// side: parses the build-time-baked manifest + holds page PNG
-/// byte slices.
+/// Slice 3D (2026-05-19) — post-CBDT-retire shim. Module now
+/// exports only `codepoint_is_emoji_range`; the CBDT bake +
+/// EmojiAtlas + EmojiAtlasEntry + load_emoji_atlas are gone.
+/// Emoji codepoints route to `glyph_cache_colr` via the Slice
+/// 3B dispatch hook in `hdmi_logic.rs`.
 mod sdf_atlas_emoji;
-/// SDF arc slice C.2 -- GL-side of the emoji atlas pipeline.
-/// Linux-only; decodes each PNG page at session bring-up + uploads
-/// as a GL_RGBA8 texture.
-#[cfg(target_os = "linux")]
-mod sdf_atlas_emoji_gl;
 /// Bug 3 Slice 1 prep (2026-05-19) -- standalone glTexSubImage2D
 /// smoke test. Verifies vc4 driver behavior before committing the
 /// runtime glyph cache infrastructure that depends on it. Module

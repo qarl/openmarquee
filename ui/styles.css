@@ -39,8 +39,14 @@
    to whatever the system has and the device falls back to tofu — no
    crash either way. */
 @font-face {
+    /* Slice 3D (2026-05-19): switched from the legacy CBDT font
+       (noto-color-emoji.ttf) to the COLRv1 vector font. Matches
+       the renderer-side runtime COLRv1 rasterizer added in
+       Slice 3A.rev + 3B + activated in Slice 3D. Browsers
+       (Chrome / Firefox / Safari) all support COLRv1 natively,
+       so editor canvas paints emoji crisp at any zoom. */
     font-family: "Noto Color Emoji";
-    src: url("fonts/noto-color-emoji.ttf") format("truetype");
+    src: url("fonts/noto-color-emoji-colrv1.ttf") format("truetype");
     font-display: swap;
     unicode-range:
         U+1F000-1FFFF,  /* supplementary plane: 😀 etc. */

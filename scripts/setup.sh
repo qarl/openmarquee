@@ -60,8 +60,10 @@ fi
 # identically in editor and on glass. The TTF is ~10 MB — too heavy
 # for git — so we fetch it at setup time. Pinned + sha-verified inside
 # the download script. Idempotent: re-running setup.sh is cheap.
-echo "==> ensuring Noto Color Emoji is installed"
-bash "$OPENMARQUEE_SRC/scripts/download-emoji-font.sh"
+echo "==> ensuring Noto Color Emoji (COLRv1) is installed"
+# Slice 3D (2026-05-19): the CBDT-bake-side download
+# (download-emoji-font.sh + the legacy noto-color-emoji.ttf) is
+# retired. The runtime COLRv1 path needs ONLY the COLRv1 font.
 bash "$OPENMARQUEE_SRC/scripts/download-emoji-font-colrv1.sh"
 mkdir -p "$OPENMARQUEE_BUILD_DIR/ui/fonts"
 # Atomic copy via .tmp + mv so a partial write on a network-mounted
@@ -69,7 +71,7 @@ mkdir -p "$OPENMARQUEE_BUILD_DIR/ui/fonts"
 # that the dev server would serve as garbage. Plain `cp` on the
 # default local BUILD_DIR is fine, but the .tmp/mv cost is negligible
 # and covers the edge case.
-for f in noto-color-emoji.ttf noto-color-emoji-colrv1.ttf; do
+for f in noto-color-emoji-colrv1.ttf; do
     cp "$OPENMARQUEE_SRC/ui/fonts/$f" \
         "$OPENMARQUEE_BUILD_DIR/ui/fonts/$f.tmp"
     mv "$OPENMARQUEE_BUILD_DIR/ui/fonts/$f.tmp" \

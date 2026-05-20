@@ -30,7 +30,6 @@ set without needing internet at runtime.
 | `reenie-beanie.ttf` | Reenie Beanie | SIL OFL-1.1 | https://fonts.google.com/specimen/Reenie+Beanie |
 | `shadows-into-light.ttf` | Shadows Into Light | SIL OFL-1.1 | https://fonts.google.com/specimen/Shadows+Into+Light |
 | `dejavu-sans.ttf` | DejaVu Sans | Bitstream Vera + Public Domain | https://github.com/dejavu-fonts/dejavu-fonts |
-| `noto-color-emoji.ttf` | Noto Color Emoji (CBDT) | SIL OFL-1.1 | https://github.com/googlefonts/noto-emoji |
 | `noto-color-emoji-colrv1.ttf` | Noto Color Emoji (COLRv1, SVG-stripped) | SIL OFL-1.1 | https://github.com/google/fonts/tree/main/ofl/notocoloremoji |
 
 SIL OFL-1.1: https://openfontlicense.org/
@@ -47,15 +46,16 @@ Arrows. Picked over Noto Sans because Noto Sans Regular ships
 without Geometric Shapes; DejaVu Sans covers 5918 codepoints in one
 ~750 KB TTF.
 
-`noto-color-emoji-colrv1.ttf` is the runtime COLRv1 vector emoji
-font (Bug 3 Slice 3). Replaces the build-time-baked CBDT atlas
-across Slices 3B-3D so emoji rasterize on demand at the requested
-PPEM (crisp at any size for HDMI signage). The upstream tarball is
-24.3 MB because it bundles an SVG table for browser fallback (80%
-of the file); we strip SVG via fontTools before bundling because
-skrifa (the renderer's COLRv1 paint-tree reader) needs only
-COLR/CPAL/glyf, dropping the file to 4.8 MB. The build-time
-download+strip step lives in
-`scripts/download-emoji-font-colrv1.sh`, wired in via
-`scripts/setup.sh`. `noto-color-emoji.ttf` (CBDT) is
-the existing build-time atlas source and is retired by Slice 3D.
+`noto-color-emoji-colrv1.ttf` is THE emoji font on the device
+post-Slice-3D. Bug 3 Slice 3A.rev added the COLRv1 rasterizer
+module (skrifa + tiny-skia); 3B wired runtime dispatch + a
+dedicated dynamic atlas page; 3D retired the build-time CBDT
+bake of the older `noto-color-emoji.ttf` so emoji rasterize on
+demand at the cell size (96 px) and sample with bilinear filter,
+giving crisp edges at any on-screen size. The upstream tarball
+is 24.3 MB because it bundles an SVG table for browser fallback
+(80% of the file); `scripts/download-emoji-font-colrv1.sh`
+strips SVG via fontTools before bundling because skrifa (the
+renderer's COLRv1 paint-tree reader) needs only COLR/CPAL/glyf,
+dropping the file to 4.8 MB. The download+strip step is wired
+into `scripts/setup.sh`.

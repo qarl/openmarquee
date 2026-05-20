@@ -438,10 +438,6 @@ void main() {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GlyphKind {
     Msdf,
-    /// Emoji atlas page index. The draw side resolves page -> GL
-    /// texture via the GL-side emoji lookup; UVs on the quad are
-    /// atlas-space within that page (2048x2048 in C.1's bake).
-    Emoji { page: u32 },
     Tofu,
     /// Bug 3 Slice 2B: runtime-MSDF glyph from the dynamic atlas
     /// page. UVs on the quad are atlas-space within the 2048×2048
@@ -450,12 +446,14 @@ pub enum GlyphKind {
     /// dynamic-atlas texture via a thread_local (mirrors the static
     /// MSDF atlas lookup pattern in hdmi.rs).
     DynamicMsdf,
-    /// Bug 3 Slice 3B: runtime-COLRv1 emoji glyph from the dynamic
-    /// COLR atlas page (separate from DynamicMsdf — 96 px cells vs
-    /// 48 px for MSDF). Same UV semantics as DynamicMsdf relative
-    /// to the dynamic page; draw side binds the COLR page texture
-    /// via a parallel thread_local + uses the FS_EMOJI fragment
-    /// shader (RGBA passthrough — same as the static CBDT path).
+    /// Bug 3 Slice 3B + 3D: runtime-COLRv1 emoji glyph from the
+    /// dynamic COLR atlas page (separate from DynamicMsdf — 96 px
+    /// cells vs 48 px for MSDF). Same UV semantics as DynamicMsdf
+    /// relative to the dynamic page; draw side binds the COLR
+    /// page texture via a parallel thread_local + uses the
+    /// FS_EMOJI fragment shader (RGBA passthrough). Slice 3D
+    /// retired the static-CBDT `Emoji { page }` variant; emoji
+    /// codepoints now route exclusively through this path.
     DynamicEmoji,
 }
 
@@ -518,7 +516,6 @@ pub struct MsdfQuadGroup {
 /// branchy reshape).
 pub fn layout_text_to_quads(
     atlas: &crate::sdf_atlas::MsdfAtlas,
-    emoji: Option<&crate::sdf_atlas_emoji::EmojiAtlas>,
     text: &str,
     size_px: f32,
     // Bug 4 (2026-05-19): boxW in PIXELS for per-line X-squish.
@@ -598,7 +595,6 @@ pub fn layout_text_to_quads(
     //   4. tofu -- deterministic missing-glyph rect
     #[derive(Clone)]
     enum CharKind {
-        Emoji(crate::sdf_atlas_emoji::EmojiAtlasEntry),
         Msdf(crate::sdf_atlas::GlyphEntry),
         Whitespace,
         Tofu,
@@ -613,13 +609,14 @@ pub fn layout_text_to_quads(
             plane_bounds: crate::glyph_cache::PlaneBounds,
             cell_px: u32,
         },
-        /// Bug 3 Slice 3B: runtime-cached COLRv1 emoji glyph. The
-        /// slot position (in dynamic-COLR-atlas pixels) + per-glyph
-        /// metrics come from the cache's SlotState::Ready. Pass-2
-        /// emits MsdfQuad with kind=GlyphKind::DynamicEmoji using
-        /// the same em-cell-centered geometry as the static Emoji
-        /// path (square cell, centered on the em-height). UVs come
-        /// from slot.{x,y} / ATLAS_DIM, mirroring DynamicMsdf.
+        /// Bug 3 Slice 3B + 3D: runtime-cached COLRv1 emoji glyph.
+        /// Slice 3D retired the static-CBDT `Emoji(EmojiAtlasEntry)`
+        /// variant; emoji codepoints now route exclusively through
+        /// this path. Geometry mirrors the retired static-emoji
+        /// path (square cell, centered on the em-height) so the
+        /// on-screen size is preserved across the cutover. UVs
+        /// come from slot.{x,y} / ATLAS_DIM, same as DynamicMsdf
+        /// against its dynamic page.
         DynamicEmoji {
             slot: crate::atlas_page::SlotPos,
             advance_em: f32,
@@ -642,10 +639,6 @@ pub fn layout_text_to_quads(
         },
         Pending,
     }
-    // Emoji-atlas source PPEM as f32 for advance scaling. None when
-    // no emoji atlas supplied (host tests / pre-C.3 callers).
-    let emoji_ppem: Option<f32> = emoji.map(|a| a.manifest.source_ppem as f32);
-
     // Bug 3 Slice 2A (2026-05-19): font_family_id is FNV-1a low 32
     // bits of the font stem. u32 widens the u8 used in Slice 1B's
     // dormant-API scaffolding so cross-font collisions are
@@ -671,34 +664,15 @@ pub fn layout_text_to_quads(
             let cp = ch as u32;
             let is_whitespace = matches!(cp, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20 | 0xA0);
 
-            // Emoji dispatch (Q4 step 1): codepoint in the emoji
-            // ranges AND in the atlas's entries. Skipped variants
-            // (U+FE0F, skin-tone modifiers, ZWJ compounds) have no
-            // entry and fall through to MSDF/tofu.
-            let emoji_entry = if !is_whitespace {
-                match (emoji, crate::sdf_atlas_emoji::codepoint_is_emoji_range(cp)) {
-                    (Some(a), true) => {
-                        crate::sdf_atlas_emoji::atlas_entry_for_codepoint(a, cp).copied()
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            // Bug 3 Slice 3B (2026-05-19): runtime COLRv1 dispatch.
-            // After static-CBDT miss, before static-MSDF, try the
-            // runtime cache for codepoints in the emoji range. The
-            // COLRv1 font (NotoColorEmoji-COLRv1) covers a different
-            // codepoint set than the static CBDT bake (which is
-            // build-time-pinned to a subset for binary-size
-            // reasons), so this fires for the long tail of emoji
-            // codepoints that the bake doesn't carry. On COLR
-            // FontMissing (font lacks the cp) we fall through to
-            // the existing static MSDF + DynamicMsdf fallback chain
-            // -- so non-emoji-range chars never reach this branch
-            // and emoji-range chars not in the COLRv1 font end up
-            // on the MSDF DejaVu fallback.
+            // Bug 3 Slice 3B + 3D (2026-05-19): COLRv1 dispatch.
+            // Slice 3D retired the static-CBDT atlas, so emoji
+            // codepoints route exclusively through the runtime
+            // COLRv1 cache. On COLR FontMissing (NotoColorEmoji-
+            // COLRv1 lacks the cp) we fall through to the
+            // static-MSDF + DynamicMsdf fallback chain — so non-
+            // emoji-range chars never reach this branch, and
+            // emoji-range chars not in the COLRv1 font end up on
+            // the MSDF DejaVu fallback.
             //
             // Pending state (Requested/Generating/None on first
             // encounter): render Tofu THIS frame; the worker's
@@ -742,20 +716,13 @@ pub fn layout_text_to_quads(
                 })
             };
 
-            let (kind, adv) = if let Some(ee) = emoji_entry {
-                // Emoji advance in em: CBDT advance_px at source_ppem,
-                // normalized to em (1 em = source_ppem px in the CBDT
-                // bake). Browser-matching default per design Q3.
-                let ppem = emoji_ppem.unwrap_or(1.0).max(1.0);
-                let adv_em = ee.advance_px as f32 / ppem;
-                any_ink = true;
-                (CharKind::Emoji(ee), adv_em)
-            } else if let Some(ColrResolution::Ready { slot, advance_em }) = colr_dispatch {
+            let (kind, adv) = if let Some(ColrResolution::Ready { slot, advance_em }) = colr_dispatch {
                 // Bug 3 Slice 3B: COLRv1 cache hit (Ready). Advance
                 // is the COLRv1 font's hmtx-derived advance in em
                 // (units_per_em normalized). Cell px = COLR_CELL_PX
-                // (96, matches the CBDT cell size so the on-screen
-                // emoji geometry matches the static path).
+                // (96, matches the retired CBDT cell size so the
+                // on-screen emoji geometry is preserved across the
+                // Slice 3D cutover).
                 any_ink = true;
                 (
                     CharKind::DynamicEmoji {
@@ -948,9 +915,7 @@ pub fn layout_text_to_quads(
                 {
                     (plane_bounds.pl_top, plane_bounds.pl_bottom)
                 }
-                CharKind::Emoji(_)
-                | CharKind::DynamicEmoji { .. }
-                | CharKind::Tofu => (ascent_em, descent_em),
+                CharKind::DynamicEmoji { .. } | CharKind::Tofu => (ascent_em, descent_em),
                 _ => continue,
             };
             if top_em > ink_ascent_em {
@@ -1015,17 +980,13 @@ pub fn layout_text_to_quads(
     // per-call site comment for the median-of-mixed-encodings
     // mechanism this guards against.
     const INSET_PX: f32 = 0.5;
-    // Emoji-atlas geometry (only used when an entry is hit). cell_em
-    // = cell_px / source_ppem; atlas_dim is the page dimension for
-    // UV normalization. Pre-computed once outside the loop.
-    let (emoji_cell_em, emoji_atlas_dim_f, emoji_cell_px_f) = match emoji {
-        Some(a) => (
-            a.manifest.cell_px as f32 / (a.manifest.source_ppem as f32).max(1.0),
-            a.manifest.atlas_dim as f32,
-            a.manifest.cell_px as f32,
-        ),
-        None => (0.0, 1.0, 0.0),
-    };
+    // Slice 3D (2026-05-19): emoji cell-em ratio preserved from the
+    // retired CBDT bake so the on-screen emoji size is unchanged
+    // across the cutover. 96 px cell at 128 ppem = 0.75 em; the
+    // COLR runtime rasterizer in glyph_cache_colr.rs uses the same
+    // 96 px cell, so the DynamicEmoji draw path can keep the same
+    // emoji_cell_em constant.
+    let emoji_cell_em: f32 = crate::glyph_cache_colr::COLR_CELL_PX as f32 / 128.0;
     let mut quads: Vec<MsdfQuad> = Vec::new();
     for (line_idx, layout) in layouts.iter().enumerate() {
         // Baseline y in pixel-space, y-down. Each line's baseline
@@ -1142,56 +1103,6 @@ pub fn layout_text_to_quads(
                         uv_right: uv_r,
                         uv_bottom: uv_b,
                         kind: GlyphKind::DynamicMsdf,
-                    });
-                }
-                CharKind::Emoji(ee) => {
-                    // Slice C.3 geometry (design Q3):
-                    //   * quad w/h on screen = cell_em * size_px (square)
-                    //   * centered horizontally within the advance
-                    //   * centered vertically on the em-height (matches
-                    //     browser engines' typical emoji baseline)
-                    //
-                    // The full atlas cell (96x96 incl. letterboxing) is
-                    // mapped to the quad: the bake's letterboxing
-                    // already preserves the glyph's natural aspect
-                    // ratio, so using the full cell is the simplest
-                    // path without re-deriving src_w/src_h on screen.
-                    // Bug 4 (2026-05-19): emoji X dim uses x_size_px
-                    // so per-line X squish deforms emoji proportionally
-                    // alongside text. Matches Canvas2D's drawImage 9-arg
-                    // which scales the WHOLE rasterized bitmap (text +
-                    // emoji glyphs) uniformly on the X axis. Y dim stays
-                    // emoji_cell_em * size_px (square at natural scale).
-                    let cell_w_px = emoji_cell_em * x_size_px;
-                    let cell_h_px = emoji_cell_em * size_px;
-                    let center_x = cursor_x + adv_px * 0.5;
-                    let center_y =
-                        baseline_y - (ascent_em + descent_em) * 0.5 * size_px;
-                    let px_l = center_x - cell_w_px * 0.5;
-                    let px_r = center_x + cell_w_px * 0.5;
-                    let px_t = center_y - cell_h_px * 0.5;
-                    let px_b = center_y + cell_h_px * 0.5;
-                    // Bug 2 (2026-05-19): same 0.5-px UV inset as MSDF path.
-                    // Emoji atlas is RGBA8 not three-channel MSDF, so the
-                    // exact median-mixing mechanism doesn't apply, but
-                    // GL_LINEAR at the cell boundary still bilinearly mixes
-                    // this glyph's edge pixels with the NEIGHBOR glyph's
-                    // edge pixels -- visible as colored fringes between
-                    // adjacent emoji glyphs at large scales. Same fix.
-                    let uv_l = (ee.x as f32 + INSET_PX) / emoji_atlas_dim_f;
-                    let uv_r = (ee.x as f32 + emoji_cell_px_f - INSET_PX) / emoji_atlas_dim_f;
-                    let uv_t = (ee.y as f32 + INSET_PX) / emoji_atlas_dim_f;
-                    let uv_b = (ee.y as f32 + emoji_cell_px_f - INSET_PX) / emoji_atlas_dim_f;
-                    quads.push(MsdfQuad {
-                        px_left: px_l,
-                        px_top: px_t,
-                        px_right: px_r,
-                        px_bottom: px_b,
-                        uv_left: uv_l,
-                        uv_top: uv_t,
-                        uv_right: uv_r,
-                        uv_bottom: uv_b,
-                        kind: GlyphKind::Emoji { page: ee.page },
                     });
                 }
                 CharKind::DynamicEmoji { slot, advance_em: _, cell_px: dyn_cell_px } => {
@@ -4656,15 +4567,15 @@ mod tests {
     #[test]
     fn layout_text_to_quads_returns_none_for_empty() {
         let atlas = load_anton_atlas();
-        assert!(layout_text_to_quads(&atlas, None, "", 100.0, f32::INFINITY, None).is_none());
+        assert!(layout_text_to_quads(&atlas,"", 100.0, f32::INFINITY, None).is_none());
         // Spaces only -- no ink, returns None.
-        assert!(layout_text_to_quads(&atlas, None, "   ", 100.0, f32::INFINITY, None).is_none());
+        assert!(layout_text_to_quads(&atlas,"   ", 100.0, f32::INFINITY, None).is_none());
     }
 
     #[test]
     fn layout_text_to_quads_emits_one_quad_per_ink_glyph() {
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "AB", 100.0, f32::INFINITY, None)
+        let group = layout_text_to_quads(&atlas,"AB", 100.0, f32::INFINITY, None)
             .expect("AB at 100px lays out");
         assert_eq!(group.quads.len(), 2);
         // Quads are in left-to-right order.
@@ -4704,7 +4615,7 @@ mod tests {
         let inset_x = 0.5 / atlas_w;
         let inset_y = 0.5 / atlas_h;
 
-        let group = layout_text_to_quads(&atlas, None, "A", 100.0, f32::INFINITY, None)
+        let group = layout_text_to_quads(&atlas,"A", 100.0, f32::INFINITY, None)
             .expect("A lays out");
         let q = &group.quads[0];
         let a_glyph = atlas.manifest.glyph_for(b'A' as u32)
@@ -4748,8 +4659,8 @@ mod tests {
     #[test]
     fn layout_text_to_quads_scales_with_size_px() {
         let atlas = load_anton_atlas();
-        let small = layout_text_to_quads(&atlas, None, "A", 50.0, f32::INFINITY, None).expect("A@50");
-        let large = layout_text_to_quads(&atlas, None, "A", 500.0, f32::INFINITY, None).expect("A@500");
+        let small = layout_text_to_quads(&atlas,"A", 50.0, f32::INFINITY, None).expect("A@50");
+        let large = layout_text_to_quads(&atlas,"A", 500.0, f32::INFINITY, None).expect("A@500");
         // Pixel-space quad scales linearly with size_px (10x size_px
         // -> ~10x quad width).
         let small_w = small.quads[0].px_right - small.quads[0].px_left;
@@ -4760,7 +4671,7 @@ mod tests {
     #[test]
     fn layout_text_to_quads_multi_line_uses_two_baselines() {
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "A\nB", 100.0, f32::INFINITY, None)
+        let group = layout_text_to_quads(&atlas,"A\nB", 100.0, f32::INFINITY, None)
             .expect("two-line lays out");
         assert_eq!(group.quads.len(), 2);
         // Second line's quad sits below the first line's quad in
@@ -4788,7 +4699,7 @@ mod tests {
         // ~0 and ink_ascent_em ~= cap height -- much less than the
         // 1.2 em-extent. bm_h should be visibly smaller than the
         // pre-Bug-1c em-based 1.2 * size_px = ~120 px.
-        let group = layout_text_to_quads(&atlas, None, "ABC", size_px, f32::INFINITY, None)
+        let group = layout_text_to_quads(&atlas,"ABC", size_px, f32::INFINITY, None)
             .expect("ABC lays out");
         let em_extent_px = (atlas.manifest.ascent_em
             - atlas.manifest.descent_em)
@@ -4828,9 +4739,9 @@ mod tests {
             atlas_rgb: inter.atlas_rgb,
         };
         let size_px = 100.0_f32;
-        let group_caps = layout_text_to_quads(&atlas, None, "ABC", size_px, f32::INFINITY, None)
+        let group_caps = layout_text_to_quads(&atlas,"ABC", size_px, f32::INFINITY, None)
             .expect("caps lays out");
-        let group_desc = layout_text_to_quads(&atlas, None, "Apy", size_px, f32::INFINITY, None)
+        let group_desc = layout_text_to_quads(&atlas,"Apy", size_px, f32::INFINITY, None)
             .expect("desc lays out");
         // Bug 1c: ink_descent_em from 'p' / 'y' descender lowers the
         // min, widening bm_h. Single-pixel rounding tolerance.
@@ -4866,9 +4777,9 @@ mod tests {
             atlas_rgb: inter.atlas_rgb,
         };
         let size_px = 100.0_f32;
-        let group_caps_caps = layout_text_to_quads(&atlas, None, "ABC\nABC", size_px, f32::INFINITY, None)
+        let group_caps_caps = layout_text_to_quads(&atlas,"ABC\nABC", size_px, f32::INFINITY, None)
             .expect("caps/caps lays out");
-        let group_caps_desc = layout_text_to_quads(&atlas, None, "ABC\npy", size_px, f32::INFINITY, None)
+        let group_caps_desc = layout_text_to_quads(&atlas,"ABC\npy", size_px, f32::INFINITY, None)
             .expect("caps/desc lays out");
         // The caps_desc variant has the SAME line stacking math
         // (two lines × line_h_px + last_extent) but last_extent is
@@ -4895,7 +4806,7 @@ mod tests {
         // bm_w would have been the full natural advance (since
         // group-level squish was deferred to box_to_ndc_quad).
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "ABCDE", 200.0, 100.0, None)
+        let group = layout_text_to_quads(&atlas,"ABCDE", 200.0, 100.0, None)
             .expect("ABCDE lays out");
         // pad=1 on each side; bm_w should be ~100 + 2.
         // Allow 1 px slack for ceil rounding.
@@ -4918,7 +4829,7 @@ mod tests {
         let atlas = load_anton_atlas();
         let size_px = 100.0_f32;
         // Get the per-line natural widths first (with infinity box).
-        let baseline = layout_text_to_quads(&atlas, None, "ABCDE\nAB", size_px, f32::INFINITY, None)
+        let baseline = layout_text_to_quads(&atlas,"ABCDE\nAB", size_px, f32::INFINITY, None)
             .expect("baseline 2-line lays out");
         let baseline_w = baseline.width;
         // Pick a box_w between AB's natural width and ABCDE's natural
@@ -4926,7 +4837,7 @@ mod tests {
         // floor to a round number; this should leave AB un-capped
         // (it's shorter than half-ABCDE for typical fonts).
         let box_w = baseline_w as f32 * 0.6;
-        let group = layout_text_to_quads(&atlas, None, "ABCDE\nAB", size_px, box_w, None)
+        let group = layout_text_to_quads(&atlas,"ABCDE\nAB", size_px, box_w, None)
             .expect("capped 2-line lays out");
         // bm_w should equal the larger of (capped ABCDE = box_w) and
         // (uncapped AB natural). For a typical font where AB <
@@ -4953,7 +4864,7 @@ mod tests {
         // as pre-Bug-4 layout. This preserves the host-test opt-out
         // contract.
         let atlas = load_anton_atlas();
-        let group = layout_text_to_quads(&atlas, None, "ABCDE\nAB", 100.0, f32::INFINITY, None)
+        let group = layout_text_to_quads(&atlas,"ABCDE\nAB", 100.0, f32::INFINITY, None)
             .expect("inf lays out");
         // Width should be > 0 and stable. Test mostly guards against
         // any future regression that decouples INFINITY from the
@@ -4961,7 +4872,7 @@ mod tests {
         assert!(group.width > 10);
         // bm_w with INFINITY equals bm_w with a very large finite
         // box_w (e.g. 1e7). Same layout regardless.
-        let huge = layout_text_to_quads(&atlas, None, "ABCDE\nAB", 100.0, 1e7_f32, None)
+        let huge = layout_text_to_quads(&atlas,"ABCDE\nAB", 100.0, 1e7_f32, None)
             .expect("huge lays out");
         assert_eq!(group.width, huge.width);
     }
@@ -4969,124 +4880,59 @@ mod tests {
     #[test]
     fn layout_text_to_quads_emits_tofu_for_unknown_codepoint() {
         let atlas = load_anton_atlas();
-        // U+2603 (snowman) isn't in anton's Basic-Latin + Latin-1
-        // baked set; we expect a tofu quad.
+        // U+2603 ☃ (snowman) isn't in anton's Basic-Latin +
+        // Latin-1 baked set; we expect a tofu quad.
         //
-        // SDF arc slice C.3: when no emoji atlas is supplied, U+2603
-        // falls through to MSDF (miss) then tofu. With an emoji atlas
-        // supplied AND U+2603 in its entries the result would differ;
-        // see layout_text_to_quads_emits_emoji_for_baked_codepoint.
-        let group = layout_text_to_quads(&atlas, None, "\u{2603}", 100.0, f32::INFINITY, None)
+        // Slice 3D: U+2603 IS inside codepoint_is_emoji_range
+        // (U+2600-27BF), but with no runtime glyph cache passed
+        // the COLR dispatch can't fire, so it falls through to
+        // static MSDF (miss) then Tofu. With a runtime cache an
+        // emoji-range codepoint present in NotoColorEmoji-COLRv1
+        // would resolve to DynamicEmoji instead — see
+        // glyph_cache_colr::tests for that path's coverage.
+        let group = layout_text_to_quads(&atlas,"\u{2603}", 100.0, f32::INFINITY, None)
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
         assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
     }
 
-    // SDF arc slice C.3 -- emoji segmentation tests.
-    //
-    // Use the baked emoji atlas (slice C.1 artifact, ~1360
-    // codepoints). Test codepoints picked to land inside the
-    // baked ranges declared in ui/styles.css (U+1F000-1FFFF +
-    // U+2600-27BF):
-    //   U+1F31F = 🌟 (glowing star, supplementary plane)
-    //   U+2728  = ✨ (sparkles, Dingbats block)
-    // Codepoints outside these ranges (e.g. U+2B50 ⭐ in Misc
-    // Symbols and Arrows) fall through to MSDF/tofu, matching the
-    // browser's font-fallback behavior with the same
-    // unicode-range declaration.
-    fn load_emoji_atlas_for_test() -> crate::sdf_atlas_emoji::EmojiAtlas {
-        crate::sdf_atlas_emoji::load_emoji_atlas()
-            .expect("baked emoji atlas parses")
-    }
+    // Slice 3D (2026-05-19): the SDF-arc-C.3 emoji segmentation
+    // tests that depended on the build-time CBDT atlas have been
+    // retired alongside the CBDT bake itself. Emoji codepoints now
+    // route to the runtime COLRv1 cache via
+    // `crate::glyph_cache_colr`; coverage for the COLRv1
+    // rasterizer lives in `glyph_cache_colr::tests` (the
+    // grinning_face / red_heart / earth_globe / absent_codepoint
+    // suite). The two host-side tests below cover the codepoint-
+    // range dispatch shape — emoji-range with no runtime cache
+    // falls through to Tofu (matches Pending-on-first-frame
+    // semantics with a None cache), and out-of-range codepoints
+    // still fall through to MSDF/Tofu just like before.
 
     #[test]
-    fn layout_text_to_quads_emits_emoji_for_baked_codepoint() {
+    fn layout_text_to_quads_emoji_range_no_runtime_cache_emits_tofu() {
         let atlas = load_anton_atlas();
-        let emoji = load_emoji_atlas_for_test();
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", 100.0, f32::INFINITY, None)
-            .expect("emoji-only string lays out");
-        assert_eq!(group.quads.len(), 1);
-        match group.quads[0].kind {
-            GlyphKind::Emoji { page } => {
-                // Page index is whatever the bake assigned (typically 0
-                // for low-range codepoints). Just sanity: < the
-                // manifest's page count.
-                assert!(
-                    page < emoji.manifest.pages,
-                    "emoji page {page} out of range vs manifest pages {}",
-                    emoji.manifest.pages,
-                );
-            }
-            other => panic!("expected GlyphKind::Emoji, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn layout_text_to_quads_falls_through_to_tofu_when_no_emoji_atlas() {
-        let atlas = load_anton_atlas();
-        // Same codepoint as above but no emoji atlas supplied -- the
-        // dispatch should hit the MSDF-miss path and emit tofu,
-        // identical to pre-C.3 behavior.
-        let group = layout_text_to_quads(&atlas, None, "\u{1F31F}", 100.0, f32::INFINITY, None)
+        // Same codepoint as the retired emits-emoji-for-baked test
+        // — but with no runtime glyph cache the COLR dispatch
+        // can't fire, so the codepoint falls through to MSDF
+        // (which doesn't have it) and emits Tofu, matching the
+        // pre-3D no-emoji-atlas behavior.
+        let group = layout_text_to_quads(&atlas, "\u{1F31F}", 100.0, f32::INFINITY, None)
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
         assert_eq!(group.quads[0].kind, GlyphKind::Tofu);
-    }
-
-    #[test]
-    fn layout_text_to_quads_mixed_msdf_emoji_tofu_runs() {
-        let atlas = load_anton_atlas();
-        let emoji = load_emoji_atlas_for_test();
-        // "A🌟B" -- two MSDF glyphs flanking an emoji.
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "A\u{1F31F}B", 100.0, f32::INFINITY, None)
-            .expect("mixed run lays out");
-        assert_eq!(group.quads.len(), 3);
-        assert_eq!(group.quads[0].kind, GlyphKind::Msdf);
-        match group.quads[1].kind {
-            GlyphKind::Emoji { .. } => {}
-            other => panic!("expected emoji in middle, got {other:?}"),
-        }
-        assert_eq!(group.quads[2].kind, GlyphKind::Msdf);
-        // Order: left-to-right by px_left.
-        assert!(group.quads[0].px_left < group.quads[1].px_left);
-        assert!(group.quads[1].px_left < group.quads[2].px_left);
-    }
-
-    #[test]
-    fn layout_text_to_quads_emoji_quad_is_square_and_em_sized() {
-        let atlas = load_anton_atlas();
-        let emoji = load_emoji_atlas_for_test();
-        let size_px = 100.0;
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{1F31F}", size_px, f32::INFINITY, None)
-            .expect("emoji lays out");
-        let q = &group.quads[0];
-        let w = q.px_right - q.px_left;
-        let h = q.px_bottom - q.px_top;
-        // Square cell.
-        assert!(
-            (w - h).abs() < 0.5,
-            "emoji quad not square: {w} x {h}"
-        );
-        // Geometry per design Q3: cell_em * size_px. cell_em
-        // = cell_px / source_ppem (typically 96/128 = 0.75).
-        let expected_em =
-            emoji.manifest.cell_px as f32 / emoji.manifest.source_ppem as f32;
-        let expected_px = expected_em * size_px;
-        assert!(
-            (w - expected_px).abs() < 1.0,
-            "emoji quad width {w} != expected {expected_px}"
-        );
     }
 
     #[test]
     fn layout_text_to_quads_out_of_range_codepoint_falls_to_tofu() {
         let atlas = load_anton_atlas();
-        let emoji = load_emoji_atlas_for_test();
         // U+2B50 ⭐ is in Misc Symbols + Arrows (U+2B00-2BFF),
-        // OUTSIDE the ui/styles.css declared ranges. The browser
-        // wouldn't render this from Noto Color Emoji either; we
-        // mirror that fallback for parity.
-        let group = layout_text_to_quads(&atlas, Some(&emoji), "\u{2B50}", 100.0, f32::INFINITY, None)
+        // OUTSIDE the codepoint_is_emoji_range gate. The COLR
+        // dispatch never fires for it; MSDF doesn't have it
+        // either; Tofu is the result — matches browser's font-
+        // fallback behavior with the same unicode-range
+        // declaration.
+        let group = layout_text_to_quads(&atlas, "\u{2B50}", 100.0, f32::INFINITY, None)
             .expect("tofu lays out");
         assert_eq!(group.quads.len(), 1);
         assert_eq!(group.quads[0].kind, GlyphKind::Tofu);

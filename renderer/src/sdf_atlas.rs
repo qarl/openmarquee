@@ -112,9 +112,13 @@ pub struct MsdfAtlas {
     pub atlas_rgb: &'static [u8],
 }
 
-/// Compile-time-baked atlases for every font in `ui/fonts/*.ttf`
-/// EXCEPT `noto-color-emoji.ttf` (which gets a separate
-/// color-bitmap atlas in slice C).
+/// Compile-time-baked MSDF atlases for every font in
+/// `ui/fonts/*.ttf` EXCEPT the color-emoji fonts
+/// (`noto-color-emoji.ttf` / `noto-color-emoji-colrv1.ttf` — both
+/// skipped because MSDF can't represent the multi-color glyph
+/// data they carry). Slice 3D retired the static CBDT bake of
+/// the former; the latter is the runtime COLRv1 source loaded by
+/// `crate::glyph_cache_colr`.
 ///
 /// Built into the binary via `include_bytes!` / `include_str!` from
 /// `OUT_DIR/sdf-atlases/`.

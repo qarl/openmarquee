@@ -764,4 +764,43 @@ mod tests {
             "U+25CF (●) should not be present in NotoColorEmoji-COLRv1",
         );
     }
+
+    #[test]
+    fn rasterizes_every_demo_reel_emoji_codepoint() {
+        // Slice 3D (2026-05-19): after CBDT retirement, EVERY emoji
+        // on the FYS demo reel is served by this COLRv1 path. The
+        // only emoji-bearing slide is SCREAM (slide 10), text
+        // "🔓 🫵 🪧". Verify all three codepoints rasterize so the
+        // cutover can't silently regress one of them to Tofu.
+        //   🔓 U+1F513 OPEN LOCK
+        //   🫵 U+1FAF5 INDEX POINTING AT THE VIEWER (Unicode 14)
+        //   🪧 U+1FAA7 PLACARD (Unicode 14)
+        let path = colrv1_font_path();
+        if !path.exists() {
+            return;
+        }
+        for &(cp, name) in &[
+            (0x1F513_u32, "🔓 open lock"),
+            (0x1FAF5_u32, "🫵 index pointing at viewer"),
+            (0x1FAA7_u32, "🪧 placard"),
+        ] {
+            let out = rasterize_colr_cell(&path, cp)
+                .unwrap_or_else(|e| panic!("rasterize errored for {name} (U+{cp:04X}): {e}"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} (U+{cp:04X}) returned None — NotoColorEmoji-COLRv1 \
+                         lacks this glyph; the demo reel would show Tofu for it",
+                    )
+                });
+            assert_eq!(out.cell_px, COLR_CELL_PX, "{name}: wrong cell_px");
+            assert_eq!(
+                out.rgba_bytes.len() as u32,
+                COLR_CELL_PX * COLR_CELL_PX * 4,
+                "{name}: wrong rgba buffer length",
+            );
+            let any_nonzero_alpha = out.rgba_bytes.chunks_exact(4).any(|p| p[3] != 0);
+            assert!(any_nonzero_alpha, "{name}: rasterized cell is fully transparent");
+            assert!(out.advance_em > 0.0, "{name}: non-positive advance_em");
+        }
+    }
 }

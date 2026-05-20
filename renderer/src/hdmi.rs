@@ -374,13 +374,6 @@ pub struct EglSession<'a> {
     /// quad-layout pass + atlas-lookup don't re-parse JSON per
     /// draw.
     msdf_atlases: Vec<crate::sdf_atlas_gl::MsdfAtlasGl>,
-    /// SDF arc slice C.2 -- session-wide emoji color-bitmap atlases.
-    /// One GL_RGBA8 texture per atlas page (up to 8 pages, ~3 pages
-    /// in practice for Noto's coverage of our codepoint ranges).
-    /// Uploaded once at session bring-up by `sdf_atlas_emoji_gl::
-    /// upload_all`; freed at teardown by `delete_all`. C.3 wires the
-    /// codepoint-segmented layout path that consumes these.
-    emoji_atlases: Vec<crate::sdf_atlas_emoji_gl::EmojiAtlasGl>,
     /// Bug 3 Slice 1 part B (2026-05-19): dynamic runtime glyph
     /// cache for codepoints not in the static build-time-baked
     /// MSDF atlas (e.g. ●, ∞). Cache + atlas page created at session
@@ -602,7 +595,6 @@ where
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
         msdf_atlases: Vec::new(),
-        emoji_atlases: Vec::new(),
         // Bug 3 Slice 1 part B (2026-05-19): construct the dynamic
         // glyph cache + its backing atlas page upfront. GlyphCache
         // spawns 4 std::thread workers via crossbeam-channel mpsc;
@@ -671,27 +663,13 @@ where
         populate_dynamic_atlas_colr_lookup(tex);
     }
 
-    // SDF arc slice C.2 -- decode + upload the Noto Color Emoji
-    // color-bitmap atlas pages. ~3 pages at ~16 MB RGBA each
-    // (4 baked + 4 placeholders that load_emoji_atlas trims).
-    // Failure semantics: emoji-side failure is non-fatal (slides
-    // without emoji render fine without the atlas); log + continue.
-    match crate::sdf_atlas_emoji::load_emoji_atlas() {
-        Ok(emoji_atlas) => {
-            match crate::sdf_atlas_emoji_gl::upload_all(&gl, &emoji_atlas) {
-                Ok(uploaded) => {
-                    session.emoji_atlases = uploaded;
-                    populate_emoji_lookup(&emoji_atlas, &session.emoji_atlases);
-                }
-                Err(e) => {
-                    eprintln!("warn: emoji atlas upload failed: {e}; emoji will render as tofu");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("warn: emoji atlas load failed: {e}; emoji will render as tofu");
-        }
-    }
+    // Slice 3D (2026-05-19): the SDF-arc-C.2 CBDT atlas upload
+    // (~64 MB RGBA across ~3 pages, plus the `EMOJI_ATLAS_CPU`
+    // OnceLock + per-page GL textures) is retired. Emoji
+    // codepoints now route to the Slice 3B runtime COLRv1 cache
+    // via `dynamic_atlas_page_colr` set up above. The COLR cache
+    // rasterizes each codepoint on first encounter and emits a
+    // GlyphKind::DynamicEmoji quad on subsequent frames.
 
     let work_result = work(&mut session);
 
@@ -739,12 +717,9 @@ where
     // teardown can't dereference dead texture handles.
     clear_msdf_lookup();
     crate::sdf_atlas_gl::delete_all(&gl, &mut session.msdf_atlases);
-    // SDF arc slice C.2 -- free emoji atlas textures while GL is
-    // still bound. Clear lookup table BEFORE delete_all so a stale
-    // lookup can't outlive the NativeTexture handles (parallels
-    // the MSDF teardown ordering).
-    clear_emoji_lookup();
-    crate::sdf_atlas_emoji_gl::delete_all(&gl, &mut session.emoji_atlases);
+    // Slice 3D (2026-05-19): the CBDT-side `clear_emoji_lookup()` +
+    // `delete_all` of session.emoji_atlases are gone alongside the
+    // atlas itself. Only the dynamic-COLR teardown below remains.
     // Bug 3 Slice 1 part B (2026-05-19): free the dynamic atlas
     // page texture while GL is still bound. dynamic_glyph_cache's
     // Drop signals + joins the worker pool on session-struct drop
@@ -2137,9 +2112,9 @@ fn draw_text_layer_msdf(
     //   - `tofu_verts`: missing-codepoint quads; drawn with FS_TOFU.
     //     UVs span [0,1] across each tofu quad so FS_TOFU can use
     //     them as in-rect coordinates for the outline test.
-    //   - `emoji_per_page`: color-emoji quads, keyed by emoji-atlas
-    //     page. Each page produces one draw call with that page's
-    //     bound texture (a single text run can touch >1 page).
+    //   - Slice 3D: the CBDT-side `emoji_per_page` BTreeMap is
+    //     retired alongside the static atlas; emoji draws now go
+    //     through `dynamic_emoji_verts` only (Slice 3B).
     let mut ink_verts: Vec<f32> = Vec::with_capacity(group.quads.len() * 24);
     let mut tofu_verts: Vec<f32> = Vec::new();
     // Bug 3 Slice 2B: dynamic-MSDF quads. Same vert layout as
@@ -2156,11 +2131,6 @@ fn draw_text_layer_msdf(
     // (FS_EMOJI program — same shader the static CBDT path uses;
     // only the bound texture differs).
     let mut dynamic_emoji_verts: Vec<f32> = Vec::new();
-    // BTreeMap (not HashMap) so multi-page emoji draws iterate in
-    // page-index order -- gives goldens a deterministic draw order
-    // when an emoji-bearing text touches multiple atlas pages.
-    let mut emoji_per_page: std::collections::BTreeMap<u32, Vec<f32>> =
-        std::collections::BTreeMap::new();
     for q in &group.quads {
         let xl = to_ndc_x(q.px_left);
         let xr = to_ndc_x(q.px_right);
@@ -2186,21 +2156,6 @@ fn draw_text_layer_msdf(
                 let ut = q.uv_top;
                 let ub = q.uv_bottom;
                 ink_verts.extend_from_slice(&[
-                    xl, yb, ul, ub,
-                    xr, yb, ur, ub,
-                    xl, yt, ul, ut,
-                    xr, yb, ur, ub,
-                    xl, yt, ul, ut,
-                    xr, yt, ur, ut,
-                ]);
-            }
-            GlyphKind::Emoji { page } => {
-                let ul = q.uv_left;
-                let ur = q.uv_right;
-                let ut = q.uv_top;
-                let ub = q.uv_bottom;
-                let bucket = emoji_per_page.entry(page).or_insert_with(Vec::new);
-                bucket.extend_from_slice(&[
                     xl, yb, ul, ub,
                     xr, yb, ur, ub,
                     xl, yt, ul, ut,
@@ -2246,7 +2201,6 @@ fn draw_text_layer_msdf(
     }
     if ink_verts.is_empty()
         && tofu_verts.is_empty()
-        && emoji_per_page.is_empty()
         && dynamic_ink_verts.is_empty()
         && dynamic_emoji_verts.is_empty()
     {
@@ -2378,63 +2332,11 @@ fn draw_text_layer_msdf(
             gl.delete_buffer(vbo);
         }
 
-        // Batch 3 (SDF arc slice C.3): emoji color-bitmap quads,
-        // one draw call per atlas page. Empty when no emoji in
-        // this layer. Pages with no GL-side texture (e.g. emoji
-        // atlas failed to upload at bring-up) are silently dropped.
-        if !emoji_per_page.is_empty() {
-            let egp = cached_emoji_program(gl)?;
-            let stride = (4 * std::mem::size_of::<f32>()) as i32;
-            for (page, verts) in emoji_per_page.iter() {
-                let tex = EMOJI_ATLAS_LOOKUP.with(|c| {
-                    c.borrow()
-                        .iter()
-                        .find(|(p, _)| *p == *page)
-                        .map(|(_, t)| *t)
-                });
-                let Some(emoji_tex) = tex else {
-                    // No GL texture for this page (atlas failed to
-                    // upload at bring-up). Skip rather than fall
-                    // through to tofu -- the layout side already
-                    // committed to emoji geometry for this quad,
-                    // and emitting tofu now would have the wrong
-                    // bounds.
-                    continue;
-                };
-                let vbo = gl
-                    .create_buffer()
-                    .map_err(|e| anyhow!("glGenBuffers (emoji page {page}): {e}"))?;
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-                let bytes = std::slice::from_raw_parts(
-                    verts.as_ptr() as *const u8,
-                    verts.len() * std::mem::size_of::<f32>(),
-                );
-                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-
-                gl.use_program(Some(egp.program));
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(emoji_tex));
-                gl.uniform_1_i32(egp.u_atlas.as_ref(), 0);
-                gl.uniform_1_f32(egp.u_opacity.as_ref(), opacity);
-
-                gl.enable_vertex_attrib_array(egp.a_pos);
-                gl.vertex_attrib_pointer_f32(egp.a_pos, 2, glow::FLOAT, false, stride, 0);
-                gl.enable_vertex_attrib_array(egp.a_uv);
-                gl.vertex_attrib_pointer_f32(
-                    egp.a_uv,
-                    2,
-                    glow::FLOAT,
-                    false,
-                    stride,
-                    (2 * std::mem::size_of::<f32>()) as i32,
-                );
-                let vert_count = (verts.len() / 4) as i32;
-                gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
-                gl.disable_vertex_attrib_array(egp.a_pos);
-                gl.disable_vertex_attrib_array(egp.a_uv);
-                gl.delete_buffer(vbo);
-            }
-        }
+        // Batch 3 retired in Slice 3D (2026-05-19): the static
+        // CBDT emoji color-bitmap per-page draw call is gone. The
+        // FS_EMOJI program (link cache) is preserved because the
+        // Slice 3B DynamicEmoji batch below still uses it — same
+        // RGBA passthrough, different texture binding.
 
         // Batch 4 (Bug 3 Slice 2B): dynamic-MSDF glyphs. Same
         // FS_MSDF_FIXED program as the static-MSDF batch (the SDF
@@ -8183,53 +8085,16 @@ fn msdf_atlas_for_family(
 }
 
 // =====================================================================
-// SDF arc slice C.2 -- emoji color-bitmap atlas lookup
+// Slice 3D (2026-05-19) — emoji atlas lookup retired
 // =====================================================================
 //
-// Parallel to the MSDF lookup above. Emoji atlas is process-singleton
-// (built from one TTF), multi-page; the lookup maps page number to
-// the uploaded GL texture for that page. Codepoint -> page resolution
-// lives in the manifest (CPU-side), kept in a OnceLock for the same
-// reason the MSDF CPU-side parsed Vec is.
-
-std::thread_local! {
-    /// Vec<(page, NativeTexture)> indexed by the manifest's page
-    /// number. Populated at session bring-up; cleared at teardown
-    /// BEFORE the GL textures are deleted.
-    static EMOJI_ATLAS_LOOKUP: std::cell::RefCell<Vec<(u32, glow::NativeTexture)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Process-wide parsed emoji atlas. Loaded once at first session
-/// bring-up; subsequent sessions reuse. Matches MSDF_ATLASES_CPU's
-/// pattern.
-static EMOJI_ATLAS_CPU: std::sync::OnceLock<crate::sdf_atlas_emoji::EmojiAtlas> =
-    std::sync::OnceLock::new();
-
-fn populate_emoji_lookup(
-    cpu_atlas: &crate::sdf_atlas_emoji::EmojiAtlas,
-    gl_atlases: &[crate::sdf_atlas_emoji_gl::EmojiAtlasGl],
-) {
-    // First session populates the CPU-side cache; subsequent
-    // sessions skip via OnceLock semantics.
-    let _ = EMOJI_ATLAS_CPU.get_or_init(|| crate::sdf_atlas_emoji::EmojiAtlas {
-        manifest: cpu_atlas.manifest.clone(),
-        pages_png: cpu_atlas.pages_png.clone(),
-    });
-    // GL-side lookup is rebuilt every session because the
-    // NativeTexture handles are session-scoped.
-    EMOJI_ATLAS_LOOKUP.with(|c| {
-        let mut v = c.borrow_mut();
-        v.clear();
-        for a in gl_atlases {
-            v.push((a.page, a.tex));
-        }
-    });
-}
-
-fn clear_emoji_lookup() {
-    EMOJI_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
-}
+// Pre-3D this section housed `EMOJI_ATLAS_LOOKUP` (Vec<(page,
+// NativeTexture)>) + `EMOJI_ATLAS_CPU` (OnceLock<EmojiAtlas>) +
+// `populate_emoji_lookup` / `clear_emoji_lookup`. All retired
+// alongside the CBDT bake. Emoji draw resolution now goes through
+// `DYNAMIC_ATLAS_COLR_LOOKUP` (Slice 3B) — see
+// `populate_dynamic_atlas_colr_lookup` / `dynamic_atlas_colr_tex`
+// elsewhere in this file.
 
 /// qarl-direct perf-profile (2026-05-08): transition shader cache.
 /// Each render_transition_animated_in_session invocation was
@@ -9597,7 +9462,6 @@ fn paint_slide_with_viewport(
                 let wrapped =
                     wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
-                let emoji_atlas_cpu = EMOJI_ATLAS_CPU.get();
                 let group = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
                     .and_then(|(_atlas_tex, atlas)| {
@@ -9606,14 +9470,12 @@ fn paint_slide_with_viewport(
                         // wrap_text_to_width above — natural-overflow
                         // lines get squished to boxW; lines that fit
                         // pass through unchanged.
-                        // Bug 3 Slice 2B: borrow `runtime_glyph_ctx` for
-                        // this layout pass. The dispatch hook inside
-                        // layout_text_to_quads handles None opt-out
-                        // (test sites + standalone callers without a
-                        // session pass None upstream).
+                        // Slice 3D (2026-05-19): emoji arg retired
+                        // alongside the static-CBDT atlas. Emoji
+                        // codepoints route to the runtime COLRv1
+                        // cache via runtime_glyph_ctx below.
                         crate::hdmi_logic::layout_text_to_quads(
                             atlas,
-                            emoji_atlas_cpu,
                             &wrapped,
                             size_px,
                             max_width_px,
