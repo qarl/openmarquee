@@ -12,7 +12,7 @@
 // browser TZ" trade-off in the module header.
 
 import { describe, expect, it } from "vitest";
-import { formatAutoText } from "./auto-format.js";
+import { formatAutoText, setSignTimezone } from "./auto-format.js";
 
 describe("formatAutoText", () => {
     describe("mode=time", () => {
@@ -161,6 +161,93 @@ describe("formatAutoText", () => {
             // day: only day_short branches off; everything else =
             // day_long.
             expect(formatAutoText("day", "garbage_format", now)).toBe("Tuesday");
+        });
+    });
+
+    // Parity follow-up (2026-05-20): the auto_mode preview resolves
+    // in the SIGN's configured timezone, not the operator's browser
+    // zone. These tests pin `now` to an explicit UTC INSTANT (via
+    // Date.UTC) so the assertions are deterministic regardless of
+    // the machine running the suite — the `timeZone` arg does the
+    // conversion.
+    describe("explicit timezone (sign-tz preview parity)", () => {
+        it("resolves time in the given IANA zone", () => {
+            // 2026-04-21 23:30:15 UTC. Tokyo is UTC+9, no DST.
+            const now = new Date(Date.UTC(2026, 3, 21, 23, 30, 15));
+            expect(formatAutoText("time", "time_hms", now, "Asia/Tokyo"))
+                .toBe("08:30:15");
+            expect(formatAutoText("time", "time_hms", now, "UTC"))
+                .toBe("23:30:15");
+        });
+
+        it("date rolls over at the sign zone's midnight, not UTC's", () => {
+            // 2026-04-21 23:30 UTC: in Tokyo (+9) it is already the
+            // 22nd; in Los_Angeles (-7 in April, PDT) it is still
+            // the 21st. The previewed calendar day must follow the
+            // sign zone — same bug class as a wrong clock.
+            const now = new Date(Date.UTC(2026, 3, 21, 23, 30, 0));
+            expect(formatAutoText("date", "date_iso", now, "Asia/Tokyo"))
+                .toBe("2026-04-22");
+            expect(formatAutoText("date", "date_iso", now, "UTC"))
+                .toBe("2026-04-21");
+            expect(formatAutoText("date", "date_iso", now, "America/Los_Angeles"))
+                .toBe("2026-04-21");
+        });
+
+        it("day-of-week follows the sign zone across a date boundary", () => {
+            // 2026-04-21 is a Tuesday (UTC). At 23:30 UTC, Tokyo has
+            // rolled to Wednesday the 22nd.
+            const now = new Date(Date.UTC(2026, 3, 21, 23, 30, 0));
+            expect(formatAutoText("day", "day_long", now, "UTC")).toBe("Tuesday");
+            expect(formatAutoText("day", "day_long", now, "Asia/Tokyo"))
+                .toBe("Wednesday");
+        });
+
+        it("honors DST — London is BST (+1) in July, GMT (+0) in January", () => {
+            const july = new Date(Date.UTC(2026, 6, 15, 12, 0, 0));
+            expect(formatAutoText("time", "time_hm", july, "Europe/London"))
+                .toBe("13:00"); // BST = UTC+1
+            const january = new Date(Date.UTC(2026, 0, 15, 12, 0, 0));
+            expect(formatAutoText("time", "time_hm", january, "Europe/London"))
+                .toBe("12:00"); // GMT = UTC+0
+        });
+
+        it("null / omitted timezone falls back to browser-local", () => {
+            // "Device local" — the browser can't know the sign's
+            // zone. Explicit-null and the 3-arg call must agree, and
+            // both equal the browser-local getters' result.
+            const now = new Date(2026, 3, 21, 14, 30, 45);
+            const threeArg = formatAutoText("time", "time_hms", now);
+            const explicitNull = formatAutoText("time", "time_hms", now, null);
+            expect(explicitNull).toBe(threeArg);
+            expect(explicitNull).toBe(
+                `${String(now.getHours()).padStart(2, "0")}:`
+                + `${String(now.getMinutes()).padStart(2, "0")}:`
+                + `${String(now.getSeconds()).padStart(2, "0")}`,
+            );
+        });
+
+        it("an invalid timezone string falls back to browser-local, no throw", () => {
+            const now = new Date(2026, 3, 21, 14, 30, 45);
+            // Must not throw out of the preview render loop.
+            expect(
+                formatAutoText("time", "time_hms", now, "Not/A_Zone"),
+            ).toBe(formatAutoText("time", "time_hms", now, null));
+        });
+    });
+
+    describe("setSignTimezone (app-wide default)", () => {
+        it("setSignTimezone changes the default zone used by 3-arg calls", () => {
+            const now = new Date(Date.UTC(2026, 3, 21, 23, 30, 15));
+            setSignTimezone("Asia/Tokyo");
+            // 3-arg call now uses the module default = Asia/Tokyo.
+            expect(formatAutoText("time", "time_hms", now)).toBe("08:30:15");
+            setSignTimezone("UTC");
+            expect(formatAutoText("time", "time_hms", now)).toBe("23:30:15");
+            // Reset so other test files / cases see the default.
+            setSignTimezone(null);
+            // null default -> browser-local fallback (no throw).
+            expect(typeof formatAutoText("time", "time_hms", now)).toBe("string");
         });
     });
 });

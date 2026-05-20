@@ -47,6 +47,7 @@ import {
     updateTextSlide,
     updateVideo,
 } from "./api.js";
+import { setSignTimezone } from "./auto-format.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
@@ -86,6 +87,13 @@ const DEFAULT_SECTION = "slides";
 async function resolvePanelDims() {
     try {
         const settings = await getSettings();
+        // Parity follow-up (2026-05-20): publish the sign's
+        // configured timezone app-wide so every auto_mode preview
+        // (editor canvas, slide tiles, inline preview) resolves
+        // its clock/date in the SAME zone the device renders in.
+        // Runs before the editor mounts, so the first preview
+        // frame already has the right zone.
+        setSignTimezone(settings.timezone);
         const dims = effectiveDisplayDims(settings);
         const outputMode = settings.output_mode || "hdmi";
         // Schema default is 80 (settings.py:150-155). Coerce to int +
@@ -581,7 +589,14 @@ async function boot() {
 
     mountSettings(root.querySelector(".settings-slot"), {
         fetchSettings: getSettings,
-        onSave: saveSettings,
+        // Parity follow-up: re-publish the sign timezone after a
+        // Settings save so the editor's auto_mode preview tracks a
+        // timezone change without a page reload.
+        onSave: async (s) => {
+            const result = await saveSettings(s);
+            setSignTimezone(s.timezone);
+            return result;
+        },
     });
 
     // Stream panel — phone-camera takeover (SYSTEM_SPEC §5.11). Doesn't
