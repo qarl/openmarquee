@@ -4,6 +4,10 @@ import { mountStreamPanel } from "./stream-panel.js";
 
 beforeEach(() => {
     vi.stubGlobal("RTCPeerConnection", undefined);
+    // The panel persists source-mode + facing-mode + rtsp-url to
+    // localStorage; clear it between tests so one test's writes don't
+    // leak into the next mount's hydration.
+    globalThis.localStorage?.clear();
 });
 
 afterEach(() => {
@@ -155,6 +159,16 @@ function defaultMounts(overrides = {}) {
             session_id: "22222222-2222-2222-2222-222222222222",
             sdp_answer: "v=0\r\nfake-answer\r\n",
             started_at: "2026-04-29T00:00:00+00:00",
+        })),
+        apiStartRtspStream: vi.fn(async () => ({
+            session_id: "33333333-3333-3333-3333-333333333333",
+            sdp_answer: null,
+            started_at: "2026-05-20T00:00:00+00:00",
+        })),
+        apiTakeoverRtspStream: vi.fn(async () => ({
+            session_id: "44444444-4444-4444-4444-444444444444",
+            sdp_answer: null,
+            started_at: "2026-05-20T00:00:00+00:00",
         })),
         apiStopStream: vi.fn(async () => undefined),
         fetchSettings: vi.fn(async () => ({
@@ -1324,5 +1338,187 @@ describe("mountStreamPanel", () => {
         // (already nulled by teardownPC) and skipped failTo. Stop lands
         // in preview (Phase 12.2 followup: camera stays open).
         expect(handle.getState()).toBe("preview");
+    });
+
+    // --- VLC (RTSP) source (STREAM/VLC slice 5) ---------------------------
+
+    function mountVlc(overrides = {}) {
+        // Mount directly in VLC mode by pre-seeding the persisted
+        // source-mode pref — sidesteps racing the camera-mode
+        // mount-init that the default (Camera) mount would run.
+        globalThis.localStorage.setItem(
+            "openmarquee:stream:source-mode",
+            "vlc",
+        );
+        const container = document.createElement("div");
+        const opts = defaultMounts(overrides);
+        const handle = mountStreamPanel(container, opts);
+        return { container, opts, handle };
+    }
+
+    it("renders the source toggle with Camera selected by default", () => {
+        const container = document.createElement("div");
+        mountStreamPanel(container, defaultMounts());
+        expect(container.querySelectorAll(".stream-source-opt").length).toBe(2);
+        const camera = container.querySelector('[data-source="camera"]');
+        const vlc = container.querySelector('[data-source="vlc"]');
+        expect(camera.classList.contains("is-selected")).toBe(true);
+        expect(vlc.classList.contains("is-selected")).toBe(false);
+        // Camera mode: viewfinder shown, VLC panel hidden.
+        expect(container.querySelector(".stream-stage").hidden).toBe(false);
+        expect(container.querySelector(".stream-vlc-panel").hidden).toBe(true);
+    });
+
+    it("switching to VLC shows the URL panel + Start streaming, hides the viewfinder", () => {
+        const container = document.createElement("div");
+        mountStreamPanel(container, defaultMounts());
+        container.querySelector('[data-source="vlc"]').click();
+        expect(container.querySelector(".stream-vlc-panel").hidden).toBe(false);
+        expect(container.querySelector(".stream-stage").hidden).toBe(true);
+        expect(container.querySelector(".stream-start-vlc").hidden).toBe(false);
+        expect(container.querySelector(".stream-go-live").hidden).toBe(true);
+    });
+
+    it("Start streaming in VLC mode calls the rtsp API and goes live", async () => {
+        const { container, opts, handle } = mountVlc();
+        container.querySelector(".stream-vlc-url").value =
+            "rtsp://laptop:8554/live";
+        container.querySelector(".stream-start-vlc").click();
+        await waitFor(() => handle.getState() === "live");
+        expect(opts.apiStartRtspStream).toHaveBeenCalledWith(
+            "rtsp://laptop:8554/live",
+        );
+        // The WebRTC start path must NOT have fired.
+        expect(opts.apiStartStream).not.toHaveBeenCalled();
+        expect(container.querySelector(".stream-stop").hidden).toBe(false);
+        // VLC mode has no viewfinder (camera stage hidden) and no
+        // PC.getStats() metrics grid.
+        expect(container.querySelector(".stream-stage").hidden).toBe(true);
+        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
+    });
+
+    it("VLC start with an empty URL surfaces a message and skips the API", async () => {
+        const { container, opts, handle } = mountVlc();
+        container.querySelector(".stream-vlc-url").value = "   ";
+        container.querySelector(".stream-start-vlc").click();
+        await tick();
+        expect(opts.apiStartRtspStream).not.toHaveBeenCalled();
+        expect(handle.getState()).toBe("idle");
+        expect(
+            container.querySelector(".stream-status").textContent,
+        ).toMatch(/RTSP URL/i);
+    });
+
+    it("VLC live → Stop calls stopStream and returns to idle", async () => {
+        const { container, opts, handle } = mountVlc();
+        container.querySelector(".stream-vlc-url").value =
+            "rtsp://laptop:8554/live";
+        container.querySelector(".stream-start-vlc").click();
+        await waitFor(() => handle.getState() === "live");
+        container.querySelector(".stream-stop").click();
+        await waitFor(() => handle.getState() === "idle");
+        expect(opts.apiStopStream).toHaveBeenCalledWith(
+            "33333333-3333-3333-3333-333333333333",
+        );
+        // VLC has no preview phase — Stop lands in idle, not preview.
+        expect(handle.getState()).toBe("idle");
+    });
+
+    it("VLC start persists the URL + source mode to localStorage", async () => {
+        const { container, handle } = mountVlc();
+        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".stream-start-vlc").click();
+        await waitFor(() => handle.getState() === "live");
+        expect(
+            globalThis.localStorage.getItem("openmarquee:stream:rtsp-url"),
+        ).toBe("rtsp://host:8554/x");
+        expect(
+            globalThis.localStorage.getItem("openmarquee:stream:source-mode"),
+        ).toBe("vlc");
+    });
+
+    it("the source toggle is disabled while a VLC stream is live", async () => {
+        const { container, handle } = mountVlc();
+        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".stream-start-vlc").click();
+        await waitFor(() => handle.getState() === "live");
+        for (const opt of container.querySelectorAll(".stream-source-opt")) {
+            expect(opt.disabled).toBe(true);
+        }
+    });
+
+    it("a 409 from the rtsp start surfaces the take-over prompt", async () => {
+        const conflict = new Error("stream_already_active");
+        conflict.code = "stream_already_active";
+        const { container, handle } = mountVlc({
+            apiStartRtspStream: vi.fn(async () => {
+                throw conflict;
+            }),
+        });
+        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".stream-start-vlc").click();
+        await waitFor(() => handle.getState() === "take-over-prompt");
+        expect(container.querySelector(".stream-take-over").hidden).toBe(false);
+    });
+
+    it("Take over in VLC mode calls the rtsp takeover API", async () => {
+        const conflict = new Error("stream_already_active");
+        conflict.code = "stream_already_active";
+        const { container, opts, handle } = mountVlc({
+            apiStartRtspStream: vi.fn(async () => {
+                throw conflict;
+            }),
+        });
+        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".stream-start-vlc").click();
+        await waitFor(() => handle.getState() === "take-over-prompt");
+        container.querySelector(".stream-take-over").click();
+        await waitFor(() => handle.getState() === "live");
+        expect(opts.apiTakeoverRtspStream).toHaveBeenCalledWith(
+            "rtsp://host:8554/x",
+        );
+        // The WebRTC takeover path must NOT have fired.
+        expect(opts.apiTakeoverStream).not.toHaveBeenCalled();
+    });
+
+    it("VLC Take over with an empty URL surfaces a message and skips the API", async () => {
+        const conflict = new Error("stream_already_active");
+        conflict.code = "stream_already_active";
+        const { container, opts, handle } = mountVlc({
+            apiStartRtspStream: vi.fn(async () => {
+                throw conflict;
+            }),
+        });
+        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".stream-start-vlc").click();
+        await waitFor(() => handle.getState() === "take-over-prompt");
+        // Clear the URL, then tap Take over — it must not call the API.
+        container.querySelector(".stream-vlc-url").value = "   ";
+        container.querySelector(".stream-take-over").click();
+        await tick();
+        expect(opts.apiTakeoverRtspStream).not.toHaveBeenCalled();
+        expect(
+            container.querySelector(".stream-status").textContent,
+        ).toMatch(/RTSP URL/i);
+    });
+
+    it("switching from camera to VLC releases the camera", async () => {
+        // Mount in the default camera mode so mount-init opens the
+        // camera; the switch to VLC must then stop its tracks so the
+        // camera light goes off.
+        const track = makeFakeTrack();
+        const stream = makeFakeStream({ tracks: [track] });
+        const container = document.createElement("div");
+        const handle = mountStreamPanel(
+            container,
+            defaultMounts({ getUserMedia: vi.fn(async () => stream) }),
+        );
+        await waitFor(() => handle.getState() === "preview");
+        expect(track.stopped).toBe(false);
+
+        container.querySelector('[data-source="vlc"]').click();
+
+        expect(track.stopped).toBe(true);
+        expect(container.querySelector(".stream-vlc-panel").hidden).toBe(false);
     });
 });

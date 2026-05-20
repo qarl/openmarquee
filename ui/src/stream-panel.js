@@ -1,9 +1,14 @@
-// Stream panel — phone-camera takeover (SYSTEM_SPEC §5.11).
+// Stream panel — live takeover (SYSTEM_SPEC §5.11 +
+// docs/STREAM_VLC_PROPOSAL.md).
 //
-// One-tap "Go Live" UX: open the back camera, negotiate WebRTC against
-// the device's playback engine (aiortc subscriber), and the device's
-// screen takes over with the live feed. Stop returns the playlist
-// where it was.
+// A source toggle picks between two takeover transports:
+//   - Camera — one-tap "Go Live": open the back camera, negotiate
+//     WebRTC against the device's playback engine (aiortc
+//     subscriber). The flow below.
+//   - VLC stream — paste the RTSP URL the operator's VLC is
+//     publishing; the device pulls it (no camera, no WebRTC, no SDP).
+// Either way the device's screen takes over with the live feed and
+// Stop returns the playlist where it was.
 //
 // Flow on this side:
 //   1. getUserMedia({video:{facingMode:'environment'}, audio:false})
@@ -27,8 +32,10 @@ import {
     effectiveDisplayDims,
     getSettings,
     getStreamStatus,
+    startRtspStream,
     startStream,
     stopStream,
+    takeoverRtspStream,
     takeoverStream,
 } from "./api.js";
 
@@ -66,6 +73,44 @@ function readFacingModePref() {
 function writeFacingModePref(value) {
     try {
         globalThis.localStorage?.setItem(FACING_MODE_LS_KEY, value);
+    } catch {
+        /* quota / disabled — skip */
+    }
+}
+
+// Per-session persistence for the source mode (phone camera vs VLC
+// RTSP stream) and the last-used RTSP URL — same best-effort
+// localStorage pattern as the facing-mode pref. A re-mounted panel
+// resumes on the operator's last source and doesn't make them re-type
+// their VLC address.
+const SOURCE_MODE_LS_KEY = "openmarquee:stream:source-mode";
+const RTSP_URL_LS_KEY = "openmarquee:stream:rtsp-url";
+function readSourceModePref() {
+    try {
+        const v = globalThis.localStorage?.getItem(SOURCE_MODE_LS_KEY);
+        if (v === "camera" || v === "vlc") return v;
+    } catch {
+        /* no localStorage available (private browsing, sandbox) */
+    }
+    return "camera";
+}
+function writeSourceModePref(value) {
+    try {
+        globalThis.localStorage?.setItem(SOURCE_MODE_LS_KEY, value);
+    } catch {
+        /* quota / disabled — skip */
+    }
+}
+function readRtspUrlPref() {
+    try {
+        return globalThis.localStorage?.getItem(RTSP_URL_LS_KEY) || "";
+    } catch {
+        return "";
+    }
+}
+function writeRtspUrlPref(value) {
+    try {
+        globalThis.localStorage?.setItem(RTSP_URL_LS_KEY, value);
     } catch {
         /* quota / disabled — skip */
     }
@@ -116,6 +161,10 @@ const SECTION_TEMPLATE = `
                     <span class="stream-go-live-dot" aria-hidden="true"></span>
                     Go live
                 </button>
+                <button type="button" class="om-btn primary stream-start-vlc" hidden>
+                    <span class="stream-go-live-dot" aria-hidden="true"></span>
+                    Start streaming
+                </button>
                 <button type="button" class="om-btn stream-stop" hidden>
                     <span class="stream-stop-square" aria-hidden="true"></span>
                     Stop
@@ -128,6 +177,13 @@ const SECTION_TEMPLATE = `
                 </button>
             </div>
         </header>
+
+        <div class="stream-source-toggle" role="radiogroup" aria-label="Stream source">
+            <button type="button" class="stream-source-opt is-selected" role="radio"
+                    aria-checked="true" data-source="camera">Camera</button>
+            <button type="button" class="stream-source-opt" role="radio"
+                    aria-checked="false" data-source="vlc">VLC stream</button>
+        </div>
 
         <div class="stream-stage">
             <div class="stream-preview-wrap">
@@ -153,6 +209,25 @@ const SECTION_TEMPLATE = `
                     LIVE
                 </div>
             </div>
+        </div>
+
+        <div class="stream-vlc-panel" hidden>
+            <label class="stream-vlc-url-label" for="stream-vlc-url">RTSP URL</label>
+            <input type="text" id="stream-vlc-url" class="stream-vlc-url"
+                   placeholder="rtsp://your-laptop:8554/live"
+                   autocomplete="off" spellcheck="false" />
+            <details class="stream-vlc-help">
+                <summary>How to publish from VLC</summary>
+                <ol>
+                    <li>In VLC: Media → Stream…</li>
+                    <li>Add your video or playlist, then click Stream.</li>
+                    <li>Destination: choose <b>RTSP</b> — port 8554, path <b>/live</b>.</li>
+                    <li>Click Stream to start, then paste the rtsp:// URL above.</li>
+                </ol>
+                <p class="stream-vlc-help-note">
+                    Your VLC and this sign must be on the same network or tailnet.
+                </p>
+            </details>
         </div>
 
         <div class="stream-paused-row" hidden>
@@ -190,7 +265,9 @@ const SECTION_TEMPLATE = `
  * @param {object} [options] — dependency-injection seams for tests.
  * @param {() => Promise} [options.apiGetStatus]
  * @param {(sdp:string) => Promise} [options.apiStartStream]
+ * @param {(url:string) => Promise} [options.apiStartRtspStream]
  * @param {(sdp:string) => Promise} [options.apiTakeoverStream]
+ * @param {(url:string) => Promise} [options.apiTakeoverRtspStream]
  * @param {(sessionId:string) => Promise} [options.apiStopStream]
  * @param {(constraints) => Promise<MediaStream>} [options.getUserMedia]
  * @param {() => RTCPeerConnection} [options.createPeerConnection]
@@ -210,7 +287,9 @@ export function mountStreamPanel(container, options = {}) {
     const {
         apiGetStatus = getStreamStatus,
         apiStartStream = startStream,
+        apiStartRtspStream = startRtspStream,
         apiTakeoverStream = takeoverStream,
+        apiTakeoverRtspStream = takeoverRtspStream,
         apiStopStream = stopStream,
         fetchSettings = getSettings,
         getUserMedia = (constraints) =>
@@ -221,11 +300,16 @@ export function mountStreamPanel(container, options = {}) {
 
     container.innerHTML = SECTION_TEMPLATE;
 
+    const stageEl = container.querySelector(".stream-stage");
     const previewWrapEl = container.querySelector(".stream-preview-wrap");
     const previewEl = container.querySelector(".stream-preview");
     const previewEmptyEl = container.querySelector(".stream-preview-empty");
     const statusEl = container.querySelector(".stream-status");
     const goLiveBtn = container.querySelector(".stream-go-live");
+    const startVlcBtn = container.querySelector(".stream-start-vlc");
+    const sourceOptEls = container.querySelectorAll(".stream-source-opt");
+    const vlcPanelEl = container.querySelector(".stream-vlc-panel");
+    const vlcUrlEl = container.querySelector(".stream-vlc-url");
     const stopBtn = container.querySelector(".stream-stop");
     const takeOverBtn = container.querySelector(".stream-take-over");
     const cancelTakeoverBtn = container.querySelector(".stream-cancel-takeover");
@@ -237,6 +321,11 @@ export function mountStreamPanel(container, options = {}) {
     const latencyEl = container.querySelector('[data-metric="latency"]');
     const bitrateEl = container.querySelector('[data-metric="bitrate"]');
     const droppedEl = container.querySelector('[data-metric="dropped"]');
+
+    // Pre-fill the RTSP URL field with the operator's last-used VLC
+    // address so a re-mount (or a return visit) doesn't make them
+    // re-type it.
+    vlcUrlEl.value = readRtspUrlPref();
 
     // Mirror the device's display aspect ratio onto the preview wrap so
     // the operator sees actual cropping (object-fit: cover on the video
@@ -293,7 +382,12 @@ export function mountStreamPanel(container, options = {}) {
         // cycles. Re-§5.11: flip is hot-swappable mid-stream via
         // track.replaceTrack — no PC teardown.
         facingMode: readFacingModePref(),
-        // Active RTCPeerConnection. Null between sessions.
+        // "camera" (phone WebRTC) | "vlc" (operator's VLC over RTSP).
+        // Hydrated from localStorage so the operator's last source
+        // choice survives mount cycles.
+        sourceMode: readSourceModePref(),
+        // Active RTCPeerConnection. Null between sessions, and always
+        // null in VLC mode (RTSP has no peer connection).
         pc: null,
         // User-facing message rendered into .stream-status. Reset when
         // a transition clears it.
@@ -426,11 +520,38 @@ export function mountStreamPanel(container, options = {}) {
     }
 
     function render() {
-        // Visibility matrix per phase. The render is idempotent — call
-        // it after every state mutation; the DOM converges.
+        // Visibility matrix per phase + source mode. The render is
+        // idempotent — call it after every state mutation; the DOM
+        // converges.
         const phase = state.phase;
+        const isVlc = state.sourceMode === "vlc";
+        const isCamera = !isVlc;
         const ready = phase === "idle" || phase === "preview" || phase === "error";
-        goLiveBtn.hidden = !ready;
+
+        // Source toggle: reflect the selection, and lock it while a
+        // session is starting or live — the source can't be swapped
+        // mid-stream.
+        const lockToggle =
+            phase === "requesting-camera" ||
+            phase === "negotiating" ||
+            phase === "live";
+        for (const opt of sourceOptEls) {
+            const selected = opt.dataset.source === state.sourceMode;
+            opt.classList.toggle("is-selected", selected);
+            opt.setAttribute("aria-checked", selected ? "true" : "false");
+            opt.disabled = lockToggle;
+        }
+
+        // Camera-mode viewfinder vs VLC-mode URL panel.
+        stageEl.hidden = isVlc;
+        vlcPanelEl.hidden = isCamera;
+
+        // Action buttons. Camera mode shows Go live; VLC mode shows
+        // Start streaming. VLC has no preview phase — its ready set is
+        // just idle/error.
+        const vlcReady = phase === "idle" || phase === "error";
+        goLiveBtn.hidden = !(isCamera && ready);
+        startVlcBtn.hidden = !(isVlc && vlcReady);
         stopBtn.hidden = phase !== "live";
         takeOverBtn.hidden = phase !== "take-over-prompt";
         cancelTakeoverBtn.hidden = phase !== "take-over-prompt";
@@ -444,28 +565,30 @@ export function mountStreamPanel(container, options = {}) {
             !state.localStream || (phase !== "preview" && phase !== "live");
 
         // LIVE pill on the viewfinder + metrics grid below it: only
-        // while live. The paused-playlist hint shows in any "ready"
-        // phase (idle/preview/error) — i.e. anywhere Go live is
-        // available.
+        // while live. The metrics grid is camera-only — VLC has no
+        // RTCPeerConnection to read getStats() from. The paused-
+        // playlist hint shows in any "ready" phase.
         livePillEl.hidden = phase !== "live";
-        metricsGridEl.hidden = phase !== "live";
+        metricsGridEl.hidden = !(isCamera && phase === "live");
         pausedRowEl.hidden = !ready;
 
         // Empty-state cover only when there's no local preview to show.
         previewEmptyEl.hidden = state.localStream !== null;
 
-        // Disable Go live during transient phases so a double-tap can't
-        // start two negotiations.
+        // Disable the action buttons during transient phases so a
+        // double-tap can't start two sessions.
         goLiveBtn.disabled =
             phase === "requesting-camera" || phase === "negotiating";
+        startVlcBtn.disabled = phase === "negotiating";
 
         // Elapsed + stats timer lifecycle. Both 1Hz, both started on
         // the live transition + cleared on every non-live phase.
+        // Camera mode only — VLC has no PC and no metrics grid.
         // simulateOnly's stats timer skips the polling work (no real
         // PC) but keeps the mock cell values intact as the demo
         // payoff — render() doesn't reset them on phase=live so they
         // persist as long as the panel mounts.
-        if (phase === "live") {
+        if (phase === "live" && isCamera) {
             if (state.startedAt === null) state.startedAt = Date.now();
             tickElapsed();
             if (elapsedTimer === null) {
@@ -759,12 +882,11 @@ export function mountStreamPanel(container, options = {}) {
 
     async function stopLive() {
         const sessionId = state.sessionId;
-        // Phase 12.2 followup: keep the camera open + return to
-        // preview so the operator can re-go-live without another
-        // permission dialog. The PC is torn down (the session is
-        // over); the local camera stream is preserved as the
-        // viewfinder source.
-        teardownPC({ keepCamera: true });
+        const wasVlc = state.sourceMode === "vlc";
+        // Camera mode: keep the camera open + return to preview so the
+        // operator can re-go-live without another permission dialog.
+        // VLC mode has no camera + no PC — it drops straight to idle.
+        teardownPC({ keepCamera: !wasVlc });
         state.sessionId = null;
         // simulateOnly minted the session_id locally — the backend
         // never knew about it, so /api/stream/stop has nothing to
@@ -774,16 +896,22 @@ export function mountStreamPanel(container, options = {}) {
                 if (sessionId) await apiStopStream(sessionId);
             } catch {
                 // Stop API failure is non-fatal — the device times
-                // out the session on PC disconnect anyway. Don't
-                // block the operator.
+                // out the session on disconnect anyway. Don't block
+                // the operator.
             }
         }
-        state.phase = "preview";
+        state.phase = wasVlc ? "idle" : "preview";
         setMessage("");
         render();
     }
 
     async function takeOver() {
+        // VLC takeovers re-issue the RTSP start against /takeover; the
+        // camera takeover path below is webrtc-only.
+        if (state.sourceMode === "vlc") {
+            await takeOverVlc();
+            return;
+        }
         try {
             state.phase = "requesting-camera";
             setMessage("Requesting camera access…");
@@ -805,6 +933,126 @@ export function mountStreamPanel(container, options = {}) {
         } catch (err) {
             failTo(err);
         }
+    }
+
+    // --- VLC (RTSP) source handlers ---------------------------------------
+
+    function readVlcUrl() {
+        return (vlcUrlEl.value || "").trim();
+    }
+
+    async function startVlc() {
+        // Let a still-running mount-init settle first, so its /status
+        // pre-flight can't race this one (mirrors goLive()).
+        if (mountInitPromise) {
+            try {
+                await mountInitPromise;
+            } catch {
+                /* mount-init swallows its own errors */
+            }
+        }
+        if (state.phase === "take-over-prompt") {
+            // Mount-init resolved into take-over-prompt — another
+            // source owns the screen; nothing for startVlc to do.
+            return;
+        }
+        const url = readVlcUrl();
+        if (!url) {
+            setMessage("Enter the RTSP URL your VLC is publishing.");
+            return;
+        }
+        writeRtspUrlPref(url);
+        // Pre-flight /status: if another source owns the screen,
+        // surface the take-over prompt instead of failing the start.
+        try {
+            const status = await apiGetStatus();
+            if (status.state === "active") {
+                state.phase = "take-over-prompt";
+                setMessage("Someone else is streaming to this screen.");
+                render();
+                return;
+            }
+        } catch {
+            // /status failure is non-fatal — try /start anyway; its
+            // response (200 or 409) tells us the truth.
+        }
+        try {
+            state.phase = "negotiating";
+            setMessage("Connecting to VLC…");
+            render();
+            if (simulateOnly) {
+                await simulateNegotiate();
+            } else {
+                const { session_id, started_at } =
+                    await apiStartRtspStream(url);
+                state.sessionId = session_id;
+                const startedMs = started_at ? Date.parse(started_at) : NaN;
+                if (Number.isFinite(startedMs)) state.startedAt = startedMs;
+            }
+            state.phase = "live";
+            setMessage("Live from VLC.");
+            render();
+        } catch (err) {
+            if (err && err.code === "stream_already_active") {
+                // Race: nothing active at the /status check, but
+                // another source hit /start in the gap.
+                state.phase = "take-over-prompt";
+                setMessage("Someone else is streaming to this screen.");
+                render();
+                return;
+            }
+            failTo(err);
+        }
+    }
+
+    async function takeOverVlc() {
+        const url = readVlcUrl();
+        if (!url) {
+            setMessage("Enter the RTSP URL your VLC is publishing.");
+            return;
+        }
+        writeRtspUrlPref(url);
+        try {
+            state.phase = "negotiating";
+            setMessage("Taking over…");
+            render();
+            if (simulateOnly) {
+                await simulateNegotiate();
+            } else {
+                const { session_id, started_at } =
+                    await apiTakeoverRtspStream(url);
+                state.sessionId = session_id;
+                const startedMs = started_at ? Date.parse(started_at) : NaN;
+                if (Number.isFinite(startedMs)) state.startedAt = startedMs;
+            }
+            state.phase = "live";
+            setMessage("Live from VLC.");
+            render();
+        } catch (err) {
+            failTo(err);
+        }
+    }
+
+    function switchSourceMode(mode) {
+        if (mode !== "camera" && mode !== "vlc") return;
+        if (mode === state.sourceMode) return;
+        // The toggle is render()-disabled while a session is starting
+        // or live; guard here too against a stale click.
+        if (
+            state.phase === "requesting-camera" ||
+            state.phase === "negotiating" ||
+            state.phase === "live"
+        ) {
+            return;
+        }
+        state.sourceMode = mode;
+        writeSourceModePref(mode);
+        // Leaving camera mode drops the camera so its light goes off;
+        // either way the panel resets to idle (a fresh start).
+        teardownPC();
+        state.phase = "idle";
+        setMessage("");
+        render();
     }
 
     function cancelTakeover() {
@@ -888,6 +1136,9 @@ export function mountStreamPanel(container, options = {}) {
             render();
             return;
         }
+        // VLC mode has no camera to pre-open — the panel just sits
+        // idle with the RTSP URL field ready for the operator.
+        if (state.sourceMode === "vlc") return;
         try {
             state.phase = "requesting-camera";
             setMessage("Requesting camera access…");
@@ -922,6 +1173,22 @@ export function mountStreamPanel(container, options = {}) {
 
     goLiveBtn.addEventListener("click", () => {
         goLive();
+    });
+    startVlcBtn.addEventListener("click", () => {
+        startVlc();
+    });
+    for (const opt of sourceOptEls) {
+        opt.addEventListener("click", () => {
+            switchSourceMode(opt.dataset.source);
+        });
+    }
+    // Pressing Enter in the RTSP URL field starts the VLC stream — the
+    // operator just pasted a URL; Enter is the expected commit gesture.
+    vlcUrlEl.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" && !startVlcBtn.hidden && !startVlcBtn.disabled) {
+            ev.preventDefault();
+            startVlc();
+        }
     });
     stopBtn.addEventListener("click", () => {
         stopLive();

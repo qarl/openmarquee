@@ -4085,6 +4085,86 @@ html, body { margin: 0; padding: 0; height: 100%; }
     color: var(--om-text, var(--text));
 }
 
+/* --- VLC stream source (STREAM/VLC) ---------------------------------- */
+
+/* Segmented control: pick the takeover source (camera vs VLC). */
+.stream-source-toggle {
+    display: inline-flex;
+    align-self: flex-start;
+    gap: 2px;
+    padding: 2px;
+    border-radius: var(--om-radius, 0.5rem);
+    background: var(--om-line, var(--panel-border));
+}
+.stream-source-opt {
+    appearance: none;
+    border: 0;
+    cursor: pointer;
+    padding: 6px 16px;
+    font: inherit;
+    font-size: 14px;
+    border-radius: calc(var(--om-radius, 0.5rem) - 2px);
+    background: transparent;
+    color: var(--om-text-dim, var(--text));
+}
+.stream-source-opt.is-selected {
+    background: var(--om-surface-2, var(--panel-bg, #fff));
+    color: var(--om-text, var(--text));
+    font-weight: 600;
+}
+.stream-source-opt:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+/* VLC RTSP URL field + the publish-instructions disclosure. Occupies
+   the same slot the camera viewfinder uses; the two are toggled by
+   source mode. */
+.stream-vlc-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.stream-vlc-url-label {
+    font-size: 13px;
+    color: var(--om-text-dim, var(--text));
+}
+.stream-vlc-url {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    font-family: var(--om-mono, monospace);
+    font-size: 14px;
+    color: var(--om-text, var(--text));
+    background: var(--om-led-bg, #000);
+    border: 1px solid var(--om-line, var(--panel-border));
+    border-radius: var(--om-radius, 0.5rem);
+}
+.stream-vlc-url:focus {
+    outline: none;
+    border-color: var(--om-accent);
+    box-shadow: 0 0 0 1px var(--om-accent);
+}
+.stream-vlc-help {
+    font-size: 13px;
+    color: var(--om-text-dim, var(--text));
+}
+.stream-vlc-help summary {
+    cursor: pointer;
+    padding: 4px 0;
+}
+.stream-vlc-help ol {
+    margin: 6px 0 0;
+    padding-left: 1.4em;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.stream-vlc-help-note {
+    margin: 8px 0 0;
+    opacity: 0.85;
+}
+
 
 /* --- Flock panel — om-flock-grid + om-peer-card (per the 2026-04-28
    design handoff). The prior flock-tile-* rules above are deprecated

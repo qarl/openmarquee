@@ -657,6 +657,36 @@ export async function startStream(sdpOffer) {
 }
 
 /**
+ * Start a VLC takeover. The Pi pulls the RTSP URL the operator's VLC
+ * is publishing — there is no SDP, so the response's `sdp_answer` is
+ * null; only `session_id` + `started_at` matter. Throws the same
+ * structured 409 error as startStream when another source already
+ * owns the screen.
+ */
+export async function startRtspStream(url) {
+    const response = await apiFetch("/api/stream/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "rtsp", url }),
+        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
+    });
+    if (response.status === 409) {
+        const body = await response.json();
+        const detail = body?.detail || {};
+        const err = new Error("stream_already_active");
+        err.code = detail.error || "stream_already_active";
+        err.activeSessionId = detail.active_session_id || null;
+        err.status = 409;
+        throw err;
+    }
+    if (!response.ok) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(`Stream start failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
  * Force-stop any active session and start a new one in the same call.
  * Same response shape as startStream — phone applies the answer.
  */
@@ -665,6 +695,24 @@ export async function takeoverStream(sdpOffer) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sdp_offer: sdpOffer }),
+        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(`Stream takeover failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
+ * Force-stop any active session and start a VLC takeover in the same
+ * call. Same response shape as startRtspStream (sdp_answer is null).
+ */
+export async function takeoverRtspStream(url) {
+    const response = await apiFetch("/api/stream/takeover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "rtsp", url }),
         signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
     });
     if (!response.ok) {

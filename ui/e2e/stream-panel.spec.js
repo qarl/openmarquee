@@ -96,12 +96,13 @@ test("Stream nav route shows the panel with Go Live button", async ({ page }) =>
     await expect(page.locator(".stream-header-title")).toHaveText("Stream");
     await expect(page.locator(".stream-go-live")).toBeVisible();
     await expect(page.locator(".stream-stop")).toBeHidden();
-    // 2026-04-29 redesign: tailscale-foreground warning + camera-flip
-    // button removed from the panel template. LIVE pill + metrics grid
-    // only surface in the live phase. Idle-only paused-playlist row is
-    // visible.
+    // 2026-04-29 redesign dropped the tailscale-foreground warning.
+    // The camera-flip button was dropped then restored 2026-05-01 —
+    // it exists but is hidden in idle (no open camera). LIVE pill +
+    // metrics grid only surface in the live phase. Idle-only paused-
+    // playlist row is visible.
     await expect(page.locator(".stream-warning")).toHaveCount(0);
-    await expect(page.locator(".stream-flip-camera")).toHaveCount(0);
+    await expect(page.locator(".stream-flip-camera")).toBeHidden();
     await expect(page.locator(".stream-live-pill")).toBeHidden();
     await expect(page.locator(".stream-metrics-grid")).toBeHidden();
     await expect(page.locator(".stream-paused-row")).toBeVisible();
@@ -221,7 +222,8 @@ test("active session at /status surfaces Take over UI without opening camera", a
     });
 
     await page.goto("/#/stream");
-    await page.locator(".stream-go-live").click();
+    // Mount-init's own /status pre-flight surfaces the take-over UI —
+    // no Go-live click needed (and clicking would race mount-init).
 
     await expect(page.locator(".stream-take-over")).toBeVisible();
     await expect(page.locator(".stream-cancel-takeover")).toBeVisible();
