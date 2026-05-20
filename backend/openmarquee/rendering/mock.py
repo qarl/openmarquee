@@ -148,6 +148,7 @@ class MockRenderer:
         self.advance_calls: list[int] = []
         self.render_frame_calls: int = 0
         self.end_external_frames_calls: int = 0
+        self.reopen_calls: int = 0
         self.capture_calls: list[str] = []
 
         # State machine mirror -- same shape as the Rust sidecar's
@@ -310,6 +311,13 @@ class MockRenderer:
         MockRenderer satisfies the Renderer protocol and the VLC
         pumps can call it unconditionally. Counted for tests."""
         self.end_external_frames_calls += 1
+
+    def reopen(self) -> None:
+        """No-op for the mock — there is no out-of-process subprocess
+        whose Open-time config (display rotation, FYS bug 5) needs a
+        restart. Present so MockRenderer satisfies the Renderer
+        protocol. Counted for tests."""
+        self.reopen_calls += 1
 
     # ------------------------------------------------------------------
     # Internals

@@ -187,6 +187,25 @@ class AutoFallbackRenderer:
             mock = self._swap_to_mock(f"end_external_frames: {e}")
             mock.end_external_frames()
 
+    def reopen(self) -> None:
+        """Restart the active renderer so it picks up Open-time config
+        (display rotation, FYS bug 5). Mock is a no-op; the
+        RustRenderer proxy restarts its subprocess + re-Opens. A
+        subprocess failure during the reopen swaps to Mock, consistent
+        with the other forwarders. The caller (api_settings) stops the
+        playback loop around this so nothing else drives the renderer.
+        """
+        if self._mock is not None:
+            self._mock.reopen()
+            return
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+        try:
+            self._primary.reopen()
+        except RustRendererSubprocessError as e:
+            self._swap_to_mock(f"reopen: {e}")
+
     # --- Lifecycle ---
 
     def open(self):
@@ -437,6 +456,12 @@ def _rust_sidecar_renderer_or_fallback():
             # Callable (not a snapshot) so a respawn re-reads the
             # current setting.
             get_timezone=lambda: _settings_storage_singleton().load().timezone,
+            # FYS bug 5: display rotation, read at each Open. A
+            # rotation change triggers a renderer reopen
+            # (api_settings.py), which re-reads this.
+            get_rotation=lambda: int(
+                _settings_storage_singleton().load().display_rotation
+            ),
         )
     except Exception:
         log.exception("RustRenderer construction failed; falling back to mock")

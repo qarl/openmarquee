@@ -67,8 +67,10 @@ from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_auth_storage,
     get_content_storage,
+    get_playback_loop,
     get_settings_storage,
 )
+from openmarquee.playback import PlaybackLoop
 from openmarquee.settings import SettingsStorage, SystemSettings
 from openmarquee.wifi_prefill import read_system_wifi
 
@@ -77,6 +79,7 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 SettingsDep = Annotated[SettingsStorage, Depends(get_settings_storage)]
 ContentDep = Annotated[ContentStorage, Depends(get_content_storage)]
 AuthDep = Annotated[AuthStorage, Depends(get_auth_storage)]
+LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
 
 log = logging.getLogger(__name__)
 
@@ -257,6 +260,7 @@ async def set_settings(
     payload: dict[str, Any],
     storage: SettingsDep,
     content_storage: ContentDep,
+    loop: LoopDep,
 ) -> dict[str, Any]:
     previous = storage.load()
     # 20.4: replace the sentinel for each secret field with the stored
@@ -295,6 +299,11 @@ async def set_settings(
         or int(previous.display_width) != int(validated.display_width)
         or int(previous.display_height) != int(validated.display_height)
     )
+    # FYS bug 5: rotation is the only display field the renderer reacts
+    # to (its mode comes from the DRM panel, not Settings width/height).
+    rotation_changed = int(previous.display_rotation) != int(
+        validated.display_rotation
+    )
     # Wifi-station fields: BEFORE save so we can diff. The actual
     # apply (template wpa_supplicant-wlan0.conf + systemctl restart
     # + iw poll) runs in a background thread so the HTTP response
@@ -316,7 +325,25 @@ async def set_settings(
     # panel-native dims when displaying the operator's last in-browser
     # bake — the visible drift is bounded (slight pixel-density change)
     # and corrects fully on the next operator save in the editor.
-    _ = dims_changed  # kept for clarity; could be deleted in follow-up
+    _ = dims_changed  # width/height deltas: no renderer action needed
+    # FYS bug 5: the renderer reads display rotation at Open time. On a
+    # rotation change, restart the renderer so it re-Opens with the new
+    # rotation — stop the playback loop first so nothing drives the
+    # renderer during the reopen, then restart it (it re-fetches +
+    # re-begins the current slide against the freshly reopened
+    # sidecar). reopen() is sync (subprocess relaunch + IPC round
+    # trips) — run it off the event loop so other requests aren't
+    # blocked. Rotation is a set-once-at-install setting, so the
+    # one-time playback blip is acceptable.
+    if rotation_changed:
+        await loop.stop()
+        try:
+            await asyncio.to_thread(loop.renderer.reopen)
+        except Exception:
+            log.exception(
+                "settings: renderer reopen after rotation change failed"
+            )
+        await loop.start()
     if wifi_station_changed:
         wifi_station.apply_in_background(
             enabled=validated.wifi_station_enabled,

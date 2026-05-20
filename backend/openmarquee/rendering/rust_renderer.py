@@ -397,6 +397,7 @@ class RustRenderer:
         output: str = "hdmi",
         extra_args: list[str] | None = None,
         get_timezone: Callable[[], str | None] | None = None,
+        get_rotation: Callable[[], int] | None = None,
         reconnect_max_retries: int = DEFAULT_RECONNECT_MAX_RETRIES,
         reconnect_window_s: float = DEFAULT_RECONNECT_WINDOW_S,
         watchdog_enabled: bool = True,
@@ -422,6 +423,12 @@ class RustRenderer:
         # each (re)spawn — a Settings tz change followed by a
         # backend restart re-spawns the sidecar with the new TZ.
         self._get_timezone = get_timezone or (lambda: None)
+        # FYS bug 5: the operator's configured display rotation
+        # (Settings.display_rotation ∈ {0,90,180,270}). Sent in the
+        # Open op's params so the sidecar lays content out at the
+        # rotated logical dims. Read at each open()/reconnect — a
+        # rotation change drives a renderer reopen (api_settings.py).
+        self._get_rotation = get_rotation or (lambda: 0)
 
         self._proc: subprocess.Popen[str] | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -499,6 +506,14 @@ class RustRenderer:
             params["drm_card"] = self._drm_card
         if self._content_root is not None:
             params["content_root"] = self._content_root
+        # FYS bug 5: display rotation. The sidecar's OpenParams.rotation
+        # has #[serde(default)] so omitting it (older sidecar) is safe;
+        # sending it is harmless to a sidecar that ignores it.
+        try:
+            params["rotation"] = int(self._get_rotation())
+        except Exception:
+            log.exception("rust_renderer: get_rotation failed; defaulting to 0")
+            params["rotation"] = 0
         body = self._send_op("open", params, _allow_reconnect=False)
         if body is None or "mode_w" not in body or "mode_h" not in body:
             raise RustRendererProtocolError(
@@ -599,6 +614,19 @@ class RustRenderer:
                 self._opened = False
         finally:
             self._terminate_subprocess()
+
+    def reopen(self) -> None:
+        """Restart the sidecar subprocess and re-run Open.
+
+        FYS bug 5: the sidecar reads display rotation at Open time, so
+        a rotation change needs a fresh Open. api_settings.py calls
+        this (with the playback loop STOPPED so nothing else is
+        driving the renderer) after Settings.display_rotation changes.
+        Equivalent to close() + open() — a fully fresh subprocess; the
+        caller replays per-slide state (the playback loop re-issues
+        begin_slide on its next iteration after it restarts)."""
+        self.close()
+        self.open()
 
     # ------------------------------------------------------------------
     # Renderer Protocol conformance (nominal).

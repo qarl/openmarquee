@@ -44,3 +44,16 @@ class Renderer(Protocol):
         call this on every exit path of a `render_frame` run.
         """
         ...
+
+    def reopen(self) -> None:
+        """Restart the renderer so it picks up open-time configuration.
+
+        FYS bug 5: display rotation is applied at the sidecar's Open;
+        a rotation change drives a renderer reopen. `RustRenderer`
+        restarts its subprocess + re-Opens; in-process renderers
+        (`MockRenderer`) treat it as a no-op. The caller (api_settings)
+        STOPS the playback loop around this call, so nothing else is
+        driving the renderer; the loop replays per-slide state when it
+        restarts.
+        """
+        ...
