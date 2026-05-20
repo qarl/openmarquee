@@ -86,18 +86,46 @@ pub(crate) fn rasterize_colr_cell(
     let mut pixmap = ts::Pixmap::new(COLR_CELL_PX, COLR_CELL_PX)
         .ok_or_else(|| anyhow::anyhow!("Pixmap::new({COLR_CELL_PX}) failed"))?;
 
-    // Initial transform: skrifa's paint callbacks emit ops in FONT
-    // UNITS (Y-up). Map them into pixmap pixel space (Y-down,
-    // origin top-left) by scaling by ppem/upem and Y-flipping so
-    // baseline (font y=0) lands at canvas y=ppem, and the top of
-    // the em-box (font y=upem) lands at canvas y=0. Glyphs that
-    // extend above the cap or below the baseline beyond the em-box
-    // get cropped by the pixmap — acceptable since the dynamic
-    // atlas slot is fixed-size; Slice 3C can revisit if a glyph
-    // family wants more headroom.
+    // Parity Bug (2026-05-20): a COLR emoji's drawable region — its
+    // COLRv1 clip box — is NOT the em box. Noto Color Emoji glyphs
+    // run ~0.19-0.22 em BELOW the baseline and the wider ones spill
+    // past the right em edge. The pre-fix transform mapped the em
+    // box [0,upem] onto the pixmap, so skrifa's paint ops for the
+    // overshoot landed outside [0,COLR_CELL_PX] and tiny-skia
+    // cropped them — emoji rendered with a hard flat cut at the
+    // bottom (and the right, for the wider glyphs).
+    //
+    // Fix: fit the glyph's clip box, expanded to a SQUARE (so it
+    // drops into the square atlas cell without distortion, centred
+    // on the clip box), onto the pixmap. The whole glyph now lands
+    // inside the cell — nothing cropped. `plane_bounds` is that
+    // square NORMALISED so its side is 1.0 em; the draw site sizes
+    // the on-screen quad from plane_bounds, so each emoji renders
+    // at ~1 em — matching the Canvas2D editor, where ctx.fillText
+    // draws emoji at 1.0x the font size. Using the raw clip-box
+    // extent (~1.1 em for Noto) instead would overshoot the editor
+    // emoji by ~10-14%.
+    let raw_bb =
+        color_glyph.bounding_box(LocationRef::default(), Size::unscaled());
+    // Clip-box square in font units: (x_min, y_min, side). Falls
+    // back to the em box when the font reports no usable clip box.
+    let (sq_x_min, sq_y_min, sq_side) = match raw_bb {
+        Some(bb) if bb.x_max > bb.x_min && bb.y_max > bb.y_min => {
+            let side = (bb.x_max - bb.x_min).max(bb.y_max - bb.y_min);
+            let cx = (bb.x_min + bb.x_max) * 0.5;
+            let cy = (bb.y_min + bb.y_max) * 0.5;
+            (cx - side * 0.5, cy - side * 0.5, side)
+        }
+        _ => (0.0, 0.0, upem),
+    };
+    let sq_y_max = sq_y_min + sq_side;
+
+    // Map the clip-box square onto the [0,COLR_CELL_PX] pixmap,
+    // Y-flipped (skrifa emits font units Y-up; pixmap is Y-down).
     let ppem = COLR_CELL_PX as f32;
-    let scale = ppem / upem;
-    let root_transform = ts::Transform::from_row(scale, 0.0, 0.0, -scale, 0.0, ppem);
+    let k = ppem / sq_side;
+    let root_transform =
+        ts::Transform::from_row(k, 0.0, 0.0, -k, -k * sq_x_min, k * sq_y_max);
 
     // Spool the paint tree into the painter.
     let mut painter = TinySkiaColorPainter::new(&mut pixmap, &font, ppem, upem, root_transform);
@@ -110,21 +138,17 @@ pub(crate) fn rasterize_colr_cell(
     let glyph_metrics = font.glyph_metrics(Size::unscaled(), LocationRef::default());
     let advance_em = glyph_metrics.advance_width(glyph_id).unwrap_or(0.0) / upem;
 
-    // Plane bounds — prefer the glyph's COLRv1 clipbox if present
-    // (defines the precise drawable region per the spec). Otherwise
-    // fall back to the entire em-box so the dispatch site at least
-    // has a non-degenerate value to scale by. Slice 3B can refine
-    // by reading actual painted-pixel extents if the clipbox proves
-    // too generous in practice.
-    let clipbox_em = color_glyph
-        .bounding_box(LocationRef::default(), Size::unscaled())
-        .map(|bb| em_bounds_from(bb, upem))
-        .unwrap_or(PlaneBounds {
-            pl_left: 0.0,
-            pl_right: 1.0,
-            pl_bottom: 0.0,
-            pl_top: 1.0,
-        });
+    // plane_bounds = the rasterised square, baseline-relative, with
+    // its side normalised to 1.0 em (pl_right-pl_left == pl_top-
+    // pl_bottom == 1.0). pl_bottom < 0 means the glyph descends
+    // below the baseline. The atlas cell's full [0,1] UV range maps
+    // onto this square, so the draw quad IS this square.
+    let plane_bounds = PlaneBounds {
+        pl_left: sq_x_min / sq_side,
+        pl_right: sq_x_min / sq_side + 1.0,
+        pl_bottom: sq_y_min / sq_side,
+        pl_top: sq_y_min / sq_side + 1.0,
+    };
 
     let rgba_bytes = pixmap.data().to_vec();
 
@@ -132,17 +156,8 @@ pub(crate) fn rasterize_colr_cell(
         rgba_bytes,
         cell_px: COLR_CELL_PX,
         advance_em,
-        plane_bounds: clipbox_em,
+        plane_bounds,
     }))
-}
-
-fn em_bounds_from(bb: BoundingBox<f32>, upem: f32) -> PlaneBounds {
-    PlaneBounds {
-        pl_left: bb.x_min / upem,
-        pl_right: bb.x_max / upem,
-        pl_top: bb.y_max / upem,
-        pl_bottom: bb.y_min / upem,
-    }
 }
 
 // ---------- TinySkiaColorPainter ----------

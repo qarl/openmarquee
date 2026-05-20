@@ -612,14 +612,16 @@ pub fn layout_text_to_quads(
         /// Bug 3 Slice 3B + 3D: runtime-cached COLRv1 emoji glyph.
         /// Slice 3D retired the static-CBDT `Emoji(EmojiAtlasEntry)`
         /// variant; emoji codepoints now route exclusively through
-        /// this path. Geometry mirrors the retired static-emoji
-        /// path (square cell, centered on the em-height) so the
-        /// on-screen size is preserved across the cutover. UVs
-        /// come from slot.{x,y} / ATLAS_DIM, same as DynamicMsdf
-        /// against its dynamic page.
+        /// this path. `plane_bounds` is the rasterizer's clip-box
+        /// square, normalised to a 1-em side, baseline-relative —
+        /// the emoji quad is positioned from it exactly like
+        /// `DynamicMsdf` (parity fix 2026-05-20). UVs come from
+        /// slot.{x,y} / ATLAS_DIM, same as DynamicMsdf against its
+        /// dynamic page.
         DynamicEmoji {
             slot: crate::atlas_page::SlotPos,
             advance_em: f32,
+            plane_bounds: crate::glyph_cache::PlaneBounds,
             cell_px: u32,
         },
     }
@@ -636,6 +638,7 @@ pub fn layout_text_to_quads(
         Ready {
             slot: crate::atlas_page::SlotPos,
             advance_em: f32,
+            plane_bounds: crate::glyph_cache::PlaneBounds,
         },
         Pending,
     }
@@ -700,8 +703,8 @@ pub fn layout_text_to_quads(
                         Some(crate::glyph_cache::SlotState::Ready {
                             slot,
                             advance_em,
-                            plane_bounds: _,
-                        }) => Some(ColrResolution::Ready { slot, advance_em }),
+                            plane_bounds,
+                        }) => Some(ColrResolution::Ready { slot, advance_em, plane_bounds }),
                         Some(crate::glyph_cache::SlotState::FontMissing) => {
                             // Fall through to MSDF fallback chain.
                             None
@@ -716,18 +719,19 @@ pub fn layout_text_to_quads(
                 })
             };
 
-            let (kind, adv) = if let Some(ColrResolution::Ready { slot, advance_em }) = colr_dispatch {
+            let (kind, adv) =
+                if let Some(ColrResolution::Ready { slot, advance_em, plane_bounds }) = colr_dispatch {
                 // Bug 3 Slice 3B: COLRv1 cache hit (Ready). Advance
                 // is the COLRv1 font's hmtx-derived advance in em
-                // (units_per_em normalized). Cell px = COLR_CELL_PX
-                // (96, matches the retired CBDT cell size so the
-                // on-screen emoji geometry is preserved across the
-                // Slice 3D cutover).
+                // (units_per_em normalized). `plane_bounds` is the
+                // rasterizer's normalised clip-box square; pass-2
+                // positions the quad from it. Cell px = COLR_CELL_PX.
                 any_ink = true;
                 (
                     CharKind::DynamicEmoji {
                         slot,
                         advance_em,
+                        plane_bounds,
                         cell_px: crate::glyph_cache_colr::COLR_CELL_PX,
                     },
                     advance_em,
@@ -915,7 +919,14 @@ pub fn layout_text_to_quads(
                 {
                     (plane_bounds.pl_top, plane_bounds.pl_bottom)
                 }
-                CharKind::DynamicEmoji { .. } | CharKind::Tofu => (ascent_em, descent_em),
+                // Parity fix 2026-05-20: a COLR emoji contributes
+                // its own clip-box plane_bounds (the emoji descends
+                // below the baseline), so bm_h / the scissor bound
+                // the full emoji quad — same as DynamicMsdf.
+                CharKind::DynamicEmoji { plane_bounds, .. } => {
+                    (plane_bounds.pl_top, plane_bounds.pl_bottom)
+                }
+                CharKind::Tofu => (ascent_em, descent_em),
                 _ => continue,
             };
             if top_em > ink_ascent_em {
@@ -980,22 +991,6 @@ pub fn layout_text_to_quads(
     // per-call site comment for the median-of-mixed-encodings
     // mechanism this guards against.
     const INSET_PX: f32 = 0.5;
-    // Parity Bug 2 (2026-05-20): on-screen em-size of a COLR emoji
-    // cell. The COLR runtime rasterizer (glyph_cache_colr.rs)
-    // renders each emoji at `ppem = COLR_CELL_PX` into a
-    // COLR_CELL_PX-square pixmap — the font's em-box [0, upem] maps
-    // onto the FULL [0, COLR_CELL_PX] cell, so the cell spans
-    // exactly ONE em. The DynamicEmoji draw must therefore size the
-    // cell at 1.0 em of the layer's font.
-    //
-    // The Slice 3D cutover wrongly carried the RETIRED CBDT bake's
-    // ratio here (`COLR_CELL_PX / 128.0` = 0.75 — the CBDT bake
-    // rendered emoji at 128 ppem into a 96 px cell, capturing only
-    // 0.75 em). That shrank every COLR emoji to 0.75x its true
-    // size — visibly smaller than the Canvas2D editor preview,
-    // which draws emoji at the native ~1 em via ctx.fillText.
-    // 1.0 restores cross-renderer parity.
-    let emoji_cell_em: f32 = 1.0;
     let mut quads: Vec<MsdfQuad> = Vec::new();
     for (line_idx, layout) in layouts.iter().enumerate() {
         // Baseline y in pixel-space, y-down. Each line's baseline
@@ -1114,27 +1109,31 @@ pub fn layout_text_to_quads(
                         kind: GlyphKind::DynamicMsdf,
                     });
                 }
-                CharKind::DynamicEmoji { slot, advance_em: _, cell_px: dyn_cell_px } => {
-                    // Bug 3 Slice 3B (2026-05-19): same on-screen
-                    // geometry as the static Emoji branch (square
-                    // cell at em-height, centered horizontally +
-                    // vertically) but with UVs sourced from the
-                    // dynamic-COLR atlas page (2048×2048, see
-                    // atlas_page::ATLAS_DIM) and cell_px = 96
-                    // (COLR_CELL_PX matches build.rs EMOJI_CELL_PX
-                    // exactly so the on-screen size matches the
-                    // CBDT path one-to-one). Slice 3D will retire
-                    // the static path; this geometry already
-                    // matches so no resize ripple.
-                    let cell_w_px = emoji_cell_em * x_size_px;
-                    let cell_h_px = emoji_cell_em * size_px;
-                    let center_x = cursor_x + adv_px * 0.5;
-                    let center_y =
-                        baseline_y - (ascent_em + descent_em) * 0.5 * size_px;
-                    let px_l = center_x - cell_w_px * 0.5;
-                    let px_r = center_x + cell_w_px * 0.5;
-                    let px_t = center_y - cell_h_px * 0.5;
-                    let px_b = center_y + cell_h_px * 0.5;
+                CharKind::DynamicEmoji { slot, advance_em: _, plane_bounds, cell_px: dyn_cell_px } => {
+                    // Parity fix (2026-05-20): position the emoji
+                    // quad from `plane_bounds` — the rasterizer's
+                    // COLRv1 clip-box square, normalised to a 1-em
+                    // side, baseline-relative — exactly the math the
+                    // CharKind::DynamicMsdf branch above uses.
+                    //
+                    // The pre-fix path drew a fixed emoji_cell_em-
+                    // square cell centred on the font em-midpoint.
+                    // Combined with the rasterizer's old em-box crop
+                    // (which clipped the part of the emoji below the
+                    // baseline), every emoji rendered with a hard
+                    // flat cut at the cell's bottom edge. Sourcing
+                    // the quad from plane_bounds lets the emoji
+                    // descend below the baseline like the glyph is
+                    // designed to — no crop. UVs still span the full
+                    // dynamic-COLR atlas cell. No degenerate-bounds
+                    // guard (unlike DynamicMsdf) is needed: the
+                    // rasterizer always emits a normalised 1-em
+                    // square here.
+                    let pb = plane_bounds;
+                    let px_l = cursor_x + pb.pl_left * x_size_px;
+                    let px_r = cursor_x + pb.pl_right * x_size_px;
+                    let px_t = baseline_y - pb.pl_top * size_px;
+                    let px_b = baseline_y - pb.pl_bottom * size_px;
                     let atlas_dim_f = crate::atlas_page::ATLAS_DIM as f32;
                     let cp_f = *dyn_cell_px as f32;
                     let uv_l = (slot.x as f32 + INSET_PX) / atlas_dim_f;
@@ -5016,14 +5015,15 @@ mod tests {
     }
 
     #[test]
-    fn layout_text_to_quads_colr_emoji_cell_spans_one_em() {
-        // Parity Bug 2 (2026-05-20): a COLR emoji must render at
-        // exactly 1.0 em of the layer's font size. The COLR runtime
-        // rasterizer maps the font em-box onto the FULL
-        // COLR_CELL_PX cell, so the cell is one em square. The
-        // retired-CBDT 0.75-em ratio (carried wrongly through the
-        // Slice 3D cutover) shrank emoji to 75% on glass vs the
-        // Canvas2D preview's native ~1-em ctx.fillText emoji.
+    fn layout_text_to_quads_colr_emoji_quad_follows_plane_bounds() {
+        // Parity fix (2026-05-20): a COLR emoji quad is positioned
+        // from the rasterizer's clip-box plane_bounds (a 1-em-square,
+        // baseline-relative), exactly like CharKind::DynamicMsdf —
+        // NOT a fixed cell centred on the em-midpoint. This lets the
+        // emoji descend below the baseline like the Noto glyph is
+        // designed to, instead of being cropped flat at a cell edge
+        // (the bottom-clip bug). The group bbox must also CONTAIN
+        // the quad so the draw-time scissor cannot clip it.
         let atlas = load_anton_atlas();
         let cache = crate::glyph_cache::GlyphCache::new(0);
         // 🔓 U+1F513 — a SCREAM-slide codepoint, absent from anton's
@@ -5036,11 +5036,20 @@ mod tests {
             codepoint: cp,
             render_mode: crate::glyph_cache::RenderMode::Colr,
         };
+        // A 1-em-square plane_bounds that descends 0.2 em BELOW the
+        // baseline (pl_bottom < 0) — the shape the fixed rasterizer
+        // produces for a Noto emoji (clip box squared + normalised).
+        let pb = crate::glyph_cache::PlaneBounds {
+            pl_left: 0.05,
+            pl_right: 1.05,
+            pl_bottom: -0.2,
+            pl_top: 0.8,
+        };
         cache.insert_ready_slot_for_test(
             key,
             crate::atlas_page::SlotPos { x: 0, y: 0 },
-            1.0, // advance_em
-            crate::glyph_cache::PlaneBounds::default(),
+            1.2, // advance_em (Noto emoji hmtx ~1.2-1.25 em)
+            pb,
         );
         let fonts_dir = std::env::temp_dir();
         let ctx = crate::glyph_cache::RuntimeGlyphCtx {
@@ -5054,16 +5063,30 @@ mod tests {
         assert_eq!(group.quads.len(), 1);
         let q = &group.quads[0];
         assert_eq!(q.kind, GlyphKind::DynamicEmoji);
+        // Quad dimensions follow plane_bounds: a 1-em square -> size_px.
         let w = q.px_right - q.px_left;
         let h = q.px_bottom - q.px_top;
-        // 1 em == size_px. The Bug-2 regression (0.75 em) gave 75.0.
+        assert!((w - size_px).abs() < 0.01, "emoji quad width {w} should be 1 em");
+        assert!((h - size_px).abs() < 0.01, "emoji quad height {h} should be 1 em");
+        // Single line: baseline_y = pad(1) + ink_ascent(pl_top 0.8)
+        // * size. The emoji quad must descend BELOW that baseline —
+        // the un-clip guarantee (pre-fix it was cropped at the cell
+        // edge and never passed the baseline).
+        let baseline_y = 1.0 + 0.8 * size_px;
         assert!(
-            (w - size_px).abs() < 0.01,
-            "emoji quad width {w} should be 1 em ({size_px}px), not 0.75 em",
+            q.px_bottom > baseline_y,
+            "emoji quad bottom {} must descend below the baseline {} \
+             (not be cropped at a cell edge)",
+            q.px_bottom,
+            baseline_y,
         );
+        // The group bbox must contain the full emoji quad, so the
+        // draw-time scissor (derived from the bbox) cannot clip it.
         assert!(
-            (h - size_px).abs() < 0.01,
-            "emoji quad height {h} should be 1 em ({size_px}px), not 0.75 em",
+            q.px_bottom <= group.height as f32 + 0.01,
+            "emoji quad bottom {} must be within the group bbox height {}",
+            q.px_bottom,
+            group.height,
         );
     }
 
