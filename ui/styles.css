@@ -617,12 +617,18 @@ header h1 {
     margin-top: 2px;
 }
 
-/* Transition chip lives inside the meta column under the title. */
-/* Per-block transition selector. Was a cycle-button until 2026-04-28;
-   now a <select> pulldown so the new 16-transition palette can grow
-   without scaling problems. Browser default <select> chrome is killed
-   via appearance:none so the existing pill look survives the swap. */
-.track-block-transition {
+/* Shared pull-down menu chrome (Bug 4, 2026-05-19).
+   ONE source of truth for the compact mono-font pill pulldown:
+   the Playlists-panel Transition selector (.track-block-transition)
+   plus the Slide-panel Blend + Motion selectors (.field-blend,
+   .field-motion) all wear this class so they stay visually
+   consistent. qarl 2026-05-19: "i like the design of the
+   transition menu ... blend and motion need to look like [it]
+   (custom font, etc.)". The custom font is --om-mono; default
+   <select> chrome is killed via appearance:none so the pill look
+   + custom chevron survive. Layout-specific bits (where the menu
+   sits / how wide it is) stay on the per-use class, NOT here. */
+.om-pulldown {
     align-self: flex-start;
     font-size: 10.5px;
     font-family: var(--om-mono);
@@ -644,14 +650,19 @@ header h1 {
     background-repeat: no-repeat;
     background-position: right 6px center;
 }
-.track-block-transition:hover {
+.om-pulldown:hover {
     border-color: var(--om-accent);
     color: var(--om-text);
 }
-.track-block-transition:focus-visible {
+.om-pulldown:focus-visible {
     outline: 2px solid var(--om-accent);
     outline-offset: 1px;
 }
+
+/* The Playlists-panel transition chip (.track-block-transition)
+   carries no CSS of its own — its visual chrome is .om-pulldown.
+   The .track-block-transition class survives in the markup purely
+   as a JS hook (change listener + sortable drag-filter selector). */
 
 /* Remove × — top-right corner, always visible (unlike the old
    thumb-overlay design, this one's outside the thumb). */

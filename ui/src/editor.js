@@ -226,7 +226,7 @@ const LAYER_GROUP_TEMPLATE = `
         <div class="om-row" style="gap: 10px; align-items: end;">
             <label class="om-field" style="flex: 1;">
                 <span>Blend</span>
-                <select class="om-select field-blend" aria-label="layer blend mode">
+                <select class="om-pulldown field-blend" aria-label="layer blend mode">
                     <option value="normal">Normal</option>
                     <option value="multiply">Multiply</option>
                     <option value="screen">Screen</option>
@@ -296,7 +296,7 @@ const LAYER_GROUP_TEMPLATE = `
         <div class="om-row" style="gap: 10px; align-items: end;">
             <label class="om-field" style="flex: 1;">
                 <span>Motion</span>
-                <select class="om-select field-motion" aria-label="layer motion">
+                <select class="om-pulldown field-motion" aria-label="layer motion">
                     <option value="static">Static</option>
                     <option value="ticker">Ticker</option>
                     <option value="breathe">Breathe</option>

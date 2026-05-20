@@ -594,7 +594,7 @@ function renderTrackBlock(
         <div class="track-block-meta">
             <b class="track-block-name">${safeName}</b>
             <span class="track-block-sub">${safeType} · #${String(item.id).slice(0, 6)}</span>
-            <select class="track-block-transition"
+            <select class="om-pulldown track-block-transition"
                     title="Transition out of this slide">${transitionOptionsHTML(entry.transition)}</select>
         </div>
         <button type="button" class="track-block-duration track-block-dur"
