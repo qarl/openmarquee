@@ -82,16 +82,7 @@ test("sidebar nav routes through every top-level section on click", async ({ pag
     await expect(page.locator(".field-display-width")).toHaveValue("1920");
 });
 
-test("ffmpeg.wasm spike page renders the H.264 button + the file picker", async ({ page }) => {
-    await page.goto("/spike.html");
-    await expect(page).toHaveTitle(/ffmpeg\.wasm spike/);
-    await expect(page.locator("#run-h264")).toBeVisible();
-    await expect(page.locator("#source-file")).toBeVisible();
-    // Initial status line says "ready." after boot() fires.
-    await expect(page.locator("#spike-status")).toContainText("ready");
-});
-
-test("spike page serves the bundled ffmpeg worker + vendored core assets", async ({ page }) => {
+test("the ffmpeg worker + vendored core assets are bundled into dist/", async ({ page }) => {
     // Worker and core files must exist on the captive portal — otherwise
     // the first click on a pipeline button 404s and the operator sees an
     // ffmpeg.wasm init error. Regression guard for the esbuild worker-
