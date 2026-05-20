@@ -31,8 +31,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from PIL import Image
-
 from openmarquee.content import ContentItem
 from openmarquee.rendering import Renderer
 
@@ -906,29 +904,4 @@ def scheduled_fetch_items(
     if loop is not None:
         loop._stamp_playlist_id(active_id)
     return list_in_playlist_order(content_storage, playlist_storage, active_id)
-
-
-def _cover_fit(image: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Scale `image` to cover (`target_w`, `target_h`) and center-crop.
-
-    Preserves the source aspect — the larger dimension is resized up or
-    down to exactly match the target, and the overflow on the other axis
-    is cropped evenly on both sides. Mirrors the browser-side editor
-    previews so what the operator sees IS what the device renders.
-
-    Used by the stream takeover path (`stream.py`) to fit camera frames
-    onto the renderer's dimensions. Outside the DELETE-PIL slide-render
-    hot path -- camera frames still arrive as PIL Images upstream.
-    """
-    src_w, src_h = image.size
-    scale = max(target_w / src_w, target_h / src_h)
-    new_w = max(1, round(src_w * scale))
-    new_h = max(1, round(src_h * scale))
-    # LANCZOS is the slower-but-sharper resample; for a one-shot render
-    # at slide entry the ~10-15ms cost on a Pi Zero 2 W is invisible
-    # behind the transition.
-    resized = image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
-    left = (new_w - target_w) // 2
-    top = (new_h - target_h) // 2
-    return resized.crop((left, top, left + target_w, top + target_h))
 

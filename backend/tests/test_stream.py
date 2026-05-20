@@ -38,6 +38,7 @@ from openmarquee.stream import (
     StreamNotActive,
     StreamSession,
 )
+from openmarquee.stream_source import WebRtcStreamSource
 
 _FAST_DURATION_MS = 100
 _FAST_EMPTY_POLL = 0.01
@@ -59,8 +60,8 @@ class _FakeRTCPeerConnection:
     """Records calls + serves a canned SDP answer.
 
     Doesn't try to imitate ICE, codec negotiation, or media flow — the
-    StreamSession's track-consumer side is exercised directly by feeding
-    av.VideoFrames at a real consumer task in test_consume_video.
+    frame-consumer side is exercised directly by feeding av.VideoFrames
+    to a WebRtcStreamSource in test_webrtc_source_yields_rgb888.
     """
 
     answer_sdp = "v=0\r\nfake-answer\r\n"
@@ -94,9 +95,9 @@ class _FakeRTCPeerConnection:
 class _FakeTrack:
     """One-shot iterator over canned av.VideoFrames.
 
-    StreamSession._consume_video runs `while not self._closed: await
+    WebRtcStreamSource.frames() runs `while not self._closed: await
     track.recv()`, so once frames are exhausted the recv() raises and
-    the consumer exits its outer try/except. Mirrors how aiortc handles
+    the source exits its outer try/except. Mirrors how aiortc handles
     a track ending (MediaStreamError).
     """
 
@@ -181,14 +182,36 @@ async def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01):
 
 
 @pytest.mark.asyncio
-async def test_consume_video_pushes_rgb888_at_renderer_dims(tmp_path):
-    """Stream frames at any size are downscaled to the renderer's
-    native dims and pushed as RGB888 — same wire format §7.6 mandates.
-    Without this guarantee, mixing stream + playlist sources would
-    produce frames the renderer rejects."""
+async def test_webrtc_source_yields_rgb888_at_renderer_dims(tmp_path):
+    """WebRtcStreamSource downscales frames of any size to the
+    renderer's native dims and yields them as RGB888 — same wire
+    format §7.6 mandates. Without this guarantee, mixing stream +
+    playlist sources would produce frames the renderer rejects."""
     renderer = MockRenderer(8, 8, tmp_path / "out.png")
-    # Loop must be running for pause()/resume() to bind events. We
-    # don't actually need it to render anything for this test.
+    source = WebRtcStreamSource(renderer)
+    # Source frame is 320×240 (different from the 8×8 renderer) so the
+    # cover-fit path is exercised. The FakeTrack's recv() raises once
+    # exhausted; the source's broad `except Exception` treats that as
+    # a clean track-end (mirrors aiortc's MediaStreamError).
+    source.set_track(_FakeTrack([_video_frame(320, 240, fill=128)]))
+
+    captured = [frame async for frame in source.frames()]
+
+    assert captured, "source didn't yield any frame"
+    # RGB888 contract: width * height * 3 bytes. Renderer is 8×8 → 192.
+    assert len(captured[0]) == 8 * 8 * 3
+    # Solid gray input → solid gray output (no swizzle, no channel
+    # reorder); confirms RGB byte order is preserved end-to-end.
+    assert captured[0] == bytes([128] * (8 * 8 * 3))
+
+
+@pytest.mark.asyncio
+async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
+    """End-to-end: a StreamSession's pump drives its WebRtcStreamSource
+    and pushes each yielded frame to renderer.render_frame(). Drives
+    the on_track callback directly (the fake PC never negotiates real
+    media) so the pump path itself is exercised."""
+    renderer = MockRenderer(8, 8, tmp_path / "out.png")
     loop = PlaybackLoop(
         renderer=renderer,
         fetch_items=lambda: [],
@@ -199,27 +222,24 @@ async def test_consume_video_pushes_rgb888_at_renderer_dims(tmp_path):
     try:
         with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
             session = StreamSession(loop)
-            # Bypass start() — it does pause+SDP negotiation we already
-            # have other tests for. Drive the consumer directly.
             captured: list[bytes] = []
             original_render = renderer.render_frame
             renderer.render_frame = lambda data: captured.append(data) or original_render(data)
 
-            # Source frame is 320×240 (different from the 8×8 renderer)
-            # so the cover-fit path is exercised. Consumer's broad
-            # `except Exception` catches the FakeTrack's StopAsyncIteration
-            # cleanly, so this returns rather than re-raises (mirrors
-            # how aiortc's MediaStreamError ends a real session).
-            track = _FakeTrack([_video_frame(320, 240, fill=128)])
-            await session._consume_video(track)
+            await session.start("v=0\r\noffer\r\n")
+            # Fire the captured on_track handler — the fake PC records
+            # it but never invokes it (no real ICE/DTLS/SRTP).
+            on_track = session._pc.handlers["track"]
+            on_track(_FakeTrack([_video_frame(320, 240, fill=128)]))
+            # Pump runs the source to exhaustion, then completes.
+            assert session._pump_task is not None
+            await session._pump_task
+            await session.close()
     finally:
         await loop.stop()
 
-    assert captured, "consumer didn't push any frame to the renderer"
-    # RGB888 contract: width * height * 3 bytes. Renderer is 8×8 → 192 bytes.
+    assert captured, "pump didn't push any frame to the renderer"
     assert len(captured[0]) == 8 * 8 * 3
-    # Solid gray input → solid gray output (no swizzle, no channel
-    # reorder); confirms RGB byte order is preserved end-to-end.
     assert captured[0] == bytes([128] * (8 * 8 * 3))
 
 

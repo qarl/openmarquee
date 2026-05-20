@@ -28,9 +28,9 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from PIL import Image
 
-from openmarquee.playback import PlaybackLoop, _cover_fit
+from openmarquee.playback import PlaybackLoop
+from openmarquee.stream_source import WebRtcStreamSource
 
 log = logging.getLogger(__name__)
 
@@ -62,11 +62,12 @@ class StreamNotActive(Exception):
 class StreamSession:
     """One WebRTC peer connection feeding the playback engine.
 
-    The session owns its RTCPeerConnection and the consumer task that
-    pulls decoded frames off the inbound video track. Frames are
-    cover-fit-downscaled to the renderer's native dimensions and
-    pushed as RGB888 — same wire format the playlist source uses
-    (§7.6 renderer wire format).
+    The session owns its RTCPeerConnection and a pump task that
+    drives a `StreamSource` — for a phone takeover that is a
+    `WebRtcStreamSource` wrapping the inbound video track. The source
+    yields RGB888 frames already cover-fit-scaled to the renderer's
+    native dimensions; the pump hands each to `renderer.render_frame`
+    — same wire format the playlist source uses (§7.6).
     """
 
     # Phase 12.1 Finding #2 mitigation — phantom-session watchdog
@@ -105,7 +106,10 @@ class StreamSession:
         # subtracts wall-clock-now in the same UTC frame.
         self.started_at: datetime = datetime.now(UTC)
         self._pc = RTCPeerConnection()
-        self._consume_task: asyncio.Task | None = None
+        # The takeover frame source. The track it needs arrives later,
+        # via the on_track callback in start().
+        self._source = WebRtcStreamSource(playback.renderer)
+        self._pump_task: asyncio.Task | None = None
         self._closed = False
         # Phase 12.1 Finding #2: signaled when the first on_track
         # event fires. The phantom-session watchdog awaits this with
@@ -132,7 +136,8 @@ class StreamSession:
             # Only video for v1 — audio is muted at capture per §5.11.
             if track.kind == "video":
                 self._first_track_event.set()
-                self._consume_task = asyncio.create_task(self._consume_video(track))
+                self._source.set_track(track)
+                self._pump_task = asyncio.create_task(self._pump())
 
         await self._pc.setRemoteDescription(offer)
         answer = await self._pc.createAnswer()
@@ -177,34 +182,23 @@ class StreamSession:
         except asyncio.CancelledError:
             raise
 
-    async def _consume_video(self, track) -> None:  # noqa: ANN001
-        """Pull frames off the track, scale, push to the renderer.
+    async def _pump(self) -> None:
+        """Drive the source: push each yielded frame to the renderer.
 
-        Runs until the track ends, the session is closed, or a fatal
-        decode error occurs. Per-frame failures (renderer crash, scale
-        glitch) are logged and skipped — one bad frame doesn't kill
-        the takeover.
+        Runs until the source's iterator is exhausted (track ended,
+        session closed) or the task is cancelled. A per-frame renderer
+        failure is logged and skipped — one bad frame doesn't kill the
+        takeover. Decode/scale errors are handled inside the source.
         """
         renderer = self._playback.renderer
         try:
-            while not self._closed:
-                frame = await track.recv()  # av.VideoFrame
-                target_w = renderer.width
-                target_h = renderer.height
+            async for frame_bytes in self._source.frames():
                 try:
-                    rgb = frame.to_ndarray(format="rgb24")
-                    pil = Image.fromarray(rgb)
-                    if pil.size != (target_w, target_h):
-                        pil = _cover_fit(pil, target_w, target_h)
-                    renderer.render_frame(pil.tobytes())
+                    renderer.render_frame(frame_bytes)
                 except Exception:
                     log.exception("stream: dropped frame")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            # Track ended (MediaStreamError) or aiortc raised on recv.
-            # Log + return; close() handles cleanup.
-            log.info("stream: video track consumer exiting")
 
     async def close(self) -> None:
         """Tear down the PC and resume the playback loop. Idempotent."""
@@ -226,10 +220,15 @@ class StreamSession:
             self._watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._watchdog_task
-        if self._consume_task is not None and not self._consume_task.done():
-            self._consume_task.cancel()
+        # Close the source first so its frames() iterator stops, then
+        # cancel the pump in case it is blocked mid-recv inside the
+        # source's iterator (close() alone can't interrupt a pending
+        # track.recv()).
+        await self._source.close()
+        if self._pump_task is not None and not self._pump_task.done():
+            self._pump_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._consume_task
+                await self._pump_task
         try:
             await self._pc.close()
         finally:
