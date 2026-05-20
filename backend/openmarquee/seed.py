@@ -385,6 +385,13 @@ class _DemoLayer:
     blend: str = "normal"
     opacity: float = 1.0
     text_align: str = "center"
+    # auto_mode / auto_format — when set, the layer's text is
+    # populated at render time from a data source (clock, date,
+    # etc.) rather than from the static `text` field. Added
+    # 2026-05-19 so the Boot frame can carry a live time-clock
+    # layer. None for every other reel layer (static text).
+    auto_mode: str | None = None
+    auto_format: str | None = None
 
 
 @dataclass(frozen=True)
@@ -410,8 +417,9 @@ _BOOT_LOG_TEXT = (
     "> openMarquee v0.4.2 boot\n"
     "  panel-0 . . . . . . . .  ok\n"
     "  motion-engine . . . . .  ok\n"
-    "  flock-mesh . . . . . . . ok\n"
-    "  9.6V / 0.41A / 27°C\n"
+    "  flock-mesh  . . . . . .  ok\n"
+    "  9.6V / 0.4A / 27°C /\n"
+    "\n"
     "  ready."
 )
 
@@ -419,7 +427,7 @@ _BOOT_LOG_TEXT = (
 # never shows a gap. The motion engine wraps within the box.
 # qarl 2026-05-06 reel edits: shortened to single-instance strings —
 # the motion-engine ticker handles repetition visually as it scrolls.
-_SCREAM_TEXT = "🔓 🫵 🪧  "
+_SCREAM_TEXT = "🔓 🫵 🪧 ! "
 _CHANT_TEXT = "FREE  YOUR  SIGN  "
 
 
@@ -455,7 +463,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text="FREE",
                 font_family="Anton",
                 text_color="#FFB43C",
-                box=_b(0.05, 0.1, 0.9, 0.8),
+                box=_b(0.05, 0.2321, 0.9, 0.5358),
                 font_size_pct=80.0,
             ),
         ),
@@ -473,7 +481,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text="YOUR",
                 font_family="Alfa Slab One",
                 text_color="#5AF095",
-                box=_b(0.05, 0.1, 0.9, 0.8),
+                box=_b(0.1283, 0.2343, 0.7433, 0.5315),
                 font_size_pct=70.0,
             ),
         ),
@@ -744,21 +752,23 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 motion_intensity=70,
                 motion_phase=0.7,
             ),
-            # Bonus 5th layer — mono, white, blinking fast, half-opacity
-            # so it reads as a glitch overlay rather than competing
-            # with the four corners. qarl 2026-05-06 round-2: enlarged
-            # + repositioned up-left so it dominates more of the frame.
+            # Bonus 5th layer — display face, white, blinking fast,
+            # half-opacity so it reads as a glitch overlay rather
+            # than competing with the four corners. qarl 2026-05-06
+            # round-2: enlarged + repositioned up-left so it
+            # dominates more of the frame. qarl 2026-05-19: refaced
+            # JetBrains Mono → Alfa Slab One + recentred.
             _DemoLayer(
                 text="FREE YOUR\nSIGN!!!",
-                font_family="JetBrains Mono",
+                font_family="Alfa Slab One",
                 text_color="#FFFFFF",
-                box=_b(0.1599, 0.1667, 0.6711, 0.7013),
+                box=_b(0.2552, 0.2642, 0.5420, 0.5342),
                 font_size_pct=24.5,
                 motion="blink",
                 motion_intensity=90,
                 motion_phase=0.4,
                 motion_speed=1.6,
-                opacity=0.55,
+                opacity=0.54,
             ),
         ),
         transition_out="pixelate",
@@ -821,9 +831,11 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     # 10 · SCREAM — Anton ticker on rainbow gradient. qarl 2026-05-06
     # editor pass: duration 600→1000ms, ticker font size 40→11.5,
     # box stretched to fill more of the slide vertically.
+    # qarl 2026-05-19: emoji translation 🔓 🫵 🪧 ! + ticker font
+    # size 11.5→22.5 + duration 1000→1500ms.
     _DemoFrame(
         name="10 · Scream",
-        duration_ms=1000,
+        duration_ms=1500,
         background_pattern=BackgroundPattern(
             pattern="gradient",
             color_a="#FF5FA7",
@@ -836,7 +848,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_family="Anton",
                 text_color="#050608",
                 box=_b(0.05, 0.0817, 0.9, 0.8151),
-                font_size_pct=11.5,
+                font_size_pct=22.5,
                 motion="ticker",
                 motion_intensity=85,
             ),
@@ -1021,14 +1033,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         background_color="#050608",
         layers=(
             _DemoLayer(
-                # 5% of box width fits each boot-log line on one line.
-                # v1's 10% (height-based) was ~108px; B3 width-based at
-                # 10% would be ~173px and wraps the longest lines.
+                # qarl 2026-05-19: boot-log refreshed (extra blank
+                # line opens room for the time-clock layer below)
+                # + font_size_pct 5.0→8.0 + box re-sized.
                 text=_BOOT_LOG_TEXT,
                 font_family="VT323",
                 text_color="#FFB43C",
-                box=_b(0.05, 0.18, 0.9, 0.64),
-                font_size_pct=5.0,
+                box=_b(0.05, 0.18, 0.9, 0.7756),
+                font_size_pct=8.0,
                 text_align="left",
             ),
             _DemoLayer(
@@ -1040,6 +1052,20 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 motion="breathe",
                 motion_intensity=45,
                 motion_speed=0.7,  # slow heartbeat (B2)
+            ),
+            # qarl 2026-05-19: live time-clock layer. Empty text —
+            # auto_mode="time" populates it at render time; the
+            # renderer formats per auto_format="time_hms".
+            _DemoLayer(
+                text="",
+                font_family="VT323",
+                text_color="#F4B755",
+                box=_b(0.7007, 0.6295, 0.1941, 0.1),
+                font_size_pct=33.5,
+                text_align="left",
+                motion="static",
+                auto_mode="time",
+                auto_format="time_hms",
             ),
         ),
         # qarl 2026-05-06: loop transition Boot→FREE switched iris→scroll.
@@ -1098,6 +1124,8 @@ def _seed_demo_reel_slides(
                 blend=layer.blend,
                 opacity=layer.opacity,
                 text_align=layer.text_align,
+                auto_mode=layer.auto_mode,
+                auto_format=layer.auto_format,
             )
             for layer in spec.layers
         ]
