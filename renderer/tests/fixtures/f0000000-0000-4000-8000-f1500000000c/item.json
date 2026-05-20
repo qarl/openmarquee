@@ -1,18 +1,18 @@
 {
   "schema_version": 3,
-  "updated_at": "2026-05-16T17:18:14.598136+00:00",
+  "updated_at": "2026-05-20T00:00:00.000000+00:00",
   "item": {
     "type": "text_slide",
     "id": "f0000000-0000-4000-8000-f1500000000c",
     "name": "10 · Scream",
-    "duration_ms": 1000,
+    "duration_ms": 1500,
     "text_layers": [
       {
-        "text": "🔓 🫵 🪧  ",
+        "text": "🔓 🫵 🪧 ! ",
         "name": "",
         "font_family": "Anton",
         "font_size_px": null,
-        "font_size_pct": 11.5,
+        "font_size_pct": 22.5,
         "weight": null,
         "text_color": "#050608",
         "text_align": "center",
