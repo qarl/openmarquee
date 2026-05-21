@@ -161,6 +161,13 @@ class StreamSession:
         # backed by real media and the watchdog auto-closes.
         self._first_track_event = asyncio.Event()
         self._watchdog_task: asyncio.Task | None = None
+        # Stream-transport-only state (stays unused for a WebRTC
+        # session). Stream hardening C2 (findings M1+M2): signaled when
+        # _pump renders its first frame. The stream first-frame
+        # watchdog awaits this with a timeout; if it never resolves,
+        # the stream URL was dead/unreachable and the watchdog auto-
+        # closes — symmetric to the WebRTC phantom-track watchdog.
+        self._first_frame_event = asyncio.Event()
 
     @property
     def closed(self) -> bool:
@@ -210,10 +217,15 @@ class StreamSession:
         """Stream takeover: pause playback and start pumping the stream
         source.
 
-        There is no SDP, no peer connection, and no phantom-track
-        watchdog — ffmpeg either delivers frames or it doesn't, and
-        the operator sees the result on glass. The pump starts
-        immediately (unlike WebRTC, there is no track to wait for).
+        There is no SDP and no peer connection — but there IS a first-
+        frame watchdog, symmetric to the WebRTC phantom-track watchdog.
+        The pump starts immediately (unlike WebRTC, there is no track
+        to wait for); the watchdog catches the case where the pump
+        never produces a frame (a dead/unreachable URL where
+        ffprobe/ffmpeg hang or yield nothing) and auto-closes the
+        session so the playlist resumes instead of freezing forever.
+        The pump also auto-closes the session on ANY exit (ffmpeg
+        crash, mid-stream disconnect, stream EOF) — see `_pump`.
 
         Security: `stream_url` is operator-supplied. FfmpegStreamSource
         constructs a StreamConsumer, whose `__init__` allowlist-
@@ -227,6 +239,12 @@ class StreamSession:
         self._source = FfmpegStreamSource(self._playback.renderer, stream_url)
         await self._playback.pause()
         self._pump_task = asyncio.create_task(self._pump())
+        # Stream hardening C2 (findings M1+M2): arm a first-frame
+        # watchdog. If _pump never renders a frame within
+        # _PHANTOM_TIMEOUT_SECONDS (dead URL, ffprobe/ffmpeg hangs),
+        # auto-close so the playlist resumes. Symmetric to the WebRTC
+        # phantom-track watchdog armed in start_webrtc().
+        self._watchdog_task = asyncio.create_task(self._watch_for_first_frame())
 
     async def _watch_for_first_track(self) -> None:
         """Phase 12.1 Finding #2: auto-close if no track materializes
@@ -252,6 +270,41 @@ class StreamSession:
         except asyncio.CancelledError:
             raise
 
+    async def _watch_for_first_frame(self) -> None:
+        """Stream hardening C2 (findings M1+M2): auto-close if _pump
+        never renders a frame within _PHANTOM_TIMEOUT_SECONDS.
+
+        Mirrors `_watch_for_first_track` (the WebRTC phantom-track
+        watchdog) — same timeout constant, same TimeoutError → close()
+        teardown. Catches a stream takeover to a dead/unreachable URL
+        where ffprobe/ffmpeg hang or yield nothing: without this the
+        session stays is_active and the playlist freezes on the last
+        frame forever.
+
+        This bounds the ZERO-frames-ever case; a pump that DID produce
+        frames and then exited mid-stream is handled by `_pump`'s own
+        finally-block close. Cancellation-safe: close() cancels this
+        task, which surfaces as CancelledError here and is re-raised."""
+        try:
+            await asyncio.wait_for(
+                self._first_frame_event.wait(),
+                timeout=self._PHANTOM_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            if self._closed:
+                # Session was closed via the normal path (or by the
+                # pump's own teardown) during the wait — nothing to do.
+                return
+            log.warning(
+                "stream: session %s rendered no frame within %.1fs; "
+                "closing as unreachable",
+                self.id,
+                self._PHANTOM_TIMEOUT_SECONDS,
+            )
+            await self.close()
+        except asyncio.CancelledError:
+            raise
+
     async def _pump(self) -> None:
         """Drive the source: push each yielded frame to the renderer.
 
@@ -265,9 +318,20 @@ class StreamSession:
         push-frame rendering at all (a Rust sidecar without the
         push-frames IPC op). Logging per frame at the stream's frame
         rate floods the journal — that per-frame-logging shape caused
-        a measured fps regression on the production sign. The session
-        stays "active" holding the last frame; close() still tears it
-        down normally.
+        a measured fps regression on the production sign.
+
+        Stream hardening C2 (findings M1+M2): the pump self-closes the
+        session on EVERY non-cancellation exit. The `finally` block
+        below checks `_closed`: if the pump is exiting because the
+        source ran dry (ffmpeg crashed, the stream disconnected, EOF)
+        and the session is NOT already closing, it calls `close()` so
+        the playlist RESUMES instead of freezing on the last frame
+        forever. A close()-driven cancellation (the operator stopped
+        the stream, or a takeover) already has `_closed=True`, so the
+        `finally` is a no-op there — `close()` does not re-enter.
+        The first rendered frame also signals `_first_frame_event`,
+        which disarms the first-frame watchdog (`_watch_for_first_
+        frame`) for a healthy takeover.
         """
         renderer = self._playback.renderer
         source = self._source
@@ -305,10 +369,14 @@ class StreamSession:
                     log.error(
                         "stream: renderer rejected a pushed frame — "
                         "push-frame rendering is unavailable; stopping "
-                        "the frame pump. The takeover session stays "
-                        "active holding the last frame."
+                        "the frame pump."
                     )
                     return
+                # Stream hardening C2: a frame rendered cleanly —
+                # disarm the first-frame watchdog. set() is idempotent
+                # so doing it every frame (rather than guarding on the
+                # first) is cheap and keeps the pump branch-free.
+                self._first_frame_event.set()
         except asyncio.CancelledError:
             raise
         finally:
@@ -320,6 +388,29 @@ class StreamSession:
                 renderer.end_external_frames()
             except Exception:
                 log.exception("stream: end_external_frames failed")
+            # Stream hardening C2 (findings M1+M2): a stream pump that
+            # has exited MUST NOT leave the session is_active. If the
+            # pump is here because the source ran dry (ffmpeg crashed,
+            # the stream disconnected, EOF, an unreachable URL that
+            # never yielded a frame) and the session is NOT already
+            # closing, auto-close it so the playlist RESUMES instead of
+            # freezing on the last frame forever.
+            #
+            # Gated to the stream transport (`_pc is None`): the WebRTC
+            # transport deliberately does NOT tear down on track-end —
+            # WebRtcStreamSource documents that contract (the pre-
+            # refactor `_consume_video` behaviour), and the WebRTC path
+            # has its own phantom-track watchdog for the no-media case.
+            # C2's scope is the ffmpeg stream takeover only.
+            #
+            # The `_closed` guard skips this when close() drove the
+            # exit (operator stop / takeover / the first-frame
+            # watchdog): close() sets `_closed=True` before cancelling
+            # the pump, so its own teardown does not re-enter. close()'s
+            # `current_task()` guard makes the self-call from here safe
+            # (no pump cancel/await of itself).
+            if not self._closed and self._pc is None:
+                await self.close()
 
     async def close(self) -> None:
         """Tear down whichever transport is in use and resume the
@@ -350,7 +441,19 @@ class StreamSession:
         # track.recv() / ffmpeg stdout read).
         if self._source is not None:
             await self._source.close()
-        if self._pump_task is not None and not self._pump_task.done():
+        # Skip the pump cancel/await when the pump is itself the caller
+        # — stream hardening C2 routes a pump that exited on its own
+        # (ffmpeg crash, disconnect, EOF) through close() from inside
+        # the pump's `finally`. Cancelling + awaiting your own task
+        # would self-deadlock; the pump is already on its way out, so
+        # there is nothing to cancel. Self-call is detected via
+        # `asyncio.current_task()`, the same way the watchdog cancel
+        # above guards its self-cancel.
+        if (
+            self._pump_task is not None
+            and not self._pump_task.done()
+            and asyncio.current_task() is not self._pump_task
+        ):
             self._pump_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._pump_task

@@ -634,8 +634,12 @@ async def test_start_stream_session_pulls_frames(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stream_session_has_no_peer_connection(tmp_path, monkeypatch):
-    """A stream takeover uses no RTCPeerConnection and arms no
-    phantom-track watchdog — that machinery is WebRTC-only."""
+    """A stream takeover uses no RTCPeerConnection — that machinery is
+    WebRTC-only. It DOES arm a watchdog: stream hardening C2 gives the
+    stream path a first-frame watchdog symmetric to the WebRTC phantom-
+    track one (`_watch_for_first_frame`), so an unreachable URL can't
+    freeze the playlist. The watchdog is a stream-path task, not a
+    peer-connection; the no-PC invariant is what this test guards."""
     # NV12 frame size for the injected 8x8 source.
     _patch_mock_ffmpeg(
         monkeypatch, tmp_path, n_frames=1,
@@ -647,8 +651,203 @@ async def test_stream_session_has_no_peer_connection(tmp_path, monkeypatch):
         session = StreamSession(loop)
         await session.start_stream("rtsp://laptop:8554/live")
         assert session._pc is None
-        assert session._watchdog_task is None
+        # C2: the stream path arms a first-frame watchdog.
+        assert session._watchdog_task is not None
         await session.close()
         assert not loop.is_paused
     finally:
+        await loop.stop()
+
+
+# --- 6. stream-takeover freeze hardening (C2, findings M1+M2) ---------------
+
+
+@pytest.mark.asyncio
+async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(
+    tmp_path, monkeypatch
+):
+    """C2 / finding M1: a stream takeover to a dead/unreachable URL —
+    ffmpeg yields ZERO frames — must NOT leave the session permanently
+    is_active with the playlist frozen on the last frame.
+
+    The first-frame watchdog (`_watch_for_first_frame`, symmetric to
+    the WebRTC phantom-track watchdog) auto-closes the session after
+    `_PHANTOM_TIMEOUT_SECONDS` of no frames ever rendered; the pump
+    exhausting `frames()` immediately also auto-closes. Either way the
+    session ends up closed and the playlist resumes — never a
+    permanently-frozen sign the operator must manually /stop.
+
+    The watchdog timeout is compressed via monkeypatch so the test
+    runs fast — mirrors `test_phantom_session_watchdog_closes_on_no_
+    track`."""
+    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
+    # n_frames=0 → the mock ffmpeg emits nothing and exits: the
+    # "unreachable URL" failure mode (ffmpeg/ffprobe yields no media).
+    _patch_mock_ffmpeg(
+        monkeypatch, tmp_path, n_frames=0,
+        frame_size=8 * 8 * 3 // 2, source_size=(8, 8),
+    )
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    try:
+        manager = StreamManager(loop)
+        session_id, _answer = await manager.start(
+            StreamStartRequest(url="rtsp://dead-host:8554/nothing")
+        )
+        session = manager._session
+        assert session is not None and session.id == session_id
+        # The takeover paused the playlist.
+        assert await _wait_until(lambda: loop.is_paused)
+        # The pump runs out of frames immediately (and/or the first-
+        # frame watchdog fires): the session MUST close itself, not
+        # leak as permanently is_active.
+        assert await _wait_until(lambda: session.closed, timeout=2.0), (
+            "session never closed — unreachable-URL takeover froze the playlist"
+        )
+        assert session.closed
+        assert not manager.is_active
+        # close() resumed the loop — the playlist is no longer frozen.
+        # `closed` flips True at the START of close(); resume() runs at
+        # its END, after an awaiting subprocess reap — so poll for the
+        # resume rather than reading it synchronously off `closed`.
+        assert await _wait_until(lambda: not loop.is_paused, timeout=2.0), (
+            "close() did not resume the playlist"
+        )
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_stream_takeover_midstream_pump_exit_does_not_freeze_playlist(
+    tmp_path, monkeypatch
+):
+    """C2 / finding M2: a stream takeover that DID render frames and
+    then loses its source mid-stream (ffmpeg crashes / disconnects /
+    the stream EOFs) must NOT leave the session is_active with the
+    playlist frozen on the last frame.
+
+    A mock ffmpeg that emits a few frames then exits stands in for the
+    mid-stream-disconnect case (the pump exhausts `frames()` AFTER
+    having yielded frames). The pump's `finally`-block auto-close fires
+    so the session closes and the playlist resumes — the invariant is
+    "a pump that has exited MUST NOT leave the session is_active"."""
+    frame_size = 8 * 8 * 3 // 2
+    # n_frames=3 → the pump renders 3 frames, then frames() ends:
+    # mid-stream pump exit AFTER frames flowed.
+    _patch_mock_ffmpeg(
+        monkeypatch, tmp_path, n_frames=3,
+        frame_size=frame_size, source_size=(8, 8),
+    )
+    loop, renderer = _empty_loop(tmp_path)
+    captured: list[bytes] = []
+    original_render = renderer.render_frame
+
+    def _record(data, **kwargs):
+        captured.append(data)
+        return original_render(data, **kwargs)
+
+    renderer.render_frame = _record
+    await loop.start()
+    try:
+        manager = StreamManager(loop)
+        session_id, _answer = await manager.start(
+            StreamStartRequest(url="rtsp://laptop:8554/live")
+        )
+        session = manager._session
+        assert session is not None and session.id == session_id
+        assert await _wait_until(lambda: loop.is_paused)
+        # Frames DID flow (this is the mid-stream case, not the
+        # never-reachable case).
+        assert await _wait_until(lambda: len(captured) >= 3)
+        # ...and then frames() ended: the pump exited and MUST have
+        # auto-closed the session — not left it is_active.
+        assert await _wait_until(lambda: session.closed, timeout=2.0), (
+            "session never closed after a mid-stream pump exit — "
+            "the playlist froze on the last frame"
+        )
+        assert session.closed
+        assert not manager.is_active
+        # close() resumed the loop — poll: resume() runs at the END of
+        # close(), after `closed` has already flipped True.
+        assert await _wait_until(lambda: not loop.is_paused, timeout=2.0), (
+            "close() did not resume the playlist"
+        )
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_stream_takeover_healthy_stream_stays_active(tmp_path, monkeypatch):
+    """C2 happy-path guard: a healthy takeover that IS producing frames
+    must stay is_active and must NOT be closed by the first-frame
+    watchdog. Once frames flow, `_first_frame_event` is set and the
+    watchdog disarms — it only fires on the ZERO-frames-ever case.
+
+    A `continuous` mock ffmpeg streams frames endlessly; the watchdog
+    timeout is compressed but kept comfortably above mock subprocess
+    spawn + first-frame latency, and the test then observes well past
+    that timeout — a live, frame-producing session must remain open
+    and the playlist paused until an explicit operator stop."""
+    # Compressed so the test is fast, but long enough that the mock
+    # ffmpeg's spawn + first frame land inside it — the watchdog must
+    # see the first frame and disarm. The test waits past this window
+    # below: if a healthy session were wrongly killable it'd be caught.
+    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 1.0)
+
+    import functools
+
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
+
+    frame_size = 8 * 8 * 3 // 2
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=0, continuous=True
+    )
+    monkeypatch.setattr(
+        "openmarquee.stream_source.StreamConsumer",
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=(8, 8)),
+    )
+
+    loop, renderer = _empty_loop(tmp_path)
+    captured: list[bytes] = []
+    original_render = renderer.render_frame
+
+    def _record(data, **kwargs):
+        captured.append(data)
+        return original_render(data, **kwargs)
+
+    renderer.render_frame = _record
+    await loop.start()
+    try:
+        manager = StreamManager(loop)
+        session_id, _answer = await manager.start(
+            StreamStartRequest(url="rtsp://laptop:8554/live")
+        )
+        session = manager._session
+        assert session is not None and session.id == session_id
+        assert await _wait_until(lambda: loop.is_paused)
+        # Frames are flowing — the first frame disarms the watchdog.
+        assert await _wait_until(lambda: len(captured) >= 2)
+        # The first-frame watchdog should have seen the first frame
+        # and exited (disarmed), NOT have fired its close().
+        assert session._watchdog_task is not None
+        assert await _wait_until(lambda: session._watchdog_task.done())
+        # Wait well past the watchdog timeout — a healthy, frame-
+        # producing session must NOT be auto-closed.
+        await asyncio.sleep(1.3)
+        assert not session.closed, (
+            "the first-frame watchdog wrongly closed a live, "
+            "frame-producing session"
+        )
+        assert manager.is_active
+        assert loop.is_paused
+        # A normal operator-driven stop still works.
+        await manager.stop(session_id)
+        assert session.closed
+        assert not manager.is_active
+        assert not loop.is_paused
+    finally:
+        await manager.stop_all()
         await loop.stop()
