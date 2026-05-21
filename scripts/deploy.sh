@@ -113,6 +113,18 @@ rsync -avz --delete --delete-excluded \
     --exclude '._*' \
     "$OPENMARQUEE_BUILD_DIR/system/" "$TARGET:$REMOTE_ROOT/system/"
 
+# images/ carries the pi-gen substage assets install.sh's boot-splash
+# section (7d) reads at redeploy time: the Plymouth theme, boot-config-
+# lib.sh, and the plymouth-quit handoff drop-in. build_sd_bundle.sh
+# bundles images/ for a factory SD image; the developer/redeploy path
+# needs the same single canonical copies or install.sh logs "asset
+# absent; skip" and the boot splash silently never installs. Small dir.
+echo "==> rsync images/ to $TARGET:$REMOTE_ROOT/images/"
+rsync -avz --delete --delete-excluded \
+    --exclude '._*' \
+    --exclude '__pycache__' \
+    "$OPENMARQUEE_BUILD_DIR/images/" "$TARGET:$REMOTE_ROOT/images/"
+
 echo "==> running install.sh on remote (idempotent provisioning)"
 # install.sh handles venv (Batch 11.1 / sweep #5 #7 requirements.lock
 # pin), systemd unit install, hostapd/dnsmasq/iptables wiring, and
