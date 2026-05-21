@@ -9,6 +9,9 @@
 #   ui/                       -- pre-built UI bundle (index.html + dist/)
 #   scripts/                  -- install.sh and helpers (no SD-build scripts)
 #   system/                   -- systemd units, hostapd.conf, dnsmasq.conf
+#   images/                   -- pi-gen substage tree (Plymouth boot-splash
+#                                theme + boot-config-lib.sh + handoff drop-in;
+#                                install.sh's redeploy path reads these)
 #   bin/openmarquee-render    -- Rust IPC sidecar, aarch64-linux-gnu
 #   wheels/                   -- vendored pip wheels for linux_aarch64
 #   pyproject.toml            -- copied for `pip install -e .` on device
@@ -197,6 +200,20 @@ rsync -a --delete \
     --exclude '.Jimmy/' \
     --exclude '.git/' \
     "$REPO_ROOT/system/" "$ROOT/system/"
+
+# images/ carries the pi-gen substage tree — small (~the boot-splash
+# theme PNG + recipe text). install.sh's redeploy path (section 7d)
+# reads the Plymouth theme files, boot-config-lib.sh, and the
+# plymouth-quit handoff drop-in from /opt/openmarquee/images/..., so
+# the same boot splash a factory-flashed card gets from the image
+# build also reaches an already-provisioned Pi on redeploy.
+say "Copying images/ to staging (pi-gen substage tree — boot-splash assets)"
+rsync -a --delete \
+    --exclude '._*' \
+    --exclude '.DS_Store' \
+    --exclude '.Jimmy/' \
+    --exclude '.git/' \
+    "$REPO_ROOT/images/" "$ROOT/images/"
 
 # --- 2. Rust IPC sidecar binary (aarch64) -----------------------------------
 

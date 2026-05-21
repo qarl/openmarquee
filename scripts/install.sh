@@ -649,6 +649,178 @@ elif [ "$DRY_RUN" -eq 1 ]; then
     say "DRYRUN: would enable persistent journal at /var/log/journal"
 fi
 
+# --- 7d. Boot splash --------------------------------------------------------
+#
+# Apply the Plymouth boot splash to an ALREADY-PROVISIONED Pi. A
+# factory-flashed card gets the splash from the pi-gen image build
+# (substages 01-plymouth-theme / 02-boot-config / 03-plymouth-handoff);
+# this section replicates the SAME four effects on the redeploy path so
+# a live sign picks up the splash without a reflash:
+#   1. plymouth package installed
+#   2. the openmarquee theme laid into /usr/share/plymouth/themes/
+#   3. plymouth-set-default-theme -R openmarquee (rebuilds the initramfs)
+#   4. config.txt + cmdline.txt patched (disable_splash + quiet/splash)
+#   5. the plymouth-quit --retain-splash handoff drop-in installed
+#
+# The boot splash is NON-CRITICAL to device function. Every step here
+# is best-effort: if plymouth can't be fetched (offline / apt failure)
+# we log it via `say` and continue — we do NOT abort the install.
+#
+# Idempotent: re-running on an already-splashed Pi is a clean no-op
+# (apt sees plymouth installed, the theme copy overwrites identically,
+# plymouth-set-default-theme is idempotent, the boot-config-lib patch
+# functions short-circuit when their marker is already present, and the
+# drop-in copy overwrites identically).
+#
+# Slotted BEFORE section 8 deliberately: section 8 runs the single
+# `systemctl daemon-reload`, which picks up the handoff drop-in this
+# section installs — no separate daemon-reload needed here.
+say "Apply boot splash (Plymouth)"
+
+# All the boot-splash source assets ship in the bundle under
+# /opt/openmarquee/images/ (build_sd_bundle.sh copies the pi-gen
+# substage tree). SPLASH_STAGE is the stage-openmarquee/ root.
+SPLASH_STAGE="${OPT_DIR}/images/openmarquee/stage-openmarquee"
+
+# 1. Install the plymouth package. install.sh otherwise runs offline
+#    (no apt) on most paths, so this may fail when there's no network
+#    or no apt cache — that's tolerated: the apt call sits in an `if`
+#    (which suspends set -e for its condition), so a failure just logs
+#    a `say` warning and continues rather than fail-stopping the
+#    install. The presence check makes a re-run quiet (apt is itself
+#    idempotent, but skipping the call avoids needless apt chatter).
+PLYMOUTH_PRESENT=0
+if [ "$DRY_RUN" -eq 1 ]; then
+    say "DRYRUN: would apt-get install -y plymouth (if not already present)"
+    # Assume present in dry-run so the rest of the section prints its
+    # full action set for test visibility.
+    PLYMOUTH_PRESENT=1
+elif command -v plymouth >/dev/null 2>&1; then
+    say "  plymouth already installed; skip apt"
+    PLYMOUTH_PRESENT=1
+else
+    say "  plymouth not present; attempting apt-get install"
+    if apt-get install -y plymouth; then
+        PLYMOUTH_PRESENT=1
+        say "  plymouth installed"
+    else
+        say "  WARNING: could not install plymouth (offline / apt failure?)"
+        say "           boot splash skipped — non-critical, device still works."
+        say "           Run 'sudo apt install plymouth' (needs network) then"
+        say "           re-run install.sh to enable the splash."
+    fi
+fi
+
+# 2. Install the openmarquee Plymouth theme. The 4 theme files
+#    (openmarquee.plymouth / .script / splash.png / spinner.png) live
+#    under the 01-plymouth-theme substage's files/openmarquee/ dir.
+#    generate_splash.py is the reproducible-artwork source and is
+#    deliberately NOT copied into the rootfs (mirrors 01-run.sh).
+if [ "$PLYMOUTH_PRESENT" -eq 1 ]; then
+    THEME_SRC="${SPLASH_STAGE}/01-plymouth-theme/files/openmarquee"
+    THEME_DST="${ROOT_PREFIX}/usr/share/plymouth/themes/openmarquee"
+    say "Install Plymouth theme to ${THEME_DST}"
+    if [ "$DRY_RUN" -eq 1 ] || [ -d "$THEME_SRC" ]; then
+        run install -d -m 755 "$THEME_DST"
+        for theme_file in openmarquee.plymouth openmarquee.script splash.png spinner.png; do
+            run install -m 644 "${THEME_SRC}/${theme_file}" "${THEME_DST}/${theme_file}"
+        done
+    else
+        say "  theme source ${THEME_SRC} absent; skip (bundle predates boot splash)"
+    fi
+
+    # 3. Select the openmarquee theme as the system default. -R rebuilds
+    #    the initramfs so the splash is available from early boot.
+    #    Idempotent (re-selecting the same theme is a no-op). Gated to a
+    #    real-device install — plymouth-set-default-theme writes
+    #    /etc/plymouth/plymouthd.conf + runs update-initramfs, neither of
+    #    which makes sense against a tmpdir --root.
+    if [ -z "$ROOT_PREFIX" ]; then
+        say "Set openmarquee as the default Plymouth theme (-R rebuilds initramfs)"
+        run plymouth-set-default-theme -R openmarquee
+    else
+        say "DRYRUN: would run plymouth-set-default-theme -R openmarquee"
+    fi
+fi
+
+# 4. Patch the Pi boot files (config.txt + cmdline.txt).
+#
+#    REUSE THE TESTED LIBRARY — DO NOT REIMPLEMENT. cmdline.txt is a
+#    single-line file of space-separated kernel params: a stray newline
+#    silently drops every param after it and can leave the kernel with
+#    no root= — a boot-bricking edit recoverable only by a physical
+#    reflash. images/.../02-boot-config/boot-config-lib.sh already has
+#    `patch_config_txt` + `patch_cmdline_txt`, both idempotent and
+#    unit-tested by test-boot-config.sh. We `source` that lib and CALL
+#    those functions rather than writing a fresh, untested cmdline patch
+#    here.
+#
+#    DRY_RUN safety: the lib's patch_* functions modify the boot files
+#    DIRECTLY — they do not go through install.sh's `run` wrapper. So
+#    under --dry-run we must NOT call them; we only `say` what would
+#    happen. The `if [ "$DRY_RUN" -eq 0 ]` guard below enforces that.
+BOOT_LIB="${SPLASH_STAGE}/02-boot-config/boot-config-lib.sh"
+if [ -f "$BOOT_LIB" ]; then
+    # shellcheck source=/dev/null
+    source "$BOOT_LIB"
+    # Resolve the boot dir the same way 02-run.sh does: trixie puts the
+    # boot partition at /boot/firmware, older layouts at /boot.
+    boot_dir=""
+    for candidate in "${ROOT_PREFIX}/boot/firmware" "${ROOT_PREFIX}/boot"; do
+        if [ -f "${candidate}/cmdline.txt" ] && [ -f "${candidate}/config.txt" ]; then
+            boot_dir="$candidate"
+            break
+        fi
+    done
+    if [ -z "$boot_dir" ]; then
+        # Non-fatal: a missing boot dir means we can't patch, but the
+        # device still functions (the splash just won't show). Mirrors
+        # the boot-splash-is-non-critical stance for the whole section.
+        say "  WARNING: cmdline.txt + config.txt not found under ${ROOT_PREFIX}/boot[/firmware]"
+        say "           skipping boot-config patch — splash may not display."
+    else
+        say "Patch boot config in ${boot_dir} (config.txt + cmdline.txt)"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            # patch_* modify the files directly; both are idempotent and
+            # short-circuit when the marker is already present. They
+            # `return 1` on a missing / empty boot file — guard the
+            # calls so that non-zero can't trip `set -e` and abort the
+            # whole redeploy: the boot splash is non-critical, a bad
+            # boot file must not break a production FYS redeploy.
+            patch_config_txt  "${boot_dir}/config.txt" \
+                || say "  WARNING: config.txt patch skipped (see above)"
+            patch_cmdline_txt "${boot_dir}/cmdline.txt" \
+                || say "  WARNING: cmdline.txt patch skipped (see above)"
+        else
+            say "  DRYRUN: would patch config.txt (disable_splash=1) +"
+            say "          cmdline.txt (quiet splash plymouth.ignore-serial-consoles)"
+        fi
+    fi
+else
+    say "  boot-config-lib.sh absent at ${BOOT_LIB}; skip boot-config patch"
+fi
+
+# 5. Install the plymouth-quit --retain-splash handoff drop-in. This
+#    keeps the splash framebuffer on screen until the renderer paints
+#    its first frame (no black flash). The drop-in lands in a
+#    plymouth-quit.service.d/ dir; section 8's daemon-reload picks it
+#    up. The copy overwrites identically on re-run (idempotent).
+HANDOFF_SRC="${SPLASH_STAGE}/03-plymouth-handoff/files/plymouth-quit.service.d/retain-splash.conf"
+HANDOFF_DST_DIR="${SYSTEMD_DIR}/plymouth-quit.service.d"
+HANDOFF_DST="${HANDOFF_DST_DIR}/retain-splash.conf"
+say "Install plymouth-quit --retain-splash handoff drop-in"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "$HANDOFF_SRC" ]; then
+    run install -d -m 755 "$HANDOFF_DST_DIR"
+    run install -m 644 "$HANDOFF_SRC" "$HANDOFF_DST"
+else
+    say "  handoff drop-in source ${HANDOFF_SRC} absent; skip"
+fi
+
+# 6. No separate `systemctl daemon-reload` needed here: section 8 below
+#    runs `systemctl daemon-reload` and that picks up the drop-in just
+#    installed (this section is slotted before section 8 precisely so
+#    the drop-in is in place when that reload runs).
+
 # --- 8. systemctl reload + enable -------------------------------------------
 
 say "Reload systemd + enable units"
