@@ -2732,6 +2732,29 @@ pub fn render_image_slide(
 /// indexed, 16-bit) bail with a context-rich error -- the
 /// browser doesn't produce them, but the diagnostic surfaces if
 /// an operator hand-edits an asset.
+///
+/// Bug W2 (2026-05-21): the returned RGBA buffer is row-flipped
+/// to BOTTOM-UP order. The PNG file decodes top-down (row 0 =
+/// image top); every caller uploads this buffer with
+/// `glTexImage2D` and draws it through `VS_TEXTURED_QUAD`, whose
+/// quads map texture `v=0` to the BOTTOM of the screen (the
+/// bottom-left vertex carries UV (0,0) -- see
+/// `cover_fit_quad_verts` and `create_fullscreen_quad`). A
+/// top-down buffer through that quad samples image-top at
+/// screen-bottom, i.e. renders the image UPSIDE DOWN. This was
+/// latent in the image bake since slice (a) -- it surfaced when
+/// the Web slide (which renders via this exact image path) put
+/// obviously-oriented content (a webpage screenshot) on glass.
+/// Flipping rows here matches the GL `v` convention so every
+/// image-asset path -- scanout, capture, image-as-background --
+/// renders right-side up, with no quad/shader change that would
+/// touch the text / video / stream / pattern paths.
+///
+/// Same CLASS as FYS bug 2 (a625e35, the NV12 v-flip): a GL
+/// Y-convention mismatch. The video path flipped `v` in its
+/// fragment shaders; the image path is fixed here at decode
+/// because its texture data is host-side bytes (a shader flip
+/// would need a dedicated image-only shader variant).
 fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("open png {}", path.display()))?;
@@ -2765,6 +2788,11 @@ fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
             path.display(),
         ),
     };
+    // Bug W2: flip to bottom-up row order so the GL `v` convention
+    // (see the doc comment above) renders the image right-side up.
+    // The flip helper lives in hdmi_logic.rs so it is host-testable
+    // on the Mac dev box (hdmi.rs is Linux-only).
+    let rgba = crate::hdmi_logic::flip_rgba_rows_vertically(rgba, w, h);
     Ok((rgba, w, h))
 }
 

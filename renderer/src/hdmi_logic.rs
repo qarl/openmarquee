@@ -3019,6 +3019,49 @@ pub fn nv12_dims_ok(frame_w: u32, frame_h: u32) -> bool {
     frame_w <= MAX_GL_TEXTURE_DIM && frame_h <= MAX_GL_TEXTURE_DIM
 }
 
+/// Bug W2 (2026-05-21) -- reverse the row order of an RGBA8 pixel
+/// buffer (top-down -> bottom-up, or vice versa).
+///
+/// Why the image bake needs this: a PNG file decodes TOP-DOWN
+/// (row 0 = image top). `load_png_rgba` uploads that buffer with
+/// `glTexImage2D` and every image-asset path draws it through a
+/// `VS_TEXTURED_QUAD` quad whose `v=0` maps to the BOTTOM of the
+/// screen (the bottom-left vertex carries UV (0,0) — see
+/// `cover_fit_quad_verts` above and `create_fullscreen_quad`). A
+/// top-down buffer through that quad samples image-top at
+/// screen-bottom, i.e. renders the image UPSIDE DOWN. Flipping
+/// the decoded buffer to bottom-up here matches the GL `v`
+/// convention so every image-asset path — scanout, capture,
+/// image-as-background — renders right-side up, with no
+/// quad/shader change that would also touch the text / video /
+/// stream / pattern paths.
+///
+/// Same CLASS as FYS bug 2 (a625e35, the NV12 v-flip): a GL
+/// Y-convention mismatch. The video path flipped `v` in its
+/// fragment shaders; the image path is fixed at decode because
+/// its texture data is host-side bytes.
+///
+/// `rgba` must be exactly `w * h * 4` bytes. A buffer whose
+/// length does not match — a malformed asset the decoder somehow
+/// let through — is returned UNCHANGED rather than panicking on
+/// the chunk math; the GL upload downstream surfaces the real
+/// error. Pure (no GL), so the flip is host-testable on the Mac
+/// dev box even though `hdmi.rs` itself is Linux-only.
+pub fn flip_rgba_rows_vertically(rgba: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+    let stride = (w as usize).saturating_mul(4);
+    let expected = stride.saturating_mul(h as usize);
+    if stride == 0 || h == 0 || rgba.len() != expected {
+        return rgba;
+    }
+    let mut flipped = vec![0u8; expected];
+    for y in 0..h as usize {
+        let src = y * stride;
+        let dst = (h as usize - 1 - y) * stride;
+        flipped[dst..dst + stride].copy_from_slice(&rgba[src..src + stride]);
+    }
+    flipped
+}
+
 /// FYS bug B (2026-05-21) -- compute the COVER-fit fullscreen-quad
 /// vertices for a regular uploaded image / video slide.
 ///
@@ -7546,6 +7589,66 @@ mod tests {
             -1.0,  1.0, 0.0, 1.0,
              1.0,  1.0, 1.0, 1.0,
         ]);
+    }
+
+    // --- Bug W2 (2026-05-21): image-asset orientation ----------------
+    //
+    // A Web slide renders via the SAME image bake as a regular image
+    // slide (`load_png_rgba` -> `glTexImage2D` -> textured quad). A
+    // PNG decodes top-down, but the image-bake quad maps texture
+    // `v=0` to screen-bottom, so a standard top-down asset came out
+    // UPSIDE DOWN on glass. `load_png_rgba` now routes the decoded
+    // buffer through `flip_rgba_rows_vertically` (bottom-up) so the
+    // GL `v` convention renders it right-side up. These tests pin
+    // that flip; they FAIL against the pre-fix code (which never
+    // flipped the buffer).
+
+    /// `flip_rgba_rows_vertically` reverses row order: a top-down
+    /// RGBA buffer becomes bottom-up. The on-glass W2 fix in one
+    /// pure assertion — a top-down RED-top/BLUE-bottom buffer must
+    /// come back BLUE-top/RED-bottom so the image-bake quad paints
+    /// it right-side up.
+    #[test]
+    fn flip_rgba_rows_reverses_row_order() {
+        // 1x2 image: row 0 RED, row 1 BLUE (standard top-down).
+        let top_down: Vec<u8> = vec![
+            255, 0, 0, 255, // row 0 (top) = RED
+            0, 0, 255, 255, // row 1 (bottom) = BLUE
+        ];
+        let flipped = flip_rgba_rows_vertically(top_down.clone(), 1, 2);
+        assert_eq!(&flipped[0..4], &[0, 0, 255, 255], "row 0 is now BLUE");
+        assert_eq!(&flipped[4..8], &[255, 0, 0, 255], "row 1 is now RED");
+        // Flipping twice is the identity — proves it's a pure flip,
+        // not a one-way transform that would double-flip on reuse.
+        assert_eq!(flip_rgba_rows_vertically(flipped, 1, 2), top_down);
+    }
+
+    /// A wider real-shape buffer flips a whole row at a time — the
+    /// per-pixel order WITHIN a row is preserved, only row order
+    /// reverses. Guards against an off-by-one / transpose bug.
+    #[test]
+    fn flip_rgba_rows_preserves_within_row_pixel_order() {
+        // 2x2: top row = [RED, GREEN], bottom row = [BLUE, WHITE].
+        let top_down: Vec<u8> = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, // row 0: RED, GREEN
+            0, 0, 255, 255, 255, 255, 255, 255, // row 1: BLUE, WHITE
+        ];
+        let flipped = flip_rgba_rows_vertically(top_down, 2, 2);
+        // Row 0 is now the old bottom row, left-to-right unchanged.
+        assert_eq!(&flipped[0..8], &[0, 0, 255, 255, 255, 255, 255, 255]);
+        // Row 1 is now the old top row, left-to-right unchanged.
+        assert_eq!(&flipped[8..16], &[255, 0, 0, 255, 0, 255, 0, 255]);
+    }
+
+    /// A buffer whose length does not match `w*h*4` — a malformed
+    /// asset — is returned unchanged rather than panicking on the
+    /// chunk math. Zero height is a clean no-op too.
+    #[test]
+    fn flip_rgba_rows_tolerates_a_mismatched_buffer() {
+        let weird = vec![1u8, 2, 3];
+        assert_eq!(flip_rgba_rows_vertically(weird.clone(), 4, 4), weird);
+        let empty: Vec<u8> = Vec::new();
+        assert_eq!(flip_rgba_rows_vertically(empty.clone(), 4, 0), empty);
     }
 
     #[test]
