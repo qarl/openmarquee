@@ -253,7 +253,7 @@ export async function updateTextSlide(id, payload) {
  * server-side.
  */
 export async function saveStream(payload) {
-    const response = await apiFetch("/api/content/vlc-streams", {
+    const response = await apiFetch("/api/content/streams", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -270,7 +270,7 @@ export async function saveStream(payload) {
  * preserved so playlist + schedule references hold).
  */
 export async function updateStream(id, payload) {
-    const response = await apiFetch(`/api/content/vlc-streams/${id}`, {
+    const response = await apiFetch(`/api/content/streams/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

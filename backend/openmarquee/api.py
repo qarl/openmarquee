@@ -664,7 +664,7 @@ async def update_image(
 
 
 class StreamUpload(BaseModel):
-    """Wire format for POST /api/content/vlc-streams.
+    """Wire format for POST /api/content/streams.
 
     A stream slide has no operator-uploaded asset — the video is a
     live network feed and the thumbnail card is synthesised at save time
@@ -682,7 +682,7 @@ class StreamUpload(BaseModel):
     transition_ms: int = 500
 
 
-@router.post("/vlc-streams", response_model=StreamSlide)
+@router.post("/streams", response_model=StreamSlide)
 async def upload_stream(
     payload: StreamUpload,
     storage: StorageDep,
@@ -709,7 +709,7 @@ async def upload_stream(
 
 
 class StreamUpdate(BaseModel):
-    """Wire format for PUT /api/content/vlc-streams/{id}. All metadata;
+    """Wire format for PUT /api/content/streams/{id}. All metadata;
     the UUID is preserved so playlist + schedule references hold."""
 
     name: str
@@ -720,7 +720,7 @@ class StreamUpdate(BaseModel):
     transition_ms: int = 500
 
 
-@router.put("/vlc-streams/{item_id}", response_model=StreamSlide)
+@router.put("/streams/{item_id}", response_model=StreamSlide)
 async def update_stream(
     item_id: UUID,
     payload: StreamUpdate,

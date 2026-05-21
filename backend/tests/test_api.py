@@ -821,7 +821,7 @@ def test_post_stream_creates_slide_and_appends_to_playlist(
     client: TestClient, playlist_storage: PlaylistStorage
 ):
     response = client.post(
-        "/api/content/vlc-streams",
+        "/api/content/streams",
         json={
             "name": "Q3 Live",
             "stream_url": "rtsp://laptop:8554/live",
@@ -842,7 +842,7 @@ def test_post_stream_creates_slide_and_appends_to_playlist(
 
 def test_post_stream_uses_defaults_for_omitted_fields(client: TestClient):
     response = client.post(
-        "/api/content/vlc-streams",
+        "/api/content/streams",
         json={"name": "Minimal", "stream_url": "rtsp://h:8554/x"},
     )
     assert response.status_code == 200
@@ -856,7 +856,7 @@ def test_post_stream_rejects_bad_on_unreachable(client: TestClient):
     """An invalid on_unreachable value is caught by the StreamSlide
     model and surfaced as a 422 (not a 500)."""
     response = client.post(
-        "/api/content/vlc-streams",
+        "/api/content/streams",
         json={
             "name": "Bad",
             "stream_url": "rtsp://h/x",
@@ -870,7 +870,7 @@ def test_get_stream_thumbnail_is_a_png(client: TestClient):
     """The synthetic 'stream' card is reachable via the standard
     asset endpoint so the editor tile renders like any other slide."""
     post = client.post(
-        "/api/content/vlc-streams",
+        "/api/content/streams",
         json={"name": "Live", "stream_url": "rtsp://h:8554/x"},
     )
     item_id = post.json()["id"]
@@ -881,12 +881,12 @@ def test_get_stream_thumbnail_is_a_png(client: TestClient):
 
 def test_put_stream_updates_metadata_preserving_id(client: TestClient):
     post = client.post(
-        "/api/content/vlc-streams",
+        "/api/content/streams",
         json={"name": "Before", "stream_url": "rtsp://h:8554/old"},
     )
     item_id = post.json()["id"]
     response = client.put(
-        f"/api/content/vlc-streams/{item_id}",
+        f"/api/content/streams/{item_id}",
         json={
             "name": "After",
             "stream_url": "rtsp://h:8554/new",
@@ -903,14 +903,14 @@ def test_put_stream_updates_metadata_preserving_id(client: TestClient):
 
 
 def test_put_stream_wrong_type_returns_409(client: TestClient):
-    """Updating a non-stream id via the vlc-streams route is a 409."""
+    """Updating a non-stream id via the streams route is a 409."""
     text = client.post(
         "/api/content/text-slides",
         json=_upload_payload(name="a-text-slide"),
     )
     text_id = text.json()["id"]
     response = client.put(
-        f"/api/content/vlc-streams/{text_id}",
+        f"/api/content/streams/{text_id}",
         json={"name": "x", "stream_url": "rtsp://h/x"},
     )
     assert response.status_code == 409
@@ -918,7 +918,7 @@ def test_put_stream_wrong_type_returns_409(client: TestClient):
 
 def test_put_stream_unknown_id_returns_404(client: TestClient):
     response = client.put(
-        f"/api/content/vlc-streams/{uuid4()}",
+        f"/api/content/streams/{uuid4()}",
         json={"name": "ghost", "stream_url": "rtsp://h/x"},
     )
     assert response.status_code == 404
