@@ -43,11 +43,13 @@ import {
     saveTextSlide,
     saveStream,
     saveVideo,
+    saveWeb,
     updateFlockPeer,
     updateImage,
     updateStream,
     updateTextSlide,
     updateVideo,
+    updateWeb,
 } from "./api.js";
 import { setSignTimezone } from "./auto-format.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
@@ -70,6 +72,7 @@ import { rerenderAllSlidesForRotation } from "./rotation-rerender.js";
 import { mountStreamPanel } from "./stream-panel.js";
 import { mountVideoUploader } from "./video-upload.js";
 import { mountStreamUploader } from "./stream-upload.js";
+import { mountWebSlideEditor } from "./web-slide.js";
 import { initWasmRenderer, registerFont } from "./wasm-renderer.js";
 
 // Fallback dims if /api/settings can't be reached — matches SYSTEM_SPEC
@@ -278,6 +281,9 @@ async function boot() {
             <div class="tab-pane" data-tab="stream" hidden>
                 <div class="stream-upload-slot"></div>
             </div>
+            <div class="tab-pane" data-tab="web" hidden>
+                <div class="web-slide-slot"></div>
+            </div>
         </section>
         <section data-section="playlists" class="panel">
             <div class="playlist-track-slot"></div>
@@ -305,6 +311,7 @@ async function boot() {
     let imageUploader = null;
     let videoUploader = null;
     let streamUploader = null;
+    let webSlideEditor = null;
     // Inline preview runs a requestAnimationFrame loop + caches
     // <img>/<video> elements; stop() before dropping its DOM.
     let inlinePreviewHandle = null;
@@ -351,6 +358,7 @@ async function boot() {
         await imageUploader?.refreshBrowser?.();
         await videoUploader?.refreshBrowser?.();
         await streamUploader?.refreshBrowser?.();
+        await webSlideEditor?.refreshBrowser?.();
         // Slides shell tab counts + sidebar totals.
         await slidesShell?.refreshCounts?.();
         await refreshSidebarCounts();
@@ -543,6 +551,17 @@ async function boot() {
             onSave: onSaveWithRefresh(saveStream),
             onSaveExisting: onSaveWithRefresh(updateStream),
         });
+
+        // Web slide editor — pure metadata, no canvas, so it ignores
+        // width/height (mounted here alongside the others for a
+        // consistent re-mount lifecycle).
+        const webSlot = root.querySelector(".web-slide-slot");
+        webSlot.innerHTML = "";
+        webSlideEditor = mountWebSlideEditor(webSlot, {
+            fetchItems: listContent,
+            onSave: onSaveWithRefresh(saveWeb),
+            onSaveExisting: onSaveWithRefresh(updateWeb),
+        });
     }
 
     // Phase 1b parity fix (2026-05-14): init the fontdue-WASM
@@ -610,6 +629,7 @@ async function boot() {
                 else if (tabKey === "image") imageUploader?.createNew?.();
                 else if (tabKey === "video") videoUploader?.createNew?.();
                 else if (tabKey === "stream") streamUploader?.createNew?.();
+                else if (tabKey === "web") webSlideEditor?.createNew?.();
             },
         },
     );
@@ -770,6 +790,7 @@ async function boot() {
         "slides/image": "Image slides",
         "slides/video": "Video slides",
         "slides/stream": "Streams",
+        "slides/web": "Web slides",
         playlists: "Playlists",
         stream: "Stream",
         flock: "Flock",
@@ -947,6 +968,10 @@ async function boot() {
             section: "slides/stream",
             load: (slide) => streamUploader.loadForEdit(slide),
         },
+        web: {
+            section: "slides/web",
+            load: (slide) => webSlideEditor.loadForEdit(slide),
+        },
     };
     document.addEventListener("openmarquee:edit-slide", async (event) => {
         const { id, type } = event.detail || {};
@@ -983,6 +1008,7 @@ async function boot() {
             imageUploader?.refreshBrowser?.(),
             videoUploader?.refreshBrowser?.(),
             streamUploader?.refreshBrowser?.(),
+            webSlideEditor?.refreshBrowser?.(),
             slidesShell?.refreshCounts?.(),
             refreshSidebarCounts(),
             inlinePreviewHandle?.refresh?.(),

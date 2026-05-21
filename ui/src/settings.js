@@ -266,6 +266,38 @@ const SECTION_TEMPLATE = `
                 </label>
             </div>
 
+            <div class="om-card">
+                <div ${CARD_EYEBROW}>Web slides</div>
+                <p class="settings-hint" style="margin: 0 0 12px;">
+                    Web slides show a screenshot of a web page. The Pi can't
+                    run a browser, so you run a small render helper on your
+                    own machine that takes the screenshots. These point the
+                    sign at that helper.
+                </p>
+                <div class="om-stack" style="gap: 12px;">
+                    <label class="field om-field">
+                        <span>Web helper address</span>
+                        <input type="text" class="om-input field-web-helper-url"
+                               placeholder="http://192.168.1.50:8888"
+                               autocomplete="off" spellcheck="false">
+                        <p class="field-hint" style="margin: 6px 0 0;">
+                            The address of the render helper you run on your
+                            own machine, e.g. http://192.168.1.50:8888
+                        </p>
+                    </label>
+                    <label class="field om-field">
+                        <span>Web helper token</span>
+                        <input type="text" class="om-input field-web-helper-token"
+                               autocomplete="off" spellcheck="false">
+                        <p class="field-hint" style="margin: 6px 0 0;">
+                            A shared token the sign and the helper both use
+                            on your LAN. Pick any text and set the same value
+                            on the helper.
+                        </p>
+                    </label>
+                </div>
+            </div>
+
             <div class="om-card settings-operator-password">
                 <div ${CARD_EYEBROW}>Operator login</div>
                 <p class="settings-hint" style="margin: 0 0 12px;">
@@ -356,6 +388,8 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const stationPasswordEl = container.querySelector(".field-wifi-station-password");
     const wifiRescanBtn = container.querySelector(".settings-wifi-rescan");
     const tzEl = container.querySelector(".field-timezone");
+    const webHelperUrlEl = container.querySelector(".field-web-helper-url");
+    const webHelperTokenEl = container.querySelector(".field-web-helper-token");
     const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
     const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
     const tsAuthKeyEl = container.querySelector(".field-tailscale-auth-key");
@@ -754,6 +788,10 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             syncTailscaleStationGating();
             syncWs281xOrderVisibility();
             setTimezoneValue(tzEl, settings.timezone || "");
+            // Web-slide render helper address + token. Both default
+            // empty (a device with no Web slides never needs them).
+            webHelperUrlEl.value = settings.web_helper_url ?? "";
+            webHelperTokenEl.value = settings.web_helper_token ?? "";
             // Trigger a wifi scan in the background so the dropdown is
             // useful by the time the operator gets to it.
             populateWifiScan();
@@ -861,6 +899,8 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             wifi_station_password: stationPasswordEl.value || null,
             ws281x_pixel_order: ws281xOrderEl.value || "row_major",
             timezone: tzEl.value || null,
+            web_helper_url: webHelperUrlEl.value.trim(),
+            web_helper_token: webHelperTokenEl.value.trim(),
             tailscale_enabled: tsEnabledEl.checked,
             tailscale_hostname: tsHostnameEl.value.trim() || null,
             tailscale_auth_key: tsAuthKeyEl.value || null,

@@ -4219,6 +4219,50 @@ html, body { margin: 0; padding: 0; height: 100%; }
 }
 
 
+/* --- Web slide editor — a metadata-only sibling of the Stream editor
+   (web-slide.js). No file upload, no in-editor preview: the render
+   helper screenshots the page on the operator's machine and the
+   result only appears on the sign. --- */
+
+/* Hint under the refresh-interval select. */
+.web-refresh-note {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: var(--om-text-dim, var(--text));
+}
+
+/* Placeholder preview card — a web slide has no operator image; this
+   stands in for the screenshotted page inside the editor. Mirrors
+   .stream-preview-card. */
+.web-preview-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 28px 16px;
+    border-radius: var(--om-radius, 0.5rem);
+    background: var(--om-led-bg, #000);
+    border: 1px solid var(--om-line, var(--panel-border));
+}
+.web-preview-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--om-accent);
+}
+.web-preview-url {
+    font-family: var(--om-mono, monospace);
+    font-size: 13px;
+    color: var(--om-text, var(--text));
+    word-break: break-all;
+}
+.web-preview-note {
+    font-size: 12px;
+    color: var(--om-text-dim, var(--text));
+}
+
+
 /* --- Flock panel — om-flock-grid + om-peer-card (per the 2026-04-28
    design handoff). The prior flock-tile-* rules above are deprecated
    but kept dormant to avoid touching this commit's blast radius;

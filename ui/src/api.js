@@ -285,6 +285,43 @@ export async function updateStream(id, payload) {
 }
 
 /**
+ * Create a web slide. `payload` matches the backend `WebUpload` schema
+ * (api.py) — pure metadata (name, url, refresh_interval_s, duration_ms,
+ * transition). There is no asset upload: the screenshot is produced by
+ * the render helper (`web-helper/`) and the placeholder card is
+ * synthesised server-side.
+ */
+export async function saveWeb(payload) {
+    const response = await apiFetch("/api/content/web", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(`Save failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
+ * Update an existing web slide (metadata only; the UUID is preserved
+ * so playlist + schedule references hold).
+ */
+export async function updateWeb(id, payload) {
+    const response = await apiFetch(`/api/content/web/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(`Update web failed (${response.status}): ${detail}`);
+    }
+    return await response.json();
+}
+
+/**
  * Update an existing image slide. `png_base64` may be null to keep the
  * stored PNG untouched (metadata-only update).
  */
