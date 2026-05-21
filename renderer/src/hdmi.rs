@@ -3761,7 +3761,10 @@ pub fn paint_and_present_one_transition_frame(
         TransitionEndpoint::Video { .. } => {}
     }
 
-    let work: Result<()> = (|| unsafe {
+    // Ok(true) = transition frame painted + ready to present;
+    // Ok(false) = FYS bug C skip (a video endpoint had no frame
+    // ready this tick) — caller skips the swap+commit.
+    let work: Result<bool> = (|| unsafe {
         // Two sequential bakes via the dispatcher. For Text
         // endpoints, `bake_slide_to_fbo` does the slide_caches
         // prewarm + `get_mut` internally. The `&mut session`
@@ -3798,7 +3801,16 @@ pub fn paint_and_present_one_transition_frame(
                 decoder: *decoder,
             },
         };
-        let (fbo_a, tex_a) = bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_a)?;
+        // FYS bug C: a Video endpoint with no frame ready this tick
+        // bakes to Ok(None) — skip the whole transition paint for
+        // this tick (the next advance retries). bake_a's None has
+        // already freed its own FBO pair, so there is nothing to
+        // clean up here.
+        let Some((fbo_a, tex_a)) =
+            bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_a)?
+        else {
+            return Ok(false);
+        };
         let inputs_b = match &mut endpoint_b {
             TransitionEndpoint::Text(_) => {
                 let (id, bg, layers, states) =
@@ -3827,7 +3839,15 @@ pub fn paint_and_present_one_transition_frame(
             },
         };
         let (fbo_b, tex_b) = match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_b) {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                // FYS bug C: the to-endpoint video had no frame this
+                // tick. Free the already-baked from-endpoint FBO and
+                // skip the transition paint for this tick.
+                session.gl.delete_framebuffer(fbo_a);
+                session.gl.delete_texture(tex_a);
+                return Ok(false);
+            }
             Err(e) => {
                 session.gl.delete_framebuffer(fbo_a);
                 session.gl.delete_texture(tex_a);
@@ -3936,9 +3956,16 @@ pub fn paint_and_present_one_transition_frame(
             session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
             run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
-        Ok(())
+        Ok(true)
     })();
-    work?;
+    if !work? {
+        // FYS bug C: a video endpoint had no frame ready this tick;
+        // the closure skipped the transition paint. Skip the
+        // swap+commit too — the DRM scanout holds the previous frame
+        // and the next advance retries. Mirrors the single-video
+        // paint_and_present_one_video_slide_frame Ok(None) path.
+        return Ok(());
+    }
 
     // swap → lock → addFB → commit_fb same as paint_and_
     // present_one_frame_for_slide.
@@ -6573,15 +6600,20 @@ unsafe fn create_slide_fbo_pair(
 ///     `bake_image_slide_to_current_fbo`.
 ///   - `SlideBakeInputs::Video` (Linux only) →
 ///     `create_slide_fbo_pair` + `bake_video_slide_to_current_fbo`.
-///     A `Ok(None)` from the video helper (no frame ready this
-///     tick) maps to an `Err` here — the slice-4-wired transition
-///     path can't honor a "no frame ready" snapshot as a transition
-///     input. The Err propagates up to the IPC PaintTransition
-///     handler at the call site.
+///
+/// Returns `Ok(Some((fbo, tex)))` on a baked endpoint, or `Ok(None)`
+/// when a Video endpoint had no frame ready this tick (FYS bug C):
+/// a V4L2 M2M decoder is pipelined, so `bake_video_slide_to_current
+/// _fbo` legitimately returns `Ok(None)` on a warmup / back-pressure
+/// tick. The transition caller treats `Ok(None)` as "skip this
+/// tick" (hold the scanout, the next advance retries) rather than a
+/// hard failure — mirroring the single-video paint path. Text and
+/// Image endpoints always bake, so they only ever return `Some`.
 ///
 /// Caller is responsible for `delete_framebuffer` + `delete_texture`
-/// on the returned pair after sampling. On any kind-specific
-/// failure, all resources are freed before propagating Err.
+/// on a returned pair after sampling. On `Ok(None)` and on any
+/// kind-specific failure, all resources are freed here before
+/// returning.
 ///
 /// Slice 3 introduced the dispatcher; slice 4 (4dcc7b2, 2026-05-16)
 /// wired it into `paint_and_present_one_transition_frame` so the
@@ -6599,7 +6631,7 @@ unsafe fn bake_slide_to_fbo(
     mode_w: u32,
     mode_h: u32,
     inputs: SlideBakeInputs<'_>,
-) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+) -> Result<Option<(glow::NativeFramebuffer, glow::NativeTexture)>> {
     use glow::HasContext;
     match inputs {
         SlideBakeInputs::Text {
@@ -6647,6 +6679,8 @@ unsafe fn bake_slide_to_fbo(
                 .slide_caches
                 .get_mut(&slide_id)
                 .expect("slide_caches entry initialized above");
+            // Text always bakes — wrap in Some (only Video can
+            // return Ok(None), the FYS-bug-C "no frame this tick").
             make_slide_fbo(
                 session.gl,
                 mode_w,
@@ -6658,6 +6692,7 @@ unsafe fn bake_slide_to_fbo(
                 Some(&mut cache.tex),
                 runtime_glyph_ctx,
             )
+            .map(Some)
         }
         SlideBakeInputs::Image { asset_path } => {
             let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
@@ -6673,7 +6708,7 @@ unsafe fn bake_slide_to_fbo(
                 session.gl.delete_texture(tex);
                 return Err(e);
             }
-            Ok((fbo, tex))
+            Ok(Some((fbo, tex)))
         }
         #[cfg(target_os = "linux")]
         SlideBakeInputs::Video {
@@ -6694,26 +6729,28 @@ unsafe fn bake_slide_to_fbo(
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             match paint_result {
-                Ok(Some(_path_label)) => Ok((fbo, tex)),
+                Ok(Some(_path_label)) => Ok(Some((fbo, tex))),
                 Ok(None) => {
-                    // Helper signaled "no frame ready this tick"
-                    // (decoder not yet primed or back-pressured past
-                    // the 5×2ms retry budget). The FBO holds
-                    // GL-undefined storage from the
-                    // `tex_image_2d(..., None)` allocation in
-                    // `create_slide_fbo_pair` — the helper's
-                    // viewport+clear lives INSIDE the DmaBuf/MMAP
-                    // path, after the no-frame early-return, and
-                    // never ran. Free the pair and propagate an
-                    // explicit error; the slice-4-wired transition
-                    // caller (paint_and_present_one_transition_
-                    // frame) propagates the Err via `?` up to the
-                    // IPC PaintTransition handler.
+                    // FYS bug C (2026-05-21): the helper signaled
+                    // "no frame ready this tick" — a V4L2 M2M
+                    // decoder is pipelined, so a feed may not yield
+                    // a frame the same tick (warmup right after
+                    // prime, or back-pressure past the 5×2ms retry
+                    // budget). The FBO holds GL-undefined storage
+                    // (the helper's viewport+clear lives after its
+                    // no-frame early-return and never ran), so it is
+                    // not a usable transition input. Free the pair
+                    // and return Ok(None): the transition caller
+                    // skips this tick and the next advance retries,
+                    // exactly as the single-video paint path does.
+                    // Before this, Ok(None) became a hard Err that
+                    // failed the WHOLE transition — so any
+                    // video-involved transition aborted the moment
+                    // either decoder bubbled (almost always tick 1,
+                    // with the just-primed to-slide decoder cold).
                     session.gl.delete_framebuffer(fbo);
                     session.gl.delete_texture(tex);
-                    Err(anyhow!(
-                        "bake_slide_to_fbo (video): no frame ready (decoder warmup or EAGAIN saturation)"
-                    ))
+                    Ok(None)
                 }
                 Err(e) => {
                     session.gl.delete_framebuffer(fbo);
