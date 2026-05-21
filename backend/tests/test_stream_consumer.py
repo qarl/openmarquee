@@ -15,6 +15,7 @@ kwarg so ffprobe is skipped (the probe path has its own coverage).
 from __future__ import annotations
 
 import asyncio
+import os
 import stat
 import sys
 
@@ -475,6 +476,61 @@ async def test_ffprobe_rounds_odd_source_dims_up_to_even(tmp_path):
     await consumer.close()
 
     assert (consumer.source_width, consumer.source_height) == (8, 6)
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_probe_reaps_ffprobe(tmp_path):
+    """A cancellation landing while ffprobe is running (a takeover
+    teardown / a playlist frames.aclose() in the probe window) must
+    not orphan the ffprobe child. _probe_source_size's finally kills +
+    reaps it on the CancelledError path."""
+    # A mock ffprobe that prints its own PID then sleeps long enough to
+    # be cancellable — it never produces dims, so without the reap it
+    # would be left running.
+    pidfile = tmp_path / "ffprobe.pid"
+    probe = tmp_path / "ffprobe"
+    probe_body = f"#!{sys.executable}\n"
+    probe_body += "import os, time\n"
+    probe_body += f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+    probe_body += "time.sleep(30)\n"
+    probe.write_text(probe_body)
+    probe.chmod(probe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    consumer = StreamConsumer(
+        "rtsp://host:8554/live", 1920, 1080,
+        ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
+        ffprobe_bin=str(probe),
+    )
+
+    async def pump():
+        async for _ in consumer.frames():
+            pass
+
+    task = asyncio.create_task(pump())
+    # Wait until the mock ffprobe is up — frames() is now suspended
+    # inside _probe_source_size's await proc.communicate().
+    got = await _wait_until(lambda: pidfile.exists())
+    assert got, "mock ffprobe never started"
+    probe_pid = int(pidfile.read_text())
+
+    # Cancel frames() mid-probe — the CancelledError propagates into
+    # _probe_source_size; its finally must kill + reap the ffprobe.
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The ffprobe child is reaped, not orphaned — its PID is gone.
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    reaped = await _wait_until(lambda: not _alive(probe_pid))
+    assert reaped, "ffprobe child was orphaned by mid-probe cancellation"
+
+    await consumer.close()
 
 
 # --- URL scheme allowlist (security) ---------------------------------------

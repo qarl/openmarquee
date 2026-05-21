@@ -270,48 +270,67 @@ class StreamConsumer:
         except (OSError, ValueError) as exc:
             log.error("stream: failed to spawn ffprobe: %s", exc)
             return None
+        # `proc` is now bound (the spawn succeeded). The finally below
+        # reaps the ffprobe child on EVERY exit path — normal return,
+        # timeout, parse error, AND a CancelledError propagating in
+        # from frames() being cancelled mid-probe (a takeover teardown
+        # or a playlist frames.aclose() landing in the probe window).
+        # ffprobe is a LOCAL here, not tracked by self._proc, so the
+        # finally is the only thing that prevents an orphan holding a
+        # socket to the stream source.
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=_FFPROBE_TIMEOUT_SECONDS
-            )
-        except TimeoutError:
-            log.error(
-                "stream: ffprobe timed out after %.1fs probing %s",
-                _FFPROBE_TIMEOUT_SECONDS,
-                self._stream_url,
-            )
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
-            return None
-        if proc.returncode != 0:
-            log.error(
-                "stream: ffprobe exited rc=%s: %s",
-                proc.returncode,
-                stderr.decode("utf-8", errors="replace").strip(),
-            )
-            return None
-        try:
-            payload = json.loads(stdout.decode("utf-8", errors="replace"))
-            stream = payload["streams"][0]
-            w = int(stream["width"])
-            h = int(stream["height"])
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
-            log.error(
-                "stream: ffprobe output unparseable (%s): %r",
-                exc,
-                stdout[:256],
-            )
-            return None
-        if w <= 0 or h <= 0:
-            log.error("stream: ffprobe reported non-positive dims %dx%d", w, h)
-            return None
-        # NV12 chroma is 4:2:0 — both axes must be even. ffmpeg's NV12
-        # output always pads to even dims; round up defensively so the
-        # fixed-size frame read can't desync on an odd-dim source.
-        w += w & 1
-        h += h & 1
-        return (w, h)
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=_FFPROBE_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                # The finally below kills + reaps the timed-out ffprobe.
+                log.error(
+                    "stream: ffprobe timed out after %.1fs probing %s",
+                    _FFPROBE_TIMEOUT_SECONDS,
+                    self._stream_url,
+                )
+                return None
+            if proc.returncode != 0:
+                log.error(
+                    "stream: ffprobe exited rc=%s: %s",
+                    proc.returncode,
+                    stderr.decode("utf-8", errors="replace").strip(),
+                )
+                return None
+            try:
+                payload = json.loads(stdout.decode("utf-8", errors="replace"))
+                stream = payload["streams"][0]
+                w = int(stream["width"])
+                h = int(stream["height"])
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+                log.error(
+                    "stream: ffprobe output unparseable (%s): %r",
+                    exc,
+                    stdout[:256],
+                )
+                return None
+            if w <= 0 or h <= 0:
+                log.error("stream: ffprobe reported non-positive dims %dx%d", w, h)
+                return None
+            # NV12 chroma is 4:2:0 — both axes must be even. ffmpeg's
+            # NV12 output always pads to even dims; round up defensively
+            # so the fixed-size frame read can't desync on an odd-dim
+            # source.
+            w += w & 1
+            h += h & 1
+            return (w, h)
+        finally:
+            # Reap the ffprobe child on every exit path. After a normal
+            # communicate() the proc has already exited (returncode
+            # set) — the guard skips the kill. On a timeout / error /
+            # cancellation it is still alive: kill + wait so no orphan
+            # ffprobe (each holds a socket to the stream source) is
+            # left behind.
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
 
     async def frames(self) -> AsyncIterator[bytes]:
         """Spawn ffmpeg and yield NV12 frames until the stream ends
