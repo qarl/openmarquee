@@ -163,8 +163,8 @@ def _draw_dot_matrix_mark(draw: ImageDraw.ImageDraw, box: tuple[int, ...],
 
     # The LED tile: rounded rect, near-black, faint inset light edge.
     draw.rounded_rectangle(box, radius=radius, fill=LED_BG)
-    draw.rounded_rectangle(box, radius=radius, outline=LINE_2,
-                           width=max(1, round(tile_w * 0.014)))
+    draw.rounded_rectangle(box, radius=radius, outline=ACCENT,
+                           width=max(2, round(tile_w * 0.075)))
 
     # Interior dot field, inset 2/16 of the tile width on every side (the
     # CSS `inset: 2px` on a 16px-wide tile).
@@ -290,11 +290,16 @@ def generate_splash() -> str:
     stack_top = lockup_cy - stack_h // 2     # top of "OPEN"
 
     # --- The dot-matrix mark --------------------------------------------
-    # 16px-wide tile -> 3px corner radius is ~0.19 of the width.
-    mark_radius = max(1, round(mark_w * 0.19))
+    mark_radius = 0  # qarl: square corners, not rounded
+    # qarl: the mark box bottom aligns with the "Marquee" baseline (the
+    # bottom of the "M"), NOT the "q" descender. "M" is a cap with no
+    # descender — (inked top of Marquee) + (M bbox bottom - Marquee bbox
+    # top) lands exactly on the baseline.
+    m_box = draw.textbbox((0, 0), "M", font=marq_font)
+    mark_bottom = stack_top + open_h + gap_lines + (m_box[3] - marq_box[1])
     _draw_dot_matrix_mark(
         draw,
-        (lockup_x, stack_top, lockup_x + mark_w, stack_top + stack_h),
+        (lockup_x, stack_top, lockup_x + mark_w, mark_bottom),
         mark_radius)
 
     # --- The stacked text ------------------------------------------------
