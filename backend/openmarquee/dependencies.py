@@ -814,24 +814,16 @@ def _playback_loop_singleton() -> PlaybackLoop:
         return evaluate_schedule(datetime.now(), schedule_storage.load())
 
     async def web_screenshot_producer(slide, width: int, height: int) -> bool:
-        # Web slide (P3): the screenshot-refresh producer the playback
-        # loop fire-and-forgets when a Web slide's slot is stale.
-        # Reads the helper URL + token from Settings each call so an
-        # operator's edit takes effect on the next refresh; saves the
-        # fetched screenshot to the slide's asset.png via save_web.
+        # Web slide: the screenshot-refresh producer the playback loop
+        # fire-and-forgets when a Web slide's slot is stale. Renders
+        # slide.url ON-DEVICE (headless Chromium) at the passed display
+        # resolution (renderer.width/height — rotation-aware) and saves
+        # the PNG to the slide's asset.png via save_web.
         # fetch_web_screenshot catches every failure itself — it never
         # raises out here.
         from openmarquee.web_screenshot import fetch_web_screenshot
 
-        cfg = settings_storage.load()
-        return await fetch_web_screenshot(
-            slide,
-            storage,
-            cfg.web_helper_url,
-            cfg.web_helper_token,
-            width,
-            height,
-        )
+        return await fetch_web_screenshot(slide, storage, width, height)
 
     loop = PlaybackLoop(
         renderer=renderer,
