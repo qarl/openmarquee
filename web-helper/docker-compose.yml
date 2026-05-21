@@ -1,0 +1,29 @@
+# openMarquee Web slide helper -- Compose file for an always-on setup
+# (e.g. a NAS or a home server you leave running).
+#
+#   docker compose up -d        # build + start in the background
+#   docker compose logs         # see the startup banner / bearer token
+#   docker compose down         # stop + remove the container
+#
+# The named volume keeps the generated bearer token stable across
+# restarts and `docker compose down`, so you only paste it into the
+# sign once. To pin your own token instead, set OPENMARQUEE_WEB_HELPER_TOKEN
+# (uncomment the `environment` block below) and the volume is optional.
+services:
+  web-helper:
+    build: .
+    image: openmarquee/web-helper
+    container_name: openmarquee-web-helper
+    # Come back up after a reboot / crash -- this is meant to stay on.
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      # Persists ~/.openmarquee-web-helper/token (pwuser's home).
+      - web-helper-token:/home/pwuser/.openmarquee-web-helper
+    # environment:
+    #   # Optional: use a fixed token instead of the auto-generated one.
+    #   - OPENMARQUEE_WEB_HELPER_TOKEN=replace-with-your-own-token
+
+volumes:
+  web-helper-token:

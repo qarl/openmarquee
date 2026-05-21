@@ -1,0 +1,21 @@
+# Keep the Docker build context lean -- only the package + pyproject +
+# README are needed to `pip install .`.
+tests/
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Python build / test cruft.
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# VCS + macOS metadata.
+.git
+.gitignore
+._*
+.DS_Store
