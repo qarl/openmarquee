@@ -5,257 +5,404 @@ A WebSlide is "an image slide whose asset.png is auto-refreshed from a
 render of an operator-supplied URL". Historically that render happened
 on an operator's own machine (a headless-Chromium helper in
 `web-helper/`) because the Pi can't run a browser. This module replaces
-that: it rasterizes the page on-device with the WeasyPrint print
-engine, which is small enough to fit the Pi's RAM headroom.
+that: it rasterizes the page on-device.
 
-Pipeline: `WeasyPrint(url) -> PDF bytes -> pypdfium2 -> PNG bytes`.
-WeasyPrint lays the page out and writes a PDF; pypdfium2 rasterizes
-that PDF's first page to a bitmap and exports a PNG. A `@page` rule is
-injected so the PDF page is sized to the slide's actual panel
-dimensions (without it WeasyPrint defaults to A4 proportions and the
-page fills only part of the panel — see `_build_page_css`).
+Render engine — Chromium headless. The page is rendered by the
+**Chromium browser** running headless, driven through its built-in CLI
+(`chromium --headless --screenshot ...`). This is a full modern web
+engine: JavaScript runs, web fonts load, CSS animations settle — so a
+page can ship its own layout/`fit()` JS and have it execute before the
+screenshot is taken (`--virtual-time-budget` gives that JS a generous
+slice of virtual time). Chromium is a *subprocess* this module spawns;
+there is no Python import for it (the binary is `chromium` or
+`chromium-browser`, resolved at call time via `shutil.which`).
 
-RAM mitigation — short-lived subprocess. WeasyPrint's RSS (~55 MB,
-mostly Pango/cairo/fontconfig) is too much to keep resident on the
-Pi's tight memory budget. This module is therefore designed to run AS
-A STANDALONE SUBPROCESS — `python -m openmarquee.web_render <url> <w>
-<h> <outpath>` — so that footprint is reclaimed by the OS the moment
-the process exits. C3's producer spawns it that way and reads the PNG
-back off `<outpath>`. The module is still importable + the render
-function still directly callable in-process (the tests do that, with
-the heavy libs mocked) — the subprocess wrapper is an option, not a
-requirement of the API.
+Pipeline: `chromium --screenshot (render_w x render_h PNG) -> Pillow
+composite onto a panel_w x panel_h black canvas -> PNG bytes`.
+
+Pillarbox compositing. The Web slide shows on a fixed-size sign panel.
+A page may be authored narrower (or differently shaped) than the panel.
+The locked decision is to *pillarbox*: render the page at its own
+render window size, then composite that render CENTERED on a
+panel-sized solid-BLACK canvas. The leftover space becomes black bars.
+The page is never cropped to its content and content is never
+bitmap-upscaled — see `composite_pillarbox` for the three cases.
+
+RAM mitigation — short-lived subprocess. Chromium's footprint is far
+too large to keep resident on the Pi's tight memory budget. This module
+is therefore designed to run AS A STANDALONE SUBPROCESS — `python -m
+openmarquee.web_render <url> <render_w> <render_h> <panel_w> <panel_h>
+<out_path>` — so that footprint is reclaimed by the OS the moment the
+process exits. C3's producer spawns it that way and reads the PNG back
+off `<out_path>`. The module is still importable + the render function
+still directly callable in-process (the tests do that, with the
+chromium subprocess mocked) — the subprocess wrapper is an option, not
+a requirement of the API.
 
 argv contract (the subprocess entry point — see `main`):
 
-    python -m openmarquee.web_render <url> <panel_w> <panel_h> <out_path>
+    python -m openmarquee.web_render \\
+        <url> <render_w> <render_h> <panel_w> <panel_h> <out_path>
 
-    <url>       the page to render — must be http/https (validated)
-    <panel_w>   panel width in pixels  (positive integer)
-    <panel_h>   panel height in pixels (positive integer)
-    <out_path>  filesystem path the PNG is written to
+    <url>        the page to render — must be http/https (validated)
+    <render_w>   Chromium render-window width  (positive integer)
+    <render_h>   Chromium render-window height (positive integer)
+    <panel_w>    sign panel width in pixels    (positive integer)
+    <panel_h>    sign panel height in pixels   (positive integer)
+    <out_path>   filesystem path the panel-sized PNG is written to
 
-    exit 0  — PNG written to <out_path>
+    exit 0  — panel-sized PNG written to <out_path>
     exit 1  — render failed (a one-line reason on stderr)
-    exit 2  — bad argv (wrong count / non-integer dims / rejected URL)
+    exit 2  — bad argv (wrong count / non-integer or non-positive
+              dims / rejected URL)
 
-Deferred imports: `weasyprint` and `pypdfium2` are imported INSIDE
-`render_web_png` (not at module top level), mirroring the helper's
-deferred-Playwright pattern. The module imports — and the unit tests
-run — on a host without either library installed.
+Deferred import: `PIL` (Pillow) is imported INSIDE the functions that
+use it, not at module top level — mirroring the historical
+deferred-import discipline. Pillow is a backend dependency, so this is
+ordering hygiene rather than an optional-dependency guard. Chromium has
+no Python import at all; it is resolved with `shutil.which` and spawned.
 """
 
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 import sys
+import tempfile
 from io import BytesIO
+from pathlib import Path
 
 from openmarquee.content import validate_web_url
 
 log = logging.getLogger(__name__)
 
-# Per-asset network fetch budget, in seconds. WeasyPrint fetches the
-# page document AND every sub-resource (CSS, images, web fonts); each
-# of those fetches goes through our `url_fetcher` wrapper and is capped
-# at this value. A single slow asset therefore can't hang the whole
-# render — it times out, that one resource is skipped/errors, and the
-# render still completes in bounded time. C3's producer additionally
-# wraps the whole subprocess in an overall timeout; this is the
-# inner, per-fetch bound.
-WEB_RENDER_FETCH_TIMEOUT_S = 15.0
+# Overall wall-clock budget for the Chromium subprocess, in seconds. A
+# real render on the Pi runs ~5-40s (page fetch + JS + the
+# virtual-time-budget settle), so this is generous headroom. On expiry
+# the subprocess is KILLED and reaped (never orphaned) and the render
+# raises WebRenderError — the module never hangs unboundedly. C3's
+# producer may additionally wrap the whole `python -m ...` invocation
+# in its own timeout; this is the inner, Chromium-specific bound.
+WEB_RENDER_TIMEOUT_S = 45.0
 
-# CSS reference pixels are defined as 1px == 1/96 inch; PDF user space
-# is points, 1pt == 1/72 inch. A box that is N CSS px wide is therefore
-# N * 72/96 == N * 0.75 pt wide in the PDF WeasyPrint emits. pypdfium2
-# rasterizes at `points * scale` device pixels, so to land a P-pt page
-# on exactly P_px device pixels we render at scale 96/72. See
-# `_PDFIUM_RENDER_SCALE` and `render_web_png`.
-_CSS_PX_PER_INCH = 96.0
-_PDF_PT_PER_INCH = 72.0
+# Virtual-time budget handed to Chromium, in MILLISECONDS. Chromium
+# advances the page's clock as fast as it can up to this many ms of
+# virtual time and only then takes the screenshot — so a page's own
+# JavaScript (timers, a `fit()` reflow, font swaps) gets to run before
+# the capture, without us waiting that long in wall-clock terms.
+WEB_RENDER_VIRTUAL_TIME_BUDGET_MS = 12000
 
-# pypdfium2 render scale that maps a px-sized @page back to exactly
-# that many device pixels. The @page is `<panel_w>px <panel_h>px`,
-# which WeasyPrint emits as a `panel_w * 0.75` pt page; rendering that
-# at scale 96/72 == 1.3333… yields `panel_w * 0.75 * 1.3333 == panel_w`
-# device pixels — exact, no rounding drift.
-_PDFIUM_RENDER_SCALE = _CSS_PX_PER_INCH / _PDF_PT_PER_INCH
+# The candidate names of the Chromium binary, in resolution order.
+# Debian/Raspberry Pi OS packages it as `chromium`; some distros still
+# ship `chromium-browser`. `shutil.which` tries each; the first hit is
+# used, and if neither resolves a typed WebRenderError is raised.
+_CHROMIUM_BINARIES = ("chromium", "chromium-browser")
+
+# The 8-byte PNG signature. Chromium's `--screenshot` output is
+# sanity-checked against this before compositing, so a truncated or
+# non-PNG file (a crash that still exited 0, say) fails loudly here
+# rather than as an opaque Pillow error.
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
 class WebRenderError(Exception):
-    """A web render failed — network failure, a WeasyPrint/pypdfium2
-    error, or an empty/zero-size result. Raised by `render_web_png` so
-    callers (and the subprocess `main`) get one clear, typed failure
-    instead of a library-specific exception or an unbounded hang."""
+    """A web render failed — Chromium missing, the Chromium subprocess
+    erroring or timing out, a missing/non-PNG screenshot, or a Pillow
+    composite error. Raised by `render_web_png` so callers (and the
+    subprocess `main`) get one clear, typed failure instead of a
+    library/OS-specific exception or an unbounded hang."""
 
 
-def _build_page_css(panel_w: int, panel_h: int) -> str:
-    """Build the `@page` stylesheet string that sizes the PDF page to
-    the panel.
+def _resolve_chromium() -> str:
+    """Resolve the Chromium binary path, trying each name in
+    `_CHROMIUM_BINARIES`.
 
-    WeasyPrint, given no `@page` size, lays the document out on its
-    default A4 page — so a 1360x768 panel would get an A4-proportioned
-    render that only fills part of the slide. Passing this stylesheet
-    in `write_pdf(stylesheets=[...])` overrides that: the page becomes
-    exactly `panel_w x panel_h` CSS px with no margin, so page 1 of the
-    resulting PDF IS the panel-sized render.
+    Returns the absolute path of the first binary `shutil.which` finds.
 
-    Pure function — unit-tested directly. `panel_w`/`panel_h` are the
-    slide's ACTUAL panel dimensions in pixels (the caller passes
-    `renderer.width` / `renderer.height`).
+    Raises:
+        WebRenderError: neither `chromium` nor `chromium-browser` is on
+            PATH — there is no browser to render with.
     """
-    return f"@page {{ size: {panel_w}px {panel_h}px; margin: 0; }}"
+    for name in _CHROMIUM_BINARIES:
+        path = shutil.which(name)
+        if path:
+            return path
+    raise WebRenderError(
+        "no Chromium binary found on PATH (looked for "
+        f"{', '.join(_CHROMIUM_BINARIES)})"
+    )
 
 
-def render_web_png(url: str, panel_w: int, panel_h: int) -> bytes:
-    """Render `url` to a `panel_w x panel_h` top-down PNG and return its
-    bytes.
+def _build_chromium_argv(
+    chromium: str, url: str, render_w: int, render_h: int, screenshot_path: str
+) -> list[str]:
+    """Build the Chromium headless-screenshot command line.
 
-    Pipeline: WeasyPrint lays `url` out and writes a PDF whose page is
-    sized to the panel (via an injected `@page` stylesheet — see
-    `_build_page_css`); pypdfium2 then rasterizes page 1 of that PDF to
-    a bitmap at exactly the panel resolution and exports a PNG.
+    Pure function — unit-tested directly. The flags:
+
+      --headless              run without a UI / display server
+      --no-sandbox            the Pi runs this as a service user with
+                              no user namespaces; the sandbox can't
+                              initialize, so it is disabled explicitly
+      --disable-gpu           no GPU compositing path in headless on
+                              the Pi's vc4 — software raster only
+      --disable-dev-shm-usage write tmpfiles under /tmp not /dev/shm;
+                              the Pi's small /dev/shm otherwise causes
+                              Chromium to crash mid-render
+      --hide-scrollbars       a captured scrollbar is render litter
+      --virtual-time-budget   advance the page clock this many ms so the
+                              page's own JS runs before the screenshot
+      --screenshot=<path>     write the PNG capture here
+      --window-size=<w>,<h>   the render viewport — Chromium emits a PNG
+                              of exactly this pixel size
+    """
+    return [
+        chromium,
+        "--headless",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--hide-scrollbars",
+        f"--virtual-time-budget={WEB_RENDER_VIRTUAL_TIME_BUDGET_MS}",
+        f"--screenshot={screenshot_path}",
+        f"--window-size={render_w},{render_h}",
+        url,
+    ]
+
+
+def composite_pillarbox(
+    render_png: bytes, panel_w: int, panel_h: int
+) -> bytes:
+    """Composite a Chromium render onto a panel-sized black canvas and
+    return the panel-sized PNG bytes.
+
+    Pillarbox semantics — `render_png` is a PNG of whatever size
+    Chromium produced (the render window size). It is placed CENTERED on
+    a fresh `panel_w x panel_h` solid-BLACK canvas. Three cases:
+
+      1. render == panel  — the render already IS the panel; it is
+         returned re-encoded with no bars (a generic landscape page
+         rendered straight at panel size).
+      2. render SMALLER than the panel on an axis — black bars on that
+         axis, centered. This is the pillarbox: the render is pasted
+         unscaled and the margin is black.
+      3. render LARGER than the panel on an axis — the whole render is
+         uniformly scaled DOWN to fit within the panel (aspect ratio
+         preserved), then centered with black padding on the other
+         axis. This is a composite/pad downscale-to-fit, NOT a
+         crop-to-content + upscale (which the design explicitly
+         rejects); it only handles an oversize render.
+
+    The output PNG is always exactly `panel_w x panel_h`.
+
+    Pure function (no I/O) — unit-tested directly. Pillow is imported
+    here, not at module scope.
+
+    Args:
+        render_png: the Chromium screenshot, as PNG bytes.
+        panel_w, panel_h: the sign panel dimensions in pixels.
+
+    Returns:
+        PNG bytes — a panel-sized, RGB, top-down PNG.
+
+    Raises:
+        WebRenderError: `render_png` is not a decodable image, or the
+            composite otherwise fails.
+    """
+    from PIL import Image
+
+    try:
+        with Image.open(BytesIO(render_png)) as opened:
+            # Materialize to RGB up front: the paste target is RGB, and
+            # `Image.open` is lazy — load before the `with` closes the
+            # backing buffer.
+            render = opened.convert("RGB")
+    except Exception as exc:  # noqa: BLE001 — funnel every decode error
+        raise WebRenderError(
+            f"Chromium screenshot is not a decodable image: {exc}"
+        ) from exc
+
+    try:
+        # Case 3: the render overflows the panel on at least one axis —
+        # uniformly scale it DOWN to fit inside the panel. The scale is
+        # the smaller of the two per-axis ratios so neither axis spills;
+        # `min(..., 1.0)` makes this a no-op when the render already
+        # fits (cases 1 and 2).
+        rw, rh = render.size
+        scale = min(panel_w / rw, panel_h / rh, 1.0)
+        if scale < 1.0:
+            scaled_w = max(1, round(rw * scale))
+            scaled_h = max(1, round(rh * scale))
+            render = render.resize(
+                (scaled_w, scaled_h), Image.LANCZOS
+            )
+
+        # Case 1 fast-ish path / general path: paste the (possibly
+        # downscaled) render centered on a solid-black panel canvas.
+        # When render == panel the paste covers the whole canvas and
+        # there are simply no bars.
+        canvas = Image.new("RGB", (panel_w, panel_h), (0, 0, 0))
+        off_x = (panel_w - render.size[0]) // 2
+        off_y = (panel_h - render.size[1]) // 2
+        canvas.paste(render, (off_x, off_y))
+
+        buf = BytesIO()
+        canvas.save(buf, format="PNG")
+        return buf.getvalue()
+    except WebRenderError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — funnel every Pillow error
+        raise WebRenderError(
+            f"failed to composite the web render onto the panel: {exc}"
+        ) from exc
+
+
+def render_web_png(
+    url: str,
+    render_w: int,
+    render_h: int,
+    panel_w: int,
+    panel_h: int,
+) -> bytes:
+    """Render `url` with Chromium headless and composite it pillarboxed
+    onto a `panel_w x panel_h` black panel; return the panel PNG bytes.
+
+    Pipeline: Chromium headless loads `url` at a `render_w x render_h`
+    window and writes a PNG screenshot (its own JavaScript gets
+    `WEB_RENDER_VIRTUAL_TIME_BUDGET_MS` of virtual time to run first);
+    that render is then composited CENTERED on a panel-sized solid-black
+    canvas (`composite_pillarbox`) so the output is exactly the panel
+    size.
 
     The URL is validated (`validate_web_url`, http/https only) BEFORE
-    anything is fetched — WeasyPrint can read `file://` and other
-    schemes, which on operator-supplied input is a local-file-read
-    vector, so a non-web URL never reaches the engine.
+    Chromium is spawned — a `file://` URL handed to a browser is a
+    local-file-read vector, so a non-web URL never reaches it.
 
-    `weasyprint` and `pypdfium2` are imported here, not at module
-    scope, so the module imports on a host without them installed.
-
-    Network fetches (the document + every sub-resource) are bounded by
-    a per-request timeout (`WEB_RENDER_FETCH_TIMEOUT_S`) via a custom
-    `url_fetcher`, so one slow asset can't hang the render.
+    The Chromium subprocess is bounded by `WEB_RENDER_TIMEOUT_S`; on
+    timeout it is KILLED and reaped (never orphaned) and a
+    WebRenderError is raised. The render therefore never hangs.
 
     Args:
         url: the page to render. Must be http/https.
-        panel_w, panel_h: the panel dimensions in pixels. The output
-            PNG is exactly this size.
+        render_w, render_h: the Chromium render-window size in pixels.
+        panel_w, panel_h: the sign panel size in pixels. The output PNG
+            is exactly this size.
 
     Returns:
-        PNG bytes — a standard top-down PNG. (The renderer's image-bake
-        path handles any orientation concerns; this module just emits a
-        normal PNG.)
+        PNG bytes — a panel-sized, top-down PNG.
 
     Raises:
         ValueError: `url` failed `validate_web_url` (non-http/https
-            scheme, control characters, a userinfo component). Raised
-            before any network access.
-        WebRenderError: the render failed — a network failure, a
-            WeasyPrint or pypdfium2 error, or an empty/zero-size
-            result. Never hangs unboundedly.
+            scheme, control characters, a userinfo component), or a
+            dimension is non-positive. Raised before Chromium is
+            spawned — a caller/input error, distinct from a render
+            failure.
+        WebRenderError: the render failed — Chromium missing, the
+            subprocess erroring or timing out, a missing/non-PNG
+            screenshot, or a composite error. Never hangs unboundedly.
     """
-    # Validate FIRST — before the heavy imports, before any fetch. A
-    # `file://` / `data://` URL must never reach WeasyPrint. A bad URL
+    # Validate FIRST — before resolving or spawning Chromium. A
+    # `file://` / `data://` URL must never reach the browser. A bad URL
     # raises ValueError straight out (not WebRenderError): it's a
     # caller/input error, distinct from a render failure.
     validate_web_url(url)
 
+    if render_w <= 0 or render_h <= 0:
+        raise ValueError(
+            f"render dimensions must be positive, got {render_w}x{render_h}"
+        )
     if panel_w <= 0 or panel_h <= 0:
         raise ValueError(
             f"panel dimensions must be positive, got {panel_w}x{panel_h}"
         )
 
-    # Deferred imports — keep weasyprint/pypdfium2 off the module +
-    # test-suite import path (mirrors web-helper's deferred Playwright).
-    import weasyprint
-    import pypdfium2
+    chromium = _resolve_chromium()
 
-    # A `url_fetcher` that wraps WeasyPrint's default with a per-request
-    # timeout. WeasyPrint calls this for the document AND every
-    # sub-resource; the default fetcher accepts a `timeout` kwarg but
-    # WeasyPrint itself never passes one, so an asset fetch is otherwise
-    # unbounded. Capping each call means a single slow asset times out
-    # rather than hanging the whole render.
-    def _bounded_url_fetcher(fetch_url: str):
-        return weasyprint.default_url_fetcher(
-            fetch_url, timeout=WEB_RENDER_FETCH_TIMEOUT_S
-        )
+    # Chromium writes its screenshot to a temp file; we read it back,
+    # composite, and delete the temp file in the `finally`. A NamedTemp
+    # is created and immediately closed so Chromium (a separate process)
+    # owns the path exclusively — we only need a unique filesystem path.
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="web-render-", suffix=".png", delete=False
+    )
+    tmp.close()
+    screenshot_path = tmp.name
 
-    # --- WeasyPrint: URL -> PDF bytes -----------------------------------
     try:
-        page_css = weasyprint.CSS(string=_build_page_css(panel_w, panel_h))
-        pdf_bytes = weasyprint.HTML(
-            url=url, url_fetcher=_bounded_url_fetcher
-        ).write_pdf(stylesheets=[page_css])
-    except Exception as exc:  # noqa: BLE001 — funnel every lib error
-        # WeasyPrint raises a wide range of types (network errors,
-        # parse errors, fontconfig failures); funnel them all into one
-        # typed WebRenderError so the caller has a single thing to
-        # catch. `from exc` keeps the original for the logs.
-        raise WebRenderError(
-            f"WeasyPrint failed to render {url}: {exc}"
-        ) from exc
-
-    if not pdf_bytes:
-        raise WebRenderError(
-            f"WeasyPrint produced an empty PDF for {url}"
+        argv = _build_chromium_argv(
+            chromium, url, render_w, render_h, screenshot_path
         )
-
-    # --- pypdfium2: PDF bytes -> panel-sized PNG bytes ------------------
-    pdf = None
-    try:
-        pdf = pypdfium2.PdfDocument(pdf_bytes)
-        if len(pdf) < 1:
-            raise WebRenderError(
-                f"rendered PDF for {url} has no pages"
-            )
-        # Page 1 IS the panel-sized render — the @page rule sized the
-        # whole document to one panel-shaped page.
-        page = pdf[0]
+        # --- Chromium headless: URL -> screenshot PNG ------------------
         try:
-            # Render at the scale that maps the px-sized @page back to
-            # exactly panel_w x panel_h device pixels — see
-            # `_PDFIUM_RENDER_SCALE`. pypdfium2 renders at
-            # `points * scale`; the page is `panel_w * 0.75` pt wide,
-            # so `0.75 * (96/72) == 1.0` and the bitmap lands exactly.
-            bitmap = page.render(scale=_PDFIUM_RENDER_SCALE)
-            try:
-                pil_image = bitmap.to_pil()
-            finally:
-                bitmap.close()
-        finally:
-            page.close()
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=WEB_RENDER_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # `subprocess.run` already kills the child and reaps it on a
+            # TimeoutExpired before re-raising — so the process is not
+            # orphaned. Surface it as a typed, bounded failure.
+            raise WebRenderError(
+                f"Chromium render of {url} timed out after "
+                f"{WEB_RENDER_TIMEOUT_S:.0f}s"
+            ) from exc
+        except OSError as exc:
+            raise WebRenderError(
+                f"failed to launch Chromium for {url}: {exc}"
+            ) from exc
 
-        # Belt-and-braces: rounding inside pdfium can leave the bitmap
-        # off by a pixel for some panel sizes. Force the exact panel
-        # dimensions so the producer always saves a correctly-sized
-        # asset.png. (.size is (w, h).)
-        if pil_image.size != (panel_w, panel_h):
-            pil_image = pil_image.resize((panel_w, panel_h))
+        if proc.returncode != 0:
+            stderr = (proc.stderr or b"").decode(
+                "utf-8", errors="replace"
+            ).strip()
+            # Keep the message single-line — the subprocess `main`
+            # prints it straight to stderr.
+            detail = stderr.splitlines()[-1] if stderr else "(no output)"
+            raise WebRenderError(
+                f"Chromium exited {proc.returncode} rendering {url}: "
+                f"{detail}"
+            )
 
-        buf = BytesIO()
-        # A standard top-down PNG — no orientation tricks here.
-        pil_image.save(buf, format="PNG")
-        png_bytes = buf.getvalue()
-    except WebRenderError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — funnel every lib error
-        raise WebRenderError(
-            f"pypdfium2 failed to rasterize {url}: {exc}"
-        ) from exc
+        # --- read + sanity-check Chromium's screenshot ----------------
+        shot = Path(screenshot_path)
+        if not shot.exists():
+            raise WebRenderError(
+                f"Chromium produced no screenshot file for {url}"
+            )
+        render_png = shot.read_bytes()
+        if not render_png:
+            raise WebRenderError(
+                f"Chromium produced an empty screenshot for {url}"
+            )
+        if not render_png.startswith(_PNG_MAGIC):
+            raise WebRenderError(
+                f"Chromium screenshot for {url} is not a PNG"
+            )
+
+        # --- Pillow: pillarbox-composite onto the panel ---------------
+        return composite_pillarbox(render_png, panel_w, panel_h)
     finally:
-        # PdfDocument holds native buffers — close it explicitly so the
-        # subprocess doesn't depend on GC to release them before exit.
-        if pdf is not None:
-            pdf.close()
-
-    if not png_bytes:
-        raise WebRenderError(
-            f"rasterizing {url} produced an empty PNG"
-        )
-
-    return png_bytes
+        # Always clean up Chromium's temp output, success or failure.
+        try:
+            Path(screenshot_path).unlink(missing_ok=True)
+        except OSError as exc:  # pragma: no cover — best-effort cleanup
+            log.warning(
+                "web-render: could not remove temp screenshot %s: %s",
+                screenshot_path,
+                exc,
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
     """Subprocess entry point — see the module docstring's argv
     contract.
 
-    Parses argv (`<url> <panel_w> <panel_h> <out_path>`), renders the
-    page, and writes the PNG to `<out_path>`. Returns a process exit
-    code; `__main__` below passes it to `sys.exit`.
+    Parses argv (`<url> <render_w> <render_h> <panel_w> <panel_h>
+    <out_path>`), renders the page, and writes the panel-sized PNG to
+    `<out_path>`. Returns a process exit code; `__main__` below passes
+    it to `sys.exit`.
 
     Args:
         argv: the argument list WITHOUT the program name (defaults to
@@ -263,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
             `main` directly.
 
     Returns:
-        0  — success, PNG written.
+        0  — success, panel-sized PNG written.
         1  — the render failed (a clear reason printed to stderr).
         2  — bad argv: wrong argument count, a non-integer / non-
              positive dimension, or a URL that failed validation.
@@ -271,30 +418,32 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
-    if len(argv) != 4:
+    if len(argv) != 6:
         print(
             "usage: python -m openmarquee.web_render "
-            "<url> <panel_w> <panel_h> <out_path>",
+            "<url> <render_w> <render_h> <panel_w> <panel_h> <out_path>",
             file=sys.stderr,
         )
         return 2
 
-    url, raw_w, raw_h, out_path = argv
+    url, raw_rw, raw_rh, raw_pw, raw_ph, out_path = argv
 
     try:
-        panel_w = int(raw_w)
-        panel_h = int(raw_h)
+        render_w = int(raw_rw)
+        render_h = int(raw_rh)
+        panel_w = int(raw_pw)
+        panel_h = int(raw_ph)
     except ValueError:
         print(
-            f"web-render: panel dimensions must be integers, "
-            f"got width={raw_w!r} height={raw_h!r}",
+            "web-render: render/panel dimensions must be integers, got "
+            f"render={raw_rw!r}x{raw_rh!r} panel={raw_pw!r}x{raw_ph!r}",
             file=sys.stderr,
         )
         return 2
-    if panel_w <= 0 or panel_h <= 0:
+    if render_w <= 0 or render_h <= 0 or panel_w <= 0 or panel_h <= 0:
         print(
-            f"web-render: panel dimensions must be positive, "
-            f"got {panel_w}x{panel_h}",
+            "web-render: render/panel dimensions must be positive, got "
+            f"render={render_w}x{render_h} panel={panel_w}x{panel_h}",
             file=sys.stderr,
         )
         return 2
@@ -303,7 +452,9 @@ def main(argv: list[str] | None = None) -> int:
         # A rejected URL (file://, etc.) raises ValueError — treat it
         # as a bad-argv error (exit 2), not a render failure: the
         # operator gave us input we will not even attempt to render.
-        png_bytes = render_web_png(url, panel_w, panel_h)
+        png_bytes = render_web_png(
+            url, render_w, render_h, panel_w, panel_h
+        )
     except ValueError as exc:
         print(f"web-render: invalid URL: {exc}", file=sys.stderr)
         return 2
@@ -311,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"web-render: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001 — last-ditch guard
-        # render_web_png funnels library errors into WebRenderError,
+        # render_web_png funnels expected errors into WebRenderError,
         # but a genuinely unexpected failure must still exit non-zero
         # with a message rather than dump a traceback the producer
         # can't parse.
@@ -337,7 +488,9 @@ if __name__ == "__main__":  # pragma: no cover — exercised via subprocess
 
 __all__ = [
     "render_web_png",
+    "composite_pillarbox",
     "main",
     "WebRenderError",
-    "WEB_RENDER_FETCH_TIMEOUT_S",
+    "WEB_RENDER_TIMEOUT_S",
+    "WEB_RENDER_VIRTUAL_TIME_BUDGET_MS",
 ]
