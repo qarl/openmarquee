@@ -365,6 +365,14 @@ fn default_image_duration_ms() -> u32 {
 /// when the item exists but isn't an image slide. Caller
 /// dispatches the type selection -- find_text_slide /
 /// find_image_slide are parallel narrow loaders.
+///
+/// Also accepts `web`-type slides: a Web slide is "an image slide
+/// whose asset.png is auto-refreshed from the render helper" (the
+/// backend writes the fetched screenshot to the same `asset.png`),
+/// so the renderer paints it via the exact image path. A `web`
+/// envelope carries extra `url` / `refresh_interval_s` fields, but
+/// `ImageSlide` has no `deny_unknown_fields` and every field has a
+/// serde default, so it deserializes cleanly into `ImageSlide`.
 pub fn find_image_slide(content_root: &Path, item_id: Uuid) -> Result<Option<ImageSlide>> {
     let path = item_dir(content_root, item_id).join("item.json");
     let bytes = std::fs::read(&path)
@@ -376,7 +384,7 @@ pub fn find_image_slide(content_root: &Path, item_id: Uuid) -> Result<Option<Ima
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if kind != "image" {
+    if kind != "image" && kind != "web" {
         return Ok(None);
     }
     let slide: ImageSlide = serde_json::from_value(envelope.item)
@@ -1474,6 +1482,24 @@ mod tests {
   }
 }"##;
 
+    // A `web`-type envelope -- carries the extra `url` /
+    // `refresh_interval_s` fields. find_image_slide accepts it: a
+    // Web slide renders as an image (its asset.png is a screenshot
+    // the helper refreshes).
+    const SAMPLE_WEB_ITEM: &str = r##"{
+  "schema_version": 3,
+  "item": {
+    "type": "web",
+    "id": "3964c302-311f-44f2-a6c9-efd24a16cfc0",
+    "name": "status board",
+    "url": "https://status.example.com",
+    "refresh_interval_s": 300,
+    "duration_ms": 7000,
+    "transition": "fade",
+    "transition_ms": 500
+  }
+}"##;
+
     #[test]
     fn find_image_slide_returns_some_for_image_item() {
         let td = TempDir::new().unwrap();
@@ -1484,6 +1510,23 @@ mod tests {
         let slide = find_image_slide(td.path(), id).unwrap().unwrap();
         assert_eq!(slide.id, id);
         assert_eq!(slide.duration_ms, 3000);
+        assert_eq!(slide.transition, "fade");
+    }
+
+    #[test]
+    fn find_image_slide_returns_some_for_web_item() {
+        // A Web slide renders as an image slide: find_image_slide
+        // treats `web` as `image`, and the extra url /
+        // refresh_interval_s fields deserialize harmlessly into
+        // ImageSlide (no deny_unknown_fields).
+        let td = TempDir::new().unwrap();
+        let id = Uuid::parse_str("3964c302-311f-44f2-a6c9-efd24a16cfc0").unwrap();
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir, "item.json", SAMPLE_WEB_ITEM);
+        let slide = find_image_slide(td.path(), id).unwrap().unwrap();
+        assert_eq!(slide.id, id);
+        assert_eq!(slide.duration_ms, 7000);
         assert_eq!(slide.transition, "fade");
     }
 

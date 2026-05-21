@@ -7,7 +7,13 @@ from uuid import UUID, uuid4
 import pytest
 from PIL import Image
 
-from openmarquee.content import ImageSlide, StreamSlide, TextLayer, TextSlide
+from openmarquee.content import (
+    ImageSlide,
+    StreamSlide,
+    TextLayer,
+    TextSlide,
+    WebSlide,
+)
 
 
 def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
@@ -28,7 +34,7 @@ def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
         text_layers=[TextLayer(**layer)],
         **kwargs,
     )
-from openmarquee.playback import PlaybackLoop
+from openmarquee.playback import PlaybackLoop, web_refresh_due
 from openmarquee.rendering.mock import MockRenderer
 from openmarquee.stream_consumer import StreamConsumer
 from tests.test_stream_consumer import _write_mock_ffmpeg
@@ -47,6 +53,7 @@ def _new_loop(
     get_timezone=None,
     auto_tick_seconds=0.02,
     active_playlist_id=None,
+    web_screenshot_producer=None,
 ):
     return PlaybackLoop(
         renderer,
@@ -56,6 +63,7 @@ def _new_loop(
         get_timezone=get_timezone,
         auto_tick_seconds=auto_tick_seconds,
         active_playlist_id=active_playlist_id,
+        web_screenshot_producer=web_screenshot_producer,
     )
 
 
@@ -934,3 +942,157 @@ async def test_stream_slide_preempted_by_pause(
     assert loop._resume_at_index == 0
     await loop.resume()
     await loop.stop()
+
+
+# --- Web slide: refresh staleness + non-blocking kick (Web slide P3) -------
+
+
+def test_web_refresh_due_first_fetch_is_always_due():
+    """No prior fetch (None) -> a refresh is due on first sight."""
+    assert web_refresh_due(None, now_monotonic=100.0, refresh_interval_s=300)
+
+
+def test_web_refresh_due_fresh_slide_is_not_due():
+    """A slide fetched less than refresh_interval_s ago is NOT due."""
+    # Fetched at t=100, interval 300s, now t=250 -> 150s elapsed < 300.
+    assert not web_refresh_due(
+        100.0, now_monotonic=250.0, refresh_interval_s=300
+    )
+
+
+def test_web_refresh_due_stale_slide_is_due():
+    """A slide whose last fetch is older than refresh_interval_s IS due."""
+    # Fetched at t=100, interval 300s, now t=500 -> 400s elapsed >= 300.
+    assert web_refresh_due(
+        100.0, now_monotonic=500.0, refresh_interval_s=300
+    )
+
+
+def test_web_refresh_due_exactly_at_interval_is_due():
+    """Elapsed exactly equal to the interval counts as due."""
+    assert web_refresh_due(
+        100.0, now_monotonic=400.0, refresh_interval_s=300
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_slide_kicks_refresh_producer(renderer):
+    """Entering a Web slide's slot fires the screenshot producer."""
+    web = WebSlide(
+        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        refresh_interval_s=10,
+    )
+    calls: list[tuple] = []
+
+    async def producer(slide, width, height) -> bool:
+        calls.append((slide.id, width, height))
+        return True
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [web],
+        read_asset=lambda _id: _png_bytes(8, 8, (1, 2, 3)),
+        web_screenshot_producer=producer,
+    )
+    await loop.start()
+    await asyncio.sleep(0.1)
+    await loop.stop()
+    # The producer was kicked at least once with the slide id + the
+    # renderer's panel dimensions.
+    assert calls
+    assert calls[0] == (web.id, renderer.width, renderer.height)
+
+
+@pytest.mark.asyncio
+async def test_web_slide_slot_does_not_await_the_fetch(renderer):
+    """CRITICAL: entering a Web slot must NOT block on the screenshot
+    fetch. With a producer that hangs forever, the slide still plays
+    (begin_slide fires) well within the slot — proving create_task,
+    not await."""
+    web = WebSlide(
+        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        refresh_interval_s=10,
+    )
+    started = asyncio.Event()
+
+    async def hanging_producer(slide, width, height) -> bool:
+        started.set()
+        # Never returns within the test window — if _loop awaited
+        # this, the slide would never render.
+        await asyncio.sleep(3600)
+        return True
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [web],
+        read_asset=lambda _id: _png_bytes(8, 8, (4, 5, 6)),
+        web_screenshot_producer=hanging_producer,
+    )
+    await loop.start()
+    # The slide rendered despite the producer hanging — the loop did
+    # not await the fetch.
+    await asyncio.sleep(0.15)
+    seen = [c[0] for c in renderer.begin_slide_calls]
+    inflight = set(loop._web_inflight)
+    await loop.stop()
+    assert web.id in seen, "web slide never rendered — _loop blocked on fetch"
+    # The hanging fetch is still tracked in-flight (it never finished).
+    assert started.is_set()
+    assert web.id in inflight
+
+
+@pytest.mark.asyncio
+async def test_web_slide_inflight_fetch_is_not_re_kicked(renderer):
+    """While a fetch is in flight for a slide, re-entering its slot
+    does NOT kick a second fetch (the in-flight guard)."""
+    web = WebSlide(
+        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        # Tiny interval so staleness alone would re-kick every slot.
+        refresh_interval_s=10,
+    )
+    call_count = 0
+    release = asyncio.Event()
+
+    async def slow_producer(slide, width, height) -> bool:
+        nonlocal call_count
+        call_count += 1
+        await release.wait()
+        return True
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [web],
+        read_asset=lambda _id: _png_bytes(8, 8, (7, 8, 9)),
+        web_screenshot_producer=slow_producer,
+    )
+    await loop.start()
+    # Several slot cycles pass (100ms duration each) while the first
+    # fetch is still blocked — no second kick should have happened.
+    await asyncio.sleep(0.4)
+    count_while_inflight = call_count
+    release.set()
+    await asyncio.sleep(0.05)
+    await loop.stop()
+    assert count_while_inflight == 1, (
+        f"expected exactly one in-flight fetch, got {count_while_inflight}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_slide_renders_without_a_producer(renderer):
+    """A Web slide with no producer wired still plays as an image
+    slide (renders its current asset.png), no crash."""
+    web = WebSlide(
+        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+    )
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [web],
+        read_asset=lambda _id: _png_bytes(8, 8, (10, 11, 12)),
+        web_screenshot_producer=None,
+    )
+    await loop.start()
+    await asyncio.sleep(0.1)
+    seen = [c[0] for c in renderer.begin_slide_calls]
+    await loop.stop()
+    assert web.id in seen

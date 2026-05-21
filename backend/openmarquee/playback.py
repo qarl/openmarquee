@@ -25,13 +25,13 @@ import asyncio
 import contextlib
 import logging
 import tempfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from openmarquee.content import ContentItem, StreamSlide
+from openmarquee.content import ContentItem, StreamSlide, WebSlide
 from openmarquee.rendering import Renderer
 from openmarquee.stream_consumer import StreamConsumer
 
@@ -48,6 +48,38 @@ log = logging.getLogger(__name__)
 # on_unreachable policy. Short enough that a dead URL doesn't dominate
 # a 10-second slot.
 _STREAM_CONNECT_TIMEOUT_S = 3.0
+
+
+def web_refresh_due(
+    last_fetch_monotonic: float | None,
+    now_monotonic: float,
+    refresh_interval_s: float,
+) -> bool:
+    """Pure staleness predicate for a Web slide's screenshot refresh.
+
+    A Web slide's `asset.png` is a screenshot the render helper
+    re-produces every `refresh_interval_s`. When the slide's slot
+    comes round, the playback loop asks this whether a fresh fetch
+    is owed.
+
+    Args:
+        last_fetch_monotonic: when a refresh was last KICKED for this
+            slide (monotonic clock), or None if one never has been.
+        now_monotonic: the current monotonic time.
+        refresh_interval_s: the slide's `refresh_interval_s`.
+
+    Returns:
+        True when a refresh is due: always True the first time (no
+        prior fetch), then True once `refresh_interval_s` has elapsed
+        since the last kick. The timestamp is stamped at KICK time
+        (not completion) so a slow in-flight fetch doesn't make the
+        loop re-kick it on the next slot — the in-flight set handles
+        the same-slide double-kick guard, and stamping-at-kick keeps
+        the cadence steady regardless of fetch latency.
+    """
+    if last_fetch_monotonic is None:
+        return True
+    return (now_monotonic - last_fetch_monotonic) >= refresh_interval_s
 
 
 class PlaybackLoop:
@@ -68,10 +100,22 @@ class PlaybackLoop:
         auto_tick_seconds: float = 1.0,
         stuck_backoff_seconds: float = 3.0,
         active_playlist_id: Callable[[], UUID | None] | None = None,
+        web_screenshot_producer: (
+            Callable[[WebSlide, int, int], Awaitable[bool]] | None
+        ) = None,
     ):
         self._renderer = renderer
         self._fetch_items = fetch_items
         self._read_asset = read_asset
+        # Web slide (Web slide P3): the screenshot-refresh producer. A
+        # coroutine that, given a WebSlide + the panel width/height,
+        # fetches a fresh screenshot from the render helper and saves
+        # it as the slide's asset.png. The loop fire-and-forgets it
+        # (asyncio.create_task) when a Web slide's slot is stale — it
+        # is NEVER awaited inside _loop, so a 2-10s helper fetch can't
+        # freeze the sign. None in tests / configs that don't wire a
+        # producer (a Web slide then just renders its current asset).
+        self._web_screenshot_producer = web_screenshot_producer
         # Bug 1 (2026-05-20): a cheap "which playlist is active right
         # now per the schedule" probe, re-evaluated once per slot so a
         # schedule/playlist switch preempts the running playlist
@@ -171,6 +215,18 @@ class PlaybackLoop:
         # gates the zero-playable warning to one line per stuck
         # episode (then DEBUG), and a recovery INFO when it clears.
         self._all_unplayable: bool = False
+        # Web slide (Web slide P3): per-slide-id monotonic timestamp of
+        # the last screenshot refresh KICK. web_refresh_due() compares
+        # against this to decide staleness; a slide id absent from the
+        # dict has never been fetched and is due on first sight.
+        self._web_last_fetch: dict[UUID, float] = {}
+        # Web slide (P3): slide ids with a screenshot fetch CURRENTLY
+        # in flight. Guards against double-kicking the same slide while
+        # a previous fetch (2-10s) is still running — without it a Web
+        # slide whose slot recurs faster than its fetch finishes would
+        # stack tasks. The fetch coroutine's done-callback clears the
+        # id (see _kick_web_refresh).
+        self._web_inflight: set[UUID] = set()
 
     @property
     def is_running(self) -> bool:
@@ -393,6 +449,20 @@ class PlaybackLoop:
                     self._current_auto_mode = None
                     self._current_auto_format = None
 
+                # Web slide (Web slide P3): when a Web slide's slot is
+                # entered, fire-and-forget a screenshot refresh if the
+                # current asset is stale. _maybe_kick_web_refresh
+                # launches the fetch with create_task and returns
+                # IMMEDIATELY — the loop NEVER awaits it, so a 2-10s
+                # helper fetch can't freeze the sign. The slide then
+                # plays via the normal IPC route below (a `web` slide
+                # is an image slide to the renderer — see content.rs
+                # find_image_slide), painting whatever asset.png
+                # currently exists; the fresh screenshot shows up on
+                # the next slot.
+                if isinstance(item, WebSlide):
+                    self._maybe_kick_web_refresh(item)
+
                 # STREAM/VLC Mode B: a StreamSlide can't go through
                 # the sidecar — the Rust ContentItem enum has no
                 # stream envelope kind. Intercept it here, BEFORE
@@ -614,6 +684,71 @@ class PlaybackLoop:
             hasattr(self._renderer, "begin_slide")
             and hasattr(self._renderer, "advance")
         )
+
+    def _maybe_kick_web_refresh(self, slide: WebSlide) -> None:
+        """Fire-and-forget a screenshot refresh for `slide` if one is
+        due — NON-BLOCKING.
+
+        Called from `_loop` when a Web slide's slot is entered. A Web
+        slide renders as an image slide (the renderer paints its
+        `asset.png`); this keeps that asset fresh by periodically
+        re-fetching a screenshot from the render helper.
+
+        CRITICAL — this MUST NOT block the playback loop. A screenshot
+        fetch takes 2-10s; if `_loop` awaited it the sign would freeze
+        for the whole fetch (the "coffe" Bug A failure class). So the
+        fetch is launched with `asyncio.create_task` and this method
+        returns IMMEDIATELY — `_loop` then plays the slide with
+        whatever `asset.png` currently exists (last-good screenshot,
+        or the create-time placeholder). The fresh screenshot lands
+        asynchronously and shows up the next time the slot comes round
+        (the renderer's image bake re-reads the PNG per paint).
+
+        Guards:
+          - no producer wired -> no-op.
+          - not stale (web_refresh_due is False) -> no-op.
+          - a fetch already in flight for this id -> no-op (the
+            in-flight set prevents stacking tasks when a slot recurs
+            faster than its fetch finishes).
+        The done-callback clears the in-flight id and surfaces any
+        task exception via the logger — the producer catches
+        everything itself, so this is belt-and-suspenders.
+        """
+        if self._web_screenshot_producer is None:
+            return
+        slide_id = slide.id
+        if slide_id in self._web_inflight:
+            return
+        now = asyncio.get_event_loop().time()
+        last = self._web_last_fetch.get(slide_id)
+        if not web_refresh_due(last, now, slide.refresh_interval_s):
+            return
+
+        # Stamp the kick time NOW (not on completion): keeps the
+        # refresh cadence steady regardless of how long the fetch
+        # takes, and ensures a slow fetch isn't re-kicked next slot.
+        self._web_last_fetch[slide_id] = now
+        self._web_inflight.add(slide_id)
+        producer = self._web_screenshot_producer
+        width = self._renderer.width
+        height = self._renderer.height
+        task = asyncio.create_task(producer(slide, width, height))
+
+        def _on_done(t: "asyncio.Task[bool]", _id: UUID = slide_id) -> None:
+            # Always clear the in-flight flag so the next due slot can
+            # re-kick. The producer is contracted to never raise, but
+            # guard anyway — a crashed task must not wedge the id.
+            self._web_inflight.discard(_id)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                log.error(
+                    "playback: web-screenshot task for slide id=%s "
+                    "crashed: %r", _id, exc, exc_info=exc,
+                )
+
+        task.add_done_callback(_on_done)
 
     async def _play_via_rust_ipc(
         self,
