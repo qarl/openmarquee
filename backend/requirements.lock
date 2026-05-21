@@ -23,6 +23,8 @@ argon2-cffi-bindings==25.1.0
     # via argon2-cffi
 av==16.1.0
     # via aiortc
+brotli==1.2.0
+    # via fonttools
 certifi==2026.4.22
     # via
     #   httpcore
@@ -32,16 +34,21 @@ cffi==2.0.0
     #   argon2-cffi-bindings
     #   cryptography
     #   pylibsrtp
+    #   weasyprint
 click==8.3.3
     # via uvicorn
 cryptography==48.0.0
     # via
     #   aiortc
     #   pyopenssl
+cssselect2==0.9.0
+    # via weasyprint
 dnspython==2.8.0
     # via aioice
 fastapi==0.136.1
     # via openmarquee (pyproject.toml)
+fonttools==4.63.0
+    # via weasyprint
 google-crc32c==1.8.0
     # via aiortc
 h11==0.16.0
@@ -63,25 +70,39 @@ ifaddr==0.2.0
 numpy==2.4.4
     # via openmarquee (pyproject.toml)
 pillow==12.2.0
-    # via openmarquee (pyproject.toml)
+    # via
+    #   openmarquee (pyproject.toml)
+    #   weasyprint
 pycparser==3.0
     # via cffi
 pydantic==2.13.4
     # via fastapi
 pydantic-core==2.46.4
     # via pydantic
+pydyf==0.12.1
+    # via weasyprint
 pyee==13.0.1
     # via aiortc
 pylibsrtp==1.0.0
     # via aiortc
 pyopenssl==26.2.0
     # via aiortc
+pypdfium2==5.8.0
+    # via openmarquee (pyproject.toml)
+pyphen==0.17.2
+    # via weasyprint
 python-dotenv==1.2.2
     # via uvicorn
 pyyaml==6.0.3
     # via uvicorn
 starlette==1.0.0
     # via fastapi
+tinycss2==1.5.1
+    # via
+    #   cssselect2
+    #   weasyprint
+tinyhtml5==2.1.0
+    # via weasyprint
 typing-extensions==4.15.0
     # via
     #   fastapi
@@ -99,5 +120,14 @@ uvloop==0.22.1
     # via uvicorn
 watchfiles==1.1.1
     # via uvicorn
+weasyprint==68.1
+    # via openmarquee (pyproject.toml)
+webencodings==0.5.1
+    # via
+    #   cssselect2
+    #   tinycss2
+    #   tinyhtml5
 websockets==16.0
     # via uvicorn
+zopfli==0.4.1
+    # via fonttools
