@@ -246,13 +246,13 @@ export async function updateTextSlide(id, payload) {
 }
 
 /**
- * Create a VLC-stream slide. `payload` matches the backend
- * `VlcStreamUpload` schema (api.py) — pure metadata (name, rtsp_url,
+ * Create a stream slide. `payload` matches the backend
+ * `StreamUpload` schema (api.py) — pure metadata (name, stream_url,
  * duration_ms, on_unreachable, transition). There is no asset upload:
- * the video is a live RTSP feed and the thumbnail card is synthesised
+ * the video is a live stream feed and the thumbnail card is synthesised
  * server-side.
  */
-export async function saveVlcStream(payload) {
+export async function saveStream(payload) {
     const response = await apiFetch("/api/content/vlc-streams", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -266,10 +266,10 @@ export async function saveVlcStream(payload) {
 }
 
 /**
- * Update an existing VLC-stream slide (metadata only; the UUID is
+ * Update an existing stream slide (metadata only; the UUID is
  * preserved so playlist + schedule references hold).
  */
-export async function updateVlcStream(id, payload) {
+export async function updateStream(id, payload) {
     const response = await apiFetch(`/api/content/vlc-streams/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -278,7 +278,7 @@ export async function updateVlcStream(id, payload) {
     if (!response.ok) {
         const detail = await extractDetailMessage(response);
         throw new Error(
-            `Update VLC stream failed (${response.status}): ${detail}`,
+            `Update stream failed (${response.status}): ${detail}`,
         );
     }
     return await response.json();
@@ -706,7 +706,7 @@ export async function startRtspStream(url) {
     const response = await apiFetch("/api/stream/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kind: "rtsp", url }),
+        body: JSON.stringify({ kind: "stream", url }),
         signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
     });
     if (response.status === 409) {
@@ -751,7 +751,7 @@ export async function takeoverRtspStream(url) {
     const response = await apiFetch("/api/stream/takeover", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kind: "rtsp", url }),
+        body: JSON.stringify({ kind: "stream", url }),
         signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
     });
     if (!response.ok) {

@@ -1,11 +1,11 @@
-// VLC-stream slide editor — a pure-metadata form for a playlist slide
-// that plays an RTSP stream the operator's VLC is publishing
+// Stream slide editor — a pure-metadata form for a playlist slide
+// that plays a live stream the operator is publishing
 // (docs/STREAM_VLC_PROPOSAL.md §6, Mode B).
 //
 // Unlike the image/video editors there is NO file upload: the video is
-// a live RTSP feed and the slide's thumbnail card is synthesised
-// server-side (storage.save_vlc_stream). So this module is just a
-// metadata form — name, RTSP URL, duration, and the on_unreachable
+// a live stream feed and the slide's thumbnail card is synthesised
+// server-side (storage.save_stream). So this module is just a
+// metadata form — name, stream URL, duration, and the on_unreachable
 // fallback — wired to the same auto-save + slide-browser scaffolding
 // the other slide editors use.
 //
@@ -18,14 +18,14 @@ import { attachAutoSave } from "./auto-save.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 const TEMPLATE = `
-    <section class="vlc-stream-upload">
+    <section class="stream-upload">
         <div class="slide-browser-slot"></div>
         <form class="controls" autocomplete="off">
             <div class="om-card" style="margin-bottom: 12px;">
                 <div class="om-row" style="gap: 10px;">
                     <label class="om-field" style="flex: 1;">
                         <span>Slide name</span>
-                        <input type="text" class="om-input field-name" value="VLC stream" maxlength="200">
+                        <input type="text" class="om-input field-name" value="Stream" maxlength="200">
                     </label>
                     <label class="om-field" style="width: 110px;">
                         <span>Duration (s)</span>
@@ -35,32 +35,32 @@ const TEMPLATE = `
             </div>
             <div class="om-card" style="margin-bottom: 12px;">
                 <label class="om-field">
-                    <span>RTSP URL</span>
-                    <input type="text" class="om-input field-rtsp-url"
-                           placeholder="rtsp://your-laptop:8554/live"
+                    <span>Stream URL</span>
+                    <input type="text" class="om-input field-stream-url"
+                           placeholder="rtsp://… / rtmp://… / https://….m3u8"
                            autocomplete="off" spellcheck="false">
                 </label>
-                <fieldset class="om-field vlc-unreachable">
+                <fieldset class="om-field stream-unreachable">
                     <span>If the stream isn't running</span>
-                    <label><input type="radio" name="vlc-on-unreachable" value="hold_last_frame" checked> Hold last frame</label>
-                    <label><input type="radio" name="vlc-on-unreachable" value="black"> Show black</label>
-                    <label><input type="radio" name="vlc-on-unreachable" value="skip"> Skip slide</label>
+                    <label><input type="radio" name="stream-on-unreachable" value="hold_last_frame" checked> Hold last frame</label>
+                    <label><input type="radio" name="stream-on-unreachable" value="black"> Show black</label>
+                    <label><input type="radio" name="stream-on-unreachable" value="skip"> Skip slide</label>
                 </fieldset>
             </div>
-            <div class="om-card vlc-stream-preview">
-                <div class="vlc-stream-preview-card">
-                    <span class="vlc-stream-preview-title">&#9654; Live VLC stream</span>
-                    <span class="vlc-stream-preview-url"></span>
-                    <span class="vlc-stream-preview-note">Plays live on the sign &mdash; not previewed in the editor.</span>
+            <div class="om-card stream-slide-preview">
+                <div class="stream-preview-card">
+                    <span class="stream-preview-title">&#9654; Live stream</span>
+                    <span class="stream-preview-url"></span>
+                    <span class="stream-preview-note">Plays live on the sign &mdash; not previewed in the editor.</span>
                 </div>
             </div>
-            <p class="om-save-status vlc-stream-upload-status" role="status" aria-live="polite" data-state="idle"></p>
+            <p class="om-save-status stream-upload-status" role="status" aria-live="polite" data-state="idle"></p>
         </form>
     </section>
 `;
 
 /**
- * Mount the VLC-stream slide editor into `container`.
+ * Mount the stream slide editor into `container`.
  *
  * @param {HTMLElement} container — parent element (emptied and replaced).
  * @param {object} options
@@ -71,7 +71,7 @@ const TEMPLATE = `
  *     the slide browser + auto-naming.
  * @returns {{ loadForEdit, createNew, refreshBrowser }}
  */
-export function mountVlcStreamUploader(
+export function mountStreamUploader(
     container,
     { onSave, onSaveExisting, fetchItems },
 ) {
@@ -80,9 +80,9 @@ export function mountVlcStreamUploader(
     const form = container.querySelector(".controls");
     const nameEl = container.querySelector(".field-name");
     const durationEl = container.querySelector(".field-duration");
-    const rtspUrlEl = container.querySelector(".field-rtsp-url");
-    const statusEl = container.querySelector(".vlc-stream-upload-status");
-    const previewUrlEl = container.querySelector(".vlc-stream-preview-url");
+    const streamUrlEl = container.querySelector(".field-stream-url");
+    const statusEl = container.querySelector(".stream-upload-status");
+    const previewUrlEl = container.querySelector(".stream-preview-url");
 
     const state = {
         // Non-null once an existing slide is loaded OR a create-mode
@@ -98,29 +98,29 @@ export function mountVlcStreamUploader(
 
     function onUnreachableValue() {
         const checked = form.querySelector(
-            'input[name="vlc-on-unreachable"]:checked',
+            'input[name="stream-on-unreachable"]:checked',
         );
         return checked ? checked.value : "hold_last_frame";
     }
 
     function setOnUnreachable(value) {
         const radio = form.querySelector(
-            `input[name="vlc-on-unreachable"][value="${value}"]`,
+            `input[name="stream-on-unreachable"][value="${value}"]`,
         );
-        (radio || form.querySelector('input[name="vlc-on-unreachable"]')).checked = true;
+        (radio || form.querySelector('input[name="stream-on-unreachable"]')).checked = true;
     }
 
     function refreshPreviewUrl() {
         previewUrlEl.textContent =
-            rtspUrlEl.value.trim() || "(no RTSP URL yet)";
+            streamUrlEl.value.trim() || "(no stream URL yet)";
     }
-    rtspUrlEl.addEventListener("input", refreshPreviewUrl);
+    streamUrlEl.addEventListener("input", refreshPreviewUrl);
 
     async function performSave() {
         const durationSeconds = Number(durationEl.value) || 10;
         const payload = {
-            name: nameEl.value || "VLC stream",
-            rtsp_url: rtspUrlEl.value.trim(),
+            name: nameEl.value || "Stream",
+            stream_url: streamUrlEl.value.trim(),
             duration_ms: Math.round(durationSeconds * 1000),
             on_unreachable: onUnreachableValue(),
             transition: state.transition,
@@ -143,23 +143,23 @@ export function mountVlcStreamUploader(
     const autoSave = attachAutoSave(form, {
         save: performSave,
         status: statusEl,
-        // A VLC slide is useless without an RTSP URL — gate create-mode
-        // saves on a non-empty URL. Editing an existing slide is always
-        // saveable (the URL is already on the server).
+        // A stream slide is useless without a stream URL — gate
+        // create-mode saves on a non-empty URL. Editing an existing
+        // slide is always saveable (the URL is already on the server).
         canSave: () =>
-            Boolean(state.editingId) || Boolean(rtspUrlEl.value.trim()),
+            Boolean(state.editingId) || Boolean(streamUrlEl.value.trim()),
     });
 
     async function computeDefaultName() {
-        if (!fetchItems) return "VLC Stream 1";
+        if (!fetchItems) return "Stream 1";
         try {
             const items = await fetchItems();
             return nextAutoName(
-                items.filter((i) => i.type === "vlc_stream"),
-                "VLC Stream",
+                items.filter((i) => i.type === "stream"),
+                "Stream",
             );
         } catch {
-            return "VLC Stream 1";
+            return "Stream 1";
         }
     }
 
@@ -167,7 +167,7 @@ export function mountVlcStreamUploader(
         state.editingId = null;
         state.transition = "cut";
         state.transitionMs = 500;
-        rtspUrlEl.value = "";
+        streamUrlEl.value = "";
         durationEl.value = "10";
         setOnUnreachable("hold_last_frame");
         refreshPreviewUrl();
@@ -187,16 +187,16 @@ export function mountVlcStreamUploader(
     }
 
     function loadForEdit(slide) {
-        if (!slide || slide.type !== "vlc_stream") {
+        if (!slide || slide.type !== "stream") {
             statusEl.textContent =
-                "Only VLC-stream slides are editable here.";
+                "Only stream slides are editable here.";
             return;
         }
         state.editingId = String(slide.id);
         state.transition = slide.transition || "cut";
         state.transitionMs = slide.transition_ms ?? 500;
-        nameEl.value = slide.name || "VLC stream";
-        rtspUrlEl.value = slide.rtsp_url || "";
+        nameEl.value = slide.name || "Stream";
+        streamUrlEl.value = slide.stream_url || "";
         durationEl.value = String(
             Math.max(1, (slide.duration_ms || 10_000) / 1000),
         );
@@ -213,7 +213,7 @@ export function mountVlcStreamUploader(
         browser = mountSlideBrowser(
             container.querySelector(".slide-browser-slot"),
             {
-                type: "vlc_stream",
+                type: "stream",
                 fetchItems,
                 onSelect: (item) => loadForEdit(item),
                 onCreate: () => resetToBlank(),
@@ -227,7 +227,7 @@ export function mountVlcStreamUploader(
 
     /**
      * +New flow: a blank create form. Unlike the image/video editors
-     * there is nothing to upload — the operator types an RTSP URL and
+     * there is nothing to upload — the operator types a stream URL and
      * the auto-save persists the slide once the URL is non-empty.
      */
     async function createNew() {

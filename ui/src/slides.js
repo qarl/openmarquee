@@ -1,10 +1,10 @@
 // Slides shell — the unified Library page.
 //
-// Hosts four child panels (text editor, image upload, video upload, VLC
+// Hosts four child panels (text editor, image upload, video upload,
 // stream) under one sidebar nav entry. Renders the page head + a 4-tab
 // subnav strip; tab clicks (and deep-link URLs `#/slides/text`,
-// `#/slides/image`, `#/slides/video`, `#/slides/vlc`) toggle which child
-// pane is visible.
+// `#/slides/image`, `#/slides/video`, `#/slides/stream`) toggle which
+// child pane is visible.
 //
 // Counts in the subnav strip are populated from /api/content via
 // `fetchItems`; refresh by calling `handle.refreshCounts()` after a
@@ -14,7 +14,7 @@ const TABS = [
     { key: "text",  label: "Text",  type: "text_slide", noun: "text"  },
     { key: "image", label: "Image", type: "image",      noun: "image" },
     { key: "video", label: "Video", type: "video",      noun: "video" },
-    { key: "vlc",   label: "VLC stream", type: "vlc_stream", noun: "VLC stream" },
+    { key: "stream", label: "Stream", type: "stream", noun: "Stream" },
 ];
 
 const TEMPLATE = `
@@ -23,7 +23,7 @@ const TEMPLATE = `
             <div>
                 <span class="om-eyebrow">Library · 4 sources</span>
                 <h1>Slides</h1>
-                <p>Build text, drop in images, loop a video, or pull a live VLC stream. Each slide previews at your sign's resolution.</p>
+                <p>Build text, drop in images, loop a video, or pull a live stream. Each slide previews at your sign's resolution.</p>
             </div>
             <div class="slides-shell-actions">
                 <button type="button" class="om-btn primary slides-shell-new">+ New text</button>

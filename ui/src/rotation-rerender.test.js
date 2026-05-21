@@ -23,12 +23,12 @@ function makeDeps(items, overrides = {}) {
 }
 
 describe("rerenderAllSlidesForRotation", () => {
-    it("re-renders text + video slides, skips image + vlc_stream", async () => {
+    it("re-renders text + video slides, skips image + stream", async () => {
         const items = [
             { id: "t1", type: "text_slide" },
             { id: "v1", type: "video" },
             { id: "i1", type: "image_slide" },
-            { id: "s1", type: "vlc_stream" },
+            { id: "s1", type: "stream" },
         ];
         const deps = makeDeps(items);
 

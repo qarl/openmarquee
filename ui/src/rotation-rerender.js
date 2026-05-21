@@ -33,7 +33,7 @@
 //       the device cover-fits at playout. Re-rendering would bake a portrait
 //       crop into the source and permanently destroy resolution. So image
 //       thumbnails are already correct under any rotation; nothing to do.
-//   - vlc_stream: SKIPPED — no client-side asset; the thumbnail card is
+//   - stream: SKIPPED — no client-side asset; the thumbnail card is
 //       synthesised server-side and carries no orientation.
 
 import {
@@ -150,7 +150,7 @@ export async function rerenderAllSlidesForRotation(rotation, deps = {}) {
             summary.skipped += 1;
             continue;
         }
-        // image / vlc_stream carry no orientation-baked thumbnail that
+        // image / stream carry no orientation-baked thumbnail that
         // rotation can break — see the module header.
         if (type !== "text_slide" && type !== "video") {
             summary.skipped += 1;

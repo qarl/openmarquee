@@ -4117,7 +4117,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
     opacity: 0.55;
 }
 
-/* VLC RTSP URL field + the publish-instructions disclosure. Occupies
+/* Stream URL field + the publish-instructions disclosure. Occupies
    the same slot the camera viewfinder uses; the two are toggled by
    source mode. */
 .stream-vlc-panel {
@@ -4165,20 +4165,20 @@ html, body { margin: 0; padding: 0; height: 100%; }
     opacity: 0.85;
 }
 
-/* --- VLC-stream slide editor (STREAM/VLC slice 8) -------------------- */
+/* --- Stream slide editor (STREAM/VLC slice 8) ----------------------- */
 
 /* The "If the stream isn't running" radio group. Reset the fieldset's
    default border/padding, stack the options. */
-.vlc-unreachable {
+.stream-unreachable {
     border: 0;
     margin: 0;
     padding: 0;
 }
-.vlc-unreachable > span {
+.stream-unreachable > span {
     display: block;
     margin-bottom: 6px;
 }
-.vlc-unreachable label {
+.stream-unreachable label {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -4188,9 +4188,9 @@ html, body { margin: 0; padding: 0; height: 100%; }
     cursor: pointer;
 }
 
-/* Placeholder preview card — a VLC slide has no operator image; this
+/* Placeholder preview card — a stream slide has no operator image; this
    stands in for the live feed inside the editor. */
-.vlc-stream-preview-card {
+.stream-preview-card {
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -4202,18 +4202,18 @@ html, body { margin: 0; padding: 0; height: 100%; }
     background: var(--om-led-bg, #000);
     border: 1px solid var(--om-line, var(--panel-border));
 }
-.vlc-stream-preview-title {
+.stream-preview-title {
     font-size: 16px;
     font-weight: 600;
     color: var(--om-accent);
 }
-.vlc-stream-preview-url {
+.stream-preview-url {
     font-family: var(--om-mono, monospace);
     font-size: 13px;
     color: var(--om-text, var(--text));
     word-break: break-all;
 }
-.vlc-stream-preview-note {
+.stream-preview-note {
     font-size: 12px;
     color: var(--om-text-dim, var(--text));
 }

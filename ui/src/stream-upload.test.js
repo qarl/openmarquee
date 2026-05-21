@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
-import { mountVlcStreamUploader } from "./vlc-stream-upload.js";
+import { mountStreamUploader } from "./stream-upload.js";
 
 function tick() {
     return new Promise((r) => setTimeout(r, 0));
@@ -10,26 +10,26 @@ function fireInput(el) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-describe("mountVlcStreamUploader", () => {
-    it("renders the metadata form — name, RTSP URL, duration, fallback radios, no file input", () => {
+describe("mountStreamUploader", () => {
+    it("renders the metadata form — name, stream URL, duration, fallback radios, no file input", () => {
         const container = document.createElement("div");
-        mountVlcStreamUploader(container, { onSave: vi.fn() });
+        mountStreamUploader(container, { onSave: vi.fn() });
 
         expect(container.querySelector(".field-name")).not.toBeNull();
-        expect(container.querySelector(".field-rtsp-url")).not.toBeNull();
+        expect(container.querySelector(".field-stream-url")).not.toBeNull();
         expect(container.querySelector(".field-duration")).not.toBeNull();
         expect(
-            container.querySelectorAll('input[name="vlc-on-unreachable"]').length,
+            container.querySelectorAll('input[name="stream-on-unreachable"]').length,
         ).toBe(3);
         expect(container.querySelector(".om-save-status")).not.toBeNull();
-        // A VLC slide has no asset upload — there is no file input.
+        // A stream slide has no asset upload — there is no file input.
         expect(container.querySelector('input[type="file"]')).toBeNull();
     });
 
-    it("auto-save with an empty RTSP URL does nothing (canSave gate suppresses)", async () => {
+    it("auto-save with an empty stream URL does nothing (canSave gate suppresses)", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn();
-        const handle = mountVlcStreamUploader(container, { onSave });
+        const handle = mountStreamUploader(container, { onSave });
         await tick();
 
         const nameEl = container.querySelector(".field-name");
@@ -41,18 +41,18 @@ describe("mountVlcStreamUploader", () => {
 
     it("auto-save with a URL creates the slide with the right payload + defaults", async () => {
         const container = document.createElement("div");
-        const onSave = vi.fn().mockResolvedValue({ id: "vlc-1" });
-        const handle = mountVlcStreamUploader(container, { onSave });
+        const onSave = vi.fn().mockResolvedValue({ id: "stream-1" });
+        const handle = mountStreamUploader(container, { onSave });
         await tick();
 
-        const urlEl = container.querySelector(".field-rtsp-url");
+        const urlEl = container.querySelector(".field-stream-url");
         urlEl.value = "rtsp://laptop:8554/live";
         fireInput(urlEl);
         await handle.flushAutoSave();
 
         expect(onSave).toHaveBeenCalledTimes(1);
         const payload = onSave.mock.calls[0][0];
-        expect(payload.rtsp_url).toBe("rtsp://laptop:8554/live");
+        expect(payload.stream_url).toBe("rtsp://laptop:8554/live");
         expect(payload.duration_ms).toBe(10_000);
         expect(payload.on_unreachable).toBe("hold_last_frame");
         expect(payload.transition).toBe("cut");
@@ -61,13 +61,13 @@ describe("mountVlcStreamUploader", () => {
 
     it("the on_unreachable radio selection is carried into the payload", async () => {
         const container = document.createElement("div");
-        const onSave = vi.fn().mockResolvedValue({ id: "vlc-1" });
-        const handle = mountVlcStreamUploader(container, { onSave });
+        const onSave = vi.fn().mockResolvedValue({ id: "stream-1" });
+        const handle = mountStreamUploader(container, { onSave });
         await tick();
 
-        container.querySelector(".field-rtsp-url").value = "rtsp://h/x";
+        container.querySelector(".field-stream-url").value = "rtsp://h/x";
         const blackRadio = container.querySelector(
-            'input[name="vlc-on-unreachable"][value="black"]',
+            'input[name="stream-on-unreachable"][value="black"]',
         );
         blackRadio.checked = true;
         fireInput(blackRadio);
@@ -78,17 +78,17 @@ describe("mountVlcStreamUploader", () => {
 
     it("loadForEdit pre-fills the form and round-trips the transition on save", async () => {
         const container = document.createElement("div");
-        const onSaveExisting = vi.fn().mockResolvedValue({ id: "vlc-7" });
-        const handle = mountVlcStreamUploader(container, {
+        const onSaveExisting = vi.fn().mockResolvedValue({ id: "stream-7" });
+        const handle = mountStreamUploader(container, {
             onSave: vi.fn(),
             onSaveExisting,
         });
 
         handle.loadForEdit({
-            type: "vlc_stream",
-            id: "vlc-7",
+            type: "stream",
+            id: "stream-7",
             name: "Q3 Live",
-            rtsp_url: "rtsp://host:8554/q3",
+            stream_url: "rtsp://host:8554/q3",
             duration_ms: 20_000,
             on_unreachable: "skip",
             transition: "fade",
@@ -97,13 +97,13 @@ describe("mountVlcStreamUploader", () => {
         await tick();
 
         expect(container.querySelector(".field-name").value).toBe("Q3 Live");
-        expect(container.querySelector(".field-rtsp-url").value).toBe(
+        expect(container.querySelector(".field-stream-url").value).toBe(
             "rtsp://host:8554/q3",
         );
         expect(container.querySelector(".field-duration").value).toBe("20");
         expect(
             container.querySelector(
-                'input[name="vlc-on-unreachable"]:checked',
+                'input[name="stream-on-unreachable"]:checked',
             ).value,
         ).toBe("skip");
 
@@ -116,21 +116,21 @@ describe("mountVlcStreamUploader", () => {
 
         expect(onSaveExisting).toHaveBeenCalledTimes(1);
         const [id, payload] = onSaveExisting.mock.calls[0];
-        expect(id).toBe("vlc-7");
+        expect(id).toBe("stream-7");
         expect(payload.name).toBe("Q3 Live (renamed)");
         expect(payload.transition).toBe("fade");
         expect(payload.transition_ms).toBe(300);
     });
 
-    it("the placeholder preview card shows the typed RTSP URL", () => {
+    it("the placeholder preview card shows the typed stream URL", () => {
         const container = document.createElement("div");
-        mountVlcStreamUploader(container, { onSave: vi.fn() });
+        mountStreamUploader(container, { onSave: vi.fn() });
 
-        const urlEl = container.querySelector(".field-rtsp-url");
+        const urlEl = container.querySelector(".field-stream-url");
         urlEl.value = "rtsp://shown:8554/x";
         fireInput(urlEl);
         expect(
-            container.querySelector(".vlc-stream-preview-url").textContent,
+            container.querySelector(".stream-preview-url").textContent,
         ).toBe("rtsp://shown:8554/x");
     });
 });

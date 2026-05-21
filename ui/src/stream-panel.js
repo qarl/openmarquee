@@ -84,7 +84,7 @@ function writeFacingModePref(value) {
 // resumes on the operator's last source and doesn't make them re-type
 // their VLC address.
 const SOURCE_MODE_LS_KEY = "openmarquee:stream:source-mode";
-const RTSP_URL_LS_KEY = "openmarquee:stream:rtsp-url";
+const STREAM_URL_LS_KEY = "openmarquee:stream:url";
 function readSourceModePref() {
     try {
         const v = globalThis.localStorage?.getItem(SOURCE_MODE_LS_KEY);
@@ -103,14 +103,14 @@ function writeSourceModePref(value) {
 }
 function readRtspUrlPref() {
     try {
-        return globalThis.localStorage?.getItem(RTSP_URL_LS_KEY) || "";
+        return globalThis.localStorage?.getItem(STREAM_URL_LS_KEY) || "";
     } catch {
         return "";
     }
 }
 function writeRtspUrlPref(value) {
     try {
-        globalThis.localStorage?.setItem(RTSP_URL_LS_KEY, value);
+        globalThis.localStorage?.setItem(STREAM_URL_LS_KEY, value);
     } catch {
         /* quota / disabled — skip */
     }
@@ -182,7 +182,7 @@ const SECTION_TEMPLATE = `
             <button type="button" class="stream-source-opt is-selected" role="radio"
                     aria-checked="true" data-source="camera">Camera</button>
             <button type="button" class="stream-source-opt" role="radio"
-                    aria-checked="false" data-source="vlc">VLC stream</button>
+                    aria-checked="false" data-source="vlc">Stream</button>
         </div>
 
         <div class="stream-stage">
@@ -212,9 +212,9 @@ const SECTION_TEMPLATE = `
         </div>
 
         <div class="stream-vlc-panel" hidden>
-            <label class="stream-vlc-url-label" for="stream-vlc-url">RTSP URL</label>
+            <label class="stream-vlc-url-label" for="stream-vlc-url">Stream URL</label>
             <input type="text" id="stream-vlc-url" class="stream-vlc-url"
-                   placeholder="rtsp://your-laptop:8554/live"
+                   placeholder="rtsp://… / rtmp://… / https://….m3u8"
                    autocomplete="off" spellcheck="false" />
             <details class="stream-vlc-help">
                 <summary>How to publish from VLC</summary>
@@ -958,7 +958,7 @@ export function mountStreamPanel(container, options = {}) {
         }
         const url = readVlcUrl();
         if (!url) {
-            setMessage("Enter the RTSP URL your VLC is publishing.");
+            setMessage("Enter the stream URL to publish.");
             return;
         }
         writeRtspUrlPref(url);
@@ -978,7 +978,7 @@ export function mountStreamPanel(container, options = {}) {
         }
         try {
             state.phase = "negotiating";
-            setMessage("Connecting to VLC…");
+            setMessage("Connecting to the stream…");
             render();
             if (simulateOnly) {
                 await simulateNegotiate();
@@ -990,7 +990,7 @@ export function mountStreamPanel(container, options = {}) {
                 if (Number.isFinite(startedMs)) state.startedAt = startedMs;
             }
             state.phase = "live";
-            setMessage("Live from VLC.");
+            setMessage("Live from the stream.");
             render();
         } catch (err) {
             if (err && err.code === "stream_already_active") {
@@ -1008,7 +1008,7 @@ export function mountStreamPanel(container, options = {}) {
     async function takeOverVlc() {
         const url = readVlcUrl();
         if (!url) {
-            setMessage("Enter the RTSP URL your VLC is publishing.");
+            setMessage("Enter the stream URL to publish.");
             return;
         }
         writeRtspUrlPref(url);
@@ -1026,7 +1026,7 @@ export function mountStreamPanel(container, options = {}) {
                 if (Number.isFinite(startedMs)) state.startedAt = startedMs;
             }
             state.phase = "live";
-            setMessage("Live from VLC.");
+            setMessage("Live from the stream.");
             render();
         } catch (err) {
             failTo(err);

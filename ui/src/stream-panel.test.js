@@ -4,7 +4,7 @@ import { mountStreamPanel } from "./stream-panel.js";
 
 beforeEach(() => {
     vi.stubGlobal("RTCPeerConnection", undefined);
-    // The panel persists source-mode + facing-mode + rtsp-url to
+    // The panel persists source-mode + facing-mode + stream-url to
     // localStorage; clear it between tests so one test's writes don't
     // leak into the next mount's hydration.
     globalThis.localStorage?.clear();
@@ -1406,7 +1406,7 @@ describe("mountStreamPanel", () => {
         expect(handle.getState()).toBe("idle");
         expect(
             container.querySelector(".stream-status").textContent,
-        ).toMatch(/RTSP URL/i);
+        ).toMatch(/stream URL/i);
     });
 
     it("VLC live → Stop calls stopStream and returns to idle", async () => {
@@ -1430,7 +1430,7 @@ describe("mountStreamPanel", () => {
         container.querySelector(".stream-start-vlc").click();
         await waitFor(() => handle.getState() === "live");
         expect(
-            globalThis.localStorage.getItem("openmarquee:stream:rtsp-url"),
+            globalThis.localStorage.getItem("openmarquee:stream:url"),
         ).toBe("rtsp://host:8554/x");
         expect(
             globalThis.localStorage.getItem("openmarquee:stream:source-mode"),
@@ -1499,7 +1499,7 @@ describe("mountStreamPanel", () => {
         expect(opts.apiTakeoverRtspStream).not.toHaveBeenCalled();
         expect(
             container.querySelector(".stream-status").textContent,
-        ).toMatch(/RTSP URL/i);
+        ).toMatch(/stream URL/i);
     });
 
     it("switching from camera to VLC releases the camera", async () => {

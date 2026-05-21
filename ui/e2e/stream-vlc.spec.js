@@ -1,9 +1,10 @@
-// VLC-stream takeover e2e (STREAM/VLC slice 5).
+// Stream takeover e2e (STREAM/VLC slice 5).
 //
-// The VLC source needs no camera and no WebRTC — the panel just POSTs
-// the operator's RTSP URL to /api/stream/start with kind:"rtsp". So
-// this spec only mocks the backend Stream endpoints; no getUserMedia
-// / RTCPeerConnection stubs are needed (unlike stream-panel.spec.js).
+// The stream source needs no camera and no WebRTC — the panel just
+// POSTs the operator's stream URL to /api/stream/start with
+// kind:"stream". So this spec only mocks the backend Stream endpoints;
+// no getUserMedia / RTCPeerConnection stubs are needed (unlike
+// stream-panel.spec.js).
 
 import { expect, test } from "@playwright/test";
 import { resetServerState } from "./_helpers.js";
@@ -58,7 +59,7 @@ test("source toggle switches to VLC: URL field + Start streaming appear", async 
     await expect(page.locator(".stream-stage")).toBeHidden();
 });
 
-test("VLC Start → live → Stop posts a kind=rtsp body and cycles to idle", async ({
+test("Stream Start → live → Stop posts a kind=stream body and cycles to idle", async ({
     page,
 }) => {
     await mockIdleStatus(page);
@@ -92,9 +93,9 @@ test("VLC Start → live → Stop posts a kind=rtsp body and cycles to idle", as
     await expect(page.locator(".stream-stage")).toBeHidden();
     await expect(page.locator(".stream-status")).toContainText("Live");
 
-    // The panel POSTed a kind=rtsp body carrying the operator's URL.
+    // The panel POSTed a kind=stream body carrying the operator's URL.
     expect(startBody).toEqual({
-        kind: "rtsp",
+        kind: "stream",
         url: "rtsp://laptop.tail-net:8554/live",
     });
 
