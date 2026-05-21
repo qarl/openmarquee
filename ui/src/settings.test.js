@@ -38,8 +38,6 @@ const SAMPLE = {
     wifi_station_ssid: null,
     wifi_station_password: null,
     timezone: "America/New_York",
-    web_helper_url: "http://192.168.1.50:8888",
-    web_helper_token: "lan-shared-token",
     tailscale_enabled: false,
     tailscale_hostname: null,
     tailscale_auth_key: null,
@@ -248,42 +246,6 @@ describe("mountSettings", () => {
         await tick();
 
         expect(onSave.mock.calls[0][0].timezone).toBeNull();
-    });
-
-    it("hydrates the Web-helper address + token fields from GET", async () => {
-        const container = document.createElement("div");
-        mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
-        await tick();
-
-        expect(container.querySelector(".field-web-helper-url").value).toBe(
-            "http://192.168.1.50:8888",
-        );
-        expect(container.querySelector(".field-web-helper-token").value).toBe(
-            "lan-shared-token",
-        );
-    });
-
-    it("Save includes the edited Web-helper address + token in the payload", async () => {
-        const container = document.createElement("div");
-        const onSave = vi.fn().mockResolvedValue(undefined);
-        mount(container, {
-            fetchSettings: async () => SAMPLE,
-            onSave,
-        });
-        await tick();
-
-        container.querySelector(".field-web-helper-url").value =
-            "http://10.0.0.9:9000";
-        container.querySelector(".field-web-helper-token").value =
-            "new-token";
-        container.querySelector(".settings-form").dispatchEvent(
-            new Event("input", { bubbles: true }),
-        );
-        await tick();
-
-        const payload = onSave.mock.calls[0][0];
-        expect(payload.web_helper_url).toBe("http://10.0.0.9:9000");
-        expect(payload.web_helper_token).toBe("new-token");
     });
 
     it("WiFi station fieldset is grayed out when station toggle is off", async () => {

@@ -82,8 +82,6 @@ def test_put_then_get_round_trip(client: TestClient):
         "tailscale_hostname": None,
         "flock_sync_enabled": True,
         "ui_first_run_seen": False,
-        "web_helper_url": "",
-        "web_helper_token": "",
     }
     response = client.put("/api/settings", json=payload)
     assert response.status_code == 200
@@ -97,51 +95,6 @@ def test_put_then_get_round_trip(client: TestClient):
     # And reads back redacted.
     response = client.get("/api/settings")
     assert response.json() == expected
-
-
-# --- Web slide render helper (commit P2) ---
-
-
-def test_get_returns_web_helper_fields_defaulting_to_empty(client: TestClient):
-    """GET surfaces the two web-helper fields; a fresh device has both
-    empty (no helper configured)."""
-    body = client.get("/api/settings").json()
-    assert body["web_helper_url"] == ""
-    assert body["web_helper_token"] == ""
-
-
-def test_put_accepts_and_persists_web_helper_fields(client: TestClient):
-    """PUT accepts web_helper_url + web_helper_token and they read back
-    via GET. The token is a plain field (not redacted): the P4 UI needs
-    to display + edit it, and there's no existing precedent for masking
-    a plain `str` field — the three secret fields are nullable and
-    rotate via dedicated PATCH endpoints, which P2 deliberately does
-    not add."""
-    response = client.put(
-        "/api/settings",
-        json={
-            "web_helper_url": "http://192.168.1.50:8888",
-            "web_helper_token": "shared-secret-abc",
-        },
-    )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["web_helper_url"] == "http://192.168.1.50:8888"
-    # Plain field — returned verbatim, not the "<set>" sentinel.
-    assert body["web_helper_token"] == "shared-secret-abc"
-    # Round-trips through GET too.
-    body = client.get("/api/settings").json()
-    assert body["web_helper_url"] == "http://192.168.1.50:8888"
-    assert body["web_helper_token"] == "shared-secret-abc"
-
-
-def test_put_rejects_non_http_web_helper_url(client: TestClient):
-    """A non-http/https web_helper_url is a typo the operator should
-    see rejected — the helper speaks HTTP."""
-    response = client.put(
-        "/api/settings", json={"web_helper_url": "ftp://192.168.1.50"}
-    )
-    assert response.status_code == 422
 
 
 def test_put_rejects_bad_output_mode(client: TestClient):

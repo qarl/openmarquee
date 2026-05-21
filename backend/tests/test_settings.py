@@ -361,62 +361,16 @@ def test_tailscale_hostname_rejects_spaces():
         SystemSettings(tailscale_hostname="lobby sign")
 
 
-# --- Web slide render helper ---
+# --- legacy / dropped settings keys ---
 
 
-def test_web_helper_fields_default_to_empty():
-    """A device with no render helper configured has both web-helper
-    fields empty — Web slides then just show their placeholder."""
-    s = SystemSettings()
-    assert s.web_helper_url == ""
-    assert s.web_helper_token == ""
-
-
-def test_web_helper_fields_round_trip():
-    """url + token survive a model_dump → model_validate round-trip."""
-    s = SystemSettings(
-        web_helper_url="http://192.168.1.50:8888",
-        web_helper_token="shared-secret-abc",
-    )
-    s2 = SystemSettings.model_validate(s.model_dump())
-    assert s2.web_helper_url == "http://192.168.1.50:8888"
-    assert s2.web_helper_token == "shared-secret-abc"
-
-
-def test_web_helper_url_accepts_http_and_https():
-    assert (
-        SystemSettings(web_helper_url="http://host:8888").web_helper_url
-        == "http://host:8888"
-    )
-    assert (
-        SystemSettings(web_helper_url="https://my-nas.tailnet.ts.net").web_helper_url
-        == "https://my-nas.tailnet.ts.net"
-    )
-
-
-def test_web_helper_url_empty_is_valid():
-    """Empty url means 'no helper configured' — explicitly valid."""
-    assert SystemSettings(web_helper_url="").web_helper_url == ""
-
-
-def test_web_helper_url_rejects_non_http_schemes():
-    for bad in ("ftp://host", "rtsp://host:554/stream", "/etc/passwd"):
-        with pytest.raises(ValidationError):
-            SystemSettings(web_helper_url=bad)
-
-
-def test_web_helper_token_has_no_format_constraint():
-    """The token is opaque — any non-empty string within the length
-    bound is accepted (it's whatever the operator's helper expects)."""
-    s = SystemSettings(web_helper_token="tok-with-/weird+chars=")
-    assert s.web_helper_token == "tok-with-/weird+chars="
-
-
-def test_backward_compat_settings_without_web_helper_keys_loads(tmp_path: Path):
-    """A settings.json written before P2 has no web_helper_* keys. It
-    must still load, with the new fields defaulting to ''."""
+def test_legacy_settings_with_web_helper_keys_loads(tmp_path: Path):
+    """A settings.json written while the Web slide used an external
+    render helper carries web_helper_url / web_helper_token. After the
+    switch to on-device rendering those fields are gone — the file must
+    still load (the dropped keys are stripped) and re-dump without
+    them."""
     path = tmp_path / "settings.json"
-    # A pre-P2 on-disk shape: valid settings, no web-helper keys.
     path.write_text(
         json.dumps(
             {
@@ -425,15 +379,16 @@ def test_backward_compat_settings_without_web_helper_keys_loads(tmp_path: Path):
                 "output_mode": "hdmi",
                 "display_width": 1920,
                 "display_height": 1080,
-                "brightness": 80,
-                "wifi_ssid": "Lobby-WiFi",
-                "wifi_password": "openmarquee",
+                "web_helper_url": "http://192.168.1.50:8888",
+                "web_helper_token": "shared-secret-abc",
             }
         )
     )
     loaded = SettingsStorage(path).load()
-    assert loaded.web_helper_url == ""
-    assert loaded.web_helper_token == ""
+    assert loaded.sign_name == "Lobby Sign"
+    dumped = loaded.model_dump()
+    assert "web_helper_url" not in dumped
+    assert "web_helper_token" not in dumped
 
 
 # --- SettingsStorage ---

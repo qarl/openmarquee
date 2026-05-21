@@ -24,7 +24,6 @@ import json
 import re
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
@@ -229,30 +228,6 @@ class SystemSettings(BaseModel):
         ),
     )
 
-    # --- Web slide render helper (optional) ---
-    #
-    # A Web slide shows a screenshot of a webpage. The screenshot is
-    # produced by a "render helper" the operator runs on their own
-    # machine (built in `web-helper/`); the sign fetches PNGs from it
-    # over HTTP. The helper's address + auth token are GLOBAL device
-    # settings — one helper serves every Web slide on this sign — so
-    # they live here rather than on each WebSlide. Both default empty:
-    # an unset url means "no helper configured", and Web slides then
-    # just show their placeholder. The Web-slide producer (Phase 7)
-    # reads these at fetch time; there's no apply-on-change side effect.
-    web_helper_url: str = Field(
-        default="",
-        max_length=2000,
-        description="Base address of the Web-slide render helper "
-        "(e.g. http://192.168.1.50:8888). Empty = no helper configured.",
-    )
-    web_helper_token: str = Field(
-        default="",
-        max_length=512,
-        description="Shared bearer token the sign sends to the render "
-        "helper. Empty = no token sent.",
-    )
-
     @model_validator(mode="before")
     @classmethod
     def _coerce_legacy_output_mode(cls, data: object) -> object:
@@ -275,12 +250,19 @@ class SystemSettings(BaseModel):
             mode = data.get("output_mode")
             if mode in _LEGACY_LED_OUTPUT_MODES:
                 data = {**data, "output_mode": "hdmi"}
-            # Strip the dropped ws281x_pixel_order field if a legacy
-            # settings.json still carries it. Pydantic's default
-            # extra="ignore" would silently drop it anyway, but we
-            # are explicit here so the migration is grep-able.
-            if "ws281x_pixel_order" in data:
-                data = {k: v for k, v in data.items() if k != "ws281x_pixel_order"}
+            # Strip dropped settings keys a legacy settings.json may
+            # still carry: ws281x_pixel_order (DELETE-PIL purge), and
+            # web_helper_url / web_helper_token (retired when the Web
+            # slide switched to on-device rendering). Pydantic's default
+            # extra="ignore" would silently drop them anyway, but we are
+            # explicit here so the migrations stay grep-able.
+            dropped = {
+                "ws281x_pixel_order",
+                "web_helper_url",
+                "web_helper_token",
+            }
+            if data.keys() & dropped:
+                data = {k: v for k, v in data.items() if k not in dropped}
         return data
 
     @field_validator("wifi_ssid")
@@ -379,29 +361,6 @@ class SystemSettings(BaseModel):
             raise ValueError(
                 "tailscale_hostname: expected DNS-safe 1-63 chars "
                 "(letters, digits, hyphens; no leading/trailing hyphen)"
-            )
-        return value
-
-    @field_validator("web_helper_url")
-    @classmethod
-    def _check_web_helper_url(cls, value: str) -> str:
-        """Empty = unconfigured (valid). When set, the helper speaks
-        HTTP, so the address must parse as an http/https URL with a
-        host — anything else (ftp://, rtsp://, a bare path) is a typo
-        the operator should see rejected at save time.
-
-        Surrounding whitespace is stripped: an operator pasting the
-        helper address can easily include a trailing space/newline,
-        and a stored URL with a stray space would silently break
-        every Web-slide fetch on the sign."""
-        value = value.strip()
-        if value == "":
-            return value
-        parsed = urlparse(value)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError(
-                f"web_helper_url: expected an http/https URL with a "
-                f"host, got {value!r}"
             )
         return value
 
