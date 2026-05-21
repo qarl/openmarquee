@@ -356,23 +356,28 @@ void main() {
 /// offset 2, stride 4 floats).
 ///
 /// ROTATION DIRECTION CONVENTION (defined HERE, the single source
-/// of truth): `rotation` is the CLOCKWISE rotation, in degrees, of
-/// the rendered content as a viewer looking at the panel sees it.
-/// This matches `Settings.display_rotation` -- the operator dials
-/// in how the physical panel is mounted (rotated clockwise), and
-/// the renderer composes the logical-portrait render so it reads
-/// upright on that physically-rotated panel.
+/// of truth): `rotation` is `Settings.display_rotation` -- the
+/// CLOCKWISE angle, in degrees, by which the operator has
+/// physically mounted the panel. The renderer COMPENSATES: it
+/// rotates the rendered content the OPPOSITE way (counter-clockwise
+/// by `rotation`) so the image reads upright on the physically-
+/// rotated panel. This is the macOS "Display -> Rotation" model --
+/// dial in the angle the screen is turned and the renderer turns
+/// the picture back. (FYS bug 5 follow-up: the first cut rotated
+/// content clockwise WITH the setting, which doubled the tilt
+/// instead of cancelling it.)
 ///
 /// Implementation: the UVs are held FIXED and the vertex POSITIONS
-/// are rotated clockwise. In GL's y-up NDC a clockwise screen
-/// rotation by angle θ is `(x', y') = (x·cosθ + y·sinθ,
-/// −x·sinθ + y·cosθ)`. Rotating the +/-1 quad's positions rotates
-/// the displayed image in the same direction. 90 and 270 are exact
-/// opposites (270 == 90 counter-clockwise). For 90/270 the logical
-/// scene texture is portrait while the default framebuffer is
-/// landscape; the +/-1 NDC quad rotated 90° still spans +/-1, and
-/// the anisotropic NDC->pixel mapping stretches the portrait
-/// texture to fill the landscape panel exactly.
+/// are rotated. In GL's y-up NDC a clockwise screen rotation by
+/// angle θ is `(x', y') = (x·cosθ + y·sinθ, −x·sinθ + y·cosθ)`.
+/// To rotate content counter-clockwise by `rotation` we feed that
+/// clockwise formula the negated angle: (c,s) = (cos −rotation,
+/// sin −rotation) = (cos rotation, −sin rotation). 90 and 270 are
+/// exact opposites. For 90/270 the logical scene texture is
+/// portrait while the default framebuffer is landscape; the +/-1
+/// NDC quad rotated 90° still spans +/-1, and the anisotropic
+/// NDC->pixel mapping stretches the portrait texture to fill the
+/// landscape panel exactly.
 ///
 /// `rotation == 0` returns the legacy direct-blit quad byte-for-
 /// byte (UV maps straight to NDC), so the 0° present path is
@@ -386,16 +391,19 @@ pub fn present_quad_verts(rotation: i32) -> [f32; 16] {
         (-1.0,  1.0, 0.0, 1.0),
         ( 1.0,  1.0, 1.0, 1.0),
     ];
-    // Clockwise rotation in y-up NDC: (cos, sin) for the angle.
+    // `rotation` is how the panel is physically turned clockwise;
+    // compensate by rotating content the other way. Counter-
+    // clockwise by θ == clockwise by −θ, so feed the clockwise
+    // position formula (c,s) = (cos −θ, sin −θ) = (cos θ, −sin θ).
     let (c, s): (f32, f32) = match rotation {
-        90 => (0.0, 1.0),
+        90 => (0.0, -1.0),
         180 => (-1.0, 0.0),
-        270 => (0.0, -1.0),
+        270 => (0.0, 1.0),
         _ => (1.0, 0.0), // 0 (and any unexpected value): identity
     };
     let mut out = [0.0f32; 16];
     for (i, (x, y, u, v)) in base.iter().enumerate() {
-        // Clockwise position rotation: x' = x·c + y·s, y' = −x·s + y·c.
+        // Apply the rotation matrix: x' = x·c + y·s, y' = −x·s + y·c.
         out[i * 4] = x * c + y * s;
         out[i * 4 + 1] = -x * s + y * c;
         out[i * 4 + 2] = *u;
@@ -6048,31 +6056,34 @@ mod tests {
     }
 
     #[test]
-    fn present_quad_90_rotates_clockwise() {
-        // Pins the rotation DIRECTION so a future edit can't
-        // silently flip 90 vs 270. Clockwise-90 in y-up NDC is
-        // (x', y') = (y, -x). Vert 0 carries UV (0,0) at base
-        // position (-1,-1) -> (-1, 1). Vert 3 carries UV (1,1) at
-        // base (1,1) -> (1,-1).
+    fn present_quad_90_compensates_counter_clockwise() {
+        // FYS bug 5 follow-up: a `90` setting means the panel is
+        // mounted 90° clockwise, so the renderer rotates content 90°
+        // COUNTER-clockwise to cancel it. Pins the DIRECTION so a
+        // future edit can't silently flip 90 vs 270 (or revert to
+        // the original clockwise-with-the-setting cut). Counter-
+        // clockwise-90 in y-up NDC is (x', y') = (-y, x). Vert 0
+        // carries UV (0,0) at base position (-1,-1) -> (1, -1).
+        // Vert 3 carries UV (1,1) at base (1,1) -> (-1, 1).
         let q90 = present_quad_verts(90);
-        assert_eq!((q90[0], q90[1]), (-1.0, 1.0));
-        assert_eq!((q90[12], q90[13]), (1.0, -1.0));
+        assert_eq!((q90[0], q90[1]), (1.0, -1.0));
+        assert_eq!((q90[12], q90[13]), (-1.0, 1.0));
     }
 
     #[test]
     fn present_quad_90_and_270_are_opposite() {
-        // 90 and 270 are exact opposites: a clockwise-90 vertex
-        // position, rotated a further 270 clockwise (= a full
-        // turn), returns to its rotation-0 origin. Clockwise-270 in
-        // y-up NDC is (x', y') = (-y, x).
+        // 90 and 270 are exact opposites: the counter-clockwise-90
+        // vertex position that `90` produces, rotated 90° clockwise,
+        // returns to its rotation-0 origin. Clockwise-90 in y-up NDC
+        // is (x', y') = (y, -x).
         let q0 = present_quad_verts(0);
         let q90 = present_quad_verts(90);
         for i in 0..4 {
             let (x90, y90) = (q90[i * 4], q90[i * 4 + 1]);
-            let (rx, ry) = (-y90, x90); // clockwise-270 of the 90 pos
+            let (rx, ry) = (y90, -x90); // clockwise-90 of the 90 pos
             assert!(
                 (rx - q0[i * 4]).abs() < 1e-6 && (ry - q0[i * 4 + 1]).abs() < 1e-6,
-                "90 then 270 must be identity at vert {i}",
+                "90 undone by a clockwise-90 must be identity at vert {i}",
             );
         }
     }
