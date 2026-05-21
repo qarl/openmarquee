@@ -33,7 +33,7 @@ from uuid import UUID
 
 from openmarquee.content import ContentItem, StreamSlide
 from openmarquee.rendering import Renderer
-from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
+from openmarquee.stream_consumer import StreamConsumer
 
 if TYPE_CHECKING:
     from openmarquee.content.storage import ContentStorage
@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 # treating the URL as unreachable and applying the slide's
 # on_unreachable policy. Short enough that a dead URL doesn't dominate
 # a 10-second slot.
-_VLC_CONNECT_TIMEOUT_S = 3.0
+_STREAM_CONNECT_TIMEOUT_S = 3.0
 
 
 class PlaybackLoop:
@@ -838,7 +838,7 @@ class PlaybackLoop:
         renderer = self._renderer
         loop = asyncio.get_event_loop()
         deadline = loop.time() + item.duration_ms / 1000.0
-        consumer = VlcRtspConsumer(
+        consumer = StreamConsumer(
             item.stream_url, renderer.width, renderer.height
         )
         frames = consumer.frames()
@@ -863,13 +863,13 @@ class PlaybackLoop:
                     if rendered_any:
                         budget = deadline - now
                     else:
-                        budget = min(_VLC_CONNECT_TIMEOUT_S, deadline - now)
+                        budget = min(_STREAM_CONNECT_TIMEOUT_S, deadline - now)
                     try:
                         rgb = await asyncio.wait_for(
                             frames.__anext__(), timeout=budget
                         )
                     except StopAsyncIteration:
-                        break  # ffmpeg EOF / RTSP disconnect
+                        break  # ffmpeg EOF / stream disconnect
                     except TimeoutError:
                         break  # connect timeout, or the stream stalled
                     # HW-decode (2026-05-20): the consumer HW-decodes
@@ -914,7 +914,7 @@ class PlaybackLoop:
             if not (self._stop_event.is_set() or self._pause_event.is_set()):
                 remaining = deadline - loop.time()
                 if remaining > 0:
-                    await self._apply_vlc_on_unreachable(
+                    await self._apply_stream_on_unreachable(
                         item, remaining, renderer_broken=renderer_broken
                     )
         finally:
@@ -931,7 +931,7 @@ class PlaybackLoop:
                 )
         return rendered_any
 
-    async def _apply_vlc_on_unreachable(
+    async def _apply_stream_on_unreachable(
         self,
         item: StreamSlide,
         remaining_s: float,
@@ -956,8 +956,8 @@ class PlaybackLoop:
             # fail here too; the wait below still preserves slot
             # timing either way.
             #
-            # HW-decode (2026-05-20): the VLC pump runs in NV12 pixel
-            # format. The black fill is a renderer-sized RGB888 frame
+            # HW-decode (2026-05-20): the stream pump runs in NV12
+            # pixel format. The black fill is a renderer-sized RGB888 frame
             # — a different format. end_external_frames() closes any
             # active NV12 pump session first so the black frame opens
             # a fresh rgb888 session (begin_external_frames' format is
@@ -969,7 +969,7 @@ class PlaybackLoop:
                 self._renderer.render_frame(black)
         # hold_last_frame, or black after its paint: wait the slot
         # out. _wait returns early on stop/pause so a takeover still
-        # preempts a held VLC slot.
+        # preempts a held stream slot.
         await self._wait(remaining_s)
 
     @property

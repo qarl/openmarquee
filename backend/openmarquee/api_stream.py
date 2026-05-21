@@ -2,11 +2,11 @@
 docs/STREAM_VLC_PROPOSAL.md).
 
 A takeover preempts the playlist with a live source. The request body
-is a `kind`-tagged union (StreamStartRequest):
+is a `kind`-tagged union (StreamStartBody):
 
 - kind="webrtc" — a phone publishes a WebRTC video track; the backend
   negotiates one SDP round trip (offer in, answer out).
-- kind="rtsp"   — the operator's VLC publishes an RTSP URL; the Pi
+- kind="stream" — the operator publishes a network stream URL; the Pi
   pulls it with ffmpeg. No SDP, so the response's sdp_answer is null.
 
 Either way StreamManager pauses the playback loop and pushes decoded
@@ -35,7 +35,7 @@ from openmarquee.stream import (
     StreamAlreadyActive,
     StreamManager,
     StreamNotActive,
-    StreamStartRequest,
+    StreamStartBody,
 )
 
 log = logging.getLogger(__name__)
@@ -108,19 +108,19 @@ class StreamStatus(BaseModel):
 _BASIC_TIER = HardwareTier(name="basic", max_width=854, max_height=480, max_fps=30)
 _GOOD_TIER = HardwareTier(name="good", max_width=1920, max_height=1080, max_fps=30)
 
-# Per-source tier table. Both the phone-camera (webrtc) and the VLC
-# (rtsp) sources run at the basic tier today; lifting the single
-# constant into this table lets later profiling give the two sources
-# distinct caps without touching call sites.
+# Per-source tier table. Both the phone-camera (webrtc) and the
+# network-stream sources run at the basic tier today; lifting the
+# single constant into this table lets later profiling give the two
+# sources distinct caps without touching call sites.
 _SOURCE_TIERS: dict[str, HardwareTier] = {
     "webrtc": _BASIC_TIER,
-    "rtsp": _BASIC_TIER,
+    "stream": _BASIC_TIER,
 }
 
 
 @router.post("/start", response_model=StreamStartResponse)
 async def start_stream(
-    payload: StreamStartRequest,
+    payload: StreamStartBody,
     streams: StreamDep,
 ) -> StreamStartResponse:
     try:
@@ -168,7 +168,7 @@ async def stop_stream(
 
 @router.post("/takeover", response_model=StreamStartResponse)
 async def takeover_stream(
-    payload: StreamStartRequest,
+    payload: StreamStartBody,
     streams: StreamDep,
 ) -> StreamStartResponse:
     """Force-stop whatever's active and start a new session in one

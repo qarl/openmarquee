@@ -30,8 +30,8 @@ def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
     )
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
-from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
-from tests.test_vlc_rtsp_consumer import _write_mock_ffmpeg
+from openmarquee.stream_consumer import StreamConsumer
+from tests.test_stream_consumer import _write_mock_ffmpeg
 
 # 100ms is the model's minimum duration. Tests use it directly; the
 # total runtime stays under a second.
@@ -711,23 +711,23 @@ async def test_auto_mode_exposes_metadata_on_playback_state(renderer):
 # --- STREAM/VLC Mode B: StreamSlide playback (slice 7) ---------------------
 
 
-def _patch_vlc_ffmpeg(
+def _patch_stream_ffmpeg(
     monkeypatch,
     ffmpeg_bin: str,
     *,
     source_size: tuple[int, int] = (8, 8),
 ) -> None:
-    """Point the playback loop's VlcRtspConsumer at a mock-ffmpeg
+    """Point the playback loop's StreamConsumer at a mock-ffmpeg
     binary (or a missing path, to simulate an unreachable stream).
 
     HW-decode (2026-05-20): the consumer ffprobes for the source
     resolution; inject `source_size` so the probe is skipped (no real
-    ffprobe against the test's fake RTSP URL). The consumer's NV12
+    ffprobe against the test's fake stream URL). The consumer's NV12
     frame size is then `src_w*src_h*3//2`."""
     monkeypatch.setattr(
-        "openmarquee.playback.VlcRtspConsumer",
+        "openmarquee.playback.StreamConsumer",
         functools.partial(
-            VlcRtspConsumer, ffmpeg_bin=ffmpeg_bin, source_size=source_size
+            StreamConsumer, ffmpeg_bin=ffmpeg_bin, source_size=source_size
         ),
     )
 
@@ -737,7 +737,7 @@ async def test_stream_slide_pumps_frames_to_renderer(
     renderer, tmp_path, monkeypatch
 ):
     """A StreamSlide in the playlist is intercepted before the IPC
-    path; its (mock) RTSP frames are pushed straight to the renderer.
+    path; its (mock) stream frames are pushed straight to the renderer.
 
     HW-decode (2026-05-20): the consumer emits source-resolution NV12
     (8x8 -> 96-byte NV12 frames here), and the pump threads the NV12
@@ -747,7 +747,7 @@ async def test_stream_slide_pumps_frames_to_renderer(
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5
     )
-    _patch_vlc_ffmpeg(monkeypatch, mock, source_size=(8, 8))
+    _patch_stream_ffmpeg(monkeypatch, mock, source_size=(8, 8))
     captured: list[bytes] = []
     captured_formats: list[str] = []
     original = renderer.render_frame
@@ -775,7 +775,7 @@ async def test_stream_slide_pumps_frames_to_renderer(
     assert len(captured) >= 5
     assert all(len(f) == frame_size for f in captured)
     # The mock fills frame i with the byte value i — confirms ordering
-    # and that the renderer received the RTSP frames intact.
+    # and that the renderer received the stream frames intact.
     assert captured[0] == bytes([0]) * frame_size
     assert captured[4] == bytes([4]) * frame_size
     # HW-decode: the consumer's frames are NV12; the pump threads that
@@ -794,7 +794,7 @@ async def test_stream_unreachable_skip_advances_immediately(
     abandoned at once; the loop reaches the next slide rather than
     holding the dead slot for its full duration."""
     # A missing ffmpeg binary == spawn fails == zero frames.
-    _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
+    _patch_stream_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
     stream = StreamSlide(
         name="dead",
         stream_url="rtsp://h/x",
@@ -822,7 +822,7 @@ async def test_stream_unreachable_hold_waits_out_the_slot(
 ):
     """on_unreachable='hold_last_frame' — an unreachable StreamSlide
     still occupies its full slot; the loop does NOT advance early."""
-    _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
+    _patch_stream_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
     stream = StreamSlide(
         name="dead",
         stream_url="rtsp://h/x",
@@ -850,7 +850,7 @@ async def test_stream_unreachable_black_paints_a_black_frame(
 ):
     """on_unreachable='black' paints one all-zero RGB frame before
     holding the slot."""
-    _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
+    _patch_stream_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
     captured: list[bytes] = []
     original = renderer.render_frame
 
@@ -881,13 +881,13 @@ async def test_stream_connect_timeout_falls_back(
     """If ffmpeg spawns but delivers no frame within the connect
     timeout, the slide falls back to on_unreachable rather than
     blocking on the dead stream for the whole slot."""
-    monkeypatch.setattr("openmarquee.playback._VLC_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("openmarquee.playback._STREAM_CONNECT_TIMEOUT_S", 0.2)
     # hang mock: spawns, emits 0 frames, then sleeps — ffmpeg is up but
     # never produces video, exactly how an unreachable stream URL behaves.
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, hang=True
     )
-    _patch_vlc_ffmpeg(monkeypatch, mock)
+    _patch_stream_ffmpeg(monkeypatch, mock)
     stream = StreamSlide(
         name="stuck",
         stream_url="rtsp://h/x",
@@ -919,7 +919,7 @@ async def test_stream_slide_preempted_by_pause(
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, continuous=True
     )
-    _patch_vlc_ffmpeg(monkeypatch, mock)
+    _patch_stream_ffmpeg(monkeypatch, mock)
     stream = StreamSlide(
         name="live", stream_url="rtsp://h/x", duration_ms=10_000
     )

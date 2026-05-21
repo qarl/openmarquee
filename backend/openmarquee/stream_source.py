@@ -3,16 +3,16 @@
 A *takeover* preempts the playlist and renders frames from some live
 source until the operator stops it. Phase 1 had exactly one source
 (a phone camera over WebRTC) and `StreamSession` owned the decode
-loop directly. The STREAM/VLC work adds a second source (an RTSP
-stream pulled from VLC), so the decode mechanics are extracted here
+loop directly. The STREAM/VLC work adds a second source (an ffmpeg-
+pulled network stream), so the decode mechanics are extracted here
 behind a `StreamSource` Protocol that `StreamSession` drives
 uniformly.
 
 - `StreamSource` — the Protocol. A source owns one transport and
   yields RGB888 frames already sized to the renderer.
 - `WebRtcStreamSource` — the Phase 1 source: an aiortc inbound video
-  track, decoded and cover-fit-scaled. (`RtspStreamSource`, the VLC
-  source, lands in a later slice and implements the same Protocol.)
+  track, decoded and cover-fit-scaled. (`FfmpegStreamSource`, the
+  ffmpeg-backed source, implements the same Protocol.)
 
 `_cover_fit` lives here too — it is a stream-only helper (the slide
 render path does its cover-fit browser-side; `seed.py` keeps its own
@@ -29,7 +29,7 @@ from typing import Protocol, runtime_checkable
 from PIL import Image
 
 from openmarquee.rendering import Renderer
-from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
+from openmarquee.stream_consumer import StreamConsumer
 
 log = logging.getLogger(__name__)
 
@@ -39,12 +39,12 @@ class StreamSource(Protocol):
     """A producer of frames for a takeover.
 
     Each implementation owns one transport (a WebRTC video track, an
-    RTSP-via-ffmpeg subprocess, ...) and yields frames ready to hand
-    to `Renderer.render_frame()`.
+    ffmpeg subprocess pulling a network stream, ...) and yields frames
+    ready to hand to `Renderer.render_frame()`.
 
     HW-decode (2026-05-20): a source declares its `pixel_format`. An
     RGB888 source (`WebRtcStreamSource`) yields renderer-sized RGB888
-    frames; an NV12 source (`RtspStreamSource`) yields source-
+    frames; an NV12 source (`FfmpegStreamSource`) yields source-
     resolution NV12 and exposes `frame_dims()` so the pump can tell
     the renderer the source size for its GPU cover-fit. `StreamSession`
     threads the format + dims into `render_frame()`.
@@ -105,7 +105,7 @@ class WebRtcStreamSource:
     HW-decode (2026-05-20): the WebRTC path decodes + cover-fits
     Python-side and yields renderer-sized RGB888 — `pixel_format` is
     "rgb888", the `render_frame()` default. (The HW-decode arc only
-    moves the VLC/RTSP path to GPU-side NV12; WebRTC is unchanged.)
+    moves the ffmpeg stream path to GPU-side NV12; WebRTC is unchanged.)
     """
 
     #: WebRTC frames are decoded + cover-fit Python-side to RGB888.
@@ -168,12 +168,12 @@ class WebRtcStreamSource:
         self._track_ready.set()
 
 
-class RtspStreamSource:
-    """`StreamSource` backed by a VlcRtspConsumer — the VLC takeover.
+class FfmpegStreamSource:
+    """`StreamSource` backed by a StreamConsumer — the ffmpeg takeover.
 
-    Wraps the shared RTSP-via-ffmpeg consumer (the slice-2 module) so
-    an operator-triggered VLC stream plugs into StreamSession exactly
-    like the phone-camera WebRtcStreamSource.
+    Wraps the shared ffmpeg stream consumer (the slice-2 module) so
+    an operator-triggered network stream plugs into StreamSession
+    exactly like the phone-camera WebRtcStreamSource.
 
     HW-decode (2026-05-20): the consumer HW-decodes H.264 and emits
     SOURCE-resolution NV12 (no ffmpeg swscale — the GPU does the
@@ -193,9 +193,9 @@ class RtspStreamSource:
     #: frames' pixel_format.
     pixel_format = "nv12"
 
-    def __init__(self, renderer: Renderer, rtsp_url: str):
-        self._consumer = VlcRtspConsumer(
-            rtsp_url, renderer.width, renderer.height
+    def __init__(self, renderer: Renderer, stream_url: str):
+        self._consumer = StreamConsumer(
+            stream_url, renderer.width, renderer.height
         )
 
     def frames(self) -> AsyncIterator[bytes]:

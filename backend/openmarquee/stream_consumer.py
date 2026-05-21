@@ -1,12 +1,10 @@
-"""VlcRtspConsumer — shared stream-via-ffmpeg frame source.
+"""StreamConsumer — shared stream-via-ffmpeg frame source.
 
 Both STREAM delivery modes (the operator-triggered takeover and the
 playlist StreamSlide) pull video the same way: an ffmpeg subprocess
 consumes a network stream URL. ffmpeg is protocol-agnostic, so the
 URL may be any of the supported transports — RTSP, RTMP/RTMPS, HLS or
-plain HTTP(S), SRT, or raw MPEG-TS over UDP. (The class + file are
-still named for RTSP for historical reasons; a later commit renames
-them.)
+plain HTTP(S), SRT, or raw MPEG-TS over UDP.
 
 ## HW-decode (2026-05-20)
 
@@ -42,7 +40,7 @@ The stream URL is operator-supplied and passed straight as an
 ffmpeg/ffprobe input argument. ffmpeg also honours `file://`,
 `concat:`, `pipe:`, `subfile:`, `data:` and friends — a local-file
 read / SSRF vector. `validate_stream_url` enforces a scheme allowlist
-and is called from `VlcRtspConsumer.__init__`, the hard security
+and is called from `StreamConsumer.__init__`, the hard security
 boundary: no subprocess is ever spawned for a rejected URL.
 
 `ffmpeg` + `ffprobe` are baked into the Pi image (the pi-gen package
@@ -111,7 +109,7 @@ _TERMINATE_GRACE_SECONDS = 2.0
 _FFPROBE_TIMEOUT_SECONDS = 8.0
 
 
-class VlcRtspConsumer:
+class StreamConsumer:
     """Pulls a network video stream via ffmpeg and yields raw NV12
     frames.
 
@@ -144,7 +142,7 @@ class VlcRtspConsumer:
 
     def __init__(
         self,
-        rtsp_url: str,
+        stream_url: str,
         width: int,
         height: int,
         *,
@@ -155,10 +153,10 @@ class VlcRtspConsumer:
         # Hard security boundary: reject a non-stream URL scheme
         # (file://, pipe:, concat:, …) before anything is spawned.
         # Both the playlist-slide path and the operator-takeover path
-        # (RtspStreamSource) construct the consumer, so this single
+        # (FfmpegStreamSource) construct the consumer, so this single
         # check covers every way an operator URL reaches ffmpeg.
-        validate_stream_url(rtsp_url)
-        self._rtsp_url = rtsp_url
+        validate_stream_url(stream_url)
+        self._stream_url = stream_url
         # Renderer panel dims — retained for diagnostics only; the
         # cover-fit target is the renderer's job now.
         self._renderer_width = width
@@ -198,7 +196,7 @@ class VlcRtspConsumer:
         `-rtsp_transport` is an RTSP-demuxer-private option; ffmpeg
         rejects or warns on it for any other transport. The argv
         builders gate the flag on this."""
-        return urlparse(self._rtsp_url).scheme.lower() == "rtsp"
+        return urlparse(self._stream_url).scheme.lower() == "rtsp"
 
     def _build_probe_argv(self) -> list[str]:
         """The ffprobe command line that reports the source stream's
@@ -216,7 +214,7 @@ class VlcRtspConsumer:
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height",
             "-of", "json",
-            self._rtsp_url,
+            self._stream_url,
         ]
         return argv
 
@@ -248,7 +246,7 @@ class VlcRtspConsumer:
             argv += ["-rtsp_transport", "tcp"]
         argv += [
             "-c:v", "h264_v4l2m2m",
-            "-i", self._rtsp_url,
+            "-i", self._stream_url,
             "-an",
             "-pix_fmt", "nv12",
             "-f", "rawvideo",
@@ -270,7 +268,7 @@ class VlcRtspConsumer:
                 stderr=asyncio.subprocess.PIPE,
             )
         except (OSError, ValueError) as exc:
-            log.error("vlc_rtsp: failed to spawn ffprobe: %s", exc)
+            log.error("stream: failed to spawn ffprobe: %s", exc)
             return None
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -278,9 +276,9 @@ class VlcRtspConsumer:
             )
         except TimeoutError:
             log.error(
-                "vlc_rtsp: ffprobe timed out after %.1fs probing %s",
+                "stream: ffprobe timed out after %.1fs probing %s",
                 _FFPROBE_TIMEOUT_SECONDS,
-                self._rtsp_url,
+                self._stream_url,
             )
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
@@ -288,7 +286,7 @@ class VlcRtspConsumer:
             return None
         if proc.returncode != 0:
             log.error(
-                "vlc_rtsp: ffprobe exited rc=%s: %s",
+                "stream: ffprobe exited rc=%s: %s",
                 proc.returncode,
                 stderr.decode("utf-8", errors="replace").strip(),
             )
@@ -300,13 +298,13 @@ class VlcRtspConsumer:
             h = int(stream["height"])
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
             log.error(
-                "vlc_rtsp: ffprobe output unparseable (%s): %r",
+                "stream: ffprobe output unparseable (%s): %r",
                 exc,
                 stdout[:256],
             )
             return None
         if w <= 0 or h <= 0:
-            log.error("vlc_rtsp: ffprobe reported non-positive dims %dx%d", w, h)
+            log.error("stream: ffprobe reported non-positive dims %dx%d", w, h)
             return None
         # NV12 chroma is 4:2:0 — both axes must be even. ffmpeg's NV12
         # output always pads to even dims; round up defensively so the
@@ -353,7 +351,7 @@ class VlcRtspConsumer:
                     stderr=asyncio.subprocess.PIPE,
                 )
             except (OSError, ValueError) as exc:
-                log.error("vlc_rtsp: failed to spawn ffmpeg: %s", exc)
+                log.error("stream: failed to spawn ffmpeg: %s", exc)
                 return
             assert self._proc.stdout is not None
             assert self._proc.stderr is not None
@@ -369,9 +367,9 @@ class VlcRtspConsumer:
                 yield frame
         except asyncio.IncompleteReadError:
             if self._closed:
-                log.info("vlc_rtsp: stream stopped (consumer closed)")
+                log.info("stream: stream stopped (consumer closed)")
             else:
-                log.info("vlc_rtsp: stream ended (EOF / disconnect)")
+                log.info("stream: stream ended (EOF / disconnect)")
         except asyncio.CancelledError:
             raise
         finally:
@@ -390,7 +388,7 @@ class VlcRtspConsumer:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("vlc_rtsp: stderr drain error")
+            log.exception("stream: stderr drain error")
 
     async def _reap(self) -> None:
         """Terminate + await the ffmpeg subprocess and the stderr
@@ -426,7 +424,7 @@ class VlcRtspConsumer:
             rc = proc.returncode if proc is not None else None
             if rc not in (None, 0) and self._stderr_tail:
                 log.warning(
-                    "vlc_rtsp: ffmpeg exited rc=%s; stderr tail: %s",
+                    "stream: ffmpeg exited rc=%s; stderr tail: %s",
                     rc,
                     self.stderr_tail,
                 )

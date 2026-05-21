@@ -221,7 +221,7 @@ def test_source_tier_table_covers_both_sources():
     (webrtc + rtsp); both are basic today."""
     from openmarquee.api_stream import _BASIC_TIER, _SOURCE_TIERS
 
-    assert set(_SOURCE_TIERS) == {"webrtc", "rtsp"}
+    assert set(_SOURCE_TIERS) == {"webrtc", "stream"}
     assert all(tier == _BASIC_TIER for tier in _SOURCE_TIERS.values())
 
 
@@ -235,12 +235,12 @@ def test_status_tier_shape_is_complete(client: TestClient):
     assert all(isinstance(tier[k], int) for k in ("max_width", "max_height", "max_fps"))
 
 
-# --- STREAM/VLC slice 4: RTSP takeover via the start-request union --------
+# --- STREAM/VLC slice 4: stream takeover via the start-request union ------
 
 
 def test_start_legacy_body_without_kind_still_works(client: TestClient):
     """A start body with no `kind` ({"sdp_offer": ...}) still validates
-    as a WebRTC start — the deployed phone client predates the VLC
+    as a WebRTC start — the deployed phone client predates the stream
     work and must not break."""
     response = client.post(
         "/api/stream/start", json={"sdp_offer": "v=0\r\noffer\r\n"}
@@ -249,25 +249,25 @@ def test_start_legacy_body_without_kind_still_works(client: TestClient):
     assert response.json()["sdp_answer"]  # WebRTC start has an answer
 
 
-def test_start_rtsp_returns_session_without_sdp_answer(
+def test_start_stream_returns_session_without_sdp_answer(
     client: TestClient, monkeypatch, tmp_path
 ):
-    """POST /start with a kind=rtsp body starts an RTSP takeover and
-    returns a session whose sdp_answer is null (RTSP has no SDP)."""
+    """POST /start with a kind=stream body starts a stream takeover and
+    returns a session whose sdp_answer is null (a stream has no SDP)."""
     import functools
 
-    from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
-    from tests.test_vlc_rtsp_consumer import _write_mock_ffmpeg
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
 
     mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=2)
     monkeypatch.setattr(
-        "openmarquee.stream_source.VlcRtspConsumer",
-        functools.partial(VlcRtspConsumer, ffmpeg_bin=mock),
+        "openmarquee.stream_source.StreamConsumer",
+        functools.partial(StreamConsumer, ffmpeg_bin=mock),
     )
 
     response = client.post(
         "/api/stream/start",
-        json={"kind": "rtsp", "url": "rtsp://laptop:8554/live"},
+        json={"kind": "stream", "url": "rtsp://laptop:8554/live"},
     )
     assert response.status_code == 200
     body = response.json()

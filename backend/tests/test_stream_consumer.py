@@ -1,6 +1,6 @@
-"""Slice 2 coverage for VlcRtspConsumer (STREAM/VLC arc §9).
+"""Slice 2 coverage for StreamConsumer (STREAM/VLC arc §9).
 
-VlcRtspConsumer spawns ffmpeg as a subprocess and yields raw NV12
+StreamConsumer spawns ffmpeg as a subprocess and yields raw NV12
 frames (HW-decode arc, 2026-05-20 — see the module docstring). These
 tests swap the `ffmpeg` binary for a tiny mock script (emits a known
 number of fixed-size frames, writes to stderr, exits or hangs) so the
@@ -20,7 +20,7 @@ import sys
 
 import pytest
 
-from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer, validate_stream_url
+from openmarquee.stream_consumer import StreamConsumer, validate_stream_url
 
 
 def _write_mock_ffmpeg(
@@ -98,7 +98,7 @@ async def test_yields_n_frames_at_frame_size(tmp_path):
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
     )
 
@@ -125,7 +125,7 @@ async def test_trailing_partial_frame_is_discarded(tmp_path):
         n_frames=3,
         trailing_partial=frame_size // 2,
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
     )
 
@@ -150,7 +150,7 @@ async def test_stderr_is_captured(tmp_path):
         n_frames=2,
         stderr_text="rtsp: connection refused\n",
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4)
     )
 
@@ -172,7 +172,7 @@ async def test_close_reaps_hanging_ffmpeg(tmp_path):
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=2, hang=True
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
     )
 
@@ -211,7 +211,7 @@ async def test_close_during_spawn_does_not_orphan_ffmpeg(tmp_path, monkeypatch):
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=1, hang=True
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
     )
 
@@ -264,11 +264,11 @@ async def test_nonzero_exit_logs_stderr_warning(tmp_path, caplog):
         stderr_text="rtsp: 404 stream not found\n",
         exit_code=3,
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4)
     )
 
-    with caplog.at_level("WARNING", logger="openmarquee.vlc_rtsp_consumer"):
+    with caplog.at_level("WARNING", logger="openmarquee.stream_consumer"):
         frames = [f async for f in consumer.frames()]
         await consumer.close()
 
@@ -282,7 +282,7 @@ async def test_missing_ffmpeg_binary_yields_nothing(tmp_path):
     """A missing / non-executable ffmpeg binary surfaces as a clean
     no-frames exit, not an exception — the caller's on-unreachable
     handling decides what to do."""
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live",
         8,
         8,
@@ -304,7 +304,7 @@ async def test_second_frames_call_yields_nothing(tmp_path):
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=2
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4)
     )
 
@@ -325,7 +325,7 @@ def test_argv_hw_decodes_and_emits_nv12_without_swscale():
     entirely, and emits raw NV12 on stdout. swscale was the measured
     ~16fps bottleneck; the renderer does the scale + NV12→RGB on the
     GPU now."""
-    consumer = VlcRtspConsumer("rtsp://laptop:8554/live", 1920, 1080)
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080)
     argv = consumer._build_argv()
 
     assert argv[0] == "ffmpeg"
@@ -344,7 +344,7 @@ def test_argv_no_longer_carries_renderer_dims():
     """The ffmpeg argv no longer mentions the renderer dimensions —
     output is source-resolution NV12; the cover-fit target moved to
     the renderer."""
-    consumer = VlcRtspConsumer("rtsp://laptop:8554/live", 1920, 1080)
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080)
     argv = consumer._build_argv()
     assert "1920:1080" not in " ".join(argv)
     assert "scale" not in " ".join(argv)
@@ -353,7 +353,7 @@ def test_argv_no_longer_carries_renderer_dims():
 def test_probe_argv_queries_source_dims_over_tcp():
     """The ffprobe command reports the first video stream's width +
     height as JSON, over RTSP-TCP to match the ffmpeg ingest."""
-    consumer = VlcRtspConsumer("rtsp://laptop:8554/live", 1920, 1080)
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080)
     argv = consumer._build_probe_argv()
 
     assert argv[0] == "ffprobe"
@@ -368,7 +368,7 @@ def test_probe_argv_queries_source_dims_over_tcp():
 def test_pixel_format_is_nv12():
     """The consumer advertises the NV12 pixel format so the push-frame
     pumps tell the renderer how to interpret the bytes."""
-    consumer = VlcRtspConsumer("rtsp://laptop:8554/live", 1920, 1080)
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080)
     assert consumer.pixel_format == "nv12"
 
 
@@ -383,7 +383,7 @@ async def test_frame_size_is_nv12_at_source_dims(tmp_path):
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=3
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 1920, 1080,
         ffmpeg_bin=mock, source_size=(src_w, src_h),
     )
@@ -418,7 +418,7 @@ async def test_ffprobe_discovers_source_dims(tmp_path):
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=4
     )
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 1920, 1080,
         ffmpeg_bin=mock, ffprobe_bin=str(probe),
     )
@@ -436,7 +436,7 @@ async def test_ffprobe_failure_yields_no_frames(tmp_path):
     """A failed ffprobe (missing binary) surfaces as a clean no-frames
     exit — the caller's on-unreachable handling takes over, and ffmpeg
     is never spawned."""
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 1920, 1080,
         ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
         ffprobe_bin=str(tmp_path / "does-not-exist-ffprobe"),
@@ -465,7 +465,7 @@ async def test_ffprobe_rounds_odd_source_dims_up_to_even(tmp_path):
 
     # Don't spawn ffmpeg — point it at a non-existent binary so frames()
     # exits after the probe; we only assert the rounded source dims.
-    consumer = VlcRtspConsumer(
+    consumer = StreamConsumer(
         "rtsp://host:8554/live", 1920, 1080,
         ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
         ffprobe_bin=str(probe),
@@ -536,10 +536,10 @@ def test_validate_stream_url_error_names_scheme_and_allowlist():
 
 
 def test_consumer_init_rejects_disallowed_url():
-    """VlcRtspConsumer.__init__ is the hard security boundary — a
+    """StreamConsumer.__init__ is the hard security boundary — a
     non-stream URL raises ValueError before any ffmpeg/ffprobe spawn."""
     with pytest.raises(ValueError):
-        VlcRtspConsumer("file:///etc/passwd", 1920, 1080)
+        StreamConsumer("file:///etc/passwd", 1920, 1080)
 
 
 # --- conditional -rtsp_transport -------------------------------------------
@@ -548,7 +548,7 @@ def test_consumer_init_rejects_disallowed_url():
 def test_rtsp_transport_present_for_rtsp_url():
     """For an rtsp:// URL, `-rtsp_transport tcp` is in BOTH the ffmpeg
     and the ffprobe argv — RTSP-over-TCP per §3."""
-    consumer = VlcRtspConsumer("rtsp://laptop:8554/live", 1920, 1080)
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080)
 
     argv = consumer._build_argv()
     assert argv[argv.index("-rtsp_transport") + 1] == "tcp"
@@ -565,7 +565,7 @@ def test_rtsp_transport_absent_for_non_rtsp_url(url):
     """`-rtsp_transport` is an RTSP-demuxer-private option — for a
     non-RTSP transport (HLS/HTTP, SRT) it is omitted from BOTH the
     ffmpeg and ffprobe argv so ffmpeg does not reject/warn on it."""
-    consumer = VlcRtspConsumer(url, 1920, 1080)
+    consumer = StreamConsumer(url, 1920, 1080)
 
     assert "-rtsp_transport" not in consumer._build_argv()
     assert "-rtsp_transport" not in consumer._build_probe_argv()

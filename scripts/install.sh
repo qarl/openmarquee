@@ -470,9 +470,9 @@ snapshot_state "AFTER_DEBS_INSTALL"
 
 # --- 5.6. ffmpeg availability check (STREAM/VLC feature) --------------------
 #
-# ffmpeg is a runtime dependency of the STREAM/VLC feature — the VLC
-# takeover and the vlc_stream playlist slide both shell out to it
-# (backend/openmarquee/vlc_rtsp_consumer.py). It ships in the pi-gen
+# ffmpeg is a runtime dependency of the Stream feature — the stream
+# takeover and the stream playlist slide both shell out to it
+# (backend/openmarquee/stream_consumer.py). It ships in the pi-gen
 # base-image package list (images/openmarquee/.../00-packages), so
 # factory-flashed cards have it. But a Pi provisioned BEFORE ffmpeg
 # landed in that list won't — and install.sh runs offline (no apt), so

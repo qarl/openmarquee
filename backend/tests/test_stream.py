@@ -33,11 +33,11 @@ from openmarquee.content import TextSlide
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
 from openmarquee.stream import (
-    RtspStartRequest,
     StreamAlreadyActive,
     StreamManager,
     StreamNotActive,
     StreamSession,
+    StreamStartRequest,
     WebRtcStartRequest,
 )
 from openmarquee.stream_source import WebRtcStreamSource
@@ -533,7 +533,7 @@ async def test_streamsession_start_pauses_playback_close_resumes(tmp_path):
         await loop.stop()
 
 
-# --- 5. RTSP takeover (STREAM/VLC slice 4) ---------------------------------
+# --- 5. stream takeover (STREAM/VLC slice 4) -------------------------------
 
 
 def _empty_loop(tmp_path) -> tuple[PlaybackLoop, MockRenderer]:
@@ -558,7 +558,7 @@ def _patch_mock_ffmpeg(
     frame_size: int,
     source_size: tuple[int, int] = (8, 8),
 ):
-    """Point RtspStreamSource's VlcRtspConsumer at a mock-ffmpeg
+    """Point FfmpegStreamSource's StreamConsumer at a mock-ffmpeg
     binary that emits `n_frames` frames of `frame_size` bytes.
 
     HW-decode (2026-05-20): the consumer ffprobes for the source
@@ -567,27 +567,27 @@ def _patch_mock_ffmpeg(
     NV12 size for `source_size` (src_w*src_h*3//2)."""
     import functools
 
-    from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
-    from tests.test_vlc_rtsp_consumer import _write_mock_ffmpeg
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
 
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=n_frames
     )
     monkeypatch.setattr(
-        "openmarquee.stream_source.VlcRtspConsumer",
+        "openmarquee.stream_source.StreamConsumer",
         functools.partial(
-            VlcRtspConsumer, ffmpeg_bin=mock, source_size=source_size
+            StreamConsumer, ffmpeg_bin=mock, source_size=source_size
         ),
     )
 
 
 @pytest.mark.asyncio
-async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
-    """End-to-end: StreamManager.start() with an RtspStartRequest
-    spawns an RtspStreamSource, pumps the (mock) ffmpeg's frames to
+async def test_start_stream_session_pulls_frames(tmp_path, monkeypatch):
+    """End-to-end: StreamManager.start() with a StreamStartRequest
+    spawns an FfmpegStreamSource, pumps the (mock) ffmpeg's frames to
     the renderer, and pauses the playlist. The slice-4 gate.
 
-    HW-decode (2026-05-20): the RTSP source now produces NV12 frames
+    HW-decode (2026-05-20): the stream source now produces NV12 frames
     at the source resolution (here 8x8 -> 96-byte NV12)."""
     # NV12 frame size for the injected 8x8 source.
     frame_size = 8 * 8 * 3 // 2
@@ -610,9 +610,9 @@ async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
     try:
         manager = StreamManager(loop)
         session_id, answer = await manager.start(
-            RtspStartRequest(url="rtsp://laptop:8554/live")
+            StreamStartRequest(url="rtsp://laptop:8554/live")
         )
-        # RTSP has no SDP answer to hand back.
+        # A stream takeover has no SDP answer to hand back.
         assert answer is None
         assert manager.is_active
         assert manager.active_session_id == session_id
@@ -622,7 +622,7 @@ async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
         assert await _wait_until(lambda: len(captured) >= 4)
         assert len(captured) == 4
         assert all(len(f) == frame_size for f in captured)
-        # HW-decode: the RTSP source declares NV12; the pump threads
+        # HW-decode: the stream source declares NV12; the pump threads
         # that into render_frame().
         assert all(fmt == "nv12" for fmt in captured_formats)
     finally:
@@ -633,8 +633,8 @@ async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rtsp_session_has_no_peer_connection(tmp_path, monkeypatch):
-    """An RTSP takeover uses no RTCPeerConnection and arms no
+async def test_stream_session_has_no_peer_connection(tmp_path, monkeypatch):
+    """A stream takeover uses no RTCPeerConnection and arms no
     phantom-track watchdog — that machinery is WebRTC-only."""
     # NV12 frame size for the injected 8x8 source.
     _patch_mock_ffmpeg(
@@ -645,7 +645,7 @@ async def test_rtsp_session_has_no_peer_connection(tmp_path, monkeypatch):
     await loop.start()
     try:
         session = StreamSession(loop)
-        await session.start_rtsp("rtsp://laptop:8554/live")
+        await session.start_stream("rtsp://laptop:8554/live")
         assert session._pc is None
         assert session._watchdog_task is None
         await session.close()
