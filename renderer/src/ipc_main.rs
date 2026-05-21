@@ -294,6 +294,53 @@ impl SlideCache {
         }
     }
 
+    /// Is the V4L2 decoder for `item_id` "satisfied" for re-prime
+    /// purposes?
+    ///
+    /// Linux: true iff `video_decoders` holds a primed entry.
+    /// Non-Linux: there is no `video_decoders` field and no decoder
+    /// is ever primed, so this is a const `true` — "decoder
+    /// missing" must NOT force a re-prime on a host that has no
+    /// decoder concept (the demuxer-missing clause still applies
+    /// everywhere). Returning `true` makes `video_reprime_needed`'s
+    /// `!decoder_present` clause inert off-Linux.
+    #[cfg(target_os = "linux")]
+    fn has_video_decoder(&self, item_id: uuid::Uuid) -> bool {
+        self.video_decoders.contains_key(&item_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn has_video_decoder(&self, _item_id: uuid::Uuid) -> bool {
+        true
+    }
+
+    /// FYS bug A follow-up (finding H1, 2026-05-21): decide whether a
+    /// video slide whose lightweight `items`/`item_mtimes` entry is
+    /// still cached nonetheless needs a full re-prime in `load`.
+    ///
+    /// Factored as a pure function of four booleans so it can be
+    /// unit-tested on every host (the Linux-only `video_decoders`
+    /// map is collapsed to a plain bool by `has_video_decoder`).
+    ///
+    /// A re-prime is needed when the slide is a video, is not
+    /// skip-marked, AND either heavy artifact is gone:
+    ///   * the `Mp4Demuxer` (evicted by `evict_other_video_state`), or
+    ///   * the V4L2 `VideoDecoderState` (Linux). The original Bug A
+    ///     fix only checked the demuxer — but `prime_video_decoder`
+    ///     is best-effort: an `EBUSY` from the single-instance vc4
+    ///     M2M codec (re-prime racing the kernel teardown after
+    ///     `evict_other_video_state`) leaves the demuxer inserted
+    ///     while `video_decoders` gets no entry. The next `load`
+    ///     then saw demuxer-present, short-circuited, and `paint`
+    ///     hard-errored on the absent decoder — the freeze recurred.
+    fn video_reprime_needed(
+        is_video: bool,
+        is_skip_marked: bool,
+        demuxer_present: bool,
+        decoder_present: bool,
+    ) -> bool {
+        is_video && !is_skip_marked && (!demuxer_present || !decoder_present)
+    }
+
     /// Bug 1 helper: drop every cached artifact for `item_id`. Called
     /// from `load` when the on-disk item.json mtime drifts so the
     /// next load() pass re-reads from disk (text, layout, asset path)
@@ -370,11 +417,25 @@ impl SlideCache {
                 // the demuxer is gone. Skip-marked videos are
                 // excepted: they intentionally have no demuxer and
                 // must not retry-spam a known-bad asset.
-                let video_needs_reprime = matches!(
-                    self.items.get(&item_id),
-                    Some(ContentItem::Video(_))
-                ) && !self.video_demuxers.contains_key(&item_id)
-                    && !self.video_skip.contains(&item_id);
+                //
+                // Finding H1 (2026-05-21): the demuxer-only check
+                // above is INCOMPLETE — `prime_video_decoder` is
+                // best-effort, so an EBUSY from the single-instance
+                // vc4 M2M codec leaves the demuxer inserted but
+                // `video_decoders` empty. `video_reprime_needed`
+                // now also re-primes on a missing decoder entry
+                // (Linux); `has_video_decoder` collapses the
+                // Linux-only map to a bool so this stays one
+                // expression on every host.
+                let video_needs_reprime = Self::video_reprime_needed(
+                    matches!(
+                        self.items.get(&item_id),
+                        Some(ContentItem::Video(_))
+                    ),
+                    self.video_skip.contains(&item_id),
+                    self.video_demuxers.contains_key(&item_id),
+                    self.has_video_decoder(item_id),
+                );
                 if !video_needs_reprime {
                     return Ok(());
                 }
@@ -2188,6 +2249,72 @@ mod tests {
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
         assert!(!dem.samples.is_empty());
+    }
+
+    /// Finding H1 (2026-05-21): the FYS bug A re-prime predicate
+    /// must ALSO fire when the demuxer is present but the V4L2
+    /// decoder entry is gone — `prime_video_decoder` is best-effort,
+    /// so an EBUSY from the single-instance vc4 M2M codec leaves a
+    /// demuxer-present / decoder-absent state. The pre-fix predicate
+    /// checked only the demuxer, so the next `cache.load`
+    /// short-circuited and `paint` then hard-errored on the missing
+    /// decoder — the Bug A freeze recurred.
+    ///
+    /// This exercises the pure `video_reprime_needed` function so it
+    /// runs on every host (the Linux-only `video_decoders` map is
+    /// already collapsed to the `decoder_present` bool). It FAILS
+    /// against the pre-fix predicate: pre-fix had no decoder clause,
+    /// so demuxer-present + decoder-absent yielded `false` (no
+    /// re-prime); the fix's `!decoder_present` clause yields `true`.
+    #[test]
+    fn video_reprime_needed_fires_when_decoder_missing() {
+        // The H1 bug state: a video, not skip-marked, demuxer
+        // present, decoder absent. Pre-fix => false; fixed => true.
+        assert!(
+            SlideCache::video_reprime_needed(
+                /* is_video */ true,
+                /* is_skip_marked */ false,
+                /* demuxer_present */ true,
+                /* decoder_present */ false,
+            ),
+            "demuxer-present + decoder-absent must need a re-prime (finding H1)",
+        );
+
+        // The original Bug A state still re-primes: demuxer gone.
+        assert!(
+            SlideCache::video_reprime_needed(true, false, false, false),
+            "demuxer-absent must need a re-prime (original FYS bug A)",
+        );
+        assert!(
+            SlideCache::video_reprime_needed(true, false, false, true),
+            "demuxer-absent needs a re-prime even if a decoder lingers",
+        );
+
+        // Fully primed: both artifacts live => short-circuit, no
+        // re-prime. (Off-Linux `has_video_decoder` returns true, so
+        // `decoder_present` is effectively always true there — this
+        // is the steady-state playlist-loop path on every host.)
+        assert!(
+            !SlideCache::video_reprime_needed(true, false, true, true),
+            "demuxer + decoder both present must NOT re-prime",
+        );
+
+        // Skip-marked videos must never retry-spam a known-bad
+        // asset, regardless of demuxer/decoder absence.
+        assert!(
+            !SlideCache::video_reprime_needed(true, true, false, false),
+            "skip-marked video must not re-prime",
+        );
+        assert!(
+            !SlideCache::video_reprime_needed(true, true, true, false),
+            "skip-marked video must not re-prime on a missing decoder",
+        );
+
+        // Non-video slides never need a video re-prime.
+        assert!(
+            !SlideCache::video_reprime_needed(false, false, false, false),
+            "non-video slide must not trigger a video re-prime",
+        );
     }
 
     /// V4L2 piece 3c (Linux-gated): when the dev Pi V4L2 codec
