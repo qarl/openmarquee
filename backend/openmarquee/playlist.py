@@ -132,10 +132,20 @@ class Playlist(BaseModel):
         wrapping each id in a PlaylistItem with defaults. Keeps both the
         call-site API and persisted-v2 JSON round-trippable through this
         constructor without every caller threading PlaylistItem through.
+
+        P2 (2026-05-21): `item_ids` is POPPED whenever present — not only
+        when `items` is absent. `item_ids` is a `@computed_field`, so it
+        is re-emitted on every dump; combined with `extra="allow"`, a
+        persisted `item_ids` key would otherwise be captured as an extra
+        field and written a SECOND time on the next save — a duplicate
+        JSON key. When `items` is also present it is authoritative and
+        the `item_ids` echo is simply discarded; only a legacy object
+        with `item_ids` and no `items` is migrated.
         """
-        if isinstance(data, dict) and "item_ids" in data and "items" not in data:
+        if isinstance(data, dict) and "item_ids" in data:
             ids = data.pop("item_ids")
-            data["items"] = [{"item_id": i} for i in ids]
+            if "items" not in data:
+                data["items"] = [{"item_id": i} for i in ids]
         return data
 
     @computed_field

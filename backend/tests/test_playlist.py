@@ -33,6 +33,31 @@ def test_save_then_load_round_trips_order(tmp_path: Path):
     assert loaded.item_ids == [c, a, b]
 
 
+def test_playlist_with_both_items_and_item_ids_emits_no_duplicate_key(
+    tmp_path: Path,
+):
+    """P2 regression (2026-05-21): a playlist dict carrying BOTH `items`
+    and an `item_ids` echo — the exact shape a previously-saved
+    playlist.json has, since `item_ids` is a serialized computed_field —
+    must not retain `item_ids` as an extra field. extra="allow" would
+    otherwise re-emit it on the next save as a DUPLICATE JSON key."""
+    a, b = uuid4(), uuid4()
+    raw = {
+        "id": str(uuid4()),
+        "name": "Demo",
+        "items": [{"item_id": str(a)}, {"item_id": str(b)}],
+        # The echo a prior model_dump_json() wrote alongside `items`.
+        "item_ids": [str(a), str(b)],
+    }
+    pl = Playlist.model_validate(raw)
+    # The echo must NOT survive as an extra field.
+    assert "item_ids" not in (pl.__pydantic_extra__ or {})
+    # ...so the dumped JSON carries the key exactly once.
+    assert pl.model_dump_json().count('"item_ids"') == 1
+    # `items` stays authoritative; the echo is discarded, not merged.
+    assert pl.item_ids == [a, b]
+
+
 def test_save_creates_parent_directory_if_missing(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "deeply" / "nested" / "playlist.json")
     storage.save(Playlist(item_ids=[uuid4()]))
