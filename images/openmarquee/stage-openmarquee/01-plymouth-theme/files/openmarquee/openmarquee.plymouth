@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=openMarquee
+Description=openMarquee boot splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/openmarquee
+ScriptFile=/usr/share/plymouth/themes/openmarquee/openmarquee.script

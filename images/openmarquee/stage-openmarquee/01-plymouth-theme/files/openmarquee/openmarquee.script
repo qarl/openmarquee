@@ -1,0 +1,99 @@
+// openMarquee boot splash -- Plymouth "script" plugin theme.
+//
+// Draws the brand lockup (splash.png) centered on the brand-colored
+// background, with an amber activity arc (spinner.png) spinning below
+// it. Modeled on Plymouth's stock "spinner" / "spinfinity" themes:
+// a Sprite per asset, an angle incremented in the refresh callback.
+//
+// Plymouth's scripting language is a small JS-like dialect. Coordinates
+// are screen pixels; sprite Z controls draw order (higher = on top).
+
+// --- Brand background -----------------------------------------------------
+// Fill the whole screen with --bg (#0e0e10) so any letterbox / panel
+// area reads as brand color instead of black. Plymouth wants the
+// background as two corner colors -- use the same value for both for a
+// flat fill.
+Window.SetBackgroundTopColor(0x0e / 255, 0x0e / 255, 0x10 / 255);
+Window.SetBackgroundBottomColor(0x0e / 255, 0x0e / 255, 0x10 / 255);
+
+screen_width  = Window.GetWidth();
+screen_height = Window.GetHeight();
+
+// --- Splash lockup --------------------------------------------------------
+// splash.png is authored at 1360x768. If the real panel is smaller,
+// scale the image down proportionally so it always fits; never upscale
+// (that would soften / distort the artwork on larger panels).
+splash_image = Image("splash.png");
+splash_w = splash_image.GetWidth();
+splash_h = splash_image.GetHeight();
+
+scale = 1;
+if (splash_w > screen_width || splash_h > screen_height) {
+    scale_w = screen_width / splash_w;
+    scale_h = screen_height / splash_h;
+    // Use the smaller ratio so both dimensions fit.
+    if (scale_w < scale_h) {
+        scale = scale_w;
+    } else {
+        scale = scale_h;
+    }
+    splash_image = splash_image.Scale(splash_w * scale, splash_h * scale);
+    splash_w = splash_image.GetWidth();
+    splash_h = splash_image.GetHeight();
+}
+
+splash_sprite = Sprite(splash_image);
+splash_sprite.SetX((screen_width  - splash_w) / 2);
+splash_sprite.SetY((screen_height - splash_h) / 2);
+splash_sprite.SetZ(10);
+
+// --- Activity spinner -----------------------------------------------------
+// spinner.png is a partial amber arc on transparent background. We
+// rotate it a few degrees each refresh frame for an indeterminate
+// "working" indicator. Place it below the lockup's vertical center.
+spinner_image = Image("spinner.png");
+
+// Re-center the rotated sprite each frame: Image.Rotate() returns a
+// canvas that grows to fit the rotated bitmap, so we anchor on the
+// intended center point rather than the top-left.
+spinner_center_x = screen_width / 2;
+spinner_center_y = (screen_height / 2) + (splash_h / 2) + 56;
+
+spinner_sprite = Sprite();
+spinner_sprite.SetZ(20);
+
+spinner_angle = 0;
+
+// --- Refresh callback -----------------------------------------------------
+// Called by Plymouth on every render tick. Advance the angle and
+// re-render the rotated spinner bitmap.
+fun refresh_callback() {
+    spinner_angle = spinner_angle + 0.08;       // radians per frame
+    if (spinner_angle > 2 * Math.Pi) {
+        spinner_angle = spinner_angle - 2 * Math.Pi;
+    }
+    rotated = spinner_image.Rotate(spinner_angle);
+    spinner_sprite.SetImage(rotated);
+    spinner_sprite.SetX(spinner_center_x - rotated.GetWidth() / 2);
+    spinner_sprite.SetY(spinner_center_y - rotated.GetHeight() / 2);
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+// --- Callbacks: keep them harmless ---------------------------------------
+// We intentionally don't render boot messages or a password prompt --
+// this is a kiosk appliance splash. Define no-op handlers anyway so
+// Plymouth never errors if it emits a message or asks for input.
+fun message_callback(text) {
+    // no-op: appliance splash shows no boot log text
+}
+Plymouth.SetMessageFunction(message_callback);
+
+fun display_normal_callback() {
+    // no-op: nothing extra to draw in the normal display state
+}
+Plymouth.SetDisplayNormalFunction(display_normal_callback);
+
+fun display_password_callback(prompt, bullets) {
+    // no-op: the appliance has no interactive boot-time password prompt
+}
+Plymouth.SetDisplayPasswordFunction(display_password_callback);
