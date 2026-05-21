@@ -15,6 +15,30 @@ don't use Docker, there's a no-Docker fallback further down.
 
 ---
 
+## Security
+
+Please read this before you run the helper.
+
+The helper will take a screenshot of **any** `http`/`https` URL that is
+reachable from the machine it runs on — and that includes private and
+internal addresses on your own network (for example
+`http://192.168.1.20/dashboard`). **This is intentional.** Putting an
+internal dashboard — a home-server status page, a smart-home panel, an
+office wallboard — on a sign is one of the main reasons Web slides exist,
+and that only works if the helper can reach internal addresses.
+
+Two things follow from that:
+
+- **Run the helper only on a network where that capability is
+  acceptable.** Anything the helper machine can reach over the network,
+  the helper can be told to screenshot.
+- **Keep the bearer token private.** The token is the only thing
+  protecting the helper. Anyone who has the token *and* network access to
+  the helper can make it fetch any URL it can reach. Don't paste it into
+  shared chats, screenshots, or public issues; treat it like a password.
+
+---
+
 ## Run it with Docker (recommended)
 
 You need [Docker](https://docs.docker.com/get-docker/) installed.

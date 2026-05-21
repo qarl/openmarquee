@@ -35,6 +35,15 @@ _HEX_COLOR_PATTERN = r"^#[0-9A-Fa-f]{6}$"
 #: is rejected by `validate_web_url`.
 ALLOWED_WEB_SCHEMES = frozenset({"http", "https"})
 
+#: The shared set of transition kinds every slide type supports on the way
+#: out into the next slide. Defined once here and reused by every variant's
+#: `transition` field so the value set never drifts between models.
+TransitionKind = Literal[
+    "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee",
+    "dissolve", "pixelate", "halftone", "scanline", "glitch", "push",
+    "blinds", "shutter",
+]
+
 
 def validate_web_url(url: str) -> None:
     """Raise `ValueError` if `url` is not a plain `http`/`https` web page.
@@ -372,9 +381,7 @@ class TextSlide(BaseModel):
     # Transition INTO the next slide ("cut" = instant; "fade" =
     # alpha-blend across `transition_ms` after this slide's duration
     # ends).
-    transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
-    ] = "cut"
+    transition: TransitionKind = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -472,9 +479,7 @@ class ImageSlide(BaseModel):
     duration_ms: int = Field(default=5000, ge=100)
 
     # Same transition contract as TextSlide.
-    transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
-    ] = "cut"
+    transition: TransitionKind = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -509,9 +514,7 @@ class VideoSlide(BaseModel):
 
     # Same transition contract as TextSlide/ImageSlide — applied on the way
     # out, so a cut/fade into the next slide still works across variants.
-    transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
-    ] = "cut"
+    transition: TransitionKind = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -551,9 +554,7 @@ class StreamSlide(BaseModel):
     )
 
     # Same transition contract as the other slide types.
-    transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
-    ] = "cut"
+    transition: TransitionKind = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
@@ -614,9 +615,7 @@ class WebSlide(BaseModel):
     duration_ms: int = Field(default=10_000, ge=100, le=24 * 60 * 60 * 1000)
 
     # Same transition contract as the other slide types.
-    transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
-    ] = "cut"
+    transition: TransitionKind = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
     created_at: datetime = Field(default_factory=_utcnow)
