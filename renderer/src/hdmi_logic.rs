@@ -2997,6 +2997,28 @@ pub fn nv12_cover_fit_uv_transform(
     }
 }
 
+/// Renderer-hardening C2 (finding H2, 2026-05-21) — the vc4 GPU's
+/// `GL_MAX_TEXTURE_SIZE`. The Pi Zero 2 W's VideoCore IV caps a
+/// single 2D texture at 2048 px on either axis; `glTexImage2D` with a
+/// larger dimension fails `GL_INVALID_VALUE` and leaves the texture
+/// undefined (a black / garbage blit). An external NV12 stream of a
+/// 1440p or 4K source would exceed this — the backend clamps such a
+/// stream down (an ffmpeg `scale` filter), and `bake_external_nv12_
+/// to_current_fbo` rejects anything still over-large rather than
+/// uploading a doomed texture.
+pub const MAX_GL_TEXTURE_DIM: u32 = 2048;
+
+/// Renderer-hardening C2 (finding H2, 2026-05-21) — is a frame small
+/// enough to upload as a GL texture on the vc4 GPU?
+///
+/// True iff both axes are within `MAX_GL_TEXTURE_DIM`. Factored as a
+/// pure predicate so the `bake_external_nv12_to_current_fbo`
+/// over-large guard is host-testable without a GL context (mirrors
+/// how C1 factored `video_reprime_needed`).
+pub fn nv12_dims_ok(frame_w: u32, frame_h: u32) -> bool {
+    frame_w <= MAX_GL_TEXTURE_DIM && frame_h <= MAX_GL_TEXTURE_DIM
+}
+
 /// FYS bug B (2026-05-21) -- compute the COVER-fit fullscreen-quad
 /// vertices for a regular uploaded image / video slide.
 ///
@@ -7414,6 +7436,32 @@ mod tests {
         let (scale, offset) = nv12_cover_fit_uv_transform(1920, 1080, 0, 0);
         assert_eq!(scale, [1.0, 1.0]);
         assert_eq!(offset, [0.0, 0.0]);
+    }
+
+    // Renderer-hardening C2 (finding H2, 2026-05-21) -- the over-large
+    // NV12 frame guard. A source exceeding the vc4 2048-px texture cap
+    // must be rejected before `glTexImage2D` (which would otherwise
+    // fail GL_INVALID_VALUE and blit black silently).
+    #[test]
+    fn nv12_dims_ok_accepts_at_and_below_the_cap() {
+        // A normal stream (<=2048 either axis) passes; the exact cap
+        // on both axes is still fine — 2048 is the inclusive max.
+        assert!(nv12_dims_ok(1920, 1080));
+        assert!(nv12_dims_ok(1280, 720));
+        assert!(nv12_dims_ok(MAX_GL_TEXTURE_DIM, MAX_GL_TEXTURE_DIM));
+        assert!(nv12_dims_ok(MAX_GL_TEXTURE_DIM, 1));
+        assert!(nv12_dims_ok(1, MAX_GL_TEXTURE_DIM));
+    }
+
+    #[test]
+    fn nv12_dims_ok_rejects_over_cap_on_either_axis() {
+        // A 1440p / 4K source (or anything over 2048 on one axis)
+        // is rejected — the bake returns an Err instead of uploading.
+        assert!(!nv12_dims_ok(MAX_GL_TEXTURE_DIM + 1, 1080));
+        assert!(!nv12_dims_ok(1920, MAX_GL_TEXTURE_DIM + 1));
+        assert!(!nv12_dims_ok(2560, 1440));
+        assert!(!nv12_dims_ok(3840, 2160));
+        assert!(!nv12_dims_ok(4096, 4096));
     }
 
     // FYS bug B (2026-05-21) -- cover-fit quad geometry for regular

@@ -351,6 +351,84 @@ def test_argv_no_longer_carries_renderer_dims():
     assert "scale" not in " ".join(argv)
 
 
+# --- C2 finding H2: over-large source clamp + downscale --------------------
+
+
+def test_argv_adds_scale_filter_for_over_large_source():
+    """Renderer-hardening C2 (finding H2): a source exceeding the vc4
+    GPU's 2048-px texture limit gets an ffmpeg `-vf scale` filter that
+    downscales the decoded frames to the clamped dims — so the
+    renderer's per-frame GL texture upload cannot fail GL_INVALID_VALUE.
+    The clamped dims preserve aspect and are even (NV12 4:2:0)."""
+    # 4K (3840x2160) injected as the source — well over 2048.
+    consumer = StreamConsumer(
+        "rtsp://laptop:8554/live", 1920, 1080, source_size=(3840, 2160)
+    )
+    argv = consumer._build_argv()
+
+    assert "-vf" in argv
+    scale_arg = argv[argv.index("-vf") + 1]
+    assert scale_arg.startswith("scale=")
+    # The clamped dims: 3840x2160 scaled by 2048/3840 -> 2048x1152.
+    assert scale_arg == "scale=2048:1152"
+    # frame_dims / source_width|height report the CLAMPED size — what
+    # ffmpeg emits and the renderer receives, never over 2048.
+    assert (consumer.source_width, consumer.source_height) == (2048, 1152)
+    assert consumer.source_width <= 2048 and consumer.source_height <= 2048
+    # Aspect preserved within rounding: 3840/2160 ~= 2048/1152.
+    assert abs((2048 / 1152) - (3840 / 2160)) < 0.01
+
+
+def test_argv_has_no_scale_filter_for_in_limit_source():
+    """A normal <=2048 source pays no swscale cost — `_build_argv`
+    adds NO `-vf` filter and the dims pass through unchanged. This is
+    the unchanged HW-decode path (the renderer cover-fits on the GPU)."""
+    consumer = StreamConsumer(
+        "rtsp://laptop:8554/live", 1920, 1080, source_size=(1920, 1080)
+    )
+    argv = consumer._build_argv()
+
+    assert "-vf" not in argv
+    assert "scale" not in " ".join(argv)
+    # In-limit dims pass straight through.
+    assert (consumer.source_width, consumer.source_height) == (1920, 1080)
+
+
+def test_argv_clamps_when_only_one_axis_over_limit():
+    """A source over 2048 on a single axis (a tall/wide stream) is
+    still downscaled so BOTH axes land within the cap."""
+    # 2560 wide, 1080 tall — only the width is over the limit.
+    consumer = StreamConsumer(
+        "rtsp://laptop:8554/live", 1920, 1080, source_size=(2560, 1080)
+    )
+    argv = consumer._build_argv()
+    assert "-vf" in argv
+    # Scaled by 2048/2560 = 0.8 -> 2048x864.
+    assert argv[argv.index("-vf") + 1] == "scale=2048:864"
+    assert consumer.source_width <= 2048 and consumer.source_height <= 2048
+
+
+def test_clamp_to_texture_limit_math():
+    """The clamp helper: in-limit dims pass through even-rounded;
+    over-limit dims scale down aspect-preserving to fit 2048x2048
+    with even results."""
+    from openmarquee.stream_consumer import _clamp_to_texture_limit
+
+    # In-limit -> unchanged (already even).
+    assert _clamp_to_texture_limit(1920, 1080) == (1920, 1080)
+    # In-limit odd -> even-rounded.
+    assert _clamp_to_texture_limit(1921, 1081) == (1922, 1082)
+    # Exactly at the cap -> unchanged.
+    assert _clamp_to_texture_limit(2048, 2048) == (2048, 2048)
+    # 4K -> scaled to fit, aspect preserved, even.
+    cw, ch = _clamp_to_texture_limit(3840, 2160)
+    assert cw <= 2048 and ch <= 2048
+    assert cw % 2 == 0 and ch % 2 == 0
+    assert (cw, ch) == (2048, 1152)
+    # Square 4096 -> 2048x2048.
+    assert _clamp_to_texture_limit(4096, 4096) == (2048, 2048)
+
+
 def test_probe_argv_queries_source_dims_over_tcp():
     """The ffprobe command reports the first video stream's width +
     height as JSON, over RTSP-TCP to match the ffmpeg ingest."""
@@ -476,6 +554,41 @@ async def test_ffprobe_rounds_odd_source_dims_up_to_even(tmp_path):
     await consumer.close()
 
     assert (consumer.source_width, consumer.source_height) == (8, 6)
+
+
+@pytest.mark.asyncio
+async def test_ffprobe_clamps_over_large_source_to_texture_limit(tmp_path):
+    """Renderer-hardening C2 (finding H2): when ffprobe reports a source
+    over the vc4 2048-px texture limit, the consumer clamps the
+    discovered dims — `source_width`/`source_height` (and so
+    `frame_dims`) report the downscaled even dims, and `_build_argv`
+    gains a `scale` filter to that size."""
+    probe = tmp_path / "ffprobe"
+    probe_body = f"#!{sys.executable}\n"
+    probe_body += "import json\n"
+    # 1440p source — 2560x1440, over the 2048 cap on the width axis.
+    probe_body += (
+        "print(json.dumps({'streams': [{'width': 2560, 'height': 1440}]}))\n"
+    )
+    probe.write_text(probe_body)
+    probe.chmod(probe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    # Point ffmpeg at a non-existent binary — frames() exits after the
+    # probe; we only assert the clamped source dims + argv.
+    consumer = StreamConsumer(
+        "rtsp://host:8554/live", 1920, 1080,
+        ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
+        ffprobe_bin=str(probe),
+    )
+
+    [f async for f in consumer.frames()]
+    await consumer.close()
+
+    # 2560x1440 scaled by 2048/2560 = 0.8 -> 2048x1152.
+    assert (consumer.source_width, consumer.source_height) == (2048, 1152)
+    assert consumer.source_width <= 2048 and consumer.source_height <= 2048
+    argv = consumer._build_argv()
+    assert argv[argv.index("-vf") + 1] == "scale=2048:1152"
 
 
 @pytest.mark.asyncio

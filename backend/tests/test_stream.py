@@ -207,6 +207,99 @@ async def test_webrtc_source_yields_rgb888_at_renderer_dims(tmp_path):
     assert captured[0] == bytes([128] * (8 * 8 * 3))
 
 
+def _write_mock_ffprobe(tmp_path, *, width: int, height: int):
+    """Write an executable mock-ffprobe that reports `(width, height)`
+    as the JSON ffprobe -of json output, and return its path."""
+    import json
+    import stat
+    import sys
+
+    probe = tmp_path / "ffprobe"
+    body = f"#!{sys.executable}\n"
+    body += "import sys\n"
+    body += (
+        "sys.stdout.write("
+        + repr(json.dumps({"streams": [{"width": width, "height": height}]}))
+        + ")\n"
+    )
+    probe.write_text(body)
+    probe.chmod(probe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return str(probe)
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_source_frame_dims_clamps_over_large_source(tmp_path):
+    """Renderer-hardening C2 (finding H2): `FfmpegStreamSource.
+    frame_dims()` reports the texture-limit-CLAMPED dims when ffprobe
+    discovers a source larger than the vc4 GPU's 2048-px cap — so the
+    renderer's H2(a) over-large guard is never tripped by a properly-
+    clamped stream — and the consumer's ffmpeg argv gains a `scale`
+    filter to downscale the decoded frames."""
+    import functools
+
+    from openmarquee.stream_consumer import StreamConsumer
+    from openmarquee.stream_source import FfmpegStreamSource
+
+    # ffprobe reports a 4K source (3840x2160), well over the 2048 cap.
+    probe = _write_mock_ffprobe(tmp_path, width=3840, height=2160)
+    # ffmpeg points at a non-existent binary — frames() exits cleanly
+    # after the probe; we assert frame_dims + argv, not frame yield.
+    consumer_cls = functools.partial(
+        StreamConsumer,
+        ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
+        ffprobe_bin=probe,
+    )
+    with patch("openmarquee.stream_source.StreamConsumer", consumer_cls):
+        renderer = MockRenderer(1920, 1080, tmp_path / "out.png")
+        source = FfmpegStreamSource(renderer, "rtsp://laptop:8554/live")
+        # Before any frame, ffprobe has not run — dims unknown.
+        assert source.frame_dims() is None
+        # Drain frames() — runs ffprobe, then exits (ffmpeg missing).
+        [f async for f in source.frames()]
+        await source.close()
+
+    dims = source.frame_dims()
+    assert dims is not None
+    w, h = dims
+    # 3840x2160 scaled by 2048/3840 -> 2048x1152: within the cap,
+    # aspect preserved, both even (NV12 4:2:0).
+    assert (w, h) == (2048, 1152)
+    assert w <= 2048 and h <= 2048
+    assert w % 2 == 0 and h % 2 == 0
+    # The consumer's ffmpeg argv carries the downscale `scale` filter.
+    argv = source._consumer._build_argv()
+    assert argv[argv.index("-vf") + 1] == "scale=2048:1152"
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_source_frame_dims_unchanged_for_in_limit_source(tmp_path):
+    """A normal <=2048 source passes straight through: `frame_dims()`
+    reports the raw ffprobe dims and the consumer's ffmpeg argv has NO
+    `scale` filter — the unchanged HW-decode path, no swscale cost."""
+    import functools
+
+    from openmarquee.stream_consumer import StreamConsumer
+    from openmarquee.stream_source import FfmpegStreamSource
+
+    probe = _write_mock_ffprobe(tmp_path, width=1920, height=1080)
+    consumer_cls = functools.partial(
+        StreamConsumer,
+        ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
+        ffprobe_bin=probe,
+    )
+    with patch("openmarquee.stream_source.StreamConsumer", consumer_cls):
+        renderer = MockRenderer(1280, 720, tmp_path / "out.png")
+        source = FfmpegStreamSource(renderer, "rtsp://laptop:8554/live")
+        [f async for f in source.frames()]
+        await source.close()
+
+    # In-limit source dims pass through unchanged.
+    assert source.frame_dims() == (1920, 1080)
+    argv = source._consumer._build_argv()
+    assert "-vf" not in argv
+    assert "scale" not in " ".join(argv)
+
+
 @pytest.mark.asyncio
 async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
     """End-to-end: a StreamSession's pump drives its WebRtcStreamSource

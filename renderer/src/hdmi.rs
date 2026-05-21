@@ -5846,6 +5846,44 @@ unsafe fn bake_image_slide_to_current_fbo(
     blit_result
 }
 
+/// Renderer-hardening C2 (finding L4, 2026-05-21) — check `glGetError`
+/// after an external-frame texture upload and log a non-`GL_NO_ERROR`
+/// result ONCE.
+///
+/// `glTexImage2D` / `glTexSubImage2D` can fail silently — the call
+/// returns `void`, the only signal is `glGetError`. A bad upload (an
+/// over-large texture, an out-of-memory GPU, a driver fault) would
+/// otherwise blit black/garbage with no diagnostic anywhere. This
+/// converts that into a visible log line.
+///
+/// `latch` is a per-call-site `AtomicBool`: the first non-NO_ERROR
+/// result logs, every subsequent one is silenced. A per-frame GL
+/// fault would otherwise flood the log 30×/sec (the renderer's
+/// no-per-frame-eprintln discipline). `label` names the call site.
+fn check_gl_upload_error(
+    gl: &glow::Context,
+    label: &str,
+    latch: &std::sync::atomic::AtomicBool,
+) {
+    use glow::HasContext;
+    let err = unsafe { gl.get_error() };
+    if err != glow::NO_ERROR
+        && latch
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        eprintln!(
+            "warn: {label}: glGetError 0x{err:04x} after texture upload \
+             (this frame may blit black/garbage; further faults silenced)"
+        );
+    }
+}
+
 /// STREAM/VLC slice 2.5 — upload one raw RGB888 frame as a texture
 /// and FS_BLIT it to fill the currently-bound framebuffer. The
 /// raw-bytes analogue of bake_image_slide_to_current_fbo, no PNG
@@ -5931,6 +5969,11 @@ unsafe fn bake_external_rgb_to_current_fbo(
         );
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
     }
+    // Renderer-hardening C2 (finding L4): surface a silent GL upload
+    // fault — a once-logged latch so a per-frame fault logs once.
+    static RGB_UPLOAD_ERR_LATCH: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    check_gl_upload_error(gl, "bake_external_rgb_to_current_fbo", &RGB_UPLOAD_ERR_LATCH);
     let tex = frame_tex.expect("frame_tex is Some after the branch above").0;
     run_blit_pass(gl, tex)
 }
@@ -5988,6 +6031,23 @@ unsafe fn bake_external_nv12_to_current_fbo(
             "external NV12 frame dims {}x{} must be non-zero and even",
             frame_w,
             frame_h,
+        ));
+    }
+    // Renderer-hardening C2 (finding H2, 2026-05-21): reject a frame
+    // wider/taller than the vc4 GPU's GL_MAX_TEXTURE_SIZE. glTexImage2D
+    // with a dimension over 2048 px fails GL_INVALID_VALUE and leaves
+    // the texture undefined — a SILENT black/garbage blit. Returning an
+    // Err here makes the IPC pump log the failure and hold the last
+    // good frame instead. A properly-clamped stream never trips this:
+    // the backend (FfmpegStreamSource) downscales any >2048 source via
+    // an ffmpeg `scale` filter and reports the clamped dims.
+    if !crate::hdmi_logic::nv12_dims_ok(frame_w, frame_h) {
+        return Err(anyhow!(
+            "external NV12 frame dims {}x{} exceed the vc4 GPU's {}px \
+             texture limit; the stream source must downscale to fit",
+            frame_w,
+            frame_h,
+            crate::hdmi_logic::MAX_GL_TEXTURE_DIM,
         ));
     }
     let y_plane = &nv12[..y_bytes];
@@ -6063,6 +6123,12 @@ unsafe fn bake_external_nv12_to_current_fbo(
         );
     }
     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+    // Renderer-hardening C2 (finding L4): surface a silent GL upload
+    // fault on the Y/UV plane uploads — a once-logged latch so a
+    // per-frame fault logs once, not 30×/sec.
+    static NV12_UPLOAD_ERR_LATCH: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    check_gl_upload_error(gl, "bake_external_nv12_to_current_fbo", &NV12_UPLOAD_ERR_LATCH);
     gl.active_texture(glow::TEXTURE0);
     let (y_tex, uv_tex, _, _) =
         nv12_tex.expect("nv12_tex is Some after the branch above");

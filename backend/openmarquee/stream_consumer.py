@@ -115,6 +115,42 @@ _TERMINATE_GRACE_SECONDS = 2.0
 # connect-timeout anyway.
 _FFPROBE_TIMEOUT_SECONDS = 8.0
 
+# Renderer-hardening C2 (finding H2, 2026-05-21): the vc4 GPU's
+# GL_MAX_TEXTURE_SIZE. The Pi's VideoCore IV caps a single 2D texture
+# at 2048 px on either axis. The HW-decode path emits SOURCE-resolution
+# NV12 and the renderer uploads each frame as a GL texture — so a 1440p
+# or 4K stream would exceed the cap, `glTexImage2D` would fail
+# GL_INVALID_VALUE, and the renderer would blit a black/garbage frame.
+# When a probed source exceeds this, `_build_argv` re-introduces an
+# ffmpeg `scale` filter to downscale the decoded frames to fit (the
+# ONLY case swscale is used — a normal <=2048 stream is unfiltered).
+_MAX_STREAM_DIM = 2048
+
+
+def _clamp_to_texture_limit(width: int, height: int) -> tuple[int, int]:
+    """Scale `(width, height)` down to fit within `_MAX_STREAM_DIM` on
+    both axes, preserving aspect ratio; both results are rounded to even
+    (NV12 4:2:0 chroma needs even dims).
+
+    A source already within the cap is returned unchanged (still
+    even-rounded — `_probe_source_size` already even-rounds, so this is
+    a no-op for that path). A source over the cap is scaled by the
+    single ratio that brings the larger over-cap axis to exactly the
+    limit, so the result fits within `_MAX_STREAM_DIM` x `_MAX_STREAM_DIM`
+    with aspect preserved.
+    """
+    if width <= _MAX_STREAM_DIM and height <= _MAX_STREAM_DIM:
+        return (width + (width & 1), height + (height & 1))
+    # Scale by the tighter ratio so BOTH axes land within the cap.
+    scale = min(_MAX_STREAM_DIM / width, _MAX_STREAM_DIM / height)
+    new_w = max(2, int(width * scale))
+    new_h = max(2, int(height * scale))
+    # NV12 needs even dims; round DOWN to even so neither axis can be
+    # nudged back over the cap by the rounding.
+    new_w -= new_w & 1
+    new_h -= new_h & 1
+    return (new_w, new_h)
+
 
 class StreamConsumer:
     """Pulls a network video stream via ffmpeg and yields raw NV12
@@ -170,10 +206,21 @@ class StreamConsumer:
         self._renderer_height = height
         self._ffmpeg_bin = ffmpeg_bin
         self._ffprobe_bin = ffprobe_bin
-        # Source dims: discovered via ffprobe in frames(), or injected
-        # at construction (tests / a caller that already probed). None
-        # until known.
-        self._source_size: tuple[int, int] | None = source_size
+        # Source dims: the CLAMPED `(width, height)` the renderer
+        # actually receives — discovered via ffprobe in frames(), or
+        # injected at construction (tests / a caller that already
+        # probed). None until known. `source_width`/`source_height`/
+        # `FfmpegStreamSource.frame_dims()` report this clamped pair.
+        self._source_size: tuple[int, int] | None = (
+            _clamp_to_texture_limit(*source_size)
+            if source_size is not None
+            else None
+        )
+        # Renderer-hardening C2 (finding H2): the RAW probed dims, before
+        # the >2048 texture-limit clamp. `_build_argv` compares this to
+        # `_source_size` to decide whether ffmpeg needs a downscale
+        # `scale` filter. None until ffprobe runs (or until injected).
+        self._raw_source_size: tuple[int, int] | None = source_size
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task | None = None
         self._stderr_tail = bytearray()
@@ -188,13 +235,17 @@ class StreamConsumer:
 
     @property
     def source_width(self) -> int | None:
-        """The source video width in pixels, once ffprobe has run
-        (None before `frames()` discovers it)."""
+        """The decoded-frame width in pixels, once ffprobe has run
+        (None before `frames()` discovers it). This is the texture-
+        limit-CLAMPED width (finding H2) — what ffmpeg emits and the
+        renderer receives, equal to the raw source width for a normal
+        in-limit stream."""
         return self._source_size[0] if self._source_size else None
 
     @property
     def source_height(self) -> int | None:
-        """The source video height in pixels, once ffprobe has run."""
+        """The decoded-frame height in pixels, once ffprobe has run —
+        the texture-limit-CLAMPED height (see `source_width`)."""
         return self._source_size[1] if self._source_size else None
 
     def _is_rtsp(self) -> bool:
@@ -243,7 +294,15 @@ class StreamConsumer:
         transport (rtmp/hls/http/srt/mpegts). There is deliberately
         no ffmpeg-side connect timeout: an unreachable URL makes
         ffmpeg hang, and the caller bounds that (the playlist-slide
-        path's connect-timeout, §9 slice 7) by calling close()."""
+        path's connect-timeout, §9 slice 7) by calling close().
+
+        Renderer-hardening C2 (finding H2, 2026-05-21): a `-vf scale`
+        filter is added ONLY when the probed source exceeds the vc4
+        GPU's 2048-px texture limit — it downscales the decoded frames
+        to the clamped `_source_size` so the renderer's per-frame GL
+        texture upload cannot fail GL_INVALID_VALUE (a silent black
+        blit). A normal <=2048 stream gets NO `-vf` filter and pays no
+        swscale cost — the renderer cover-fits on the GPU as before."""
         argv = [
             self._ffmpeg_bin,
             "-loglevel", "error",
@@ -255,19 +314,38 @@ class StreamConsumer:
             "-c:v", "h264_v4l2m2m",
             "-i", self._stream_url,
             "-an",
+        ]
+        # Over-large source -> downscale to the texture-limit-clamped
+        # dims. `_source_size` is the clamped pair; `_raw_source_size`
+        # the raw probed pair. They differ only when the source exceeds
+        # 2048 — otherwise no `-vf` is emitted and the path is unchanged.
+        if (
+            self._source_size is not None
+            and self._raw_source_size is not None
+            and self._source_size != self._raw_source_size
+        ):
+            scale_w, scale_h = self._source_size
+            argv += ["-vf", f"scale={scale_w}:{scale_h}"]
+        argv += [
             "-pix_fmt", "nv12",
             "-f", "rawvideo",
             "-",
         ]
         return argv
 
-    async def _probe_source_size(self) -> tuple[int, int] | None:
+    async def _probe_source_size(
+        self,
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
         """Run ffprobe to discover the source video's width + height.
 
-        Returns the `(width, height)` tuple, or None if ffprobe is
-        missing, times out, exits non-zero, or emits unparseable
-        output — in which case `frames()` surfaces a clean no-frames
-        exit (the caller's on-unreachable handling takes over)."""
+        Returns a `(raw, clamped)` pair: `raw` is the source resolution
+        ffprobe reported (even-rounded for NV12); `clamped` is `raw`
+        scaled down to fit the vc4 GPU's 2048-px texture limit (finding
+        H2 — equal to `raw` for a normal in-limit stream). Returns None
+        if ffprobe is missing, times out, exits non-zero, or emits
+        unparseable output — in which case `frames()` surfaces a clean
+        no-frames exit (the caller's on-unreachable handling takes
+        over)."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._build_probe_argv(),
@@ -326,7 +404,19 @@ class StreamConsumer:
             # source.
             w += w & 1
             h += h & 1
-            return (w, h)
+            raw = (w, h)
+            # Renderer-hardening C2 (finding H2): clamp the raw dims to
+            # the vc4 2048-px texture limit. `clamped == raw` for a
+            # normal in-limit stream; over-large -> aspect-preserving
+            # downscale (and `_build_argv` adds the `scale` filter).
+            clamped = _clamp_to_texture_limit(*raw)
+            if clamped != raw:
+                log.warning(
+                    "stream: source %dx%d exceeds the %dpx GPU texture "
+                    "limit; downscaling to %dx%d",
+                    raw[0], raw[1], _MAX_STREAM_DIM, clamped[0], clamped[1],
+                )
+            return (raw, clamped)
         finally:
             # Reap the ffprobe child on every exit path. After a normal
             # communicate() the proc has already exited (returncode
@@ -355,9 +445,15 @@ class StreamConsumer:
                 # ffprobe could not determine the source size — bail
                 # cleanly so the caller's on-unreachable path runs.
                 return
-            self._source_size = probed
+            # `_probe_source_size` returns (raw, clamped). `_source_size`
+            # is the CLAMPED pair the renderer receives; `_build_argv`
+            # reads `_raw_source_size` to decide on a downscale filter.
+            self._raw_source_size, self._source_size = probed
         if self._closed:
             return
+        # The fixed-size frame read tracks the CLAMPED dims — what ffmpeg
+        # actually emits (a `scale` filter is in the argv when the source
+        # was over the 2048-px texture limit).
         src_w, src_h = self._source_size
         # NV12: Y plane (src_w*src_h) + interleaved UV plane at half
         # res on both axes (src_w*src_h/2) = 1.5 bytes/px total.

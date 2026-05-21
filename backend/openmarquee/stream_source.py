@@ -202,12 +202,19 @@ class FfmpegStreamSource:
         return self._consumer.frames()
 
     def frame_dims(self) -> tuple[int, int] | None:
-        """The source video `(width, height)` once the consumer's
+        """The decoded-frame `(width, height)` once the consumer's
         ffprobe has run (None before the first `frames()` frame).
 
         For an NV12 source these are the dims the renderer needs in
         `begin_external_frames` — the renderer cover-fit-scales the
-        source onto its panel."""
+        source onto its panel.
+
+        Renderer-hardening C2 (finding H2, 2026-05-21): these are the
+        CLAMPED dims — what ffmpeg actually emits. A source exceeding
+        the vc4 GPU's 2048-px texture limit is downscaled by an ffmpeg
+        `scale` filter; `frame_dims` then reports the downscaled size so
+        the renderer's per-frame GL texture upload never exceeds the
+        cap. A normal in-limit stream reports the raw source dims."""
         w = self._consumer.source_width
         h = self._consumer.source_height
         if w is None or h is None:
