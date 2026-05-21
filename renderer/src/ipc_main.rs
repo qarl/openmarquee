@@ -355,12 +355,35 @@ impl SlideCache {
             .and_then(|m| m.modified().ok());
         if self.items.contains_key(&item_id) {
             if self.item_mtimes.get(&item_id).copied() == on_disk_mtime {
-                return Ok(());
+                // FYS bug A (2026-05-21): the items+mtime short-
+                // circuit treats "item.json parsed" as "slide
+                // fully loaded" — but a VIDEO slide is only loaded
+                // if its Mp4Demuxer (+ V4L2 decoder) is also live.
+                // Bug 9's evict_other_video_state drops the demuxer
+                // + decoder on every slide change while leaving
+                // `items`/`item_mtimes` intact, so a video slide
+                // re-entered after eviction (every playlist
+                // loop-back) short-circuited here and was never
+                // re-primed — paint_slide / paint_transition then
+                // failed for the rest of the run and the sign
+                // froze. Fall through to re-open + re-prime when
+                // the demuxer is gone. Skip-marked videos are
+                // excepted: they intentionally have no demuxer and
+                // must not retry-spam a known-bad asset.
+                let video_needs_reprime = matches!(
+                    self.items.get(&item_id),
+                    Some(ContentItem::Video(_))
+                ) && !self.video_demuxers.contains_key(&item_id)
+                    && !self.video_skip.contains(&item_id);
+                if !video_needs_reprime {
+                    return Ok(());
+                }
+            } else {
+                eprintln!(
+                    "ipc: slide {item_id} item.json drifted on disk; refreshing cache"
+                );
+                self.invalidate(item_id);
             }
-            eprintln!(
-                "ipc: slide {item_id} item.json drifted on disk; refreshing cache"
-            );
-            self.invalidate(item_id);
         }
         let loaded = if let Some(s) = find_text_slide(content_root, item_id)? {
             self.items.insert(item_id, ContentItem::Text(s));
@@ -2097,6 +2120,71 @@ mod tests {
         assert!(cache.items.contains_key(&id), "Video item must be in items");
         let dem = cache.video_demuxers.get(&id)
             .expect("Mp4Demuxer must be in video_demuxers when asset present");
+        assert_eq!(dem.width, 320);
+        assert_eq!(dem.height, 240);
+        assert!(!dem.samples.is_empty());
+    }
+
+    /// FYS bug A (2026-05-21): after evict_other_video_state drops a
+    /// video slide's Mp4Demuxer (Bug 9's per-slide-change eviction),
+    /// a later cache.load for that slide must RE-OPEN the demuxer —
+    /// not short-circuit on the still-present `items` entry. The
+    /// pre-fix items+mtime short-circuit left an evicted video
+    /// demuxer-less forever, so every playlist loop-back froze the
+    /// sign (paint_slide / paint_transition had no decoder state).
+    #[test]
+    fn cache_load_reprimes_video_demuxer_after_eviction() {
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(3);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("item.json"),
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "video",
+                "id": "03030303-0303-0303-0303-030303030303",
+                "name": "vid",
+                "duration_ms": 2000,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        let fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        std::fs::copy(&fixture, dir.join("asset.mp4")).unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("first load");
+        assert!(
+            cache.video_demuxers.contains_key(&id),
+            "demuxer present after the first load",
+        );
+        // Simulate Bug 9's slide-change eviction: a BeginSlide on
+        // some OTHER slide evicts this video's demuxer + decoder.
+        cache.evict_other_video_state(uuid(6));
+        assert!(
+            !cache.video_demuxers.contains_key(&id),
+            "demuxer evicted by evict_other_video_state",
+        );
+        assert!(
+            cache.items.contains_key(&id),
+            "the lightweight `items` entry deliberately survives eviction",
+        );
+        // The playlist loop-back: cache.load for the evicted slide
+        // (item.json unchanged on disk) must RE-OPEN the demuxer
+        // rather than short-circuit on the surviving `items` entry.
+        cache.load(td.path(), id).expect("re-load after eviction");
+        let dem = cache.video_demuxers.get(&id).expect(
+            "demuxer must be RE-OPENED on cache.load after eviction (FYS bug A)",
+        );
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
         assert!(!dem.samples.is_empty());
