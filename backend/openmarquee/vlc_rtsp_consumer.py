@@ -1,8 +1,12 @@
-"""VlcRtspConsumer — shared RTSP-via-ffmpeg frame source.
+"""VlcRtspConsumer — shared stream-via-ffmpeg frame source.
 
-Both STREAM/VLC delivery modes (the operator-triggered takeover and
-the playlist VlcStreamSlide) pull video the same way: an ffmpeg
-subprocess consumes an RTSP URL that VLC is publishing.
+Both STREAM delivery modes (the operator-triggered takeover and the
+playlist StreamSlide) pull video the same way: an ffmpeg subprocess
+consumes a network stream URL. ffmpeg is protocol-agnostic, so the
+URL may be any of the supported transports — RTSP, RTMP/RTMPS, HLS or
+plain HTTP(S), SRT, or raw MPEG-TS over UDP. (The class + file are
+still named for RTSP for historical reasons; a later commit renames
+them.)
 
 ## HW-decode (2026-05-20)
 
@@ -21,11 +25,25 @@ The renderer does the scale (cover-fit) + NV12→RGB on the GPU. NV12
 is 1.5 bytes/px vs RGB888's 3 → the frame-pipe bandwidth halves.
 
 Because the output is now source-resolution (not renderer-sized),
-the consumer ffprobes the RTSP URL once at start to learn the source
-`width`/`height` — that drives the fixed-size frame read. The
+the consumer ffprobes the stream URL once at start to learn the
+source `width`/`height` — that drives the fixed-size frame read. The
 `renderer_w`/`renderer_h` passed at construction are retained only
 for diagnostics / the RGB888-fallback shape; the cover-fit target is
 the renderer's job.
+
+`-rtsp_transport tcp` is an RTSP-demuxer-private option: it is added
+to both the ffmpeg and ffprobe argv ONLY when the URL's scheme is
+`rtsp`. For every other transport ffmpeg would reject or warn on the
+flag, so it is omitted.
+
+## URL scheme allowlist (security)
+
+The stream URL is operator-supplied and passed straight as an
+ffmpeg/ffprobe input argument. ffmpeg also honours `file://`,
+`concat:`, `pipe:`, `subfile:`, `data:` and friends — a local-file
+read / SSRF vector. `validate_stream_url` enforces a scheme allowlist
+and is called from `VlcRtspConsumer.__init__`, the hard security
+boundary: no subprocess is ever spawned for a rejected URL.
 
 `ffmpeg` + `ffprobe` are baked into the Pi image (the pi-gen package
 list at `images/openmarquee/stage-openmarquee/00-install-packages/
@@ -39,8 +57,41 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
+
+#: Stream URL schemes ffmpeg may be pointed at. Everything outside
+#: this set is rejected by `validate_stream_url` — in particular the
+#: local-file / pipe / concat vectors (`file`, `pipe`, `concat`,
+#: `subfile`, `data`) and a bare path with no scheme at all.
+ALLOWED_STREAM_SCHEMES = frozenset(
+    {"rtsp", "rtmp", "rtmps", "http", "https", "srt", "udp"}
+)
+
+
+def validate_stream_url(url: str) -> None:
+    """Raise `ValueError` if `url`'s scheme is not an allowed stream
+    transport.
+
+    The stream URL is operator-supplied and is passed verbatim as an
+    ffmpeg/ffprobe input argument. ffmpeg honours protocols well
+    beyond network streams — `file://`, `concat:`, `pipe:`,
+    `subfile:`, `data:` — which would turn an operator-typed URL into
+    a local-file-read / SSRF primitive. This restricts the input to
+    the network stream transports in `ALLOWED_STREAM_SCHEMES`.
+
+    The scheme comparison is case-insensitive. A URL with no scheme
+    at all (a bare path like `/etc/passwd`) is rejected. Returns None
+    on success."""
+    scheme = urlparse(url).scheme.lower()
+    if scheme not in ALLOWED_STREAM_SCHEMES:
+        allowed = ", ".join(sorted(ALLOWED_STREAM_SCHEMES))
+        shown = scheme if scheme else "(none)"
+        raise ValueError(
+            f"stream URL scheme {shown!r} is not allowed; "
+            f"the URL must use one of: {allowed}"
+        )
 
 # ffmpeg stderr is captured into a tail buffer trimmed to this many
 # bytes after each read, so a long-lived consumer can't grow memory
@@ -53,20 +104,28 @@ _STDERR_TAIL_BYTES = 8192
 _TERMINATE_GRACE_SECONDS = 2.0
 
 # How long to wait for ffprobe to report the source stream dimensions
-# before giving up. ffprobe connects to the RTSP URL and reads enough
-# of the stream to parse the SPS; a few seconds is ample on a LAN, and
-# an unreachable URL is bounded by the caller's connect-timeout anyway.
+# before giving up. ffprobe connects to the stream URL and reads
+# enough of the stream to parse the SPS; a few seconds is ample on a
+# LAN, and an unreachable URL is bounded by the caller's
+# connect-timeout anyway.
 _FFPROBE_TIMEOUT_SECONDS = 8.0
 
 
 class VlcRtspConsumer:
-    """Pulls an RTSP stream via ffmpeg and yields raw NV12 frames.
+    """Pulls a network video stream via ffmpeg and yields raw NV12
+    frames.
+
+    The input may be any ffmpeg-supported stream transport (RTSP,
+    RTMP/RTMPS, HLS/HTTP(S), SRT, MPEG-TS over UDP). The URL scheme
+    is allowlist-validated in `__init__` — a non-stream scheme
+    (`file://`, `pipe:`, …) raises `ValueError` before any subprocess
+    is spawned.
 
     Lifecycle: construct, `async for frame in consumer.frames()`,
     then `await consumer.close()`. `frames()` ffprobes the URL for
     the source resolution, spawns the ffmpeg subprocess on first
     iteration, and yields one `src_w * src_h * 3 // 2`-byte NV12
-    buffer per decoded frame until ffmpeg exits (RTSP EOF /
+    buffer per decoded frame until ffmpeg exits (stream EOF /
     disconnect / spawn failure) or `close()` is called. Single-use —
     a second `frames()` call yields nothing.
 
@@ -93,6 +152,12 @@ class VlcRtspConsumer:
         ffprobe_bin: str = "ffprobe",
         source_size: tuple[int, int] | None = None,
     ):
+        # Hard security boundary: reject a non-stream URL scheme
+        # (file://, pipe:, concat:, …) before anything is spawned.
+        # Both the playlist-slide path and the operator-takeover path
+        # (RtspStreamSource) construct the consumer, so this single
+        # check covers every way an operator URL reaches ffmpeg.
+        validate_stream_url(rtsp_url)
         self._rtsp_url = rtsp_url
         # Renderer panel dims — retained for diagnostics only; the
         # cover-fit target is the renderer's job now.
@@ -127,20 +192,33 @@ class VlcRtspConsumer:
         """The source video height in pixels, once ffprobe has run."""
         return self._source_size[1] if self._source_size else None
 
+    def _is_rtsp(self) -> bool:
+        """True when the stream URL uses the `rtsp` scheme.
+
+        `-rtsp_transport` is an RTSP-demuxer-private option; ffmpeg
+        rejects or warns on it for any other transport. The argv
+        builders gate the flag on this."""
+        return urlparse(self._rtsp_url).scheme.lower() == "rtsp"
+
     def _build_probe_argv(self) -> list[str]:
         """The ffprobe command line that reports the source stream's
         width + height as JSON. `-rtsp_transport tcp` matches the
-        ffmpeg ingest (§3); `-select_streams v:0` picks the first
-        video stream."""
-        return [
+        ffmpeg ingest (§3) and is added ONLY for an RTSP URL — for any
+        other transport the flag is omitted. `-select_streams v:0`
+        picks the first video stream."""
+        argv = [
             self._ffprobe_bin,
             "-loglevel", "error",
-            "-rtsp_transport", "tcp",
+        ]
+        if self._is_rtsp():
+            argv += ["-rtsp_transport", "tcp"]
+        argv += [
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height",
             "-of", "json",
             self._rtsp_url,
         ]
+        return argv
 
     def _build_argv(self) -> list[str]:
         """The ffmpeg command line.
@@ -154,16 +232,21 @@ class VlcRtspConsumer:
         instead. Output is raw source-resolution NV12.
 
         `-an` drops audio on ingest. `-rtsp_transport tcp` forces
-        RTSP-over-TCP (§3) — UDP stutters badly on a Pi's wifi. There
-        is deliberately no ffmpeg-side connect timeout: an unreachable
-        URL makes ffmpeg hang, and the caller bounds that (the
-        playlist-slide path's connect-timeout, §9 slice 7) by calling
-        close()."""
-        return [
+        RTSP-over-TCP (§3) — UDP stutters badly on a Pi's wifi — and
+        is added ONLY for an RTSP URL; it is an RTSP-demuxer-private
+        option that ffmpeg rejects or warns on for any other
+        transport (rtmp/hls/http/srt/mpegts). There is deliberately
+        no ffmpeg-side connect timeout: an unreachable URL makes
+        ffmpeg hang, and the caller bounds that (the playlist-slide
+        path's connect-timeout, §9 slice 7) by calling close()."""
+        argv = [
             self._ffmpeg_bin,
             "-loglevel", "error",
             "-fflags", "nobuffer",
-            "-rtsp_transport", "tcp",
+        ]
+        if self._is_rtsp():
+            argv += ["-rtsp_transport", "tcp"]
+        argv += [
             "-c:v", "h264_v4l2m2m",
             "-i", self._rtsp_url,
             "-an",
@@ -171,6 +254,7 @@ class VlcRtspConsumer:
             "-f", "rawvideo",
             "-",
         ]
+        return argv
 
     async def _probe_source_size(self) -> tuple[int, int] | None:
         """Run ffprobe to discover the source video's width + height.
@@ -287,7 +371,7 @@ class VlcRtspConsumer:
             if self._closed:
                 log.info("vlc_rtsp: stream stopped (consumer closed)")
             else:
-                log.info("vlc_rtsp: stream ended (RTSP EOF / disconnect)")
+                log.info("vlc_rtsp: stream ended (EOF / disconnect)")
         except asyncio.CancelledError:
             raise
         finally:

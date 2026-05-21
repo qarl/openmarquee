@@ -20,7 +20,7 @@ import sys
 
 import pytest
 
-from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
+from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer, validate_stream_url
 
 
 def _write_mock_ffmpeg(
@@ -475,3 +475,102 @@ async def test_ffprobe_rounds_odd_source_dims_up_to_even(tmp_path):
     await consumer.close()
 
     assert (consumer.source_width, consumer.source_height) == (8, 6)
+
+
+# --- URL scheme allowlist (security) ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rtsp://host:8554/live",
+        "rtmp://host/app/stream",
+        "rtmps://host/app/stream",
+        "http://host/stream.m3u8",
+        "https://host/stream.m3u8",
+        "srt://host:9000",
+        "udp://239.0.0.1:1234",
+    ],
+)
+def test_validate_stream_url_accepts_allowed_schemes(url):
+    """Every allowlisted stream transport (rtsp/rtmp/rtmps/http/https/
+    srt/udp) passes validation without raising."""
+    validate_stream_url(url)  # must not raise
+
+
+def test_validate_stream_url_accepts_uppercase_scheme():
+    """The scheme comparison is case-insensitive — an operator who
+    types RTSP:// is not rejected."""
+    validate_stream_url("RTSP://host:8554/live")  # must not raise
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "file:///etc/passwd",
+        "concat:in1.ts|in2.ts",
+        "pipe:1",
+        "subfile:start,end,,:secret",
+        "data:text/plain;base64,SGVsbG8=",
+        "/etc/passwd",  # bare path — no scheme at all
+        "",  # empty string
+        "gopher://host/1",  # bogus / unsupported scheme
+    ],
+)
+def test_validate_stream_url_rejects_disallowed_schemes(url):
+    """A non-stream scheme — the file-read / SSRF vectors and a bare
+    path with no scheme — raises ValueError."""
+    with pytest.raises(ValueError):
+        validate_stream_url(url)
+
+
+def test_validate_stream_url_error_names_scheme_and_allowlist():
+    """The rejection message names the offending scheme and lists the
+    allowed ones, so the operator can fix the URL."""
+    with pytest.raises(ValueError) as excinfo:
+        validate_stream_url("file:///etc/passwd")
+    msg = str(excinfo.value)
+    assert "file" in msg
+    # The allowlist is surfaced so the operator knows what is valid.
+    assert "rtsp" in msg and "https" in msg
+
+
+def test_consumer_init_rejects_disallowed_url():
+    """VlcRtspConsumer.__init__ is the hard security boundary — a
+    non-stream URL raises ValueError before any ffmpeg/ffprobe spawn."""
+    with pytest.raises(ValueError):
+        VlcRtspConsumer("file:///etc/passwd", 1920, 1080)
+
+
+# --- conditional -rtsp_transport -------------------------------------------
+
+
+def test_rtsp_transport_present_for_rtsp_url():
+    """For an rtsp:// URL, `-rtsp_transport tcp` is in BOTH the ffmpeg
+    and the ffprobe argv — RTSP-over-TCP per §3."""
+    consumer = VlcRtspConsumer("rtsp://laptop:8554/live", 1920, 1080)
+
+    argv = consumer._build_argv()
+    assert argv[argv.index("-rtsp_transport") + 1] == "tcp"
+
+    probe_argv = consumer._build_probe_argv()
+    assert probe_argv[probe_argv.index("-rtsp_transport") + 1] == "tcp"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://host/stream.m3u8", "srt://host:9000"],
+)
+def test_rtsp_transport_absent_for_non_rtsp_url(url):
+    """`-rtsp_transport` is an RTSP-demuxer-private option — for a
+    non-RTSP transport (HLS/HTTP, SRT) it is omitted from BOTH the
+    ffmpeg and ffprobe argv so ffmpeg does not reject/warn on it."""
+    consumer = VlcRtspConsumer(url, 1920, 1080)
+
+    assert "-rtsp_transport" not in consumer._build_argv()
+    assert "-rtsp_transport" not in consumer._build_probe_argv()
+    # The rest of the argv is unchanged — input URL + HW-decode flags.
+    argv = consumer._build_argv()
+    assert argv[argv.index("-c:v") + 1] == "h264_v4l2m2m"
+    assert argv[argv.index("-i") + 1] == url
+    assert argv[argv.index("-pix_fmt") + 1] == "nv12"

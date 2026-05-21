@@ -214,6 +214,15 @@ class StreamSession:
         watchdog — ffmpeg either delivers frames or it doesn't, and
         the operator sees the result on glass. The pump starts
         immediately (unlike WebRTC, there is no track to wait for).
+
+        Security: `rtsp_url` is operator-supplied. RtspStreamSource
+        constructs a VlcRtspConsumer, whose `__init__` allowlist-
+        validates the URL scheme and raises `ValueError` for a
+        non-stream scheme (file://, pipe:, …) before any subprocess
+        is spawned. That `ValueError` propagates out of start_rtsp →
+        StreamManager.start/takeover → the /api/stream route's
+        catch-all, which returns a 400 — so the operator-takeover
+        path is covered without a separate check here.
         """
         self._source = RtspStreamSource(self._playback.renderer, rtsp_url)
         await self._playback.pause()

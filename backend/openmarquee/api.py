@@ -36,6 +36,7 @@ from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync
 from openmarquee.playlist import PlaylistStorage, list_in_playlist_order
 from openmarquee.tombstone import TombstoneStorage
+from openmarquee.vlc_rtsp_consumer import validate_stream_url
 
 router = APIRouter(prefix="/api/content", tags=["content"])
 
@@ -689,6 +690,14 @@ async def upload_stream(
     flock_sync: FlockSyncDep,
     background: BackgroundTasks,
 ) -> StreamSlide:
+    # Security: the stream URL is operator-supplied and is passed as
+    # an ffmpeg input argument at playout. Reject a non-stream scheme
+    # (file://, pipe:, …) here so the operator gets an immediate 400
+    # in the editor instead of a slide that silently fails on the sign.
+    try:
+        validate_stream_url(payload.stream_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         slide = StreamSlide(**payload.model_dump())
     except ValidationError as exc:
@@ -730,6 +739,12 @@ async def update_stream(
             status_code=409,
             detail=f"{item_id} is a {existing.type}, not a stream",
         )
+    # Security: see upload_stream — reject a non-stream URL scheme with
+    # a clean 400 before the slide is persisted.
+    try:
+        validate_stream_url(payload.stream_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         updated = StreamSlide(
             id=item_id,
