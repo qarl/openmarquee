@@ -1,0 +1,9 @@
+# web-helper is a standalone Python component — keep its build /
+# test / venv cruft out of the repo.
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
