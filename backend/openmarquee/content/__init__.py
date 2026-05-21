@@ -574,9 +574,11 @@ class StreamSlide(BaseModel):
         can't push a `file://`-scheme stream slide and have this
         device persist it. The `ValueError` `validate_stream_url`
         raises propagates as a Pydantic `ValidationError`, the
-        ingest-reject signal we want."""
-        validate_stream_url(value)
-        return value
+        ingest-reject signal we want.
+
+        Returns the whitespace-stripped URL so the persisted model
+        carries the cleaned form `validate_stream_url` produced."""
+        return validate_stream_url(value)
 
 
 class WebSlide(BaseModel):

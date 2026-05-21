@@ -591,6 +591,28 @@ def test_validate_stream_url_error_names_scheme_and_allowlist():
     assert "rtsp" in msg and "https" in msg
 
 
+def test_validate_stream_url_strips_leading_whitespace():
+    """A URL with leading whitespace validates (urlparse still finds
+    the scheme) AND the STRIPPED form is returned, so no leading
+    space reaches ffmpeg."""
+    assert validate_stream_url("  rtsp://cam.local/s") == "rtsp://cam.local/s"
+
+
+def test_validate_stream_url_strips_trailing_whitespace():
+    """Trailing whitespace is stripped from the returned URL too."""
+    assert (
+        validate_stream_url("rtsp://cam.local/s  \n") == "rtsp://cam.local/s"
+    )
+
+
+def test_consumer_init_stores_stripped_url():
+    """StreamConsumer.__init__ persists the whitespace-stripped URL —
+    ffmpeg is spawned on the cleaned form, not the operator's raw
+    input."""
+    consumer = StreamConsumer("  rtsp://laptop:8554/live  ", 1920, 1080)
+    assert consumer._stream_url == "rtsp://laptop:8554/live"
+
+
 def test_consumer_init_rejects_disallowed_url():
     """StreamConsumer.__init__ is the hard security boundary — a
     non-stream URL raises ValueError before any ffmpeg/ffprobe spawn."""

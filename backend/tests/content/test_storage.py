@@ -569,6 +569,15 @@ def test_migrate_legacy_stream_item_leaves_other_types_unchanged():
     assert _migrate_legacy_stream_item(text_item) is text_item
 
 
+@pytest.mark.parametrize("item", [[], "not-a-dict", None, 42])
+def test_migrate_legacy_stream_item_tolerates_non_dict(item):
+    """A malformed envelope whose `item` is not a dict (list / str /
+    None / …) does NOT raise AttributeError on the unconditional
+    `.get` — the guard returns it unchanged so the downstream
+    discriminated-union validation produces the clean ValidationError."""
+    assert _migrate_legacy_stream_item(item) is item
+
+
 def test_load_migrates_legacy_vlc_stream_envelope(tmp_path: Path):
     """A pre-rename envelope on disk ({"type": "vlc_stream",
     "rtsp_url": ...}) loads back as a valid StreamSlide — the

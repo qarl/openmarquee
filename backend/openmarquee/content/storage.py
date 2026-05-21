@@ -95,8 +95,13 @@ def _migrate_legacy_stream_item(item: dict) -> dict:
     P2 self-healing: this fixes the shape only in memory on load; the
     next save() rewrites item.json with the new literal, so the legacy
     form drains off disk as content gets edited.
+
+    A malformed envelope whose `item` is not a dict at all (a list /
+    str / None) is returned unchanged too: `.get` would raise on a
+    non-dict, so the guard covers it and lets the downstream
+    `_CONTENT_ADAPTER` produce the clean `ValidationError`.
     """
-    if item.get("type") != "vlc_stream":
+    if not isinstance(item, dict) or item.get("type") != "vlc_stream":
         return item
     migrated = dict(item)
     migrated["type"] = "stream"

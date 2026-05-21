@@ -68,9 +68,9 @@ ALLOWED_STREAM_SCHEMES = frozenset(
 )
 
 
-def validate_stream_url(url: str) -> None:
+def validate_stream_url(url: str) -> str:
     """Raise `ValueError` if `url`'s scheme is not an allowed stream
-    transport.
+    transport; otherwise return the cleaned (whitespace-stripped) URL.
 
     The stream URL is operator-supplied and is passed verbatim as an
     ffmpeg/ffprobe input argument. ffmpeg honours protocols well
@@ -79,9 +79,15 @@ def validate_stream_url(url: str) -> None:
     a local-file-read / SSRF primitive. This restricts the input to
     the network stream transports in `ALLOWED_STREAM_SCHEMES`.
 
+    Leading/trailing whitespace is stripped up front: `urlparse`
+    tolerates a leading space and still finds the scheme, so an
+    unstripped URL would pass validation and then fail confusingly
+    inside `ffmpeg -i`. The STRIPPED value is returned so callers
+    persist (and spawn ffmpeg on) the cleaned form.
+
     The scheme comparison is case-insensitive. A URL with no scheme
-    at all (a bare path like `/etc/passwd`) is rejected. Returns None
-    on success."""
+    at all (a bare path like `/etc/passwd`) is rejected."""
+    url = url.strip()
     scheme = urlparse(url).scheme.lower()
     if scheme not in ALLOWED_STREAM_SCHEMES:
         allowed = ", ".join(sorted(ALLOWED_STREAM_SCHEMES))
@@ -90,6 +96,7 @@ def validate_stream_url(url: str) -> None:
             f"stream URL scheme {shown!r} is not allowed; "
             f"the URL must use one of: {allowed}"
         )
+    return url
 
 # ffmpeg stderr is captured into a tail buffer trimmed to this many
 # bytes after each read, so a long-lived consumer can't grow memory
@@ -155,8 +162,8 @@ class StreamConsumer:
         # Both the playlist-slide path and the operator-takeover path
         # (FfmpegStreamSource) construct the consumer, so this single
         # check covers every way an operator URL reaches ffmpeg.
-        validate_stream_url(stream_url)
-        self._stream_url = stream_url
+        # Spawn ffmpeg on the whitespace-stripped form it returns.
+        self._stream_url = validate_stream_url(stream_url)
         # Renderer panel dims — retained for diagnostics only; the
         # cover-fit target is the renderer's job now.
         self._renderer_width = width
