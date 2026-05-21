@@ -417,6 +417,25 @@ def recording_client(tmp_path: Path):
 _TEST_NOTIFY_AT = "2026-04-24T12:00:00+00:00"
 
 
+def _wait_for_pushes(client, recorder, expected_count, *, tries=100):
+    """Pump the event loop (via cheap requests) until `expected_count`
+    flock pushes have been recorded, or fail with a clear message.
+
+    The routes enqueue notify_peers via FastAPI BackgroundTasks; those
+    tasks settle on the event loop. A sync TestClient only advances the
+    loop during a client.*() call, so a test that reads recorder.pushes
+    immediately after a mutating request can observe it before the
+    background task has drained. Pumping with a cheap real GET lets the
+    pending background(s) run — bounded, never a blind sleep."""
+    for _ in range(tries):
+        if len(recorder.pushes) >= expected_count:
+            return
+        client.get("/api/flock")  # a cheap real endpoint — pumps the loop
+    raise AssertionError(
+        f"expected {expected_count} flock pushes, got {recorder.pushes!r}"
+    )
+
+
 def test_post_flock_schedules_gossip_add(recording_client):
     """SYSTEM_SPEC §13: when an operator adds a peer via POST /api/flock,
     the route schedules a gossip_add background task carrying the new
@@ -612,6 +631,7 @@ def test_text_slide_post_enqueues_updated_push(recording_client):
     )
     assert response.status_code == 200
     slide_id = UUID(response.json()["id"])
+    _wait_for_pushes(client, recorder, 1)
     assert recorder.pushes == [(slide_id, "updated")]
 
 
@@ -629,6 +649,7 @@ def test_content_delete_enqueues_deleted_push(recording_client):
     slide_id = UUID(created["id"])
     response = client.delete(f"/api/content/{slide_id}")
     assert response.status_code == 204
+    _wait_for_pushes(client, recorder, 2)
     # First push is the create ("updated"), second is the delete ("deleted").
     kinds = [k for _, k in recorder.pushes]
     assert kinds == ["updated", "deleted"]
