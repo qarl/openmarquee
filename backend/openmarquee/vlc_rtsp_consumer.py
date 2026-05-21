@@ -6,10 +6,12 @@ subprocess consumes an RTSP URL that VLC is publishing.
 
 ## HW-decode (2026-05-20)
 
-MEASURED on the Pi Zero 2 W: ffmpeg's CPU `swscale` (the old `-vf
-scale,crop,format=rgb24` stage) was the ~16fps bottleneck, NOT the
-decode. Pure HW H.264 decode (`-c:v h264_v4l2m2m`) is 125fps / ~0
-CPU. So the consumer now:
+MEASURED on the dev Pi Zero 2 W (1280x704 30fps H.264, 300 frames):
+ffmpeg's CPU `swscale` (the old `-vf scale,crop,format=rgb24` stage,
+scaling to a 1080p panel) was the bottleneck at ~7fps. HW H.264
+decode (`-c:v h264_v4l2m2m`) outputting raw NV12 runs ~26fps — a
+~3.7x speedup that lands at essentially the 30fps source rate (the
+decode-only ceiling on this Pi is ~29fps). So the consumer now:
 
   - HW-decodes the H.264 input (`-c:v h264_v4l2m2m`),
   - drops the `-vf` swscale filter entirely,
@@ -144,9 +146,10 @@ class VlcRtspConsumer:
         """The ffmpeg command line.
 
         HW-decode (2026-05-20): `-c:v h264_v4l2m2m` decodes the H.264
-        input on the Pi's hardware codec (125fps / ~0 CPU). There is
+        input on the Pi's hardware codec (~26fps measured on the dev
+        Pi Zero 2 W, vs ~7fps for the old chain). There is
         deliberately NO `-vf` filter — the old `scale,crop,format=
-        rgb24` swscale chain was the measured ~16fps bottleneck; the
+        rgb24` swscale chain was the measured bottleneck; the
         renderer does the cover-fit scale + NV12→RGB on the GPU
         instead. Output is raw source-resolution NV12.
 
