@@ -25,11 +25,27 @@ class Renderer(Protocol):
     width: int
     height: int
 
-    def render_frame(self, frame: bytes) -> None:
-        """Render one RGB frame.
+    def render_frame(
+        self,
+        frame: bytes,
+        *,
+        pixel_format: str = "rgb888",
+        frame_w: int | None = None,
+        frame_h: int | None = None,
+    ) -> None:
+        """Render one externally-produced frame.
 
-        `frame` is row-major RGB888: `width * height * 3` bytes, top-left pixel
-        first, channel order R, G, B.
+        `pixel_format` is declared once per push run (one producer =
+        one format):
+
+        - `"rgb888"` (default): `frame` is row-major RGB888,
+          `width * height * 3` bytes at the renderer dims, top-left
+          pixel first, channel order R, G, B. `frame_w`/`frame_h` are
+          ignored. Omitting the new kwargs keeps existing RGB888
+          producers unchanged.
+        - `"nv12"`: `frame` is planar NV12, `frame_w * frame_h * 3 //
+          2` bytes at the SOURCE video dims; `frame_w`/`frame_h` are
+          required. The renderer cover-fit-scales onto its panel.
         """
         ...
 

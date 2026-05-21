@@ -125,9 +125,20 @@ class AutoFallbackRenderer:
 
     # --- Renderer Protocol ---
 
-    def render_frame(self, frame: bytes) -> None:
+    def render_frame(
+        self,
+        frame: bytes,
+        *,
+        pixel_format: str = "rgb888",
+        frame_w: int | None = None,
+        frame_h: int | None = None,
+    ) -> None:
         """Forward to the active renderer. On subprocess exhaustion at
         the proxy, swap to Mock and replay the frame against it.
+
+        HW-decode (2026-05-20): `pixel_format` + `frame_w`/`frame_h`
+        are forwarded verbatim — the VLC NV12 pumps drive this through
+        either the Rust proxy or the Mock fallback.
 
         IMPORTANT: `RustRendererRespawnedError` is a SUBCLASS of
         `RustRendererSubprocessError` (raised after a SUCCESSFUL
@@ -137,7 +148,9 @@ class AutoFallbackRenderer:
         proxy.
         """
         if self._mock is not None:
-            self._mock.render_frame(frame)
+            self._mock.render_frame(
+                frame, pixel_format=pixel_format, frame_w=frame_w, frame_h=frame_h
+            )
             return
         # Lazy import: avoids paying the rust_renderer module-import
         # cost when the factory routed elsewhere (auto/drm/mock paths).
@@ -147,7 +160,9 @@ class AutoFallbackRenderer:
             RustRendererUnsupportedSlideError,
         )
         try:
-            self._primary.render_frame(frame)
+            self._primary.render_frame(
+                frame, pixel_format=pixel_format, frame_w=frame_w, frame_h=frame_h
+            )
         except RustRendererRespawnedError:
             # Proxy is alive, just had a transient blip. Bubble up
             # so the caller knows to replay session state.
@@ -161,7 +176,9 @@ class AutoFallbackRenderer:
             raise
         except RustRendererSubprocessError as e:
             mock = self._swap_to_mock(f"render_frame: {e}")
-            mock.render_frame(frame)
+            mock.render_frame(
+                frame, pixel_format=pixel_format, frame_w=frame_w, frame_h=frame_h
+            )
 
     def end_external_frames(self) -> None:
         """Forward to the active renderer (STREAM/VLC slice 2.5).

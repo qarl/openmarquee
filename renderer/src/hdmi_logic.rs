@@ -2895,6 +2895,100 @@ void main() {
 }
 "#;
 
+/// STREAM/VLC HW-decode (2026-05-20) -- cover-fit NV12 -> RGB
+/// shader for the external-frame NV12 push path.
+///
+/// The HW-decode VLC path (ffmpeg `-c:v h264_v4l2m2m`, raw NV12
+/// out, no `-vf`) hands the renderer a SOURCE-resolution NV12
+/// frame; the GPU does the scale + crop the dropped ffmpeg
+/// `scale=...:force_original_aspect_ratio=increase,crop=...`
+/// filter used to do. `FS_NV12_TO_RGB` (the V4L2 VideoSlide
+/// shader) samples `v_uv` straight — it STRETCHES, correct for
+/// VideoSlide MP4s authored at the panel res but wrong for a
+/// VLC stream of arbitrary aspect.
+///
+/// This sibling adds a uniform UV transform: `u_uv_scale`
+/// (per-axis scale) + `u_uv_offset` (per-axis offset) remap the
+/// fullscreen quad's `v_uv` [0,1] into the NV12 texture so the
+/// source covers the panel aspect-preserving with the overflow
+/// axis center-cropped. `bake_external_nv12_to_current_fbo`
+/// computes the two uniforms from (frame dims, panel dims).
+///
+/// Everything else — BT.709 limited-range matrix, the bottom-up
+/// `1.0 - v` flip, `.ra` LUMINANCE_ALPHA sampling — is identical
+/// to `FS_NV12_TO_RGB`; only the cover-fit UV remap is new.
+pub const FS_NV12_COVER_TO_RGB: &str = r#"#version 100
+precision mediump float;
+uniform sampler2D u_tex_y;
+uniform sampler2D u_tex_uv;
+uniform vec2 u_uv_scale;
+uniform vec2 u_uv_offset;
+varying vec2 v_uv;
+void main() {
+    // Cover-fit remap: scale + offset the quad UV into the source
+    // texture (center-crop the overflow axis). u_uv_scale < 1.0 on
+    // the cropped axis; u_uv_offset recenters the crop.
+    vec2 cover_uv = v_uv * u_uv_scale + u_uv_offset;
+    // Same bottom-up flip as FS_NV12_TO_RGB (V4L2 NV12 is delivered
+    // bottom-up vs the top-down quad convention).
+    vec2 uv_t = vec2(cover_uv.x, 1.0 - cover_uv.y);
+    // Limited-range Y: [16/255, 235/255] -> [0, 1].
+    float y = (texture2D(u_tex_y, uv_t).r - (16.0/255.0)) * (255.0/219.0);
+    // GLES2 LUMINANCE_ALPHA: r=L (U here), a=A (V here).
+    vec2 uv_sample = texture2D(u_tex_uv, uv_t).ra;
+    // Limited-range UV: [16/255, 240/255] -> [-0.5, 0.5].
+    vec2 uv = (uv_sample - vec2(128.0/255.0)) * (255.0/224.0);
+    // ITU-R BT.709 Annex B coefficients.
+    float r = y + 1.5748 * uv.y;
+    float g = y - 0.1873 * uv.x - 0.4681 * uv.y;
+    float b = y + 1.8556 * uv.x;
+    gl_FragColor = vec4(r, g, b, 1.0);
+}
+"#;
+
+/// STREAM/VLC HW-decode (2026-05-20) -- compute the cover-fit UV
+/// transform (scale, offset) for `FS_NV12_COVER_TO_RGB`.
+///
+/// Aspect-preserving cover-fit: the source `(frame_w, frame_h)` is
+/// scaled so it fully covers the panel `(panel_w, panel_h)`, and
+/// the overflow on the longer axis is center-cropped. The result
+/// is the `(scale, offset)` pair that remaps the panel-spanning
+/// quad's `v_uv` [0,1] into the source texture: on the cropped
+/// axis `scale < 1.0` (sample a sub-window) and `offset` recenters
+/// it; on the fully-shown axis `scale == 1.0`, `offset == 0.0`.
+///
+/// Matches the dropped ffmpeg
+/// `scale=PANEL:force_original_aspect_ratio=increase,crop=PANEL`.
+/// Pure arithmetic — host-tested, no GL.
+pub fn nv12_cover_fit_uv_transform(
+    frame_w: u32,
+    frame_h: u32,
+    panel_w: u32,
+    panel_h: u32,
+) -> ([f32; 2], [f32; 2]) {
+    // Degenerate dims -> identity (sample the whole texture). The
+    // caller's byte-size check rejects 0-area frames before paint;
+    // this guard just keeps the math division-safe.
+    if frame_w == 0 || frame_h == 0 || panel_w == 0 || panel_h == 0 {
+        return ([1.0, 1.0], [0.0, 0.0]);
+    }
+    let frame_aspect = frame_w as f32 / frame_h as f32;
+    let panel_aspect = panel_w as f32 / panel_h as f32;
+    if frame_aspect > panel_aspect {
+        // Source is wider than the panel: full height shown, crop
+        // the sides. Sample a horizontal sub-window of the texture.
+        let scale_x = panel_aspect / frame_aspect;
+        let offset_x = (1.0 - scale_x) * 0.5;
+        ([scale_x, 1.0], [offset_x, 0.0])
+    } else {
+        // Source is taller (or equal): full width shown, crop top +
+        // bottom. Sample a vertical sub-window.
+        let scale_y = frame_aspect / panel_aspect;
+        let offset_y = (1.0 - scale_y) * 0.5;
+        ([1.0, scale_y], [0.0, offset_y])
+    }
+}
+
 /// V4L2 piece 4b (2026-05-14) -- DMA-BUF zero-copy NV12 sampler
 /// via `GL_OES_EGL_image_external`. Pairs with `VS_TEXTURED_QUAD`
 /// (no vertex changes needed; the difference is purely the
@@ -7182,6 +7276,73 @@ mod tests {
         // as `.ra` because GLES2 LUMINANCE_ALPHA returns L in .r
         // and A in .a (we map U->L, V->A on upload).
         assert!(FS_NV12_TO_RGB.contains(".ra"));
+    }
+
+    #[test]
+    fn fs_nv12_cover_to_rgb_pins_cover_fit_uniforms() {
+        // STREAM/VLC HW-decode: the cover-fit NV12 shader must keep
+        // the same GLES2 + BT.709 contract as FS_NV12_TO_RGB and add
+        // exactly the two UV-transform uniforms.
+        assert!(FS_NV12_COVER_TO_RGB.starts_with("#version 100\n"));
+        assert!(FS_NV12_COVER_TO_RGB.contains("precision mediump float"));
+        assert!(FS_NV12_COVER_TO_RGB.contains("u_tex_y"));
+        assert!(FS_NV12_COVER_TO_RGB.contains("u_tex_uv"));
+        // The new cover-fit uniforms.
+        assert!(FS_NV12_COVER_TO_RGB.contains("u_uv_scale"));
+        assert!(FS_NV12_COVER_TO_RGB.contains("u_uv_offset"));
+        // Same BT.709 limited-range matrix as the V4L2 path.
+        assert!(FS_NV12_COVER_TO_RGB.contains("16.0/255.0"));
+        assert!(FS_NV12_COVER_TO_RGB.contains("255.0/219.0"));
+        assert!(FS_NV12_COVER_TO_RGB.contains("1.5748"));
+        assert!(FS_NV12_COVER_TO_RGB.contains("1.8556"));
+        assert!(FS_NV12_COVER_TO_RGB.contains(".ra"));
+        // Same bottom-up flip as FS_NV12_TO_RGB.
+        assert!(FS_NV12_COVER_TO_RGB.contains("1.0 - "));
+    }
+
+    #[test]
+    fn nv12_cover_fit_same_aspect_is_identity() {
+        // Source aspect == panel aspect: no crop, full texture shown.
+        let (scale, offset) = nv12_cover_fit_uv_transform(1920, 1080, 1280, 720);
+        assert!((scale[0] - 1.0).abs() < 1e-5);
+        assert!((scale[1] - 1.0).abs() < 1e-5);
+        assert!(offset[0].abs() < 1e-5);
+        assert!(offset[1].abs() < 1e-5);
+    }
+
+    #[test]
+    fn nv12_cover_fit_wide_source_crops_sides() {
+        // 2:1 source onto a 1:1 panel: full height, sides cropped.
+        // scale_x = panel_aspect / frame_aspect = 1.0 / 2.0 = 0.5.
+        let (scale, offset) = nv12_cover_fit_uv_transform(2000, 1000, 1000, 1000);
+        assert!((scale[0] - 0.5).abs() < 1e-5);
+        assert!((scale[1] - 1.0).abs() < 1e-5);
+        // Centered crop: offset_x = (1 - 0.5) / 2 = 0.25.
+        assert!((offset[0] - 0.25).abs() < 1e-5);
+        assert!(offset[1].abs() < 1e-5);
+    }
+
+    #[test]
+    fn nv12_cover_fit_tall_source_crops_top_bottom() {
+        // 1:2 source onto a 1:1 panel: full width, top+bottom cropped.
+        // scale_y = frame_aspect / panel_aspect = 0.5 / 1.0 = 0.5.
+        let (scale, offset) = nv12_cover_fit_uv_transform(1000, 2000, 1000, 1000);
+        assert!((scale[0] - 1.0).abs() < 1e-5);
+        assert!((scale[1] - 0.5).abs() < 1e-5);
+        assert!(offset[0].abs() < 1e-5);
+        assert!((offset[1] - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn nv12_cover_fit_degenerate_dims_are_identity() {
+        // Zero dims must not divide-by-zero; return the identity
+        // transform (the caller's byte-size check rejects the frame).
+        let (scale, offset) = nv12_cover_fit_uv_transform(0, 0, 1280, 720);
+        assert_eq!(scale, [1.0, 1.0]);
+        assert_eq!(offset, [0.0, 0.0]);
+        let (scale, offset) = nv12_cover_fit_uv_transform(1920, 1080, 0, 0);
+        assert_eq!(scale, [1.0, 1.0]);
+        assert_eq!(offset, [0.0, 0.0]);
     }
 
     #[test]

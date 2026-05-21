@@ -2,22 +2,39 @@
 
 Both STREAM/VLC delivery modes (the operator-triggered takeover and
 the playlist VlcStreamSlide) pull video the same way: an ffmpeg
-subprocess consumes an RTSP URL that VLC is publishing and emits raw
-RGB888 frames already cover-fit-scaled to the renderer. This module
-owns exactly that mechanism — subprocess spawn, the filter chain,
-fixed-size frame reads, stderr capture, teardown. It has no awareness
-of takeover-vs-slide lifecycle; the two modes wrap it (slice 4 and
-slice 7 of docs/STREAM_VLC_PROPOSAL.md §9).
+subprocess consumes an RTSP URL that VLC is publishing.
 
-`ffmpeg` is baked into the Pi image (the pi-gen package list at
-`images/openmarquee/stage-openmarquee/00-install-packages/00-packages`),
-so the binary is expected on PATH at runtime.
+## HW-decode (2026-05-20)
+
+MEASURED on the Pi Zero 2 W: ffmpeg's CPU `swscale` (the old `-vf
+scale,crop,format=rgb24` stage) was the ~16fps bottleneck, NOT the
+decode. Pure HW H.264 decode (`-c:v h264_v4l2m2m`) is 125fps / ~0
+CPU. So the consumer now:
+
+  - HW-decodes the H.264 input (`-c:v h264_v4l2m2m`),
+  - drops the `-vf` swscale filter entirely,
+  - emits raw SOURCE-resolution NV12 (`-pix_fmt nv12 -f rawvideo`).
+
+The renderer does the scale (cover-fit) + NV12→RGB on the GPU. NV12
+is 1.5 bytes/px vs RGB888's 3 → the frame-pipe bandwidth halves.
+
+Because the output is now source-resolution (not renderer-sized),
+the consumer ffprobes the RTSP URL once at start to learn the source
+`width`/`height` — that drives the fixed-size frame read. The
+`renderer_w`/`renderer_h` passed at construction are retained only
+for diagnostics / the RGB888-fallback shape; the cover-fit target is
+the renderer's job.
+
+`ffmpeg` + `ffprobe` are baked into the Pi image (the pi-gen package
+list at `images/openmarquee/stage-openmarquee/00-install-packages/
+00-packages`), so both binaries are expected on PATH at runtime.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator
 
@@ -33,18 +50,36 @@ _STDERR_TAIL_BYTES = 8192
 # to SIGKILL.
 _TERMINATE_GRACE_SECONDS = 2.0
 
+# How long to wait for ffprobe to report the source stream dimensions
+# before giving up. ffprobe connects to the RTSP URL and reads enough
+# of the stream to parse the SPS; a few seconds is ample on a LAN, and
+# an unreachable URL is bounded by the caller's connect-timeout anyway.
+_FFPROBE_TIMEOUT_SECONDS = 8.0
+
 
 class VlcRtspConsumer:
-    """Pulls an RTSP stream via ffmpeg and yields renderer-sized
-    RGB888 frames.
+    """Pulls an RTSP stream via ffmpeg and yields raw NV12 frames.
 
     Lifecycle: construct, `async for frame in consumer.frames()`,
-    then `await consumer.close()`. `frames()` spawns the ffmpeg
-    subprocess on first iteration and yields one
-    `width * height * 3`-byte buffer per decoded frame until ffmpeg
-    exits (RTSP EOF / disconnect / spawn failure) or `close()` is
-    called. Single-use — a second `frames()` call yields nothing.
+    then `await consumer.close()`. `frames()` ffprobes the URL for
+    the source resolution, spawns the ffmpeg subprocess on first
+    iteration, and yields one `src_w * src_h * 3 // 2`-byte NV12
+    buffer per decoded frame until ffmpeg exits (RTSP EOF /
+    disconnect / spawn failure) or `close()` is called. Single-use —
+    a second `frames()` call yields nothing.
+
+    The emitted frames are SOURCE-resolution NV12; the renderer
+    cover-fit-scales them onto the panel on the GPU. `pixel_format`,
+    `source_width`, and `source_height` expose what `frames()`
+    produces so the push-frame pumps can tell the renderer how to
+    interpret the bytes (the `begin_external_frames` pixel_format +
+    source dims).
     """
+
+    #: The pixel format every `frames()` buffer is in. The HW-decode
+    #: path always emits NV12; the attribute makes the format explicit
+    #: to the push-frame pumps that drive the renderer.
+    pixel_format = "nv12"
 
     def __init__(
         self,
@@ -53,12 +88,20 @@ class VlcRtspConsumer:
         height: int,
         *,
         ffmpeg_bin: str = "ffmpeg",
+        ffprobe_bin: str = "ffprobe",
+        source_size: tuple[int, int] | None = None,
     ):
         self._rtsp_url = rtsp_url
-        self._width = width
-        self._height = height
+        # Renderer panel dims — retained for diagnostics only; the
+        # cover-fit target is the renderer's job now.
+        self._renderer_width = width
+        self._renderer_height = height
         self._ffmpeg_bin = ffmpeg_bin
-        self._frame_size = width * height * 3
+        self._ffprobe_bin = ffprobe_bin
+        # Source dims: discovered via ffprobe in frames(), or injected
+        # at construction (tests / a caller that already probed). None
+        # until known.
+        self._source_size: tuple[int, int] | None = source_size
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task | None = None
         self._stderr_tail = bytearray()
@@ -71,41 +114,143 @@ class VlcRtspConsumer:
         """The tail of ffmpeg's stderr, decoded — for diagnostics."""
         return self._stderr_tail.decode("utf-8", errors="replace")
 
+    @property
+    def source_width(self) -> int | None:
+        """The source video width in pixels, once ffprobe has run
+        (None before `frames()` discovers it)."""
+        return self._source_size[0] if self._source_size else None
+
+    @property
+    def source_height(self) -> int | None:
+        """The source video height in pixels, once ffprobe has run."""
+        return self._source_size[1] if self._source_size else None
+
+    def _build_probe_argv(self) -> list[str]:
+        """The ffprobe command line that reports the source stream's
+        width + height as JSON. `-rtsp_transport tcp` matches the
+        ffmpeg ingest (§3); `-select_streams v:0` picks the first
+        video stream."""
+        return [
+            self._ffprobe_bin,
+            "-loglevel", "error",
+            "-rtsp_transport", "tcp",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            self._rtsp_url,
+        ]
+
     def _build_argv(self) -> list[str]:
-        """The ffmpeg command line. `scale` (with
-        force_original_aspect_ratio=increase) + `crop` together
-        implement cover-fit inside ffmpeg's filter graph, so there is
-        no Python-side PIL roundtrip per frame. `-an` drops audio on
-        ingest. `-rtsp_transport tcp` forces RTSP-over-TCP (§3) —
-        UDP stutters badly on a Pi's wifi. There is deliberately no
-        ffmpeg-side connect timeout: an unreachable URL makes ffmpeg
-        hang, and the caller bounds that (the playlist-slide path's
-        connect-timeout, §9 slice 7) by calling close()."""
-        vf = (
-            f"scale={self._width}:{self._height}"
-            ":force_original_aspect_ratio=increase,"
-            f"crop={self._width}:{self._height},"
-            "format=rgb24"
-        )
+        """The ffmpeg command line.
+
+        HW-decode (2026-05-20): `-c:v h264_v4l2m2m` decodes the H.264
+        input on the Pi's hardware codec (125fps / ~0 CPU). There is
+        deliberately NO `-vf` filter — the old `scale,crop,format=
+        rgb24` swscale chain was the measured ~16fps bottleneck; the
+        renderer does the cover-fit scale + NV12→RGB on the GPU
+        instead. Output is raw source-resolution NV12.
+
+        `-an` drops audio on ingest. `-rtsp_transport tcp` forces
+        RTSP-over-TCP (§3) — UDP stutters badly on a Pi's wifi. There
+        is deliberately no ffmpeg-side connect timeout: an unreachable
+        URL makes ffmpeg hang, and the caller bounds that (the
+        playlist-slide path's connect-timeout, §9 slice 7) by calling
+        close()."""
         return [
             self._ffmpeg_bin,
             "-loglevel", "error",
             "-fflags", "nobuffer",
             "-rtsp_transport", "tcp",
+            "-c:v", "h264_v4l2m2m",
             "-i", self._rtsp_url,
             "-an",
-            "-vf", vf,
+            "-pix_fmt", "nv12",
             "-f", "rawvideo",
             "-",
         ]
 
+    async def _probe_source_size(self) -> tuple[int, int] | None:
+        """Run ffprobe to discover the source video's width + height.
+
+        Returns the `(width, height)` tuple, or None if ffprobe is
+        missing, times out, exits non-zero, or emits unparseable
+        output — in which case `frames()` surfaces a clean no-frames
+        exit (the caller's on-unreachable handling takes over)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._build_probe_argv(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, ValueError) as exc:
+            log.error("vlc_rtsp: failed to spawn ffprobe: %s", exc)
+            return None
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_FFPROBE_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            log.error(
+                "vlc_rtsp: ffprobe timed out after %.1fs probing %s",
+                _FFPROBE_TIMEOUT_SECONDS,
+                self._rtsp_url,
+            )
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+            return None
+        if proc.returncode != 0:
+            log.error(
+                "vlc_rtsp: ffprobe exited rc=%s: %s",
+                proc.returncode,
+                stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return None
+        try:
+            payload = json.loads(stdout.decode("utf-8", errors="replace"))
+            stream = payload["streams"][0]
+            w = int(stream["width"])
+            h = int(stream["height"])
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+            log.error(
+                "vlc_rtsp: ffprobe output unparseable (%s): %r",
+                exc,
+                stdout[:256],
+            )
+            return None
+        if w <= 0 or h <= 0:
+            log.error("vlc_rtsp: ffprobe reported non-positive dims %dx%d", w, h)
+            return None
+        # NV12 chroma is 4:2:0 — both axes must be even. ffmpeg's NV12
+        # output always pads to even dims; round up defensively so the
+        # fixed-size frame read can't desync on an odd-dim source.
+        w += w & 1
+        h += h & 1
+        return (w, h)
+
     async def frames(self) -> AsyncIterator[bytes]:
-        """Spawn ffmpeg and yield RGB888 frames until the stream ends
-        or `close()` is called. A spawn failure (ffmpeg missing) is
-        logged and surfaced as a clean no-frames exit — the caller's
-        timeout / on-unreachable handling takes over."""
+        """Spawn ffmpeg and yield NV12 frames until the stream ends
+        or `close()` is called.
+
+        First ffprobes the URL for the source resolution (unless it
+        was injected at construction). A probe failure or an ffmpeg
+        spawn failure is logged and surfaced as a clean no-frames exit
+        — the caller's timeout / on-unreachable handling takes over."""
         if self._closed or self._proc is not None:
             return
+        if self._source_size is None:
+            probed = await self._probe_source_size()
+            if probed is None:
+                # ffprobe could not determine the source size — bail
+                # cleanly so the caller's on-unreachable path runs.
+                return
+            self._source_size = probed
+        if self._closed:
+            return
+        src_w, src_h = self._source_size
+        # NV12: Y plane (src_w*src_h) + interleaved UV plane at half
+        # res on both axes (src_w*src_h/2) = 1.5 bytes/px total.
+        frame_size = src_w * src_h * 3 // 2
         # The spawn-and-assign runs under _reap_lock so a close()
         # racing in during the create_subprocess_exec await cannot
         # reap-then-miss the not-yet-assigned subprocess (which would
@@ -130,10 +275,10 @@ class VlcRtspConsumer:
             )
         try:
             while not self._closed:
-                # readexactly enforces the RGB888 frame size: a short
+                # readexactly enforces the NV12 frame size: a short
                 # final read (ffmpeg exiting mid-frame) raises
                 # IncompleteReadError and the partial frame is dropped.
-                frame = await self._proc.stdout.readexactly(self._frame_size)
+                frame = await self._proc.stdout.readexactly(frame_size)
                 yield frame
         except asyncio.IncompleteReadError:
             if self._closed:

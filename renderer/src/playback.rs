@@ -313,15 +313,48 @@ pub struct CaptureParams {
     pub path: String,
 }
 
+/// STREAM/VLC HW-decode (2026-05-20): the external-frame pixel
+/// format, declared ONCE per begin_external_frames pump session
+/// (one producer = one format — NOT per-frame).
+///
+/// `Rgb888` is the default (`#[serde(default)]` on the field) so
+/// a producer that omits `pixel_format` — today's RGB888 VLC
+/// pumps before this change, the future webpage BrowserSource —
+/// stays wire-compatible. `Nv12` is the HW-decode VLC path:
+/// ffmpeg `-c:v h264_v4l2m2m` emits raw source-resolution NV12
+/// (no `-vf` swscale), 1.5 bytes/px, and the renderer does the
+/// cover-fit scale + NV12->RGB on the GPU.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPixelFormat {
+    /// Row-major RGB888, `width * height * 3` bytes/frame. The
+    /// `width`/`height` are the renderer panel dims.
+    #[default]
+    Rgb888,
+    /// Planar NV12 (Y plane + interleaved UV plane), `width *
+    /// height * 3 / 2` bytes/frame. The `width`/`height` are the
+    /// SOURCE video dims; the renderer cover-fit-scales onto the
+    /// panel.
+    Nv12,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BeginExternalFramesParams {
-    /// Width of each pushed RGB888 frame, in pixels. Every frame
-    /// on the binary channel is exactly `width * height * 3`
-    /// bytes; the sidecar uploads it as a `width x height` RGB
-    /// texture and blits it to fill the panel.
+    /// Width of each pushed frame, in pixels. For `rgb888` this is
+    /// the renderer panel width (every frame `width*height*3`
+    /// bytes); for `nv12` it is the SOURCE video width (every
+    /// frame `width*height*3/2` bytes) and the renderer cover-fit-
+    /// scales onto the panel.
     pub width: u32,
-    /// Height of each pushed RGB888 frame, in pixels.
+    /// Height of each pushed frame, in pixels. Panel height for
+    /// `rgb888`, source video height for `nv12`.
     pub height: u32,
+    /// Pixel format of every frame in this pump session. Declared
+    /// once (one producer = one format), NOT per-frame.
+    /// `#[serde(default)]` -> `rgb888` when absent, so pre-HW-
+    /// decode producers stay wire-compatible.
+    #[serde(default)]
+    pub pixel_format: ExternalPixelFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -658,12 +691,46 @@ mod tests {
         let req = IpcRequest::BeginExternalFrames(BeginExternalFramesParams {
             width: 1920,
             height: 1080,
+            pixel_format: ExternalPixelFormat::Rgb888,
         });
         roundtrip_request(&req);
         let encoded = serde_json::to_string(&req).unwrap();
         assert!(encoded.contains(r#""op":"begin_external_frames""#));
         assert!(encoded.contains(r#""width":1920"#));
         assert!(encoded.contains(r#""height":1080"#));
+        assert!(encoded.contains(r#""pixel_format":"rgb888""#));
+    }
+
+    #[test]
+    fn ipc_request_begin_external_frames_decodes_without_pixel_format() {
+        // STREAM/VLC HW-decode: pixel_format has #[serde(default)]
+        // so a producer that predates the field (today's RGB888 VLC
+        // pumps, the future webpage BrowserSource) stays wire-
+        // compatible — an omitted pixel_format decodes to Rgb888.
+        let json = r#"{"op":"begin_external_frames","params":{"width":854,"height":480}}"#;
+        let req: IpcRequest = serde_json::from_str(json).unwrap();
+        match req {
+            IpcRequest::BeginExternalFrames(p) => {
+                assert_eq!(p.width, 854);
+                assert_eq!(p.height, 480);
+                assert_eq!(p.pixel_format, ExternalPixelFormat::Rgb888);
+            }
+            other => panic!("expected BeginExternalFrames, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_request_begin_external_frames_nv12_round_trips() {
+        // STREAM/VLC HW-decode: the NV12 pump session. width/height
+        // are the SOURCE video dims; the renderer cover-fit-scales.
+        let req = IpcRequest::BeginExternalFrames(BeginExternalFramesParams {
+            width: 1280,
+            height: 720,
+            pixel_format: ExternalPixelFormat::Nv12,
+        });
+        roundtrip_request(&req);
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert!(encoded.contains(r#""pixel_format":"nv12""#));
     }
 
     #[test]

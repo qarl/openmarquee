@@ -36,17 +36,26 @@ log = logging.getLogger(__name__)
 
 @runtime_checkable
 class StreamSource(Protocol):
-    """A producer of renderer-sized RGB888 frames for a takeover.
+    """A producer of frames for a takeover.
 
     Each implementation owns one transport (a WebRTC video track, an
-    RTSP-via-ffmpeg subprocess, ...) and yields frames already cover-
-    fit-scaled to `renderer.width * renderer.height * 3` bytes, ready
-    to hand straight to `Renderer.render_frame()`.
+    RTSP-via-ffmpeg subprocess, ...) and yields frames ready to hand
+    to `Renderer.render_frame()`.
+
+    HW-decode (2026-05-20): a source declares its `pixel_format`. An
+    RGB888 source (`WebRtcStreamSource`) yields renderer-sized RGB888
+    frames; an NV12 source (`RtspStreamSource`) yields source-
+    resolution NV12 and exposes `frame_dims()` so the pump can tell
+    the renderer the source size for its GPU cover-fit. `StreamSession`
+    threads the format + dims into `render_frame()`.
 
     `StreamSession` drives a source: it iterates `frames()` and pushes
     each frame to the renderer until the iterator is exhausted (the
     transport reached EOF or disconnected) or `close()` is called.
     """
+
+    #: Pixel format of every `frames()` buffer — "rgb888" or "nv12".
+    pixel_format: str
 
     def frames(self) -> AsyncIterator[bytes]:
         """Yield RGB888 frames until the transport ends or `close()`
@@ -92,7 +101,15 @@ class WebRtcStreamSource:
     RTCPeerConnection's `on_track` event after SDP negotiation. The
     owner calls `set_track()` from that callback; `frames()` blocks
     until the track is set, then decodes + cover-fits each frame.
+
+    HW-decode (2026-05-20): the WebRTC path decodes + cover-fits
+    Python-side and yields renderer-sized RGB888 — `pixel_format` is
+    "rgb888", the `render_frame()` default. (The HW-decode arc only
+    moves the VLC/RTSP path to GPU-side NV12; WebRTC is unchanged.)
     """
+
+    #: WebRTC frames are decoded + cover-fit Python-side to RGB888.
+    pixel_format = "rgb888"
 
     def __init__(self, renderer: Renderer):
         self._renderer = renderer
@@ -156,14 +173,25 @@ class RtspStreamSource:
 
     Wraps the shared RTSP-via-ffmpeg consumer (the slice-2 module) so
     an operator-triggered VLC stream plugs into StreamSession exactly
-    like the phone-camera WebRtcStreamSource. ffmpeg already cover-
-    fits to the renderer dimensions, so `frames()` simply relays the
-    consumer's output.
+    like the phone-camera WebRtcStreamSource.
 
-    The renderer dimensions are read once, at construction — the
-    ffmpeg filter graph is fixed for the life of the subprocess, and
-    a display mode does not change while a takeover is up (§3).
+    HW-decode (2026-05-20): the consumer HW-decodes H.264 and emits
+    SOURCE-resolution NV12 (no ffmpeg swscale — the GPU does the
+    cover-fit). So this source yields NV12 frames, NOT renderer-sized
+    RGB888. `pixel_format` advertises "nv12"; `frame_dims()` reports
+    the source resolution the consumer discovered via ffprobe — the
+    stream pump threads both into `renderer.render_frame()` so the
+    sidecar knows how to interpret the bytes. (WebRtcStreamSource
+    stays RGB888 — the format tag per-source is the whole point.)
+
+    The renderer dimensions are read once, at construction; the
+    consumer retains them for diagnostics.
     """
+
+    #: This source produces NV12 frames (the consumer's HW-decode
+    #: output). The stream pump reads this to set begin_external_
+    #: frames' pixel_format.
+    pixel_format = "nv12"
 
     def __init__(self, renderer: Renderer, rtsp_url: str):
         self._consumer = VlcRtspConsumer(
@@ -172,6 +200,19 @@ class RtspStreamSource:
 
     def frames(self) -> AsyncIterator[bytes]:
         return self._consumer.frames()
+
+    def frame_dims(self) -> tuple[int, int] | None:
+        """The source video `(width, height)` once the consumer's
+        ffprobe has run (None before the first `frames()` frame).
+
+        For an NV12 source these are the dims the renderer needs in
+        `begin_external_frames` — the renderer cover-fit-scales the
+        source onto its panel."""
+        w = self._consumer.source_width
+        h = self._consumer.source_height
+        if w is None or h is None:
+            return None
+        return (w, h)
 
     async def close(self) -> None:
         """Stop the source + reap ffmpeg. Idempotent."""

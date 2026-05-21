@@ -151,9 +151,12 @@ for raw in sys.stdin:
         # pump-mode — read length-prefixed frames off the binary
         # channel until the 0-length sentinel. No second response.
         if log:
+            # pixel_format has #[serde(default)] in the real sidecar —
+            # an omitted format means rgb888; mirror that here.
             log.write(
                 f"begin_external_frames:{params.get('width')}x"
-                f"{params.get('height')}\n"
+                f"{params.get('height')}"
+                f":{params.get('pixel_format', 'rgb888')}\n"
             )
             log.flush()
         ok({"command": "empty"})
@@ -271,6 +274,78 @@ def test_render_frame_pushes_length_prefixed_frames_to_the_binary_channel(
     # only logs frames before the sentinel break).
     frame_lines = [ln for ln in lines if ln.startswith("external_frame:")]
     assert frame_lines == [f"external_frame:{frame_size}"] * 3
+
+
+def test_render_frame_rgb888_begin_carries_panel_dims_and_format(
+    make_renderer, tmp_path
+):
+    """HW-decode (2026-05-20): an rgb888 render_frame() run sends
+    begin_external_frames with the renderer PANEL dims and an explicit
+    pixel_format of rgb888."""
+    log_path = tmp_path / "sidecar.log"
+    r = make_renderer(env_extra={"FAKE_SIDECAR_REQUEST_LOG": str(log_path)})
+    r.open()
+    try:
+        frame = b"\x00" * (r.width * r.height * 3)
+        r.render_frame(frame)  # rgb888 is the default
+        r.end_external_frames()
+    finally:
+        r.close()
+    lines = log_path.read_text().splitlines()
+    begin = [ln for ln in lines if ln.startswith("begin_external_frames:")]
+    # Panel dims + the rgb888 format tag.
+    assert begin == [f"begin_external_frames:{r.width}x{r.height}:rgb888"]
+
+
+def test_render_frame_nv12_begin_carries_source_dims_and_format(
+    make_renderer, tmp_path
+):
+    """HW-decode (2026-05-20): an nv12 render_frame() run sends
+    begin_external_frames with the SOURCE video dims (not the panel
+    dims) and pixel_format=nv12; each NV12 frame is src_w*src_h*3//2
+    bytes on the binary channel."""
+    log_path = tmp_path / "sidecar.log"
+    r = make_renderer(env_extra={"FAKE_SIDECAR_REQUEST_LOG": str(log_path)})
+    r.open()
+    src_w, src_h = 1280, 720
+    nv12_size = src_w * src_h * 3 // 2
+    try:
+        frame = b"\x00" * nv12_size
+        r.render_frame(frame, pixel_format="nv12", frame_w=src_w, frame_h=src_h)
+        r.render_frame(frame, pixel_format="nv12", frame_w=src_w, frame_h=src_h)
+        r.end_external_frames()
+    finally:
+        r.close()
+    lines = log_path.read_text().splitlines()
+    begin = [ln for ln in lines if ln.startswith("begin_external_frames:")]
+    # SOURCE dims (1280x720), NOT the 1920x1080 panel; nv12 format.
+    assert begin == [f"begin_external_frames:{src_w}x{src_h}:nv12"]
+    frame_lines = [ln for ln in lines if ln.startswith("external_frame:")]
+    assert frame_lines == [f"external_frame:{nv12_size}"] * 2
+
+
+def test_render_frame_nv12_without_dims_raises(make_renderer):
+    """HW-decode (2026-05-20): nv12 needs the source dims — the
+    renderer cover-fit-scales the source onto its panel, so omitting
+    frame_w/frame_h is a hard error, not a silent panel-dims default."""
+    r = make_renderer()
+    r.open()
+    try:
+        with pytest.raises(RustRendererError, match="nv12 requires frame_w"):
+            r.render_frame(b"\x00" * 100, pixel_format="nv12")
+    finally:
+        r.close()
+
+
+def test_render_frame_unknown_pixel_format_raises(make_renderer):
+    """An unknown pixel_format is rejected before any wire traffic."""
+    r = make_renderer()
+    r.open()
+    try:
+        with pytest.raises(RustRendererError, match="unknown pixel_format"):
+            r.render_frame(b"\x00" * 100, pixel_format="yuv444")
+    finally:
+        r.close()
 
 
 def test_end_external_frames_without_any_frame_is_a_noop(make_renderer):

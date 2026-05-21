@@ -872,8 +872,22 @@ class PlaybackLoop:
                         break  # ffmpeg EOF / RTSP disconnect
                     except TimeoutError:
                         break  # connect timeout, or the stream stalled
+                    # HW-decode (2026-05-20): the consumer HW-decodes
+                    # H.264 + emits SOURCE-resolution NV12 (no ffmpeg
+                    # swscale — the GPU cover-fits). Thread the NV12
+                    # format + source dims into render_frame() so the
+                    # sidecar's begin_external_frames carries them.
+                    # source_width/height are known after the
+                    # consumer's ffprobe, i.e. before its first frame.
+                    src_w = consumer.source_width
+                    src_h = consumer.source_height
                     try:
-                        renderer.render_frame(rgb)
+                        renderer.render_frame(
+                            rgb,
+                            pixel_format=consumer.pixel_format,
+                            frame_w=src_w,
+                            frame_h=src_h,
+                        )
                     except Exception:
                         # The renderer can't take external frames — a
                         # Rust sidecar without the slice-2.5 push-
@@ -941,6 +955,15 @@ class PlaybackLoop:
             # render path that just failed (renderer_broken) could
             # fail here too; the wait below still preserves slot
             # timing either way.
+            #
+            # HW-decode (2026-05-20): the VLC pump runs in NV12 pixel
+            # format. The black fill is a renderer-sized RGB888 frame
+            # — a different format. end_external_frames() closes any
+            # active NV12 pump session first so the black frame opens
+            # a fresh rgb888 session (begin_external_frames' format is
+            # latched per-session). A no-op when no pump is active.
+            with contextlib.suppress(Exception):
+                self._renderer.end_external_frames()
             black = bytes(self._renderer.width * self._renderer.height * 3)
             with contextlib.suppress(Exception):
                 self._renderer.render_frame(black)

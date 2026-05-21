@@ -138,6 +138,10 @@ class MockRenderer:
         self._get_dims = get_dims
         self.output_path = Path(output_path)
         self.last_frame: bytes | None = None
+        # HW-decode (2026-05-20): the pixel_format of the most recent
+        # render_frame() call ("rgb888" / "nv12"). Lets tests assert
+        # the VLC pumps declared the right format.
+        self.last_pixel_format: str | None = None
 
         # IPC-op call recorders (tests + AutoFallbackRenderer assert
         # against these to verify the loop drove the renderer correctly).
@@ -289,10 +293,49 @@ class MockRenderer:
     # Backward-compat push-frame surface (tests, AutoFallback fallback)
     # ------------------------------------------------------------------
 
-    def render_frame(self, frame: bytes) -> None:
-        """Accept a raw RGB888 frame, cache it, write a PNG to
+    def render_frame(
+        self,
+        frame: bytes,
+        *,
+        pixel_format: str = "rgb888",
+        frame_w: int | None = None,
+        frame_h: int | None = None,
+    ) -> None:
+        """Accept a raw external frame, cache it, write a PNG to
         output_path. Preserved for tests + AutoFallbackRenderer's
-        fallback path + capture_current_frame's pull path."""
+        fallback path + capture_current_frame's pull path.
+
+        HW-decode (2026-05-20): `pixel_format` matches the Renderer
+        protocol. `"rgb888"` (the default) keeps the legacy behavior
+        — a renderer-sized RGB888 frame painted to PNG. `"nv12"` is
+        accepted (so the HW-decode VLC pumps drive the mock without
+        raising); the NV12 bytes are cached but not PNG-decoded —
+        the mock has no GPU NV12→RGB path and tests assert on the
+        call counters / last_frame, not on the mock's PNG pixels."""
+        if pixel_format not in ("rgb888", "nv12"):
+            raise ValueError(
+                f"render_frame: unknown pixel_format {pixel_format!r}"
+            )
+        if pixel_format == "nv12":
+            # The mock has no NV12→RGB path; just cache the bytes.
+            # Validate the NV12 byte size against the declared source
+            # dims so a desynced producer is still caught in tests.
+            if frame_w is None or frame_h is None:
+                raise ValueError(
+                    "render_frame: nv12 requires frame_w + frame_h"
+                )
+            expected = int(frame_w) * int(frame_h) * 3 // 2
+            if len(frame) != expected:
+                raise ValueError(
+                    f"nv12 frame length {len(frame)} does not match "
+                    f"{frame_w}x{frame_h} (expected {expected} bytes)"
+                )
+            # Record only after validation — a rejected frame is a
+            # true no-op (does not bump the counter or last_frame).
+            self.render_frame_calls += 1
+            self.last_frame = frame
+            self.last_pixel_format = "nv12"
+            return
         width, height = self._get_dims()
         expected = width * height * 3
         if len(frame) != expected:
@@ -302,6 +345,7 @@ class MockRenderer:
             )
         self.render_frame_calls += 1
         self.last_frame = frame
+        self.last_pixel_format = "rgb888"
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.output_path.write_bytes(_encode_png_rgb(width, height, frame))
 

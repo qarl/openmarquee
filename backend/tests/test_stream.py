@@ -226,7 +226,12 @@ async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
             session = StreamSession(loop)
             captured: list[bytes] = []
             original_render = renderer.render_frame
-            renderer.render_frame = lambda data: captured.append(data) or original_render(data)
+
+            def _record(data, **kwargs):
+                captured.append(data)
+                return original_render(data, **kwargs)
+
+            renderer.render_frame = _record
 
             await session.start_webrtc("v=0\r\noffer\r\n")
             # Fire the captured on_track handler — the fake PC records
@@ -270,7 +275,7 @@ async def test_session_pump_stops_and_logs_once_on_render_failure(
             session = StreamSession(loop)
             render_calls = {"n": 0}
 
-            def boom(_data):
+            def boom(_data, **_kwargs):
                 render_calls["n"] += 1
                 raise NotImplementedError("renderer can't push-render")
 
@@ -545,9 +550,21 @@ def _empty_loop(tmp_path) -> tuple[PlaybackLoop, MockRenderer]:
     return loop, renderer
 
 
-def _patch_mock_ffmpeg(monkeypatch, tmp_path, *, n_frames: int, frame_size: int):
+def _patch_mock_ffmpeg(
+    monkeypatch,
+    tmp_path,
+    *,
+    n_frames: int,
+    frame_size: int,
+    source_size: tuple[int, int] = (8, 8),
+):
     """Point RtspStreamSource's VlcRtspConsumer at a mock-ffmpeg
-    binary that emits `n_frames` frames of `frame_size` bytes."""
+    binary that emits `n_frames` frames of `frame_size` bytes.
+
+    HW-decode (2026-05-20): the consumer ffprobes for the source
+    resolution; inject `source_size` so the probe is skipped (the
+    probe path has its own coverage). `frame_size` should be the
+    NV12 size for `source_size` (src_w*src_h*3//2)."""
     import functools
 
     from openmarquee.vlc_rtsp_consumer import VlcRtspConsumer
@@ -558,7 +575,9 @@ def _patch_mock_ffmpeg(monkeypatch, tmp_path, *, n_frames: int, frame_size: int)
     )
     monkeypatch.setattr(
         "openmarquee.stream_source.VlcRtspConsumer",
-        functools.partial(VlcRtspConsumer, ffmpeg_bin=mock),
+        functools.partial(
+            VlcRtspConsumer, ffmpeg_bin=mock, source_size=source_size
+        ),
     )
 
 
@@ -566,14 +585,28 @@ def _patch_mock_ffmpeg(monkeypatch, tmp_path, *, n_frames: int, frame_size: int)
 async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
     """End-to-end: StreamManager.start() with an RtspStartRequest
     spawns an RtspStreamSource, pumps the (mock) ffmpeg's frames to
-    the renderer, and pauses the playlist. The slice-4 gate."""
-    frame_size = 8 * 8 * 3
-    _patch_mock_ffmpeg(monkeypatch, tmp_path, n_frames=4, frame_size=frame_size)
+    the renderer, and pauses the playlist. The slice-4 gate.
+
+    HW-decode (2026-05-20): the RTSP source now produces NV12 frames
+    at the source resolution (here 8x8 -> 96-byte NV12)."""
+    # NV12 frame size for the injected 8x8 source.
+    frame_size = 8 * 8 * 3 // 2
+    _patch_mock_ffmpeg(
+        monkeypatch, tmp_path, n_frames=4,
+        frame_size=frame_size, source_size=(8, 8),
+    )
     loop, renderer = _empty_loop(tmp_path)
     await loop.start()
     captured: list[bytes] = []
+    captured_formats: list[str] = []
     original_render = renderer.render_frame
-    renderer.render_frame = lambda data: captured.append(data) or original_render(data)
+
+    def _record(data, **kwargs):
+        captured.append(data)
+        captured_formats.append(kwargs.get("pixel_format", "rgb888"))
+        return original_render(data, **kwargs)
+
+    renderer.render_frame = _record
     try:
         manager = StreamManager(loop)
         session_id, answer = await manager.start(
@@ -589,6 +622,9 @@ async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
         assert await _wait_until(lambda: len(captured) >= 4)
         assert len(captured) == 4
         assert all(len(f) == frame_size for f in captured)
+        # HW-decode: the RTSP source declares NV12; the pump threads
+        # that into render_frame().
+        assert all(fmt == "nv12" for fmt in captured_formats)
     finally:
         await manager.stop_all()
         await loop.stop()
@@ -600,7 +636,11 @@ async def test_start_rtsp_session_pulls_frames(tmp_path, monkeypatch):
 async def test_rtsp_session_has_no_peer_connection(tmp_path, monkeypatch):
     """An RTSP takeover uses no RTCPeerConnection and arms no
     phantom-track watchdog — that machinery is WebRTC-only."""
-    _patch_mock_ffmpeg(monkeypatch, tmp_path, n_frames=1, frame_size=8 * 8 * 3)
+    # NV12 frame size for the injected 8x8 source.
+    _patch_mock_ffmpeg(
+        monkeypatch, tmp_path, n_frames=1,
+        frame_size=8 * 8 * 3 // 2, source_size=(8, 8),
+    )
     loop, _renderer = _empty_loop(tmp_path)
     await loop.start()
     try:

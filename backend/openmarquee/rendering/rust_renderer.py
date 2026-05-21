@@ -632,24 +632,63 @@ class RustRenderer:
     # Renderer Protocol conformance (nominal).
     # ------------------------------------------------------------------
 
-    def render_frame(self, frame: bytes) -> None:
-        """Push one RGB888 frame to the sidecar (STREAM/VLC slice 2.5).
+    def render_frame(
+        self,
+        frame: bytes,
+        *,
+        pixel_format: str = "rgb888",
+        frame_w: int | None = None,
+        frame_h: int | None = None,
+    ) -> None:
+        """Push one externally-produced frame to the sidecar.
 
-        `frame` is row-major RGB888, `width * height * 3` bytes. The
-        first call lazy-sends the `begin_external_frames` op (a normal
-        request/response op the sidecar acks immediately, flipping
-        itself into pump-mode); every call then writes the frame
-        length-prefixed onto the dedicated binary frame channel and
-        the sidecar paints it fullscreen.
+        STREAM/VLC slice 2.5 + HW-decode (2026-05-20). The first call
+        lazy-sends the `begin_external_frames` op (a normal request/
+        response op the sidecar acks immediately, flipping itself into
+        pump-mode); every call then writes the frame length-prefixed
+        onto the dedicated binary frame channel and the sidecar paints
+        it fullscreen.
 
-        Source-agnostic: this is "an RGB frame from some producer" —
-        used by the VLC takeover + VlcStreamSlide pumps today, and the
-        future webpage-slide path (STREAM_VLC_PROPOSAL §10).
+        `pixel_format` is declared ONCE per pump run — the first
+        `render_frame()` call's value is what `begin_external_frames`
+        carries; subsequent calls in the same run MUST use the same
+        format (one producer = one format):
+
+        - `"rgb888"` (default): `frame` is row-major RGB888,
+          `width * height * 3` bytes at the renderer panel dims.
+          `frame_w`/`frame_h` are ignored — the panel dims are used.
+          Backward-compatible: a caller that omits the new kwargs
+          (the future webpage BrowserSource) is unchanged.
+        - `"nv12"`: `frame` is planar NV12, `frame_w * frame_h * 3 //
+          2` bytes at the SOURCE video dims; `frame_w`/`frame_h` are
+          REQUIRED. The renderer cover-fit-scales onto the panel and
+          does the NV12→RGB conversion on the GPU. Used by the
+          HW-decode VLC pumps.
+
+        Source-agnostic: this is "a frame from some producer" — the
+        format tag is the only thing that varies.
         """
+        if pixel_format not in ("rgb888", "nv12"):
+            raise RustRendererError(
+                f"render_frame: unknown pixel_format {pixel_format!r}"
+            )
         with self._lock:
             if self._proc is None or self._frame_pipe is None:
                 raise RustRendererError("RustRenderer not opened")
             if not self._external_frames_active:
+                # The frame dims declared in begin_external_frames:
+                # for rgb888 the panel dims (today's behavior); for
+                # nv12 the SOURCE video dims (the renderer cover-fit-
+                # scales). Latched for the life of the pump run.
+                if pixel_format == "nv12":
+                    if frame_w is None or frame_h is None:
+                        raise RustRendererError(
+                            "render_frame: nv12 requires frame_w + frame_h "
+                            "(the source video dimensions)"
+                        )
+                    begin_w, begin_h = int(frame_w), int(frame_h)
+                else:
+                    begin_w, begin_h = self.width, self.height
                 # Lazy-begin: flip the sidecar into pump-mode. This is
                 # a normal write+read op — the sidecar acks at once,
                 # so a sidecar that can't pump-render surfaces its
@@ -661,7 +700,11 @@ class RustRenderer:
                 # already catch the raised error.
                 self._send_op_locked(
                     "begin_external_frames",
-                    {"width": self.width, "height": self.height},
+                    {
+                        "width": begin_w,
+                        "height": begin_h,
+                        "pixel_format": pixel_format,
+                    },
                 )
                 self._external_frames_active = True
             header = len(frame).to_bytes(4, "big")

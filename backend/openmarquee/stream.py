@@ -261,10 +261,37 @@ class StreamSession:
         down normally.
         """
         renderer = self._playback.renderer
+        source = self._source
+        assert source is not None  # _pump is only spawned with a source
+        # HW-decode (2026-05-20): the source declares its pixel format.
+        # An NV12 source (RtspStreamSource) yields source-resolution
+        # frames; the renderer needs the source dims for its GPU cover-
+        # fit. An RGB888 source (WebRtcStreamSource) needs neither —
+        # render_frame()'s rgb888 default uses the panel dims.
+        pixel_format = getattr(source, "pixel_format", "rgb888")
         try:
-            async for frame_bytes in self._source.frames():
+            async for frame_bytes in source.frames():
+                frame_w = frame_h = None
+                if pixel_format == "nv12":
+                    # frame_dims() is known once the consumer's ffprobe
+                    # has run — which is before its first frame, so this
+                    # is populated by the time we get here.
+                    dims = source.frame_dims() if hasattr(source, "frame_dims") else None
+                    if dims is None:
+                        log.error(
+                            "stream: NV12 source yielded a frame before "
+                            "its source dimensions were known; stopping "
+                            "the frame pump."
+                        )
+                        return
+                    frame_w, frame_h = dims
                 try:
-                    renderer.render_frame(frame_bytes)
+                    renderer.render_frame(
+                        frame_bytes,
+                        pixel_format=pixel_format,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                    )
                 except Exception:
                     log.error(
                         "stream: renderer rejected a pushed frame — "

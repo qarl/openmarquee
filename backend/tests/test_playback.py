@@ -378,9 +378,9 @@ def _track_frames(renderer):
     rendered: list[bytes] = []
     original = renderer.render_frame
 
-    def track(frame: bytes) -> None:
+    def track(frame: bytes, **kwargs) -> None:
         rendered.append(frame)
-        original(frame)
+        original(frame, **kwargs)
 
     renderer.render_frame = track  # type: ignore[method-assign]
     return rendered
@@ -711,12 +711,24 @@ async def test_auto_mode_exposes_metadata_on_playback_state(renderer):
 # --- STREAM/VLC Mode B: VlcStreamSlide playback (slice 7) ------------------
 
 
-def _patch_vlc_ffmpeg(monkeypatch, ffmpeg_bin: str) -> None:
+def _patch_vlc_ffmpeg(
+    monkeypatch,
+    ffmpeg_bin: str,
+    *,
+    source_size: tuple[int, int] = (8, 8),
+) -> None:
     """Point the playback loop's VlcRtspConsumer at a mock-ffmpeg
-    binary (or a missing path, to simulate an unreachable stream)."""
+    binary (or a missing path, to simulate an unreachable stream).
+
+    HW-decode (2026-05-20): the consumer ffprobes for the source
+    resolution; inject `source_size` so the probe is skipped (no real
+    ffprobe against the test's fake RTSP URL). The consumer's NV12
+    frame size is then `src_w*src_h*3//2`."""
     monkeypatch.setattr(
         "openmarquee.playback.VlcRtspConsumer",
-        functools.partial(VlcRtspConsumer, ffmpeg_bin=ffmpeg_bin),
+        functools.partial(
+            VlcRtspConsumer, ffmpeg_bin=ffmpeg_bin, source_size=source_size
+        ),
     )
 
 
@@ -725,15 +737,27 @@ async def test_vlc_stream_slide_pumps_frames_to_renderer(
     renderer, tmp_path, monkeypatch
 ):
     """A VlcStreamSlide in the playlist is intercepted before the IPC
-    path; its (mock) RTSP frames are pushed straight to the renderer."""
-    frame_size = 8 * 8 * 3
+    path; its (mock) RTSP frames are pushed straight to the renderer.
+
+    HW-decode (2026-05-20): the consumer emits source-resolution NV12
+    (8x8 -> 96-byte NV12 frames here), and the pump threads the NV12
+    pixel_format + source dims into render_frame()."""
+    # NV12 frame size for the injected 8x8 source.
+    frame_size = 8 * 8 * 3 // 2
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5
     )
-    _patch_vlc_ffmpeg(monkeypatch, mock)
+    _patch_vlc_ffmpeg(monkeypatch, mock, source_size=(8, 8))
     captured: list[bytes] = []
+    captured_formats: list[str] = []
     original = renderer.render_frame
-    renderer.render_frame = lambda d: captured.append(d) or original(d)
+
+    def _record(d, **kwargs):
+        captured.append(d)
+        captured_formats.append(kwargs.get("pixel_format", "rgb888"))
+        return original(d, **kwargs)
+
+    renderer.render_frame = _record
 
     # 2s duration: the first-frame wait is bounded by min(connect-
     # timeout, slot remaining), so a too-short slot would starve the
@@ -754,6 +778,9 @@ async def test_vlc_stream_slide_pumps_frames_to_renderer(
     # and that the renderer received the RTSP frames intact.
     assert captured[0] == bytes([0]) * frame_size
     assert captured[4] == bytes([4]) * frame_size
+    # HW-decode: the consumer's frames are NV12; the pump threads that
+    # format into render_frame().
+    assert all(fmt == "nv12" for fmt in captured_formats)
     # STREAM/VLC slice 2.5: the vlc_stream pump ends the renderer's
     # frame-pump session on every slot exit (once per playlist cycle).
     assert renderer.end_external_frames_calls >= 1
@@ -826,7 +853,12 @@ async def test_vlc_stream_unreachable_black_paints_a_black_frame(
     _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
     captured: list[bytes] = []
     original = renderer.render_frame
-    renderer.render_frame = lambda d: captured.append(d) or original(d)
+
+    def _record(d, **kwargs):
+        captured.append(d)
+        return original(d, **kwargs)
+
+    renderer.render_frame = _record
     vlc = VlcStreamSlide(
         name="dead",
         rtsp_url="rtsp://h/x",

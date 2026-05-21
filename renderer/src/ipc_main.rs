@@ -33,6 +33,10 @@ use crate::playback::{
     advance_command_to_op_result, AdvanceCommand, IpcRequest, IpcResponse, OpResult,
     OpenParams, PlaybackState,
 };
+// ExternalPixelFormat is consumed only by the Linux-only external-
+// frame pump; cfg-gate the import so macOS test builds don't warn.
+#[cfg(target_os = "linux")]
+use crate::playback::ExternalPixelFormat;
 #[cfg(target_os = "linux")]
 use crate::hdmi_logic::FontCatalog;
 #[cfg(target_os = "linux")]
@@ -709,13 +713,21 @@ fn open_external_frame_channel() -> Option<std::fs::File> {
 /// response: it just paints until the end sentinel and returns to
 /// the JSON-op loop.
 ///
-/// Reads length-prefixed RGB888 frames off the binary channel —
+/// Reads length-prefixed frames off the binary channel —
 /// `[u32-BE length][payload]` — painting each one fullscreen until
 /// a length of 0 (the end sentinel). A paint failure is persistent
 /// (a GL/DRM fault), so it is logged ONCE and the pump then just
 /// DRAINS the channel (no per-frame log flood) so the Python writer
 /// never blocks; the held last frame stays on glass. The summary
 /// line carries the frame-pacing numbers slice 9's live-fire parses.
+///
+/// STREAM/VLC HW-decode (2026-05-20): `pixel_format` is declared
+/// once per pump session (one producer = one format). For `rgb888`
+/// each frame is `width*height*3` bytes and `width`/`height` are
+/// the panel dims; for `nv12` each frame is `width*height*3/2`
+/// bytes and `width`/`height` are the SOURCE video dims (the
+/// renderer cover-fit-scales onto the panel). The expected per-
+/// frame byte size + the paint dispatch both branch on the format.
 #[cfg(target_os = "linux")]
 fn run_external_frame_pump(
     session: &mut crate::hdmi::EglSession,
@@ -723,9 +735,15 @@ fn run_external_frame_pump(
     reader: &mut std::fs::File,
     width: u32,
     height: u32,
+    pixel_format: ExternalPixelFormat,
 ) {
     use std::io::Read;
-    let frame_bytes = (width as usize) * (height as usize) * 3;
+    // Per-frame byte size depends on the declared format: RGB888 is
+    // 3 bytes/px, NV12 is 1.5 bytes/px (Y plane + half-res UV).
+    let frame_bytes = match pixel_format {
+        ExternalPixelFormat::Rgb888 => (width as usize) * (height as usize) * 3,
+        ExternalPixelFormat::Nv12 => (width as usize) * (height as usize) * 3 / 2,
+    };
     let mut len_buf = [0u8; 4];
     let mut frame: Vec<u8> = vec![0u8; frame_bytes];
     let mut painted: u64 = 0;
@@ -787,9 +805,22 @@ fn run_external_frame_pump(
             continue;
         }
         let t0 = std::time::Instant::now();
-        match crate::hdmi::paint_and_present_external_frame(
-            session, card, &frame, width, height,
-        ) {
+        // Dispatch on the session's declared pixel format. RGB888 →
+        // raw-RGB upload + FS_BLIT; NV12 → planar Y+UV upload +
+        // cover-fit BT.709 NV12→RGB blit.
+        let paint_res = match pixel_format {
+            ExternalPixelFormat::Rgb888 => {
+                crate::hdmi::paint_and_present_external_frame(
+                    session, card, &frame, width, height,
+                )
+            }
+            ExternalPixelFormat::Nv12 => {
+                crate::hdmi::paint_and_present_external_nv12_frame(
+                    session, card, &frame, width, height,
+                )
+            }
+        };
+        match paint_res {
             Ok(()) => {
                 let us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 paint_us_total += us;
@@ -974,7 +1005,8 @@ where
                     Some(reader) => {
                         emit_response(stdout, &ok_empty())?;
                         run_external_frame_pump(
-                            session, &card, reader, p.width, p.height,
+                            session, &card, reader,
+                            p.width, p.height, p.pixel_format,
                         );
                     }
                 }

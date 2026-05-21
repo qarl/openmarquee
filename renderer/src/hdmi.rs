@@ -345,6 +345,16 @@ pub struct EglSession<'a> {
     /// allocated on the first external frame, freed at session
     /// teardown.
     external_frame_tex: Option<(glow::NativeTexture, u32, u32)>,
+    /// STREAM/VLC HW-decode (2026-05-20): persistent Y + UV texture
+    /// pair for the external-frame NV12 push path. The HW-decode VLC
+    /// pump (`-c:v h264_v4l2m2m`, raw NV12 out) pushes source-res
+    /// NV12 frames; this pair is uploaded once with glTexImage2D and
+    /// thereafter updated in place with glTexSubImage2D — same
+    /// per-frame-churn-avoidance spirit as `external_frame_tex`. The
+    /// tuple is (y_tex, uv_tex, source_w, source_h); reallocated only
+    /// on a source resolution switch. Lazy-allocated on the first
+    /// NV12 frame, freed at session teardown.
+    external_nv12_tex: Option<(glow::NativeTexture, glow::NativeTexture, u32, u32)>,
     /// v1-spec-delta #10 (slice c): caller-applied settings.
     /// Default = identity (Settings::default); apply_settings
     /// updates. paint_and_present_one_frame uses
@@ -635,6 +645,7 @@ where
         scene_fbo: None,
         scene_tex: None,
         external_frame_tex: None,
+        external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
         slide_caches: std::collections::HashMap::new(),
         transition_sp_quad_vbo: None,
@@ -837,6 +848,10 @@ where
         }
         if let Some((tex, _, _)) = session.external_frame_tex.take() {
             gl.delete_texture(tex);
+        }
+        if let Some((y_tex, uv_tex, _, _)) = session.external_nv12_tex.take() {
+            gl.delete_texture(y_tex);
+            gl.delete_texture(uv_tex);
         }
         if let Some(vbo) = session.transition_sp_quad_vbo.take() {
             gl.delete_buffer(vbo);
@@ -3264,6 +3279,109 @@ pub fn paint_and_present_external_frame(
     if let Some(fb) = session.scanout_prev_fb.take() {
         if let Err(e) = card.destroy_framebuffer(fb) {
             eprintln!("warn: destroy_framebuffer(scanout_prev, external_frame): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+    Ok(())
+}
+
+/// STREAM/VLC HW-decode (2026-05-20) — paint one raw planar NV12
+/// frame pushed by an external producer (the HW-decode VLC pump:
+/// `ffmpeg -c:v h264_v4l2m2m`, raw NV12 out, no swscale `-vf`).
+///
+/// The NV12 sibling of `paint_and_present_external_frame`.
+/// Structurally identical — same scene-FBO color/rotation routing,
+/// same scanout swap/commit/pair-rotation — the only difference is
+/// the body: a planar NV12 Y+UV upload + cover-fit BT.709 NV12→RGB
+/// blit (`bake_external_nv12_to_current_fbo`) instead of an RGB888
+/// upload + FS_BLIT.
+///
+/// `frame_w`/`frame_h` are the SOURCE video dims (NV12 frame is
+/// `frame_w*frame_h*3/2` bytes); the GPU cover-fit-scales onto the
+/// panel. Source-agnostic in spirit: any NV12 producer drives this.
+pub fn paint_and_present_external_nv12_frame(
+    session: &mut EglSession,
+    card: &Card,
+    nv12: &[u8],
+    frame_w: u32,
+    frame_h: u32,
+) -> Result<()> {
+    use glow::HasContext;
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    // Non-identity brightness/gamma OR non-zero rotation routes
+    // through the scene FBO + post-pass blit — exactly as the
+    // RGB888 external-frame path does, so a VLC NV12 frame honors
+    // the operator's color + rotation settings on glass.
+    let identity = session.current_settings.is_color_identity();
+    let rotation = session.rotation;
+    let scene_fbo_handle = if !identity || rotation != 0 {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        }
+    }
+    unsafe {
+        bake_external_nv12_to_current_fbo(
+            session.gl,
+            &mut session.external_nv12_tex,
+            nv12,
+            frame_w,
+            frame_h,
+            mode_w,
+            mode_h,
+        )?;
+    }
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = (session.current_settings.brightness as f32) / 100.0;
+        let gamma = session.current_settings.gamma;
+        let (phys_w, phys_h) = session.phys_mode_size();
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
+        }
+    }
+    // Scanout swap / lock / addFB / commit / pair-rotation — verbatim
+    // from paint_and_present_external_frame.
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers (external_nv12) failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer (external_nv12) failed")?
+    };
+    let fb_buf =
+        GbmBufferAdapter::new(&new_bo).context("read GBM bo metadata (external_nv12)")?;
+    let new_fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB (external_nv12) failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card, new_fb) {
+        if let Err(de) = card.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail (external_nv12): {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev, external_nv12): {e}");
         }
     }
     if let Some(bo) = session.scanout_prev_bo.take() {
@@ -5725,6 +5843,143 @@ unsafe fn bake_external_rgb_to_current_fbo(
     }
     let tex = frame_tex.expect("frame_tex is Some after the branch above").0;
     run_blit_pass(gl, tex)
+}
+
+/// STREAM/VLC HW-decode (2026-05-20) — upload one raw planar NV12
+/// frame (Y plane + interleaved UV plane) as a texture pair and
+/// cover-fit-blit it through the BT.709 NV12→RGB shader to fill the
+/// currently-bound framebuffer.
+///
+/// The NV12 analogue of `bake_external_rgb_to_current_fbo`. The
+/// HW-decode VLC pump (`ffmpeg -c:v h264_v4l2m2m`, raw NV12 out, no
+/// `-vf`) hands us a SOURCE-resolution frame; this helper does the
+/// cover-fit scale + crop on the GPU that the dropped ffmpeg
+/// `scale=...:force_original_aspect_ratio=increase,crop=...` filter
+/// used to do — `nv12_cover_fit_uv_transform` computes the UV
+/// remap from (source dims, panel dims) and `run_nv12_cover_blit_
+/// pass` applies it.
+///
+/// `nv12` must be exactly `frame_w * frame_h * 3 / 2` bytes (Y is
+/// `frame_w*frame_h`, UV is `frame_w*frame_h/2`). `frame_w` and
+/// `frame_h` MUST be even (NV12's 4:2:0 chroma is half-res on both
+/// axes); the V4L2 codec / ffmpeg always emits even dims.
+///
+/// Texture-persistence: the Y + UV textures live in `nv12_tex`
+/// (session-persistent). Allocated once with glTexImage2D and
+/// thereafter updated in place with glTexSubImage2D — mirrors the
+/// slice-9 paint-opt in `bake_external_rgb_to_current_fbo` so the
+/// per-frame glGen/glDelete tax is avoided. Reallocation happens
+/// only on a source-resolution switch.
+unsafe fn bake_external_nv12_to_current_fbo(
+    gl: &glow::Context,
+    nv12_tex: &mut Option<(glow::NativeTexture, glow::NativeTexture, u32, u32)>,
+    nv12: &[u8],
+    frame_w: u32,
+    frame_h: u32,
+    mode_w: u32,
+    mode_h: u32,
+) -> Result<()> {
+    use glow::HasContext;
+    // NV12: Y plane is frame_w*frame_h bytes; UV plane is half-res
+    // on both axes but 2 bytes per chroma sample -> frame_w*frame_h/2.
+    let y_bytes = (frame_w as usize) * (frame_h as usize);
+    let expected = y_bytes + y_bytes / 2;
+    if nv12.len() != expected {
+        return Err(anyhow!(
+            "external NV12 frame is {} bytes, expected {}x{} NV12 = {}",
+            nv12.len(),
+            frame_w,
+            frame_h,
+            expected,
+        ));
+    }
+    if frame_w == 0 || frame_h == 0 || frame_w % 2 != 0 || frame_h % 2 != 0 {
+        return Err(anyhow!(
+            "external NV12 frame dims {}x{} must be non-zero and even",
+            frame_w,
+            frame_h,
+        ));
+    }
+    let y_plane = &nv12[..y_bytes];
+    let uv_plane = &nv12[y_bytes..];
+
+    gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+
+    let dims_changed = match *nv12_tex {
+        Some((_, _, w, h)) => w != frame_w || h != frame_h,
+        None => true,
+    };
+    // UNPACK_ALIGNMENT=1: Y rows are frame_w bytes, not 4-aligned
+    // for arbitrary source widths.
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    if dims_changed {
+        // First NV12 frame, or a source-resolution switch —
+        // (re)allocate the persistent Y + UV texture pair.
+        if let Some((old_y, old_uv, _, _)) = nv12_tex.take() {
+            gl.delete_texture(old_y);
+            gl.delete_texture(old_uv);
+        }
+        let y_tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(external NV12 Y): {e}"))?;
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::LUMINANCE as i32,
+            frame_w as i32, frame_h as i32, 0,
+            glow::LUMINANCE, glow::UNSIGNED_BYTE, Some(y_plane),
+        );
+        let uv_tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(external NV12 UV): {e}"))?;
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        // UV plane: 4:2:0 — frame_w/2 (U,V) pairs per row in
+        // LUMINANCE_ALPHA, frame_h/2 rows. FS samples .ra.
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::LUMINANCE_ALPHA as i32,
+            (frame_w / 2) as i32, (frame_h / 2) as i32, 0,
+            glow::LUMINANCE_ALPHA, glow::UNSIGNED_BYTE, Some(uv_plane),
+        );
+        *nv12_tex = Some((y_tex, uv_tex, frame_w, frame_h));
+    } else {
+        // Steady state — textures already sized; update in place.
+        let (y_tex, uv_tex, _, _) = nv12_tex.expect("dims_changed==false implies Some");
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D, 0, 0, 0,
+            frame_w as i32, frame_h as i32,
+            glow::LUMINANCE, glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(y_plane),
+        );
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D, 0, 0, 0,
+            (frame_w / 2) as i32, (frame_h / 2) as i32,
+            glow::LUMINANCE_ALPHA, glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(uv_plane),
+        );
+    }
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+    gl.active_texture(glow::TEXTURE0);
+    let (y_tex, uv_tex, _, _) =
+        nv12_tex.expect("nv12_tex is Some after the branch above");
+    // GPU-side cover-fit: source dims -> panel dims.
+    let (uv_scale, uv_offset) =
+        crate::hdmi_logic::nv12_cover_fit_uv_transform(frame_w, frame_h, mode_w, mode_h);
+    run_nv12_cover_blit_pass(gl, y_tex, uv_tex, uv_scale, uv_offset)
 }
 
 /// Phase 8 slice 2 (2026-05-16) — drain one V4L2 NV12 frame and
@@ -8842,6 +9097,96 @@ unsafe fn run_nv12_blit_pass(
     gl.bind_texture(glow::TEXTURE_2D, None);
     // Program + shared VBO come from session-lived caches; never
     // freed here.
+    Ok(())
+}
+
+/// STREAM/VLC HW-decode (2026-05-20): cached cover-fit NV12 -> RGB
+/// program for the external-frame NV12 push path. Mirrors
+/// `CachedNv12Program` but adds the two cover-fit UV-transform
+/// uniforms (`u_uv_scale`, `u_uv_offset`) consumed by
+/// `FS_NV12_COVER_TO_RGB`.
+#[derive(Copy, Clone)]
+struct CachedNv12CoverProgram {
+    program: glow::NativeProgram,
+    a_pos: u32,
+    a_uv: u32,
+    u_tex_y: Option<glow::NativeUniformLocation>,
+    u_tex_uv: Option<glow::NativeUniformLocation>,
+    u_uv_scale: Option<glow::NativeUniformLocation>,
+    u_uv_offset: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static NV12_COVER_PROGRAM: std::cell::Cell<Option<CachedNv12CoverProgram>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_nv12_cover_program(gl: &glow::Context) -> Result<CachedNv12CoverProgram> {
+    use glow::HasContext;
+    NV12_COVER_PROGRAM.with(|c| {
+        if let Some(p) = c.get() {
+            return Ok(p);
+        }
+        let program = link_program(
+            gl,
+            VS_TEXTURED_QUAD,
+            crate::hdmi_logic::FS_NV12_COVER_TO_RGB,
+        )
+        .context("link FS_NV12_COVER_TO_RGB (external NV12 paint)")?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("FS_NV12_COVER_TO_RGB VS missing a_pos"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("FS_NV12_COVER_TO_RGB VS missing a_uv"))?;
+        let u_tex_y = unsafe { gl.get_uniform_location(program, "u_tex_y") };
+        let u_tex_uv = unsafe { gl.get_uniform_location(program, "u_tex_uv") };
+        let u_uv_scale = unsafe { gl.get_uniform_location(program, "u_uv_scale") };
+        let u_uv_offset = unsafe { gl.get_uniform_location(program, "u_uv_offset") };
+        let cnp = CachedNv12CoverProgram {
+            program, a_pos, a_uv, u_tex_y, u_tex_uv, u_uv_scale, u_uv_offset,
+        };
+        c.set(Some(cnp));
+        Ok(cnp)
+    })
+}
+
+/// STREAM/VLC HW-decode (2026-05-20): draw a fullscreen quad
+/// sampling `y_tex` + `uv_tex` through the cover-fit BT.709 NV12 ->
+/// RGB shader, with `(uv_scale, uv_offset)` remapping the source
+/// onto the panel aspect-preserving (center-cropped overflow).
+/// Caller binds the destination FBO + viewport beforehand and has
+/// already uploaded the two source textures; this pass does no
+/// allocation.
+unsafe fn run_nv12_cover_blit_pass(
+    gl: &glow::Context,
+    y_tex: glow::NativeTexture,
+    uv_tex: glow::NativeTexture,
+    uv_scale: [f32; 2],
+    uv_offset: [f32; 2],
+) -> Result<()> {
+    use glow::HasContext;
+    let cnp = cached_nv12_cover_program(gl)?;
+    let vbo = cached_textured_quad_vbo(gl)?;
+    gl.use_program(Some(cnp.program));
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
+    gl.uniform_1_i32(cnp.u_tex_y.as_ref(), 0);
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
+    gl.uniform_1_i32(cnp.u_tex_uv.as_ref(), 1);
+    gl.uniform_2_f32(cnp.u_uv_scale.as_ref(), uv_scale[0], uv_scale[1]);
+    gl.uniform_2_f32(cnp.u_uv_offset.as_ref(), uv_offset[0], uv_offset[1]);
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.enable_vertex_attrib_array(cnp.a_pos);
+    gl.vertex_attrib_pointer_f32(cnp.a_pos, 2, glow::FLOAT, false, 16, 0);
+    gl.enable_vertex_attrib_array(cnp.a_uv);
+    gl.vertex_attrib_pointer_f32(cnp.a_uv, 2, glow::FLOAT, false, 16, 8);
+    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+    gl.disable_vertex_attrib_array(cnp.a_pos);
+    gl.disable_vertex_attrib_array(cnp.a_uv);
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, None);
     Ok(())
 }
 

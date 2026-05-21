@@ -325,8 +325,12 @@ class _FakeRustRenderer:
         # Don't raise from close — wrapper should swallow teardown
         # errors anyway, but we don't want to obscure assertions.
 
-    def render_frame(self, frame: bytes) -> None:
-        self.calls.append(("render_frame", (len(frame),), {}))
+    def render_frame(self, frame: bytes, **kwargs) -> None:
+        # HW-decode (2026-05-20): render_frame gained keyword-only
+        # pixel_format / frame_w / frame_h; record them so the
+        # forwarding tests can assert AutoFallbackRenderer threads
+        # them through verbatim.
+        self.calls.append(("render_frame", (len(frame),), kwargs))
         self._maybe_raise("render_frame")
 
     def begin_slide(self, *args, **kwargs):
@@ -393,7 +397,15 @@ class TestAutoFallbackRenderer:
         wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
         frame = b"\xff\x00\x00" * 128 * 96  # 1 frame of red, RGB888
         wrapper.render_frame(frame)
-        assert ("render_frame", (len(frame),), {}) in fake.calls
+        # HW-decode (2026-05-20): AutoFallbackRenderer forwards the
+        # render_frame pixel_format / frame_w / frame_h kwargs
+        # verbatim — for a plain (rgb888) call those are the defaults.
+        _rgb_kwargs = {
+            "pixel_format": "rgb888",
+            "frame_w": None,
+            "frame_h": None,
+        }
+        assert ("render_frame", (len(frame),), _rgb_kwargs) in fake.calls
         assert wrapper.is_in_fallback is False
 
     def test_render_frame_subprocess_error_triggers_fallback(self, tmp_path):
@@ -429,7 +441,16 @@ class TestAutoFallbackRenderer:
         # the (now-released) primary.
         wrapper.render_frame(frame)
         # No NEW calls to the fake's render_frame after the first.
-        assert fake.calls.count(("render_frame", (len(frame),), {})) == 1
+        # (The forwarded kwargs are the rgb888 defaults — see
+        # test_happy_path_forwards_to_primary.)
+        _rgb_kwargs = {
+            "pixel_format": "rgb888",
+            "frame_w": None,
+            "frame_h": None,
+        }
+        assert (
+            fake.calls.count(("render_frame", (len(frame),), _rgb_kwargs)) == 1
+        )
         # The MockRenderer wrote the PNG at the dev preview path.
         preview = Path(os.environ["OPENMARQUEE_DEV_PREVIEW_PATH"])
         assert preview.exists()
