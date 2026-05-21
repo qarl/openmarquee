@@ -23,6 +23,13 @@ _GOTO_TIMEOUT_MS = 20_000
 # (SPAs, late-painting widgets) finish before the screenshot is taken.
 _SETTLE_MS = 750
 
+# Cap on concurrent renders. Each in-flight render holds a Chromium
+# context + page; left unbounded, a burst of `/shot` requests piles up
+# contexts and blows host memory. Requests past the cap queue on the
+# semaphore -- harmless, since the producer's HTTP timeout bounds the
+# wait.
+MAX_CONCURRENT_RENDERS = 3
+
 
 class ScreenshotTimeout(Exception):
     """Page load exceeded the timeout budget. Maps to HTTP 504."""
@@ -37,6 +44,9 @@ class ScreenshotError(Exception):
 _playwright = None
 _browser = None
 _browser_lock = asyncio.Lock()
+
+# Bounds the number of renders running at once (see MAX_CONCURRENT_RENDERS).
+_render_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RENDERS)
 
 
 async def _ensure_browser():
@@ -57,7 +67,14 @@ async def _ensure_browser():
         from playwright.async_api import async_playwright
 
         _playwright = await async_playwright().start()
-        _browser = await _playwright.chromium.launch(headless=True)
+        # `--disable-dev-shm-usage`: Docker's default /dev/shm is 64MB,
+        # which headless Chromium overruns and crashes ("Target closed").
+        # Writing shared memory to /tmp instead is the standard hardening
+        # flag -- also helps the pipx path on memory-constrained hosts.
+        _browser = await _playwright.chromium.launch(
+            headless=True,
+            args=["--disable-dev-shm-usage"],
+        )
         return _browser
 
 
@@ -65,8 +82,11 @@ async def render_screenshot(url: str, width: int, height: int) -> bytes:
     """Render `url` at the given viewport and return PNG bytes.
 
     Drives headless Chromium: open a fresh isolated context + page at the
-    requested viewport, navigate, wait for the network to go idle, then
-    take a full-viewport PNG screenshot.
+    requested viewport, navigate, wait for the load event, settle briefly,
+    then take a full-viewport PNG screenshot.
+
+    Concurrency is capped by a module-level semaphore; a burst past the
+    cap simply queues here.
 
     Raises:
         ScreenshotTimeout: the page did not load within the budget.
@@ -76,33 +96,55 @@ async def render_screenshot(url: str, width: int, height: int) -> bytes:
     from playwright.async_api import Error as PlaywrightError
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-    browser = await _ensure_browser()
+    # Cap concurrent renders: each one holds a Chromium context + page.
+    async with _render_semaphore:
+        browser = await _ensure_browser()
 
-    context = await browser.new_context(
-        viewport={"width": width, "height": height},
-    )
-    try:
-        page = await context.new_page()
         try:
-            # `networkidle` gives JS-rendered content a chance to settle;
-            # the timeout bounds a hung / very slow page.
-            await page.goto(
-                url, wait_until="networkidle", timeout=_GOTO_TIMEOUT_MS
+            context = await browser.new_context(
+                viewport={"width": width, "height": height},
             )
-        except PlaywrightTimeoutError as exc:
-            raise ScreenshotTimeout(
-                f"timed out loading {url} after {_GOTO_TIMEOUT_MS} ms"
-            ) from exc
-        except PlaywrightError as exc:
-            raise ScreenshotError(f"failed to load {url}: {exc}") from exc
+            try:
+                page = await context.new_page()
+                try:
+                    # `load` waits for sub-resources but NOT for the
+                    # network to go idle -- `networkidle` hangs the full
+                    # timeout on long-poll / websocket / polling pages
+                    # (i.e. most live dashboards). The fixed `_SETTLE_MS`
+                    # below still gives JS-rendered content time to paint.
+                    await page.goto(
+                        url, wait_until="load", timeout=_GOTO_TIMEOUT_MS
+                    )
+                except PlaywrightTimeoutError as exc:
+                    raise ScreenshotTimeout(
+                        f"timed out loading {url} after {_GOTO_TIMEOUT_MS} ms"
+                    ) from exc
+                except PlaywrightError as exc:
+                    raise ScreenshotError(
+                        f"failed to load {url}: {exc}"
+                    ) from exc
 
-        # A short extra settle for late-painting widgets.
-        await page.wait_for_timeout(_SETTLE_MS)
+                # A short extra settle for late-painting widgets.
+                await page.wait_for_timeout(_SETTLE_MS)
 
-        return await page.screenshot(type="png")
-    finally:
-        # Always tear down the per-request context; the browser stays up.
-        await context.close()
+                return await page.screenshot(type="png")
+            finally:
+                # Always tear down the per-request context; the browser
+                # stays up for reuse.
+                await context.close()
+        except Exception:
+            # A browser that wedged connected-but-unresponsive passes
+            # `is_connected()`, so `_ensure_browser` would never relaunch
+            # it -- every later request would fail too. Tear it down here
+            # (best-effort) so the NEXT request gets a fresh browser.
+            # This is cleanup only: re-raise the original error so the
+            # caller still maps it to 502/504.
+            try:
+                await shutdown_browser()
+            except Exception:
+                # A failure inside cleanup must not mask the real error.
+                pass
+            raise
 
 
 async def shutdown_browser() -> None:
