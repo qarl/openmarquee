@@ -2997,6 +2997,66 @@ pub fn nv12_cover_fit_uv_transform(
     }
 }
 
+/// FYS bug B (2026-05-21) -- compute the COVER-fit fullscreen-quad
+/// vertices for a regular uploaded image / video slide.
+///
+/// Aspect-preserving cover-fit: the source `(frame_w, frame_h)` is
+/// scaled to fully COVER the panel `(panel_w, panel_h)`, and the
+/// overflow on the longer axis is center-cropped. This matches what
+/// the editor already shows — `drawFirstFrameToCanvas` (the video
+/// thumbnail) and the image-upload preview both cover-fit — so the
+/// sign is WYSIWYG. The pre-fix renderer STRETCHED the source to
+/// the panel, distorting any non-panel-aspect asset.
+///
+/// The returned 16-float array is 4 verts of interleaved
+/// `[x, y, u, v]` in TRIANGLE_STRIP order — the same layout as the
+/// shared fullscreen quad in `cached_textured_quad_vbo`, but with
+/// the POSITIONS scaled out past +/-1 NDC on the overflow axis. GL
+/// clips geometry to the +/-1 clip volume, so the overflow is
+/// cropped natively — no oversized GL viewport (the Pi Zero 2 W
+/// vc4 caps `GL_MAX_VIEWPORT_DIMS` at 2048; a vertical clip on a
+/// landscape panel would exceed that). UVs stay [0,1].
+///
+/// vs `nv12_cover_fit_uv_transform`: both cover-fit, but that one
+/// remaps UVs in-shader (it needs `FS_NV12_COVER_TO_RGB`); this
+/// scales quad geometry, so it drops straight into the existing
+/// FS_NV12_TO_RGB / FS_BLIT passes with no shader change.
+///
+/// Pure arithmetic — host-tested, no GL.
+pub fn cover_fit_quad_verts(
+    frame_w: u32,
+    frame_h: u32,
+    panel_w: u32,
+    panel_h: u32,
+) -> [f32; 16] {
+    // Degenerate dims -> the plain fullscreen quad. The caller's
+    // frame-size checks reject 0-area frames before paint; this
+    // guard just keeps the math division-safe.
+    let (sx, sy) = if frame_w == 0 || frame_h == 0
+        || panel_w == 0 || panel_h == 0
+    {
+        (1.0f32, 1.0f32)
+    } else {
+        let frame_aspect = frame_w as f32 / frame_h as f32;
+        let panel_aspect = panel_w as f32 / panel_h as f32;
+        if frame_aspect > panel_aspect {
+            // Source wider than the panel: full height, overflow the
+            // sides past +/-1 x (clipped == center-cropped sides).
+            (frame_aspect / panel_aspect, 1.0)
+        } else {
+            // Source taller (or equal): full width, overflow top +
+            // bottom past +/-1 y (clipped == center-cropped).
+            (1.0, panel_aspect / frame_aspect)
+        }
+    };
+    [
+        -sx, -sy, 0.0, 0.0,
+         sx, -sy, 1.0, 0.0,
+        -sx,  sy, 0.0, 1.0,
+         sx,  sy, 1.0, 1.0,
+    ]
+}
+
 /// V4L2 piece 4b (2026-05-14) -- DMA-BUF zero-copy NV12 sampler
 /// via `GL_OES_EGL_image_external`. Pairs with `VS_TEXTURED_QUAD`
 /// (no vertex changes needed; the difference is purely the
@@ -7354,6 +7414,85 @@ mod tests {
         let (scale, offset) = nv12_cover_fit_uv_transform(1920, 1080, 0, 0);
         assert_eq!(scale, [1.0, 1.0]);
         assert_eq!(offset, [0.0, 0.0]);
+    }
+
+    // FYS bug B (2026-05-21) -- cover-fit quad geometry for regular
+    // image + video slide bakes. The math is pure; these lock the
+    // crop direction + that the quad always covers the panel.
+
+    /// UVs are NEVER scaled — only the four [0,1] pairs, fixed.
+    fn cover_quad_uvs(v: &[f32; 16]) -> [(f32, f32); 4] {
+        [(v[2], v[3]), (v[6], v[7]), (v[10], v[11]), (v[14], v[15])]
+    }
+
+    #[test]
+    fn cover_fit_same_aspect_is_the_plain_fullscreen_quad() {
+        // Source aspect == panel aspect: no overflow, the exact
+        // +/-1 quad (byte-for-byte the cached_textured_quad_vbo one).
+        let v = cover_fit_quad_verts(1280, 720, 1920, 1080);
+        assert_eq!(v, [
+            -1.0, -1.0, 0.0, 0.0,
+             1.0, -1.0, 1.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+        ]);
+    }
+
+    #[test]
+    fn cover_fit_wide_source_overflows_x_keeps_y() {
+        // 2:1 source onto a 1:1 panel: full height (y == +/-1),
+        // the sides overflow past +/-1 x and get clipped (cropped).
+        // sx = frame_aspect / panel_aspect = 2.0 / 1.0 = 2.0.
+        let v = cover_fit_quad_verts(2000, 1000, 1000, 1000);
+        for i in 0..4 {
+            assert!((v[i * 4].abs() - 2.0).abs() < 1e-5, "x overflows to +/-2");
+            assert!((v[i * 4 + 1].abs() - 1.0).abs() < 1e-5, "y stays +/-1");
+        }
+        // UVs untouched — still the full [0,1] square.
+        assert_eq!(
+            cover_quad_uvs(&v),
+            [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)],
+        );
+    }
+
+    #[test]
+    fn cover_fit_tall_source_overflows_y_keeps_x() {
+        // 1:2 source onto a 1:1 panel: full width (x == +/-1), the
+        // top + bottom overflow past +/-1 y and get clipped.
+        // sy = panel_aspect / frame_aspect = 1.0 / 0.5 = 2.0.
+        let v = cover_fit_quad_verts(1000, 2000, 1000, 1000);
+        for i in 0..4 {
+            assert!((v[i * 4].abs() - 1.0).abs() < 1e-5, "x stays +/-1");
+            assert!((v[i * 4 + 1].abs() - 2.0).abs() < 1e-5, "y overflows to +/-2");
+        }
+    }
+
+    #[test]
+    fn cover_fit_always_covers_the_panel() {
+        // Whatever the source aspect, the quad must reach AT LEAST
+        // +/-1 on both axes (so the panel is fully covered, never
+        // letterboxed) — exactly one axis overflows further.
+        for (fw, fh) in [(640, 480), (1920, 1080), (1080, 1920), (3200, 900)] {
+            let v = cover_fit_quad_verts(fw, fh, 1920, 1080);
+            for i in 0..4 {
+                assert!(v[i * 4].abs() >= 1.0 - 1e-5, "x covers for {fw}x{fh}");
+                assert!(v[i * 4 + 1].abs() >= 1.0 - 1e-5, "y covers for {fw}x{fh}");
+            }
+        }
+    }
+
+    #[test]
+    fn cover_fit_degenerate_dims_are_the_fullscreen_quad() {
+        // Zero dims must not divide-by-zero; fall back to the plain
+        // +/-1 quad (caller's frame-size checks reject 0-area frames).
+        let id: [f32; 16] = [
+            -1.0, -1.0, 0.0, 0.0,
+             1.0, -1.0, 1.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+        ];
+        assert_eq!(cover_fit_quad_verts(0, 0, 1920, 1080), id);
+        assert_eq!(cover_fit_quad_verts(1280, 720, 0, 0), id);
     }
 
     #[test]

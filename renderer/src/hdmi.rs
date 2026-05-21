@@ -5356,6 +5356,12 @@ fn clear_bright_gamma_cache(gl: &glow::Context) {
             unsafe { gl.delete_buffer(vbo); }
         }
     });
+    // FYS bug B -- free the cover-fit quad VBO.
+    COVER_QUAD_VBO.with(|c| {
+        if let Some((vbo, _key)) = c.replace(None) {
+            unsafe { gl.delete_buffer(vbo); }
+        }
+    });
 }
 
 /// v1-spec-delta #10 (slice c) -- final blit from scene FBO
@@ -5435,6 +5441,57 @@ unsafe fn present_quad_vbo(gl: &glow::Context, rotation: i32) -> Result<glow::Na
         );
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
         c.set(Some((vbo, rotation)));
+        Ok(vbo)
+    })
+}
+
+std::thread_local! {
+    /// FYS bug B -- cover-fit quad VBO for regular image + video
+    /// slide bakes. The quad's POSITIONS are scaled past +/-1 NDC so
+    /// the source covers the panel aspect-preserving (GL clips the
+    /// overflow); UVs stay fixed. Keyed on (frame_w, frame_h,
+    /// panel_w, panel_h) — the geometry only changes on a source- or
+    /// panel-dims change (a slide change to a differently-sized
+    /// asset / a resolution switch), so it rebuilds rarely. Freed in
+    /// clear_bright_gamma_cache at session teardown.
+    static COVER_QUAD_VBO: std::cell::Cell<
+        Option<(glow::NativeBuffer, (u32, u32, u32, u32))>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+/// FYS bug B (2026-05-21) -- get-or-rebuild the cover-fit quad VBO
+/// for a (source dims, panel dims) pair. The vertices come from the
+/// host-tested `cover_fit_quad_verts`. STATIC_DRAW; rebuilt only
+/// when the requested dims differ from the cached ones.
+unsafe fn cover_quad_vbo(
+    gl: &glow::Context,
+    frame_w: u32,
+    frame_h: u32,
+    panel_w: u32,
+    panel_h: u32,
+) -> Result<glow::NativeBuffer> {
+    use glow::HasContext;
+    let key = (frame_w, frame_h, panel_w, panel_h);
+    COVER_QUAD_VBO.with(|c| {
+        if let Some((vbo, cached_key)) = c.get() {
+            if cached_key == key {
+                return Ok(vbo);
+            }
+            gl.delete_buffer(vbo);
+        }
+        let vbo = gl
+            .create_buffer()
+            .map_err(|e| anyhow!("glGenBuffers(cover_quad): {e}"))?;
+        let verts = crate::hdmi_logic::cover_fit_quad_verts(
+            frame_w, frame_h, panel_w, panel_h,
+        );
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes = std::slice::from_raw_parts(
+            verts.as_ptr() as *const u8,
+            std::mem::size_of_val(&verts),
+        );
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+        c.set(Some((vbo, key)));
         Ok(vbo)
     })
 }
@@ -5751,7 +5808,13 @@ unsafe fn bake_image_slide_to_current_fbo(
         img_w as i32, img_h as i32, 0,
         glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
     );
-    let blit_result = run_blit_pass(gl, tex);
+    // FYS bug B (2026-05-21): cover-fit the image to the panel
+    // (aspect-preserving, overflow center-cropped) instead of
+    // stretching it — matches the cover-fit editor preview. The
+    // panel is cleared black above, so a cover quad that exactly
+    // covers it leaves no bars.
+    let cover_vbo = cover_quad_vbo(gl, img_w, img_h, mode_w, mode_h)?;
+    let blit_result = run_blit_pass_quad(gl, tex, cover_vbo);
     gl.delete_texture(tex);
     blit_result
 }
@@ -6098,6 +6161,17 @@ unsafe fn bake_video_slide_to_current_fbo(
     };
     let f_w = frame.width();
     let f_h = frame.height();
+    // FYS bug B (2026-05-21): a regular uploaded MP4 video must be
+    // shown aspect-preserving, not stretched to fill the panel.
+    // cover_quad_vbo gives a quad whose positions overflow +/-1 NDC
+    // on the longer axis so the source covers the panel and the
+    // overflow is GL-clipped (center-cropped) — matching the
+    // cover-fit editor preview / thumbnail. (The HW-decode NV12
+    // push path covers via an in-shader UV remap instead; both
+    // cover-fit — see cover_fit_quad_verts / nv12_cover_fit_uv_
+    // transform.) The whole panel is still cleared black below as a
+    // safety net; a cover quad leaves no bars.
+    let cover_vbo = cover_quad_vbo(session.gl, f_w, f_h, mode_w, mode_h)?;
     // V4L2 piece 4d: branch on the Frame's transport mode. DmaBuf
     // path (piece 4a-c) skips the per-frame Y/UV CPU upload + uses
     // an EGLImage-bound external-OES sampler. MMAP path (piece
@@ -6115,6 +6189,7 @@ unsafe fn bake_video_slide_to_current_fbo(
             gl.clear(glow::COLOR_BUFFER_BIT);
             run_nv12_dmabuf_blit_pass(
                 gl,
+                cover_vbo,
                 session.egl_lib,
                 session.display,
                 fd,
@@ -6202,7 +6277,8 @@ unsafe fn bake_video_slide_to_current_fbo(
     // Reset active unit so run_nv12_blit_pass's own binding
     // sequence starts from a clean slate.
     gl.active_texture(glow::TEXTURE0);
-    let blit_result = run_nv12_blit_pass(gl, y_tex, uv_tex);
+    // FYS bug B: cover_vbo cover-fits the frame to the panel.
+    let blit_result = run_nv12_blit_pass(gl, cover_vbo, y_tex, uv_tex);
     gl.delete_texture(y_tex);
     gl.delete_texture(uv_tex);
     // Restore GL_UNPACK_ALIGNMENT to the default (4). Bumped to 1
@@ -9062,20 +9138,22 @@ fn cached_nv12_program(gl: &glow::Context) -> Result<CachedNv12Program> {
     })
 }
 
-/// V4L2 piece 3d: draw a fullscreen quad sampling `y_tex` (Y plane,
+/// V4L2 piece 3d: draw a `vbo` quad sampling `y_tex` (Y plane,
 /// GL_LUMINANCE) and `uv_tex` (UV plane, GL_LUMINANCE_ALPHA) through
 /// the BT.601 limited-range NV12 -> RGB shader. Caller binds the
 /// destination FBO + viewport beforehand. The two source textures
 /// must already be uploaded; this pass does no allocation -- just
-/// the per-frame draw.
+/// the per-frame draw. `vbo` is a 4-vert interleaved `[x,y,u,v]`
+/// TRIANGLE_STRIP quad — the shared `cached_textured_quad_vbo` for a
+/// plain fill, or a `cover_quad_vbo` for FYS bug B cover-fit.
 unsafe fn run_nv12_blit_pass(
     gl: &glow::Context,
+    vbo: glow::NativeBuffer,
     y_tex: glow::NativeTexture,
     uv_tex: glow::NativeTexture,
 ) -> Result<()> {
     use glow::HasContext;
     let cnp = cached_nv12_program(gl)?;
-    let vbo = cached_textured_quad_vbo(gl)?;
     gl.use_program(Some(cnp.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
@@ -9409,6 +9487,9 @@ fn cached_nv12_dmabuf_program(gl: &glow::Context) -> Result<CachedNv12DmaBufProg
 ///
 /// Inputs:
 ///   - `gl`: the active GLES2 context.
+///   - `vbo`: the 4-vert interleaved `[x,y,u,v]` TRIANGLE_STRIP
+///     quad to draw — `cached_textured_quad_vbo` for a plain fill
+///     or a `cover_quad_vbo` for FYS bug B cover-fit.
 ///   - `egl_lib`, `display`: the EGL display the GL context was
 ///     created against. Used for eglCreateImageKHR.
 ///   - `fd`: V4L2-exported DMA-BUF file descriptor (from
@@ -9429,7 +9510,7 @@ fn cached_nv12_dmabuf_program(gl: &glow::Context) -> Result<CachedNv12DmaBufProg
 ///     CAPTURE is single-plane; UV at offset Y_SIZE).
 ///   - Creates a transient GL_TEXTURE_EXTERNAL_OES texture, binds
 ///     the EGLImage via glEGLImageTargetTexture2DOES.
-///   - Draws a fullscreen quad through FS_NV12_DMABUF_TO_RGB.
+///   - Draws the `vbo` quad through FS_NV12_DMABUF_TO_RGB.
 ///   - Tears down the texture + EGLImage. Caller-managed:
 ///     destruction order is texture-then-image (the texture holds
 ///     a reference to the image until unbound; destroying the
@@ -9449,6 +9530,7 @@ fn cached_nv12_dmabuf_program(gl: &glow::Context) -> Result<CachedNv12DmaBufProg
 #[cfg(target_os = "linux")]
 pub unsafe fn run_nv12_dmabuf_blit_pass(
     gl: &glow::Context,
+    vbo: glow::NativeBuffer,
     egl_lib: &egl::DynamicInstance<egl::EGL1_5>,
     display: egl::Display,
     fd: std::os::fd::RawFd,
@@ -9527,7 +9609,6 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     // FS_NV12_DMABUF_TO_RGB on first call.
     let blit_result = (|| -> Result<()> {
         let cnp = cached_nv12_dmabuf_program(gl)?;
-        let vbo = cached_textured_quad_vbo(gl)?;
         gl.use_program(Some(cnp.program));
         // Texture is ALREADY bound + the image associated above;
         // just set the sampler uniform to TEXTURE0.
@@ -10790,25 +10871,37 @@ unsafe fn run_overlay_blend_pass(
 }
 
 /// v1-spec-delta #7 (slice c) helper -- blit a texture to the
-/// currently-bound framebuffer via FS_BLIT. Used at end of the
-/// overlay route to copy the final scene texture to the default
-/// framebuffer. Caller must have bound the target FBO and set
-/// the viewport.
+/// currently-bound framebuffer via FS_BLIT, filling it (the shared
+/// fullscreen quad). Used at end of the overlay route to copy the
+/// final scene texture to the default framebuffer. Caller must have
+/// bound the target FBO and set the viewport.
 unsafe fn run_blit_pass(
     gl: &glow::Context,
     src_tex: glow::NativeTexture,
 ) -> Result<()> {
+    run_blit_pass_quad(gl, src_tex, cached_textured_quad_vbo(gl)?)
+}
+
+/// FYS bug B (2026-05-21) -- `run_blit_pass` with an explicit quad
+/// `vbo`. `run_blit_pass` passes the shared fullscreen quad (fill);
+/// the image slide bake passes a `cover_quad_vbo` so the asset is
+/// cover-fit (aspect-preserved, overflow clipped) instead of
+/// stretched. `vbo` is a 4-vert interleaved `[x,y,u,v]`
+/// TRIANGLE_STRIP quad.
+unsafe fn run_blit_pass_quad(
+    gl: &glow::Context,
+    src_tex: glow::NativeTexture,
+    vbo: glow::NativeBuffer,
+) -> Result<()> {
     use glow::HasContext;
     // P2-G (2026-05-10): use the existing session-cached
     // CachedBlitProgram (was already cached for the atlas SB
-    // bg-cache path; just plug it in here too) + the shared
-    // cached_textured_quad_vbo. Pre-fix this path was per-call
-    // link_program + create_buffer + 2x get_attrib_location +
-    // 1x get_uniform_location + draw + delete_buffer +
+    // bg-cache path; just plug it in here too). Pre-fix this path
+    // was per-call link_program + create_buffer + 2x get_attrib_
+    // location + 1x get_uniform_location + draw + delete_buffer +
     // delete_program -- on the overlay-route final blit, that's
     // every frame the slide has a non-Normal-blend layer.
     let cbp = cached_blit_program(gl)?;
-    let vbo = cached_textured_quad_vbo(gl)?;
     gl.use_program(Some(cbp.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
@@ -10822,8 +10915,8 @@ unsafe fn run_blit_pass(
     gl.disable_vertex_attrib_array(cbp.a_pos);
     gl.disable_vertex_attrib_array(cbp.a_uv);
     gl.bind_texture(glow::TEXTURE_2D, None);
-    // Program + shared VBO come from session-lived caches; never
-    // freed here.
+    // Program + caller-supplied VBO come from session-lived caches;
+    // never freed here.
     Ok(())
 }
 
