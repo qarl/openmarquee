@@ -850,6 +850,28 @@ def get_playback_loop() -> PlaybackLoop:
     return _playback_loop_singleton()
 
 
+def get_web_screenshot_kicker() -> Callable[[Any], None]:
+    """Dependency provider for the immediate Web-slide screenshot kick.
+
+    Bug W1: a freshly-created (or url-changed) Web slide shows only the
+    synthetic placeholder asset until its first playback slot — the
+    dashboard thumbnail / editor preview / preview window are blank
+    until then, because the screenshot producer is lazy/periodic.
+
+    Returns a callable that, given the new/changed WebSlide, fires an
+    IMMEDIATE fire-and-forget screenshot fetch via the playback loop's
+    `kick_web_refresh_now`. The loop already owns the producer closure
+    (with the helper URL/token + renderer dims) and the fire-and-forget
+    + done-callback machinery — this provider just hands the API route
+    a thin entry point onto it, so the route never blocks the request
+    and never duplicates the producer's logic.
+
+    Tests override this via `app.dependency_overrides` to assert the
+    kick happens (or to stub it out) without spinning a real loop.
+    """
+    return _playback_loop_singleton().kick_web_refresh_now
+
+
 @lru_cache
 def _stream_manager_singleton():
     """Process-wide stream takeover manager (SYSTEM_SPEC §5.11).

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 from pathlib import Path
@@ -1041,3 +1042,158 @@ def test_put_web_unknown_id_returns_404(client: TestClient):
         json={"name": "ghost", "url": "https://h/x"},
     )
     assert response.status_code == 404
+
+
+# --- web (Bug W1): immediate screenshot kick on create / url change --------
+
+
+def test_post_web_kicks_an_immediate_screenshot_fetch(client: TestClient):
+    """Bug W1: creating a Web slide kicks an immediate screenshot fetch
+    so the thumbnail/preview populate promptly instead of waiting for
+    the first playback slot. Mock the kicker; assert it ran for the
+    created slide."""
+    from openmarquee.dependencies import get_web_screenshot_kicker
+
+    kicked: list = []
+    app.dependency_overrides[get_web_screenshot_kicker] = (
+        lambda: kicked.append
+    )
+    response = client.post(
+        "/api/content/web",
+        json={"name": "Status", "url": "https://h/x"},
+    )
+    assert response.status_code == 200
+    # The kicker was invoked exactly once, with the created WebSlide.
+    assert len(kicked) == 1
+    assert str(kicked[0].id) == response.json()["id"]
+    assert kicked[0].url == "https://h/x"
+
+
+def test_post_web_does_not_block_on_the_screenshot_fetch(client: TestClient):
+    """CRITICAL (mirrors test_playback's "slot does not await the
+    fetch"): the create response must NOT block on the screenshot
+    fetch. A kicker that launches a hanging fetch task must not delay
+    the POST response."""
+    from openmarquee.dependencies import get_web_screenshot_kicker
+
+    async def _hangs_forever(_slide) -> bool:
+        await asyncio.sleep(3600)
+        return True
+
+    launched: list = []
+
+    def kicker(slide) -> None:
+        # Fire-and-forget a task that never finishes — exactly what a
+        # slow render helper would look like. The route must return
+        # without awaiting it.
+        launched.append(asyncio.ensure_future(_hangs_forever(slide)))
+
+    app.dependency_overrides[get_web_screenshot_kicker] = lambda: kicker
+    try:
+        response = client.post(
+            "/api/content/web",
+            json={"name": "Slow", "url": "https://h/slow"},
+        )
+        # The POST returned promptly despite the hanging fetch.
+        assert response.status_code == 200
+        assert len(launched) == 1
+        assert not launched[0].done()  # still hanging — was not awaited
+    finally:
+        # Cancel the dangling task so it doesn't leak past the test.
+        for task in launched:
+            task.cancel()
+
+
+def test_post_web_succeeds_even_when_the_kick_producer_fails(
+    client: TestClient,
+):
+    """Bug W1 edge: if the render helper is unreachable at create time
+    the producer fails internally — creation must NOT fail. The
+    fire-and-forget kick must not surface a producer failure as a 500
+    or an unhandled task exception."""
+    from openmarquee.dependencies import get_web_screenshot_kicker
+
+    async def _failing_producer(_slide) -> bool:
+        raise RuntimeError("render helper unreachable")
+
+    crashed: list = []
+
+    def kicker(slide) -> None:
+        # Mirror the playback loop's fire-and-forget + done-callback:
+        # a producer that raises is consumed by the done-callback so it
+        # never surfaces as an unretrieved-exception warning.
+        task = asyncio.ensure_future(_failing_producer(slide))
+
+        def _on_done(t: "asyncio.Task") -> None:
+            if not t.cancelled() and t.exception() is not None:
+                crashed.append(t.exception())
+
+        task.add_done_callback(_on_done)
+
+    app.dependency_overrides[get_web_screenshot_kicker] = lambda: kicker
+    response = client.post(
+        "/api/content/web",
+        json={"name": "Unreachable", "url": "https://h/down"},
+    )
+    # Creation succeeded despite the producer failing.
+    assert response.status_code == 200
+    item_id = response.json()["id"]
+    # The slide really exists and is fetchable.
+    assert client.get(f"/api/content/{item_id}").status_code == 200
+    # The producer failure was consumed by the done-callback, not
+    # raised — belt-and-suspenders proof it can't crash the request.
+    assert len(crashed) == 1
+
+
+def test_put_web_url_change_kicks_a_screenshot_fetch(client: TestClient):
+    """Bug W1: changing a Web slide's url re-shoots the screenshot so
+    the thumbnail reflects the new page."""
+    from openmarquee.dependencies import get_web_screenshot_kicker
+
+    post = client.post(
+        "/api/content/web",
+        json={"name": "Before", "url": "https://h/old"},
+    )
+    item_id = post.json()["id"]
+
+    kicked: list = []
+    app.dependency_overrides[get_web_screenshot_kicker] = (
+        lambda: kicked.append
+    )
+    response = client.put(
+        f"/api/content/web/{item_id}",
+        json={"name": "Before", "url": "https://h/new"},
+    )
+    assert response.status_code == 200
+    # The url changed — a re-shot was kicked for the updated slide.
+    assert len(kicked) == 1
+    assert kicked[0].url == "https://h/new"
+    assert str(kicked[0].id) == item_id
+
+
+def test_put_web_metadata_only_edit_does_not_kick_a_fetch(client: TestClient):
+    """Bug W1: a PUT that changes only name/duration (url unchanged)
+    must NOT re-shoot — the existing screenshot is still valid."""
+    from openmarquee.dependencies import get_web_screenshot_kicker
+
+    post = client.post(
+        "/api/content/web",
+        json={"name": "Before", "url": "https://h/same"},
+    )
+    item_id = post.json()["id"]
+
+    kicked: list = []
+    app.dependency_overrides[get_web_screenshot_kicker] = (
+        lambda: kicked.append
+    )
+    response = client.put(
+        f"/api/content/web/{item_id}",
+        json={
+            "name": "After",
+            "url": "https://h/same",  # unchanged
+            "duration_ms": 20_000,
+        },
+    )
+    assert response.status_code == 200
+    # url unchanged — no re-shot.
+    assert kicked == []

@@ -725,18 +725,57 @@ class PlaybackLoop:
         """
         if self._web_screenshot_producer is None:
             return
+        now = asyncio.get_event_loop().time()
+        last = self._web_last_fetch.get(slide.id)
+        if not web_refresh_due(last, now, slide.refresh_interval_s):
+            return
+        self._launch_web_refresh(slide)
+
+    def kick_web_refresh_now(self, slide: WebSlide) -> None:
+        """Fire-and-forget an IMMEDIATE screenshot refresh for `slide`,
+        bypassing the staleness check — NON-BLOCKING.
+
+        Bug W1: a freshly-created (or url-changed) Web slide has only
+        the synthetic placeholder asset until its first playback slot
+        comes round — the dashboard thumbnail / editor preview are
+        blank until then. The create/update API handler calls this so
+        the real screenshot populates promptly instead of waiting for
+        the periodic producer.
+
+        Same non-blocking contract as `_maybe_kick_web_refresh`: the
+        fetch is launched with `asyncio.create_task` and this returns
+        IMMEDIATELY, so the HTTP request never blocks on the 2-10s
+        helper fetch. The in-flight guard still applies (a kick while
+        a fetch is already running for this id is a no-op) and the
+        kick time is stamped so the periodic loop's next slot sees the
+        slide as fresh. A no-op if no producer is wired (test configs).
+        """
+        if self._web_screenshot_producer is None:
+            return
+        self._launch_web_refresh(slide)
+
+    def _launch_web_refresh(self, slide: WebSlide) -> None:
+        """Launch the fire-and-forget screenshot fetch task for `slide`.
+
+        Shared by `_maybe_kick_web_refresh` (the periodic, staleness-
+        gated path) and `kick_web_refresh_now` (the create/update
+        immediate path). Stamps the kick time, marks the id in-flight,
+        creates the task, and attaches the done-callback that clears
+        the in-flight id + surfaces a crashed task via the logger.
+
+        The in-flight guard lives here so neither caller can stack two
+        fetches for the same slide. The producer is contracted never
+        to raise; the done-callback is belt-and-suspenders so a
+        failed task can't surface as an unretrieved-exception warning.
+        """
         slide_id = slide.id
         if slide_id in self._web_inflight:
             return
-        now = asyncio.get_event_loop().time()
-        last = self._web_last_fetch.get(slide_id)
-        if not web_refresh_due(last, now, slide.refresh_interval_s):
-            return
-
+        assert self._web_screenshot_producer is not None
         # Stamp the kick time NOW (not on completion): keeps the
         # refresh cadence steady regardless of how long the fetch
         # takes, and ensures a slow fetch isn't re-kicked next slot.
-        self._web_last_fetch[slide_id] = now
+        self._web_last_fetch[slide_id] = asyncio.get_event_loop().time()
         self._web_inflight.add(slide_id)
         producer = self._web_screenshot_producer
         width = self._renderer.width

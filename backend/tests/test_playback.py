@@ -1181,3 +1181,102 @@ async def test_inflight_id_not_pruned_when_slide_leaves_playlist(renderer):
     await asyncio.sleep(0.05)
     assert web.id not in loop._web_inflight
     await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_kick_web_refresh_now_fires_an_immediate_fetch(renderer):
+    """Bug W1: kick_web_refresh_now fires the producer immediately,
+    bypassing the staleness check — used by the create/update API
+    handlers so a new/changed Web slide gets a real asset promptly."""
+    web = WebSlide(
+        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        # A long interval — web_refresh_due would say "not due" if it
+        # had ever been stamped; kick_web_refresh_now ignores it.
+        refresh_interval_s=86400,
+    )
+    calls: list[tuple] = []
+
+    async def producer(slide, width, height) -> bool:
+        calls.append((slide.id, width, height))
+        return True
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (1, 2, 3)),
+        web_screenshot_producer=producer,
+    )
+    loop.kick_web_refresh_now(web)
+    await asyncio.sleep(0.05)
+    # The producer ran once with the slide id + the renderer's dims.
+    assert calls == [(web.id, renderer.width, renderer.height)]
+
+
+@pytest.mark.asyncio
+async def test_kick_web_refresh_now_does_not_block_on_a_hanging_fetch(
+    renderer,
+):
+    """Bug W1: kick_web_refresh_now is fire-and-forget — it returns
+    IMMEDIATELY even if the producer hangs forever (a slow/dead render
+    helper must never delay the create/update HTTP response)."""
+    web = WebSlide(
+        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+    )
+    started = asyncio.Event()
+
+    async def hanging_producer(slide, width, height) -> bool:
+        started.set()
+        await asyncio.sleep(3600)
+        return True
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (4, 5, 6)),
+        web_screenshot_producer=hanging_producer,
+    )
+    # Returns synchronously — no await — despite the hanging producer.
+    loop.kick_web_refresh_now(web)
+    await asyncio.sleep(0.05)
+    assert started.is_set()
+    # The hanging fetch is tracked in-flight; it never finished.
+    assert web.id in loop._web_inflight
+
+
+@pytest.mark.asyncio
+async def test_kick_web_refresh_now_no_producer_is_a_noop(renderer):
+    """Bug W1: with no producer wired (test/standalone configs),
+    kick_web_refresh_now is a clean no-op — it must not raise."""
+    web = WebSlide(name="status", url="https://h/x")
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (1, 1, 1)),
+        web_screenshot_producer=None,
+    )
+    # No producer — does nothing, raises nothing.
+    loop.kick_web_refresh_now(web)
+    assert web.id not in loop._web_inflight
+
+
+@pytest.mark.asyncio
+async def test_kick_web_refresh_now_failed_producer_does_not_raise(renderer):
+    """Bug W1 edge: a producer that raises (render helper unreachable)
+    must not surface as an unretrieved-task exception — the kick's
+    done-callback consumes it and clears the in-flight id."""
+    web = WebSlide(name="status", url="https://h/down")
+
+    async def failing_producer(slide, width, height) -> bool:
+        raise RuntimeError("render helper unreachable")
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (1, 1, 1)),
+        web_screenshot_producer=failing_producer,
+    )
+    loop.kick_web_refresh_now(web)
+    await asyncio.sleep(0.05)
+    # The crashed task's done-callback cleared the in-flight id, so a
+    # subsequent kick can still proceed — no wedged id, no raise.
+    assert web.id not in loop._web_inflight

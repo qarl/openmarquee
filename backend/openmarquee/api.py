@@ -8,6 +8,7 @@ content variants, post-demo.
 import base64
 import io
 import json
+from collections.abc import Callable
 from typing import Annotated
 from uuid import UUID
 
@@ -33,6 +34,7 @@ from openmarquee.dependencies import (
     get_flock_sync,
     get_playlist_storage,
     get_tombstone_storage,
+    get_web_screenshot_kicker,
 )
 from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync
@@ -46,6 +48,13 @@ StorageDep = Annotated[ContentStorage, Depends(get_content_storage)]
 PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]
 TombstoneDep = Annotated[TombstoneStorage, Depends(get_tombstone_storage)]
 FlockSyncDep = Annotated[FlockSync, Depends(get_flock_sync)]
+# Bug W1: a callable that fires an IMMEDIATE, fire-and-forget Web-slide
+# screenshot fetch so a just-created / url-changed Web slide gets a real
+# asset image promptly instead of showing the placeholder until its
+# first playback slot. Non-blocking — the route never awaits the fetch.
+WebScreenshotKickerDep = Annotated[
+    Callable[[WebSlide], None], Depends(get_web_screenshot_kicker)
+]
 
 
 # --- Batch 11.3 / sweep #5 #4: CORS allowlist helper ---
@@ -786,6 +795,7 @@ async def upload_web(
     storage: StorageDep,
     playlist_storage: PlaylistDep,
     flock_sync: FlockSyncDep,
+    kick_web_screenshot: WebScreenshotKickerDep,
     background: BackgroundTasks,
 ) -> WebSlide:
     # Security: the URL is operator-supplied and is handed to the
@@ -804,6 +814,15 @@ async def upload_web(
     storage.save_web(slide)
     _append_to_playlist(playlist_storage, slide.id)
     background.add_task(flock_sync.notify_peers, slide.id, "updated")
+    # Bug W1: a brand-new Web slide only has the synthetic placeholder
+    # asset until its first playback slot — its dashboard thumbnail /
+    # editor preview would be blank until then. Kick an IMMEDIATE
+    # screenshot fetch so the real asset image populates promptly. The
+    # kick is fire-and-forget (the playback loop launches it via
+    # create_task) so the create response returns immediately; if the
+    # render helper is unreachable the producer logs + leaves the
+    # placeholder, so creation still succeeds.
+    kick_web_screenshot(slide)
     return slide
 
 
@@ -825,6 +844,7 @@ async def update_web(
     payload: WebUpdate,
     storage: StorageDep,
     flock_sync: FlockSyncDep,
+    kick_web_screenshot: WebScreenshotKickerDep,
     background: BackgroundTasks,
 ) -> WebSlide:
     try:
@@ -854,6 +874,13 @@ async def update_web(
         raise _validation_error_422(exc) from exc
     storage.save_web(updated)
     background.add_task(flock_sync.notify_peers, updated.id, "updated")
+    # Bug W1: when the url CHANGED the existing screenshot is now stale
+    # (it shot the old page) — kick an IMMEDIATE, fire-and-forget
+    # re-shot so the thumbnail/preview reflect the new url promptly. A
+    # metadata-only edit (name/duration/transition, url unchanged)
+    # keeps the existing screenshot and does NOT re-shoot.
+    if payload.url != existing.url:
+        kick_web_screenshot(updated)
     return updated
 
 
