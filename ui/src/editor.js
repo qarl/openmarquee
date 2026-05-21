@@ -332,6 +332,10 @@ const LAYER_GROUP_TEMPLATE = `
  * @param {object} options
  * @param {number} options.width  — sign width in pixels.
  * @param {number} options.height — sign height in pixels.
+ * @param {number} [options.rotation] — device display_rotation
+ *     (0/90/180/270). Threaded into rasterizeAtTarget so the saved
+ *     asset.png is laid out in the panel's installed orientation
+ *     (FYS bug 7). Defaults to 0 (landscape).
  * @param {(payload) => Promise<any>} options.onSave — called for NEW
  *     slides; payload is the TextSlideUpload shape with text_layers list.
  * @param {(id, payload) => Promise<any>} [options.onSaveExisting] — called
@@ -344,7 +348,15 @@ const LAYER_GROUP_TEMPLATE = `
  */
 export function mountEditor(
     container,
-    { width, height, onSave, onSaveExisting, fetchItems, onGenerateBackground },
+    {
+        width,
+        height,
+        rotation = 0,
+        onSave,
+        onSaveExisting,
+        fetchItems,
+        onGenerateBackground,
+    },
 ) {
     container.innerHTML = EDITOR_TEMPLATE;
 
@@ -1447,7 +1459,10 @@ export function mountEditor(
 
     async function performSave() {
         if (document.fonts?.ready) await document.fonts.ready;
-        const png_base64 = rasterizeAtTarget(state);
+        // FYS bug 7: pass the device rotation so the saved asset.png is
+        // laid out portrait at 90/270 — matching the dashboard tile's
+        // rotation-aware --device-aspect.
+        const png_base64 = rasterizeAtTarget(state, rotation);
         const durationSeconds = Number(durationEl.value) || 5;
         const text_layers = state.layers.map((layer) => ({
             text: layer.text,

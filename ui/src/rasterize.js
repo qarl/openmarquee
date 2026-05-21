@@ -624,11 +624,23 @@ export function pickFontSizePct() {
 /**
  * Render the editor scene onto a fresh offscreen 4K canvas and
  * return its base64 PNG body.
+ *
+ * FYS bug 7 (2026-05-20): `rotation` is the device's display_rotation
+ * (0 / 90 / 180 / 270). At 90 / 270 the panel is mounted portrait, so
+ * the saved asset.png must be laid out PORTRAIT — RASTERIZE_H ×
+ * RASTERIZE_W — to match the portrait `--device-aspect` the dashboard
+ * thumbnail tile pins. At 0 / 180 the asset.png stays landscape
+ * (RASTERIZE_W × RASTERIZE_H), exactly as before. Only the offscreen
+ * canvas DIMS change here; drawCanvas lays the scene out fractionally
+ * (box.x/y/w/h are 0..1) so it fills whatever aspect it's handed —
+ * there is no pixel-rotation transform, the operator already authored
+ * the slide against a portrait editor canvas at 90/270.
  */
-export function rasterizeAtTarget(state) {
+export function rasterizeAtTarget(state, rotation = 0) {
     const off = document.createElement("canvas");
-    off.width = RASTERIZE_W;
-    off.height = RASTERIZE_H;
+    const portrait = rotation === 90 || rotation === 270;
+    off.width = portrait ? RASTERIZE_H : RASTERIZE_W;
+    off.height = portrait ? RASTERIZE_W : RASTERIZE_H;
     drawCanvas(off, state);
     return canvasToBase64(off);
 }

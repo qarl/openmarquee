@@ -66,6 +66,7 @@ import { Icons } from "./icons.js";
 import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountSlidesShell } from "./slides.js";
+import { rerenderAllSlidesForRotation } from "./rotation-rerender.js";
 import { mountStreamPanel } from "./stream-panel.js";
 import { mountVideoUploader } from "./video-upload.js";
 import { mountVlcStreamUploader } from "./vlc-stream-upload.js";
@@ -106,8 +107,19 @@ async function resolvePanelDims() {
         const brightness = Number.isFinite(brightnessRaw)
             ? Math.max(0, Math.min(100, Math.round(brightnessRaw)))
             : 80;
+        // FYS bug 7: rotation is carried alongside the effective dims so
+        // the editor can lay out its saved asset.png in the panel's
+        // installed orientation (rasterizeAtTarget swaps to portrait at
+        // 90/270).
+        const rotation = Number(settings.display_rotation || 0);
         if (dims !== null) {
-            return { width: dims.width, height: dims.height, outputMode, brightness };
+            return {
+                width: dims.width,
+                height: dims.height,
+                rotation,
+                outputMode,
+                brightness,
+            };
         }
     } catch {
         // Fall through to fallback — editor still mounts even if the
@@ -116,6 +128,7 @@ async function resolvePanelDims() {
     return {
         width: FALLBACK_WIDTH,
         height: FALLBACK_HEIGHT,
+        rotation: 0,
         outputMode: "hdmi",
         brightness: 80,
     };
@@ -390,7 +403,13 @@ async function boot() {
      * Mount (or re-mount) every panel that depends on display dims.
      * Called once at boot + again whenever Settings emits a change.
      */
-    function mountDimensionedPanels({ width, height, outputMode, brightness }) {
+    function mountDimensionedPanels({
+        width,
+        height,
+        rotation = 0,
+        outputMode,
+        brightness,
+    }) {
         // CSS variable picked up by every tile thumbnail + preview
         // wrapper (.pallet-tile-thumb, .track-block-thumb-wrap,
         // .slide-browser-tile-thumb) so the thumbs match the device's
@@ -486,6 +505,7 @@ async function boot() {
         editor = mountEditor(editorSlot, {
             width,
             height,
+            rotation,
             fetchItems: listContent,
             onSave: onSaveWithRefresh(saveTextSlide),
             onSaveExisting: onSaveWithRefresh(updateTextSlide),
@@ -566,7 +586,11 @@ async function boot() {
     }
 
     // Initial mount.
-    mountDimensionedPanels(await resolvePanelDims());
+    const _bootDims = await resolvePanelDims();
+    mountDimensionedPanels(_bootDims);
+    // FYS bug 7: track the rotation across settings-updated events so a
+    // rotation change can trigger the stored-thumbnail bulk re-render.
+    let lastKnownRotation = _bootDims.rotation || 0;
 
     // Slides shell — wraps the 3 child panels under one nav entry. Mounts
     // once: child panels live in stable .tab-pane slots that survive a
@@ -664,8 +688,25 @@ async function boot() {
     // Re-mount on settings change so the canvas always matches current
     // display config.
     document.addEventListener("openmarquee:settings-updated", async () => {
-        mountDimensionedPanels(await resolvePanelDims());
+        const dims = await resolvePanelDims();
+        mountDimensionedPanels(dims);
         refreshBrandSignName();
+        // FYS bug 7: on a display-rotation change, every stored slide's
+        // asset.png is now the wrong orientation for the reshaped
+        // dashboard tiles. Bulk re-render them at the new rotation,
+        // then re-mount so the slide browser picks up the fresh
+        // thumbnails (their updated_at bump busts the <img> cache).
+        const newRotation = dims.rotation || 0;
+        if (newRotation !== lastKnownRotation) {
+            lastKnownRotation = newRotation;
+            try {
+                const summary = await rerenderAllSlidesForRotation(newRotation);
+                console.info("[bug7] rotation thumbnail re-render:", summary);
+            } catch (err) {
+                console.warn("[bug7] rotation thumbnail re-render failed:", err);
+            }
+            mountDimensionedPanels(dims);
+        }
     });
 
     // Device name shown in the topbar (right of the wordmark). Refreshed
