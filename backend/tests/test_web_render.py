@@ -1,20 +1,17 @@
 """Tests for the on-device web-slide renderer (Web slide C2).
 
 `openmarquee.web_render` turns an operator-supplied URL into a
-panel-sized PNG entirely on the Pi:
-`chromium --headless --screenshot -> Pillow pillarbox composite -> PNG`.
+display-sized PNG entirely on the Pi: `chromium --headless --screenshot`
+rendered at the sign's live display resolution, returned verbatim (no
+panel / letterbox compositing — the render IS the display size).
 
 The Chromium browser is a *subprocess* the module spawns (there is no
 Python import for it). These tests mock `subprocess.run` — so the whole
 suite runs on a host WITHOUT Chromium installed — and assert the wiring
 (the headless flags, `--window-size`, `--screenshot`, the timeout +
 kill/reap behavior, the typed error). `shutil.which` is also patched so
-binary resolution is deterministic.
-
-The pillarbox composite is pure Pillow and is unit-tested directly:
-a render smaller than the panel pillarboxes with black bars, a render
-equal to the panel produces no bars, a render larger than the panel is
-uniformly downscaled to fit and centered.
+binary resolution is deterministic. The fake Chromium, like the real
+one, emits a screenshot of exactly the `--window-size`.
 """
 
 import subprocess
@@ -29,7 +26,6 @@ from openmarquee.web_render import (
     WEB_RENDER_VIRTUAL_TIME_BUDGET_MS,
     WebRenderError,
     _build_chromium_argv,
-    composite_pillarbox,
     main,
     render_web_png,
 )
@@ -80,15 +76,13 @@ def _install_fake_chromium(
     against a fake Chromium.
 
     `which` is what `shutil.which` returns (None -> no binary found).
-    The fake `subprocess.run` records its argv/kwargs into `calls`,
-    optionally writes `screenshot_png` to the `--screenshot=` path
-    (mimicking a real Chromium capture), and then either returns a
-    `_FakeCompletedProcess`, raises `subprocess.TimeoutExpired`, or
-    raises `launch_error`.
+    The fake `subprocess.run` records its argv/kwargs into `calls` and
+    writes a screenshot to the `--screenshot=` path. When `screenshot_png`
+    is None it synthesizes a solid PNG of exactly the requested
+    `--window-size` — mimicking real Chromium, which emits a capture of
+    the window size. A test that needs a specific (bad / non-PNG / odd)
+    payload passes `screenshot_png` explicitly.
     """
-    if screenshot_png is None:
-        screenshot_png = _solid_png(800, 600, (10, 120, 200))
-
     monkeypatch.setattr(
         web_render.shutil, "which",
         lambda name: which if name in web_render._CHROMIUM_BINARIES else None,
@@ -99,10 +93,18 @@ def _install_fake_chromium(
             calls["argv"] = argv
             calls["timeout"] = timeout
             calls["capture_output"] = capture_output
-        # Mimic Chromium writing its --screenshot file. The module
-        # pre-creates the temp path (so Chromium owns it exclusively),
-        # so it exists+empty by default; `write_screenshot` fills it,
-        # `delete_screenshot` removes it to drive the missing-file path.
+        # Mirror real Chromium: the capture is the --window-size. When
+        # the test pinned an explicit screenshot_png, use that instead.
+        win = (1360, 768)
+        for arg in argv:
+            if arg.startswith("--window-size="):
+                w, h = arg.split("=", 1)[1].split(",")
+                win = (int(w), int(h))
+        payload = (
+            screenshot_png
+            if screenshot_png is not None
+            else _solid_png(win[0], win[1], (10, 120, 200))
+        )
         for arg in argv:
             if arg.startswith("--screenshot="):
                 path = arg.split("=", 1)[1]
@@ -111,7 +113,7 @@ def _install_fake_chromium(
                     os.unlink(path)
                 elif write_screenshot:
                     with open(path, "wb") as fh:
-                        fh.write(screenshot_png)
+                        fh.write(payload)
         if launch_error is not None:
             raise launch_error
         if raise_timeout:
@@ -139,7 +141,7 @@ def test_build_chromium_argv_has_headless_flags():
 
 
 def test_build_chromium_argv_window_size_and_screenshot():
-    """`--window-size` carries the RENDER size; `--screenshot` carries
+    """`--window-size` carries the display size; `--screenshot` carries
     the temp output path; the URL is the final argument."""
     argv = _build_chromium_argv(
         "/usr/bin/chromium", "https://x.example.com", 1024, 600, "/tmp/s.png"
@@ -161,116 +163,31 @@ def test_build_chromium_argv_virtual_time_budget():
 
 
 # ---------------------------------------------------------------------
-# composite_pillarbox — pure Pillow, the three pillarbox cases.
-# ---------------------------------------------------------------------
-def test_composite_pillarbox_smaller_render_gets_black_bars():
-    """A render SMALLER than the panel is centered with BLACK bars —
-    corners are black, the center carries the render's content."""
-    # An 800x600 render onto a 1360x768 panel -> bars on all sides.
-    render = _solid_png(800, 600, (10, 120, 200))
-    out = composite_pillarbox(render, 1360, 768)
-
-    img = _open_png(out)
-    assert img.size == (1360, 768)
-    # Corners are in the pillarbox margin -> black.
-    assert img.getpixel((0, 0)) == (0, 0, 0)
-    assert img.getpixel((1359, 0)) == (0, 0, 0)
-    assert img.getpixel((0, 767)) == (0, 0, 0)
-    assert img.getpixel((1359, 767)) == (0, 0, 0)
-    # The center is inside the centered render -> the render's color.
-    assert img.getpixel((680, 384)) == (10, 120, 200)
-
-
-def test_composite_pillarbox_smaller_render_is_centered():
-    """The smaller render is CENTERED — the content starts at the
-    expected offset, not flush at (0, 0)."""
-    # 800x600 on 1360x768: off_x = (1360-800)//2 = 280, off_y = 84.
-    render = _solid_png(800, 600, (255, 0, 0))
-    out = composite_pillarbox(render, 1360, 768)
-    img = _open_png(out)
-
-    # Just left of the content -> black; just inside -> red.
-    assert img.getpixel((279, 384)) == (0, 0, 0)
-    assert img.getpixel((280, 384)) == (255, 0, 0)
-    # Just above the content -> black; just inside -> red.
-    assert img.getpixel((680, 83)) == (0, 0, 0)
-    assert img.getpixel((680, 84)) == (255, 0, 0)
-
-
-def test_composite_pillarbox_equal_render_has_no_bars():
-    """A render EQUAL to the panel produces no bars — every pixel,
-    corners included, is the render's content."""
-    render = _solid_png(1360, 768, (40, 200, 90))
-    out = composite_pillarbox(render, 1360, 768)
-
-    img = _open_png(out)
-    assert img.size == (1360, 768)
-    # No pillarbox -> corners carry content, not black.
-    assert img.getpixel((0, 0)) == (40, 200, 90)
-    assert img.getpixel((1359, 767)) == (40, 200, 90)
-    assert img.getpixel((680, 384)) == (40, 200, 90)
-
-
-def test_composite_pillarbox_larger_render_is_downscaled_to_fit():
-    """A render LARGER than the panel is uniformly scaled DOWN to fit
-    inside the panel, then centered — output is still panel-sized."""
-    # A 2720x1536 render (exactly 2x the panel) onto a 1360x768 panel.
-    # Uniform downscale by 0.5 -> 1360x768 -> exactly fills the panel.
-    render = _solid_png(2720, 1536, (200, 50, 50))
-    out = composite_pillarbox(render, 1360, 768)
-
-    img = _open_png(out)
-    assert img.size == (1360, 768)
-    # 2x render downscales to exactly panel size -> no bars.
-    assert img.getpixel((0, 0)) == (200, 50, 50)
-    assert img.getpixel((680, 384)) == (200, 50, 50)
-
-
-def test_composite_pillarbox_larger_render_wrong_aspect_is_padded():
-    """A render larger than the panel on one axis with a different
-    aspect ratio is downscaled to fit AND padded — black bars appear on
-    the axis that doesn't fill, output stays panel-sized."""
-    # A 2720x768 render (2x panel width, equal height) onto 1360x768.
-    # min(1360/2720, 768/768) = 0.5 -> scaled to 1360x384 -> letterbox
-    # bars top and bottom.
-    render = _solid_png(2720, 768, (0, 0, 255))
-    out = composite_pillarbox(render, 1360, 768)
-
-    img = _open_png(out)
-    assert img.size == (1360, 768)
-    # Scaled height 384, centered -> off_y = (768-384)//2 = 192.
-    assert img.getpixel((680, 0)) == (0, 0, 0)        # top bar
-    assert img.getpixel((680, 767)) == (0, 0, 0)      # bottom bar
-    assert img.getpixel((680, 384)) == (0, 0, 255)    # content band
-
-
-def test_composite_pillarbox_rejects_non_image_bytes():
-    """Bytes that aren't a decodable image surface as a typed
-    WebRenderError, not a raw Pillow exception."""
-    with pytest.raises(WebRenderError, match="not a decodable image"):
-        composite_pillarbox(b"not a png at all", 1360, 768)
-
-
-# ---------------------------------------------------------------------
 # render_web_png — the success path + its wiring.
 # ---------------------------------------------------------------------
-def test_render_web_png_returns_panel_sized_png(monkeypatch):
-    """A normal render returns real PNG bytes sized to the PANEL, not
-    the render window."""
-    _install_fake_chromium(
-        monkeypatch, screenshot_png=_solid_png(800, 600, (10, 120, 200))
-    )
-    png = render_web_png("https://status.example.com", 800, 600, 1360, 768)
+def test_render_web_png_returns_display_sized_png(monkeypatch):
+    """A normal render returns real PNG bytes sized to the display
+    resolution it was asked for — the render IS that size, no bars."""
+    _install_fake_chromium(monkeypatch)
+    png = render_web_png("https://status.example.com", 1360, 768)
     assert png.startswith(b"\x89PNG\r\n\x1a\n")
     assert _open_png(png).size == (1360, 768)
 
 
-def test_render_web_png_spawns_chromium_with_render_window(monkeypatch):
-    """Chromium is spawned with `--window-size=<render_w>,<render_h>`
-    (the render size), `--screenshot`, and the headless flags."""
+def test_render_web_png_renders_at_portrait_resolution(monkeypatch):
+    """A portrait display resolution renders portrait — the render
+    follows whatever resolution the (rotation-aware) caller passes."""
+    _install_fake_chromium(monkeypatch)
+    png = render_web_png("https://status.example.com", 768, 1360)
+    assert _open_png(png).size == (768, 1360)
+
+
+def test_render_web_png_spawns_chromium_with_window_size(monkeypatch):
+    """Chromium is spawned with `--window-size=<width>,<height>` (the
+    display size), `--screenshot`, and the headless flags."""
     calls = {}
     _install_fake_chromium(monkeypatch, calls=calls)
-    render_web_png("https://status.example.com", 1024, 600, 1360, 768)
+    render_web_png("https://status.example.com", 1024, 600)
 
     argv = calls["argv"]
     assert argv[0] == "/usr/bin/chromium"
@@ -285,20 +202,8 @@ def test_render_web_png_passes_overall_timeout(monkeypatch):
     so the render never hangs unboundedly."""
     calls = {}
     _install_fake_chromium(monkeypatch, calls=calls)
-    render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+    render_web_png("https://status.example.com", 1360, 768)
     assert calls["timeout"] == WEB_RENDER_TIMEOUT_S
-
-
-def test_render_web_png_equal_render_panel_has_no_bars(monkeypatch):
-    """render == panel: the render is returned as the panel with no
-    pillarbox bars."""
-    _install_fake_chromium(
-        monkeypatch, screenshot_png=_solid_png(1360, 768, (40, 200, 90))
-    )
-    png = render_web_png("https://status.example.com", 1360, 768, 1360, 768)
-    img = _open_png(png)
-    assert img.size == (1360, 768)
-    assert img.getpixel((0, 0)) == (40, 200, 90)
 
 
 def test_render_web_png_resolves_chromium_browser_fallback(monkeypatch):
@@ -320,7 +225,7 @@ def test_render_web_png_resolves_chromium_browser_fallback(monkeypatch):
         return _FakeCompletedProcess(returncode=0)
 
     monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
-    render_web_png("https://status.example.com", 800, 600, 1360, 768)
+    render_web_png("https://status.example.com", 800, 600)
     assert calls["argv"][0] == "/usr/bin/chromium-browser"
 
 
@@ -331,7 +236,7 @@ def test_render_web_png_no_chromium_binary_raises(monkeypatch):
     """Neither chromium nor chromium-browser on PATH -> WebRenderError."""
     monkeypatch.setattr(web_render.shutil, "which", lambda name: None)
     with pytest.raises(WebRenderError, match="no Chromium binary"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+        render_web_png("https://status.example.com", 1360, 768)
 
 
 def test_render_web_png_chromium_nonzero_exit_raises(monkeypatch):
@@ -342,7 +247,7 @@ def test_render_web_png_chromium_nonzero_exit_raises(monkeypatch):
         write_screenshot=False,
     )
     with pytest.raises(WebRenderError, match="Chromium exited 1"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+        render_web_png("https://status.example.com", 1360, 768)
 
 
 def test_render_web_png_timeout_raises_and_does_not_hang(monkeypatch):
@@ -350,7 +255,7 @@ def test_render_web_png_timeout_raises_and_does_not_hang(monkeypatch):
     `subprocess.run` kills+reaps the child, so nothing is orphaned."""
     _install_fake_chromium(monkeypatch, raise_timeout=True)
     with pytest.raises(WebRenderError, match="timed out"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+        render_web_png("https://status.example.com", 1360, 768)
 
 
 def test_render_web_png_launch_error_raises(monkeypatch):
@@ -360,14 +265,14 @@ def test_render_web_png_launch_error_raises(monkeypatch):
         monkeypatch, launch_error=OSError("exec format error")
     )
     with pytest.raises(WebRenderError, match="failed to launch Chromium"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+        render_web_png("https://status.example.com", 1360, 768)
 
 
 def test_render_web_png_missing_screenshot_raises(monkeypatch):
     """Chromium exits 0 but the screenshot file is gone -> WebRenderError."""
     _install_fake_chromium(monkeypatch, delete_screenshot=True)
     with pytest.raises(WebRenderError, match="no screenshot"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+        render_web_png("https://status.example.com", 1360, 768)
 
 
 def test_render_web_png_empty_screenshot_raises(monkeypatch):
@@ -375,7 +280,7 @@ def test_render_web_png_empty_screenshot_raises(monkeypatch):
     WebRenderError (no silent empty render)."""
     _install_fake_chromium(monkeypatch, write_screenshot=False)
     with pytest.raises(WebRenderError, match="empty screenshot"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+        render_web_png("https://status.example.com", 1360, 768)
 
 
 def test_render_web_png_non_png_screenshot_raises(monkeypatch):
@@ -385,7 +290,7 @@ def test_render_web_png_non_png_screenshot_raises(monkeypatch):
         monkeypatch, screenshot_png=b"GIF89a not a png"
     )
     with pytest.raises(WebRenderError, match="not a PNG"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, 768)
+        render_web_png("https://status.example.com", 1360, 768)
 
 
 def test_render_web_png_cleans_up_temp_screenshot(monkeypatch):
@@ -407,7 +312,7 @@ def test_render_web_png_cleans_up_temp_screenshot(monkeypatch):
         return _FakeCompletedProcess(returncode=0)
 
     monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
-    render_web_png("https://status.example.com", 800, 600, 1360, 768)
+    render_web_png("https://status.example.com", 800, 600)
 
     from pathlib import Path
     assert "path" in seen
@@ -434,7 +339,7 @@ def test_render_web_png_cleans_up_temp_screenshot_on_failure(monkeypatch):
 
     monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
     with pytest.raises(WebRenderError):
-        render_web_png("https://status.example.com", 800, 600, 1360, 768)
+        render_web_png("https://status.example.com", 800, 600)
 
     from pathlib import Path
     assert "path" in seen
@@ -452,35 +357,27 @@ def test_render_web_png_rejects_file_url_before_spawn(monkeypatch):
 
     monkeypatch.setattr(web_render.subprocess, "run", _fail_run)
     with pytest.raises(ValueError, match="scheme"):
-        render_web_png("file:///etc/passwd", 1360, 768, 1360, 768)
+        render_web_png("file:///etc/passwd", 1360, 768)
     assert spawned["ran"] is False
 
 
-def test_render_web_png_rejects_nonpositive_render_dims():
+def test_render_web_png_rejects_nonpositive_dims():
     """A zero/negative render dimension is a ValueError."""
     with pytest.raises(ValueError, match="render dimensions"):
-        render_web_png("https://status.example.com", 0, 768, 1360, 768)
-
-
-def test_render_web_png_rejects_nonpositive_panel_dims():
-    """A zero/negative panel dimension is a ValueError."""
-    with pytest.raises(ValueError, match="panel dimensions"):
-        render_web_png("https://status.example.com", 1360, 768, 1360, -1)
+        render_web_png("https://status.example.com", 0, 768)
+    with pytest.raises(ValueError, match="render dimensions"):
+        render_web_png("https://status.example.com", 1360, -1)
 
 
 # ---------------------------------------------------------------------
 # main() — the subprocess entry point + its argv contract.
 # ---------------------------------------------------------------------
-def test_main_good_args_writes_panel_png(monkeypatch, tmp_path, capsys):
-    """Good argv: the render runs and a panel-sized PNG lands at
+def test_main_good_args_writes_png(monkeypatch, tmp_path, capsys):
+    """Good argv: the render runs and a display-sized PNG lands at
     <out_path>, exit 0, nothing on stderr."""
-    _install_fake_chromium(
-        monkeypatch, screenshot_png=_solid_png(800, 600, (9, 9, 9))
-    )
+    _install_fake_chromium(monkeypatch)
     out = tmp_path / "shot.png"
-    rc = main([
-        "https://status.example.com", "800", "600", "1360", "768", str(out),
-    ])
+    rc = main(["https://status.example.com", "1360", "768", str(out)])
 
     assert rc == 0
     data = out.read_bytes()
@@ -498,20 +395,14 @@ def test_main_wrong_arg_count_exits_2(capsys):
 
 def test_main_non_integer_dimensions_exit_2(capsys):
     """A non-integer dimension -> exit 2 + a clear stderr message."""
-    rc = main([
-        "https://status.example.com", "wide", "768", "1360", "768",
-        "/tmp/x.png",
-    ])
+    rc = main(["https://status.example.com", "wide", "768", "/tmp/x.png"])
     assert rc == 2
     assert "integers" in capsys.readouterr().err
 
 
 def test_main_nonpositive_dimensions_exit_2(capsys):
     """A zero/negative dimension -> exit 2 + a clear stderr message."""
-    rc = main([
-        "https://status.example.com", "1360", "768", "1360", "-1",
-        "/tmp/x.png",
-    ])
+    rc = main(["https://status.example.com", "1360", "-1", "/tmp/x.png"])
     assert rc == 2
     assert "positive" in capsys.readouterr().err
 
@@ -523,9 +414,7 @@ def test_main_file_url_rejected_exit_2(monkeypatch, capsys):
         raise AssertionError("Chromium must not be spawned for file://")
 
     monkeypatch.setattr(web_render.subprocess, "run", _fail_run)
-    rc = main([
-        "file:///etc/passwd", "1360", "768", "1360", "768", "/tmp/x.png",
-    ])
+    rc = main(["file:///etc/passwd", "1360", "768", "/tmp/x.png"])
     assert rc == 2
     assert "invalid URL" in capsys.readouterr().err
 
@@ -538,9 +427,7 @@ def test_main_render_failure_exits_1(monkeypatch, tmp_path, capsys):
         write_screenshot=False,
     )
     out = tmp_path / "shot.png"
-    rc = main([
-        "https://status.example.com", "1360", "768", "1360", "768", str(out),
-    ])
+    rc = main(["https://status.example.com", "1360", "768", str(out)])
 
     assert rc == 1
     assert "web-render:" in capsys.readouterr().err
@@ -551,9 +438,7 @@ def test_main_timeout_exits_1(monkeypatch, tmp_path, capsys):
     """A Chromium timeout -> exit 1 + a clear stderr message; no hang."""
     _install_fake_chromium(monkeypatch, raise_timeout=True)
     out = tmp_path / "shot.png"
-    rc = main([
-        "https://status.example.com", "1360", "768", "1360", "768", str(out),
-    ])
+    rc = main(["https://status.example.com", "1360", "768", str(out)])
     assert rc == 1
     assert "timed out" in capsys.readouterr().err
 
@@ -564,7 +449,7 @@ def test_main_unwritable_output_path_exits_1(monkeypatch, capsys):
     _install_fake_chromium(monkeypatch)
     # A path whose parent directory does not exist -> OSError on open.
     rc = main([
-        "https://status.example.com", "800", "600", "1360", "768",
+        "https://status.example.com", "800", "600",
         "/nonexistent-dir-xyz/shot.png",
     ])
     assert rc == 1
