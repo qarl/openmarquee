@@ -41,6 +41,7 @@ from openmarquee.content import (
     StreamSlide,
     TextSlide,
     VideoSlide,
+    WebSlide,
 )
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
@@ -65,6 +66,10 @@ _CONTENT_ADAPTER: TypeAdapter[ContentItem] = TypeAdapter(ContentItem)
 
 # The synthetic thumbnail card drawn for a StreamSlide (16:9).
 _STREAM_PLACEHOLDER_SIZE = (640, 360)
+
+# The synthetic placeholder card drawn for a WebSlide before its first
+# screenshot arrives (16:9, same shape as the stream card).
+_WEB_PLACEHOLDER_SIZE = (640, 360)
 
 
 def _migrate_legacy_stream_item(item: dict) -> dict:
@@ -152,6 +157,51 @@ def render_stream_placeholder_png(slide: StreamSlide) -> bytes:
         (235, 235, 235),
     )
     url = slide.stream_url
+    if len(url) > 54:
+        url = url[:51] + "…"
+    _draw_centered(
+        draw, url, _placeholder_font(18), width, cy + radius + 64,
+        (150, 150, 156),
+    )
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def render_web_placeholder_png(slide: WebSlide) -> bytes:
+    """Draw the synthetic placeholder card for a WebSlide.
+
+    A WebSlide's asset.png is a screenshot produced by the render
+    helper (`web-helper/`). Before the first screenshot arrives — and
+    whenever the helper is unreachable — this card stands in so the
+    slide tile (and the renderer) has something to show. The
+    periodic-fetch producer overwrites it with a real screenshot.
+    """
+    width, height = _WEB_PLACEHOLDER_SIZE
+    img = Image.new("RGB", (width, height), (24, 24, 28))
+    draw = ImageDraw.Draw(img)
+
+    # A globe-ish accent disc, slightly above centre.
+    cx, cy, radius = width // 2, height // 2 - 24, 46
+    draw.ellipse(
+        (cx - radius, cy - radius, cx + radius, cy + radius),
+        fill=(0, 138, 255),
+    )
+    # Two meridians + an equator, suggesting a globe.
+    draw.line((cx, cy - radius, cx, cy + radius), fill=(24, 24, 28), width=3)
+    draw.line((cx - radius, cy, cx + radius, cy), fill=(24, 24, 28), width=3)
+    draw.ellipse(
+        (cx - radius // 2, cy - radius, cx + radius // 2, cy + radius),
+        outline=(24, 24, 28),
+        width=3,
+    )
+
+    _draw_centered(
+        draw, "Web slide", _placeholder_font(30), width, cy + radius + 26,
+        (235, 235, 235),
+    )
+    url = slide.url
     if len(url) > 54:
         url = url[:51] + "…"
     _draw_centered(
@@ -308,6 +358,35 @@ class ContentStorage:
         self.save(
             slide,
             render_stream_placeholder_png(slide),
+            updated_at=updated_at,
+        )
+
+    def save_web(
+        self,
+        slide: WebSlide,
+        png_bytes: bytes | None = None,
+        *,
+        updated_at: datetime | None = None,
+    ) -> None:
+        """Persist a web slide.
+
+        Unlike StreamSlide, a WebSlide DOES carry a stored asset.png:
+        it is the screenshot the renderer paints (the Web slide is "an
+        image slide whose asset.png is auto-refreshed from the helper").
+
+        `png_bytes` is the screenshot to write. On create the operator
+        has no screenshot — the helper hasn't run yet — so callers pass
+        None and a synthetic placeholder card is generated and stored
+        instead. The periodic-fetch producer (a later commit) calls
+        this with real screenshot bytes to refresh the asset in place.
+
+        `updated_at` semantics match save() — defaults to now() for a
+        local edit, accepts an explicit value so peer-ingest preserves
+        the originating stamp.
+        """
+        self.save(
+            slide,
+            png_bytes if png_bytes is not None else render_web_placeholder_png(slide),
             updated_at=updated_at,
         )
 

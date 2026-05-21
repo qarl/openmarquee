@@ -922,3 +922,122 @@ def test_put_stream_unknown_id_returns_404(client: TestClient):
         json={"name": "ghost", "stream_url": "rtsp://h/x"},
     )
     assert response.status_code == 404
+
+
+# --- web (Web slide P1) ----------------------------------------------------
+
+
+def test_post_web_creates_slide_and_appends_to_playlist(
+    client: TestClient, playlist_storage: PlaylistStorage
+):
+    response = client.post(
+        "/api/content/web",
+        json={
+            "name": "Status Page",
+            "url": "https://status.example.com",
+            "refresh_interval_s": 600,
+            "duration_ms": 15_000,
+            "transition": "fade",
+            "transition_ms": 300,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "web"
+    assert body["url"] == "https://status.example.com"
+    assert body["refresh_interval_s"] == 600
+    # Appended to the default playlist like every other slide type.
+    assert UUID(body["id"]) in playlist_storage.load().item_ids
+
+
+def test_post_web_uses_defaults_for_omitted_fields(client: TestClient):
+    response = client.post(
+        "/api/content/web",
+        json={"name": "Minimal", "url": "https://h/x"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["refresh_interval_s"] == 300
+    assert body["duration_ms"] == 10_000
+    assert body["transition"] == "cut"
+
+
+def test_post_web_rejects_non_http_url(client: TestClient):
+    """A file:// url is operator-supplied and never a valid web page —
+    rejected with a clean 400 (not a 422 or a 500)."""
+    response = client.post(
+        "/api/content/web",
+        json={"name": "Bad", "url": "file:///etc/passwd"},
+    )
+    assert response.status_code == 400
+
+
+def test_get_web_placeholder_is_a_png(client: TestClient):
+    """The synthetic placeholder card is reachable via the standard
+    asset endpoint before the first screenshot arrives."""
+    post = client.post(
+        "/api/content/web",
+        json={"name": "Status", "url": "https://h/x"},
+    )
+    item_id = post.json()["id"]
+    asset = client.get(f"/api/content/{item_id}/asset")
+    assert asset.status_code == 200
+    assert asset.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_put_web_updates_metadata_preserving_id(client: TestClient):
+    post = client.post(
+        "/api/content/web",
+        json={"name": "Before", "url": "https://h/old"},
+    )
+    item_id = post.json()["id"]
+    response = client.put(
+        f"/api/content/web/{item_id}",
+        json={
+            "name": "After",
+            "url": "https://h/new",
+            "refresh_interval_s": 120,
+            "duration_ms": 20_000,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == item_id  # UUID preserved
+    assert body["name"] == "After"
+    assert body["url"] == "https://h/new"
+    assert body["refresh_interval_s"] == 120
+
+
+def test_put_web_rejects_non_http_url(client: TestClient):
+    post = client.post(
+        "/api/content/web",
+        json={"name": "Status", "url": "https://h/x"},
+    )
+    item_id = post.json()["id"]
+    response = client.put(
+        f"/api/content/web/{item_id}",
+        json={"name": "x", "url": "ftp://h/x"},
+    )
+    assert response.status_code == 400
+
+
+def test_put_web_wrong_type_returns_409(client: TestClient):
+    """Updating a non-web id via the web route is a 409."""
+    text = client.post(
+        "/api/content/text-slides",
+        json=_upload_payload(name="a-text-slide"),
+    )
+    text_id = text.json()["id"]
+    response = client.put(
+        f"/api/content/web/{text_id}",
+        json={"name": "x", "url": "https://h/x"},
+    )
+    assert response.status_code == 409
+
+
+def test_put_web_unknown_id_returns_404(client: TestClient):
+    response = client.put(
+        f"/api/content/web/{uuid4()}",
+        json={"name": "ghost", "url": "https://h/x"},
+    )
+    assert response.status_code == 404

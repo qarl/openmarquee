@@ -14,6 +14,7 @@ from openmarquee.content import (
     TextLayer,
     TextSlide,
     VideoSlide,
+    WebSlide,
 )
 from openmarquee.content.storage import (
     SCHEMA_VERSION,
@@ -598,3 +599,60 @@ def test_load_migrates_legacy_vlc_stream_envelope(tmp_path: Path):
     assert loaded.type == "stream"
     assert loaded.stream_url == "rtsp://h/x"
     assert loaded.id == item_id
+
+
+# --- web (Web slide P1) ----------------------------------------------------
+
+
+def test_save_web_writes_envelope_and_placeholder(tmp_path: Path):
+    """save_web with no screenshot generates a synthetic placeholder
+    card (no screenshot has arrived yet) and persists it as the
+    standard asset.png."""
+    storage = ContentStorage(tmp_path)
+    slide = WebSlide(name="Status", url="https://status.example.com")
+    storage.save_web(slide)
+
+    png = storage.asset_path(slide.id).read_bytes()
+    # A valid PNG (signature) decodable to the placeholder card dims.
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert Image.open(BytesIO(png)).size == (640, 360)
+
+
+def test_save_web_with_explicit_png_writes_those_bytes(tmp_path: Path):
+    """save_web with explicit png_bytes (the P3 producer's path) writes
+    those bytes verbatim instead of the placeholder."""
+    storage = ContentStorage(tmp_path)
+    slide = WebSlide(name="Status", url="https://status.example.com")
+    screenshot = b"\x89PNG\r\n\x1a\n-screenshot-bytes"
+    storage.save_web(slide, screenshot)
+
+    assert storage.asset_path(slide.id).read_bytes() == screenshot
+
+
+def test_load_roundtrips_web_slide(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    slide = WebSlide(
+        name="Status",
+        url="https://status.example.com",
+        refresh_interval_s=600,
+        duration_ms=15_000,
+        transition="fade",
+        transition_ms=300,
+    )
+    storage.save_web(slide)
+    loaded = storage.load(slide.id)
+    assert isinstance(loaded, WebSlide)
+    assert loaded.model_copy(update={"updated_at": None}) == slide
+    assert loaded.updated_at is not None
+
+
+def test_list_all_surfaces_web_items(tmp_path: Path):
+    storage = ContentStorage(tmp_path)
+    text = TextSlide(name="t", text="t")
+    web = WebSlide(name="w", url="https://h/x")
+    storage.save_text_slide(text, b"\x89PNG_text")
+    storage.save_web(web)
+
+    by_type = {item.type: item for item in storage.list_all()}
+    assert isinstance(by_type["web"], WebSlide)
+    assert isinstance(by_type["text_slide"], TextSlide)

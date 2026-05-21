@@ -8,17 +8,57 @@ What's deliberately *not* in the model: where any rendered asset lives on disk.
 That's the storage layer's job (`openmarquee.content.storage`). Models are pure
 metadata; storage maps an item's `id` to bytes.
 
-Variants today: `TextSlide`, `ImageSlide`, `VideoSlide`.
+Variants today: `TextSlide`, `ImageSlide`, `VideoSlide`, `StreamSlide`,
+`WebSlide`.
 """
 
 from datetime import UTC, datetime
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Hex color regex: #RRGGBB. Six lowercase or uppercase hex digits.
 _HEX_COLOR_PATTERN = r"^#[0-9A-Fa-f]{6}$"
+
+#: URL schemes a WebSlide may point at. A Web slide renders an actual
+#: web page, so only the two HTTP transports are allowed — unlike the
+#: stream allowlist (rtsp/rtmp/srt/udp/...) this is deliberately just
+#: `http`/`https`. Everything else (`file:`, `ftp:`, a bare path, ...)
+#: is rejected by `validate_web_url`.
+ALLOWED_WEB_SCHEMES = frozenset({"http", "https"})
+
+
+def validate_web_url(url: str) -> None:
+    """Raise `ValueError` if `url` is not a plain `http`/`https` web page.
+
+    The URL is operator-supplied and is handed to the render helper
+    (`web-helper/`) which loads it in a real browser. A WebSlide must
+    point at an actual web page, so the scheme allowlist is exactly
+    `{"http", "https"}` — `file:`, `ftp:`, `data:` and friends are
+    rejected (a `file:` URL would turn an operator-typed field into a
+    local-file-read primitive on the helper machine).
+
+    This intentionally does NOT reuse `stream_consumer.validate_stream_url`
+    — that allows the rtsp/rtmp/srt/udp transports, which are nonsense
+    for a web page. Pure function: returns None on success.
+
+    The scheme comparison is case-insensitive. A URL with no scheme at
+    all (a bare path like `/etc/passwd`), an empty string, or a URL
+    carrying ASCII control characters (a header-injection / smuggling
+    vector) is rejected.
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        raise ValueError("web URL must not contain control characters")
+    scheme = urlparse(url).scheme.lower()
+    if scheme not in ALLOWED_WEB_SCHEMES:
+        allowed = ", ".join(sorted(ALLOWED_WEB_SCHEMES))
+        shown = scheme if scheme else "(none)"
+        raise ValueError(
+            f"web URL scheme {shown!r} is not allowed; "
+            f"the URL must use one of: {allowed}"
+        )
 
 
 def _utcnow() -> datetime:
@@ -504,9 +544,55 @@ class StreamSlide(BaseModel):
     updated_at: datetime | None = None
 
 
+class WebSlide(BaseModel):
+    """A web page rendered onto the sign — a playlist slide that shows
+    a screenshot of an operator-supplied URL.
+
+    The Raspberry Pi can't run a browser, so a render helper
+    (`web-helper/`, running on the operator's machine) loads the page
+    and produces screenshots; the sign fetches them. Architecturally
+    the Web slide is "an image slide whose asset.png is auto-refreshed
+    from the helper" — so unlike StreamSlide it DOES carry a stored
+    asset.png that the renderer paints. On create there is no
+    screenshot yet, so the initial asset is a synthetic placeholder
+    card (see content/storage.py); the periodic-fetch producer
+    overwrites it with a real screenshot.
+
+    `duration_ms` is the fixed slot length, like every other slide
+    type. `refresh_interval_s` is how often the helper re-fetches a
+    fresh screenshot of `url`.
+    """
+
+    type: Literal["web"] = "web"
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(max_length=200)
+    # The web page the render helper screenshots
+    # (e.g. https://status.example.com).
+    url: str = Field(max_length=2000)
+    # How often the screenshot is re-fetched, in seconds. Bounded:
+    # min 10s (a tighter cadence would hammer the helper / the target
+    # site) and max 24h (a day-stale screenshot is the loosest sane
+    # refresh). Default 300s = a 5-minute refresh.
+    refresh_interval_s: int = Field(
+        default=300, ge=10, le=24 * 60 * 60
+    )
+    # Fixed slot length, capped at 24h — same as StreamSlide.
+    duration_ms: int = Field(default=10_000, ge=100, le=24 * 60 * 60 * 1000)
+
+    # Same transition contract as the other slide types.
+    transition: Literal[
+        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
+    ] = "cut"
+    transition_ms: int = Field(default=500, ge=0, le=5000)
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    # See TextSlide.updated_at — output-only mirror of the storage envelope.
+    updated_at: datetime | None = None
+
+
 # Discriminated union of content variants. Pydantic uses the `type` literal to
 # route to the right subclass on deserialize.
 ContentItem = Annotated[
-    TextSlide | ImageSlide | VideoSlide | StreamSlide,
+    TextSlide | ImageSlide | VideoSlide | StreamSlide | WebSlide,
     Field(discriminator="type"),
 ]

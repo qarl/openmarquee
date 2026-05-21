@@ -12,6 +12,8 @@ from openmarquee.content import (
     TextLayer,
     TextSlide,
     VideoSlide,
+    WebSlide,
+    validate_web_url,
 )
 
 
@@ -562,3 +564,89 @@ def test_stream_slide_routes_through_content_item_union():
     decoded = adapter.validate_python(slide.model_dump(mode="json"))
     assert isinstance(decoded, StreamSlide)
     assert decoded == slide
+
+
+# --- WebSlide (Web slide P1) -----------------------------------------------
+
+
+def test_web_slide_minimal_construction():
+    slide = WebSlide(name="Status", url="https://status.example.com")
+    assert slide.type == "web"
+    assert slide.url == "https://status.example.com"
+    assert slide.refresh_interval_s == 300
+    assert slide.duration_ms == 10_000
+    assert slide.transition == "cut"
+    assert slide.transition_ms == 500
+    assert isinstance(slide.id, UUID)
+    assert slide.updated_at is None
+
+
+def test_web_slide_refresh_interval_bounds_enforced():
+    # Below the 10 s floor.
+    with pytest.raises(ValidationError):
+        WebSlide(name="W", url="https://h/x", refresh_interval_s=9)
+    # Above the 24 h ceiling.
+    with pytest.raises(ValidationError):
+        WebSlide(
+            name="W", url="https://h/x", refresh_interval_s=24 * 60 * 60 + 1
+        )
+
+
+def test_web_slide_duration_bounds_enforced():
+    # Below the 100 ms floor.
+    with pytest.raises(ValidationError):
+        WebSlide(name="W", url="https://h/x", duration_ms=50)
+    # Above the 24 h ceiling.
+    with pytest.raises(ValidationError):
+        WebSlide(
+            name="W", url="https://h/x", duration_ms=24 * 60 * 60 * 1000 + 1
+        )
+
+
+def test_web_slide_rejects_other_type_literal():
+    with pytest.raises(ValidationError):
+        WebSlide(type="video", name="W", url="https://h/x")
+
+
+def test_web_slide_routes_through_content_item_union():
+    """The ContentItem discriminated union routes a web envelope back
+    to WebSlide on decode."""
+    adapter = TypeAdapter(ContentItem)
+    slide = WebSlide(name="Status", url="https://status.example.com")
+    decoded = adapter.validate_python(slide.model_dump(mode="json"))
+    assert isinstance(decoded, WebSlide)
+    assert decoded == slide
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com",
+        "https://example.com/dashboard",
+        "HTTP://example.com",  # case-insensitive scheme
+        "HTTPS://example.com",
+    ],
+)
+def test_validate_web_url_accepts_http_and_https(url):
+    """Plain http/https web pages pass validation without raising."""
+    validate_web_url(url)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rtsp://host:8554/live",  # a stream transport — not a web page
+        "file:///etc/passwd",  # local-file-read vector
+        "ftp://host/file",
+        "data:text/html,<h1>x</h1>",
+        "/etc/passwd",  # bare path — no scheme at all
+        "",  # empty string
+        "http://exa\x00mple.com",  # NUL control char
+        "https://exa\nmple.com",  # newline control char
+    ],
+)
+def test_validate_web_url_rejects_non_http(url):
+    """A non-http(s) scheme, a bare path, an empty string, and a URL
+    carrying control characters all raise ValueError."""
+    with pytest.raises(ValueError):
+        validate_web_url(url)

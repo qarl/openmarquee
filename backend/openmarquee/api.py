@@ -24,6 +24,8 @@ from openmarquee.content import (
     TextBox,
     TextSlide,
     VideoSlide,
+    WebSlide,
+    validate_web_url,
 )
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
@@ -754,6 +756,103 @@ async def update_stream(
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc
     storage.save_stream(updated)
+    background.add_task(flock_sync.notify_peers, updated.id, "updated")
+    return updated
+
+
+class WebUpload(BaseModel):
+    """Wire format for POST /api/content/web.
+
+    A web slide has no operator-uploaded asset — the screenshot is
+    produced later by the render helper (`web-helper/`) and the
+    placeholder card is synthesised at save time (storage.save_web).
+    The payload is therefore pure metadata. `transition` is a plain
+    string here; the WebSlide model does the Literal validation (a bad
+    value surfaces as a 422), mirroring how StreamUpload.transition
+    works.
+    """
+
+    name: str
+    url: str
+    refresh_interval_s: int = 300
+    duration_ms: int = 10_000
+    transition: str = "cut"
+    transition_ms: int = 500
+
+
+@router.post("/web", response_model=WebSlide)
+async def upload_web(
+    payload: WebUpload,
+    storage: StorageDep,
+    playlist_storage: PlaylistDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
+) -> WebSlide:
+    # Security: the URL is operator-supplied and is handed to the
+    # render helper, which loads it in a real browser. Reject a
+    # non-http(s) scheme (file://, ftp://, …) here so the operator
+    # gets an immediate 400 in the editor instead of a slide that
+    # silently fails.
+    try:
+        validate_web_url(payload.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        slide = WebSlide(**payload.model_dump())
+    except ValidationError as exc:
+        raise _validation_error_422(exc) from exc
+    storage.save_web(slide)
+    _append_to_playlist(playlist_storage, slide.id)
+    background.add_task(flock_sync.notify_peers, slide.id, "updated")
+    return slide
+
+
+class WebUpdate(BaseModel):
+    """Wire format for PUT /api/content/web/{id}. All metadata; the
+    UUID is preserved so playlist + schedule references hold."""
+
+    name: str
+    url: str
+    refresh_interval_s: int = 300
+    duration_ms: int = 10_000
+    transition: str = "cut"
+    transition_ms: int = 500
+
+
+@router.put("/web/{item_id}", response_model=WebSlide)
+async def update_web(
+    item_id: UUID,
+    payload: WebUpdate,
+    storage: StorageDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
+) -> WebSlide:
+    try:
+        existing = storage.load(item_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"no web slide {item_id}"
+        ) from exc
+    if existing.type != "web":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item_id} is a {existing.type}, not a web slide",
+        )
+    # Security: see upload_web — reject a non-http(s) URL scheme with
+    # a clean 400 before the slide is persisted.
+    try:
+        validate_web_url(payload.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        updated = WebSlide(
+            id=item_id,
+            created_at=existing.created_at,
+            **payload.model_dump(),
+        )
+    except ValidationError as exc:
+        raise _validation_error_422(exc) from exc
+    storage.save_web(updated)
     background.add_task(flock_sync.notify_peers, updated.id, "updated")
     return updated
 
