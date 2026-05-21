@@ -1096,3 +1096,88 @@ async def test_web_slide_renders_without_a_producer(renderer):
     seen = [c[0] for c in renderer.begin_slide_calls]
     await loop.stop()
     assert web.id in seen
+
+
+# --- C3/M1: prune the per-slide Web-refresh tracking dicts -----------------
+
+
+@pytest.mark.asyncio
+async def test_web_last_fetch_pruned_when_slide_leaves_playlist(renderer):
+    """C3/M1: once the playlist no longer contains a Web slide id, the
+    next loop pass prunes that id out of _web_last_fetch — no unbounded
+    leak as a sign churns through Web slides over months."""
+    web_a = WebSlide(
+        name="a", url="https://h/a", duration_ms=_FAST_DURATION_MS,
+        refresh_interval_s=10,
+    )
+    web_b = WebSlide(
+        name="b", url="https://h/b", duration_ms=_FAST_DURATION_MS,
+        refresh_interval_s=10,
+    )
+
+    async def producer(slide, width, height) -> bool:
+        return True
+
+    # The playlist starts with both Web slides, then drops web_a.
+    items = {"current": [web_a, web_b]}
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: items["current"],
+        read_asset=lambda _id: _png_bytes(8, 8, (1, 2, 3)),
+        web_screenshot_producer=producer,
+    )
+    await loop.start()
+    await asyncio.sleep(0.15)
+    # Both slides have a tracking entry while both are in the playlist.
+    assert web_a.id in loop._web_last_fetch
+    assert web_b.id in loop._web_last_fetch
+    # Drop web_a from the playlist; the next outer pass prunes it.
+    items["current"] = [web_b]
+    await asyncio.sleep(0.15)
+    pruned = dict(loop._web_last_fetch)
+    await loop.stop()
+    assert web_a.id not in pruned, "departed Web slide id leaked in _web_last_fetch"
+    assert web_b.id in pruned, "still-present Web slide id wrongly pruned"
+
+
+@pytest.mark.asyncio
+async def test_inflight_id_not_pruned_when_slide_leaves_playlist(renderer):
+    """C3/M1: a Web slide id whose fetch is still IN FLIGHT must NOT be
+    pruned from _web_inflight even after it leaves the playlist —
+    pruning a genuinely-running id would re-enable a double-kick. The
+    set self-cleans via the kick's done-callback when the task ends."""
+    web = WebSlide(
+        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        refresh_interval_s=10,
+    )
+    release = asyncio.Event()
+
+    async def hanging_producer(slide, width, height) -> bool:
+        # Stays in flight until released — so its id sits in
+        # _web_inflight across the playlist change below.
+        await release.wait()
+        return True
+
+    items = {"current": [web]}
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: items["current"],
+        read_asset=lambda _id: _png_bytes(8, 8, (4, 5, 6)),
+        web_screenshot_producer=hanging_producer,
+    )
+    await loop.start()
+    await asyncio.sleep(0.15)
+    assert web.id in loop._web_inflight  # fetch kicked, still running
+    # Remove the Web slide from the playlist while its fetch is in
+    # flight; the prune pass runs (empty playlist) but must leave the
+    # in-flight id alone.
+    items["current"] = []
+    await asyncio.sleep(0.15)
+    assert web.id in loop._web_inflight, (
+        "in-flight Web slide id was pruned — would re-enable double-kick"
+    )
+    # Releasing the fetch lets the done-callback self-clean the id.
+    release.set()
+    await asyncio.sleep(0.05)
+    assert web.id not in loop._web_inflight
+    await loop.stop()

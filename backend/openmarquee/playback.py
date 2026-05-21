@@ -361,6 +361,15 @@ class PlaybackLoop:
                 log.exception("playback: fetch_items failed")
                 items = []
 
+            # C3/M1 (2026-05-20): prune the per-slide Web-refresh
+            # tracking dicts so a sign whose playlist churns through
+            # many Web slides over months doesn't leak an entry per id
+            # forever. Done once per outer-loop pass, after the fetch,
+            # so `items` is in hand. Runs even on the empty-items path
+            # below (a playlist emptied of Web slides should release
+            # their entries) — hence before the `if not items` check.
+            self._prune_web_tracking(items)
+
             if not items:
                 self._current_id = None
                 self._current_type = None
@@ -749,6 +758,37 @@ class PlaybackLoop:
                 )
 
         task.add_done_callback(_on_done)
+
+    def _prune_web_tracking(self, items: list[ContentItem]) -> None:
+        """Drop per-slide Web-refresh tracking entries for slide ids no
+        longer in the current playlist — C3/M1 (2026-05-20).
+
+        `_web_last_fetch` (a dict of last-kick timestamps) and
+        `_web_inflight` (a set of ids with a fetch running) are both
+        keyed by slide id. Without pruning, every Web slide id ever
+        played accumulates an entry forever — an unbounded leak on a
+        sign whose playlist churns through many Web slides over months.
+
+        `_web_last_fetch` is pruned freely: it is just timestamps, and
+        a re-added slide that has lost its entry simply reads as "due
+        on first sight" (web_refresh_due treats a missing key as None),
+        which is correct.
+
+        `_web_inflight` is NOT pruned here. An id in `_web_inflight`
+        means a fetch task is genuinely running for that slide; the
+        kick's done-callback (`_on_done`) already removes the id when
+        the task COMPLETES. Pruning a still-running id would re-enable
+        a double-kick if that slide reappears before its fetch
+        finishes. The set therefore self-cleans and needs no active
+        prune — a stale entry is impossible because every task has a
+        done-callback.
+        """
+        if not self._web_last_fetch:
+            return
+        current_ids = {item.id for item in items}
+        stale = self._web_last_fetch.keys() - current_ids
+        for slide_id in stale:
+            del self._web_last_fetch[slide_id]
 
     async def _play_via_rust_ipc(
         self,
