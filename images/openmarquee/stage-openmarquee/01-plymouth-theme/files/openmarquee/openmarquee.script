@@ -5,77 +5,123 @@
 // it. Modeled on Plymouth's stock "spinner" / "spinfinity" themes:
 // a Sprite per asset, an angle incremented in the refresh callback.
 //
-// Plymouth's scripting language is a small JS-like dialect. Coordinates
-// are screen pixels; sprite Z controls draw order (higher = on top).
+// LATE-DISPLAY ROBUSTNESS (the reason this theme does not lay out at
+// script-load time): on a Raspberry Pi with vc4-kms, plymouthd starts
+// in the initramfs ~7s before /dev/dri/card0 exists. The theme script
+// is loaded during that gap, when Window.GetWidth()/GetHeight() still
+// report 0 (no display). The original theme computed its layout once,
+// at load -- so it scaled/positioned the splash against a 0-size
+// screen and never recovered when the real display appeared. Result:
+// a black boot. This version computes the layout in the refresh
+// callback instead, (re)laying-out whenever a non-zero display size
+// becomes available or changes. So the splash renders correctly the
+// moment vc4-kms brings the display up.
 
 // --- Brand background -----------------------------------------------------
 // Fill the whole screen with --bg (#0e0e10) so any letterbox / panel
-// area reads as brand color instead of black. Plymouth wants the
-// background as two corner colors -- use the same value for both for a
-// flat fill.
-Window.SetBackgroundTopColor(0x0e / 255, 0x0e / 255, 0x10 / 255);
-Window.SetBackgroundBottomColor(0x0e / 255, 0x0e / 255, 0x10 / 255);
+// area reads as brand color instead of black. Plymouth's script
+// dialect has NO hex-literal support (0x.. is a parse error that
+// aborts the whole script) -- the channel values must be decimal:
+// 0x0e = 14, 0x10 = 16.
+Window.SetBackgroundTopColor(14 / 255, 14 / 255, 16 / 255);
+Window.SetBackgroundBottomColor(14 / 255, 14 / 255, 16 / 255);
 
-screen_width  = Window.GetWidth();
-screen_height = Window.GetHeight();
+// --- Assets ---------------------------------------------------------------
+// Loaded once at script-load (reading a file needs no display). The
+// splash is scaled per-display inside layout(); spinner_source is the
+// un-rotated original, re-rotated each frame.
+splash_source  = Image("splash.png");   // brand lockup, authored 1360x768
+spinner_source = Image("spinner.png");  // amber activity arc
 
-// --- Splash lockup --------------------------------------------------------
-// splash.png is authored at 1360x768. If the real panel is smaller,
-// scale the image down proportionally so it always fits; never upscale
-// (that would soften / distort the artwork on larger panels).
-splash_image = Image("splash.png");
-splash_w = splash_image.GetWidth();
-splash_h = splash_image.GetHeight();
-
-scale = 1;
-if (splash_w > screen_width || splash_h > screen_height) {
-    scale_w = screen_width / splash_w;
-    scale_h = screen_height / splash_h;
-    // Use the smaller ratio so both dimensions fit.
-    if (scale_w < scale_h) {
-        scale = scale_w;
-    } else {
-        scale = scale_h;
-    }
-    splash_image = splash_image.Scale(splash_w * scale, splash_h * scale);
-    splash_w = splash_image.GetWidth();
-    splash_h = splash_image.GetHeight();
-}
-
-splash_sprite = Sprite(splash_image);
-splash_sprite.SetX((screen_width  - splash_w) / 2);
-splash_sprite.SetY((screen_height - splash_h) / 2);
+// Sprites created empty; their images + positions are set by layout()
+// once a display exists. Z controls draw order (higher = on top).
+splash_sprite = Sprite();
 splash_sprite.SetZ(10);
-
-// --- Activity spinner -----------------------------------------------------
-// spinner.png is a partial amber arc on transparent background. We
-// rotate it a few degrees each refresh frame for an indeterminate
-// "working" indicator. Place it below the lockup's vertical center.
-spinner_image = Image("spinner.png");
-
-// Re-center the rotated sprite each frame: Image.Rotate() returns a
-// canvas that grows to fit the rotated bitmap, so we anchor on the
-// intended center point rather than the top-left.
-spinner_center_x = screen_width / 2;
-spinner_center_y = (screen_height / 2) + (splash_h / 2) + 56;
-
 spinner_sprite = Sprite();
 spinner_sprite.SetZ(20);
 
 spinner_angle = 0;
 
-// --- Refresh callback -----------------------------------------------------
-// Called by Plymouth on every render tick. Advance the angle and
-// re-render the rotated spinner bitmap.
-fun refresh_callback() {
-    spinner_angle = spinner_angle + 0.08;       // radians per frame
-    if (spinner_angle > 2 * Math.Pi) {
-        spinner_angle = spinner_angle - 2 * Math.Pi;
+// Layout state. laid_out_w/h = the display size we last laid out for
+// (0 = never, i.e. no display has appeared yet). spinner_center_* are
+// filled in by layout().
+laid_out_w = 0;
+laid_out_h = 0;
+spinner_center_x = 0;
+spinner_center_y = 0;
+
+// --- layout(): (re)place everything for the current display size ----------
+// Called every refresh tick. A cheap no-op once laid out for a stable
+// size; does the real work the first time a non-zero display size
+// appears (vc4-kms bringing /dev/dri/card0 up) and again if it ever
+// changes. Note: != / && are avoided -- this dialect is small, so the
+// "size changed" test is written as a pair of > comparisons.
+fun layout() {
+    w = Window.GetWidth();
+    h = Window.GetHeight();
+
+    changed = 0;
+    if (w > laid_out_w) { changed = 1; }
+    if (laid_out_w > w) { changed = 1; }
+    if (h > laid_out_h) { changed = 1; }
+    if (laid_out_h > h) { changed = 1; }
+
+    if (w > 0) {
+        if (h > 0) {
+            if (changed > 0) {
+                laid_out_w = w;
+                laid_out_h = h;
+
+                // Splash lockup: scale DOWN to fit if the panel is
+                // smaller than the artwork; never upscale.
+                src_w = splash_source.GetWidth();
+                src_h = splash_source.GetHeight();
+                scale = 1;
+                if (src_w > w || src_h > h) {
+                    scale_w = w / src_w;
+                    scale_h = h / src_h;
+                    if (scale_w < scale_h) {
+                        scale = scale_w;
+                    } else {
+                        scale = scale_h;
+                    }
+                }
+                if (scale < 1) {
+                    splash_image = splash_source.Scale(src_w * scale,
+                                                       src_h * scale);
+                } else {
+                    splash_image = splash_source;
+                }
+                splash_w = splash_image.GetWidth();
+                splash_h = splash_image.GetHeight();
+                splash_sprite.SetImage(splash_image);
+                splash_sprite.SetX((w - splash_w) / 2);
+                splash_sprite.SetY((h - splash_h) / 2);
+
+                // Spinner: centered horizontally, below the lockup.
+                spinner_center_x = w / 2;
+                spinner_center_y = (h / 2) + (splash_h / 2) + 56;
+            }
+        }
     }
-    rotated = spinner_image.Rotate(spinner_angle);
-    spinner_sprite.SetImage(rotated);
-    spinner_sprite.SetX(spinner_center_x - rotated.GetWidth() / 2);
-    spinner_sprite.SetY(spinner_center_y - rotated.GetHeight() / 2);
+}
+
+// --- Refresh callback -----------------------------------------------------
+// Called by Plymouth on every render tick. layout() picks up the
+// display as soon as it exists; the spinner only animates once a
+// layout has happened (laid_out_w > 0).
+fun refresh_callback() {
+    layout();
+    if (laid_out_w > 0) {
+        spinner_angle = spinner_angle + 0.08;       // radians per frame
+        if (spinner_angle > 2 * Math.Pi) {
+            spinner_angle = spinner_angle - 2 * Math.Pi;
+        }
+        rotated = spinner_source.Rotate(spinner_angle);
+        spinner_sprite.SetImage(rotated);
+        spinner_sprite.SetX(spinner_center_x - rotated.GetWidth() / 2);
+        spinner_sprite.SetY(spinner_center_y - rotated.GetHeight() / 2);
+    }
 }
 Plymouth.SetRefreshFunction(refresh_callback);
 
