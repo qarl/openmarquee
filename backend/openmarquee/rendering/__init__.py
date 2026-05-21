@@ -56,7 +56,7 @@ class Renderer(Protocol):
         sidecar (`RustRenderer`) uses this to close the frame-pump
         session; in-process renderers (`MockRenderer`) treat it as a
         no-op. Idempotent. Callers that push frames — the stream
-        takeover pump and the `VlcStreamSlide` playback pump — MUST
+        takeover pump and the `StreamSlide` playback pump — MUST
         call this on every exit path of a `render_frame` run.
         """
         ...

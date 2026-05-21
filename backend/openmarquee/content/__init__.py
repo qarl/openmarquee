@@ -462,30 +462,30 @@ class VideoSlide(BaseModel):
     updated_at: datetime | None = None
 
 
-class VlcStreamSlide(BaseModel):
-    """A scheduled VLC stream — a playlist slide that plays an RTSP
-    stream the operator's VLC is publishing (docs/STREAM_VLC_PROPOSAL.md
-    §6).
+class StreamSlide(BaseModel):
+    """A scheduled video stream — a playlist slide that plays a live
+    network video stream the operator is publishing
+    (docs/STREAM_VLC_PROPOSAL.md §6).
 
     Unlike VideoSlide there is NO stored asset.mp4: the video bytes
-    arrive live over RTSP at playback time. The only stored file is a
-    synthetic asset.png thumbnail card, generated at save time (see
+    arrive live over the network at playback time. The only stored file
+    is a synthetic asset.png thumbnail card, generated at save time (see
     content/storage.py) so the slide tile has something to show in the
     editor's saved-slides list — the renderer never paints that PNG.
 
     `duration_ms` is the fixed slot length, like every other slide type
     (proposal Q8 default — a "play until the stream ends" option is a
     later follow-up). `on_unreachable` (proposal Q12) decides what the
-    playback loop does when the RTSP URL can't be reached when the slot
+    playback loop does when the stream URL can't be reached when the slot
     fires.
     """
 
-    type: Literal["vlc_stream"] = "vlc_stream"
+    type: Literal["stream"] = "stream"
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(max_length=200)
-    # The RTSP URL the operator's VLC publishes
+    # The stream URL the operator publishes
     # (e.g. rtsp://laptop:8554/live).
-    rtsp_url: str = Field(max_length=2000)
+    stream_url: str = Field(max_length=2000)
     # Fixed slot length, capped at 24h.
     duration_ms: int = Field(default=10_000, ge=100, le=24 * 60 * 60 * 1000)
     # Fallback when the RTSP URL is unreachable at slot-fire time.
@@ -507,6 +507,6 @@ class VlcStreamSlide(BaseModel):
 # Discriminated union of content variants. Pydantic uses the `type` literal to
 # route to the right subclass on deserialize.
 ContentItem = Annotated[
-    TextSlide | ImageSlide | VideoSlide | VlcStreamSlide,
+    TextSlide | ImageSlide | VideoSlide | StreamSlide,
     Field(discriminator="type"),
 ]

@@ -10,12 +10,16 @@ from PIL import Image
 
 from openmarquee.content import (
     ImageSlide,
+    StreamSlide,
     TextLayer,
     TextSlide,
     VideoSlide,
-    VlcStreamSlide,
 )
-from openmarquee.content.storage import SCHEMA_VERSION, ContentStorage
+from openmarquee.content.storage import (
+    SCHEMA_VERSION,
+    ContentStorage,
+    _migrate_legacy_stream_item,
+)
 
 
 def _make_slide(**overrides) -> TextSlide:
@@ -489,16 +493,16 @@ def test_delete_invalidates_cache_entry(tmp_path: Path):
         storage.load(slide.id)
 
 
-# --- vlc stream (STREAM/VLC slice 6) ---------------------------------------
+# --- stream (STREAM/VLC slice 6) -------------------------------------------
 
 
-def test_save_vlc_stream_writes_envelope_and_placeholder(tmp_path: Path):
-    """save_vlc_stream generates a synthetic 'VLC stream' thumbnail
-    card (the slide carries no operator-supplied image) and persists
-    it as the standard asset.png."""
+def test_save_stream_writes_envelope_and_placeholder(tmp_path: Path):
+    """save_stream generates a synthetic 'stream' thumbnail card (the
+    slide carries no operator-supplied image) and persists it as the
+    standard asset.png."""
     storage = ContentStorage(tmp_path)
-    slide = VlcStreamSlide(name="Q3 Live", rtsp_url="rtsp://laptop:8554/live")
-    storage.save_vlc_stream(slide)
+    slide = StreamSlide(name="Q3 Live", stream_url="rtsp://laptop:8554/live")
+    storage.save_stream(slide)
 
     png = storage.asset_path(slide.id).read_bytes()
     # A valid PNG (signature) decodable to the placeholder card dims.
@@ -506,30 +510,91 @@ def test_save_vlc_stream_writes_envelope_and_placeholder(tmp_path: Path):
     assert Image.open(BytesIO(png)).size == (640, 360)
 
 
-def test_load_roundtrips_vlc_stream_slide(tmp_path: Path):
+def test_load_roundtrips_stream_slide(tmp_path: Path):
     storage = ContentStorage(tmp_path)
-    slide = VlcStreamSlide(
+    slide = StreamSlide(
         name="Q3 Live",
-        rtsp_url="rtsp://laptop:8554/live",
+        stream_url="rtsp://laptop:8554/live",
         duration_ms=15_000,
         on_unreachable="black",
         transition="fade",
         transition_ms=300,
     )
-    storage.save_vlc_stream(slide)
+    storage.save_stream(slide)
     loaded = storage.load(slide.id)
-    assert isinstance(loaded, VlcStreamSlide)
+    assert isinstance(loaded, StreamSlide)
     assert loaded.model_copy(update={"updated_at": None}) == slide
     assert loaded.updated_at is not None
 
 
-def test_list_all_surfaces_vlc_stream_items(tmp_path: Path):
+def test_list_all_surfaces_stream_items(tmp_path: Path):
     storage = ContentStorage(tmp_path)
     text = TextSlide(name="t", text="t")
-    vlc = VlcStreamSlide(name="v", rtsp_url="rtsp://h:8554/x")
+    stream = StreamSlide(name="v", stream_url="rtsp://h:8554/x")
     storage.save_text_slide(text, b"\x89PNG_text")
-    storage.save_vlc_stream(vlc)
+    storage.save_stream(stream)
 
     by_type = {item.type: item for item in storage.list_all()}
-    assert isinstance(by_type["vlc_stream"], VlcStreamSlide)
+    assert isinstance(by_type["stream"], StreamSlide)
     assert isinstance(by_type["text_slide"], TextSlide)
+
+
+# --- legacy vlc_stream -> stream migration (STREAM-rename slice 1) ----------
+
+
+def test_migrate_legacy_stream_item_remaps_type_and_url():
+    """A legacy vlc_stream item dict is remapped to the stream shape:
+    `type` -> "stream" and `rtsp_url` -> `stream_url`."""
+    legacy = {
+        "type": "vlc_stream",
+        "id": str(uuid4()),
+        "name": "Old Live",
+        "rtsp_url": "rtsp://h/x",
+        "duration_ms": 10_000,
+        "on_unreachable": "hold_last_frame",
+    }
+    migrated = _migrate_legacy_stream_item(legacy)
+    assert migrated["type"] == "stream"
+    assert migrated["stream_url"] == "rtsp://h/x"
+    assert "rtsp_url" not in migrated
+    # Pure helper — the input dict is not mutated.
+    assert legacy["type"] == "vlc_stream"
+    assert "rtsp_url" in legacy
+
+
+def test_migrate_legacy_stream_item_leaves_other_types_unchanged():
+    """A non-vlc_stream item is returned untouched (identity)."""
+    text_item = {"type": "text_slide", "id": str(uuid4()), "name": "t"}
+    assert _migrate_legacy_stream_item(text_item) is text_item
+
+
+def test_load_migrates_legacy_vlc_stream_envelope(tmp_path: Path):
+    """A pre-rename envelope on disk ({"type": "vlc_stream",
+    "rtsp_url": ...}) loads back as a valid StreamSlide — the
+    discriminated-union load path remaps it before validation."""
+    storage = ContentStorage(tmp_path)
+    item_id = uuid4()
+    legacy_envelope = {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "item": {
+            "type": "vlc_stream",
+            "id": str(item_id),
+            "name": "Legacy Live",
+            "rtsp_url": "rtsp://h/x",
+            "duration_ms": 12_000,
+            "on_unreachable": "black",
+            "transition": "cut",
+            "transition_ms": 500,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    item_dir = tmp_path / str(item_id)
+    item_dir.mkdir()
+    (item_dir / "item.json").write_text(json.dumps(legacy_envelope, indent=2))
+
+    loaded = storage.load(item_id)
+    assert isinstance(loaded, StreamSlide)
+    assert loaded.type == "stream"
+    assert loaded.stream_url == "rtsp://h/x"
+    assert loaded.id == item_id

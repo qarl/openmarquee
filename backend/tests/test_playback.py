@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 from PIL import Image
 
-from openmarquee.content import ImageSlide, TextLayer, TextSlide, VlcStreamSlide
+from openmarquee.content import ImageSlide, StreamSlide, TextLayer, TextSlide
 
 
 def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
@@ -708,7 +708,7 @@ async def test_auto_mode_exposes_metadata_on_playback_state(renderer):
     assert loop.current_item_auto_format is None
 
 
-# --- STREAM/VLC Mode B: VlcStreamSlide playback (slice 7) ------------------
+# --- STREAM/VLC Mode B: StreamSlide playback (slice 7) ---------------------
 
 
 def _patch_vlc_ffmpeg(
@@ -733,10 +733,10 @@ def _patch_vlc_ffmpeg(
 
 
 @pytest.mark.asyncio
-async def test_vlc_stream_slide_pumps_frames_to_renderer(
+async def test_stream_slide_pumps_frames_to_renderer(
     renderer, tmp_path, monkeypatch
 ):
-    """A VlcStreamSlide in the playlist is intercepted before the IPC
+    """A StreamSlide in the playlist is intercepted before the IPC
     path; its (mock) RTSP frames are pushed straight to the renderer.
 
     HW-decode (2026-05-20): the consumer emits source-resolution NV12
@@ -762,8 +762,8 @@ async def test_vlc_stream_slide_pumps_frames_to_renderer(
     # 2s duration: the first-frame wait is bounded by min(connect-
     # timeout, slot remaining), so a too-short slot would starve the
     # budget below the mock python-interpreter's spawn time.
-    slide = VlcStreamSlide(
-        name="live", rtsp_url="rtsp://h:8554/x", duration_ms=2000
+    slide = StreamSlide(
+        name="live", stream_url="rtsp://h:8554/x", duration_ms=2000
     )
     loop = _new_loop(
         renderer, fetch_items=lambda: [slide], read_asset=lambda _id: b""
@@ -781,71 +781,71 @@ async def test_vlc_stream_slide_pumps_frames_to_renderer(
     # HW-decode: the consumer's frames are NV12; the pump threads that
     # format into render_frame().
     assert all(fmt == "nv12" for fmt in captured_formats)
-    # STREAM/VLC slice 2.5: the vlc_stream pump ends the renderer's
+    # STREAM/VLC slice 2.5: the stream pump ends the renderer's
     # frame-pump session on every slot exit (once per playlist cycle).
     assert renderer.end_external_frames_calls >= 1
 
 
 @pytest.mark.asyncio
-async def test_vlc_stream_unreachable_skip_advances_immediately(
+async def test_stream_unreachable_skip_advances_immediately(
     renderer, tmp_path, monkeypatch
 ):
-    """on_unreachable='skip' — an unreachable VlcStreamSlide is
+    """on_unreachable='skip' — an unreachable StreamSlide is
     abandoned at once; the loop reaches the next slide rather than
     holding the dead slot for its full duration."""
     # A missing ffmpeg binary == spawn fails == zero frames.
     _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
-    vlc = VlcStreamSlide(
+    stream = StreamSlide(
         name="dead",
-        rtsp_url="rtsp://h/x",
+        stream_url="rtsp://h/x",
         duration_ms=10_000,
         on_unreachable="skip",
     )
     text, png = _make_slide("after", (0, 255, 0))
     loop = _new_loop(
         renderer,
-        fetch_items=lambda: [vlc, text],
+        fetch_items=lambda: [stream, text],
         read_asset=lambda _id: png,
     )
     await loop.start()
     await asyncio.sleep(0.3)
     seen = [c[0] for c in renderer.begin_slide_calls]
     await loop.stop()
-    # The 10s VLC slide was skipped near-instantly — the text slide
+    # The 10s stream slide was skipped near-instantly — the text slide
     # after it was reached well inside 0.3s.
     assert text.id in seen
 
 
 @pytest.mark.asyncio
-async def test_vlc_stream_unreachable_hold_waits_out_the_slot(
+async def test_stream_unreachable_hold_waits_out_the_slot(
     renderer, tmp_path, monkeypatch
 ):
-    """on_unreachable='hold_last_frame' — an unreachable VlcStreamSlide
+    """on_unreachable='hold_last_frame' — an unreachable StreamSlide
     still occupies its full slot; the loop does NOT advance early."""
     _patch_vlc_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
-    vlc = VlcStreamSlide(
+    stream = StreamSlide(
         name="dead",
-        rtsp_url="rtsp://h/x",
+        stream_url="rtsp://h/x",
         duration_ms=10_000,
         on_unreachable="hold_last_frame",
     )
     text, png = _make_slide("after", (0, 255, 0))
     loop = _new_loop(
         renderer,
-        fetch_items=lambda: [vlc, text],
+        fetch_items=lambda: [stream, text],
         read_asset=lambda _id: png,
     )
     await loop.start()
     await asyncio.sleep(0.3)
     seen = [c[0] for c in renderer.begin_slide_calls]
     await loop.stop()
-    # The VLC slot is being held for its 10s duration — the text slide
-    # after it is NOT reached.
+    # The stream slot is being held for its 10s duration — the text
+    # slide after it is NOT reached.
     assert text.id not in seen
 
 
 @pytest.mark.asyncio
-async def test_vlc_stream_unreachable_black_paints_a_black_frame(
+async def test_stream_unreachable_black_paints_a_black_frame(
     renderer, tmp_path, monkeypatch
 ):
     """on_unreachable='black' paints one all-zero RGB frame before
@@ -859,14 +859,14 @@ async def test_vlc_stream_unreachable_black_paints_a_black_frame(
         return original(d, **kwargs)
 
     renderer.render_frame = _record
-    vlc = VlcStreamSlide(
+    stream = StreamSlide(
         name="dead",
-        rtsp_url="rtsp://h/x",
+        stream_url="rtsp://h/x",
         duration_ms=300,
         on_unreachable="black",
     )
     loop = _new_loop(
-        renderer, fetch_items=lambda: [vlc], read_asset=lambda _id: b""
+        renderer, fetch_items=lambda: [stream], read_asset=lambda _id: b""
     )
     await loop.start()
     await asyncio.sleep(0.2)
@@ -875,7 +875,7 @@ async def test_vlc_stream_unreachable_black_paints_a_black_frame(
 
 
 @pytest.mark.asyncio
-async def test_vlc_stream_connect_timeout_falls_back(
+async def test_stream_connect_timeout_falls_back(
     renderer, tmp_path, monkeypatch
 ):
     """If ffmpeg spawns but delivers no frame within the connect
@@ -883,21 +883,21 @@ async def test_vlc_stream_connect_timeout_falls_back(
     blocking on the dead stream for the whole slot."""
     monkeypatch.setattr("openmarquee.playback._VLC_CONNECT_TIMEOUT_S", 0.2)
     # hang mock: spawns, emits 0 frames, then sleeps — ffmpeg is up but
-    # never produces video, exactly how an unreachable RTSP URL behaves.
+    # never produces video, exactly how an unreachable stream URL behaves.
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, hang=True
     )
     _patch_vlc_ffmpeg(monkeypatch, mock)
-    vlc = VlcStreamSlide(
+    stream = StreamSlide(
         name="stuck",
-        rtsp_url="rtsp://h/x",
+        stream_url="rtsp://h/x",
         duration_ms=10_000,
         on_unreachable="skip",
     )
     text, png = _make_slide("after", (0, 255, 0))
     loop = _new_loop(
         renderer,
-        fetch_items=lambda: [vlc, text],
+        fetch_items=lambda: [stream, text],
         read_asset=lambda _id: png,
     )
     await loop.start()
@@ -910,21 +910,21 @@ async def test_vlc_stream_connect_timeout_falls_back(
 
 
 @pytest.mark.asyncio
-async def test_vlc_stream_slide_preempted_by_pause(
+async def test_stream_slide_preempted_by_pause(
     renderer, tmp_path, monkeypatch
 ):
-    """A pause() during a VlcStreamSlide slot is honored — the loop
+    """A pause() during a StreamSlide slot is honored — the loop
     yields the renderer and saves the resume index, so a stream
-    takeover can preempt a VLC slot."""
+    takeover can preempt a stream slot."""
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, continuous=True
     )
     _patch_vlc_ffmpeg(monkeypatch, mock)
-    vlc = VlcStreamSlide(
-        name="live", rtsp_url="rtsp://h/x", duration_ms=10_000
+    stream = StreamSlide(
+        name="live", stream_url="rtsp://h/x", duration_ms=10_000
     )
     loop = _new_loop(
-        renderer, fetch_items=lambda: [vlc], read_asset=lambda _id: b""
+        renderer, fetch_items=lambda: [stream], read_asset=lambda _id: b""
     )
     await loop.start()
     await asyncio.sleep(0.15)  # let the pump start streaming frames

@@ -32,7 +32,7 @@ The Rust sidecar owns GPU-side composition; slide/transition frame bytes
 never cross the process boundary — playback.py drives those via the IPC
 ops directly. The one exception is the STREAM/VLC push-frames path
 (slice 2.5): `render_frame` flips the sidecar into pump-mode and streams
-externally-produced RGB888 frames (a VLC takeover, a vlc_stream slide)
+externally-produced RGB888 frames (a stream takeover, a stream slide)
 down a dedicated binary pipe; `end_external_frames` ends the pump.
 
 ## Failure model (slice 1 baseline + 2026-05-14 reconnect/watchdog)

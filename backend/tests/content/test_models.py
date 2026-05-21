@@ -7,11 +7,11 @@ from pydantic import TypeAdapter, ValidationError
 from openmarquee.content import (
     ContentItem,
     ImageSlide,
+    StreamSlide,
     TextBox,
     TextLayer,
     TextSlide,
     VideoSlide,
-    VlcStreamSlide,
 )
 
 
@@ -506,13 +506,13 @@ def test_text_slide_multi_layer_round_trips_in_order():
     ]
 
 
-# --- VlcStreamSlide (STREAM/VLC slice 6) -----------------------------------
+# --- StreamSlide (STREAM/VLC slice 6) --------------------------------------
 
 
-def test_vlc_stream_slide_minimal_construction():
-    slide = VlcStreamSlide(name="Q3 Live", rtsp_url="rtsp://laptop:8554/live")
-    assert slide.type == "vlc_stream"
-    assert slide.rtsp_url == "rtsp://laptop:8554/live"
+def test_stream_slide_minimal_construction():
+    slide = StreamSlide(name="Q3 Live", stream_url="rtsp://laptop:8554/live")
+    assert slide.type == "stream"
+    assert slide.stream_url == "rtsp://laptop:8554/live"
     assert slide.duration_ms == 10_000
     assert slide.on_unreachable == "hold_last_frame"
     assert slide.transition == "cut"
@@ -521,44 +521,44 @@ def test_vlc_stream_slide_minimal_construction():
     assert slide.updated_at is None
 
 
-def test_vlc_stream_slide_rejects_unknown_on_unreachable():
+def test_stream_slide_rejects_unknown_on_unreachable():
     with pytest.raises(ValidationError):
-        VlcStreamSlide(
-            name="Live", rtsp_url="rtsp://h/x", on_unreachable="explode"
+        StreamSlide(
+            name="Live", stream_url="rtsp://h/x", on_unreachable="explode"
         )
 
 
-def test_vlc_stream_slide_accepts_each_on_unreachable_option():
+def test_stream_slide_accepts_each_on_unreachable_option():
     for opt in ("hold_last_frame", "black", "skip"):
-        slide = VlcStreamSlide(
-            name="Live", rtsp_url="rtsp://h/x", on_unreachable=opt
+        slide = StreamSlide(
+            name="Live", stream_url="rtsp://h/x", on_unreachable=opt
         )
         assert slide.on_unreachable == opt
 
 
-def test_vlc_stream_slide_duration_bounds_enforced():
+def test_stream_slide_duration_bounds_enforced():
     # Below the 100 ms floor.
     with pytest.raises(ValidationError):
-        VlcStreamSlide(name="Live", rtsp_url="rtsp://h/x", duration_ms=50)
+        StreamSlide(name="Live", stream_url="rtsp://h/x", duration_ms=50)
     # Above the 24 h ceiling.
     with pytest.raises(ValidationError):
-        VlcStreamSlide(
+        StreamSlide(
             name="Live",
-            rtsp_url="rtsp://h/x",
+            stream_url="rtsp://h/x",
             duration_ms=24 * 60 * 60 * 1000 + 1,
         )
 
 
-def test_vlc_stream_slide_rejects_other_type_literal():
+def test_stream_slide_rejects_other_type_literal():
     with pytest.raises(ValidationError):
-        VlcStreamSlide(type="video", name="Live", rtsp_url="rtsp://h/x")
+        StreamSlide(type="video", name="Live", stream_url="rtsp://h/x")
 
 
-def test_vlc_stream_slide_routes_through_content_item_union():
-    """The ContentItem discriminated union routes a vlc_stream envelope
-    back to VlcStreamSlide on decode."""
+def test_stream_slide_routes_through_content_item_union():
+    """The ContentItem discriminated union routes a stream envelope
+    back to StreamSlide on decode."""
     adapter = TypeAdapter(ContentItem)
-    slide = VlcStreamSlide(name="Q3 Live", rtsp_url="rtsp://laptop:8554/live")
+    slide = StreamSlide(name="Q3 Live", stream_url="rtsp://laptop:8554/live")
     decoded = adapter.validate_python(slide.model_dump(mode="json"))
-    assert isinstance(decoded, VlcStreamSlide)
+    assert isinstance(decoded, StreamSlide)
     assert decoded == slide

@@ -38,9 +38,9 @@ from openmarquee._atomic import atomic_write_bytes, atomic_write_text
 from openmarquee.content import (
     ContentItem,
     ImageSlide,
+    StreamSlide,
     TextSlide,
     VideoSlide,
-    VlcStreamSlide,
 )
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
@@ -63,12 +63,45 @@ _VIDEO_FILENAME = "asset.mp4"
 # right subclass on deserialize based on the `type` literal.
 _CONTENT_ADAPTER: TypeAdapter[ContentItem] = TypeAdapter(ContentItem)
 
-# The synthetic thumbnail card drawn for a VlcStreamSlide (16:9).
-_VLC_PLACEHOLDER_SIZE = (640, 360)
+# The synthetic thumbnail card drawn for a StreamSlide (16:9).
+_STREAM_PLACEHOLDER_SIZE = (640, 360)
+
+
+def _migrate_legacy_stream_item(item: dict) -> dict:
+    """Remap a legacy `vlc_stream` item dict to the current `stream` shape.
+
+    The `vlc_stream` slide type was renamed to `stream` (and its
+    `rtsp_url` field to `stream_url`) — same data shape, just renamed
+    identifiers, so this is NOT a SCHEMA_VERSION bump. `ContentItem` is
+    a Pydantic discriminated union keyed on `type`: the discriminator
+    runs *before* any model validator, so a `model_validator(mode=
+    "before")` on the model would never see a `vlc_stream` envelope (it
+    fails to match a union member first). The remap therefore has to
+    happen on the raw parsed dict, before `_CONTENT_ADAPTER.validate_
+    python`.
+
+    Pure function: given the inner `item` dict, if its `type` is the
+    legacy `"vlc_stream"` literal, return a *copy* with `type` set to
+    `"stream"` and the `rtsp_url` key renamed to `stream_url` (only
+    renamed when `stream_url` isn't already present, so a half-migrated
+    hand-edited envelope doesn't lose data). Any other item is returned
+    unchanged.
+
+    P2 self-healing: this fixes the shape only in memory on load; the
+    next save() rewrites item.json with the new literal, so the legacy
+    form drains off disk as content gets edited.
+    """
+    if item.get("type") != "vlc_stream":
+        return item
+    migrated = dict(item)
+    migrated["type"] = "stream"
+    if "rtsp_url" in migrated and "stream_url" not in migrated:
+        migrated["stream_url"] = migrated.pop("rtsp_url")
+    return migrated
 
 
 def _placeholder_font(size: int) -> ImageFont.ImageFont:
-    """A scalable font for the VLC placeholder card. Pillow's bundled
+    """A scalable font for the stream placeholder card. Pillow's bundled
     default font is used at the requested size; the bare-default
     fallback covers any Pillow too old for the size argument."""
     try:
@@ -91,16 +124,15 @@ def _draw_centered(
     draw.text(((width - text_w) / 2, y), text, font=font, fill=fill)
 
 
-def render_vlc_placeholder_png(slide: VlcStreamSlide) -> bytes:
-    """Draw the synthetic 'VLC stream' thumbnail card for a
-    VlcStreamSlide.
+def render_stream_placeholder_png(slide: StreamSlide) -> bytes:
+    """Draw the synthetic 'stream' thumbnail card for a StreamSlide.
 
-    A VlcStreamSlide carries no operator-supplied image — the video is
-    a live RTSP feed. This card just gives the editor's saved-slides
+    A StreamSlide carries no operator-supplied image — the video is
+    a live network feed. This card just gives the editor's saved-slides
     tile something to render; the device renderer never paints it.
     Per docs/STREAM_VLC_PROPOSAL.md §6 recommendation (b).
     """
-    width, height = _VLC_PLACEHOLDER_SIZE
+    width, height = _STREAM_PLACEHOLDER_SIZE
     img = Image.new("RGB", (width, height), (24, 24, 28))
     draw = ImageDraw.Draw(img)
 
@@ -116,10 +148,10 @@ def render_vlc_placeholder_png(slide: VlcStreamSlide) -> bytes:
     )
 
     _draw_centered(
-        draw, "VLC stream", _placeholder_font(30), width, cy + radius + 26,
+        draw, "Stream", _placeholder_font(30), width, cy + radius + 26,
         (235, 235, 235),
     )
-    url = slide.rtsp_url
+    url = slide.stream_url
     if len(url) > 54:
         url = url[:51] + "…"
     _draw_centered(
@@ -255,17 +287,17 @@ class ContentStorage:
                 shutil.rmtree(item_dir, ignore_errors=True)
             raise
 
-    def save_vlc_stream(
+    def save_stream(
         self,
-        slide: VlcStreamSlide,
+        slide: StreamSlide,
         *,
         updated_at: datetime | None = None,
     ) -> None:
-        """Persist a VLC-stream slide.
+        """Persist a stream slide.
 
         Unlike the other slide types there is no operator-supplied
-        asset — the video arrives live over RTSP. A synthetic 'VLC
-        stream' thumbnail card is generated here and handed to save()
+        asset — the video arrives live over the network. A synthetic
+        'stream' thumbnail card is generated here and handed to save()
         as the asset.png, so the editor's saved-slides tile renders
         consistently with every other slide type (proposal §6).
 
@@ -275,7 +307,7 @@ class ContentStorage:
         """
         self.save(
             slide,
-            render_vlc_placeholder_png(slide),
+            render_stream_placeholder_png(slide),
             updated_at=updated_at,
         )
 
@@ -320,6 +352,11 @@ class ContentStorage:
                 f"expected {SCHEMA_VERSION} — migration needed"
             )
 
+        # Remap any legacy `vlc_stream` item to the current `stream`
+        # shape BEFORE validation — the ContentItem union discriminates
+        # on `type`, so the rename has to land on the raw dict (a
+        # model_validator would never see an unmatched union member).
+        data["item"] = _migrate_legacy_stream_item(data["item"])
         # TypeAdapter dispatches to the right ContentItem variant based on
         # the `type` literal. Unknown types surface as validation errors.
         type(self)._stats["envelope_validates"] += 1
