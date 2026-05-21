@@ -57,10 +57,9 @@ def web_refresh_due(
 ) -> bool:
     """Pure staleness predicate for a Web slide's screenshot refresh.
 
-    A Web slide's `asset.png` is a screenshot the render helper
-    re-produces every `refresh_interval_s`. When the slide's slot
-    comes round, the playback loop asks this whether a fresh fetch
-    is owed.
+    A Web slide's `asset.png` is a screenshot re-rendered on-device
+    every `refresh_interval_s`. When the slide's slot comes round,
+    the playback loop asks this whether a fresh render is owed.
 
     Args:
         last_fetch_monotonic: when a refresh was last KICKED for this
@@ -107,14 +106,14 @@ class PlaybackLoop:
         self._renderer = renderer
         self._fetch_items = fetch_items
         self._read_asset = read_asset
-        # Web slide (Web slide P3): the screenshot-refresh producer. A
-        # coroutine that, given a WebSlide + the panel width/height,
-        # fetches a fresh screenshot from the render helper and saves
-        # it as the slide's asset.png. The loop fire-and-forgets it
-        # (asyncio.create_task) when a Web slide's slot is stale — it
-        # is NEVER awaited inside _loop, so a 2-10s helper fetch can't
-        # freeze the sign. None in tests / configs that don't wire a
-        # producer (a Web slide then just renders its current asset).
+        # Web slide: the screenshot-refresh producer. A coroutine
+        # that, given a WebSlide + the display width/height, renders a
+        # fresh screenshot on-device and saves it as the slide's
+        # asset.png. The loop fire-and-forgets it (asyncio.create_task)
+        # when a Web slide's slot is stale — it is NEVER awaited inside
+        # _loop, so a multi-second render can't freeze the sign. None
+        # in tests / configs that don't wire a producer (a Web slide
+        # then just renders its current asset).
         self._web_screenshot_producer = web_screenshot_producer
         # Bug 1 (2026-05-20): a cheap "which playlist is active right
         # now per the schedule" probe, re-evaluated once per slot so a
@@ -458,12 +457,12 @@ class PlaybackLoop:
                     self._current_auto_mode = None
                     self._current_auto_format = None
 
-                # Web slide (Web slide P3): when a Web slide's slot is
-                # entered, fire-and-forget a screenshot refresh if the
-                # current asset is stale. _maybe_kick_web_refresh
-                # launches the fetch with create_task and returns
-                # IMMEDIATELY — the loop NEVER awaits it, so a 2-10s
-                # helper fetch can't freeze the sign. The slide then
+                # Web slide: when a Web slide's slot is entered,
+                # fire-and-forget a screenshot refresh if the current
+                # asset is stale. _maybe_kick_web_refresh launches the
+                # render with create_task and returns IMMEDIATELY — the
+                # loop NEVER awaits it, so a multi-second render can't
+                # freeze the sign. The slide then
                 # plays via the normal IPC route below (a `web` slide
                 # is an image slide to the renderer — see content.rs
                 # find_image_slide), painting whatever asset.png
@@ -701,12 +700,12 @@ class PlaybackLoop:
         Called from `_loop` when a Web slide's slot is entered. A Web
         slide renders as an image slide (the renderer paints its
         `asset.png`); this keeps that asset fresh by periodically
-        re-fetching a screenshot from the render helper.
+        re-rendering a screenshot on-device.
 
-        CRITICAL — this MUST NOT block the playback loop. A screenshot
-        fetch takes 2-10s; if `_loop` awaited it the sign would freeze
-        for the whole fetch (the "coffe" Bug A failure class). So the
-        fetch is launched with `asyncio.create_task` and this method
+        CRITICAL — this MUST NOT block the playback loop. An on-device
+        render takes several seconds; if `_loop` awaited it the sign
+        would freeze for it (the "coffe" Bug A failure class). So the
+        render is launched with `asyncio.create_task` and this method
         returns IMMEDIATELY — `_loop` then plays the slide with
         whatever `asset.png` currently exists (last-good screenshot,
         or the create-time placeholder). The fresh screenshot lands
@@ -743,9 +742,9 @@ class PlaybackLoop:
         the periodic producer.
 
         Same non-blocking contract as `_maybe_kick_web_refresh`: the
-        fetch is launched with `asyncio.create_task` and this returns
-        IMMEDIATELY, so the HTTP request never blocks on the 2-10s
-        helper fetch. The in-flight guard still applies (a kick while
+        render is launched with `asyncio.create_task` and this returns
+        IMMEDIATELY, so the create/update request never blocks on the
+        on-device render. The in-flight guard still applies (a kick while
         a fetch is already running for this id is a no-op) and the
         kick time is stamped so the periodic loop's next slot sees the
         slide as fresh. A no-op if no producer is wired (test configs).

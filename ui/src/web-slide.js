@@ -1,12 +1,11 @@
 // Web slide editor — a pure-metadata form for a playlist slide that
 // shows a screenshot of an operator-supplied web page.
 //
-// The Raspberry Pi can't run a browser, so a render helper
-// (`web-helper/`, running on the operator's own machine) loads the URL
-// and produces screenshots; the sign fetches them. Architecturally
-// the Web slide is "an image slide whose asset.png is auto-refreshed
-// from the helper". On create there is no screenshot yet — the
-// backend synthesises a placeholder card (storage.save_web). So this
+// The Pi renders the page itself with headless Chromium and bakes a
+// screenshot. Architecturally the Web slide is "an image slide whose
+// asset.png is auto-refreshed from an on-device render". On create
+// there is no screenshot yet — the backend synthesises a placeholder
+// card (storage.save_web). So this
 // module, like the Stream editor, is just a metadata form — name,
 // page URL, refresh interval, and duration — wired to the same
 // auto-save + slide-browser scaffolding the other slide editors use.

@@ -3,8 +3,8 @@ entirely on the Pi, with no external render helper.
 
 A WebSlide is "an image slide whose asset.png is auto-refreshed from a
 render of an operator-supplied URL". Historically that render happened
-on an operator's own machine (a headless-Chromium helper in
-`web-helper/`) because the Pi can't run a browser. This module replaces
+off-device — a headless-Chromium helper the operator ran on their own
+machine — because the Pi can't run a browser. This module replaces
 that: it rasterizes the page on-device.
 
 Render engine — Chromium headless. The page is rendered by the

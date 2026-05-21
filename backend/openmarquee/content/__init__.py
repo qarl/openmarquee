@@ -48,12 +48,12 @@ TransitionKind = Literal[
 def validate_web_url(url: str) -> None:
     """Raise `ValueError` if `url` is not a plain `http`/`https` web page.
 
-    The URL is operator-supplied and is handed to the render helper
-    (`web-helper/`) which loads it in a real browser. A WebSlide must
-    point at an actual web page, so the scheme allowlist is exactly
-    `{"http", "https"}` — `file:`, `ftp:`, `data:` and friends are
-    rejected (a `file:` URL would turn an operator-typed field into a
-    local-file-read primitive on the helper machine).
+    The URL is operator-supplied and is rendered on-device in a real
+    browser (headless Chromium). A WebSlide must point at an actual web
+    page, so the scheme allowlist is exactly `{"http", "https"}` —
+    `file:`, `ftp:`, `data:` and friends are rejected (a `file:` URL
+    would turn an operator-typed field into a local-file-read primitive
+    on the Pi).
 
     This intentionally does NOT reuse `stream_consumer.validate_stream_url`
     — that allows the rtsp/rtmp/srt/udp transports, which are nonsense
@@ -585,29 +585,27 @@ class WebSlide(BaseModel):
     """A web page rendered onto the sign — a playlist slide that shows
     a screenshot of an operator-supplied URL.
 
-    The Raspberry Pi can't run a browser, so a render helper
-    (`web-helper/`, running on the operator's machine) loads the page
-    and produces screenshots; the sign fetches them. Architecturally
-    the Web slide is "an image slide whose asset.png is auto-refreshed
-    from the helper" — so unlike StreamSlide it DOES carry a stored
-    asset.png that the renderer paints. On create there is no
-    screenshot yet, so the initial asset is a synthetic placeholder
-    card (see content/storage.py); the periodic-fetch producer
-    overwrites it with a real screenshot.
+    The Pi renders the page itself with headless Chromium and bakes a
+    screenshot. Architecturally the Web slide is "an image slide whose
+    asset.png is auto-refreshed from an on-device render" — so unlike
+    StreamSlide it DOES carry a stored asset.png that the renderer
+    paints. On create there is no screenshot yet, so the initial asset
+    is a synthetic placeholder card (see content/storage.py); the
+    periodic-render producer overwrites it with a real screenshot.
 
     `duration_ms` is the fixed slot length, like every other slide
-    type. `refresh_interval_s` is how often the helper re-fetches a
-    fresh screenshot of `url`.
+    type. `refresh_interval_s` is how often a fresh screenshot of
+    `url` is rendered.
     """
 
     type: Literal["web"] = "web"
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(max_length=200)
-    # The web page the render helper screenshots
+    # The web page rendered on-device
     # (e.g. https://status.example.com).
     url: str = Field(max_length=2000)
-    # How often the screenshot is re-fetched, in seconds. Bounded:
-    # min 10s (a tighter cadence would hammer the helper / the target
+    # How often the screenshot is re-rendered, in seconds. Bounded:
+    # min 10s (a tighter cadence would hammer the Pi / the target
     # site) and max 24h (a day-stale screenshot is the loosest sane
     # refresh). Default 300s = a 5-minute refresh.
     refresh_interval_s: int = Field(

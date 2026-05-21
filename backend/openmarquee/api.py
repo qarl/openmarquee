@@ -773,7 +773,7 @@ class WebUpload(BaseModel):
     """Wire format for POST /api/content/web.
 
     A web slide has no operator-uploaded asset — the screenshot is
-    produced later by the render helper (`web-helper/`) and the
+    rendered on-device later (openmarquee.web_render) and the
     placeholder card is synthesised at save time (storage.save_web).
     The payload is therefore pure metadata. `transition` is a plain
     string here; the WebSlide model does the Literal validation (a bad
@@ -798,11 +798,11 @@ async def upload_web(
     kick_web_screenshot: WebScreenshotKickerDep,
     background: BackgroundTasks,
 ) -> WebSlide:
-    # Security: the URL is operator-supplied and is handed to the
-    # render helper, which loads it in a real browser. Reject a
-    # non-http(s) scheme (file://, ftp://, …) here so the operator
-    # gets an immediate 400 in the editor instead of a slide that
-    # silently fails.
+    # Security: the URL is operator-supplied and is rendered on-device
+    # in a real browser (headless Chromium). Reject a non-http(s)
+    # scheme (file://, ftp://, …) here so the operator gets an
+    # immediate 400 in the editor instead of a slide that silently
+    # fails.
     try:
         validate_web_url(payload.url)
     except ValueError as exc:
@@ -820,7 +820,7 @@ async def upload_web(
     # screenshot fetch so the real asset image populates promptly. The
     # kick is fire-and-forget (the playback loop launches it via
     # create_task) so the create response returns immediately; if the
-    # render helper is unreachable the producer logs + leaves the
+    # on-device render fails the producer logs + leaves the
     # placeholder, so creation still succeeds.
     kick_web_screenshot(slide)
     return slide

@@ -287,9 +287,8 @@ export async function updateStream(id, payload) {
 /**
  * Create a web slide. `payload` matches the backend `WebUpload` schema
  * (api.py) — pure metadata (name, url, refresh_interval_s, duration_ms,
- * transition). There is no asset upload: the screenshot is produced by
- * the render helper (`web-helper/`) and the placeholder card is
- * synthesised server-side.
+ * transition). There is no asset upload: the screenshot is rendered
+ * on-device and the placeholder card is synthesised server-side.
  */
 export async function saveWeb(payload) {
     const response = await apiFetch("/api/content/web", {

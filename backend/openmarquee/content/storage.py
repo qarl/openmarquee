@@ -177,11 +177,11 @@ def render_stream_placeholder_png(slide: StreamSlide) -> bytes:
 def render_web_placeholder_png(slide: WebSlide) -> bytes:
     """Draw the synthetic placeholder card for a WebSlide.
 
-    A WebSlide's asset.png is a screenshot produced by the render
-    helper (`web-helper/`). Before the first screenshot arrives — and
-    whenever the helper is unreachable — this card stands in so the
-    slide tile (and the renderer) has something to show. The
-    periodic-fetch producer overwrites it with a real screenshot.
+    A WebSlide's asset.png is a screenshot rendered on-device. Before
+    the first screenshot arrives — and whenever a render fails — this
+    card stands in so the slide tile (and the renderer) has something
+    to show. The periodic-render producer overwrites it with a real
+    screenshot.
     """
     width, height = _WEB_PLACEHOLDER_SIZE
     img = Image.new("RGB", (width, height), (24, 24, 28))
@@ -377,13 +377,14 @@ class ContentStorage:
 
         Unlike StreamSlide, a WebSlide DOES carry a stored asset.png:
         it is the screenshot the renderer paints (the Web slide is "an
-        image slide whose asset.png is auto-refreshed from the helper").
+        image slide whose asset.png is auto-refreshed from an on-device
+        render").
 
-        `png_bytes` is the screenshot to write. On create the operator
-        has no screenshot — the helper hasn't run yet — so callers pass
+        `png_bytes` is the screenshot to write. On create there is no
+        screenshot yet — nothing has been rendered — so callers pass
         None and a synthetic placeholder card is generated and stored
-        instead. The periodic-fetch producer (a later commit) calls
-        this with real screenshot bytes to refresh the asset in place.
+        instead. The periodic-render producer calls this with real
+        screenshot bytes to refresh the asset in place.
 
         `updated_at` semantics match save() — defaults to now() for a
         local edit, accepts an explicit value so peer-ingest preserves

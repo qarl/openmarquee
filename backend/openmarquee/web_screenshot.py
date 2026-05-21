@@ -5,9 +5,9 @@ A WebSlide is "an image slide whose asset.png is auto-refreshed from an
 on-device render of an operator-supplied URL". The Pi renders the page
 itself with headless Chromium (`openmarquee.web_render`); this module
 is the playback-side driver — it calls the renderer and overwrites the
-slide's `asset.png` in place. (Historically the render happened on an
-operator's own machine via a `web-helper/` HTTP service the sign
-fetched from; that helper is gone.)
+slide's `asset.png` in place. (Historically the render happened
+off-device — the sign fetched PNGs from a helper service the operator
+ran; that is gone.)
 
 The single entry point is `fetch_web_screenshot` — an async coroutine
 the playback loop fire-and-forgets (`asyncio.create_task`) when a Web
