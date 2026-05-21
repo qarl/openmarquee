@@ -3054,7 +3054,7 @@ pub fn cover_fit_quad_verts(
     // Degenerate dims -> the plain fullscreen quad. The caller's
     // frame-size checks reject 0-area frames before paint; this
     // guard just keeps the math division-safe.
-    let (sx, sy) = if frame_w == 0 || frame_h == 0
+    let (mut sx, mut sy) = if frame_w == 0 || frame_h == 0
         || panel_w == 0 || panel_h == 0
     {
         (1.0f32, 1.0f32)
@@ -3071,12 +3071,74 @@ pub fn cover_fit_quad_verts(
             (1.0, panel_aspect / frame_aspect)
         }
     };
+    // Hardening C3 / L2 (2026-05-21): defensive sanity clamp. A
+    // pathological source aspect (e.g. 10000x1) drives sx/sy
+    // unboundedly large, pushing the quad verts far past the GL
+    // guard band. A quad scaled 16x already covers the panel many
+    // times over — beyond that is degenerate input, so cap it.
+    // For any normal aspect this changes nothing.
+    sx = sx.min(16.0);
+    sy = sy.min(16.0);
     [
         -sx, -sy, 0.0, 0.0,
          sx, -sy, 1.0, 0.0,
         -sx,  sy, 0.0, 1.0,
          sx,  sy, 1.0, 1.0,
     ]
+}
+
+/// Hardening C3 / L1 (2026-05-21) — the cover-fit quad VBO key:
+/// `(frame_w, frame_h, panel_w, panel_h)`. The geometry only
+/// changes when the source or panel dims change.
+pub type CoverQuadKey = (u32, u32, u32, u32);
+
+/// Hardening C3 / L1 (2026-05-21) — slot-selection result for the
+/// 2-entry cover-fit VBO cache (`COVER_QUAD_VBO` in `hdmi.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverQuadSlot {
+    /// `key` is already resident in slot `idx` — reuse its VBO.
+    Hit { idx: usize },
+    /// Cache miss — build into slot `idx`, evicting whatever VBO
+    /// (if any) currently occupies it.
+    Miss { idx: usize },
+}
+
+/// Hardening C3 / L1 (2026-05-21) — choose the 2-entry cover-fit
+/// VBO cache slot for `key`.
+///
+/// Background: a video↔video transition between two
+/// differently-sized sources alternates the two endpoints' keys
+/// every frame. The pre-fix SINGLE-slot cache rebuilt its only
+/// slot TWICE PER FRAME for the whole transition (glGenBuffers +
+/// buffer_data + glDeleteBuffers churn — no leak, just waste). A
+/// 2-entry cache keeps BOTH transition endpoints' VBOs resident.
+///
+/// On a hit, returns the occupied slot. On a miss, returns the
+/// slot to (re)build into: the first empty slot, else the
+/// least-recently-built slot. `next_build` is the round-robin
+/// cursor the caller advances after a miss-driven build, so two
+/// alternating keys settle into the two slots and then hit
+/// forever. Pure (no GL) so the slot logic is host-testable.
+pub fn cover_quad_slot(
+    slots: &[Option<CoverQuadKey>; 2],
+    key: CoverQuadKey,
+    next_build: usize,
+) -> CoverQuadSlot {
+    // Hit: key already resident.
+    for (idx, slot) in slots.iter().enumerate() {
+        if *slot == Some(key) {
+            return CoverQuadSlot::Hit { idx };
+        }
+    }
+    // Miss: prefer an empty slot so a cold cache fills both before
+    // it ever evicts.
+    for (idx, slot) in slots.iter().enumerate() {
+        if slot.is_none() {
+            return CoverQuadSlot::Miss { idx };
+        }
+    }
+    // Both occupied: evict via the round-robin cursor.
+    CoverQuadSlot::Miss { idx: next_build % 2 }
 }
 
 /// V4L2 piece 4b (2026-05-14) -- DMA-BUF zero-copy NV12 sampler
@@ -7541,6 +7603,109 @@ mod tests {
         ];
         assert_eq!(cover_fit_quad_verts(0, 0, 1920, 1080), id);
         assert_eq!(cover_fit_quad_verts(1280, 720, 0, 0), id);
+    }
+
+    #[test]
+    fn cover_fit_pathological_aspect_is_clamped() {
+        // Hardening C3 / L1: a 10000x1 source into a 1920x1080
+        // panel has frame_aspect = 10000, panel_aspect ≈ 1.78, so
+        // the raw sx = frame_aspect / panel_aspect ≈ 5625 — far
+        // past the GL guard band. The L2 clamp caps it at 16.0.
+        let v = cover_fit_quad_verts(10000, 1, 1920, 1080);
+        for i in 0..4 {
+            assert!(
+                v[i * 4].abs() <= 16.0 + 1e-3,
+                "x clamped to <=16 (got {})", v[i * 4],
+            );
+            assert!(
+                v[i * 4 + 1].abs() <= 16.0 + 1e-3,
+                "y clamped to <=16 (got {})", v[i * 4 + 1],
+            );
+        }
+        // The clamped axis lands exactly on the cap.
+        assert!((v[0].abs() - 16.0).abs() < 1e-3, "wide source pinned at sx=16");
+        // A pathological TALL source clamps the other axis the
+        // same way.
+        let vt = cover_fit_quad_verts(1, 10000, 1920, 1080);
+        assert!((vt[1].abs() - 16.0).abs() < 1e-3, "tall source pinned at sy=16");
+    }
+
+    #[test]
+    fn cover_fit_normal_aspect_unchanged_by_clamp() {
+        // The L2 clamp is purely defensive — for a normal aspect
+        // (sx/sy well under 16) it changes nothing.
+        let v = cover_fit_quad_verts(2000, 1000, 1000, 1000);
+        assert_eq!(v, [
+            -2.0, -1.0, 0.0, 0.0,
+             2.0, -1.0, 1.0, 0.0,
+            -2.0,  1.0, 0.0, 1.0,
+             2.0,  1.0, 1.0, 1.0,
+        ]);
+    }
+
+    #[test]
+    fn cover_quad_slot_miss_fills_empty_slots_first() {
+        // Cold cache: a miss fills slot 0, then slot 1.
+        let slots: [Option<CoverQuadKey>; 2] = [None, None];
+        assert_eq!(
+            cover_quad_slot(&slots, (1920, 1080, 1920, 1080), 0),
+            CoverQuadSlot::Miss { idx: 0 },
+        );
+        let slots: [Option<CoverQuadKey>; 2] =
+            [Some((1920, 1080, 1920, 1080)), None];
+        assert_eq!(
+            cover_quad_slot(&slots, (1280, 720, 1920, 1080), 0),
+            CoverQuadSlot::Miss { idx: 1 },
+        );
+    }
+
+    #[test]
+    fn cover_quad_slot_alternating_keys_both_hit() {
+        // The video↔video transition case: two differently-sized
+        // endpoints. Once both keys are resident, every subsequent
+        // lookup is a HIT — no rebuild, no churn.
+        let key_a: CoverQuadKey = (1920, 1080, 1920, 1080);
+        let key_b: CoverQuadKey = (640, 480, 1920, 1080);
+        let slots: [Option<CoverQuadKey>; 2] = [Some(key_a), Some(key_b)];
+        assert_eq!(
+            cover_quad_slot(&slots, key_a, 0),
+            CoverQuadSlot::Hit { idx: 0 },
+        );
+        assert_eq!(
+            cover_quad_slot(&slots, key_b, 1),
+            CoverQuadSlot::Hit { idx: 1 },
+        );
+        // Order in the array doesn't matter — a hit finds the key
+        // wherever it sits.
+        let slots: [Option<CoverQuadKey>; 2] = [Some(key_b), Some(key_a)];
+        assert_eq!(
+            cover_quad_slot(&slots, key_a, 0),
+            CoverQuadSlot::Hit { idx: 1 },
+        );
+    }
+
+    #[test]
+    fn cover_quad_slot_evicts_round_robin_when_full() {
+        // Both slots occupied, a third (different) key arrives:
+        // evict via the round-robin cursor, not at random.
+        let slots: [Option<CoverQuadKey>; 2] = [
+            Some((1920, 1080, 1920, 1080)),
+            Some((640, 480, 1920, 1080)),
+        ];
+        let key_c: CoverQuadKey = (800, 600, 1920, 1080);
+        assert_eq!(
+            cover_quad_slot(&slots, key_c, 0),
+            CoverQuadSlot::Miss { idx: 0 },
+        );
+        assert_eq!(
+            cover_quad_slot(&slots, key_c, 1),
+            CoverQuadSlot::Miss { idx: 1 },
+        );
+        // The cursor wraps (modulo 2).
+        assert_eq!(
+            cover_quad_slot(&slots, key_c, 2),
+            CoverQuadSlot::Miss { idx: 0 },
+        );
     }
 
     #[test]

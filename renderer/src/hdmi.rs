@@ -5383,10 +5383,11 @@ fn clear_bright_gamma_cache(gl: &glow::Context) {
             unsafe { gl.delete_buffer(vbo); }
         }
     });
-    // FYS bug B -- free the cover-fit quad VBO.
+    // FYS bug B / hardening C3 L1 -- free both cover-fit quad VBO
+    // cache slots.
     COVER_QUAD_VBO.with(|c| {
-        if let Some((vbo, _key)) = c.replace(None) {
-            unsafe { gl.delete_buffer(vbo); }
+        for slot in c.replace([None, None]).into_iter().flatten() {
+            unsafe { gl.delete_buffer(slot.0); }
         }
     });
 }
@@ -5479,17 +5480,38 @@ std::thread_local! {
     /// overflow); UVs stay fixed. Keyed on (frame_w, frame_h,
     /// panel_w, panel_h) — the geometry only changes on a source- or
     /// panel-dims change (a slide change to a differently-sized
-    /// asset / a resolution switch), so it rebuilds rarely. Freed in
-    /// clear_bright_gamma_cache at session teardown.
-    static COVER_QUAD_VBO: std::cell::Cell<
-        Option<(glow::NativeBuffer, (u32, u32, u32, u32))>,
-    > = const { std::cell::Cell::new(None) };
+    /// asset / a resolution switch).
+    ///
+    /// Hardening C3 / L1 (2026-05-21): a 2-ENTRY cache. A
+    /// video↔video transition between two differently-sized
+    /// sources alternates the two endpoints' keys every frame; a
+    /// single-slot cache rebuilt its only slot twice per frame for
+    /// the whole transition. Two slots keep BOTH endpoints' VBOs
+    /// resident, so steady-state transition frames are pure hits.
+    /// Slot selection is the host-tested pure `cover_quad_slot`.
+    /// Both slots are freed in clear_bright_gamma_cache at session
+    /// teardown.
+    static COVER_QUAD_VBO: std::cell::RefCell<
+        [Option<(glow::NativeBuffer, crate::hdmi_logic::CoverQuadKey)>; 2],
+    > = const { std::cell::RefCell::new([None, None]) };
+
+    /// Hardening C3 / L1 -- round-robin eviction cursor for the
+    /// 2-entry `COVER_QUAD_VBO` cache (used only when both slots
+    /// are occupied and a third key arrives).
+    static COVER_QUAD_VBO_NEXT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// FYS bug B (2026-05-21) -- get-or-rebuild the cover-fit quad VBO
 /// for a (source dims, panel dims) pair. The vertices come from the
-/// host-tested `cover_fit_quad_verts`. STATIC_DRAW; rebuilt only
-/// when the requested dims differ from the cached ones.
+/// host-tested `cover_fit_quad_verts`. STATIC_DRAW; rebuilt only on
+/// a cache miss.
+///
+/// Hardening C3 / L1: 2-entry cache. `cover_quad_slot` (pure,
+/// host-tested) picks the slot — a hit reuses the resident VBO; a
+/// miss builds into an empty slot, else evicts the round-robin
+/// slot. The evicted slot's VBO is `glDeleteBuffers`-freed before
+/// the replacement is stored, so the cache never leaks a VBO.
 unsafe fn cover_quad_vbo(
     gl: &glow::Context,
     frame_w: u32,
@@ -5498,28 +5520,47 @@ unsafe fn cover_quad_vbo(
     panel_h: u32,
 ) -> Result<glow::NativeBuffer> {
     use glow::HasContext;
-    let key = (frame_w, frame_h, panel_w, panel_h);
-    COVER_QUAD_VBO.with(|c| {
-        if let Some((vbo, cached_key)) = c.get() {
-            if cached_key == key {
-                return Ok(vbo);
+    let key: crate::hdmi_logic::CoverQuadKey =
+        (frame_w, frame_h, panel_w, panel_h);
+    COVER_QUAD_VBO.with(|cell| {
+        let keys = {
+            let slots = cell.borrow();
+            [slots[0].map(|(_, k)| k), slots[1].map(|(_, k)| k)]
+        };
+        let next_build = COVER_QUAD_VBO_NEXT.with(|c| c.get());
+        match crate::hdmi_logic::cover_quad_slot(&keys, key, next_build) {
+            crate::hdmi_logic::CoverQuadSlot::Hit { idx } => {
+                let slots = cell.borrow();
+                // Hit guaranteed by cover_quad_slot — slot is Some.
+                Ok(slots[idx].expect("cover_quad_slot Hit -> occupied slot").0)
             }
-            gl.delete_buffer(vbo);
+            crate::hdmi_logic::CoverQuadSlot::Miss { idx } => {
+                // Free the evicted slot's VBO (if any) before the
+                // replacement is stored — no leak.
+                if let Some((old_vbo, _)) = cell.borrow_mut()[idx].take() {
+                    gl.delete_buffer(old_vbo);
+                }
+                let vbo = gl
+                    .create_buffer()
+                    .map_err(|e| anyhow!("glGenBuffers(cover_quad): {e}"))?;
+                let verts = crate::hdmi_logic::cover_fit_quad_verts(
+                    frame_w, frame_h, panel_w, panel_h,
+                );
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let bytes = std::slice::from_raw_parts(
+                    verts.as_ptr() as *const u8,
+                    std::mem::size_of_val(&verts),
+                );
+                gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW,
+                );
+                cell.borrow_mut()[idx] = Some((vbo, key));
+                // Advance the round-robin cursor so the NEXT
+                // eviction picks the other slot.
+                COVER_QUAD_VBO_NEXT.with(|c| c.set((idx + 1) % 2));
+                Ok(vbo)
+            }
         }
-        let vbo = gl
-            .create_buffer()
-            .map_err(|e| anyhow!("glGenBuffers(cover_quad): {e}"))?;
-        let verts = crate::hdmi_logic::cover_fit_quad_verts(
-            frame_w, frame_h, panel_w, panel_h,
-        );
-        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        let bytes = std::slice::from_raw_parts(
-            verts.as_ptr() as *const u8,
-            std::mem::size_of_val(&verts),
-        );
-        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-        c.set(Some((vbo, key)));
-        Ok(vbo)
     })
 }
 

@@ -1651,6 +1651,23 @@ fn handle_inner_request(
             if let Err(e) = cache.load(content_root, p.to_slide_id) {
                 return err(format!("begin_transition load failed: {e:#}"));
             }
+            // Hardening C3 / M1 (2026-05-21): also re-prime the
+            // FROM-slide. The transition paint path fetches the
+            // from-endpoint demuxer / decoder with a HARD ERROR if
+            // absent — yet a from-slide whose decoder got evicted
+            // (single-instance vc4 M2M codec, Bug 9 slide-change
+            // eviction) never gets re-primed here. `cache.load`
+            // short-circuits cheaply when the slide is already
+            // primed, so this is near-free in the common case and
+            // mirrors the C1/H1 re-prime fix for the to-slide.
+            // The from-slide id comes from PlaybackState.current
+            // (begin_transition itself derives it the same way and
+            // errors below if there's no current slide).
+            if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
+                if let Err(e) = cache.load(content_root, from_id) {
+                    return err(format!("begin_transition load failed: {e:#}"));
+                }
+            }
             // Bug 8 / Fix A: same skip-marker check as BeginSlide,
             // applied to the to-slide of a transition.
             if cache.video_skip.contains(&p.to_slide_id) {
@@ -1944,6 +1961,101 @@ mod tests {
         assert_eq!(resp, IpcResponse::Ok { result: OpResult::Empty });
         assert!(state.pending.is_some());
         assert_eq!(state.pending.as_ref().unwrap().to_slide.slide_id, id_b);
+    }
+
+    /// Hardening C3 / M1 (2026-05-21): `BeginTransition` must
+    /// re-prime the FROM-slide too, not just the to-slide. A
+    /// from-slide whose video demuxer/decoder was evicted (Bug 9
+    /// slide-change eviction, single-instance vc4 M2M codec) would
+    /// otherwise reach the transition paint path with no demuxer
+    /// and hard-error. This mirrors the C1/H1 to-slide re-prime
+    /// test style: evict the from-slide's demuxer, then assert
+    /// `BeginTransition` re-opens it.
+    #[test]
+    fn handle_begin_transition_reprimes_evicted_from_slide() {
+        let video_fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        let td = tempfile::TempDir::new().unwrap();
+        // From-slide: a video.
+        let id_from = uuid(1);
+        let dir_from = td.path().join(id_from.to_string());
+        std::fs::create_dir_all(&dir_from).unwrap();
+        std::fs::write(
+            dir_from.join("item.json"),
+            r##"{
+              "schema_version": 3,
+              "item": {
+                "type": "video",
+                "id": "01010101-0101-0101-0101-010101010101",
+                "name": "from-vid",
+                "duration_ms": 2000,
+                "transition": "cut",
+                "transition_ms": 500
+              }
+            }"##,
+        )
+        .unwrap();
+        std::fs::copy(&video_fixture, dir_from.join("asset.mp4")).unwrap();
+        // To-slide: a plain text slide.
+        let id_to = uuid(2);
+        let dir_to = td.path().join(id_to.to_string());
+        std::fs::create_dir_all(&dir_to).unwrap();
+        std::fs::write(dir_to.join("item.json"), SAMPLE_TEXT_ITEM_FOR_UUID_1).unwrap();
+
+        let mut state = PlaybackState::new();
+        let mut cache = SlideCache::new();
+        // Begin on the from-slide so it becomes `state.current`.
+        let resp_begin = handle_inner_request(
+            IpcRequest::BeginSlide(BeginSlideParams {
+                slide_id: id_from,
+                t0_ms: 0,
+                duration_ms: 2000,
+            }),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert_eq!(resp_begin, IpcResponse::Ok { result: OpResult::Empty });
+        assert!(
+            cache.video_demuxers.contains_key(&id_from),
+            "from-slide demuxer primed by BeginSlide",
+        );
+        // Simulate the Bug 9 slide-change eviction of the
+        // from-slide's video state.
+        cache.evict_other_video_state(uuid(9));
+        assert!(
+            !cache.video_demuxers.contains_key(&id_from),
+            "from-slide demuxer evicted",
+        );
+        assert!(
+            state.current.as_ref().map(|c| c.slide_id) == Some(id_from),
+            "from-slide is still state.current after eviction",
+        );
+        // BeginTransition to the text to-slide must re-prime the
+        // evicted from-slide's demuxer (M1 fix).
+        let resp = handle_inner_request(
+            IpcRequest::BeginTransition(BeginTransitionParams {
+                to_slide_id: id_to,
+                to_duration_ms: 5000,
+                kind: "fade".to_string(),
+                transition_ms: 800,
+                t0_ms: 1000,
+            }),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert_eq!(resp, IpcResponse::Ok { result: OpResult::Empty });
+        assert!(
+            cache.video_demuxers.contains_key(&id_from),
+            "BeginTransition must RE-PRIME the evicted from-slide demuxer (M1)",
+        );
+        assert!(state.pending.is_some());
     }
 
     #[test]
