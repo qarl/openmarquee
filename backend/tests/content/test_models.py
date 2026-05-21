@@ -566,6 +566,29 @@ def test_stream_slide_routes_through_content_item_union():
     assert decoded == slide
 
 
+def test_stream_slide_rejects_disallowed_url_scheme_on_construction():
+    """The stream-transport scheme allowlist runs on plain model
+    construction — not only in the route handler — so the validation
+    can't be bypassed."""
+    with pytest.raises(ValidationError):
+        StreamSlide(name="Bad", stream_url="file:///etc/passwd")
+
+
+def test_stream_slide_ingest_path_rejects_disallowed_url_scheme():
+    """The flock-sync ingest path validates a peer-pushed stream slide
+    through the same `ContentItem` TypeAdapter `_fetch_and_save` uses.
+    A disallowed-scheme `stream_url` is rejected at ingest, never
+    persisted."""
+    adapter = TypeAdapter(ContentItem)
+    envelope = {
+        "type": "stream",
+        "name": "Hostile peer push",
+        "stream_url": "file:///etc/passwd",
+    }
+    with pytest.raises(ValidationError):
+        adapter.validate_python(envelope)
+
+
 # --- WebSlide (Web slide P1) -----------------------------------------------
 
 
@@ -618,6 +641,36 @@ def test_web_slide_routes_through_content_item_union():
     assert decoded == slide
 
 
+def test_web_slide_rejects_disallowed_url_scheme_on_construction():
+    """The http(s) scheme allowlist runs on plain model construction —
+    not only in the route handler — so the validation can't be
+    bypassed."""
+    with pytest.raises(ValidationError):
+        WebSlide(name="Bad", url="file:///etc/passwd")
+
+
+def test_web_slide_rejects_userinfo_url_on_construction():
+    """The userinfo (`user@host`) rejection also runs on plain model
+    construction, not just in the route handler."""
+    with pytest.raises(ValidationError):
+        WebSlide(name="Bad", url="http://evil@host/")
+
+
+def test_web_slide_ingest_path_rejects_disallowed_url_scheme():
+    """The flock-sync ingest path validates a peer-pushed web slide
+    through the same `ContentItem` TypeAdapter `_fetch_and_save` uses.
+    A `file://` `url` is rejected at ingest, never persisted — this
+    closes the route-bypass gap (H3)."""
+    adapter = TypeAdapter(ContentItem)
+    envelope = {
+        "type": "web",
+        "name": "Hostile peer push",
+        "url": "file:///etc/passwd",
+    }
+    with pytest.raises(ValidationError):
+        adapter.validate_python(envelope)
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -648,5 +701,20 @@ def test_validate_web_url_accepts_http_and_https(url):
 def test_validate_web_url_rejects_non_http(url):
     """A non-http(s) scheme, a bare path, an empty string, and a URL
     carrying control characters all raise ValueError."""
+    with pytest.raises(ValueError):
+        validate_web_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://evil@host/",  # bare userinfo
+        "https://user:pass@real.example.com/",  # user:password userinfo
+        "http://login@phish.example.com/dashboard",
+    ],
+)
+def test_validate_web_url_rejects_userinfo(url):
+    """A URL whose authority carries a `user@` userinfo component is a
+    phishing / host-confusion vector — rejected with a ValueError."""
     with pytest.raises(ValueError):
         validate_web_url(url)

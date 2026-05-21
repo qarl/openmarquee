@@ -19,6 +19,12 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# `validate_stream_url` lives in stream_consumer alongside the ffmpeg
+# allowlist constant. A top-level import is safe: stream_consumer.py
+# imports only the stdlib — it does NOT import from openmarquee.content
+# — so there is no import cycle.
+from openmarquee.stream_consumer import validate_stream_url
+
 # Hex color regex: #RRGGBB. Six lowercase or uppercase hex digits.
 _HEX_COLOR_PATTERN = r"^#[0-9A-Fa-f]{6}$"
 
@@ -47,17 +53,28 @@ def validate_web_url(url: str) -> None:
     The scheme comparison is case-insensitive. A URL with no scheme at
     all (a bare path like `/etc/passwd`), an empty string, or a URL
     carrying ASCII control characters (a header-injection / smuggling
-    vector) is rejected.
+    vector) is rejected. A URL whose authority carries a userinfo
+    component (`http://user@host/`) is also rejected — the `user@`
+    prefix is a phishing / host-confusion vector (it visually pushes
+    the real host out of an operator's glance) and a web page never
+    needs HTTP-basic credentials baked into the typed URL.
     """
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
         raise ValueError("web URL must not contain control characters")
-    scheme = urlparse(url).scheme.lower()
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
     if scheme not in ALLOWED_WEB_SCHEMES:
         allowed = ", ".join(sorted(ALLOWED_WEB_SCHEMES))
         shown = scheme if scheme else "(none)"
         raise ValueError(
             f"web URL scheme {shown!r} is not allowed; "
             f"the URL must use one of: {allowed}"
+        )
+    # `netloc` is host[:port], optionally prefixed with `userinfo@`.
+    # A `@` in it means a userinfo component is present — reject it.
+    if "@" in parsed.netloc:
+        raise ValueError(
+            "web URL must not contain a userinfo ('user@') component"
         )
 
 
@@ -543,6 +560,23 @@ class StreamSlide(BaseModel):
     # See TextSlide.updated_at — output-only mirror of the storage envelope.
     updated_at: datetime | None = None
 
+    @field_validator("stream_url")
+    @classmethod
+    def _stream_url_scheme_allowed(cls, value: str) -> str:
+        """Enforce the stream-transport scheme allowlist on EVERY
+        construction.
+
+        The route handlers call `validate_stream_url` explicitly for a
+        clean 400, but the flock-sync ingest path constructs the model
+        directly via the `ContentItem` TypeAdapter — bypassing the
+        routes. Running the validator here closes that gap: a peer
+        can't push a `file://`-scheme stream slide and have this
+        device persist it. The `ValueError` `validate_stream_url`
+        raises propagates as a Pydantic `ValidationError`, the
+        ingest-reject signal we want."""
+        validate_stream_url(value)
+        return value
+
 
 class WebSlide(BaseModel):
     """A web page rendered onto the sign — a playlist slide that shows
@@ -588,6 +622,23 @@ class WebSlide(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
     # See TextSlide.updated_at — output-only mirror of the storage envelope.
     updated_at: datetime | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _url_is_a_web_page(cls, value: str) -> str:
+        """Enforce the http(s) scheme allowlist on EVERY construction.
+
+        The route handlers (`upload_web` / `update_web`) call
+        `validate_web_url` explicitly for a clean 400, but the
+        flock-sync ingest path constructs the model directly via the
+        `ContentItem` TypeAdapter — bypassing the routes. Running the
+        validator here closes that gap: a peer can't push a
+        `file://`-scheme web slide and have this device persist it.
+        The `ValueError` `validate_web_url` raises propagates as a
+        Pydantic `ValidationError`, which is exactly the ingest-reject
+        signal we want."""
+        validate_web_url(value)
+        return value
 
 
 # Discriminated union of content variants. Pydantic uses the `type` literal to
