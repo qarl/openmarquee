@@ -738,6 +738,20 @@ if [ "$PLYMOUTH_PRESENT" -eq 1 ]; then
     if [ -z "$ROOT_PREFIX" ]; then
         say "Set openmarquee as the default Plymouth theme (-R rebuilds initramfs)"
         run plymouth-set-default-theme -R openmarquee
+        # Confirm openmarquee actually became the default. Query the
+        # current default directly -- `plymouth-set-default-theme` with
+        # no args prints it -- rather than parsing the `-l` theme list:
+        # the list query can transiently miss a just-installed theme
+        # right after -R (a caching/timing quirk on a fresh plymouth
+        # install -- observed false-failing an FYS rollout 2026-05-21).
+        # Non-fatal: the boot splash is not device-critical, so a
+        # mismatch is a WARNING, consistent with the rest of 7d.
+        cur_theme="$(plymouth-set-default-theme 2>/dev/null || true)"
+        if [ "$cur_theme" = openmarquee ]; then
+            say "  default Plymouth theme = openmarquee"
+        else
+            say "  WARNING: default Plymouth theme is '${cur_theme}', not openmarquee — splash may not display"
+        fi
     else
         say "DRYRUN: would run plymouth-set-default-theme -R openmarquee"
     fi
