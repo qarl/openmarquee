@@ -25,7 +25,9 @@ import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
 // Common refresh cadences offered in the select. Values are seconds and
 // stay within the backend's bound (refresh_interval_s: 10s..86400s,
-// WebSlide in content/__init__.py). 300s (5 min) is the default.
+// WebSlide in content/__init__.py). 3600s (1 hour) is the default — an
+// on-device render is multi-minute on the Pi, so a tighter default
+// would re-render almost continuously.
 const REFRESH_OPTIONS = [
     { value: 60, label: "Every minute" },
     { value: 300, label: "Every 5 minutes" },
@@ -35,7 +37,7 @@ const REFRESH_OPTIONS = [
     { value: 21600, label: "Every 6 hours" },
     { value: 86400, label: "Once a day" },
 ];
-const DEFAULT_REFRESH_S = 300;
+const DEFAULT_REFRESH_S = 3600;
 
 const TEMPLATE = `
     <section class="web-slide">

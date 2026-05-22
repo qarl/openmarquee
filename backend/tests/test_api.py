@@ -958,7 +958,7 @@ def test_post_web_uses_defaults_for_omitted_fields(client: TestClient):
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["refresh_interval_s"] == 300
+    assert body["refresh_interval_s"] == 3600
     assert body["duration_ms"] == 10_000
     assert body["transition"] == "cut"
 

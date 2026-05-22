@@ -67,12 +67,15 @@ from openmarquee.content import validate_web_url
 
 log = logging.getLogger(__name__)
 
-# Overall wall-clock budget for the Chromium subprocess, in seconds. A
-# real render on the Pi runs ~5-40s (page fetch + JS + the
-# virtual-time-budget settle), so this is generous headroom. On expiry
-# the subprocess is KILLED and reaped (never orphaned) and the render
+# Overall wall-clock budget for the Chromium subprocess, in seconds.
+# On the memory-tight Pi a render is SLOW: measured ~5-8.5 min on the
+# dev Pi (a Pi Zero 2 W) with the backend running — Chromium
+# swap-thrashes the 416 MB box. This 20-minute budget covers that, plus
+# the heavier FYS case (the Rust renderer also resident), with margin —
+# while still bounding a genuinely hung render. On expiry the
+# subprocess is KILLED and reaped (never orphaned) and the render
 # raises WebRenderError — the module never hangs unboundedly.
-WEB_RENDER_TIMEOUT_S = 45.0
+WEB_RENDER_TIMEOUT_S = 1200.0
 
 # Virtual-time budget handed to Chromium, in MILLISECONDS. Chromium
 # advances the page's clock as fast as it can up to this many ms of
@@ -159,6 +162,34 @@ def _build_chromium_argv(
     ]
 
 
+def _nice_prefix() -> list[str]:
+    """Build the command prefix that de-prioritizes the transient
+    Chromium render so it yields CPU + disk I/O to the playback
+    renderer and the backend.
+
+    On the Pi a render is multi-minute and swap-thrashes the
+    memory-tight box; without this the Rust renderer would lose frames
+    for the whole render. `nice -n 19` drops Chromium to the lowest CPU
+    priority; `ionice -c 3` puts its disk I/O — the heavy swap traffic —
+    in the idle class. Both are best-effort: each is included only if
+    its binary resolves on PATH, so a host missing either still renders
+    (just without that mitigation) — which is also what lets the unit
+    tests, on hosts without these tools, see the bare Chromium argv.
+
+    `nice`/`ionice` exec their argument, so the prefixes chain: the
+    final process image is still Chromium and `subprocess.run` sees
+    Chromium's own exit code.
+    """
+    prefix: list[str] = []
+    nice = shutil.which("nice")
+    if nice:
+        prefix += [nice, "-n", "19"]
+    ionice = shutil.which("ionice")
+    if ionice:
+        prefix += [ionice, "-c", "3"]
+    return prefix
+
+
 def render_web_png(url: str, width: int, height: int) -> bytes:
     """Render `url` with Chromium headless at `width` x `height` and
     return the PNG bytes.
@@ -223,7 +254,9 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
     screenshot_path = tmp.name
 
     try:
-        argv = _build_chromium_argv(
+        # Prefix nice/ionice so the multi-minute render yields CPU +
+        # disk to the playback renderer instead of stuttering the sign.
+        argv = _nice_prefix() + _build_chromium_argv(
             chromium, url, width, height, screenshot_path
         )
         # --- Chromium headless: URL -> screenshot PNG ------------------

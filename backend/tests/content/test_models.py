@@ -596,7 +596,7 @@ def test_web_slide_minimal_construction():
     slide = WebSlide(name="Status", url="https://status.example.com")
     assert slide.type == "web"
     assert slide.url == "https://status.example.com"
-    assert slide.refresh_interval_s == 300
+    assert slide.refresh_interval_s == 3600
     assert slide.duration_ms == 10_000
     assert slide.transition == "cut"
     assert slide.transition_ms == 500

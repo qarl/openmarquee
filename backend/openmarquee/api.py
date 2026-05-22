@@ -783,7 +783,7 @@ class WebUpload(BaseModel):
 
     name: str
     url: str
-    refresh_interval_s: int = 300
+    refresh_interval_s: int = 3600
     duration_ms: int = 10_000
     transition: str = "cut"
     transition_ms: int = 500
@@ -832,7 +832,7 @@ class WebUpdate(BaseModel):
 
     name: str
     url: str
-    refresh_interval_s: int = 300
+    refresh_interval_s: int = 3600
     duration_ms: int = 10_000
     transition: str = "cut"
     transition_ms: int = 500

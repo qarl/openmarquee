@@ -607,9 +607,11 @@ class WebSlide(BaseModel):
     # How often the screenshot is re-rendered, in seconds. Bounded:
     # min 10s (a tighter cadence would hammer the Pi / the target
     # site) and max 24h (a day-stale screenshot is the loosest sane
-    # refresh). Default 300s = a 5-minute refresh.
+    # refresh). Default 3600s = a 1-hour refresh: an on-device render is
+    # multi-minute on the Pi, so a tighter default would re-render
+    # almost continuously.
     refresh_interval_s: int = Field(
-        default=300, ge=10, le=24 * 60 * 60
+        default=3600, ge=10, le=24 * 60 * 60
     )
     # Fixed slot length, capped at 24h — same as StreamSlide.
     duration_ms: int = Field(default=10_000, ge=100, le=24 * 60 * 60 * 1000)

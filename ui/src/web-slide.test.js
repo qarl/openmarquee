@@ -26,8 +26,8 @@ describe("mountWebSlideEditor", () => {
         expect(
             container.querySelectorAll(".field-web-refresh option").length,
         ).toBeGreaterThan(1);
-        // Default refresh is 5 minutes (300s).
-        expect(container.querySelector(".field-web-refresh").value).toBe("300");
+        // Default refresh is 1 hour (3600s).
+        expect(container.querySelector(".field-web-refresh").value).toBe("3600");
     });
 
     it("auto-save with an empty page URL does nothing (canSave gate suppresses)", async () => {
@@ -57,7 +57,7 @@ describe("mountWebSlideEditor", () => {
         expect(onSave).toHaveBeenCalledTimes(1);
         const payload = onSave.mock.calls[0][0];
         expect(payload.url).toBe("https://status.example.com");
-        expect(payload.refresh_interval_s).toBe(300);
+        expect(payload.refresh_interval_s).toBe(3600);
         expect(payload.duration_ms).toBe(10_000);
         expect(payload.transition).toBe("cut");
         expect(payload.transition_ms).toBe(500);
@@ -73,11 +73,13 @@ describe("mountWebSlideEditor", () => {
 
         container.querySelector(".field-web-url").value = "https://h/x";
         const refreshEl = container.querySelector(".field-web-refresh");
-        refreshEl.value = "3600";
+        // A non-default choice (the default is 3600) so this proves the
+        // chosen value — not the default — is what reaches the payload.
+        refreshEl.value = "300";
         fireInput(refreshEl);
         await handle.flushAutoSave();
 
-        expect(onSave.mock.calls[0][0].refresh_interval_s).toBe(3600);
+        expect(onSave.mock.calls[0][0].refresh_interval_s).toBe(300);
     });
 
     it("loadForEdit pre-fills the form and round-trips the transition on save", async () => {
