@@ -24,6 +24,29 @@ on the device; your content stays on your SD card.
 dashboard in your browser against a mock backend — build a playlist, try the editor,
 see the motion effects, no hardware required.
 
+## Screenshots
+
+### The editor
+
+Drop in slides, stack layers, dial in motion and blend modes — every change
+previews at your sign's exact resolution.
+
+![The openMarquee editor](docs/screenshots/editor.png)
+
+### Playlists
+
+Drag to reorder, set a transition and a duration per slide; the loop runs
+end-to-end on the device.
+
+![The openMarquee playlist builder](docs/screenshots/playlist.png)
+
+### Flock
+
+Every openMarquee on your network in one view — sync media to one sign or all
+of them, offline.
+
+![The openMarquee flock view](docs/screenshots/flock.png)
+
 ## Features
 
 ### Slides — five kinds of content
