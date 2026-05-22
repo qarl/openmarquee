@@ -56,11 +56,13 @@ underlying libgbm pool may rotate 3-4 BOs internally; we hand back
 each prev BO to libgbm immediately after `drmModeRmFB`, so the
 high-water mark is bounded.
 
-Image-bg texture cache: `image_bg_cache: HashMap<PathBuf, ...>` in
-`EglSession`. **Currently unbounded — no eviction.** Bounded by
-playlist content-set size in practice (FYS reel has ≤4 distinct
-images). Tracked as a §6 risk; budget assumes ≤4 distinct images
-until the eviction policy lands.
+Image-bg texture cache: `image_bg_cache: LruMap<PathBuf, ...>` in
+`EglSession`. **LRU-evicted on insert at the §4 hard cap of 6
+entries** (eviction policy landed 2026-05-08; see §6 risk item #2
+for the full surface + cross-platform test set in
+`renderer/src/lru.rs`). The FYS reel runs with ≤4 distinct images
+in practice, so the hard cap of 6 sits as headroom over the
+typical working set rather than as a binding constraint.
 
 Glyph atlas (†): the `~6 MB` single-atlas figure predates the SDF
 arc and Bug 3. The text path now uses a build-time **static MSDF
