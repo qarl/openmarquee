@@ -313,6 +313,9 @@ header h1 {
     overflow-x: auto;
 }
 .playlist-browser-tile {
+    /* Positioned so the absolutely-placed delete × lands at THIS
+       tile's top-right, not some unpositioned ancestor's. */
+    position: relative;
     flex: 0 0 auto;
     width: 7rem;
     /* Match heights across the strip — the action <button> stretches to
@@ -866,6 +869,8 @@ header h1 {
 /* Delete × sits in the top-right of the tile, hidden until hover/focus
    to keep the default tile look clean. Same hover-to-reveal pattern as
    the edit pencil. */
+/* Visible by default (tappable on touch); hover-to-reveal for pointer
+   devices is in the @media (hover: hover) block at end of file. */
 .pallet-tile-delete {
     position: absolute;
     top: 0.25rem;
@@ -880,12 +885,8 @@ header h1 {
     line-height: 1;
     padding: 0;
     cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s ease;
-}
-.pallet-tile:hover .pallet-tile-delete,
-.pallet-tile:focus-within .pallet-tile-delete {
     opacity: 1;
+    transition: opacity 0.15s ease;
 }
 .pallet-tile-delete:hover { background: var(--danger); color: #1a1a1d; }
 
@@ -1332,8 +1333,9 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 .slide-browser-tile-action {
     flex: 1 1 auto;
 }
-/* Delete × in the top-right of a browser tile — same hover-to-reveal
-   pattern as the pallet's edit/delete affordances. */
+/* Delete × in the top-right of a browser tile. Visible by default so
+   it is tappable on touch devices (no hover); the hover-to-reveal for
+   pointer devices is in the @media (hover: hover) block at end of file. */
 .slide-browser-tile-delete {
     position: absolute;
     top: 0.25rem;
@@ -1348,12 +1350,8 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     line-height: 1;
     padding: 0;
     cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s ease;
-}
-.slide-browser-tile:hover .slide-browser-tile-delete,
-.slide-browser-tile:focus-within .slide-browser-tile-delete {
     opacity: 1;
+    transition: opacity 0.15s ease;
 }
 .slide-browser-tile-delete:hover { background: var(--danger); color: #1a1a1d; }
 /* Type badge in the browser strip. Delete × at top-right stays the
@@ -2464,7 +2462,8 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 }
 
 /* Match the pallet-tile × for visual consistency: round, top-right,
-   hidden until hover/focus of the tile, red on hover. */
+   red on hover. Visible by default (tappable on touch); hover-to-reveal
+   for pointer devices is in the @media (hover: hover) block (end file). */
 .flock-tile-delete {
     position: absolute;
     top: 0.35rem;
@@ -2479,14 +2478,9 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     line-height: 1;
     padding: 0;
     cursor: pointer;
-    opacity: 0;
+    opacity: 1;
     transition: opacity 0.15s ease;
     z-index: 2;
-}
-
-.flock-tile:hover .flock-tile-delete,
-.flock-tile:focus-within .flock-tile-delete {
-    opacity: 1;
 }
 
 .flock-tile-delete:hover {
@@ -4424,3 +4418,30 @@ html, body { margin: 0; padding: 0; height: 100%; }
     font-size: 12.5px;
 }
 .flock-status.error { color: var(--om-bad, #d33); }
+
+/* --- Tile delete-button (×) touch reachability ---------------------------
+   Every tile delete × is `opacity: 1` by default so it is visible and
+   tappable on touch devices, which have no hover. On pointer devices
+   this block hides it until the tile is hovered or focused — a
+   progressive enhancement that keeps the desktop view uncluttered.
+   The playlist delete button reuses the .slide-browser-tile-delete
+   class for its styling but sits inside a .playlist-browser-tile
+   parent, so it needs its own reveal selector (it had none before —
+   the × was permanently invisible on every device). */
+@media (hover: hover) {
+    .slide-browser-tile-delete,
+    .pallet-tile-delete,
+    .flock-tile-delete {
+        opacity: 0;
+    }
+    .slide-browser-tile:hover .slide-browser-tile-delete,
+    .slide-browser-tile:focus-within .slide-browser-tile-delete,
+    .playlist-browser-tile:hover .playlist-browser-tile-delete,
+    .playlist-browser-tile:focus-within .playlist-browser-tile-delete,
+    .pallet-tile:hover .pallet-tile-delete,
+    .pallet-tile:focus-within .pallet-tile-delete,
+    .flock-tile:hover .flock-tile-delete,
+    .flock-tile:focus-within .flock-tile-delete {
+        opacity: 1;
+    }
+}
