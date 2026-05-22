@@ -164,28 +164,12 @@ def test_build_chromium_argv_virtual_time_budget():
 
 
 # ---------------------------------------------------------------------
-# _nice_prefix — the CPU/IO de-prioritization prefix.
+# _nice_prefix — the CPU de-prioritization prefix.
 # ---------------------------------------------------------------------
-def test_nice_prefix_includes_nice_and_ionice(monkeypatch):
-    """When both nice and ionice resolve, the prefix drops Chromium to
-    the lowest CPU priority (nice -n 19) and idle disk I/O (ionice -c 3)."""
-    monkeypatch.setattr(
-        web_render.shutil, "which",
-        lambda name: {
-            "nice": "/usr/bin/nice", "ionice": "/usr/bin/ionice",
-        }.get(name),
-    )
-    assert _nice_prefix() == [
-        "/usr/bin/nice", "-n", "19", "/usr/bin/ionice", "-c", "3",
-    ]
-
-
-def test_nice_prefix_omits_missing_binaries(monkeypatch):
-    """Each prefix is best-effort — a host missing both tools yields an
-    empty prefix; with only nice present, just the nice part."""
-    monkeypatch.setattr(web_render.shutil, "which", lambda name: None)
-    assert _nice_prefix() == []
-
+def test_nice_prefix_uses_nice(monkeypatch):
+    """When `nice` resolves, the prefix drops Chromium to the lowest
+    CPU priority (nice -n 19). No ionice — the idle I/O class starves
+    the render under the renderer's I/O contention."""
     monkeypatch.setattr(
         web_render.shutil, "which",
         lambda name: "/usr/bin/nice" if name == "nice" else None,
@@ -193,9 +177,16 @@ def test_nice_prefix_omits_missing_binaries(monkeypatch):
     assert _nice_prefix() == ["/usr/bin/nice", "-n", "19"]
 
 
+def test_nice_prefix_empty_when_nice_missing(monkeypatch):
+    """The prefix is best-effort — a host without `nice` yields an
+    empty prefix and the render still runs, bare."""
+    monkeypatch.setattr(web_render.shutil, "which", lambda name: None)
+    assert _nice_prefix() == []
+
+
 def test_render_web_png_prepends_nice_prefix_when_available(monkeypatch):
-    """render_web_png prepends the nice/ionice prefix to the spawned
-    argv so the transient render yields to the playback renderer."""
+    """render_web_png prepends the nice prefix to the spawned argv so
+    the transient render yields CPU to the playback renderer."""
     calls = {}
 
     monkeypatch.setattr(
@@ -203,7 +194,6 @@ def test_render_web_png_prepends_nice_prefix_when_available(monkeypatch):
         lambda name: {
             "chromium": "/usr/bin/chromium",
             "nice": "/usr/bin/nice",
-            "ionice": "/usr/bin/ionice",
         }.get(name),
     )
 
@@ -219,10 +209,8 @@ def test_render_web_png_prepends_nice_prefix_when_available(monkeypatch):
     render_web_png("https://status.example.com", 1360, 768)
 
     argv = calls["argv"]
-    assert argv[:6] == [
-        "/usr/bin/nice", "-n", "19", "/usr/bin/ionice", "-c", "3",
-    ]
-    assert argv[6] == "/usr/bin/chromium"
+    assert argv[:3] == ["/usr/bin/nice", "-n", "19"]
+    assert argv[3] == "/usr/bin/chromium"
     assert argv[-1] == "https://status.example.com"
 
 

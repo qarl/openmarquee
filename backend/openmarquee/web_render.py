@@ -164,29 +164,33 @@ def _build_chromium_argv(
 
 def _nice_prefix() -> list[str]:
     """Build the command prefix that de-prioritizes the transient
-    Chromium render so it yields CPU + disk I/O to the playback
-    renderer and the backend.
+    Chromium render so it yields to the playback renderer and backend.
 
     On the Pi a render is multi-minute and swap-thrashes the
     memory-tight box; without this the Rust renderer would lose frames
     for the whole render. `nice -n 19` drops Chromium to the lowest CPU
-    priority; `ionice -c 3` puts its disk I/O — the heavy swap traffic —
-    in the idle class. Both are best-effort: each is included only if
-    its binary resolves on PATH, so a host missing either still renders
-    (just without that mitigation) — which is also what lets the unit
-    tests, on hosts without these tools, see the bare Chromium argv.
+    priority — and the kernel derives a correspondingly low best-effort
+    block-I/O priority from that nice value, so the heavy swap traffic
+    is deprioritized too, WITHOUT the starvation that the idle I/O
+    class (`ionice -c 3`) causes here: an idle-class render measured on
+    the dev Pi with playback live blocked indefinitely in
+    `folio_wait_bit_common` — starved of swap-in I/O by the renderer's
+    steady disk traffic — and never finished. `nice` alone
+    deprioritizes without ever starving, so that is all this uses.
 
-    `nice`/`ionice` exec their argument, so the prefixes chain: the
-    final process image is still Chromium and `subprocess.run` sees
-    Chromium's own exit code.
+    Best-effort: the prefix is included only if `nice` resolves on
+    PATH, so a host without it still renders (just without the
+    mitigation) — which is also what lets the unit tests, on hosts
+    without `nice`, see the bare Chromium argv.
+
+    `nice` execs its argument, so the prefix chains: the final process
+    image is still Chromium and `subprocess.run` sees Chromium's own
+    exit code.
     """
     prefix: list[str] = []
     nice = shutil.which("nice")
     if nice:
         prefix += [nice, "-n", "19"]
-    ionice = shutil.which("ionice")
-    if ionice:
-        prefix += [ionice, "-c", "3"]
     return prefix
 
 
@@ -254,8 +258,8 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
     screenshot_path = tmp.name
 
     try:
-        # Prefix nice/ionice so the multi-minute render yields CPU +
-        # disk to the playback renderer instead of stuttering the sign.
+        # Prefix nice so the multi-minute render yields CPU to the
+        # playback renderer instead of stuttering the sign.
         argv = _nice_prefix() + _build_chromium_argv(
             chromium, url, width, height, screenshot_path
         )
