@@ -11,6 +11,61 @@ This is a **scoping pass only** — no code edits in this round. The
 goal is to land a transport choice, integration shape, and slice
 plan that QA + qarl can review before implementation starts.
 
+---
+
+> **AS-BUILT UPDATE — 2026-05-22.** The proposal below shipped:
+> all 9 implementation slices + slice 2.5 are in production.
+> Slices 1–6 + 2.5 landed 2026-05-19/20
+> (commits `5f5a870` → `2be8b66` + `45e7b2e`); a follow-on
+> **stream-generalize** arc renamed the surface off VLC/RTSP and
+> widened the consumer to a multi-protocol allowlist
+> (commits `7495ab9` / `c1a3ef0` / `3a2a17e`, 2026-05-20); a
+> **stream hardening** arc closed three robustness items
+> (commits `d288b70` / `b9fcfa2` / `6dd7265`, 2026-05-21). The
+> proposal body is preserved unchanged as the decision record
+> (transport rationale, rejected alternatives, tradeoff math);
+> read it for the *why*, read the code for the *what*. Key
+> deltas between the proposal and the shipped reality:
+>
+> - **Type literal:** proposal `"vlc_stream"` → shipped `"stream"`
+>   (`backend/openmarquee/content/__init__.py:543`).
+> - **Field name:** proposal `rtsp_url` → shipped `stream_url`
+>   (same file, line 548).
+> - **Pydantic class:** proposal `VlcStreamSlide` → shipped
+>   `StreamSlide` (same file, line 525).
+> - **Consumer module:** proposal `vlc_rtsp_consumer.py` /
+>   `VlcRtspConsumer` → shipped `stream_consumer.py` /
+>   `StreamConsumer`.
+> - **Source class:** proposal `RtspStreamSource` → shipped
+>   `FfmpegStreamSource` (Mode A wrapper in `stream_source.py`).
+> - **Transport scope:** proposal RTSP-only → shipped
+>   multi-protocol allowlist `{rtsp, rtmp, rtmps, http, https,
+>   srt, udp}` (see `ALLOWED_STREAM_SCHEMES` in
+>   `stream_consumer.py`). The proposal's RTSP-centric §3 + §4
+>   filter-chain examples remain accurate for the RTSP case;
+>   the other six schemes ride the same shape.
+> - **Slice 2.5 push-frames IPC op:** flagged as a Slice-9
+>   BLOCKER in §4 + §9 of the proposal; landed as commit
+>   `45e7b2e` (RustRenderer.render_frame no longer raises
+>   NotImplementedError).
+> - **§8 Q1–Q17 open questions:** all answered + shipped, mostly
+>   via the proposal's recommended defaults plus the
+>   multi-protocol generalization. Q17 (`vlc_stream` vs
+>   `vlc_stream_slide`) went past the original options and came
+>   out as `"stream"`.
+> - **§10 future "webpage slide":** shipped as `WebSlide`
+>   (`content/__init__.py:584`) + the on-device Chromium
+>   render arc (commits `ca315af`..`e6d7219`). The seam this
+>   proposal designed into §10 — Slice 1 Protocol + Slice 2.5
+>   push-frames — was reused without modification, as
+>   predicted.
+>
+> Canonical SYSTEM_SPEC §5.11 (in `~/project/openmarquee/`)
+> now carries the production architecture; this doc remains the
+> decision-record artifact.
+
+---
+
 ## 1. Current state recap
 
 Phase 1 live stream (per `backend/openmarquee/stream.py`,
