@@ -18,4 +18,4 @@ wpasupplicant
 zstd
 v4l-utils
 plymouth
-chromium
+chromium-headless-shell

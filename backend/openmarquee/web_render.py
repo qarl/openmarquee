@@ -7,15 +7,21 @@ off-device — a headless-Chromium helper the operator ran on their own
 machine — because the Pi can't run a browser. This module replaces
 that: it rasterizes the page on-device.
 
-Render engine — Chromium headless. The page is rendered by the
-**Chromium browser** running headless, driven through its built-in CLI
-(`chromium --headless --screenshot ...`). This is a full modern web
-engine: JavaScript runs, web fonts load, CSS animations settle — so a
-page can ship its own layout/`fit()` JS and have it execute before the
-screenshot is taken (`--virtual-time-budget` gives that JS a generous
-slice of virtual time). Chromium is a *subprocess* this module spawns;
-there is no Python import for it (the binary is `chromium` or
-`chromium-browser`, resolved at call time via `shutil.which`).
+Render engine — the Chromium headless shell. The page is rendered by
+**`chromium-headless-shell`**, the slim headless-only Chromium binary
+(no browser UI / extensions / PDF stack), driven through its built-in
+`--screenshot` CLI. It is still a full modern web engine: JavaScript
+runs, web fonts load, CSS animations settle — so a page can ship its
+own layout/`fit()` JS and have it execute before the screenshot is
+taken (`--virtual-time-budget` gives that JS a generous slice of
+virtual time). The slim shell is what lets a render FIT alongside the
+playback renderer on the memory-tight Pi: measured on the dev Pi (a
+Pi Zero 2 W) it renders in ~3 min with the renderer running, whereas
+the full `chromium` browser swap-thrashes too hard to finish at all.
+Chromium is a *subprocess* this module spawns; there is no Python
+import for it. The binary is resolved at call time via `shutil.which`
+— `chromium-headless-shell` preferred, the full `chromium` /
+`chromium-browser` browser kept only as a fallback.
 
 Render size — the live display resolution. The page is rendered at the
 sign's ACTUAL current display resolution. The caller (the screenshot
@@ -28,7 +34,7 @@ newspaper page centered by its dark body background). When the sign is
 physically rotated to portrait and the rotation set, the display
 resolution becomes portrait and the page fills it directly.
 
-Pipeline: `chromium --headless --screenshot` writes a `width x height`
+Pipeline: the headless shell's `--screenshot` writes a `width x height`
 PNG; this module validates it (the PNG signature) and returns those
 bytes verbatim.
 
@@ -75,6 +81,10 @@ log = logging.getLogger(__name__)
 # while still bounding a genuinely hung render. On expiry the
 # subprocess is KILLED and reaped (never orphaned) and the render
 # raises WebRenderError — the module never hangs unboundedly.
+# (The ~5-8.5 min figure above is the full-`chromium`-browser worst
+# case that set this ceiling; chromium-headless-shell — the engine
+# this module now uses — measured ~3 min on the dev Pi. The generous
+# ceiling stays as a hang backstop.)
 WEB_RENDER_TIMEOUT_S = 1200.0
 
 # Virtual-time budget handed to Chromium, in MILLISECONDS. Chromium
@@ -84,11 +94,20 @@ WEB_RENDER_TIMEOUT_S = 1200.0
 # the capture, without us waiting that long in wall-clock terms.
 WEB_RENDER_VIRTUAL_TIME_BUDGET_MS = 12000
 
-# The candidate names of the Chromium binary, in resolution order.
-# Debian/Raspberry Pi OS packages it as `chromium`; some distros still
-# ship `chromium-browser`. `shutil.which` tries each; the first hit is
-# used, and if neither resolves a typed WebRenderError is raised.
-_CHROMIUM_BINARIES = ("chromium", "chromium-browser")
+# The candidate Chromium binaries, in resolution order — the slim
+# headless-only shell is PREFERRED. `chromium-headless-shell` is the
+# purpose-built headless binary (no browser UI / extensions / PDF
+# stack) — a lighter RSS footprint, which the memory-tight Pi needs to
+# fit a render alongside the playback renderer. Debian/Raspberry Pi OS
+# also package the full browser as `chromium` (older distros:
+# `chromium-browser`), kept as fallbacks. `shutil.which` tries each in
+# order; the first hit wins; if none resolves a typed WebRenderError is
+# raised.
+_CHROMIUM_BINARIES = (
+    "chromium-headless-shell",
+    "chromium",
+    "chromium-browser",
+)
 
 # The 8-byte PNG signature. Chromium's `--screenshot` output is
 # sanity-checked against this before it is returned, so a truncated or
@@ -112,8 +131,9 @@ def _resolve_chromium() -> str:
     Returns the absolute path of the first binary `shutil.which` finds.
 
     Raises:
-        WebRenderError: neither `chromium` nor `chromium-browser` is on
-            PATH — there is no browser to render with.
+        WebRenderError: none of `_CHROMIUM_BINARIES`
+            (`chromium-headless-shell`, `chromium`, `chromium-browser`)
+            is on PATH — there is no engine to render with.
     """
     for name in _CHROMIUM_BINARIES:
         path = shutil.which(name)
@@ -132,7 +152,10 @@ def _build_chromium_argv(
 
     Pure function — unit-tested directly. The flags:
 
-      --headless              run without a UI / display server
+      --headless              run without a UI / display server. Added
+                              ONLY for the full `chromium` binary;
+                              `chromium-headless-shell` is inherently
+                              headless and is not given it.
       --no-sandbox            the Pi runs this as a service user with
                               no user namespaces; the sandbox can't
                               initialize, so it is disabled explicitly
@@ -148,9 +171,13 @@ def _build_chromium_argv(
       --window-size=<w>,<h>   the render viewport — Chromium emits a PNG
                               of exactly this pixel size
     """
-    return [
-        chromium,
-        "--headless",
+    argv = [chromium]
+    # The full `chromium` binary needs --headless to suppress the UI;
+    # chromium-headless-shell is headless by construction and is not
+    # given it.
+    if "headless-shell" not in chromium:
+        argv.append("--headless")
+    argv += [
         "--no-sandbox",
         "--disable-gpu",
         "--disable-dev-shm-usage",
@@ -160,6 +187,7 @@ def _build_chromium_argv(
         f"--window-size={width},{height}",
         url,
     ]
+    return argv
 
 
 def _nice_prefix() -> list[str]:

@@ -1,17 +1,18 @@
 """Tests for the on-device web-slide renderer (Web slide C2).
 
 `openmarquee.web_render` turns an operator-supplied URL into a
-display-sized PNG entirely on the Pi: `chromium --headless --screenshot`
-rendered at the sign's live display resolution, returned verbatim (no
-panel / letterbox compositing — the render IS the display size).
+display-sized PNG entirely on the Pi: `chromium-headless-shell`'s
+`--screenshot` rendered at the sign's live display resolution, returned
+verbatim (no panel / letterbox compositing — the render IS the display
+size).
 
-The Chromium browser is a *subprocess* the module spawns (there is no
+The Chromium shell is a *subprocess* the module spawns (there is no
 Python import for it). These tests mock `subprocess.run` — so the whole
 suite runs on a host WITHOUT Chromium installed — and assert the wiring
-(the headless flags, `--window-size`, `--screenshot`, the timeout +
-kill/reap behavior, the typed error). `shutil.which` is also patched so
-binary resolution is deterministic. The fake Chromium, like the real
-one, emits a screenshot of exactly the `--window-size`.
+(the flags, `--window-size`, `--screenshot`, the timeout + kill/reap
+behavior, the typed error). `shutil.which` is also patched so binary
+resolution is deterministic. The fake Chromium, like the real one,
+emits a screenshot of exactly the `--window-size`.
 """
 
 import subprocess
@@ -161,6 +162,32 @@ def test_build_chromium_argv_virtual_time_budget():
     assert (
         f"--virtual-time-budget={WEB_RENDER_VIRTUAL_TIME_BUDGET_MS}" in argv
     )
+
+
+def test_build_chromium_argv_omits_headless_for_headless_shell():
+    """chromium-headless-shell is inherently headless — it must NOT be
+    given `--headless`; the full `chromium` browser still gets it."""
+    shell = _build_chromium_argv(
+        "/usr/bin/chromium-headless-shell", "https://x.example.com",
+        1024, 600, "/tmp/s.png",
+    )
+    assert "--headless" not in shell
+    assert shell[0] == "/usr/bin/chromium-headless-shell"
+    # ...but the screenshot/window/url wiring is identical.
+    assert "--window-size=1024,600" in shell
+    assert "--screenshot=/tmp/s.png" in shell
+    assert shell[-1] == "https://x.example.com"
+
+    full = _build_chromium_argv(
+        "/usr/bin/chromium", "https://x.example.com", 1024, 600, "/tmp/s.png",
+    )
+    assert "--headless" in full
+
+
+def test_headless_shell_is_the_preferred_binary():
+    """The slim headless shell is resolved before the full browser —
+    it is the lighter footprint that fits alongside the renderer."""
+    assert web_render._CHROMIUM_BINARIES[0] == "chromium-headless-shell"
 
 
 # ---------------------------------------------------------------------
