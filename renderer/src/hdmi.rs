@@ -2881,6 +2881,182 @@ fn render_image_slide_in_session(
     })
 }
 
+/// QA H2 (2026-05-23) — self-paced VideoSlide renderer for the
+/// standalone `--play-reel` driver. Mirrors the IPC sidecar's V4L2
+/// decode + paint dispatch, but with the reel's "hold this slide for
+/// N ms" pacing instead of the per-Advance tick the sidecar gets.
+///
+/// Open the asset's `Mp4Demuxer`, prime a fresh V4L2 decoder via
+/// `crate::video_decode::prime_video_decoder`, then loop calling
+/// `paint_and_present_one_video_slide_frame` at `fps` until `hold_ms`
+/// elapses. The video LOOPS during the hold — when
+/// `next_sample_idx` wraps past `samples.len()`,
+/// `reprime_video_decoder_for_loop` re-feeds the SPS+PPS+IDR primer
+/// and the decoder picks back up at sample 1. This matches the
+/// self-paced reel UX ("show this slide for N seconds" — a 2s video
+/// in a 5s hold plays through 2.5x).
+///
+/// Failure mode: open / prime / first-frame paint failures bubble
+/// to the caller. The reel's Video arm catches and falls through to
+/// the existing black-hold sleep + warn log — production rule per
+/// QA H2 dispatch: NEVER crash the reel.
+#[cfg(target_os = "linux")]
+pub fn render_video_slide_in_session(
+    session: &mut EglSession,
+    card: &Card,
+    asset_path: &Path,
+    hold_ms: u64,
+    fps: u32,
+) -> Result<()> {
+    if fps == 0 {
+        bail!("fps must be > 0");
+    }
+    let dem = crate::mp4_demux::Mp4Demuxer::open(asset_path)
+        .with_context(|| {
+            format!("open MP4 for reel video render: {}", asset_path.display())
+        })?;
+    let mut state = crate::video_decode::prime_video_decoder(&dem)
+        .with_context(|| {
+            format!(
+                "prime V4L2 decoder for reel video {}",
+                asset_path.display(),
+            )
+        })?;
+    let frame_budget = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+    let total_frames =
+        ((hold_ms as f64) / 1000.0 * fps as f64).round().max(1.0) as u32;
+    eprintln!(
+        "rendering video_slide from {} ({}x{}, {} samples) for {hold_ms}ms at {fps}fps ({total_frames} frames)",
+        asset_path.display(),
+        dem.width,
+        dem.height,
+        dem.samples.len(),
+    );
+    for _frame in 0..total_frames {
+        let frame_start = std::time::Instant::now();
+        if state.next_sample_idx >= dem.samples.len() {
+            // Reached end of stream — re-feed SPS+PPS+IDR + sample[0]
+            // to wrap. On failure (rare), bubble — the reel catches
+            // and falls back to black-hold for remainder.
+            crate::video_decode::reprime_video_decoder_for_loop(
+                &mut state, &dem,
+            )?;
+        }
+        paint_and_present_one_video_slide_frame(
+            session,
+            card,
+            &dem.samples,
+            &mut state.next_sample_idx,
+            &mut state.frames_decoded,
+            &state.decoder,
+        )?;
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_budget {
+            std::thread::sleep(frame_budget - elapsed);
+        }
+    }
+    Ok(())
+}
+
+/// QA M2 (2026-05-23) — self-paced any-endpoint transition renderer
+/// for the standalone `--play-reel` driver. Today's reel
+/// special-cases (Text, Text) → `render_transition_animated_in_session`
+/// and falls back to "hard cut + warn" for any other combo. This
+/// wrapper dispatches the (Text|Image)² matrix via the same
+/// per-frame `paint_and_present_one_transition_frame` the IPC
+/// sidecar uses (which has already handled Text/Image/Image/Text/
+/// Image/Image for slice 6+).
+///
+/// Video-involving endpoints (V↔T/I/V) are EXPLICITLY NOT supported
+/// here — the reel has no `SlideCache` for V4L2 decoder state.
+/// Returns `Err` for those combos so the reel's match arm can fall
+/// back to a hard cut. Scoped to "image-involving transitions" per
+/// the QA M2 dispatch text.
+///
+/// Mirrors `render_transition_animated_in_session`'s self-paced
+/// frame-loop shape, but routes through the more-flexible
+/// `paint_and_present_one_transition_frame` primitive instead of the
+/// text/text-only legacy 3-pass / SP / SB dispatch tree.
+pub fn render_transition_any_endpoint_in_session(
+    session: &mut EglSession,
+    card: &Card,
+    prev_item: &crate::content::ContentItem,
+    item: &crate::content::ContentItem,
+    fonts: Option<&FontCatalog>,
+    content_root: &Path,
+    kind: &str,
+    transition_ms: u32,
+    fps: u32,
+) -> Result<()> {
+    if transition_ms == 0 {
+        bail!("transition_ms must be > 0");
+    }
+    if fps == 0 {
+        bail!("fps must be > 0");
+    }
+    // Video-involving transitions need cache-resident V4L2 decoder
+    // state; the standalone reel doesn't carry one. Bail so the
+    // caller hard-cuts (matches the pre-H2/M2 video transition
+    // behavior — scoped fix, not a regression).
+    if matches!(prev_item, crate::content::ContentItem::Video(_))
+        || matches!(item, crate::content::ContentItem::Video(_))
+    {
+        bail!(
+            "video-involving transitions not supported in the standalone reel \
+             (no SlideCache for V4L2 decoder state); caller should hard-cut",
+        );
+    }
+    let frame_budget = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+    let total_frames =
+        ((transition_ms as f64) / 1000.0 * fps as f64).round().max(1.0) as u32;
+    eprintln!(
+        "rendering any-endpoint transition kind={kind:?} prev={} item={} transition_ms={transition_ms} fps={fps} ({total_frames} frames)",
+        prev_item.type_label(),
+        item.type_label(),
+    );
+    for f in 0..total_frames {
+        let frame_start = std::time::Instant::now();
+        // Build fresh TransitionEndpoints per iteration. Text/Image
+        // variants hold immutable references, so reconstruction is
+        // cheap (just borrows from the caller's ContentItem refs).
+        let endpoint_a = match prev_item {
+            crate::content::ContentItem::Text(s) => TransitionEndpoint::Text(s),
+            crate::content::ContentItem::Image(s) => TransitionEndpoint::Image(s),
+            crate::content::ContentItem::Video(_) => unreachable!(
+                "video bailed above"
+            ),
+        };
+        let endpoint_b = match item {
+            crate::content::ContentItem::Text(s) => TransitionEndpoint::Text(s),
+            crate::content::ContentItem::Image(s) => TransitionEndpoint::Image(s),
+            crate::content::ContentItem::Video(_) => unreachable!(
+                "video bailed above"
+            ),
+        };
+        // Linear-in-time progress in [0.0, 1.0) for frames in
+        // [0, total_frames). The endpoint at progress=1.0 (slide
+        // fully on screen) is handled by the subsequent slide hold,
+        // not the transition loop — same convention as
+        // render_transition_animated_in_session.
+        let progress = (f as f32) / (total_frames as f32);
+        paint_and_present_one_transition_frame(
+            session,
+            card,
+            endpoint_a,
+            endpoint_b,
+            fonts,
+            Some(content_root),
+            kind,
+            progress,
+        )?;
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_budget {
+            std::thread::sleep(frame_budget - elapsed);
+        }
+    }
+    Ok(())
+}
+
 /// v1-spec-delta #9 (slice d, 2026-05-08) -- single-frame
 /// paint + present helper for the IPC sidecar. Called once per
 /// Advance op (PaintSlide branch). Holds NO sleep / loop --
@@ -11806,52 +11982,102 @@ pub fn render_playlist_reel(
                     }
                 }
                 // Entry transition (skip when no predecessor).
-                // v1-spec-delta #8 (slice a): image-involving
-                // transitions are not yet implemented. The
-                // animated-transition harness expects two
-                // TextSlides for the FBO bake. When EITHER side
-                // is an image, hard-cut into the new item by
-                // skipping the transition with a warn line.
+                // QA M2 (2026-05-23): image-involving combos now
+                // route through render_transition_any_endpoint_in_
+                // session, matching the IPC sidecar's
+                // paint_and_present_one_transition_frame dispatch.
+                //
+                // (Text, Text) STAYS on render_transition_animated_
+                // in_session: that path has a 3-tier dispatch
+                // (single-pass → scissored-bake → legacy 3-pass)
+                // that the QA-mandated 2026-05-08 perf rewrite added
+                // to keep text/text transitions inside the 33ms
+                // vsync budget at 1080p×30Hz. paint_and_present_one_
+                // transition_frame uses the 3-pass legacy shape only
+                // — routing (Text, Text) through it would silently
+                // degrade the working fast path. Pre-commit review
+                // (2026-05-23) caught this regression risk.
+                //
+                // Video-involving combos (V↔T/I/V) still hard-cut —
+                // the reel has no SlideCache for V4L2 decoder state.
                 if let Some(p) = prev_idx_for_reel(i, pass, resolved.len()) {
                     if p != i {
                         let (prev_item, _, _) = &resolved[p];
                         let (_, kind, transition_ms) = &resolved[i];
                         let transition_ms = clamp_transition_ms(*transition_ms);
-                        match (prev_item, item) {
-                            (ContentItem::Text(prev_slide), ContentItem::Text(slide)) => {
-                                eprintln!(
-                                    "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms}",
-                                    resolved.len() - 1,
-                                );
-                                if let Err(e) = render_transition_animated_in_session(
-                                    session,
-                                    card,
-                                    prev_slide,
-                                    slide,
-                                    fonts,
-                                    Some(content_root),
-                                    kind,
-                                    transition_ms,
-                                    fps,
-                                ) {
+                        let prev_is_video =
+                            matches!(prev_item, ContentItem::Video(_));
+                        let item_is_video = matches!(item, ContentItem::Video(_));
+                        if prev_is_video || item_is_video {
+                            // Video-involving transitions: scoped
+                            // deferral. Caller hard-cuts (existing
+                            // pre-M2 behavior for these combos).
+                            eprintln!(
+                                "reel: video-involving transition into item {i} ({} -> {}) not yet supported in standalone reel; using hard cut",
+                                prev_item.type_label(),
+                                item.type_label(),
+                            );
+                        } else {
+                            match (prev_item, item) {
+                                (ContentItem::Text(prev_slide), ContentItem::Text(slide)) => {
+                                    // (Text, Text) keeps the QA-
+                                    // mandated SP/SB/3-pass tiered
+                                    // dispatch — perf-critical path.
                                     eprintln!(
-                                        "reel: warn — transition into item {i} failed: {e:#}; \
-                                         skipping to slide hold (acts as hard cut)"
+                                        "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms} (text -> text)",
+                                        resolved.len() - 1,
                                     );
-                                } else {
-                                    transitions_run += 1;
+                                    if let Err(e) = render_transition_animated_in_session(
+                                        session,
+                                        card,
+                                        prev_slide,
+                                        slide,
+                                        fonts,
+                                        Some(content_root),
+                                        kind,
+                                        transition_ms,
+                                        fps,
+                                    ) {
+                                        eprintln!(
+                                            "reel: warn — transition into item {i} failed: {e:#}; \
+                                             skipping to slide hold (acts as hard cut)"
+                                        );
+                                    } else {
+                                        transitions_run += 1;
+                                    }
                                 }
-                            }
-                            _ => {
-                                // Image-involving transition not
-                                // yet supported -- slice (b)
-                                // bundles image transition support
-                                // with the FBO-bake refactor.
-                                eprintln!(
-                                    "reel: image-involving transition into item {i} ({} -> {}) not yet implemented; using hard cut",
-                                    prev_item.type_label(),
-                                    item.type_label(),
-                                );
+                                _ => {
+                                    // Image-involving (any of T↔I,
+                                    // I↔T, I↔I) — route through the
+                                    // new wrapper that exercises the
+                                    // same paint_and_present_one_
+                                    // transition_frame primitive the
+                                    // IPC sidecar uses.
+                                    eprintln!(
+                                        "reel: transition into item {i}/{} kind={kind:?} ms={transition_ms} ({} -> {})",
+                                        resolved.len() - 1,
+                                        prev_item.type_label(),
+                                        item.type_label(),
+                                    );
+                                    if let Err(e) = render_transition_any_endpoint_in_session(
+                                        session,
+                                        card,
+                                        prev_item,
+                                        item,
+                                        fonts,
+                                        content_root,
+                                        kind,
+                                        transition_ms,
+                                        fps,
+                                    ) {
+                                        eprintln!(
+                                            "reel: warn — transition into item {i} failed: {e:#}; \
+                                             skipping to slide hold (acts as hard cut)"
+                                        );
+                                    } else {
+                                        transitions_run += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -11881,31 +12107,45 @@ pub fn render_playlist_reel(
                         let asset = image_slide_asset_path(content_root, slide.id);
                         render_image_slide_in_session(session, card, &asset, hold_ms)
                     }
-                    ContentItem::Video(_slide) => {
-                        // v1-spec-delta #8 (slice c, infra-only):
-                        // VideoSlide schema is mirrored + dispatched
-                        // here, but the actual H.264 decode pipeline
-                        // doesn't ship in this slice -- approach
-                        // selection (gstreamer subprocess vs ffmpeg
-                        // vs raw V4L2 M2M) is qarl-direct review per
-                        // QA's slicing read. Today: warn-and-fall to
-                        // a hard cut so the renderer doesn't choke
-                        // on video envelopes in playlists. The slot
-                        // is held for the spec'd hold_ms duration
-                        // (black screen) so the reel pacing is
-                        // preserved.
-                        eprintln!(
-                            "reel: video item {i} ({:?}) decode pipeline not yet implemented; holding {}ms with black",
-                            _slide.name,
-                            hold_ms,
+                    ContentItem::Video(slide) => {
+                        // QA H2 (2026-05-23): route through the same
+                        // V4L2 decode + per-frame paint pipeline the
+                        // IPC sidecar uses (lifted into
+                        // crate::video_decode). On any failure (no
+                        // /dev/video10, malformed MP4, V4L2 prime
+                        // error, mid-stream decode failure), fall
+                        // back to the legacy black-hold sleep so
+                        // the reel pacing is preserved and the
+                        // operator never sees the reel crash.
+                        let asset =
+                            crate::content::video_slide_asset_path(content_root, slide.id);
+                        #[cfg(target_os = "linux")]
+                        let result = render_video_slide_in_session(
+                            session, card, &asset, hold_ms, fps,
                         );
-                        // Hold the slot. Use a solid-black
-                        // render_solid_color call so the panel shows
-                        // something deterministic for hold_ms; the
-                        // slice-d follow-up replaces this with the
-                        // real decode-frame path.
-                        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-                        Ok(())
+                        #[cfg(not(target_os = "linux"))]
+                        let result: Result<()> = {
+                            // Non-Linux build (Mac unit tests, etc.):
+                            // V4L2 is Linux-only; keep the black-hold
+                            // fallback so dev hosts can run --play-reel
+                            // against a video fixture without panicking.
+                            let _ = slide;
+                            let _ = asset;
+                            let _ = fps;
+                            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                            Ok(())
+                        };
+                        if let Err(e) = &result {
+                            eprintln!(
+                                "reel: warn — video item {i} ({:?}) decode pipeline failed: {e:#}; \
+                                 falling back to black-hold for {hold_ms}ms",
+                                slide.name,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                            Ok(())
+                        } else {
+                            Ok(())
+                        }
                     }
                 };
                 if let Err(e) = render_result {

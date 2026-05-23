@@ -80,6 +80,12 @@ mod glyph_cache_colr;
 // individually `#[cfg(target_os = "linux")]` gated inside the
 // module so Mac compiles + runs the pure-Rust tests.
 mod v4l2;
+/// QA H2 (2026-05-23) — V4L2 H.264 decoder priming + per-slide
+/// state, shared between the IPC sidecar and the standalone reel.
+/// Linux-only; the module's `#![cfg(target_os = "linux")]` collapses
+/// it to a no-op on Mac.
+#[cfg(target_os = "linux")]
+mod video_decode;
 
 use std::path::PathBuf;
 

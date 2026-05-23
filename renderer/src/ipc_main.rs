@@ -42,50 +42,13 @@ use crate::hdmi_logic::FontCatalog;
 #[cfg(target_os = "linux")]
 use crate::v4l2;
 
-/// V4L2 piece 3c (2026-05-14): /dev/video10 is the bcm2835-codec
-/// decode-side node on Raspberry Pi (verified via piece 1 inventory
-/// and piece 2b live decode). Hardcoded for now; a future settings
-/// surface might let operators override on different SoCs.
+/// QA H2 (2026-05-23): `V4L2_DECODER_PATH` + `VideoDecoderState` +
+/// `prime_video_decoder` lifted to `crate::video_decode` so the
+/// standalone `--play-reel` driver can dispatch them too. Re-export
+/// the linux-gated names locally for backwards-compatible references
+/// from existing call sites + tests in this file.
 #[cfg(target_os = "linux")]
-const V4L2_DECODER_PATH: &str = "/dev/video10";
-
-/// Linux-only V4L2 H.264 decoder state cached alongside the
-/// Mp4Demuxer for a VideoSlide. cache.load opens + primes the
-/// decoder (format negotiation, REQBUFS, STREAMON, SPS+PPS+IDR
-/// fed); piece 3d paint_slide consumes per-advance samples and
-/// uploads decoded NV12 frames to GLES textures.
-#[cfg(target_os = "linux")]
-struct VideoDecoderState {
-    decoder: v4l2::Decoder,
-    /// Index of the next sample (in the demuxer's `samples` Vec)
-    /// to feed on the next paint_slide / advance tick. cache.load
-    /// primes by feeding sample 0 (the IDR + any pre-IDR NALs);
-    /// after priming this is 1.
-    next_sample_idx: usize,
-    /// Number of frames successfully painted via the per-advance
-    /// paint hook (piece 3e). Incremented in
-    /// `paint_and_present_one_video_slide_frame` after a
-    /// successful blit+swap. Used for first-frame logging +
-    /// future slide-end frame-count diagnostics.
-    frames_decoded: usize,
-    /// Negotiated capture dimensions (may differ from the input
-    /// dims via codec width/height adjustment). Used by piece 3e
-    /// to size the GLES texture upload at exactly the codec's
-    /// stride (avoids spurious right-edge garbage on non-aligned
-    /// widths).
-    capture_w: u32,
-    capture_h: u32,
-}
-
-#[cfg(target_os = "linux")]
-impl VideoDecoderState {
-    /// Convenience for the paint hook's "did we make progress
-    /// this tick?" check; returns the current frames_decoded
-    /// counter (incremented by the paint helper on success).
-    fn frames_decoded_for_log(&self) -> usize {
-        self.frames_decoded
-    }
-}
+use crate::video_decode::{prime_video_decoder, VideoDecoderState, V4L2_DECODER_PATH};
 
 /// Phase 9 Step 9a (2026-05-16) — IPC sidecar per-Advance paint
 /// metrics for soak readiness. Aggregates PaintSlide + PaintTransition
@@ -512,103 +475,6 @@ impl SlideCache {
             content_root.display()
         ))
     }
-}
-
-/// V4L2 piece 3c: open + prime an `v4l2::Decoder` against the
-/// Pi's bcm2835-codec for a given Mp4Demuxer's stream. Returns a
-/// `VideoDecoderState` ready for piece 3d to drain frames from.
-///
-/// Priming sequence (per bcm2835-codec / V4L2 M2M MPLANE recipe):
-///   1. Decoder::open("/dev/video10")
-///   2. set_output_format(H264, w, h) -- compressed-in queue
-///   3. set_capture_format(NV12, w, h) -- decoded-out queue;
-///      negotiated dims may differ from the request (codec
-///      rounds to its alignment).
-///   4. allocate_buffers(OUTPUT, 4) + allocate_buffers(CAPTURE, 4)
-///   5. start_streaming() -- STREAMON OUTPUT then CAPTURE
-///   6. feed(sps_pps_annexb) -- header NALs prepended once
-///   7. feed(sample[0]) -- first sample (IDR + any pre-IDR NALs)
-///
-/// Failure at any step bubbles; the cache.load caller swallows
-/// to eprintln + falls through to the "video slides TBD" PIL
-/// fallback wire.
-#[cfg(target_os = "linux")]
-fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
-    use std::path::Path;
-    let path = Path::new(V4L2_DECODER_PATH);
-    if !path.exists() {
-        anyhow::bail!(
-            "V4L2 decoder device {} does not exist (no codec driver loaded?)",
-            V4L2_DECODER_PATH
-        );
-    }
-    let dec = v4l2::Decoder::open(path)
-        .with_context(|| format!("open V4L2 decoder at {}", V4L2_DECODER_PATH))?;
-    // V4L2 piece 4d (2026-05-14): opt-in DMA-BUF zero-copy path
-    // via env var. Piece 4e smoke shipped GREEN (qa/captures/
-    // v4l2-piece4e-dmabuf-smoke-2026-05-14.md, 6.3× mean / 9.1× p50
-    // improvement vs MMAP), but the default remained MMAP pending
-    // a separate flip decision. Set BEFORE allocate_buffers so
-    // REQBUFS uses the right memory type.
-    let use_dmabuf = std::env::var("OPENMARQUEE_RENDERER_DMABUF")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if use_dmabuf {
-        dec.set_capture_buffer_type(v4l2::CaptureBufferType::DmaBuf);
-    }
-    let w = dem.width as u32;
-    let h = dem.height as u32;
-    let _out_fmt = dec
-        .set_output_format(v4l2::V4L2_PIX_FMT_H264, w, h)
-        .context("S_FMT OUTPUT (H264)")?;
-    let cap_fmt = dec
-        .set_capture_format(v4l2::V4L2_PIX_FMT_NV12, w, h)
-        .context("S_FMT CAPTURE (NV12)")?;
-    // Fail loud if the codec emits FULL_RANGE quantization — the
-    // MMAP-path FS_NV12_TO_RGB shader does explicit LIM_RANGE
-    // scaling and would crush blacks / clip whites. See
-    // `qa/v1-spec-delta-2026-05-14.md` P1.
-    let q = dec
-        .assert_capture_quantization_compatible()
-        .context("CAPTURE quantization compatibility")?;
-    eprintln!(
-        "v4l2 capture quantization: {} ({})",
-        q,
-        match q {
-            v4l2::V4L2_QUANTIZATION_DEFAULT => "DEFAULT",
-            v4l2::V4L2_QUANTIZATION_LIM_RANGE => "LIM_RANGE",
-            _ => "?",
-        }
-    );
-    dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
-        .context("REQBUFS OUTPUT")?;
-    dec.allocate_buffers(v4l2::QueueDirection::Capture, 4)
-        .context("REQBUFS CAPTURE")?;
-    dec.start_streaming().context("STREAMON")?;
-    // Feed the codec headers + first sample as a SINGLE
-    // concatenated buffer. `v4l2::Decoder::feed` is single-shot-
-    // safe per its docstring -- back-to-back calls collide on
-    // OUTPUT buffer index 0 (the second feed clobbers the first
-    // before the kernel has dequeued it). The proven-working
-    // recipe in v4l2::tests::decode_test_fixture_320x240 feeds
-    // the entire Annex-B stream in one call; we mirror that.
-    let first_sample = dem
-        .samples
-        .first()
-        .ok_or_else(|| anyhow!("MP4 contains zero samples"))?;
-    let header = dem.sps_pps_annexb();
-    let mut primer: Vec<u8> = Vec::with_capacity(header.len() + first_sample.len());
-    primer.extend_from_slice(&header);
-    primer.extend_from_slice(first_sample);
-    dec.feed(&primer).context("feed SPS+PPS+IDR primer")?;
-    Ok(VideoDecoderState {
-        decoder: dec,
-        next_sample_idx: 1,
-        frames_decoded: 0,
-        capture_w: cap_fmt.width,
-        capture_h: cap_fmt.height,
-    })
 }
 
 /// Emit a response to stdout as a single JSON line + flush.
