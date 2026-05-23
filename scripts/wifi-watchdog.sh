@@ -51,7 +51,7 @@ STATE_FILE=/var/run/wifi-watchdog.fails
 LOG=/var/log/wifi-watchdog.log
 THRESHOLD=2
 
-ts() { date -Iseconds; }
+ts() { date -u -Iseconds; }
 
 # Log a message to BOTH the watchdog file log and the systemd
 # journal (tagged `wifi-watchdog`). The journal pairing fixes the

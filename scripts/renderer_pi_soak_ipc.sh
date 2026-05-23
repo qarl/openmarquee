@@ -165,7 +165,7 @@ heartbeat_loop() {
 # follows the service unit; --no-pager + --output=short-iso prints
 # wall-clock prefixes that the parser can use.
 START_TS=$(date +%s)
-echo "==> starting capture at $(date -Iseconds)"
+echo "==> starting capture at $(date -u -Iseconds)"
 echo "    (background ssh + journalctl tail; will run $DURATION_S seconds)"
 heartbeat_loop &
 HEARTBEAT_PID=$!
