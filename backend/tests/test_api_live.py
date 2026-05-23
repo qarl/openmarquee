@@ -9,6 +9,7 @@ external contract.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
@@ -283,6 +284,161 @@ def test_takeover_400_surfaces_error_class_in_detail(client: TestClient):
     assert "Address family not supported" not in response.text
 
 
+# --- Slice 4 Test B (2026-05-23): real aiortc client SDP round-trip ---------
+#
+# Happy-path lock for the Live signaling path. Drives a REAL aiortc
+# RTCPeerConnection (not _FakeRTCPeerConnection) through
+# /api/live/start against the in-process app with real aiortc on the
+# server side too. Catches general aiortc/SDP regressions that the
+# fake-PC tests can't see (codec negotiation, ICE candidate handling,
+# real SDP parser behavior).
+#
+# Skip-gated on aiortc availability — the rest of the test surface
+# uses _FakeRTCPeerConnection and would skip cleanly if a runner
+# doesn't have aiortc installed. We DON'T skip on macOS: the
+# happy-path doesn't depend on netlink (Mac's getifaddrs uses
+# sysctl, not netlink), so the test passes on both platforms and
+# the Mac dev-loop benefits from the coverage. QA's earlier
+# "skip on darwin" guidance was paired with the primary
+# (seccomp-hardening) approach which we DEFERRED; the fallback
+# this test implements has no Mac-specific failure mode.
+#
+# Note: this test exercises SDP exchange + answer-parsing on both
+# sides (client applies the answer at the end — catches answer-
+# parser regressions too). It does NOT poll for
+# pc.connectionState == "connected" (that would test DTLS / SRTP /
+# ICE-connectivity on the loopback transport, which is outside the
+# netlink-regression target). It does NOT send frames. The
+# end-to-end frame-flow case is manually validated against FYS
+# (the Slice 2 shake-out + the backend log correlation showing
+# 70 frames painted).
+
+
+@pytest.mark.asyncio
+async def test_aiortc_client_round_trips_real_sdp_through_api_live_start(
+    loop: PlaybackLoop, manager: LiveManager
+):
+    """Real aiortc RTCPeerConnection on the client side POSTs a real
+    SDP offer (not the "v=0\\r\\noffer" stub the other tests use) to
+    /api/live/start. The server runs real aiortc too — no
+    _FakeRTCPeerConnection patch — so the test exercises actual
+    `setRemoteDescription` + `createAnswer` + `setLocalDescription`
+    (with ICE gathering) on the production code path.
+
+    Asserts:
+    - 200 OK.
+    - response carries `session_id` + `sdp_answer` + `started_at`.
+    - `sdp_answer` is a parseable SDP (starts with v=0) and aiortc
+      client-side can apply it via setRemoteDescription without
+      raising.
+    - /api/live/stop returns 204 + status flips back to idle.
+
+    Would have caught the FYS netlink-EAFNOSUPPORT regression
+    immediately if the test runner enforced systemd-style
+    RestrictAddressFamilies (the primary-B approach we DEFERRED —
+    see Slice 4 commit message). With Slice 4 Test A's static
+    config lock + this happy-path lock + Slice 3's _RaisingRTC
+    exception-shape lock, the three-axis coverage matrix is
+    ~complete.
+    """
+    pytest.importorskip("aiortc")
+    pytest.importorskip("httpx")
+    import httpx
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc.contrib.media import MediaPlayer
+
+    fixture_mp4 = Path(__file__).resolve().parent.parent.parent / "ui" / "test" / "fixture.mp4"
+    if not fixture_mp4.is_file():
+        pytest.skip(f"harness fixture missing at {fixture_mp4}")
+
+    # Wire the test app to the loop + manager fixtures, NO patch on
+    # RTCPeerConnection — the production aiortc class is what gets
+    # exercised here.
+    app.dependency_overrides[get_playback_loop] = lambda: loop
+    app.dependency_overrides[get_live_manager] = lambda: manager
+    pc: RTCPeerConnection | None = None
+    player: MediaPlayer | None = None
+    try:
+        # Build the client-side PC + load the looping fixture as the
+        # video track source.
+        pc = RTCPeerConnection()
+        player = MediaPlayer(str(fixture_mp4), loop=True)
+        assert player.video is not None, (
+            "MediaPlayer must yield a video track from the harness fixture"
+        )
+        pc.addTrack(player.video)
+
+        # Non-trickle ICE: bake all candidates into the local
+        # description before sending the offer. Same shape the
+        # browser harness's `waitForIceGatheringComplete` enforces.
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        # Bound the gather wait so a misconfigured runner can't hang
+        # the test indefinitely. 30 s is generous; typical local
+        # gather completes in <5 s.
+        for _ in range(600):
+            if pc.iceGatheringState == "complete":
+                break
+            await asyncio.sleep(0.05)
+        assert pc.iceGatheringState == "complete", (
+            f"iceGatheringState stuck at {pc.iceGatheringState} after 30 s; "
+            f"runner may lack a usable network interface (or netlink, on Linux)"
+        )
+
+        # POST the offer via httpx ASGI transport so the request goes
+        # through the FastAPI app in-process WITHOUT a TestClient
+        # thread context — keeps everything in the test's asyncio
+        # loop so the production aiortc handler shares the loop with
+        # the client PC.
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            start_resp = await http.post(
+                "/api/live/start",
+                json={"sdp_offer": pc.localDescription.sdp},
+                timeout=60.0,
+            )
+            assert start_resp.status_code == 200, (
+                f"expected 200, got {start_resp.status_code}: {start_resp.text}"
+            )
+            body = start_resp.json()
+            assert "session_id" in body
+            assert "started_at" in body
+            assert isinstance(body["sdp_answer"], str)
+            assert body["sdp_answer"].startswith("v=0"), (
+                f"sdp_answer doesn't look like SDP: {body['sdp_answer'][:80]!r}"
+            )
+            # Client-side applies the answer — exercises aiortc's SDP
+            # parser on the answer the server just produced. If the
+            # answer is malformed in some way the fake test couldn't
+            # see, this raises.
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=body["sdp_answer"], type="answer")
+            )
+
+            # Stop cleanly to leave the live manager idle for any
+            # following test.
+            stop_resp = await http.post(
+                "/api/live/stop",
+                json={"session_id": body["session_id"]},
+                timeout=10.0,
+            )
+            assert stop_resp.status_code == 204
+            status_resp = await http.get("/api/live/status")
+            assert status_resp.status_code == 200
+            assert status_resp.json()["state"] == "idle"
+    finally:
+        if pc is not None:
+            # Best-effort cleanup — pc.close() can raise if the connection
+            # is already half-torn-down; we don't care here.
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                await pc.close()
+        app.dependency_overrides.clear()
+        _live_manager_singleton.cache_clear()
+        _playback_loop_singleton.cache_clear()
+
+
 # --- Slice 4 Test A (2026-05-23): canonical systemd unit AF_NETLINK lock ----
 #
 # Catches the regression on every CI run regardless of platform —
@@ -300,22 +456,13 @@ def test_systemd_unit_whitelists_af_netlink():
     400 with OSError [Errno 97] (Address family not supported by
     protocol). Diagnosed on FYS 2026-05-23.
     """
-    unit = (
-        Path(__file__).resolve().parent.parent.parent
-        / "system"
-        / "openmarquee-backend.service"
-    )
+    unit = Path(__file__).resolve().parent.parent.parent / "system" / "openmarquee-backend.service"
     assert unit.is_file(), (
-        f"canonical unit file not found at {unit}; relocation? update the "
-        f"test path."
+        f"canonical unit file not found at {unit}; relocation? update the test path."
     )
     text = unit.read_text()
     line = next(
-        (
-            ln
-            for ln in text.splitlines()
-            if ln.strip().startswith("RestrictAddressFamilies=")
-        ),
+        (ln for ln in text.splitlines() if ln.strip().startswith("RestrictAddressFamilies=")),
         None,
     )
     assert line is not None, (
