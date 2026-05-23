@@ -321,6 +321,12 @@ async function boot() {
     // whatever id this holds at call time.
     let currentPlaylistId = DEFAULT_PLAYLIST_ID;
     let playlistBrowserHandle = null;
+    // Schedule page's editor handle — captured so we can refresh its
+    // playlist <select>s after a playlist add / delete / rename. The
+    // schedule UI caches `availableChoices` at mount + only refreshes
+    // it on its own Add-rule button; without an external trigger the
+    // dropdown shows deleted playlists until the user reloads.
+    let scheduleHandle = null;
 
     // Slides shell — sub-tab switcher + +New button. Mounted once; the
     // child editor / image / video panels mount into the .tab-pane slots
@@ -388,6 +394,7 @@ async function boot() {
         playlistBrowserHandle?.highlight(currentPlaylistId);
         await playlistTrack?.refresh();
         await inlinePreviewHandle?.refresh();
+        await scheduleHandle?.refresh();
         await refreshSidebarCounts();
     }
 
@@ -404,6 +411,7 @@ async function boot() {
         playlistBrowserHandle?.highlight(currentPlaylistId);
         await playlistTrack?.refresh();
         await inlinePreviewHandle?.refresh();
+        await scheduleHandle?.refresh();
         await refreshSidebarCounts();
     }
 
@@ -448,6 +456,9 @@ async function boot() {
                 await playlistBrowserHandle?.refresh();
                 playlistBrowserHandle?.highlight(currentPlaylistId);
                 await inlinePreviewHandle?.refresh();
+                // Schedule dropdown options carry display names — a
+                // rename here needs to propagate to the schedule UI.
+                await scheduleHandle?.refresh();
                 await refreshSidebarCounts();
             },
             onDraftChange: async (draft) => {
@@ -636,7 +647,10 @@ async function boot() {
     refreshSidebarCounts();
 
     // Schedule + settings don't depend on dims, so they mount once.
-    mountSchedule(root.querySelector(".schedule-slot"), {
+    // Hold onto the schedule handle so playlist add/delete/rename in
+    // main.js can trigger a refresh — the schedule UI caches choices
+    // and won't pick up external changes otherwise.
+    scheduleHandle = mountSchedule(root.querySelector(".schedule-slot"), {
         fetchSchedule: getSchedule,
         onSave: saveSchedule,
         // Yields {id, name} pairs so the schedule UI's playlist <select>
