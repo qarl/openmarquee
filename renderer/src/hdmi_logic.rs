@@ -10100,6 +10100,134 @@ mod tests {
         );
     }
 
+    /// Regression-lock for D1 "blacks-not-black" — QA H1 audit cited
+    /// the 2026-05-17 recon (`qa/captures/bug-7-blacks-not-black-
+    /// recon-2026-05-17.md`) and recommended Option B (a `step+mix`
+    /// branch-free snap to exact zero for the FS_BRIGHT_GAMMA pass).
+    /// The recon was a PAPER analysis pre-probe — it explicitly punted
+    /// vc4 hardware confirmation as out-of-scope.
+    ///
+    /// Between the recon (2026-05-17) and the QA audit (2026-05-23)
+    /// the single-frame FBO-readback probe was run on vc4 hardware and
+    /// confirmed `pow(0.0, 1/2.2) == 0.0` — the suspected vc4 imprecision
+    /// does NOT exist on bcm2835's GLES2 implementation. The shader was
+    /// annotated accordingly: "No epsilon needed." Option B was never
+    /// implemented because it isn't needed.
+    ///
+    /// This lock fences two invariants in the FS_BRIGHT_GAMMA shader so
+    /// a future "cleanup" PR doesn't:
+    ///
+    ///   - Strip the unconditional `clamp(rgb, vec3(0.0), vec3(1.0))`
+    ///     thinking it's redundant. The clamp keeps `pow`'s base
+    ///     well-defined per GLSL ES 1.00 §8.2 ("pow undefined for
+    ///     negative bases"). Without it, a future `u_brightness > 1.0`
+    ///     change (out-of-scope today; brightness is `[0,1]`) would
+    ///     produce undefined-behavior shader output on overflow.
+    ///
+    ///   - Re-implement the recon's Option B `step+mix` snap thinking
+    ///     "the comment is wrong; the recon promised an epsilon."
+    ///     The comment IS the source of truth — it cites the vc4 probe
+    ///     that disproved the bug. The recon is historical.
+    ///
+    /// Like the `legacy_3pass_transition_re_bakes_*` test above this is
+    /// a source-grep test rather than behavioral, because vc4's
+    /// `pow(0.0, x)` math isn't reproducible without on-Pi hardware.
+    /// The shader's correct behavior was confirmed by the original
+    /// probe; this test locks the SHADER SOURCE so a refactor can't
+    /// silently regress.
+    ///
+    /// QA close-out 2026-05-23: D1 closed as audit-stale-and-no-action
+    /// (third such closure of the night, mirroring H3 + M1). Audit
+    /// tracked in QA's per-session overnight doc; recon stays the
+    /// repo-resident source of truth at the path cited above.
+    #[test]
+    fn fs_bright_gamma_keeps_pre_pow_clamp_and_no_epsilon_documentation() {
+        // Pin the shader contents directly — it's a `pub const` in
+        // this same file, so the source string we grep against is
+        // the canonical authority.
+        let shader = super::FS_BRIGHT_GAMMA;
+
+        // Invariant 1: unconditional clamp to [0, 1] is present.
+        // (Approx hdmi_logic.rs:2775 at this writing; line drifts.)
+        // If a refactor reflows the clamp into different vec3 args
+        // (e.g. `clamp(rgb, 0.0, 1.0)` with float scalars implicitly
+        // broadcast) update this assertion to the new shape; don't
+        // silently delete the lock.
+        assert!(
+            shader.contains("clamp(rgb, vec3(0.0), vec3(1.0))"),
+            "FS_BRIGHT_GAMMA must clamp rgb to [0, 1] BEFORE the pow \
+             call so the base is well-defined per GLSL ES 1.00 §8.2. \
+             The unconditional clamp is what makes `pow(0.0, 1/gamma) \
+             == 0.0` on vc4 (verified via single-frame FBO-readback \
+             probe 2026-05-17). If the clamp shape changed \
+             intentionally, update this assertion AND the recon doc \
+             at qa/captures/bug-7-blacks-not-black-recon-2026-05-17.md \
+             — but DON'T silently delete it without QA sign-off."
+        );
+
+        // Invariant 1b: the clamp appears BEFORE the pow call. The
+        // affirmative `contains` assertion above doesn't catch a
+        // reordering (clamp-after-pow keeps both substrings but
+        // breaks the math: pow's base can be negative + undefined).
+        // Subagent review caught the gap pre-commit.
+        let clamp_idx = shader
+            .find("clamp(rgb, vec3(0.0), vec3(1.0))")
+            .expect("clamp asserted present by invariant 1 above");
+        let pow_idx = shader
+            .find("pow(rgb")
+            .expect("pow call is the whole point of FS_BRIGHT_GAMMA");
+        assert!(
+            clamp_idx < pow_idx,
+            "FS_BRIGHT_GAMMA must clamp rgb BEFORE the pow call \
+             (clamp idx {clamp_idx} < pow idx {pow_idx}). A \
+             clamp-after-pow ordering keeps the substrings but \
+             breaks the math: pow's base can be negative, which is \
+             undefined per GLSL ES 1.00 §8.2."
+        );
+
+        // Invariant 2: the "No epsilon needed" comment anchor stays in
+        // place. The anchor phrase is stable across reasonable comment
+        // rewrites (it explicitly names the probe). If a future
+        // cleanup PR re-implements Option B from the recon, the anchor
+        // text will conflict and trip this assertion — surfacing the
+        // closure rationale before the regression lands.
+        assert!(
+            shader.contains("FBO-readback probe 2026-05-17"),
+            "FS_BRIGHT_GAMMA must retain the comment anchor for D1's \
+             close-out rationale ('verified via single-frame FBO-\
+             readback probe'). The comment is the source of truth: \
+             the 2026-05-17 recon recommended Option B (step+mix snap) \
+             as a paper-analysis fix for a SUSPECTED vc4 \
+             `pow(0.0, 1/2.2)` imprecision, but the actual probe on \
+             vc4 hardware confirmed `pow(0.0, 1/2.2) == 0.0` — no \
+             epsilon needed. If a future cleanup PR strips this \
+             comment thinking it's stale, restore it from the recon \
+             cross-ref at qa/captures/bug-7-blacks-not-black-recon-\
+             2026-05-17.md AND get QA sign-off; don't silently \
+             re-introduce Option B as a 'safety' fix."
+        );
+
+        // Invariant 3 (anti-pattern): the shader must NOT contain the
+        // recon's Option B step+mix snap. Option B was the paper-
+        // analysis recommendation for a SUSPECTED vc4 imprecision
+        // that the probe disproved — re-introducing it "for safety"
+        // is the exact silent regression this lock fences. Matches
+        // the H3/motion-phase/black-flash locks' anti-pattern arm.
+        assert!(
+            !shader.contains("step(rgb, vec3(1e-6))")
+                && !shader.contains("step(rgb, vec3(0.000001))"),
+            "FS_BRIGHT_GAMMA must NOT contain the recon's Option B \
+             step+mix snap — the probe disproved the vc4 imprecision \
+             it was designed to mitigate. Re-introducing it 'for \
+             safety' is the silent regression this lock fences. See \
+             qa/captures/bug-7-blacks-not-black-recon-2026-05-17.md \
+             §5 (Option B) for the original recommendation + why it \
+             was closed without implementation. If qarl re-probed on \
+             different hardware and the bug now exists, restart from \
+             a fresh recon — don't silently re-add Option B here."
+        );
+    }
+
     // wrap_text_to_width — 2026-05-17 port of the JS+Python helpers.
     // Each test pins one branch of the greedy line-fill algorithm; the
     // max_width is computed from the actual rasterized advance widths
