@@ -293,3 +293,222 @@ async def test_success_clears_the_failure_throttle(
         r.levelno == logging.WARNING and "down again" in r.message
         for r in caplog.records
     )
+
+
+# --- memory-pressure gate (postmortem mitigation #3, 2026-05-23) ----------
+#
+# fetch_web_screenshot reads /proc/meminfo before acquiring the
+# render lock and skips the cycle when MemAvailable is below floor
+# OR SwapUsed is above ceiling. The skip returns False (same
+# contract as every other failure path — keeps last-good asset).
+#
+# Mocking pattern: monkeypatch `web_screenshot._read_meminfo` to
+# return a chosen `(mem_available_mb, swap_used_mb)` tuple, or None
+# to simulate the fail-open path (dev macOS, no /proc/meminfo).
+
+
+@pytest.mark.asyncio
+async def test_skips_when_mem_available_under_floor(
+    tmp_path, monkeypatch, caplog
+):
+    """MemAvailable below the 80 MB default floor -> skip + False +
+    no render call. INFO-level log naming the pressure and thresholds
+    so the operator sees the timeline."""
+    storage = ContentStorage(tmp_path)
+    slide = _web_slide()
+    storage.save_web(slide)
+    before = storage.read_asset(slide.id)
+
+    calls: list = []
+    _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
+    monkeypatch.setattr(
+        web_screenshot, "_read_meminfo", lambda: (70, 10)
+    )
+
+    with caplog.at_level(logging.INFO, logger="openmarquee.web_screenshot"):
+        ok = await fetch_web_screenshot(slide, storage, 1360, 768)
+
+    assert ok is False
+    assert calls == []  # render never invoked
+    assert storage.read_asset(slide.id) == before  # asset untouched
+    assert any(
+        "skipping render" in r.message
+        and "MemAvailable=70MB" in r.message
+        and "floor=80MB" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_skips_when_swap_used_over_ceiling(
+    tmp_path, monkeypatch, caplog
+):
+    """SwapUsed above the 30 MB default ceiling -> skip + False + no
+    render call, even when MemAvailable is comfortable."""
+    storage = ContentStorage(tmp_path)
+    slide = _web_slide()
+    storage.save_web(slide)
+    before = storage.read_asset(slide.id)
+
+    calls: list = []
+    _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
+    monkeypatch.setattr(
+        web_screenshot, "_read_meminfo", lambda: (200, 40)
+    )
+
+    with caplog.at_level(logging.INFO, logger="openmarquee.web_screenshot"):
+        ok = await fetch_web_screenshot(slide, storage, 1360, 768)
+
+    assert ok is False
+    assert calls == []
+    assert storage.read_asset(slide.id) == before
+    assert any(
+        "skipping render" in r.message
+        and "SwapUsed=40MB" in r.message
+        and "ceiling=30MB" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_proceeds_when_memory_ok(tmp_path, monkeypatch):
+    """Comfortable headroom -> render runs as usual."""
+    storage = ContentStorage(tmp_path)
+    slide = _web_slide()
+    storage.save_web(slide)
+
+    calls: list = []
+    _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
+    monkeypatch.setattr(
+        web_screenshot, "_read_meminfo", lambda: (200, 10)
+    )
+
+    ok = await fetch_web_screenshot(slide, storage, 1360, 768)
+
+    assert ok is True
+    assert calls == [("https://status.example.com", 1360, 768)]
+
+
+@pytest.mark.asyncio
+async def test_proceeds_when_meminfo_unavailable(tmp_path, monkeypatch):
+    """_read_meminfo returns None (dev macOS, missing /proc/meminfo)
+    -> fail-open, render runs. The gate is a safety mitigation, not a
+    correctness gate; refusing to render on every dev machine would
+    break CI for no benefit."""
+    storage = ContentStorage(tmp_path)
+    slide = _web_slide()
+    storage.save_web(slide)
+
+    calls: list = []
+    _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
+    monkeypatch.setattr(web_screenshot, "_read_meminfo", lambda: None)
+
+    ok = await fetch_web_screenshot(slide, storage, 1360, 768)
+
+    assert ok is True
+    assert calls == [("https://status.example.com", 1360, 768)]
+
+
+@pytest.mark.asyncio
+async def test_env_var_overrides_floor(tmp_path, monkeypatch):
+    """OPENMARQUEE_WEB_RENDER_MEM_FLOOR_MB raises the floor; readings
+    that would have passed the default 80 now skip. Same shape applies
+    to OPENMARQUEE_WEB_RENDER_SWAP_CEILING_MB (symmetric envelope —
+    one env-var test fences the lookup; static-parse fences both
+    names exist)."""
+    storage = ContentStorage(tmp_path)
+    slide = _web_slide()
+    storage.save_web(slide)
+
+    calls: list = []
+    _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
+    monkeypatch.setenv("OPENMARQUEE_WEB_RENDER_MEM_FLOOR_MB", "200")
+    # 150 MB available would pass the default 80 floor; with the env
+    # override at 200 it must now skip.
+    monkeypatch.setattr(
+        web_screenshot, "_read_meminfo", lambda: (150, 10)
+    )
+
+    ok = await fetch_web_screenshot(slide, storage, 1360, 768)
+
+    assert ok is False
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_skip_does_not_acquire_render_lock(tmp_path, monkeypatch):
+    """The gate fires BEFORE the _render_lock acquire. A wedged
+    in-flight render (lock held by another task) must not block the
+    skip path — the skip returns immediately regardless of lock
+    contention. This pins the postmortem-named invariant: a skip is
+    a cheap fast-path, not a serialized one."""
+    storage = ContentStorage(tmp_path)
+    slide = _web_slide()
+    storage.save_web(slide)
+
+    calls: list = []
+    _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
+    monkeypatch.setattr(
+        web_screenshot, "_read_meminfo", lambda: (10, 99)
+    )
+
+    # Hold the render lock from a separate task that never releases.
+    # If the gate ran AFTER the lock acquire, fetch_web_screenshot
+    # would block forever waiting on the lock.
+    await web_screenshot._render_lock.acquire()
+    try:
+        # 0.5s is generous — the skip path is microseconds in practice.
+        # asyncio.wait_for raises TimeoutError if the call blocks.
+        ok = await asyncio.wait_for(
+            fetch_web_screenshot(slide, storage, 1360, 768),
+            timeout=0.5,
+        )
+    finally:
+        web_screenshot._render_lock.release()
+
+    assert ok is False
+    assert calls == []  # render never invoked
+
+
+# --- /proc/meminfo parser ------------------------------------------------
+
+
+def test_read_meminfo_returns_none_off_linux(monkeypatch, tmp_path):
+    """When /proc/meminfo is absent (the dev macOS host running this
+    suite), the helper returns None — the fail-open signal to the
+    gate. Forces the path explicitly via a missing tmp file so this
+    test is deterministic on either host."""
+    monkeypatch.setattr(
+        web_screenshot, "_MEMINFO_PATH", tmp_path / "no-such-file"
+    )
+    assert web_screenshot._read_meminfo() is None
+
+
+def test_read_meminfo_parses_valid_format(monkeypatch, tmp_path):
+    """A well-formed /proc/meminfo parses to the expected (mem_mb,
+    swap_used_mb) tuple. Numbers: 122880 kB = 120 MB; SwapUsed =
+    SwapTotal - SwapFree = 102400 - 71680 = 30720 kB = 30 MB."""
+    fake = tmp_path / "meminfo"
+    fake.write_text(
+        "MemTotal:         425984 kB\n"
+        "MemFree:           20480 kB\n"
+        "MemAvailable:     122880 kB\n"
+        "SwapTotal:        102400 kB\n"
+        "SwapFree:          71680 kB\n"
+    )
+    monkeypatch.setattr(web_screenshot, "_MEMINFO_PATH", fake)
+    assert web_screenshot._read_meminfo() == (120, 30)
+
+
+def test_read_meminfo_returns_none_on_missing_keys(monkeypatch, tmp_path):
+    """A meminfo with the lines but missing one of the three required
+    keys (a future kernel rename, say) -> None, fail-open. The
+    refactor lands a clean signal rather than a KeyError surfacing
+    up the playback path."""
+    fake = tmp_path / "meminfo"
+    # No SwapTotal/SwapFree — the helper can't compute swap_used.
+    fake.write_text(
+        "MemAvailable:     122880 kB\n"
+    )
+    monkeypatch.setattr(web_screenshot, "_MEMINFO_PATH", fake)
+    assert web_screenshot._read_meminfo() is None

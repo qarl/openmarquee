@@ -31,12 +31,26 @@ Two structural points keep the on-device render off the playback path:
     Web slide's refresh simply waits its turn — invisible, since the
     producer is fire-and-forget and the slide shows its last-good
     asset meanwhile.
+
+A third point gates the spawn itself on system memory pressure
+(postmortem mitigation #3, 2026-05-23): `fetch_web_screenshot`
+reads /proc/meminfo BEFORE acquiring the render lock and skips the
+cycle when MemAvailable < OPENMARQUEE_WEB_RENDER_MEM_FLOOR_MB
+(default 80 MB) OR SwapUsed > OPENMARQUEE_WEB_RENDER_SWAP_CEILING_MB
+(default 30 MB). The skip is invisible to the sign (last-good
+asset.png stays on screen) but breaks the swap-thrash → brcmfmac
+SDIO CMD53 → WiFi-wedge chain that drove the 2026-05-23 outage.
+The helper fails open on non-Linux (no /proc/meminfo) so dev
+environments and CI keep rendering.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from openmarquee.content import WebSlide
@@ -46,6 +60,83 @@ if TYPE_CHECKING:
     from openmarquee.content.storage import ContentStorage
 
 log = logging.getLogger(__name__)
+
+# Memory-pressure gate thresholds (postmortem mitigation #3,
+# 2026-05-23). The Pi Zero 2 W has only ~426 MB total RAM; spawning
+# chromium-headless-shell adds ~100-150 MB peak. Sustained pressure
+# manifests as brcmfmac SDIO CMD53 errors (the chronic WiFi
+# instability substrate). Skip the render when MemAvailable is below
+# the floor OR SwapUsed is above the ceiling — the slide keeps its
+# previous asset.png, the sign keeps painting it, and the operator
+# sees the skip in the INFO log timeline.
+_MEM_FLOOR_MB_DEFAULT = 80
+_SWAP_CEILING_MB_DEFAULT = 30
+# /proc/meminfo lines look like `MemAvailable:    123456 kB`. The
+# regex anchors both columns so a renamed/reformatted key is a hard
+# parse failure rather than a silent miss.
+_MEMINFO_LINE_RE = re.compile(r"^(\S+):\s+(\d+)\s+kB\s*$")
+_MEMINFO_PATH = Path("/proc/meminfo")
+
+
+def _mem_floor_mb() -> int:
+    """Override default via OPENMARQUEE_WEB_RENDER_MEM_FLOOR_MB.
+
+    Non-int or negative values fall back to the default — neither
+    silently makes the gate unreachable nor inverts its meaning.
+    """
+    raw = os.environ.get("OPENMARQUEE_WEB_RENDER_MEM_FLOOR_MB")
+    if not raw:
+        return _MEM_FLOOR_MB_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _MEM_FLOOR_MB_DEFAULT
+    return value if value >= 0 else _MEM_FLOOR_MB_DEFAULT
+
+
+def _swap_ceiling_mb() -> int:
+    """Override default via OPENMARQUEE_WEB_RENDER_SWAP_CEILING_MB.
+
+    Non-int or negative values fall back to the default — a negative
+    ceiling would make every render skip (swap_used >= 0 > negative),
+    which is a foot-gun the operator almost certainly didn't intend.
+    """
+    raw = os.environ.get("OPENMARQUEE_WEB_RENDER_SWAP_CEILING_MB")
+    if not raw:
+        return _SWAP_CEILING_MB_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _SWAP_CEILING_MB_DEFAULT
+    return value if value >= 0 else _SWAP_CEILING_MB_DEFAULT
+
+
+def _read_meminfo() -> tuple[int, int] | None:
+    """Read /proc/meminfo, return (mem_available_mb, swap_used_mb).
+
+    Fail-open: returns None on any failure (non-Linux host, missing
+    keys, parse error). Callers interpret None as "can't measure ->
+    don't skip" so dev environments without /proc/meminfo (macOS) and
+    any future weird-Linux scenarios keep rendering. The gate is a
+    safety mitigation, not a hard correctness gate — do NOT "fix"
+    this to fail-closed without re-thinking dev/CI consequences.
+    """
+    try:
+        text = _MEMINFO_PATH.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    kv: dict[str, int] = {}
+    for line in text.splitlines():
+        m = _MEMINFO_LINE_RE.match(line)
+        if m:
+            kv[m.group(1)] = int(m.group(2))
+    try:
+        mem_available_kb = kv["MemAvailable"]
+        swap_total_kb = kv["SwapTotal"]
+        swap_free_kb = kv["SwapFree"]
+    except KeyError:
+        return None
+    return mem_available_kb // 1024, (swap_total_kb - swap_free_kb) // 1024
 
 # Process-wide single-flight lock for on-device renders. Only one
 # Chromium may run at a time — two concurrent headless browsers would
@@ -107,6 +198,34 @@ async def fetch_web_screenshot(
         unretrieved-task warning. On a False return the slide keeps its
         previous asset.png.
     """
+    # Memory-pressure gate (postmortem mitigation #3, 2026-05-23).
+    # Skip the Chromium spawn entirely when the Pi is already swap-
+    # thrashing — adding a ~100-150 MB browser to a ~20-60 MB-free
+    # box is what drives the brcmfmac SDIO instability. The gate
+    # runs BEFORE the _render_lock acquire so a skipped refresh is a
+    # cheap fast-path (no contention with another in-flight render)
+    # and returns False so the slide keeps its last-good asset.png —
+    # consistent with every other failure path in this function.
+    mem = _read_meminfo()
+    if mem is not None:
+        mem_available_mb, swap_used_mb = mem
+        floor = _mem_floor_mb()
+        ceiling = _swap_ceiling_mb()
+        if mem_available_mb < floor or swap_used_mb > ceiling:
+            log.info(
+                "web-screenshot: skipping render for slide id=%s "
+                "(url=%s) — memory pressure: MemAvailable=%dMB "
+                "(floor=%dMB), SwapUsed=%dMB (ceiling=%dMB); "
+                "keeping last-good asset",
+                slide.id,
+                slide.url,
+                mem_available_mb,
+                floor,
+                swap_used_mb,
+                ceiling,
+            )
+            return False
+
     try:
         # The render is blocking + multi-second: run it OFF the event
         # loop. The lock serializes renders process-wide so only one
