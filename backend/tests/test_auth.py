@@ -27,7 +27,6 @@ from openmarquee.auth import (
     verify_token,
 )
 
-
 # --- hash/verify primitives ---
 
 
@@ -349,9 +348,33 @@ def test_ui_html_pages_whitelisted(client: TestClient):
         "/styles.css",
     ):
         response = client.get(path)
-        assert response.status_code != 401, (
-            f"middleware 401'd a whitelisted path: {path}"
-        )
+        assert response.status_code != 401, f"middleware 401'd a whitelisted path: {path}"
+
+
+def test_test_harness_paths_whitelisted(client: TestClient):
+    """The Live-takeover fake-camera harness at ui/test/ must be
+    reachable without a bearer token, same auth shape as /dist/.
+
+    The HTML page loads BEFORE the inline JS can read the operator's
+    localStorage token; gating the page itself would 401 the harness
+    on every load. The JS that runs after the page loads still attaches
+    the bearer header to its /api/live/* calls.
+
+    (Same StaticFiles caveat as test_ui_html_pages_whitelisted above:
+    the test backend doesn't actually mount ui/, so 404 is fine —
+    only 401 from the auth middleware fails this test.)
+    """
+    client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    for path in (
+        "/test/fake-camera.html",
+        "/test/fixture.mp4",
+        "/test/README.md",
+    ):
+        response = client.get(path)
+        assert response.status_code != 401, f"middleware 401'd a whitelisted /test/ path: {path}"
 
 
 def test_protected_path_returns_401_without_token(client: TestClient):
@@ -366,9 +389,7 @@ def test_protected_path_returns_401_with_invalid_token(client: TestClient):
         "/api/auth/set-password",
         json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
     )
-    response = client.get(
-        "/api/content", headers={"Authorization": "Bearer 1.invalidtoken"}
-    )
+    response = client.get("/api/content", headers={"Authorization": "Bearer 1.invalidtoken"})
     assert response.status_code == 401
 
 
@@ -378,9 +399,7 @@ def test_protected_path_succeeds_with_valid_token(client: TestClient):
         json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
     )
     token = set_resp.json()["token"]
-    response = client.get(
-        "/api/content", headers={"Authorization": f"Bearer {token}"}
-    )
+    response = client.get("/api/content", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
 
 
@@ -416,8 +435,7 @@ def test_media_route_accepts_token_query_param(client: TestClient):
     bogus = uuid.uuid4()
     response = client.get(f"/api/content/{bogus}/asset?token={token}")
     assert response.status_code != 401, (
-        f"middleware 401'd a valid token-query for media route "
-        f"(got {response.status_code})"
+        f"middleware 401'd a valid token-query for media route (got {response.status_code})"
     )
     # Confirm a 404 (or other non-auth status) actually fires.
     assert response.status_code in (404, 200)
