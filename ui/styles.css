@@ -386,7 +386,7 @@ header h1 {
 .inline-preview-stage {
     position: relative;
     width: 100%;
-    /* Matches stream-preview-wrap (B3 normalization, qarl 2026-04-29).
+    /* Matches live-preview-wrap (B3 normalization, qarl 2026-04-29).
        Was 32rem; tightened to 26rem so the playlist preview reads at the
        same scale as the slide editor + stream viewfinder. */
     max-width: 26rem;
@@ -1284,7 +1284,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 .preview-wrap {
     /* The wrap owns the chrome (border / radius / LED background); the
        inner .editor-canvas just paints. Width capped at 26rem to match
-       stream-preview-wrap and inline-preview-stage so all three preview
+       live-preview-wrap and inline-preview-stage so all three preview
        windows read at the same scale (B3 normalization, qarl 2026-04-29). */
     display: flex;
     justify-content: center;
@@ -3811,9 +3811,9 @@ html, body { margin: 0; padding: 0; height: 100%; }
 }
 
 
-/* --- Stream panel — phone-camera takeover (SYSTEM_SPEC §5.11). --- */
+/* --- Live panel — phone-camera or stream-transport takeover (SYSTEM_SPEC §5.11). --- */
 
-.stream {
+.live {
     display: flex;
     flex-direction: column;
     gap: 1rem;
@@ -3825,11 +3825,11 @@ html, body { margin: 0; padding: 0; height: 100%; }
    when no stream is open). Forced to a phone-portrait aspect so the
    layout doesn't jump when the camera opens — most modern phones
    surface portrait video to getUserMedia. */
-.stream-stage {
+.live-stage {
     display: flex;
     justify-content: center;
 }
-.stream-preview-wrap {
+.live-preview-wrap {
     position: relative;
     width: 100%;
     max-width: 26rem;
@@ -3839,13 +3839,13 @@ html, body { margin: 0; padding: 0; height: 100%; }
        pre-Go-Live, mirroring the device-side aiortc subscriber's
        cover-fit at playback time. Default 9/16 covers the typical
        phone-portrait frame when /api/settings hasn't loaded yet. */
-    aspect-ratio: var(--om-stream-aspect, 9 / 16);
+    aspect-ratio: var(--om-live-aspect, 9 / 16);
     background: var(--om-led-bg, #000);
     border-radius: var(--om-radius, 0.5rem);
     overflow: hidden;
     border: 1px solid var(--om-line, var(--panel-border));
 }
-.stream-preview {
+.live-preview {
     width: 100%;
     height: 100%;
     object-fit: cover;
@@ -3853,9 +3853,9 @@ html, body { margin: 0; padding: 0; height: 100%; }
 
 /* Flip-camera button — overlay on the viewfinder's top-right corner.
    Only surfaces while a local camera stream is open (preview + live);
-   stream-panel.js sets `hidden` per-phase. Touch target is comfortably
+   live-panel.js sets `hidden` per-phase. Touch target is comfortably
    larger than the 12px icon so a phone tap doesn't miss. Re-§5.11. */
-.stream-flip-camera {
+.live-flip-camera {
     position: absolute;
     top: 0.5rem;
     right: 0.5rem;
@@ -3873,14 +3873,14 @@ html, body { margin: 0; padding: 0; height: 100%; }
     line-height: 0;
     transition: background-color 120ms ease;
 }
-.stream-flip-camera:hover { background: rgba(0, 0, 0, 0.75); }
-.stream-flip-camera:focus-visible {
+.live-flip-camera:hover { background: rgba(0, 0, 0, 0.75); }
+.live-flip-camera:focus-visible {
     outline: 2px solid var(--om-accent, var(--accent, #ffb84d));
     outline-offset: 2px;
 }
-.stream-flip-camera[disabled] { opacity: 0.5; cursor: progress; }
-.stream-flip-camera[hidden] { display: none !important; }
-.stream-preview-empty {
+.live-flip-camera[disabled] { opacity: 0.5; cursor: progress; }
+.live-flip-camera[hidden] { display: none !important; }
+.live-preview-empty {
     position: absolute;
     inset: 0;
     display: flex;
@@ -3892,7 +3892,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
     padding: 1rem;
 }
 
-.stream-status {
+.live-status {
     min-height: 1.2em;
     color: var(--om-text-fade, var(--muted));
     font-size: 0.9rem;
@@ -3902,17 +3902,17 @@ html, body { margin: 0; padding: 0; height: 100%; }
    action slot stays put across modes (Go live -> Stop -> Take over) so
    the operator's eye doesn't have to chase. Per the 2026-04-29 design
    handoff (variant A + E + chat2.md unification). */
-.stream-header {
+.live-header {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
     gap: 1rem;
     margin-bottom: 14px;
 }
-.stream-header-text {
+.live-header-text {
     min-width: 0;
 }
-.stream-header-eyebrow {
+.live-header-eyebrow {
     display: block;
     font-family: var(--om-mono, monospace);
     font-size: 10.5px;
@@ -3921,7 +3921,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
     color: var(--om-text-fade, var(--muted));
     margin-bottom: 4px;
 }
-.stream-header-title {
+.live-header-title {
     margin: 0;
     font-family: var(--om-sans, inherit);
     font-size: 22px;
@@ -3929,23 +3929,23 @@ html, body { margin: 0; padding: 0; height: 100%; }
     letter-spacing: -0.02em;
     color: var(--om-text, var(--text));
 }
-.stream-header-blurb {
+.live-header-blurb {
     margin: 4px 0 0;
     color: var(--om-text-dim, var(--muted));
     font-size: 13px;
     max-width: 56ch;
 }
-.stream-header-action {
+.live-header-action {
     flex-shrink: 0;
 }
-.stream-header-action .om-btn {
+.live-header-action .om-btn {
     height: 44px;
     padding: 0 22px;
     gap: 8px;
 }
 /* Go live primary action: small dark dot left of label (8x8, against
    the orange button bg the dot reads as a recessed indicator). */
-.stream-go-live-dot {
+.live-go-live-dot {
     width: 8px;
     height: 8px;
     border-radius: 4px;
@@ -3954,12 +3954,12 @@ html, body { margin: 0; padding: 0; height: 100%; }
 /* Stop button: red-tinted destructive variant. Square indicator
    instead of a dot, matching the 'stop' shape the operator sees on
    any standard transport control. */
-.stream-stop {
+.live-stop {
     background: rgba(255, 90, 107, 0.16);
     color: var(--om-bad, #ff5a6b);
     border: 1px solid rgba(255, 90, 107, 0.35);
 }
-.stream-stop-square {
+.live-stop-square {
     width: 10px;
     height: 10px;
     background: var(--om-bad, #ff5a6b);
@@ -3968,12 +3968,12 @@ html, body { margin: 0; padding: 0; height: 100%; }
    another publisher's session is destructive-to-them. (Reversible
    default: if QA wants this in a darker orange instead, it's a one-
    line color swap.) */
-.stream-take-over {
+.live-take-over {
     background: rgba(255, 90, 107, 0.16);
     color: var(--om-bad, #ff5a6b);
     border: 1px solid rgba(255, 90, 107, 0.35);
 }
-.stream-go-live[disabled] {
+.live-go-live[disabled] {
     opacity: 0.6;
     cursor: progress;
 }
@@ -3982,7 +3982,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
    (var(--om-accent)) per qarl's iteration ('no REC - instead make that
    an orange LIVE'). The pulsing dot reuses the existing @keyframes
    om-pulse defined near the flock indicator block. */
-.stream-live-pill {
+.live-live-pill {
     position: absolute;
     top: 12px;
     left: 12px;
@@ -4007,13 +4007,13 @@ html, body { margin: 0; padding: 0; height: 100%; }
    post-Stop, render() set `livePillEl.hidden = true` correctly
    but the pill stayed visually rendered because `display:
    inline-flex` was overriding the UA `[hidden]` default. */
-.stream-live-pill[hidden],
-.stream-paused-row[hidden],
-.stream-metrics-grid[hidden],
-.stream-preview-empty[hidden] {
+.live-live-pill[hidden],
+.live-paused-row[hidden],
+.live-metrics-grid[hidden],
+.live-preview-empty[hidden] {
     display: none !important;
 }
-.stream-live-pill-dot {
+.live-live-pill-dot {
     width: 6px;
     height: 6px;
     border-radius: 3px;
@@ -4029,7 +4029,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
 /* Idle-only paused-playlist row. Sits under the viewfinder so the
    operator sees what's currently playing on the sign before they
    take over the screen. */
-.stream-paused-row {
+.live-paused-row {
     display: flex;
     align-items: center;
     gap: 10px;
@@ -4040,39 +4040,39 @@ html, body { margin: 0; padding: 0; height: 100%; }
     font-size: 12.5px;
     color: var(--om-text-dim, var(--muted));
 }
-.stream-paused-row-dot {
+.live-paused-row-dot {
     width: 6px;
     height: 6px;
     border-radius: 3px;
     background: var(--om-text-fade, var(--muted));
 }
-.stream-paused-row-name {
+.live-paused-row-name {
     color: var(--om-text, var(--text));
 }
 
 /* Live-only metrics grid — 4 cells across (Elapsed / Latency / Bitrate
    / Dropped). Phase A.1 mocks Latency/Bitrate/Dropped; Elapsed ticks
    real against state.startedAt at 1Hz. Phase B will wire all four. */
-.stream-metrics-grid {
+.live-metrics-grid {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     gap: 10px;
     margin-top: 14px;
 }
-.stream-metric-cell {
+.live-metric-cell {
     padding: 12px 14px;
     background: var(--om-surface-2, var(--panel));
     border: 1px solid var(--om-line, var(--panel-border));
     border-radius: 10px;
 }
-.stream-metric-label {
+.live-metric-label {
     font-size: 10.5px;
     font-family: var(--om-mono, monospace);
     letter-spacing: 0.14em;
     text-transform: uppercase;
     color: var(--om-text-fade, var(--muted));
 }
-.stream-metric-value {
+.live-metric-value {
     font-size: 16px;
     font-family: var(--om-mono, monospace);
     margin-top: 4px;
@@ -4082,7 +4082,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
 /* --- VLC stream source (STREAM/VLC) ---------------------------------- */
 
 /* Segmented control: pick the takeover source (camera vs VLC). */
-.stream-source-toggle {
+.live-source-toggle {
     display: inline-flex;
     align-self: flex-start;
     gap: 2px;
@@ -4090,7 +4090,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
     border-radius: var(--om-radius, 0.5rem);
     background: var(--om-line, var(--panel-border));
 }
-.stream-source-opt {
+.live-source-opt {
     appearance: none;
     border: 0;
     cursor: pointer;
@@ -4101,12 +4101,12 @@ html, body { margin: 0; padding: 0; height: 100%; }
     background: transparent;
     color: var(--om-text-dim, var(--text));
 }
-.stream-source-opt.is-selected {
+.live-source-opt.is-selected {
     background: var(--om-surface-2, var(--panel-bg, #fff));
     color: var(--om-text, var(--text));
     font-weight: 600;
 }
-.stream-source-opt:disabled {
+.live-source-opt:disabled {
     cursor: not-allowed;
     opacity: 0.55;
 }
@@ -4114,16 +4114,16 @@ html, body { margin: 0; padding: 0; height: 100%; }
 /* Stream URL field + the publish-instructions disclosure. Occupies
    the same slot the camera viewfinder uses; the two are toggled by
    source mode. */
-.stream-vlc-panel {
+.live-vlc-panel {
     display: flex;
     flex-direction: column;
     gap: 8px;
 }
-.stream-vlc-url-label {
+.live-vlc-url-label {
     font-size: 13px;
     color: var(--om-text-dim, var(--text));
 }
-.stream-vlc-url {
+.live-vlc-url {
     width: 100%;
     box-sizing: border-box;
     padding: 10px 12px;
@@ -4134,27 +4134,27 @@ html, body { margin: 0; padding: 0; height: 100%; }
     border: 1px solid var(--om-line, var(--panel-border));
     border-radius: var(--om-radius, 0.5rem);
 }
-.stream-vlc-url:focus {
+.live-vlc-url:focus {
     outline: none;
     border-color: var(--om-accent);
     box-shadow: 0 0 0 1px var(--om-accent);
 }
-.stream-vlc-help {
+.live-vlc-help {
     font-size: 13px;
     color: var(--om-text-dim, var(--text));
 }
-.stream-vlc-help summary {
+.live-vlc-help summary {
     cursor: pointer;
     padding: 4px 0;
 }
-.stream-vlc-help ol {
+.live-vlc-help ol {
     margin: 6px 0 0;
     padding-left: 1.4em;
     display: flex;
     flex-direction: column;
     gap: 3px;
 }
-.stream-vlc-help-note {
+.live-vlc-help-note {
     margin: 8px 0 0;
     opacity: 0.85;
 }
@@ -4163,16 +4163,16 @@ html, body { margin: 0; padding: 0; height: 100%; }
 
 /* The "If the stream isn't running" radio group. Reset the fieldset's
    default border/padding, stack the options. */
-.stream-unreachable {
+.live-unreachable {
     border: 0;
     margin: 0;
     padding: 0;
 }
-.stream-unreachable > span {
+.live-unreachable > span {
     display: block;
     margin-bottom: 6px;
 }
-.stream-unreachable label {
+.live-unreachable label {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -4184,7 +4184,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
 
 /* Placeholder preview card — a stream slide has no operator image; this
    stands in for the live feed inside the editor. */
-.stream-preview-card {
+.live-preview-card {
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -4196,18 +4196,18 @@ html, body { margin: 0; padding: 0; height: 100%; }
     background: var(--om-led-bg, #000);
     border: 1px solid var(--om-line, var(--panel-border));
 }
-.stream-preview-title {
+.live-preview-title {
     font-size: 16px;
     font-weight: 600;
     color: var(--om-accent);
 }
-.stream-preview-url {
+.live-preview-url {
     font-family: var(--om-mono, monospace);
     font-size: 13px;
     color: var(--om-text, var(--text));
     word-break: break-all;
 }
-.stream-preview-note {
+.live-preview-note {
     font-size: 12px;
     color: var(--om-text-dim, var(--text));
 }
@@ -4227,7 +4227,7 @@ html, body { margin: 0; padding: 0; height: 100%; }
 
 /* Placeholder preview card — a web slide has no operator image; this
    stands in for the screenshotted page inside the editor. Mirrors
-   .stream-preview-card. */
+   .live-preview-card. */
 .web-preview-card {
     display: flex;
     flex-direction: column;

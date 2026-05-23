@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mountStreamPanel } from "./stream-panel.js";
+import { mountLivePanel } from "./live-panel.js";
 
 beforeEach(() => {
     vi.stubGlobal("RTCPeerConnection", undefined);
-    // The panel persists source-mode + facing-mode + stream-url to
+    // The panel persists source-mode + facing-mode + live-url to
     // localStorage; clear it between tests so one test's writes don't
     // leak into the next mount's hydration.
     globalThis.localStorage?.clear();
@@ -147,7 +147,7 @@ function defaultMounts(overrides = {}) {
             session_id: null,
             tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
         })),
-        apiStartStream: vi.fn(async () => ({
+        apiStartLive: vi.fn(async () => ({
             session_id: "11111111-1111-1111-1111-111111111111",
             sdp_answer: "v=0\r\nfake-answer\r\n",
             // Phase A.2: backend stamps wall-clock UTC start time so
@@ -155,22 +155,22 @@ function defaultMounts(overrides = {}) {
             // authoritative reference instead of phone-local Date.now.
             started_at: "2026-04-29T00:00:00+00:00",
         })),
-        apiTakeoverStream: vi.fn(async () => ({
+        apiTakeoverLive: vi.fn(async () => ({
             session_id: "22222222-2222-2222-2222-222222222222",
             sdp_answer: "v=0\r\nfake-answer\r\n",
             started_at: "2026-04-29T00:00:00+00:00",
         })),
-        apiStartRtspStream: vi.fn(async () => ({
+        apiStartRtspLive: vi.fn(async () => ({
             session_id: "33333333-3333-3333-3333-333333333333",
             sdp_answer: null,
             started_at: "2026-05-20T00:00:00+00:00",
         })),
-        apiTakeoverRtspStream: vi.fn(async () => ({
+        apiTakeoverRtspLive: vi.fn(async () => ({
             session_id: "44444444-4444-4444-4444-444444444444",
             sdp_answer: null,
             started_at: "2026-05-20T00:00:00+00:00",
         })),
-        apiStopStream: vi.fn(async () => undefined),
+        apiStopLive: vi.fn(async () => undefined),
         fetchSettings: vi.fn(async () => ({
             display_width: 1920,
             display_height: 1080,
@@ -184,25 +184,25 @@ function defaultMounts(overrides = {}) {
 
 // --- Tests --------------------------------------------------------------
 
-describe("mountStreamPanel", () => {
+describe("mountLivePanel", () => {
     it("renders Go live in idle: action button visible, LIVE pill + metrics + Stop hidden", () => {
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        expect(container.querySelector(".stream-go-live").hidden).toBe(false);
-        expect(container.querySelector(".stream-stop").hidden).toBe(true);
+        expect(container.querySelector(".live-go-live").hidden).toBe(false);
+        expect(container.querySelector(".live-stop").hidden).toBe(true);
         // 2026-04-29 redesign dropped the tailscale-foreground warning;
         // still gone. Camera flip was dropped in that pass too but
         // restored 2026-05-01 per qarl — it's hidden in idle (no
         // localStream), surfaces in preview/live.
-        expect(container.querySelector(".stream-warning")).toBeNull();
-        expect(container.querySelector(".stream-flip-camera").hidden).toBe(true);
+        expect(container.querySelector(".live-warning")).toBeNull();
+        expect(container.querySelector(".live-flip-camera").hidden).toBe(true);
         // LIVE pill + metrics grid only show in the live phase.
-        expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
-        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
+        expect(container.querySelector(".live-live-pill").hidden).toBe(true);
+        expect(container.querySelector(".live-metrics-grid").hidden).toBe(true);
         // Paused-playlist hint is visible in any "ready" phase.
-        expect(container.querySelector(".stream-paused-row").hidden).toBe(false);
+        expect(container.querySelector(".live-paused-row").hidden).toBe(false);
         // Phase machine starts in idle synchronously; mount-init's
         // pre-flight + camera-open are both async and resolve later
         // (covered by separate tests below).
@@ -217,7 +217,7 @@ describe("mountStreamPanel", () => {
         // screen, leaving the panel in the new "preview" phase.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
         await waitFor(() => handle.getState() === "preview");
 
@@ -225,9 +225,9 @@ describe("mountStreamPanel", () => {
         expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
         // Go live still visible (preview is a "ready" phase); no LIVE
         // pill or metrics grid yet (those are live-only).
-        expect(container.querySelector(".stream-go-live").hidden).toBe(false);
-        expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
-        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
+        expect(container.querySelector(".live-go-live").hidden).toBe(false);
+        expect(container.querySelector(".live-live-pill").hidden).toBe(true);
+        expect(container.querySelector(".live-metrics-grid").hidden).toBe(true);
     });
 
     it("mount-init falls back to idle silently when getUserMedia rejects", async () => {
@@ -240,7 +240,7 @@ describe("mountStreamPanel", () => {
                 throw new Error("Permission denied");
             }),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
         // Wait for mount-init's getUserMedia attempt to land first
         // (the panel starts in idle synchronously, so a naive
@@ -251,25 +251,25 @@ describe("mountStreamPanel", () => {
         expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
         // No noise in the status line — the panel reads as a clean
         // idle state.
-        expect(container.querySelector(".stream-status").textContent).toBe("");
+        expect(container.querySelector(".live-status").textContent).toBe("");
     });
 
     it("defers camera + /status until the section becomes visible", async () => {
         // Bug B4 (qarl batch 2026-04-29): mount-init was firing at app
         // boot regardless of route, so the camera permission prompt
-        // appeared before the operator ever clicked the Stream tab.
+        // appeared before the operator ever clicked the Live tab.
         // The panel should now wait for its closest [data-section]
         // ancestor's `hidden` attribute to clear before probing /status
         // or opening the camera.
         const section = document.createElement("section");
-        section.setAttribute("data-section", "stream");
+        section.setAttribute("data-section", "live");
         section.hidden = true;
         const container = document.createElement("div");
         section.appendChild(container);
         document.body.appendChild(section);
         try {
             const opts = defaultMounts();
-            const handle = mountStreamPanel(container, opts);
+            const handle = mountLivePanel(container, opts);
 
             // Flush microtasks so any (errant) eager init has a chance
             // to land — asserting on a negative needs determinism, not
@@ -280,7 +280,7 @@ describe("mountStreamPanel", () => {
             expect(opts.getUserMedia).not.toHaveBeenCalled();
             expect(handle.getState()).toBe("idle");
 
-            // Operator navigates to Stream → nav clears the hidden attr.
+            // Operator navigates to Live → nav clears the hidden attr.
             section.hidden = false;
 
             await waitFor(() => handle.getState() === "preview");
@@ -296,23 +296,23 @@ describe("mountStreamPanel", () => {
     it("doesn't race nav setup: section.hidden=undefined at mount still defers init when nav applies hidden synchronously after", async () => {
         // QA caught this regression on 2026-04-29: my first B4 fix
         // (097d89c) checked section.hidden synchronously at mount, but
-        // mountStreamPanel runs BEFORE nav.js's initial show() call in
+        // mountLivePanel runs BEFORE nav.js's initial show() call in
         // main.js's boot order. So `hidden` was still undefined at
         // mount time and the panel eager-inited anyway, even when the
-        // operator was on a non-Stream route after the welcome-dismiss
+        // operator was on a non-Live route after the welcome-dismiss
         // reload.
         //
         // The fix defers the visibility decision to the next animation
         // frame, by which time nav has applied initial hidden states.
         const section = document.createElement("section");
-        section.setAttribute("data-section", "stream");
+        section.setAttribute("data-section", "live");
         // hidden NOT set — simulating mount-before-nav at boot.
         const container = document.createElement("div");
         section.appendChild(container);
         document.body.appendChild(section);
         try {
             const opts = defaultMounts();
-            const handle = mountStreamPanel(container, opts);
+            const handle = mountLivePanel(container, opts);
 
             // Boot sequence: nav's show() lands synchronously after mount.
             // Simulate that by setting hidden synchronously here.
@@ -328,7 +328,7 @@ describe("mountStreamPanel", () => {
             expect(opts.getUserMedia).not.toHaveBeenCalled();
             expect(handle.getState()).toBe("idle");
 
-            // Operator clicks the Stream tab → nav clears the hidden attr.
+            // Operator clicks the Live tab → nav clears the hidden attr.
             section.hidden = false;
             await waitFor(() => handle.getState() === "preview");
             expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
@@ -352,11 +352,11 @@ describe("mountStreamPanel", () => {
                 tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
             })),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
         await waitFor(() => handle.getState() === "take-over-prompt");
         expect(opts.getUserMedia).not.toHaveBeenCalled();
-        expect(container.querySelector(".stream-take-over").hidden).toBe(false);
+        expect(container.querySelector(".live-take-over").hidden).toBe(false);
     });
 
     it("Go live from preview skips the second pre-flight + camera-open round trip", async () => {
@@ -364,11 +364,11 @@ describe("mountStreamPanel", () => {
         // Go live should reuse them and go straight to negotiating.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
         await waitFor(() => handle.getState() === "preview");
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         // Single /status (mount-init) + single getUserMedia (mount-
@@ -380,9 +380,9 @@ describe("mountStreamPanel", () => {
     it("Go Live → live: opens camera, negotiates, flips to live phase", async () => {
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         expect(opts.apiGetStatus).toHaveBeenCalledTimes(1);
@@ -391,14 +391,14 @@ describe("mountStreamPanel", () => {
         // Default tier = back camera, no audio (per §5.11 NO AUDIO posture).
         expect(constraints.video.facingMode).toBe("environment");
         expect(constraints.audio).toBe(false);
-        expect(opts.apiStartStream).toHaveBeenCalledTimes(1);
+        expect(opts.apiStartLive).toHaveBeenCalledTimes(1);
         // Live state: Stop visible, Go live hidden, LIVE pill +
         // metrics grid visible, idle-only paused-playlist row hidden.
-        expect(container.querySelector(".stream-stop").hidden).toBe(false);
-        expect(container.querySelector(".stream-go-live").hidden).toBe(true);
-        expect(container.querySelector(".stream-live-pill").hidden).toBe(false);
-        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(false);
-        expect(container.querySelector(".stream-paused-row").hidden).toBe(true);
+        expect(container.querySelector(".live-stop").hidden).toBe(false);
+        expect(container.querySelector(".live-go-live").hidden).toBe(true);
+        expect(container.querySelector(".live-live-pill").hidden).toBe(false);
+        expect(container.querySelector(".live-metrics-grid").hidden).toBe(false);
+        expect(container.querySelector(".live-paused-row").hidden).toBe(true);
     });
 
     it("Stop → preview hides LIVE pill + metrics grid (QA regression — inconsistent state where Go live and LIVE pill were simultaneously visible)", async () => {
@@ -406,38 +406,38 @@ describe("mountStreamPanel", () => {
         // (preview phase) but LIVE pill still rendered. JS-level fix:
         // render() correctly sets .hidden=true on each live-only
         // element. The visual fix lived in styles.css — see
-        // .stream-live-pill[hidden] etc. block — because the
+        // .live-live-pill[hidden] etc. block — because the
         // .om-app [hidden] !important global rule wasn't winning the
         // cascade against display: inline-flex / flex / grid in QA's
         // verifier-build environment.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
         await waitFor(() => handle.getState() === "preview");
         // Preview-empty cover hides as soon as the camera stream
-        // is wired to the <video> — defends the .stream-preview-
+        // is wired to the <video> — defends the .live-preview-
         // empty[hidden] rule too, since it's the same shape.
-        expect(container.querySelector(".stream-preview-empty").hidden).toBe(true);
+        expect(container.querySelector(".live-preview-empty").hidden).toBe(true);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
         // Live phase: LIVE pill + metrics grid visible, paused row hidden.
-        expect(container.querySelector(".stream-live-pill").hidden).toBe(false);
-        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(false);
-        expect(container.querySelector(".stream-paused-row").hidden).toBe(true);
+        expect(container.querySelector(".live-live-pill").hidden).toBe(false);
+        expect(container.querySelector(".live-metrics-grid").hidden).toBe(false);
+        expect(container.querySelector(".live-paused-row").hidden).toBe(true);
 
-        container.querySelector(".stream-stop").click();
+        container.querySelector(".live-stop").click();
         await waitFor(() => handle.getState() === "preview");
         // Preview phase: LIVE pill + metrics grid hidden, paused row visible,
         // Go live re-visible (none of those should be in a "live"-only state).
-        expect(container.querySelector(".stream-live-pill").hidden).toBe(true);
-        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
-        expect(container.querySelector(".stream-paused-row").hidden).toBe(false);
-        expect(container.querySelector(".stream-go-live").hidden).toBe(false);
-        expect(container.querySelector(".stream-stop").hidden).toBe(true);
+        expect(container.querySelector(".live-live-pill").hidden).toBe(true);
+        expect(container.querySelector(".live-metrics-grid").hidden).toBe(true);
+        expect(container.querySelector(".live-paused-row").hidden).toBe(false);
+        expect(container.querySelector(".live-go-live").hidden).toBe(false);
+        expect(container.querySelector(".live-stop").hidden).toBe(true);
         // Camera kept open across Stop → the empty-cover stays hidden.
-        expect(container.querySelector(".stream-preview-empty").hidden).toBe(true);
+        expect(container.querySelector(".live-preview-empty").hidden).toBe(true);
     });
 
     it("Stop → preview: posts session_id, keeps the camera open for fast re-go-live", async () => {
@@ -448,19 +448,19 @@ describe("mountStreamPanel", () => {
         // local camera stream is preserved.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         const stream = opts.getUserMedia.mock.results[0].value;
         const track = (await stream).getVideoTracks()[0];
 
-        container.querySelector(".stream-stop").click();
+        container.querySelector(".live-stop").click();
         await waitFor(() => handle.getState() === "preview");
 
-        expect(opts.apiStopStream).toHaveBeenCalledTimes(1);
-        expect(opts.apiStopStream.mock.calls[0][0]).toBe(
+        expect(opts.apiStopLive).toHaveBeenCalledTimes(1);
+        expect(opts.apiStopLive.mock.calls[0][0]).toBe(
             "11111111-1111-1111-1111-111111111111",
         );
         // The PC is closed (session ended) but the camera stream
@@ -478,16 +478,16 @@ describe("mountStreamPanel", () => {
                 tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
             })),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
 
         expect(opts.getUserMedia).not.toHaveBeenCalled();
-        expect(opts.apiStartStream).not.toHaveBeenCalled();
-        expect(container.querySelector(".stream-take-over").hidden).toBe(false);
-        expect(container.querySelector(".stream-cancel-takeover").hidden).toBe(false);
-        expect(container.querySelector(".stream-go-live").hidden).toBe(true);
+        expect(opts.apiStartLive).not.toHaveBeenCalled();
+        expect(container.querySelector(".live-take-over").hidden).toBe(false);
+        expect(container.querySelector(".live-cancel-takeover").hidden).toBe(false);
+        expect(container.querySelector(".live-go-live").hidden).toBe(true);
     });
 
     it("/start returning 409 mid-flight transitions to take-over-prompt and tears down the half-open PC + camera", async () => {
@@ -497,15 +497,15 @@ describe("mountStreamPanel", () => {
         // overwrote the references and orphaned them — camera light
         // stayed on, PC kept ICE'ing.
         const container = document.createElement("div");
-        const conflict = Object.assign(new Error("stream_already_active"), {
-            code: "stream_already_active",
+        const conflict = Object.assign(new Error("live_already_active"), {
+            code: "live_already_active",
             activeSessionId: "44",
             status: 409,
         });
         const stream = makeFakeStream();
         const fakePc = makeFakePc();
         const opts = defaultMounts({
-            apiStartStream: vi.fn(async () => {
+            apiStartLive: vi.fn(async () => {
                 throw conflict;
             }),
             getUserMedia: vi.fn(async () => stream),
@@ -514,13 +514,13 @@ describe("mountStreamPanel", () => {
         // _fakePc on opts is the default fixture; override here so we
         // can assert against the one actually used.
         opts._fakePc = fakePc;
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
 
         expect(opts.getUserMedia).toHaveBeenCalled();
-        expect(container.querySelector(".stream-take-over").hidden).toBe(false);
+        expect(container.querySelector(".live-take-over").hidden).toBe(false);
         // The PC created during the failed negotiation MUST be closed,
         // and the camera stream's tracks MUST be stopped — otherwise
         // tapping Take Over (which creates fresh ones) leaks the
@@ -534,26 +534,26 @@ describe("mountStreamPanel", () => {
         // gotten to take-over-prompt some other way and we want
         // cancelTakeover to be safe to call regardless.
         const container = document.createElement("div");
-        const conflict = Object.assign(new Error("stream_already_active"), {
-            code: "stream_already_active",
+        const conflict = Object.assign(new Error("live_already_active"), {
+            code: "live_already_active",
             activeSessionId: "44",
             status: 409,
         });
         const stream = makeFakeStream();
         const fakePc = makeFakePc();
         const opts = defaultMounts({
-            apiStartStream: vi.fn(async () => {
+            apiStartLive: vi.fn(async () => {
                 throw conflict;
             }),
             getUserMedia: vi.fn(async () => stream),
             createPeerConnection: vi.fn(() => fakePc),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
 
-        container.querySelector(".stream-cancel-takeover").click();
+        container.querySelector(".live-cancel-takeover").click();
         await tick();
         expect(handle.getState()).toBe("idle");
         // Already torn down by goLive's catch; cancelTakeover's defensive
@@ -563,7 +563,7 @@ describe("mountStreamPanel", () => {
     });
 
     it("Bug 6: cancelTakeover stays idle even when mountInit resolves AFTER cancel", async () => {
-        // Regression for the stream-panel cancelTakeover race (2026-05-17):
+        // Regression for the live-panel cancelTakeover race (2026-05-17):
         // a deferred mountInit() rAF could resume after cancelTakeover()
         // restored state.phase = "idle", walk through "requesting-camera"
         // and silently land us in "preview" — violating the L817-823
@@ -574,8 +574,8 @@ describe("mountStreamPanel", () => {
         // the cancel click, we force the race window open every run.
         // If a fix regresses, this test fails 100%, not 20%.
         const container = document.createElement("div");
-        const conflict = Object.assign(new Error("stream_already_active"), {
-            code: "stream_already_active",
+        const conflict = Object.assign(new Error("live_already_active"), {
+            code: "live_already_active",
             activeSessionId: "44",
             status: 409,
         });
@@ -611,7 +611,7 @@ describe("mountStreamPanel", () => {
                     tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
                 };
             }),
-            apiStartStream: vi.fn(async () => {
+            apiStartLive: vi.fn(async () => {
                 throw conflict;
             }),
             getUserMedia: vi.fn(async () => {
@@ -626,16 +626,16 @@ describe("mountStreamPanel", () => {
             }),
             createPeerConnection: vi.fn(() => fakePc),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
         // Reach take-over-prompt via goLive (which does its own
         // pre-flight + 409). mountInit is suspended at its first await.
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
 
         // Cancel — synchronously sets phase = "idle" AND latches the
         // mountInitCancelled flag (the Option A fix).
-        container.querySelector(".stream-cancel-takeover").click();
+        container.querySelector(".live-cancel-takeover").click();
         expect(handle.getState()).toBe("idle");
 
         // NOW release mountInit's two awaits. Pre-fix this would walk:
@@ -663,16 +663,16 @@ describe("mountStreamPanel", () => {
                 tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
             })),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
 
-        container.querySelector(".stream-take-over").click();
+        container.querySelector(".live-take-over").click();
         await waitFor(() => handle.getState() === "live");
 
-        expect(opts.apiTakeoverStream).toHaveBeenCalledTimes(1);
-        expect(opts.apiStartStream).not.toHaveBeenCalled();
+        expect(opts.apiTakeoverLive).toHaveBeenCalledTimes(1);
+        expect(opts.apiStartLive).not.toHaveBeenCalled();
     });
 
     it("Cancel from take-over-prompt returns to idle without negotiating", async () => {
@@ -684,15 +684,15 @@ describe("mountStreamPanel", () => {
                 tier: { name: "basic", max_width: 854, max_height: 480, max_fps: 30 },
             })),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
 
-        container.querySelector(".stream-cancel-takeover").click();
+        container.querySelector(".live-cancel-takeover").click();
         await tick();
         expect(handle.getState()).toBe("idle");
-        expect(opts.apiTakeoverStream).not.toHaveBeenCalled();
+        expect(opts.apiTakeoverLive).not.toHaveBeenCalled();
     });
 
     it("flip-camera button surfaces in preview, swaps facingMode, and persists choice", async () => {
@@ -720,10 +720,10 @@ describe("mountStreamPanel", () => {
         try {
             const container = document.createElement("div");
             const opts = defaultMounts();
-            const handle = mountStreamPanel(container, opts);
+            const handle = mountLivePanel(container, opts);
             await waitFor(() => handle.getState() === "preview");
 
-            const flipBtn = container.querySelector(".stream-flip-camera");
+            const flipBtn = container.querySelector(".live-flip-camera");
             expect(flipBtn).not.toBeNull();
             expect(flipBtn.hidden).toBe(false);
 
@@ -739,7 +739,7 @@ describe("mountStreamPanel", () => {
             // before its returned promise resolves, which races the
             // post-await code (state mutation + writeFacingModePref).
             await waitFor(
-                () => backing.get("openmarquee:stream:facing-mode") === "user",
+                () => backing.get("openmarquee:live:facing-mode") === "user",
             );
             expect(
                 opts.getUserMedia.mock.calls[1][0].video.facingMode,
@@ -785,11 +785,11 @@ describe("mountStreamPanel", () => {
         fakePc.getSenders = () => [
             { track: { kind: "video", _id: "track-1" }, replaceTrack },
         ];
-        const handle = mountStreamPanel(container, opts);
-        container.querySelector(".stream-go-live").click();
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
-        const flipBtn = container.querySelector(".stream-flip-camera");
+        const flipBtn = container.querySelector(".live-flip-camera");
         flipBtn.click();
         await waitFor(() => replaceTrack.mock.calls.length === 1);
 
@@ -804,7 +804,7 @@ describe("mountStreamPanel", () => {
     });
 
     it("mount-init reads localStorage and opens the operator's last facingMode", async () => {
-        const backing = new Map([["openmarquee:stream:facing-mode", "user"]]);
+        const backing = new Map([["openmarquee:live:facing-mode", "user"]]);
         const stub = {
             getItem: (k) => (backing.has(k) ? backing.get(k) : null),
             setItem: (k, v) => backing.set(k, String(v)),
@@ -818,7 +818,7 @@ describe("mountStreamPanel", () => {
         try {
             const container = document.createElement("div");
             const opts = defaultMounts();
-            const handle = mountStreamPanel(container, opts);
+            const handle = mountLivePanel(container, opts);
             await waitFor(() => handle.getState() === "preview");
             expect(
                 opts.getUserMedia.mock.calls[0][0].video.facingMode,
@@ -839,17 +839,17 @@ describe("mountStreamPanel", () => {
                 throw new Error("Permission denied");
             }),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "error");
 
-        expect(container.querySelector(".stream-status").textContent).toMatch(
+        expect(container.querySelector(".live-status").textContent).toMatch(
             /Permission denied/,
         );
         // Go Live becomes available again on error so the operator can
         // retry after granting permission.
-        expect(container.querySelector(".stream-go-live").hidden).toBe(false);
+        expect(container.querySelector(".live-go-live").hidden).toBe(false);
     });
 
     it("preview wrap aspect ratio mirrors the device's display dims on mount", async () => {
@@ -865,17 +865,17 @@ describe("mountStreamPanel", () => {
                 display_height: 32,
             })),
         });
-        mountStreamPanel(container, opts);
+        mountLivePanel(container, opts);
         await waitFor(
             () =>
                 container
-                    .querySelector(".stream-preview-wrap")
-                    .style.getPropertyValue("--om-stream-aspect")
+                    .querySelector(".live-preview-wrap")
+                    .style.getPropertyValue("--om-live-aspect")
                     .replace(/\s+/g, "") === "64/32",
         );
-        const wrap = container.querySelector(".stream-preview-wrap");
+        const wrap = container.querySelector(".live-preview-wrap");
         expect(
-            wrap.style.getPropertyValue("--om-stream-aspect").replace(/\s+/g, ""),
+            wrap.style.getPropertyValue("--om-live-aspect").replace(/\s+/g, ""),
         ).toBe("64/32");
     });
 
@@ -888,12 +888,12 @@ describe("mountStreamPanel", () => {
         const opts = defaultMounts({
             fetchSettings: vi.fn(async () => dims),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
         await waitFor(
             () =>
                 container
-                    .querySelector(".stream-preview-wrap")
-                    .style.getPropertyValue("--om-stream-aspect")
+                    .querySelector(".live-preview-wrap")
+                    .style.getPropertyValue("--om-live-aspect")
                     .replace(/\s+/g, "") === "1920/1080",
         );
 
@@ -903,8 +903,8 @@ describe("mountStreamPanel", () => {
         await waitFor(
             () =>
                 container
-                    .querySelector(".stream-preview-wrap")
-                    .style.getPropertyValue("--om-stream-aspect")
+                    .querySelector(".live-preview-wrap")
+                    .style.getPropertyValue("--om-live-aspect")
                     .replace(/\s+/g, "") === "64/32",
         );
         expect(opts.fetchSettings).toHaveBeenCalledTimes(2);
@@ -924,12 +924,12 @@ describe("mountStreamPanel", () => {
                 display_rotation: 90,
             })),
         });
-        mountStreamPanel(container, opts);
+        mountLivePanel(container, opts);
         await waitFor(
             () =>
                 container
-                    .querySelector(".stream-preview-wrap")
-                    .style.getPropertyValue("--om-stream-aspect")
+                    .querySelector(".live-preview-wrap")
+                    .style.getPropertyValue("--om-live-aspect")
                     .replace(/\s+/g, "") === "1080/1920",
         );
     });
@@ -943,12 +943,12 @@ describe("mountStreamPanel", () => {
                 display_rotation: 180,
             })),
         });
-        mountStreamPanel(container, opts);
+        mountLivePanel(container, opts);
         await waitFor(
             () =>
                 container
-                    .querySelector(".stream-preview-wrap")
-                    .style.getPropertyValue("--om-stream-aspect")
+                    .querySelector(".live-preview-wrap")
+                    .style.getPropertyValue("--om-live-aspect")
                     .replace(/\s+/g, "") === "1920/1080",
         );
     });
@@ -964,15 +964,15 @@ describe("mountStreamPanel", () => {
         // Server says the session started 65 seconds ago.
         const serverStartedAt = new Date(Date.now() - 65000).toISOString();
         const opts = defaultMounts({
-            apiStartStream: vi.fn(async () => ({
+            apiStartLive: vi.fn(async () => ({
                 session_id: "11111111-1111-1111-1111-111111111111",
                 sdp_answer: "v=0\r\nfake-answer\r\n",
                 started_at: serverStartedAt,
             })),
         });
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         // First render reads state.startedAt and writes the cell.
@@ -998,9 +998,9 @@ describe("mountStreamPanel", () => {
     it("metrics cells populate from RTCPeerConnection.getStats() on the live transition (Phase B.1)", async () => {
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
         // First poll fires synchronously inside render() on the live
         // transition (so cells populate before the user sees them).
@@ -1049,8 +1049,8 @@ describe("mountStreamPanel", () => {
                     },
                 ],
             ]);
-            const handle = mountStreamPanel(container, opts);
-            container.querySelector(".stream-go-live").click();
+            const handle = mountLivePanel(container, opts);
+            container.querySelector(".live-go-live").click();
             // The Go Live click chain awaits multiple promises before
             // landing in live. Pump microtasks until the panel is in
             // live phase + the synchronous first pollStats() resolved
@@ -1137,8 +1137,8 @@ describe("mountStreamPanel", () => {
                 },
             ],
         ]);
-        const handle = mountStreamPanel(container, opts);
-        container.querySelector(".stream-go-live").click();
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
         await waitFor(
             () =>
@@ -1161,11 +1161,11 @@ describe("mountStreamPanel", () => {
         });
         // simulateOnly also skips /start, so this test would fail if
         // pollStats fired against a non-existent PC.
-        opts.apiStartStream = vi.fn(async () => {
+        opts.apiStartLive = vi.fn(async () => {
             throw new Error("simulateOnly should not call /start");
         });
-        const handle = mountStreamPanel(container, opts);
-        container.querySelector(".stream-go-live").click();
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
         // Cells stay at the template's mock literals (the demo's
         // visible payoff). No PC, no real polling, no cell rewrites.
@@ -1183,7 +1183,7 @@ describe("mountStreamPanel", () => {
     it("destroy() removes the settings-updated listener", async () => {
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
         await waitFor(() => opts.fetchSettings.mock.calls.length >= 1);
         handle.destroy();
         // After destroy, dispatching the event should NOT trigger
@@ -1197,9 +1197,9 @@ describe("mountStreamPanel", () => {
     it("destroy() tears down PC + tracks and clears the DOM", async () => {
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         handle.destroy();
@@ -1215,7 +1215,7 @@ describe("mountStreamPanel", () => {
         // notice. pagehide is the browser's last reliable hook.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
         await waitFor(() => handle.getState() === "preview");
         const stream = await opts.getUserMedia.mock.results[0].value;
@@ -1234,15 +1234,15 @@ describe("mountStreamPanel", () => {
         // out after 10s but the panel keeps showing "Live." indefinitely.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         opts._fakePc._setConnectionState("failed");
         await waitFor(() => handle.getState() === "error");
 
-        expect(container.querySelector(".stream-status").textContent).toMatch(
+        expect(container.querySelector(".live-status").textContent).toMatch(
             /Connection failed/,
         );
         // Tracks were stopped so the camera light goes off; PC closed
@@ -1255,59 +1255,59 @@ describe("mountStreamPanel", () => {
         // it the same as failed — operator can re-tap Go Live to retry.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         opts._fakePc._setConnectionState("disconnected");
         await waitFor(() => handle.getState() === "error");
-        expect(container.querySelector(".stream-status").textContent).toMatch(
+        expect(container.querySelector(".live-status").textContent).toMatch(
             /disconnected/,
         );
     });
 
-    it("simulateOnly: Go Live skips PC creation + /api/stream/start, still flips to live", async () => {
+    it("simulateOnly: Go Live skips PC creation + /api/live/start, still flips to live", async () => {
         // The openmarquee.com/demo bundle has no real peer — the panel
         // still needs to demo end-to-end (camera open, live state,
         // Tailscale warning) without actually negotiating WebRTC.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, {
+        const handle = mountLivePanel(container, {
             ...opts,
             simulateOnly: true,
         });
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         // Camera was opened (the local preview is the visible payoff
         // of the demo) but no PC was created and no /start was called.
         expect(opts.getUserMedia).toHaveBeenCalledTimes(1);
         expect(opts.createPeerConnection).not.toHaveBeenCalled();
-        expect(opts.apiStartStream).not.toHaveBeenCalled();
+        expect(opts.apiStartLive).not.toHaveBeenCalled();
         // Live state surfaces normally — Stop visible, LIVE pill on the viewfinder.
-        expect(container.querySelector(".stream-stop").hidden).toBe(false);
-        expect(container.querySelector(".stream-live-pill").hidden).toBe(false);
+        expect(container.querySelector(".live-stop").hidden).toBe(false);
+        expect(container.querySelector(".live-live-pill").hidden).toBe(false);
     });
 
-    it("simulateOnly: Stop returns to preview without calling /api/stream/stop", async () => {
+    it("simulateOnly: Stop returns to preview without calling /api/live/stop", async () => {
         // The session_id was minted locally — the backend never knew
         // about it, so /stop would 404. Skip the call entirely.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, {
+        const handle = mountLivePanel(container, {
             ...opts,
             simulateOnly: true,
         });
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
-        container.querySelector(".stream-stop").click();
+        container.querySelector(".live-stop").click();
         await waitFor(() => handle.getState() === "preview");
 
-        expect(opts.apiStopStream).not.toHaveBeenCalled();
+        expect(opts.apiStopLive).not.toHaveBeenCalled();
     });
 
     it("connectionstatechange listener ignores our own pc.close() teardown", async () => {
@@ -1318,9 +1318,9 @@ describe("mountStreamPanel", () => {
         // settling on 'idle'.
         const container = document.createElement("div");
         const opts = defaultMounts();
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
 
-        container.querySelector(".stream-go-live").click();
+        container.querySelector(".live-go-live").click();
         await waitFor(() => handle.getState() === "live");
 
         const pc = opts._fakePc;
@@ -1332,7 +1332,7 @@ describe("mountStreamPanel", () => {
             pc._setConnectionState("closed");
         };
 
-        container.querySelector(".stream-stop").click();
+        container.querySelector(".live-stop").click();
         await waitFor(() => handle.getState() === "preview");
         // Did NOT pass through 'error' — the listener saw state.pc !== pc
         // (already nulled by teardownPC) and skipped failTo. Stop lands
@@ -1347,77 +1347,77 @@ describe("mountStreamPanel", () => {
         // source-mode pref — sidesteps racing the camera-mode
         // mount-init that the default (Camera) mount would run.
         globalThis.localStorage.setItem(
-            "openmarquee:stream:source-mode",
+            "openmarquee:live:source-mode",
             "vlc",
         );
         const container = document.createElement("div");
         const opts = defaultMounts(overrides);
-        const handle = mountStreamPanel(container, opts);
+        const handle = mountLivePanel(container, opts);
         return { container, opts, handle };
     }
 
     it("renders the source toggle with Camera selected by default", () => {
         const container = document.createElement("div");
-        mountStreamPanel(container, defaultMounts());
-        expect(container.querySelectorAll(".stream-source-opt").length).toBe(2);
+        mountLivePanel(container, defaultMounts());
+        expect(container.querySelectorAll(".live-source-opt").length).toBe(2);
         const camera = container.querySelector('[data-source="camera"]');
         const vlc = container.querySelector('[data-source="vlc"]');
         expect(camera.classList.contains("is-selected")).toBe(true);
         expect(vlc.classList.contains("is-selected")).toBe(false);
         // Camera mode: viewfinder shown, VLC panel hidden.
-        expect(container.querySelector(".stream-stage").hidden).toBe(false);
-        expect(container.querySelector(".stream-vlc-panel").hidden).toBe(true);
+        expect(container.querySelector(".live-stage").hidden).toBe(false);
+        expect(container.querySelector(".live-vlc-panel").hidden).toBe(true);
     });
 
     it("switching to VLC shows the URL panel + Start streaming, hides the viewfinder", () => {
         const container = document.createElement("div");
-        mountStreamPanel(container, defaultMounts());
+        mountLivePanel(container, defaultMounts());
         container.querySelector('[data-source="vlc"]').click();
-        expect(container.querySelector(".stream-vlc-panel").hidden).toBe(false);
-        expect(container.querySelector(".stream-stage").hidden).toBe(true);
-        expect(container.querySelector(".stream-start-vlc").hidden).toBe(false);
-        expect(container.querySelector(".stream-go-live").hidden).toBe(true);
+        expect(container.querySelector(".live-vlc-panel").hidden).toBe(false);
+        expect(container.querySelector(".live-stage").hidden).toBe(true);
+        expect(container.querySelector(".live-start-vlc").hidden).toBe(false);
+        expect(container.querySelector(".live-go-live").hidden).toBe(true);
     });
 
     it("Start streaming in VLC mode calls the rtsp API and goes live", async () => {
         const { container, opts, handle } = mountVlc();
-        container.querySelector(".stream-vlc-url").value =
+        container.querySelector(".live-vlc-url").value =
             "rtsp://laptop:8554/live";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-start-vlc").click();
         await waitFor(() => handle.getState() === "live");
-        expect(opts.apiStartRtspStream).toHaveBeenCalledWith(
+        expect(opts.apiStartRtspLive).toHaveBeenCalledWith(
             "rtsp://laptop:8554/live",
         );
         // The WebRTC start path must NOT have fired.
-        expect(opts.apiStartStream).not.toHaveBeenCalled();
-        expect(container.querySelector(".stream-stop").hidden).toBe(false);
+        expect(opts.apiStartLive).not.toHaveBeenCalled();
+        expect(container.querySelector(".live-stop").hidden).toBe(false);
         // VLC mode has no viewfinder (camera stage hidden) and no
         // PC.getStats() metrics grid.
-        expect(container.querySelector(".stream-stage").hidden).toBe(true);
-        expect(container.querySelector(".stream-metrics-grid").hidden).toBe(true);
+        expect(container.querySelector(".live-stage").hidden).toBe(true);
+        expect(container.querySelector(".live-metrics-grid").hidden).toBe(true);
     });
 
     it("VLC start with an empty URL surfaces a message and skips the API", async () => {
         const { container, opts, handle } = mountVlc();
-        container.querySelector(".stream-vlc-url").value = "   ";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-vlc-url").value = "   ";
+        container.querySelector(".live-start-vlc").click();
         await tick();
-        expect(opts.apiStartRtspStream).not.toHaveBeenCalled();
+        expect(opts.apiStartRtspLive).not.toHaveBeenCalled();
         expect(handle.getState()).toBe("idle");
         expect(
-            container.querySelector(".stream-status").textContent,
+            container.querySelector(".live-status").textContent,
         ).toMatch(/stream URL/i);
     });
 
-    it("VLC live → Stop calls stopStream and returns to idle", async () => {
+    it("VLC live → Stop calls stopLive and returns to idle", async () => {
         const { container, opts, handle } = mountVlc();
-        container.querySelector(".stream-vlc-url").value =
+        container.querySelector(".live-vlc-url").value =
             "rtsp://laptop:8554/live";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-start-vlc").click();
         await waitFor(() => handle.getState() === "live");
-        container.querySelector(".stream-stop").click();
+        container.querySelector(".live-stop").click();
         await waitFor(() => handle.getState() === "idle");
-        expect(opts.apiStopStream).toHaveBeenCalledWith(
+        expect(opts.apiStopLive).toHaveBeenCalledWith(
             "33333333-3333-3333-3333-333333333333",
         );
         // VLC has no preview phase — Stop lands in idle, not preview.
@@ -1426,79 +1426,79 @@ describe("mountStreamPanel", () => {
 
     it("VLC start persists the URL + source mode to localStorage", async () => {
         const { container, handle } = mountVlc();
-        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".live-start-vlc").click();
         await waitFor(() => handle.getState() === "live");
         expect(
-            globalThis.localStorage.getItem("openmarquee:stream:url"),
+            globalThis.localStorage.getItem("openmarquee:live:url"),
         ).toBe("rtsp://host:8554/x");
         expect(
-            globalThis.localStorage.getItem("openmarquee:stream:source-mode"),
+            globalThis.localStorage.getItem("openmarquee:live:source-mode"),
         ).toBe("vlc");
     });
 
     it("the source toggle is disabled while a VLC stream is live", async () => {
         const { container, handle } = mountVlc();
-        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".live-start-vlc").click();
         await waitFor(() => handle.getState() === "live");
-        for (const opt of container.querySelectorAll(".stream-source-opt")) {
+        for (const opt of container.querySelectorAll(".live-source-opt")) {
             expect(opt.disabled).toBe(true);
         }
     });
 
     it("a 409 from the rtsp start surfaces the take-over prompt", async () => {
-        const conflict = new Error("stream_already_active");
-        conflict.code = "stream_already_active";
+        const conflict = new Error("live_already_active");
+        conflict.code = "live_already_active";
         const { container, handle } = mountVlc({
-            apiStartRtspStream: vi.fn(async () => {
+            apiStartRtspLive: vi.fn(async () => {
                 throw conflict;
             }),
         });
-        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".live-start-vlc").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
-        expect(container.querySelector(".stream-take-over").hidden).toBe(false);
+        expect(container.querySelector(".live-take-over").hidden).toBe(false);
     });
 
     it("Take over in VLC mode calls the rtsp takeover API", async () => {
-        const conflict = new Error("stream_already_active");
-        conflict.code = "stream_already_active";
+        const conflict = new Error("live_already_active");
+        conflict.code = "live_already_active";
         const { container, opts, handle } = mountVlc({
-            apiStartRtspStream: vi.fn(async () => {
+            apiStartRtspLive: vi.fn(async () => {
                 throw conflict;
             }),
         });
-        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".live-start-vlc").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
-        container.querySelector(".stream-take-over").click();
+        container.querySelector(".live-take-over").click();
         await waitFor(() => handle.getState() === "live");
-        expect(opts.apiTakeoverRtspStream).toHaveBeenCalledWith(
+        expect(opts.apiTakeoverRtspLive).toHaveBeenCalledWith(
             "rtsp://host:8554/x",
         );
         // The WebRTC takeover path must NOT have fired.
-        expect(opts.apiTakeoverStream).not.toHaveBeenCalled();
+        expect(opts.apiTakeoverLive).not.toHaveBeenCalled();
     });
 
     it("VLC Take over with an empty URL surfaces a message and skips the API", async () => {
-        const conflict = new Error("stream_already_active");
-        conflict.code = "stream_already_active";
+        const conflict = new Error("live_already_active");
+        conflict.code = "live_already_active";
         const { container, opts, handle } = mountVlc({
-            apiStartRtspStream: vi.fn(async () => {
+            apiStartRtspLive: vi.fn(async () => {
                 throw conflict;
             }),
         });
-        container.querySelector(".stream-vlc-url").value = "rtsp://host:8554/x";
-        container.querySelector(".stream-start-vlc").click();
+        container.querySelector(".live-vlc-url").value = "rtsp://host:8554/x";
+        container.querySelector(".live-start-vlc").click();
         await waitFor(() => handle.getState() === "take-over-prompt");
         // Clear the URL, then tap Take over — it must not call the API.
-        container.querySelector(".stream-vlc-url").value = "   ";
-        container.querySelector(".stream-take-over").click();
+        container.querySelector(".live-vlc-url").value = "   ";
+        container.querySelector(".live-take-over").click();
         await tick();
-        expect(opts.apiTakeoverRtspStream).not.toHaveBeenCalled();
+        expect(opts.apiTakeoverRtspLive).not.toHaveBeenCalled();
         expect(
-            container.querySelector(".stream-status").textContent,
+            container.querySelector(".live-status").textContent,
         ).toMatch(/stream URL/i);
     });
 
@@ -1509,7 +1509,7 @@ describe("mountStreamPanel", () => {
         const track = makeFakeTrack();
         const stream = makeFakeStream({ tracks: [track] });
         const container = document.createElement("div");
-        const handle = mountStreamPanel(
+        const handle = mountLivePanel(
             container,
             defaultMounts({ getUserMedia: vi.fn(async () => stream) }),
         );
@@ -1519,6 +1519,6 @@ describe("mountStreamPanel", () => {
         container.querySelector('[data-source="vlc"]').click();
 
         expect(track.stopped).toBe(true);
-        expect(container.querySelector(".stream-vlc-panel").hidden).toBe(false);
+        expect(container.querySelector(".live-vlc-panel").hidden).toBe(false);
     });
 });

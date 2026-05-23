@@ -46,10 +46,10 @@ export const Icons = {
     Flock: svg(
         '<circle cx="6" cy="9" r="2.5"/><circle cx="18" cy="9" r="2.5"/><circle cx="12" cy="17" r="2.5"/><path d="M8 10l3 5M16 10l-3 5"/>',
     ),
-    // Stream — broadcasting waves emanating from a center dot. Reads as
+    // Live — broadcasting waves emanating from a center dot. Reads as
     // "live signal going out" without overlapping the Video icon's
     // camera-and-lens shape.
-    Stream: svg(
+    Live: svg(
         '<circle cx="12" cy="12" r="2"/><path d="M8.5 8.5a5 5 0 000 7M15.5 8.5a5 5 0 010 7M5.5 5.5a9 9 0 000 13M18.5 5.5a9 9 0 010 13"/>',
     ),
     Plus: svg('<path d="M12 5v14M5 12h14"/>'),

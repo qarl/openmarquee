@@ -69,7 +69,7 @@ import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountSlidesShell } from "./slides.js";
 import { rerenderAllSlidesForRotation } from "./rotation-rerender.js";
-import { mountStreamPanel } from "./stream-panel.js";
+import { mountLivePanel } from "./live-panel.js";
 import { mountVideoUploader } from "./video-upload.js";
 import { mountStreamUploader } from "./stream-upload.js";
 import { mountWebSlideEditor } from "./web-slide.js";
@@ -84,7 +84,7 @@ const FALLBACK_HEIGHT = 96;
 const SECTIONS = [
     "slides",
     "playlists",
-    "stream",
+    "live",
     "flock",
     "schedule",
     "settings",
@@ -183,7 +183,7 @@ async function boot() {
     // anyway -- its mock-backend.js stubs every /api/* response,
     // including /api/auth/* -- so the auth gate has nothing to enforce.
     // Skip the whole gate when the body carries data-demo-mode, the
-    // same flag stream-panel uses for an analogous "skip the live-
+    // same flag live-panel uses for an analogous "skip the live-
     // backend round trip" carve-out.
     const isDemoMode =
         typeof document !== "undefined" &&
@@ -288,8 +288,8 @@ async function boot() {
         <section data-section="playlists" class="panel">
             <div class="playlist-track-slot"></div>
         </section>
-        <section data-section="stream" class="panel">
-            <div class="stream-panel-slot"></div>
+        <section data-section="live" class="panel">
+            <div class="live-panel-slot"></div>
         </section>
         <section data-section="flock" class="panel">
             <div class="flock-slot"></div>
@@ -672,14 +672,14 @@ async function boot() {
     // negotiate WebRTC against — `data-demo-mode` on <body> flips the
     // panel into a state-machine-only mode that still opens the local
     // camera + transitions through live, but skips the real PC creation
-    // and the /api/stream/{start,stop,takeover} round trips. The
+    // and the /api/live/{start,stop,takeover} round trips. The
     // pathname check is belt-and-suspenders: if someone ever strips
     // data-demo-mode from the demo template, the panel still simulates
     // (instead of silently breaking with a setRemoteDescription throw).
     // 20.2 hotfix lifted the same check earlier in boot() to gate the
     // auth redirect; this is the SAME `isDemoMode` const, hoisted up
     // to that earlier declaration.
-    mountStreamPanel(root.querySelector(".stream-panel-slot"), {
+    mountLivePanel(root.querySelector(".live-panel-slot"), {
         simulateOnly: isDemoMode,
     });
 
@@ -761,7 +761,7 @@ async function boot() {
         flock: "Flock",
         slides: "Slides",
         playlist: "Playlist",
-        stream: "Stream",
+        live: "Live",
         schedule: "Schedule",
         settings: "Settings",
         menu: "Menu",
@@ -792,7 +792,7 @@ async function boot() {
         "slides/stream": "Streams",
         "slides/web": "Web slides",
         playlists: "Playlists",
-        stream: "Stream",
+        live: "Live",
         flock: "Flock",
         schedule: "Schedule",
         settings: "Settings",

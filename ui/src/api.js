@@ -675,14 +675,14 @@ export async function deleteFlockPeer(peerId) {
 }
 
 
-/* --- Stream: live phone-camera takeover (SYSTEM_SPEC §5.11). --- */
+/* --- Live: phone-camera or stream-transport takeover (SYSTEM_SPEC §5.11). --- */
 
 // Negotiation timeout for /start + /takeover. Tailscale on a flat tailnet
 // completes the SDP+ICE round trip in well under a second; 15s is a wide
 // margin that still surfaces a wedged backend or a lossy WAN link before
 // the operator stares at "Connecting…" forever. Without this, an unhealthy
 // fetch hangs the panel indefinitely (QA finding from Phase 12.2 review).
-const STREAM_NEGOTIATE_TIMEOUT_MS = 15_000;
+const LIVE_NEGOTIATE_TIMEOUT_MS = 15_000;
 
 /**
  * Current stream state. Shape:
@@ -694,10 +694,10 @@ const STREAM_NEGOTIATE_TIMEOUT_MS = 15_000;
  * affordance when another phone owns the screen — without a separate
  * round trip after the 409.
  */
-export async function getStreamStatus() {
-    const response = await apiFetch("/api/stream/status");
+export async function getLiveStatus() {
+    const response = await apiFetch("/api/live/status");
     if (!response.ok) {
-        throw new Error(`Stream status failed (${response.status})`);
+        throw new Error(`Live status failed (${response.status})`);
     }
     return await response.json();
 }
@@ -708,25 +708,25 @@ export async function getStreamStatus() {
  * `active_session_id` so the caller can switch to the take-over flow
  * without re-polling /status.
  */
-export async function startStream(sdpOffer) {
-    const response = await apiFetch("/api/stream/start", {
+export async function startLive(sdpOffer) {
+    const response = await apiFetch("/api/live/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sdp_offer: sdpOffer }),
-        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(LIVE_NEGOTIATE_TIMEOUT_MS),
     });
     if (response.status === 409) {
         const body = await response.json();
         const detail = body?.detail || {};
-        const err = new Error("stream_already_active");
-        err.code = detail.error || "stream_already_active";
+        const err = new Error("live_already_active");
+        err.code = detail.error || "live_already_active";
         err.activeSessionId = detail.active_session_id || null;
         err.status = 409;
         throw err;
     }
     if (!response.ok) {
         const detail = await extractDetailMessage(response);
-        throw new Error(`Stream start failed (${response.status}): ${detail}`);
+        throw new Error(`Live start failed (${response.status}): ${detail}`);
     }
     return await response.json();
 }
@@ -735,64 +735,64 @@ export async function startStream(sdpOffer) {
  * Start a VLC takeover. The Pi pulls the RTSP URL the operator's VLC
  * is publishing — there is no SDP, so the response's `sdp_answer` is
  * null; only `session_id` + `started_at` matter. Throws the same
- * structured 409 error as startStream when another source already
+ * structured 409 error as startLive when another source already
  * owns the screen.
  */
-export async function startRtspStream(url) {
-    const response = await apiFetch("/api/stream/start", {
+export async function startRtspLive(url) {
+    const response = await apiFetch("/api/live/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ kind: "stream", url }),
-        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(LIVE_NEGOTIATE_TIMEOUT_MS),
     });
     if (response.status === 409) {
         const body = await response.json();
         const detail = body?.detail || {};
-        const err = new Error("stream_already_active");
-        err.code = detail.error || "stream_already_active";
+        const err = new Error("live_already_active");
+        err.code = detail.error || "live_already_active";
         err.activeSessionId = detail.active_session_id || null;
         err.status = 409;
         throw err;
     }
     if (!response.ok) {
         const detail = await extractDetailMessage(response);
-        throw new Error(`Stream start failed (${response.status}): ${detail}`);
+        throw new Error(`Live start failed (${response.status}): ${detail}`);
     }
     return await response.json();
 }
 
 /**
  * Force-stop any active session and start a new one in the same call.
- * Same response shape as startStream — phone applies the answer.
+ * Same response shape as startLive — phone applies the answer.
  */
-export async function takeoverStream(sdpOffer) {
-    const response = await apiFetch("/api/stream/takeover", {
+export async function takeoverLive(sdpOffer) {
+    const response = await apiFetch("/api/live/takeover", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sdp_offer: sdpOffer }),
-        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(LIVE_NEGOTIATE_TIMEOUT_MS),
     });
     if (!response.ok) {
         const detail = await extractDetailMessage(response);
-        throw new Error(`Stream takeover failed (${response.status}): ${detail}`);
+        throw new Error(`Live takeover failed (${response.status}): ${detail}`);
     }
     return await response.json();
 }
 
 /**
  * Force-stop any active session and start a VLC takeover in the same
- * call. Same response shape as startRtspStream (sdp_answer is null).
+ * call. Same response shape as startRtspLive (sdp_answer is null).
  */
-export async function takeoverRtspStream(url) {
-    const response = await apiFetch("/api/stream/takeover", {
+export async function takeoverRtspLive(url) {
+    const response = await apiFetch("/api/live/takeover", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ kind: "stream", url }),
-        signal: AbortSignal.timeout(STREAM_NEGOTIATE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(LIVE_NEGOTIATE_TIMEOUT_MS),
     });
     if (!response.ok) {
         const detail = await extractDetailMessage(response);
-        throw new Error(`Stream takeover failed (${response.status}): ${detail}`);
+        throw new Error(`Live takeover failed (${response.status}): ${detail}`);
     }
     return await response.json();
 }
@@ -801,14 +801,14 @@ export async function takeoverRtspStream(url) {
  * Stop a stream by session id. 404 if it isn't the currently-active
  * session — caller's local state is stale; usually safe to swallow.
  */
-export async function stopStream(sessionId) {
-    const response = await apiFetch("/api/stream/stop", {
+export async function stopLive(sessionId) {
+    const response = await apiFetch("/api/live/stop", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId }),
     });
     if (!response.ok && response.status !== 404) {
         const detail = await extractDetailMessage(response);
-        throw new Error(`Stream stop failed (${response.status}): ${detail}`);
+        throw new Error(`Live stop failed (${response.status}): ${detail}`);
     }
 }

@@ -1,4 +1,4 @@
-// Stream panel — live takeover (SYSTEM_SPEC §5.11 +
+// Live panel — phone-camera or stream-transport takeover (SYSTEM_SPEC §5.11 +
 // docs/STREAM_VLC_PROPOSAL.md).
 //
 // A source toggle picks between two takeover transports:
@@ -16,11 +16,11 @@
 //   3. createOffer + setLocalDescription
 //   4. wait for non-trickle ICE gathering (so the SDP has all candidates
 //      baked in — matches the backend's "one round trip" signaling)
-//   5. POST /api/stream/start with the offer SDP, get back the answer
+//   5. POST /api/live/start with the offer SDP, get back the answer
 //   6. setRemoteDescription(answer) → frames flow
 //
 // On 409 (another phone owns the screen), surface a "Take over"
-// affordance instead of "Go Live". Take over hits POST /api/stream/takeover
+// affordance instead of "Go Live". Take over hits POST /api/live/takeover
 // with the same offer.
 //
 // Tailscale-lifecycle warning is rendered while live: iOS / Android
@@ -31,16 +31,16 @@
 import {
     effectiveDisplayDims,
     getSettings,
-    getStreamStatus,
-    startRtspStream,
-    startStream,
-    stopStream,
-    takeoverRtspStream,
-    takeoverStream,
+    getLiveStatus,
+    startRtspLive,
+    startLive,
+    stopLive,
+    takeoverRtspLive,
+    takeoverLive,
 } from "./api.js";
 
 // All media constraints in one place so the §5.11 hardware-tier table
-// drives them via the basic-tier numbers reported by /api/stream/status.
+// drives them via the basic-tier numbers reported by /api/live/status.
 // Defaults match the basic tier; if /status reports a different tier
 // at mount time, we'll override.
 const DEFAULT_CAPTURE_CONSTRAINTS = {
@@ -56,11 +56,11 @@ const DEFAULT_CAPTURE_CONSTRAINTS = {
 // Per-session persistence for the operator's last camera choice. Reads
 // at mount-init so a re-mounted panel resumes with the camera the
 // operator picked last time, not the spec'd 'environment' default.
-// localStorage key namespaced under openmarquee:stream:* (consistent
+// localStorage key namespaced under openmarquee:live:* (consistent
 // with the demo bundle's LS_KEY pattern). Best-effort — a private-
 // browsing failure or a quota-exceeded write is silently swallowed,
 // the panel just runs against the in-memory default for the session.
-const FACING_MODE_LS_KEY = "openmarquee:stream:facing-mode";
+const FACING_MODE_LS_KEY = "openmarquee:live:facing-mode";
 function readFacingModePref() {
     try {
         const v = globalThis.localStorage?.getItem(FACING_MODE_LS_KEY);
@@ -83,8 +83,8 @@ function writeFacingModePref(value) {
 // localStorage pattern as the facing-mode pref. A re-mounted panel
 // resumes on the operator's last source and doesn't make them re-type
 // their VLC address.
-const SOURCE_MODE_LS_KEY = "openmarquee:stream:source-mode";
-const STREAM_URL_LS_KEY = "openmarquee:stream:url";
+const SOURCE_MODE_LS_KEY = "openmarquee:live:source-mode";
+const STREAM_URL_LS_KEY = "openmarquee:live:url";
 function readSourceModePref() {
     try {
         const v = globalThis.localStorage?.getItem(SOURCE_MODE_LS_KEY);
@@ -145,53 +145,53 @@ function writeRtspUrlPref(value) {
 //    handoff). Real-elapsed ticks against state.startedAt. Phase B
 //    will wire RTCPeerConnection.getStats() polling for the rest.
 const SECTION_TEMPLATE = `
-    <section class="stream">
-        <header class="stream-header">
-            <div class="stream-header-text">
-                <span class="stream-header-eyebrow">Live · this device's camera</span>
-                <h1 class="stream-header-title">Stream</h1>
-                <p class="stream-header-blurb">
+    <section class="live">
+        <header class="live-header">
+            <div class="live-header-text">
+                <span class="live-header-eyebrow">Live · this device's camera</span>
+                <h1 class="live-header-title">Live</h1>
+                <p class="live-header-blurb">
                     Push the camera on this device straight to your sign.
                     The active playlist pauses while you broadcast and
                     picks up where it left off.
                 </p>
             </div>
-            <div class="stream-header-action">
-                <button type="button" class="om-btn primary stream-go-live">
-                    <span class="stream-go-live-dot" aria-hidden="true"></span>
+            <div class="live-header-action">
+                <button type="button" class="om-btn primary live-go-live">
+                    <span class="live-go-live-dot" aria-hidden="true"></span>
                     Go live
                 </button>
-                <button type="button" class="om-btn primary stream-start-vlc" hidden>
-                    <span class="stream-go-live-dot" aria-hidden="true"></span>
+                <button type="button" class="om-btn primary live-start-vlc" hidden>
+                    <span class="live-go-live-dot" aria-hidden="true"></span>
                     Start streaming
                 </button>
-                <button type="button" class="om-btn stream-stop" hidden>
-                    <span class="stream-stop-square" aria-hidden="true"></span>
+                <button type="button" class="om-btn live-stop" hidden>
+                    <span class="live-stop-square" aria-hidden="true"></span>
                     Stop
                 </button>
-                <button type="button" class="om-btn stream-take-over" hidden>
+                <button type="button" class="om-btn live-take-over" hidden>
                     Take over
                 </button>
-                <button type="button" class="om-btn ghost stream-cancel-takeover" hidden>
+                <button type="button" class="om-btn ghost live-cancel-takeover" hidden>
                     Cancel
                 </button>
             </div>
         </header>
 
-        <div class="stream-source-toggle" role="radiogroup" aria-label="Stream source">
-            <button type="button" class="stream-source-opt is-selected" role="radio"
+        <div class="live-source-toggle" role="radiogroup" aria-label="Live source">
+            <button type="button" class="live-source-opt is-selected" role="radio"
                     aria-checked="true" data-source="camera">Camera</button>
-            <button type="button" class="stream-source-opt" role="radio"
+            <button type="button" class="live-source-opt" role="radio"
                     aria-checked="false" data-source="vlc">Stream</button>
         </div>
 
-        <div class="stream-stage">
-            <div class="stream-preview-wrap">
-                <video class="stream-preview" autoplay muted playsinline></video>
-                <div class="stream-preview-empty">
+        <div class="live-stage">
+            <div class="live-preview-wrap">
+                <video class="live-preview" autoplay muted playsinline></video>
+                <div class="live-preview-empty">
                     Tap <strong>Go live</strong> to open your camera.
                 </div>
-                <button type="button" class="stream-flip-camera"
+                <button type="button" class="live-flip-camera"
                         aria-label="Switch camera (front / back)"
                         title="Switch camera"
                         hidden>
@@ -204,19 +204,19 @@ const SECTION_TEMPLATE = `
                         <path d="M9.5 13l-1.5-1.5M14.5 13l1.5 1.5"/>
                     </svg>
                 </button>
-                <div class="stream-live-pill" hidden>
-                    <span class="stream-live-pill-dot" aria-hidden="true"></span>
+                <div class="live-live-pill" hidden>
+                    <span class="live-live-pill-dot" aria-hidden="true"></span>
                     LIVE
                 </div>
             </div>
         </div>
 
-        <div class="stream-vlc-panel" hidden>
-            <label class="stream-vlc-url-label" for="stream-vlc-url">Stream URL</label>
-            <input type="text" id="stream-vlc-url" class="stream-vlc-url"
+        <div class="live-vlc-panel" hidden>
+            <label class="live-vlc-url-label" for="live-vlc-url">Stream URL</label>
+            <input type="text" id="live-vlc-url" class="live-vlc-url"
                    placeholder="rtsp://… / rtmp://… / https://….m3u8"
                    autocomplete="off" spellcheck="false" />
-            <details class="stream-vlc-help">
+            <details class="live-vlc-help">
                 <summary>How to publish from VLC</summary>
                 <ol>
                     <li>In VLC: Media → Stream…</li>
@@ -224,55 +224,55 @@ const SECTION_TEMPLATE = `
                     <li>Destination: choose <b>RTSP</b> — port 8554, path <b>/live</b>.</li>
                     <li>Click Stream to start, then paste the rtsp:// URL above.</li>
                 </ol>
-                <p class="stream-vlc-help-note">
+                <p class="live-vlc-help-note">
                     Your VLC and this sign must be on the same network or tailnet.
                 </p>
             </details>
         </div>
 
-        <div class="stream-paused-row" hidden>
-            <span class="stream-paused-row-dot" aria-hidden="true"></span>
-            <span>paused while live · resumes <b class="stream-paused-row-name">the active playlist</b> when you stop</span>
+        <div class="live-paused-row" hidden>
+            <span class="live-paused-row-dot" aria-hidden="true"></span>
+            <span>paused while live · resumes <b class="live-paused-row-name">the active playlist</b> when you stop</span>
         </div>
 
-        <div class="stream-metrics-grid" hidden>
-            <div class="stream-metric-cell">
-                <div class="stream-metric-label">Elapsed</div>
-                <div class="stream-metric-value" data-metric="elapsed">00:00</div>
+        <div class="live-metrics-grid" hidden>
+            <div class="live-metric-cell">
+                <div class="live-metric-label">Elapsed</div>
+                <div class="live-metric-value" data-metric="elapsed">00:00</div>
             </div>
-            <div class="stream-metric-cell">
-                <div class="stream-metric-label">Latency</div>
-                <div class="stream-metric-value" data-metric="latency">78 ms</div>
+            <div class="live-metric-cell">
+                <div class="live-metric-label">Latency</div>
+                <div class="live-metric-value" data-metric="latency">78 ms</div>
             </div>
-            <div class="stream-metric-cell">
-                <div class="stream-metric-label">Bitrate</div>
-                <div class="stream-metric-value" data-metric="bitrate">2.8 Mbps</div>
+            <div class="live-metric-cell">
+                <div class="live-metric-label">Bitrate</div>
+                <div class="live-metric-value" data-metric="bitrate">2.8 Mbps</div>
             </div>
-            <div class="stream-metric-cell">
-                <div class="stream-metric-label">Dropped</div>
-                <div class="stream-metric-value" data-metric="dropped">0</div>
+            <div class="live-metric-cell">
+                <div class="live-metric-label">Dropped</div>
+                <div class="live-metric-value" data-metric="dropped">0</div>
             </div>
         </div>
 
-        <div class="stream-status" role="status" aria-live="polite"></div>
+        <div class="live-status" role="status" aria-live="polite"></div>
     </section>
 `;
 
 /**
- * Mount the Stream panel into `container`.
+ * Mount the Live panel into `container`.
  *
  * @param {HTMLElement} container — slot to fill.
  * @param {object} [options] — dependency-injection seams for tests.
  * @param {() => Promise} [options.apiGetStatus]
- * @param {(sdp:string) => Promise} [options.apiStartStream]
- * @param {(url:string) => Promise} [options.apiStartRtspStream]
- * @param {(sdp:string) => Promise} [options.apiTakeoverStream]
- * @param {(url:string) => Promise} [options.apiTakeoverRtspStream]
- * @param {(sessionId:string) => Promise} [options.apiStopStream]
+ * @param {(sdp:string) => Promise} [options.apiStartLive]
+ * @param {(url:string) => Promise} [options.apiStartRtspLive]
+ * @param {(sdp:string) => Promise} [options.apiTakeoverLive]
+ * @param {(url:string) => Promise} [options.apiTakeoverRtspLive]
+ * @param {(sessionId:string) => Promise} [options.apiStopLive]
  * @param {(constraints) => Promise<MediaStream>} [options.getUserMedia]
  * @param {() => RTCPeerConnection} [options.createPeerConnection]
  * @param {boolean} [options.simulateOnly] — when true, skip the
- *   WebRTC negotiation and the /api/stream/{start,stop,takeover}
+ *   WebRTC negotiation and the /api/live/{start,stop,takeover}
  *   round trips entirely. The local-camera preview, state machine,
  *   and Tailscale-foreground warning still all run as in production.
  *   Used by the openmarquee.com/demo bundle, where there's no real
@@ -283,14 +283,14 @@ const SECTION_TEMPLATE = `
  *   side renderer's cover-fit at playback time).
  * @returns {{ destroy: () => void, getState: () => string }}
  */
-export function mountStreamPanel(container, options = {}) {
+export function mountLivePanel(container, options = {}) {
     const {
-        apiGetStatus = getStreamStatus,
-        apiStartStream = startStream,
-        apiStartRtspStream = startRtspStream,
-        apiTakeoverStream = takeoverStream,
-        apiTakeoverRtspStream = takeoverRtspStream,
-        apiStopStream = stopStream,
+        apiGetStatus = getLiveStatus,
+        apiStartLive = startLive,
+        apiStartRtspLive = startRtspLive,
+        apiTakeoverLive = takeoverLive,
+        apiTakeoverRtspLive = takeoverRtspLive,
+        apiStopLive = stopLive,
         fetchSettings = getSettings,
         getUserMedia = (constraints) =>
             navigator.mediaDevices.getUserMedia(constraints),
@@ -300,23 +300,23 @@ export function mountStreamPanel(container, options = {}) {
 
     container.innerHTML = SECTION_TEMPLATE;
 
-    const stageEl = container.querySelector(".stream-stage");
-    const previewWrapEl = container.querySelector(".stream-preview-wrap");
-    const previewEl = container.querySelector(".stream-preview");
-    const previewEmptyEl = container.querySelector(".stream-preview-empty");
-    const statusEl = container.querySelector(".stream-status");
-    const goLiveBtn = container.querySelector(".stream-go-live");
-    const startVlcBtn = container.querySelector(".stream-start-vlc");
-    const sourceOptEls = container.querySelectorAll(".stream-source-opt");
-    const vlcPanelEl = container.querySelector(".stream-vlc-panel");
-    const vlcUrlEl = container.querySelector(".stream-vlc-url");
-    const stopBtn = container.querySelector(".stream-stop");
-    const takeOverBtn = container.querySelector(".stream-take-over");
-    const cancelTakeoverBtn = container.querySelector(".stream-cancel-takeover");
-    const flipCameraBtn = container.querySelector(".stream-flip-camera");
-    const livePillEl = container.querySelector(".stream-live-pill");
-    const pausedRowEl = container.querySelector(".stream-paused-row");
-    const metricsGridEl = container.querySelector(".stream-metrics-grid");
+    const stageEl = container.querySelector(".live-stage");
+    const previewWrapEl = container.querySelector(".live-preview-wrap");
+    const previewEl = container.querySelector(".live-preview");
+    const previewEmptyEl = container.querySelector(".live-preview-empty");
+    const statusEl = container.querySelector(".live-status");
+    const goLiveBtn = container.querySelector(".live-go-live");
+    const startVlcBtn = container.querySelector(".live-start-vlc");
+    const sourceOptEls = container.querySelectorAll(".live-source-opt");
+    const vlcPanelEl = container.querySelector(".live-vlc-panel");
+    const vlcUrlEl = container.querySelector(".live-vlc-url");
+    const stopBtn = container.querySelector(".live-stop");
+    const takeOverBtn = container.querySelector(".live-take-over");
+    const cancelTakeoverBtn = container.querySelector(".live-cancel-takeover");
+    const flipCameraBtn = container.querySelector(".live-flip-camera");
+    const livePillEl = container.querySelector(".live-live-pill");
+    const pausedRowEl = container.querySelector(".live-paused-row");
+    const metricsGridEl = container.querySelector(".live-metrics-grid");
     const elapsedEl = container.querySelector('[data-metric="elapsed"]');
     const latencyEl = container.querySelector('[data-metric="latency"]');
     const bitrateEl = container.querySelector('[data-metric="bitrate"]');
@@ -346,7 +346,7 @@ export function mountStreamPanel(container, options = {}) {
             const dims = effectiveDisplayDims(s);
             if (dims !== null) {
                 previewWrapEl.style.setProperty(
-                    "--om-stream-aspect",
+                    "--om-live-aspect",
                     `${dims.width} / ${dims.height}`,
                 );
             }
@@ -389,7 +389,7 @@ export function mountStreamPanel(container, options = {}) {
         // Active RTCPeerConnection. Null between sessions, and always
         // null in VLC mode (RTSP has no peer connection).
         pc: null,
-        // User-facing message rendered into .stream-status. Reset when
+        // User-facing message rendered into .live-status. Reset when
         // a transition clears it.
         message: "",
         // Timestamp of the last 'live' transition (Date.now()). Cleared
@@ -436,7 +436,7 @@ export function mountStreamPanel(container, options = {}) {
     //
     // Polling cadence is 1Hz to match Elapsed and to keep the bitrate
     // delta meaningful (sub-second deltas amplify jitter). Phase B.2
-    // will augment with /api/stream/status subscriber-side metrics
+    // will augment with /api/live/status subscriber-side metrics
     // (frames received, decode latency on the device).
     //
     // Single-track assumption: §5.11 v1 publishes one video track + no
@@ -765,7 +765,7 @@ export function mountStreamPanel(container, options = {}) {
         await waitForIceGathering(pc);
         const offerSdp = pc.localDescription.sdp;
 
-        const apiCall = takeover ? apiTakeoverStream : apiStartStream;
+        const apiCall = takeover ? apiTakeoverLive : apiStartLive;
         const { session_id, sdp_answer, started_at } = await apiCall(offerSdp);
         await pc.setRemoteDescription({ sdp: sdp_answer, type: "answer" });
         state.sessionId = session_id;
@@ -783,7 +783,7 @@ export function mountStreamPanel(container, options = {}) {
 
     async function simulateNegotiate() {
         // Demo-mode shortcut: skip the WebRTC negotiation entirely.
-        // No PC, no /api/stream/{start,takeover} round trip — just
+        // No PC, no /api/live/{start,takeover} round trip — just
         // mint a local session_id so the rest of the panel's
         // state machine has something to track.
         // The local-camera preview is already wired up by the
@@ -863,7 +863,7 @@ export function mountStreamPanel(container, options = {}) {
             setMessage("Live.");
             render();
         } catch (err) {
-            if (err && err.code === "stream_already_active") {
+            if (err && err.code === "live_already_active") {
                 // Race: nothing was active at /status check time, but
                 // another phone hit /start in the gap. Tear down the
                 // PC + camera we just opened — Take Over creates fresh
@@ -889,11 +889,11 @@ export function mountStreamPanel(container, options = {}) {
         teardownPC({ keepCamera: !wasVlc });
         state.sessionId = null;
         // simulateOnly minted the session_id locally — the backend
-        // never knew about it, so /api/stream/stop has nothing to
+        // never knew about it, so /api/live/stop has nothing to
         // tear down and would just 404.
         if (!simulateOnly) {
             try {
-                if (sessionId) await apiStopStream(sessionId);
+                if (sessionId) await apiStopLive(sessionId);
             } catch {
                 // Stop API failure is non-fatal — the device times
                 // out the session on disconnect anyway. Don't block
@@ -984,7 +984,7 @@ export function mountStreamPanel(container, options = {}) {
                 await simulateNegotiate();
             } else {
                 const { session_id, started_at } =
-                    await apiStartRtspStream(url);
+                    await apiStartRtspLive(url);
                 state.sessionId = session_id;
                 const startedMs = started_at ? Date.parse(started_at) : NaN;
                 if (Number.isFinite(startedMs)) state.startedAt = startedMs;
@@ -993,7 +993,7 @@ export function mountStreamPanel(container, options = {}) {
             setMessage("Live from the stream.");
             render();
         } catch (err) {
-            if (err && err.code === "stream_already_active") {
+            if (err && err.code === "live_already_active") {
                 // Race: nothing active at the /status check, but
                 // another source hit /start in the gap.
                 state.phase = "take-over-prompt";
@@ -1020,7 +1020,7 @@ export function mountStreamPanel(container, options = {}) {
                 await simulateNegotiate();
             } else {
                 const { session_id, started_at } =
-                    await apiTakeoverRtspStream(url);
+                    await apiTakeoverRtspLive(url);
                 state.sessionId = session_id;
                 const startedMs = started_at ? Date.parse(started_at) : NaN;
                 if (Number.isFinite(startedMs)) state.startedAt = startedMs;
@@ -1109,7 +1109,7 @@ export function mountStreamPanel(container, options = {}) {
     // fire two /status pre-flights. Settled (set to null) when mount-
     // init returns either via success or via a swallowed error.
     let mountInitPromise = null;
-    // Bug 6 (stream-panel cancelTakeover race, 2026-05-17): once the
+    // Bug 6 (live-panel cancelTakeover race, 2026-05-17): once the
     // operator clicks Cancel from a 409-mid-flight take-over-prompt,
     // a still-pending mountInit() must NOT walk back through "idle"
     // → "requesting-camera" → "preview" and silently revive the
@@ -1284,7 +1284,7 @@ export function mountStreamPanel(container, options = {}) {
 
     // Defer one animation frame before deciding. nav.js's initial show()
     // call applies `hidden` attrs to non-active sections SYNCHRONOUSLY at
-    // boot, but mountStreamPanel can run earlier in the boot order — so
+    // boot, but mountLivePanel can run earlier in the boot order — so
     // a synchronous isHiddenChain() reads `undefined` and we'd eager-init
     // even when the operator is on a non-Stream route. By the time rAF
     // fires, all sync boot mounts have completed, including nav setup.

@@ -1,4 +1,4 @@
-// Stream panel e2e (SYSTEM_SPEC §5.11). Phase 12.2 dry-land coverage.
+// Live panel e2e (SYSTEM_SPEC §5.11). Phase 12.2 dry-land coverage.
 //
 // Real WebRTC + a real backend SDP handshake gets a live-fire pass in
 // Phase 12.3 (hardware bring-up). Here we stub navigator.mediaDevices
@@ -84,28 +84,28 @@ const STUB_INIT_SCRIPT = `
     };
 `;
 
-test("Stream nav route shows the panel with Go Live button", async ({ page }) => {
+test("Live nav route shows the panel with Go Live button", async ({ page }) => {
     await page.goto("/");
 
-    await page.locator('.nav-link[data-section="stream"]').click();
-    await expect(page.locator('.panel[data-section="stream"]')).toBeVisible();
-    await expect(page.locator('.nav-link[data-section="stream"]')).toHaveClass(
+    await page.locator('.nav-link[data-section="live"]').click();
+    await expect(page.locator('.panel[data-section="live"]')).toBeVisible();
+    await expect(page.locator('.nav-link[data-section="live"]')).toHaveClass(
         /active/,
     );
 
-    await expect(page.locator(".stream-header-title")).toHaveText("Stream");
-    await expect(page.locator(".stream-go-live")).toBeVisible();
-    await expect(page.locator(".stream-stop")).toBeHidden();
+    await expect(page.locator(".live-header-title")).toHaveText("Live");
+    await expect(page.locator(".live-go-live")).toBeVisible();
+    await expect(page.locator(".live-stop")).toBeHidden();
     // 2026-04-29 redesign dropped the tailscale-foreground warning.
     // The camera-flip button was dropped then restored 2026-05-01 —
     // it exists but is hidden in idle (no open camera). LIVE pill +
     // metrics grid only surface in the live phase. Idle-only paused-
     // playlist row is visible.
-    await expect(page.locator(".stream-warning")).toHaveCount(0);
-    await expect(page.locator(".stream-flip-camera")).toBeHidden();
-    await expect(page.locator(".stream-live-pill")).toBeHidden();
-    await expect(page.locator(".stream-metrics-grid")).toBeHidden();
-    await expect(page.locator(".stream-paused-row")).toBeVisible();
+    await expect(page.locator(".live-warning")).toHaveCount(0);
+    await expect(page.locator(".live-flip-camera")).toBeHidden();
+    await expect(page.locator(".live-live-pill")).toBeHidden();
+    await expect(page.locator(".live-metrics-grid")).toBeHidden();
+    await expect(page.locator(".live-paused-row")).toBeVisible();
 });
 
 test("Go Live → Stop cycle flips through live and back to idle", async ({
@@ -115,10 +115,10 @@ test("Go Live → Stop cycle flips through live and back to idle", async ({
     // panel mounts against the real (camera-less) globals first and the
     // first click produces a permission-denied error.
     await page.addInitScript(STUB_INIT_SCRIPT);
-    // Mock the backend Stream endpoints. /status reports idle, /start
+    // Mock the backend Live endpoints. /status reports idle, /start
     // returns a fake answer + session id, /stop returns 204. Lets us
     // verify the panel flow without depending on real aiortc.
-    await page.route("/api/stream/status", (route) => {
+    await page.route("/api/live/status", (route) => {
         route.fulfill({
             status: 200,
             contentType: "application/json",
@@ -129,7 +129,7 @@ test("Go Live → Stop cycle flips through live and back to idle", async ({
             }),
         });
     });
-    await page.route("/api/stream/start", (route) => {
+    await page.route("/api/live/start", (route) => {
         route.fulfill({
             status: 200,
             contentType: "application/json",
@@ -143,23 +143,23 @@ test("Go Live → Stop cycle flips through live and back to idle", async ({
             }),
         });
     });
-    await page.route("/api/stream/stop", (route) => {
+    await page.route("/api/live/stop", (route) => {
         route.fulfill({ status: 204 });
     });
 
-    await page.goto("/#/stream");
-    await expect(page.locator('.panel[data-section="stream"]')).toBeVisible();
+    await page.goto("/#/live");
+    await expect(page.locator('.panel[data-section="live"]')).toBeVisible();
 
-    await page.locator(".stream-go-live").click();
+    await page.locator(".live-go-live").click();
     // Live state surfaces: Stop button visible, Go live hidden,
     // LIVE pill on the viewfinder visible, 4-cell metrics grid below
     // the viewfinder visible, idle-only paused-playlist row hidden.
-    await expect(page.locator(".stream-stop")).toBeVisible();
-    await expect(page.locator(".stream-go-live")).toBeHidden();
-    await expect(page.locator(".stream-live-pill")).toBeVisible();
-    await expect(page.locator(".stream-metrics-grid")).toBeVisible();
-    await expect(page.locator(".stream-paused-row")).toBeHidden();
-    await expect(page.locator(".stream-status")).toContainText("Live");
+    await expect(page.locator(".live-stop")).toBeVisible();
+    await expect(page.locator(".live-go-live")).toBeHidden();
+    await expect(page.locator(".live-live-pill")).toBeVisible();
+    await expect(page.locator(".live-metrics-grid")).toBeVisible();
+    await expect(page.locator(".live-paused-row")).toBeHidden();
+    await expect(page.locator(".live-status")).toContainText("Live");
 
     // Phase A.2: Elapsed cell ticks against the wire-served started_at
     // (mocked 5s ago in the /start route above), NOT phone-local time.
@@ -186,12 +186,12 @@ test("Go Live → Stop cycle flips through live and back to idle", async ({
     // wouldn't equal '42 ms'.
     await expect(page.locator('[data-metric="latency"]')).toHaveText("42 ms");
 
-    await page.locator(".stream-stop").click();
-    await expect(page.locator(".stream-go-live")).toBeVisible();
-    await expect(page.locator(".stream-stop")).toBeHidden();
-    await expect(page.locator(".stream-live-pill")).toBeHidden();
-    await expect(page.locator(".stream-metrics-grid")).toBeHidden();
-    await expect(page.locator(".stream-paused-row")).toBeVisible();
+    await page.locator(".live-stop").click();
+    await expect(page.locator(".live-go-live")).toBeVisible();
+    await expect(page.locator(".live-stop")).toBeHidden();
+    await expect(page.locator(".live-live-pill")).toBeHidden();
+    await expect(page.locator(".live-metrics-grid")).toBeHidden();
+    await expect(page.locator(".live-paused-row")).toBeVisible();
 });
 
 test("active session at /status surfaces Take over UI without opening camera", async ({
@@ -209,7 +209,7 @@ test("active session at /status surfaces Take over UI without opening camera", a
             return real(...args);
         };
     `);
-    await page.route("/api/stream/status", (route) => {
+    await page.route("/api/live/status", (route) => {
         route.fulfill({
             status: 200,
             contentType: "application/json",
@@ -221,14 +221,14 @@ test("active session at /status surfaces Take over UI without opening camera", a
         });
     });
 
-    await page.goto("/#/stream");
+    await page.goto("/#/live");
     // Mount-init's own /status pre-flight surfaces the take-over UI —
     // no Go-live click needed (and clicking would race mount-init).
 
-    await expect(page.locator(".stream-take-over")).toBeVisible();
-    await expect(page.locator(".stream-cancel-takeover")).toBeVisible();
-    await expect(page.locator(".stream-go-live")).toBeHidden();
-    await expect(page.locator(".stream-status")).toContainText("Someone else");
+    await expect(page.locator(".live-take-over")).toBeVisible();
+    await expect(page.locator(".live-cancel-takeover")).toBeVisible();
+    await expect(page.locator(".live-go-live")).toBeHidden();
+    await expect(page.locator(".live-status")).toContainText("Someone else");
 
     // Camera permission was NOT requested — saves the operator a dialog
     // they'd just dismiss after seeing the "take over" prompt.
