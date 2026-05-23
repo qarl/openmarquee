@@ -7,16 +7,20 @@ verbatim (no panel / letterbox compositing — the render IS the display
 size).
 
 The Chromium shell is a *subprocess* the module spawns (there is no
-Python import for it). These tests mock `subprocess.run` — so the whole
-suite runs on a host WITHOUT Chromium installed — and assert the wiring
-(the flags, `--window-size`, `--screenshot`, the timeout + kill/reap
-behavior, the typed error). `shutil.which` is also patched so binary
-resolution is deterministic. The fake Chromium, like the real one,
-emits a screenshot of exactly the `--window-size`.
+Python import for it). These tests mock `subprocess.Popen` — so the
+whole suite runs on a host WITHOUT Chromium installed — and assert the
+wiring (the flags, `--window-size`, `--screenshot`, the timeout +
+kill/reap behavior, the typed error). `shutil.which` is also patched
+so binary resolution is deterministic. The fake Chromium, like the
+real one, emits a screenshot of exactly the `--window-size`.
 """
 
+import os
+import signal
 import subprocess
+import time
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -52,13 +56,53 @@ def _open_png(data: bytes) -> Image.Image:
 # ---------------------------------------------------------------------
 # Fake Chromium subprocess.
 # ---------------------------------------------------------------------
-class _FakeCompletedProcess:
-    """Stand-in for `subprocess.CompletedProcess`."""
+class _FakePopen:
+    """Stand-in for `subprocess.Popen` that matches the surface
+    `render_web_png` actually uses: `pid`, `returncode`, `communicate`,
+    `wait`, `kill`. The fake child is assigned a stable pretend PID
+    (used by `os.killpg` assertions in the tests).
+    """
 
-    def __init__(self, returncode=0, stderr=b""):
+    _next_pid = 50000
+
+    def __init__(
+        self, returncode=0, stderr=b"", raise_timeout=False, calls=None
+    ):
+        self.pid = _FakePopen._next_pid
+        _FakePopen._next_pid += 1
         self.returncode = returncode
-        self.stdout = b""
-        self.stderr = stderr
+        self._stderr = stderr
+        self._raise_timeout = raise_timeout
+        self._calls = calls
+        self._waited = False
+        self._communicate_called = False
+
+    def communicate(self, timeout=None):
+        if self._communicate_called:
+            # Real Popen.communicate raises ValueError on a second
+            # call (pipes already closed). The renderer's finally
+            # block intentionally catches this — a drain attempt
+            # against an already-drained Popen is a no-op.
+            raise ValueError("communicate() already called")
+        # Only record the first communicate timeout — that's the
+        # "render" budget, distinct from the small post-sweep drain
+        # value the finally block passes.
+        if self._calls is not None:
+            self._calls["timeout"] = timeout
+        self._communicate_called = True
+        if self._raise_timeout:
+            # Real Popen.communicate keeps the child alive on timeout
+            # so the caller can clean up; mirror that contract — pid
+            # remains a valid target for killpg.
+            raise subprocess.TimeoutExpired(cmd="chromium", timeout=timeout)
+        return (b"", self._stderr)
+
+    def wait(self, timeout=None):
+        self._waited = True
+        return self.returncode
+
+    def kill(self):  # pragma: no cover — defensive escalation path
+        self.returncode = -9
 
 
 def _install_fake_chromium(
@@ -74,29 +118,41 @@ def _install_fake_chromium(
     delete_screenshot=False,
     calls=None,
 ):
-    """Patch `shutil.which` + `subprocess.run` so `render_web_png` runs
-    against a fake Chromium.
+    """Patch `shutil.which` + `subprocess.Popen` + `os.killpg` so
+    `render_web_png` runs against a fake Chromium.
 
     `which` is what `shutil.which` returns (None -> no binary found).
-    The fake `subprocess.run` records its argv/kwargs into `calls` and
-    writes a screenshot to the `--screenshot=` path. When `screenshot_png`
-    is None it synthesizes a solid PNG of exactly the requested
-    `--window-size` — mimicking real Chromium, which emits a capture of
-    the window size. A test that needs a specific (bad / non-PNG / odd)
-    payload passes `screenshot_png` explicitly.
+    The fake `subprocess.Popen` records its argv/kwargs into `calls`
+    and writes a screenshot to the `--screenshot=` path BEFORE Popen
+    returns (so `communicate()` sees the file already on disk —
+    mirroring how Chromium has written the PNG by the time it exits).
+    When `screenshot_png` is None it synthesizes a solid PNG of exactly
+    the requested `--window-size` — mimicking real Chromium, which
+    emits a capture of the window size. A test that needs a specific
+    (bad / non-PNG / odd) payload passes `screenshot_png` explicitly.
+
+    `os.killpg` is patched to record (pgid, sig) pairs into
+    `calls["killpg"]` — the regression assertion that the SIGTERM →
+    grace → SIGKILL sweep actually runs against the process group.
     """
     monkeypatch.setattr(
         web_render.shutil, "which",
         lambda name: which if name in web_render._CHROMIUM_BINARIES else None,
     )
 
-    def _fake_run(argv, capture_output=False, timeout=None):
+    # Capture the helper kwargs into closure locals so the Popen
+    # signature's own `stderr` kwarg (the IO redirection setting) doesn't
+    # shadow the test-fixture `stderr` payload.
+    captured_stderr_payload = stderr
+    captured_raise_timeout = raise_timeout
+    captured_returncode = returncode
+
+    def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
         if calls is not None:
             calls["argv"] = argv
-            calls["timeout"] = timeout
-            calls["capture_output"] = capture_output
-        # Mirror real Chromium: the capture is the --window-size. When
-        # the test pinned an explicit screenshot_png, use that instead.
+            calls["start_new_session"] = start_new_session
+            calls["stdout"] = stdout
+            calls["stderr"] = stderr
         win = (1360, 768)
         for arg in argv:
             if arg.startswith("--window-size="):
@@ -111,18 +167,40 @@ def _install_fake_chromium(
             if arg.startswith("--screenshot="):
                 path = arg.split("=", 1)[1]
                 if delete_screenshot:
-                    import os
                     os.unlink(path)
                 elif write_screenshot:
                     with open(path, "wb") as fh:
                         fh.write(payload)
         if launch_error is not None:
             raise launch_error
-        if raise_timeout:
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
-        return _FakeCompletedProcess(returncode=returncode, stderr=stderr)
+        return _FakePopen(
+            returncode=captured_returncode,
+            stderr=captured_stderr_payload,
+            raise_timeout=captured_raise_timeout,
+            calls=calls,
+        )
 
-    monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
+    monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
+
+    # Default-stub os.killpg into a no-op recorder. The renderer
+    # finally-block invokes it on the fake's PID, which doesn't exist
+    # — without this stub, the real killpg would ProcessLookupError
+    # (which the renderer handles), but recording the calls lets tests
+    # assert the SIGTERM→SIGKILL sweep pattern. Tests that need to
+    # simulate "group still alive" can patch `os.killpg` over this.
+    killpg_calls: list[tuple[int, int]] = []
+    if calls is not None:
+        calls["killpg"] = killpg_calls
+
+    def _fake_killpg(pgid, sig):
+        killpg_calls.append((pgid, sig))
+        # Mimic clean-exit: signal 0 (existence probe) after SIGTERM
+        # raises ProcessLookupError so the grace-loop exits immediately
+        # rather than spinning the full 2-second window in tests.
+        if sig == 0:
+            raise ProcessLookupError(f"no such process group {pgid}")
+
+    monkeypatch.setattr(web_render.os, "killpg", _fake_killpg)
 
 
 # ---------------------------------------------------------------------
@@ -224,15 +302,19 @@ def test_render_web_png_prepends_nice_prefix_when_available(monkeypatch):
         }.get(name),
     )
 
-    def _fake_run(argv, capture_output=False, timeout=None):
+    def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
         calls["argv"] = argv
         for arg in argv:
             if arg.startswith("--screenshot="):
                 with open(arg.split("=", 1)[1], "wb") as fh:
                     fh.write(_solid_png(1360, 768, (1, 2, 3)))
-        return _FakeCompletedProcess(returncode=0)
+        return _FakePopen(returncode=0)
 
-    monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
+    monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(
+        web_render.os, "killpg",
+        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
+    )
     render_web_png("https://status.example.com", 1360, 768)
 
     argv = calls["argv"]
@@ -295,15 +377,19 @@ def test_render_web_png_resolves_chromium_browser_fallback(monkeypatch):
         if name == "chromium-browser" else None,
     )
 
-    def _fake_run(argv, capture_output=False, timeout=None):
+    def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
         calls["argv"] = argv
         for arg in argv:
             if arg.startswith("--screenshot="):
                 with open(arg.split("=", 1)[1], "wb") as fh:
                     fh.write(_solid_png(800, 600, (1, 2, 3)))
-        return _FakeCompletedProcess(returncode=0)
+        return _FakePopen(returncode=0)
 
-    monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
+    monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(
+        web_render.os, "killpg",
+        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
+    )
     render_web_png("https://status.example.com", 800, 600)
     assert calls["argv"][0] == "/usr/bin/chromium-browser"
 
@@ -381,16 +467,20 @@ def test_render_web_png_cleans_up_temp_screenshot(monkeypatch):
         web_render.shutil, "which", lambda name: "/usr/bin/chromium"
     )
 
-    def _fake_run(argv, capture_output=False, timeout=None):
+    def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
         for arg in argv:
             if arg.startswith("--screenshot="):
                 path = arg.split("=", 1)[1]
                 seen["path"] = path
                 with open(path, "wb") as fh:
                     fh.write(_solid_png(800, 600, (5, 5, 5)))
-        return _FakeCompletedProcess(returncode=0)
+        return _FakePopen(returncode=0)
 
-    monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
+    monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(
+        web_render.os, "killpg",
+        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
+    )
     render_web_png("https://status.example.com", 800, 600)
 
     from pathlib import Path
@@ -407,16 +497,20 @@ def test_render_web_png_cleans_up_temp_screenshot_on_failure(monkeypatch):
         web_render.shutil, "which", lambda name: "/usr/bin/chromium"
     )
 
-    def _fake_run(argv, capture_output=False, timeout=None):
+    def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
         for arg in argv:
             if arg.startswith("--screenshot="):
                 path = arg.split("=", 1)[1]
                 seen["path"] = path
                 with open(path, "wb") as fh:
                     fh.write(b"junk")
-        return _FakeCompletedProcess(returncode=1, stderr=b"boom")
+        return _FakePopen(returncode=1, stderr=b"boom")
 
-    monkeypatch.setattr(web_render.subprocess, "run", _fake_run)
+    monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(
+        web_render.os, "killpg",
+        lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
+    )
     with pytest.raises(WebRenderError):
         render_web_png("https://status.example.com", 800, 600)
 
@@ -489,10 +583,10 @@ def test_main_nonpositive_dimensions_exit_2(capsys):
 def test_main_file_url_rejected_exit_2(monkeypatch, capsys):
     """A `file://` URL is rejected — exit 2 (bad input), a clear
     'invalid URL' message, and the render is never attempted."""
-    def _fail_run(*a, **k):
+    def _fail_popen(*a, **k):
         raise AssertionError("Chromium must not be spawned for file://")
 
-    monkeypatch.setattr(web_render.subprocess, "run", _fail_run)
+    monkeypatch.setattr(web_render.subprocess, "Popen", _fail_popen)
     rc = main(["file:///etc/passwd", "1360", "768", "/tmp/x.png"])
     assert rc == 2
     assert "invalid URL" in capsys.readouterr().err
@@ -533,3 +627,172 @@ def test_main_unwritable_output_path_exits_1(monkeypatch, capsys):
     ])
     assert rc == 1
     assert "failed to write PNG" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------
+# Chromium process-group sweep (QA 2026-05-23 leak fix).
+#
+# FYS production after 78 min backend uptime held 8 alive (not zombie)
+# chromium-headless-shell processes from a single spawn cycle — each
+# ~75 MB resident in swap, leading to kswapd0 thrash + dashboard
+# slowness. Pkill of the leftover procs dropped swap 311 → 213 MB and
+# 1-min load 8.37 → 6.06 within 30s. Confirms the dominant footprint
+# is leaked helpers, not the active backend.
+#
+# Root cause: subprocess.run reaps only the immediate child. Chromium
+# under --no-sandbox + Debian's /bin/sh wrapper forks renderer /
+# utility / GPU helpers; when the browser-parent exits cleanly those
+# helpers can detach and persist. The fix puts the spawn in its own
+# session via `start_new_session=True` and tears the WHOLE process
+# group down (SIGTERM → 2s grace → SIGKILL) in the finally block.
+# ---------------------------------------------------------------------
+def test_render_web_png_spawns_in_new_session_for_group_kill(monkeypatch):
+    """`start_new_session=True` is on the Popen call — the spawn gets
+    its own process group (PGID == proc.pid) so the finally-block sweep
+    in _terminate_process_group can kill every descendant in one shot.
+    Regression: the leak existed because subprocess.run had no
+    equivalent option."""
+    calls = {}
+    _install_fake_chromium(monkeypatch, calls=calls)
+    render_web_png("https://status.example.com", 1360, 768)
+    assert calls["start_new_session"] is True
+
+
+def test_render_web_png_sweeps_process_group_on_clean_exit(monkeypatch):
+    """The finally block kills the chromium process group EVEN ON THE
+    CLEAN-EXIT PATH. The common case: chromium exited 0, but renderer/
+    utility helpers may have detached and persisted. SIGTERM is
+    unconditional; ProcessLookupError on an already-empty group is the
+    healthy outcome (caught silently)."""
+    calls = {}
+    _install_fake_chromium(monkeypatch, calls=calls)
+    render_web_png("https://status.example.com", 1360, 768)
+    sigs = [sig for _pgid, sig in calls["killpg"]]
+    assert signal.SIGTERM in sigs
+
+
+def test_render_web_png_sweeps_process_group_on_timeout(monkeypatch):
+    """The finally block ALSO runs on the TimeoutExpired path — the
+    typed WebRenderError is raised AFTER the sweep so the descendants
+    are torn down before the call returns. Without the sweep, a timed-
+    out chromium would leave its renderer/utility helpers behind."""
+    calls = {}
+    _install_fake_chromium(monkeypatch, raise_timeout=True, calls=calls)
+    with pytest.raises(WebRenderError, match="timed out"):
+        render_web_png("https://status.example.com", 1360, 768)
+    sigs = [sig for _pgid, sig in calls["killpg"]]
+    assert signal.SIGTERM in sigs
+
+
+def test_render_web_png_escalates_to_sigkill_when_group_survives(
+    monkeypatch,
+):
+    """When the process group survives SIGTERM (the failure mode this
+    fix addresses on FYS), the sweep escalates to SIGKILL after the
+    grace period. Simulated by stubbing killpg to NEVER raise
+    ProcessLookupError — the existence-probe loop runs the full grace
+    window, then SIGKILL fires."""
+    seen = []
+
+    def _stuck_killpg(pgid, sig):
+        # Record every call. signal 0 = existence probe; return success
+        # (don't raise) so the renderer thinks the group is still alive
+        # and the grace loop spins to deadline.
+        seen.append((pgid, sig))
+
+    # Speed the grace window so this test is sub-second.
+    monkeypatch.setattr(
+        web_render, "_PROCESS_GROUP_TERM_GRACE_S", 0.1
+    )
+    _install_fake_chromium(monkeypatch)
+    monkeypatch.setattr(web_render.os, "killpg", _stuck_killpg)
+
+    render_web_png("https://status.example.com", 1360, 768)
+
+    signals_sent = [sig for _, sig in seen]
+    assert signal.SIGTERM in signals_sent
+    assert signal.SIGKILL in signals_sent
+    # SIGKILL fired AFTER SIGTERM (the order matters — never reverse).
+    assert signals_sent.index(signal.SIGTERM) < signals_sent.index(
+        signal.SIGKILL
+    )
+
+
+def test_render_web_png_passes_overall_timeout_via_communicate(
+    monkeypatch,
+):
+    """The Chromium wall-clock budget is passed to Popen.communicate
+    so the render never hangs unboundedly — restored after the
+    subprocess.run → Popen migration."""
+    calls = {}
+    _install_fake_chromium(monkeypatch, calls=calls)
+    render_web_png("https://status.example.com", 1360, 768)
+    assert calls["timeout"] == WEB_RENDER_TIMEOUT_S
+
+
+# ---------------------------------------------------------------------
+# Live-fire smoke (auto-skipped when chromium-headless-shell isn't on
+# PATH — runs on the Pi + on CI Linux, skips on macOS dev). Walks /proc
+# for chromium-headless-shell descendants of the test process before
+# and after a real render; asserts the count returns to baseline within
+# the grace window. This is the regression that fences the actual leak
+# QA observed on FYS — the unit tests above prove the SHAPE; this
+# proves the BEHAVIOR.
+# ---------------------------------------------------------------------
+def _count_chromium_procs() -> int:
+    """Walk /proc for procs whose comm contains 'chromium-headless'.
+
+    Linux-only (skipped when /proc isn't a directory). No psutil
+    dependency — the backend doesn't import it and we won't add a
+    runtime dep for one test."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return 0
+    count = 0
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text().strip()
+        except (OSError, PermissionError):
+            continue
+        if "chromium-headless" in comm or "headless-shell" in comm:
+            count += 1
+    return count
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("chromium-headless-shell") is None,
+    reason="chromium-headless-shell not on PATH "
+    "(auto-skipped on macOS dev; runs on Pi + CI Linux)",
+)
+def test_render_web_png_leaves_no_chromium_helpers_alive(tmp_path):
+    """Live-fire regression for QA's 2026-05-23 leak: count chromium-
+    headless-shell procs before render, run a real render, poll for
+    the count to return to baseline within the grace window, assert
+    delta == 0.
+
+    Pre-fix: the count would stay 7-8 above baseline (one wrapper sh
+    + browser parent + ~6 renderer/utility helpers, all alive in
+    swap). Post-fix: the finally-block killpg sweep returns the count
+    to baseline within _PROCESS_GROUP_TERM_GRACE_S + a small reap
+    margin (each-process exit isn't instantaneous after SIGKILL)."""
+    baseline = _count_chromium_procs()
+    # example.com is the safest possible live URL: tiny, stable, and
+    # IANA-managed for exactly this kind of test. Network-dependent
+    # but the live-fire gate already implies the host has network.
+    render_web_png("https://example.com", 640, 480)
+
+    # Poll up to ~3s for procs to exit after SIGTERM/SIGKILL (each
+    # process honoring the signal takes a few hundred ms on the Pi).
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if _count_chromium_procs() <= baseline:
+            return
+        time.sleep(0.1)
+
+    final = _count_chromium_procs()
+    pytest.fail(
+        f"chromium-headless procs leaked: baseline={baseline} "
+        f"final={final} delta={final - baseline}"
+    )
