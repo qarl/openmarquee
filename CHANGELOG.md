@@ -16,6 +16,83 @@ component locations for cross-ecosystem readability.
 
 ## [Unreleased]
 
+(empty — next changes land here.)
+
+## [0.6.0-beta] — 2026-05-23
+
+### Overnight stability + Mode A push (2026-05-23)
+
+Mode A (Live takeover) end-to-end on FYS hardware, chromium subprocess
+reap-leak fix, parity harness coverage expansion, and seven additional
+regression-locks that close standing audit deltas. Cross-pair commits:
+
+- `88398f8` BACKEND (web_render): kill chromium process group on render
+  exit. Fixes the FYS swap-thrash leak where each Newsmoji refresh
+  accumulated ~8 chromium helper subprocesses; `subprocess.Popen` with
+  `start_new_session=True` + `finally: os.killpg(SIGTERM)` reaps the
+  whole group. New `chromium_render_no_orphan_procs` regression test
+  (skip-gated to Linux + chromium-headless-shell available).
+- `3a4fd22` / `860275d` Live takeover panel renamed from "Stream" back
+  to "Live" (Mode A). StreamSlide (Mode B, `type: "stream"`) is
+  explicitly unchanged. API route prefix flipped `/api/stream/*` →
+  `/api/live/*`; error code `stream_already_active` → `live_already_active`.
+- `dbfe0d4` Live Mode A test harness — `ui/test/fake-camera.html`
+  single-file fake-camera publisher (captureStream of a bundled
+  fixture.mp4) + auth-whitelist regression-lock for `/test/` paths.
+- `8c2b127` Live signaling fix — `AF_NETLINK` added to systemd unit's
+  `RestrictAddressFamilies=` (aiortc/aioice needs netlink for ICE
+  candidate gathering; OSError errno 97 EAFNOSUPPORT was 400'ing
+  /api/live/start until this landed). `/api/live/{start,takeover}`
+  400 detail now structured `{error, error_class}` so wire-side
+  diagnosers see the failing exception class. **Mode A confirmed
+  end-to-end working on FYS** via fake-camera harness against real
+  hardware (70 frames painted to HDMI through the Rust sidecar's
+  external-frame pump, 0 skipped, avg 35ms paint).
+- `6b6f4e8` / `8d5c006` Live Slice 4 regression tests — static
+  config assertion (`test_systemd_unit_whitelists_af_netlink`) +
+  real aiortc client SDP round-trip lock against `httpx.AsyncClient`
+  + `ASGITransport(app)`.
+- `84d8d6a` RENDERER+BACKEND (reconfigure IPC): partial op
+  (brightness + gamma in-place via shader uniforms; rotation typed
+  `UnsupportedField` error). Replaces the long-standing "not yet
+  implemented (slice e)" stub at `ipc_main.rs:1705`. Closes
+  v1-spec-delta CRITICAL/MAJOR open item.
+- `b9e6b67` RENDERER (reel): H2+M2 dispatch parity. Standalone
+  `--play-reel` path lifts video-decode + image-involving-transition
+  dispatch out of `ipc_main.rs` into new shared `video_decode.rs`
+  module; reel arm routes Video through V4L2 (graceful black-hold
+  fallback on /dev/video10 absent) and image-bg transitions through
+  the existing any-endpoint mix path. Text-Text transitions stay on
+  the QA-mandated SP/SB fast-path.
+- `be3d10b` UI (D2 closure): chip-pill universal-application
+  regression lock. The 2026-05-19 `.om-pulldown` migration already
+  shipped Option X; this commit codifies that state with a
+  static-parse test (every `<select>` in `ui/src/*.js` either wears
+  `.om-pulldown` or is the documented hidden font-family pattern).
+- `18f585b` UI (M5 closure): Live Cancel TODO replaced with
+  decision-record comment + no-backend-call contract lock. Subagent
+  review caught a real silent-contract regression (the lock's
+  initial `_BACKEND_CALL_NAMES` list used import names instead of
+  the `api*`-aliased in-scope names — would have shipped a useless
+  test green).
+- `6230321` RENDERER (D1 closure): `FS_BRIGHT_GAMMA` blacks-not-black
+  regression-lock. Probe ran on vc4 + confirmed `pow(0.0, 1/2.2) ==
+  0.0` exact-zero (no epsilon needed). Four invariants pinned:
+  pre-pow clamp present, clamp ordering, audit-anchor comment,
+  Option-B anti-pattern (asserts the `step(rgb, vec3(1e-6))`
+  signature is NOT present).
+- `1b00db8` UI (H4): parity-harness gains 7 missing transitions
+  (iris, scanline, glitch, push, flip, marquee, shutter). Per-pixel
+  JS translations of the Rust SP fragment shaders; subagent review
+  verified line-by-line algorithm equivalence for each. Unlocks
+  the cross-renderer parity gold-bless gate for the previously
+  BROWSER-SKIP'd 7 fixtures.
+
+**Six audit items closed as audit-stale + already-locked** (H3, M1,
+D1, M3, D2 work-already-done, M5 work-already-wired): existing
+regression-lock tests fence the invariants; verify-against-HEAD-blob
+discipline caught the audit-doc lag.
+
 ### SDF arc — text rendering refactor (2026-05-17 → 2026-05-18)
 
 Replaced the per-frame AlphaBitmap font raster with build-time-baked
@@ -71,9 +148,7 @@ SP-portable set doesn't support via `--capture-sb-mid`).
 
 THE FONT-CLAMP BUG IS RESOLVED IN PRODUCTION as of this deploy.
 
-## [0.6.0-beta] — 2026-05-17
-
-### Removed — DELETE-PIL purge
+### DELETE-PIL purge (2026-05-17)
 
 The Python rendering subsystem has been deleted. The Rust IPC
 sidecar (`renderer/`, binary `openmarquee-render`) is now the only
