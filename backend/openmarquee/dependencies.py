@@ -865,18 +865,18 @@ def get_web_screenshot_kicker() -> Callable[[Any], None]:
 
 
 @lru_cache
-def _stream_manager_singleton():
-    """Process-wide stream takeover manager (SYSTEM_SPEC §5.11).
+def _live_manager_singleton():
+    """Process-wide live-takeover manager (SYSTEM_SPEC §5.11).
 
-    Lazy-imported so a backend that never touches /api/stream/* doesn't
+    Lazy-imported so a backend that never touches /api/live/* doesn't
     pay the aiortc import cost (it pulls cryptography, av, libvpx via
-    PyAV — heavy). Holds at most one StreamSession at a time.
+    PyAV — heavy). Holds at most one LiveSession at a time.
     """
-    from openmarquee.stream import StreamManager
+    from openmarquee.live import LiveManager
 
-    return StreamManager(_playback_loop_singleton())
+    return LiveManager(_playback_loop_singleton())
 
 
-def get_stream_manager():
-    """Dependency provider for the stream-takeover manager."""
-    return _stream_manager_singleton()
+def get_live_manager():
+    """Dependency provider for the live-takeover manager."""
+    return _live_manager_singleton()

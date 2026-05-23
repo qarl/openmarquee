@@ -1,21 +1,21 @@
-"""REST API for live stream takeover (SYSTEM_SPEC §5.11 + §6 +
+"""REST API for live takeover (SYSTEM_SPEC §5.11 + §6 +
 docs/STREAM_VLC_PROPOSAL.md).
 
 A takeover preempts the playlist with a live source. The request body
-is a `kind`-tagged union (StreamStartBody):
+is a `kind`-tagged union (LiveStartBody):
 
 - kind="webrtc" — a phone publishes a WebRTC video track; the backend
   negotiates one SDP round trip (offer in, answer out).
 - kind="stream" — the operator publishes a network stream URL; the Pi
   pulls it with ffmpeg. No SDP, so the response's sdp_answer is null.
 
-Either way StreamManager pauses the playback loop and pushes decoded
+Either way LiveManager pauses the playback loop and pushes decoded
 frames to the renderer. Endpoints:
 
-POST /api/stream/start    — start a new session (409 if one's active)
-POST /api/stream/stop     — tear down a session by id (404 if gone)
-GET  /api/stream/status   — idle | active + active session_id + tier
-POST /api/stream/takeover — force-stop the active session and start fresh
+POST /api/live/start    — start a new session (409 if one's active)
+POST /api/live/stop     — tear down a session by id (404 if gone)
+GET  /api/live/status   — idle | active + active session_id + tier
+POST /api/live/takeover — force-stop the active session and start fresh
 
 Non-trickle ICE for the WebRTC path: all candidates are baked into the
 SDP answer, so /start does the full SDP round trip in a single
@@ -30,22 +30,22 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from openmarquee.dependencies import get_stream_manager
-from openmarquee.stream import (
-    StreamAlreadyActive,
-    StreamManager,
-    StreamNotActive,
-    StreamStartBody,
+from openmarquee.dependencies import get_live_manager
+from openmarquee.live import (
+    LiveAlreadyActive,
+    LiveManager,
+    LiveNotActive,
+    LiveStartBody,
 )
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/stream", tags=["stream"])
+router = APIRouter(prefix="/api/live", tags=["live"])
 
-StreamDep = Annotated[StreamManager, Depends(get_stream_manager)]
+LiveDep = Annotated[LiveManager, Depends(get_live_manager)]
 
 
-class StreamStartResponse(BaseModel):
+class LiveStartResponse(BaseModel):
     """Session id (+ SDP answer for a WebRTC start). The phone applies
     the answer to its RTCPeerConnection to complete the handshake; an
     RTSP start has no answer, so `sdp_answer` is null there.
@@ -54,19 +54,19 @@ class StreamStartResponse(BaseModel):
     when the session was created — the phone's Elapsed counter ticks
     against (now - started_at) so it's correct even if the phone's
     clock is skewed from the device's, and survives a panel re-mount
-    mid-stream (Phase A.2)."""
+    mid-session (Phase A.2)."""
 
     session_id: UUID
     sdp_answer: str | None = None
     started_at: datetime
 
 
-class StreamStopRequest(BaseModel):
+class LiveStopRequest(BaseModel):
     session_id: UUID
 
 
 class HardwareTier(BaseModel):
-    """The capture / decode caps a stream source should clamp to.
+    """The capture / decode caps a live source should clamp to.
 
     `basic` = Pi Zero 2 W (854×480/30), `good` = Pi 4/5
     (1920×1080/30); `future` is reserved for the Phase 12.3 hardware
@@ -81,7 +81,7 @@ class HardwareTier(BaseModel):
     max_fps: int
 
 
-class StreamStatus(BaseModel):
+class LiveStatus(BaseModel):
     """Polled by the phone before every Go Live tap.
 
     `state == "active"` with a session_id different from the caller's
@@ -90,7 +90,7 @@ class StreamStatus(BaseModel):
 
     `started_at` is the wall-clock UTC timestamp of the active
     session's creation, or None when idle. Lets a panel that mounts
-    mid-stream pick up the Elapsed counter from /status without
+    mid-session pick up the Elapsed counter from /status without
     needing to have observed the original /start response (Phase A.2).
     """
 
@@ -100,7 +100,7 @@ class StreamStatus(BaseModel):
     tier: HardwareTier
 
 
-# Stream hardware tiers (SYSTEM_SPEC §5.11 + STREAM_VLC_PROPOSAL §7).
+# Live-takeover hardware tiers (SYSTEM_SPEC §5.11 + STREAM_VLC_PROPOSAL §7).
 # Phase 12.3 hardware live-fire (STREAM/VLC slice 9) validates these
 # numbers and adds real per-device detection; until then /status
 # reports a static tier. If SW H.264 decode can't sustain a number on
@@ -118,20 +118,20 @@ _SOURCE_TIERS: dict[str, HardwareTier] = {
 }
 
 
-@router.post("/start", response_model=StreamStartResponse)
-async def start_stream(
-    payload: StreamStartBody,
-    streams: StreamDep,
-) -> StreamStartResponse:
+@router.post("/start", response_model=LiveStartResponse)
+async def start_live(
+    payload: LiveStartBody,
+    live: LiveDep,
+) -> LiveStartResponse:
     try:
-        session_id, answer = await streams.start(payload)
-    except StreamAlreadyActive as exc:
+        session_id, answer = await live.start(payload)
+    except LiveAlreadyActive as exc:
         # 409 carries the active session id so the phone can offer
         # "Take over" without a second round trip to /status.
         raise HTTPException(
             status_code=409,
             detail={
-                "error": "stream_already_active",
+                "error": "live_already_active",
                 "active_session_id": str(exc.active_session_id),
             },
         ) from exc
@@ -140,62 +140,62 @@ async def start_stream(
         # request is the most likely source of badness.
         # 11.2: don't reflect the exception string into the response --
         # aiortc/SDP-parse messages can carry internals. Log + opaque 400.
-        log.exception("stream negotiation failed")
+        log.exception("live negotiation failed")
         raise HTTPException(
             status_code=400,
-            detail="stream negotiation failed",
+            detail="live negotiation failed",
         ) from exc
-    started_at = streams.active_session_started_at
+    started_at = live.active_session_started_at
     assert started_at is not None  # session was just created above
-    return StreamStartResponse(
+    return LiveStartResponse(
         session_id=session_id, sdp_answer=answer, started_at=started_at
     )
 
 
 @router.post("/stop", status_code=204)
-async def stop_stream(
-    payload: StreamStopRequest,
-    streams: StreamDep,
+async def stop_live(
+    payload: LiveStopRequest,
+    live: LiveDep,
 ) -> None:
     try:
-        await streams.stop(payload.session_id)
-    except StreamNotActive as exc:
+        await live.stop(payload.session_id)
+    except LiveNotActive as exc:
         raise HTTPException(
             status_code=404,
             detail=f"no active session {exc.session_id}",
         ) from exc
 
 
-@router.post("/takeover", response_model=StreamStartResponse)
-async def takeover_stream(
-    payload: StreamStartBody,
-    streams: StreamDep,
-) -> StreamStartResponse:
+@router.post("/takeover", response_model=LiveStartResponse)
+async def takeover_live(
+    payload: LiveStartBody,
+    live: LiveDep,
+) -> LiveStartResponse:
     """Force-stop whatever's active and start a new session in one
     request. Phone hits this when the user ack'd the "someone else
     is streaming" warning and tapped Take Over."""
     try:
-        session_id, answer = await streams.takeover(payload)
+        session_id, answer = await live.takeover(payload)
     except Exception as exc:
         # 11.2: don't reflect the exception string. Log + opaque 400.
-        log.exception("stream takeover failed")
+        log.exception("live takeover failed")
         raise HTTPException(
             status_code=400,
-            detail="stream takeover failed",
+            detail="live takeover failed",
         ) from exc
-    started_at = streams.active_session_started_at
+    started_at = live.active_session_started_at
     assert started_at is not None  # session was just created above
-    return StreamStartResponse(
+    return LiveStartResponse(
         session_id=session_id, sdp_answer=answer, started_at=started_at
     )
 
 
-@router.get("/status", response_model=StreamStatus)
-async def stream_status(streams: StreamDep) -> StreamStatus:
-    return StreamStatus(
-        state="active" if streams.is_active else "idle",
-        session_id=streams.active_session_id,
-        started_at=streams.active_session_started_at,
+@router.get("/status", response_model=LiveStatus)
+async def live_status(live: LiveDep) -> LiveStatus:
+    return LiveStatus(
+        state="active" if live.is_active else "idle",
+        session_id=live.active_session_id,
+        started_at=live.active_session_started_at,
         # /status is polled by the phone before Go Live, so it reports
         # the webrtc (phone-camera) source's tier.
         tier=_SOURCE_TIERS["webrtc"],

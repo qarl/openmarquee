@@ -1,17 +1,17 @@
-"""Phase 12.1 stream takeover coverage (SYSTEM_SPEC §5.11).
+"""Phase 12.1 live takeover coverage (SYSTEM_SPEC §5.11).
 
 Four scenarios called out in IMPLEMENTATION_PLAN Phase 12.1:
 
 1. Frame format — incoming WebRTC frames are downscaled to renderer
    dims and pushed as RGB888 (matching §7.6 wire format).
-2. Single-publisher — second concurrent /start raises StreamAlreadyActive.
+2. Single-publisher — second concurrent /start raises LiveAlreadyActive.
 3. Takeover — /takeover force-stops the existing session and starts new.
-4. Pause-and-resume — PlaybackLoop pauses on stream activate and resumes
-   the same slide it was on when the session ends.
+4. Pause-and-resume — PlaybackLoop pauses on live-takeover activate and
+   resumes the same slide it was on when the session ends.
 
 aiortc's RTCPeerConnection is patched out for the orchestration tests
 because the PC's actual SDP/ICE machinery is irrelevant here — the
-StreamManager+StreamSession state and the PlaybackLoop pause/resume
+LiveManager+LiveSession state and the PlaybackLoop pause/resume
 integration are what we're verifying. Real aiortc gets a live-fire
 exercise in Phase 12.3 (hardware bring-up) instead.
 """
@@ -32,11 +32,11 @@ from PIL import Image
 from openmarquee.content import TextSlide
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
-from openmarquee.stream import (
-    StreamAlreadyActive,
-    StreamManager,
-    StreamNotActive,
-    StreamSession,
+from openmarquee.live import (
+    LiveAlreadyActive,
+    LiveManager,
+    LiveNotActive,
+    LiveSession,
     StreamStartRequest,
     WebRtcStartRequest,
 )
@@ -51,7 +51,7 @@ _FAST_EMPTY_POLL = 0.01
 
 class _FakeSdp:
     """Stand-in for aiortc's RTCSessionDescription. Only `sdp` and `type`
-    are consumed by StreamSession.start, so a thin shim suffices."""
+    are consumed by LiveSession.start, so a thin shim suffices."""
 
     def __init__(self, sdp: str, type: str):
         self.sdp = sdp
@@ -302,7 +302,7 @@ async def test_ffmpeg_source_frame_dims_unchanged_for_in_limit_source(tmp_path):
 
 @pytest.mark.asyncio
 async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
-    """End-to-end: a StreamSession's pump drives its WebRtcStreamSource
+    """End-to-end: a LiveSession's pump drives its WebRtcStreamSource
     and pushes each yielded frame to renderer.render_frame(). Drives
     the on_track callback directly (the fake PC never negotiates real
     media) so the pump path itself is exercised."""
@@ -315,8 +315,8 @@ async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
     )
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            session = StreamSession(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
             captured: list[bytes] = []
             original_render = renderer.render_frame
 
@@ -364,8 +364,8 @@ async def test_session_pump_stops_and_logs_once_on_render_failure(
     )
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            session = StreamSession(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
             render_calls = {"n": 0}
 
             def boom(_data, **_kwargs):
@@ -401,19 +401,19 @@ async def test_session_pump_stops_and_logs_once_on_render_failure(
 
 
 @pytest.mark.asyncio
-async def test_second_start_while_active_raises_stream_already_active(tmp_path):
+async def test_second_start_while_active_raises_live_already_active(tmp_path):
     """Second concurrent /start is rejected with the active session id
     so the phone can switch to the take-over affordance without polling
     /status separately."""
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            manager = StreamManager(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = LiveManager(loop)
             session_id, _answer = await manager.start(WebRtcStartRequest(sdp_offer="v=0\r\noffer-1\r\n"))
             assert manager.is_active
 
-            with pytest.raises(StreamAlreadyActive) as exc_info:
+            with pytest.raises(LiveAlreadyActive) as exc_info:
                 await manager.start(WebRtcStartRequest(sdp_offer="v=0\r\noffer-2\r\n"))
             assert exc_info.value.active_session_id == session_id
 
@@ -435,8 +435,8 @@ async def test_takeover_replaces_active_session_with_new_id(tmp_path):
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            manager = StreamManager(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = LiveManager(loop)
             first_id, _ = await manager.start(WebRtcStartRequest(sdp_offer="v=0\r\noffer-1\r\n"))
             first_session = manager._session
             assert first_session is not None
@@ -459,8 +459,8 @@ async def test_takeover_with_no_active_session_just_starts(tmp_path):
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            manager = StreamManager(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = LiveManager(loop)
             assert not manager.is_active
             session_id, _ = await manager.takeover(WebRtcStartRequest(sdp_offer="v=0\r\noffer\r\n"))
             assert manager.is_active
@@ -477,11 +477,11 @@ async def test_stop_unknown_session_raises(tmp_path):
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            manager = StreamManager(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            manager = LiveManager(loop)
             from uuid import uuid4
 
-            with pytest.raises(StreamNotActive):
+            with pytest.raises(LiveNotActive):
                 await manager.stop(uuid4())
     finally:
         await loop.stop()
@@ -492,7 +492,7 @@ async def test_stop_unknown_session_raises(tmp_path):
 
 @pytest.mark.asyncio
 async def test_pause_resume_returns_to_same_slide(tmp_path):
-    """Stream takeover pauses the loop mid-cycle; resume puts the same
+    """Live takeover pauses the loop mid-cycle; resume puts the same
     slide back on screen. Per §5.11: pause+resume, not restart-from-
     slide-start (sub-second position-within-slide isn't tracked, but
     the slide identity is)."""
@@ -549,7 +549,7 @@ async def test_pause_when_loop_not_running_is_noop(tmp_path):
 async def test_phantom_session_watchdog_closes_on_no_track(tmp_path, monkeypatch):
     """Phase 12.1 Finding #2: a bogus SDP that parses + answers cleanly
     but never delivers a real track produces a "phantom" session — the
-    PC is open, StreamManager.is_active=True, but no media flows. The
+    PC is open, LiveManager.is_active=True, but no media flows. The
     phantom-session watchdog should auto-close after _PHANTOM_TIMEOUT_
     SECONDS, flipping closed=True so is_active turns False on the next
     /status query.
@@ -558,13 +558,13 @@ async def test_phantom_session_watchdog_closes_on_no_track(tmp_path, monkeypatch
     never invokes it (no real ICE / DTLS / SRTP), simulating exactly
     the "answered but no track" failure mode."""
     # Compress the watchdog timeout so the test runs in <0.5s.
-    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
 
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            session = StreamSession(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
             await session.start_webrtc("v=0\r\nbogus-no-media\r\n")
             assert not session.closed
             # Wait past the watchdog timeout. on_track never fires
@@ -586,13 +586,13 @@ async def test_phantom_watchdog_canceled_on_normal_close(tmp_path, monkeypatch):
     watchdog timer fires) cancels the watchdog so it doesn't dangle
     + race with the explicit close. Without this, the watchdog could
     fire its own log.warning ('phantom') even on a clean close."""
-    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS", 5.0)
 
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            session = StreamSession(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
             await session.start_webrtc("v=0\r\noffer\r\n")
             # Close before the 5s timeout would fire.
             await session.close()
@@ -607,15 +607,15 @@ async def test_phantom_watchdog_canceled_on_normal_close(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_streamsession_start_pauses_playback_close_resumes(tmp_path):
-    """Direct integration: StreamSession.start_webrtc() pauses the
-    loop, StreamSession.close() resumes. This is the contract
-    StreamManager relies on — verified separately from the manager so
+    """Direct integration: LiveSession.start_webrtc() pauses the
+    loop, LiveSession.close() resumes. This is the contract
+    LiveManager relies on — verified separately from the manager so
     a manager-side bug doesn't mask a session-side regression."""
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
     try:
-        with patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection):
-            session = StreamSession(loop)
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
             await session.start_webrtc("v=0\r\noffer\r\n")
             await _wait_until(lambda: loop.is_paused)
             assert loop.is_paused
@@ -676,7 +676,7 @@ def _patch_mock_ffmpeg(
 
 @pytest.mark.asyncio
 async def test_start_stream_session_pulls_frames(tmp_path, monkeypatch):
-    """End-to-end: StreamManager.start() with a StreamStartRequest
+    """End-to-end: LiveManager.start() with a StreamStartRequest
     spawns an FfmpegStreamSource, pumps the (mock) ffmpeg's frames to
     the renderer, and pauses the playlist. The slice-4 gate.
 
@@ -701,7 +701,7 @@ async def test_start_stream_session_pulls_frames(tmp_path, monkeypatch):
 
     renderer.render_frame = _record
     try:
-        manager = StreamManager(loop)
+        manager = LiveManager(loop)
         session_id, answer = await manager.start(
             StreamStartRequest(url="rtsp://laptop:8554/live")
         )
@@ -741,7 +741,7 @@ async def test_stream_session_has_no_peer_connection(tmp_path, monkeypatch):
     loop, _renderer = _empty_loop(tmp_path)
     await loop.start()
     try:
-        session = StreamSession(loop)
+        session = LiveSession(loop)
         await session.start_stream("rtsp://laptop:8554/live")
         assert session._pc is None
         # C2: the stream path arms a first-frame watchdog.
@@ -773,7 +773,7 @@ async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(
     The watchdog timeout is compressed via monkeypatch so the test
     runs fast — mirrors `test_phantom_session_watchdog_closes_on_no_
     track`."""
-    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
     # n_frames=0 → the mock ffmpeg emits nothing and exits: the
     # "unreachable URL" failure mode (ffmpeg/ffprobe yields no media).
     _patch_mock_ffmpeg(
@@ -783,7 +783,7 @@ async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(
     loop, _renderer = _empty_loop(tmp_path)
     await loop.start()
     try:
-        manager = StreamManager(loop)
+        manager = LiveManager(loop)
         session_id, _answer = await manager.start(
             StreamStartRequest(url="rtsp://dead-host:8554/nothing")
         )
@@ -843,7 +843,7 @@ async def test_stream_takeover_midstream_pump_exit_does_not_freeze_playlist(
     renderer.render_frame = _record
     await loop.start()
     try:
-        manager = StreamManager(loop)
+        manager = LiveManager(loop)
         session_id, _answer = await manager.start(
             StreamStartRequest(url="rtsp://laptop:8554/live")
         )
@@ -887,7 +887,7 @@ async def test_stream_takeover_healthy_stream_stays_active(tmp_path, monkeypatch
     # ffmpeg's spawn + first frame land inside it — the watchdog must
     # see the first frame and disarm. The test waits past this window
     # below: if a healthy session were wrongly killable it'd be caught.
-    monkeypatch.setattr(StreamSession, "_PHANTOM_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS", 1.0)
 
     import functools
 
@@ -914,7 +914,7 @@ async def test_stream_takeover_healthy_stream_stays_active(tmp_path, monkeypatch
     renderer.render_frame = _record
     await loop.start()
     try:
-        manager = StreamManager(loop)
+        manager = LiveManager(loop)
         session_id, _answer = await manager.start(
             StreamStartRequest(url="rtsp://laptop:8554/live")
         )

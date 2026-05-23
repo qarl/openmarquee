@@ -1,9 +1,9 @@
-"""Endpoint coverage for /api/stream/* (SYSTEM_SPEC §6 + §5.11).
+"""Endpoint coverage for /api/live/* (SYSTEM_SPEC §6 + §5.11).
 
 Asserts the wire contract — request/response shapes, status codes,
 overrides for active-session error reporting. The deeper behavioral
 coverage (frame format, takeover semantics, pause+resume against the
-loop) is in test_stream.py; here we just walk the four endpoints'
+loop) is in test_live.py; here we just walk the four endpoints'
 external contract.
 """
 
@@ -17,14 +17,14 @@ from fastapi.testclient import TestClient
 from openmarquee.app import app
 from openmarquee.dependencies import (
     _playback_loop_singleton,
-    _stream_manager_singleton,
+    _live_manager_singleton,
     get_playback_loop,
-    get_stream_manager,
+    get_live_manager,
 )
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
-from openmarquee.stream import StreamManager
-from tests.test_stream import _FakeRTCPeerConnection
+from openmarquee.live import LiveManager
+from tests.test_live import _FakeRTCPeerConnection
 
 
 @pytest.fixture
@@ -39,28 +39,28 @@ def loop(tmp_path) -> PlaybackLoop:
 
 
 @pytest.fixture
-def manager(loop: PlaybackLoop) -> StreamManager:
-    return StreamManager(loop)
+def manager(loop: PlaybackLoop) -> LiveManager:
+    return LiveManager(loop)
 
 
 @pytest.fixture
-def client(loop: PlaybackLoop, manager: StreamManager):
+def client(loop: PlaybackLoop, manager: LiveManager):
     app.dependency_overrides[get_playback_loop] = lambda: loop
-    app.dependency_overrides[get_stream_manager] = lambda: manager
+    app.dependency_overrides[get_live_manager] = lambda: manager
     try:
         with (
-            patch("openmarquee.stream.RTCPeerConnection", _FakeRTCPeerConnection),
+            patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection),
             TestClient(app) as test_client,
         ):
             yield test_client
     finally:
         app.dependency_overrides.clear()
-        _stream_manager_singleton.cache_clear()
+        _live_manager_singleton.cache_clear()
         _playback_loop_singleton.cache_clear()
 
 
 def test_status_idle_when_no_session(client: TestClient):
-    response = client.get("/api/stream/status")
+    response = client.get("/api/live/status")
     assert response.status_code == 200
     body = response.json()
     assert body["state"] == "idle"
@@ -75,7 +75,7 @@ def test_status_idle_when_no_session(client: TestClient):
 
 def test_start_returns_session_id_and_answer_sdp(client: TestClient):
     response = client.post(
-        "/api/stream/start",
+        "/api/live/start",
         json={"sdp_offer": "v=0\r\noffer\r\n"},
     )
     assert response.status_code == 200
@@ -87,10 +87,10 @@ def test_start_returns_session_id_and_answer_sdp(client: TestClient):
 
 def test_status_reports_active_after_start(client: TestClient):
     start = client.post(
-        "/api/stream/start",
+        "/api/live/start",
         json={"sdp_offer": "v=0\r\noffer\r\n"},
     ).json()
-    status = client.get("/api/stream/status").json()
+    status = client.get("/api/live/status").json()
     assert status["state"] == "active"
     assert status["session_id"] == start["session_id"]
     # Phase A.2: started_at flows through both /start and /status so
@@ -112,7 +112,7 @@ def test_status_started_at_is_none_when_idle(client: TestClient):
     """Phase A.2: /status returns started_at=null when no session is
     active, so the phone can distinguish 'no live session' from
     'live session, just no Elapsed yet'."""
-    body = client.get("/api/stream/status").json()
+    body = client.get("/api/live/status").json()
     assert body["state"] == "idle"
     assert body["started_at"] is None
 
@@ -121,33 +121,33 @@ def test_second_start_returns_409_with_active_session_id(client: TestClient):
     """Phone needs the active session id back so it can switch from
     'Go Live' to 'Take Over' without a separate /status round trip."""
     first = client.post(
-        "/api/stream/start",
+        "/api/live/start",
         json={"sdp_offer": "v=0\r\noffer-1\r\n"},
     ).json()
 
     second = client.post(
-        "/api/stream/start",
+        "/api/live/start",
         json={"sdp_offer": "v=0\r\noffer-2\r\n"},
     )
     assert second.status_code == 409
     detail = second.json()["detail"]
-    assert detail["error"] == "stream_already_active"
+    assert detail["error"] == "live_already_active"
     assert detail["active_session_id"] == first["session_id"]
 
 
 def test_stop_tears_down_session(client: TestClient):
     start = client.post(
-        "/api/stream/start",
+        "/api/live/start",
         json={"sdp_offer": "v=0\r\noffer\r\n"},
     ).json()
 
     stop = client.post(
-        "/api/stream/stop",
+        "/api/live/stop",
         json={"session_id": start["session_id"]},
     )
     assert stop.status_code == 204
 
-    status = client.get("/api/stream/status").json()
+    status = client.get("/api/live/status").json()
     assert status["state"] == "idle"
     assert status["session_id"] is None
 
@@ -156,7 +156,7 @@ def test_stop_unknown_session_returns_404(client: TestClient):
     from uuid import uuid4
 
     response = client.post(
-        "/api/stream/stop",
+        "/api/live/stop",
         json={"session_id": str(uuid4())},
     )
     assert response.status_code == 404
@@ -164,26 +164,26 @@ def test_stop_unknown_session_returns_404(client: TestClient):
 
 def test_takeover_replaces_active_session(client: TestClient):
     first = client.post(
-        "/api/stream/start",
+        "/api/live/start",
         json={"sdp_offer": "v=0\r\noffer-1\r\n"},
     ).json()
 
     second = client.post(
-        "/api/stream/takeover",
+        "/api/live/takeover",
         json={"sdp_offer": "v=0\r\noffer-2\r\n"},
     )
     assert second.status_code == 200
     second_body = second.json()
     assert second_body["session_id"] != first["session_id"]
 
-    status = client.get("/api/stream/status").json()
+    status = client.get("/api/live/status").json()
     assert status["state"] == "active"
     assert status["session_id"] == second_body["session_id"]
 
 
 def test_takeover_with_no_active_session_starts_one(client: TestClient):
     response = client.post(
-        "/api/stream/takeover",
+        "/api/live/takeover",
         json={"sdp_offer": "v=0\r\noffer\r\n"},
     )
     assert response.status_code == 200
@@ -197,7 +197,7 @@ def test_hardware_tier_json_round_trips():
     """HardwareTier survives a model_dump -> model_validate round trip
     for both the basic and good tiers — the /status wire shape and any
     persisted form stay stable."""
-    from openmarquee.api_stream import HardwareTier
+    from openmarquee.api_live import HardwareTier
 
     for tier in (
         HardwareTier(name="basic", max_width=854, max_height=480, max_fps=30),
@@ -209,7 +209,7 @@ def test_hardware_tier_json_round_trips():
 
 def test_good_tier_is_pi4_1080p():
     """The `good` tier (Pi 4/5) is 1920×1080/30 per STREAM_VLC §7."""
-    from openmarquee.api_stream import _GOOD_TIER
+    from openmarquee.api_live import _GOOD_TIER
 
     assert _GOOD_TIER.name == "good"
     assert (_GOOD_TIER.max_width, _GOOD_TIER.max_height) == (1920, 1080)
@@ -219,7 +219,7 @@ def test_good_tier_is_pi4_1080p():
 def test_source_tier_table_covers_both_sources():
     """The per-source tier table has an entry for each stream source
     (webrtc + rtsp); both are basic today."""
-    from openmarquee.api_stream import _BASIC_TIER, _SOURCE_TIERS
+    from openmarquee.api_live import _BASIC_TIER, _SOURCE_TIERS
 
     assert set(_SOURCE_TIERS) == {"webrtc", "stream"}
     assert all(tier == _BASIC_TIER for tier in _SOURCE_TIERS.values())
@@ -228,7 +228,7 @@ def test_source_tier_table_covers_both_sources():
 def test_status_tier_shape_is_complete(client: TestClient):
     """/status reports a fully-formed tier object (name + all three
     caps) — the phone reads every field to clamp its capture."""
-    body = client.get("/api/stream/status").json()
+    body = client.get("/api/live/status").json()
     tier = body["tier"]
     assert set(tier) == {"name", "max_width", "max_height", "max_fps"}
     assert tier["name"] in ("basic", "good", "future")
@@ -243,7 +243,7 @@ def test_start_legacy_body_without_kind_still_works(client: TestClient):
     as a WebRTC start — the deployed phone client predates the stream
     work and must not break."""
     response = client.post(
-        "/api/stream/start", json={"sdp_offer": "v=0\r\noffer\r\n"}
+        "/api/live/start", json={"sdp_offer": "v=0\r\noffer\r\n"}
     )
     assert response.status_code == 200
     assert response.json()["sdp_answer"]  # WebRTC start has an answer
@@ -266,18 +266,18 @@ def test_start_stream_returns_session_without_sdp_answer(
     )
 
     response = client.post(
-        "/api/stream/start",
+        "/api/live/start",
         json={"kind": "stream", "url": "rtsp://laptop:8554/live"},
     )
     assert response.status_code == 200
     body = response.json()
     assert "session_id" in body
     assert body["sdp_answer"] is None
-    assert client.get("/api/stream/status").json()["state"] == "active"
+    assert client.get("/api/live/status").json()["state"] == "active"
     # Stop the session so the real ffmpeg subprocess is reaped inside
     # this test's event loop (the WebRTC tests use a fake PC and have
     # no subprocess to clean up).
     stop = client.post(
-        "/api/stream/stop", json={"session_id": body["session_id"]}
+        "/api/live/stop", json={"session_id": body["session_id"]}
     )
     assert stop.status_code == 204

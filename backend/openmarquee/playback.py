@@ -140,8 +140,8 @@ class PlaybackLoop:
         self._auto_tick = auto_tick_seconds
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
-        # Pause/resume for stream takeover (SYSTEM_SPEC §5.11). When a
-        # stream session is active, it pause()s the loop, takes over
+        # Pause/resume for live takeover (SYSTEM_SPEC §5.11). When a
+        # live session is active, it pause()s the loop, takes over
         # render_frame() calls itself, then resume()s when done. Two
         # events because asyncio.Event has no "wait for clear": _pause
         # set means "stop rendering and yield", _resume set means
@@ -235,16 +235,16 @@ class PlaybackLoop:
     def is_paused(self) -> bool:
         """True when a pause has been requested and not yet resumed.
 
-        Stream takeover (SYSTEM_SPEC §5.11) flips this on while a
-        WebRTC session is active so the playback loop yields the
-        renderer to the stream's frame source.
+        Live takeover (SYSTEM_SPEC §5.11) flips this on while a
+        live session is active so the playback loop yields the
+        renderer to the session's frame source.
         """
         return self._pause_event is not None and self._pause_event.is_set()
 
     @property
     def renderer(self) -> Renderer:
         """The renderer the loop drives. Exposed so a paused loop's
-        external frame source (e.g. the stream session) can push frames
+        external frame source (e.g. the live session) can push frames
         through the same wire format the loop normally uses, instead of
         instantiating a parallel renderer."""
         return self._renderer
@@ -608,9 +608,9 @@ class PlaybackLoop:
     async def _wait(self, seconds: float) -> None:
         """Sleep up to `seconds`, returning early on stop or pause request.
 
-        Pause-awareness keeps stream takeover responsive: without it, a
+        Pause-awareness keeps live takeover responsive: without it, a
         5-second slide on screen would mean up to 5s of playlist render
-        before the stream session's pause() actually yields the renderer.
+        before the live session's pause() actually yields the renderer.
         """
         assert self._stop_event is not None
         assert self._pause_event is not None
@@ -633,9 +633,9 @@ class PlaybackLoop:
     async def _wait_for_resume(self) -> None:
         """Block until resume_event is set OR stop_event is set.
 
-        Used by the outer-while when a stream takeover has paused the
+        Used by the outer-while when a live takeover has paused the
         loop — we yield indefinitely (no rendering, no advancing) until
-        the stream session ends or the loop is asked to stop entirely.
+        the live session ends or the loop is asked to stop entirely.
         """
         assert self._resume_event is not None
         assert self._stop_event is not None
@@ -655,7 +655,7 @@ class PlaybackLoop:
     async def pause(self) -> None:
         """Request the loop yield rendering. No-op if not running.
 
-        Used by Stream takeover (SYSTEM_SPEC §5.11): when a WebRTC
+        Used by Live takeover (SYSTEM_SPEC §5.11): when a live
         session activates, it pause()s the loop, takes over render_frame
         calls itself, then resume()s when the session ends. Idempotent —
         repeated pause() calls don't accumulate state.

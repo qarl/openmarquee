@@ -21,7 +21,7 @@ from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
-from openmarquee.api_stream import router as stream_router
+from openmarquee.api_live import router as live_router
 from openmarquee.api_system import router as system_router
 from openmarquee.dependencies import (
     get_auth_storage,
@@ -34,7 +34,7 @@ from openmarquee.dependencies import (
     get_schedule_storage,
     get_seed_marker_path,
     get_settings_storage,
-    get_stream_manager,
+    get_live_manager,
 )
 from openmarquee.dev import router as dev_router
 from openmarquee.perf_middleware import PerfMiddleware
@@ -165,13 +165,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             log.exception("startup pull worker autostart failed")
     yield
-    # Tear down any active stream session BEFORE the playback loop stops
+    # Tear down any active live session BEFORE the playback loop stops
     # so the session's close() can resume() the loop cleanly even though
     # the loop is about to exit. Order matters less now that resume() is
     # a no-op against a stopped loop, but the explicit shutdown order is
     # cheaper than reasoning about the race later.
     with suppress(Exception):
-        await get_stream_manager().stop_all()
+        await get_live_manager().stop_all()
     await get_playback_loop().stop()
     with suppress(Exception):
         await get_pull_worker().stop()
@@ -246,7 +246,7 @@ app.include_router(schedule_router)
 app.include_router(settings_router)
 app.include_router(backgrounds_router)
 app.include_router(playback_router)
-app.include_router(stream_router)
+app.include_router(live_router)
 app.include_router(system_router)
 app.include_router(flock_router)
 

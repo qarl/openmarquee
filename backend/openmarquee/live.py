@@ -1,4 +1,4 @@
-"""Stream takeover (SYSTEM_SPEC §5.11 + docs/STREAM_VLC_PROPOSAL.md).
+"""Live takeover (SYSTEM_SPEC §5.11 + docs/STREAM_VLC_PROPOSAL.md).
 
 A live source preempts the active playlist on the device's screen.
 Two transports:
@@ -14,12 +14,12 @@ resumes the same slide it was on when the session ends.
 
 Two classes:
 
-- StreamManager — process-singleton holding at most one StreamSession
-  at a time. /api/stream/start refuses if one's already active;
-  /api/stream/takeover force-stops + restarts. start()/takeover()
+- LiveManager — process-singleton holding at most one LiveSession
+  at a time. /api/live/start refuses if one's already active;
+  /api/live/takeover force-stops + restarts. start()/takeover()
   dispatch on the request's `kind`.
 
-- StreamSession — one takeover. It owns a StreamSource and a pump
+- LiveSession — one takeover. It owns a StreamSource and a pump
   task draining it to the renderer; the WebRTC transport additionally
   owns an RTCPeerConnection + a phantom-track watchdog. close() tears
   down whichever transport is in use and resumes the loop.
@@ -53,47 +53,50 @@ class WebRtcStartRequest(BaseModel):
 
 
 class StreamStartRequest(BaseModel):
-    """Start a stream takeover. `url` is the network stream URL the
-    operator is publishing (e.g. rtsp://laptop:8554/live)."""
+    """Start a stream-transport takeover. `url` is the network stream
+    URL the operator is publishing (e.g. rtsp://laptop:8554/live).
+
+    Named for the TRANSPORT (a network stream), not the panel — the
+    same body shape is reused inside the live-takeover panel."""
 
     kind: Literal["stream"] = "stream"
     url: str
 
 
-# The /api/stream/start + /takeover request body. A plain (non-
+# The /api/live/start + /takeover request body. A plain (non-
 # discriminated) union, so Pydantic's smart matching applies: each
 # variant's `kind` has a default, which means a legacy body with no
 # `kind` ({"sdp_offer": ...}) still validates as a WebRtcStartRequest
-# — the deployed phone client predates the stream work and must keep
-# working until its UI bundle is refreshed.
-StreamStartBody = Union[WebRtcStartRequest, StreamStartRequest]
+# — the deployed phone client predates the stream-transport work and
+# must keep working until its UI bundle is refreshed.
+LiveStartBody = Union[WebRtcStartRequest, StreamStartRequest]
 
 
-class StreamAlreadyActive(Exception):
-    """Raised when /api/stream/start is called with a session active.
+class LiveAlreadyActive(Exception):
+    """Raised when /api/live/start is called with a session active.
 
     The route catches this and returns 409 with the active session id,
     so the phone can surface a "take over" affordance.
     """
 
     def __init__(self, active_session_id: UUID):
-        super().__init__(f"stream session {active_session_id} is already active")
+        super().__init__(f"live session {active_session_id} is already active")
         self.active_session_id = active_session_id
 
 
-class StreamNotActive(Exception):
-    """Raised when /api/stream/stop is called for an unknown session id.
+class LiveNotActive(Exception):
+    """Raised when /api/live/stop is called for an unknown session id.
 
     Either nothing is active, or a different phone owns the active
     session. The route returns 404.
     """
 
     def __init__(self, session_id: UUID):
-        super().__init__(f"no active stream session {session_id}")
+        super().__init__(f"no active live session {session_id}")
         self.session_id = session_id
 
 
-class StreamSession:
+class LiveSession:
     """One takeover feeding the playback engine.
 
     The session owns a `StreamSource` and a pump task that drains it
@@ -102,7 +105,7 @@ class StreamSession:
     - `start_webrtc()` — a phone-camera takeover: negotiate SDP on an
       RTCPeerConnection, wrap the inbound track in a
       `WebRtcStreamSource`, and arm a phantom-track watchdog.
-    - `start_stream()` — a stream takeover: wrap an
+    - `start_stream()` — a stream-transport takeover: wrap an
       `FfmpegStreamSource` (ffmpeg pulling the stream URL); no peer
       connection, no SDP, no watchdog.
 
@@ -126,7 +129,7 @@ class StreamSession:
     # TODO(qarl-confirm): default mitigation is timeout-based.
     # Alternative #1: pre-validate SDP at the API boundary (parse
     # the m= sections, require a video media line). Pro: rejects
-    # at /api/stream/start before any session exists. Con: needs
+    # at /api/live/start before any session exists. Con: needs
     # an SDP parser, can miss subtle malformed cases that aiortc
     # would still accept-but-not-negotiate.
     # Alternative #2: poll RTCPeerConnection.connectionState every
@@ -141,10 +144,10 @@ class StreamSession:
     def __init__(self, playback: PlaybackLoop):
         self._playback = playback
         self.id: UUID = uuid4()
-        # Wall-clock timestamp at session creation. The Stream UI's
+        # Wall-clock timestamp at session creation. The Live UI's
         # Elapsed metric ticks against (now - started_at) read off
-        # /api/stream/status, so the value survives a panel re-mount
-        # mid-stream (Phase A.2 — closes the loop on QA's A.2 callout).
+        # /api/live/status, so the value survives a panel re-mount
+        # mid-session (Phase A.2 — closes the loop on QA's A.2 callout).
         # UTC explicit so the JSON response is unambiguous; the phone
         # subtracts wall-clock-now in the same UTC frame.
         self.started_at: datetime = datetime.now(UTC)
@@ -153,7 +156,7 @@ class StreamSession:
         self._source: WebRtcStreamSource | FfmpegStreamSource | None = None
         self._pump_task: asyncio.Task | None = None
         self._closed = False
-        # WebRTC-transport-only state (stays None for a stream session).
+        # WebRTC-transport-only state (stays None for a stream-transport session).
         self._pc: RTCPeerConnection | None = None
         # Phase 12.1 Finding #2: signaled when the first on_track
         # event fires. The phantom-session watchdog awaits this with
@@ -179,7 +182,7 @@ class StreamSession:
 
         Returns the SDP answer (with ICE candidates baked in — non-trickle
         for v1 per §5.11). The caller hands this back to the phone in the
-        same /api/stream/start response.
+        same /api/live/start response.
         """
         self._pc = RTCPeerConnection()
         source = WebRtcStreamSource(self._playback.renderer)
@@ -205,7 +208,7 @@ class StreamSession:
         # for the first track event; if no track materializes (bogus
         # SDP that answered cleanly but had no real media, phone
         # crashed mid-handshake, etc.) the session is auto-closed.
-        # Closing flips _closed=True, which makes StreamManager.
+        # Closing flips _closed=True, which makes LiveManager.
         # is_active return False on the next /status query — the
         # phone will see the session has gone away.
         self._watchdog_task = asyncio.create_task(self._watch_for_first_track())
@@ -214,8 +217,8 @@ class StreamSession:
         return self._pc.localDescription.sdp
 
     async def start_stream(self, stream_url: str) -> None:
-        """Stream takeover: pause playback and start pumping the stream
-        source.
+        """Stream-transport takeover: pause playback and start pumping
+        the stream source.
 
         There is no SDP and no peer connection — but there IS a first-
         frame watchdog, symmetric to the WebRTC phantom-track watchdog.
@@ -232,7 +235,7 @@ class StreamSession:
         validates the URL scheme and raises `ValueError` for a
         non-stream scheme (file://, pipe:, …) before any subprocess
         is spawned. That `ValueError` propagates out of start_stream →
-        StreamManager.start/takeover → the /api/stream route's
+        LiveManager.start/takeover → the /api/live route's
         catch-all, which returns a 400 — so the operator-takeover
         path is covered without a separate check here.
         """
@@ -262,7 +265,7 @@ class StreamSession:
                 # wait — nothing to do.
                 return
             log.warning(
-                "stream: session %s saw no track within %.1fs; closing as phantom",
+                "live: session %s saw no track within %.1fs; closing as phantom",
                 self.id,
                 self._PHANTOM_TIMEOUT_SECONDS,
             )
@@ -296,7 +299,7 @@ class StreamSession:
                 # pump's own teardown) during the wait — nothing to do.
                 return
             log.warning(
-                "stream: session %s rendered no frame within %.1fs; "
+                "live: session %s rendered no frame within %.1fs; "
                 "closing as unreachable",
                 self.id,
                 self._PHANTOM_TIMEOUT_SECONDS,
@@ -352,7 +355,7 @@ class StreamSession:
                     dims = source.frame_dims() if hasattr(source, "frame_dims") else None
                     if dims is None:
                         log.error(
-                            "stream: NV12 source yielded a frame before "
+                            "live: NV12 source yielded a frame before "
                             "its source dimensions were known; stopping "
                             "the frame pump."
                         )
@@ -367,7 +370,7 @@ class StreamSession:
                     )
                 except Exception:
                     log.error(
-                        "stream: renderer rejected a pushed frame — "
+                        "live: renderer rejected a pushed frame — "
                         "push-frame rendering is unavailable; stopping "
                         "the frame pump."
                     )
@@ -387,7 +390,7 @@ class StreamSession:
             try:
                 renderer.end_external_frames()
             except Exception:
-                log.exception("stream: end_external_frames failed")
+                log.exception("live: end_external_frames failed")
             # Stream hardening C2 (findings M1+M2): a stream pump that
             # has exited MUST NOT leave the session is_active. If the
             # pump is here because the source ran dry (ffmpeg crashed,
@@ -425,8 +428,10 @@ class StreamSession:
         # when the watchdog is the caller (TimeoutError path → close()
         # → here), since that task is itself currently running and
         # cancelling it would self-cancel awkwardly. Self-cancel is
-        # detected via `asyncio.current_task()`. (Stream sessions have
-        # no watchdog — _watchdog_task stays None.)
+        # detected via `asyncio.current_task()`. (Stream-transport
+        # sessions also have a watchdog — _watch_for_first_frame —
+        # which goes through this same cancel path; the None case
+        # only applies if start_* raised before arming the watchdog.)
         if (
             self._watchdog_task is not None
             and not self._watchdog_task.done()
@@ -468,8 +473,8 @@ class StreamSession:
             await self._playback.resume()
 
 
-class StreamManager:
-    """Single-publisher state. Owns at most one StreamSession at a time.
+class LiveManager:
+    """Single-publisher state. Owns at most one LiveSession at a time.
 
     Process-singleton in production (wired in dependencies.py); tests
     instantiate one per fixture.
@@ -477,7 +482,7 @@ class StreamManager:
 
     def __init__(self, playback: PlaybackLoop):
         self._playback = playback
-        self._session: StreamSession | None = None
+        self._session: LiveSession | None = None
         # Serializes start/stop/takeover so two concurrent phone requests
         # can't end up with two live sessions or a half-closed one.
         self._lock = asyncio.Lock()
@@ -494,7 +499,7 @@ class StreamManager:
     def active_session_started_at(self) -> datetime | None:
         """Wall-clock timestamp the active session was created.
 
-        Surfaced through /api/stream/status so the publishing phone's
+        Surfaced through /api/live/status so the publishing phone's
         Elapsed counter ticks against the device's authoritative start
         time — survives a panel re-mount and is correct even if the
         phone's clock is skewed from the device's. None when no
@@ -504,30 +509,30 @@ class StreamManager:
 
     @staticmethod
     async def _start_session(
-        session: StreamSession, request: StreamStartBody
+        session: LiveSession, request: LiveStartBody
     ) -> str | None:
         """Run the transport-specific start for `request`'s kind.
 
-        Returns the SDP answer for a WebRTC start, or None for a stream
-        start (there is no answer to hand back)."""
+        Returns the SDP answer for a WebRTC start, or None for a
+        stream-transport start (there is no answer to hand back)."""
         if isinstance(request, WebRtcStartRequest):
             return await session.start_webrtc(request.sdp_offer)
         return await session.start_stream(request.url)
 
     async def start(
-        self, request: StreamStartBody
+        self, request: LiveStartBody
     ) -> tuple[UUID, str | None]:
         """Negotiate a new session. Returns (session_id, sdp_answer);
-        sdp_answer is None for a stream start.
+        sdp_answer is None for a stream-transport start.
 
-        Raises StreamAlreadyActive if a session is already running —
+        Raises LiveAlreadyActive if a session is already running —
         the phone should switch to the take-over affordance.
         """
         async with self._lock:
             if self.is_active:
                 assert self._session is not None
-                raise StreamAlreadyActive(self._session.id)
-            session = StreamSession(self._playback)
+                raise LiveAlreadyActive(self._session.id)
+            session = LiveSession(self._playback)
             try:
                 answer_sdp = await self._start_session(session, request)
             except Exception:
@@ -539,7 +544,7 @@ class StreamManager:
             return (session.id, answer_sdp)
 
     async def takeover(
-        self, request: StreamStartBody
+        self, request: LiveStartBody
     ) -> tuple[UUID, str | None]:
         """Force-stop any active session, then start a new one.
 
@@ -549,7 +554,7 @@ class StreamManager:
         async with self._lock:
             if self._session is not None:
                 await self._stop_locked()
-            session = StreamSession(self._playback)
+            session = LiveSession(self._playback)
             try:
                 answer_sdp = await self._start_session(session, request)
             except Exception:
@@ -559,11 +564,11 @@ class StreamManager:
             return (session.id, answer_sdp)
 
     async def stop(self, session_id: UUID) -> None:
-        """Stop the named session. Raises StreamNotActive if it isn't
+        """Stop the named session. Raises LiveNotActive if it isn't
         the currently-active session (or nothing is active)."""
         async with self._lock:
             if self._session is None or self._session.id != session_id:
-                raise StreamNotActive(session_id)
+                raise LiveNotActive(session_id)
             await self._stop_locked()
 
     async def stop_all(self) -> None:
