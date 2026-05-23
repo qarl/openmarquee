@@ -35,14 +35,78 @@ jobs:
         working-directory: backend
         run: pytest
 
+  # Builds renderer-wasm/pkg/ via the canonical local script
+  # (scripts/build_wasm_renderer.sh: cargo wasm32 build +
+  # wasm-bindgen-cli post-process). pkg/ is gitignored — consumers
+  # (ui, e2e) download it as an artifact instead of building twice.
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # Cache cargo registry + ~/.cargo/bin/wasm-bindgen + the
+      # renderer-wasm target dir. Key on renderer-wasm/Cargo.lock so
+      # a wasm-bindgen version bump (Cargo.toml edit → lock refresh)
+      # flushes the cache automatically. Cold ~3-5 min (cargo install
+      # wasm-bindgen-cli dominates); warm ~20s.
+      - name: Cache cargo + wasm-bindgen-cli + renderer-wasm target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/wasm-bindgen
+            renderer-wasm/target
+          key: wasm-bindgen-${{ runner.os }}-${{ hashFiles('renderer-wasm/Cargo.lock') }}
+          restore-keys: |
+            wasm-bindgen-${{ runner.os }}-
+      # Pinned to 0.2.121 per scripts/build_wasm_renderer.sh comment:
+      # Cargo.toml declares wasm-bindgen "0.2.95" but the lock resolves
+      # to 0.2.121 transitively. CLI must match the resolved version
+      # or wasm-bindgen warns about ABI drift.
+      #
+      # Version-check (not just existence-check): the cache `restore-keys`
+      # fallback can hand back a wasm-bindgen binary from an older
+      # Cargo.lock that pinned a DIFFERENT version. An existence-only
+      # guard would skip install + we'd silently glue the wrong ABI.
+      # --force is required because cargo install refuses to overwrite
+      # an existing binary at the same path otherwise.
+      - name: Install wasm-bindgen-cli 0.2.121 (if not at correct version)
+        run: |
+          if ! "$HOME/.cargo/bin/wasm-bindgen" --version 2>/dev/null | grep -q '0\.2\.121'; then
+            cargo install wasm-bindgen-cli --version 0.2.121 --force
+          fi
+      - name: Build renderer-wasm
+        run: bash scripts/build_wasm_renderer.sh
+      - name: Upload renderer-wasm/pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: renderer-wasm-pkg
+          path: renderer-wasm/pkg/
+          retention-days: 1
+          if-no-files-found: error
+
   ui:
     runs-on: ubuntu-latest
+    needs: build-wasm
     steps:
       - uses: actions/checkout@v4
       - name: Set up Node 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # Resolves the gitignored renderer-wasm/pkg/ import in
+      # ui/src/wasm-renderer.js — esbuild needs it on disk to bundle.
+      # vitest doesn't (vitest.config.js aliases to a test-stub) so
+      # this only matters for the bundle step.
+      - name: Download renderer-wasm/pkg artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: renderer-wasm-pkg
+          path: renderer-wasm/pkg/
       - name: Install UI dependencies
         working-directory: ui
         run: npm ci
@@ -77,7 +141,7 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
-    needs: [backend, ui]
+    needs: [backend, ui, build-wasm]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python 3.11
@@ -91,9 +155,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # Same artifact the ui job consumes — Playwright loads pages
+      # that import ui/dist/main.js (built below), which transitively
+      # imports renderer-wasm/pkg/. Without pkg/ on disk the bundle
+      # build fails and Playwright then 404s on /dist/main.js.
+      - name: Download renderer-wasm/pkg artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: renderer-wasm-pkg
+          path: renderer-wasm/pkg/
       - name: Install UI dependencies
         working-directory: ui
         run: npm ci
+      - name: esbuild bundle
+        working-directory: ui
+        run: npm run build
       - name: Install Playwright Chromium
         working-directory: ui
         run: npx playwright install --with-deps chromium
