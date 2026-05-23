@@ -9877,6 +9877,110 @@ mod tests {
         );
     }
 
+    /// Regression-lock for the black-flash-at-transition-boundaries fix
+    /// (commit `7c605cce`, 2026-05-09 — backlog item #3).
+    ///
+    /// The fix introduced `held_scanout_fb` / `held_scanout_bo` on
+    /// `EglSession` plus a single `end_of_in_session_render_call` helper
+    /// that all 5 in-session render entry points call at end-of-call,
+    /// so the scanout framebuffer is held across in-session call
+    /// boundaries and `modeset_done` stays TRUE for the session's
+    /// lifetime after the first SetCrtc. Pre-fix: SetCrtc re-fired
+    /// 35/4000 frames at 1920×1080@60 on the vc4 (the Pi-bench in the
+    /// commit message). Post-fix: 1 fire per session (the bring-up).
+    ///
+    /// The bug is *silent* — no panic, no test failure, the symptom is
+    /// only visible on glass as a one-frame black flash at every
+    /// hold↔transition boundary. A refactor that drops the helper call
+    /// from one of the 5 in-session entry points, OR re-introduces
+    /// `modeset_done = false` anywhere post-session-init, would
+    /// reintroduce the bug without `cargo test` catching it. This is
+    /// the source-grep fence the recon doc anticipated.
+    ///
+    /// See `docs/black-flash-at-transition-boundaries-recon.md` §4
+    /// lines 162-170 for the sketched assertion + rationale.
+    ///
+    /// Like the `legacy_3pass_transition_re_bakes_*` test above, this
+    /// is a structural-grep test rather than a behavioral one because
+    /// the GL-scanout + SetCrtc state is un-mockable. A benign string
+    /// refactor (renaming the helper, rewording the struct-init in a
+    /// way that changes the grep-matched substring) will legitimately
+    /// trip this — fix the assertion + the recon doc cross-ref when
+    /// that happens; don't silently delete the test.
+    #[test]
+    fn black_flash_fix_structural_invariants_hold_across_in_session_boundaries() {
+        let hdmi_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hdmi.rs");
+        let source = std::fs::read_to_string(&hdmi_path).unwrap_or_else(|e| {
+            panic!(
+                "must read {} for black-flash regression check: {e}",
+                hdmi_path.display(),
+            )
+        });
+
+        // ---- Affirmative invariant ----
+        //
+        // `end_of_in_session_render_call(` must appear at least 6 times
+        // in hdmi.rs: 1 definition + 5 in-session render-entry-point
+        // callers (per the recon's audit at §4 lines 162-170, verified
+        // at HEAD against the live source 2026-05-22). Drop below 6 and
+        // at least one in-session path is no longer threading the
+        // end-of-call cleanup; the next call into that path will
+        // re-fire SetCrtc (visible as a one-frame black flash on glass).
+        let helper_matches = source.matches("end_of_in_session_render_call(").count();
+        assert!(
+            helper_matches >= 6,
+            "expected ≥6 occurrences of `end_of_in_session_render_call(` \
+             in renderer/src/hdmi.rs (1 defn + 5 in-session callers); \
+             found {helper_matches}. A refactor likely dropped the helper \
+             call from at least one of the 5 in-session render entry \
+             points; the scanout framebuffer is no longer held across \
+             that path's call boundary; SetCrtc will re-fire on the next \
+             in-session render call into the unwired path; visible black \
+             flash regression on glass. Re-thread the helper at every \
+             entry point, OR update this lower bound if the entry-point \
+             set legitimately changed (the recon doc's call-site list at \
+             docs/black-flash-at-transition-boundaries-recon.md §4 \
+             lines 162-170 is authoritative).",
+        );
+
+        // ---- Anti-pattern invariant ----
+        //
+        // `modeset_done = false` must NEVER appear as a CODE statement
+        // (only as the `modeset_done: false` struct-init at session
+        // creation, which uses `:` not `=`, and possibly as a substring
+        // inside doc-comments narrating the OLD bug). Re-introducing the
+        // assignment would force the next in-session render call to
+        // take the SetCrtc-fires-again path; visible black flash.
+        //
+        // We strip `//`-style line comments before checking so the
+        // narration on hdmi.rs:1097 ("/// resetting modeset_done =
+        // false (which forced the NEXT call's …") doesn't spuriously
+        // trip the assertion.
+        let mut anti_pattern_lines: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in source.lines().enumerate() {
+            let code = match line.find("//") {
+                Some(cmt) => &line[..cmt],
+                None => line,
+            };
+            if code.contains("modeset_done = false") {
+                anti_pattern_lines.push((idx + 1, line.trim().to_string()));
+            }
+        }
+        assert!(
+            anti_pattern_lines.is_empty(),
+            "modeset_done must NEVER be reset to false post-session-init \
+             (the struct-init at session creation uses `:`, not `=`, so it \
+             does NOT match `modeset_done = false`). A reset re-enables \
+             the SetCrtc-fires-again path; visible black flash at the \
+             next in-session render call. Offending line(s): {:?}. \
+             Recon: docs/black-flash-at-transition-boundaries-recon.md \
+             §4 lines 162-170.",
+            anti_pattern_lines,
+        );
+    }
+
     // wrap_text_to_width — 2026-05-17 port of the JS+Python helpers.
     // Each test pins one branch of the greedy line-fill algorithm; the
     // max_width is computed from the actual rasterized advance widths
