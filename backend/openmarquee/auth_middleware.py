@@ -48,48 +48,50 @@ log = logging.getLogger(__name__)
 # Exact-match paths that bypass auth. Everything else falls through to
 # the bearer check (with prefix-match for /static/, /fonts/,
 # /api/flock/asset/).
-_WHITELIST_EXACT: frozenset[str] = frozenset({
-    "/healthz",
-    "/",
-    # UI shells served by the StaticFiles mount. These are inert HTML
-    # pages -- the actual editor only opens after main.js fetches the
-    # token-gated /api endpoints, which still require auth. (20.2: the
-    # captive-portal phone flow needs to reach welcome / login / set-
-    # password BEFORE the operator has a token; the StaticFiles mount
-    # exposes them with the literal .html paths.)
-    "/welcome",          # 20.1: kept for /welcome (no .html) form
-    "/welcome.html",     # 20.2: actual served path
-    "/login",
-    "/login.html",
-    "/set-password.html",
-    "/index.html",
-    "/spike.html",       # ffmpeg-wasm spike page, exercised by smoke.spec.js
-    "/styles.css",       # main stylesheet referenced by index.html
-    "/favicon.ico",
-    "/api/auth/status",
-    "/api/auth/set-password",
-    "/api/auth/login",
-    # Peer-callable flock endpoints -- the spec authorizes them via
-    # Tailscale ACL, not bearer token (a peer device doesn't have
-    # the local operator's password).
-    "/api/flock/manifest",
-    "/api/flock/notify",
-    "/api/flock/sync-announce",
-    "/api/flock/hello",
-    # Bug 5 (qarl 2026-05-16): cross-flock readable thumbnails. The
-    # flock panel on each device renders one tile per peer with a
-    # live PNG of what that peer is currently playing — fetched
-    # directly from the peer's /api/playback/current-thumbnail
-    # (cover art) or /current-frame (live composite). The peer
-    # endpoint already implements an Origin allowlist (see
-    # cors_headers_for_origin + the operator's flock-membership
-    # list in api_playback.py); that CORS allowlist + tailnet
-    # ACL together are the auth boundary for cross-flock reads.
-    # Header-bearer auth doesn't apply: our local operator's
-    # token isn't signed against a peer's AuthState.
-    "/api/playback/current-thumbnail",
-    "/api/playback/current-frame",
-})
+_WHITELIST_EXACT: frozenset[str] = frozenset(
+    {
+        "/healthz",
+        "/",
+        # UI shells served by the StaticFiles mount. These are inert HTML
+        # pages -- the actual editor only opens after main.js fetches the
+        # token-gated /api endpoints, which still require auth. (20.2: the
+        # captive-portal phone flow needs to reach welcome / login / set-
+        # password BEFORE the operator has a token; the StaticFiles mount
+        # exposes them with the literal .html paths.)
+        "/welcome",  # 20.1: kept for /welcome (no .html) form
+        "/welcome.html",  # 20.2: actual served path
+        "/login",
+        "/login.html",
+        "/set-password.html",
+        "/index.html",
+        "/spike.html",  # ffmpeg-wasm spike page, exercised by smoke.spec.js
+        "/styles.css",  # main stylesheet referenced by index.html
+        "/favicon.ico",
+        "/api/auth/status",
+        "/api/auth/set-password",
+        "/api/auth/login",
+        # Peer-callable flock endpoints -- the spec authorizes them via
+        # Tailscale ACL, not bearer token (a peer device doesn't have
+        # the local operator's password).
+        "/api/flock/manifest",
+        "/api/flock/notify",
+        "/api/flock/sync-announce",
+        "/api/flock/hello",
+        # Bug 5 (qarl 2026-05-16): cross-flock readable thumbnails. The
+        # flock panel on each device renders one tile per peer with a
+        # live PNG of what that peer is currently playing — fetched
+        # directly from the peer's /api/playback/current-thumbnail
+        # (cover art) or /current-frame (live composite). The peer
+        # endpoint already implements an Origin allowlist (see
+        # cors_headers_for_origin + the operator's flock-membership
+        # list in api_playback.py); that CORS allowlist + tailnet
+        # ACL together are the auth boundary for cross-flock reads.
+        # Header-bearer auth doesn't apply: our local operator's
+        # token isn't signed against a peer's AuthState.
+        "/api/playback/current-thumbnail",
+        "/api/playback/current-frame",
+    }
+)
 
 # Prefix-match paths. Order doesn't matter; first-match wins on the
 # any() iteration below.
@@ -102,6 +104,14 @@ _WHITELIST_PREFIX: tuple[str, ...] = (
     # main.js can attach an Authorization header; gating them would
     # 401 the editor itself on every load.
     "/dist/",
+    # Live-takeover test harness — ui/test/fake-camera.html + the
+    # bundled fixture.mp4 (Phase 12.x dispatch). Same auth shape as
+    # /dist/: the HTML loads unauthenticated, then its inline JS reads
+    # the operator's existing bearer token from localStorage and uses
+    # it on the /api/live/* calls. The page itself exposes no secrets.
+    # Naturally absent from a production image — ui/dist/ ships, ui/
+    # /test/ doesn't, so this prefix has no security cost there.
+    "/test/",
     # Peer-fetch route: /api/flock/asset/<UUID>/<filename>. Same
     # tailnet-ACL rationale as the flock list above.
     "/api/flock/asset/",
@@ -241,13 +251,15 @@ async def _send_401(send: Any, not_configured: bool) -> None:
         else "authentication required"
     )
     body = json.dumps({"detail": detail}).encode("utf-8")
-    await send({
-        "type": "http.response.start",
-        "status": 401,
-        "headers": [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(body)).encode("ascii")),
-            (b"www-authenticate", b"Bearer"),
-        ],
-    })
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"www-authenticate", b"Bearer"),
+            ],
+        }
+    )
     await send({"type": "http.response.body", "body": body})
