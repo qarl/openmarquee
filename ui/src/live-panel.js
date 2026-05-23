@@ -1073,13 +1073,33 @@ export function mountLivePanel(container, options = {}) {
         // and bails — regardless of whether it observes the new
         // "idle" phase or the prior "take-over-prompt" phase.
         mountInitCancelled = true;
-        // TODO(qarl-confirm): Cancel from a mount-time take-over-prompt
-        // currently drops to plain idle — no viewfinder. With preview-
-        // on-mount, the alternative is to re-run mountInit() so /status
-        // is rechecked and the camera opens if the prior publisher has
-        // since stopped. Defaulted to idle for the simplest semantics
-        // (operator chose Cancel = "I want out") — flip to mountInit()
-        // re-trigger if the empty panel feels jarring after Cancel.
+        // Cancel from a mount-time take-over-prompt drops to plain
+        // idle (no viewfinder reopen). Decision-record per QA dispatch
+        // M5 closure (2026-05-23):
+        //
+        //   Path A (chosen) — Cancel = "I want out". Operator's
+        //     explicit choice; returning the panel to a clean,
+        //     request-driven state respects their intent. Next Go
+        //     Live click re-runs the full request flow + reopens
+        //     the camera.
+        //
+        //   Path B (alternative, deferred) — re-run mountInit() to
+        //     recheck /api/live/status + reopen the camera if the
+        //     prior publisher has since stopped. Trigger to flip:
+        //     operators consistently flag the empty-panel-after-
+        //     cancel UX as jarring. No such report as of M5
+        //     closure. If flipped: the mountInitCancelled latch
+        //     above must be reset before the re-invocation, and
+        //     the Bug-6 race-fix logic at live-panel.test.js:565+
+        //     needs a parallel pass.
+        //
+        // The no-backend-call contract (cancel never POSTs to
+        // /api/live/*) is locked by `test_ui_live_cancel_*` in
+        // backend/tests/test_ui_live_cancel_takeover.py. A future
+        // "helpful" refactor that adds e.g. /api/live/stop here
+        // would 404 noisily (no session exists at cancel time
+        // when reached via the mount-time-prompt path); the static
+        // lock catches that on commit.
         state.phase = "idle";
         setMessage("");
         render();
