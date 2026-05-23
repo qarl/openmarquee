@@ -132,7 +132,7 @@ already_done() {
 # will use.
 if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
     {
-        printf '\n=== install.sh START: %s ===\n' "$(date -Iseconds 2>/dev/null || date)"
+        printf '\n=== install.sh START: %s ===\n' "$(date -u -Iseconds 2>/dev/null || date -u)"
         printf '\n--- /proc/cmdline ---\n'
         cat /proc/cmdline 2>&1 || true
         printf '\n--- uname -a ---\n'
@@ -167,7 +167,7 @@ snapshot_state() {
     local debug_log="/var/log/openmarquee-debug.log"
     {
         printf '\n\n================================================================\n'
-        printf '=== snapshot: %s at %s ===\n' "$tag" "$(date -Iseconds 2>/dev/null || date)"
+        printf '=== snapshot: %s at %s ===\n' "$tag" "$(date -u -Iseconds 2>/dev/null || date -u)"
         printf '================================================================\n'
         printf '\n--- systemctl status (relevant units) ---\n'
         systemctl status hostapd dnsmasq NetworkManager openmarquee-backend openmarquee-firstboot openmarquee-ap0 2>&1 || true

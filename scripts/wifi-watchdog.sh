@@ -26,7 +26,7 @@ STATE_FILE=/var/run/wifi-watchdog.fails
 LOG=/var/log/wifi-watchdog.log
 THRESHOLD=3
 
-ts() { date -Iseconds; }
+ts() { date -u -Iseconds; }
 
 fails=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
 gw=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')

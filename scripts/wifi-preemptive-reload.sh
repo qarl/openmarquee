@@ -46,7 +46,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 LOG=/var/log/wifi-preemptive-reload.log
 
-ts() { date -Iseconds; }
+ts() { date -u -Iseconds; }
 
 echo "$(ts): start preemptive NetworkManager cycle" >> "$LOG"
 
