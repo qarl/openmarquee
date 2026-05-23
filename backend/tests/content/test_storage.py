@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -401,13 +401,13 @@ def test_save_stamps_envelope_with_updated_at(tmp_path: Path):
     stamp = storage.read_updated_at(slide.id)
     # Tz-aware and recent (within a few seconds of now).
     assert stamp.tzinfo is not None
-    assert (datetime.now(timezone.utc) - stamp).total_seconds() < 5
+    assert (datetime.now(UTC) - stamp).total_seconds() < 5
 
 
 def test_save_accepts_explicit_updated_at_for_peer_ingest(tmp_path: Path):
     storage = ContentStorage(tmp_path)
     slide = _make_slide()
-    fixed = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    fixed = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
     storage.save(slide, b"\x89PNG", updated_at=fixed)
     assert storage.read_updated_at(slide.id) == fixed
 
@@ -429,7 +429,7 @@ def test_read_updated_at_falls_back_to_mtime_for_pre_flock_envelopes(tmp_path: P
     epoch = 1700000000
     os.utime(envelope_path, (epoch, epoch))
     stamp = storage.read_updated_at(slide.id)
-    assert stamp == datetime.fromtimestamp(epoch, tz=timezone.utc)
+    assert stamp == datetime.fromtimestamp(epoch, tz=UTC)
 
 
 # --- Batch 7.1: mtime cache tests ---
@@ -586,7 +586,7 @@ def test_load_migrates_legacy_vlc_stream_envelope(tmp_path: Path):
     item_id = uuid4()
     legacy_envelope = {
         "schema_version": SCHEMA_VERSION,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
         "item": {
             "type": "vlc_stream",
             "id": str(item_id),
@@ -596,7 +596,7 @@ def test_load_migrates_legacy_vlc_stream_envelope(tmp_path: Path):
             "on_unreachable": "black",
             "transition": "cut",
             "transition_ms": 500,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
         },
     }
     item_dir = tmp_path / str(item_id)

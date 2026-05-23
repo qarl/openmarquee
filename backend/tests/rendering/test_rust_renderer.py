@@ -43,7 +43,6 @@ from openmarquee.rendering.rust_renderer import (
     SlideComplete,
 )
 
-
 # ============================================================
 # Fake sidecar subprocess script.
 #
@@ -793,10 +792,9 @@ def test_context_manager_closes_on_exit(make_renderer):
 
 def test_context_manager_closes_even_on_exception(make_renderer):
     r = make_renderer()
-    with pytest.raises(RuntimeError, match="boom"):
-        with r:
-            assert r.is_alive
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"), r:
+        assert r.is_alive
+        raise RuntimeError("boom")
     assert r.is_alive is False
 
 

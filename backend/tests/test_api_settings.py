@@ -392,11 +392,11 @@ def auth_client(
     mint the token + use the standard Authorization: Bearer header
     pattern.
     """
+    from openmarquee.auth import AuthStorage
     from openmarquee.dependencies import (
         _auth_storage_singleton,
         get_auth_storage,
     )
-    from openmarquee.auth import AuthStorage
 
     auth_path = tmp_path / "auth.json"
     auth_storage = AuthStorage(auth_path)
@@ -569,6 +569,7 @@ def test_scrubbed_error_summary_strips_ctx_key():
     helper's `ctx` strip; the validator-message convention is a
     separate upstream constraint."""
     from pydantic import BaseModel, ValidationError, field_validator
+
     from openmarquee.api_settings import _scrubbed_error_summary
 
     class _Probe(BaseModel):

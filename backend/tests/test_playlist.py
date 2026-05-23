@@ -13,7 +13,6 @@ from openmarquee.playlist import (
     PlaylistStorage,
 )
 
-
 # --- Legacy single-playlist API (operates on the default playlist by id) ---
 
 

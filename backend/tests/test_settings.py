@@ -12,7 +12,6 @@ from openmarquee.settings import (
     SystemSettings,
 )
 
-
 # --- Defaults ---
 
 

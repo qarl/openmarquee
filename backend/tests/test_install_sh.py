@@ -365,7 +365,7 @@ def test_dry_run_chmod_plus_x_on_system_sh_helpers(dry_output: str) -> None:
         "openmarquee-tailscale.sh",
     ]:
         assert (
-            f"chmod +x" in dry_output and helper in dry_output
+            "chmod +x" in dry_output and helper in dry_output
         ), f"system helper {helper} must be chmod +x'd"
 
 

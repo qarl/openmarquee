@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -26,7 +26,6 @@ from openmarquee.dependencies import (
 from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync, NotifyKind
 from openmarquee.tombstone import TombstoneStorage
-
 
 # Minimal valid 1x1 PNG for content upload endpoints (Pillow-generated).
 _TINY_PNG_B64 = (
@@ -555,7 +554,7 @@ def test_notify_endpoint_delegates_to_sync(recording_client):
     assert cid_seen == cid
     assert kind_seen == "updated"
     assert sender_seen == "peer.ts.net"
-    assert at_seen == datetime(2026, 4, 24, 12, 0, 0, tzinfo=timezone.utc)
+    assert at_seen == datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC)
 
 
 def test_notify_endpoint_rejects_unknown_kind(recording_client):
@@ -670,7 +669,7 @@ def test_peer_ingested_content_does_not_trigger_outbound_push(
 
     overridden_content = app.dependency_overrides[get_content_storage]()
     slide = TextSlide(name="Ingested", text_layers=[TextLayer(text="from peer")])
-    overridden_content.save(slide, b"", updated_at=datetime.now(timezone.utc))
+    overridden_content.save(slide, b"", updated_at=datetime.now(UTC))
 
     # A follow-up API roundtrip is needed to flush any pending backgrounds
     # (TestClient drains them synchronously at context exit).
@@ -743,7 +742,7 @@ def test_delete_of_unknown_id_leaves_no_tombstone(
 def test_manifest_filters_expired_tombstones(tmp_path: Path):
     # Build a manifest client whose tombstone log is seeded directly with
     # one fresh + one expired entry, and confirm only the fresh one surfaces.
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from openmarquee.content.storage import ContentStorage
     from openmarquee.dependencies import (
@@ -760,7 +759,7 @@ def test_manifest_filters_expired_tombstones(tmp_path: Path):
     flock = FlockStorage(tmp_path / "flock.json")
     content = ContentStorage(tmp_path / "content")
     tombstones = TombstoneStorage(tmp_path / "tombstones.json")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fresh_id = uuid4()
     stale_id = uuid4()
     tombstones.add(fresh_id, now=now - timedelta(days=1))

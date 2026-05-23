@@ -12,7 +12,6 @@ runs on Mac with no NetworkManager / no Pi. What we DO verify:
 from __future__ import annotations
 
 import importlib
-from typing import Optional
 from unittest.mock import MagicMock
 
 import pytest

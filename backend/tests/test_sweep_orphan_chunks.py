@@ -9,13 +9,9 @@ file (main.js / login.js / set-password.js / ...) references.
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 import stat
+import subprocess
 from pathlib import Path
-
-import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SWEEP = _REPO_ROOT / "scripts" / "demo" / "sweep_orphan_chunks.sh"

@@ -414,7 +414,6 @@ class TestAutoFallbackRenderer:
         wrapper swaps to MockRenderer and replays the same frame
         against it. is_in_fallback becomes True permanently."""
         from openmarquee.dependencies import AutoFallbackRenderer
-        from openmarquee.rendering.mock import MockRenderer
         from openmarquee.rendering.rust_renderer import (
             RustRendererSubprocessError,
         )
@@ -738,8 +737,9 @@ class TestAutoFallbackRenderer:
         SubprocessError first (UnsupportedSlideError isn't a
         SubprocessError subclass), but if the class hierarchy ever
         shifts, this test catches the regression."""
-        import openmarquee.dependencies as deps_module
         import inspect
+
+        import openmarquee.dependencies as deps_module
 
         src = inspect.getsource(deps_module.AutoFallbackRenderer._forward_ipc_op)
         unsupported_at = src.find("RustRendererUnsupportedSlideError")

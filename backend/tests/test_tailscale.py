@@ -8,9 +8,7 @@ sub-command, exits on time.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import stat
 from pathlib import Path
 

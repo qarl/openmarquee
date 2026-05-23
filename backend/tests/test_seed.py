@@ -18,7 +18,6 @@ from openmarquee.seed import (
     seed_if_needed,
 )
 
-
 _FAKE_MP4 = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 120
 
 

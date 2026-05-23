@@ -35,7 +35,6 @@ from openmarquee.rendering.rust_renderer import (
     SlideComplete,
 )
 
-
 _FAST_DURATION_MS = 100  # model minimum; keeps test runtime sub-second
 
 

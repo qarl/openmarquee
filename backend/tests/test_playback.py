@@ -8,7 +8,6 @@ import pytest
 from PIL import Image
 
 from openmarquee.content import (
-    ImageSlide,
     StreamSlide,
     TextLayer,
     TextSlide,

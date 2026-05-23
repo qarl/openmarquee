@@ -139,9 +139,13 @@ def test_load_background_lru_skips_png_decode_on_cache_hit():
     returns the cached Image without a fresh decode. Sweep #2 #15."""
     from io import BytesIO
     from uuid import uuid4
+
     from PIL import Image as _Image
+
     from openmarquee.auto_render import (
-        load_background, _stats, clear_image_bg_cache,
+        _stats,
+        clear_image_bg_cache,
+        load_background,
     )
 
     clear_image_bg_cache()
@@ -175,10 +179,15 @@ def test_load_background_lru_evicts_at_cap():
     the (cap+1)th add evicts the oldest."""
     from io import BytesIO
     from uuid import uuid4
+
     from PIL import Image as _Image
+
     from openmarquee.auto_render import (
-        _IMAGE_BG_LRU_MAX, _image_bg_cache, load_background, _stats,
+        _IMAGE_BG_LRU_MAX,
+        _image_bg_cache,
+        _stats,
         clear_image_bg_cache,
+        load_background,
     )
 
     clear_image_bg_cache()

@@ -79,7 +79,7 @@ def _log_fetch_failure(slide: WebSlide, msg: str, *args) -> None:
 
 async def fetch_web_screenshot(
     slide: WebSlide,
-    storage: "ContentStorage",
+    storage: ContentStorage,
     width: int,
     height: int,
 ) -> bool:

@@ -1,7 +1,7 @@
 """Unit tests for the tombstone log (recently-deleted content breadcrumbs)."""
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -44,8 +44,8 @@ def test_add_then_load_round_trips(storage: TombstoneStorage):
 
 def test_add_same_id_twice_refreshes_timestamp(storage: TombstoneStorage):
     cid = uuid4()
-    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    t1 = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    t1 = datetime(2026, 2, 1, tzinfo=UTC)
     storage.add(cid, now=t0)
     storage.add(cid, now=t1)
     loaded = storage.load()
@@ -57,7 +57,7 @@ def test_list_active_filters_out_expired(tmp_path: Path):
     storage = TombstoneStorage(tmp_path / "t.json", ttl_days=30)
     fresh = uuid4()
     stale = uuid4()
-    now = datetime(2026, 4, 24, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 24, tzinfo=UTC)
     storage.add(fresh, now=now - timedelta(days=5))
     storage.add(stale, now=now - timedelta(days=40))
     active = storage.list_active(now=now)
@@ -66,7 +66,7 @@ def test_list_active_filters_out_expired(tmp_path: Path):
 
 def test_prune_expired_removes_from_disk(tmp_path: Path):
     storage = TombstoneStorage(tmp_path / "t.json", ttl_days=30)
-    now = datetime(2026, 4, 24, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 24, tzinfo=UTC)
     storage.add(uuid4(), now=now - timedelta(days=40))
     storage.add(uuid4(), now=now - timedelta(days=5))
     removed = storage.prune_expired(now=now)

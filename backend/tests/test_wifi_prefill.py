@@ -14,8 +14,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from openmarquee.wifi_prefill import read_system_wifi
 
 

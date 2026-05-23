@@ -20,8 +20,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from openmarquee.flock import Flock, FlockStorage
 from openmarquee.playlist import (
     DEFAULT_PLAYLIST_NAME,
@@ -31,7 +29,6 @@ from openmarquee.playlist import (
 from openmarquee.schedule import Schedule, ScheduleStorage
 from openmarquee.settings import SettingsStorage, SystemSettings
 from openmarquee.tombstone import TombstoneLog, TombstoneStorage
-
 
 # --- the recovery contract, asserted per storage class ---
 

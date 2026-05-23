@@ -30,8 +30,6 @@ import pytest
 from PIL import Image
 
 from openmarquee.content import TextSlide
-from openmarquee.playback import PlaybackLoop
-from openmarquee.rendering.mock import MockRenderer
 from openmarquee.live import (
     LiveAlreadyActive,
     LiveManager,
@@ -40,6 +38,8 @@ from openmarquee.live import (
     StreamStartRequest,
     WebRtcStartRequest,
 )
+from openmarquee.playback import PlaybackLoop
+from openmarquee.rendering.mock import MockRenderer
 from openmarquee.stream_source import WebRtcStreamSource
 
 _FAST_DURATION_MS = 100

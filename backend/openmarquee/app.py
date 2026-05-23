@@ -17,16 +17,17 @@ from openmarquee.api import router as content_router
 from openmarquee.api_auth import router as auth_router
 from openmarquee.api_backgrounds import router as backgrounds_router
 from openmarquee.api_flock import router as flock_router
+from openmarquee.api_live import router as live_router
 from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
-from openmarquee.api_live import router as live_router
 from openmarquee.api_system import router as system_router
 from openmarquee.dependencies import (
     get_auth_storage,
     get_content_storage,
     get_demo_video_path,
+    get_live_manager,
     get_playback_loop,
     get_playlist_storage,
     get_pull_worker,
@@ -34,7 +35,6 @@ from openmarquee.dependencies import (
     get_schedule_storage,
     get_seed_marker_path,
     get_settings_storage,
-    get_live_manager,
 )
 from openmarquee.dev import router as dev_router
 from openmarquee.perf_middleware import PerfMiddleware
