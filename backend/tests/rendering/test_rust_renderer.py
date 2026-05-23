@@ -546,9 +546,7 @@ def test_request_json_encoding_matches_spec(make_renderer, tmp_path):
 # tests exercise the Python proxy's wire encoding + error-promotion
 # behavior; the actual shader-uniform update is covered by the Rust-
 # side unit tests (renderer/src/playback.rs::validate_reconfigure).
-def test_reconfigure_brightness_serializes_to_expected_body(
-    make_renderer, tmp_path
-):
+def test_reconfigure_brightness_serializes_to_expected_body(make_renderer, tmp_path):
     """`reconfigure(brightness=0.5)` emits the canonical wire body
     `{"op":"reconfigure","params":{"brightness":0.5}}` — the form the
     sidecar's validate_reconfigure consumes."""
@@ -599,9 +597,7 @@ def test_reconfigure_rotation_typed_error_propagates_with_stable_prefix(
         r.open()
         with pytest.raises(RustRendererOpError) as exc_info:
             r.reconfigure(rotation=180)
-        assert exc_info.value.message.startswith(
-            "reconfigure: unsupported field 'rotation'"
-        )
+        assert exc_info.value.message.startswith("reconfigure: unsupported field 'rotation'")
     finally:
         r.close()
 
@@ -612,17 +608,14 @@ def test_reconfigure_invalid_value_typed_error_propagates(make_renderer):
     for '<field>'"`. Surfaces as RustRendererOpError; prefix-stable
     so the Python side can branch on field name."""
     wire = (
-        "reconfigure: invalid value for 'brightness' — "
-        "got 1.5; expected finite float in [0.0, 1.0]"
+        "reconfigure: invalid value for 'brightness' — got 1.5; expected finite float in [0.0, 1.0]"
     )
     r = make_renderer(env_extra={"FAKE_SIDECAR_RECONFIGURE_ERR": wire})
     try:
         r.open()
         with pytest.raises(RustRendererOpError) as exc_info:
             r.reconfigure(brightness=1.5)
-        assert exc_info.value.message.startswith(
-            "reconfigure: invalid value for 'brightness'"
-        )
+        assert exc_info.value.message.startswith("reconfigure: invalid value for 'brightness'")
     finally:
         r.close()
 

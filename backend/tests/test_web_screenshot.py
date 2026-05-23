@@ -43,8 +43,7 @@ def _clear_failure_throttle():
     web_screenshot._failed_slide_ids.clear()
 
 
-def _install_render(monkeypatch, *, png=None, raise_exc=None, calls=None,
-                    on_call=None):
+def _install_render(monkeypatch, *, png=None, raise_exc=None, calls=None, on_call=None):
     """Patch `web_screenshot.render_web_png` with a synchronous fake.
 
     `png` is returned; `raise_exc` is raised instead. `calls` (a list)
@@ -123,9 +122,7 @@ async def test_render_error_leaves_asset_untouched(tmp_path, monkeypatch):
     storage.save_web(slide)
     before = storage.read_asset(slide.id)
 
-    _install_render(
-        monkeypatch, raise_exc=WebRenderError("Chromium crashed")
-    )
+    _install_render(monkeypatch, raise_exc=WebRenderError("Chromium crashed"))
 
     ok = await fetch_web_screenshot(slide, storage, 1360, 768)
 
@@ -142,9 +139,7 @@ async def test_invalid_url_leaves_asset_untouched(tmp_path, monkeypatch):
     storage.save_web(slide)
     before = storage.read_asset(slide.id)
 
-    _install_render(
-        monkeypatch, raise_exc=ValueError("unsupported URL scheme")
-    )
+    _install_render(monkeypatch, raise_exc=ValueError("unsupported URL scheme"))
 
     ok = await fetch_web_screenshot(slide, storage, 1360, 768)
 
@@ -227,9 +222,7 @@ async def test_renders_are_serialized(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_failure_warns_repeat_failure_debugs(
-    tmp_path, monkeypatch, caplog
-):
+async def test_first_failure_warns_repeat_failure_debugs(tmp_path, monkeypatch, caplog):
     """The first failure for a slide id logs WARNING; a second
     consecutive failure for the same id logs DEBUG — so a persistently
     broken URL on a short refresh interval doesn't WARNING-spam."""
@@ -237,9 +230,7 @@ async def test_first_failure_warns_repeat_failure_debugs(
     slide = _web_slide()
     storage.save_web(slide)
 
-    _install_render(
-        monkeypatch, raise_exc=WebRenderError("render failed")
-    )
+    _install_render(monkeypatch, raise_exc=WebRenderError("render failed"))
 
     with caplog.at_level(logging.DEBUG, logger="openmarquee.web_screenshot"):
         ok1 = await fetch_web_screenshot(slide, storage, 1360, 768)
@@ -250,22 +241,15 @@ async def test_first_failure_warns_repeat_failure_debugs(
 
     assert ok1 is False and ok2 is False
     # First failure -> WARNING.
-    assert any(
-        r.levelno == logging.WARNING and "render failed" in r.message
-        for r in first_records
-    )
+    assert any(r.levelno == logging.WARNING and "render failed" in r.message for r in first_records)
     # Second failure for the SAME id -> DEBUG, not WARNING.
-    failure_lines = [
-        r for r in second_records if "render failed" in r.message
-    ]
+    failure_lines = [r for r in second_records if "render failed" in r.message]
     assert failure_lines
     assert all(r.levelno == logging.DEBUG for r in failure_lines)
 
 
 @pytest.mark.asyncio
-async def test_success_clears_the_failure_throttle(
-    tmp_path, monkeypatch, caplog
-):
+async def test_success_clears_the_failure_throttle(tmp_path, monkeypatch, caplog):
     """A success between failures clears the throttle entry, so the
     next failure for that id WARNINGs afresh rather than being
     DEBUG-suppressed."""
@@ -289,10 +273,7 @@ async def test_success_clears_the_failure_throttle(
     caplog.clear()
     with caplog.at_level(logging.DEBUG, logger="openmarquee.web_screenshot"):
         await fetch_web_screenshot(slide, storage, 1360, 768)
-    assert any(
-        r.levelno == logging.WARNING and "down again" in r.message
-        for r in caplog.records
-    )
+    assert any(r.levelno == logging.WARNING and "down again" in r.message for r in caplog.records)
 
 
 # --- memory-pressure gate (postmortem mitigation #3, 2026-05-23) ----------
@@ -308,9 +289,7 @@ async def test_success_clears_the_failure_throttle(
 
 
 @pytest.mark.asyncio
-async def test_skips_when_mem_available_under_floor(
-    tmp_path, monkeypatch, caplog
-):
+async def test_skips_when_mem_available_under_floor(tmp_path, monkeypatch, caplog):
     """MemAvailable below the 80 MB default floor -> skip + False +
     no render call. INFO-level log naming the pressure and thresholds
     so the operator sees the timeline."""
@@ -321,9 +300,7 @@ async def test_skips_when_mem_available_under_floor(
 
     calls: list = []
     _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
-    monkeypatch.setattr(
-        web_screenshot, "_read_meminfo", lambda: (70, 10)
-    )
+    monkeypatch.setattr(web_screenshot, "_read_meminfo", lambda: (70, 10))
 
     with caplog.at_level(logging.INFO, logger="openmarquee.web_screenshot"):
         ok = await fetch_web_screenshot(slide, storage, 1360, 768)
@@ -340,9 +317,7 @@ async def test_skips_when_mem_available_under_floor(
 
 
 @pytest.mark.asyncio
-async def test_skips_when_swap_used_over_ceiling(
-    tmp_path, monkeypatch, caplog
-):
+async def test_skips_when_swap_used_over_ceiling(tmp_path, monkeypatch, caplog):
     """SwapUsed above the 30 MB default ceiling -> skip + False + no
     render call, even when MemAvailable is comfortable."""
     storage = ContentStorage(tmp_path)
@@ -352,9 +327,7 @@ async def test_skips_when_swap_used_over_ceiling(
 
     calls: list = []
     _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
-    monkeypatch.setattr(
-        web_screenshot, "_read_meminfo", lambda: (200, 40)
-    )
+    monkeypatch.setattr(web_screenshot, "_read_meminfo", lambda: (200, 40))
 
     with caplog.at_level(logging.INFO, logger="openmarquee.web_screenshot"):
         ok = await fetch_web_screenshot(slide, storage, 1360, 768)
@@ -379,9 +352,7 @@ async def test_proceeds_when_memory_ok(tmp_path, monkeypatch):
 
     calls: list = []
     _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
-    monkeypatch.setattr(
-        web_screenshot, "_read_meminfo", lambda: (200, 10)
-    )
+    monkeypatch.setattr(web_screenshot, "_read_meminfo", lambda: (200, 10))
 
     ok = await fetch_web_screenshot(slide, storage, 1360, 768)
 
@@ -425,9 +396,7 @@ async def test_env_var_overrides_floor(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENMARQUEE_WEB_RENDER_MEM_FLOOR_MB", "200")
     # 150 MB available would pass the default 80 floor; with the env
     # override at 200 it must now skip.
-    monkeypatch.setattr(
-        web_screenshot, "_read_meminfo", lambda: (150, 10)
-    )
+    monkeypatch.setattr(web_screenshot, "_read_meminfo", lambda: (150, 10))
 
     ok = await fetch_web_screenshot(slide, storage, 1360, 768)
 
@@ -448,9 +417,7 @@ async def test_skip_does_not_acquire_render_lock(tmp_path, monkeypatch):
 
     calls: list = []
     _install_render(monkeypatch, png=_PNG_1x1, calls=calls)
-    monkeypatch.setattr(
-        web_screenshot, "_read_meminfo", lambda: (10, 99)
-    )
+    monkeypatch.setattr(web_screenshot, "_read_meminfo", lambda: (10, 99))
 
     # Hold the render lock from a separate task that never releases.
     # If the gate ran AFTER the lock acquire, fetch_web_screenshot
@@ -478,9 +445,7 @@ def test_read_meminfo_returns_none_off_linux(monkeypatch, tmp_path):
     suite), the helper returns None — the fail-open signal to the
     gate. Forces the path explicitly via a missing tmp file so this
     test is deterministic on either host."""
-    monkeypatch.setattr(
-        web_screenshot, "_MEMINFO_PATH", tmp_path / "no-such-file"
-    )
+    monkeypatch.setattr(web_screenshot, "_MEMINFO_PATH", tmp_path / "no-such-file")
     assert web_screenshot._read_meminfo() is None
 
 
@@ -507,8 +472,6 @@ def test_read_meminfo_returns_none_on_missing_keys(monkeypatch, tmp_path):
     up the playback path."""
     fake = tmp_path / "meminfo"
     # No SwapTotal/SwapFree — the helper can't compute swap_used.
-    fake.write_text(
-        "MemAvailable:     122880 kB\n"
-    )
+    fake.write_text("MemAvailable:     122880 kB\n")
     monkeypatch.setattr(web_screenshot, "_MEMINFO_PATH", fake)
     assert web_screenshot._read_meminfo() is None

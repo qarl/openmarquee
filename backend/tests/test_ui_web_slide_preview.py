@@ -33,9 +33,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_WEB_SLIDE = (
-    Path(__file__).resolve().parent.parent.parent / "ui" / "src" / "web-slide.js"
-)
+_WEB_SLIDE = Path(__file__).resolve().parent.parent.parent / "ui" / "src" / "web-slide.js"
 
 
 def _read_web_slide_source() -> str:
@@ -43,8 +41,7 @@ def _read_web_slide_source() -> str:
     of the locked symbols in `//` line comments and `/* */` block
     comments don't false-pass the assertions."""
     assert _WEB_SLIDE.is_file(), (
-        f"web-slide.js not found at {_WEB_SLIDE}; relocation? "
-        f"Update the test path."
+        f"web-slide.js not found at {_WEB_SLIDE}; relocation? Update the test path."
     )
     text = _WEB_SLIDE.read_text(encoding="utf-8")
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -65,8 +62,7 @@ def test_web_slide_imports_media_src() -> None:
         "every screenshot fetch 401s."
     )
     assert "mediaSrc" in source, (
-        "mediaSrc import missing — asset URLs will lack the auth "
-        "token and 401 in production."
+        "mediaSrc import missing — asset URLs will lack the auth token and 401 in production."
     )
 
 
@@ -78,7 +74,7 @@ def test_web_slide_template_has_screenshot_img() -> None:
     forever."""
     source = _read_web_slide_source()
     assert 'class="web-preview-screenshot"' in source, (
-        "<img class=\"web-preview-screenshot\"> element missing from "
+        '<img class="web-preview-screenshot"> element missing from '
         "the template — the editor preview has no surface to render "
         "the saved slide's asset.png on."
     )
@@ -90,18 +86,17 @@ def test_web_slide_template_has_screenshot_img() -> None:
         flags=re.DOTALL,
     )
     assert img_match, (
-        "could not find the <img class=\"web-preview-screenshot\"> tag "
+        'could not find the <img class="web-preview-screenshot"> tag '
         "in a parseable shape — refactor may have split the attribute "
         "across an awkward boundary."
     )
     img_tag = img_match.group(0)
     assert "hidden" in img_tag, (
-        "<img class=\"web-preview-screenshot\"> must start `hidden` — "
+        '<img class="web-preview-screenshot"> must start `hidden` — '
         "the unsaved-draft path relies on the placeholder showing first."
     )
     assert "alt=" in img_tag, (
-        "<img class=\"web-preview-screenshot\"> missing alt attribute — "
-        "accessibility regression."
+        '<img class="web-preview-screenshot"> missing alt attribute — accessibility regression.'
     )
 
 
@@ -160,7 +155,7 @@ def test_web_slide_screenshot_has_error_fallback() -> None:
         source,
     )
     assert handler_match, (
-        "screenshotEl.addEventListener(\"error\", ...) handler not "
+        'screenshotEl.addEventListener("error", ...) handler not '
         "found — a transient asset fetch failure will leave a broken-"
         "image icon in the editor instead of the placeholder."
     )

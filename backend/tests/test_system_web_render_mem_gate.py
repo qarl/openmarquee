@@ -42,11 +42,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_WEB_SCREENSHOT = (
-    Path(__file__).resolve().parent.parent
-    / "openmarquee"
-    / "web_screenshot.py"
-)
+_WEB_SCREENSHOT = Path(__file__).resolve().parent.parent / "openmarquee" / "web_screenshot.py"
 
 
 def _read_source() -> str:
@@ -56,8 +52,7 @@ def _read_source() -> str:
     that matches the way the test target is actually written —
     docstrings are triple-quoted, comments are `#`-to-EOL."""
     assert _WEB_SCREENSHOT.is_file(), (
-        f"web_screenshot.py not found at {_WEB_SCREENSHOT}; "
-        f"relocation? Update the test path."
+        f"web_screenshot.py not found at {_WEB_SCREENSHOT}; relocation? Update the test path."
     )
     text = _WEB_SCREENSHOT.read_text(encoding="utf-8")
     # Strip triple-double-quoted docstrings (greedy non-greedy across

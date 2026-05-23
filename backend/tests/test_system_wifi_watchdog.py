@@ -49,8 +49,7 @@ def _read_script_source() -> str:
     don't false-pass the assertions. Inline `#` after code (e.g.
     `set -u  # comment`) is also stripped."""
     assert _SCRIPT.is_file(), (
-        f"wifi-watchdog.sh not found at {_SCRIPT}; relocation? "
-        f"Update the test path."
+        f"wifi-watchdog.sh not found at {_SCRIPT}; relocation? Update the test path."
     )
     text = _SCRIPT.read_text(encoding="utf-8")
     # Strip `#`-to-EOL comments. Keep the shebang (`#!`) by anchoring
@@ -103,7 +102,7 @@ def test_no_gateway_branch_restarts_network_manager() -> None:
         flags=re.DOTALL,
     )
     assert match, (
-        "could not locate the `if [ -z \"$gw\" ]; then ... elif` "
+        'could not locate the `if [ -z "$gw" ]; then ... elif` '
         "no-default-gateway branch — refactor may have restructured "
         "the control flow. Re-confirm the branch still escalates."
     )
@@ -142,7 +141,7 @@ def test_ping_fail_branch_restarts_network_manager() -> None:
     # to the closing `fi`. Greedy/non-greedy doesn't matter here —
     # the script has exactly one `else ... fi` after the ping-OK arm.
     match = re.search(
-        r'elif ping[^\n]*then.*?\belse\b(.*?)\bfi\b\s*$',
+        r"elif ping[^\n]*then.*?\belse\b(.*?)\bfi\b\s*$",
         source,
         flags=re.DOTALL,
     )
@@ -198,7 +197,7 @@ def test_path_preamble_in_script() -> None:
     break NM-restart calls."""
     source = _read_script_source()
     assert re.search(
-        r'export\s+PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        r"export\s+PATH=/usr/sbin:/usr/bin:/sbin:/bin",
         source,
     ), (
         "script PATH preamble missing — without /usr/sbin in PATH "
@@ -213,7 +212,7 @@ def test_pipefail_relaxed_for_cron_safety() -> None:
     can't abort the watchdog silently mid-cron. Postmortem §3
     flagged this as a real risk."""
     source = _read_script_source()
-    assert not re.search(r'set\s+-[eu]*e[u]*o\s+pipefail', source), (
+    assert not re.search(r"set\s+-[eu]*e[u]*o\s+pipefail", source), (
         "`set -euo pipefail` (or any combination including -e or "
         "pipefail) is present — under cron a non-zero exit from "
         "`ip route show` or a similar query would abort the "
@@ -223,7 +222,7 @@ def test_pipefail_relaxed_for_cron_safety() -> None:
     # Confirm `set -u` (unset-var safety) IS kept — catches
     # typos at runtime without killing on harmless command
     # failures.
-    assert re.search(r'^\s*set\s+-u\s*$', source, flags=re.MULTILINE), (
+    assert re.search(r"^\s*set\s+-u\s*$", source, flags=re.MULTILINE), (
         "`set -u` removed — unset-variable safety lost. Keep it "
         "(catches refactor typos like `$STATE_FIL` writing to /)."
     )
@@ -237,7 +236,7 @@ def test_cron_entry_has_30s_cadence() -> None:
     cron = _read_cron_source()
     # First line: standard every-minute fire.
     assert re.search(
-        r'^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+/usr/local/bin/wifi-watchdog\.sh\s*$',
+        r"^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+/usr/local/bin/wifi-watchdog\.sh\s*$",
         cron,
         flags=re.MULTILINE,
     ), (
@@ -248,7 +247,7 @@ def test_cron_entry_has_30s_cadence() -> None:
     # Second line: offset-by-30s fire. Match `sleep 30 &&` followed
     # by the script invocation; whitespace flexible.
     assert re.search(
-        r'^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+sleep\s+30\s*&&\s*/usr/local/bin/wifi-watchdog\.sh\s*$',
+        r"^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+sleep\s+30\s*&&\s*/usr/local/bin/wifi-watchdog\.sh\s*$",
         cron,
         flags=re.MULTILINE,
     ), (
@@ -267,7 +266,7 @@ def test_cron_entry_has_path_preamble() -> None:
     cron deploy pattern."""
     cron = _read_cron_source()
     assert re.search(
-        r'^PATH=/usr/sbin:/usr/bin:/sbin:/bin\s*$',
+        r"^PATH=/usr/sbin:/usr/bin:/sbin:/bin\s*$",
         cron,
         flags=re.MULTILINE,
     ), (

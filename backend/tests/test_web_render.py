@@ -65,9 +65,7 @@ class _FakePopen:
 
     _next_pid = 50000
 
-    def __init__(
-        self, returncode=0, stderr=b"", raise_timeout=False, calls=None
-    ):
+    def __init__(self, returncode=0, stderr=b"", raise_timeout=False, calls=None):
         self.pid = _FakePopen._next_pid
         _FakePopen._next_pid += 1
         self.returncode = returncode
@@ -136,7 +134,8 @@ def _install_fake_chromium(
     grace → SIGKILL sweep actually runs against the process group.
     """
     monkeypatch.setattr(
-        web_render.shutil, "which",
+        web_render.shutil,
+        "which",
         lambda name: which if name in web_render._CHROMIUM_BINARIES else None,
     )
 
@@ -237,17 +236,18 @@ def test_build_chromium_argv_virtual_time_budget():
     argv = _build_chromium_argv(
         "/usr/bin/chromium", "https://x.example.com", 1360, 768, "/tmp/s.png"
     )
-    assert (
-        f"--virtual-time-budget={WEB_RENDER_VIRTUAL_TIME_BUDGET_MS}" in argv
-    )
+    assert f"--virtual-time-budget={WEB_RENDER_VIRTUAL_TIME_BUDGET_MS}" in argv
 
 
 def test_build_chromium_argv_omits_headless_for_headless_shell():
     """chromium-headless-shell is inherently headless — it must NOT be
     given `--headless`; the full `chromium` browser still gets it."""
     shell = _build_chromium_argv(
-        "/usr/bin/chromium-headless-shell", "https://x.example.com",
-        1024, 600, "/tmp/s.png",
+        "/usr/bin/chromium-headless-shell",
+        "https://x.example.com",
+        1024,
+        600,
+        "/tmp/s.png",
     )
     assert "--headless" not in shell
     assert shell[0] == "/usr/bin/chromium-headless-shell"
@@ -257,7 +257,11 @@ def test_build_chromium_argv_omits_headless_for_headless_shell():
     assert shell[-1] == "https://x.example.com"
 
     full = _build_chromium_argv(
-        "/usr/bin/chromium", "https://x.example.com", 1024, 600, "/tmp/s.png",
+        "/usr/bin/chromium",
+        "https://x.example.com",
+        1024,
+        600,
+        "/tmp/s.png",
     )
     assert "--headless" in full
 
@@ -276,7 +280,8 @@ def test_nice_prefix_uses_nice(monkeypatch):
     CPU priority (nice -n 19). No ionice — the idle I/O class starves
     the render under the renderer's I/O contention."""
     monkeypatch.setattr(
-        web_render.shutil, "which",
+        web_render.shutil,
+        "which",
         lambda name: "/usr/bin/nice" if name == "nice" else None,
     )
     assert _nice_prefix() == ["/usr/bin/nice", "-n", "19"]
@@ -295,7 +300,8 @@ def test_render_web_png_prepends_nice_prefix_when_available(monkeypatch):
     calls = {}
 
     monkeypatch.setattr(
-        web_render.shutil, "which",
+        web_render.shutil,
+        "which",
         lambda name: {
             "chromium": "/usr/bin/chromium",
             "nice": "/usr/bin/nice",
@@ -312,7 +318,8 @@ def test_render_web_png_prepends_nice_prefix_when_available(monkeypatch):
 
     monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(
-        web_render.os, "killpg",
+        web_render.os,
+        "killpg",
         lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
     )
     render_web_png("https://status.example.com", 1360, 768)
@@ -372,9 +379,9 @@ def test_render_web_png_resolves_chromium_browser_fallback(monkeypatch):
     fallback name is used."""
     calls = {}
     monkeypatch.setattr(
-        web_render.shutil, "which",
-        lambda name: "/usr/bin/chromium-browser"
-        if name == "chromium-browser" else None,
+        web_render.shutil,
+        "which",
+        lambda name: "/usr/bin/chromium-browser" if name == "chromium-browser" else None,
     )
 
     def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
@@ -387,7 +394,8 @@ def test_render_web_png_resolves_chromium_browser_fallback(monkeypatch):
 
     monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(
-        web_render.os, "killpg",
+        web_render.os,
+        "killpg",
         lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
     )
     render_web_png("https://status.example.com", 800, 600)
@@ -408,7 +416,9 @@ def test_render_web_png_chromium_nonzero_exit_raises(monkeypatch):
     """A non-zero Chromium exit surfaces as a typed WebRenderError
     carrying the exit code."""
     _install_fake_chromium(
-        monkeypatch, returncode=1, stderr=b"some chromium error\n",
+        monkeypatch,
+        returncode=1,
+        stderr=b"some chromium error\n",
         write_screenshot=False,
     )
     with pytest.raises(WebRenderError, match="Chromium exited 1"):
@@ -426,9 +436,7 @@ def test_render_web_png_timeout_raises_and_does_not_hang(monkeypatch):
 def test_render_web_png_launch_error_raises(monkeypatch):
     """An OSError launching Chromium (e.g. binary vanished) surfaces as
     a typed WebRenderError."""
-    _install_fake_chromium(
-        monkeypatch, launch_error=OSError("exec format error")
-    )
+    _install_fake_chromium(monkeypatch, launch_error=OSError("exec format error"))
     with pytest.raises(WebRenderError, match="failed to launch Chromium"):
         render_web_png("https://status.example.com", 1360, 768)
 
@@ -451,9 +459,7 @@ def test_render_web_png_empty_screenshot_raises(monkeypatch):
 def test_render_web_png_non_png_screenshot_raises(monkeypatch):
     """A screenshot file that isn't a PNG (a crash artifact) fails the
     PNG-magic check with a typed WebRenderError."""
-    _install_fake_chromium(
-        monkeypatch, screenshot_png=b"GIF89a not a png"
-    )
+    _install_fake_chromium(monkeypatch, screenshot_png=b"GIF89a not a png")
     with pytest.raises(WebRenderError, match="not a PNG"):
         render_web_png("https://status.example.com", 1360, 768)
 
@@ -463,9 +469,7 @@ def test_render_web_png_cleans_up_temp_screenshot(monkeypatch):
     render — no temp-file leak."""
     seen = {}
 
-    monkeypatch.setattr(
-        web_render.shutil, "which", lambda name: "/usr/bin/chromium"
-    )
+    monkeypatch.setattr(web_render.shutil, "which", lambda name: "/usr/bin/chromium")
 
     def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
         for arg in argv:
@@ -478,12 +482,14 @@ def test_render_web_png_cleans_up_temp_screenshot(monkeypatch):
 
     monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(
-        web_render.os, "killpg",
+        web_render.os,
+        "killpg",
         lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
     )
     render_web_png("https://status.example.com", 800, 600)
 
     from pathlib import Path
+
     assert "path" in seen
     assert not Path(seen["path"]).exists()
 
@@ -493,9 +499,7 @@ def test_render_web_png_cleans_up_temp_screenshot_on_failure(monkeypatch):
     fails (Chromium exits non-zero)."""
     seen = {}
 
-    monkeypatch.setattr(
-        web_render.shutil, "which", lambda name: "/usr/bin/chromium"
-    )
+    monkeypatch.setattr(web_render.shutil, "which", lambda name: "/usr/bin/chromium")
 
     def _fake_popen(argv, stdout=None, stderr=None, start_new_session=False):
         for arg in argv:
@@ -508,13 +512,15 @@ def test_render_web_png_cleans_up_temp_screenshot_on_failure(monkeypatch):
 
     monkeypatch.setattr(web_render.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(
-        web_render.os, "killpg",
+        web_render.os,
+        "killpg",
         lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError()),
     )
     with pytest.raises(WebRenderError):
         render_web_png("https://status.example.com", 800, 600)
 
     from pathlib import Path
+
     assert "path" in seen
     assert not Path(seen["path"]).exists()
 
@@ -583,6 +589,7 @@ def test_main_nonpositive_dimensions_exit_2(capsys):
 def test_main_file_url_rejected_exit_2(monkeypatch, capsys):
     """A `file://` URL is rejected — exit 2 (bad input), a clear
     'invalid URL' message, and the render is never attempted."""
+
     def _fail_popen(*a, **k):
         raise AssertionError("Chromium must not be spawned for file://")
 
@@ -596,7 +603,9 @@ def test_main_render_failure_exits_1(monkeypatch, tmp_path, capsys):
     """A render failure (Chromium non-zero exit) -> exit 1 + the reason
     on stderr; no PNG is written."""
     _install_fake_chromium(
-        monkeypatch, returncode=1, stderr=b"chromium crashed\n",
+        monkeypatch,
+        returncode=1,
+        stderr=b"chromium crashed\n",
         write_screenshot=False,
     )
     out = tmp_path / "shot.png"
@@ -621,10 +630,14 @@ def test_main_unwritable_output_path_exits_1(monkeypatch, capsys):
     clear stderr message."""
     _install_fake_chromium(monkeypatch)
     # A path whose parent directory does not exist -> OSError on open.
-    rc = main([
-        "https://status.example.com", "800", "600",
-        "/nonexistent-dir-xyz/shot.png",
-    ])
+    rc = main(
+        [
+            "https://status.example.com",
+            "800",
+            "600",
+            "/nonexistent-dir-xyz/shot.png",
+        ]
+    )
     assert rc == 1
     assert "failed to write PNG" in capsys.readouterr().err
 
@@ -701,9 +714,7 @@ def test_render_web_png_escalates_to_sigkill_when_group_survives(
         seen.append((pgid, sig))
 
     # Speed the grace window so this test is sub-second.
-    monkeypatch.setattr(
-        web_render, "_PROCESS_GROUP_TERM_GRACE_S", 0.1
-    )
+    monkeypatch.setattr(web_render, "_PROCESS_GROUP_TERM_GRACE_S", 0.1)
     _install_fake_chromium(monkeypatch)
     monkeypatch.setattr(web_render.os, "killpg", _stuck_killpg)
 
@@ -713,9 +724,7 @@ def test_render_web_png_escalates_to_sigkill_when_group_survives(
     assert signal.SIGTERM in signals_sent
     assert signal.SIGKILL in signals_sent
     # SIGKILL fired AFTER SIGTERM (the order matters — never reverse).
-    assert signals_sent.index(signal.SIGTERM) < signals_sent.index(
-        signal.SIGKILL
-    )
+    assert signals_sent.index(signal.SIGTERM) < signals_sent.index(signal.SIGKILL)
 
 
 def test_render_web_png_passes_overall_timeout_via_communicate(
@@ -763,8 +772,7 @@ def _count_chromium_procs() -> int:
 
 @pytest.mark.skipif(
     __import__("shutil").which("chromium-headless-shell") is None,
-    reason="chromium-headless-shell not on PATH "
-    "(auto-skipped on macOS dev; runs on Pi + CI Linux)",
+    reason="chromium-headless-shell not on PATH (auto-skipped on macOS dev; runs on Pi + CI Linux)",
 )
 def test_render_web_png_leaves_no_chromium_helpers_alive(tmp_path):
     """Live-fire regression for QA's 2026-05-23 leak: count chromium-
