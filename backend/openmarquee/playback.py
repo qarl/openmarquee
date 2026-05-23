@@ -99,9 +99,7 @@ class PlaybackLoop:
         auto_tick_seconds: float = 1.0,
         stuck_backoff_seconds: float = 3.0,
         active_playlist_id: Callable[[], UUID | None] | None = None,
-        web_screenshot_producer: (
-            Callable[[WebSlide, int, int], Awaitable[bool]] | None
-        ) = None,
+        web_screenshot_producer: (Callable[[WebSlide, int, int], Awaitable[bool]] | None) = None,
     ):
         self._renderer = renderer
         self._fetch_items = fetch_items
@@ -307,8 +305,9 @@ class PlaybackLoop:
         exc = task.exception()
         if exc is not None:
             log.error(
-                "playback: _loop task crashed -- sign will be frozen "
-                "until restart. Cause: %r", exc, exc_info=exc,
+                "playback: _loop task crashed -- sign will be frozen until restart. Cause: %r",
+                exc,
+                exc_info=exc,
             )
 
     async def stop(self) -> None:
@@ -420,14 +419,11 @@ class PlaybackLoop:
                     try:
                         active_now = self._active_playlist_id_fn()
                     except Exception:
-                        log.exception(
-                            "playback: active-playlist re-check failed"
-                        )
+                        log.exception("playback: active-playlist re-check failed")
                         active_now = self._current_playlist_id
                     if active_now != self._current_playlist_id:
                         log.info(
-                            "playback: active playlist changed mid-loop "
-                            "(%s → %s); preempting",
+                            "playback: active playlist changed mid-loop (%s → %s); preempting",
                             self._current_playlist_id,
                             active_now,
                         )
@@ -488,16 +484,17 @@ class PlaybackLoop:
                         # traceback, repeats drop to DEBUG.
                         if item.id in self._failed_slide_ids:
                             log.debug(
-                                "playback: stream playback failed "
-                                "for slide id=%s (throttled): %s",
-                                item.id, e,
+                                "playback: stream playback failed for slide id=%s (throttled): %s",
+                                item.id,
+                                e,
                             )
                         else:
                             self._failed_slide_ids.add(item.id)
                             log.exception(
                                 "playback: stream playback failed "
                                 "for slide id=%s; advancing to next "
-                                "item", item.id,
+                                "item",
+                                item.id,
                             )
                         await self._wait(0.25)
                         continue
@@ -518,9 +515,7 @@ class PlaybackLoop:
                 # page-flip; we send ops and wait for SlideComplete +
                 # the transition state machine to promote into the
                 # to-slide.
-                next_for_transition = (
-                    items[(i + 1) % len(items)] if len(items) > 1 else None
-                )
+                next_for_transition = items[(i + 1) % len(items)] if len(items) > 1 else None
                 # 2026-05-17 frozen-sign guard: catch broadly so a
                 # single-slide IPC fault doesn't take the whole sign
                 # down; log full traceback so the journal carries
@@ -541,7 +536,8 @@ class PlaybackLoop:
                             "playback: IPC playback failed for "
                             "slide id=%s (throttled; first fail "
                             "carried the traceback): %s",
-                            item.id, e,
+                            item.id,
+                            e,
                         )
                     else:
                         self._failed_slide_ids.add(item.id)
@@ -550,7 +546,8 @@ class PlaybackLoop:
                             "id=%s type=%s; advancing to next item "
                             "(subsequent fails for this id will be "
                             "throttled to DEBUG)",
-                            item.id, item.type,
+                            item.id,
+                            item.type,
                         )
                     # Brief settle so a hot-loop of failing slides
                     # doesn't burn CPU.
@@ -589,20 +586,20 @@ class PlaybackLoop:
                             "playback: active playlist has no playable "
                             "slides (%d item(s), all skipped/failed) — "
                             "holding last frame, re-checking every %.1fs",
-                            len(items), self._stuck_backoff,
+                            len(items),
+                            self._stuck_backoff,
                         )
                     else:
                         log.debug(
-                            "playback: still no playable slides "
-                            "(%d item(s)); backing off %.1fs",
-                            len(items), self._stuck_backoff,
+                            "playback: still no playable slides (%d item(s)); backing off %.1fs",
+                            len(items),
+                            self._stuck_backoff,
                         )
                     await self._wait(self._stuck_backoff)
                 elif any_played and self._all_unplayable:
                     self._all_unplayable = False
                     log.info(
-                        "playback: playable content returned — "
-                        "resuming normal cadence",
+                        "playback: playable content returned — resuming normal cadence",
                     )
 
     async def _wait(self, seconds: float) -> None:
@@ -688,10 +685,7 @@ class PlaybackLoop:
         and MockRenderer (DELETE-PIL slice 11 converted MockRenderer
         to the IPC shape so playback can route mock through the same
         rails as production)."""
-        return (
-            hasattr(self._renderer, "begin_slide")
-            and hasattr(self._renderer, "advance")
-        )
+        return hasattr(self._renderer, "begin_slide") and hasattr(self._renderer, "advance")
 
     def _maybe_kick_web_refresh(self, slide: WebSlide) -> None:
         """Fire-and-forget a screenshot refresh for `slide` if one is
@@ -791,8 +785,10 @@ class PlaybackLoop:
             exc = t.exception()
             if exc is not None:
                 log.error(
-                    "playback: web-screenshot task for slide id=%s "
-                    "crashed: %r", _id, exc, exc_info=exc,
+                    "playback: web-screenshot task for slide id=%s crashed: %r",
+                    _id,
+                    exc,
+                    exc_info=exc,
                 )
 
         task.add_done_callback(_on_done)
@@ -880,6 +876,7 @@ class PlaybackLoop:
             RustRendererUnsupportedTransitionError,
             SlideComplete,
         )
+
         assert self._stop_event is not None
         assert self._pause_event is not None
         loop = asyncio.get_event_loop()
@@ -900,15 +897,18 @@ class PlaybackLoop:
             # line every loop pass.
             if item.id in self._skipped_slide_ids:
                 log.debug(
-                    "playback: skipping slide %s (unsupported kind; "
-                    "throttled): %s", item.id, e.message,
+                    "playback: skipping slide %s (unsupported kind; throttled): %s",
+                    item.id,
+                    e.message,
                 )
             else:
                 self._skipped_slide_ids.add(item.id)
                 log.info(
                     "playback: skipping slide %s (Rust sidecar doesn't yet "
                     "support this kind; further skips for this id throttled "
-                    "to DEBUG): %s", item.id, e.message,
+                    "to DEBUG): %s",
+                    item.id,
+                    e.message,
                 )
             return False
         # 30 Hz tick. Matches the auto_tick_seconds-aware cadence the
@@ -930,14 +930,16 @@ class PlaybackLoop:
                 # slide id, same as the begin_slide skip above.
                 if item.id in self._skipped_slide_ids:
                     log.debug(
-                        "playback: slide %s unsupported mid-play "
-                        "(throttled): %s", item.id, e.message,
+                        "playback: slide %s unsupported mid-play (throttled): %s",
+                        item.id,
+                        e.message,
                     )
                 else:
                     self._skipped_slide_ids.add(item.id)
                     log.info(
                         "playback: slide %s became unsupported mid-play: %s",
-                        item.id, e.message,
+                        item.id,
+                        e.message,
                     )
                 return False
             if isinstance(result, SlideComplete):
@@ -977,8 +979,9 @@ class PlaybackLoop:
                 # begin_slide's the next item (= instant cut, same
                 # visible result the silent fallback produced).
                 log.info(
-                    "playback: transition kind %r unsupported; falling "
-                    "through to instant cut: %s", transition_kind, e.message,
+                    "playback: transition kind %r unsupported; falling through to instant cut: %s",
+                    transition_kind,
+                    e.message,
                 )
                 return True
             # Drive the transition window. Exit on:
@@ -1008,8 +1011,9 @@ class PlaybackLoop:
                     # transition already succeeded), but if it does
                     # treat as cut: log + bail.
                     log.info(
-                        "playback: transition %r failed mid-window; "
-                        "treating as cut: %s", transition_kind, e.message,
+                        "playback: transition %r failed mid-window; treating as cut: %s",
+                        transition_kind,
+                        e.message,
                     )
                     break
                 if not isinstance(result, PaintTransition):
@@ -1051,9 +1055,7 @@ class PlaybackLoop:
         renderer = self._renderer
         loop = asyncio.get_event_loop()
         deadline = loop.time() + item.duration_ms / 1000.0
-        consumer = StreamConsumer(
-            item.stream_url, renderer.width, renderer.height
-        )
+        consumer = StreamConsumer(item.stream_url, renderer.width, renderer.height)
         frames = consumer.frames()
         rendered_any = False
         renderer_broken = False
@@ -1078,9 +1080,7 @@ class PlaybackLoop:
                     else:
                         budget = min(_STREAM_CONNECT_TIMEOUT_S, deadline - now)
                     try:
-                        rgb = await asyncio.wait_for(
-                            frames.__anext__(), timeout=budget
-                        )
+                        rgb = await asyncio.wait_for(frames.__anext__(), timeout=budget)
                     except StopAsyncIteration:
                         break  # ffmpeg EOF / stream disconnect
                     except TimeoutError:
@@ -1111,7 +1111,8 @@ class PlaybackLoop:
                             "playback: renderer rejected a stream "
                             "frame (slide id=%s) — the push-frames "
                             "sidecar op is unavailable; skipping the "
-                            "rest of this slot", item.id,
+                            "rest of this slot",
+                            item.id,
                         )
                         renderer_broken = True
                         break
@@ -1139,8 +1140,8 @@ class PlaybackLoop:
                 renderer.end_external_frames()
             except Exception:
                 log.exception(
-                    "playback: end_external_frames failed for "
-                    "stream slide id=%s", item.id,
+                    "playback: end_external_frames failed for stream slide id=%s",
+                    item.id,
                 )
         return rendered_any
 
@@ -1214,8 +1215,10 @@ class PlaybackLoop:
             log.info(
                 "playback: playlist changed (%s → %s); clearing %d failed "
                 "+ %d skipped-slide throttle entries",
-                self._current_playlist_id, playlist_id,
-                len(self._failed_slide_ids), len(self._skipped_slide_ids),
+                self._current_playlist_id,
+                playlist_id,
+                len(self._failed_slide_ids),
+                len(self._skipped_slide_ids),
             )
             self._failed_slide_ids.clear()
             self._skipped_slide_ids.clear()
@@ -1276,13 +1279,9 @@ class PlaybackLoop:
             ):
                 return cached[0]
             slot_t0 = self._slot_t0
-            elapsed_s = (
-                0.0 if slot_t0 is None else max(0.0, loop.time() - slot_t0)
-            )
+            elapsed_s = 0.0 if slot_t0 is None else max(0.0, loop.time() - slot_t0)
             try:
-                png = await asyncio.to_thread(
-                    self._capture_current_frame_sync, elapsed_s
-                )
+                png = await asyncio.to_thread(self._capture_current_frame_sync, elapsed_s)
             except Exception:
                 log.exception("playback: capture_current_frame failed")
                 # Fall back to whatever the previous cache had so a
@@ -1311,9 +1310,7 @@ class PlaybackLoop:
             return None
         if not hasattr(self._renderer, "capture"):
             return None
-        with tempfile.NamedTemporaryFile(
-            suffix=".png", delete=False
-        ) as tf:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
             tmp_path = Path(tf.name)
         try:
             try:
@@ -1356,4 +1353,3 @@ def scheduled_fetch_items(
     if loop is not None:
         loop._stamp_playlist_id(active_id)
     return list_in_playlist_order(content_storage, playlist_storage, active_id)
-

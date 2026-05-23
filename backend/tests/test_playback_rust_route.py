@@ -14,6 +14,7 @@ IPC contract instead of the PIL hot path. Three tests:
 3. Renderer-detection: a renderer without begin_slide/advance stays
    on the existing PIL path (regression guard for the dispatch gate).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,8 +41,13 @@ _FAST_DURATION_MS = 100  # model minimum; keeps test runtime sub-second
 
 def _text_slide(name: str = "x", text: str = "x", **kwargs) -> TextSlide:
     layer_keys = {
-        "text_color", "font_family", "font_size_px",
-        "font_size_pct", "auto_mode", "auto_format", "box",
+        "text_color",
+        "font_family",
+        "font_size_px",
+        "font_size_pct",
+        "auto_mode",
+        "auto_format",
+        "box",
     }
     layer = {"text": text}
     for k in list(kwargs.keys()):
@@ -76,12 +82,8 @@ class _FakeRustRenderer:
         self.width = width
         self.height = height
         self.unsupported_slide_ids: set[UUID] = unsupported_slide_ids or set()
-        self.unsupported_transition_kinds: set[str] = (
-            unsupported_transition_kinds or set()
-        )
-        self.subprocess_error_on_begin_transition = (
-            subprocess_error_on_begin_transition
-        )
+        self.unsupported_transition_kinds: set[str] = unsupported_transition_kinds or set()
+        self.subprocess_error_on_begin_transition = subprocess_error_on_begin_transition
         self.begin_slide_calls: list[tuple[UUID, int, int]] = []
         # (to_slide_id, to_duration_ms, kind, transition_ms, t0_ms)
         self.begin_transition_calls: list[tuple[UUID, int, str, int, int]] = []
@@ -107,9 +109,7 @@ class _FakeRustRenderer:
 
     # IPC ops --------------------------------------------------------
 
-    def begin_slide(
-        self, slide_id: UUID, t0_ms: int, duration_ms: int
-    ) -> None:
+    def begin_slide(self, slide_id: UUID, t0_ms: int, duration_ms: int) -> None:
         # Record the attempt BEFORE the unsupported-slide rail so tests
         # asserting playback dispatch order see the rejected slide too.
         # Mirrors the real proxy's behavior at the IPC boundary: the
@@ -175,13 +175,9 @@ class _FakeRustRenderer:
             (to_slide_id, to_duration_ms, kind, transition_ms, t0_ms)
         )
         if self.subprocess_error_on_begin_transition:
-            raise RustRendererSubprocessError(
-                "subprocess died during op 'begin_transition'"
-            )
+            raise RustRendererSubprocessError("subprocess died during op 'begin_transition'")
         if kind in self.unsupported_transition_kinds:
-            raise RustRendererUnsupportedTransitionError(
-                f"transition kind not implemented: {kind}"
-            )
+            raise RustRendererUnsupportedTransitionError(f"transition kind not implemented: {kind}")
         self._transition_from = self._current_slide
         self._transition_to = to_slide_id
         self._transition_kind = kind
@@ -268,7 +264,8 @@ async def test_video_slide_unsupported_logs_and_advances(caplog):
     text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS)
 
     fake = _FakeRustRenderer(
-        width=8, height=8,
+        width=8,
+        height=8,
         unsupported_slide_ids={video_like.id},
     )
 
@@ -292,12 +289,12 @@ async def test_video_slide_unsupported_logs_and_advances(caplog):
 
     # The skip log line names the unsupported slide id.
     skip_logs = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if "skipping slide" in r.getMessage() and str(video_like.id) in r.getMessage()
     ]
     assert skip_logs, (
-        f"expected skip log for {video_like.id}; got "
-        f"{[r.getMessage() for r in caplog.records]}"
+        f"expected skip log for {video_like.id}; got {[r.getMessage() for r in caplog.records]}"
     )
 
     # Loop is still running after the unsupported slide -- no crash.
@@ -363,8 +360,7 @@ def test_mock_renderer_advance_returns_canonical_ipc_dataclasses(tmp_path):
         mock.begin_transition(sid2, 2000, "fade", 500, 1500)
         result = mock.advance(1700)
         assert isinstance(result, PaintTransition), (
-            f"mid-transition must return canonical PaintTransition, "
-            f"got {type(result)}"
+            f"mid-transition must return canonical PaintTransition, got {type(result)}"
         )
         # Post-transition: promoted PaintSlide.
         result = mock.advance(2100)
@@ -456,14 +452,10 @@ async def test_fix_b_throttle_first_fail_error_subsequent_debug(caplog):
         the playback loop's broad-except guard (NOT the Unsupported
         rail) so the Fix B throttle is exercised."""
 
-        def begin_slide(
-            self, slide_id: UUID, t0_ms: int, duration_ms: int
-        ) -> None:
+        def begin_slide(self, slide_id: UUID, t0_ms: int, duration_ms: int) -> None:
             # Record the call before raising (sanity for assertions).
             self.begin_slide_calls.append((slide_id, t0_ms, duration_ms))
-            raise RustRendererSubprocessError(
-                "subprocess died (simulated for Fix B throttle test)"
-            )
+            raise RustRendererSubprocessError("subprocess died (simulated for Fix B throttle test)")
 
     fake = _RaisingFake(width=8, height=8)
 
@@ -491,20 +483,21 @@ async def test_fix_b_throttle_first_fail_error_subsequent_debug(caplog):
 
     # Multiple attempts hit the bad slide.
     assert len(fake.begin_slide_calls) >= 3, (
-        f"expected ≥3 begin_slide attempts on the bad slide, got "
-        f"{len(fake.begin_slide_calls)}"
+        f"expected ≥3 begin_slide attempts on the bad slide, got {len(fake.begin_slide_calls)}"
     )
 
     # Exactly ONE ERROR record per slide_id (the first failure carries
     # the traceback). Subsequent failures of the SAME id are DEBUG.
     error_records_for_bad = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelname == "ERROR"
         and "IPC playback failed" in r.getMessage()
         and str(bad.id) in r.getMessage()
     ]
     debug_records_for_bad = [
-        r for r in caplog.records
+        r
+        for r in caplog.records
         if r.levelname == "DEBUG"
         and "throttled" in r.getMessage()
         and str(bad.id) in r.getMessage()
@@ -515,8 +508,7 @@ async def test_fix_b_throttle_first_fail_error_subsequent_debug(caplog):
         f"traceback), got {len(error_records_for_bad)}"
     )
     assert len(debug_records_for_bad) >= 1, (
-        f"expected ≥1 DEBUG throttled record after the first fail, "
-        f"got {len(debug_records_for_bad)}"
+        f"expected ≥1 DEBUG throttled record after the first fail, got {len(debug_records_for_bad)}"
     )
     # The throttle set holds the failed id.
     assert bad.id in loop._failed_slide_ids
@@ -553,9 +545,7 @@ async def test_ce225f3_broad_except_advances_past_failing_slide_to_next(caplog):
             super().__init__(*args, **kwargs)
             self._raise_for = raise_for
 
-        def begin_slide(
-            self, slide_id: UUID, t0_ms: int, duration_ms: int
-        ) -> None:
+        def begin_slide(self, slide_id: UUID, t0_ms: int, duration_ms: int) -> None:
             self.begin_slide_calls.append((slide_id, t0_ms, duration_ms))
             if slide_id == self._raise_for:
                 raise RustRendererSubprocessError(
@@ -566,7 +556,9 @@ async def test_ce225f3_broad_except_advances_past_failing_slide_to_next(caplog):
             self._duration_ms = int(duration_ms)
 
     fake = _SelectivelyRaisingFake(
-        width=8, height=8, raise_for=bad.id,
+        width=8,
+        height=8,
+        raise_for=bad.id,
     )
 
     loop = PlaybackLoop(
@@ -593,8 +585,7 @@ async def test_ce225f3_broad_except_advances_past_failing_slide_to_next(caplog):
         f"good_a never begin_slide'd; loop didn't start cleanly: {slide_ids}"
     )
     assert bad.id in slide_ids, (
-        f"bad.id never begin_slide'd; loop bailed before reaching it: "
-        f"{slide_ids}"
+        f"bad.id never begin_slide'd; loop bailed before reaching it: {slide_ids}"
     )
     assert good_b.id in slide_ids, (
         f"good_b never begin_slide'd; loop didn't advance past bad slide. "
@@ -668,16 +659,12 @@ def test_ce225f3_on_loop_task_done_logs_info_on_cancellation(caplog):
     # Cancellation is INFO, not ERROR.
     error_records = [r for r in caplog.records if r.levelname == "ERROR"]
     info_records = [
-        r for r in caplog.records
-        if r.levelname == "INFO" and "cancelled" in r.getMessage()
+        r for r in caplog.records if r.levelname == "INFO" and "cancelled" in r.getMessage()
     ]
     assert error_records == [], (
-        f"cancellation must not log ERROR; got: "
-        f"{[r.getMessage() for r in error_records]}"
+        f"cancellation must not log ERROR; got: {[r.getMessage() for r in error_records]}"
     )
-    assert len(info_records) == 1, (
-        f"expected 1 INFO 'cancelled' record, got {len(info_records)}"
-    )
+    assert len(info_records) == 1, f"expected 1 INFO 'cancelled' record, got {len(info_records)}"
     # task.exception() should NOT be invoked on a cancelled task
     # (it raises CancelledError if called before .cancelled() check).
     fake_task.exception.assert_not_called()
@@ -728,10 +715,12 @@ async def test_non_cut_transition_calls_begin_transition_for_each_slide():
     Pins the slice-4-followup wire-up: cut path stayed for slice 4;
     this asserts the new path fires when the transition spec asks
     for it."""
-    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
-                         transition="fade", transition_ms=30)
-    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
-                         transition="wipe", transition_ms=30)
+    text_a = _text_slide(
+        name="A", text="A", duration_ms=_FAST_DURATION_MS, transition="fade", transition_ms=30
+    )
+    text_b = _text_slide(
+        name="B", text="B", duration_ms=_FAST_DURATION_MS, transition="wipe", transition_ms=30
+    )
 
     fake = _FakeRustRenderer(width=8, height=8)
     loop = PlaybackLoop(
@@ -749,12 +738,8 @@ async def test_non_cut_transition_calls_begin_transition_for_each_slide():
     # through the playlist at least once. Each begin_transition entry:
     # (to_slide_id, to_duration_ms, kind, transition_ms, t0_ms).
     kinds_seen = [c[2] for c in fake.begin_transition_calls]
-    assert "fade" in kinds_seen, (
-        f"expected fade transition; got {kinds_seen}"
-    )
-    assert "wipe" in kinds_seen, (
-        f"expected wipe transition; got {kinds_seen}"
-    )
+    assert "fade" in kinds_seen, f"expected fade transition; got {kinds_seen}"
+    assert "wipe" in kinds_seen, f"expected wipe transition; got {kinds_seen}"
     # fade transition's to_slide is text_b; wipe's to_slide is text_a
     # (playlist wrap). Pin both.
     for to_id, _dur, kind, _ms, _t0 in fake.begin_transition_calls:
@@ -769,10 +754,12 @@ async def test_cut_transition_does_not_call_begin_transition():
     """transition='cut' (or unset) means instant cut between slides.
     begin_transition MUST NOT fire -- the outer loop's begin_slide on
     the next iteration IS the instant cut."""
-    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
-                         transition="cut", transition_ms=0)
-    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
-                         transition="cut", transition_ms=0)
+    text_a = _text_slide(
+        name="A", text="A", duration_ms=_FAST_DURATION_MS, transition="cut", transition_ms=0
+    )
+    text_b = _text_slide(
+        name="B", text="B", duration_ms=_FAST_DURATION_MS, transition="cut", transition_ms=0
+    )
 
     fake = _FakeRustRenderer(width=8, height=8)
     loop = PlaybackLoop(
@@ -787,8 +774,7 @@ async def test_cut_transition_does_not_call_begin_transition():
     await loop.stop()
 
     assert fake.begin_transition_calls == [], (
-        f"cut transitions should not call begin_transition; got "
-        f"{fake.begin_transition_calls}"
+        f"cut transitions should not call begin_transition; got {fake.begin_transition_calls}"
     )
     # begin_slide still fires for each slide.
     assert len(fake.begin_slide_calls) >= 2
@@ -798,10 +784,12 @@ async def test_cut_transition_does_not_call_begin_transition():
 async def test_zero_duration_transition_does_not_call_begin_transition():
     """A non-cut kind name with transition_ms=0 is also a cut (no
     blend window to drive). Edge case from the dispatch's test plan."""
-    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
-                         transition="fade", transition_ms=0)
-    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
-                         transition="fade", transition_ms=0)
+    text_a = _text_slide(
+        name="A", text="A", duration_ms=_FAST_DURATION_MS, transition="fade", transition_ms=0
+    )
+    text_b = _text_slide(
+        name="B", text="B", duration_ms=_FAST_DURATION_MS, transition="fade", transition_ms=0
+    )
 
     fake = _FakeRustRenderer(width=8, height=8)
     loop = PlaybackLoop(
@@ -836,13 +824,16 @@ async def test_unsupported_transition_falls_through_to_cut(caplog):
     # raise UnsupportedTransitionError for it, simulating the future
     # case where a Rust regression unwires a kind that the schema
     # still accepts.
-    text_a = _text_slide(name="A", text="A", duration_ms=_FAST_DURATION_MS,
-                         transition="glitch", transition_ms=30)
-    text_b = _text_slide(name="B", text="B", duration_ms=_FAST_DURATION_MS,
-                         transition="cut", transition_ms=0)
+    text_a = _text_slide(
+        name="A", text="A", duration_ms=_FAST_DURATION_MS, transition="glitch", transition_ms=30
+    )
+    text_b = _text_slide(
+        name="B", text="B", duration_ms=_FAST_DURATION_MS, transition="cut", transition_ms=0
+    )
 
     fake = _FakeRustRenderer(
-        width=8, height=8,
+        width=8,
+        height=8,
         unsupported_transition_kinds={"glitch"},
     )
     loop = PlaybackLoop(
@@ -858,17 +849,11 @@ async def test_unsupported_transition_falls_through_to_cut(caplog):
         await loop.stop()
 
     # begin_transition WAS called (we recorded the call before the raise).
-    fake_calls = [c for c in fake.begin_transition_calls
-                  if c[2] == "glitch"]
+    fake_calls = [c for c in fake.begin_transition_calls if c[2] == "glitch"]
     assert fake_calls, "begin_transition should have been attempted"
     # Loop logged the fallback.
-    skip_logs = [
-        r for r in caplog.records
-        if "falling through to instant cut" in r.getMessage()
-    ]
-    assert skip_logs, (
-        f"expected fall-through log; got {[r.getMessage() for r in caplog.records]}"
-    )
+    skip_logs = [r for r in caplog.records if "falling through to instant cut" in r.getMessage()]
+    assert skip_logs, f"expected fall-through log; got {[r.getMessage() for r in caplog.records]}"
     # Loop didn't crash -- both slides reached begin_slide.
     slide_ids = [c[0] for c in fake.begin_slide_calls]
     assert text_a.id in slide_ids
@@ -889,7 +874,8 @@ async def test_subprocess_error_during_begin_transition_swaps_to_mock():
     )
 
     fake = _FakeRustRenderer(
-        width=8, height=8,
+        width=8,
+        height=8,
         subprocess_error_on_begin_transition=True,
     )
     wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
@@ -899,6 +885,9 @@ async def test_subprocess_error_during_begin_transition_swaps_to_mock():
     with pytest.raises(AutoFallbackInMockError):
         wrapper.begin_transition(
             UUID("00000000-0000-0000-0000-000000000001"),
-            5000, "fade", 30, 0,
+            5000,
+            "fade",
+            30,
+            0,
         )
     assert wrapper.is_in_fallback is True

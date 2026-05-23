@@ -46,8 +46,11 @@ def _default_iwgetid() -> str | None:
     """Production iwgetid runner. Returns the active SSID or None."""
     try:
         out = subprocess.run(
-            ["iwgetid", "-r"], capture_output=True, text=True,
-            timeout=2.0, check=False,
+            ["iwgetid", "-r"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
         )
     except FileNotFoundError:
         # iwgetid not installed (dev macOS, minimal container, etc.).
@@ -57,6 +60,7 @@ def _default_iwgetid() -> str | None:
         return None
     ssid = out.stdout.strip()
     return ssid or None
+
 
 # Locations checked in order. The /var copy is the recommended path
 # for stock Pi OS installs without chmod'ing /etc.
@@ -128,7 +132,9 @@ def read_system_wifi(
         match = _find_matching_network(text, active_ssid)
         if match is not None:
             log.info(
-                "wifi_prefill: found creds for SSID %r in %s", active_ssid, path,
+                "wifi_prefill: found creds for SSID %r in %s",
+                active_ssid,
+                path,
             )
             return match
     if permission_denied:

@@ -23,9 +23,14 @@ def _make_slide(*, name="x", text="x", **layer_kwargs):
     auto_mode= …) and routes them into text_layers[0]; slide-level kwargs
     (name=, duration_ms=, transition=, …) stay at the root."""
     slide_kwargs = {}
-    for k in ("duration_ms", "transition", "transition_ms",
-              "background_color", "background_image_slide_id",
-              "background_video_slide_id"):
+    for k in (
+        "duration_ms",
+        "transition",
+        "transition_ms",
+        "background_color",
+        "background_image_slide_id",
+        "background_video_slide_id",
+    ):
         if k in layer_kwargs:
             slide_kwargs[k] = layer_kwargs.pop(k)
     return TextSlide(
@@ -62,8 +67,7 @@ def test_v3_1_per_layer_extensions_default_when_omitted():
 def test_motion_accepts_all_seven_values():
     """Spec docs/text-layer-motion-spec.md (2026-05-02): the operator-
     facing motion menu is static + six effects. Round-trip each."""
-    for kind in ("static", "ticker", "breathe", "pulse",
-                 "bounce", "shake", "blink"):
+    for kind in ("static", "ticker", "breathe", "pulse", "bounce", "shake", "blink"):
         layer = TextLayer(text="x", motion=kind)
         assert layer.motion == kind
 
@@ -525,16 +529,12 @@ def test_stream_slide_minimal_construction():
 
 def test_stream_slide_rejects_unknown_on_unreachable():
     with pytest.raises(ValidationError):
-        StreamSlide(
-            name="Live", stream_url="rtsp://h/x", on_unreachable="explode"
-        )
+        StreamSlide(name="Live", stream_url="rtsp://h/x", on_unreachable="explode")
 
 
 def test_stream_slide_accepts_each_on_unreachable_option():
     for opt in ("hold_last_frame", "black", "skip"):
-        slide = StreamSlide(
-            name="Live", stream_url="rtsp://h/x", on_unreachable=opt
-        )
+        slide = StreamSlide(name="Live", stream_url="rtsp://h/x", on_unreachable=opt)
         assert slide.on_unreachable == opt
 
 
@@ -610,9 +610,7 @@ def test_web_slide_refresh_interval_bounds_enforced():
         WebSlide(name="W", url="https://h/x", refresh_interval_s=9)
     # Above the 24 h ceiling.
     with pytest.raises(ValidationError):
-        WebSlide(
-            name="W", url="https://h/x", refresh_interval_s=24 * 60 * 60 + 1
-        )
+        WebSlide(name="W", url="https://h/x", refresh_interval_s=24 * 60 * 60 + 1)
 
 
 def test_web_slide_duration_bounds_enforced():
@@ -621,9 +619,7 @@ def test_web_slide_duration_bounds_enforced():
         WebSlide(name="W", url="https://h/x", duration_ms=50)
     # Above the 24 h ceiling.
     with pytest.raises(ValidationError):
-        WebSlide(
-            name="W", url="https://h/x", duration_ms=24 * 60 * 60 * 1000 + 1
-        )
+        WebSlide(name="W", url="https://h/x", duration_ms=24 * 60 * 60 * 1000 + 1)
 
 
 def test_web_slide_rejects_other_type_literal():

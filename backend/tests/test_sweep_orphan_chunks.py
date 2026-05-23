@@ -26,14 +26,10 @@ def _build_fake_dist(tmp_path: Path) -> Path:
 
     # main.js references chunk-AAAAAAAA + sortable.esm-BBBBBBBB.
     (dist / "main.js").write_text(
-        '// minified entry\n'
-        'import("./chunk-AAAAAAAA.js");\n'
-        'import("./sortable.esm-BBBBBBBB.js");\n'
+        '// minified entry\nimport("./chunk-AAAAAAAA.js");\nimport("./sortable.esm-BBBBBBBB.js");\n'
     )
     # set-password.js references esm-CCCCCCCC.
-    (dist / "set-password.js").write_text(
-        'const m = "./esm-CCCCCCCC.js";\n'
-    )
+    (dist / "set-password.js").write_text('const m = "./esm-CCCCCCCC.js";\n')
     # Three referenced chunks (alive).
     (dist / "chunk-AAAAAAAA.js").write_text("alive A\n")
     (dist / "sortable.esm-BBBBBBBB.js").write_text("alive B\n")
@@ -51,7 +47,9 @@ def test_sweep_removes_orphan_hashed_chunks(tmp_path: Path) -> None:
     dist = _build_fake_dist(tmp_path)
     result = subprocess.run(
         ["bash", str(_SWEEP), str(dist)],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     # Two orphans removed; three referenced + worker + main + set-password kept.
     surviving = {p.name for p in dist.iterdir()}
@@ -78,7 +76,9 @@ def test_sweep_dry_run_does_not_mutate(tmp_path: Path) -> None:
     pre = {p.name for p in dist.iterdir()}
     result = subprocess.run(
         ["bash", str(_SWEEP), "--dry-run", str(dist)],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     post = {p.name for p in dist.iterdir()}
     assert pre == post, f"dry-run mutated dist: {pre.symmetric_difference(post)}"
@@ -99,7 +99,9 @@ def test_sweep_no_op_on_clean_dist(tmp_path: Path) -> None:
     (dist / "chunk-AAAAAAAA.js").write_text("alive\n")
     result = subprocess.run(
         ["bash", str(_SWEEP), str(dist)],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     assert "kept=1 removed=0" in result.stdout
 
@@ -108,7 +110,9 @@ def test_sweep_rejects_missing_dist(tmp_path: Path) -> None:
     """Argument validation: nonexistent dist path exits non-zero."""
     result = subprocess.run(
         ["bash", str(_SWEEP), str(tmp_path / "nope")],
-        check=False, capture_output=True, text=True,
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 2
     assert "usage" in result.stderr.lower()
@@ -133,13 +137,15 @@ def test_sweep_discovers_entry_files_dynamically(tmp_path: Path) -> None:
     # A NEW entry file with a name no current entry-file list contains.
     (dist / "admin.js").write_text('import("./chunk-AAAAAAAA.js");\n')
     # main.js doesn't reference AAAAAAAA -- only admin.js does.
-    (dist / "main.js").write_text('// no chunk imports here\n')
+    (dist / "main.js").write_text("// no chunk imports here\n")
     (dist / "chunk-AAAAAAAA.js").write_text("alive via admin.js\n")
     (dist / "chunk-BBBBBBBB.js").write_text("real orphan\n")
 
     subprocess.run(
         ["bash", str(_SWEEP), str(dist)],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     surviving = {p.name for p in dist.iterdir()}
     # AAAA must survive because admin.js references it.
@@ -161,7 +167,9 @@ def test_sweep_handles_missing_entry_files(tmp_path: Path) -> None:
     (dist / "chunk-ZZZZZZZZ.js").write_text("orphan\n")
     result = subprocess.run(
         ["bash", str(_SWEEP), str(dist)],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     surviving = {p.name for p in dist.iterdir()}
     assert "chunk-AAAAAAAA.js" in surviving

@@ -76,13 +76,15 @@ async def test_start_up_returns_error_when_no_url_appears(stub_dir, monkeypatch)
 async def test_read_status_authenticated(stub_dir, monkeypatch):
     """tailscale status --json emits BackendState=Running + Self
     has TailscaleIPs."""
-    status_json = json.dumps({
-        "BackendState": "Running",
-        "Self": {
-            "HostName": "mysign7k2",
-            "TailscaleIPs": ["100.64.1.2", "fd7a:115c::1"],
-        },
-    })
+    status_json = json.dumps(
+        {
+            "BackendState": "Running",
+            "Self": {
+                "HostName": "mysign7k2",
+                "TailscaleIPs": ["100.64.1.2", "fd7a:115c::1"],
+            },
+        }
+    )
     stub = _write_stub(stub_dir, f"cat <<'EOF'\n{status_json}\nEOF\n")
     monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", str(stub))
     result = await tailscale.read_status()
@@ -132,8 +134,7 @@ async def test_auth_url_regex_tolerant_of_whitespace(stub_dir, monkeypatch):
     with leading whitespace. The regex matches the URL itself."""
     stub = _write_stub(
         stub_dir,
-        "echo '   https://login.tailscale.com/a/with-leading-whitespace' >&2\n"
-        "sleep 30\n",
+        "echo '   https://login.tailscale.com/a/with-leading-whitespace' >&2\nsleep 30\n",
     )
     monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", str(stub))
     result = await tailscale.start_up(device_id=None)

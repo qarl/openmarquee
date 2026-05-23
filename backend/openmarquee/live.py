@@ -299,8 +299,7 @@ class LiveSession:
                 # pump's own teardown) during the wait — nothing to do.
                 return
             log.warning(
-                "live: session %s rendered no frame within %.1fs; "
-                "closing as unreachable",
+                "live: session %s rendered no frame within %.1fs; closing as unreachable",
                 self.id,
                 self._PHANTOM_TIMEOUT_SECONDS,
             )
@@ -508,9 +507,7 @@ class LiveManager:
         return self._session.started_at if self.is_active else None
 
     @staticmethod
-    async def _start_session(
-        session: LiveSession, request: LiveStartBody
-    ) -> str | None:
+    async def _start_session(session: LiveSession, request: LiveStartBody) -> str | None:
         """Run the transport-specific start for `request`'s kind.
 
         Returns the SDP answer for a WebRTC start, or None for a
@@ -519,9 +516,7 @@ class LiveManager:
             return await session.start_webrtc(request.sdp_offer)
         return await session.start_stream(request.url)
 
-    async def start(
-        self, request: LiveStartBody
-    ) -> tuple[UUID, str | None]:
+    async def start(self, request: LiveStartBody) -> tuple[UUID, str | None]:
         """Negotiate a new session. Returns (session_id, sdp_answer);
         sdp_answer is None for a stream-transport start.
 
@@ -543,9 +538,7 @@ class LiveManager:
             self._session = session
             return (session.id, answer_sdp)
 
-    async def takeover(
-        self, request: LiveStartBody
-    ) -> tuple[UUID, str | None]:
+    async def takeover(self, request: LiveStartBody) -> tuple[UUID, str | None]:
         """Force-stop any active session, then start a new one.
 
         No-op-but-still-creates if nothing was active — the user got to

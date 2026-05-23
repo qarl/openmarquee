@@ -39,9 +39,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_INLINE_PREVIEW = (
-    Path(__file__).resolve().parent.parent.parent / "ui" / "src" / "inline-preview.js"
-)
+_INLINE_PREVIEW = Path(__file__).resolve().parent.parent.parent / "ui" / "src" / "inline-preview.js"
 
 
 def _read_inline_preview_source() -> str:
@@ -51,8 +49,7 @@ def _read_inline_preview_source() -> str:
     strip; real code doesn't put `//` before a fonts call on the
     same line."""
     assert _INLINE_PREVIEW.is_file(), (
-        f"inline-preview.js not found at {_INLINE_PREVIEW}; relocation? "
-        f"Update the test path."
+        f"inline-preview.js not found at {_INLINE_PREVIEW}; relocation? Update the test path."
     )
     text = _INLINE_PREVIEW.read_text(encoding="utf-8")
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -69,7 +66,7 @@ def test_inline_preview_imports_font_picker_helpers():
     would build a token document.fonts can't match → check() always
     returns false → load() kick fires every frame forever."""
     source = _read_inline_preview_source()
-    assert "from \"./font-picker.js\"" in source, (
+    assert 'from "./font-picker.js"' in source, (
         "inline-preview.js must import from font-picker.js for the "
         "font-load orchestration to use the correct family-name shape."
     )

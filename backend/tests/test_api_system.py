@@ -86,9 +86,7 @@ def test_format_uptime_zero_is_zero_seconds():
 # --- /api/system/info endpoint behavior ---
 
 
-def test_info_exposes_device_id_when_identity_present(
-    client: TestClient, tmp_path, monkeypatch
-):
+def test_info_exposes_device_id_when_identity_present(client: TestClient, tmp_path, monkeypatch):
     """qarl 2026-05-12: /api/system/info exposes the MySignXXX
     device_id from /var/openmarquee/identity.json. Point the reader
     at a fixture file to verify the field round-trips through the
@@ -102,18 +100,15 @@ def test_info_exposes_device_id_when_identity_present(
     assert body["device_id"] == "MySign7K2"
 
 
-def test_tailscale_up_returns_auth_url_from_stub(
-    client: TestClient, tmp_path, monkeypatch
-):
+def test_tailscale_up_returns_auth_url_from_stub(client: TestClient, tmp_path, monkeypatch):
     """qarl 2026-05-12 (arc 4): POST /api/system/tailscale/up spawns
     `tailscale up`, parses the auth URL, returns it. Use a bash stub
     so the test doesn't need a real Tailscale install."""
     import stat as _stat
+
     stub = tmp_path / "tailscale"
     stub.write_text(
-        "#!/usr/bin/env bash\n"
-        "echo 'visit https://login.tailscale.com/a/teststub42' >&2\n"
-        "sleep 30\n"
+        "#!/usr/bin/env bash\necho 'visit https://login.tailscale.com/a/teststub42' >&2\nsleep 30\n"
     )
     stub.chmod(stub.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
     monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", str(stub))
@@ -124,14 +119,12 @@ def test_tailscale_up_returns_auth_url_from_stub(
     assert body["auth_url"] == "https://login.tailscale.com/a/teststub42"
 
 
-def test_tailscale_status_authenticated_from_stub(
-    client: TestClient, tmp_path, monkeypatch
-):
+def test_tailscale_status_authenticated_from_stub(client: TestClient, tmp_path, monkeypatch):
     import stat as _stat
+
     stub = tmp_path / "tailscale"
     blob = (
-        '{"BackendState":"Running",'
-        '"Self":{"HostName":"mysign7k2","TailscaleIPs":["100.64.1.2"]}}'
+        '{"BackendState":"Running","Self":{"HostName":"mysign7k2","TailscaleIPs":["100.64.1.2"]}}'
     )
     stub.write_text(f"#!/usr/bin/env bash\ncat <<'EOF'\n{blob}\nEOF\n")
     stub.chmod(stub.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
@@ -147,9 +140,7 @@ def test_tailscale_status_authenticated_from_stub(
 def test_info_device_id_null_when_identity_absent(client: TestClient, tmp_path, monkeypatch):
     """Off-device dev path: identity.json doesn't exist; the field
     is null. UI falls back to OS hostname there."""
-    monkeypatch.setenv(
-        "OPENMARQUEE_IDENTITY_PATH", str(tmp_path / "does-not-exist.json")
-    )
+    monkeypatch.setenv("OPENMARQUEE_IDENTITY_PATH", str(tmp_path / "does-not-exist.json"))
     response = client.get("/api/system/info")
     assert response.status_code == 200
     assert response.json()["device_id"] is None
@@ -267,9 +258,7 @@ def test_info_cors_for_localhost_origin(client: TestClient):
         headers={"Origin": "http://localhost:9000"},
     )
     assert response.status_code == 200
-    assert response.headers.get("access-control-allow-origin") == (
-        "http://localhost:9000"
-    )
+    assert response.headers.get("access-control-allow-origin") == ("http://localhost:9000")
     assert response.headers.get("vary") == "Origin"
 
 
@@ -281,6 +270,4 @@ def test_info_cors_for_captive_portal_ap_origin(client: TestClient):
         headers={"Origin": "http://192.168.4.1"},
     )
     assert response.status_code == 200
-    assert response.headers.get("access-control-allow-origin") == (
-        "http://192.168.4.1"
-    )
+    assert response.headers.get("access-control-allow-origin") == ("http://192.168.4.1")

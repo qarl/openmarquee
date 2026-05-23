@@ -83,9 +83,7 @@ class PollinationsProvider:
         try:
             response = httpx.get(url, params=params, timeout=self.timeout_seconds)
         except httpx.HTTPError as exc:
-            raise BackgroundGenError(
-                f"network failure talking to pollinations.ai: {exc}"
-            ) from exc
+            raise BackgroundGenError(f"network failure talking to pollinations.ai: {exc}") from exc
         if response.status_code != 200:
             raise BackgroundGenError(
                 f"pollinations.ai {response.status_code}: {response.text[:200]}"
@@ -114,8 +112,7 @@ def resolve_provider(name: str | None) -> ImageGenProvider:
         return PROVIDERS[resolved]
     except KeyError as exc:
         raise BackgroundProviderUnknown(
-            f"no image-gen provider named {resolved!r}. "
-            f"Known: {sorted(PROVIDERS)}"
+            f"no image-gen provider named {resolved!r}. Known: {sorted(PROVIDERS)}"
         ) from exc
 
 

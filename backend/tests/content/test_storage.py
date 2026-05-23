@@ -29,8 +29,14 @@ def _make_slide(**overrides) -> TextSlide:
     flat kwargs the tests were already using and shuttle them into the
     canonical layer."""
     layer_keys = {
-        "text", "text_color", "font_family", "font_size_px",
-        "font_size_pct", "auto_mode", "auto_format", "box",
+        "text",
+        "text_color",
+        "font_family",
+        "font_size_px",
+        "font_size_pct",
+        "auto_mode",
+        "auto_format",
+        "box",
     }
     layer = {"text": overrides.pop("text", "Hello, world")}
     for k in list(overrides.keys()):
@@ -420,9 +426,7 @@ def test_read_updated_at_falls_back_to_mtime_for_pre_flock_envelopes(tmp_path: P
     item_dir.mkdir()
     envelope_path = item_dir / "item.json"
     envelope_path.write_text(
-        json.dumps(
-            {"schema_version": SCHEMA_VERSION, "item": slide.model_dump(mode="json")}
-        )
+        json.dumps({"schema_version": SCHEMA_VERSION, "item": slide.model_dump(mode="json")})
     )
     (item_dir / "asset.png").write_bytes(b"\x89PNG")
     # Force a known mtime so the assertion is deterministic.

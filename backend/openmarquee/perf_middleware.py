@@ -42,9 +42,7 @@ _request_log: deque[dict[str, Any]] = deque(maxlen=_REQUEST_LOG_MAX)
 # log line emitted while handling a request gets a request_id tag.
 # Echoed back to the client as X-Request-ID so phone / UI traces can
 # join across the wire.
-request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "request_id", default="-"
-)
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
 
 class RequestIdLogFilter(logging.Filter):
@@ -85,9 +83,7 @@ def _coerce_request_id(headers: list[tuple[bytes, bytes]]) -> str:
             # Keep it tight: alnum + dash, up to 64 chars. Reject
             # anything that smells like an injection vector before it
             # reaches a log handler.
-            if 1 <= len(candidate) <= 64 and all(
-                c.isalnum() or c == "-" for c in candidate
-            ):
+            if 1 <= len(candidate) <= 64 and all(c.isalnum() or c == "-" for c in candidate):
                 return candidate
     return uuid.uuid4().hex[:12]
 
@@ -148,6 +144,10 @@ class PerfMiddleware:
             if duration_ms >= 50.0:
                 log.info(
                     "perf: %s %s -> %d in %.1fms [%s]",
-                    method, path, status_holder["code"], duration_ms, request_id,
+                    method,
+                    path,
+                    status_holder["code"],
+                    duration_ms,
+                    request_id,
                 )
             request_id_var.reset(token)

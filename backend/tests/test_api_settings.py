@@ -28,9 +28,7 @@ def content_storage(tmp_path: Path) -> ContentStorage:
 
 
 @pytest.fixture
-def client(
-    storage: SettingsStorage, content_storage: ContentStorage
-) -> TestClient:
+def client(storage: SettingsStorage, content_storage: ContentStorage) -> TestClient:
     app.dependency_overrides[get_settings_storage] = lambda: storage
     app.dependency_overrides[get_content_storage] = lambda: content_storage
     try:
@@ -269,8 +267,10 @@ def test_get_prefills_wifi_on_first_run_when_system_creds_available(
     SSID/password and the persisted settings have wifi_station_enabled
     flipped to True."""
     import openmarquee.api_settings as api_settings_mod
+
     monkeypatch.setattr(
-        api_settings_mod, "read_system_wifi",
+        api_settings_mod,
+        "read_system_wifi",
         lambda: ("MyHomeWifi", "abcdefgh"),
     )
 
@@ -287,7 +287,8 @@ def test_get_prefills_wifi_on_first_run_when_system_creds_available(
     # Persisted: subsequent GET (even if read_system_wifi later returns
     # different creds) returns the saved values.
     monkeypatch.setattr(
-        api_settings_mod, "read_system_wifi",
+        api_settings_mod,
+        "read_system_wifi",
         lambda: ("DifferentNet", "differentpass"),
     )
     response = client.get("/api/settings")
@@ -301,6 +302,7 @@ def test_get_does_not_prefill_when_system_creds_unavailable(
     """No active connection / unreadable conf / etc. → read_system_wifi
     returns None → settings come back unchanged with empty wifi fields."""
     import openmarquee.api_settings as api_settings_mod
+
     monkeypatch.setattr(api_settings_mod, "read_system_wifi", lambda: None)
 
     response = client.get("/api/settings")
@@ -324,8 +326,10 @@ def test_get_does_not_prefill_after_first_run_completed(
     assert response.status_code == 200
 
     import openmarquee.api_settings as api_settings_mod
+
     monkeypatch.setattr(
-        api_settings_mod, "read_system_wifi",
+        api_settings_mod,
+        "read_system_wifi",
         lambda: ("ShouldNotPrefill", "shouldnotpass"),
     )
 
@@ -351,8 +355,10 @@ def test_get_does_not_prefill_when_operator_already_set_ssid(
     assert response.status_code == 200
 
     import openmarquee.api_settings as api_settings_mod
+
     monkeypatch.setattr(
-        api_settings_mod, "read_system_wifi",
+        api_settings_mod,
+        "read_system_wifi",
         lambda: ("SystemNet", "systempass"),
     )
 
@@ -592,14 +598,11 @@ def test_scrubbed_error_summary_strips_ctx_key():
         summary = _scrubbed_error_summary(exc)
         # ctx is gone (defense in depth against future bad validators).
         assert "ctx" not in summary, (
-            f"helper kept the ctx key (the ValueError leak vector): "
-            f"{summary!r}"
+            f"helper kept the ctx key (the ValueError leak vector): {summary!r}"
         )
         # Rejected value is absent (because both `input` and `ctx`
         # were stripped, AND this safe validator didn't embed it in msg).
-        assert forbidden not in summary, (
-            f"rejected value leaked: {summary!r}"
-        )
+        assert forbidden not in summary, f"rejected value leaked: {summary!r}"
         # Audit trail intact: field name + error type still visible.
         assert "secret" in summary
         assert "value_error" in summary
@@ -632,9 +635,7 @@ def test_patch_validation_log_does_not_leak_secret_to_journal(
     assert response.status_code == 422
     # The WARNING line must mention the field name (audit trail) but
     # NOT the rejected value.
-    warning_lines = [
-        rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"
-    ]
+    warning_lines = [rec.getMessage() for rec in caplog.records if rec.levelname == "WARNING"]
     # The model's internal field name is wifi_password (the URL path
     # `wifi-ap-password` is the API alias). Audit trail is the field
     # name, not the URL path.
@@ -642,9 +643,7 @@ def test_patch_validation_log_does_not_leak_secret_to_journal(
         f"expected field=wifi_password in log, got: {warning_lines}"
     )
     for line in warning_lines:
-        assert forbidden_value not in line, (
-            f"REJECTED SECRET LEAKED TO LOG: {line!r}"
-        )
+        assert forbidden_value not in line, f"REJECTED SECRET LEAKED TO LOG: {line!r}"
 
 
 def test_patch_validation_response_does_not_leak_secret_or_pydantic_text(

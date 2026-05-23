@@ -347,9 +347,7 @@ async def test_session_pump_pushes_source_frames_to_renderer(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_session_pump_stops_and_logs_once_on_render_failure(
-    tmp_path, caplog
-):
+async def test_session_pump_stops_and_logs_once_on_render_failure(tmp_path, caplog):
     """If render_frame raises (a Rust sidecar without the push-frames
     IPC op), the pump logs ONCE and stops — it does NOT log a
     traceback per frame at the stream's frame rate. Guards against the
@@ -410,7 +408,9 @@ async def test_second_start_while_active_raises_live_already_active(tmp_path):
     try:
         with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
             manager = LiveManager(loop)
-            session_id, _answer = await manager.start(WebRtcStartRequest(sdp_offer="v=0\r\noffer-1\r\n"))
+            session_id, _answer = await manager.start(
+                WebRtcStartRequest(sdp_offer="v=0\r\noffer-1\r\n")
+            )
             assert manager.is_active
 
             with pytest.raises(LiveAlreadyActive) as exc_info:
@@ -441,7 +441,9 @@ async def test_takeover_replaces_active_session_with_new_id(tmp_path):
             first_session = manager._session
             assert first_session is not None
 
-            second_id, _ = await manager.takeover(WebRtcStartRequest(sdp_offer="v=0\r\noffer-2\r\n"))
+            second_id, _ = await manager.takeover(
+                WebRtcStartRequest(sdp_offer="v=0\r\noffer-2\r\n")
+            )
 
             assert second_id != first_id
             assert first_session.closed
@@ -663,14 +665,10 @@ def _patch_mock_ffmpeg(
     from openmarquee.stream_consumer import StreamConsumer
     from tests.test_stream_consumer import _write_mock_ffmpeg
 
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=n_frames
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=n_frames)
     monkeypatch.setattr(
         "openmarquee.stream_source.StreamConsumer",
-        functools.partial(
-            StreamConsumer, ffmpeg_bin=mock, source_size=source_size
-        ),
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=source_size),
     )
 
 
@@ -685,8 +683,11 @@ async def test_start_stream_session_pulls_frames(tmp_path, monkeypatch):
     # NV12 frame size for the injected 8x8 source.
     frame_size = 8 * 8 * 3 // 2
     _patch_mock_ffmpeg(
-        monkeypatch, tmp_path, n_frames=4,
-        frame_size=frame_size, source_size=(8, 8),
+        monkeypatch,
+        tmp_path,
+        n_frames=4,
+        frame_size=frame_size,
+        source_size=(8, 8),
     )
     loop, renderer = _empty_loop(tmp_path)
     await loop.start()
@@ -702,9 +703,7 @@ async def test_start_stream_session_pulls_frames(tmp_path, monkeypatch):
     renderer.render_frame = _record
     try:
         manager = LiveManager(loop)
-        session_id, answer = await manager.start(
-            StreamStartRequest(url="rtsp://laptop:8554/live")
-        )
+        session_id, answer = await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
         # A stream takeover has no SDP answer to hand back.
         assert answer is None
         assert manager.is_active
@@ -735,8 +734,11 @@ async def test_stream_session_has_no_peer_connection(tmp_path, monkeypatch):
     peer-connection; the no-PC invariant is what this test guards."""
     # NV12 frame size for the injected 8x8 source.
     _patch_mock_ffmpeg(
-        monkeypatch, tmp_path, n_frames=1,
-        frame_size=8 * 8 * 3 // 2, source_size=(8, 8),
+        monkeypatch,
+        tmp_path,
+        n_frames=1,
+        frame_size=8 * 8 * 3 // 2,
+        source_size=(8, 8),
     )
     loop, _renderer = _empty_loop(tmp_path)
     await loop.start()
@@ -756,9 +758,7 @@ async def test_stream_session_has_no_peer_connection(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(
-    tmp_path, monkeypatch
-):
+async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(tmp_path, monkeypatch):
     """C2 / finding M1: a stream takeover to a dead/unreachable URL —
     ffmpeg yields ZERO frames — must NOT leave the session permanently
     is_active with the playlist frozen on the last frame.
@@ -777,8 +777,11 @@ async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(
     # n_frames=0 → the mock ffmpeg emits nothing and exits: the
     # "unreachable URL" failure mode (ffmpeg/ffprobe yields no media).
     _patch_mock_ffmpeg(
-        monkeypatch, tmp_path, n_frames=0,
-        frame_size=8 * 8 * 3 // 2, source_size=(8, 8),
+        monkeypatch,
+        tmp_path,
+        n_frames=0,
+        frame_size=8 * 8 * 3 // 2,
+        source_size=(8, 8),
     )
     loop, _renderer = _empty_loop(tmp_path)
     await loop.start()
@@ -812,9 +815,7 @@ async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(
 
 
 @pytest.mark.asyncio
-async def test_stream_takeover_midstream_pump_exit_does_not_freeze_playlist(
-    tmp_path, monkeypatch
-):
+async def test_stream_takeover_midstream_pump_exit_does_not_freeze_playlist(tmp_path, monkeypatch):
     """C2 / finding M2: a stream takeover that DID render frames and
     then loses its source mid-stream (ffmpeg crashes / disconnects /
     the stream EOFs) must NOT leave the session is_active with the
@@ -829,8 +830,11 @@ async def test_stream_takeover_midstream_pump_exit_does_not_freeze_playlist(
     # n_frames=3 → the pump renders 3 frames, then frames() ends:
     # mid-stream pump exit AFTER frames flowed.
     _patch_mock_ffmpeg(
-        monkeypatch, tmp_path, n_frames=3,
-        frame_size=frame_size, source_size=(8, 8),
+        monkeypatch,
+        tmp_path,
+        n_frames=3,
+        frame_size=frame_size,
+        source_size=(8, 8),
     )
     loop, renderer = _empty_loop(tmp_path)
     captured: list[bytes] = []
@@ -844,9 +848,7 @@ async def test_stream_takeover_midstream_pump_exit_does_not_freeze_playlist(
     await loop.start()
     try:
         manager = LiveManager(loop)
-        session_id, _answer = await manager.start(
-            StreamStartRequest(url="rtsp://laptop:8554/live")
-        )
+        session_id, _answer = await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
         session = manager._session
         assert session is not None and session.id == session_id
         assert await _wait_until(lambda: loop.is_paused)
@@ -915,9 +917,7 @@ async def test_stream_takeover_healthy_stream_stays_active(tmp_path, monkeypatch
     await loop.start()
     try:
         manager = LiveManager(loop)
-        session_id, _answer = await manager.start(
-            StreamStartRequest(url="rtsp://laptop:8554/live")
-        )
+        session_id, _answer = await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
         session = manager._session
         assert session is not None and session.id == session_id
         assert await _wait_until(lambda: loop.is_paused)
@@ -931,8 +931,7 @@ async def test_stream_takeover_healthy_stream_stays_active(tmp_path, monkeypatch
         # producing session must NOT be auto-closed.
         await asyncio.sleep(1.3)
         assert not session.closed, (
-            "the first-frame watchdog wrongly closed a live, "
-            "frame-producing session"
+            "the first-frame watchdog wrongly closed a live, frame-producing session"
         )
         assert manager.is_active
         assert loop.is_paused

@@ -89,7 +89,7 @@ async def detect_display_dims() -> DisplayDims:
                 timeout=2,
                 check=False,
             )
-            m = re.search(r'geometry\s+(\d+)\s+(\d+)', out.stdout)
+            m = re.search(r"geometry\s+(\d+)\s+(\d+)", out.stdout)
             if m:
                 return DisplayDims(
                     width=int(m.group(1)),
@@ -145,8 +145,7 @@ async def scan_wifi() -> WifiScanResult:
 
     # macOS path (dev convenience).
     airport = Path(
-        "/System/Library/PrivateFrameworks/Apple80211.framework/"
-        "Versions/Current/Resources/airport"
+        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
     )
     if airport.exists():
         try:
@@ -189,15 +188,9 @@ def _parse_iw_scan(output: str) -> list[WifiNetwork]:
             if not ssid:
                 continue
             existing = networks.get(ssid)
-            if (
-                existing is None
-                or (
-                    current_signal is not None
-                    and (
-                        existing.signal_dbm is None
-                        or current_signal > existing.signal_dbm
-                    )
-                )
+            if existing is None or (
+                current_signal is not None
+                and (existing.signal_dbm is None or current_signal > existing.signal_dbm)
             ):
                 networks[ssid] = WifiNetwork(ssid=ssid, signal_dbm=current_signal)
             current_signal = None
@@ -372,11 +365,13 @@ async def tailscale_up() -> TailscaleUpResponse:
     auth. Caller polls /tailscale/status to detect the transition."""
     device_id = identity.read_device_id()
     result = await tailscale.start_up(device_id)
-    return TailscaleUpResponse(**{
-        "state": result["state"],
-        "auth_url": result.get("auth_url"),
-        "message": result.get("message"),
-    })
+    return TailscaleUpResponse(
+        **{
+            "state": result["state"],
+            "auth_url": result.get("auth_url"),
+            "message": result.get("message"),
+        }
+    )
 
 
 @router.get("/tailscale/status", response_model=TailscaleStatusResponse)
@@ -385,12 +380,14 @@ async def tailscale_status() -> TailscaleStatusResponse:
     UI polls this while in the URL-auth modal to detect when the
     operator's browser sign-in completes."""
     result = await tailscale.read_status()
-    return TailscaleStatusResponse(**{
-        "state": result["state"],
-        "hostname": result.get("hostname"),
-        "ipv4": result.get("ipv4"),
-        "message": result.get("message"),
-    })
+    return TailscaleStatusResponse(
+        **{
+            "state": result["state"],
+            "hostname": result.get("hostname"),
+            "ipv4": result.get("ipv4"),
+            "message": result.get("message"),
+        }
+    )
 
 
 def _read_model() -> str | None:
@@ -523,7 +520,7 @@ def _parse_airport_scan(output: str) -> list[WifiNetwork]:
         ssid = line[: m.start()].strip()
         if not ssid:
             continue
-        rest = line[m.end():].split()
+        rest = line[m.end() :].split()
         rssi: int | None = None
         if rest:
             try:
@@ -532,8 +529,7 @@ def _parse_airport_scan(output: str) -> list[WifiNetwork]:
                 rssi = None
         existing = networks.get(ssid)
         if existing is None or (
-            rssi is not None
-            and (existing.signal_dbm is None or rssi > existing.signal_dbm)
+            rssi is not None and (existing.signal_dbm is None or rssi > existing.signal_dbm)
         ):
             networks[ssid] = WifiNetwork(ssid=ssid, signal_dbm=rssi)
     return sorted(

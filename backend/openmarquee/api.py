@@ -52,9 +52,7 @@ FlockSyncDep = Annotated[FlockSync, Depends(get_flock_sync)]
 # screenshot fetch so a just-created / url-changed Web slide gets a real
 # asset image promptly instead of showing the placeholder until its
 # first playback slot. Non-blocking — the route never awaits the fetch.
-WebScreenshotKickerDep = Annotated[
-    Callable[[WebSlide], None], Depends(get_web_screenshot_kicker)
-]
+WebScreenshotKickerDep = Annotated[Callable[[WebSlide], None], Depends(get_web_screenshot_kicker)]
 
 
 # --- Batch 11.3 / sweep #5 #4: CORS allowlist helper ---
@@ -75,11 +73,13 @@ WebScreenshotKickerDep = Annotated[
 # enumeration. captive-portal AP IP is the operator's phone hitting
 # the device directly during setup; loopback covers dev + the device
 # talking to itself.
-_BUILTIN_ALLOWLIST_HOSTS: frozenset[str] = frozenset({
-    "localhost",
-    "127.0.0.1",
-    "192.168.4.1",  # captive-portal AP gateway (SYSTEM_SPEC §4.1)
-})
+_BUILTIN_ALLOWLIST_HOSTS: frozenset[str] = frozenset(
+    {
+        "localhost",
+        "127.0.0.1",
+        "192.168.4.1",  # captive-portal AP gateway (SYSTEM_SPEC §4.1)
+    }
+)
 
 
 def _parse_origin_host(origin: str) -> str | None:
@@ -105,9 +105,7 @@ def _parse_origin_host(origin: str) -> str | None:
     return host or None
 
 
-def origin_in_flock_allowlist(
-    origin: str, flock_storage: FlockStorage
-) -> bool:
+def origin_in_flock_allowlist(origin: str, flock_storage: FlockStorage) -> bool:
     """Decide whether a request's `Origin` should receive a reflective
     `Access-Control-Allow-Origin` header.
 
@@ -140,9 +138,7 @@ def origin_in_flock_allowlist(
     return False
 
 
-def cors_headers_for_origin(
-    origin: str, flock_storage: FlockStorage
-) -> dict[str, str]:
+def cors_headers_for_origin(origin: str, flock_storage: FlockStorage) -> dict[str, str]:
     """Build the response-header dict for a flock-readable endpoint.
 
     Returns `{ACAO: <origin>, Vary: "Origin"}` when allow-listed, or
@@ -182,9 +178,7 @@ def _decode_image_payload(b64: str) -> bytes:
         data = base64.b64decode(b64, validate=True)
     except ValueError as exc:
         # 11.2: don't reflect exception string into response.
-        raise HTTPException(
-            status_code=400, detail="image_base64 is not valid base64"
-        ) from exc
+        raise HTTPException(status_code=400, detail="image_base64 is not valid base64") from exc
     try:
         # 11.1 / sweep #5 #5: use .load() not .verify() at the upload
         # boundary. verify() only walks structural metadata; load()
@@ -235,9 +229,7 @@ def _decode_png_payload(b64: str) -> bytes:
         png = base64.b64decode(b64, validate=True)
     except ValueError as exc:  # binascii.Error subclasses ValueError
         # 11.2: don't reflect exception string into response.
-        raise HTTPException(
-            status_code=400, detail="png_base64 is not valid base64"
-        ) from exc
+        raise HTTPException(status_code=400, detail="png_base64 is not valid base64") from exc
 
     try:
         # 11.1 / sweep #5 #5: .load() not .verify() -- runs the
@@ -336,9 +328,7 @@ async def upload_text_slide(
     # not-supplied `box` falls back to TextSlide's default_factory rather
     # than failing on `box=None` (TextBox isn't optional on the model).
     try:
-        slide = TextSlide(
-            **payload.model_dump(exclude={"png_base64"}, exclude_none=True)
-        )
+        slide = TextSlide(**payload.model_dump(exclude={"png_base64"}, exclude_none=True))
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc
 
@@ -416,9 +406,7 @@ def _decode_mp4_payload(b64: str) -> bytes:
         mp4 = base64.b64decode(b64, validate=True)
     except ValueError as exc:
         # 11.2: don't reflect exception string into response.
-        raise HTTPException(
-            status_code=400, detail="mp4_base64 is not valid base64"
-        ) from exc
+        raise HTTPException(status_code=400, detail="mp4_base64 is not valid base64") from exc
 
     # MP4 files start with a box: 4 bytes big-endian size, then 4 bytes type.
     # The first box is almost always `ftyp`. We tolerate any ftyp brand.
@@ -492,8 +480,8 @@ def _count_video_traks_in_mp4(mp4: bytes) -> int:
         boxes: list[tuple[bytes, int, int]] = []
         pos = 0
         while pos + 8 <= len(payload):
-            size = int.from_bytes(payload[pos:pos + 4], "big")
-            kind = payload[pos + 4:pos + 8]
+            size = int.from_bytes(payload[pos : pos + 4], "big")
+            kind = payload[pos + 4 : pos + 8]
             if size < 8 or pos + size > len(payload):
                 raise _Malformed
             boxes.append((kind, pos + 8, pos + size))
@@ -742,9 +730,7 @@ async def update_stream(
     try:
         existing = storage.load(item_id)
     except FileNotFoundError as exc:
-        raise HTTPException(
-            status_code=404, detail=f"no stream {item_id}"
-        ) from exc
+        raise HTTPException(status_code=404, detail=f"no stream {item_id}") from exc
     if existing.type != "stream":
         raise HTTPException(
             status_code=409,
@@ -850,9 +836,7 @@ async def update_web(
     try:
         existing = storage.load(item_id)
     except FileNotFoundError as exc:
-        raise HTTPException(
-            status_code=404, detail=f"no web slide {item_id}"
-        ) from exc
+        raise HTTPException(status_code=404, detail=f"no web slide {item_id}") from exc
     if existing.type != "web":
         raise HTTPException(
             status_code=409,

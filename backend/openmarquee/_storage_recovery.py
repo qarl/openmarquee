@@ -57,12 +57,16 @@ def quarantine_corrupt_file(path: Path, exc: Exception) -> Path | None:
             "Storage at %s failed to parse AND quarantine-rename to %s "
             "failed; the next save() will overwrite the bad file in "
             "place. Original parse error: %s",
-            path, corrupt, exc,
+            path,
+            corrupt,
+            exc,
         )
         return None
     log.warning(
         "Storage at %s failed to parse; quarantined to %s; starting "
         "fresh from defaults. Original parse error: %s",
-        path, corrupt, exc,
+        path,
+        corrupt,
+        exc,
     )
     return corrupt

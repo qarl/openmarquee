@@ -140,8 +140,7 @@ def _resolve_chromium() -> str:
         if path:
             return path
     raise WebRenderError(
-        "no Chromium binary found on PATH (looked for "
-        f"{', '.join(_CHROMIUM_BINARIES)})"
+        f"no Chromium binary found on PATH (looked for {', '.join(_CHROMIUM_BINARIES)})"
     )
 
 
@@ -269,9 +268,7 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
     validate_web_url(url)
 
     if width <= 0 or height <= 0:
-        raise ValueError(
-            f"render dimensions must be positive, got {width}x{height}"
-        )
+        raise ValueError(f"render dimensions must be positive, got {width}x{height}")
 
     chromium = _resolve_chromium()
 
@@ -279,18 +276,14 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
     # and delete the temp file in the `finally`. A NamedTemp is created
     # and immediately closed so Chromium (a separate process) owns the
     # path exclusively — we only need a unique filesystem path.
-    tmp = tempfile.NamedTemporaryFile(
-        prefix="web-render-", suffix=".png", delete=False
-    )
+    tmp = tempfile.NamedTemporaryFile(prefix="web-render-", suffix=".png", delete=False)
     tmp.close()
     screenshot_path = tmp.name
 
     try:
         # Prefix nice so the multi-minute render yields CPU to the
         # playback renderer instead of stuttering the sign.
-        argv = _nice_prefix() + _build_chromium_argv(
-            chromium, url, width, height, screenshot_path
-        )
+        argv = _nice_prefix() + _build_chromium_argv(chromium, url, width, height, screenshot_path)
         # --- Chromium headless: URL -> screenshot PNG ------------------
         try:
             proc = subprocess.run(
@@ -303,41 +296,27 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
             # TimeoutExpired before re-raising — so the process is not
             # orphaned. Surface it as a typed, bounded failure.
             raise WebRenderError(
-                f"Chromium render of {url} timed out after "
-                f"{WEB_RENDER_TIMEOUT_S:.0f}s"
+                f"Chromium render of {url} timed out after {WEB_RENDER_TIMEOUT_S:.0f}s"
             ) from exc
         except OSError as exc:
-            raise WebRenderError(
-                f"failed to launch Chromium for {url}: {exc}"
-            ) from exc
+            raise WebRenderError(f"failed to launch Chromium for {url}: {exc}") from exc
 
         if proc.returncode != 0:
-            stderr = (proc.stderr or b"").decode(
-                "utf-8", errors="replace"
-            ).strip()
+            stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
             # Keep the message single-line — the subprocess `main`
             # prints it straight to stderr.
             detail = stderr.splitlines()[-1] if stderr else "(no output)"
-            raise WebRenderError(
-                f"Chromium exited {proc.returncode} rendering {url}: "
-                f"{detail}"
-            )
+            raise WebRenderError(f"Chromium exited {proc.returncode} rendering {url}: {detail}")
 
         # --- read + sanity-check Chromium's screenshot ----------------
         shot = Path(screenshot_path)
         if not shot.exists():
-            raise WebRenderError(
-                f"Chromium produced no screenshot file for {url}"
-            )
+            raise WebRenderError(f"Chromium produced no screenshot file for {url}")
         render_png = shot.read_bytes()
         if not render_png:
-            raise WebRenderError(
-                f"Chromium produced an empty screenshot for {url}"
-            )
+            raise WebRenderError(f"Chromium produced an empty screenshot for {url}")
         if not render_png.startswith(_PNG_MAGIC):
-            raise WebRenderError(
-                f"Chromium screenshot for {url} is not a PNG"
-            )
+            raise WebRenderError(f"Chromium screenshot for {url} is not a PNG")
 
         return render_png
     finally:
@@ -376,8 +355,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if len(argv) != 4:
         print(
-            "usage: python -m openmarquee.web_render "
-            "<url> <width> <height> <out_path>",
+            "usage: python -m openmarquee.web_render <url> <width> <height> <out_path>",
             file=sys.stderr,
         )
         return 2
@@ -389,15 +367,13 @@ def main(argv: list[str] | None = None) -> int:
         height = int(raw_h)
     except ValueError:
         print(
-            "web-render: render dimensions must be integers, got "
-            f"{raw_w!r}x{raw_h!r}",
+            f"web-render: render dimensions must be integers, got {raw_w!r}x{raw_h!r}",
             file=sys.stderr,
         )
         return 2
     if width <= 0 or height <= 0:
         print(
-            "web-render: render dimensions must be positive, got "
-            f"{width}x{height}",
+            f"web-render: render dimensions must be positive, got {width}x{height}",
             file=sys.stderr,
         )
         return 2

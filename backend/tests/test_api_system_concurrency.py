@@ -55,7 +55,8 @@ async def test_slow_wifi_scan_doesnt_block_concurrent_state_polls(
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://testserver",
+        transport=transport,
+        base_url="http://testserver",
     ) as client:
         # Fire the slow one first, then the fast one. If the slow
         # call were still sync, gather() would wait for it to
@@ -78,8 +79,8 @@ async def test_slow_wifi_scan_doesnt_block_concurrent_state_polls(
     # in roughly its own runtime, not slow_seconds later.
     assert state_resp.status_code == 200
     assert state_elapsed < slow_seconds / 2, (
-        f"state poll waited {state_elapsed*1000:.0f}ms while a "
-        f"{slow_seconds*1000:.0f}ms subprocess was in flight -- "
+        f"state poll waited {state_elapsed * 1000:.0f}ms while a "
+        f"{slow_seconds * 1000:.0f}ms subprocess was in flight -- "
         "the event loop was blocked"
     )
     # Sanity: the slow call actually ran (total >= slow_seconds),

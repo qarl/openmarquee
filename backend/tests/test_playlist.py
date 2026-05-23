@@ -104,8 +104,7 @@ def test_invalid_json_is_quarantined_and_starts_fresh(
 
     # WARNING log emitted citing the path + parse error.
     assert any("failed to parse" in rec.message for rec in caplog.records), (
-        f"expected a WARNING about parse failure, got: "
-        f"{[r.message for r in caplog.records]}"
+        f"expected a WARNING about parse failure, got: {[r.message for r in caplog.records]}"
     )
 
 
@@ -443,13 +442,7 @@ def test_list_in_playlist_order_patches_transitions_onto_items(tmp_path: Path):
 
     playlist_storage = PlaylistStorage(tmp_path / "playlist.json")
     playlist_storage.save(
-        Playlist(
-            items=[
-                PlaylistItem(
-                    item_id=slide.id, transition="fade", transition_ms=250
-                )
-            ]
-        )
+        Playlist(items=[PlaylistItem(item_id=slide.id, transition="fade", transition_ms=250)])
     )
 
     ordered = list_in_playlist_order(storage, playlist_storage)
@@ -496,9 +489,7 @@ def test_list_in_playlist_order_include_orphans_returns_items_from_non_default_p
     )
     # true_orphan is in storage but in no playlist.
 
-    ordered = list_in_playlist_order(
-        storage, playlist_storage, include_orphans=True
-    )
+    ordered = list_in_playlist_order(storage, playlist_storage, include_orphans=True)
     ids = [item.id for item in ordered]
     # Default playlist's item comes first, in playlist order.
     assert ids[0] == in_default.id

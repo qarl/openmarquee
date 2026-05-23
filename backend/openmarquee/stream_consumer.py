@@ -63,9 +63,7 @@ log = logging.getLogger(__name__)
 #: this set is rejected by `validate_stream_url` — in particular the
 #: local-file / pipe / concat vectors (`file`, `pipe`, `concat`,
 #: `subfile`, `data`) and a bare path with no scheme at all.
-ALLOWED_STREAM_SCHEMES = frozenset(
-    {"rtsp", "rtmp", "rtmps", "http", "https", "srt", "udp"}
-)
+ALLOWED_STREAM_SCHEMES = frozenset({"rtsp", "rtmp", "rtmps", "http", "https", "srt", "udp"})
 
 
 def validate_stream_url(url: str) -> str:
@@ -93,10 +91,10 @@ def validate_stream_url(url: str) -> str:
         allowed = ", ".join(sorted(ALLOWED_STREAM_SCHEMES))
         shown = scheme if scheme else "(none)"
         raise ValueError(
-            f"stream URL scheme {shown!r} is not allowed; "
-            f"the URL must use one of: {allowed}"
+            f"stream URL scheme {shown!r} is not allowed; the URL must use one of: {allowed}"
         )
     return url
+
 
 # ffmpeg stderr is captured into a tail buffer trimmed to this many
 # bytes after each read, so a long-lived consumer can't grow memory
@@ -212,9 +210,7 @@ class StreamConsumer:
         # probed). None until known. `source_width`/`source_height`/
         # `FfmpegStreamSource.frame_dims()` report this clamped pair.
         self._source_size: tuple[int, int] | None = (
-            _clamp_to_texture_limit(*source_size)
-            if source_size is not None
-            else None
+            _clamp_to_texture_limit(*source_size) if source_size is not None else None
         )
         # Renderer-hardening C2 (finding H2): the RAW probed dims, before
         # the >2048 texture-limit clamp. `_build_argv` compares this to
@@ -264,14 +260,18 @@ class StreamConsumer:
         picks the first video stream."""
         argv = [
             self._ffprobe_bin,
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
         ]
         if self._is_rtsp():
             argv += ["-rtsp_transport", "tcp"]
         argv += [
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "json",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
             self._stream_url,
         ]
         return argv
@@ -305,14 +305,18 @@ class StreamConsumer:
         swscale cost — the renderer cover-fits on the GPU as before."""
         argv = [
             self._ffmpeg_bin,
-            "-loglevel", "error",
-            "-fflags", "nobuffer",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
         ]
         if self._is_rtsp():
             argv += ["-rtsp_transport", "tcp"]
         argv += [
-            "-c:v", "h264_v4l2m2m",
-            "-i", self._stream_url,
+            "-c:v",
+            "h264_v4l2m2m",
+            "-i",
+            self._stream_url,
             "-an",
         ]
         # Over-large source -> downscale to the texture-limit-clamped
@@ -327,8 +331,10 @@ class StreamConsumer:
             scale_w, scale_h = self._source_size
             argv += ["-vf", f"scale={scale_w}:{scale_h}"]
         argv += [
-            "-pix_fmt", "nv12",
-            "-f", "rawvideo",
+            "-pix_fmt",
+            "nv12",
+            "-f",
+            "rawvideo",
             "-",
         ]
         return argv
@@ -412,9 +418,12 @@ class StreamConsumer:
             clamped = _clamp_to_texture_limit(*raw)
             if clamped != raw:
                 log.warning(
-                    "stream: source %dx%d exceeds the %dpx GPU texture "
-                    "limit; downscaling to %dx%d",
-                    raw[0], raw[1], _MAX_STREAM_DIM, clamped[0], clamped[1],
+                    "stream: source %dx%d exceeds the %dpx GPU texture limit; downscaling to %dx%d",
+                    raw[0],
+                    raw[1],
+                    _MAX_STREAM_DIM,
+                    clamped[0],
+                    clamped[1],
                 )
             return (raw, clamped)
         finally:
@@ -477,9 +486,7 @@ class StreamConsumer:
                 return
             assert self._proc.stdout is not None
             assert self._proc.stderr is not None
-            self._stderr_task = asyncio.create_task(
-                self._drain_stderr(self._proc.stderr)
-            )
+            self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc.stderr))
         try:
             while not self._closed:
                 # readexactly enforces the NV12 frame size: a short
@@ -525,9 +532,7 @@ class StreamConsumer:
                 with contextlib.suppress(ProcessLookupError):
                     proc.terminate()
                 try:
-                    await asyncio.wait_for(
-                        proc.wait(), timeout=_TERMINATE_GRACE_SECONDS
-                    )
+                    await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECONDS)
                 except TimeoutError:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()

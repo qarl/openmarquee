@@ -43,8 +43,7 @@ def _clear_failure_throttle():
     web_screenshot._failed_slide_ids.clear()
 
 
-def _install_render(monkeypatch, *, png=None, raise_exc=None, calls=None,
-                    on_call=None):
+def _install_render(monkeypatch, *, png=None, raise_exc=None, calls=None, on_call=None):
     """Patch `web_screenshot.render_web_png` with a synchronous fake.
 
     `png` is returned; `raise_exc` is raised instead. `calls` (a list)
@@ -123,9 +122,7 @@ async def test_render_error_leaves_asset_untouched(tmp_path, monkeypatch):
     storage.save_web(slide)
     before = storage.read_asset(slide.id)
 
-    _install_render(
-        monkeypatch, raise_exc=WebRenderError("Chromium crashed")
-    )
+    _install_render(monkeypatch, raise_exc=WebRenderError("Chromium crashed"))
 
     ok = await fetch_web_screenshot(slide, storage, 1360, 768)
 
@@ -142,9 +139,7 @@ async def test_invalid_url_leaves_asset_untouched(tmp_path, monkeypatch):
     storage.save_web(slide)
     before = storage.read_asset(slide.id)
 
-    _install_render(
-        monkeypatch, raise_exc=ValueError("unsupported URL scheme")
-    )
+    _install_render(monkeypatch, raise_exc=ValueError("unsupported URL scheme"))
 
     ok = await fetch_web_screenshot(slide, storage, 1360, 768)
 
@@ -227,9 +222,7 @@ async def test_renders_are_serialized(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_failure_warns_repeat_failure_debugs(
-    tmp_path, monkeypatch, caplog
-):
+async def test_first_failure_warns_repeat_failure_debugs(tmp_path, monkeypatch, caplog):
     """The first failure for a slide id logs WARNING; a second
     consecutive failure for the same id logs DEBUG — so a persistently
     broken URL on a short refresh interval doesn't WARNING-spam."""
@@ -237,9 +230,7 @@ async def test_first_failure_warns_repeat_failure_debugs(
     slide = _web_slide()
     storage.save_web(slide)
 
-    _install_render(
-        monkeypatch, raise_exc=WebRenderError("render failed")
-    )
+    _install_render(monkeypatch, raise_exc=WebRenderError("render failed"))
 
     with caplog.at_level(logging.DEBUG, logger="openmarquee.web_screenshot"):
         ok1 = await fetch_web_screenshot(slide, storage, 1360, 768)
@@ -250,22 +241,15 @@ async def test_first_failure_warns_repeat_failure_debugs(
 
     assert ok1 is False and ok2 is False
     # First failure -> WARNING.
-    assert any(
-        r.levelno == logging.WARNING and "render failed" in r.message
-        for r in first_records
-    )
+    assert any(r.levelno == logging.WARNING and "render failed" in r.message for r in first_records)
     # Second failure for the SAME id -> DEBUG, not WARNING.
-    failure_lines = [
-        r for r in second_records if "render failed" in r.message
-    ]
+    failure_lines = [r for r in second_records if "render failed" in r.message]
     assert failure_lines
     assert all(r.levelno == logging.DEBUG for r in failure_lines)
 
 
 @pytest.mark.asyncio
-async def test_success_clears_the_failure_throttle(
-    tmp_path, monkeypatch, caplog
-):
+async def test_success_clears_the_failure_throttle(tmp_path, monkeypatch, caplog):
     """A success between failures clears the throttle entry, so the
     next failure for that id WARNINGs afresh rather than being
     DEBUG-suppressed."""
@@ -289,7 +273,4 @@ async def test_success_clears_the_failure_throttle(
     caplog.clear()
     with caplog.at_level(logging.DEBUG, logger="openmarquee.web_screenshot"):
         await fetch_web_screenshot(slide, storage, 1360, 768)
-    assert any(
-        r.levelno == logging.WARNING and "down again" in r.message
-        for r in caplog.records
-    )
+    assert any(r.levelno == logging.WARNING and "down again" in r.message for r in caplog.records)

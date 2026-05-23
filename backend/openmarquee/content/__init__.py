@@ -39,9 +39,22 @@ ALLOWED_WEB_SCHEMES = frozenset({"http", "https"})
 #: out into the next slide. Defined once here and reused by every variant's
 #: `transition` field so the value set never drifts between models.
 TransitionKind = Literal[
-    "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee",
-    "dissolve", "pixelate", "halftone", "scanline", "glitch", "push",
-    "blinds", "shutter",
+    "cut",
+    "fade",
+    "wipe",
+    "slide",
+    "iris",
+    "scroll",
+    "flip",
+    "marquee",
+    "dissolve",
+    "pixelate",
+    "halftone",
+    "scanline",
+    "glitch",
+    "push",
+    "blinds",
+    "shutter",
 ]
 
 
@@ -76,15 +89,12 @@ def validate_web_url(url: str) -> None:
         allowed = ", ".join(sorted(ALLOWED_WEB_SCHEMES))
         shown = scheme if scheme else "(none)"
         raise ValueError(
-            f"web URL scheme {shown!r} is not allowed; "
-            f"the URL must use one of: {allowed}"
+            f"web URL scheme {shown!r} is not allowed; the URL must use one of: {allowed}"
         )
     # `netloc` is host[:port], optionally prefixed with `userinfo@`.
     # A `@` in it means a userinfo component is present — reject it.
     if "@" in parsed.netloc:
-        raise ValueError(
-            "web URL must not contain a userinfo ('user@') component"
-        )
+        raise ValueError("web URL must not contain a userinfo ('user@') component")
 
 
 def _utcnow() -> datetime:
@@ -195,12 +205,12 @@ class TextLayer(BaseModel):
     # spec.md, step 3) lands.
     motion: Literal[
         "static",
-        "ticker",   # horizontal travel, linear, LTR
+        "ticker",  # horizontal travel, linear, LTR
         "breathe",  # scale around box center, sine
-        "pulse",    # alpha modulation, sine
-        "bounce",   # vertical bob, sine
-        "shake",    # deterministic Gaussian micro-jitter
-        "blink",    # square-wave on/off opacity
+        "pulse",  # alpha modulation, sine
+        "bounce",  # vertical bob, sine
+        "shake",  # deterministic Gaussian micro-jitter
+        "blink",  # square-wave on/off opacity
     ] = "static"
     # Operator-facing single-knob motion control (0=mild, 100=intense).
     # Each effect maps this to a sensible per-effect range — see
@@ -307,8 +317,18 @@ class BackgroundPattern(BaseModel):
     """
 
     pattern: Literal[
-        "solid", "gradient", "dots", "halftone", "stripes",
-        "scanlines", "checker", "grid", "rings", "rays", "confetti", "bricks",
+        "solid",
+        "gradient",
+        "dots",
+        "halftone",
+        "stripes",
+        "scanlines",
+        "checker",
+        "grid",
+        "rings",
+        "rays",
+        "confetti",
+        "bricks",
     ]
     color_a: str = Field(pattern=_HEX_COLOR_PATTERN)
     color_b: str = Field(default="#FFFFFF", pattern=_HEX_COLOR_PATTERN)
@@ -448,11 +468,13 @@ class TextSlide(BaseModel):
         catches a malformed payload before it round-trips through
         storage."""
         present = sum(
-            1 for v in (
+            1
+            for v in (
                 self.background_image_slide_id,
                 self.background_video_slide_id,
                 self.background_pattern,
-            ) if v is not None
+            )
+            if v is not None
         )
         if present > 1:
             raise ValueError(
@@ -549,9 +571,7 @@ class StreamSlide(BaseModel):
     # Fixed slot length, capped at 24h.
     duration_ms: int = Field(default=10_000, ge=100, le=24 * 60 * 60 * 1000)
     # Fallback when the RTSP URL is unreachable at slot-fire time.
-    on_unreachable: Literal["hold_last_frame", "black", "skip"] = (
-        "hold_last_frame"
-    )
+    on_unreachable: Literal["hold_last_frame", "black", "skip"] = "hold_last_frame"
 
     # Same transition contract as the other slide types.
     transition: TransitionKind = "cut"
@@ -610,9 +630,7 @@ class WebSlide(BaseModel):
     # refresh). Default 3600s = a 1-hour refresh: an on-device render is
     # multi-minute on the Pi, so a tighter default would re-render
     # almost continuously.
-    refresh_interval_s: int = Field(
-        default=3600, ge=10, le=24 * 60 * 60
-    )
+    refresh_interval_s: int = Field(default=3600, ge=10, le=24 * 60 * 60)
     # Fixed slot length, capped at 24h — same as StreamSlide.
     duration_ms: int = Field(default=10_000, ge=100, le=24 * 60 * 60 * 1000)
 

@@ -27,7 +27,9 @@ def _write_conf(tmp_path: Path, body: str) -> Path:
 
 
 def test_returns_creds_for_active_network(tmp_path: Path):
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
 update_config=1
 country=US
@@ -37,7 +39,8 @@ network={
     psk="hunter2pass"
     key_mgmt=WPA-PSK
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "MyHome",  # fake iwgetid
@@ -49,7 +52,9 @@ def test_picks_block_matching_active_ssid_when_multiple(tmp_path: Path):
     """wpa_supplicant.conf can list several network={} blocks. We
     must pick the one whose ssid matches `iwgetid -r`, not just the
     first one."""
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 network={
     ssid="OtherNet"
     psk="otherpass"
@@ -58,7 +63,8 @@ network={
     ssid="ActiveNet"
     psk="activepass"
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "ActiveNet",
@@ -69,12 +75,12 @@ network={
 # --- failure modes (all return None) ---
 
 
-_MIN_CONF = '''
+_MIN_CONF = """
 network={
     ssid="X"
     psk="ypassxxx"
 }
-'''
+"""
 
 
 def test_returns_none_when_iwgetid_returns_empty(tmp_path: Path):
@@ -132,13 +138,16 @@ def test_skips_disabled_network_blocks(tmp_path: Path):
     its ssid matches the active connection. (Edge case — the active
     SSID in such a config implies the disabled flag was added later
     and wpa_supplicant didn't reload — but we should respect it.)"""
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 network={
     ssid="MyNet"
     psk="mypass12"
     disabled=1
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "MyNet",
@@ -149,12 +158,15 @@ network={
 def test_returns_none_for_open_network_no_psk(tmp_path: Path):
     """Open networks (no psk= line) can't pre-fill a password field
     and we don't try."""
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 network={
     ssid="OpenAP"
     key_mgmt=NONE
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "OpenAP",
@@ -168,12 +180,15 @@ def test_skips_hex_encoded_psk(tmp_path: Path):
     password's 8-63 printable-ASCII validator. Skip rather than
     return invalid creds."""
     hex_psk = "a" * 64
-    conf = _write_conf(tmp_path, f'''
+    conf = _write_conf(
+        tmp_path,
+        f"""
 network={{
     ssid="HexNet"
     psk={hex_psk}
 }}
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "HexNet",
@@ -199,12 +214,15 @@ def test_unescapes_quote_inside_psk(tmp_path: Path):
     wifi password was `my"pass1` but the form showed `my\\"pass1`
     and they had to manually clean it up. Verify the parser
     unescapes."""
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 network={
     ssid="EscNet"
     psk="my\\"pass1"
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "EscNet",
@@ -216,12 +234,15 @@ def test_unescapes_backslash_inside_psk(tmp_path: Path):
     """wpa_supplicant.conf(5) also permits \\\\ (literal backslash)
     inside quoted PSK values. Pre-fix the parser passed both chars
     through; post-fix it emits one literal backslash."""
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 network={
     ssid="BackslashNet"
     psk="back\\\\slash"
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "BackslashNet",
@@ -234,12 +255,15 @@ def test_unescapes_quote_inside_ssid(tmp_path: Path):
     The active-SSID match check must compare against the unescaped
     form since iwgetid -r emits the actual SSID bytes, not the
     conf-file escape sequence."""
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 network={
     ssid="Joe\\"sNet"
     psk="goodpass"
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: 'Joe"sNet',
@@ -253,12 +277,15 @@ def test_psk_value_never_logged(tmp_path: Path, caplog):
     rendering a noisy fixture (escaped + matched + mismatched) and
     grepping the captured log for the PSK substring."""
     secret = "topsecret!"
-    conf = _write_conf(tmp_path, f'''
+    conf = _write_conf(
+        tmp_path,
+        f'''
 network={{
     ssid="LogNet"
     psk="{secret}"
 }}
-''')
+''',
+    )
     with caplog.at_level("DEBUG", logger="openmarquee.wifi_prefill"):
         result = read_system_wifi(
             paths=(conf,),
@@ -277,22 +304,23 @@ network={{
         assert secret not in str(rec.msg), (
             f"PSK leaked to {rec.levelname} log (raw msg): {rec.msg!r}"
         )
-        for arg in (rec.args or ()):
-            assert secret not in str(arg), (
-                f"PSK leaked to {rec.levelname} log (arg): {arg!r}"
-            )
+        for arg in rec.args or ():
+            assert secret not in str(arg), f"PSK leaked to {rec.levelname} log (arg): {arg!r}"
 
 
 def test_handles_trailing_whitespace_in_conf(tmp_path: Path):
     """Operators sometimes hand-edit conf and leave trailing spaces
     inside the network={} block. The regex's `.+?\\s*$` handles it
     so the SSID match against the active connection still works."""
-    conf = _write_conf(tmp_path, '''
+    conf = _write_conf(
+        tmp_path,
+        """
 network={
     ssid="MyNet"
     psk="mypass12"
 }
-''')
+""",
+    )
     result = read_system_wifi(
         paths=(conf,),
         get_active_ssid=lambda: "MyNet",

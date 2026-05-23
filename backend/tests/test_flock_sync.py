@@ -223,9 +223,7 @@ async def test_ingest_update_pulls_content_and_saves_with_sender_timestamp(
         if url == f"http://peer.ts.net/api/content/{peer_cid}":
             return httpx.Response(200, json=sender_slide.model_dump(mode="json"))
         if url == f"http://peer.ts.net/api/content/{peer_cid}/asset":
-            return httpx.Response(
-                200, content=sender_png, headers={"content-type": "image/png"}
-            )
+            return httpx.Response(200, content=sender_png, headers={"content-type": "image/png"})
         return httpx.Response(404)
 
     sync, content, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
@@ -287,9 +285,7 @@ async def test_ingest_update_skips_when_sender_evicted(tmp_path: Path):
     cid = uuid4()
 
     def handler(request):
-        return httpx.Response(
-            200, json={"schema_version": 1, "entries": [], "tombstones": []}
-        )
+        return httpx.Response(200, json={"schema_version": 1, "entries": [], "tombstones": []})
 
     sync, content, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
     await sync.ingest_push(cid, "updated", "peer.ts.net", _NOW)
@@ -383,17 +379,13 @@ async def test_announce_sync_skipped_when_sync_disabled(tmp_path: Path):
         calls.append(request)
         return httpx.Response(204)
 
-    sync, _, _, _ = _build_sync(
-        tmp_path, httpx.MockTransport(handler), enabled=False
-    )
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler), enabled=False)
     await sync.announce_sync_to_peer("peer.ts.net", True)
     assert calls == []
 
 
 def test_apply_sync_announcement_flips_matching_peer(tmp_path: Path):
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     peer = flock.add(address="peer.ts.net")
     assert peer.sync is False
     ok = sync.apply_sync_announcement("peer.ts.net", True)
@@ -402,9 +394,7 @@ def test_apply_sync_announcement_flips_matching_peer(tmp_path: Path):
 
 
 def test_apply_sync_announcement_rejects_unknown_sender(tmp_path: Path):
-    sync, _, _, _ = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     assert sync.apply_sync_announcement("stranger.ts.net", True) is False
 
 
@@ -468,8 +458,7 @@ def _manifest_with(*entries, tombstones=()):
             for cid, ts in entries
         ],
         "tombstones": [
-            {"content_id": str(cid), "deleted_at": ts.isoformat()}
-            for cid, ts in tombstones
+            {"content_id": str(cid), "deleted_at": ts.isoformat()} for cid, ts in tombstones
         ],
     }
 
@@ -555,10 +544,7 @@ async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
 
     await sync.pull_from_peer("peer.ts.net")
     # Only the peer-name probe + the manifest — content + asset NOT fetched.
-    assert all(
-        u.endswith("/api/flock/manifest") or u.endswith("/api/settings")
-        for u in fetched
-    )
+    assert all(u.endswith("/api/flock/manifest") or u.endswith("/api/settings") for u in fetched)
     assert content.load(cid).name == "Local wins"
 
 
@@ -573,9 +559,7 @@ async def test_pull_from_peer_survives_single_entry_failure(tmp_path: Path):
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url.endswith("/api/flock/manifest"):
-            return httpx.Response(
-                200, json=_manifest_with((good_cid, ts), (bad_cid, ts))
-            )
+            return httpx.Response(200, json=_manifest_with((good_cid, ts), (bad_cid, ts)))
         if url.endswith(f"/api/content/{good_cid}"):
             return httpx.Response(200, json=good_slide.model_dump(mode="json"))
         if url.endswith(f"/api/content/{good_cid}/asset"):
@@ -646,9 +630,7 @@ async def test_notify_peers_noops_when_sync_disabled(tmp_path: Path):
         calls.append(request)
         return httpx.Response(204)
 
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(handler), enabled=False
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler), enabled=False)
     peer = flock.add(address="peer.ts.net")
     flock.update(peer.id, sync=True)
     await sync.notify_peers(uuid4(), "updated")
@@ -673,9 +655,7 @@ async def test_pull_from_peer_noops_when_sync_disabled(tmp_path: Path):
         hits.append(str(request.url))
         return httpx.Response(200, json={"schema_version": 1, "entries": [], "tombstones": []})
 
-    sync, _, _, _ = _build_sync(
-        tmp_path, httpx.MockTransport(handler), enabled=False
-    )
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler), enabled=False)
     await sync.pull_from_peer("peer.ts.net")
     assert hits == []
 
@@ -828,9 +808,7 @@ async def test_gossip_add_swallows_peer_errors(tmp_path: Path):
 
 def test_apply_hello_adds_new_peer(tmp_path: Path):
     """Inbound hello for an unknown address adds it to local flock."""
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     assert flock.load().peers == []
     added = sync.apply_hello("new.ts.net")
     assert added is True
@@ -843,9 +821,7 @@ def test_apply_hello_idempotent_for_known_peer(tmp_path: Path):
     """Duplicate hello (race between reciprocal-add + forward-
     notification) is a no-op rather than a 409 — gossip introductions
     can land twice for the same peer in a 3+-device flock."""
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     flock.add(address="known.ts.net")
     added = sync.apply_hello("known.ts.net")
     assert added is False
@@ -890,16 +866,12 @@ async def test_pull_from_peer_records_items_behind_pre_apply(tmp_path: Path):
         if url.endswith("/api/flock/manifest"):
             return httpx.Response(
                 200,
-                json=_manifest_with(
-                    (cid_a, remote_ts), (cid_b, remote_ts), (cid_c, remote_ts)
-                ),
+                json=_manifest_with((cid_a, remote_ts), (cid_b, remote_ts), (cid_c, remote_ts)),
             )
         if "/api/content/" in url and url.endswith("/asset"):
             return httpx.Response(200, content=png)
         if "/api/content/" in url:
-            slide = TextSlide(
-                id=UUID(url.rsplit("/", 1)[-1]), name="r", text="r"
-            )
+            slide = TextSlide(id=UUID(url.rsplit("/", 1)[-1]), name="r", text="r")
             return httpx.Response(200, json=slide.model_dump(mode="json"))
         return httpx.Response(404)
 

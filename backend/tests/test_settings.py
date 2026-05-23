@@ -216,9 +216,7 @@ def test_storage_seeds_tailscale_hostname_from_sign_name_on_first_load(tmp_path)
     assert loaded.tailscale_hostname == loaded.sign_name.lower()
 
 
-def test_storage_anchors_to_device_id_when_identity_json_present(
-    tmp_path, monkeypatch
-):
+def test_storage_anchors_to_device_id_when_identity_json_present(tmp_path, monkeypatch):
     """qarl 2026-05-12 (a2): when identity.json holds a MySignXXX
     device_id (set at first boot), the IMMUTABLE infrastructure fields
     anchor to it instead of the random Sign<XXX> mint:
@@ -399,9 +397,9 @@ def test_storage_load_returns_defaults_when_file_absent(tmp_path: Path):
     storage = SettingsStorage(tmp_path / "settings.json")
     loaded = storage.load()
     skip = {"sign_name", "wifi_ssid", "tailscale_hostname"}
-    assert loaded.model_dump(exclude=skip) == SystemSettings(
-        sign_name="ignored"
-    ).model_dump(exclude=skip)
+    assert loaded.model_dump(exclude=skip) == SystemSettings(sign_name="ignored").model_dump(
+        exclude=skip
+    )
 
 
 def test_storage_save_then_load_roundtrip(tmp_path: Path):

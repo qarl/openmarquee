@@ -25,9 +25,7 @@ def _isolated_singletons(tmp_path: Path, monkeypatch):
     """Redirect the settings file + preview path into tmp and flush
     the singleton caches so each test starts fresh."""
     monkeypatch.setenv("OPENMARQUEE_SETTINGS_PATH", str(tmp_path / "settings.json"))
-    monkeypatch.setenv(
-        "OPENMARQUEE_DEV_PREVIEW_PATH", str(tmp_path / "preview.png")
-    )
+    monkeypatch.setenv("OPENMARQUEE_DEV_PREVIEW_PATH", str(tmp_path / "preview.png"))
     # Clear the WIDTH/HEIGHT env overrides — if they're set (e.g. by
     # a parent shell), our dynamic path short-circuits into static
     # dims and the test misses the point.
@@ -76,9 +74,7 @@ class TestMockRendererFollowsSettings:
         renderer = _mock_renderer_singleton()
         assert renderer.width == 4 and renderer.height == 3
 
-    def test_settings_change_causes_next_render_to_resize_output(
-        self, tmp_path: Path
-    ):
+    def test_settings_change_causes_next_render_to_resize_output(self, tmp_path: Path):
         """Full integration: render at one size, flip settings, render
         again — the second PNG on disk must be the new size."""
         from PIL import Image
@@ -116,18 +112,14 @@ class TestResolveSelfAddress:
         _settings_storage_singleton.cache_clear()
         assert _resolve_self_address() == "lobby"
 
-    def test_gethostname_fallback_rejects_bare_short_name(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_gethostname_fallback_rejects_bare_short_name(self, monkeypatch, tmp_path: Path):
         # Stock Pi returns "raspberrypi"; Tailscale peers can't resolve
         # that. Better to return None so notify_peers skips with a
         # warning than to send pushes with an unreachable sender_address.
         from openmarquee.dependencies import _resolve_self_address
 
         monkeypatch.delenv("OPENMARQUEE_SELF_ADDRESS", raising=False)
-        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
-            SystemSettings()
-        )
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(SystemSettings())
         _settings_storage_singleton.cache_clear()
         with mock.patch("openmarquee.dependencies.socket.gethostname", return_value="raspberrypi"):
             assert _resolve_self_address() is None
@@ -186,9 +178,7 @@ class TestRealRendererFactory:
         renderer = factory()
         assert isinstance(renderer, AutoFallbackRenderer)
 
-    def test_renderer_rust_sidecar_env_returns_auto_fallback_wrapper(
-        self, monkeypatch, tmp_path
-    ):
+    def test_renderer_rust_sidecar_env_returns_auto_fallback_wrapper(self, monkeypatch, tmp_path):
         """slice-2 branch + slice-2-followup (2026-05-14):
         OPENMARQUEE_RENDERER=rust-sidecar returns an AutoFallbackRenderer
         wrapping a RustRenderer instance, NOT the bare proxy. This pins
@@ -217,9 +207,7 @@ class TestRealRendererFactory:
         # Wrapper is not in fallback mode yet (no failure has happened).
         assert renderer.is_in_fallback is False
 
-    def test_renderer_rust_sidecar_honors_binary_env_override(
-        self, monkeypatch, tmp_path
-    ):
+    def test_renderer_rust_sidecar_honors_binary_env_override(self, monkeypatch, tmp_path):
         """OPENMARQUEE_RENDERER_BINARY routes through to the proxy's
         binary_path. The proxy doesn't validate path existence at
         construction time (it errors at open()); that's the lifespan's
@@ -230,9 +218,7 @@ class TestRealRendererFactory:
         monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidecar")
         monkeypatch.setenv("OPENMARQUEE_RENDERER_BINARY", str(custom_path))
         monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(tmp_path))
-        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
-            SystemSettings()
-        )
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(SystemSettings())
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
@@ -240,9 +226,7 @@ class TestRealRendererFactory:
         # Drill through to the wrapped proxy to pin the env-var contract.
         assert renderer._primary._binary_path == str(custom_path)
 
-    def test_renderer_rust_sidecar_uses_content_root_from_env(
-        self, monkeypatch, tmp_path
-    ):
+    def test_renderer_rust_sidecar_uses_content_root_from_env(self, monkeypatch, tmp_path):
         """The proxy receives the content_root the rest of the backend
         resolved via _resolve_content_root (env override first, then
         ./openmarquee-content)."""
@@ -252,18 +236,14 @@ class TestRealRendererFactory:
         my_cr.mkdir()
         monkeypatch.setenv("OPENMARQUEE_RENDERER", "rust-sidecar")
         monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(my_cr))
-        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(
-            SystemSettings()
-        )
+        SettingsStorage(Path(os.environ["OPENMARQUEE_SETTINGS_PATH"])).save(SystemSettings())
         _settings_storage_singleton.cache_clear()
         factory = self._import_factory()
         renderer = factory()
         assert isinstance(renderer, AutoFallbackRenderer)
         assert renderer._primary._content_root == str(my_cr)
 
-    def test_renderer_rust_sidecar_unknown_value_falls_through_to_auto(
-        self, monkeypatch, tmp_path
-    ):
+    def test_renderer_rust_sidecar_unknown_value_falls_through_to_auto(self, monkeypatch, tmp_path):
         """Sanity check: a typo in OPENMARQUEE_RENDERER (e.g. "rust-side"
         without the "-car") falls through to the settings-based auto
         path. DELETE-PIL: settings.output_mode is always "hdmi" post-
@@ -369,6 +349,7 @@ class TestAutoFallbackRenderer:
         """Returns a factory that builds a MockRenderer wired into the
         test's tmp directory + a sentinel callsite counter so tests can
         assert lazy construction."""
+
         def _build(tmp_path: Path):
             calls = [0]
 
@@ -447,9 +428,7 @@ class TestAutoFallbackRenderer:
             "frame_w": None,
             "frame_h": None,
         }
-        assert (
-            fake.calls.count(("render_frame", (len(frame),), _rgb_kwargs)) == 1
-        )
+        assert fake.calls.count(("render_frame", (len(frame),), _rgb_kwargs)) == 1
         # The MockRenderer wrote the PNG at the dev preview path.
         preview = Path(os.environ["OPENMARQUEE_DEV_PREVIEW_PATH"])
         assert preview.exists()
@@ -475,9 +454,7 @@ class TestAutoFallbackRenderer:
         # Wrapper released the reference to the dead primary.
         assert wrapper._primary is None
 
-    def test_ipc_op_subprocess_error_swaps_and_raises_autofallback_error(
-        self, tmp_path
-    ):
+    def test_ipc_op_subprocess_error_swaps_and_raises_autofallback_error(self, tmp_path):
         """When an IPC op (advance / begin_slide / etc.) raises
         SubprocessError on the primary, the wrapper swaps to Mock and
         re-raises as AutoFallbackInMockError so the caller knows to
@@ -520,9 +497,7 @@ class TestAutoFallbackRenderer:
         )
         _settings_storage_singleton.cache_clear()
         fake = _FakeRustRenderer()
-        fake.raise_on_op["open"] = RustRendererSubprocessError(
-            "rust binary not found"
-        )
+        fake.raise_on_op["open"] = RustRendererSubprocessError("rust binary not found")
         wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
         with pytest.raises(RustRendererSubprocessError, match="not found"):
             wrapper.open()
@@ -723,14 +698,11 @@ class TestAutoFallbackRenderer:
                 wrapper.advance(t_ms=100)
         # Log line names the op + reproduces the wire-format message.
         matching = [
-            r for r in caplog.records
-            if "skipped" in r.getMessage() and "advance" in r.getMessage()
+            r for r in caplog.records if "skipped" in r.getMessage() and "advance" in r.getMessage()
         ]
         assert matching, f"expected skip log; got {[r.getMessage() for r in caplog.records]}"
 
-    def test_unsupported_slide_error_is_caught_before_subprocess_error(
-        self, tmp_path
-    ):
+    def test_unsupported_slide_error_is_caught_before_subprocess_error(self, tmp_path):
         """Subagent-flagged invariant from the slice-4 dispatch: the
         except chain MUST list UnsupportedSlideError BEFORE
         SubprocessError. Today the chain is technically safe even with

@@ -71,6 +71,7 @@ def _configure_logging() -> None:
     # the new format, otherwise the formatter would raise KeyError
     # on the missing request_id attribute.
     from openmarquee.perf_middleware import RequestIdLogFilter
+
     for handler in logging.getLogger().handlers:
         handler.addFilter(RequestIdLogFilter())
     # Silence chatty deps at INFO; their WARNING+ still surfaces.
@@ -140,6 +141,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 _playback_loop_singleton,
                 _real_renderer_singleton,
             )
+
             _real_renderer_singleton.cache_clear()
             _playback_loop_singleton.cache_clear()
             os.environ["OPENMARQUEE_RENDERER"] = "mock"

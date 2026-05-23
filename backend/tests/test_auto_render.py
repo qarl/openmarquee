@@ -22,8 +22,14 @@ def _auto_slide(**kwargs) -> TextSlide:
     Schema v3 routed text fields off the slide root; accept the flat
     kwargs the tests already use and route them into text_layers[0]."""
     layer_keys = {
-        "text", "text_color", "font_family", "font_size_px",
-        "font_size_pct", "auto_mode", "auto_format", "box",
+        "text",
+        "text_color",
+        "font_family",
+        "font_size_px",
+        "font_size_pct",
+        "auto_mode",
+        "auto_format",
+        "box",
     }
     layer = {"text": kwargs.pop("text", "placeholder")}
     for k in list(kwargs.keys()):
@@ -161,7 +167,8 @@ def test_load_background_lru_skips_png_decode_on_cache_hit():
         return png_bytes
 
     slide = _auto_slide(
-        auto_mode="time", auto_format="time_hm",
+        auto_mode="time",
+        auto_format="time_hm",
         background_image_slide_id=bg_id,
     )
     load_background(slide, 16, 16, fake_read)
@@ -204,7 +211,8 @@ def test_load_background_lru_evicts_at_cap():
     ids = [uuid4() for _ in range(_IMAGE_BG_LRU_MAX + 1)]
     for i in ids:
         slide = _auto_slide(
-            auto_mode="time", auto_format="time_hm",
+            auto_mode="time",
+            auto_format="time_hm",
             background_image_slide_id=i,
         )
         load_background(slide, 8, 8, fake_read)

@@ -57,6 +57,7 @@ def _encode_png_rgb(width: int, height: int, rgb_bytes: bytes) -> bytes:
     sidecar owns all real rendering on production; MockRenderer's PNG
     output is just a serialization step for the dev live-preview page.
     """
+
     def chunk(name: bytes, data: bytes) -> bytes:
         return (
             struct.pack(">I", len(data))
@@ -125,9 +126,7 @@ class MockRenderer:
         if output_path is None:
             raise TypeError("output_path is required")
         if get_dims is not None and (width is not None or height is not None):
-            raise ValueError(
-                "pass either static width+height OR get_dims, not both"
-            )
+            raise ValueError("pass either static width+height OR get_dims, not both")
         if get_dims is None and (width is None or height is None):
             raise ValueError("need both width and height, or a get_dims callable")
         if get_dims is None:
@@ -146,9 +145,7 @@ class MockRenderer:
         # IPC-op call recorders (tests + AutoFallbackRenderer assert
         # against these to verify the loop drove the renderer correctly).
         self.begin_slide_calls: list[tuple[uuid.UUID | str, int, int]] = []
-        self.begin_transition_calls: list[
-            tuple[uuid.UUID | str, int, str, int, int]
-        ] = []
+        self.begin_transition_calls: list[tuple[uuid.UUID | str, int, str, int, int]] = []
         self.advance_calls: list[int] = []
         self.render_frame_calls: int = 0
         self.end_external_frames_calls: int = 0
@@ -283,9 +280,7 @@ class MockRenderer:
         target.parent.mkdir(parents=True, exist_ok=True)
         slide_id = str(self._current_slide) if self._current_slide else ""
         width, height = self._get_dims()
-        png_bytes = _encode_png_rgb(
-            width, height, _placeholder_rgb_bytes(width, height, slide_id)
-        )
+        png_bytes = _encode_png_rgb(width, height, _placeholder_rgb_bytes(width, height, slide_id))
         target.write_bytes(png_bytes)
         return CaptureResult(path=str(target), bytes=len(png_bytes))
 
@@ -313,17 +308,13 @@ class MockRenderer:
         the mock has no GPU NV12→RGB path and tests assert on the
         call counters / last_frame, not on the mock's PNG pixels."""
         if pixel_format not in ("rgb888", "nv12"):
-            raise ValueError(
-                f"render_frame: unknown pixel_format {pixel_format!r}"
-            )
+            raise ValueError(f"render_frame: unknown pixel_format {pixel_format!r}")
         if pixel_format == "nv12":
             # The mock has no NV12→RGB path; just cache the bytes.
             # Validate the NV12 byte size against the declared source
             # dims so a desynced producer is still caught in tests.
             if frame_w is None or frame_h is None:
-                raise ValueError(
-                    "render_frame: nv12 requires frame_w + frame_h"
-                )
+                raise ValueError("render_frame: nv12 requires frame_w + frame_h")
             expected = int(frame_w) * int(frame_h) * 3 // 2
             if len(frame) != expected:
                 raise ValueError(

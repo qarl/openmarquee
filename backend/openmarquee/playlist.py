@@ -103,7 +103,22 @@ class PlaylistItem(BaseModel):
 
     item_id: UUID
     transition: Literal[
-        "cut", "fade", "wipe", "slide", "iris", "scroll", "flip", "marquee", "dissolve", "pixelate", "halftone", "scanline", "glitch", "push", "blinds", "shutter"
+        "cut",
+        "fade",
+        "wipe",
+        "slide",
+        "iris",
+        "scroll",
+        "flip",
+        "marquee",
+        "dissolve",
+        "pixelate",
+        "halftone",
+        "scanline",
+        "glitch",
+        "push",
+        "blinds",
+        "shutter",
     ] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
@@ -407,8 +422,10 @@ def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
     schema = data.get("schema_version", 1)
 
     # v4: already in target form.
-    if schema >= PLAYLIST_SCHEMA_VERSION and "playlists" in data and isinstance(
-        data["playlists"], list
+    if (
+        schema >= PLAYLIST_SCHEMA_VERSION
+        and "playlists" in data
+        and isinstance(data["playlists"], list)
     ):
         return PlaylistCollection.model_validate(data), False
 
@@ -523,11 +540,7 @@ def list_in_playlist_order(
         # playlists AND true orphans alike. Pre-2026-04-28 this excluded
         # items in other playlists, which made non-default playlist
         # content invisible to the pallets / bg-picker / api/content.
-        extras = [
-            item
-            for item_id, item in items_by_id.items()
-            if item_id not in used
-        ]
+        extras = [item for item_id, item in items_by_id.items() if item_id not in used]
         # Chronological order so newly-created items land at the end of
         # the list (B19, 2026-05-05). Was sort-by-uuid (deterministic
         # but effectively random). The frontend slide-browser re-sorts

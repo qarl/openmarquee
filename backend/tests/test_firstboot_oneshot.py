@@ -110,9 +110,7 @@ def test_wifi_json_is_0600(fakefs: Path) -> None:
 def test_passphrase_is_16_chars(fakefs: Path) -> None:
     """16 chars * log2(64-char alphabet) ~ 96 bits of entropy."""
     _run_oneshot(fakefs)
-    payload = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     assert len(payload["passphrase"]) == 16
 
 
@@ -120,9 +118,7 @@ def test_passphrase_uses_safe_charset(fakefs: Path) -> None:
     """Charset: A-Z a-z 0-9 + - _ . @. No quotes, backslash, or
     ampersand -- those break shell + hostapd.conf parsing."""
     _run_oneshot(fakefs)
-    payload = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     assert re.match(r"^[A-Za-z0-9+_.@\-]{16}$", payload["passphrase"]), (
         f"passphrase has forbidden chars: {payload['passphrase']!r}"
     )
@@ -133,9 +129,7 @@ def test_ssid_is_mysign_device_id(fakefs: Path) -> None:
     Replaces the prior openMarquee-<MAC-suffix> form. The same
     identifier appears as /etc/hostname + identity.json device_id."""
     _run_oneshot(fakefs)
-    payload = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     assert re.match(r"^MySign[A-Z0-9]{3}$", payload["ssid"]), (
         f"SSID {payload['ssid']!r} doesn't match MySign[A-Z0-9]{{3}}"
     )
@@ -167,12 +161,8 @@ def test_identity_ssid_hostname_all_match(fakefs: Path) -> None:
     same MySignXXX string. The single-source-of-truth claim only
     holds if the four representations stay in lockstep."""
     _run_oneshot(fakefs)
-    identity = json.loads(
-        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
-    )
-    wifi = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    identity = json.loads((fakefs / "var" / "openmarquee" / "identity.json").read_text())
+    wifi = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     hostname = (fakefs / "etc" / "hostname").read_text().strip()
     hostapd = (fakefs / "etc" / "hostapd" / "hostapd.conf").read_text()
     device_id = identity["device_id"]
@@ -186,9 +176,7 @@ def test_etc_hosts_127_0_1_1_points_at_mysign(fakefs: Path) -> None:
     "unable to resolve host MySignXXX" on every invocation."""
     _run_oneshot(fakefs)
     hosts = (fakefs / "etc" / "hosts").read_text()
-    identity = json.loads(
-        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
-    )
+    identity = json.loads((fakefs / "var" / "openmarquee" / "identity.json").read_text())
     device_id = identity["device_id"]
     # The 127.0.1.1 line should point at MySignXXX, not at the
     # pre-firstboot bootstrap hostname.
@@ -204,13 +192,9 @@ def test_idempotent_rerun_preserves_device_id(fakefs: Path) -> None:
     rotate the device_id on the next boot and decouple the operator's
     welcome-card sticker from the device."""
     _run_oneshot(fakefs)
-    first = json.loads(
-        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
-    )["device_id"]
+    first = json.loads((fakefs / "var" / "openmarquee" / "identity.json").read_text())["device_id"]
     _run_oneshot(fakefs)
-    second = json.loads(
-        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
-    )["device_id"]
+    second = json.loads((fakefs / "var" / "openmarquee" / "identity.json").read_text())["device_id"]
     assert first == second
 
 
@@ -221,9 +205,7 @@ def test_hostapd_ssid_line_templated(fakefs: Path) -> None:
     """Source ships `ssid=openMarquee-SETUP`; oneshot must replace
     with the generated SSID."""
     _run_oneshot(fakefs)
-    payload = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     hostapd = (fakefs / "etc" / "hostapd" / "hostapd.conf").read_text()
     assert f"ssid={payload['ssid']}" in hostapd
     # And the placeholder is gone.
@@ -235,9 +217,7 @@ def test_hostapd_passphrase_line_templated(fakefs: Path) -> None:
     must replace. This is the sweep #5 #2 closure -- without this
     the device ships with a known passphrase."""
     _run_oneshot(fakefs)
-    payload = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     hostapd = (fakefs / "etc" / "hostapd" / "hostapd.conf").read_text()
     assert f"wpa_passphrase={payload['passphrase']}" in hostapd
     assert "wpa_passphrase=change-me-at-first-boot" not in hostapd
@@ -248,9 +228,7 @@ def test_hostapd_passphrase_line_templated(fakefs: Path) -> None:
 
 def test_welcome_html_ssid_placeholder_filled(fakefs: Path) -> None:
     _run_oneshot(fakefs)
-    payload = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     welcome = (fakefs / "opt" / "openmarquee" / "ui" / "welcome.html").read_text()
     assert "{{AP_SSID}}" not in welcome
     assert payload["ssid"] in welcome
@@ -258,9 +236,7 @@ def test_welcome_html_ssid_placeholder_filled(fakefs: Path) -> None:
 
 def test_welcome_html_password_placeholder_filled(fakefs: Path) -> None:
     _run_oneshot(fakefs)
-    payload = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     welcome = (fakefs / "opt" / "openmarquee" / "ui" / "welcome.html").read_text()
     assert "{{AP_PASSWORD}}" not in welcome
     assert payload["passphrase"] in welcome
@@ -271,9 +247,7 @@ def test_welcome_html_device_id_placeholder_filled(fakefs: Path) -> None:
     "Your sign: MySignXXX" so they have something memorable to
     reference. {{DEVICE_ID}} must be substituted."""
     _run_oneshot(fakefs)
-    identity = json.loads(
-        (fakefs / "var" / "openmarquee" / "identity.json").read_text()
-    )
+    identity = json.loads((fakefs / "var" / "openmarquee" / "identity.json").read_text())
     welcome = (fakefs / "opt" / "openmarquee" / "ui" / "welcome.html").read_text()
     assert "{{DEVICE_ID}}" not in welcome
     assert identity["device_id"] in welcome
@@ -365,16 +339,10 @@ def test_second_run_reuses_wifi_json(fakefs: Path) -> None:
     rather than regenerating. Protects against interrupted runs and
     against accidental re-invocation."""
     _run_oneshot(fakefs)
-    payload_1 = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
+    payload_1 = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
     _run_oneshot(fakefs)
-    payload_2 = json.loads(
-        (fakefs / "var" / "openmarquee" / "wifi.json").read_text()
-    )
-    assert payload_1 == payload_2, (
-        "second run regenerated credentials -- not idempotent"
-    )
+    payload_2 = json.loads((fakefs / "var" / "openmarquee" / "wifi.json").read_text())
+    assert payload_1 == payload_2, "second run regenerated credentials -- not idempotent"
 
 
 def test_second_run_keeps_hostapd_conf_consistent(fakefs: Path) -> None:
@@ -418,13 +386,7 @@ def test_nm_keyfile_moved_from_bootfs_to_system_connections(
 ) -> None:
     _stage_bootfs_keyfile(fakefs, ssid="HomeWifi", psk="hunter2-test")
     _run_oneshot(fakefs)
-    dst = (
-        fakefs
-        / "etc"
-        / "NetworkManager"
-        / "system-connections"
-        / "openmarquee-wifi.nmconnection"
-    )
+    dst = fakefs / "etc" / "NetworkManager" / "system-connections" / "openmarquee-wifi.nmconnection"
     assert dst.exists(), "keyfile not copied to system-connections/"
     body = dst.read_text()
     assert "ssid=HomeWifi" in body
@@ -446,13 +408,7 @@ def test_nm_keyfile_chmod_600_after_move(fakefs: Path) -> None:
     load-bearing."""
     _stage_bootfs_keyfile(fakefs, ssid="x", psk="y")
     _run_oneshot(fakefs)
-    dst = (
-        fakefs
-        / "etc"
-        / "NetworkManager"
-        / "system-connections"
-        / "openmarquee-wifi.nmconnection"
-    )
+    dst = fakefs / "etc" / "NetworkManager" / "system-connections" / "openmarquee-wifi.nmconnection"
     mode = stat.S_IMODE(dst.stat().st_mode)
     assert mode == 0o600, f"expected 0600, got {oct(mode)}"
 

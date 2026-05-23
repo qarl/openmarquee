@@ -82,9 +82,7 @@ async def set_password(
     if payload.password != payload.password_confirm:
         raise HTTPException(status_code=422, detail="passwords do not match")
     if auth.load() is not None:
-        raise HTTPException(
-            status_code=409, detail="password already configured"
-        )
+        raise HTTPException(status_code=409, detail="password already configured")
     from openmarquee.auth import AuthState
 
     state = AuthState(password_hash=hash_password(payload.password))
@@ -102,9 +100,7 @@ async def login(
     password."""
     state = auth.load()
     if state is None:
-        raise HTTPException(
-            status_code=404, detail="password not yet configured"
-        )
+        raise HTTPException(status_code=404, detail="password not yet configured")
     if not verify_password(state.password_hash, payload.password):
         raise HTTPException(status_code=401, detail="invalid password")
     return _TokenResponse(token=mint_token(state))
@@ -133,14 +129,10 @@ async def change_password_endpoint(
         raise HTTPException(status_code=401, detail="invalid token")
 
     if not verify_password(state.password_hash, payload.current_password):
-        raise HTTPException(
-            status_code=401, detail="current password is wrong"
-        )
+        raise HTTPException(status_code=401, detail="current password is wrong")
 
     if payload.new_password != payload.new_password_confirm:
-        raise HTTPException(
-            status_code=422, detail="new passwords do not match"
-        )
+        raise HTTPException(status_code=422, detail="new passwords do not match")
 
     new_state = change_password(state, payload.new_password)
     auth.save(new_state)

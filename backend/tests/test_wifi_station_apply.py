@@ -9,6 +9,7 @@ runs on Mac with no NetworkManager / no Pi. What we DO verify:
   - Poll-timeout when device-state never reaches 100 -> 'failed'.
   - has_settings_changed diff helper.
 """
+
 from __future__ import annotations
 
 import importlib
@@ -23,6 +24,7 @@ def reset_module():
     module-global state (the _STATE singleton + the nmcli_runner
     handle) regardless of test order."""
     import openmarquee.wifi_station
+
     importlib.reload(openmarquee.wifi_station)
     yield openmarquee.wifi_station
 
@@ -30,6 +32,7 @@ def reset_module():
 def _nmcli_result(returncode: int = 0, stdout: str = "", stderr: str = "") -> object:
     """Build a fake _NmcliResult for monkey-patched nmcli_runner returns."""
     import openmarquee.wifi_station as ws
+
     return ws._NmcliResult(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
@@ -51,9 +54,7 @@ def test_apply_enabled_idempotent_when_already_connected(reset_module) -> None:
         # path -- but the new apply path doesn't call rescan when
         # idempotent-short-circuiting, so it should NOT appear.
         if args[:4] == ["device", "wifi", "rescan", "ifname"]:
-            raise AssertionError(
-                "rescan must NOT fire on idempotent-already-connected path"
-            )
+            raise AssertionError("rescan must NOT fire on idempotent-already-connected path")
         # Anything else (e.g. wifi connect) MUST NOT be called.
         raise AssertionError(f"unexpected nmcli call: {args}")
 
@@ -79,8 +80,10 @@ def test_apply_enabled_new_ssid_deletes_old_then_connects(reset_module) -> None:
         if "connection" in args and "show" in args and "--active" in args:
             # First query: still on oldnet.
             # After we delete + connect, the next query reports newnet.
-            if any(call[0][:5] == ("device", "wifi", "connect", new_ssid, "password")
-                   for call in call_log):
+            if any(
+                call[0][:5] == ("device", "wifi", "connect", new_ssid, "password")
+                for call in call_log
+            ):
                 return _nmcli_result(stdout=f"{new_ssid}:wlan0\n")
             return _nmcli_result(stdout=f"{old_ssid}:wlan0\n")
         if "GENERAL.STATE" in args:
@@ -100,16 +103,12 @@ def test_apply_enabled_new_ssid_deletes_old_then_connects(reset_module) -> None:
     # The delete-old MUST appear in the call log BEFORE the
     # wifi-connect-new (sequential ordering pin).
     delete_idx = next(
-        i for i, (args, _) in enumerate(call_log)
-        if args[:3] == ("connection", "delete", old_ssid)
+        i for i, (args, _) in enumerate(call_log) if args[:3] == ("connection", "delete", old_ssid)
     )
     connect_idx = next(
-        i for i, (args, _) in enumerate(call_log)
-        if args[:3] == ("device", "wifi", "connect")
+        i for i, (args, _) in enumerate(call_log) if args[:3] == ("device", "wifi", "connect")
     )
-    assert delete_idx < connect_idx, (
-        f"delete-old must precede connect-new; log: {call_log}"
-    )
+    assert delete_idx < connect_idx, f"delete-old must precede connect-new; log: {call_log}"
 
     state = ws.current_state()
     assert state.state == "connected"
@@ -206,10 +205,7 @@ def test_apply_disabled_deletes_active_connection(reset_module) -> None:
     state = ws.current_state()
     assert state.state == "disabled"
     # Verify the delete fired.
-    assert any(
-        args[:3] == ("connection", "delete", current_ssid)
-        for args, _ in call_log
-    )
+    assert any(args[:3] == ("connection", "delete", current_ssid) for args, _ in call_log)
 
 
 def test_apply_disabled_when_no_active_connection_is_a_noop(
@@ -315,16 +311,12 @@ def test_apply_enabled_rescans_before_connect(reset_module) -> None:
     assert ok is True
 
     rescan_idx = next(
-        i for i, args in enumerate(call_log)
-        if args[:4] == ("device", "wifi", "rescan", "ifname")
+        i for i, args in enumerate(call_log) if args[:4] == ("device", "wifi", "rescan", "ifname")
     )
     connect_idx = next(
-        i for i, args in enumerate(call_log)
-        if args[:3] == ("device", "wifi", "connect")
+        i for i, args in enumerate(call_log) if args[:3] == ("device", "wifi", "connect")
     )
-    assert rescan_idx < connect_idx, (
-        f"rescan must precede connect; log: {call_log}"
-    )
+    assert rescan_idx < connect_idx, f"rescan must precede connect; log: {call_log}"
 
 
 def test_apply_enabled_rescan_failure_is_best_effort(reset_module) -> None:
@@ -364,10 +356,9 @@ def test_apply_enabled_rescan_failure_is_best_effort(reset_module) -> None:
     assert ok is True
 
     # Connect MUST appear despite rescan failure.
-    assert any(
-        args[:3] == ("device", "wifi", "connect")
-        for args in call_log
-    ), "connect must fire even when rescan errored"
+    assert any(args[:3] == ("device", "wifi", "connect") for args in call_log), (
+        "connect must fire even when rescan errored"
+    )
 
 
 def test_apply_enabled_radio_unavailable_fast_fails(reset_module) -> None:
@@ -388,13 +379,9 @@ def test_apply_enabled_radio_unavailable_fast_fails(reset_module) -> None:
             return _nmcli_result(stdout="GENERAL.STATE:20 (unavailable)\n")
         # Anything beyond the two read-only queries is a bug.
         if args[:4] == ["device", "wifi", "rescan", "ifname"]:
-            raise AssertionError(
-                "rescan must NOT fire when device is unavailable"
-            )
+            raise AssertionError("rescan must NOT fire when device is unavailable")
         if args[:3] == ["device", "wifi", "connect"]:
-            raise AssertionError(
-                "connect must NOT fire when device is unavailable"
-            )
+            raise AssertionError("connect must NOT fire when device is unavailable")
         raise AssertionError(f"unexpected nmcli call: {args}")
 
     ws.nmcli_runner = MagicMock(side_effect=fake_runner)
@@ -452,6 +439,7 @@ def test_device_state_code_parses_numeric_prefix() -> None:
     nmcli's state string (the parenthetical text is human prose).
     Pin the parser shape so a future nmcli format-change is loud."""
     from openmarquee.wifi_station import _device_state_code
+
     assert _device_state_code("100 (connected)") == 100
     assert _device_state_code("20 (unavailable)") == 20
     assert _device_state_code("30 (disconnected)") == 30
@@ -465,43 +453,72 @@ def test_device_state_code_parses_numeric_prefix() -> None:
 
 def test_has_settings_changed_detects_toggle_on() -> None:
     from openmarquee.wifi_station import has_settings_changed
+
     assert has_settings_changed(
-        prev_enabled=False, prev_ssid=None, prev_password=None,
-        new_enabled=True, new_ssid="net", new_password="pw1234567890",
+        prev_enabled=False,
+        prev_ssid=None,
+        prev_password=None,
+        new_enabled=True,
+        new_ssid="net",
+        new_password="pw1234567890",
     )
 
 
 def test_has_settings_changed_detects_toggle_off() -> None:
     from openmarquee.wifi_station import has_settings_changed
+
     assert has_settings_changed(
-        prev_enabled=True, prev_ssid="net", prev_password="pw1234567890",
-        new_enabled=False, new_ssid="net", new_password="pw1234567890",
+        prev_enabled=True,
+        prev_ssid="net",
+        prev_password="pw1234567890",
+        new_enabled=False,
+        new_ssid="net",
+        new_password="pw1234567890",
     )
 
 
 def test_has_settings_changed_detects_creds_diff_when_enabled() -> None:
     from openmarquee.wifi_station import has_settings_changed
+
     assert has_settings_changed(
-        prev_enabled=True, prev_ssid="old", prev_password="pw1",
-        new_enabled=True, new_ssid="new", new_password="pw1",
+        prev_enabled=True,
+        prev_ssid="old",
+        prev_password="pw1",
+        new_enabled=True,
+        new_ssid="new",
+        new_password="pw1",
     )
     assert has_settings_changed(
-        prev_enabled=True, prev_ssid="net", prev_password="oldpw",
-        new_enabled=True, new_ssid="net", new_password="newpw",
+        prev_enabled=True,
+        prev_ssid="net",
+        prev_password="oldpw",
+        new_enabled=True,
+        new_ssid="net",
+        new_password="newpw",
     )
 
 
 def test_has_settings_changed_stable_when_disabled() -> None:
     from openmarquee.wifi_station import has_settings_changed
+
     assert not has_settings_changed(
-        prev_enabled=False, prev_ssid=None, prev_password=None,
-        new_enabled=False, new_ssid=None, new_password=None,
+        prev_enabled=False,
+        prev_ssid=None,
+        prev_password=None,
+        new_enabled=False,
+        new_ssid=None,
+        new_password=None,
     )
 
 
 def test_has_settings_changed_stable_when_enabled_with_same_creds() -> None:
     from openmarquee.wifi_station import has_settings_changed
+
     assert not has_settings_changed(
-        prev_enabled=True, prev_ssid="net", prev_password="pw1234567890",
-        new_enabled=True, new_ssid="net", new_password="pw1234567890",
+        prev_enabled=True,
+        prev_ssid="net",
+        prev_password="pw1234567890",
+        new_enabled=True,
+        new_ssid="net",
+        new_password="pw1234567890",
     )

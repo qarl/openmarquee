@@ -52,7 +52,8 @@ async def test_concurrent_text_slide_puts_final_state_matches_one_payload(
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver",
+            transport=transport,
+            base_url="http://testserver",
         ) as client:
             # Create the slide first.
             png = _real_png()
@@ -61,8 +62,9 @@ async def test_concurrent_text_slide_puts_final_state_matches_one_payload(
                 json={
                     "name": "v0",
                     "duration_ms": 5000,
-                    "text_layers": [{"text": "original",
-                                     "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+                    "text_layers": [
+                        {"text": "original", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}
+                    ],
                     "png_base64": png,
                     "background_color": "#000000",
                 },
@@ -74,24 +76,20 @@ async def test_concurrent_text_slide_puts_final_state_matches_one_payload(
             payload_a = {
                 "name": "from-A",
                 "duration_ms": 5000,
-                "text_layers": [{"text": "AAAA",
-                                 "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+                "text_layers": [{"text": "AAAA", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
                 "background_color": "#000000",
                 "png_base64": png,
             }
             payload_b = {
                 "name": "from-B",
                 "duration_ms": 5000,
-                "text_layers": [{"text": "BBBB",
-                                 "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
+                "text_layers": [{"text": "BBBB", "box": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}],
                 "background_color": "#000000",
                 "png_base64": png,
             }
             results = await asyncio.gather(
-                client.put(f"/api/content/text-slides/{slide_id}",
-                           json=payload_a),
-                client.put(f"/api/content/text-slides/{slide_id}",
-                           json=payload_b),
+                client.put(f"/api/content/text-slides/{slide_id}", json=payload_a),
+                client.put(f"/api/content/text-slides/{slide_id}", json=payload_b),
             )
             for r in results:
                 assert r.status_code == 200
@@ -100,9 +98,11 @@ async def test_concurrent_text_slide_puts_final_state_matches_one_payload(
             # consistently across name + text_layers[0].text -- a
             # half-merged state (name from one, text from the
             # other) would mean save_text_slide isn't fully atomic.
-            final = (await client.get(
-                f"/api/content/{slide_id}",
-            )).json()
+            final = (
+                await client.get(
+                    f"/api/content/{slide_id}",
+                )
+            ).json()
             final_name = final["name"]
             final_text = final["text_layers"][0]["text"]
             assert final_name in ("from-A", "from-B")

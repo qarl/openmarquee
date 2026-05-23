@@ -138,7 +138,7 @@ def _run_nmcli(args: list[str], *, sudo: bool = False, timeout: int = 30) -> _Nm
     (NOPASSWD; failure to grant raises a CalledProcessError-equivalent
     via the returncode). Returns the captured result regardless of
     exit code — callers inspect `returncode` to decide success."""
-    cmd = ([_NMCLI_BIN] + args)
+    cmd = [_NMCLI_BIN] + args
     if sudo:
         cmd = ["sudo", "-n"] + cmd
     try:
@@ -273,9 +273,14 @@ def _wifi_connect(ssid: str, password: str) -> _NmcliResult:
     """
     return nmcli_runner(
         [
-            "device", "wifi", "connect", ssid,
-            "password", password,
-            "ifname", _STATION_IFNAME,
+            "device",
+            "wifi",
+            "connect",
+            ssid,
+            "password",
+            password,
+            "ifname",
+            _STATION_IFNAME,
         ],
         sudo=True,
         timeout=45,
@@ -331,7 +336,8 @@ def apply_disabled() -> None:
             if result.returncode != 0:
                 log.warning(
                     "wifi station: connection delete %r failed: %s",
-                    active, result.stderr,
+                    active,
+                    result.stderr,
                 )
         _set_state("disabled", detail=None, ssid=None)
 
@@ -420,13 +426,15 @@ def apply_enabled(
         if active and active != ssid:
             log.info(
                 "wifi station: removing prior connection %r before switching to %r",
-                active, ssid,
+                active,
+                ssid,
             )
             result = _connection_delete(active)
             if result.returncode != 0:
                 log.warning(
                     "wifi station: failed to delete %r (continuing anyway): %s",
-                    active, result.stderr,
+                    active,
+                    result.stderr,
                 )
 
         # Connect. nmcli returns 0 on success, non-zero on:
@@ -457,7 +465,8 @@ def apply_enabled(
             ssid=ssid,
         )
         log.warning(
-            "wifi station: timed out waiting for connection to ssid=%r", ssid,
+            "wifi station: timed out waiting for connection to ssid=%r",
+            ssid,
         )
         return False
 

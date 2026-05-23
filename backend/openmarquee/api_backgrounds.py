@@ -89,9 +89,7 @@ async def generate_background(
         # isn't in our registry).
         # 11.2: don't reflect exception string -- log + opaque 400.
         log.warning("unknown background provider: %s", exc)
-        raise HTTPException(
-            status_code=400, detail="unknown background provider"
-        ) from exc
+        raise HTTPException(status_code=400, detail="unknown background provider") from exc
 
     try:
         raw = provider.generate(payload.prompt)
@@ -103,9 +101,7 @@ async def generate_background(
         # response goes to the server log so an on-device journalctl
         # tail still surfaces rate-limit / timeout / etc.
         log.exception("background provider failed")
-        raise HTTPException(
-            status_code=502, detail="background provider failed"
-        ) from exc
+        raise HTTPException(status_code=502, detail="background provider failed") from exc
 
     # Store the provider's bytes verbatim — no device-side resample.
     # Playback cover-fits down to panel dims on slide entry, so keeping

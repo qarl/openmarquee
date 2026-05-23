@@ -34,9 +34,7 @@ import re
 from pathlib import Path
 
 # Project root resolves from this file: backend/tests/X.py → repo/
-_LIVE_PANEL_JS = (
-    Path(__file__).resolve().parent.parent.parent / "ui" / "src" / "live-panel.js"
-)
+_LIVE_PANEL_JS = Path(__file__).resolve().parent.parent.parent / "ui" / "src" / "live-panel.js"
 
 # Names that, if found inside `cancelTakeover`'s body, would
 # indicate a backend call.
@@ -74,8 +72,7 @@ def _read_live_panel_source() -> str:
     that calls these functions doesn't put `//` before the call on
     the same line."""
     assert _LIVE_PANEL_JS.is_file(), (
-        f"live-panel.js not found at {_LIVE_PANEL_JS} — relocation? Update "
-        f"the test path."
+        f"live-panel.js not found at {_LIVE_PANEL_JS} — relocation? Update the test path."
     )
     text = _LIVE_PANEL_JS.read_text(encoding="utf-8")
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -100,9 +97,7 @@ def _extract_cancel_takeover_body(source: str) -> str:
     )
     # Find the opening brace AFTER the signature.
     brace_open = source.find("{", fn_start + len(marker))
-    assert brace_open != -1, (
-        f"`{marker}` has no opening brace? source structure changed."
-    )
+    assert brace_open != -1, f"`{marker}` has no opening brace? source structure changed."
     # Brace-balance walk to the matching close.
     depth = 0
     for idx in range(brace_open, len(source)):
@@ -115,9 +110,7 @@ def _extract_cancel_takeover_body(source: str) -> str:
                 # Body is the slice between the opening `{` and the
                 # closing `}` (exclusive of both).
                 return source[brace_open + 1 : idx]
-    raise AssertionError(
-        f"unbalanced braces walking `{marker}` body — source likely truncated."
-    )
+    raise AssertionError(f"unbalanced braces walking `{marker}` body — source likely truncated.")
 
 
 def test_cancel_takeover_function_exists():

@@ -96,12 +96,8 @@ async def test_yields_n_frames_at_frame_size(tmp_path):
     (ffmpeg exit) ends the iteration cleanly."""
     # NV12 frame size for the injected 8x8 source.
     frame_size = 8 * 8 * 3 // 2
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5
-    )
-    consumer = StreamConsumer(
-        "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5)
+    consumer = StreamConsumer("rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8))
 
     frames = [f async for f in consumer.frames()]
     await consumer.close()
@@ -126,9 +122,7 @@ async def test_trailing_partial_frame_is_discarded(tmp_path):
         n_frames=3,
         trailing_partial=frame_size // 2,
     )
-    consumer = StreamConsumer(
-        "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
-    )
+    consumer = StreamConsumer("rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8))
 
     frames = [f async for f in consumer.frames()]
     await consumer.close()
@@ -151,9 +145,7 @@ async def test_stderr_is_captured(tmp_path):
         n_frames=2,
         stderr_text="rtsp: connection refused\n",
     )
-    consumer = StreamConsumer(
-        "rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4)
-    )
+    consumer = StreamConsumer("rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4))
 
     frames = [f async for f in consumer.frames()]
     await consumer.close()
@@ -170,12 +162,8 @@ async def test_close_reaps_hanging_ffmpeg(tmp_path):
     """close() terminates a still-running ffmpeg: the subprocess is
     reaped (returncode set) and the frames() iterator unblocks."""
     frame_size = 8 * 8 * 3 // 2
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=2, hang=True
-    )
-    consumer = StreamConsumer(
-        "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=2, hang=True)
+    consumer = StreamConsumer("rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8))
 
     collected: list[bytes] = []
 
@@ -209,12 +197,8 @@ async def test_close_during_spawn_does_not_orphan_ffmpeg(tmp_path, monkeypatch):
     guarded, so close()'s reap blocks until self._proc is set, then
     terminates it."""
     frame_size = 8 * 8 * 3 // 2
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=1, hang=True
-    )
-    consumer = StreamConsumer(
-        "rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8)
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=1, hang=True)
+    consumer = StreamConsumer("rtsp://host:8554/live", 8, 8, ffmpeg_bin=mock, source_size=(8, 8))
 
     spawn_entered = asyncio.Event()
     release_spawn = asyncio.Event()
@@ -265,9 +249,7 @@ async def test_nonzero_exit_logs_stderr_warning(tmp_path, caplog):
         stderr_text="rtsp: 404 stream not found\n",
         exit_code=3,
     )
-    consumer = StreamConsumer(
-        "rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4)
-    )
+    consumer = StreamConsumer("rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4))
 
     with caplog.at_level("WARNING", logger="openmarquee.stream_consumer"):
         frames = [f async for f in consumer.frames()]
@@ -302,12 +284,8 @@ async def test_second_frames_call_yields_nothing(tmp_path):
     """The consumer is single-use: once frames() has run, a second
     call yields nothing rather than spawning a second ffmpeg."""
     frame_size = 4 * 4 * 3 // 2
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=2
-    )
-    consumer = StreamConsumer(
-        "rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4)
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=2)
+    consumer = StreamConsumer("rtsp://host:8554/live", 4, 4, ffmpeg_bin=mock, source_size=(4, 4))
 
     first = [f async for f in consumer.frames()]
     second = [f async for f in consumer.frames()]
@@ -361,9 +339,7 @@ def test_argv_adds_scale_filter_for_over_large_source():
     renderer's per-frame GL texture upload cannot fail GL_INVALID_VALUE.
     The clamped dims preserve aspect and are even (NV12 4:2:0)."""
     # 4K (3840x2160) injected as the source — well over 2048.
-    consumer = StreamConsumer(
-        "rtsp://laptop:8554/live", 1920, 1080, source_size=(3840, 2160)
-    )
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080, source_size=(3840, 2160))
     argv = consumer._build_argv()
 
     assert "-vf" in argv
@@ -383,9 +359,7 @@ def test_argv_has_no_scale_filter_for_in_limit_source():
     """A normal <=2048 source pays no swscale cost — `_build_argv`
     adds NO `-vf` filter and the dims pass through unchanged. This is
     the unchanged HW-decode path (the renderer cover-fits on the GPU)."""
-    consumer = StreamConsumer(
-        "rtsp://laptop:8554/live", 1920, 1080, source_size=(1920, 1080)
-    )
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080, source_size=(1920, 1080))
     argv = consumer._build_argv()
 
     assert "-vf" not in argv
@@ -398,9 +372,7 @@ def test_argv_clamps_when_only_one_axis_over_limit():
     """A source over 2048 on a single axis (a tall/wide stream) is
     still downscaled so BOTH axes land within the cap."""
     # 2560 wide, 1080 tall — only the width is over the limit.
-    consumer = StreamConsumer(
-        "rtsp://laptop:8554/live", 1920, 1080, source_size=(2560, 1080)
-    )
+    consumer = StreamConsumer("rtsp://laptop:8554/live", 1920, 1080, source_size=(2560, 1080))
     argv = consumer._build_argv()
     assert "-vf" in argv
     # Scaled by 2048/2560 = 0.8 -> 2048x864.
@@ -459,12 +431,13 @@ async def test_frame_size_is_nv12_at_source_dims(tmp_path):
     # dims 1920x1080 to prove the frame size tracks the source.
     src_w, src_h = 6, 4
     frame_size = src_w * src_h * 3 // 2  # = 36
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=3
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=3)
     consumer = StreamConsumer(
-        "rtsp://host:8554/live", 1920, 1080,
-        ffmpeg_bin=mock, source_size=(src_w, src_h),
+        "rtsp://host:8554/live",
+        1920,
+        1080,
+        ffmpeg_bin=mock,
+        source_size=(src_w, src_h),
     )
 
     frames = [f async for f in consumer.frames()]
@@ -487,19 +460,17 @@ async def test_ffprobe_discovers_source_dims(tmp_path):
     probe = tmp_path / "ffprobe"
     probe_body = f"#!{sys.executable}\n"
     probe_body += "import sys, json\n"
-    probe_body += (
-        f"print(json.dumps({{'streams': [{{'width': {src_w}, "
-        f"'height': {src_h}}}]}}))\n"
-    )
+    probe_body += f"print(json.dumps({{'streams': [{{'width': {src_w}, 'height': {src_h}}}]}}))\n"
     probe.write_text(probe_body)
     probe.chmod(probe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=4
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=4)
     consumer = StreamConsumer(
-        "rtsp://host:8554/live", 1920, 1080,
-        ffmpeg_bin=mock, ffprobe_bin=str(probe),
+        "rtsp://host:8554/live",
+        1920,
+        1080,
+        ffmpeg_bin=mock,
+        ffprobe_bin=str(probe),
     )
 
     frames = [f async for f in consumer.frames()]
@@ -516,7 +487,9 @@ async def test_ffprobe_failure_yields_no_frames(tmp_path):
     exit — the caller's on-unreachable handling takes over, and ffmpeg
     is never spawned."""
     consumer = StreamConsumer(
-        "rtsp://host:8554/live", 1920, 1080,
+        "rtsp://host:8554/live",
+        1920,
+        1080,
         ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
         ffprobe_bin=str(tmp_path / "does-not-exist-ffprobe"),
     )
@@ -545,7 +518,9 @@ async def test_ffprobe_rounds_odd_source_dims_up_to_even(tmp_path):
     # Don't spawn ffmpeg — point it at a non-existent binary so frames()
     # exits after the probe; we only assert the rounded source dims.
     consumer = StreamConsumer(
-        "rtsp://host:8554/live", 1920, 1080,
+        "rtsp://host:8554/live",
+        1920,
+        1080,
         ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
         ffprobe_bin=str(probe),
     )
@@ -567,16 +542,16 @@ async def test_ffprobe_clamps_over_large_source_to_texture_limit(tmp_path):
     probe_body = f"#!{sys.executable}\n"
     probe_body += "import json\n"
     # 1440p source — 2560x1440, over the 2048 cap on the width axis.
-    probe_body += (
-        "print(json.dumps({'streams': [{'width': 2560, 'height': 1440}]}))\n"
-    )
+    probe_body += "print(json.dumps({'streams': [{'width': 2560, 'height': 1440}]}))\n"
     probe.write_text(probe_body)
     probe.chmod(probe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     # Point ffmpeg at a non-existent binary — frames() exits after the
     # probe; we only assert the clamped source dims + argv.
     consumer = StreamConsumer(
-        "rtsp://host:8554/live", 1920, 1080,
+        "rtsp://host:8554/live",
+        1920,
+        1080,
         ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
         ffprobe_bin=str(probe),
     )
@@ -610,7 +585,9 @@ async def test_cancel_mid_probe_reaps_ffprobe(tmp_path):
     probe.chmod(probe.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     consumer = StreamConsumer(
-        "rtsp://host:8554/live", 1920, 1080,
+        "rtsp://host:8554/live",
+        1920,
+        1080,
         ffmpeg_bin=str(tmp_path / "unused-ffmpeg"),
         ffprobe_bin=str(probe),
     )
@@ -713,9 +690,7 @@ def test_validate_stream_url_strips_leading_whitespace():
 
 def test_validate_stream_url_strips_trailing_whitespace():
     """Trailing whitespace is stripped from the returned URL too."""
-    assert (
-        validate_stream_url("rtsp://cam.local/s  \n") == "rtsp://cam.local/s"
-    )
+    assert validate_stream_url("rtsp://cam.local/s  \n") == "rtsp://cam.local/s"
 
 
 def test_consumer_init_stores_stripped_url():

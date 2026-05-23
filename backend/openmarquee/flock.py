@@ -128,8 +128,7 @@ class FlockPeer(BaseModel):
         default=None,
         ge=0,
         le=100,
-        description="Peer's WiFi RSSI as a percentage (0-100). "
-        "Populated by Phase B health probes.",
+        description="Peer's WiFi RSSI as a percentage (0-100). Populated by Phase B health probes.",
     )
     uptime: str | None = Field(
         default=None,
