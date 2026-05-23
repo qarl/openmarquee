@@ -138,6 +138,7 @@ def _read_meminfo() -> tuple[int, int] | None:
         return None
     return mem_available_kb // 1024, (swap_total_kb - swap_free_kb) // 1024
 
+
 # Process-wide single-flight lock for on-device renders. Only one
 # Chromium may run at a time — two concurrent headless browsers would
 # each claim hundreds of MB and OOM the ~426 MB Pi. asyncio.Lock binds
