@@ -18,11 +18,11 @@ import time
 
 import pytest
 
+from openmarquee import web_screenshot
 from openmarquee.content import WebSlide
 from openmarquee.content.storage import ContentStorage
-from openmarquee import web_screenshot
-from openmarquee.web_screenshot import fetch_web_screenshot
 from openmarquee.web_render import WebRenderError
+from openmarquee.web_screenshot import fetch_web_screenshot
 
 # A tiny but valid 1x1 PNG — enough that ContentStorage.save_web writes
 # it verbatim (save_web with explicit bytes doesn't re-decode).
