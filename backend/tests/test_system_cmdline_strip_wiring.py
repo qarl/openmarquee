@@ -32,21 +32,9 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent.parent
 _LIB = (
-    _REPO
-    / "images"
-    / "openmarquee"
-    / "stage-openmarquee"
-    / "02-boot-config"
-    / "boot-config-lib.sh"
+    _REPO / "images" / "openmarquee" / "stage-openmarquee" / "02-boot-config" / "boot-config-lib.sh"
 )
-_PIGEN_RUN = (
-    _REPO
-    / "images"
-    / "openmarquee"
-    / "stage-openmarquee"
-    / "02-boot-config"
-    / "02-run.sh"
-)
+_PIGEN_RUN = _REPO / "images" / "openmarquee" / "stage-openmarquee" / "02-boot-config" / "02-run.sh"
 _INSTALL = _REPO / "scripts" / "install.sh"
 
 _TARGET_TOKEN = "cgroup_disable=memory"
@@ -118,7 +106,7 @@ def test_pigen_run_invokes_strip_with_target_token() -> None:
         source,
     ), (
         f"02-run.sh does not invoke `strip_cmdline_token "
-        f"\"{_TARGET_TOKEN}\"`. Freshly-built pi-gen images will "
+        f'"{_TARGET_TOKEN}"`. Freshly-built pi-gen images will '
         f"still carry the cgroup_disable=memory flag — PSI/cgroup "
         f"memory accounting + systemd-OOMD remain blocked."
     )
@@ -136,7 +124,7 @@ def test_install_sh_invokes_strip_with_target_token() -> None:
         source,
     ), (
         f"install.sh does not invoke `strip_cmdline_token "
-        f"\"{_TARGET_TOKEN}\"`. An operator-driven redeploy on a "
+        f'"{_TARGET_TOKEN}"`. An operator-driven redeploy on a '
         f"running Pi will not pick up the mitigation — only freshly-"
         f"built images would."
     )
