@@ -27,6 +27,7 @@ import { mediaSrc } from "./api.js";
 import { formatAutoText } from "./auto-format.js";
 import { anyLayerAnimated } from "./canvas-motion.js";
 import { drawTextOnly } from "./editor.js";
+import { FONT_WEIGHT_BY_VALUE, cssFontFamily } from "./font-picker.js";
 import { markEnd, markStart } from "./perf.js";
 import { drawCanvas } from "./rasterize.js";
 import { stateFromItem } from "./state-from-item.js";
@@ -188,6 +189,40 @@ export function mountInlinePreview(container, options) {
     // change forces re-rasterization; refresh() clears it on edit-save.
     let textOverlay = null;
     let textOverlayKey = null;
+
+    // Font-load orchestration (2026-05-24 thumbnail-font-fallback fix).
+    //
+    // The text-overlay branch in drawTextOverVideo() rasterizes text
+    // via canvas2D ctx.fillText, which silently falls back to system
+    // fonts when the requested @font-face family hasn't finished
+    // loading. The first render of a slide can therefore lock a
+    // fallback-font raster into the cache via textOverlayKey; later
+    // frames hit the cache and never re-rasterize, so the operator
+    // sees stale fallback-font thumbnails for the rest of the session.
+    //
+    // Plan A (per-render check + kick) is inline in the rasterize
+    // branch below — if any layer's font isn't yet loaded, kick
+    // `document.fonts.load(...)` and on resolve clear textOverlayKey +
+    // re-renderOnce. This frame still paints with whatever the cache
+    // has (matches today's behavior) but a fresh raster lands next
+    // frame.
+    //
+    // Plan B (this listener) — covers the common app-just-opened case
+    // where every bundled font is loading in parallel with the first
+    // render. `document.fonts.ready` resolves once when all in-flight
+    // font loads have settled; clearing textOverlayKey here triggers a
+    // fresh rasterize on the next frame, with the real fonts.
+    //
+    // `stopped` guard avoids touching the cache after the panel is
+    // torn down (the .then() can resolve after stop() runs). Matches
+    // the same guard pattern used in refresh() above.
+    if (document.fonts?.ready) {
+        document.fonts.ready.then(() => {
+            if (stopped) return;
+            textOverlayKey = null;
+            renderOnce();
+        });
+    }
 
     async function refresh() {
         if (stopped) return;
@@ -916,6 +951,53 @@ export function mountInlinePreview(container, options) {
             )
             .join("|");
         const key = `${item.id}|${layerSig}|${srcW}x${srcH}`;
+        // Plan A (2026-05-24 thumbnail-font-fallback fix). For each
+        // text layer, verify the requested @font-face family is
+        // loaded; if not, kick `document.fonts.load(...)` and on
+        // resolve clear textOverlayKey + re-renderOnce so the next
+        // frame rasterizes with the real font. We don't await here:
+        // this frame still paints with whatever the cache has (which
+        // matches today's behavior — operator may see fallback
+        // briefly for the very first frame), then the resolve handler
+        // refreshes the raster.
+        //
+        // `document.fonts.load` is idempotent for already-pending
+        // loads (returns the same promise), so re-kicking on every
+        // rAF frame while a font is still loading is cheap. Once
+        // loaded, document.fonts.check() returns true and we skip
+        // the kick entirely.
+        //
+        // 40px in the token matches editor.js:846's kick. fonts.load
+        // resolves on (family, weight), not exact size — one token
+        // covers every size the layer might rasterize at.
+        if (document.fonts?.check && document.fonts?.load) {
+            for (const layer of item.text_layers || []) {
+                const family = layer.font_family;
+                if (!family) continue;
+                const weight = FONT_WEIGHT_BY_VALUE.get(family) ?? 700;
+                const token = `${weight} 40px ${cssFontFamily(family)}`;
+                let ready = false;
+                try {
+                    ready = document.fonts.check(token);
+                } catch {
+                    // Invalid family token (rare — cssFontFamily
+                    // should yield a well-formed value). Fall through;
+                    // worst case the layer renders with fallback this
+                    // session, same as pre-fix.
+                }
+                if (ready) continue;
+                document.fonts
+                    .load(token)
+                    .then(() => {
+                        if (stopped) return;
+                        textOverlayKey = null;
+                        renderOnce();
+                    })
+                    .catch(() => {
+                        /* family unavailable; fallback persists */
+                    });
+            }
+        }
         if (sizeChanged || textOverlayKey !== key) {
             drawTextOnly(textOverlay, item);
             textOverlayKey = key;
