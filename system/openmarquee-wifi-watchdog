@@ -1,0 +1,19 @@
+# /etc/cron.d/openmarquee-wifi-watchdog — fires the WiFi watchdog
+# script every 30 seconds. Cron's smallest native unit is 1 minute,
+# so we run twice per minute: once at :00 and once at :30 (via the
+# `sleep 30 &&` prefix on the second line). The script itself is
+# idempotent + state-file-backed, so the double fire is safe.
+#
+# Why 30s + THRESHOLD=2 (vs the original 1-min + THRESHOLD=3):
+# the original cadence × threshold gave a ~3-min minimum-detection
+# floor — longer than NetworkManager's typical AP-deauth recovery
+# window, so today's 2026-05-23 wedge was observed but never
+# acted on. 30s × THRESHOLD=2 = ~60s detection floor, fast enough
+# to recover before customer-facing impact.
+#
+# PATH is set explicitly: cron's default PATH doesn't include
+# /usr/sbin (systemctl lives there). The script also sets PATH
+# as belt-and-suspenders.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root /usr/local/bin/wifi-watchdog.sh
+* * * * * root sleep 30 && /usr/local/bin/wifi-watchdog.sh
