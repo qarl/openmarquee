@@ -450,9 +450,18 @@ function _encodePlaylistBody(entriesOrIds, name) {
     return body;
 }
 
-/** Fetch the full playlist collection: { schema_version, playlists: [...] }. */
+/** Fetch the full playlist collection: { schema_version, playlists: [...] }.
+ *
+ * `cache: "no-store"` is intentional — without it the browser was
+ * serving stale post-delete responses from its HTTP cache in some
+ * configurations (qarl bug 2026-05-24: deleted tile reappeared on
+ * refresh because the GET hit cache from before the DELETE landed).
+ * Defensive against intermediate caching too (service workers,
+ * proxies). Playlist GETs are infrequent enough that no-store is
+ * cheap.
+ */
 export async function listPlaylists() {
-    const response = await apiFetch("/api/playlists");
+    const response = await apiFetch("/api/playlists", { cache: "no-store" });
     if (!response.ok) {
         throw new Error(`Playlists fetch failed (${response.status})`);
     }
