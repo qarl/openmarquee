@@ -722,7 +722,9 @@ def test_unsupported_slide_error_is_subclass_of_op_error(make_renderer):
     except-chain ordering."""
     r = make_renderer(
         env_extra={
-            "FAKE_SIDECAR_RECONFIGURE_ERR": "Capture: VideoSlide capture not implemented (image + text only)"
+            "FAKE_SIDECAR_RECONFIGURE_ERR": (
+                "Capture: VideoSlide capture not implemented (image + text only)"
+            )
         }
     )
     try:
@@ -761,7 +763,9 @@ def test_generic_op_error_not_promoted(make_renderer):
     RustRendererOpError -- promotion is substring-gated, not blanket."""
     r = make_renderer(
         env_extra={
-            "FAKE_SIDECAR_RECONFIGURE_ERR": "paint_slide: image_slide requires content_root (--content-root)"
+            "FAKE_SIDECAR_RECONFIGURE_ERR": (
+                "paint_slide: image_slide requires content_root (--content-root)"
+            )
         }
     )
     try:

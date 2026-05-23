@@ -693,9 +693,11 @@ class TestAutoFallbackRenderer:
             "Capture: VideoSlide capture not implemented (image + text only)"
         )
         wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
-        with caplog.at_level(_logging.INFO, logger="openmarquee.dependencies"):
-            with pytest.raises(RustRendererUnsupportedSlideError):
-                wrapper.advance(t_ms=100)
+        with (
+            caplog.at_level(_logging.INFO, logger="openmarquee.dependencies"),
+            pytest.raises(RustRendererUnsupportedSlideError),
+        ):
+            wrapper.advance(t_ms=100)
         # Log line names the op + reproduces the wire-format message.
         matching = [
             r for r in caplog.records if "skipped" in r.getMessage() and "advance" in r.getMessage()

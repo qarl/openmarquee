@@ -26,8 +26,6 @@ from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-log = logging.getLogger(__name__)
-
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_content_storage,
@@ -38,6 +36,8 @@ from openmarquee.dependencies import (
 from openmarquee.flock import FLOCK_ADDRESS_PATTERN, Flock, FlockPeer, FlockStorage
 from openmarquee.flock_sync import FlockSync, NotifyKind
 from openmarquee.tombstone import Tombstone, TombstoneStorage
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/flock", tags=["flock"])
 

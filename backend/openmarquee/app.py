@@ -23,6 +23,7 @@ from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
 from openmarquee.api_system import router as system_router
+from openmarquee.auth_middleware import AuthMiddleware
 from openmarquee.dependencies import (
     get_auth_storage,
     get_content_storage,
@@ -197,8 +198,6 @@ app.add_middleware(PerfMiddleware)
 # AuthMiddleware -- perf records still cover auth-rejected 401s
 # (useful for "are we 401-ing a lot?" observability). AuthMiddleware
 # fails closed: requests not on the whitelist need a valid token.
-from openmarquee.auth_middleware import AuthMiddleware
-
 # Pass a callable resolver -- the middleware looks up the storage
 # per-request so the singleton's lru_cache can be cleared between
 # tests (tests point OPENMARQUEE_AUTH_PATH at a tmp dir).

@@ -135,14 +135,12 @@ def test_no_bare_date_iseconds_in_watched_dirs() -> None:
                     line_no = content[: match.start()].count("\n") + 1
                     snippet = match.group(0).strip()
                     violations.append(
-                        f"{relpath}:{line_no}: {snippet!r} — add `-u` "
-                        f"or `--utc` before `-Iseconds`"
+                        f"{relpath}:{line_no}: {snippet!r} — add `-u` or `--utc` before `-Iseconds`"
                     )
     assert not violations, (
         "Bare `date -Iseconds` (without `-u`/`--utc`) found in "
         "watched directories — every log-emitter timestamp must be "
-        "UTC for journalctl-correlation per postmortem #8:\n  "
-        + "\n  ".join(violations)
+        "UTC for journalctl-correlation per postmortem #8:\n  " + "\n  ".join(violations)
     )
 
 

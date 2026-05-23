@@ -13,6 +13,10 @@ from openmarquee.content import (
     TextSlide,
     WebSlide,
 )
+from openmarquee.playback import PlaybackLoop, web_refresh_due
+from openmarquee.rendering.mock import MockRenderer
+from openmarquee.stream_consumer import StreamConsumer
+from tests.test_stream_consumer import _write_mock_ffmpeg
 
 
 def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
@@ -39,11 +43,6 @@ def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
         **kwargs,
     )
 
-
-from openmarquee.playback import PlaybackLoop, web_refresh_due
-from openmarquee.rendering.mock import MockRenderer
-from openmarquee.stream_consumer import StreamConsumer
-from tests.test_stream_consumer import _write_mock_ffmpeg
 
 # 100ms is the model's minimum duration. Tests use it directly; the
 # total runtime stays under a second.

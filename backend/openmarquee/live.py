@@ -31,7 +31,7 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime
-from typing import Literal, Union
+from typing import Literal
 from uuid import UUID, uuid4
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
@@ -69,7 +69,7 @@ class StreamStartRequest(BaseModel):
 # `kind` ({"sdp_offer": ...}) still validates as a WebRtcStartRequest
 # — the deployed phone client predates the stream-transport work and
 # must keep working until its UI bundle is refreshed.
-LiveStartBody = Union[WebRtcStartRequest, StreamStartRequest]
+LiveStartBody = WebRtcStartRequest | StreamStartRequest
 
 
 class LiveAlreadyActive(Exception):

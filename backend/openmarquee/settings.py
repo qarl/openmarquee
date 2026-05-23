@@ -154,7 +154,11 @@ class SystemSettings(BaseModel):
         default=1.0,
         ge=0.1,
         le=3.0,
-        description="Display gamma correction. 1.0 is identity (no second gamma applied; assets arrive sRGB-encoded). Operator can dial up if the TV's HDMI pipeline isn't gamma-correct on its own.",
+        description=(
+            "Display gamma correction. 1.0 is identity (no second gamma "
+            "applied; assets arrive sRGB-encoded). Operator can dial up "
+            "if the TV's HDMI pipeline isn't gamma-correct on its own."
+        ),
     )
 
     # Captive-portal access point — this is how phones connect during

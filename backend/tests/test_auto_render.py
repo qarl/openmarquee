@@ -9,6 +9,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError
 
 from openmarquee.auto_render import (
     render_auto_text,
@@ -100,11 +101,11 @@ class TestAutoFormatValidator:
         assert s.text_layers[0].auto_format == "time_hms"
 
     def test_rejects_format_without_mode(self):
-        with pytest.raises(Exception):  # ValidationError — let pydantic match
+        with pytest.raises(ValidationError):
             _auto_slide(auto_format="time_hm")
 
     def test_rejects_mode_mismatch(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _auto_slide(auto_mode="time", auto_format="day_long")
 
     def test_mode_without_format_is_allowed(self):
