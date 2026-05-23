@@ -1055,7 +1055,12 @@ where
             let is_begin_slide = matches!(req, IpcRequest::BeginSlide(_));
 
             // v1-spec-delta #9 (slice e -- Capture wired now;
-            // Reconfigure remains architectural-quality defer).
+            // Reconfigure landed as a partial op for QA H1
+            // 2026-05-23: brightness + gamma applied in-place via
+            // session.apply_settings; rotation rejected with a typed
+            // error since DRM mode-change + EGL surface invalidation
+            // remain deferred post-v1).
+            //
             // Capture intercepts here BEFORE handle_inner_request
             // because the standard dispatch returns "not yet
             // implemented" and we need session+gl to capture.
@@ -1064,6 +1069,29 @@ where
                 let resp = capture_current_scene_to_png(
                     session, &cache, &state, fonts, content_root, &path,
                 );
+                emit_response(stdout, &resp)?;
+                continue;
+            }
+
+            // QA H1 (2026-05-23): Reconfigure intercepts here too,
+            // for the same reason — the standard dispatch has no
+            // session, so brightness/gamma have no shader uniforms to
+            // touch. validate_reconfigure builds the new Settings (or
+            // a typed error); on success we route through the same
+            // session.apply_settings sink that SettingsWatcher uses,
+            // so the next frame paints with the new color profile.
+            // Closes the IPC half of §3.4 / §6.3's ≤2s settings-apply
+            // story — IPC-driven is INSTANT vs the file-poll path.
+            if let IpcRequest::Reconfigure(ref p) = req {
+                let resp = match crate::playback::validate_reconfigure(
+                    session.current_settings(), p,
+                ) {
+                    Ok(updated) => {
+                        session.apply_settings(updated);
+                        ok_empty()
+                    }
+                    Err(e) => err(e.message()),
+                };
                 emit_response(stdout, &resp)?;
                 continue;
             }
@@ -1702,8 +1730,34 @@ fn handle_inner_request(
         IpcRequest::Capture(_) => {
             err("Capture not yet implemented (slice e)")
         }
-        IpcRequest::Reconfigure(_) => {
-            err("Reconfigure not yet implemented (slice e)")
+        IpcRequest::Reconfigure(p) => {
+            // QA H1 (2026-05-23) — partial implementation: brightness
+            // + gamma applied in-place; rotation deferred.
+            //
+            // The HDMI inner loop intercepts Reconfigure BEFORE this
+            // standard dispatch (sibling pattern to Capture at the
+            // top of `run_open_and_inner_loop_linux`) so brightness /
+            // gamma route into `session.apply_settings`. Reaching
+            // this fallback means reconfigure was sent to a state-
+            // only sidecar with no render session: rotation still
+            // rejects via the typed error; brightness / gamma have no
+            // shader to update so we surface a typed "needs HDMI
+            // session" error instead of silently ACK'ing.
+            match crate::playback::validate_reconfigure(
+                &crate::content::Settings::default(), &p,
+            ) {
+                Err(e) => err(e.message()),
+                Ok(_) if p.brightness.is_some() || p.gamma.is_some() => {
+                    err(
+                        "reconfigure: brightness/gamma require the \
+                         HDMI render session — this state-only \
+                         sidecar build has no shader uniforms to \
+                         update; use the HDMI sidecar or update \
+                         settings.json directly"
+                    )
+                }
+                Ok(_) => ok_empty(),
+            }
         }
         IpcRequest::BeginExternalFrames(_) => {
             // The Linux HDMI inner loop intercepts this op before
@@ -2076,7 +2130,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_reconfigure_returns_not_yet_implemented() {
+    fn handle_reconfigure_rotation_returns_typed_unsupported_field_error() {
+        // QA H1 (2026-05-23): rotation is the deferred arm — typed
+        // error in BOTH the HDMI inner-loop interception and the
+        // state-only standard dispatch tested here. The exact prefix
+        // is part of the Python-facing wire contract.
         let mut state = PlaybackState::new();
         let mut cache = SlideCache::new();
         let td = tempfile::TempDir::new().unwrap();
@@ -2088,9 +2146,65 @@ mod tests {
         let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
         match resp {
             IpcResponse::Err { error } => {
-                assert!(error.contains("Reconfigure not yet implemented"));
+                assert!(
+                    error.starts_with(
+                        "reconfigure: unsupported field 'rotation'"
+                    ),
+                    "expected the typed unsupported-field prefix; got: {error}"
+                );
             }
             other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_reconfigure_brightness_in_state_only_build_returns_typed_error() {
+        // State-only sidecar (Mac unit-test build) has no render
+        // session, so brightness/gamma have no shader to update.
+        // The standard dispatch surfaces a typed "needs HDMI" error
+        // instead of silently ACK'ing. The HDMI inner loop's
+        // interception (covered by Pi-side integration) is what
+        // actually applies the change in production.
+        let mut state = PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let td = tempfile::TempDir::new().unwrap();
+        let req = IpcRequest::Reconfigure(crate::playback::ReconfigureParams {
+            rotation: None,
+            brightness: Some(0.5),
+            gamma: None,
+        });
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        match resp {
+            IpcResponse::Err { error } => {
+                assert!(
+                    error.contains("require the HDMI render session"),
+                    "expected the state-only-build error; got: {error}"
+                );
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_reconfigure_no_op_in_state_only_build_succeeds() {
+        // A reconfigure carrying no fields at all (all None) is a
+        // valid no-op and should ACK with ok_empty even from the
+        // state-only sidecar — there's nothing to apply and nothing
+        // to reject.
+        let mut state = PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let td = tempfile::TempDir::new().unwrap();
+        let req = IpcRequest::Reconfigure(crate::playback::ReconfigureParams {
+            rotation: None,
+            brightness: None,
+            gamma: None,
+        });
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        match resp {
+            IpcResponse::Ok { result } => {
+                assert_eq!(result, OpResult::Empty);
+            }
+            other => panic!("expected Ok(Empty), got {other:?}"),
         }
     }
 

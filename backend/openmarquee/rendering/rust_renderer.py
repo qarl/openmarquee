@@ -581,9 +581,27 @@ class RustRenderer:
     ) -> None:
         """Op 6. Apply new settings without losing playback state.
 
-        Note: the current sidecar returns `"Reconfigure not yet implemented
-        (slice e)"` for any reconfigure call (per `ipc_main.rs`). The proxy
-        will surface that as `RustRendererOpError` until the slice lands."""
+        QA H1 (2026-05-23) — PARTIAL implementation:
+          - brightness (float in [0.0, 1.0]) — applied in-place via
+            shader uniform; takes effect on the next frame.
+          - gamma (float in (0.0, 4.0]) — same path.
+          - rotation — REJECTED with `RustRendererOpError` carrying a
+            `"reconfigure: unsupported field 'rotation'"` message. DRM
+            mode-change + EGL surface invalidation remain deferred
+            post-v1; to change rotation, edit settings.json and
+            restart the renderer.
+
+        Out-of-range / non-finite brightness or gamma values are
+        rejected with `RustRendererOpError` carrying a
+        `"reconfigure: invalid value for '<field>'"` message.
+
+        Sidecar build difference: only the HDMI inner loop (Pi
+        production path) actually applies brightness/gamma to the
+        shader. The state-only sidecar (used by Mac unit tests)
+        surfaces a `"require the HDMI render session"` error on
+        brightness/gamma — tests should mock at this layer rather
+        than expecting the state-only build to ACK the apply.
+        """
         params: dict[str, Any] = {}
         if rotation is not None:
             params["rotation"] = int(rotation)

@@ -547,6 +547,93 @@ def test_request_json_encoding_matches_spec(make_renderer, tmp_path):
     assert requests[5] == {"op": "close"}
 
 
+# QA H1 (2026-05-23) — partial Reconfigure op coverage. The sidecar's
+# HDMI inner loop applies brightness/gamma in-place via the
+# FS_BRIGHT_GAMMA shader; rotation rejects with a typed error. These
+# tests exercise the Python proxy's wire encoding + error-promotion
+# behavior; the actual shader-uniform update is covered by the Rust-
+# side unit tests (renderer/src/playback.rs::validate_reconfigure).
+def test_reconfigure_brightness_serializes_to_expected_body(
+    make_renderer, tmp_path
+):
+    """`reconfigure(brightness=0.5)` emits the canonical wire body
+    `{"op":"reconfigure","params":{"brightness":0.5}}` — the form the
+    sidecar's validate_reconfigure consumes."""
+    log_path = tmp_path / "req.log"
+    r = make_renderer(env_extra={"FAKE_SIDECAR_REQUEST_LOG": str(log_path)})
+    try:
+        r.open()
+        r.reconfigure(brightness=0.5)
+        r.reconfigure(gamma=2.2)
+        r.reconfigure(brightness=0.8, gamma=1.8)
+    finally:
+        r.close()
+
+    requests = [
+        json.loads(ln)
+        for ln in log_path.read_text().strip().splitlines()
+        if json.loads(ln).get("op") == "reconfigure"
+    ]
+    assert requests[0] == {
+        "op": "reconfigure",
+        "params": {"brightness": 0.5},
+    }
+    assert requests[1] == {
+        "op": "reconfigure",
+        "params": {"gamma": 2.2},
+    }
+    assert requests[2] == {
+        "op": "reconfigure",
+        "params": {"brightness": 0.8, "gamma": 1.8},
+    }
+
+
+def test_reconfigure_rotation_typed_error_propagates_with_stable_prefix(
+    make_renderer,
+):
+    """The sidecar rejects rotation with a structured-string error
+    starting `"reconfigure: unsupported field 'rotation'"`. The proxy
+    surfaces this verbatim as RustRendererOpError so a caller can
+    prefix-match to render an operator message."""
+    wire = (
+        "reconfigure: unsupported field 'rotation' — "
+        "rotation/resolution changes require DRM mode-change + EGL "
+        "surface invalidation, deferred post-v1; change rotation via "
+        "settings.json + a renderer restart"
+    )
+    r = make_renderer(env_extra={"FAKE_SIDECAR_RECONFIGURE_ERR": wire})
+    try:
+        r.open()
+        with pytest.raises(RustRendererOpError) as exc_info:
+            r.reconfigure(rotation=180)
+        assert exc_info.value.message.startswith(
+            "reconfigure: unsupported field 'rotation'"
+        )
+    finally:
+        r.close()
+
+
+def test_reconfigure_invalid_value_typed_error_propagates(make_renderer):
+    """The sidecar rejects out-of-range brightness/gamma with a
+    structured-string error starting `"reconfigure: invalid value
+    for '<field>'"`. Surfaces as RustRendererOpError; prefix-stable
+    so the Python side can branch on field name."""
+    wire = (
+        "reconfigure: invalid value for 'brightness' — "
+        "got 1.5; expected finite float in [0.0, 1.0]"
+    )
+    r = make_renderer(env_extra={"FAKE_SIDECAR_RECONFIGURE_ERR": wire})
+    try:
+        r.open()
+        with pytest.raises(RustRendererOpError) as exc_info:
+            r.reconfigure(brightness=1.5)
+        assert exc_info.value.message.startswith(
+            "reconfigure: invalid value for 'brightness'"
+        )
+    finally:
+        r.close()
+
+
 # ============================================================
 # Error-class dispatch: byte-stable wire-format error strings.
 # ============================================================

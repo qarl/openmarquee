@@ -370,6 +370,110 @@ pub struct ReconfigureParams {
     pub gamma: Option<f32>,
 }
 
+/// Typed error from `validate_reconfigure` — surfaces field-level
+/// rejection (unsupported / out-of-range) as a stable, prefix-matchable
+/// string so Python can render a useful operator message instead of
+/// a generic stub. The IPC envelope's `error` field is a plain
+/// `String`, so this lives at the Rust-internal layer; the wire form
+/// is `.message()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconfigureError {
+    /// The reconfigure op carried a field that this build of the
+    /// renderer can't apply in-place. v1: rotation/resolution.
+    UnsupportedField {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// A field's value fell outside the schema's range (or was NaN /
+    /// non-finite). The renderer rejects rather than clamping so the
+    /// operator sees the bad input.
+    InvalidValue {
+        field: &'static str,
+        detail: String,
+    },
+}
+
+impl ReconfigureError {
+    /// Render to a stable, prefix-matchable string for the IPC wire.
+    /// Format:
+    ///   "reconfigure: unsupported field '<name>' — <reason>"
+    ///   "reconfigure: invalid value for '<name>' — <detail>"
+    /// Python prefix-matches on `reconfigure: unsupported field` /
+    /// `reconfigure: invalid value` to choose its operator-facing
+    /// message.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnsupportedField { field, reason } => format!(
+                "reconfigure: unsupported field '{field}' — {reason}"
+            ),
+            Self::InvalidValue { field, detail } => format!(
+                "reconfigure: invalid value for '{field}' — {detail}"
+            ),
+        }
+    }
+}
+
+/// Validate a Reconfigure IPC payload against a starting Settings
+/// snapshot and return the new Settings to apply, or a typed error
+/// the caller can render to the wire.
+///
+/// v1 supports brightness + gamma in-place (shader uniform updates,
+/// no DRM mode-change / EGL surface invalidation). Rotation /
+/// resolution are deferred post-v1 and rejected here.
+///
+/// Type conversion: IPC carries brightness as `f32` in [0.0, 1.0];
+/// `Settings.brightness` is `u32` in [0, 100]. We map by
+/// `(b * 100.0).round() as u32` — a deliberate, lossy 1/100-step.
+/// The full Settings refactor to `f32` brightness is wire-format
+/// scope creep; the 1% step is operationally fine.
+///
+/// Returns `Ok(current.clone())` if every field is `None` (a no-op
+/// reconfigure is still a successful operation).
+pub fn validate_reconfigure(
+    current: &crate::content::Settings,
+    p: &ReconfigureParams,
+) -> Result<crate::content::Settings, ReconfigureError> {
+    if p.rotation.is_some() {
+        return Err(ReconfigureError::UnsupportedField {
+            field: "rotation",
+            reason: "rotation/resolution changes require DRM \
+                     mode-change + EGL surface invalidation, \
+                     deferred post-v1; change rotation via \
+                     settings.json + a renderer restart",
+        });
+    }
+    let mut updated = current.clone();
+    if let Some(b) = p.brightness {
+        if !b.is_finite() || !(0.0..=1.0).contains(&b) {
+            return Err(ReconfigureError::InvalidValue {
+                field: "brightness",
+                detail: format!(
+                    "got {b}; expected finite float in [0.0, 1.0]"
+                ),
+            });
+        }
+        updated.brightness = (b * 100.0).round().clamp(0.0, 100.0) as u32;
+    }
+    if let Some(g) = p.gamma {
+        // Schema bounds match backend/openmarquee/settings.py
+        // (Pydantic `ge=0.1, le=3.0`). Aligning here so a wider IPC
+        // value isn't accepted only to be rejected next time the
+        // backend reads settings.json. Also rejects NaN/infinity and
+        // values below 0.1 (the shader's `1.0/max(g, 0.001)` would
+        // silently saturate near zero, masking operator misuse).
+        if !g.is_finite() || !(0.1..=3.0).contains(&g) {
+            return Err(ReconfigureError::InvalidValue {
+                field: "gamma",
+                detail: format!(
+                    "got {g}; expected finite float in [0.1, 3.0]"
+                ),
+            });
+        }
+        updated.gamma = g;
+    }
+    Ok(updated)
+}
+
 /// Tagged response envelope. `ok` is the outcome flag; on
 /// success `result` carries the per-op return data; on
 /// failure `error` carries a human-readable diagnostic. The
@@ -915,6 +1019,201 @@ mod tests {
                 slide_id: uuid(7),
             }),
             OpResult::SlideComplete { slide_id: uuid(7) }
+        );
+    }
+
+    // ----- validate_reconfigure (QA H1 2026-05-23) -----
+    //
+    // Pure-logic gate for the Reconfigure IPC op. v1 supports
+    // brightness + gamma in-place (shader uniform updates only);
+    // rotation/resolution rejected until the DRM mode-change + EGL
+    // surface invalidation work lands post-v1. These tests pin both
+    // the success-path Settings transform AND the typed-error
+    // message format the Python side prefix-matches on.
+
+    use crate::content::Settings;
+
+    fn baseline_settings() -> Settings {
+        // A non-default starting point so the no-op test can prove
+        // that unset fields are preserved exactly (not silently
+        // reset to the schema defaults).
+        Settings {
+            brightness: 60,
+            gamma: 1.4,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn validate_reconfigure_rejects_rotation() {
+        let current = baseline_settings();
+        let result = validate_reconfigure(
+            &current,
+            &ReconfigureParams {
+                rotation: Some(180),
+                brightness: None,
+                gamma: None,
+            },
+        );
+        match result {
+            Err(ReconfigureError::UnsupportedField { field, .. }) => {
+                assert_eq!(field, "rotation");
+            }
+            other => panic!("expected UnsupportedField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_reconfigure_accepts_brightness_in_range() {
+        let current = baseline_settings();
+        let updated = validate_reconfigure(
+            &current,
+            &ReconfigureParams {
+                rotation: None,
+                brightness: Some(0.5),
+                gamma: None,
+            },
+        )
+        .expect("0.5 is a valid brightness");
+        // 0.5 * 100 = 50 (round-and-clamp into the u32 Settings field).
+        assert_eq!(updated.brightness, 50);
+        // Gamma untouched when not in the params.
+        assert_eq!(updated.gamma, current.gamma);
+    }
+
+    #[test]
+    fn validate_reconfigure_accepts_gamma_in_range() {
+        let current = baseline_settings();
+        let updated = validate_reconfigure(
+            &current,
+            &ReconfigureParams {
+                rotation: None,
+                brightness: None,
+                gamma: Some(2.2),
+            },
+        )
+        .expect("2.2 is a valid gamma");
+        assert_eq!(updated.gamma, 2.2);
+        // Brightness untouched when not in the params.
+        assert_eq!(updated.brightness, current.brightness);
+    }
+
+    #[test]
+    fn validate_reconfigure_rejects_brightness_out_of_range() {
+        let current = baseline_settings();
+        for bad in [-0.1f32, 1.5, f32::NAN, f32::INFINITY] {
+            let result = validate_reconfigure(
+                &current,
+                &ReconfigureParams {
+                    rotation: None,
+                    brightness: Some(bad),
+                    gamma: None,
+                },
+            );
+            match result {
+                Err(ReconfigureError::InvalidValue { field, .. }) => {
+                    assert_eq!(field, "brightness", "rejected on {bad}");
+                }
+                other => panic!("expected InvalidValue for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_reconfigure_rejects_gamma_out_of_range() {
+        let current = baseline_settings();
+        // 0.0 explicitly rejected — the shader's `1.0/max(g, 0.001)`
+        // would silently saturate, masking operator misuse. Bounds
+        // mirror the backend Pydantic constraint (ge=0.1, le=3.0).
+        for bad in [0.0f32, 0.05, -1.0, 3.5, 5.0, f32::NAN, f32::INFINITY] {
+            let result = validate_reconfigure(
+                &current,
+                &ReconfigureParams {
+                    rotation: None,
+                    brightness: None,
+                    gamma: Some(bad),
+                },
+            );
+            match result {
+                Err(ReconfigureError::InvalidValue { field, .. }) => {
+                    assert_eq!(field, "gamma", "rejected on {bad}");
+                }
+                other => panic!("expected InvalidValue for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_reconfigure_accepts_schema_boundary_values() {
+        // Pin the inclusive boundary semantics so a future tightening
+        // can't silently shrink the accepted range.
+        let current = baseline_settings();
+        for b in [0.0f32, 1.0] {
+            validate_reconfigure(
+                &current,
+                &ReconfigureParams {
+                    rotation: None,
+                    brightness: Some(b),
+                    gamma: None,
+                },
+            )
+            .unwrap_or_else(|e| panic!("brightness {b} rejected: {e:?}"));
+        }
+        for g in [0.1f32, 3.0] {
+            validate_reconfigure(
+                &current,
+                &ReconfigureParams {
+                    rotation: None,
+                    brightness: None,
+                    gamma: Some(g),
+                },
+            )
+            .unwrap_or_else(|e| panic!("gamma {g} rejected: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_reconfigure_no_op_preserves_settings() {
+        let current = baseline_settings();
+        let updated = validate_reconfigure(
+            &current,
+            &ReconfigureParams {
+                rotation: None,
+                brightness: None,
+                gamma: None,
+            },
+        )
+        .expect("all-None reconfigure is a valid no-op");
+        assert_eq!(updated, current);
+    }
+
+    #[test]
+    fn reconfigure_error_message_format_is_stable() {
+        // The Python proxy prefix-matches on these strings to choose
+        // its operator message. If the format changes, the matching
+        // Python regex must change too — pin the contract here.
+        let unsupported = ReconfigureError::UnsupportedField {
+            field: "rotation",
+            reason: "...",
+        };
+        assert!(
+            unsupported
+                .message()
+                .starts_with("reconfigure: unsupported field 'rotation'"),
+            "got: {}",
+            unsupported.message()
+        );
+
+        let invalid = ReconfigureError::InvalidValue {
+            field: "brightness",
+            detail: "got 2.0; expected ...".into(),
+        };
+        assert!(
+            invalid
+                .message()
+                .starts_with("reconfigure: invalid value for 'brightness'"),
+            "got: {}",
+            invalid.message()
         );
     }
 }
