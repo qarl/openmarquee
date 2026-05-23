@@ -40,6 +40,7 @@ def _png_dims(png_path: Path) -> tuple[int, int]:
 def _playwright_installed() -> bool:
     try:
         import playwright.async_api  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -60,8 +61,15 @@ def test_bake_uncage_fixture_produces_1080p_png(tmp_path: Path) -> None:
     and Phase 2 (operator-browser bakes on save) to depend on."""
     out_png = tmp_path / "uncage.png"
     result = subprocess.run(
-        [sys.executable, str(BAKE_SCRIPT), str(FIXTURE_JSON),
-         "--out", str(out_png), "--tick", "0.8"],
+        [
+            sys.executable,
+            str(BAKE_SCRIPT),
+            str(FIXTURE_JSON),
+            "--out",
+            str(out_png),
+            "--tick",
+            "0.8",
+        ],
         capture_output=True,
         text=True,
         timeout=60,
@@ -79,6 +87,4 @@ def test_bake_uncage_fixture_produces_1080p_png(tmp_path: Path) -> None:
     # floor that catches all-black / all-transparent regressions.
     assert size > 50_000, f"bake output suspiciously small: {size} bytes"
     width, height = _png_dims(out_png)
-    assert (width, height) == (1920, 1080), (
-        f"bake output is {width}x{height}, expected 1920x1080"
-    )
+    assert (width, height) == (1920, 1080), f"bake output is {width}x{height}, expected 1920x1080"

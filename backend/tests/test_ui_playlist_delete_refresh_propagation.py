@@ -64,9 +64,7 @@ def _read_js_source_stripped(path: Path) -> str:
     marker and silently eats everything up to the next `*/` (which
     might be 7KB away in a different scope). Stripping `//` first
     neutralizes those false openers."""
-    assert path.is_file(), (
-        f"JS source not found at {path}; relocation? Update the test path."
-    )
+    assert path.is_file(), f"JS source not found at {path}; relocation? Update the test path."
     text = path.read_text(encoding="utf-8")
     text = re.sub(r"//[^\n]*", "", text)
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -86,9 +84,7 @@ def _extract_function_body(source: str, function_signature: str) -> str:
     )
     # Find the opening brace after the signature.
     brace_start = source.find("{", idx)
-    assert brace_start >= 0, (
-        f"No opening brace after {function_signature!r}."
-    )
+    assert brace_start >= 0, f"No opening brace after {function_signature!r}."
     depth = 0
     i = brace_start
     while i < len(source):
@@ -98,11 +94,9 @@ def _extract_function_body(source: str, function_signature: str) -> str:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return source[brace_start + 1:i]
+                return source[brace_start + 1 : i]
         i += 1
-    raise AssertionError(
-        f"Could not find matching close brace for {function_signature!r}."
-    )
+    raise AssertionError(f"Could not find matching close brace for {function_signature!r}.")
 
 
 def test_main_declares_and_captures_schedule_handle():
@@ -221,13 +215,10 @@ def test_list_playlists_opts_out_of_http_cache():
         r"export\s+async\s+function\s+listPlaylists\(\s*\)\s*\{[^}]*\}",
         source,
     )
-    assert list_match, (
-        "listPlaylists function not found in api.js. Refactored? "
-        "Update this test."
-    )
+    assert list_match, "listPlaylists function not found in api.js. Refactored? Update this test."
     body = list_match.group(0)
     assert re.search(r'cache:\s*"no-store"', body), (
-        "listPlaylists() must pass `cache: \"no-store\"` to apiFetch "
+        'listPlaylists() must pass `cache: "no-store"` to apiFetch '
         "so the browser doesn't serve a stale post-delete GET from "
         "its HTTP cache. Without this, the tile-stays-in-DOM symptom "
         "(qarl bug 2026-05-24) can re-surface intermittently."

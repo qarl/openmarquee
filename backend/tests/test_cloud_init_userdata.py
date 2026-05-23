@@ -123,8 +123,7 @@ def test_user_data_hostname_randomizer_uses_od_not_xxd(user_data: str) -> None:
     trailing dash, permanent because the marker file still gets
     touched on line 57)."""
     assert "SUFFIX=$(od -An -tx1" in user_data, (
-        "hostname randomizer must use od (coreutils); xxd is not in "
-        "00-packages on trixie"
+        "hostname randomizer must use od (coreutils); xxd is not in 00-packages on trixie"
     )
     assert "| xxd" not in user_data, "xxd pipeline must not be re-introduced"
 

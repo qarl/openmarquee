@@ -72,7 +72,9 @@ def cached_truetype(path_or_name: str, size: int) -> ImageFont.ImageFont:
 
 
 def load_font(
-    family: str | None, size_px: int | None, canvas_height: int,
+    family: str | None,
+    size_px: int | None,
+    canvas_height: int,
 ) -> ImageFont.ImageFont:
     """Pick a best-effort font. Size defaults to ~40% of canvas
     height so the auto value reads across a HUB75 panel without

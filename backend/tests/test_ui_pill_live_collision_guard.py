@@ -72,9 +72,7 @@ def test_styles_css_uses_tag_qualified_section_live_selector() -> None:
     modifier (same specificity, later-in-file → cascade wins on
     `display/flex-direction/padding`)."""
     css = _read_css_source_stripped(_STYLES_CSS)
-    assert re.search(
-        r"(?m)^\s*section\.live\s*\{", css
-    ), (
+    assert re.search(r"(?m)^\s*section\.live\s*\{", css), (
         "Expected tag-qualified `section.live { ... }` selector in "
         "styles.css for the Live panel root. The pill collision guard "
         "relies on this being tag-qualified — see test docstring."
@@ -91,15 +89,13 @@ def test_styles_css_does_not_contain_bare_live_selector() -> None:
     # `, ` (selector-list continuation). We DON'T match `.live-foo`
     # (the `-` is part of the class name) or `.something .live` (a
     # descendant selector — qualified by ancestor, not bare).
-    bare_live = re.search(
-        r"(?m)^\s*\.live\s*[,{]", css
-    )
+    bare_live = re.search(r"(?m)^\s*\.live\s*[,{]", css)
     assert bare_live is None, (
         "Bare `.live { ... }` selector found in styles.css — this "
         "re-introduces the Bug 3 cascade collision with the "
         "`.om-pill.live` status-pill modifier. Use a tag-qualified "
         "form like `section.live { ... }` instead. Found near: "
-        f"{css[max(0, bare_live.start() - 30):bare_live.end() + 30] if bare_live else ''!r}"
+        f"{css[max(0, bare_live.start() - 30) : bare_live.end() + 30] if bare_live else ''!r}"
     )
 
 
@@ -110,12 +106,8 @@ def test_styles_css_om_pill_base_sets_inline_flex() -> None:
     css = _read_css_source_stripped(_STYLES_CSS)
     # Find the `.om-pill { ... }` rule block (NOT `.om-pill.live` or
     # `.om-pill .om-pulse`).
-    pill_rule = re.search(
-        r"(?m)^\.om-pill\s*\{([^}]*)\}", css
-    )
-    assert pill_rule is not None, (
-        "Expected `.om-pill { ... }` base rule in styles.css."
-    )
+    pill_rule = re.search(r"(?m)^\.om-pill\s*\{([^}]*)\}", css)
+    assert pill_rule is not None, "Expected `.om-pill { ... }` base rule in styles.css."
     body = pill_rule.group(1)
     assert "display: inline-flex" in body, (
         "`.om-pill` base rule must declare `display: inline-flex` so "
@@ -136,12 +128,8 @@ def test_styles_css_om_pill_live_modifier_only_sets_color_and_background() -> No
     properties here, the pill's base layout could be silently
     overridden."""
     css = _read_css_source_stripped(_STYLES_CSS)
-    pill_live = re.search(
-        r"(?m)^\.om-pill\.live\s*\{([^}]*)\}", css
-    )
-    assert pill_live is not None, (
-        "Expected `.om-pill.live { ... }` modifier rule in styles.css."
-    )
+    pill_live = re.search(r"(?m)^\.om-pill\.live\s*\{([^}]*)\}", css)
+    assert pill_live is not None, "Expected `.om-pill.live { ... }` modifier rule in styles.css."
     body = pill_live.group(1)
     forbidden = ("display:", "padding:", "flex-direction:", "max-width:", "gap:")
     for prop in forbidden:
@@ -158,10 +146,8 @@ def test_live_panel_section_element_type_unchanged() -> None:
     changes it to `<div class="live">` etc., the panel loses its
     layout (different bug but still bad)."""
     src = _LIVE_PANEL_JS.read_text(encoding="utf-8")
-    assert re.search(
-        r'<section\s+class="live"\s*>', src
-    ), (
-        "Expected `<section class=\"live\">` panel root in "
+    assert re.search(r'<section\s+class="live"\s*>', src), (
+        'Expected `<section class="live">` panel root in '
         "ui/src/live-panel.js. The tag-qualified `section.live` CSS "
         "selector relies on this element type — if the panel root "
         "becomes a different element type, the section.live rule "

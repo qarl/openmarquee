@@ -43,7 +43,6 @@ from openmarquee.rendering.rust_renderer import (
     SlideComplete,
 )
 
-
 # ============================================================
 # Fake sidecar subprocess script.
 #
@@ -54,7 +53,7 @@ from openmarquee.rendering.rust_renderer import (
 # embedded in the request stream (see SCRIPT_HEADER).
 # ============================================================
 
-FAKE_SIDECAR_SOURCE = r'''
+FAKE_SIDECAR_SOURCE = r"""
 import json
 import os
 import sys
@@ -194,7 +193,7 @@ for raw in sys.stdin:
 
 if log:
     log.close()
-'''
+"""
 
 
 @pytest.fixture
@@ -247,9 +246,7 @@ def test_rust_renderer_satisfies_renderer_protocol(make_renderer):
     assert r.height == 1080
 
 
-def test_render_frame_pushes_length_prefixed_frames_to_the_binary_channel(
-    make_renderer, tmp_path
-):
+def test_render_frame_pushes_length_prefixed_frames_to_the_binary_channel(make_renderer, tmp_path):
     """STREAM/VLC slice 2.5: render_frame() lazy-sends the
     begin_external_frames op on the JSON channel, then writes each
     frame length-prefixed onto the dedicated binary channel;
@@ -276,9 +273,7 @@ def test_render_frame_pushes_length_prefixed_frames_to_the_binary_channel(
     assert frame_lines == [f"external_frame:{frame_size}"] * 3
 
 
-def test_render_frame_rgb888_begin_carries_panel_dims_and_format(
-    make_renderer, tmp_path
-):
+def test_render_frame_rgb888_begin_carries_panel_dims_and_format(make_renderer, tmp_path):
     """HW-decode (2026-05-20): an rgb888 render_frame() run sends
     begin_external_frames with the renderer PANEL dims and an explicit
     pixel_format of rgb888."""
@@ -297,9 +292,7 @@ def test_render_frame_rgb888_begin_carries_panel_dims_and_format(
     assert begin == [f"begin_external_frames:{r.width}x{r.height}:rgb888"]
 
 
-def test_render_frame_nv12_begin_carries_source_dims_and_format(
-    make_renderer, tmp_path
-):
+def test_render_frame_nv12_begin_carries_source_dims_and_format(make_renderer, tmp_path):
     """HW-decode (2026-05-20): an nv12 render_frame() run sends
     begin_external_frames with the SOURCE video dims (not the panel
     dims) and pixel_format=nv12; each NV12 frame is src_w*src_h*3//2
@@ -653,9 +646,7 @@ def test_reconfigure_invalid_value_typed_error_propagates(make_renderer):
         "Capture: VideoSlide capture not implemented (image + text only)",
     ],
 )
-def test_err_response_raises_op_error_with_stable_message(
-    make_renderer, wire_string
-):
+def test_err_response_raises_op_error_with_stable_message(make_renderer, wire_string):
     """The proxy translates `{"err": {"error": "..."}}` into RustRendererOpError
     with `.message` equal to the verbatim sidecar string. This pins error-
     class dispatch: callers can match `e.message == "<known string>"` to
@@ -705,9 +696,7 @@ def test_op_error_is_subclass_of_renderer_error(make_renderer):
         "paint_transition: to non-text slide TBD",
     ],
 )
-def test_unsupported_slide_wire_strings_promote_to_subclass(
-    make_renderer, wire_string
-):
+def test_unsupported_slide_wire_strings_promote_to_subclass(make_renderer, wire_string):
     """Sidecar wire-format strings that signal "slide kind not yet
     supported" get promoted to RustRendererUnsupportedSlideError at
     the proxy boundary. The promotion is what lets AutoFallbackRenderer
@@ -733,8 +722,7 @@ def test_unsupported_slide_error_is_subclass_of_op_error(make_renderer):
     except-chain ordering."""
     r = make_renderer(
         env_extra={
-            "FAKE_SIDECAR_RECONFIGURE_ERR":
-                "Capture: VideoSlide capture not implemented (image + text only)"
+            "FAKE_SIDECAR_RECONFIGURE_ERR": "Capture: VideoSlide capture not implemented (image + text only)"
         }
     )
     try:
@@ -773,8 +761,7 @@ def test_generic_op_error_not_promoted(make_renderer):
     RustRendererOpError -- promotion is substring-gated, not blanket."""
     r = make_renderer(
         env_extra={
-            "FAKE_SIDECAR_RECONFIGURE_ERR":
-                "paint_slide: image_slide requires content_root (--content-root)"
+            "FAKE_SIDECAR_RECONFIGURE_ERR": "paint_slide: image_slide requires content_root (--content-root)"
         }
     )
     try:
@@ -880,10 +867,9 @@ def test_context_manager_closes_on_exit(make_renderer):
 
 def test_context_manager_closes_even_on_exception(make_renderer):
     r = make_renderer()
-    with pytest.raises(RuntimeError, match="boom"):
-        with r:
-            assert r.is_alive
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"), r:
+        assert r.is_alive
+        raise RuntimeError("boom")
     assert r.is_alive is False
 
 

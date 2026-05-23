@@ -8,7 +8,6 @@ import pytest
 from PIL import Image
 
 from openmarquee.content import (
-    ImageSlide,
     StreamSlide,
     TextLayer,
     TextSlide,
@@ -22,8 +21,13 @@ def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
     kwargs the existing tests use and shuttle them into the canonical
     layer."""
     layer_keys = {
-        "text_color", "font_family", "font_size_px",
-        "font_size_pct", "auto_mode", "auto_format", "box",
+        "text_color",
+        "font_family",
+        "font_size_px",
+        "font_size_pct",
+        "auto_mode",
+        "auto_format",
+        "box",
     }
     layer = {"text": text}
     for k in list(kwargs.keys()):
@@ -34,6 +38,8 @@ def _text_slide(*, name="x", text="x", **kwargs) -> TextSlide:
         text_layers=[TextLayer(**layer)],
         **kwargs,
     )
+
+
 from openmarquee.playback import PlaybackLoop, web_refresh_due
 from openmarquee.rendering.mock import MockRenderer
 from openmarquee.stream_consumer import StreamConsumer
@@ -209,10 +215,7 @@ async def test_schedule_switch_preempts_running_playlist(renderer):
     """Bug 1: switching the active playlist mid-loop preempts the
     running playlist instead of waiting for it to finish its loop."""
     pl_a, pl_b = uuid4(), uuid4()
-    a_slides = [
-        _text_slide(name=f"a{i}", text=f"a{i}", duration_ms=300)
-        for i in range(3)
-    ]
+    a_slides = [_text_slide(name=f"a{i}", text=f"a{i}", duration_ms=300) for i in range(3)]
     b0 = _text_slide(name="b0", text="b0", duration_ms=100)
     png = _png_bytes(8, 8, (10, 20, 30))
     assets = {s.id: png for s in (*a_slides, b0)}
@@ -308,9 +311,7 @@ async def test_loop_recovers_from_renderer_op_failure(renderer):
 
     # The successful slide(s) made it through; the failing one was
     # caught by the per-slide try/except + throttle in _loop.
-    saw_b_via_original = any(
-        c[0] == slide_b.id for c in renderer.begin_slide_calls
-    )
+    saw_b_via_original = any(c[0] == slide_b.id for c in renderer.begin_slide_calls)
     assert saw_b_via_original
 
 
@@ -340,9 +341,7 @@ async def test_all_unplayable_playlist_backs_off_and_recovers(renderer):
     def begin(slide_id, t0_ms, duration_ms):
         begin_calls.append(slide_id)
         if slide_id == bad_slide.id:
-            raise RustRendererUnsupportedSlideError(
-                "video slide unsupported (load failed)"
-            )
+            raise RustRendererUnsupportedSlideError("video slide unsupported (load failed)")
         original_begin(slide_id, t0_ms, duration_ms)
 
     renderer.begin_slide = begin  # type: ignore[method-assign]
@@ -375,9 +374,7 @@ async def test_all_unplayable_playlist_backs_off_and_recovers(renderer):
     state["playlist"] = [good_slide]
     await asyncio.sleep(0.4)
     await loop.stop()
-    assert good_slide.id in begin_calls, (
-        "loop did not recover when playable content returned"
-    )
+    assert good_slide.id in begin_calls, "loop did not recover when playable content returned"
 
 
 def _track_frames(renderer):
@@ -734,16 +731,12 @@ def _patch_stream_ffmpeg(
     frame size is then `src_w*src_h*3//2`."""
     monkeypatch.setattr(
         "openmarquee.playback.StreamConsumer",
-        functools.partial(
-            StreamConsumer, ffmpeg_bin=ffmpeg_bin, source_size=source_size
-        ),
+        functools.partial(StreamConsumer, ffmpeg_bin=ffmpeg_bin, source_size=source_size),
     )
 
 
 @pytest.mark.asyncio
-async def test_stream_slide_pumps_frames_to_renderer(
-    renderer, tmp_path, monkeypatch
-):
+async def test_stream_slide_pumps_frames_to_renderer(renderer, tmp_path, monkeypatch):
     """A StreamSlide in the playlist is intercepted before the IPC
     path; its (mock) stream frames are pushed straight to the renderer.
 
@@ -752,9 +745,7 @@ async def test_stream_slide_pumps_frames_to_renderer(
     pixel_format + source dims into render_frame()."""
     # NV12 frame size for the injected 8x8 source.
     frame_size = 8 * 8 * 3 // 2
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5)
     _patch_stream_ffmpeg(monkeypatch, mock, source_size=(8, 8))
     captured: list[bytes] = []
     captured_formats: list[str] = []
@@ -770,12 +761,8 @@ async def test_stream_slide_pumps_frames_to_renderer(
     # 2s duration: the first-frame wait is bounded by min(connect-
     # timeout, slot remaining), so a too-short slot would starve the
     # budget below the mock python-interpreter's spawn time.
-    slide = StreamSlide(
-        name="live", stream_url="rtsp://h:8554/x", duration_ms=2000
-    )
-    loop = _new_loop(
-        renderer, fetch_items=lambda: [slide], read_asset=lambda _id: b""
-    )
+    slide = StreamSlide(name="live", stream_url="rtsp://h:8554/x", duration_ms=2000)
+    loop = _new_loop(renderer, fetch_items=lambda: [slide], read_asset=lambda _id: b"")
     await loop.start()
     await asyncio.sleep(0.5)
     await loop.stop()
@@ -795,9 +782,7 @@ async def test_stream_slide_pumps_frames_to_renderer(
 
 
 @pytest.mark.asyncio
-async def test_stream_unreachable_skip_advances_immediately(
-    renderer, tmp_path, monkeypatch
-):
+async def test_stream_unreachable_skip_advances_immediately(renderer, tmp_path, monkeypatch):
     """on_unreachable='skip' — an unreachable StreamSlide is
     abandoned at once; the loop reaches the next slide rather than
     holding the dead slot for its full duration."""
@@ -825,9 +810,7 @@ async def test_stream_unreachable_skip_advances_immediately(
 
 
 @pytest.mark.asyncio
-async def test_stream_unreachable_hold_waits_out_the_slot(
-    renderer, tmp_path, monkeypatch
-):
+async def test_stream_unreachable_hold_waits_out_the_slot(renderer, tmp_path, monkeypatch):
     """on_unreachable='hold_last_frame' — an unreachable StreamSlide
     still occupies its full slot; the loop does NOT advance early."""
     _patch_stream_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
@@ -853,9 +836,7 @@ async def test_stream_unreachable_hold_waits_out_the_slot(
 
 
 @pytest.mark.asyncio
-async def test_stream_unreachable_black_paints_a_black_frame(
-    renderer, tmp_path, monkeypatch
-):
+async def test_stream_unreachable_black_paints_a_black_frame(renderer, tmp_path, monkeypatch):
     """on_unreachable='black' paints one all-zero RGB frame before
     holding the slot."""
     _patch_stream_ffmpeg(monkeypatch, str(tmp_path / "no-such-ffmpeg"))
@@ -873,9 +854,7 @@ async def test_stream_unreachable_black_paints_a_black_frame(
         duration_ms=300,
         on_unreachable="black",
     )
-    loop = _new_loop(
-        renderer, fetch_items=lambda: [stream], read_asset=lambda _id: b""
-    )
+    loop = _new_loop(renderer, fetch_items=lambda: [stream], read_asset=lambda _id: b"")
     await loop.start()
     await asyncio.sleep(0.2)
     await loop.stop()
@@ -883,18 +862,14 @@ async def test_stream_unreachable_black_paints_a_black_frame(
 
 
 @pytest.mark.asyncio
-async def test_stream_connect_timeout_falls_back(
-    renderer, tmp_path, monkeypatch
-):
+async def test_stream_connect_timeout_falls_back(renderer, tmp_path, monkeypatch):
     """If ffmpeg spawns but delivers no frame within the connect
     timeout, the slide falls back to on_unreachable rather than
     blocking on the dead stream for the whole slot."""
     monkeypatch.setattr("openmarquee.playback._STREAM_CONNECT_TIMEOUT_S", 0.2)
     # hang mock: spawns, emits 0 frames, then sleeps — ffmpeg is up but
     # never produces video, exactly how an unreachable stream URL behaves.
-    mock = _write_mock_ffmpeg(
-        tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, hang=True
-    )
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, hang=True)
     _patch_stream_ffmpeg(monkeypatch, mock)
     stream = StreamSlide(
         name="stuck",
@@ -918,9 +893,7 @@ async def test_stream_connect_timeout_falls_back(
 
 
 @pytest.mark.asyncio
-async def test_stream_slide_preempted_by_pause(
-    renderer, tmp_path, monkeypatch
-):
+async def test_stream_slide_preempted_by_pause(renderer, tmp_path, monkeypatch):
     """A pause() during a StreamSlide slot is honored — the loop
     yields the renderer and saves the resume index, so a stream
     takeover can preempt a stream slot."""
@@ -928,12 +901,8 @@ async def test_stream_slide_preempted_by_pause(
         tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=0, continuous=True
     )
     _patch_stream_ffmpeg(monkeypatch, mock)
-    stream = StreamSlide(
-        name="live", stream_url="rtsp://h/x", duration_ms=10_000
-    )
-    loop = _new_loop(
-        renderer, fetch_items=lambda: [stream], read_asset=lambda _id: b""
-    )
+    stream = StreamSlide(name="live", stream_url="rtsp://h/x", duration_ms=10_000)
+    loop = _new_loop(renderer, fetch_items=lambda: [stream], read_asset=lambda _id: b"")
     await loop.start()
     await asyncio.sleep(0.15)  # let the pump start streaming frames
     await loop.pause()
@@ -955,31 +924,27 @@ def test_web_refresh_due_first_fetch_is_always_due():
 def test_web_refresh_due_fresh_slide_is_not_due():
     """A slide fetched less than refresh_interval_s ago is NOT due."""
     # Fetched at t=100, interval 300s, now t=250 -> 150s elapsed < 300.
-    assert not web_refresh_due(
-        100.0, now_monotonic=250.0, refresh_interval_s=300
-    )
+    assert not web_refresh_due(100.0, now_monotonic=250.0, refresh_interval_s=300)
 
 
 def test_web_refresh_due_stale_slide_is_due():
     """A slide whose last fetch is older than refresh_interval_s IS due."""
     # Fetched at t=100, interval 300s, now t=500 -> 400s elapsed >= 300.
-    assert web_refresh_due(
-        100.0, now_monotonic=500.0, refresh_interval_s=300
-    )
+    assert web_refresh_due(100.0, now_monotonic=500.0, refresh_interval_s=300)
 
 
 def test_web_refresh_due_exactly_at_interval_is_due():
     """Elapsed exactly equal to the interval counts as due."""
-    assert web_refresh_due(
-        100.0, now_monotonic=400.0, refresh_interval_s=300
-    )
+    assert web_refresh_due(100.0, now_monotonic=400.0, refresh_interval_s=300)
 
 
 @pytest.mark.asyncio
 async def test_web_slide_kicks_refresh_producer(renderer):
     """Entering a Web slide's slot fires the screenshot producer."""
     web = WebSlide(
-        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        name="status",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
         refresh_interval_s=10,
     )
     calls: list[tuple] = []
@@ -1010,7 +975,9 @@ async def test_web_slide_slot_does_not_await_the_fetch(renderer):
     (begin_slide fires) well within the slot — proving create_task,
     not await."""
     web = WebSlide(
-        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        name="status",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
         refresh_interval_s=10,
     )
     started = asyncio.Event()
@@ -1046,7 +1013,9 @@ async def test_web_slide_inflight_fetch_is_not_re_kicked(renderer):
     """While a fetch is in flight for a slide, re-entering its slot
     does NOT kick a second fetch (the in-flight guard)."""
     web = WebSlide(
-        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        name="status",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
         # Tiny interval so staleness alone would re-kick every slot.
         refresh_interval_s=10,
     )
@@ -1083,7 +1052,9 @@ async def test_web_slide_renders_without_a_producer(renderer):
     """A Web slide with no producer wired still plays as an image
     slide (renders its current asset.png), no crash."""
     web = WebSlide(
-        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        name="status",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
     )
     loop = _new_loop(
         renderer,
@@ -1107,11 +1078,15 @@ async def test_web_last_fetch_pruned_when_slide_leaves_playlist(renderer):
     next loop pass prunes that id out of _web_last_fetch — no unbounded
     leak as a sign churns through Web slides over months."""
     web_a = WebSlide(
-        name="a", url="https://h/a", duration_ms=_FAST_DURATION_MS,
+        name="a",
+        url="https://h/a",
+        duration_ms=_FAST_DURATION_MS,
         refresh_interval_s=10,
     )
     web_b = WebSlide(
-        name="b", url="https://h/b", duration_ms=_FAST_DURATION_MS,
+        name="b",
+        url="https://h/b",
+        duration_ms=_FAST_DURATION_MS,
         refresh_interval_s=10,
     )
 
@@ -1147,7 +1122,9 @@ async def test_inflight_id_not_pruned_when_slide_leaves_playlist(renderer):
     pruning a genuinely-running id would re-enable a double-kick. The
     set self-cleans via the kick's done-callback when the task ends."""
     web = WebSlide(
-        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        name="status",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
         refresh_interval_s=10,
     )
     release = asyncio.Event()
@@ -1189,7 +1166,9 @@ async def test_kick_web_refresh_now_fires_an_immediate_fetch(renderer):
     bypassing the staleness check — used by the create/update API
     handlers so a new/changed Web slide gets a real asset promptly."""
     web = WebSlide(
-        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        name="status",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
         # A long interval — web_refresh_due would say "not due" if it
         # had ever been stamped; kick_web_refresh_now ignores it.
         refresh_interval_s=86400,
@@ -1220,7 +1199,9 @@ async def test_kick_web_refresh_now_does_not_block_on_a_hanging_fetch(
     IMMEDIATELY even if the producer hangs forever (a slow/dead render
     helper must never delay the create/update HTTP response)."""
     web = WebSlide(
-        name="status", url="https://h/x", duration_ms=_FAST_DURATION_MS,
+        name="status",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
     )
     started = asyncio.Event()
 

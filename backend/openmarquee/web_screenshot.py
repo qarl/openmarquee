@@ -170,7 +170,7 @@ def _log_fetch_failure(slide: WebSlide, msg: str, *args) -> None:
 
 async def fetch_web_screenshot(
     slide: WebSlide,
-    storage: "ContentStorage",
+    storage: ContentStorage,
     width: int,
     height: int,
 ) -> bool:
@@ -234,9 +234,7 @@ async def fetch_web_screenshot(
         # PNG-signature-checks the result — it returns valid PNG bytes
         # or raises.
         async with _render_lock:
-            png_bytes = await asyncio.to_thread(
-                render_web_png, slide.url, width, height
-            )
+            png_bytes = await asyncio.to_thread(render_web_png, slide.url, width, height)
     except ValueError as exc:
         # render_web_png rejected the URL before spawning Chromium
         # (non-http/https scheme, control chars, a userinfo component).
@@ -244,8 +242,7 @@ async def fetch_web_screenshot(
         # so this is a belt-and-suspenders path.
         _log_fetch_failure(
             slide,
-            "web-screenshot: slide id=%s has an invalid URL %s; "
-            "keeping last-good asset (%s)",
+            "web-screenshot: slide id=%s has an invalid URL %s; keeping last-good asset (%s)",
             slide.id,
             slide.url,
             exc,
@@ -283,8 +280,7 @@ async def fetch_web_screenshot(
         # than crash the fire-and-forget task.
         _failed_slide_ids.add(slide.id)
         log.exception(
-            "web-screenshot: rendered slide id=%s but failed to save "
-            "it; keeping last-good asset",
+            "web-screenshot: rendered slide id=%s but failed to save it; keeping last-good asset",
             slide.id,
         )
         return False

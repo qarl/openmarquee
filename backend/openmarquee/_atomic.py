@@ -29,7 +29,10 @@ DEFAULT_MODE = 0o600
 
 
 def atomic_write_text(
-    path: Path, text: str, *, mode: int = DEFAULT_MODE,
+    path: Path,
+    text: str,
+    *,
+    mode: int = DEFAULT_MODE,
 ) -> None:
     """Atomically replace `path` with `text`. Cleans up the .tmp
     on rename failure; sets the target file mode (default 0600)
@@ -49,7 +52,10 @@ def atomic_write_text(
 
 
 def atomic_write_bytes(
-    path: Path, data: bytes, *, mode: int = DEFAULT_MODE,
+    path: Path,
+    data: bytes,
+    *,
+    mode: int = DEFAULT_MODE,
 ) -> None:
     """Same shape as atomic_write_text, for binary payloads
     (PNG / MP4 asset bytes). Default 0600 still applies -- the

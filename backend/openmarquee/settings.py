@@ -60,9 +60,7 @@ _IANA_TZ_PATTERN = re.compile(r"^[A-Za-z0-9_+/\-]{1,64}$")
 _TAILSCALE_AUTH_KEY_PATTERN = re.compile(r"^tskey-[a-z]+-[A-Za-z0-9\-]{8,}$")
 
 # RFC 1123 hostname chars, 1-63 per label, no trailing/leading hyphen.
-_TAILSCALE_HOSTNAME_PATTERN = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$"
-)
+_TAILSCALE_HOSTNAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
 
 
 def _default_sign_name() -> str:
@@ -269,18 +267,14 @@ class SystemSettings(BaseModel):
     @classmethod
     def _check_ssid(cls, value: str) -> str:
         if not _SSID_PATTERN.match(value):
-            raise ValueError(
-                f"wifi_ssid: expected 1-32 printable ASCII chars, got {value!r}"
-            )
+            raise ValueError(f"wifi_ssid: expected 1-32 printable ASCII chars, got {value!r}")
         return value
 
     @field_validator("wifi_password")
     @classmethod
     def _check_wifi_password(cls, value: str) -> str:
         if not _WIFI_PASSPHRASE_PATTERN.match(value):
-            raise ValueError(
-                "wifi_password: expected empty or 8-63 printable ASCII chars"
-            )
+            raise ValueError("wifi_password: expected empty or 8-63 printable ASCII chars")
         return value
 
     @field_validator("wifi_station_ssid")
@@ -300,9 +294,7 @@ class SystemSettings(BaseModel):
         if value is None or value == "":
             return None
         if not _WIFI_PASSPHRASE_PATTERN.match(value):
-            raise ValueError(
-                "wifi_station_password: expected 8-63 printable ASCII chars"
-            )
+            raise ValueError("wifi_station_password: expected 8-63 printable ASCII chars")
         return value
 
     @model_validator(mode="after")
@@ -322,13 +314,9 @@ class SystemSettings(BaseModel):
         # Empty creds with the toggle on is a user mistake worth catching.
         if self.wifi_station_enabled:
             if not self.wifi_station_ssid:
-                raise ValueError(
-                    "wifi_station_enabled=true but wifi_station_ssid is empty"
-                )
+                raise ValueError("wifi_station_enabled=true but wifi_station_ssid is empty")
             if not self.wifi_station_password:
-                raise ValueError(
-                    "wifi_station_enabled=true but wifi_station_password is empty"
-                )
+                raise ValueError("wifi_station_enabled=true but wifi_station_password is empty")
         return self
 
     @field_validator("timezone")
@@ -414,6 +402,7 @@ class SettingsStorage:
             # back to the legacy Sign<3-hex> path so existing dev
             # flows keep working.
             from openmarquee import identity as _identity
+
             device_id = _identity.read_device_id()
             if device_id is not None:
                 updates["sign_name"] = device_id

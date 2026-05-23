@@ -96,8 +96,11 @@ def test_perf_stats_returns_expected_shape(client: TestClient):
     assert {"hits", "misses", "maxsize", "currsize"} <= set(body["font_cache"])
     # Counter dicts are dicts of int.
     for section in (
-        "content_storage", "playlist_storage", "flock_storage",
-        "settings_storage", "schedule_storage",
+        "content_storage",
+        "playlist_storage",
+        "flock_storage",
+        "settings_storage",
+        "schedule_storage",
     ):
         assert all(isinstance(v, int) for v in body[section].values())
 
@@ -146,14 +149,10 @@ def test_middleware_logs_each_request(client: TestClient):
 def test_middleware_echoes_inbound_request_id(client: TestClient):
     """X-Request-ID header on the request round-trips back on the
     response so a caller's trace can join across the wire."""
-    response = client.get(
-        "/healthz", headers={"X-Request-ID": "phone-trace-42"}
-    )
+    response = client.get("/healthz", headers={"X-Request-ID": "phone-trace-42"})
     assert response.headers.get("x-request-id") == "phone-trace-42"
     # And the perf ring records it.
-    assert any(
-        e.get("request_id") == "phone-trace-42" for e in recent_requests()
-    )
+    assert any(e.get("request_id") == "phone-trace-42" for e in recent_requests())
 
 
 def test_middleware_mints_request_id_when_absent(client: TestClient):
@@ -175,14 +174,16 @@ def test_middleware_rejects_malformed_request_id(client: TestClient):
     # safe leading slice. Cover the long-input + special-char paths
     # with values httpx will actually pass through.
     response = client.get(
-        "/healthz", headers={"X-Request-ID": "a" * 100}  # over 64
+        "/healthz",
+        headers={"X-Request-ID": "a" * 100},  # over 64
     )
     rid = response.headers.get("x-request-id")
     assert rid is not None
     assert len(rid) == 12  # minted, not echoed
 
     response = client.get(
-        "/healthz", headers={"X-Request-ID": "has spaces!"}  # not alnum/-
+        "/healthz",
+        headers={"X-Request-ID": "has spaces!"},  # not alnum/-
     )
     rid = response.headers.get("x-request-id")
     assert rid is not None
@@ -247,8 +248,13 @@ def test_request_id_log_filter_stamps_record():
     token = request_id_var.set("test-id-abc")
     try:
         record = logging.LogRecord(
-            name="test", level=logging.INFO, pathname="", lineno=0,
-            msg="", args=(), exc_info=None,
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="",
+            args=(),
+            exc_info=None,
         )
         RequestIdLogFilter().filter(record)
         assert record.request_id == "test-id-abc"
@@ -256,8 +262,13 @@ def test_request_id_log_filter_stamps_record():
         request_id_var.reset(token)
     # Outside a request scope, default is "-".
     record = logging.LogRecord(
-        name="test", level=logging.INFO, pathname="", lineno=0,
-        msg="", args=(), exc_info=None,
+        name="test",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="",
+        args=(),
+        exc_info=None,
     )
     RequestIdLogFilter().filter(record)
     assert record.request_id == "-"
@@ -279,6 +290,7 @@ def test_font_cache_info_surfaces_through_endpoint(client: TestClient):
     perf baseline cares whether the cache is actually being hit
     on hot auto-render paths."""
     from openmarquee.text_raster import load_font
+
     load_font("Inter", 32, 100)  # cold load -> miss
     load_font("Inter", 32, 100)  # warm -> hit
     body = client.get("/api/system/perf-stats").json()

@@ -65,9 +65,17 @@ def _upload_payload(**overrides) -> dict:
     (name=, duration_ms=, background_color=, transition=, …) stay at
     the root. Schema v3 contract — see SYSTEM_SPEC §5.10a."""
     layer_keys = {
-        "text", "text_color", "font_family", "font_size_px",
-        "font_size_pct", "auto_mode", "auto_format", "box",
-        "motion", "motion_intensity", "motion_phase",
+        "text",
+        "text_color",
+        "font_family",
+        "font_size_px",
+        "font_size_pct",
+        "auto_mode",
+        "auto_format",
+        "box",
+        "motion",
+        "motion_intensity",
+        "motion_phase",
     }
     layer = {"text": overrides.pop("text", "Hello, world")}
     for k in list(overrides.keys()):
@@ -170,14 +178,15 @@ def test_text_slide_post_persists_box_from_payload(client: TestClient):
     field, so Pydantic silently dropped it from the editor's payload
     and every save reverted to TextSlide's default. This test pins the
     POST route's box-roundtrip contract."""
-    payload = _upload_payload(
-        name="A", text="A", box={"x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4}
-    )
+    payload = _upload_payload(name="A", text="A", box={"x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4})
     response = client.post("/api/content/text-slides", json=payload)
     assert response.status_code == 200
     body = response.json()
     assert body["text_layers"][0]["box"] == {
-        "x": 0.2, "y": 0.3, "w": 0.5, "h": 0.4,
+        "x": 0.2,
+        "y": 0.3,
+        "w": 0.5,
+        "h": 0.4,
     }
 
 
@@ -189,17 +198,21 @@ def test_text_slide_put_persists_box_from_payload(client: TestClient):
     item_id = posted["id"]
     # Default box on POST without explicit field.
     assert posted["text_layers"][0]["box"] == {
-        "x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8,
+        "x": 0.1,
+        "y": 0.1,
+        "w": 0.8,
+        "h": 0.8,
     }
 
-    payload = _upload_payload(
-        name="A", text="A", box={"x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7}
-    )
+    payload = _upload_payload(name="A", text="A", box={"x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7})
     response = client.put(f"/api/content/text-slides/{item_id}", json=payload)
     assert response.status_code == 200
     body = response.json()
     assert body["text_layers"][0]["box"] == {
-        "x": 0.05, "y": 0.05, "w": 0.6, "h": 0.7,
+        "x": 0.05,
+        "y": 0.05,
+        "w": 0.6,
+        "h": 0.7,
     }
 
 
@@ -212,8 +225,11 @@ def test_text_slide_post_persists_motion_fields(client: TestClient):
     operator's intensity/phase changes vanish on save. This is the
     regression test for that bug (qarl QA report 2026-05-02)."""
     payload = _upload_payload(
-        name="P", text="P",
-        motion="breathe", motion_intensity=75, motion_phase=0.4,
+        name="P",
+        text="P",
+        motion="breathe",
+        motion_intensity=75,
+        motion_phase=0.4,
     )
     response = client.post("/api/content/text-slides", json=payload)
     assert response.status_code == 200
@@ -236,8 +252,11 @@ def test_text_slide_put_persists_motion_fields(client: TestClient):
     assert posted["text_layers"][0]["motion_phase"] == 0.0
 
     payload = _upload_payload(
-        name="P", text="P",
-        motion="ticker", motion_intensity=75, motion_phase=0.4,
+        name="P",
+        text="P",
+        motion="ticker",
+        motion_intensity=75,
+        motion_phase=0.4,
     )
     response = client.put(f"/api/content/text-slides/{item_id}", json=payload)
     assert response.status_code == 200
@@ -266,7 +285,10 @@ def test_text_slide_post_without_box_uses_model_default(client: TestClient):
     response = client.post("/api/content/text-slides", json=payload)
     assert response.status_code == 200
     assert response.json()["text_layers"][0]["box"] == {
-        "x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8,
+        "x": 0.1,
+        "y": 0.1,
+        "w": 0.8,
+        "h": 0.8,
     }
 
 
@@ -275,9 +297,7 @@ def test_list_content_exposes_updated_at_for_cachebust(client: TestClient):
     GET /api/content must return each item's storage envelope updated_at
     so a re-render bump (settings dim flip → text_rerender side-effect)
     invalidates the browser HTTP cache."""
-    upload = client.post(
-        "/api/content/text-slides", json=_upload_payload(name="A", text="A")
-    )
+    upload = client.post("/api/content/text-slides", json=_upload_payload(name="A", text="A"))
     assert upload.status_code == 200
     response = client.get("/api/content")
     items = response.json()
@@ -601,9 +621,7 @@ def test_post_video_accepts_video_plus_audio_mp4(client: TestClient):
     it (it previously rejected any non-single-trak file). The
     'coffee' clip qarl tried failed exactly here."""
     payload = _video_payload(
-        mp4_base64=base64.b64encode(
-            _fake_mp4((b"vide", b"soun"))
-        ).decode("ascii"),
+        mp4_base64=base64.b64encode(_fake_mp4((b"vide", b"soun"))).decode("ascii"),
     )
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 200, response.json()
@@ -614,9 +632,7 @@ def test_post_video_rejects_audio_only_mp4(client: TestClient):
     audio-only file) has nothing to play and is rejected — the
     rust select_video_mdia would bail with 'no video trak'."""
     payload = _video_payload(
-        mp4_base64=base64.b64encode(
-            _fake_mp4((b"soun", b"soun"))
-        ).decode("ascii"),
+        mp4_base64=base64.b64encode(_fake_mp4((b"soun", b"soun"))).decode("ascii"),
     )
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 400
@@ -1055,9 +1071,7 @@ def test_post_web_kicks_an_immediate_screenshot_fetch(client: TestClient):
     from openmarquee.dependencies import get_web_screenshot_kicker
 
     kicked: list = []
-    app.dependency_overrides[get_web_screenshot_kicker] = (
-        lambda: kicked.append
-    )
+    app.dependency_overrides[get_web_screenshot_kicker] = lambda: kicked.append
     response = client.post(
         "/api/content/web",
         json={"name": "Status", "url": "https://h/x"},
@@ -1157,9 +1171,7 @@ def test_put_web_url_change_kicks_a_screenshot_fetch(client: TestClient):
     item_id = post.json()["id"]
 
     kicked: list = []
-    app.dependency_overrides[get_web_screenshot_kicker] = (
-        lambda: kicked.append
-    )
+    app.dependency_overrides[get_web_screenshot_kicker] = lambda: kicked.append
     response = client.put(
         f"/api/content/web/{item_id}",
         json={"name": "Before", "url": "https://h/new"},
@@ -1183,9 +1195,7 @@ def test_put_web_metadata_only_edit_does_not_kick_a_fetch(client: TestClient):
     item_id = post.json()["id"]
 
     kicked: list = []
-    app.dependency_overrides[get_web_screenshot_kicker] = (
-        lambda: kicked.append
-    )
+    app.dependency_overrides[get_web_screenshot_kicker] = lambda: kicked.append
     response = client.put(
         f"/api/content/web/{item_id}",
         json={

@@ -121,12 +121,12 @@ def _scrubbed_error_summary(exc: Exception) -> str:
         # operator's audit trail.
         keep = ("loc", "type", "msg", "url")
         sanitised = [
-            {k: err[k] for k in keep if k in err}
-            for err in exc.errors(include_input=False)
+            {k: err[k] for k in keep if k in err} for err in exc.errors(include_input=False)
         ]
         return repr(sanitised)
     except (AttributeError, TypeError):
         return type(exc).__name__
+
 
 # 20.4: sentinel returned by GET in place of each of the three secret
 # fields. Picked for readability + the leading `<` so a careless eye-
@@ -199,10 +199,7 @@ async def get_settings(storage: SettingsDep) -> dict[str, Any]:
     or accept and tap "Make it mine".
     """
     settings = storage.load()
-    if (
-        not settings.ui_first_run_seen
-        and not (settings.wifi_station_ssid or "").strip()
-    ):
+    if not settings.ui_first_run_seen and not (settings.wifi_station_ssid or "").strip():
         # Batch 6.2: read_system_wifi spawns iwgetid (up to 2s) and
         # reads /etc/wpa_supplicant -- both blocking. Offload to a
         # worker thread so the first-run GET doesn't stall the loop
@@ -215,11 +212,13 @@ async def get_settings(storage: SettingsDep) -> dict[str, Any]:
                 # validates the new values against the same constraints
                 # as a PUT — invalid creds (somehow) raise ValidationError
                 # and we fall through with original settings.
-                updated = settings.model_copy(update={
-                    "wifi_station_enabled": True,
-                    "wifi_station_ssid": ssid,
-                    "wifi_station_password": psk,
-                })
+                updated = settings.model_copy(
+                    update={
+                        "wifi_station_enabled": True,
+                        "wifi_station_ssid": ssid,
+                        "wifi_station_password": psk,
+                    }
+                )
                 # Round-trip through the storage validator so any
                 # field-level rules (length, charset) get enforced
                 # before we persist.
@@ -227,14 +226,12 @@ async def get_settings(storage: SettingsDep) -> dict[str, Any]:
                 storage.save(updated)
                 settings = updated
                 log.info(
-                    "first-run: pre-filled wifi creds for SSID %r from "
-                    "system wpa_supplicant.conf",
+                    "first-run: pre-filled wifi creds for SSID %r from system wpa_supplicant.conf",
                     ssid,
                 )
             except Exception:
                 log.exception(
-                    "first-run: wifi prefill failed validation; "
-                    "leaving settings untouched",
+                    "first-run: wifi prefill failed validation; leaving settings untouched",
                 )
     return _redact_secrets(settings.model_dump())
 
@@ -289,9 +286,7 @@ async def set_settings(
         # #379 follow-up: log via _scrubbed_error_summary so the rejected
         # value never lands in journald either.
         log.warning("settings PUT validation failed: %s", _scrubbed_error_summary(exc))
-        raise HTTPException(
-            status_code=422, detail="settings validation failed"
-        ) from exc
+        raise HTTPException(status_code=422, detail="settings validation failed") from exc
     # Compare the dim-affecting fields BEFORE the save so we know whether
     # to fire the text-slide rerender.
     dims_changed = (
@@ -301,9 +296,7 @@ async def set_settings(
     )
     # FYS bug 5: rotation is the only display field the renderer reacts
     # to (its mode comes from the DRM panel, not Settings width/height).
-    rotation_changed = int(previous.display_rotation) != int(
-        validated.display_rotation
-    )
+    rotation_changed = int(previous.display_rotation) != int(validated.display_rotation)
     # Wifi-station fields: BEFORE save so we can diff. The actual
     # apply (template wpa_supplicant-wlan0.conf + systemctl restart
     # + iw poll) runs in a background thread so the HTTP response
@@ -340,9 +333,7 @@ async def set_settings(
         try:
             await asyncio.to_thread(loop.renderer.reopen)
         except Exception:
-            log.exception(
-                "settings: renderer reopen after rotation change failed"
-            )
+            log.exception("settings: renderer reopen after rotation change failed")
         await loop.start()
     if wifi_station_changed:
         wifi_station.apply_in_background(
@@ -397,9 +388,7 @@ def _verify_current_password(
     if not verify_token(_strip_bearer(authorization), state):
         raise HTTPException(status_code=401, detail="invalid token")
     if not verify_password(state.password_hash, current_password):
-        raise HTTPException(
-            status_code=401, detail="current password is wrong"
-        )
+        raise HTTPException(status_code=401, detail="current password is wrong")
 
 
 def _patch_secret_field(
@@ -432,11 +421,10 @@ def _patch_secret_field(
         # safe -- anyone with shell on the Pi can `journalctl` otherwise.
         log.warning(
             "settings PATCH validation failed (field=%s): %s",
-            field, _scrubbed_error_summary(exc),
+            field,
+            _scrubbed_error_summary(exc),
         )
-        raise HTTPException(
-            status_code=422, detail="secret field validation failed"
-        ) from exc
+        raise HTTPException(status_code=422, detail="secret field validation failed") from exc
     storage.save(updated)
     return _redact_secrets(updated.model_dump())
 
@@ -453,9 +441,7 @@ async def patch_wifi_ap_password(
     a non-None `str` in SystemSettings)."""
     _verify_current_password(auth, authorization, payload.current_password)
     if not payload.new_value:
-        raise HTTPException(
-            status_code=422, detail="wifi_password cannot be empty"
-        )
+        raise HTTPException(status_code=422, detail="wifi_password cannot be empty")
     return _patch_secret_field(storage, "wifi_password", payload.new_value)
 
 
@@ -480,10 +466,7 @@ async def patch_wifi_station_password(
     # re-template the conf + restart wpa_supplicant. Background thread
     # so the PATCH returns immediately; UI polls
     # /api/settings/wifi-station-state for live status.
-    if (
-        previous.wifi_station_enabled
-        and previous.wifi_station_password != new_value
-    ):
+    if previous.wifi_station_enabled and previous.wifi_station_password != new_value:
         latest = storage.load()
         wifi_station.apply_in_background(
             enabled=latest.wifi_station_enabled,

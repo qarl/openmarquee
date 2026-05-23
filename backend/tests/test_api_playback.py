@@ -148,9 +148,7 @@ def test_current_thumbnail_returns_204_when_idle(client: TestClient):
     assert response.status_code == 204
 
 
-def test_current_thumbnail_serves_current_item_asset(
-    client: TestClient, storage: ContentStorage
-):
+def test_current_thumbnail_serves_current_item_asset(client: TestClient, storage: ContentStorage):
     slide = TextSlide(name="thumb-test", text="t", duration_ms=1000)
     png = _png_bytes(8, 8, (0, 200, 100))
     storage.save_text_slide(slide, png)
@@ -279,9 +277,7 @@ def _playing_text_slide(client: TestClient, storage: ContentStorage) -> None:
         time.sleep(0.05)
 
 
-def test_current_thumbnail_no_cors_for_unknown_origin(
-    client: TestClient, storage: ContentStorage
-):
+def test_current_thumbnail_no_cors_for_unknown_origin(client: TestClient, storage: ContentStorage):
     """A cross-origin GET from a domain NOT on the flock allowlist
     gets no Access-Control-Allow-Origin -- browser blocks the read."""
     _playing_text_slide(client, storage)
@@ -294,9 +290,7 @@ def test_current_thumbnail_no_cors_for_unknown_origin(
     client.post("/api/playback/stop")
 
 
-def test_current_thumbnail_cors_for_localhost_origin(
-    client: TestClient, storage: ContentStorage
-):
+def test_current_thumbnail_cors_for_localhost_origin(client: TestClient, storage: ContentStorage):
     """localhost is in the builtin allowlist (dev convenience)."""
     _playing_text_slide(client, storage)
     response = client.get(
@@ -304,9 +298,7 @@ def test_current_thumbnail_cors_for_localhost_origin(
         headers={"Origin": "http://localhost:8000"},
     )
     assert response.status_code == 200
-    assert response.headers.get("access-control-allow-origin") == (
-        "http://localhost:8000"
-    )
+    assert response.headers.get("access-control-allow-origin") == ("http://localhost:8000")
     assert response.headers.get("vary") == "Origin"
     client.post("/api/playback/stop")
 
@@ -334,9 +326,7 @@ def test_current_thumbnail_cors_for_flock_peer_origin(
             headers={"Origin": "https://peer-lobby.ts.net"},
         )
         assert response.status_code == 200
-        assert response.headers.get("access-control-allow-origin") == (
-            "https://peer-lobby.ts.net"
-        )
+        assert response.headers.get("access-control-allow-origin") == ("https://peer-lobby.ts.net")
         assert response.headers.get("vary") == "Origin"
     finally:
         client.post("/api/playback/stop")

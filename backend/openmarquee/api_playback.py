@@ -127,11 +127,7 @@ async def get_current_thumbnail(
     # they fall through cleanly without any ACAO header (browser doesn't
     # need one).
     headers = {"Cache-Control": "no-store"}
-    headers.update(
-        cors_headers_for_origin(
-            request.headers.get("origin", ""), flock_storage
-        )
-    )
+    headers.update(cors_headers_for_origin(request.headers.get("origin", ""), flock_storage))
     return FileResponse(
         path,
         media_type="image/png",
@@ -143,7 +139,9 @@ async def get_current_thumbnail(
     "/current-frame",
     responses={
         200: {"content": {"image/png": {}}},
-        503: {"description": "Capture not available (nothing playing or non-text/non-image slide)."},
+        503: {
+            "description": "Capture not available (nothing playing or non-text/non-image slide)."
+        },
     },
 )
 async def get_current_frame(
@@ -179,11 +177,7 @@ async def get_current_frame(
     # Batch 11.3 / sweep #5 #4: same allowlist-reflective ACAO as
     # /current-thumbnail above. See cors_headers_for_origin in api.py.
     headers = {"Cache-Control": "no-store"}
-    headers.update(
-        cors_headers_for_origin(
-            request.headers.get("origin", ""), flock_storage
-        )
-    )
+    headers.update(cors_headers_for_origin(request.headers.get("origin", ""), flock_storage))
     return Response(
         content=png,
         media_type="image/png",

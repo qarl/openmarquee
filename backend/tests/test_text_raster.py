@@ -4,7 +4,7 @@ chain, LRU cache behavior, measure_centered geometry."""
 from __future__ import annotations
 
 import pytest
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from openmarquee.text_raster import (
     BUNDLED_FONT_FILES,

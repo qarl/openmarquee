@@ -291,23 +291,23 @@ def test_dry_run_installs_rust_sidecar_binary_to_usr_local_bin(
     and chmod +x's it. The destination path is what the systemd unit
     points OPENMARQUEE_RENDERER_BINARY at."""
     # The header line.
-    assert (
-        "Install Rust IPC sidecar binary" in dry_output
-    ), "missing rust sidecar install step in dry-run"
+    assert "Install Rust IPC sidecar binary" in dry_output, (
+        "missing rust sidecar install step in dry-run"
+    )
     # The actions: mkdir parent, cp binary, chmod +x. Each must reference
     # the production path /usr/local/bin/openmarquee-render (the systemd
     # unit's OPENMARQUEE_RENDERER_BINARY default).
-    assert (
-        "/usr/local/bin/openmarquee-render" in dry_output
-    ), "rust binary destination must be /usr/local/bin/openmarquee-render"
-    assert (
-        "chmod +x" in dry_output and "openmarquee-render" in dry_output
-    ), "rust binary must be chmod +x'd"
+    assert "/usr/local/bin/openmarquee-render" in dry_output, (
+        "rust binary destination must be /usr/local/bin/openmarquee-render"
+    )
+    assert "chmod +x" in dry_output and "openmarquee-render" in dry_output, (
+        "rust binary must be chmod +x'd"
+    )
     # The source path the staged binary is copied FROM. deploy.sh's
     # corresponding rsync step puts it here.
-    assert (
-        "/opt/openmarquee/bin/openmarquee-render" in dry_output
-    ), "rust binary staging source must be /opt/openmarquee/bin/openmarquee-render"
+    assert "/opt/openmarquee/bin/openmarquee-render" in dry_output, (
+        "rust binary staging source must be /opt/openmarquee/bin/openmarquee-render"
+    )
 
 
 def test_dry_run_rust_sidecar_install_runs_after_systemd_units_before_hostapd(
@@ -329,8 +329,7 @@ def test_dry_run_rust_sidecar_install_runs_after_systemd_units_before_hostapd(
     ]:
         assert idx != -1, f"missing dry-run marker: {marker}"
     assert systemd_idx < rust_idx < hostapd_idx < reload_idx, (
-        f"slice-3 ordering broken: {systemd_idx=} {rust_idx=} "
-        f"{hostapd_idx=} {reload_idx=}"
+        f"slice-3 ordering broken: {systemd_idx=} {rust_idx=} {hostapd_idx=} {reload_idx=}"
     )
 
 
@@ -339,12 +338,12 @@ def test_dry_run_rust_sidecar_step_uses_root_prefix(tmp_path: Path) -> None:
     tests don't accidentally write to the real /usr/local/bin/."""
     output = _run_dry(tmp_path)
     # The dry-run paths must include the tmp prefix.
-    assert (
-        f"{tmp_path}/usr/local/bin/openmarquee-render" in output
-    ), "rust binary destination should respect --root prefix"
-    assert (
-        f"{tmp_path}/opt/openmarquee/bin/openmarquee-render" in output
-    ), "rust binary source should respect --root prefix"
+    assert f"{tmp_path}/usr/local/bin/openmarquee-render" in output, (
+        "rust binary destination should respect --root prefix"
+    )
+    assert f"{tmp_path}/opt/openmarquee/bin/openmarquee-render" in output, (
+        "rust binary source should respect --root prefix"
+    )
 
 
 # --- Task #99 (2026-05-14): AP/NM coexistence fixes ---
@@ -364,9 +363,9 @@ def test_dry_run_chmod_plus_x_on_system_sh_helpers(dry_output: str) -> None:
         "openmarquee-firstboot.sh",
         "openmarquee-tailscale.sh",
     ]:
-        assert (
-            f"chmod +x" in dry_output and helper in dry_output
-        ), f"system helper {helper} must be chmod +x'd"
+        assert "chmod +x" in dry_output and helper in dry_output, (
+            f"system helper {helper} must be chmod +x'd"
+        )
 
 
 def test_dry_run_unmasks_hostapd_and_dnsmasq(dry_output: str) -> None:
@@ -403,9 +402,7 @@ def test_dry_run_unmask_precedes_enable_for_hostapd(dry_output: str) -> None:
     enable_idx = dry_output.find("systemctl enable openmarquee-backend.service")
     assert unmask_idx != -1, "unmask marker missing"
     assert enable_idx != -1, "enable marker missing"
-    assert unmask_idx < enable_idx, (
-        f"unmask must precede enable: {unmask_idx=} {enable_idx=}"
-    )
+    assert unmask_idx < enable_idx, f"unmask must precede enable: {unmask_idx=} {enable_idx=}"
 
 
 def test_ap0_service_orders_before_networkmanager() -> None:
@@ -420,9 +417,7 @@ def test_ap0_service_orders_before_networkmanager() -> None:
     # The ordering keywords are case-sensitive in systemd.
     assert "Before=" in unit, "openmarquee-ap0.service missing Before="
     # Pull the Before= value(s) and assert NM appears.
-    before_lines = [
-        line for line in unit.splitlines() if line.startswith("Before=")
-    ]
+    before_lines = [line for line in unit.splitlines() if line.startswith("Before=")]
     assert before_lines, "no Before= directive found"
     joined = " ".join(before_lines)
     assert "hostapd.service" in joined, "Before= must keep hostapd ordering"

@@ -10,7 +10,6 @@ hostname.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -52,14 +51,14 @@ def test_returns_none_on_format_violation(identity_env: Path) -> None:
     """Format is MySign + 3 [A-Z0-9]. Lowercase, wrong prefix,
     wrong length, or extra chars all reject."""
     for bad in [
-        "mysign7K2",      # lowercase prefix
-        "MySign7k2",      # lowercase suffix char
-        "MySign7K",       # too short
-        "MySign7K22",     # too long
-        "OtherPrefix7K2", # wrong prefix
-        "MySign-K2",      # hyphen in suffix
-        "MySign7!2",      # special char in suffix
-        "",               # empty
+        "mysign7K2",  # lowercase prefix
+        "MySign7k2",  # lowercase suffix char
+        "MySign7K",  # too short
+        "MySign7K22",  # too long
+        "OtherPrefix7K2",  # wrong prefix
+        "MySign-K2",  # hyphen in suffix
+        "MySign7!2",  # special char in suffix
+        "",  # empty
     ]:
         identity_env.write_text(json.dumps({"device_id": bad}))
         assert identity.read_device_id() is None, (
@@ -73,9 +72,7 @@ def test_returns_none_when_device_id_not_string(identity_env: Path) -> None:
     between disk and the wire shape."""
     for bad in [123, None, ["MySign7K2"], {"nested": "obj"}]:
         identity_env.write_text(json.dumps({"device_id": bad}))
-        assert identity.read_device_id() is None, (
-            f"non-string {bad!r} should have returned None"
-        )
+        assert identity.read_device_id() is None, f"non-string {bad!r} should have returned None"
 
 
 def test_format_regex_pins_valid_set() -> None:

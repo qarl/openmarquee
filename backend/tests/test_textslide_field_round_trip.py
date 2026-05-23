@@ -29,14 +29,16 @@ from openmarquee.content import TextSlide
 # model. These are server-assigned (id, created_at, updated_at) or
 # discriminator (`type`). Adding to this set requires a comment
 # justifying why the field is server-only.
-_TEXTSLIDE_FIELDS_NOT_ON_UPLOAD = frozenset({
-    # Discriminator — implicit on the upload route.
-    "type",
-    # Server-assigned at storage time.
-    "id",
-    "created_at",
-    "updated_at",
-})
+_TEXTSLIDE_FIELDS_NOT_ON_UPLOAD = frozenset(
+    {
+        # Discriminator — implicit on the upload route.
+        "type",
+        # Server-assigned at storage time.
+        "id",
+        "created_at",
+        "updated_at",
+    }
+)
 
 
 def test_every_textslide_field_round_trips_through_upload():

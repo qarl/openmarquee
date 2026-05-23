@@ -194,9 +194,7 @@ class FfmpegStreamSource:
     pixel_format = "nv12"
 
     def __init__(self, renderer: Renderer, stream_url: str):
-        self._consumer = StreamConsumer(
-            stream_url, renderer.width, renderer.height
-        )
+        self._consumer = StreamConsumer(stream_url, renderer.width, renderer.height)
 
     def frames(self) -> AsyncIterator[bytes]:
         return self._consumer.frames()

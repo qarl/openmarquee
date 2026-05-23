@@ -410,8 +410,7 @@ class RustRenderer:
         self.height = int(height)
 
         self._binary_path = str(
-            binary_path
-            or os.environ.get("OPENMARQUEE_RENDERER_BINARY", self.DEFAULT_BINARY)
+            binary_path or os.environ.get("OPENMARQUEE_RENDERER_BINARY", self.DEFAULT_BINARY)
         )
         self._content_root = str(content_root) if content_root is not None else None
         self._drm_card = drm_card
@@ -516,14 +515,10 @@ class RustRenderer:
             params["rotation"] = 0
         body = self._send_op("open", params, _allow_reconnect=False)
         if body is None or "mode_w" not in body or "mode_h" not in body:
-            raise RustRendererProtocolError(
-                f"Open OK response missing mode_w/mode_h: {body!r}"
-            )
+            raise RustRendererProtocolError(f"Open OK response missing mode_w/mode_h: {body!r}")
         return int(body["mode_w"]), int(body["mode_h"])
 
-    def begin_slide(
-        self, slide_id: uuid.UUID | str, t0_ms: int, duration_ms: int
-    ) -> None:
+    def begin_slide(self, slide_id: uuid.UUID | str, t0_ms: int, duration_ms: int) -> None:
         """Op 2. Loads the slide into the sidecar's cache + resets per-slide
         playback state."""
         self._send_op(
@@ -567,9 +562,7 @@ class RustRenderer:
         Caller is responsible for the directory existing + write permissions."""
         body = self._send_op("capture", {"path": str(path)})
         if body is None or "path" not in body or "bytes" not in body:
-            raise RustRendererProtocolError(
-                f"Capture OK response missing path/bytes: {body!r}"
-            )
+            raise RustRendererProtocolError(f"Capture OK response missing path/bytes: {body!r}")
         return CaptureResult(path=str(body["path"]), bytes=int(body["bytes"]))
 
     def reconfigure(
@@ -687,9 +680,7 @@ class RustRenderer:
         format tag is the only thing that varies.
         """
         if pixel_format not in ("rgb888", "nv12"):
-            raise RustRendererError(
-                f"render_frame: unknown pixel_format {pixel_format!r}"
-            )
+            raise RustRendererError(f"render_frame: unknown pixel_format {pixel_format!r}")
         with self._lock:
             if self._proc is None or self._frame_pipe is None:
                 raise RustRendererError("RustRenderer not opened")
@@ -731,9 +722,7 @@ class RustRenderer:
                 self._frame_pipe.write(frame)
                 self._frame_pipe.flush()
             except (BrokenPipeError, OSError) as e:
-                raise RustRendererSubprocessError(
-                    f"frame-channel write failed: {e}"
-                ) from e
+                raise RustRendererSubprocessError(f"frame-channel write failed: {e}") from e
 
     def end_external_frames(self) -> None:
         """End a run of `render_frame()` pushes (STREAM/VLC slice 2.5).
@@ -837,9 +826,7 @@ class RustRenderer:
         except OSError as e:
             os.close(frame_read_fd)
             os.close(frame_write_fd)
-            raise RustRendererSubprocessError(
-                f"Failed to launch Rust subprocess: {e}"
-            ) from e
+            raise RustRendererSubprocessError(f"Failed to launch Rust subprocess: {e}") from e
         # The sidecar holds the read end now; the parent drops it.
         # Wrap the write end in a BufferedWriter — its flush() writes
         # the whole buffer (looping over partial pipe writes), so
@@ -910,17 +897,18 @@ class RustRenderer:
                         f"begin_slide/begin_transition. (cause: {e})"
                     ) from e
                 # Reconnect exhausted or disabled: surface the trail.
-                trail = "; ".join(self._reconnect_reasons[-self._reconnect_max:]) \
-                    if self._reconnect_reasons else "no prior attempts"
+                trail = (
+                    "; ".join(self._reconnect_reasons[-self._reconnect_max :])
+                    if self._reconnect_reasons
+                    else "no prior attempts"
+                )
                 raise RustRendererSubprocessError(
                     f"subprocess died during op {op!r} and reconnect exhausted "
                     f"(max={self._reconnect_max} in {self._reconnect_window_s:.0f}s) "
                     f"-- trail: [{trail}] -- last cause: {e}"
                 ) from e
 
-    def _send_op_locked(
-        self, op: str, params: dict[str, Any] | None
-    ) -> dict[str, Any] | None:
+    def _send_op_locked(self, op: str, params: dict[str, Any] | None) -> dict[str, Any] | None:
         """Wire-level send. Caller holds `_lock`. Raises
         RustRendererSubprocessError on any subprocess-layer failure;
         the wrapper `_send_op` decides whether to attempt reconnect."""
@@ -928,9 +916,7 @@ class RustRenderer:
             raise RustRendererError("RustRenderer not opened")
         if self._proc.poll() is not None:
             rc = self._proc.returncode
-            raise RustRendererSubprocessError(
-                f"Rust subprocess exited (rc={rc}) before op {op!r}"
-            )
+            raise RustRendererSubprocessError(f"Rust subprocess exited (rc={rc}) before op {op!r}")
 
         request: dict[str, Any] = {"op": op}
         if params is not None:
@@ -942,23 +928,18 @@ class RustRenderer:
             self._proc.stdin.write(line + "\n")
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError) as e:
-            raise RustRendererSubprocessError(
-                f"Failed to write op {op!r}: {e}"
-            ) from e
+            raise RustRendererSubprocessError(f"Failed to write op {op!r}: {e}") from e
 
         try:
             assert self._proc.stdout is not None
             response_line = self._proc.stdout.readline()
         except (BrokenPipeError, OSError) as e:
-            raise RustRendererSubprocessError(
-                f"Failed to read response to op {op!r}: {e}"
-            ) from e
+            raise RustRendererSubprocessError(f"Failed to read response to op {op!r}: {e}") from e
         if not response_line:
             # EOF — subprocess closed stdout. Usually means it died.
             rc = self._proc.poll()
             raise RustRendererSubprocessError(
-                f"Rust subprocess closed stdout before responding to op "
-                f"{op!r} (rc={rc})"
+                f"Rust subprocess closed stdout before responding to op {op!r} (rc={rc})"
             )
 
         try:
@@ -970,9 +951,7 @@ class RustRenderer:
 
         return self._decode_response(op, resp)
 
-    def _decode_response(
-        self, op: str, resp: Any
-    ) -> dict[str, Any] | None:
+    def _decode_response(self, op: str, resp: Any) -> dict[str, Any] | None:
         """Decode the externally-tagged IpcResponse. On Ok, returns the
         OpResult fields dict with the `command` tag preserved as
         `__command__` (so advance() can dispatch). On `command == "empty"`
@@ -984,9 +963,7 @@ class RustRenderer:
         if "err" in resp:
             err_body = resp["err"]
             if not isinstance(err_body, dict) or "error" not in err_body:
-                raise RustRendererProtocolError(
-                    f"Malformed Err response (op {op!r}): {resp!r}"
-                )
+                raise RustRendererProtocolError(f"Malformed Err response (op {op!r}): {resp!r}")
             raise _classify_op_error(str(err_body["error"]))
         if "ok" not in resp:
             raise RustRendererProtocolError(
@@ -994,9 +971,7 @@ class RustRenderer:
             )
         ok_body = resp["ok"]
         if not isinstance(ok_body, dict) or "result" not in ok_body:
-            raise RustRendererProtocolError(
-                f"Malformed Ok response (op {op!r}): {resp!r}"
-            )
+            raise RustRendererProtocolError(f"Malformed Ok response (op {op!r}): {resp!r}")
         result = ok_body["result"]
         if not isinstance(result, dict) or "command" not in result:
             raise RustRendererProtocolError(
@@ -1033,9 +1008,7 @@ class RustRenderer:
             return SlideComplete(slide_id=uuid.UUID(str(body["slide_id"])))
         if command == "idle":
             return Idle()
-        raise RustRendererProtocolError(
-            f"advance: unknown command {command!r} (body: {body!r})"
-        )
+        raise RustRendererProtocolError(f"advance: unknown command {command!r} (body: {body!r})")
 
     def _terminate_subprocess(self) -> None:
         proc = self._proc
@@ -1092,9 +1065,8 @@ class RustRenderer:
         now = time.monotonic()
         cutoff = now - self._reconnect_window_s
         kept = [
-            (t, r) for t, r in zip(
-                self._reconnect_attempts, self._reconnect_reasons, strict=True
-            )
+            (t, r)
+            for t, r in zip(self._reconnect_attempts, self._reconnect_reasons, strict=True)
             if t >= cutoff
         ]
         self._reconnect_attempts = [t for t, _ in kept]
@@ -1115,9 +1087,7 @@ class RustRenderer:
         next op gets a clean "not opened" error path.
         """
         if self._reconnect_max <= 0:
-            log.warning(
-                "RustRenderer reconnect disabled (max_retries=0); not respawning"
-            )
+            log.warning("RustRenderer reconnect disabled (max_retries=0); not respawning")
             return False
         self._prune_reconnect_window()
         if len(self._reconnect_attempts) >= self._reconnect_max:
@@ -1218,9 +1188,7 @@ class RustRenderer:
                     return  # close() ran while we were waiting
                 if self._proc.poll() is None:
                     continue  # someone reconnected already
-                self._attempt_reconnect_locked(
-                    reason=f"watchdog: subprocess died (rc={rc})"
-                )
+                self._attempt_reconnect_locked(reason=f"watchdog: subprocess died (rc={rc})")
             finally:
                 self._lock.release()
 

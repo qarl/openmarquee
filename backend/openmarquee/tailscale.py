@@ -36,9 +36,7 @@ DEFAULT_BIN = "/usr/bin/tailscale"
 # or sometimes inline:
 #   "Browser:\nhttps://login.tailscale.com/a/abc123def"
 # Match the URL itself; tolerate either form.
-_AUTH_URL_RE = re.compile(
-    r"https?://login\.tailscale\.com/[A-Za-z0-9/_\-]+"
-)
+_AUTH_URL_RE = re.compile(r"https?://login\.tailscale\.com/[A-Za-z0-9/_\-]+")
 
 State = Literal["disabled", "pending", "authenticated", "error"]
 
@@ -154,9 +152,7 @@ async def read_status() -> dict:
             "message": f"tailscale binary not found at {_bin()}",
         }
     try:
-        stdout, _stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=5.0
-        )
+        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
     except TimeoutError:
         proc.kill()
         await proc.wait()

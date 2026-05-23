@@ -139,7 +139,8 @@ class TestConstructorValidation:
     def test_rejects_both_static_and_dynamic_dims(self, tmp_path: Path):
         with pytest.raises(ValueError, match="either"):
             MockRenderer(
-                width=10, height=10,
+                width=10,
+                height=10,
                 output_path=tmp_path / "out.png",
                 get_dims=lambda: (20, 20),
             )

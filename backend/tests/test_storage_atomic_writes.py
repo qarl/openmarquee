@@ -75,14 +75,16 @@ def _patch_replace_to_raise(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_content_storage_save_rollback_on_replace_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """ContentStorage.save: when tmp.replace fails mid-save, the
     original envelope+asset remain readable on disk + no .tmp
     files linger."""
     storage = ContentStorage(tmp_path / "content")
     slide_v1 = TextSlide(
-        name="v1", duration_ms=5000,
+        name="v1",
+        duration_ms=5000,
         text_layers=[TextLayer(text="version 1")],
     )
     storage.save(slide_v1, _fake_png())
@@ -92,7 +94,9 @@ def test_content_storage_save_rollback_on_replace_failure(
     _patch_replace_to_raise(monkeypatch)
 
     slide_v2 = TextSlide(
-        id=slide_v1.id, name="v2", duration_ms=5000,
+        id=slide_v1.id,
+        name="v2",
+        duration_ms=5000,
         text_layers=[TextLayer(text="version 2")],
     )
     with pytest.raises(OSError):
@@ -109,28 +113,33 @@ def test_content_storage_save_rollback_on_replace_failure(
 
 
 def test_playlist_storage_save_all_rollback_on_replace_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     storage = PlaylistStorage(tmp_path / "playlist.json")
-    v1 = PlaylistCollection(playlists=[
-        Playlist(
-            id=DEFAULT_PLAYLIST_ID,
-            name=DEFAULT_PLAYLIST_NAME,
-            items=[],
-        ),
-    ])
+    v1 = PlaylistCollection(
+        playlists=[
+            Playlist(
+                id=DEFAULT_PLAYLIST_ID,
+                name=DEFAULT_PLAYLIST_NAME,
+                items=[],
+            ),
+        ]
+    )
     storage.save_all(v1)
     assert storage.load_all().playlists[0].name == DEFAULT_PLAYLIST_NAME
 
     _patch_replace_to_raise(monkeypatch)
 
-    v2 = PlaylistCollection(playlists=[
-        Playlist(
-            id=DEFAULT_PLAYLIST_ID,
-            name="renamed-attempt",
-            items=[],
-        ),
-    ])
+    v2 = PlaylistCollection(
+        playlists=[
+            Playlist(
+                id=DEFAULT_PLAYLIST_ID,
+                name="renamed-attempt",
+                items=[],
+            ),
+        ]
+    )
     with pytest.raises(OSError):
         storage.save_all(v2)
 
@@ -144,7 +153,8 @@ def test_playlist_storage_save_all_rollback_on_replace_failure(
 
 
 def test_flock_storage_save_rollback_on_replace_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     storage = FlockStorage(tmp_path / "flock.json")
     # Add a baseline peer.
@@ -167,7 +177,8 @@ def test_flock_storage_save_rollback_on_replace_failure(
 
 
 def test_schedule_storage_save_rollback_on_replace_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     storage = ScheduleStorage(tmp_path / "schedule.json")
     v1 = Schedule()  # default empty
@@ -189,7 +200,8 @@ def test_schedule_storage_save_rollback_on_replace_failure(
 
 
 def test_settings_storage_save_rollback_on_replace_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     storage = SettingsStorage(tmp_path / "settings.json")
     v1 = storage.load()  # triggers first-write
@@ -212,7 +224,8 @@ def test_settings_storage_save_rollback_on_replace_failure(
 
 
 def test_tombstone_storage_save_rollback_on_replace_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     storage = TombstoneStorage(tmp_path / "tombstones.json")
     id_a = uuid4()

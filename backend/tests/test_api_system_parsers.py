@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from openmarquee.api_system import _parse_airport_scan, _parse_iw_scan
 
-
 # --- iw scan parser ----------------------------------------------------------
 
 

@@ -159,6 +159,7 @@ class AutoFallbackRenderer:
             RustRendererSubprocessError,
             RustRendererUnsupportedSlideError,
         )
+
         try:
             self._primary.render_frame(
                 frame, pixel_format=pixel_format, frame_w=frame_w, frame_h=frame_h
@@ -176,9 +177,7 @@ class AutoFallbackRenderer:
             raise
         except RustRendererSubprocessError as e:
             mock = self._swap_to_mock(f"render_frame: {e}")
-            mock.render_frame(
-                frame, pixel_format=pixel_format, frame_w=frame_w, frame_h=frame_h
-            )
+            mock.render_frame(frame, pixel_format=pixel_format, frame_w=frame_w, frame_h=frame_h)
 
     def end_external_frames(self) -> None:
         """Forward to the active renderer (STREAM/VLC slice 2.5).
@@ -196,6 +195,7 @@ class AutoFallbackRenderer:
             RustRendererRespawnedError,
             RustRendererSubprocessError,
         )
+
         try:
             self._primary.end_external_frames()
         except RustRendererRespawnedError:
@@ -218,6 +218,7 @@ class AutoFallbackRenderer:
         from openmarquee.rendering.rust_renderer import (
             RustRendererSubprocessError,
         )
+
         try:
             self._primary.reopen()
         except RustRendererSubprocessError as e:
@@ -243,6 +244,7 @@ class AutoFallbackRenderer:
             RustRendererRespawnedError,
             RustRendererSubprocessError,
         )
+
         try:
             return self._primary.open()
         except RustRendererRespawnedError:
@@ -309,6 +311,7 @@ class AutoFallbackRenderer:
             RustRendererUnsupportedSlideError,
             RustRendererUnsupportedTransitionError,
         )
+
         method = getattr(self._primary, op_name)
         try:
             return method(*args, **kwargs)
@@ -331,7 +334,8 @@ class AutoFallbackRenderer:
             # both documents the policy and pins the log line.
             log.info(
                 "AutoFallbackRenderer: %s skipped (unsupported slide kind): %s",
-                op_name, e.message,
+                op_name,
+                e.message,
             )
             raise
         except RustRendererUnsupportedTransitionError as e:
@@ -345,8 +349,9 @@ class AutoFallbackRenderer:
             # is already in place (same shape as UnsupportedSlideError:
             # log + re-raise, do NOT swap to Mock).
             log.info(
-                "AutoFallbackRenderer: %s downgraded to cut (unsupported "
-                "transition kind): %s", op_name, e.message,
+                "AutoFallbackRenderer: %s downgraded to cut (unsupported transition kind): %s",
+                op_name,
+                e.message,
             )
             raise
         except RustRendererSubprocessError as e:
@@ -457,9 +462,7 @@ def _rust_sidecar_renderer_or_fallback():
     settings = _settings_storage_singleton().load()
     width = int(settings.display_width)
     height = int(settings.display_height)
-    binary_path = os.environ.get(
-        "OPENMARQUEE_RENDERER_BINARY", "/usr/local/bin/openmarquee-render"
-    )
+    binary_path = os.environ.get("OPENMARQUEE_RENDERER_BINARY", "/usr/local/bin/openmarquee-render")
     content_root = _resolve_content_root()
     try:
         primary = RustRenderer(
@@ -476,9 +479,7 @@ def _rust_sidecar_renderer_or_fallback():
             # FYS bug 5: display rotation, read at each Open. A
             # rotation change triggers a renderer reopen
             # (api_settings.py), which re-reads this.
-            get_rotation=lambda: int(
-                _settings_storage_singleton().load().display_rotation
-            ),
+            get_rotation=lambda: int(_settings_storage_singleton().load().display_rotation),
         )
     except Exception:
         log.exception("RustRenderer construction failed; falling back to mock")
@@ -621,6 +622,7 @@ def _auth_storage_singleton():
     # leaves, but keeping the lazy resolution clean avoids future
     # ordering surprises).
     from openmarquee.auth import AuthStorage
+
     return AuthStorage(_resolve_auth_path())
 
 

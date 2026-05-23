@@ -443,9 +443,7 @@ class FlockSync:
             # invisible cleanup, not "behind" in the user-facing
             # sense. Flip if you want the count to include them.
             missing = sum(
-                1
-                for entry in entries
-                if not self.content.exists(UUID(entry["content_id"]))
+                1 for entry in entries if not self.content.exists(UUID(entry["content_id"]))
             )
             self._record_items_behind(peer_address, missing)
 

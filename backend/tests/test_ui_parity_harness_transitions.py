@@ -61,8 +61,7 @@ def _harness_transition_keys() -> set[str]:
     mention of a method signature in a `//` line comment doesn't
     falsely register as a registered transition."""
     assert _PARITY_HARNESS.is_file(), (
-        f"parity harness not found at {_PARITY_HARNESS}; relocation? "
-        f"Update the test path."
+        f"parity harness not found at {_PARITY_HARNESS}; relocation? Update the test path."
     )
     text = _PARITY_HARNESS.read_text(encoding="utf-8")
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -76,11 +75,11 @@ def _parity_fixture_transitions() -> set[str]:
     `transition_mid` `kind` markers — those are fixture types, not
     transitions."""
     assert _PARITY_FIXTURES.is_file(), (
-        f"parity fixtures not found at {_PARITY_FIXTURES}; relocation? "
-        f"Update the test path."
+        f"parity fixtures not found at {_PARITY_FIXTURES}; relocation? Update the test path."
     )
     data = json.loads(_PARITY_FIXTURES.read_text(encoding="utf-8"))
     transitions: set[str] = set()
+
     # The fixtures.json shape is a list (or object containing a list)
     # of fixture dicts with a "transition" key on transition_mid
     # fixtures. Recursively walk and collect.
@@ -110,13 +109,11 @@ def test_parity_harness_covers_every_fixture_transition():
     """
     harness_keys = _harness_transition_keys()
     assert harness_keys, (
-        "TRANSITION_FNS appears empty — did the regex break? Or did "
-        "the harness move?"
+        "TRANSITION_FNS appears empty — did the regex break? Or did the harness move?"
     )
     fixture_transitions = _parity_fixture_transitions()
     assert fixture_transitions, (
-        "no `transition` values found in parity fixtures.json — fixture "
-        "shape changed?"
+        "no `transition` values found in parity fixtures.json — fixture shape changed?"
     )
     missing = fixture_transitions - harness_keys
     assert not missing, (

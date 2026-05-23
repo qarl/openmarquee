@@ -44,7 +44,10 @@ def test_build_emits_dist_htaccess_with_short_cache(tmp_path: Path) -> None:
     }
     subprocess.run(
         ["bash", str(_BUILD), str(src_ui)],
-        check=True, capture_output=True, text=True, env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
     )
 
     htaccess = build_dir / "demo" / "dist" / ".htaccess"
@@ -55,9 +58,7 @@ def test_build_emits_dist_htaccess_with_short_cache(tmp_path: Path) -> None:
         "dotfile + orphan sweeps."
     )
     body = htaccess.read_text()
-    assert "max-age=300" in body, (
-        f"Cache-Control max-age regressed; body was:\n{body!r}"
-    )
+    assert "max-age=300" in body, f"Cache-Control max-age regressed; body was:\n{body!r}"
     assert "must-revalidate" in body
 
 
@@ -79,7 +80,10 @@ def test_build_emits_root_htaccess_with_short_cache(tmp_path: Path) -> None:
     }
     subprocess.run(
         ["bash", str(_BUILD), str(src_ui)],
-        check=True, capture_output=True, text=True, env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
     )
 
     htaccess = build_dir / "demo" / ".htaccess"
@@ -112,7 +116,10 @@ def test_build_htaccess_survives_dotfile_and_orphan_sweeps(tmp_path: Path) -> No
     env = {**os.environ, "OPENMARQUEE_BUILD_DIR": str(build_dir)}
     result = subprocess.run(
         ["bash", str(_BUILD), str(src_ui)],
-        check=True, capture_output=True, text=True, env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
     )
     # Orphan sweep should have fired.
     assert "removed=1" in result.stdout or "removed orphan" in result.stdout

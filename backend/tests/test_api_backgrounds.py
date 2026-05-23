@@ -105,6 +105,7 @@ def test_generate_saves_image_and_appends_to_playlist(
     assert body["name"].endswith(" — Background")
 
     from uuid import UUID
+
     item_id = UUID(body["id"])
     asset = storage.read_asset(item_id)
     # Provider bytes are stored verbatim now — no device-side resample.
@@ -198,9 +199,7 @@ def test_generate_rejects_unknown_provider(client: TestClient):
     assert response.json()["detail"] == "unknown background provider"
 
 
-def test_generate_no_longer_requires_api_key_env(
-    client: TestClient, monkeypatch
-):
+def test_generate_no_longer_requires_api_key_env(client: TestClient, monkeypatch):
     """Pollinations (the default provider) needs no API key — the 503 path
     the OpenAI-based prototype used doesn't exist anymore."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

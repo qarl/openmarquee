@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -19,8 +19,7 @@ from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync, PullWorker
 from openmarquee.tombstone import TombstoneStorage
 
-
-_NOW = datetime(2026, 4, 24, 12, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC)
 
 
 def _make_png_bytes(color=(10, 20, 30)) -> bytes:
@@ -200,7 +199,7 @@ async def test_ingest_update_pulls_content_and_saves_with_sender_timestamp(
     tmp_path: Path,
 ):
     peer_cid = uuid4()
-    peer_updated_at = datetime(2026, 4, 20, 12, 0, 0, tzinfo=timezone.utc)
+    peer_updated_at = datetime(2026, 4, 20, 12, 0, 0, tzinfo=UTC)
     sender_slide = TextSlide(id=peer_cid, name="From Peer", text="hello")
     sender_png = _make_png_bytes((255, 0, 128))
 
@@ -224,9 +223,7 @@ async def test_ingest_update_pulls_content_and_saves_with_sender_timestamp(
         if url == f"http://peer.ts.net/api/content/{peer_cid}":
             return httpx.Response(200, json=sender_slide.model_dump(mode="json"))
         if url == f"http://peer.ts.net/api/content/{peer_cid}/asset":
-            return httpx.Response(
-                200, content=sender_png, headers={"content-type": "image/png"}
-            )
+            return httpx.Response(200, content=sender_png, headers={"content-type": "image/png"})
         return httpx.Response(404)
 
     sync, content, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
@@ -246,7 +243,7 @@ async def test_ingest_update_pulls_content_and_saves_with_sender_timestamp(
 async def test_ingest_update_skips_when_local_is_newer(tmp_path: Path):
     # Sender's stamp is BEFORE our local stamp → last-writer-wins keeps us.
     cid = uuid4()
-    peer_updated_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    peer_updated_at = datetime(2026, 4, 20, tzinfo=UTC)
     local_updated_at = peer_updated_at + timedelta(hours=1)
     fetched: list[str] = []
 
@@ -288,9 +285,7 @@ async def test_ingest_update_skips_when_sender_evicted(tmp_path: Path):
     cid = uuid4()
 
     def handler(request):
-        return httpx.Response(
-            200, json={"schema_version": 1, "entries": [], "tombstones": []}
-        )
+        return httpx.Response(200, json={"schema_version": 1, "entries": [], "tombstones": []})
 
     sync, content, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
     await sync.ingest_push(cid, "updated", "peer.ts.net", _NOW)
@@ -310,7 +305,7 @@ def _make_fake_mp4_bytes() -> bytes:
 @pytest.mark.asyncio
 async def test_ingest_update_handles_video_with_separate_mp4_fetch(tmp_path: Path):
     peer_cid = uuid4()
-    peer_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    peer_ts = datetime(2026, 4, 20, tzinfo=UTC)
     sender_video = VideoSlide(id=peer_cid, name="From Peer", duration_ms=3000)
     png = _make_png_bytes()
     mp4 = _make_fake_mp4_bytes()
@@ -384,17 +379,13 @@ async def test_announce_sync_skipped_when_sync_disabled(tmp_path: Path):
         calls.append(request)
         return httpx.Response(204)
 
-    sync, _, _, _ = _build_sync(
-        tmp_path, httpx.MockTransport(handler), enabled=False
-    )
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler), enabled=False)
     await sync.announce_sync_to_peer("peer.ts.net", True)
     assert calls == []
 
 
 def test_apply_sync_announcement_flips_matching_peer(tmp_path: Path):
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     peer = flock.add(address="peer.ts.net")
     assert peer.sync is False
     ok = sync.apply_sync_announcement("peer.ts.net", True)
@@ -403,9 +394,7 @@ def test_apply_sync_announcement_flips_matching_peer(tmp_path: Path):
 
 
 def test_apply_sync_announcement_rejects_unknown_sender(tmp_path: Path):
-    sync, _, _, _ = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     assert sync.apply_sync_announcement("stranger.ts.net", True) is False
 
 
@@ -469,8 +458,7 @@ def _manifest_with(*entries, tombstones=()):
             for cid, ts in entries
         ],
         "tombstones": [
-            {"content_id": str(cid), "deleted_at": ts.isoformat()}
-            for cid, ts in tombstones
+            {"content_id": str(cid), "deleted_at": ts.isoformat()} for cid, ts in tombstones
         ],
     }
 
@@ -479,7 +467,7 @@ def _manifest_with(*entries, tombstones=()):
 async def test_pull_from_peer_fetches_missing_content(tmp_path: Path):
     remote_cid = uuid4()
     remote_slide = TextSlide(id=remote_cid, name="Remote", text="r")
-    remote_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    remote_ts = datetime(2026, 4, 20, tzinfo=UTC)
     png = _make_png_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -508,7 +496,7 @@ async def test_pull_from_peer_applies_tombstones(tmp_path: Path):
     # window, or list_active() (the final assert) drops it. A
     # hardcoded 2026-04 date aged out of that window — the time-bomb
     # this replaces.
-    remote_delete_at = datetime.now(timezone.utc) - timedelta(days=2)
+    remote_delete_at = datetime.now(UTC) - timedelta(days=2)
     local_updated_at = remote_delete_at - timedelta(days=5)
     # Local content the remote has tombstoned. updated_at is OLDER
     # than the delete, so the pull's last-write-wins rule applies the
@@ -540,8 +528,8 @@ def _pull_tombstone_handler(request):
 @pytest.mark.asyncio
 async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
     cid = uuid4()
-    remote_ts = datetime(2026, 4, 10, tzinfo=timezone.utc)
-    local_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    remote_ts = datetime(2026, 4, 10, tzinfo=UTC)
+    local_ts = datetime(2026, 4, 20, tzinfo=UTC)
     fetched: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -556,10 +544,7 @@ async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
 
     await sync.pull_from_peer("peer.ts.net")
     # Only the peer-name probe + the manifest — content + asset NOT fetched.
-    assert all(
-        u.endswith("/api/flock/manifest") or u.endswith("/api/settings")
-        for u in fetched
-    )
+    assert all(u.endswith("/api/flock/manifest") or u.endswith("/api/settings") for u in fetched)
     assert content.load(cid).name == "Local wins"
 
 
@@ -567,16 +552,14 @@ async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
 async def test_pull_from_peer_survives_single_entry_failure(tmp_path: Path):
     good_cid = uuid4()
     bad_cid = uuid4()
-    ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    ts = datetime(2026, 4, 20, tzinfo=UTC)
     good_slide = TextSlide(id=good_cid, name="Good", text="g")
     png = _make_png_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url.endswith("/api/flock/manifest"):
-            return httpx.Response(
-                200, json=_manifest_with((good_cid, ts), (bad_cid, ts))
-            )
+            return httpx.Response(200, json=_manifest_with((good_cid, ts), (bad_cid, ts)))
         if url.endswith(f"/api/content/{good_cid}"):
             return httpx.Response(200, json=good_slide.model_dump(mode="json"))
         if url.endswith(f"/api/content/{good_cid}/asset"):
@@ -647,9 +630,7 @@ async def test_notify_peers_noops_when_sync_disabled(tmp_path: Path):
         calls.append(request)
         return httpx.Response(204)
 
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(handler), enabled=False
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(handler), enabled=False)
     peer = flock.add(address="peer.ts.net")
     flock.update(peer.id, sync=True)
     await sync.notify_peers(uuid4(), "updated")
@@ -674,9 +655,7 @@ async def test_pull_from_peer_noops_when_sync_disabled(tmp_path: Path):
         hits.append(str(request.url))
         return httpx.Response(200, json={"schema_version": 1, "entries": [], "tombstones": []})
 
-    sync, _, _, _ = _build_sync(
-        tmp_path, httpx.MockTransport(handler), enabled=False
-    )
+    sync, _, _, _ = _build_sync(tmp_path, httpx.MockTransport(handler), enabled=False)
     await sync.pull_from_peer("peer.ts.net")
     assert hits == []
 
@@ -829,9 +808,7 @@ async def test_gossip_add_swallows_peer_errors(tmp_path: Path):
 
 def test_apply_hello_adds_new_peer(tmp_path: Path):
     """Inbound hello for an unknown address adds it to local flock."""
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     assert flock.load().peers == []
     added = sync.apply_hello("new.ts.net")
     assert added is True
@@ -844,9 +821,7 @@ def test_apply_hello_idempotent_for_known_peer(tmp_path: Path):
     """Duplicate hello (race between reciprocal-add + forward-
     notification) is a no-op rather than a 409 — gossip introductions
     can land twice for the same peer in a 3+-device flock."""
-    sync, _, _, flock = _build_sync(
-        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
-    )
+    sync, _, _, flock = _build_sync(tmp_path, httpx.MockTransport(lambda r: httpx.Response(204)))
     flock.add(address="known.ts.net")
     added = sync.apply_hello("known.ts.net")
     assert added is False
@@ -883,7 +858,7 @@ async def test_pull_from_peer_records_items_behind_pre_apply(tmp_path: Path):
     cid_a = uuid4()
     cid_b = uuid4()
     cid_c = uuid4()
-    remote_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    remote_ts = datetime(2026, 4, 20, tzinfo=UTC)
     png = _make_png_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -891,16 +866,12 @@ async def test_pull_from_peer_records_items_behind_pre_apply(tmp_path: Path):
         if url.endswith("/api/flock/manifest"):
             return httpx.Response(
                 200,
-                json=_manifest_with(
-                    (cid_a, remote_ts), (cid_b, remote_ts), (cid_c, remote_ts)
-                ),
+                json=_manifest_with((cid_a, remote_ts), (cid_b, remote_ts), (cid_c, remote_ts)),
             )
         if "/api/content/" in url and url.endswith("/asset"):
             return httpx.Response(200, content=png)
         if "/api/content/" in url:
-            slide = TextSlide(
-                id=UUID(url.rsplit("/", 1)[-1]), name="r", text="r"
-            )
+            slide = TextSlide(id=UUID(url.rsplit("/", 1)[-1]), name="r", text="r")
             return httpx.Response(200, json=slide.model_dump(mode="json"))
         return httpx.Response(404)
 
@@ -910,7 +881,7 @@ async def test_pull_from_peer_records_items_behind_pre_apply(tmp_path: Path):
     content.save(
         TextSlide(id=cid_a, name="had", text="had"),
         _make_png_bytes(),
-        updated_at=datetime(2026, 4, 19, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 19, tzinfo=UTC),
     )
 
     await sync.pull_from_peer("peer.ts.net")
@@ -927,7 +898,7 @@ async def test_pull_from_peer_records_zero_when_in_sync(tmp_path: Path):
     """If we already have everything in the peer's manifest at pull
     time, items_behind = 0. UI surfaces this as 'in sync'."""
     cid = uuid4()
-    remote_ts = datetime(2026, 4, 20, tzinfo=timezone.utc)
+    remote_ts = datetime(2026, 4, 20, tzinfo=UTC)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url).endswith("/api/flock/manifest"):
@@ -939,7 +910,7 @@ async def test_pull_from_peer_records_zero_when_in_sync(tmp_path: Path):
     content.save(
         TextSlide(id=cid, name="had", text="had"),
         _make_png_bytes(),
-        updated_at=datetime(2026, 4, 19, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 19, tzinfo=UTC),
     )
 
     await sync.pull_from_peer("peer.ts.net")

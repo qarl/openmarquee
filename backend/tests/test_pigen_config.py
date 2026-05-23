@@ -159,8 +159,7 @@ def test_packages_no_duplicates(packages: list[str]) -> None:
     """Duplicates aren't fatal to apt, but they're noise. The package
     list should be a clean set."""
     assert len(packages) == len(set(packages)), (
-        f"duplicate package(s) in 00-packages: "
-        f"{[p for p in packages if packages.count(p) > 1]}"
+        f"duplicate package(s) in 00-packages: {[p for p in packages if packages.count(p) > 1]}"
     )
 
 

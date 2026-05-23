@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -27,11 +27,9 @@ from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync, NotifyKind
 from openmarquee.tombstone import TombstoneStorage
 
-
 # Minimal valid 1x1 PNG for content upload endpoints (Pillow-generated).
 _TINY_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nG"
-    "P4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 )
 
 
@@ -210,9 +208,7 @@ def test_discover_marks_already_added_peers(client: TestClient, monkeypatch):
     assert body["candidates"][0]["already_in_flock"] is True
 
 
-def test_discover_handles_tailscale_failure_gracefully(
-    client: TestClient, monkeypatch
-):
+def test_discover_handles_tailscale_failure_gracefully(client: TestClient, monkeypatch):
     """tailscale binary present but returns non-zero (network blip,
     daemon down) — fallback to empty + source='none'. No 500."""
     import openmarquee.api_flock as mod
@@ -291,9 +287,7 @@ def test_post_validates_address_too_long(client: TestClient):
     "bad_address",
     ["http://foo", "foo/bar", "a b", "foo@bar", "foo:notaport"],
 )
-def test_post_rejects_malformed_addresses_as_422(
-    client: TestClient, bad_address: str
-):
+def test_post_rejects_malformed_addresses_as_422(client: TestClient, bad_address: str):
     response = client.post("/api/flock", json={"address": bad_address})
     assert response.status_code == 422
 
@@ -307,9 +301,7 @@ def test_post_accepts_host_with_port(client: TestClient):
 def test_post_strips_whitespace_and_lowercases(client: TestClient):
     # Operator pastes from a Tailscale UI with stray whitespace + mixed
     # case — don't punish them with a 422, just normalize.
-    response = client.post(
-        "/api/flock", json={"address": "  Lobby.TS.Net  "}
-    )
+    response = client.post("/api/flock", json={"address": "  Lobby.TS.Net  "})
     assert response.status_code == 201
     assert response.json()["address"] == "lobby.ts.net"
     # And a follow-up POST with the canonical form is a 409 duplicate.
@@ -431,9 +423,7 @@ def _wait_for_pushes(client, recorder, expected_count, *, tries=100):
         if len(recorder.pushes) >= expected_count:
             return
         client.get("/api/flock")  # a cheap real endpoint — pumps the loop
-    raise AssertionError(
-        f"expected {expected_count} flock pushes, got {recorder.pushes!r}"
-    )
+    raise AssertionError(f"expected {expected_count} flock pushes, got {recorder.pushes!r}")
 
 
 def test_post_flock_schedules_gossip_add(recording_client):
@@ -453,9 +443,7 @@ def test_hello_endpoint_delegates_to_sync(recording_client):
     """POST /api/flock/hello calls FlockSync.apply_hello with the
     introduced peer's address. Returns 204."""
     client, recorder, _ = recording_client
-    response = client.post(
-        "/api/flock/hello", json={"address": "stranger.ts.net"}
-    )
+    response = client.post("/api/flock/hello", json={"address": "stranger.ts.net"})
     assert response.status_code == 204
     assert recorder.hellos == ["stranger.ts.net"]
 
@@ -466,9 +454,7 @@ def test_hello_endpoint_idempotent_for_known_peer(recording_client):
     semantics handle the no-op; the route just returns success."""
     client, recorder, _ = recording_client
     client.post("/api/flock/hello", json={"address": "stranger.ts.net"})
-    response = client.post(
-        "/api/flock/hello", json={"address": "stranger.ts.net"}
-    )
+    response = client.post("/api/flock/hello", json={"address": "stranger.ts.net"})
     assert response.status_code == 204
     assert recorder.hellos == ["stranger.ts.net", "stranger.ts.net"]
 
@@ -495,9 +481,7 @@ def test_hello_endpoint_schedules_name_probe_on_first_hello(recording_client):
     Loop-safety: probe_peer_name only reads /api/settings, doesn't
     gossip — no cascade risk."""
     client, recorder, _ = recording_client
-    response = client.post(
-        "/api/flock/hello", json={"address": "stranger.ts.net"}
-    )
+    response = client.post("/api/flock/hello", json={"address": "stranger.ts.net"})
     assert response.status_code == 204
     # apply_hello returned True (recorder default), so the route
     # scheduled probe_peer_name as a background task.
@@ -510,12 +494,8 @@ def test_hello_endpoint_skips_name_probe_for_known_peer(recording_client):
     gossips us about an existing peer in a 3+-device flock."""
     client, recorder, _ = recording_client
     # Override apply_hello to return False (already-known case).
-    recorder.apply_hello = lambda address: (
-        recorder.hellos.append(address) or False
-    )
-    response = client.post(
-        "/api/flock/hello", json={"address": "known.ts.net"}
-    )
+    recorder.apply_hello = lambda address: (recorder.hellos.append(address) or False)
+    response = client.post("/api/flock/hello", json={"address": "known.ts.net"})
     assert response.status_code == 204
     assert recorder.hellos == ["known.ts.net"]
     # No probe — apply_hello returned False so nothing was newly added.
@@ -530,9 +510,7 @@ def test_hello_endpoint_does_not_require_known_sender(recording_client):
     client, recorder, flock = recording_client
     # The recording_client fixture pre-adds peer.ts.net; stranger.ts.net
     # is genuinely unknown. Should still 204.
-    response = client.post(
-        "/api/flock/hello", json={"address": "stranger.ts.net"}
-    )
+    response = client.post("/api/flock/hello", json={"address": "stranger.ts.net"})
     assert response.status_code == 204
     assert recorder.hellos == ["stranger.ts.net"]
 
@@ -555,7 +533,7 @@ def test_notify_endpoint_delegates_to_sync(recording_client):
     assert cid_seen == cid
     assert kind_seen == "updated"
     assert sender_seen == "peer.ts.net"
-    assert at_seen == datetime(2026, 4, 24, 12, 0, 0, tzinfo=timezone.utc)
+    assert at_seen == datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC)
 
 
 def test_notify_endpoint_rejects_unknown_kind(recording_client):
@@ -656,9 +634,7 @@ def test_content_delete_enqueues_deleted_push(recording_client):
     assert recorder.pushes[-1] == (slide_id, "deleted")
 
 
-def test_peer_ingested_content_does_not_trigger_outbound_push(
-    recording_client, tmp_path: Path
-):
+def test_peer_ingested_content_does_not_trigger_outbound_push(recording_client, tmp_path: Path):
     """Loop-prevention invariant: FlockSync ingests content via
     ContentStorage.save() DIRECTLY (not via the HTTP route), so the push
     hook — which lives on the route — never fires for ingested content.
@@ -670,7 +646,7 @@ def test_peer_ingested_content_does_not_trigger_outbound_push(
 
     overridden_content = app.dependency_overrides[get_content_storage]()
     slide = TextSlide(name="Ingested", text_layers=[TextLayer(text="from peer")])
-    overridden_content.save(slide, b"", updated_at=datetime.now(timezone.utc))
+    overridden_content.save(slide, b"", updated_at=datetime.now(UTC))
 
     # A follow-up API roundtrip is needed to flush any pending backgrounds
     # (TestClient drains them synchronously at context exit).
@@ -728,9 +704,7 @@ def test_manifest_surfaces_tombstone_after_delete(manifest_client: TestClient):
     assert body["tombstones"][0]["content_id"] == slide_id
 
 
-def test_delete_of_unknown_id_leaves_no_tombstone(
-    manifest_client: TestClient, tmp_path: Path
-):
+def test_delete_of_unknown_id_leaves_no_tombstone(manifest_client: TestClient, tmp_path: Path):
     # A DELETE on an id we never had must not mint a tombstone — peers
     # would otherwise learn about a deletion that never happened and drop
     # content they rightfully hold.
@@ -743,7 +717,7 @@ def test_delete_of_unknown_id_leaves_no_tombstone(
 def test_manifest_filters_expired_tombstones(tmp_path: Path):
     # Build a manifest client whose tombstone log is seeded directly with
     # one fresh + one expired entry, and confirm only the fresh one surfaces.
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from openmarquee.content.storage import ContentStorage
     from openmarquee.dependencies import (
@@ -760,7 +734,7 @@ def test_manifest_filters_expired_tombstones(tmp_path: Path):
     flock = FlockStorage(tmp_path / "flock.json")
     content = ContentStorage(tmp_path / "content")
     tombstones = TombstoneStorage(tmp_path / "tombstones.json")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fresh_id = uuid4()
     stale_id = uuid4()
     tombstones.add(fresh_id, now=now - timedelta(days=1))

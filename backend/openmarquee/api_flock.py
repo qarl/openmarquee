@@ -109,9 +109,7 @@ async def list_flock(storage: FlockDep) -> Flock:
 
 
 @router.get("/manifest", response_model=Manifest)
-async def get_manifest(
-    content: ContentDep, tombstones: TombstoneDep
-) -> Manifest:
+async def get_manifest(content: ContentDep, tombstones: TombstoneDep) -> Manifest:
     """Inventory this device exposes to pulling peers.
 
     Entries are live content_ids + their updated_at (for last-writer-wins
@@ -176,9 +174,7 @@ async def update_peer(
     # Mirror a sync-flag flip back to the peer so their UI reflects the
     # change without waiting for the next pull-worker tick.
     if body.sync is not None:
-        background.add_task(
-            sync.announce_sync_to_peer, peer.address, bool(body.sync)
-        )
+        background.add_task(sync.announce_sync_to_peer, peer.address, bool(body.sync))
     return peer
 
 
@@ -380,9 +376,7 @@ async def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
 
 
 @router.post("/hello", status_code=204)
-async def receive_hello(
-    body: HelloBody, sync: FlockSyncDep, background: BackgroundTasks
-) -> None:
+async def receive_hello(body: HelloBody, sync: FlockSyncDep, background: BackgroundTasks) -> None:
     """SYSTEM_SPEC §13 introduction protocol: a peer is telling us
     about a flock member (either themselves, in the reciprocal-add
     case, or another peer in the forward-notification case). We add
@@ -412,9 +406,7 @@ async def receive_hello(
 
 
 @router.post("/sync-announce", status_code=204)
-async def receive_sync_announce(
-    body: SyncAnnounceBody, sync: FlockSyncDep
-) -> None:
+async def receive_sync_announce(body: SyncAnnounceBody, sync: FlockSyncDep) -> None:
     """A peer flipped their sync flag for us — mirror it on our side so
     both UIs agree without waiting for a pull round. Only accepted from
     addresses that are already in our flock (same allowlist model as
@@ -428,9 +420,7 @@ async def receive_sync_announce(
 
 
 @router.post("/notify", status_code=204)
-async def receive_notify(
-    body: NotifyBody, sync: FlockSyncDep, flock: FlockDep
-) -> None:
+async def receive_notify(body: NotifyBody, sync: FlockSyncDep, flock: FlockDep) -> None:
     """Inbound push from a flock peer. For 'updated' we pull the content
     back from the sender and save it locally (skipping if our copy is
     newer). For 'deleted' we record a tombstone + drop our copy.

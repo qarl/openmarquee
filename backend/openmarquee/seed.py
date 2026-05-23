@@ -369,9 +369,11 @@ WELCOME_BG_COLOR = "#0A3D4A"
 # are expanded here into rapid sub-slide sequences with `cut`
 # transitions between them, per qarl's explicit greenlight.
 
+
 @dataclass(frozen=True)
 class _DemoLayer:
     """One TextLayer's worth of config for a demo reel frame."""
+
     text: str
     font_family: str | None = None
     text_color: str = "#FFFFFF"
@@ -397,6 +399,7 @@ class _DemoLayer:
 @dataclass(frozen=True)
 class _DemoFrame:
     """One slide in the demo reel."""
+
     name: str  # display name in the slide list (numbered for ordering)
     layers: tuple[_DemoLayer, ...]
     duration_ms: int = 1000
@@ -470,7 +473,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="wipe",
         transition_ms=600,
     ),
-
     # 2 · YOUR — Alfa Slab, mint green.
     _DemoFrame(
         name="02 · YOUR",
@@ -488,7 +490,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="slide",
         transition_ms=600,
     ),
-
     # 3 · SIGN — Bowlby, hot pink, breathing. qarl 2026-05-06 edits:
     # bumped duration 1600→2000 + breathe intensity 35→86 (more dramatic).
     _DemoFrame(
@@ -509,7 +510,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="fade",
         transition_ms=600,
     ),
-
     # 4 · THE SENTENCE — Playfair italic on cream. Mic-drop + a
     # left-aligned subtitle that uses word-wrap (B4) to flow across
     # multiple lines within its narrower box.
@@ -545,7 +545,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="cut",
         transition_ms=500,
     ),
-
     # 5 · LIBERATE — first synonym, dignified Playfair on cream.
     # Caption text_align=left so the // comment reads as code.
     _DemoFrame(
@@ -575,7 +574,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="push",
         transition_ms=600,
     ),
-
     # 6 · UNCAGE — Alfa Slab on amber→scarlet gradient, shaking.
     _DemoFrame(
         name="06 · Uncage!!",
@@ -617,7 +615,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="flip",
         transition_ms=600,
     ),
-
     # 7a · TYPO (broken) — confidently displayed mistake.
     _DemoFrame(
         name="07a · Typo (oops)",
@@ -643,7 +640,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="cut",  # internal cut to mid-fix
         transition_ms=500,
     ),
-
     # 7b · TYPO (mid-fix) — striking through SG, glow on insertion.
     _DemoFrame(
         name="07b · Typo (mid-fix)",
@@ -672,7 +668,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="cut",  # internal cut to fixed
         transition_ms=500,
     ),
-
     # 7c · TYPO (fixed) — clean, with green confirmation caption.
     _DemoFrame(
         name="07c · Typo (fixed)",
@@ -698,7 +693,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="shutter",
         transition_ms=600,
     ),
-
     # 8 · TILE CHAOS — 5 overlapping center-crossing layers, each with a
     # different font/color/motion/phase. Boxes are ~0.5×0.5 with off-grid
     # positions so they cross the center and read as chaos, not as a
@@ -774,7 +768,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="pixelate",
         transition_ms=600,
     ),
-
     # 9 · CHANT WALL — 5 ticker stripes. qarl 2026-05-06 editor pass:
     # duration 1700→2000ms; layers re-stacked with overlapping boxes
     # for a denser look + reduced font sizes per stripe.
@@ -784,25 +777,34 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         background_color="#050608",
         layers=(
             _DemoLayer(
-                text=_CHANT_TEXT, font_family="Bowlby One SC",
+                text=_CHANT_TEXT,
+                font_family="Bowlby One SC",
                 text_color="#FFB43C",
                 box=_b(0.048, 0.1261, 0.9, 0.16),
                 font_size_pct=8.0,
-                motion="ticker", motion_intensity=70, motion_phase=0.0,
+                motion="ticker",
+                motion_intensity=70,
+                motion_phase=0.0,
             ),
             _DemoLayer(
-                text=_CHANT_TEXT, font_family="Anton",
+                text=_CHANT_TEXT,
+                font_family="Anton",
                 text_color="#5AF095",
                 box=_b(0.0658, 0.0727, 0.9, 0.5574),
                 font_size_pct=15.0,
-                motion="ticker", motion_intensity=60, motion_phase=0.5,
+                motion="ticker",
+                motion_intensity=60,
+                motion_phase=0.5,
             ),
             _DemoLayer(
-                text=_CHANT_TEXT, font_family="Alfa Slab One",
+                text=_CHANT_TEXT,
+                font_family="Alfa Slab One",
                 text_color="#FF5FA7",
                 box=_b(0.0646, 0.3489, 0.9, 0.3293),
                 font_size_pct=8.5,
-                motion="ticker", motion_intensity=70, motion_phase=0.2,
+                motion="ticker",
+                motion_intensity=70,
+                motion_phase=0.2,
             ),
             _DemoLayer(
                 # qarl edit landed with one trailing space dropped on
@@ -812,7 +814,9 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#5FD5FF",
                 box=_b(0.0529, 0.4715, 0.9, 0.2852),
                 font_size_pct=10.0,
-                motion="ticker", motion_intensity=60, motion_phase=0.8,
+                motion="ticker",
+                motion_intensity=60,
+                motion_phase=0.8,
             ),
             _DemoLayer(
                 # qarl edit landed with no trailing space on this layer.
@@ -821,13 +825,14 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#FFFFFF",
                 box=_b(0.05, 0.5851, 0.9, 0.272),
                 font_size_pct=12.5,
-                motion="ticker", motion_intensity=80, motion_phase=0.3,
+                motion="ticker",
+                motion_intensity=80,
+                motion_phase=0.3,
             ),
         ),
         transition_out="marquee",
         transition_ms=600,
     ),
-
     # 10 · SCREAM — Anton ticker on rainbow gradient. qarl 2026-05-06
     # editor pass: duration 600→1000ms, ticker font size 40→11.5,
     # box stretched to fill more of the slide vertically.
@@ -856,7 +861,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="cut",
         transition_ms=500,
     ),
-
     # 11 · SILENCE — // signal lost, dying carrier on slow pulse.
     # motion_speed=0.5 for an ominous half-tempo heartbeat (B2).
     _DemoFrame(
@@ -879,7 +883,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="scanline",
         transition_ms=600,
     ),
-
     # 12 · STADIUM — typed line + ticker echo. Echo at 0.4 opacity for
     # ghost-trail feel; ticker at 1.4x speed for urgency.
     _DemoFrame(
@@ -921,7 +924,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="glitch",
         transition_ms=600,
     ),
-
     # 13a · PANIC FLASH (1/3) — Bowlby amber, shake max.
     _DemoFrame(
         name="13a · Panic 1",
@@ -941,7 +943,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="cut",
         transition_ms=500,
     ),
-
     # 13b · PANIC FLASH (2/3) — Alfa Slab pink, shake max.
     _DemoFrame(
         name="13b · Panic 2",
@@ -961,7 +962,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="cut",
         transition_ms=500,
     ),
-
     # 13c · PANIC FLASH (3/3) — Permanent Marker cyan, shake max.
     # Slightly longer hold so the iris-out has air to breathe.
     _DemoFrame(
@@ -983,7 +983,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="iris",
         transition_ms=600,
     ),
-
     # 14 · COOLDOWN — credits, slow blink "// loop · 1/∞" at 0.7
     # opacity for a fading-out vibe.
     _DemoFrame(
@@ -1023,7 +1022,6 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="scroll",  # to BOOT
         transition_ms=600,
     ),
-
     # 15 · BOOT — VT323 boot log + breathing status badge. Loop
     # transition Boot→FREE uses iris (qarl 2026-05-04: "iris was
     # the original Boot→FREE choice and still works").
@@ -1114,8 +1112,10 @@ def _seed_demo_reel_slides(
                 font_size_pct=layer.font_size_pct,
                 font_size_px=layer.font_size_px,
                 box=TextBox(
-                    x=layer.box[0], y=layer.box[1],
-                    w=layer.box[2], h=layer.box[3],
+                    x=layer.box[0],
+                    y=layer.box[1],
+                    w=layer.box[2],
+                    h=layer.box[3],
                 ),
                 motion=layer.motion,
                 motion_intensity=layer.motion_intensity,
@@ -1149,7 +1149,11 @@ def render_welcome_png(width: int, height: int) -> bytes:
 
 
 def _wrap_text_to_width(
-    text: str, draw, font, emoji_font, max_width: int,
+    text: str,
+    draw,
+    font,
+    emoji_font,
+    max_width: int,
 ) -> str:
     """Insert \\n at word boundaries so each line fits within
     `max_width`. Preserves any pre-existing literal \\n breaks.
@@ -1267,11 +1271,7 @@ def _draw_text_into(
     # the stroke color around each glyph BEFORE the foreground fill is
     # applied. Used by auto-mode layers for the readability outline
     # the prior compose_auto_frame baked in.
-    stroke_kwargs = (
-        {"stroke_width": 1, "stroke_fill": outline_color}
-        if outline_color
-        else {}
-    )
+    stroke_kwargs = {"stroke_width": 1, "stroke_fill": outline_color} if outline_color else {}
 
     # Fits inside the box on both axes — paint directly, no squish.
     if natural_w <= px_box_w and natural_h <= px_box_h:
@@ -1290,7 +1290,9 @@ def _draw_text_into(
             draw,
             (anchor_x, box_center_y - natural_h / 2 - bbox[1]),
             text,
-            fg=fg, font=font, emoji_font=emoji_font,
+            fg=fg,
+            font=font,
+            emoji_font=emoji_font,
             stroke_kwargs=stroke_kwargs,
             align=text_align,
         )
@@ -1317,13 +1319,13 @@ def _draw_text_into(
         td,
         (pad_pre_w - bbox[0], pad_pre_h - bbox[1]),
         text,
-        fg=fg, font=font, emoji_font=emoji_font,
+        fg=fg,
+        font=font,
+        emoji_font=emoji_font,
         stroke_kwargs=stroke_kwargs,
         align=text_align,
     )
-    squished = temp.resize(
-        (target_w + pad_post * 2, target_h + pad_post * 2), Image.LANCZOS
-    )
+    squished = temp.resize((target_w + pad_post * 2, target_h + pad_post * 2), Image.LANCZOS)
     paste_x = int(box_center_x - squished.width / 2)
     paste_y = int(box_center_y - squished.height / 2)
     img.paste(squished, (paste_x, paste_y), squished)
@@ -1484,6 +1486,7 @@ def _load_emoji_font(size_px: int):
     """
     try:
         from openmarquee.text_raster import bundled_fonts_dir, cached_truetype
+
         path = bundled_fonts_dir() / "noto-color-emoji.ttf"
         if not path.exists():
             return None
@@ -1531,8 +1534,14 @@ def _measure_text_runs(draw, text: str, font, emoji_font) -> tuple[int, int, int
 
 
 def _draw_text_runs(
-    draw, xy: tuple[float, float], text: str, *,
-    fg: str, font, emoji_font, stroke_kwargs: dict,
+    draw,
+    xy: tuple[float, float],
+    text: str,
+    *,
+    fg: str,
+    font,
+    emoji_font,
+    stroke_kwargs: dict,
     align: str = "center",
 ) -> None:
     """Render `text` at `xy` using emoji_font for emoji codepoints
@@ -1547,13 +1556,23 @@ def _draw_text_runs(
     pil_align = align if align in ("left", "center", "right") else "center"
     if emoji_font is None:
         draw.text(
-            xy, text, fill=fg, font=font, align=pil_align, **stroke_kwargs,
+            xy,
+            text,
+            fill=fg,
+            font=font,
+            align=pil_align,
+            **stroke_kwargs,
         )
         return
     runs = _segment_text_for_emoji(text)
     if all(kind == "text" for kind, _ in runs):
         draw.text(
-            xy, text, fill=fg, font=font, align=pil_align, **stroke_kwargs,
+            xy,
+            text,
+            fill=fg,
+            font=font,
+            align=pil_align,
+            **stroke_kwargs,
         )
         return
     cursor_x = float(xy[0])
@@ -1565,13 +1584,18 @@ def _draw_text_runs(
             # fill / stroke don't apply to color glyphs (the colors
             # are baked into the font's bitmap data), so we omit them.
             draw.text(
-                (cursor_x, cursor_y), run_text,
-                font=run_font, embedded_color=True,
+                (cursor_x, cursor_y),
+                run_text,
+                font=run_font,
+                embedded_color=True,
             )
         else:
             draw.text(
-                (cursor_x, cursor_y), run_text,
-                fill=fg, font=run_font, **stroke_kwargs,
+                (cursor_x, cursor_y),
+                run_text,
+                fill=fg,
+                font=run_font,
+                **stroke_kwargs,
             )
         # Advance by horizontal-advance width (not ink-bbox right edge)
         # so consecutive runs in different fonts don't visually touch
@@ -1588,6 +1612,7 @@ def _load_text_font(family: str | None, size_px: int):
         bundled_fonts_dir,
         cached_truetype,
     )
+
     if family:
         bundled_name = BUNDLED_FONT_FILES.get(family)
         if bundled_name:

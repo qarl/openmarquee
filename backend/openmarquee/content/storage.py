@@ -158,14 +158,22 @@ def render_stream_placeholder_png(slide: StreamSlide) -> bytes:
     )
 
     _draw_centered(
-        draw, "Stream", _placeholder_font(30), width, cy + radius + 26,
+        draw,
+        "Stream",
+        _placeholder_font(30),
+        width,
+        cy + radius + 26,
         (235, 235, 235),
     )
     url = slide.stream_url
     if len(url) > 54:
         url = url[:51] + "…"
     _draw_centered(
-        draw, url, _placeholder_font(18), width, cy + radius + 64,
+        draw,
+        url,
+        _placeholder_font(18),
+        width,
+        cy + radius + 64,
         (150, 150, 156),
     )
 
@@ -203,14 +211,22 @@ def render_web_placeholder_png(slide: WebSlide) -> bytes:
     )
 
     _draw_centered(
-        draw, "Web slide", _placeholder_font(30), width, cy + radius + 26,
+        draw,
+        "Web slide",
+        _placeholder_font(30),
+        width,
+        cy + radius + 26,
         (235, 235, 235),
     )
     url = slide.url
     if len(url) > 54:
         url = url[:51] + "…"
     _draw_centered(
-        draw, url, _placeholder_font(18), width, cy + radius + 64,
+        draw,
+        url,
+        _placeholder_font(18),
+        width,
+        cy + radius + 64,
         (150, 150, 156),
     )
 

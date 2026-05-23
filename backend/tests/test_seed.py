@@ -18,7 +18,6 @@ from openmarquee.seed import (
     seed_if_needed,
 )
 
-
 _FAKE_MP4 = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 120
 
 
@@ -58,12 +57,8 @@ def no_bundled_assets_by_default(tmp_path: Path, monkeypatch):
     empty_bg.mkdir()
     empty_vid = tmp_path / "auto-empty-videos"
     empty_vid.mkdir()
-    monkeypatch.setattr(
-        "openmarquee.seed._default_bundled_backgrounds_dir", lambda: empty_bg
-    )
-    monkeypatch.setattr(
-        "openmarquee.seed._default_bundled_videos_dir", lambda: empty_vid
-    )
+    monkeypatch.setattr("openmarquee.seed._default_bundled_backgrounds_dir", lambda: empty_bg)
+    monkeypatch.setattr("openmarquee.seed._default_bundled_videos_dir", lambda: empty_vid)
 
 
 def _write_sample_jpeg(path: Path, color=(100, 100, 100), size=(512, 512)) -> None:
@@ -127,8 +122,7 @@ def test_text_slide_renders_inside_box(tmp_path):
             else:
                 bottom_right += 1
     assert top_right > top_left + bottom_left + bottom_right, (
-        f"text bled out of box: tr={top_right} tl={top_left} "
-        f"bl={bottom_left} br={bottom_right}"
+        f"text bled out of box: tr={top_right} tl={top_left} bl={bottom_left} br={bottom_right}"
     )
 
 
@@ -213,7 +207,11 @@ def test_reel_intro_slides_use_qarl_specified_fonts(
     _DEMO_REEL spec list doesn't silently revert the intro typography."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
     text_slides = [s for s in created if s.type == "text_slide"]
-    intro = {s.text_layers[0].text: s for s in text_slides if s.text_layers[0].text in {"FREE", "YOUR", "SIGN"}}
+    intro = {
+        s.text_layers[0].text: s
+        for s in text_slides
+        if s.text_layers[0].text in {"FREE", "YOUR", "SIGN"}
+    }
     assert intro["FREE"].text_layers[0].font_family == "Anton"
     assert intro["YOUR"].text_layers[0].font_family == "Alfa Slab One"
     assert intro["SIGN"].text_layers[0].font_family == "Bowlby One SC"
@@ -436,9 +434,7 @@ def test_seed_registers_bundled_backgrounds_over_pillow_fallback(
     # samples -- doesn't trip the test. The bg_names + welcome
     # assertions are the load-bearing claims.)
     assert len(created) >= 8
-    bg_names = sorted(
-        s.name for s in created if s.name.endswith("— Background")
-    )
+    bg_names = sorted(s.name for s in created if s.name.endswith("— Background"))
     assert bg_names == ["Midnight — Background", "Parchment — Background"]
     # The default Demo playlist holds the full demo reel (reel slot
     # names are "NN · Label"); backgrounds are NOT auto-appended.
@@ -676,7 +672,8 @@ def test_seed_bundled_videos_derives_title_from_filename(
 
 
 def test_write_marker_rollback_on_replace_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """_write_marker uses the same tmp.write_text + tmp.replace
     atomic pattern as the 6 storage classes covered in Batch 9.2.
