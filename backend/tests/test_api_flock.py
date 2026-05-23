@@ -494,7 +494,7 @@ def test_hello_endpoint_skips_name_probe_for_known_peer(recording_client):
     gossips us about an existing peer in a 3+-device flock."""
     client, recorder, _ = recording_client
     # Override apply_hello to return False (already-known case).
-    recorder.apply_hello = lambda address: (recorder.hellos.append(address) or False)
+    recorder.apply_hello = lambda address: recorder.hellos.append(address) or False
     response = client.post("/api/flock/hello", json={"address": "known.ts.net"})
     assert response.status_code == 204
     assert recorder.hellos == ["known.ts.net"]
