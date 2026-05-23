@@ -276,9 +276,8 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
     # and delete the temp file in the `finally`. A NamedTemp is created
     # and immediately closed so Chromium (a separate process) owns the
     # path exclusively — we only need a unique filesystem path.
-    tmp = tempfile.NamedTemporaryFile(prefix="web-render-", suffix=".png", delete=False)
-    tmp.close()
-    screenshot_path = tmp.name
+    with tempfile.NamedTemporaryFile(prefix="web-render-", suffix=".png", delete=False) as tmp:
+        screenshot_path = tmp.name
 
     try:
         # Prefix nice so the multi-minute render yields CPU to the

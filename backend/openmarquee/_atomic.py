@@ -19,6 +19,7 @@ discipline automatically.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -44,10 +45,8 @@ def atomic_write_text(
         os.chmod(tmp, mode)
         tmp.replace(path)
     except Exception:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
-        except FileNotFoundError:
-            pass
         raise
 
 
@@ -66,8 +65,6 @@ def atomic_write_bytes(
         os.chmod(tmp, mode)
         tmp.replace(path)
     except Exception:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
-        except FileNotFoundError:
-            pass
         raise
