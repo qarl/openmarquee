@@ -62,11 +62,15 @@ production code path.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from openmarquee.content import validate_web_url
@@ -284,40 +288,62 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
         # playback renderer instead of stuttering the sign.
         argv = _nice_prefix() + _build_chromium_argv(chromium, url, width, height, screenshot_path)
         # --- Chromium headless: URL -> screenshot PNG ------------------
+        # `start_new_session=True` puts Chromium in its own session +
+        # process group (PGID == proc.pid), so we can kill the WHOLE
+        # group in the finally block — see _terminate_process_group's
+        # docstring for why a clean `proc.wait()` isn't enough on the
+        # Pi under chromium-headless-shell + --no-sandbox + Debian's
+        # /bin/sh wrapper. QA 2026-05-23: 8 helper procs persisted per
+        # spawn cycle on FYS, swap thrash → dashboard slowness.
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 argv,
-                capture_output=True,
-                timeout=WEB_RENDER_TIMEOUT_S,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            # `subprocess.run` already kills the child and reaps it on a
-            # TimeoutExpired before re-raising — so the process is not
-            # orphaned. Surface it as a typed, bounded failure.
-            raise WebRenderError(
-                f"Chromium render of {url} timed out after {WEB_RENDER_TIMEOUT_S:.0f}s"
-            ) from exc
         except OSError as exc:
             raise WebRenderError(f"failed to launch Chromium for {url}: {exc}") from exc
 
-        if proc.returncode != 0:
-            stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
-            # Keep the message single-line — the subprocess `main`
-            # prints it straight to stderr.
-            detail = stderr.splitlines()[-1] if stderr else "(no output)"
-            raise WebRenderError(f"Chromium exited {proc.returncode} rendering {url}: {detail}")
+        try:
+            try:
+                _stdout, _stderr = proc.communicate(timeout=WEB_RENDER_TIMEOUT_S)
+            except subprocess.TimeoutExpired as exc:
+                # The finally below tears down the whole process group;
+                # re-raise as the typed, bounded failure.
+                raise WebRenderError(
+                    f"Chromium render of {url} timed out after {WEB_RENDER_TIMEOUT_S:.0f}s"
+                ) from exc
 
-        # --- read + sanity-check Chromium's screenshot ----------------
-        shot = Path(screenshot_path)
-        if not shot.exists():
-            raise WebRenderError(f"Chromium produced no screenshot file for {url}")
-        render_png = shot.read_bytes()
-        if not render_png:
-            raise WebRenderError(f"Chromium produced an empty screenshot for {url}")
-        if not render_png.startswith(_PNG_MAGIC):
-            raise WebRenderError(f"Chromium screenshot for {url} is not a PNG")
+            returncode = proc.returncode
+            stderr_bytes = _stderr or b""
+            if returncode != 0:
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+                # Keep the message single-line — the subprocess `main`
+                # prints it straight to stderr.
+                detail = stderr_text.splitlines()[-1] if stderr_text else "(no output)"
+                raise WebRenderError(f"Chromium exited {returncode} rendering {url}: {detail}")
 
-        return render_png
+            # --- read + sanity-check Chromium's screenshot ------------
+            shot = Path(screenshot_path)
+            if not shot.exists():
+                raise WebRenderError(f"Chromium produced no screenshot file for {url}")
+            render_png = shot.read_bytes()
+            if not render_png:
+                raise WebRenderError(f"Chromium produced an empty screenshot for {url}")
+            if not render_png.startswith(_PNG_MAGIC):
+                raise WebRenderError(f"Chromium screenshot for {url} is not a PNG")
+
+            return render_png
+        finally:
+            # ALWAYS sweep the whole process group, including on the
+            # clean-exit path. chromium-headless-shell on Debian under
+            # --no-sandbox forks renderer / utility helpers that stay
+            # alive after the browser-parent exits (QA 2026-05-23: 8
+            # leaked procs / cycle on FYS, ~75 MB each in swap). On a
+            # clean exit the group is already empty and the first
+            # killpg ProcessLookupError's harmlessly — the common case.
+            _terminate_process_group(proc)
     finally:
         # Always clean up Chromium's temp output, success or failure.
         try:
@@ -327,6 +353,106 @@ def render_web_png(url: str, width: int, height: int) -> bytes:
                 "web-render: could not remove temp screenshot %s: %s",
                 screenshot_path,
                 exc,
+            )
+
+
+# Grace period between SIGTERM and SIGKILL on the process-group sweep.
+# Two seconds covers a healthy chromium honoring SIGTERM (sub-second on
+# the dev Pi) without spending forever waiting on a wedged group.
+_PROCESS_GROUP_TERM_GRACE_S = 2.0
+
+
+def _terminate_process_group(proc: subprocess.Popen) -> None:
+    """Kill the spawned process's whole process group (SIGTERM, then
+    SIGKILL after a grace period if anything survives), then reap the
+    immediate child.
+
+    The leak this addresses: chromium-headless-shell on Debian under
+    `--no-sandbox` forks renderer / utility / GPU helpers. When the
+    browser-parent exits cleanly, those helpers can detach and persist
+    as ALIVE (not zombie) processes — QA measured 8 leaked procs per
+    spawn cycle on FYS, each holding ~75 MB resident in swap, leading
+    to kswapd0 thrash and dashboard slowness after ~11 cycles.
+
+    `subprocess.run`'s reap-on-exit only handles the immediate child;
+    descendants in the same process group are left alone. `Popen` with
+    `start_new_session=True` puts the spawn in its own session + group
+    (PGID == proc.pid), so killpg here reaches every descendant in one
+    shot.
+
+    Idempotent + tolerant of the common case where the group is already
+    gone (clean chromium exit): the first SIGTERM ProcessLookupError's
+    and the function returns immediately.
+
+    Caller MUST have spawned proc with `start_new_session=True`.
+    """
+    pid = proc.pid
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # Group already empty — clean exit, the common case.
+        pass
+    except OSError as exc:  # pragma: no cover — defensive
+        log.warning(
+            "web-render: killpg(SIGTERM, pgid=%d) failed: %s",
+            pid,
+            exc,
+        )
+    else:
+        # SIGTERM landed on something — give the group up to
+        # _PROCESS_GROUP_TERM_GRACE_S to honor it before escalating.
+        deadline = time.monotonic() + _PROCESS_GROUP_TERM_GRACE_S
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)  # signal 0 = existence probe
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:  # pragma: no cover — defensive
+                log.warning(
+                    "web-render: killpg(SIGKILL, pgid=%d) failed: %s",
+                    pid,
+                    exc,
+                )
+
+    # Drain + close the stdout/stderr pipes. Per Python docs,
+    # `communicate()` is the documented safe-retry after a
+    # TimeoutExpired — it won't lose buffered output and closes the FDs
+    # so they don't leak. More importantly: chromium helpers in the
+    # process group inherited the same stdout/stderr write-ends; if
+    # they buffered to a full pipe before we killed them, they could
+    # block on write() and fail to honor SIGTERM cleanly, forcing the
+    # SIGKILL fallback. Draining here unblocks any such writers.
+    # ValueError if pipes were already closed (e.g. clean-exit path
+    # already drained inside the main try); TimeoutExpired caught by
+    # the wait() fallback below.
+    with contextlib.suppress(subprocess.TimeoutExpired, ValueError):
+        proc.communicate(timeout=2.0)
+
+    # Reap the immediate child so we don't leave a zombie. wait() is
+    # cheap once the process is gone; the 2s timeout is paranoia
+    # against an unkillable child (which should be impossible after
+    # SIGKILL above but doesn't hurt).
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:  # pragma: no cover — defensive
+        # Group-kill (not just proc.kill) for symmetry — proc.kill
+        # would only signal the immediate child, which we've already
+        # tried. If somehow that ProcessLookupError'd previously, retry
+        # killpg in case a new descendant appeared.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGKILL)
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "web-render: immediate child pid=%d would not reap",
+                pid,
             )
 
 
