@@ -38,7 +38,7 @@ post-Python-renderer retirement (Rust process owns the budget).
 | ------------------------------- | ---------- | ----- | -------- |
 | GBM scanout BOs (1080p RGBA)    | 8.3 MB     | 3     | 25 MB    |
 | Scene FBO renderbuffer (1080p)  | 8.3 MB     | 1     | 8 MB     |
-| Glyph atlas (text rasterizer)   | ~6 MB      | 1     | 6 MB     |
+| Glyph atlas (static + dynamic)† | ~6 MB      | 1     | 6 MB     |
 | Pattern texture cache           | ~0.3 MB    | 6     | 2 MB     |
 | Image-bg texture cache          | 8.3 MB     | ≤4    | ≤33 MB   |
 | Video decoder ring (720p H.264) | ~3 MB      | 4     | 12 MB    |
@@ -56,11 +56,24 @@ underlying libgbm pool may rotate 3-4 BOs internally; we hand back
 each prev BO to libgbm immediately after `drmModeRmFB`, so the
 high-water mark is bounded.
 
-Image-bg texture cache: `image_bg_cache: HashMap<PathBuf, ...>` in
-`EglSession`. **Currently unbounded — no eviction.** Bounded by
-playlist content-set size in practice (FYS reel has ≤4 distinct
-images). Tracked as a §6 risk; budget assumes ≤4 distinct images
-until the eviction policy lands.
+Image-bg texture cache: `image_bg_cache: LruMap<PathBuf, ...>` in
+`EglSession`. **LRU-evicted on insert at the §4 hard cap of 6
+entries** (eviction policy landed 2026-05-08; see §6 risk item #2
+for the full surface + cross-platform test set in
+`renderer/src/lru.rs`). The FYS reel runs with ≤4 distinct images
+in practice, so the hard cap of 6 sits as headroom over the
+typical working set rather than as a binding constraint.
+
+Glyph atlas (†): the `~6 MB` single-atlas figure predates the SDF
+arc and Bug 3. The text path now uses a build-time **static MSDF
+atlas** (`sdf_atlas_gl.rs`, RGB888, per-font) plus runtime **dynamic
+atlas page(s)** (`atlas_page.rs`, Bug 3 Slice 3B): an MSDF
+font-fallback page and a COLRv1 emoji page, each a 2048×2048 RGBA8
+GPU texture (~16 MB). Every dynamic page is bounded — a free-list +
+LRU eviction (Slice 3C; see §6.4) recycles cold cells rather than
+growing the texture. The `~6 MB` target therefore undercounts the
+current architecture; this row is flagged for re-measure (§7) once
+slice-12(b) instrumentation reports glyph-atlas actuals.
 
 ### 2b. Heap (Rust process malloc) — target ≤ 60 MB
 
@@ -224,10 +237,17 @@ lines, gate on:
    can require 4-deep DPB. Raising to 6-deep is +6 MB CMA. Item #8
    (c+) work re-evaluates this on real hardware decode.
 
-4. **Glyph atlas growth.** Atlas grows monotonically as new
-   characters render. Soak with a Lorem-Ipsum-like reel (high
-   character variance) is a future stress test; canonical FYS reel
-   has bounded character set so atlas saturates quickly.
+4. **Glyph atlas growth — BOUNDED, Bug 3 Slice 3C (2026-05-20).** The
+   dynamic glyph atlas (`renderer/src/atlas_page.rs`) is a fixed
+   2048×2048 page with a bump allocator backed by a free-list; it does
+   **not** grow monotonically. When a page fills, `GlyphCache`
+   (`renderer/src/glyph_cache.rs` — `evict_lru_ready`) evicts the
+   least-recently-used `Ready` glyph and `AtlasPage::free_slot`
+   recycles its cell. A high-character-variance reel exhausts the page
+   slot count (1764 MSDF / 441 COLR) and then recycles cold cells
+   instead of wedging or growing; an evicted glyph needed again is a
+   plain cache miss. The canonical FYS reel has a bounded character
+   set and saturates well under capacity.
 
 5. **Mesa userspace state under shader churn.** Each shader
    compile + program object adds to Mesa's internal state. The
@@ -246,6 +266,9 @@ the budgets when:
   §6 #1).
 - Resolution targets change (revises every line item — currently
   1080p frozen per §11).
+- The SDF arc + Bug 3 dynamic glyph atlas have landed (build-time
+  static MSDF atlas + runtime dynamic MSDF/COLR pages, LRU-evicted) —
+  the §2a glyph-atlas row needs a re-measure.
 - Soak measurements (slice 12c) come back outside the §2d totals.
 
 The instrumentation slice (12b) is what tells us whether the budget

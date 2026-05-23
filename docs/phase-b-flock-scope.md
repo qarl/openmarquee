@@ -135,7 +135,21 @@ Could ship as: a `/api/flock/{peer_id}/diff` endpoint that returns
 local content storage. UI consumes it on render. Renders "N items
 behind" badge on peer cards when nonzero.
 
-### B.5 — Tailscale magicDNS auto-discovery (PENDING qarl input) {#b5}
+### B.5 — Tailscale magicDNS auto-discovery (✅ SHIPPED 2026-04-29) {#b5}
+
+**Update 2026-05-22:** shipped end-to-end as
+`GET /api/flock/discover` (`backend/openmarquee/api_flock.py:276`)
+— shells out to `tailscale status --json`, returns every online
+Tailnet peer as a candidate, cross-references already-added peers,
+and falls back to empty candidates when the `tailscale` binary
+isn't on PATH or the call errors. The Add Peer modal renders the
+candidate list inline with click-to-populate (frontend in
+`ui/src/flock.js`). The per-candidate openMarquee-marker probe
+discussed in the decision points below is still an open
+`TODO(qarl-confirm)` in the route — every online Tailnet peer
+shows up in the candidate list today, regardless of software.
+The decision-record below captures the options weighed and the
+path taken; "Could ship as" at the bottom describes what did ship.
 
 §13's third Phase B item. Today's UX: operator manually types the
 peer's tailnet address into the "Add Peer" modal. Phase B can
@@ -187,15 +201,15 @@ Add Peer modal calls it on open and renders the list inline.
 
 - **B.4 gossip-on-add live-fire verification** — the protocol is
   fully shipped per §13 (a05184b); a single-backend demo can't
-  exercise multi-peer round-trips. Real verification waits for
-  Phase 6 hardware so two+ devices on a Tailnet can be observed
-  reciprocally adding each other.
-- **B.5 magicDNS auto-discovery** — bigger scope, Tailscale-binary-
-  dependent. Could ship as a draft via the same TODO(qarl-confirm)
-  pattern B.3 used: shell-out to `tailscale status --json`, return
-  candidates with an `is_openmarquee` filter probe, dev-fallback
-  to empty list. Implementation possible without Phase 6; live-
-  fire verification waits for it.
+  exercise multi-peer round-trips. Real verification needs two
+  devices on the same Tailnet — hardware-ready since the Phase 6
+  HDMI bring-up landed 2026-05-01, just not yet exercised at the
+  multi-peer level.
+- **B.5 magicDNS auto-discovery** — ✅ SHIPPED 2026-04-29 via
+  `GET /api/flock/discover` (`api_flock.py:276`) +
+  `flock.js` Add Peer modal candidate list. Live-fire multi-peer
+  verification on a real Tailnet shares the same outstanding
+  item as B.4 above.
 
 ## Where this doc lives
 

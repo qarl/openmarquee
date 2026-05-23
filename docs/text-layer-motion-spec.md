@@ -1,6 +1,6 @@
 # Text-Layer Motion Spec
 
-**Status:** shipped — see [`motion.py`](../backend/openmarquee/motion.py) (motion effects + compose_motion_frame; sweep #2 perf work in Batch 8.4 added the scratch buffer pool).
+**Status:** shipped — implemented in the Rust render path. Per-effect functions live in [`renderer/src/hdmi_logic.rs`](../renderer/src/hdmi_logic.rs) (`motion_ticker`, `motion_breathe`, `motion_pulse`, `motion_bounce`, `motion_shake`, `motion_blink`); the schema lives in `backend/openmarquee/content/__init__.py` (`motion` / `motion_intensity` / `motion_phase` / `motion_speed` on `TextLayer`, plus the `_migrate_legacy_motion` validator that renames the legacy `"scroll"` value to `"ticker"`). The PIL-era Python `motion.py` was deleted in the DELETE-PIL purge (commit `f720019`, 2026-05-17). This spec remains the math contract the Rust implementation honors.
 
 Drafted 2026-05-02 after the
 DRM/KMS rewrite (commit chain fc433dc → a55a215) collapsed the

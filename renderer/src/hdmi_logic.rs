@@ -9877,6 +9877,229 @@ mod tests {
         );
     }
 
+    /// Regression-lock for the motion-phase-discontinuity-at-transition-
+    /// boundaries fix — three commits, 2026-05-09 → 2026-05-16:
+    /// `7417ae0` (session-global tick_seconds basis), `413efca` (extend
+    /// the fix to the IPC sidecar PaintSlide path), and `fff3ab8`
+    /// (Phase 4v-3b motion through IPC PaintTransition path). Backlog
+    /// item #2; recon at `docs/motion-phase-discontinuity-recon.md`.
+    ///
+    /// The fix plumbs `session.motion_tick_seconds()` (a session-global
+    /// monotonic basis that never resets within the session's lifetime)
+    /// into every in-session + IPC render path that previously held a
+    /// call-local clock or a static-snapshot bake. Pre-fix: each render
+    /// call computed its own `Instant::now()` snapshot, so the
+    /// `sin(2*pi*freq*tick + phase)` motion math snapped phase at every
+    /// hold↔transition boundary (`tick` reset to ~0 at the boundary
+    /// crossing).
+    ///
+    /// Like the black-flash fix above, this bug is *silent* — no panic,
+    /// no test failure; the only symptom is a visible phase jump on
+    /// glass at boundary crossings. The existing
+    /// `legacy_3pass_transition_re_bakes_animated_layers_per_frame`
+    /// test locks the per-frame re-bake gate + loop shape, but NOT the
+    /// timing basis — a refactor that reverts one of the 7+ call sites
+    /// to a call-local clock would pass that test while re-breaking
+    /// motion-phase continuity.
+    ///
+    /// This source-grep test locks two invariants in `hdmi.rs`:
+    ///
+    /// - Affirmative: `motion_tick_seconds(` appears ≥7 times — at
+    ///   least 1 definition (L5212) + 6 callers across the in-session
+    ///   render path (L1482, L7442, L7916, L8358) and the IPC sidecar
+    ///   path (L2940, L3738). Plus 3 doc-comment mentions today, which
+    ///   are bonus headroom but not load-bearing for the floor.
+    ///
+    /// - Anti-pattern: no CODE line may contain both `tick_seconds` AND
+    ///   `Instant::now()`. That combination on a single statement is
+    ///   the pre-fix bug pattern (`let tick_seconds = ... Instant::now()
+    ///   ...`). `Instant::now()` for perf timing alone is fine — the
+    ///   bug is specifically deriving the motion tick from a call-local
+    ///   clock. Comments are stripped (`//`-onward of each line) so the
+    ///   anti-pattern check ignores narration inside `///` doc-comments.
+    ///
+    /// Recon citation: `docs/motion-phase-discontinuity-recon.md` §4
+    /// line 94 (sketches a synthetic boundary-continuity assertion as
+    /// the secondary verify; this source-grep is the discipline-side
+    /// regression lock that the recon noted would be a useful sibling).
+    /// Authoritative call-site list:
+    /// `qa/captures/motion-through-transitions-audit-2026-05-16.md`.
+    ///
+    /// Same caveats as the black-flash test above: a benign string
+    /// refactor (renaming `motion_tick_seconds`, restructuring how
+    /// `tick_seconds` gets named, etc.) will legitimately trip this —
+    /// update the assertion + the recon doc cross-ref when it does;
+    /// don't silently delete the test.
+    #[test]
+    fn motion_tick_seconds_is_session_global_not_call_local() {
+        let hdmi_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hdmi.rs");
+        let source = std::fs::read_to_string(&hdmi_path).unwrap_or_else(|e| {
+            panic!(
+                "must read {} for motion-phase regression check: {e}",
+                hdmi_path.display(),
+            )
+        });
+
+        // ---- Affirmative invariant ----
+        //
+        // `motion_tick_seconds(` must appear at least 7 times in
+        // hdmi.rs: 1 definition + 6 call sites (4 in-session + 2 IPC
+        // sidecar). Drop below 7 and at least one render path is no
+        // longer pulling from the session-global tick; motion phase
+        // snaps at the boundary that site governs (visible only on
+        // glass).
+        let matches = source.matches("motion_tick_seconds(").count();
+        assert!(
+            matches >= 7,
+            "expected ≥7 occurrences of `motion_tick_seconds(` in \
+             renderer/src/hdmi.rs (1 defn + 6 call sites across the \
+             in-session render path L1482/L7442/L7916/L8358 + the IPC \
+             sidecar path L2940/L3738); found {matches}. A refactor \
+             likely reverted at least one site to a call-local clock; \
+             motion phase will snap at the boundary that site governs. \
+             Recon: docs/motion-phase-discontinuity-recon.md §4 line 94. \
+             Authoritative call-site list: \
+             qa/captures/motion-through-transitions-audit-2026-05-16.md.",
+        );
+
+        // ---- Anti-pattern invariant ----
+        //
+        // No CODE line in hdmi.rs may contain both `tick_seconds` AND
+        // `Instant::now()` — that combination on the same statement is
+        // the pre-fix bug pattern. `Instant::now()` ALONE is fine (it's
+        // legitimately used elsewhere for perf timing); the bug is
+        // specifically using it to *derive* tick_seconds.
+        //
+        // Comments are stripped before checking so narrative inside
+        // `///` doc-comments doesn't spuriously trip the assertion.
+        let mut anti_pattern_lines: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in source.lines().enumerate() {
+            let code = match line.find("//") {
+                Some(cmt) => &line[..cmt],
+                None => line,
+            };
+            if code.contains("tick_seconds") && code.contains("Instant::now()") {
+                anti_pattern_lines.push((idx + 1, line.trim().to_string()));
+            }
+        }
+        assert!(
+            anti_pattern_lines.is_empty(),
+            "tick_seconds must derive from session.motion_tick_seconds() — \
+             a session-global monotonic basis — NOT from a call-local \
+             Instant::now() snapshot. Mixing both names on a single CODE \
+             line is the pre-fix anti-pattern that snapped motion phase \
+             at every hold↔transition boundary. Offending line(s): {:?}. \
+             Recon: docs/motion-phase-discontinuity-recon.md §4 line 94.",
+            anti_pattern_lines,
+        );
+    }
+
+    /// Regression-lock for the black-flash-at-transition-boundaries fix
+    /// (commit `7c605cce`, 2026-05-09 — backlog item #3).
+    ///
+    /// The fix introduced `held_scanout_fb` / `held_scanout_bo` on
+    /// `EglSession` plus a single `end_of_in_session_render_call` helper
+    /// that all 5 in-session render entry points call at end-of-call,
+    /// so the scanout framebuffer is held across in-session call
+    /// boundaries and `modeset_done` stays TRUE for the session's
+    /// lifetime after the first SetCrtc. Pre-fix: SetCrtc re-fired
+    /// 35/4000 frames at 1920×1080@60 on the vc4 (the Pi-bench in the
+    /// commit message). Post-fix: 1 fire per session (the bring-up).
+    ///
+    /// The bug is *silent* — no panic, no test failure, the symptom is
+    /// only visible on glass as a one-frame black flash at every
+    /// hold↔transition boundary. A refactor that drops the helper call
+    /// from one of the 5 in-session entry points, OR re-introduces
+    /// `modeset_done = false` anywhere post-session-init, would
+    /// reintroduce the bug without `cargo test` catching it. This is
+    /// the source-grep fence the recon doc anticipated.
+    ///
+    /// See `docs/black-flash-at-transition-boundaries-recon.md` §4
+    /// lines 162-170 for the sketched assertion + rationale.
+    ///
+    /// Like the `legacy_3pass_transition_re_bakes_*` test above, this
+    /// is a structural-grep test rather than a behavioral one because
+    /// the GL-scanout + SetCrtc state is un-mockable. A benign string
+    /// refactor (renaming the helper, rewording the struct-init in a
+    /// way that changes the grep-matched substring) will legitimately
+    /// trip this — fix the assertion + the recon doc cross-ref when
+    /// that happens; don't silently delete the test.
+    #[test]
+    fn black_flash_fix_structural_invariants_hold_across_in_session_boundaries() {
+        let hdmi_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hdmi.rs");
+        let source = std::fs::read_to_string(&hdmi_path).unwrap_or_else(|e| {
+            panic!(
+                "must read {} for black-flash regression check: {e}",
+                hdmi_path.display(),
+            )
+        });
+
+        // ---- Affirmative invariant ----
+        //
+        // `end_of_in_session_render_call(` must appear at least 6 times
+        // in hdmi.rs: 1 definition + 5 in-session render-entry-point
+        // callers (per the recon's audit at §4 lines 162-170, verified
+        // at HEAD against the live source 2026-05-22). Drop below 6 and
+        // at least one in-session path is no longer threading the
+        // end-of-call cleanup; the next call into that path will
+        // re-fire SetCrtc (visible as a one-frame black flash on glass).
+        let helper_matches = source.matches("end_of_in_session_render_call(").count();
+        assert!(
+            helper_matches >= 6,
+            "expected ≥6 occurrences of `end_of_in_session_render_call(` \
+             in renderer/src/hdmi.rs (1 defn + 5 in-session callers); \
+             found {helper_matches}. A refactor likely dropped the helper \
+             call from at least one of the 5 in-session render entry \
+             points; the scanout framebuffer is no longer held across \
+             that path's call boundary; SetCrtc will re-fire on the next \
+             in-session render call into the unwired path; visible black \
+             flash regression on glass. Re-thread the helper at every \
+             entry point, OR update this lower bound if the entry-point \
+             set legitimately changed (the recon doc's call-site list at \
+             docs/black-flash-at-transition-boundaries-recon.md §4 \
+             lines 162-170 is authoritative).",
+        );
+
+        // ---- Anti-pattern invariant ----
+        //
+        // `modeset_done = false` must NEVER appear as a CODE statement
+        // (only as the `modeset_done: false` struct-init at session
+        // creation, which uses `:` not `=`, and possibly as a substring
+        // inside doc-comments narrating the OLD bug). Re-introducing the
+        // assignment would force the next in-session render call to
+        // take the SetCrtc-fires-again path; visible black flash.
+        //
+        // We strip `//`-style line comments before checking so the
+        // narration on hdmi.rs:1097 ("/// resetting modeset_done =
+        // false (which forced the NEXT call's …") doesn't spuriously
+        // trip the assertion.
+        let mut anti_pattern_lines: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in source.lines().enumerate() {
+            let code = match line.find("//") {
+                Some(cmt) => &line[..cmt],
+                None => line,
+            };
+            if code.contains("modeset_done = false") {
+                anti_pattern_lines.push((idx + 1, line.trim().to_string()));
+            }
+        }
+        assert!(
+            anti_pattern_lines.is_empty(),
+            "modeset_done must NEVER be reset to false post-session-init \
+             (the struct-init at session creation uses `:`, not `=`, so it \
+             does NOT match `modeset_done = false`). A reset re-enables \
+             the SetCrtc-fires-again path; visible black flash at the \
+             next in-session render call. Offending line(s): {:?}. \
+             Recon: docs/black-flash-at-transition-boundaries-recon.md \
+             §4 lines 162-170.",
+            anti_pattern_lines,
+        );
+    }
+
     // wrap_text_to_width — 2026-05-17 port of the JS+Python helpers.
     // Each test pins one branch of the greedy line-fill algorithm; the
     // max_width is computed from the actual rasterized advance widths

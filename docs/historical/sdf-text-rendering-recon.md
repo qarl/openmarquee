@@ -1,5 +1,40 @@
 # SDF Text Rendering + Emoji — Recon
 
+> **STATUS — HISTORICAL (moved here 2026-05-22).** This recon was
+> authored 2026-05-17 *before* the SDF + emoji impl arcs dispatched.
+> Both arcs have since shipped end-to-end:
+>
+> - **SDF arc (slices A–E)** landed 2026-05-17/18, ending with the
+>   FYS Pi deploy in commit `6251a9e` ("RENDERER SDF E (deploy): SDF
+>   arc shipped to FYS Pi, font-clamp bug RESOLVED"). The
+>   font-clamp bug this recon set out to fix is gone by construction
+>   in the shipped MSDF pipeline.
+> - **Emoji arc (Bug 3 Slices 3A.rev → 3D)** landed 2026-05-19/20.
+>   The shipped path is **runtime COLRv1 vector emoji via
+>   `skrifa` + `tiny-skia`** (`renderer/src/glyph_cache_colr.rs`,
+>   commits `5ce026a` / `5ce12a4` / `2893289`), NOT the parallel
+>   CBDT color-bitmap atlas this recon's §9 + Slice C plan
+>   described. The recon's "Open assumption flag #8: No COLRv1
+>   support" was the explicit override point; qarl approved
+>   skrifa + tiny-skia once swash 0.2.7 turned out to be COLRv0-only.
+> - **LRU eviction** for the dynamic atlas pages landed in Bug 3
+>   Slice 3C (`c9ca378`, 2026-05-20) — see the (still-current)
+>   `docs/renderer-memory-budget.md` §6.4.
+>
+> Read this doc for the *pre-implementation reasoning*: the
+> alternatives considered (single-channel SDF, fontsdf, `fwidth()`
+> precision math, CBDT bake), the rejected paths, the assumption
+> flags that became override points. For the *production
+> architecture*, read the canonical SYSTEM_SPEC §5.10a (outer-repo)
+> + `docs/renderer-memory-budget.md` + the renderer source under
+> `renderer/src/sdf_atlas*.rs`, `glyph_cache*.rs`, `atlas_page.rs`.
+>
+> The doc's §9 (Emoji color-bitmap parallel atlas) + Slice C
+> (CBDT extraction) describe the pre-impl plan, which was
+> superseded mid-arc by the COLRv1 pivot. They are kept as the
+> decision-record artifact for the architectural choice that
+> didn't ship.
+
 *Recon doc, 2026-05-17. Authored at the close of the DELETE-PIL arc, before the SDF impl arc dispatches. Scope: lay out the implementation surface, identify load-bearing measurement questions, and propose a sliced impl plan that QA + qarl can dispatch against.*
 
 The pain this arc fixes: text rendering in the Rust renderer rasterizes each glyph at the requested font size into a per-layer alpha bitmap (no shared atlas). The bitmap is hard-capped at 2048×2048 to fit vc4's `GL_MAX_TEXTURE_SIZE`, and large slides (1000+ px text on 1080p) hit `clamp_size_px_to_bitmap_cap()` and silently shrink — the "font-clamp bug." Plus: zero emoji support in Rust; the browser + the (Python-side, seed-only) raster paths both render emoji via Noto Color Emoji fallback, and the Rust path does not.
@@ -227,7 +262,7 @@ The outline width is in *SDF distance units*, which means it stays visually cons
 **Assumption flags:**
 
 - "Noto Color Emoji ships at 128×128 CBDT" — I'm citing from memory of the Noto repo; should be verified at build time when the build.rs step runs `ttf-parser` on the actual TTF file.
-- COLRv1 not yet supported in Rust — accepting this for v1; revisit in 6 months if cosmic-text catches up.
+- ~~COLRv1 not yet supported in Rust — accepting this for v1; revisit in 6 months if cosmic-text catches up.~~ **RESOLVED — Bug 3 Slice 3A–3D (2026-05-19/20):** runtime COLRv1 emoji landed via `skrifa` + `tiny-skia` (see consolidated assumption flag #8).
 - The "downscale CBDT to 96×96 at bake" loses some emoji fidelity. If qarl wants edge-perfect emoji we can use the full 128×128 atlas tile (still fits 256 tiles in 2048² = 65k cells; emoji codepoint count is ~3500 unique = fits comfortably at 128×128 in a single 2048² atlas at 256 tiles per row × 16 rows = need 14 rows for 3500 emoji).
 
 ---
@@ -313,6 +348,6 @@ Per `[[feedback_make_best_guess_on_broad_mandates]]`, the recon makes best-guess
 5. **MSDF crate = `msdfgen` (C++ FFI)** (§2). Best-tested option. Override = `fontsdf` pure-Rust + accept single-channel limits.
 6. **Build-time atlas baking** (§8). Mapbox/Three.js/Bevy pattern; avoids cold-start cost. Override = runtime regen + disk cache.
 7. **Emoji at 96×96 atlas tile** (§9). Downscaled from Noto's 128×128 CBDT. Override = 128×128 (still fits comfortably).
-8. **No COLRv1 support** (§9). cosmic-text doesn't ship it yet. Override = block on Rust ecosystem catching up.
+8. ~~**No COLRv1 support** (§9). cosmic-text doesn't ship it yet. Override = block on Rust ecosystem catching up.~~ **RESOLVED — Bug 3 Slice 3A–3D (2026-05-19/20):** overridden. Runtime COLRv1 vector emoji landed via `skrifa` + `tiny-skia` (not cosmic-text) — commits `5ce026a` (3A.rev) / `5ce12a4` (3B) / `2893289` (3D). See `renderer/src/glyph_cache_colr.rs`.
 
 All eight are reversible mid-arc. None are load-bearing on the slice ordering — change them between slices A and B if qarl pushes back during the dispatch cycle.
