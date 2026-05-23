@@ -73,6 +73,124 @@ printf 'disable_splash=1\n' > "$TMP/c5.txt"
 patch_config_txt "$TMP/c5.txt" >/dev/null
 check "pre-set disable_splash untouched" "1" "$(grep -c 'disable_splash=1' "$TMP/c5.txt")"
 
+# ── strip_cmdline_token (mitigation #5, 2026-05-23) ─────────────────
+# Strips a single named kernel param token from cmdline.txt. Used to
+# remove the base Pi OS `cgroup_disable=memory` flag so kernel PSI /
+# cgroup memory accounting becomes available.
+
+# Token in MIDDLE of line — stripped + surrounding tokens preserved +
+# single line.
+printf 'foo bar cgroup_disable=memory baz quux\n' > "$TMP/s1.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s1.txt" >/dev/null
+check "s1: one line after strip" "1" "$(wc -l < "$TMP/s1.txt" | tr -d ' ')"
+check "s1: target token stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/s1.txt")"
+grep -qw foo  "$TMP/s1.txt" && ok "s1: foo preserved"  || bad "s1: foo lost"
+grep -qw bar  "$TMP/s1.txt" && ok "s1: bar preserved"  || bad "s1: bar lost"
+grep -qw baz  "$TMP/s1.txt" && ok "s1: baz preserved"  || bad "s1: baz lost"
+grep -qw quux "$TMP/s1.txt" && ok "s1: quux preserved" || bad "s1: quux lost"
+
+# Token at LINE-START — stripped + rest preserved.
+printf 'cgroup_disable=memory foo bar baz\n' > "$TMP/s2.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s2.txt" >/dev/null
+check "s2: target token stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/s2.txt")"
+# After stripping a leading token, the result must NOT have a leading
+# space (the awk re-join handles this; this fence catches a refactor
+# that broke that property).
+grep -q '^cgroup_disable=memory' "$TMP/s2.txt" && bad "s2: leading token still present" \
+    || ok "s2: leading token removed"
+grep -q '^ ' "$TMP/s2.txt" && bad "s2: leading space remained" || ok "s2: no leading space"
+grep -qw foo "$TMP/s2.txt" && ok "s2: foo preserved" || bad "s2: foo lost"
+
+# Token at LINE-END — stripped + rest preserved + no trailing space.
+printf 'foo bar baz cgroup_disable=memory\n' > "$TMP/s3.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s3.txt" >/dev/null
+check "s3: target token stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/s3.txt")"
+# Trailing space before the newline would be a refactor smell — the
+# printf '%s\n' "$stripped" path should never leave one.
+grep -q ' $' "$TMP/s3.txt" && bad "s3: trailing space remained" || ok "s3: no trailing space"
+grep -qw baz "$TMP/s3.txt" && ok "s3: baz preserved" || bad "s3: baz lost"
+
+# Token ABSENT — no-op, file unchanged, exit 0.
+printf 'foo bar baz\n' > "$TMP/s4.txt"
+before_s4="$(cat "$TMP/s4.txt")"
+if strip_cmdline_token "cgroup_disable=memory" "$TMP/s4.txt" >/dev/null; then
+    ok "s4: absent-token exits 0"
+else
+    bad "s4: absent-token did not exit 0"
+fi
+after_s4="$(cat "$TMP/s4.txt")"
+check "s4: file unchanged" "$before_s4" "$after_s4"
+
+# Token appears TWICE (paranoid — real cmdline.txt won't, but the
+# helper must be safe) — both occurrences stripped.
+printf 'a cgroup_disable=memory b cgroup_disable=memory c\n' > "$TMP/s5.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s5.txt" >/dev/null
+check "s5: both occurrences stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/s5.txt")"
+grep -qw a "$TMP/s5.txt" && ok "s5: a preserved" || bad "s5: a lost"
+grep -qw b "$TMP/s5.txt" && ok "s5: b preserved" || bad "s5: b lost"
+grep -qw c "$TMP/s5.txt" && ok "s5: c preserved" || bad "s5: c lost"
+
+# Substring-prefix collision: `cgroup_disable=memory_zone` MUST NOT
+# be stripped when the target is `cgroup_disable=memory`. awk field
+# comparison is the safety; a regex-/sed-based refactor would burn
+# here.
+printf 'foo cgroup_disable=memory_zone bar cgroup_disable=memory baz\n' > "$TMP/s6.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s6.txt" >/dev/null
+grep -qw 'cgroup_disable=memory_zone' "$TMP/s6.txt" \
+    && ok "s6: substring-prefix collision preserved" \
+    || bad "s6: substring-prefix collision wrongly stripped"
+check "s6: exact-match token stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/s6.txt")"
+
+# Multiple spaces between tokens — collapsed to single space (mirrors
+# patch_cmdline_txt's normalization).
+printf 'foo   bar    cgroup_disable=memory    baz\n' > "$TMP/s7.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s7.txt" >/dev/null
+check "s7: target token stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/s7.txt")"
+grep -q '  ' "$TMP/s7.txt" && bad "s7: double-space remained" || ok "s7: spaces collapsed"
+
+# Idempotency — second run is a no-op, file identical to first-run
+# output, exit 0.
+printf 'foo cgroup_disable=memory bar\n' > "$TMP/s8.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s8.txt" >/dev/null
+after_first="$(cat "$TMP/s8.txt")"
+if strip_cmdline_token "cgroup_disable=memory" "$TMP/s8.txt" >/dev/null; then
+    ok "s8: second run exits 0 (idempotent)"
+else
+    bad "s8: second run did not exit 0"
+fi
+after_second="$(cat "$TMP/s8.txt")"
+check "s8: second run yields identical file" "$after_first" "$after_second"
+
+# Empty file refused — same safety as patch_cmdline_txt.
+: > "$TMP/s9.txt"
+if strip_cmdline_token "cgroup_disable=memory" "$TMP/s9.txt" >/dev/null 2>&1; then
+    bad "s9: empty file should be refused"
+else
+    ok "s9: empty file refused"
+fi
+
+# CR/LF input is collapsed to a single line (mirrors patch_cmdline_txt's
+# c3 test — symmetry guard so the two helpers don't diverge on the
+# tr '\r\n' '  ' normalization in future refactors).
+printf 'foo\r\ncgroup_disable=memory\r\nbar\r\n' > "$TMP/s11.txt"
+strip_cmdline_token "cgroup_disable=memory" "$TMP/s11.txt" >/dev/null
+check "s11: CR/LF input -> one line" "1" "$(wc -l < "$TMP/s11.txt" | tr -d ' ')"
+check "s11: target token stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/s11.txt")"
+grep -q 'foo bar' "$TMP/s11.txt" && ok "s11: surrounding tokens re-joined" \
+    || bad "s11: surrounding tokens not re-joined"
+
+# Single-token file: stripping the only token would empty the file.
+# Refused (a kernel without `root=` etc. bricks boot).
+printf 'cgroup_disable=memory\n' > "$TMP/s10.txt"
+before_s10="$(cat "$TMP/s10.txt")"
+if strip_cmdline_token "cgroup_disable=memory" "$TMP/s10.txt" >/dev/null 2>&1; then
+    bad "s10: would-be-empty result should be refused"
+else
+    ok "s10: would-be-empty result refused"
+fi
+after_s10="$(cat "$TMP/s10.txt")"
+check "s10: file untouched on refusal" "$before_s10" "$after_s10"
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL PASS"
 else

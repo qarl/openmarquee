@@ -36,3 +36,8 @@ echo "02-run.sh: patching boot config in ${boot_dir}"
 
 patch_config_txt  "${boot_dir}/config.txt"
 patch_cmdline_txt "${boot_dir}/cmdline.txt"
+# Postmortem mitigation #5 (2026-05-23): the base Pi OS image
+# carries `cgroup_disable=memory` in cmdline.txt, which suppresses
+# kernel PSI/cgroup memory accounting + blocks systemd-OOMD
+# policies. Strip it so we get memory-pressure telemetry.
+strip_cmdline_token "cgroup_disable=memory" "${boot_dir}/cmdline.txt"

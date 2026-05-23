@@ -62,3 +62,57 @@ patch_cmdline_txt() {
     printf '%s %s\n' "$current" "$add" > "$file"
     echo "cmdline.txt: appended '$add'"
 }
+
+# Strip a single named kernel param token from cmdline.txt, IN PLACE.
+#
+# Same DANGER as patch_cmdline_txt — cmdline.txt is a SINGLE line and
+# a stray newline silently drops every param after it. This function:
+#   - reads the whole file and re-joins any spanned lines to one,
+#   - splits the line on whitespace + drops EXACT-MATCH fields (awk
+#     field comparison, NOT regex/sed substring match — so a token
+#     `cgroup_disable=memory` does NOT also strip `cgroup_disable=
+#     memory_zone` or similar substring-prefix collisions),
+#   - writes the result back with exactly ONE trailing newline,
+#   - refuses to write an EMPTY file (a cmdline.txt without `root=`
+#     bricks boot, recoverable only by physical reflash),
+#   - is idempotent: a re-run when the token is already absent
+#     short-circuits as a no-op with a clear log line.
+#
+# Used by postmortem mitigation #5 (2026-05-23) to remove the base
+# Pi OS `cgroup_disable=memory` flag, which suppresses kernel PSI /
+# cgroup memory accounting and blocks systemd-OOMD policies — the
+# substrate for sustained-memory-pressure failure modes.
+strip_cmdline_token() {
+    local token="$1"
+    local file="$2"
+    if [ ! -f "$file" ]; then
+        echo "strip_cmdline_token: $file not found" >&2
+        return 1
+    fi
+    local current
+    current="$(tr '\r\n' '  ' < "$file" | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')"
+    if [ -z "$current" ]; then
+        echo "strip_cmdline_token: $file is empty — refusing to patch" >&2
+        return 1
+    fi
+    local stripped
+    stripped="$(printf '%s\n' "$current" | awk -v t="$token" '{
+        out=""
+        for (i=1; i<=NF; i++) {
+            if ($i != t) {
+                if (out=="") out=$i; else out=out" "$i
+            }
+        }
+        print out
+    }')"
+    if [ "$stripped" = "$current" ]; then
+        echo "cmdline.txt: '$token' not present — no-op"
+        return 0
+    fi
+    if [ -z "$stripped" ]; then
+        echo "strip_cmdline_token: stripping '$token' would empty $file — refusing" >&2
+        return 1
+    fi
+    printf '%s\n' "$stripped" > "$file"
+    echo "cmdline.txt: stripped '$token'"
+}

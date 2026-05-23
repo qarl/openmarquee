@@ -805,9 +805,15 @@ if [ -f "$BOOT_LIB" ]; then
                 || say "  WARNING: config.txt patch skipped (see above)"
             patch_cmdline_txt "${boot_dir}/cmdline.txt" \
                 || say "  WARNING: cmdline.txt patch skipped (see above)"
+            # Postmortem mitigation #5 (2026-05-23): strip the base
+            # Pi OS `cgroup_disable=memory` flag so PSI/cgroup
+            # memory accounting + systemd-OOMD become available.
+            strip_cmdline_token "cgroup_disable=memory" "${boot_dir}/cmdline.txt" \
+                || say "  WARNING: cmdline.txt strip skipped (see above)"
         else
             say "  DRYRUN: would patch config.txt (disable_splash=1) +"
             say "          cmdline.txt (quiet splash plymouth.ignore-serial-consoles)"
+            say "          cmdline.txt strip (cgroup_disable=memory)"
         fi
     fi
 else
