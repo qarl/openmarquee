@@ -3817,7 +3817,10 @@ html, body { margin: 0; padding: 0; height: 100%; }
 
 /* --- Live panel — phone-camera or stream-transport takeover (SYSTEM_SPEC §5.11). --- */
 
-.live {
+/* Tag-qualified to avoid collision with the `.om-pill.live` status-pill
+   modifier — bare `.live` would inherit padding/flex-direction onto pills.
+   See backend/tests/test_ui_pill_live_collision_guard.py. */
+section.live {
     display: flex;
     flex-direction: column;
     gap: 1rem;
