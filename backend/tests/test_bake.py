@@ -23,6 +23,17 @@ REPO = Path(__file__).resolve().parent.parent.parent
 BAKE_SCRIPT = REPO / "scripts" / "bake.py"
 FIXTURE_UUID = "f0000000-0000-4000-8000-000000000020"  # UNCAGE replica
 FIXTURE_JSON = REPO / "renderer" / "tests" / "fixtures" / FIXTURE_UUID / "item.json"
+# The Canvas2D parity harness that bake.py drives top-imports
+# `../../renderer-wasm/pkg/renderer_wasm.js` — a wasm-bindgen-produced
+# ESM glue module. The `pkg/` directory is gitignored + only exists if
+# the local dev environment has run `scripts/build_wasm_renderer.sh`
+# (which needs Rust + wasm32 target + wasm-bindgen-cli). On CI the
+# `build-wasm` workflow job produces it as an artifact for the `ui` /
+# `e2e` jobs — but the `backend` job (where pytest runs) doesn't
+# consume that artifact, so the file is absent there too. Skip-gate so
+# the test is exercised ONLY in the dev environment where Playwright
+# Chromium + a wasm build BOTH exist.
+RENDERER_WASM_JS = REPO / "renderer-wasm" / "pkg" / "renderer_wasm.js"
 
 
 def _png_dims(png_path: Path) -> tuple[int, int]:
@@ -53,6 +64,14 @@ def _playwright_installed() -> bool:
 @pytest.mark.skipif(
     not FIXTURE_JSON.exists(),
     reason=f"UNCAGE fixture missing at {FIXTURE_JSON}",
+)
+@pytest.mark.skipif(
+    not RENDERER_WASM_JS.exists(),
+    reason=(
+        f"renderer-wasm bundle not built at {RENDERER_WASM_JS} — "
+        "run scripts/build_wasm_renderer.sh (needs Rust + wasm32 target + "
+        "wasm-bindgen-cli) to enable this test in dev"
+    ),
 )
 def test_bake_uncage_fixture_produces_1080p_png(tmp_path: Path) -> None:
     """End-to-end: invoke scripts/bake.py on the UNCAGE parity fixture,
