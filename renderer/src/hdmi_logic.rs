@@ -9877,6 +9877,125 @@ mod tests {
         );
     }
 
+    /// Regression-lock for the motion-phase-discontinuity-at-transition-
+    /// boundaries fix — three commits, 2026-05-09 → 2026-05-16:
+    /// `7417ae0` (session-global tick_seconds basis), `413efca` (extend
+    /// the fix to the IPC sidecar PaintSlide path), and `fff3ab8`
+    /// (Phase 4v-3b motion through IPC PaintTransition path). Backlog
+    /// item #2; recon at `docs/motion-phase-discontinuity-recon.md`.
+    ///
+    /// The fix plumbs `session.motion_tick_seconds()` (a session-global
+    /// monotonic basis that never resets within the session's lifetime)
+    /// into every in-session + IPC render path that previously held a
+    /// call-local clock or a static-snapshot bake. Pre-fix: each render
+    /// call computed its own `Instant::now()` snapshot, so the
+    /// `sin(2*pi*freq*tick + phase)` motion math snapped phase at every
+    /// hold↔transition boundary (`tick` reset to ~0 at the boundary
+    /// crossing).
+    ///
+    /// Like the black-flash fix above, this bug is *silent* — no panic,
+    /// no test failure; the only symptom is a visible phase jump on
+    /// glass at boundary crossings. The existing
+    /// `legacy_3pass_transition_re_bakes_animated_layers_per_frame`
+    /// test locks the per-frame re-bake gate + loop shape, but NOT the
+    /// timing basis — a refactor that reverts one of the 7+ call sites
+    /// to a call-local clock would pass that test while re-breaking
+    /// motion-phase continuity.
+    ///
+    /// This source-grep test locks two invariants in `hdmi.rs`:
+    ///
+    /// - Affirmative: `motion_tick_seconds(` appears ≥7 times — at
+    ///   least 1 definition (L5212) + 6 callers across the in-session
+    ///   render path (L1482, L7442, L7916, L8358) and the IPC sidecar
+    ///   path (L2940, L3738). Plus 3 doc-comment mentions today, which
+    ///   are bonus headroom but not load-bearing for the floor.
+    ///
+    /// - Anti-pattern: no CODE line may contain both `tick_seconds` AND
+    ///   `Instant::now()`. That combination on a single statement is
+    ///   the pre-fix bug pattern (`let tick_seconds = ... Instant::now()
+    ///   ...`). `Instant::now()` for perf timing alone is fine — the
+    ///   bug is specifically deriving the motion tick from a call-local
+    ///   clock. Comments are stripped (`//`-onward of each line) so the
+    ///   anti-pattern check ignores narration inside `///` doc-comments.
+    ///
+    /// Recon citation: `docs/motion-phase-discontinuity-recon.md` §4
+    /// line 94 (sketches a synthetic boundary-continuity assertion as
+    /// the secondary verify; this source-grep is the discipline-side
+    /// regression lock that the recon noted would be a useful sibling).
+    /// Authoritative call-site list:
+    /// `qa/captures/motion-through-transitions-audit-2026-05-16.md`.
+    ///
+    /// Same caveats as the black-flash test above: a benign string
+    /// refactor (renaming `motion_tick_seconds`, restructuring how
+    /// `tick_seconds` gets named, etc.) will legitimately trip this —
+    /// update the assertion + the recon doc cross-ref when it does;
+    /// don't silently delete the test.
+    #[test]
+    fn motion_tick_seconds_is_session_global_not_call_local() {
+        let hdmi_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hdmi.rs");
+        let source = std::fs::read_to_string(&hdmi_path).unwrap_or_else(|e| {
+            panic!(
+                "must read {} for motion-phase regression check: {e}",
+                hdmi_path.display(),
+            )
+        });
+
+        // ---- Affirmative invariant ----
+        //
+        // `motion_tick_seconds(` must appear at least 7 times in
+        // hdmi.rs: 1 definition + 6 call sites (4 in-session + 2 IPC
+        // sidecar). Drop below 7 and at least one render path is no
+        // longer pulling from the session-global tick; motion phase
+        // snaps at the boundary that site governs (visible only on
+        // glass).
+        let matches = source.matches("motion_tick_seconds(").count();
+        assert!(
+            matches >= 7,
+            "expected ≥7 occurrences of `motion_tick_seconds(` in \
+             renderer/src/hdmi.rs (1 defn + 6 call sites across the \
+             in-session render path L1482/L7442/L7916/L8358 + the IPC \
+             sidecar path L2940/L3738); found {matches}. A refactor \
+             likely reverted at least one site to a call-local clock; \
+             motion phase will snap at the boundary that site governs. \
+             Recon: docs/motion-phase-discontinuity-recon.md §4 line 94. \
+             Authoritative call-site list: \
+             qa/captures/motion-through-transitions-audit-2026-05-16.md.",
+        );
+
+        // ---- Anti-pattern invariant ----
+        //
+        // No CODE line in hdmi.rs may contain both `tick_seconds` AND
+        // `Instant::now()` — that combination on the same statement is
+        // the pre-fix bug pattern. `Instant::now()` ALONE is fine (it's
+        // legitimately used elsewhere for perf timing); the bug is
+        // specifically using it to *derive* tick_seconds.
+        //
+        // Comments are stripped before checking so narrative inside
+        // `///` doc-comments doesn't spuriously trip the assertion.
+        let mut anti_pattern_lines: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in source.lines().enumerate() {
+            let code = match line.find("//") {
+                Some(cmt) => &line[..cmt],
+                None => line,
+            };
+            if code.contains("tick_seconds") && code.contains("Instant::now()") {
+                anti_pattern_lines.push((idx + 1, line.trim().to_string()));
+            }
+        }
+        assert!(
+            anti_pattern_lines.is_empty(),
+            "tick_seconds must derive from session.motion_tick_seconds() — \
+             a session-global monotonic basis — NOT from a call-local \
+             Instant::now() snapshot. Mixing both names on a single CODE \
+             line is the pre-fix anti-pattern that snapped motion phase \
+             at every hold↔transition boundary. Offending line(s): {:?}. \
+             Recon: docs/motion-phase-discontinuity-recon.md §4 line 94.",
+            anti_pattern_lines,
+        );
+    }
+
     /// Regression-lock for the black-flash-at-transition-boundaries fix
     /// (commit `7c605cce`, 2026-05-09 — backlog item #3).
     ///
