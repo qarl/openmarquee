@@ -10,16 +10,21 @@
 // page URL, refresh interval, and duration — wired to the same
 // auto-save + slide-browser scaffolding the other slide editors use.
 //
-// There is NO file upload and NO in-editor preview: the editor can't
-// run a browser any more than the Pi can; the helper screenshots the
-// page on the operator's machine and the result only appears on the
-// sign.
+// There is NO file upload from the editor: the operator's machine
+// can't render the target page any more than the Pi can — the helper
+// screenshots the page on the Pi (or a paired helper) and persists
+// the result as the slide's asset.png. For SAVED slides the editor
+// previews that same asset.png inline via the /api/content/{id}/asset
+// endpoint the slide-browser tiles + inline preview already use. For
+// unsaved drafts (no id yet) the placeholder card with the URL is the
+// only thing we have to show.
 //
 // Transitions are not edited here (consistent with the image / video /
 // stream editors); the slide's transition/transition_ms round-trip
 // through `state` so editing a slide's name doesn't reset a transition
 // set elsewhere.
 
+import { mediaSrc } from "./api.js";
 import { attachAutoSave } from "./auto-save.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
 
@@ -72,10 +77,13 @@ const TEMPLATE = `
                 </p>
             </div>
             <div class="om-card web-slide-preview">
+                <img class="web-preview-screenshot" alt="Web page screenshot"
+                     draggable="false" hidden
+                     style="width: 100%; height: auto; display: block;">
                 <div class="web-preview-card">
                     <span class="web-preview-title">&#127760; Web page</span>
                     <span class="web-preview-url"></span>
-                    <span class="web-preview-note">Screenshotted on the sign &mdash; not previewed in the editor.</span>
+                    <span class="web-preview-note">Screenshot updates on the sign &mdash; render in progress.</span>
                 </div>
             </div>
             <p class="om-save-status web-slide-status" role="status" aria-live="polite" data-state="idle"></p>
@@ -108,6 +116,15 @@ export function mountWebSlideEditor(
     const refreshEl = container.querySelector(".field-web-refresh");
     const statusEl = container.querySelector(".web-slide-status");
     const previewUrlEl = container.querySelector(".web-preview-url");
+    const screenshotEl = container.querySelector(".web-preview-screenshot");
+    const previewCardEl = container.querySelector(".web-preview-card");
+    // Asset 404s or transient network errors silently fall back to the
+    // URL-only placeholder card — operator gets a sensible UI rather
+    // than a broken-image icon. The persisted side is intact regardless.
+    screenshotEl.addEventListener("error", () => {
+        screenshotEl.hidden = true;
+        previewCardEl.hidden = false;
+    });
 
     // Populate the refresh-interval select once.
     for (const opt of REFRESH_OPTIONS) {
@@ -128,6 +145,12 @@ export function mountWebSlideEditor(
         // slide; overwritten from the slide on loadForEdit.
         transition: "cut",
         transitionMs: 500,
+        // Cache-bust stamp for the screenshot img — loadForEdit sets
+        // it to the slide envelope's updated_at/created_at; a fresh
+        // post-create save sets it to Date.now() so the operator
+        // sees the backend's just-rendered placeholder PNG instead
+        // of a possibly-stale browser-cached version.
+        assetVersion: null,
     };
 
     function refreshIntervalValue() {
@@ -168,6 +191,25 @@ export function mountWebSlideEditor(
     }
     webUrlEl.addEventListener("input", refreshPreviewUrl);
 
+    // Show the saved slide's screenshot when we have an id; otherwise
+    // fall back to the URL-only placeholder card. The `?v=` cache-bust
+    // matches the slide-browser tile pattern so refetches don't snag
+    // a stale image when an envelope's updated_at bumps.
+    function refreshScreenshot() {
+        if (!state.editingId) {
+            screenshotEl.hidden = true;
+            previewCardEl.hidden = false;
+            screenshotEl.removeAttribute("src");
+            return;
+        }
+        const v = encodeURIComponent(state.assetVersion || Date.now());
+        screenshotEl.src = mediaSrc(
+            `/api/content/${state.editingId}/asset?v=${v}`,
+        );
+        screenshotEl.hidden = false;
+        previewCardEl.hidden = true;
+    }
+
     async function performSave() {
         const durationSeconds = Number(durationEl.value) || 10;
         const payload = {
@@ -185,6 +227,11 @@ export function mountWebSlideEditor(
         const created = await onSave(payload);
         if (created?.id) {
             state.editingId = String(created.id);
+            // Just-created slide has no envelope yet; Date.now() bust
+            // gives the operator the backend's freshly-rendered
+            // placeholder PNG without a browser-cache miss later.
+            state.assetVersion = null;
+            refreshScreenshot();
             if (browser) {
                 await browser.refresh();
                 browser.highlight(state.editingId);
@@ -217,12 +264,14 @@ export function mountWebSlideEditor(
 
     async function resetToBlank() {
         state.editingId = null;
+        state.assetVersion = null;
         state.transition = "cut";
         state.transitionMs = 500;
         webUrlEl.value = "";
         durationEl.value = "10";
         setRefreshInterval(DEFAULT_REFRESH_S);
         refreshPreviewUrl();
+        refreshScreenshot();
         autoSave.cancel();
         statusEl.textContent = "";
         statusEl.dataset.state = "idle";
@@ -244,6 +293,7 @@ export function mountWebSlideEditor(
             return;
         }
         state.editingId = String(slide.id);
+        state.assetVersion = slide.updated_at || slide.created_at || null;
         state.transition = slide.transition || "cut";
         state.transitionMs = slide.transition_ms ?? 500;
         nameEl.value = slide.name || "Web";
@@ -253,6 +303,7 @@ export function mountWebSlideEditor(
             Math.max(1, (slide.duration_ms || 10_000) / 1000),
         );
         refreshPreviewUrl();
+        refreshScreenshot();
         if (browser) browser.highlight(slide.id);
         // Loading an existing slide is not a user edit — drop any
         // auto-save the field mutations above scheduled.

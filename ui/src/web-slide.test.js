@@ -157,4 +157,61 @@ describe("mountWebSlideEditor", () => {
             container.querySelector(".web-preview-url").textContent,
         ).toBe("https://shown.example.com/x");
     });
+
+    it("unsaved (no editingId) keeps the placeholder visible and hides the screenshot img", () => {
+        // Bug #5 (qarl 2026-05-23): the editor preview pane was a
+        // placeholder card forever. For a brand-new draft (no id
+        // yet), there's no asset on the server to fetch — so the
+        // placeholder remains the only signal the operator gets.
+        // This pins that fallback: the img stays hidden until a
+        // save lands an id.
+        const container = document.createElement("div");
+        mountWebSlideEditor(container, { onSave: vi.fn() });
+
+        const screenshot = container.querySelector(".web-preview-screenshot");
+        const placeholder = container.querySelector(".web-preview-card");
+        expect(screenshot).not.toBeNull();
+        expect(screenshot.hidden).toBe(true);
+        expect(screenshot.getAttribute("src")).toBeNull();
+        expect(placeholder.hidden).toBe(false);
+    });
+
+    it("loadForEdit shows the saved slide's screenshot via /api/content/{id}/asset with a cache-bust", async () => {
+        // Bug #5 fix: for a SAVED web slide, the editor pane previews
+        // the same asset.png the slide-browser tile thumb does — the
+        // backend always has SOMETHING at /asset (either the Pi's
+        // rendered screenshot or the just-created placeholder PNG
+        // synthesised by storage.save_web). The img src must include
+        // the auth-token query param (via mediaSrc) AND a `?v=` cache-
+        // bust whose value reflects the envelope's updated_at, so an
+        // updated screenshot doesn't get masked by an HTTP-cached old
+        // copy.
+        const container = document.createElement("div");
+        const handle = mountWebSlideEditor(container, { onSave: vi.fn() });
+
+        handle.loadForEdit({
+            type: "web",
+            id: "web-42",
+            name: "Status",
+            url: "https://h/x",
+            refresh_interval_s: 3600,
+            duration_ms: 10_000,
+            updated_at: "2026-05-23T01:23:45+00:00",
+        });
+
+        const screenshot = container.querySelector(".web-preview-screenshot");
+        const placeholder = container.querySelector(".web-preview-card");
+        expect(screenshot.hidden).toBe(false);
+        expect(placeholder.hidden).toBe(true);
+        expect(screenshot.getAttribute("src")).toContain(
+            "/api/content/web-42/asset",
+        );
+        expect(screenshot.getAttribute("src")).toContain("v=");
+        // The cache-bust value reflects updated_at, not Date.now() —
+        // a stale browser cache after a peer-flock sync re-rendered
+        // the asset must invalidate cleanly.
+        expect(screenshot.getAttribute("src")).toContain(
+            encodeURIComponent("2026-05-23T01:23:45+00:00"),
+        );
+    });
 });
