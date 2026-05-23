@@ -274,6 +274,12 @@ pub struct EglSession<'a> {
     /// docs. The reel driver passes &mut self.image_bg_cache
     /// to paint_slide via render_*_in_session.
     image_bg_cache: ImageBgCache,
+    /// Task #168 (2026-05-22): per-session async-refresh GL texture
+    /// cache for ImageSlide / WebSlide paints. Replaces the per-paint
+    /// PNG decode + glTexImage2D + delete cycle that hitched the
+    /// render thread by 100-300ms on every Web-slide refresh
+    /// transition. See `image_slide_tex` module docs for the policy.
+    image_slide_tex_cache: crate::image_slide_tex::ImageSlideTextureCache,
     /// v1-spec-delta #9 (slice d): per-session N-2 BO/FB
     /// rotation for IPC sidecar mode. The standalone render_*_
     /// in_session loops keep their own loop-local rotation;
@@ -635,6 +641,9 @@ where
         modeset_done: false,
         flip_pending: false,
         image_bg_cache: ImageBgCache::with_capacity(IMAGE_BG_CACHE_CAPACITY),
+        image_slide_tex_cache: crate::image_slide_tex::ImageSlideTextureCache::with_capacity(
+            crate::image_slide_tex::IMAGE_SLIDE_TEX_CACHE_CAPACITY,
+        ),
         scanout_prev_bo: None,
         scanout_prev_fb: None,
         scanout_current_bo: None,
@@ -741,6 +750,14 @@ where
             // Trace-level diagnostic: cached image freed.
             // Comment-only -- production logs stay quiet.
             let _ = path;
+        }
+        // Task #168: drain the image-slide texture cache while the GL
+        // context is still bound. Pending workers (if any) drop their
+        // mpsc channels with the cache; their tx.send becomes a no-op
+        // on the next try. No thread-join needed — workers exit on
+        // their own as soon as decode finishes.
+        for tex in session.image_slide_tex_cache.take_all_textures() {
+            unsafe { gl.delete_texture(tex); }
         }
         // qarl-direct perf-profile (2026-05-08, post-cache hoist):
         // free per-slide cached GL textures from the session-
@@ -3154,6 +3171,18 @@ pub fn paint_and_present_one_image_slide_frame(
     } else {
         None
     };
+    // Task #168: route through ImageSlideTextureCache so a Web slide
+    // refresh (asset.png overwritten by the producer) does the PNG
+    // decode on a worker thread. The first paint after `with_egl_
+    // session` brings up the slide synchronously (cold cache), then
+    // every subsequent refresh swaps in the new tex without blocking
+    // the render thread. Borrow split: `&mut session.image_slide_tex_
+    // cache` and `&session.gl` are disjoint fields — the standard
+    // pattern used elsewhere (slide_caches + gl, image_bg_cache + gl).
+    let (cached_tex, img_w, img_h) =
+        session
+            .image_slide_tex_cache
+            .ensure(session.gl, slide.id, &asset_path)?;
     if let Some((fbo, _tex)) = scene_fbo_handle {
         unsafe {
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -3161,7 +3190,14 @@ pub fn paint_and_present_one_image_slide_frame(
         }
     }
     unsafe {
-        bake_image_slide_to_current_fbo(session.gl, &asset_path, mode_w, mode_h)?;
+        blit_cached_image_slide_to_current_fbo(
+            session.gl,
+            cached_tex,
+            img_w,
+            img_h,
+            mode_w,
+            mode_h,
+        )?;
     }
     // v1-spec-delta #10 (slice c) + FYS bug 5: the scene-FBO route
     // runs the rotation-aware present pass from scene FBO to the
@@ -3752,8 +3788,11 @@ pub fn paint_and_present_one_transition_frame(
     );
     let mut text_a: Option<TextResolved<'_>> = None;
     let mut text_b: Option<TextResolved<'_>> = None;
-    let mut image_a: Option<PathBuf> = None;
-    let mut image_b: Option<PathBuf> = None;
+    // Task #168: capture slide_id alongside asset_path so the
+    // SlideBakeInputs::Image variant can drive the per-session
+    // ImageSlideTextureCache lookup keyed by slide_id.
+    let mut image_a: Option<(uuid::Uuid, PathBuf)> = None;
+    let mut image_b: Option<(uuid::Uuid, PathBuf)> = None;
     match &endpoint_a {
         TransitionEndpoint::Text(slide) => {
             let (bg, _, layers) = resolve_slide_layers(slide, fonts, content_root)?;
@@ -3767,7 +3806,7 @@ pub fn paint_and_present_one_transition_frame(
                     slide.id
                 )
             })?;
-            image_a = Some(crate::content::image_slide_asset_path(root, slide.id));
+            image_a = Some((slide.id, crate::content::image_slide_asset_path(root, slide.id)));
         }
         TransitionEndpoint::Video { .. } => {}
     }
@@ -3784,7 +3823,7 @@ pub fn paint_and_present_one_transition_frame(
                     slide.id
                 )
             })?;
-            image_b = Some(crate::content::image_slide_asset_path(root, slide.id));
+            image_b = Some((slide.id, crate::content::image_slide_asset_path(root, slide.id)));
         }
         TransitionEndpoint::Video { .. } => {}
     }
@@ -3813,9 +3852,13 @@ pub fn paint_and_present_one_transition_frame(
                     motion_states: Some(states),
                 }
             }
-            TransitionEndpoint::Image(_) => SlideBakeInputs::Image {
-                asset_path: image_a.as_deref().expect("image_a pre-resolved above"),
-            },
+            TransitionEndpoint::Image(_) => {
+                let (sid, path) = image_a.as_ref().expect("image_a pre-resolved above");
+                SlideBakeInputs::Image {
+                    slide_id: *sid,
+                    asset_path: path.as_path(),
+                }
+            }
             TransitionEndpoint::Video {
                 samples,
                 next_sample_idx,
@@ -3850,9 +3893,13 @@ pub fn paint_and_present_one_transition_frame(
                     motion_states: Some(states),
                 }
             }
-            TransitionEndpoint::Image(_) => SlideBakeInputs::Image {
-                asset_path: image_b.as_deref().expect("image_b pre-resolved above"),
-            },
+            TransitionEndpoint::Image(_) => {
+                let (sid, path) = image_b.as_ref().expect("image_b pre-resolved above");
+                SlideBakeInputs::Image {
+                    slide_id: *sid,
+                    asset_path: path.as_path(),
+                }
+            }
             TransitionEndpoint::Video {
                 samples,
                 next_sample_idx,
@@ -5871,48 +5918,34 @@ fn motion_states_for_layers(
         .collect()
 }
 
-/// Load the image at `asset_path` and blit it into the currently-
-/// bound framebuffer via FS_BLIT. Caller is responsible for binding
-/// the destination framebuffer (default fb or an FBO) and for any
-/// post-pass / scanout handling. Allocates one transient RGBA
-/// texture for the upload and deletes it before returning.
+/// Task #168 (2026-05-22): cover-fit blit of an already-cached
+/// image-slide texture into the currently-bound framebuffer. No
+/// decode, no upload, no delete — the `ImageSlideTextureCache`
+/// owns the texture lifetime; this is one fullscreen draw call.
 ///
-/// Extracted from paint_and_present_one_image_slide_frame so the
-/// non-text transition path can route image endpoints through the
-/// same machinery against an FBO target.
-unsafe fn bake_image_slide_to_current_fbo(
+/// Caller is responsible for binding the destination framebuffer
+/// (default fb or an FBO) and for any post-pass / scanout handling.
+///
+/// Pre-Task-#168 this path lived in `bake_image_slide_to_current_fbo`,
+/// which inline-decoded the PNG and uploaded a fresh GL texture per
+/// frame. On a Web slide refresh, that hitched the render thread for
+/// 100-300ms at the very transition into the refreshed slide. The
+/// cache-driven path replaces it: cache.ensure() does any work; this
+/// helper just blits.
+unsafe fn blit_cached_image_slide_to_current_fbo(
     gl: &glow::Context,
-    asset_path: &Path,
+    tex: glow::NativeTexture,
+    img_w: u32,
+    img_h: u32,
     mode_w: u32,
     mode_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
-    let (rgba, img_w, img_h) = load_png_rgba(asset_path)?;
     gl.viewport(0, 0, mode_w as i32, mode_h as i32);
     gl.clear_color(0.0, 0.0, 0.0, 1.0);
     gl.clear(glow::COLOR_BUFFER_BIT);
-    let tex = gl
-        .create_texture()
-        .map_err(|e| anyhow!("glGenTextures(bake_image_slide): {e}"))?;
-    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-    gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, glow::RGBA as i32,
-        img_w as i32, img_h as i32, 0,
-        glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
-    );
-    // FYS bug B (2026-05-21): cover-fit the image to the panel
-    // (aspect-preserving, overflow center-cropped) instead of
-    // stretching it — matches the cover-fit editor preview. The
-    // panel is cleared black above, so a cover quad that exactly
-    // covers it leaves no bars.
     let cover_vbo = cover_quad_vbo(gl, img_w, img_h, mode_w, mode_h)?;
-    let blit_result = run_blit_pass_quad(gl, tex, cover_vbo);
-    gl.delete_texture(tex);
-    blit_result
+    run_blit_pass_quad(gl, tex, cover_vbo)
 }
 
 /// Renderer-hardening C2 (finding L4, 2026-05-21) — check `glGetError`
@@ -6625,6 +6658,12 @@ enum SlideBakeInputs<'a> {
         motion_states: Option<&'a [MotionState]>,
     },
     Image {
+        /// Task #168: slide_id keys the
+        /// `ImageSlideTextureCache` lookup so the transition bake
+        /// reuses the already-uploaded tex instead of re-decoding +
+        /// re-uploading every transition frame (was the dominant
+        /// cause of the 100-300ms per-transition hitch on Web slides).
+        slide_id: uuid::Uuid,
         asset_path: &'a Path,
     },
     /// Constructed by `paint_and_present_one_transition_frame` from
@@ -6829,14 +6868,24 @@ unsafe fn bake_slide_to_fbo(
             )
             .map(Some)
         }
-        SlideBakeInputs::Image { asset_path } => {
+        SlideBakeInputs::Image { slide_id, asset_path } => {
+            // Task #168: resolve through the per-session async cache
+            // BEFORE creating the per-frame FBO pair so a cold-cache
+            // sync decode failure doesn't leak a freshly-allocated
+            // FBO. The cache.ensure() borrows `&mut session.image_
+            // slide_tex_cache` + `&session.gl` (disjoint fields).
+            let (cached_tex, img_w, img_h) = session
+                .image_slide_tex_cache
+                .ensure(session.gl, slide_id, asset_path)?;
             let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
             // create_slide_fbo_pair leaves FBO bound; paint into it
-            // via the existing slice-1 helper, then unbind to the
+            // via the cached-blit helper (no decode, no upload —
+            // just one fullscreen cover-fit draw), then unbind to the
             // default fb (mirrors make_slide_fbo's cleanup
             // discipline on the text branch).
-            let paint_result =
-                bake_image_slide_to_current_fbo(session.gl, asset_path, mode_w, mode_h);
+            let paint_result = blit_cached_image_slide_to_current_fbo(
+                session.gl, cached_tex, img_w, img_h, mode_w, mode_h,
+            );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             if let Err(e) = paint_result {
                 session.gl.delete_framebuffer(fbo);

@@ -18,6 +18,13 @@
 // Mac dev box for the pure-logic surfaces.
 #[cfg(target_os = "linux")]
 mod hdmi;
+/// Task #168 (2026-05-22) — async-refresh GL texture cache for
+/// ImageSlide / WebSlide. Linux-only (depends on `glow`); see module
+/// docs for the state-machine. Replaces the per-paint PNG decode +
+/// glTexImage2D + delete cycle that hitched the render thread by
+/// 100-300ms on every Web-slide refresh transition.
+#[cfg(target_os = "linux")]
+mod image_slide_tex;
 mod cea861;
 mod content;
 mod hdmi_logic;
