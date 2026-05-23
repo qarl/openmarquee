@@ -630,7 +630,11 @@ header h1 {
    (custom font, etc.)". The custom font is --om-mono; default
    <select> chrome is killed via appearance:none so the pill look
    + custom chevron survive. Layout-specific bits (where the menu
-   sits / how wide it is) stay on the per-use class, NOT here. */
+   sits / how wide it is) stay on the per-use class, NOT here.
+   Universal application across every visible <select> in ui/src/
+   is locked by `test_every_ui_select_wears_chip_pill_or_documented_hidden`
+   in `backend/tests/test_ui_chip_pill_consistency.py`
+   (QA audit D2 closure, 2026-05-23). */
 .om-pulldown {
     align-self: flex-start;
     font-size: 10.5px;
