@@ -146,6 +146,19 @@ export async function extractDetailMessage(response) {
         if (Array.isArray(body.detail) && body.detail[0]?.msg) {
             return body.detail[0].msg;
         }
+        // Slice 3 (2026-05-23): structured detail dict carrying an
+        // `error` code + optional `error_class` (e.g. /api/live/start
+        // 400 returns `{error: "live_negotiation_failed", error_class:
+        // "OSError"}`). Stringify into "<error> (<error_class>)" so
+        // operators see the class hint in toasts/UI instead of a bare
+        // "400 Bad Request" fallback. error_class is the Python
+        // exception class name; safe to surface (no message string).
+        if (body.detail && typeof body.detail === "object" && body.detail.error) {
+            const cls = body.detail.error_class;
+            return cls
+                ? `${body.detail.error} (${cls})`
+                : String(body.detail.error);
+        }
     } catch {
         /* not JSON -- fall through to the status-only fallback */
     }

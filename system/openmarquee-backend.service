@@ -110,7 +110,15 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK is required by aiortc's aioice — its ICE candidate
+# gather enumerates local interfaces via a netlink socket. Without
+# this whitelist entry, /api/live/start crashes with
+# `OSError: [Errno 97] Address family not supported by protocol`
+# at the first `RTCPeerConnection.setLocalDescription(...)` call,
+# the route catches it + sanitizes to a generic 400, and the Mode A
+# (Live takeover) path silently fails. Diagnosed on FYS 2026-05-23
+# via /tmp/aiortc-shakeout-fys.py + backend journal correlation.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 LockPersonality=true
 # /var/openmarquee is not a StateDirectory= target (that would create

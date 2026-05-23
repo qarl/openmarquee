@@ -138,18 +138,32 @@ async def start_live(
     except Exception as exc:
         # SDP parse failure / aiortc raised. 400 since the phone's
         # request is the most likely source of badness.
-        # 11.2: don't reflect the exception string into the response --
-        # aiortc/SDP-parse messages can carry internals. Log + opaque 400.
+        #
+        # 11.2: never reflect the exception MESSAGE into the response
+        # (aiortc/SDP-parse messages can carry paths + internals). The
+        # full traceback goes to the backend log via log.exception
+        # below — that's the operator's diagnosis path.
+        #
+        # On the wire we surface only the exception CLASS NAME (e.g.
+        # "OSError", "ValueError", "SdpParseError"). Class names are
+        # safe identifiers; they don't carry the kind of internal
+        # detail message strings can. The reason this exists at all:
+        # without a class hint, a remote diagnoser (operator on a
+        # phone, harness in a browser) sees just "live_negotiation_
+        # failed" and has to ssh into the device to see the actual
+        # exception — that cost 25 min of hunting for an OSError
+        # [Errno 97] (netlink-EAFNOSUPPORT, FYS 2026-05-23).
         log.exception("live negotiation failed")
         raise HTTPException(
             status_code=400,
-            detail="live negotiation failed",
+            detail={
+                "error": "live_negotiation_failed",
+                "error_class": type(exc).__name__,
+            },
         ) from exc
     started_at = live.active_session_started_at
     assert started_at is not None  # session was just created above
-    return LiveStartResponse(
-        session_id=session_id, sdp_answer=answer, started_at=started_at
-    )
+    return LiveStartResponse(session_id=session_id, sdp_answer=answer, started_at=started_at)
 
 
 @router.post("/stop", status_code=204)
@@ -177,17 +191,20 @@ async def takeover_live(
     try:
         session_id, answer = await live.takeover(payload)
     except Exception as exc:
-        # 11.2: don't reflect the exception string. Log + opaque 400.
+        # 11.2 + Slice 3 (2026-05-23): never reflect the exception
+        # message; surface only the class name on the wire. Symmetric
+        # with /api/live/start above — same rationale + safety profile.
         log.exception("live takeover failed")
         raise HTTPException(
             status_code=400,
-            detail="live takeover failed",
+            detail={
+                "error": "live_takeover_failed",
+                "error_class": type(exc).__name__,
+            },
         ) from exc
     started_at = live.active_session_started_at
     assert started_at is not None  # session was just created above
-    return LiveStartResponse(
-        session_id=session_id, sdp_answer=answer, started_at=started_at
-    )
+    return LiveStartResponse(session_id=session_id, sdp_answer=answer, started_at=started_at)
 
 
 @router.get("/status", response_model=LiveStatus)

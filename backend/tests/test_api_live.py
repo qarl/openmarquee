@@ -16,14 +16,14 @@ from fastapi.testclient import TestClient
 
 from openmarquee.app import app
 from openmarquee.dependencies import (
-    _playback_loop_singleton,
     _live_manager_singleton,
-    get_playback_loop,
+    _playback_loop_singleton,
     get_live_manager,
+    get_playback_loop,
 )
+from openmarquee.live import LiveManager
 from openmarquee.playback import PlaybackLoop
 from openmarquee.rendering.mock import MockRenderer
-from openmarquee.live import LiveManager
 from tests.test_live import _FakeRTCPeerConnection
 
 
@@ -190,6 +190,98 @@ def test_takeover_with_no_active_session_starts_one(client: TestClient):
     assert "session_id" in response.json()
 
 
+# --- Slice 3 (2026-05-23): structured 400 detail on negotiation failure -----
+#
+# Locks the new wire shape so a remote diagnoser sees the exception
+# CLASS NAME (never the message). Regression for the netlink-EAFNOSUPPORT
+# diagnosis cost: the prior opaque "live negotiation failed" string
+# detail buried the real OSError [Errno 97] in the backend log only;
+# `error_class` on the wire would have flagged "OSError" at the harness
+# layer in seconds.
+
+
+class _RaisingRTCPeerConnection:
+    """Raises OSError from setLocalDescription — same exception class
+    that aioice's gather raises on EAFNOSUPPORT (the FYS netlink-
+    hardening bug). Used to drive api_live's exception handler into
+    its sanitized-400 path under controlled conditions."""
+
+    answer_sdp = "v=0\r\nfake-answer\r\n"
+
+    def __init__(self):
+        self.handlers: dict[str, object] = {}
+        self.closed = False
+
+    def on(self, event: str):
+        def decorator(fn):
+            self.handlers[event] = fn
+            return fn
+
+        return decorator
+
+    async def setRemoteDescription(self, desc):  # noqa: ANN001
+        pass
+
+    async def createAnswer(self):
+        class _Desc:
+            sdp = self.answer_sdp
+            type = "answer"
+
+        return _Desc()
+
+    async def setLocalDescription(self, desc):  # noqa: ANN001
+        raise OSError(97, "Address family not supported by protocol")
+
+    async def close(self):
+        self.closed = True
+
+
+def test_start_400_surfaces_error_class_in_detail(client: TestClient):
+    """The 400 detail must be a structured dict carrying the exception
+    CLASS NAME — never the exception message. Lock this regression
+    pre-deploy so a future systemd / aiortc / SDP-parse failure doesn't
+    again cost 25 min of journalctl spelunking to identify."""
+    with patch("openmarquee.live.RTCPeerConnection", _RaisingRTCPeerConnection):
+        response = client.post(
+            "/api/live/start",
+            json={"sdp_offer": "v=0\r\noffer\r\n"},
+        )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict), f"detail must be a dict; got {detail!r}"
+    assert detail["error"] == "live_negotiation_failed"
+    # error_class is the type-name string; assert it's present + a
+    # non-empty Python identifier rather than pinning a specific class
+    # (the catch is broad — many exception types can reach it).
+    error_class = detail["error_class"]
+    assert isinstance(error_class, str) and error_class
+    assert error_class.isidentifier()
+    # On the wire we MUST NOT leak the exception message (it can carry
+    # paths / internals). The _RaisingRTCPeerConnection raises with
+    # "Address family not supported by protocol" — that string must
+    # NOT appear anywhere in the response body.
+    body_text = response.text
+    assert "Address family not supported" not in body_text
+
+
+def test_takeover_400_surfaces_error_class_in_detail(client: TestClient):
+    """Symmetric assertion for the /takeover handler. Same wire shape;
+    error code is `live_takeover_failed` to distinguish the surface."""
+    with patch("openmarquee.live.RTCPeerConnection", _RaisingRTCPeerConnection):
+        response = client.post(
+            "/api/live/takeover",
+            json={"sdp_offer": "v=0\r\noffer\r\n"},
+        )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["error"] == "live_takeover_failed"
+    error_class = detail["error_class"]
+    assert isinstance(error_class, str) and error_class
+    assert error_class.isidentifier()
+    assert "Address family not supported" not in response.text
+
+
 # --- STREAM/VLC slice 3: tier table ---------------------------------------
 
 
@@ -242,16 +334,12 @@ def test_start_legacy_body_without_kind_still_works(client: TestClient):
     """A start body with no `kind` ({"sdp_offer": ...}) still validates
     as a WebRTC start — the deployed phone client predates the stream
     work and must not break."""
-    response = client.post(
-        "/api/live/start", json={"sdp_offer": "v=0\r\noffer\r\n"}
-    )
+    response = client.post("/api/live/start", json={"sdp_offer": "v=0\r\noffer\r\n"})
     assert response.status_code == 200
     assert response.json()["sdp_answer"]  # WebRTC start has an answer
 
 
-def test_start_stream_returns_session_without_sdp_answer(
-    client: TestClient, monkeypatch, tmp_path
-):
+def test_start_stream_returns_session_without_sdp_answer(client: TestClient, monkeypatch, tmp_path):
     """POST /start with a kind=stream body starts a stream takeover and
     returns a session whose sdp_answer is null (a stream has no SDP)."""
     import functools
@@ -277,7 +365,5 @@ def test_start_stream_returns_session_without_sdp_answer(
     # Stop the session so the real ffmpeg subprocess is reaped inside
     # this test's event loop (the WebRTC tests use a fake PC and have
     # no subprocess to clean up).
-    stop = client.post(
-        "/api/live/stop", json={"session_id": body["session_id"]}
-    )
+    stop = client.post("/api/live/stop", json={"session_id": body["session_id"]})
     assert stop.status_code == 204
