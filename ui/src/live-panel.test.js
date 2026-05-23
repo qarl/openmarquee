@@ -176,6 +176,11 @@ function defaultMounts(overrides = {}) {
             display_height: 1080,
         })),
         getUserMedia: vi.fn(async () => makeFakeStream()),
+        // jsdom doesn't expose navigator.mediaDevices, so the real
+        // hasGetUserMedia predicate would always report false and
+        // trip the mount-init missing-API guard. Default tests want
+        // the API-available path; missing-API tests override below.
+        hasGetUserMedia: () => true,
         createPeerConnection: vi.fn(() => fakePc),
         _fakePc: fakePc,
         ...overrides,
@@ -252,6 +257,71 @@ describe("mountLivePanel", () => {
         // No noise in the status line — the panel reads as a clean
         // idle state.
         expect(container.querySelector(".live-status").textContent).toBe("");
+    });
+
+    it("mount-init shows actionable banner when navigator.mediaDevices is missing (Safari over plain HTTP)", async () => {
+        // qarl-reported 2026-05-23: tapping Go live on
+        // http://192.168.1.67/#/live in Safari = "no observable
+        // effect". Safari restricts navigator.mediaDevices to
+        // secure contexts (HTTPS, localhost, *.local) — a private
+        // IPv4 over plain HTTP is NOT a secure context, so the API
+        // is undefined and the default factory throws a cryptic
+        // TypeError. Mount-init must detect this BEFORE the doomed
+        // call and surface a clear, actionable banner that survives
+        // (no auto-clear) until the operator switches source or
+        // moves on. Also asserts getUserMedia is NEVER called when
+        // the predicate reports false — short-circuit, not retry.
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            hasGetUserMedia: () => false,
+        });
+        const handle = mountLivePanel(container, opts);
+
+        await waitFor(() => opts.apiGetStatus.mock.calls.length === 1);
+        // Mount-init's /status round-trip + the predicate short-
+        // circuit both resolve synchronously after that, so a single
+        // tick is enough to land the message.
+        await tick();
+        expect(opts.getUserMedia).not.toHaveBeenCalled();
+        expect(handle.getState()).toBe("idle");
+        expect(container.querySelector(".live-status").textContent).toContain(
+            "Camera unavailable",
+        );
+        expect(container.querySelector(".live-status").textContent).toContain(
+            "Try HTTPS or use a Stream URL",
+        );
+        // Button stays visible (idle is in the `ready` set) so the
+        // click-time defensive guard is exercisable.
+        expect(container.querySelector(".live-go-live").hidden).toBe(false);
+    });
+
+    it("Go live click surfaces actionable error (not raw TypeError) when navigator.mediaDevices is missing", async () => {
+        // Defensive guard at the top of goLive: even if mount-init's
+        // banner is somehow missed (predicate flips after mount,
+        // race with first paint), clicking Go live must NOT emit
+        // "Stream failed: undefined is not an object (...)". It
+        // surfaces the same clean banner + skips POST /api/live/start.
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            hasGetUserMedia: () => false,
+        });
+        const handle = mountLivePanel(container, opts);
+        // Settle mount-init's /status round-trip + predicate short-
+        // circuit before the click.
+        await waitFor(() => opts.apiGetStatus.mock.calls.length === 1);
+        await tick();
+
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "error");
+
+        expect(opts.getUserMedia).not.toHaveBeenCalled();
+        expect(opts.apiStartLive).not.toHaveBeenCalled();
+        const statusText = container.querySelector(".live-status").textContent;
+        expect(statusText).toContain("Camera unavailable");
+        // Absence assertion: no "Stream failed:" prefix double-stutter,
+        // and no raw "undefined is not an object" TypeError leak.
+        expect(statusText).not.toContain("Stream failed:");
+        expect(statusText).not.toContain("undefined is not an object");
     });
 
     it("defers camera + /status until the section becomes visible", async () => {

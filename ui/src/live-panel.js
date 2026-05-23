@@ -144,6 +144,20 @@ function writeRtspUrlPref(value) {
 // 4. Mocked metrics for latency/bitrate/dropped (Phase A.1 per QA's
 //    handoff). Real-elapsed ticks against state.startedAt. Phase B
 //    will wire RTCPeerConnection.getStats() polling for the rest.
+
+// Safari restricts navigator.mediaDevices to secure contexts (HTTPS,
+// localhost, 127.0.0.1, *.local) — private IPv4 literals like 192.168.x.x
+// over plain HTTP are NOT secure contexts. Chrome is more permissive
+// for private-network IPs, so this trap only fires on Safari (qarl-
+// reported 2026-05-23 on http://192.168.1.67/#/live). The raw TypeError
+// the default getUserMedia factory throws is cryptic; we detect the
+// missing API at mount + click time and surface this actionable message
+// instead. Stream source remains usable — it doesn't touch the media-
+// devices API.
+const CAMERA_API_UNAVAILABLE_MSG =
+    "Camera unavailable — your browser blocks camera access on plain HTTP. " +
+    "Try HTTPS or use a Stream URL instead.";
+
 const SECTION_TEMPLATE = `
     <section class="live">
         <header class="live-header">
@@ -270,6 +284,10 @@ const SECTION_TEMPLATE = `
  * @param {(url:string) => Promise} [options.apiTakeoverRtspLive]
  * @param {(sessionId:string) => Promise} [options.apiStopLive]
  * @param {(constraints) => Promise<MediaStream>} [options.getUserMedia]
+ * @param {() => boolean} [options.hasGetUserMedia] — preflight
+ *   predicate; returns true iff navigator.mediaDevices.getUserMedia
+ *   is callable. Defaults to a real-navigator probe; tests override
+ *   to simulate Safari's missing-API behavior on plain-HTTP origins.
  * @param {() => RTCPeerConnection} [options.createPeerConnection]
  * @param {boolean} [options.simulateOnly] — when true, skip the
  *   WebRTC negotiation and the /api/live/{start,stop,takeover}
@@ -294,6 +312,14 @@ export function mountLivePanel(container, options = {}) {
         fetchSettings = getSettings,
         getUserMedia = (constraints) =>
             navigator.mediaDevices.getUserMedia(constraints),
+        // Evaluated at CALL time (not default-arg-eval) so SSR /
+        // pre-paint contexts where `navigator` isn't yet defined
+        // don't trip on module load. Tests override to simulate the
+        // Safari-over-plain-HTTP missing-API case.
+        hasGetUserMedia = () =>
+            typeof navigator !== "undefined" &&
+            !!navigator.mediaDevices &&
+            typeof navigator.mediaDevices.getUserMedia === "function",
         createPeerConnection = () => new RTCPeerConnection(),
         simulateOnly = false,
     } = options;
@@ -840,6 +866,16 @@ export function mountLivePanel(container, options = {}) {
             }
         }
 
+        // Defensive preflight: mount-init normally lands the banner
+        // first, but if the click arrives before mount-init runs (or
+        // the predicate changes underneath us), surface the same
+        // actionable message rather than emit the raw TypeError
+        // through failTo. No API call, no transient state churn.
+        if (state.localStream === null && !hasGetUserMedia()) {
+            failWith(CAMERA_API_UNAVAILABLE_MSG);
+            return;
+        }
+
         try {
             // Open camera if mount-init didn't already (idle/error
             // entry; preview entry already has a live localStream).
@@ -910,6 +946,13 @@ export function mountLivePanel(container, options = {}) {
         // camera takeover path below is webrtc-only.
         if (state.sourceMode === "vlc") {
             await takeOverVlc();
+            return;
+        }
+        // Same defensive guard as goLive: surface the missing-
+        // mediaDevices case as an actionable banner instead of a raw
+        // TypeError through failTo.
+        if (!hasGetUserMedia()) {
+            failWith(CAMERA_API_UNAVAILABLE_MSG);
             return;
         }
         try {
@@ -1113,6 +1156,18 @@ export function mountLivePanel(container, options = {}) {
         render();
     }
 
+    // Like failTo but skips the "Stream failed: " prefix — the message
+    // IS the diagnostic. Used for environmental failures (missing
+    // browser API, etc.) where the prefix would create a confusing
+    // "Stream failed: Camera unavailable — ..." stutter.
+    function failWith(message) {
+        teardownPC();
+        state.sessionId = null;
+        state.phase = "error";
+        setMessage(message);
+        render();
+    }
+
     // --- Mount-time pre-flight + camera open ------------------------------
 
     // Phase 12.2 followup (qarl 2026-04-29): open the camera at mount
@@ -1159,6 +1214,15 @@ export function mountLivePanel(container, options = {}) {
         // VLC mode has no camera to pre-open — the panel just sits
         // idle with the RTSP URL field ready for the operator.
         if (state.sourceMode === "vlc") return;
+        // Surface the missing-mediaDevices case (Safari over plain
+        // HTTP non-localhost) BEFORE the doomed getUserMedia attempt,
+        // so the operator sees a persistent actionable banner instead
+        // of a silent fall-back to empty-message idle. Stay in idle
+        // phase so the source toggle still works (VLC remains usable).
+        if (!hasGetUserMedia()) {
+            setMessage(CAMERA_API_UNAVAILABLE_MSG);
+            return;
+        }
         try {
             state.phase = "requesting-camera";
             setMessage("Requesting camera access…");
