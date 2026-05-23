@@ -9,6 +9,7 @@ external contract.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -280,6 +281,55 @@ def test_takeover_400_surfaces_error_class_in_detail(client: TestClient):
     assert isinstance(error_class, str) and error_class
     assert error_class.isidentifier()
     assert "Address family not supported" not in response.text
+
+
+# --- Slice 4 Test A (2026-05-23): canonical systemd unit AF_NETLINK lock ----
+#
+# Catches the regression on every CI run regardless of platform —
+# pure file-parse, no aiortc / no Linux runtime dependency. If a
+# future "harden the unit further" PR strips AF_NETLINK without
+# understanding aioice's ICE-gather dependency, CI fails here
+# immediately with a pointer at the comment block that explains why.
+
+
+def test_systemd_unit_whitelists_af_netlink():
+    """The canonical openmarquee-backend.service must include
+    AF_NETLINK in RestrictAddressFamilies. aiortc's aioice opens an
+    AF_NETLINK socket to enumerate interfaces during ICE candidate
+    gathering; without the whitelist entry, `/api/live/start` returns
+    400 with OSError [Errno 97] (Address family not supported by
+    protocol). Diagnosed on FYS 2026-05-23.
+    """
+    unit = (
+        Path(__file__).resolve().parent.parent.parent
+        / "system"
+        / "openmarquee-backend.service"
+    )
+    assert unit.is_file(), (
+        f"canonical unit file not found at {unit}; relocation? update the "
+        f"test path."
+    )
+    text = unit.read_text()
+    line = next(
+        (
+            ln
+            for ln in text.splitlines()
+            if ln.strip().startswith("RestrictAddressFamilies=")
+        ),
+        None,
+    )
+    assert line is not None, (
+        "RestrictAddressFamilies= directive missing from "
+        f"{unit}. The systemd hardening line must remain present + carry "
+        "AF_NETLINK."
+    )
+    assert "AF_NETLINK" in line, (
+        f"AF_NETLINK missing from RestrictAddressFamilies — aiortc/aioice "
+        f"needs it for ICE candidate gathering (see the comment block above "
+        f"the directive in {unit.name} + the FYS 2026-05-23 diagnosis in "
+        f"the Slice 3 commit). Stripping it silently re-introduces the "
+        f"Mode A '/api/live/start 400' bug. Current line: {line!r}"
+    )
 
 
 # --- STREAM/VLC slice 3: tier table ---------------------------------------
