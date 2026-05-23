@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
       - name: Install backend with dev extras
         working-directory: backend
         run: pip install -e '.[dev]'
@@ -26,10 +26,16 @@ jobs:
       - name: pip-audit
         working-directory: backend
         run: pip-audit -r requirements.lock
+      # Stderr is intentionally NOT redirected here: if pip-compile
+      # crashes (e.g. pip-tools / pip version drift like the 2026-05-24
+      # AttributeError trip), the error message lands in the CI log
+      # rather than producing an empty stdout that diffs as "lock fully
+      # deleted" — which is what hid the pip-tools 7.4.1 vs pip 26
+      # incompat from the lock-drift gate for hours.
       - name: Lock drift check
         working-directory: backend
         run: |
-          pip-compile --quiet --strip-extras pyproject.toml -o - 2>/dev/null \
+          pip-compile --quiet --strip-extras pyproject.toml -o - \
             | diff -u requirements.lock -
       - name: Pytest
         working-directory: backend
@@ -144,10 +150,10 @@ jobs:
     needs: [backend, ui, build-wasm]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.11
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
       - name: Install backend
         working-directory: backend
         run: pip install -e '.[dev]'

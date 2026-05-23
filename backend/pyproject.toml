@@ -58,7 +58,19 @@ dev = [
     # spurious diffs in the header comment block. Pinning eliminates
     # that. Bump in lockstep with a re-run of pip-compile + commit
     # of the updated requirements.lock.
-    "pip-tools==7.4.1",
+    #
+    # Bumped 2026-05-24: 7.4.1 → 7.5.3. pip 26 removed the
+    # `PackageFinder.allow_all_prereleases` attribute that pip-tools
+    # 7.4.x relied on; pip-compile crashes with AttributeError on any
+    # host that has pip >= 26. 7.5.0 added the compat shim. Floor for
+    # any future bump is 7.5.0; staying EXACT-pinned keeps the lock-
+    # drift check immune to header churn across dev/CI.
+    #
+    # DO NOT loosen this pin to chase a pip-audit CVE alert against
+    # pip-tools 7.5.x — bump the exact version instead. Loosening
+    # would reintroduce header churn in requirements.lock across
+    # dev/CI and re-open the lock-drift gate to false positives.
+    "pip-tools==7.5.3",
     "pip-audit>=2.7",
 ]
 
