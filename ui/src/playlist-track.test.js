@@ -623,3 +623,82 @@ describe("mountPlaylistTrack — default-playlist name input context", () => {
         void handle;
     });
 });
+
+
+describe("mountPlaylistTrack — Sortable bind-generation guard", () => {
+    it("destroys a stale Sortable pair when a newer refresh() interleaves", async () => {
+        // refresh()'s slow path lazy-imports sortablejs (~30-100ms cold)
+        // before creating trackSortable + palletSortable. If a second
+        // refresh fires while the first is awaiting that import, both
+        // refreshes hit the pre-await destroy() (which finds null), then
+        // BOTH create new pairs, then BOTH would assign to the module-
+        // scoped trackSortable/palletSortable -- the loser's pair would
+        // dangle without ever being destroyed.
+        //
+        // The generation guard (mirrors editor.js:1185-1205) bumps a
+        // counter pre-await and checks it post-await; the stale pair
+        // gets destroyed instead of leaking.
+        //
+        // We verify by spy-substituting Sortable.create with a tracked
+        // fake instance + forcing the second refresh to complete with
+        // a different refreshKey (so it can't take the memo fast path).
+        const { default: Sortable } = await import("sortablejs");
+        const destroyCalls = [];
+        let instanceCounter = 0;
+        const createSpy = vi
+            .spyOn(Sortable, "create")
+            .mockImplementation((el, opts) => {
+                const id = `s${instanceCounter++}`;
+                return {
+                    id,
+                    groupName: opts?.group?.name || "unknown",
+                    destroy: () => destroyCalls.push(id),
+                    option: vi.fn(),
+                };
+            });
+
+        // playlists shape will change between the two refreshes so
+        // refreshKey differs and neither hits the memo fast path.
+        let playlists = [
+            { id: DEFAULT_PLAYLIST_ID, name: "default", items: [{ item_id: "a" }] },
+        ];
+
+        const container = document.createElement("div");
+        const handle = mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({ schema_version: 4, playlists }),
+            onReorder: vi.fn().mockResolvedValue(undefined),
+        });
+        // Drain mount-time refresh (creates pair #0 + #1).
+        await tick();
+        await tick();
+        const createsAfterMount = createSpy.mock.calls.length;
+        expect(createsAfterMount).toBeGreaterThanOrEqual(2);
+        // No destroys yet -- mount-time pair is the active one.
+        expect(destroyCalls).toHaveLength(0);
+
+        // Mutate playlists between the two refresh() invocations so
+        // each refresh sees a distinct refreshKey (defeats the memo
+        // fast-path that would short-circuit before the bind step).
+        playlists = [
+            { id: DEFAULT_PLAYLIST_ID, name: "default", items: [{ item_id: "a" }, { item_id: "b" }] },
+        ];
+        const refreshA = handle.refresh();
+        playlists = [
+            { id: DEFAULT_PLAYLIST_ID, name: "default", items: [{ item_id: "b" }] },
+        ];
+        const refreshB = handle.refresh();
+        await Promise.all([refreshA, refreshB]);
+        await tick();
+
+        // Two refreshes ran the slow path → 2 new pairs created (= 4
+        // additional Sortable.create calls). The mount-time pair was
+        // destroyed by refresh A's pre-await destroy(); refresh A's
+        // own pair was destroyed by the generation guard when refresh
+        // B's bump invalidated it. Total destroys: mount-pair (2) +
+        // A's stale pair (2) = 4. The winning pair (B's) stays alive.
+        const createsAfterRaces = createSpy.mock.calls.length;
+        expect(createsAfterRaces).toBe(createsAfterMount + 4);
+        expect(destroyCalls).toHaveLength(4);
+    });
+});
