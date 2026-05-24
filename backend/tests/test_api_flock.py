@@ -471,6 +471,80 @@ def test_hello_endpoint_rejects_malformed_address(recording_client):
     assert recorder.hellos == []
 
 
+# ---- 2026-05-24 security audit MEDIUM finding 2: SSRF-shape gate ----
+#
+# POST /api/flock/hello is UNAUTHENTICATED (peer-discovery whitelist).
+# Without a trusted-peer-address gate, an attacker on the LAN can post
+# an arbitrary address (any public IP, any LAN host, any registered
+# hostname) and the backend stores it AND fires `GET http://<addr>/api/
+# settings` as a background-task probe. That's a blind SSRF / LAN
+# portscan primitive. These tests pin the trust-shape contract on
+# HelloBody so a future refactor can't silently drop it.
+
+
+@pytest.mark.parametrize(
+    "addr",
+    [
+        "10.0.0.1",  # RFC1918 (10/8)
+        "10.255.255.254",
+        "172.16.0.1",  # RFC1918 (172.16/12)
+        "172.31.255.254",
+        "192.168.0.1",  # RFC1918 (192.168/16)
+        "192.168.1.100:8080",  # RFC1918 with port (FLOCK_ADDRESS_PATTERN permits)
+        "127.0.0.1",  # loopback (local dev)
+        "100.64.0.1",  # Tailscale CGNAT (100.64/10)
+        "100.127.255.254",  # CGNAT upper-edge
+        "fireplacesign.tail71c768.ts.net",  # Tailscale magic-DNS
+        "lobby.ts.net",  # bare-subdomain magic-DNS
+        "stranger.ts.net",  # what the existing tests use
+    ],
+)
+def test_hello_endpoint_accepts_trusted_peer_addresses(addr, recording_client):
+    """Trusted-shape addresses must pass the new validator: RFC1918,
+    loopback, Tailscale CGNAT, *.ts.net magic-DNS. The dev Pi at
+    `fireplacesign.tail71c768.ts.net` is the production reference
+    case — must validate or production breaks."""
+    client, recorder, _ = recording_client
+    response = client.post("/api/flock/hello", json={"address": addr})
+    assert response.status_code == 204, (
+        f"expected 204 for trusted address {addr!r}; got {response.status_code} "
+        f"with body {response.text!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "addr",
+    [
+        "1.2.3.4",  # public IPv4
+        "8.8.8.8",  # public DNS
+        "203.0.113.42",  # TEST-NET-3 (RFC5737 documentation, but still NOT private)
+        "100.128.0.1",  # just OUTSIDE the CGNAT 100.64.0.0/10 block
+        "evil.com",  # public hostname
+        "attacker.example",
+        "tailscale.com",  # non-tailnet host that happens to be Tailscale's marketing site
+        "example.ts.net.evil.com",  # `.ts.net` middle-of-hostname tricks
+        "ts.net",  # bare TLD, no subdomain
+        "1.2.3.4.ts.net",  # embedded IPv4 as subdomain (suffix-match bypass)
+        "foo..bar.ts.net",  # double-dot in subdomain
+    ],
+)
+def test_hello_endpoint_rejects_untrusted_peer_addresses(addr, recording_client):
+    """Public IPs, non-tailnet hostnames, near-CGNAT addresses, and
+    `.ts.net`-suffix-spoofing attempts must all reject with 422 BEFORE
+    apply_hello sees them (so the SSRF-shape background probe never
+    fires)."""
+    client, recorder, _ = recording_client
+    response = client.post("/api/flock/hello", json={"address": addr})
+    assert response.status_code == 422, (
+        f"expected 422 for untrusted address {addr!r}; got {response.status_code}"
+    )
+    # The handler short-circuited at the validator; apply_hello was
+    # NOT called, so the background probe_peer_name task NOT scheduled.
+    assert recorder.hellos == [], (
+        f"untrusted address {addr!r} reached apply_hello — SSRF gate bypassed"
+    )
+
+
 def test_hello_endpoint_schedules_name_probe_on_first_hello(recording_client):
     """Phase B.4: when an inbound hello adds a never-seen peer
     (apply_hello returns True), schedule the same probe_peer_name

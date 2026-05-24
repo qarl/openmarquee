@@ -26,6 +26,7 @@ Storage shape (flock.json):
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 from datetime import UTC, datetime
@@ -50,6 +51,92 @@ FLOCK_ADDRESS_PATTERN = re.compile(
     r"(?:[A-Za-z0-9\-\.]{0,251}[A-Za-z0-9])?"
     r"(?::[0-9]{1,5})?$"
 )
+
+# Tailscale magic-DNS suffix regex: <label>(.label)*.ts.net where
+# each label is DNS-clean (alphanumeric + hyphen, no embedded IPs or
+# bare dots). Without this, a pure `endswith(".ts.net")` check would
+# accept e.g. `1.2.3.4.ts.net` or `foo..bar.ts.net` — Tailscale's
+# DNS won't resolve them, but a misconfigured operator resolver
+# could forward unknown `*.ts.net` queries elsewhere and weaken the
+# "registry-controlled TLD" trust assumption.
+_TAILSCALE_MAGIC_DNS_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)*\.ts\.net$"
+)
+
+# Trusted-peer IPv4 ranges for is_trusted_peer_address(). Explicit
+# rather than relying on `ipaddress.IPv4Address.is_private` because
+# the latter is over-broad: it returns True for RFC5737 documentation
+# ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) and other non-
+# globally-reachable blocks that aren't actual trusted-peer addresses
+# in the openMarquee deployment model. Mirroring the constants block
+# here keeps the trust surface explicit + auditable.
+_TRUSTED_PEER_RANGES = (
+    ipaddress.ip_network("10.0.0.0/8"),  # RFC1918 class A
+    ipaddress.ip_network("172.16.0.0/12"),  # RFC1918 class B
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC1918 class C
+    ipaddress.ip_network("127.0.0.0/8"),  # loopback
+    ipaddress.ip_network("100.64.0.0/10"),  # Tailscale CGNAT
+)
+
+
+def is_trusted_peer_address(addr: str) -> bool:
+    """True iff `addr` is an IP / hostname that the device should
+    accept as a flock-peer candidate without operator confirmation.
+
+    Used as a defense-in-depth gate on the UNAUTHENTICATED POST
+    /api/flock/hello: without it, an attacker on the LAN can post a
+    public IP or any internal-LAN host, then the backend stores it +
+    fires a background GET against the address (blind SSRF / portscan
+    primitive). Per the 2026-05-24 security audit MEDIUM finding 2.
+
+    Accepted shapes:
+    - RFC1918 IPv4 (10.x, 172.16-31.x, 192.168.x) -- same LAN as Pi
+    - Loopback IPv4 (127.x) -- local development
+    - Tailscale CGNAT IPv4 (100.64.0.0/10) -- tailnet-assigned addr
+    - `*.ts.net` hostname -- Tailscale magic-DNS shape (registry-
+      controlled TLD; an attacker can't register a non-Tailscale
+      `*.ts.net` without compromising Tailscale's registry)
+
+    The `:port` suffix on `addr` is stripped before the check (the
+    FLOCK_ADDRESS_PATTERN regex permits it; the trust check operates
+    on the host alone).
+
+    Operator-driven POST /api/flock (the authenticated path) does
+    NOT use this gate -- the operator's intent IS the trust signal
+    there. Only /api/flock/hello (unauth gossip-on-add) needs the
+    SSRF-shape protection.
+    """
+    # Strip optional :port suffix before evaluating the host.
+    host = addr.rsplit(":", 1)[0] if ":" in addr and addr.count(":") == 1 else addr
+    # Tailscale magic-DNS subdomain shape: must be DNS-label-clean
+    # under the .ts.net suffix. Pure `endswith(".ts.net")` would
+    # accept embedded IPs / double-dots; the regex enforces real
+    # subdomain shape.
+    if _TAILSCALE_MAGIC_DNS_PATTERN.match(host):
+        # Belt-and-suspenders: the regex accepts digit-only labels
+        # (legitimate DNS), so an attacker could still smuggle an
+        # IPv4 literal as the subdomain (e.g. `1.2.3.4.ts.net`).
+        # Reject if the prefix-before-.ts.net parses as an IP.
+        prefix = host[: -len(".ts.net")]
+        try:
+            ipaddress.ip_address(prefix)
+            return False
+        except ValueError:
+            pass
+        return True
+    # IP literal: must be in one of the explicit trusted ranges.
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # Not an IP and not *.ts.net -> reject. This blocks public-
+        # hostname SSRF targets (evil.com, attacker.example) and any
+        # other non-Tailscale DNS name an attacker might supply.
+        return False
+    if not isinstance(ip, ipaddress.IPv4Address):
+        # IPv6 is not yet supported in the flock-address surface
+        # (FLOCK_ADDRESS_PATTERN's docstring also notes this).
+        return False
+    return any(ip in net for net in _TRUSTED_PEER_RANGES)
 
 
 def _now() -> datetime:

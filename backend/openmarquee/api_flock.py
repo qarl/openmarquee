@@ -33,7 +33,13 @@ from openmarquee.dependencies import (
     get_flock_sync,
     get_tombstone_storage,
 )
-from openmarquee.flock import FLOCK_ADDRESS_PATTERN, Flock, FlockPeer, FlockStorage
+from openmarquee.flock import (
+    FLOCK_ADDRESS_PATTERN,
+    Flock,
+    FlockPeer,
+    FlockStorage,
+    is_trusted_peer_address,
+)
 from openmarquee.flock_sync import FlockSync, NotifyKind
 from openmarquee.tombstone import Tombstone, TombstoneStorage
 
@@ -215,7 +221,18 @@ class HelloBody(BaseModel):
     receiver adds it to its own flock if not already present and does
     NOT cascade further (loop prevention). Used both for the
     reciprocal-add hello (A→B carries A's address) and the
-    forward-notification hello (A→C carries the new B's address)."""
+    forward-notification hello (A→C carries the new B's address).
+
+    The /hello endpoint is UNAUTHENTICATED (peer-discovery whitelist),
+    so the address field gets an extra trust-shape gate beyond the
+    standard FLOCK_ADDRESS_PATTERN: addresses must be RFC1918 /
+    loopback / Tailscale-CGNAT IPs or `*.ts.net` hostnames. Without
+    this gate, an attacker on the LAN could post a public-IP or LAN-
+    host address and trigger a background GET from the Pi (blind SSRF
+    / portscan primitive — 2026-05-24 security audit MEDIUM finding 2).
+    The operator-driven AddPeerBody intentionally does NOT carry this
+    gate (operator intent IS the trust signal there).
+    """
 
     address: str = Field(
         min_length=1,
@@ -228,6 +245,22 @@ class HelloBody(BaseModel):
     def _normalize_address(cls, value: object) -> object:
         if isinstance(value, str):
             return value.strip().lower()
+        return value
+
+    @field_validator("address", mode="after")
+    @classmethod
+    def _check_trusted_shape(cls, value: str) -> str:
+        # Runs AFTER `_normalize_address` (mode="before") + the
+        # FLOCK_ADDRESS_PATTERN regex check (pattern= on the Field).
+        # By this point `value` is a normalized, shape-valid address;
+        # we only need to verify it lives in a trusted-peer range.
+        if not is_trusted_peer_address(value):
+            raise ValueError(
+                "hello address must be a private IP (RFC1918), "
+                "loopback, Tailscale CGNAT (100.64.0.0/10), or a "
+                "Tailscale magic-DNS name (*.ts.net); refusing "
+                f"public/non-tailnet address {value!r}"
+            )
         return value
 
 
