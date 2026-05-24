@@ -167,6 +167,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      # ffmpeg ships ffprobe (needed by stream_consumer in the uvicorn
+      # webServer Playwright launches) AND the ffmpeg CLI used by e2e
+      # fixture helpers to generate test videos on-the-fly (e.g.
+      # text-over-video, video-upload specs). The backend job has the
+      # same install at L18 for its own pytest needs — the e2e job is
+      # a separate CI runner + needs its own apt-install.
+      - name: Install ffmpeg (for ffprobe + fixture-video generation)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
       - name: Install backend
         working-directory: backend
         run: pip install -e '.[dev]'
