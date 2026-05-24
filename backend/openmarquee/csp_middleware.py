@@ -45,7 +45,7 @@ DEFAULT_CSP_POLICY = (
     "img-src 'self' data: blob:; "
     "media-src 'self' blob:; "
     "font-src 'self'; "
-    "connect-src 'self'; "
+    "connect-src 'self' blob:; "
     "worker-src 'self' blob:; "
     "object-src 'none'; "
     "frame-ancestors 'none'; "
