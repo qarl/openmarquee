@@ -69,6 +69,10 @@ import { mountSchedule } from "./schedule.js";
 import { mountSettings } from "./settings.js";
 import { mountSlidesShell } from "./slides.js";
 import { rerenderAllSlidesForRotation } from "./rotation-rerender.js";
+import {
+    buildEditRoutes,
+    runDeleteCascade,
+} from "./slide-event-handlers.js";
 import { mountLivePanel } from "./live-panel.js";
 import { mountVideoUploader } from "./video-upload.js";
 import { mountStreamUploader } from "./stream-upload.js";
@@ -965,28 +969,17 @@ async function boot() {
     // is intentional: nav.js prefix-walks it to the parent `slides`
     // section, AND the slides shell's hashchange listener picks the
     // correct tab from the same URL — one mutation, both effects.
-    const EDIT_ROUTES = {
-        text_slide: {
-            section: "slides/text",
-            load: (slide) => editor.loadForEdit(slide),
-        },
-        image: {
-            section: "slides/image",
-            load: (slide) => imageUploader.loadForEdit(slide),
-        },
-        video: {
-            section: "slides/video",
-            load: (slide) => videoUploader.loadForEdit(slide),
-        },
-        stream: {
-            section: "slides/stream",
-            load: (slide) => streamUploader.loadForEdit(slide),
-        },
-        web: {
-            section: "slides/web",
-            load: (slide) => webSlideEditor.loadForEdit(slide),
-        },
-    };
+    // Route table is built once but reads handles via the accessor at
+    // dispatch time so a settings-updated re-mount (which reassigns
+    // editor / imageUploader / etc. -- see mountDimensionedPanels) is
+    // transparent. See slide-event-handlers.js for the contract.
+    const EDIT_ROUTES = buildEditRoutes(() => ({
+        editor,
+        imageUploader,
+        videoUploader,
+        streamUploader,
+        webSlideEditor,
+    }));
     document.addEventListener("openmarquee:edit-slide", async (event) => {
         const { id, type } = event.detail || {};
         const route = EDIT_ROUTES[type];
@@ -1015,18 +1008,19 @@ async function boot() {
             return;
         }
         // Refresh every surface that lists slides so the deleted tile
-        // vanishes without a page reload.
-        await Promise.all([
-            playlistTrack?.refresh(),
-            editor?.refreshBrowser?.(),
-            imageUploader?.refreshBrowser?.(),
-            videoUploader?.refreshBrowser?.(),
-            streamUploader?.refreshBrowser?.(),
-            webSlideEditor?.refreshBrowser?.(),
-            slidesShell?.refreshCounts?.(),
-            refreshSidebarCounts(),
-            inlinePreviewHandle?.refresh?.(),
-        ]);
+        // vanishes without a page reload. See slide-event-handlers.js
+        // for the 9-target contract + parallel semantics.
+        await runDeleteCascade({
+            playlistTrack,
+            editor,
+            imageUploader,
+            videoUploader,
+            streamUploader,
+            webSlideEditor,
+            slidesShell,
+            refreshSidebarCounts,
+            inlinePreviewHandle,
+        });
     });
     // Silence unused-var; `nav` is the mount's return value in case a
     // caller later wants to trigger navigation programmatically.
