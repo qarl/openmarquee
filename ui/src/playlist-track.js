@@ -201,6 +201,15 @@ export function mountPlaylistTrack(container, options) {
 
     let trackSortable = null;
     let palletSortable = null;
+    // Generation guard: bindTrackSortable + bindPalletSortable await a
+    // lazy `import("sortablejs")` (~30-100ms cold). If a second refresh()
+    // fires while the first is still awaiting, both refreshes hit the
+    // pre-await destroy(), then BOTH assign new instances to the module-
+    // scoped trackSortable/palletSortable; the earlier pair dangles
+    // without a destroy(). Same shape as editor.js's sortableBindGeneration
+    // (L1185-1205). Bumped at the start of every slow-path refresh; the
+    // post-await assignment bails if a newer refresh has incremented it.
+    let sortableBindGeneration = 0;
     // Bumped on every refresh() so tile thumbnail URLs force a refetch
     // (edits don't change created_at, so the HTTP cache would otherwise
     // serve stale bytes after an in-place save).
@@ -390,8 +399,12 @@ export function mountPlaylistTrack(container, options) {
             }
 
             // Lazy-import sortablejs; the two binders await it. Parallel
-            // since they're independent.
-            [trackSortable, palletSortable] = await Promise.all([
+            // since they're independent. Generation guard (see declaration
+            // comment above) handles the race where a second refresh()
+            // fires while we're awaiting these — without it, the loser's
+            // Sortable pair dangles without a destroy().
+            const myGeneration = ++sortableBindGeneration;
+            const [newTrack, newPallet] = await Promise.all([
                 bindTrackSortable(
                     trackEl,
                     markContentDirty,
@@ -401,8 +414,19 @@ export function mountPlaylistTrack(container, options) {
                 ),
                 bindPalletSortable(palletEl),
             ]);
+            if (myGeneration !== sortableBindGeneration) {
+                // A newer refresh started while we were awaiting. Destroy
+                // what we created so we don't leak; the winner has its own
+                // pair queued up.
+                newTrack?.destroy();
+                newPallet?.destroy();
+                return;
+            }
+            [trackSortable, palletSortable] = [newTrack, newPallet];
 
             // Eyebrow stats: total playlists, then this loop's block count + duration.
+            // Inside the gated branch so a stale refresh can't clobber the
+            // winner's stats either.
             const statsEl = container.querySelector("[data-playlist-stats]");
             if (statsEl) {
                 const playlistCount = (collection.playlists || []).length;
