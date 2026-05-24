@@ -1,12 +1,19 @@
 // E2E: Settings secret-field rotation flow (Phase A.5).
 //
-// Each of the 3 secret fields (wifi_password / wifi_station_password /
-// tailscale_auth_key) has a Change… inline form. The form drives a
-// PATCH /api/settings/<endpoint> with current_password + new_value.
+// The 2 remaining secret fields (wifi_password / wifi_station_password)
+// each have a Change… inline form. The form drives a PATCH
+// /api/settings/<endpoint> with current_password + new_value.
 // The 20.4 wiring sets skipAuth401Redirect=true so a wrong-current-
 // password 401 stays inline rather than bouncing to /login.html
 // (which would be the wrong UX -- 401 here means "you typed the
 // wrong current password," not "your bearer token is stale").
+//
+// (The tailscale_auth_key Change…→Cancel test was removed 2026-05-24:
+// tailscale was refactored to an "Enable Tailscale" button + URL
+// sign-in flow, and the auth-key input is now a hidden back-compat
+// field with no secret-field UX. A test for the new Enable-Tailscale
+// flow is deferred — it's a feature-test addition, not stop-the-
+// bleeding for the CI green-up arc.)
 //
 // Same OPENMARQUEE_DISABLE_AUTH=1 harness as the other auth specs:
 // AuthMiddleware bypassed for /api/* in general so editor mounts
@@ -83,24 +90,3 @@ test("wifi-ap-password Change… rejects empty new_value (422 from backend)", as
     );
 });
 
-test("tailscale-auth-key Change… → Save then Cancel re-open clears form", async ({ page }) => {
-    await page.goto("/#/settings");
-    const row = page.locator('.secret-field[data-secret="tailscale-auth-key"]');
-    await expect(row.locator(".secret-status")).toContainText(/Not set/i);
-
-    await row.locator(".secret-change-btn").click();
-    await row.locator(".secret-current-password").fill(INITIAL_PASSWORD);
-    await row.locator(".secret-new-value").fill("tskey-auth-aaaaaaaaaaaaaaaaaa");
-    await row.locator(".secret-save-btn").click();
-    await expect(row.locator(".secret-form")).toBeHidden({ timeout: 5000 });
-    await expect(row.locator(".secret-status")).toContainText(/Set/i);
-
-    // Re-open + cancel: inputs are cleared, form collapses.
-    await row.locator(".secret-change-btn").click();
-    await row.locator(".secret-current-password").fill("partial-typing");
-    await row.locator(".secret-cancel-btn").click();
-    await expect(row.locator(".secret-form")).toBeHidden();
-    // Next open() starts clean.
-    await row.locator(".secret-change-btn").click();
-    await expect(row.locator(".secret-current-password")).toHaveValue("");
-});
