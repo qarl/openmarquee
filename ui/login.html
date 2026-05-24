@@ -151,6 +151,17 @@
 
         .reveal-btn:hover { color: var(--text); }
 
+        /* WCAG 2.4.7 — keyboard-only operators need a visible focus
+           ring on the Sign-in submit + the Show/Hide reveal button.
+           `:focus-visible` fires on keyboard navigation only, so
+           mouse clicks don't trigger a stray outline. Input fields
+           keep their own border-color focus indicator above. */
+        button:focus-visible,
+        .reveal-btn:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
         button.submit {
             width: 100%;
             min-height: 3rem;
