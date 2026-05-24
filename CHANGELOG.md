@@ -17,7 +17,15 @@ locations for cross-ecosystem readability.
 
 ## [Unreleased]
 
-(empty — next changes land here.)
+### Tooling
+
+- Pin `ruff==0.15.14` in `backend/pyproject.toml` dev extras to
+  eliminate local-vs-CI formatter drift. Was floating at
+  `ruff>=0.3`, which meant `pip install -e '.[dev]'` resolved to
+  whatever ruff version pip's resolver picked at install time on
+  each runner. On 2026-05-24 alone, four separate CI-parity
+  commits landed solely to absorb that drift (`8f77001 1d2887e
+  e7f3425 6126ca3`). Pinning eliminates the class.
 
 ## [0.7.0-rc.1] — 2026-05-24
 

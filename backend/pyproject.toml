@@ -46,7 +46,13 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "ruff>=0.3",
+    # ruff is EXACT-pinned: CI gates `ruff format --check`, and any
+    # version skew between local + CI dev installs produces a "valid
+    # code fails CI" parity churn (four such commits on 2026-05-24
+    # alone -- `git log --before=2026-05-25 --grep=ruff` recovers
+    # them). When bumping the pin, run `ruff format .` locally with
+    # the new version first; same-PR reformats may be required.
+    "ruff==0.15.14",
     # Lockfile + CVE-audit tooling. pip-compile (from pip-tools)
     # regenerates requirements.lock from pyproject.toml; pip-audit
     # gates pre-deploy on CVE findings against the lockfile. Both
