@@ -91,9 +91,7 @@ def test_migration_is_idempotent(tmp_path: Path):
     # NOTE: import is local to keep _make_slide_with_pattern out of
     # the module namespace where the earlier tests don't need it.
     # The helper itself lives further down in this file.
-    pattern_slide = _make_slide_with_pattern(
-        bg="#000000", color_a="#050608", color_b="#FFB43C"
-    )
+    pattern_slide = _make_slide_with_pattern(bg="#000000", color_a="#050608", color_b="#FFB43C")
     storage.save_text_slide(bg_slide, png=b"\x89PNG")
     storage.save_text_slide(pattern_slide, png=b"\x89PNG")
 
