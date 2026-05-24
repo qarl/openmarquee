@@ -617,7 +617,7 @@ matched by the Python proxy's `RustRendererOpError.message` (slice 1).
 - After 30 days clean (no rollbacks invoked), Step 10 deletes `backend/openmarquee/rendering/` (except the import shim). The env-var gate goes away.
 
 **During the dual-tree window, what's fragile:**
-- The Python backend's `playback.py` has hard-coded imports from `rendering.gpu_compositor`. We add a feature flag at import time so the rust-sidecar path skips those imports. Otherwise, no changes to Python.
+- The Python backend's `playback.py` has hard-coded imports from `rendering.gpu_compositor`. We add a feature flag at import time so the rust-sidecar path skips those imports. Otherwise, no changes to Python. **[DONE: the rust-sidecar flip + the post-soak Step 10 deletion of `rendering/gpu_compositor.py` + `shader_compositor.py` landed in commits b320dfd + 70a4865; this fragility no longer applies.]**
 - The Rust standalone test path needs DRM master. It's incompatible with Python's renderer running. Document this; don't try to be clever with master-handoff.
 
 ---

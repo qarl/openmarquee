@@ -138,10 +138,12 @@ renderer must consume them as-is.
 ### 6.2 Transitions (from `backend/openmarquee/playlist.py`)
 
 PlaylistItem.transition is one of 16 string values. The renderer must
-support all 16. Their visual semantics match the existing fragment
-shaders under `backend/openmarquee/rendering/shader_compositor.py`
-(treat that as a reference for what each one looks like, not as a
-contract to keep verbatim).
+support all 16. Their visual semantics matched the legacy fragment
+shaders that lived in `backend/openmarquee/rendering/shader_compositor.py`
+(deleted in 70a4865; see `docs/historical/shader-compositor.md` for
+the preserved snapshot). The Rust sidecar now owns the transition
+implementations; treat the historical doc as a reference for visual
+intent, not a contract to keep verbatim.
 
   `cut`, `fade`, `wipe`, `iris`, `dissolve`, `pixelate`, `scanline`,
   `halftone`, `glitch`, `slide`, `push`, `scroll`, `blinds`, `flip`,
