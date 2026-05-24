@@ -815,7 +815,7 @@ def test_power_save_warning_check_present() -> None:
         r'\[\s*"\$ps_state"\s*=\s*"on"\s*\]',
         source,
     ), (
-        "watchdog must check `[ \"$ps_state\" = \"on\" ]` and "
+        'watchdog must check `[ "$ps_state" = "on" ]` and '
         "note() a WARN — anything else (always-log, only-on-fails, "
         "etc.) misses the silent-clobber detection."
     )
