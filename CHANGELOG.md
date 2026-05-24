@@ -17,15 +17,86 @@ locations for cross-ecosystem readability.
 
 ## [Unreleased]
 
+### Backend
+
+- `77bc965` BACKEND (perf P2 — PlaybackLoop._wait). Single
+  `wake_event` race replaces the prior 2-Task `asyncio.wait(
+  FIRST_COMPLETED)` pattern. At the 30Hz playback tick the old shape
+  cost ~0.45% of one core in handle-allocation + event-loop
+  bookkeeping (per QA's perf-resweep v2 P2). New shape uses
+  `asyncio.wait_for(self._wake_event.wait(), timeout=seconds)` with
+  `stop()` and `pause()` both setting the wake event so any in-flight
+  `_wait` returns promptly. Microbench: 2 Tasks/call → 0 Tasks/call
+  (CPython 3.11+ `wait_for` uses `asyncio.timeout()` + `loop.call_at`,
+  no Task wrap); ~42% net overhead drop (157→91 µs/call on local
+  Mac CPython 3.13.5). 7 new test-first equivalence tests in
+  `test_playback.py` pin sleep cadence + mid-wait wake (stop and
+  pause) + race-on-entry (stop and pause) + zero-second short-
+  circuit + cancellation propagation.
+- `a1534de` TESTS (close 2 THIN modules in one bundle). Extends
+  `test_tailscale_self.py` with 8 logical tests (15 cases with
+  parametrize) covering `_query_self_fqdn`'s subprocess + parse
+  path (missing binary, timeout, OSError, non-zero exit, non-JSON
+  stdout, missing/wrong-shape `Self`, trailing-dot normalization,
+  empty/whitespace DNSName). Extends `test_dev.py` with 4 tests
+  covering the dev-preview UX contract (polling JS setInterval,
+  cache-buster query param, 404 detail message, renderer-bytes
+  round-trip). Backend coverage audit tier moves from `0 GAP / 2
+  THIN / 35 GOOD / 8 DEEP` to `0 GAP / 0 THIN / 37 GOOD / 8 DEEP`.
+- `65414ce` TESTS (storage_recovery — close the single GAP). 8 unit
+  tests for `quarantine_corrupt_file()` covering happy path, source-
+  missing pre-condition, OSError-during-rename, ISO-UTC-Z filename
+  pattern, success-WARN log, byte-identical content preservation
+  (binary + invalid-UTF8), prior-quarantine-sibling coexistence,
+  UTC-vs-local timestamp regression lock. Closes the only GAP
+  module from the 2026-05-24 backend coverage audit (45 modules /
+  72-LOC helper). Keeps the existing integration test in
+  `test_playlist.py` as wiring coverage (no migration).
+
+### Renderer
+
+- `2ff8479` RENDERER (perf P1 — `draw_text_layer_msdf` VBO cache).
+  Replaces the per-text-layer `create_buffer` / `delete_buffer` pair
+  at the 4 sub-batches (msdf-ink / tofu / dynamic-msdf / dynamic-
+  emoji) with a single thread_local-cached `NativeBuffer` for the
+  session. Mirrors the existing `cached_msdf_program` /
+  `cached_tofu_program` / `cached_emoji_program` Cell<Option<T>>
+  pattern. Per-call GL handle churn drops from 4 creates + 4 deletes
+  to 0 (one create at session bring-up, one delete at teardown via
+  `clear_msdf_text_vbo_cache`); ~0.2% of one core on Pi Zero 2 W
+  (per QA's perf-resweep v2 P1, scales with text-layer count per
+  frame). `cargo test --release` 542 passing post-refactor.
+
+### UI
+
+- `cae645e` UI (main.js Path C slice 1 — testability extract).
+  Pulls `buildEditRoutes` + `runDeleteCascade` out of `main.js` into
+  testable helpers (jimmy:openmarquee-code2).
+- `07315d1` UI (slides.js behavioral test suite). 11 tests across 4
+  describes covering the slide-browser surface (jimmy:openmarquee-
+  code2).
+- `4a086a9` UI (playlist-track Sortable race). Ports `editor.js`'s
+  Sortable bind-generation guard to `playlist-track` to fix a
+  refresh-race leak (jimmy:openmarquee-code2).
+- `453d87a` UI (a11y + loading-UX polish bundle 3). Layer-eye
+  `aria-pressed` + upload async disable + tailscale polling
+  timeout (jimmy:openmarquee-code2).
+- `dcc90e5` UI (a11y polish bundle 2). Edit button `aria-label` +
+  default-playlist context + upload-input action verbs (jimmy:
+  openmarquee-code2).
+
 ### Tooling
 
-- Pin `ruff==0.15.14` in `backend/pyproject.toml` dev extras to
-  eliminate local-vs-CI formatter drift. Was floating at
+- `abc1ab5` TOOLING (pin `ruff==0.15.14`). Was floating at
   `ruff>=0.3`, which meant `pip install -e '.[dev]'` resolved to
   whatever ruff version pip's resolver picked at install time on
   each runner. On 2026-05-24 alone, four separate CI-parity
   commits landed solely to absorb that drift (`8f77001 1d2887e
-  e7f3425 6126ca3`). Pinning eliminates the class.
+  e7f3425 6126ca3`). Pinning eliminates the class. Pin propagates
+  to CI automatically via the existing dev-extras install (both
+  backend and e2e jobs). Includes a date-anchored rationale comment
+  + bump-protocol ("run `ruff format .` locally with the new
+  version first").
 
 ## [0.7.0-rc.1] — 2026-05-24
 
