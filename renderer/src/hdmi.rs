@@ -785,6 +785,9 @@ where
     // the GL context lifecycle.
     clear_glyph_program_cache(&gl);
     clear_msdf_program_cache(&gl);
+    // QA perf-resweep-v2 P1: free the shared MSDF text scratch VBO
+    // (cached across draw_text_layer_msdf calls within the session).
+    clear_msdf_text_vbo_cache(&gl);
     // SDF arc slice B.2: free msdf atlas textures while context
     // is still bound. Clear the lookup table first so a paint after
     // teardown can't dereference dead texture handles.
@@ -2364,9 +2367,7 @@ fn draw_text_layer_msdf(
         // Batch 1: MSDF-ink glyphs.
         if !ink_verts.is_empty() {
             let cgp = cached_msdf_program(gl, layer.outline)?;
-            let vbo = gl
-                .create_buffer()
-                .map_err(|e| anyhow!("glGenBuffers (msdf): {e}"))?;
+            let vbo = cached_msdf_text_vbo(gl)?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let bytes = std::slice::from_raw_parts(
                 ink_verts.as_ptr() as *const u8,
@@ -2417,16 +2418,13 @@ fn draw_text_layer_msdf(
             gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
             gl.disable_vertex_attrib_array(a_pos);
             gl.disable_vertex_attrib_array(a_uv);
-            gl.delete_buffer(vbo);
         }
 
         // Batch 2: tofu quads (deterministic gray rect + black
         // outline for missing-codepoint glyphs).
         if !tofu_verts.is_empty() {
             let tgp = cached_tofu_program(gl)?;
-            let vbo = gl
-                .create_buffer()
-                .map_err(|e| anyhow!("glGenBuffers (tofu): {e}"))?;
+            let vbo = cached_msdf_text_vbo(gl)?;
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let bytes = std::slice::from_raw_parts(
                 tofu_verts.as_ptr() as *const u8,
@@ -2453,7 +2451,6 @@ fn draw_text_layer_msdf(
             gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
             gl.disable_vertex_attrib_array(tgp.a_pos);
             gl.disable_vertex_attrib_array(tgp.a_uv);
-            gl.delete_buffer(vbo);
         }
 
         // Batch 3 retired in Slice 3D (2026-05-19): the static
@@ -2472,9 +2469,7 @@ fn draw_text_layer_msdf(
         if !dynamic_ink_verts.is_empty() {
             if let Some(dyn_tex) = dynamic_atlas_tex() {
                 let cgp = cached_msdf_program(gl, layer.outline)?;
-                let vbo = gl
-                    .create_buffer()
-                    .map_err(|e| anyhow!("glGenBuffers (dynamic msdf): {e}"))?;
+                let vbo = cached_msdf_text_vbo(gl)?;
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let bytes = std::slice::from_raw_parts(
                     dynamic_ink_verts.as_ptr() as *const u8,
@@ -2519,7 +2514,6 @@ fn draw_text_layer_msdf(
                 gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
                 gl.disable_vertex_attrib_array(a_pos);
                 gl.disable_vertex_attrib_array(a_uv);
-                gl.delete_buffer(vbo);
             }
         }
 
@@ -2534,9 +2528,7 @@ fn draw_text_layer_msdf(
         if !dynamic_emoji_verts.is_empty() {
             if let Some(dyn_colr_tex) = dynamic_atlas_colr_tex() {
                 let egp = cached_emoji_program(gl)?;
-                let vbo = gl
-                    .create_buffer()
-                    .map_err(|e| anyhow!("glGenBuffers (dynamic emoji): {e}"))?;
+                let vbo = cached_msdf_text_vbo(gl)?;
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let bytes = std::slice::from_raw_parts(
                     dynamic_emoji_verts.as_ptr() as *const u8,
@@ -2566,9 +2558,14 @@ fn draw_text_layer_msdf(
                 gl.draw_arrays(glow::TRIANGLES, 0, vert_count);
                 gl.disable_vertex_attrib_array(egp.a_pos);
                 gl.disable_vertex_attrib_array(egp.a_uv);
-                gl.delete_buffer(vbo);
             }
         }
+        // P1 cache: the shared scratch VBO stays bound to
+        // ARRAY_BUFFER after the last batch. Unbind so the caller's
+        // post-state matches the pre-cache shape (the `delete_buffer`
+        // calls implicitly unbound on each iteration). Cheap; one
+        // bind_buffer(None) per call rather than four deletes.
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
         // Restore GL_SCISSOR_TEST to its pre-ticker state so the
         // scissored-bake region clip (if active) survives.
         if ticker_clip && !scissor_was_enabled {
@@ -9098,6 +9095,53 @@ fn clear_msdf_program_cache(gl: &glow::Context) {
     FS_EMOJI_PROGRAM.with(|c| {
         if let Some(egp) = c.replace(None) {
             unsafe { gl.delete_program(egp.program); }
+        }
+    });
+}
+
+// QA perf-resweep-v2 P1 (2026-05-24): shared scratch VBO for the 4
+// draw_text_layer_msdf sub-batches (msdf-ink, tofu, dynamic-msdf,
+// dynamic-emoji). Each batch uploads its own f32 vertex data with
+// glow::STATIC_DRAW; with a cached buffer name, the per-frame
+// create/delete pair turns into a single create per session +
+// glBufferData-orphan re-upload per draw, which is the standard
+// dynamic-geometry pattern on GLES2.
+//
+// Pre-cache cost on Pi Zero 2 W: ~0.2% of one core in create/delete
+// pair overhead (per QA's perf-resweep-v2 P1 calibration; rate
+// scales with text-layer count per frame and active-batch fraction).
+// Post-cache: a single create at session bring-up; the delete is
+// moved to session teardown via clear_msdf_text_vbo_cache (paired
+// with clear_msdf_program_cache).
+//
+// STATIC_DRAW hint is preserved because the data is conceptually
+// static for the lifetime of each draw call -- the driver orphans
+// the prior store on each glBufferData call regardless of hint;
+// the hint just signals optimization intent. Leaving it matches
+// the pre-cache semantics exactly.
+std::thread_local! {
+    static MSDF_TEXT_VBO: std::cell::Cell<Option<glow::NativeBuffer>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cached_msdf_text_vbo(gl: &glow::Context) -> Result<glow::NativeBuffer> {
+    use glow::HasContext;
+    MSDF_TEXT_VBO.with(|c| {
+        if let Some(vbo) = c.get() {
+            return Ok(vbo);
+        }
+        let vbo = unsafe { gl.create_buffer() }
+            .map_err(|e| anyhow!("glGenBuffers (msdf text vbo): {e}"))?;
+        c.set(Some(vbo));
+        Ok(vbo)
+    })
+}
+
+fn clear_msdf_text_vbo_cache(gl: &glow::Context) {
+    use glow::HasContext;
+    MSDF_TEXT_VBO.with(|c| {
+        if let Some(vbo) = c.replace(None) {
+            unsafe { gl.delete_buffer(vbo); }
         }
     });
 }
