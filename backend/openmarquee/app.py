@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from openmarquee import __version__
+from openmarquee._tailscale_self import get_self_fqdn
 from openmarquee.api import router as content_router
 from openmarquee.api_auth import router as auth_router
 from openmarquee.api_backgrounds import router as backgrounds_router
@@ -40,6 +41,7 @@ from openmarquee.dependencies import (
     get_settings_storage,
 )
 from openmarquee.dev import router as dev_router
+from openmarquee.fqdn_redirect_middleware import FqdnRedirectMiddleware
 from openmarquee.perf_middleware import PerfMiddleware
 from openmarquee.seed import seed_if_needed
 
@@ -221,9 +223,27 @@ app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
 # /api/system/perf-stats.
 app.add_middleware(PerfMiddleware)
 
-# Batch 20.1 / phase A.1: bearer-token gate. AuthMiddleware fails
-# closed: requests not on the whitelist need a valid token. Pass a
-# callable resolver -- the middleware looks up the storage
+# HTTPS Phase 1: 301-redirect non-FQDN requests to the canonical
+# Tailscale HTTPS URL. Added AFTER PerfMiddleware so the 301 is still
+# timestamped (observability on "how often is the short-name hit?")
+# but BEFORE AuthMiddleware so we don't waste a bearer-token compare
+# on a request we're about to throw away. Skip-list inside the
+# middleware passes loopback / RFC1918 / CGNAT / FQDN / settings-
+# disabled / Tailscale-down through unmodified. Resolvers are
+# injected so tests fake the FQDN + settings without touching real
+# subprocess / settings files.
+app.add_middleware(
+    FqdnRedirectMiddleware,
+    fqdn_resolver=get_self_fqdn,
+    settings_resolver=lambda: get_settings_storage().load(),
+)
+
+# Batch 20.1 / phase A.1: bearer-token gate. add_middleware stacks
+# outer-most-first, so PerfMiddleware (added first) wraps
+# AuthMiddleware -- perf records still cover auth-rejected 401s
+# (useful for "are we 401-ing a lot?" observability). AuthMiddleware
+# fails closed: requests not on the whitelist need a valid token.
+# Pass a callable resolver -- the middleware looks up the storage
 # per-request so the singleton's lru_cache can be cleared between
 # tests (tests point OPENMARQUEE_AUTH_PATH at a tmp dir).
 app.add_middleware(AuthMiddleware, auth_storage_resolver=get_auth_storage)

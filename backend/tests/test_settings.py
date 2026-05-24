@@ -321,6 +321,45 @@ def test_tailscale_defaults_off():
     assert s.tailscale_enabled is False
     assert s.tailscale_auth_key is None
     assert s.tailscale_hostname is None
+    # HTTPS provisioning defaults ON so operators who opt into
+    # Tailscale at all get HTTPS + the FQDN-redirect convenience
+    # without an extra settings click. No-op when tailscale_enabled
+    # itself is False (the bring-up script skips the `tailscale
+    # serve` step entirely).
+    assert s.tailscale_https_enabled is True
+
+
+def test_tailscale_https_enabled_can_be_disabled():
+    s = SystemSettings(tailscale_https_enabled=False)
+    assert s.tailscale_https_enabled is False
+
+
+def test_tailscale_https_enabled_roundtrips_through_json():
+    original = SystemSettings(sign_name="SignABC", tailscale_https_enabled=False)
+    round_tripped = SystemSettings.model_validate_json(original.model_dump_json())
+    assert round_tripped.tailscale_https_enabled is False
+
+
+def test_legacy_settings_without_https_field_defaults_to_true(tmp_path: Path):
+    """A settings.json written before tailscale_https_enabled landed
+    must still load AND adopt the True default. Pydantic does this
+    naturally for missing fields; this test pins the contract so a
+    future refactor can't silently flip the legacy migration to
+    `False` and silently break HTTPS on already-deployed Pis.
+    """
+    legacy = {
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "sign_name": "SignABC",
+        "wifi_ssid": "openMarqueeABC",
+        "wifi_password": "12345678",
+        "tailscale_enabled": True,
+        "tailscale_hostname": "signabc",
+    }
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps(legacy))
+    s = SettingsStorage(p).load()
+    assert s.tailscale_enabled is True
+    assert s.tailscale_https_enabled is True
 
 
 def test_tailscale_accepts_pre_authorized_auth_key():
