@@ -115,31 +115,32 @@ class LiveSession:
     uses (§7.6). close() tears down whichever transport is in use.
     """
 
-    # Phase 12.1 Finding #2 mitigation — phantom-session watchdog
-    # timeout (WebRTC transport only). If no on_track event fires
-    # within this window after start_webrtc() returns, the session is
-    # auto-closed. Catches
-    # bogus SDPs that parse + answer cleanly but never deliver a
-    # real media track, plus phones that crash mid-handshake. Set
-    # comfortably above the worst-case real-network handshake time
-    # (~1-2s on local Tailnet, ~5s on slow/relay paths); 10s is the
-    # same threshold §5.11 uses for the PC-disconnect timeout, so
-    # the two paths converge on the same UX.
+    # Phantom-session safety-net timeouts (Phase 12.1 Finding #2 +
+    # 2026-05-24 security audit D3 Option C).
     #
-    # TODO(qarl-confirm): default mitigation is timeout-based.
-    # Alternative #1: pre-validate SDP at the API boundary (parse
-    # the m= sections, require a video media line). Pro: rejects
-    # at /api/live/start before any session exists. Con: needs
-    # an SDP parser, can miss subtle malformed cases that aiortc
-    # would still accept-but-not-negotiate.
-    # Alternative #2: poll RTCPeerConnection.connectionState every
-    # second; close on "failed" / "disconnected". Pro: catches
-    # mid-stream drops too. Con: aiortc's connectionState semantics
-    # vary across versions.
-    # Combination of all three is also possible. Flip if QA finds
-    # the timeout-only approach lets a class of bogus-SDP phantoms
-    # through.
+    # Two distinct constants because the two transport paths have
+    # different failure-detection budgets:
+    #
+    # WebRTC path: two failure detectors run in parallel.
+    # 1. Primary: RTCPeerConnection.connectionState callback (wired
+    #    in start_webrtc). Fires on aiortc state transitions; treats
+    #    `failed` and `disconnected` as terminal and closes the
+    #    session immediately. Catches mid-stream drops, ICE failures,
+    #    DTLS failures -- typically within 1-2s of the actual network
+    #    event. This is the audit-driven primary detector.
+    # 2. Safety-net: _PHANTOM_TIMEOUT_SECONDS_WEBRTC (30s). With the
+    #    state-change handler in place, this is for the genuinely-
+    #    stuck-mid-negotiation case where aiortc never fires a state
+    #    change (the handler catches most failures much faster).
+    #
+    # Stream-transport path: NO peer connection, so the only failure
+    # detector is `_watch_for_first_frame` against
+    # `_PHANTOM_TIMEOUT_SECONDS` (10s, unchanged from pre-audit).
+    # Bumping this here would silently triple the stream phantom
+    # window for ffmpeg-source failures, which is out of scope for
+    # the audit (D3 was WebRTC-only).
     _PHANTOM_TIMEOUT_SECONDS = 10.0
+    _PHANTOM_TIMEOUT_SECONDS_WEBRTC = 30.0
 
     def __init__(self, playback: PlaybackLoop):
         self._playback = playback
@@ -228,6 +229,42 @@ class LiveSession:
                 source.set_track(track)
                 self._pump_task = asyncio.create_task(self._pump())
 
+        # 2026-05-24 security audit D3 Option C: primary failure
+        # detector. aiortc fires connectionstatechange when the
+        # underlying ICE / DTLS / SCTP transport state moves. Treat
+        # `failed` and `disconnected` as terminal and tear down
+        # immediately rather than waiting for the 30s safety-net.
+        # Catches mid-stream network drops (phone walks out of WiFi
+        # range, NAT rebinding fails) within ~1-2s of the actual
+        # event vs the 10s the prior wall-clock-only design needed.
+        #
+        # close() is idempotent (guarded by self._closed) so a race
+        # between this callback + the safety-net timeout firing for
+        # the same session is harmless.
+        @self._pc.on("connectionstatechange")
+        def on_connection_state_change():
+            # Defensive try/except: aiortc's pyee event emitter swallows
+            # callback exceptions and the scheduled close() task would
+            # surface as "Task exception was never retrieved" in the
+            # asyncio log without being actionable. Wrap so any
+            # unexpected error here is logged with context.
+            try:
+                state = self._pc.connectionState if self._pc is not None else "unknown"
+                log.info("live: session %s connectionState -> %s", self.id, state)
+                if state in ("failed", "disconnected") and not self._closed:
+                    log.warning(
+                        "live: session %s connectionState=%s; closing",
+                        self.id,
+                        state,
+                    )
+                    # Sync callback -> schedule async close via create_task.
+                    asyncio.create_task(self.close())
+            except Exception:
+                log.exception(
+                    "live: session %s connectionstatechange callback raised",
+                    self.id,
+                )
+
         await self._pc.setRemoteDescription(offer)
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
@@ -282,13 +319,15 @@ class LiveSession:
 
     async def _watch_for_first_track(self) -> None:
         """Phase 12.1 Finding #2: auto-close if no track materializes
-        within _PHANTOM_TIMEOUT_SECONDS. Cancellation-safe: close()
-        cancels this task, which surfaces as CancelledError here and
-        is silently re-raised so the cancel completes."""
+        within _PHANTOM_TIMEOUT_SECONDS_WEBRTC (30s safety-net; the
+        connectionstatechange handler in start_webrtc catches most
+        failures in 1-2s). Cancellation-safe: close() cancels this
+        task, which surfaces as CancelledError here and is silently
+        re-raised so the cancel completes."""
         try:
             await asyncio.wait_for(
                 self._first_track_event.wait(),
-                timeout=self._PHANTOM_TIMEOUT_SECONDS,
+                timeout=self._PHANTOM_TIMEOUT_SECONDS_WEBRTC,
             )
         except TimeoutError:
             if self._closed:
@@ -298,7 +337,7 @@ class LiveSession:
             log.warning(
                 "live: session %s saw no track within %.1fs; closing as phantom",
                 self.id,
-                self._PHANTOM_TIMEOUT_SECONDS,
+                self._PHANTOM_TIMEOUT_SECONDS_WEBRTC,
             )
             await self.close()
         except asyncio.CancelledError:

@@ -73,6 +73,11 @@ class _FakeRTCPeerConnection:
         self.remoteDescription: _FakeSdp | None = None
         self.handlers: dict[str, Any] = {}
         self.closed = False
+        # 2026-05-24 D3 Option C: tests fire the connectionstatechange
+        # handler after mutating this field so the LiveSession callback
+        # reads the simulated state. Default to "new" matching the
+        # WebRTC spec's pre-negotiation state.
+        self.connectionState: str = "new"
 
     def on(self, event: str):
         def decorator(fn):
@@ -560,7 +565,7 @@ async def test_phantom_session_watchdog_closes_on_no_track(tmp_path, monkeypatch
     never invokes it (no real ICE / DTLS / SRTP), simulating exactly
     the "answered but no track" failure mode."""
     # Compress the watchdog timeout so the test runs in <0.5s.
-    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS_WEBRTC", 0.1)
 
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
@@ -588,7 +593,7 @@ async def test_phantom_watchdog_canceled_on_normal_close(tmp_path, monkeypatch):
     watchdog timer fires) cancels the watchdog so it doesn't dangle
     + race with the explicit close. Without this, the watchdog could
     fire its own log.warning ('phantom') even on a clean close."""
-    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS_WEBRTC", 5.0)
 
     loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
     await loop.start()
@@ -1136,3 +1141,95 @@ async def test_manager_is_active_and_paused_property(tmp_path):
     finally:
         await manager.stop_all()
         await loop.stop()
+
+
+# ---- 2026-05-24 D3 Option C: RTCPeerConnection.connectionState ----
+
+
+@pytest.mark.asyncio
+async def test_connection_state_failed_triggers_close(tmp_path, monkeypatch):
+    """Primary failure detector (audit D3 Option C). When aiortc's
+    connectionState transitions to `failed` (ICE failure, DTLS failure,
+    mid-stream transport collapse), the on-state-change callback must
+    close the session immediately rather than waiting for the 30s
+    safety-net timeout."""
+    # Bump safety-net high enough that ONLY the connectionstatechange
+    # path can possibly fire in this test's window.
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS_WEBRTC", 60.0)
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
+            await session.start_webrtc("v=0\r\noffer\r\n")
+            assert not session.closed
+            # Simulate ICE/DTLS failure: mutate fake state + fire callback.
+            session._pc.connectionState = "failed"
+            session._pc.handlers["connectionstatechange"]()
+            # The callback schedules close() as an async task; yield to
+            # the event loop so it runs.
+            await _wait_until(lambda: session.closed, timeout=1.0)
+            assert session.closed
+            assert not loop.is_paused, "close() should have resumed playback"
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_connection_state_disconnected_triggers_close(tmp_path, monkeypatch):
+    """`disconnected` is also terminal per the audit choice (qarl
+    Option C). WebRTC spec allows `disconnected` to recover to
+    `connected`, but openMarquee bias is fail-fast so the operator
+    sees the session end + can re-takeover rather than waiting on a
+    flapping link to recover."""
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS_WEBRTC", 60.0)
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
+            await session.start_webrtc("v=0\r\noffer\r\n")
+            session._pc.connectionState = "disconnected"
+            session._pc.handlers["connectionstatechange"]()
+            await _wait_until(lambda: session.closed, timeout=1.0)
+            assert session.closed
+    finally:
+        await loop.stop()
+
+
+@pytest.mark.asyncio
+async def test_connection_state_healthy_transitions_do_not_close(tmp_path, monkeypatch):
+    """`new` -> `connecting` -> `connected` is the happy path. The
+    callback must NOT close the session on any non-terminal state;
+    a future spec-tweak that adds new state names (e.g. `relaying`)
+    should also not accidentally close."""
+    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS_WEBRTC", 60.0)
+    loop, _renderer, _ = _make_loop_with_three_slides(tmp_path)
+    await loop.start()
+    try:
+        with patch("openmarquee.live.RTCPeerConnection", _FakeRTCPeerConnection):
+            session = LiveSession(loop)
+            await session.start_webrtc("v=0\r\noffer\r\n")
+            handler = session._pc.handlers["connectionstatechange"]
+            for healthy in ("connecting", "connected", "new"):
+                session._pc.connectionState = healthy
+                handler()
+                # Yield once to let any spuriously-scheduled close() task run.
+                await asyncio.sleep(0)
+                assert not session.closed, f"healthy state {healthy!r} must not trigger close()"
+            # Close manually so the loop teardown cleans up.
+            await session.close()
+    finally:
+        await loop.stop()
+
+
+def test_phantom_timeout_constants_split_webrtc_vs_stream():
+    """Regression-lock on the split-constant design (subagent caught
+    this pre-commit). The WebRTC safety-net was bumped 10s -> 30s
+    when the connectionstatechange handler landed; the STREAM
+    timeout MUST stay at 10s because the stream-transport path has
+    no secondary detector (no PC = no connectionstate). A single
+    shared constant would have silently tripled the stream phantom
+    window."""
+    assert LiveSession._PHANTOM_TIMEOUT_SECONDS_WEBRTC == 30.0
+    assert LiveSession._PHANTOM_TIMEOUT_SECONDS == 10.0
