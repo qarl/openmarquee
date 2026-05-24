@@ -41,6 +41,13 @@ fi
 # (main.js / login.js / etc.) would silently bite when a new entry
 # lands and its hashed chunk references get missed -- the sweep would
 # delete a real dependency. Dynamic discovery self-heals.
+#
+# Filtering via `find ... -name '*.js' | grep -E` rather than
+# `find -regex`: BSD `find -regex` (macOS) and GNU `find -regex`
+# (Linux/CI) ship with different default regex engines; the `\{N\}`
+# quantifier matched on macOS but returned no results on Ubuntu CI,
+# making the sweep silently no-op (`kept=0 removed=0`). POSIX `grep
+# -E` is consistent across both platforms.
 referenced=()
 while read -r entry_path; do
     [ -f "$entry_path" ] || continue
@@ -50,7 +57,7 @@ while read -r entry_path; do
         referenced+=("$name")
     done < <(grep -oE '[A-Za-z][A-Za-z0-9._-]*-[A-Z0-9]{8}\.js' "$entry_path" | sort -u)
 done < <(find "$DIST_DIR" -maxdepth 1 -type f -name '*.js' \
-         -not -regex '.*-[A-Z0-9]\{8\}\.js$')
+         | grep -vE -- '-[A-Z0-9]{8}\.js$')
 
 # Deduplicate referenced set into a lookup-friendly newline-separated
 # string for `grep -Fx` membership check below.
@@ -73,6 +80,7 @@ while read -r path; do
         echo "removed orphan chunk: $path"
     fi
     removed=$((removed + 1))
-done < <(find "$DIST_DIR" -maxdepth 1 -type f -regex '.*-[A-Z0-9]\{8\}\.js$')
+done < <(find "$DIST_DIR" -maxdepth 1 -type f -name '*.js' \
+         | grep -E -- '-[A-Z0-9]{8}\.js$')
 
 echo "sweep: kept=$kept removed=$removed"
