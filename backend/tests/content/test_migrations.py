@@ -80,15 +80,27 @@ def test_migration_preserves_png_bytes(tmp_path: Path):
 def test_migration_is_idempotent(tmp_path: Path):
     """Running the migration twice must update zero items the second
     time — this is what lets the operator leave the env var on across
-    multiple boots without re-writing already-clean content."""
+    multiple boots without re-writing already-clean content.
+
+    Exercises BOTH the bg_color path AND the pattern.color_a path
+    (the widen-migration commit 6c5de9a added pattern handling but
+    the existing idempotency test only covered bg). Subagent nit
+    follow-up — closes the explicit-anchor gap."""
     storage = ContentStorage(tmp_path)
-    slide = _make_slide(bg="#050608")
-    storage.save_text_slide(slide, png=b"\x89PNG")
+    bg_slide = _make_slide(bg="#050608")
+    # NOTE: import is local to keep _make_slide_with_pattern out of
+    # the module namespace where the earlier tests don't need it.
+    # The helper itself lives further down in this file.
+    pattern_slide = _make_slide_with_pattern(
+        bg="#000000", color_a="#050608", color_b="#FFB43C"
+    )
+    storage.save_text_slide(bg_slide, png=b"\x89PNG")
+    storage.save_text_slide(pattern_slide, png=b"\x89PNG")
 
     first = migrate_050608_bg_to_000000(storage)
     second = migrate_050608_bg_to_000000(storage)
-    assert first == 1
-    assert second == 0
+    assert first == 2  # bg-only + pattern-only items both migrated
+    assert second == 0  # both clean now — no dirty fields left
 
 
 def test_migration_skips_items_without_background_color_attr(tmp_path: Path):

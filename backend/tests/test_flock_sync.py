@@ -19,7 +19,17 @@ from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync, PullWorker
 from openmarquee.tombstone import TombstoneStorage
 
-_NOW = datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC)
+# `_NOW` was originally a hardcoded `datetime(2026, 4, 24, 12, 0, 0)`
+# but the tombstone TTL is 30 days (per TOMBSTONE_TTL_DAYS in
+# `openmarquee/tombstone.py`), so any test that ingests a tombstone
+# stamped at `_NOW` ages out of `list_active()` once wall-clock
+# wandered ~30 days past 2026-04-24. The fix mirrors qarl's
+# 2026-05-20 c2eed27 anchor-to-now pattern on
+# `test_pull_from_peer_applies_tombstones`: relative dates can't go
+# stale, absolute dates inevitably do. Re-evaluated at module import
+# (= test-run-start); per-test datetime arithmetic stays stable
+# within a run.
+_NOW = datetime.now(UTC).replace(microsecond=0)
 
 
 def _make_png_bytes(color=(10, 20, 30)) -> bytes:

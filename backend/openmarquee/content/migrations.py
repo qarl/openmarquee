@@ -64,21 +64,21 @@ def migrate_050608_bg_to_000000(storage: ContentStorage) -> int:
     """
     count = 0
     for item in storage.list_all():
-        # Detect any of the three fields holding "#050608" without
-        # touching items that have none — saves an unnecessary disk
-        # write per clean item.
+        # Walk the three fields that could hold "#050608" and build
+        # an update dict scoped to just the dirty ones. `if not
+        # updates: continue` then short-circuits clean items before
+        # any disk hit — this is the dirty-field-minimization
+        # invariant (don't save() items that wouldn't change).
+        # model_copy(update=...) replaces the named field whole, so
+        # to update pattern.color_a without flattening other pattern
+        # fields (density, pattern kind), mutate a copy of the
+        # pattern model and pass it as the new background_pattern
+        # value.
         bg = getattr(item, "background_color", None)
         pattern = getattr(item, "background_pattern", None)
         pattern_a = getattr(pattern, "color_a", None) if pattern else None
         pattern_b = getattr(pattern, "color_b", None) if pattern else None
-        if bg != "#050608" and pattern_a != "#050608" and pattern_b != "#050608":
-            continue
 
-        # Build the update dict scoped to just the dirty fields.
-        # model_copy(update=...) replaces the named field whole, so
-        # to update pattern.color_a without flattening other pattern
-        # fields, mutate a copy of the pattern model and pass it as
-        # the new background_pattern value.
         updates: dict = {}
         if bg == "#050608":
             updates["background_color"] = "#000000"
@@ -89,6 +89,8 @@ def migrate_050608_bg_to_000000(storage: ContentStorage) -> int:
             if pattern_b == "#050608":
                 pattern_updates["color_b"] = "#000000"
             updates["background_pattern"] = pattern.model_copy(update=pattern_updates)
+        if not updates:
+            continue
 
         # storage.save() needs the PNG asset to persist alongside the
         # envelope. Read the existing PNG so the asset bytes are
