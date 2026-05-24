@@ -1502,10 +1502,7 @@ void main() {
 "#;
 
 /// Fragment shader: horizontal wipe — slide_b reveals from the left
-/// edge with a hard line at x=t. Mirrors backend.openmarquee
-/// .rendering.shader_compositor's `_FRAGMENT_WIPE` minus the motion-
-/// overlay logic (we don't render motion overlays from the renderer
-/// side at this phase). Pairs with VS_TEXTURED_QUAD.
+/// edge with a hard line at x=t. Pairs with VS_TEXTURED_QUAD.
 pub const FS_WIPE: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src_a;
@@ -1874,10 +1871,9 @@ void main() {
 }
 "#;
 
-/// Fragment shader: linear cross-fade between two textures by `u_t`.
-/// Mirrors backend.openmarquee.rendering.shader_compositor's
-/// `_FRAGMENT_FADE`: at t=0 emits src_a, at t=1 emits src_b,
-/// linearly interpolated between. Phase 5-b-1 — first transition.
+/// Fragment shader: linear cross-fade between two textures by `u_t`:
+/// at t=0 emits src_a, at t=1 emits src_b, linearly interpolated
+/// between. Phase 5-b-1 — first transition.
 ///
 /// Pairs with `VS_TEXTURED_QUAD`. Caller binds src_a to texture
 /// unit 0, src_b to unit 1, and sets `u_t` per-frame from
