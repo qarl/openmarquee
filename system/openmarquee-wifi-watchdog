@@ -15,5 +15,28 @@
 # /usr/sbin (systemctl lives there). The script also sets PATH
 # as belt-and-suspenders.
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-* * * * * root /usr/local/bin/wifi-watchdog.sh
-* * * * * root sleep 30 && /usr/local/bin/wifi-watchdog.sh
+#
+# flock wrap (2026-05-24): `/usr/bin/flock -n /var/lock/wifi-
+# watchdog.lock` serializes the watchdog against itself. Without
+# it, two concurrent cron firings (or the at-:00 + at-:30 firings
+# colliding when one runs long during NM-restart / modprobe-cycle)
+# race the shared ledger files and can produce duplicate
+# escalation events — observed live on FYS 2026-05-24 11:00 (6
+# back-to-back NM-restart lines in 30s from concurrent invocations
+# stepping on each other's reads of the same RESTARTS_FILE).
+#
+# `-n` (non-blocking): if the lock is held, exit IMMEDIATELY
+# without queueing. We deliberately want concurrent cron firings
+# to silently skip rather than pile up — every skipped firing is
+# replaced 30s later by the next cron tick, which is exactly the
+# observation cadence we want. Queueing (the default) would let
+# slow-running invocations accumulate a backlog of pending checks
+# that all fire in a burst when the lock releases — the same
+# bug-shape the wrap is meant to prevent.
+#
+# Lock path `/var/lock/wifi-watchdog.lock` resolves to
+# `/run/lock/wifi-watchdog.lock` (symlink on Debian; tmpfs-backed)
+# so the lock file does not survive a reboot — a stale lock from
+# a wedged-then-rebooted invocation is impossible.
+* * * * * root /usr/bin/flock -n /var/lock/wifi-watchdog.lock /usr/local/bin/wifi-watchdog.sh
+* * * * * root sleep 30 && /usr/bin/flock -n /var/lock/wifi-watchdog.lock /usr/local/bin/wifi-watchdog.sh

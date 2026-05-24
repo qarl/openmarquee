@@ -249,29 +249,35 @@ def test_cron_entry_has_30s_cadence() -> None:
     """Cron file must fire the watchdog twice per minute (once at
     :00, once at :30 via `sleep 30 &&`). Cron's smallest native
     unit is 1 min, so the double-line is the standard idiom for
-    sub-minute cadence."""
+    sub-minute cadence. The flock wrapper (2026-05-24) is allowed
+    to sit between `root` and the script — the cadence pattern
+    survives the wrap because flock is structurally part of how
+    we run the script, not part of the schedule itself."""
     cron = _read_cron_source()
-    # First line: standard every-minute fire.
+    # First line: standard every-minute fire. Tolerates an optional
+    # `flock` wrapper between `root` and the script path.
     assert re.search(
-        r"^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+/usr/local/bin/wifi-watchdog\.sh\s*$",
+        r"^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+(?:/usr/bin/flock\s+\S+\s+\S+\s+)?"
+        r"/usr/local/bin/wifi-watchdog\.sh\s*$",
         cron,
         flags=re.MULTILINE,
     ), (
         "cron file missing the at-:00 fire line "
-        "(`* * * * * root /usr/local/bin/wifi-watchdog.sh`) — "
-        "regression to 1-min cadence."
+        "(`* * * * * root [flock prefix] /usr/local/bin/wifi-"
+        "watchdog.sh`) — regression to 1-min cadence."
     )
-    # Second line: offset-by-30s fire. Match `sleep 30 &&` followed
-    # by the script invocation; whitespace flexible.
+    # Second line: offset-by-30s fire. Same flock-tolerant shape.
     assert re.search(
-        r"^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+sleep\s+30\s*&&\s*/usr/local/bin/wifi-watchdog\.sh\s*$",
+        r"^\*\s+\*\s+\*\s+\*\s+\*\s+root\s+sleep\s+30\s*&&\s*"
+        r"(?:/usr/bin/flock\s+\S+\s+\S+\s+)?"
+        r"/usr/local/bin/wifi-watchdog\.sh\s*$",
         cron,
         flags=re.MULTILINE,
     ), (
         "cron file missing the at-:30 fire line "
-        "(`* * * * * root sleep 30 && /usr/local/bin/wifi-"
-        "watchdog.sh`) — without it the cadence is 1 min, not 30s, "
-        "and detection floor doubles to ~120s."
+        "(`* * * * * root sleep 30 && [flock prefix] /usr/local/"
+        "bin/wifi-watchdog.sh`) — without it the cadence is 1 min, "
+        "not 30s, and detection floor doubles to ~120s."
     )
 
 
@@ -860,4 +866,56 @@ def test_modprobe_ledger_wiped_before_reboot() -> None:
         "Defensive: tmpfs clears it on reboot, but explicit wipe "
         "covers the edge case where /var/run is ever moved to a "
         "persistent fs."
+    )
+
+
+# ---- 2026-05-24: flock wrap (concurrent-cron-race fix) ----
+
+
+def test_cron_uses_flock_n_nonblocking_lock() -> None:
+    """Both cron lines must wrap the script in `flock -n
+    /var/lock/wifi-watchdog.lock`.
+
+    Why `-n` (non-blocking): we deliberately want concurrent cron
+    firings to silently skip rather than queue. Without `-n`, the
+    DEFAULT behavior is BLOCKING — if a slow NM-restart or
+    modprobe-cycle holds the lock for 20s, the next cron firing
+    queues behind it instead of being dropped, then both run
+    back-to-back when the lock releases. That's the exact bug
+    shape (back-to-back-NM-restart bursts) we observed live on
+    FYS 11:00 — `flock` without `-n` would NOT fix it.
+
+    Why /var/lock specifically: it's a tmpfs symlink to /run/lock
+    on Debian, so the lock file does not survive a reboot — a
+    stale lock from a wedged-then-rebooted invocation is impossible.
+
+    Pin both the `-n` flag AND the specific lock path so a
+    refactor (e.g. someone replacing `-n` with `-w 5` for a wait,
+    or moving the lock to a persistent fs) trips this test."""
+    cron = _read_cron_source()
+    # Each script invocation line must be wrapped in flock.
+    flock_pattern = re.compile(
+        r"/usr/bin/flock\s+-n\s+/var/lock/wifi-watchdog\.lock\s+"
+        r"/usr/local/bin/wifi-watchdog\.sh",
+    )
+    matches = flock_pattern.findall(cron)
+    assert len(matches) == 2, (
+        f"expected 2 flock-wrapped cron lines, found {len(matches)}. "
+        "BOTH the at-:00 and at-:30 fire lines must be flock-wrapped — "
+        "otherwise concurrent invocations race the shared ledger files "
+        "and produce duplicate escalation events."
+    )
+    # And NO unwrapped invocation of the script (would be a regression).
+    unwrapped = re.search(
+        r"^\s*\*\s+\*\s+\*\s+\*\s+\*\s+root\s+"
+        r"(?:sleep\s+30\s*&&\s*)?"
+        r"/usr/local/bin/wifi-watchdog\.sh\s*$",
+        cron,
+        flags=re.MULTILINE,
+    )
+    assert not unwrapped, (
+        "found an unwrapped `/usr/local/bin/wifi-watchdog.sh` "
+        "cron invocation — every invocation must go through "
+        "flock to avoid the concurrent-cron race that produced "
+        "the back-to-back-NM-restart bursts observed on FYS."
     )
