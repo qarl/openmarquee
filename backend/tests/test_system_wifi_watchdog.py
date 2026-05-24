@@ -31,11 +31,13 @@ Mitigation #4 (auto-reboot on watchdog escalation):
 7. NM-restarts are recorded in `/var/run/wifi-watchdog.restarts`
    (tmpfs ledger, one epoch ts per line).
 8. After each NM-restart, the ledger is pruned to entries inside
-   REBOOT_WINDOW_SECONDS (default 1800s, widened from 600s on
-   2026-05-24); if the remaining count meets
-   REBOOT_AFTER_N_RESTARTS (default 5, widened from 3), the script issues
-   `systemctl reboot` — kernel-level firmware re-init for the
-   brcmfmac wedge case where NM restart alone CAN'T recover.
+   REBOOT_WINDOW_SECONDS (default 3600s, widened from 600s on
+   2026-05-24 in two steps: first 1800s, then 3600s after qarl's
+   "still too twitchy" feedback post-move); if the remaining count
+   meets REBOOT_AFTER_N_RESTARTS (default 8, widened from 3 in two
+   steps: first 5, then 8), the script issues `systemctl reboot` —
+   kernel-level firmware re-init for the brcmfmac wedge case where
+   NM restart alone CAN'T recover.
 9. The ledger is wiped BEFORE the reboot call (anti-reboot-loop;
    tmpfs would also wipe on boot, this is belt-and-suspenders).
 10. Pruning uses the keep-criterion `ts >= cutoff` rather than
@@ -334,56 +336,58 @@ def test_restarts_file_constant_present() -> None:
     )
 
 
-def test_reboot_threshold_is_five() -> None:
-    """REBOOT_AFTER_N_RESTARTS == 5 (Path 1 widen-envelope, 2026-05-24).
+def test_reboot_threshold_is_eight() -> None:
+    """REBOOT_AFTER_N_RESTARTS == 8 (second-widen tune, 2026-05-24 post-move).
 
-    Original value was 3 (postmortem #4) but live measurement on FYS
-    during the 11:00-11:50 wedge investigation showed real
-    catastrophic 0/5-burst windows lasting 60-120s. 3 NM-restarts
-    in 600s tripped on every degraded RF window, producing reboots
-    every ~7-10 min. 5 NM-restarts in 1800s (paired with the new
-    window) gives the system room to ride out a transient bad-RF
-    pocket without the operator seeing the sign blank.
+    History: original value was 3 (postmortem #4); widened to 5
+    in the Path 1 dispatch (2026-05-24 morning) when live measurement
+    on FYS during the 11:00-11:50 wedge investigation showed real
+    catastrophic 0/5-burst windows lasting 60-120s and 3-in-600s
+    tripped on every degraded RF window. After qarl's post-move
+    "still rebooting too often" observation (2026-05-24 evening),
+    further widened to 8 — auto-reboot stays enabled (qarl wants
+    the path to fire for genuinely-wedged chips) but only when the
+    accumulation reaches 8 NM-restarts inside REBOOT_WINDOW_SECONDS.
 
-    Below 5 re-introduces the pre-fix reboot rate; above 5 risks
-    sitting on a genuinely-wedged chip for too long. Pin to 5 so a
-    future "tighten this back" refactor surfaces this trade-off
-    instead of silently undoing it."""
+    Below 8 re-introduces the pre-second-widen reboot rate qarl
+    asked us to escape; above 8 risks sitting on a genuinely-
+    wedged chip for too long. Pin to 8 so a future "tighten this
+    back" refactor surfaces this trade-off."""
     source = _read_script_source()
     assert re.search(
-        r"^\s*REBOOT_AFTER_N_RESTARTS=5\s*$",
+        r"^\s*REBOOT_AFTER_N_RESTARTS=8\s*$",
         source,
         flags=re.MULTILINE,
     ), (
-        "REBOOT_AFTER_N_RESTARTS must be 5 (the Path 1 widen-envelope "
-        "value, 2026-05-24). Lower values re-introduce the every-7-"
-        "10-min reboot rate measured on FYS; higher values sit on a "
-        "genuinely-wedged chip for too long."
+        "REBOOT_AFTER_N_RESTARTS must be 8 (the second-widen "
+        "value, 2026-05-24 post-move). Lower values re-introduce "
+        "the reboot rate qarl observed post-move; higher values "
+        "sit on a genuinely-wedged chip for too long."
     )
 
 
-def test_reboot_window_is_1800s() -> None:
-    """REBOOT_WINDOW_SECONDS == 1800 (Path 1 widen-envelope, 2026-05-24).
+def test_reboot_window_is_3600s() -> None:
+    """REBOOT_WINDOW_SECONDS == 3600 (second-widen tune, 2026-05-24 post-move).
 
-    Original value was 600 (10 min). Widened to 1800 (30 min) so a
-    sustained-but-transient bad-RF period can absorb 5 NM-restart
-    attempts before triggering the kernel-level reboot. Paired with
-    REBOOT_AFTER_N_RESTARTS=5: 5 restarts in 30 min = ~6 min apart,
-    which is the natural cadence of the THRESHOLD=2-failures-then-
-    NM-restart pattern under sustained loss. Above 1800 starts to
-    accumulate stale restart events that no longer reflect current
-    chip health."""
+    History: original 600 (10 min) → 1800 (30 min, Path 1 widen,
+    2026-05-24 morning) → 3600 (60 min, second widen 2026-05-24
+    post-move) once qarl's observation showed even 1800 was tripping
+    reboots more often than the actual chip-wedge rate justified.
+    Paired with REBOOT_AFTER_N_RESTARTS=8: 8 restarts in 60 min =
+    ~7.5 min apart, which means the watchdog will ride out
+    essentially any sustained-but-transient RF window. Above 3600
+    starts to accumulate stale restart events that no longer reflect
+    current chip health."""
     source = _read_script_source()
     assert re.search(
-        r"^\s*REBOOT_WINDOW_SECONDS=1800\s*$",
+        r"^\s*REBOOT_WINDOW_SECONDS=3600\s*$",
         source,
         flags=re.MULTILINE,
     ), (
-        "REBOOT_WINDOW_SECONDS must be 1800 (the Path 1 widen-"
-        "envelope value, 2026-05-24). Smaller windows re-trigger "
-        "reboots too quickly under sustained-but-transient loss; "
-        "larger windows accumulate stale restart events that no "
-        "longer reflect current chip health."
+        "REBOOT_WINDOW_SECONDS must be 3600 (the second-widen "
+        "value, 2026-05-24 post-move). Smaller windows re-trigger "
+        "reboots more often than qarl wants post-move; larger "
+        "windows accumulate stale restart events."
     )
 
 
@@ -515,15 +519,23 @@ def test_pruning_uses_keep_criterion_not_delta_math() -> None:
 
 
 def test_ping_burst_constants_present() -> None:
-    """Burst-ping uses 5-of-5 with a 3-of-5 minimum to OK.
+    """Burst-ping uses 5-of-5 with a 2-of-5 minimum to OK
+    (= require 4 of 5 to fail = 80% loss before alarm).
+
+    History: original (Path 1) was 3 of 5 minimum (60% loss to
+    alarm). qarl's post-move feedback was that moderate-but-not-
+    catastrophic loss windows still drove NM-restart noise; this
+    second tune (2026-05-24 evening) tightens the failure threshold
+    to "the link is genuinely useless" before escalating.
 
     Measured on FYS 2026-05-24 during the wedge investigation: a
     single ping every 30s showed ~55% loss to the gateway while a
     burst of 5 pings at 0.2s spacing showed 0% loss against the SAME
-    target. The single-ping cadence false-positive-ed heavily,
-    driving the auto-reboot loop. The 5/3 numbers are load-bearing
-    enough to pin in the source so a 'tighten this further' refactor
-    can't silently re-introduce the single-ping shape.
+    target. The single-ping cadence false-positive-ed heavily; the
+    burst+threshold pattern de-noises that. The 5/2 numbers are
+    load-bearing enough to pin in the source so a 'tighten this
+    further' refactor can't silently re-introduce the single-ping
+    shape or roll back to the noisier 3/5 threshold.
     """
     source = _read_script_source()
     assert re.search(r"^\s*PING_BURST_COUNT=5\s*$", source, flags=re.MULTILINE), (
@@ -531,10 +543,48 @@ def test_ping_burst_constants_present() -> None:
         "re-introduce the rate-dependent false-positive shape we "
         "shipped this fix to escape."
     )
-    assert re.search(r"^\s*PING_BURST_OK_MIN=3\s*$", source, flags=re.MULTILINE), (
-        "PING_BURST_OK_MIN must be 3 — anything stricter rolls back "
-        "to false-positive territory; anything looser misses real "
+    assert re.search(r"^\s*PING_BURST_OK_MIN=2\s*$", source, flags=re.MULTILINE), (
+        "PING_BURST_OK_MIN must be 2 (= 80% loss threshold to alarm) "
+        "— stricter (e.g. 3) rolls back to the noisier post-Path-1 "
+        "shape qarl asked us to escape; looser (e.g. 1) misses real "
         "outages."
+    )
+
+
+def test_burst_threshold_is_80_percent() -> None:
+    """Semantic lock on the OK_MIN/COUNT pair: the watchdog must
+    only alarm at ≥80% loss (4 of 5 packets failing), NOT at the
+    earlier 60% loss (3 of 5 failing) the Path 1 dispatch shipped.
+
+    This guards against a "I bumped PING_BURST_COUNT to 10 for finer
+    granularity" refactor that would silently shift the threshold:
+    OK_MIN=2 against COUNT=10 means "alarm at 90% loss", quietly
+    making the watchdog hyper-tolerant. The percentage relationship
+    is what qarl actually asked for; the absolute integers are an
+    implementation detail.
+    """
+    source = _read_script_source()
+    count_match = re.search(r"^\s*PING_BURST_COUNT=(\d+)\s*$", source, flags=re.MULTILINE)
+    ok_min_match = re.search(r"^\s*PING_BURST_OK_MIN=(\d+)\s*$", source, flags=re.MULTILINE)
+    assert count_match and ok_min_match, (
+        "PING_BURST_COUNT / PING_BURST_OK_MIN constants not both "
+        "found — re-run test_ping_burst_constants_present for the "
+        "individual diagnostic."
+    )
+    count = int(count_match.group(1))
+    ok_min = int(ok_min_match.group(1))
+    # The alarm fires when `received < ok_min`; the minimum number of
+    # lost packets that triggers it is therefore `count - ok_min + 1`.
+    # Expressed as a percentage of the burst, that's the FIRE
+    # threshold — the smallest loss% that still raises an alarm.
+    fire_threshold_pct = (count - ok_min + 1) * 100 / count
+    assert fire_threshold_pct >= 80, (
+        f"Burst-loss FIRE threshold = {fire_threshold_pct:.0f}% "
+        f"(OK_MIN={ok_min} of COUNT={count} required to land; alarm "
+        f"fires at {count - ok_min + 1}/{count} packets lost). "
+        f"qarl's 2026-05-24 post-move tune asked for ≥80% — anything "
+        f"below re-introduces the noisier shape the second-widen "
+        f"dispatch was specifically about escaping."
     )
 
 
@@ -573,9 +623,10 @@ def test_ping_burst_function_uses_burst_pattern() -> None:
 
 def test_ping_burst_function_uses_ok_min_threshold() -> None:
     """The function's accept/reject decision must compare PING_RECEIVED
-    against PING_BURST_OK_MIN — pinning the >=3 of 5 rule into the
-    source so a refactor can't silently change it to e.g. '>= 1' (=
-    same as single-ping) or '== PING_BURST_COUNT' (= no tolerance)."""
+    against PING_BURST_OK_MIN — pinning the >=2 of 5 rule (alarm at
+    ≥80% loss) into the source so a refactor can't silently change it
+    to e.g. '>= 1' (= same as single-ping) or '== PING_BURST_COUNT'
+    (= no tolerance)."""
     source = _read_script_source()
     match = re.search(
         r"ping_burst_ok\(\)\s*\{(.*?)\n\}",
@@ -590,8 +641,9 @@ def test_ping_burst_function_uses_ok_min_threshold() -> None:
     ), (
         'ping_burst_ok must gate on `[ "$PING_RECEIVED" -ge '
         '"$PING_BURST_OK_MIN" ]` — anything else (e.g. -gt 0, '
-        "-eq COUNT) breaks the 'tolerate ~40% loss before alarm' "
-        "semantic the FYS investigation pinned the constants to."
+        "-eq COUNT) breaks the 'tolerate up to ~60% loss before "
+        "alarm at ≥80%' semantic the FYS investigation + post-move "
+        "tune pinned the constants to."
     )
 
 
@@ -641,7 +693,7 @@ def test_degraded_log_message_includes_fraction() -> None:
 
 def test_modprobe_threshold_constant_present() -> None:
     """MODPROBE_AFTER_N_RESTARTS=3 — pins the tier between
-    REBOOT_AFTER_N_RESTARTS=5 (reboot) and the THRESHOLD=2 ping-burst
+    REBOOT_AFTER_N_RESTARTS=8 (reboot) and the THRESHOLD=2 ping-burst
     fail count that triggers an NM-restart. Order matters: NM-restart
     must come first (cheapest), then modprobe-cycle (medium —
     resets just the wifi chip, leaves renderer + backend running),
@@ -654,7 +706,7 @@ def test_modprobe_threshold_constant_present() -> None:
         flags=re.MULTILINE,
     ), (
         "MODPROBE_AFTER_N_RESTARTS must be 3 — pinned between "
-        "THRESHOLD=2 (NM-restart) and REBOOT_AFTER_N_RESTARTS=5 "
+        "THRESHOLD=2 (NM-restart) and REBOOT_AFTER_N_RESTARTS=8 "
         "(reboot)."
     )
 
@@ -882,10 +934,10 @@ def test_modprobe_tier_fires_below_reboot_threshold() -> None:
 def test_modprobe_tier_fires_before_reboot_in_control_flow() -> None:
     """The modprobe branch must come AFTER the reboot-threshold
     check in record_nm_restart_and_maybe_reboot — otherwise a count
-    of 5+ would fire modprobe + then reboot, when the intent is to
+    of 8+ would fire modprobe + then reboot, when the intent is to
     skip modprobe entirely if we're already at reboot threshold (the
     chip needs more than a re-init). The reboot's `return` ensures
-    the modprobe branch is unreachable when count >= 5."""
+    the modprobe branch is unreachable when count >= 8."""
     source = _read_script_source()
     match = re.search(
         r"record_nm_restart_and_maybe_reboot\(\)\s*\{(.*?)\n\}",

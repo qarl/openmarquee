@@ -28,11 +28,12 @@
 # an NM-restart escalation. Persists across cron fires but cleared
 # by reboot (/var/run is tmpfs).
 #
-# 2026-05-23 escalation (postmortem mitigation #4): the THRESHOLD-
-# gated NM-restart above recovers from NM-level wedges, but NOT
-# from the documented ~2.5-day brcmfmac firmware wedge (the chip
-# itself is stuck — NM restart alone CAN'T recover). When 3 NM-
-# restarts accumulate within a 10-minute window, the script issues
+# 2026-05-23 escalation (postmortem mitigation #4, tuned 2026-05-24):
+# the THRESHOLD-gated NM-restart above recovers from NM-level wedges,
+# but NOT from the documented ~2.5-day brcmfmac firmware wedge (the
+# chip itself is stuck — NM restart alone CAN'T recover). When
+# REBOOT_AFTER_N_RESTARTS NM-restarts accumulate within
+# REBOOT_WINDOW_SECONDS (current tune: 8-in-3600s), the script issues
 # `systemctl reboot` — kernel-level firmware re-init via a clean
 # boot. Restart timestamps live in /var/run/wifi-watchdog.restarts
 # (tmpfs — auto-wiped on boot, the structural anti-reboot-loop).
@@ -66,19 +67,28 @@ LOG=/var/log/wifi-watchdog.log
 THRESHOLD=2
 # Burst-ping check (2026-05-24): instead of a single ping per
 # invocation, send 5 pings spaced 0.2s apart and consider the link
-# OK if at least 3 of 5 land. Rationale: live measurement on FYS
-# during the 11:00 wedge investigation showed a SAME-WIFI rate-
-# dependent loss pattern — sustained 1.0s-interval pings averaged
-# ~55% loss while 0.2s-interval burst pings averaged 0% loss against
-# the same gateway. A single-ping-per-30s check (the prior shape)
-# matched the worst-case loss-prone cadence and false-positive-ed
-# heavily, driving NM restarts and ultimately auto-reboot cycles on
-# a link that was actually fine for short-burst traffic. The burst
-# check costs ~1s of script wallclock per invocation (negligible)
-# and turns the watchdog into a coherent "is the link working" probe
-# rather than "did one random packet land".
+# OK if at least PING_BURST_OK_MIN of PING_BURST_COUNT land.
+# Rationale: live measurement on FYS during the 11:00 wedge
+# investigation showed a SAME-WIFI rate-dependent loss pattern —
+# sustained 1.0s-interval pings averaged ~55% loss while 0.2s-
+# interval burst pings averaged 0% loss against the same gateway.
+# A single-ping-per-30s check (the prior shape) matched the worst-
+# case loss-prone cadence and false-positive-ed heavily, driving
+# NM restarts and ultimately auto-reboot cycles on a link that was
+# actually fine for short-burst traffic. The burst check costs ~1s
+# of script wallclock per invocation (negligible) and turns the
+# watchdog into a coherent "is the link working" probe rather than
+# "did one random packet land".
+#
+# 2026-05-24 second tune (post-move bounce-back): PING_BURST_OK_MIN
+# tightened from 3 to 2 — the link must drop FOUR of five packets
+# (80% loss) before the watchdog calls it bad, vs the prior three-
+# of-five (60% loss). qarl observed continued NM-restart noise on
+# moderate but not catastrophic loss; the new threshold only fires
+# when the link is genuinely useless and lets transient ~50-70%
+# loss windows ride out without escalation.
 PING_BURST_COUNT=5
-PING_BURST_OK_MIN=3
+PING_BURST_OK_MIN=2
 # Postmortem mitigation #4 (2026-05-23): when this many NM-restarts
 # accumulate inside REBOOT_WINDOW_SECONDS, the chip is presumed
 # firmware-wedged and a clean reboot is the only path forward.
@@ -91,12 +101,18 @@ PING_BURST_OK_MIN=3
 # with brief 4/5 recoveries). With qarl chasing the physical/RF root
 # cause separately, the watchdog's job here is to recover via NM-
 # restart cycles WITHOUT prematurely escalating to a full reboot
-# the operator sees as "the sign blanked again". 5-in-1800s spans
-# ~30 minutes — enough room for 5 NM-restart attempts (each takes
-# ~15s + the 30s cron cadence + transient recovery windows) to ride
-# out a degraded RF window before triggering a kernel-level reset.
-REBOOT_AFTER_N_RESTARTS=5
-REBOOT_WINDOW_SECONDS=1800
+# the operator sees as "the sign blanked again".
+#
+# 2026-05-24 second widen (post-move bounce-back): envelope further
+# loosened from 5-in-1800s to 8-in-3600s. Auto-reboot stays enabled
+# (qarl wants the path to fire when the chip is genuinely wedged)
+# but the trigger surface is now much rarer — 8 NM-restarts across
+# an hour spans almost any sustained-bad-RF window without escalating.
+# Paired with the 80% burst-loss threshold above, the only path to a
+# reboot is a genuinely catastrophic link state for an extended
+# period.
+REBOOT_AFTER_N_RESTARTS=8
+REBOOT_WINDOW_SECONDS=3600
 # Modprobe escalation tier (Path 2 of the wifi-wedge dispatch,
 # 2026-05-24): between the NM-restart tier and the reboot tier,
 # attempt a `modprobe -r brcmfmac && modprobe brcmfmac` cycle ONCE per
@@ -142,9 +158,9 @@ note() {
 #
 # Anti-reboot-loop: the ledger is wiped BEFORE the reboot call,
 # and /var/run is tmpfs so a reboot also wipes it by side-effect.
-# Minimum theoretical reboot interval under the 2026-05-24 widen-
-# envelope (5 strikes × ~75s per strike) is ~6 min, enough for ops
-# to intervene and for transient bad-RF pockets to clear.
+# Minimum theoretical reboot interval under the 2026-05-24 second-
+# widen envelope (8 strikes × ~75s per strike) is ~10 min, enough
+# for ops to intervene and for transient bad-RF pockets to clear.
 # Returns 0 (yes) if a modprobe-cycle was performed inside the
 # current REBOOT_WINDOW_SECONDS window — used to gate the modprobe
 # tier so it fires at most once per window. Returns 1 (no) if the
