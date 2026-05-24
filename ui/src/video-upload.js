@@ -197,6 +197,11 @@ export function mountVideoUploader(
         // transcode aren't lost: they live in the DOM, and the post-
         // transcode kick() reads current field values via performSave.
         autoSave.cancel();
+        // Disable the picker until transcode settles — a re-pick mid-
+        // transcode would spawn a second ffmpeg.wasm job and double-write
+        // mp4Base64. Re-enabled in finally so failure paths don't leave
+        // a dead input.
+        fileEl.disabled = true;
         try {
             await processVideo(file);
             // After transcode completes, kick auto-save so the new bytes
@@ -211,6 +216,7 @@ export function mountVideoUploader(
             statusEl.dataset.state = "error";
         } finally {
             clearProgress();
+            fileEl.disabled = false;
         }
     });
 
