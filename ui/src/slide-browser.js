@@ -12,6 +12,7 @@ import { attachAutoTextOverlay } from "./auto-text-overlay.js";
 const TEMPLATE = `
     <div class="slide-browser" role="toolbar" aria-label="slide list">
         <ul class="slide-browser-list" role="list"></ul>
+        <div class="slide-browser-status" role="status" aria-live="polite" hidden></div>
     </div>
 `;
 
@@ -33,6 +34,7 @@ export function mountSlideBrowser(container, options) {
     const { type, fetchItems, onSelect, onCreate } = options;
     container.innerHTML = TEMPLATE;
     const listEl = container.querySelector(".slide-browser-list");
+    const statusEl = container.querySelector(".slide-browser-status");
 
     let highlightedId = null;
     // Bumped on every refresh() so thumbnail URLs force the browser to
@@ -42,13 +44,23 @@ export function mountSlideBrowser(container, options) {
     let refreshVersion = 0;
 
     async function refresh() {
-        let items = [];
+        let items;
         try {
             items = await fetchItems();
         } catch (err) {
+            // Empty-list and fetch-failure used to render identically
+            // (silent empty UL). Operator couldn't tell "you have no
+            // slides" from "we couldn't reach the server." Now the empty
+            // case stays as an empty list, and the failure case surfaces
+            // an inline message.
             console.error("[slide-browser] fetchItems failed:", err);
-            items = [];
+            listEl.innerHTML = "";
+            statusEl.hidden = false;
+            statusEl.textContent = "Couldn't load slides — check connection.";
+            return;
         }
+        statusEl.hidden = true;
+        statusEl.textContent = "";
         refreshVersion += 1;
         const filtered = items
             .filter((it) => it && it.type === type)

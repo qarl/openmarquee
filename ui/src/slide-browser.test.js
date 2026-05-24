@@ -195,4 +195,68 @@ describe("mountSlideBrowser", () => {
             container.querySelectorAll(".slide-browser-tile"),
         ).toHaveLength(0);
     });
+
+    it("surfaces a fetch-failure status message when fetchItems throws", async () => {
+        const container = document.createElement("div");
+        mountSlideBrowser(container, {
+            type: "text_slide",
+            fetchItems: async () => {
+                throw new Error("boom");
+            },
+            onSelect: vi.fn(),
+            onCreate: vi.fn(),
+        });
+        await tick();
+        const status = container.querySelector(".slide-browser-status");
+        expect(status).not.toBeNull();
+        // Was hidden in the template; refresh() must reveal it on failure.
+        expect(status.hidden).toBe(false);
+        expect(status.textContent).toMatch(/couldn't load/i);
+    });
+
+    it("keeps the status hidden when fetchItems succeeds (even with zero matches)", async () => {
+        const container = document.createElement("div");
+        mountSlideBrowser(container, {
+            // No items of this type — the "genuinely empty list" case
+            // (operator hasn't created any text slides) must NOT trigger
+            // the error path. Empty list and fetch-failure are now
+            // visibly distinct.
+            type: "text_slide",
+            fetchItems: async () => [
+                { id: "b", name: "Beta", type: "image", created_at: "2026-04-21T11:00:00Z" },
+            ],
+            onSelect: vi.fn(),
+            onCreate: vi.fn(),
+        });
+        await tick();
+        const status = container.querySelector(".slide-browser-status");
+        expect(status.hidden).toBe(true);
+        expect(status.textContent).toBe("");
+        expect(container.querySelectorAll(".slide-browser-tile")).toHaveLength(0);
+    });
+
+    it("clears a prior fetch-failure status on a subsequent successful refresh", async () => {
+        let shouldFail = true;
+        const fetchItems = vi.fn(async () => {
+            if (shouldFail) throw new Error("boom");
+            return [
+                { id: "a", name: "Alpha", type: "text_slide", created_at: "2026-04-21T10:00:00Z" },
+            ];
+        });
+        const container = document.createElement("div");
+        const handle = mountSlideBrowser(container, {
+            type: "text_slide",
+            fetchItems,
+            onSelect: vi.fn(),
+            onCreate: vi.fn(),
+        });
+        await tick();
+        const status = container.querySelector(".slide-browser-status");
+        expect(status.hidden).toBe(false);
+        shouldFail = false;
+        await handle.refresh();
+        expect(status.hidden).toBe(true);
+        expect(status.textContent).toBe("");
+        expect(container.querySelectorAll(".slide-browser-tile")).toHaveLength(1);
+    });
 });
