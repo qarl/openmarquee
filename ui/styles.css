@@ -2715,29 +2715,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   50% { opacity: .35; transform: scale(.7); }
 }
 
-/* Slide-content rendering inside the LED stage */
-.om-slide-text {
-  width: 100%; height: 100%;
-  display: flex; align-items: center; justify-content: center;
-  text-align: center;
-  font-weight: 700;
-  white-space: pre-line;
-  padding: 4%;
-  box-sizing: border-box;
-}
-.om-slide-text.font-block { font-family: "Impact", "Arial Black", var(--om-display); letter-spacing: 0.02em; }
-.om-slide-text.font-mono { font-family: var(--om-mono); }
-.om-slide-text.font-serif { font-family: Georgia, "Times New Roman", serif; }
-.om-slide-text.scroll {
-  justify-content: flex-start;
-  white-space: nowrap;
-  animation: om-scroll 8s linear infinite;
-}
-@keyframes om-scroll {
-  0% { transform: translateX(100%); }
-  100% { transform: translateX(-100%); }
-}
-
 /* ─── Pallet (saved slides drawer) ─── */
 .om-pallet {
   border-top: 1px solid var(--om-line);
@@ -2865,7 +2842,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 /* ─── Reduced motion ─── */
 @media (prefers-reduced-motion: reduce) {
   .om-marquee-strip > div { animation: none; }
-  .om-slide-text.scroll { animation: none; }
 }
 
 
