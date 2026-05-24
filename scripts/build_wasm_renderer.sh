@@ -43,6 +43,21 @@ wasm-bindgen \
     --out-dir "$OUT_DIR" \
     "target/wasm32-unknown-unknown/release/renderer_wasm.wasm"
 
+# wasm-bindgen --target web emits ESM (`export` syntax) but does NOT
+# create a package.json (only --target bundler does). Browsers see the
+# ESM hint via the `<script type="module">` load + esbuild's bundle
+# step, but Node decides ESM-vs-CJS by walking parent dirs for the
+# nearest package.json with `"type": "module"` — and there are no
+# package.json files anywhere upstream of renderer-wasm/pkg/ (the
+# repo root has none; renderer-wasm/ is a Rust crate with only
+# Cargo.toml). Without this hint, Node defaults to CommonJS for .js
+# files and chokes on the ESM `export` syntax with the misleading
+# "is a CommonJS module" error. Emit a minimal package.json so any
+# Node-side consumer (scripts/smoke_wasm_renderer.mjs, Playwright
+# specs that transitively import ui/src/wasm-renderer.js, etc.) sees
+# the file as ESM. pkg/ is gitignored so this regenerates per build.
+echo '{"type":"module"}' > "$OUT_DIR/package.json"
+
 WASM_BYTES=$(wc -c < "$OUT_DIR/renderer_wasm_bg.wasm")
 GZIP_BYTES=$(gzip -c "$OUT_DIR/renderer_wasm_bg.wasm" | wc -c | tr -d ' ')
 echo "==> built: $WASM_BYTES bytes raw, $GZIP_BYTES bytes gzipped"
