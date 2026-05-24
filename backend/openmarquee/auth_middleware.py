@@ -125,11 +125,30 @@ _WHITELIST_PREFIX: tuple[str, ...] = (
 # string fallback (the UI helper appends it client-side). Header
 # auth still works; query-param is the additive escape hatch.
 #
-# Security note: tokens in URLs leak to browser history + server
-# logs + Referer headers. The threat model here is operator's
-# localhost / tailnet access — the trade-off was explicitly accepted
-# by QA on 2026-05-16. If this widens, revisit with cookie-based
-# session auth (option b in the original dispatch).
+# Security note: tokens in URLs leak to browser history, server logs,
+# proxy-cache stores, and Referer headers on outgoing clicks. The
+# threat surface widened on 2026-05-24 when Path A (commit 9ed1bc3)
+# made the token a real argon2-verified secret -- pre-Path-A, the
+# token's "secret" half didn't matter (the version prefix was the
+# only gate), so leakage was inert. Post-Path-A:
+#
+#   * `Cache-Control: no-store` on query-authed responses prevents
+#     local + intermediary caching of the URL + body. (2026-05-24
+#     security audit MEDIUM finding 3.)
+#   * `Referrer-Policy: no-referrer` on query-authed responses
+#     prevents the token from leaking when the user clicks an
+#     outgoing link in the page chrome around the media tag.
+#   * The per-route allowlist (`_is_media_route` + the SUFFIXES
+#     tuple below) bounds query-string-auth to binary-blob endpoints
+#     only -- list / metadata / settings / auth endpoints all
+#     require the Authorization header. This is the original Bug-3+4
+#     design; documented here so a future widening surfaces the
+#     trade-off rather than silently introducing query-auth on a
+#     route that doesn't need it.
+#
+# If the operator-experience need ever broadens beyond `<img>/<video>`
+# tags (e.g., to a route the UI fetches from JavaScript), revisit
+# with cookie-based session auth instead of widening this allowlist.
 #
 # Route shape match: prefix is exact, the rest is `/<uuid>/<suffix>`.
 # Suffix gate so we don't accept query-param auth for /api/content
@@ -182,13 +201,27 @@ class AuthMiddleware:
         token = _bearer_from_headers(scope.get("headers") or [])
         # Bug 3+4 query-param fallback for media routes: bare <img>/<video>
         # src can't carry an Authorization header, so the UI appends
-        # ?token=<bearer>. Header auth still wins when both are present.
+        # ?token=<bearer>. Header auth still wins when both are present;
+        # `query_auth_used` then stays False and the response gets no
+        # extra hardening (no leakage path -> nothing to harden).
+        query_auth_used = False
         if not token and _is_media_route(path):
-            token = _token_from_query(scope.get("query_string") or b"")
+            query_token = _token_from_query(scope.get("query_string") or b"")
+            if query_token:
+                token = query_token
+                query_auth_used = True
         state = self.auth_resolver().load()
         if not await verify_token(token, state):
             await _send_401(send, state is None)
             return
+
+        # 2026-05-24 security audit MEDIUM finding 3: harden responses
+        # that authed via the query-string token fallback. Wrap send to
+        # inject Cache-Control: no-store + Referrer-Policy: no-referrer
+        # on the response start message. Header-bearer requests skip
+        # this wrap -- they have no URL-leak surface to mitigate.
+        if query_auth_used:
+            send = _wrap_send_no_store_no_referrer(send)
 
         await self.app(scope, receive, send)
 
@@ -239,6 +272,42 @@ def _bearer_from_headers(headers: list[tuple[bytes, bytes]]) -> str:
                 return parts[1].strip()
             return ""
     return ""
+
+
+def _wrap_send_no_store_no_referrer(send: Any) -> Any:
+    """Wrap an ASGI `send` so the response start message carries
+    Cache-Control: no-store + Referrer-Policy: no-referrer (2026-05-24
+    security audit MEDIUM finding 3).
+
+    Applied ONLY to requests that authed via the ?token=... query-
+    string fallback. Header-bearer-authed requests bypass the wrap.
+
+    Behavior:
+    - On the http.response.start message, strip any pre-existing
+      Cache-Control or Referrer-Policy headers and append our values.
+      Stripping (rather than just appending) yields a canonical
+      single-header response. RFC 7234 §5.2 requires compliant caches
+      to honor the most-restrictive directive when multiple Cache-
+      Control header lines combine into a comma-list, so a duplicate
+      wouldn't actually weaken protection -- but stripping defends
+      against misconfigured intermediaries that pick first-or-last
+      rather than combining.
+    - On http.response.body and other messages, pass through unchanged.
+    """
+
+    async def wrapped(message: dict) -> None:
+        if message.get("type") == "http.response.start":
+            headers = [
+                (name, value)
+                for (name, value) in (message.get("headers") or [])
+                if name.lower() not in (b"cache-control", b"referrer-policy")
+            ]
+            headers.append((b"cache-control", b"no-store"))
+            headers.append((b"referrer-policy", b"no-referrer"))
+            message = {**message, "headers": headers}
+        await send(message)
+
+    return wrapped
 
 
 async def _send_401(send: Any, not_configured: bool) -> None:

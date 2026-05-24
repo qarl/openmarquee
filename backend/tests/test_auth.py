@@ -668,3 +668,113 @@ def test_authorization_header_wins_when_both_supplied(client: TestClient):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code != 401
+
+
+# ---- 2026-05-24 security audit MEDIUM finding 3: response-header
+# ---- hardening when query-string token auth is used. Mitigates the
+# ---- URL-leak surface (browser history / server logs / Referer
+# ---- header) the query-param fallback inherently has.
+
+
+def test_query_auth_response_includes_no_store_and_no_referrer(client: TestClient):
+    """A request authed via ?token=... must come back with both
+    Cache-Control: no-store AND Referrer-Policy: no-referrer so the
+    URL+body can't be cached locally / by intermediaries and the
+    token can't leak via outgoing-link Referer."""
+    import uuid
+
+    set_resp = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    token = set_resp.json()["token"]
+    bogus = uuid.uuid4()
+    response = client.get(f"/api/content/{bogus}/asset?token={token}")
+    # The endpoint 404s (no asset seeded), but the response headers
+    # ARE the load-bearing assertion -- the wrap fires on the
+    # response-start message regardless of status code, since the
+    # middleware ran before handler dispatch and the wrap is on
+    # `send`, not conditional on success.
+    assert response.headers.get("cache-control") == "no-store", (
+        f"expected Cache-Control: no-store; got {response.headers.get('cache-control')!r}"
+    )
+    assert response.headers.get("referrer-policy") == "no-referrer", (
+        f"expected Referrer-Policy: no-referrer; got {response.headers.get('referrer-policy')!r}"
+    )
+
+
+def test_header_auth_response_does_not_include_query_hardening(client: TestClient):
+    """A request authed via Authorization header (no query-string
+    fallback) does NOT get the query-auth hardening headers -- there's
+    no URL-leak surface to mitigate, so adding the headers would be
+    no-value noise that disables caching for the common case."""
+    import uuid
+
+    set_resp = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    token = set_resp.json()["token"]
+    bogus = uuid.uuid4()
+    response = client.get(
+        f"/api/content/{bogus}/asset",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    # The handler's natural response shouldn't carry these headers.
+    # (FastAPI's default 404 doesn't add them; our wrap only fires on
+    # query-auth.) If a future handler decides to set them deliberately,
+    # this test will need an exempt list -- for now, none of the media
+    # routes do.
+    assert "cache-control" not in {k.lower() for k in response.headers}, (
+        "header-bearer request unexpectedly carries Cache-Control "
+        "(the wrap fired without query-auth)"
+    )
+    assert "referrer-policy" not in {k.lower() for k in response.headers}, (
+        "header-bearer request unexpectedly carries Referrer-Policy "
+        "(the wrap fired without query-auth)"
+    )
+
+
+def test_header_wins_query_token_present_response_has_no_query_hardening(
+    client: TestClient,
+):
+    """When BOTH Authorization header AND ?token= are present, the
+    header wins (existing test_authorization_header_wins_when_both_
+    supplied) and the response should NOT carry the query-auth
+    hardening -- the request didn't actually use query-string auth."""
+    import uuid
+
+    set_resp = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    token = set_resp.json()["token"]
+    bogus = uuid.uuid4()
+    response = client.get(
+        f"/api/content/{bogus}/asset?token=garbage",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code != 401
+    assert "cache-control" not in {k.lower() for k in response.headers}, (
+        "header-bearer-wins request shouldn't get query-auth hardening"
+    )
+
+
+def test_failed_query_auth_does_not_add_hardening_to_401(client: TestClient):
+    """A request with a bad ?token= returns 401 via _send_401 BEFORE
+    the wrap is installed (the wrap is conditional on verify_token
+    succeeding). The 401 response stays clean."""
+    import uuid
+
+    client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    bogus = uuid.uuid4()
+    response = client.get(f"/api/content/{bogus}/asset?token=garbage")
+    assert response.status_code == 401
+    # 401 path runs _send_401 directly, not through the wrap.
+    assert response.headers.get("cache-control") != "no-store", (
+        "failed-auth 401 shouldn't carry query-auth hardening "
+        "(the wrap installs AFTER verify_token succeeds)"
+    )
