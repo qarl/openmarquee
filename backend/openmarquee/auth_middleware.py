@@ -186,7 +186,7 @@ class AuthMiddleware:
         if not token and _is_media_route(path):
             token = _token_from_query(scope.get("query_string") or b"")
         state = self.auth_resolver().load()
-        if not verify_token(token, state):
+        if not await verify_token(token, state):
             await _send_401(send, state is None)
             return
 

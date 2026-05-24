@@ -86,8 +86,12 @@ async def set_password(
     from openmarquee.auth import AuthState
 
     state = AuthState(password_hash=hash_password(payload.password))
+    token, state = mint_token(state)
+    # Persist AFTER mint so the issued_token_hash is on disk before
+    # we hand the token back to the client; otherwise a server crash
+    # between mint + save would invalidate the just-returned token.
     auth.save(state)
-    return _TokenResponse(token=mint_token(state))
+    return _TokenResponse(token=token)
 
 
 @router.post("/login", response_model=_TokenResponse)
@@ -103,7 +107,9 @@ async def login(
         raise HTTPException(status_code=404, detail="password not yet configured")
     if not verify_password(state.password_hash, payload.password):
         raise HTTPException(status_code=401, detail="invalid password")
-    return _TokenResponse(token=mint_token(state))
+    token, state = mint_token(state)
+    auth.save(state)
+    return _TokenResponse(token=token)
 
 
 @router.post("/change-password", response_model=_TokenResponse)
@@ -125,7 +131,7 @@ async def change_password_endpoint(
     # endpoint specifically. The middleware whitelist excludes this
     # path; only authed callers reach this function.
     token = _strip_bearer(authorization)
-    if not verify_token(token, state):
+    if not await verify_token(token, state):
         raise HTTPException(status_code=401, detail="invalid token")
 
     if not verify_password(state.password_hash, payload.current_password):
@@ -135,8 +141,9 @@ async def change_password_endpoint(
         raise HTTPException(status_code=422, detail="new passwords do not match")
 
     new_state = change_password(state, payload.new_password)
+    new_token, new_state = mint_token(new_state)
     auth.save(new_state)
-    return _TokenResponse(token=mint_token(new_state))
+    return _TokenResponse(token=new_token)
 
 
 def _strip_bearer(authorization: str | None) -> str:

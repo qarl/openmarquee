@@ -370,7 +370,7 @@ class _PatchSecretRequest(BaseModel):
     new_value: str | None = Field(default=None)
 
 
-def _verify_current_password(
+async def _verify_current_password(
     auth: AuthStorage,
     authorization: str | None,
     current_password: str,
@@ -381,11 +381,14 @@ def _verify_current_password(
     Raises HTTPException(401) on any failure. The middleware should
     have rejected before we get here on a missing/invalid bearer, but
     belt-and-suspenders: don't trust unauth callers past this point.
+
+    Async because verify_token is async (argon2.verify offloaded to
+    a thread per the 2026-05-24 finding 1 Path A fix).
     """
     state = auth.load()
     if state is None:
         raise HTTPException(status_code=404, detail="auth not configured")
-    if not verify_token(_strip_bearer(authorization), state):
+    if not await verify_token(_strip_bearer(authorization), state):
         raise HTTPException(status_code=401, detail="invalid token")
     if not verify_password(state.password_hash, current_password):
         raise HTTPException(status_code=401, detail="current password is wrong")
@@ -439,7 +442,7 @@ async def patch_wifi_ap_password(
     """Rotate the captive-portal AP WPA2 passphrase. Cannot be cleared --
     the AP must always carry a passphrase (the wifi_password field is
     a non-None `str` in SystemSettings)."""
-    _verify_current_password(auth, authorization, payload.current_password)
+    await _verify_current_password(auth, authorization, payload.current_password)
     if not payload.new_value:
         raise HTTPException(status_code=422, detail="wifi_password cannot be empty")
     return _patch_secret_field(storage, "wifi_password", payload.new_value)
@@ -456,7 +459,7 @@ async def patch_wifi_station_password(
     valid when wifi_station_enabled=false. The model's
     _check_wifi_has_at_least_one_mode_enabled validator catches the
     "station enabled but no creds" combination."""
-    _verify_current_password(auth, authorization, payload.current_password)
+    await _verify_current_password(auth, authorization, payload.current_password)
     # Empty string → null per the model's _check_station_password
     # validator. Both shapes resolve to "clear the field".
     new_value = payload.new_value or None
@@ -485,6 +488,6 @@ async def patch_tailscale_auth_key(
 ) -> dict[str, Any]:
     """Rotate the Tailscale pre-auth key. Empty/null clears (common --
     a successfully-consumed key has no reason to stay on disk)."""
-    _verify_current_password(auth, authorization, payload.current_password)
+    await _verify_current_password(auth, authorization, payload.current_password)
     new_value = payload.new_value or None
     return _patch_secret_field(storage, "tailscale_auth_key", new_value)

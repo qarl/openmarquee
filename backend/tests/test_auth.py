@@ -94,38 +94,182 @@ def test_corrupt_auth_json_recovers_to_not_configured(tmp_path: Path):
 
 def test_mint_token_includes_version_prefix():
     state = AuthState(password_hash=hash_password("pw"), token_version=7)
-    token = mint_token(state)
+    token, updated = mint_token(state)
     assert token.startswith("7.")
     # secret part is token_urlsafe(32) -> 43 b64 chars
     assert len(token.split(".", 1)[1]) == 43
+    # New state carries the argon2 hash of the issued secret.
+    assert updated.issued_token_hash is not None
 
 
-def test_verify_token_returns_true_for_matching_version():
+@pytest.mark.asyncio
+async def test_verify_token_returns_true_for_freshly_minted_token():
+    """The fresh-mint path: mint_token returns (token, updated_state);
+    verify_token against the updated state argon2-verifies + accepts."""
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
     state = AuthState(password_hash=hash_password("pw"), token_version=3)
-    token = mint_token(state)
-    assert verify_token(token, state) is True
+    token, updated = mint_token(state)
+    assert await verify_token(token, updated) is True
 
 
-def test_verify_token_returns_false_after_version_bump():
+@pytest.mark.asyncio
+async def test_verify_token_returns_false_after_version_bump():
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
     state = AuthState(password_hash=hash_password("pw"), token_version=3)
-    token = mint_token(state)
-    state_bumped = state.model_copy(update={"token_version": 4})
-    assert verify_token(token, state_bumped) is False
+    token, updated = mint_token(state)
+    state_bumped = updated.model_copy(update={"token_version": 4})
+    assert await verify_token(token, state_bumped) is False
 
 
-def test_verify_token_returns_false_for_malformed():
+@pytest.mark.asyncio
+async def test_verify_token_returns_false_for_malformed():
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
     state = AuthState(password_hash=hash_password("pw"))
-    assert verify_token("", state) is False
-    assert verify_token("no-dot-no-version", state) is False
-    assert verify_token("notanumber.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", state) is False
+    assert await verify_token("", state) is False
+    assert await verify_token("no-dot-no-version", state) is False
+    assert (
+        await verify_token(
+            "notanumber.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            state,
+        )
+        is False
+    )
     # Wrong-length secret part:
-    assert verify_token("1.short", state) is False
+    assert await verify_token("1.short", state) is False
 
 
-def test_verify_token_returns_false_when_state_is_none():
+@pytest.mark.asyncio
+async def test_verify_token_returns_false_when_state_is_none():
     """Auth not configured -- nothing to verify against."""
-    token = mint_token(AuthState(password_hash=hash_password("pw")))
-    assert verify_token(token, None) is False
+    token, _ = mint_token(AuthState(password_hash=hash_password("pw")))
+    assert await verify_token(token, None) is False
+
+
+# ---- 2026-05-24 security audit Path A: real secret verification ----
+
+
+@pytest.mark.asyncio
+async def test_verify_token_rejects_forged_secret_with_correct_version_prefix():
+    """THE FIX (audit finding 1 HIGH). Pre-fix: any `<version>.<43-
+    char-b64>` validated as long as the version matched. Post-fix:
+    the secret must argon2-verify against state.issued_token_hash.
+    """
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=3)
+    real_token, updated = mint_token(state)
+    real_version, _real_secret = real_token.split(".", 1)
+    # Forge a token: same version prefix, 43-char b64-safe random secret
+    # the attacker generated themselves.
+    forged_secret = "Z" * 43  # well-formed shape, not the real secret
+    forged_token = f"{real_version}.{forged_secret}"
+    assert forged_token != real_token
+    assert await verify_token(forged_token, updated) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_token_rejects_unknown_version():
+    """A token whose version prefix doesn't match state.token_version
+    rejects without even touching argon2 (cheap fail)."""
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=3)
+    _, updated = mint_token(state)
+    # Reuse the valid hash's secret but lie about the version prefix.
+    fake = f"99.{'a' * 43}"
+    assert await verify_token(fake, updated) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_token_rejects_when_no_hash_persisted_yet():
+    """A state with token_version set but issued_token_hash=None (e.g.,
+    fresh AuthState before the first mint, or a corrupt-state
+    recovery) must NOT accept any token -- otherwise the rotation
+    lever would be the only gate."""
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=3)
+    token = f"3.{'x' * 43}"
+    assert state.issued_token_hash is None
+    assert await verify_token(token, state) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_token_cache_short_circuits_second_call(monkeypatch):
+    """Second verify with the same token must skip argon2 (cache hit).
+    Functional check via monkeypatching the _HASHER.verify call --
+    expect exactly one call across two verifies."""
+    from openmarquee import auth as auth_module
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=3)
+    token, updated = mint_token(state)
+    call_count = {"n": 0}
+    real_verify = auth_module._argon2_verify_secret
+
+    def counting_verify(*args, **kwargs):
+        call_count["n"] += 1
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(auth_module, "_argon2_verify_secret", counting_verify)
+    assert await verify_token(token, updated) is True
+    assert await verify_token(token, updated) is True
+    assert call_count["n"] == 1, (
+        f"expected 1 argon2.verify call across 2 verifies (cache hit on "
+        f"second); got {call_count['n']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_change_password_clears_verified_token_cache():
+    """change_password must flush the cache so a previously-verified-
+    but-now-rotated token can't ride out the 10min TTL window."""
+    from openmarquee.auth import _VERIFIED_TOKEN_CACHE, clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=3)
+    token, updated = mint_token(state)
+    # Populate the cache.
+    assert await verify_token(token, updated) is True
+    assert token in _VERIFIED_TOKEN_CACHE
+    # change_password is sync but calls clear_verified_token_cache.
+    change_password(updated, "new-password")
+    assert _VERIFIED_TOKEN_CACHE == {}, "change_password did not flush the verified-token cache"
+
+
+@pytest.mark.asyncio
+async def test_consecutive_mints_invalidate_the_older_token():
+    """Operator-visible consequence of the {version: single_hash}
+    design: minting a new token under the same version invalidates the
+    previous one (logging in on a second device kicks the first off).
+    This pins the trade-off so a future "multi-session" refactor
+    surfaces it explicitly."""
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=3)
+    token_a, state_after_a = mint_token(state)
+    assert await verify_token(token_a, state_after_a) is True
+    # Second mint under the same version overwrites the issued hash.
+    # mint_token MUST flush the verified-token cache internally --
+    # otherwise token_a's cached-True entry would ride out the 10min
+    # TTL even though the issued_token_hash has rotated. Don't add a
+    # manual clear_verified_token_cache() here; that would mask the
+    # bug the subagent caught.
+    token_b, state_after_b = mint_token(state_after_a)
+    assert state_after_b.token_version == state_after_a.token_version
+    assert await verify_token(token_a, state_after_b) is False
+    assert await verify_token(token_b, state_after_b) is True
 
 
 def test_change_password_bumps_token_version():
