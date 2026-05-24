@@ -229,6 +229,17 @@ class SystemSettings(BaseModel):
             "Defaults to the operating-system hostname when unset."
         ),
     )
+    tailscale_https_enabled: bool = Field(
+        default=True,
+        description=(
+            "Provision HTTPS via `tailscale serve` when tailscale_enabled. "
+            "Tailscale-issued Let's Encrypt cert covers the FQDN "
+            "(`<hostname>.<tailnet>.ts.net`) only; short MagicDNS names + "
+            "LAN IPs continue working on plain HTTP. When True, the backend "
+            "also 301-redirects non-FQDN/non-LAN requests to the canonical "
+            "HTTPS FQDN so operator bookmarks resolve to a secure context."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

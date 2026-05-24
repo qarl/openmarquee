@@ -22,7 +22,7 @@ fi
 
 # jq would be cleaner but we don't want to require a new package on the
 # SD image. Python is already present for the backend.
-read -r ENABLED HOSTNAME AUTH_KEY <<<"$(python3 - <<PY
+read -r ENABLED HOSTNAME AUTH_KEY HTTPS_ENABLED <<<"$(python3 - <<PY
 import json
 with open("$SETTINGS_PATH") as f:
     s = json.load(f)
@@ -30,6 +30,11 @@ print(
     "1" if s.get("tailscale_enabled") else "0",
     s.get("tailscale_hostname") or "-",
     s.get("tailscale_auth_key") or "-",
+    # Default True when the field is absent (legacy settings.json from
+    # before HTTPS landed). Matches SystemSettings.tailscale_https_
+    # enabled's Pydantic default — keeps boot behavior consistent
+    # whether the file's been re-saved or not.
+    "1" if s.get("tailscale_https_enabled", True) else "0",
 )
 PY
 )"
@@ -57,6 +62,32 @@ fi
 
 echo "tailscale: bringing up (${ARGS[*]/--authkey=*/--authkey=***})"
 tailscale up "${ARGS[@]}"
+
+# HTTPS Phase 1: tell tailscaled to serve our HTTP backend over TLS on
+# port 443 (terminates on the tailscale-interface listener only, NOT on
+# the AP-side or LAN-side wlan0 surfaces). Provisions a Let's Encrypt
+# cert for the node's FQDN (`<hostname>.<tailnet>.ts.net`) and renews
+# it automatically. Short MagicDNS names + LAN IPs continue to work on
+# plain HTTP — the FastAPI middleware in
+# `openmarquee.fqdn_redirect_middleware` 301-redirects non-FQDN /
+# non-captive / non-LAN requests to the canonical HTTPS URL so operator
+# bookmarks land on a secure-context page (Chrome's getUserMedia gate).
+#
+# `tailscale serve --bg` is idempotent; re-running with the same args
+# is a no-op. Persisted to /var/lib/tailscale/serve.json so the listener
+# survives reboots without an explicit systemd supervision step.
+#
+# `|| echo` (not `|| exit 1`): HTTPS provisioning failure must NOT
+# block the AP-side captive-portal flow. The Let's Encrypt issuance
+# step requires the admin-console "HTTPS Certificates" toggle to be
+# flipped per-tailnet; until then, `tailscale serve` errors and we
+# fall through. Operators see the camera-banner workaround text as
+# the runtime signal that HTTPS isn't live yet.
+if [ "$HTTPS_ENABLED" = "1" ]; then
+    echo "tailscale: provisioning HTTPS via 'tailscale serve --https=443'"
+    tailscale serve --bg --https=443 http://localhost:80 \
+        || echo "tailscale serve: failed (HTTPS unavailable on tailnet)" >&2
+fi
 
 # Best-effort: once the node is authenticated, clear the auth key from
 # settings.json so a later leak of the file can't re-auth. The backend

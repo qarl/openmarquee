@@ -29,7 +29,7 @@ device-OS / manual-bring-up reference.
 | `wpa_supplicant-openmarquee.conf` | `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf` | legacy station-mode template (kept for fallback / pre-trixie boards). Pi OS Lite trixie uses NetworkManager + nmcli instead — see Station-mode applier below. |
 | `openmarquee-sudoers` | `/etc/sudoers.d/openmarquee` | minimal NOPASSWD grants for the `openmarquee` user: two narrow `nmcli` subcommands needed by the wifi-station applier. Read-only nmcli queries don't need sudo (the user is in the `netdev` group) |
 | `openmarquee-tailscale.service` | `/etc/systemd/system/` | oneshot that reads settings.json and runs `tailscale up` if enabled |
-| `openmarquee-tailscale.sh` | `/opt/openmarquee/system/` | the bring-up script for the service above |
+| `openmarquee-tailscale.sh` | `/opt/openmarquee/system/` | the bring-up script for the service above. Also provisions HTTPS via `tailscale serve --bg --https=443 http://localhost:80` when `tailscale_https_enabled` is set (default true). Tailscale issues a Let's Encrypt cert for the node's FQDN (`<hostname>.<tailnet>.ts.net`); the FastAPI `FqdnRedirectMiddleware` 301-redirects non-FQDN/non-LAN requests to the canonical HTTPS URL so operators' camera + getUserMedia work without a secure-context-banner |
 
 The backend service is wrapped with `ProtectSystem=strict`, a dedicated
 service user, and `CAP_NET_BIND_SERVICE` so uvicorn can bind port 80
