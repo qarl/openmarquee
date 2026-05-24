@@ -9,14 +9,228 @@ Components share a single version string across the backend
 (`backend/openmarquee/__init__.py` + `backend/pyproject.toml`),
 renderer (`renderer/Cargo.toml`), and UI (`ui/package.json`).
 
-PEP 440 caveat: pip normalizes `0.5.0-beta` to `0.5.0b0` at install
-time with a deprecation-warning print. Functional behavior is
-unchanged; the literal version string is preserved across all four
-component locations for cross-ecosystem readability.
+PEP 440 caveat: pip normalizes pre-release identifiers at install
+time with a deprecation-warning print (e.g. `0.5.0-beta` → `0.5.0b0`,
+`0.7.0-rc.1` → `0.7.0rc1`). Functional behavior is unchanged; the
+literal version string is preserved across all four component
+locations for cross-ecosystem readability.
 
 ## [Unreleased]
 
 (empty — next changes land here.)
+
+## [0.7.0-rc.1] — 2026-05-24
+
+Release-candidate cut covering the post-`v0.6.0-beta` arc. Mix of
+operator-visible fixes (D1-redux black-not-black, Live Mode A pause /
+resume, hostname-aware camera-permission banner), system-level
+mitigations for the FYS Pi's intermittent wifi loss (a seven-commit
+watchdog stack), HTTPS-on-Tailscale Phase 1, an overnight CSP audit,
+plus the CI green-up sweep needed to get all 1389 backend tests
+passing for the first time in this arc.
+
+### Backend
+
+- `0e10058` BACKEND+UI (M1 — Content-Security-Policy middleware).
+  Single source of truth `DEFAULT_CSP_POLICY` + `CSPMiddleware` ASGI
+  class stamps `content-security-policy` on every HTTP response.
+  Env-gated report-only mode via `OPENMARQUEE_CSP_REPORT_ONLY=1`.
+  Two pre-commit inline-script extracts (parity-harness.html +
+  fake-camera.html, 835 LOC of inline JS lifted to `.entry.js`
+  bundles) so the policy doesn't break existing pages.
+- `f72c49f` + `6307d4a` CSP follow-up: allow `blob:` in `script-src`
+  + `connect-src` for the e2e ffmpeg.wasm dynamic-module path
+  (browser-side fixture-video generation).
+- `bbd64c5` BACKEND (D1-redux v1) + `6c5de9a` (widen). Seed-data
+  rewrite of `#050608` → `#000000` plus an env-gated content
+  migration (`OPENMARQUEE_MIGRATE_050608_BG=1`) that walks all three
+  bg-carrying fields: `slide.background_color`,
+  `background_pattern.color_a`, `background_pattern.color_b`. The
+  v1 commit only touched `background_color`; live-fire showed
+  intermittent lifted-black on pattern-using slides, fixed in the
+  widen. Pre-Bug-7 (Broadcast RGB Limited) the `#050608` and
+  `#000000` were visually identical; post-Bug-7's full-range fix
+  the `(5,6,8)` lift became visible. **True black confirmed on FYS
+  glass post-deploy** via `/api/playback/current-frame` corner-pixel
+  probe (`(0,0,0)` everywhere, `(5,6,8)` count = 0).
+- `ac47242` LIVE (Fork B — operator pause / resume on Mode A
+  takeover). New `LiveSession._paused` flag + `pause()` / `resume()`
+  methods; the pump loop drains the source but skips render while
+  paused (DRM scanout holds the last frame; upstream stays alive).
+  `_first_frame_event.set()` moved to the top of the pump loop so
+  the watchdog sees proof-of-life even if the operator pauses
+  pre-first-frame. New `POST /api/live/{pause,resume}` endpoints +
+  `LiveStatus.paused` field + UI Pause button with optimistic flip
+  + in-flight debounce.
+- `9bc63cd` BACKEND+WIFI-WATCHDOG carry-forwards. PerfMiddleware
+  re-ordered to be outermost so the ring records auth-rejected
+  401s (previously the Auth middleware short-circuited before Perf
+  saw the request); watchdog gains a tick-start `iw get power_save`
+  warning check so re-introduced power-save shows up in the log.
+- `18f585b` BACKEND+UI (M5 closure). Live-panel Cancel no-backend-
+  call contract lock + decision-record comment at `live-panel.js:
+  1101`. Subagent review caught a real silent-contract regression
+  where the initial assertion list used import names rather than
+  the `api*`-aliased in-scope names — would have shipped useless
+  green.
+- `5c2cea2` BACKEND (web_render). Restore chromium process-group-
+  kill (originally `88398f8`) from a half-merge that landed the
+  tests but dropped the source-side `Popen` + `start_new_session`
+  + `killpg` triple. Group A — 28 CI failures.
+- `e7c0b50` BACKEND (3 fixes). Migration's detection-then-update
+  split simplified per subagent nit; `test_migration_is_idempotent`
+  extended to cover both bg + pattern paths; `_NOW` in
+  `test_flock_sync.py` switched from hardcoded `datetime(2026, 4,
+  24, ...)` to `datetime.now(UTC).replace(microsecond=0)` (the
+  hardcoded date had aged past the 30-day tombstone TTL, causing
+  two CI failures every day). **First all-green CI of the arc.**
+- `6e226e9` renderer: BT.601 → BT.709 comment correction. The
+  matrix coefficients were updated 2026-05-14 but the header
+  comment was missed; pure docs.
+- `be7dbcb` BACKEND: `pip-compile` lock refresh — fixes idna +
+  starlette CVEs plus 6 routine bumps.
+
+### System / Ops
+
+- **Wifi-watchdog seven-commit stack** addressing FYS-Pi wifi loss
+  that was causing ~7-minute reboot cycles. From baseline to ~12-22
+  minute stable windows (~30-50% reboot reduction in the morning
+  Path 1 arc; further loosened post-move in the evening when the
+  sign was still bouncing); underlying RF / hardware root cause
+  remains qarl's investigation:
+  - `f9ca5f9` burst-ping (replace single-ping with 5-ping burst,
+    pass on ≥3 of 5) — stops the false-positive reboot loop.
+  - `e25e787` Path 1 widen-envelope: `REBOOT_AFTER_N_RESTARTS` 3→5,
+    `REBOOT_WINDOW_SECONDS` 600→1800 — absorb sustained-but-
+    transient bad-RF pockets.
+  - `f4bcac8` Path 2 modprobe-cycle tier: `rmmod + modprobe
+    brcmfmac` escalation between NM-restart and reboot — cheaper
+    recovery than a full reboot when it works.
+  - `8a04c28` flock wrap: `/usr/bin/flock -n /var/lock/wifi-
+    watchdog.lock` on both cron invocations — serializes concurrent
+    cron firings to fix the back-to-back NM-restart race.
+  - `1b46639` wcc fix: `modprobe -r brcmfmac` instead of `rmmod
+    brcmfmac` — handles the `brcmfmac_wcc` sub-module reverse-dep.
+  - `d22addf` Option D doc lock: 17-line `KNOWN LIMITATION`
+    docblock fencing the dual-mode (STA + AP for captive-portal)
+    no-op. On FYS, `hostapd` on `ap0` holds a `brcmfmac` reference
+    `modprobe -r` can't break; mitigation falls through to reboot
+    tier. Documented to prevent future "fix" attempts.
+  - `e2beb57` Second-widen tune (post-move bounce-back): envelope
+    further loosened from 5-in-1800s to 8-in-3600s; burst-loss
+    threshold tightened from 60% (3-of-5 OK) to 80% (2-of-5 OK).
+    Auto-reboot stays enabled — qarl wants the path to fire for
+    genuinely-wedged chips — but the trigger surface is now much
+    rarer. New `test_burst_threshold_is_80_percent` semantically
+    locks the OK_MIN/COUNT pair into producing a ≥80% loss FIRE
+    threshold.
+- `97d36fc` BACKEND+SYSTEM (HTTPS Phase 1). `tailscale serve --bg
+  --https=443` plus a `FqdnRedirectMiddleware` that 301s non-FQDN
+  hostnames to the canonical Let's-Encrypt-issued FQDN. New
+  `settings.tailscale_https_enabled` (default `True`); awaiting
+  per-device admin-console toggle by the operator.
+- `56767a4` OPS (network mitigation 2). Wifi-watchdog gains an AP-
+  deauth-detection path — was previously a no-op.
+- `69cd5e9` OPS (network mitigation 3). Backend skips Web-slide
+  render when system memory pressure exceeds the threshold (avoids
+  chromium OOM cascading into a reboot).
+- `d3ede6b` OPS (network mitigation 4). Auto-reboot on watchdog
+  escalation (now superseded by the Path 1+2 stack above but ships
+  in this cut as part of the iterative arc).
+- `7159bab` OPS (network mitigation 5). Strip
+  `cgroup_disable=memory` from `cmdline.txt` so memory pressure
+  signals actually fire.
+- `387d71c` SYSTEM (TZ drift postmortem #8). Standardize Pi log
+  timestamps on UTC via `date -u` at six log-emitter sites + an
+  auto-catch test. **The Pi system TZ remains local** — the
+  schedule.py rule evaluator uses naive `datetime.now()` and
+  changing `timedatectl set-timezone UTC` would silently shift
+  every operator-configured schedule window.
+
+### UI
+
+- `4a948fb` + `0afd012` LIVE PANEL camera-permission banner. First
+  commit surfaces the missing-`navigator.mediaDevices` Safari /
+  HTTP-context case as an actionable banner instead of a console
+  error; second makes the message hostname-aware via injectable
+  `getHostname` (HTTPS-redirect copy vs HTTP-context copy).
+- `1b00db8` UI (H4 closure). Parity-harness gains 7 transitions
+  (iris, scanline, glitch, push, flip, marquee, shutter) as per-
+  pixel JS translations of the Rust SP fragment shaders. Closes
+  the 7 BROWSER-SKIP fixtures.
+- `cbcb376` UI (Bug 2). Playlist add / delete / rename now propagate
+  to the schedule UI; `listPlaylists` cache-busted.
+- `08d3ca3` UI (Bug 3). Tag-qualify the bare `.live` selector
+  (`section.live`) to break the `.om-pill.live` collision a class-
+  rename had silently created.
+- `03d588c` + `6c5d79a` UI (Bug 5 — web-slide inline preview). Two-
+  commit fix: editor renders the saved slide's `asset.png` inline,
+  then `@font-face` load + cache-invalidate so thumbnails refresh
+  post-font-load.
+- **Dead-CSS sweep waves** (~819 LOC, ~81 selector groups). The
+  97-candidate orphan list landed earlier this arc is now
+  exhausted: `7948bd2` (497 LOC / ~55 classes), `a52b141` (298 LOC
+  / ~23 classes), `11cb751` (5 `.bg-*` theme-exploration classes),
+  `9d1e211` (`.om-slide-text` + `.font-*` + `@keyframes om-scroll`,
+  24 LOC).
+- `4c65de2` UI E2E (settings-remount). Drop dead `.settings-save`
+  clicks — settings now auto-save on input / change.
+- `1200cfb` UI E2E (fonts). Bless 23 chromium-linux font-snapshot
+  goldens (post-MSDF baseline).
+- `bca642c` UI E2E (change-secret-flow). Drop the obsolete
+  tailscale-auth-key Change → Cancel test (UX flow superseded).
+- `d9d982f` UI E2E (auto-slide). Click the segmented Time button
+  instead of the stale `selectOption` (UI refactored to chip pills).
+
+### Tooling / CI
+
+- `d2d322c` CI: bump Python 3.11 → 3.13 + pip-tools 7.5.3 +
+  surface lock-drift errors (the previous `2>/dev/null` was
+  swallowing the real failure into a phantom 103-line diff).
+- `ccea63b` CI: add `build-wasm` job + artifact handoff to unblock
+  `ui/e2e` which depends on the gitignored `renderer-wasm/pkg`.
+  Cache key is wasm-pack version-checked.
+- `9f6ec95` + `499e206` CI: install ffmpeg on backend + e2e jobs
+  (fixes ffprobe-missing test failure + fixture-video generation).
+- `f24c056` CI + playwright: HTML reporter on CI + upload
+  `test-results/` actuals (lets us inspect failures without a
+  full local Playwright environment).
+- `0768886` SCRIPTS (`build_wasm_renderer`). Emit
+  `pkg/package.json` with `"type": "module"` so Node treats the
+  wasm-pack `--target web` output as ESM (default is CJS via
+  parent-`package.json` walk; wasm-pack doesn't emit one).
+- `095ea71` SCRIPTS (`sweep_orphan_chunks`). Swap
+  `find -regex '.*\.\{N\}'` for `find -name 'GLOB' | grep -E`
+  — the GNU `find` on Ubuntu CI returns empty where BSD `find`
+  on macOS matches.
+- `1fad8ea` TESTS: `chmod +x` 3 scripts + skip-gate `test_bake`
+  on wasm-pkg presence.
+- **Ruff cleanup arc** for the strict-CI gate:
+  - `fe29851` (lint --fix + F821 UUID import).
+  - `4777cc9` (`ruff format .` whole-suite formatter sweep, 77
+    files).
+  - `9687d22` (residual 20 cleared — defer-and-document wasn't
+    viable under the strict gate).
+  - `7ad29d7 8a5e884 87b44e7 8f77001 e58a7b8 c1fef9f 1d2887e
+    e7f3425 6126ca3` (formatter version drift residuals + post-
+    merge-conflict tidies).
+
+### Notes
+
+- **CI status at cut**: 1389 passed, 3 skipped, 0 failed.
+- **Process invariants validated this arc**: pre-commit subagent
+  review (caught the Fork B watchdog-pre-first-frame bug, the CSP
+  inline-script blockers, and the M5 import-name vs in-scope-name
+  assertion gap), pre-commit `git diff --cached --stat` (instituted
+  after `9bc63cd` accidentally bundled 18 unrelated stash phantoms),
+  surface-first scope before editing (caught a dispatch referencing
+  a non-existent memory file before any edits hit disk).
+- **Deferred to next arc** (not blockers for `rc.1`): HTTPS short-
+  name daylight (mkcert + per-device root-CA scope, ~3-4h, deferred
+  until qarl asks); systemd `StartLimitBurst` 5-in-10s hazard on
+  `openmarquee-backend.service` (recommend
+  `StartLimitIntervalSec=60` + `StartLimitBurst=10`, surfaced in N1
+  baseline, not RC-blocking).
 
 ## [0.6.0-beta] — 2026-05-23
 
@@ -346,5 +560,7 @@ configured at the time of this entry (slice 3); these links go
 live with slice 5 (git tag + GitHub release artifacts). Until
 then they will 404 — treat as placeholders.
 -->
-[Unreleased]: https://github.com/openmarquee/openmarquee/compare/v0.5.0-beta...HEAD
+[Unreleased]: https://github.com/openmarquee/openmarquee/compare/v0.7.0-rc.1...HEAD
+[0.7.0-rc.1]: https://github.com/openmarquee/openmarquee/compare/v0.6.0-beta...v0.7.0-rc.1
+[0.6.0-beta]: https://github.com/openmarquee/openmarquee/compare/v0.5.0-beta...v0.6.0-beta
 [0.5.0-beta]: https://github.com/openmarquee/openmarquee/releases/tag/v0.5.0-beta

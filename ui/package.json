@@ -1,6 +1,6 @@
 {
   "name": "openmarquee-ui",
-  "version": "0.6.0-beta",
+  "version": "0.7.0-rc.1",
   "private": true,
   "description": "openMarquee browser UI",
   "license": "GPL-3.0-or-later",
