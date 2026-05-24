@@ -99,7 +99,7 @@ REBOOT_AFTER_N_RESTARTS=5
 REBOOT_WINDOW_SECONDS=1800
 # Modprobe escalation tier (Path 2 of the wifi-wedge dispatch,
 # 2026-05-24): between the NM-restart tier and the reboot tier,
-# attempt a `rmmod brcmfmac && modprobe brcmfmac` cycle ONCE per
+# attempt a `modprobe -r brcmfmac && modprobe brcmfmac` cycle ONCE per
 # REBOOT_WINDOW_SECONDS window. Resets just the wifi chip rather
 # than the whole system — ~5-15s of downtime vs ~30-60s for a
 # full reboot, and the chromium-headless-shell + Rust renderer
@@ -165,26 +165,41 @@ modprobe_done_in_window() {
     return 1
 }
 
-# rmmod + modprobe the brcmfmac driver. Returns 0 if BOTH commands
+# Unload + reload the brcmfmac driver. Returns 0 if BOTH commands
 # succeeded; 1 otherwise. The 1-second sleep between gives the
 # kernel time to release the wifi-related sysfs entries before the
-# re-probe. stderr from both commands captured + routed through
-# note() so it lands in BOTH $LOG AND journal (per
+# re-probe.
+#
+# Uses `modprobe -r` (NOT bare `rmmod`) so reverse-deps are handled
+# transparently. Live-fire 2026-05-24 13:21:47 on FYS proved this
+# necessary: `rmmod brcmfmac` fails on this Pi because
+# brcmfmac_wcc is loaded ON TOP of brcmfmac (chip-specific
+# extension for the BCM43430-W variant). `rmmod` does NOT handle
+# reverse-deps so the kernel refuses with "Module brcmfmac is in
+# use by: brcmfmac_wcc". `modprobe -r brcmfmac` walks the rdep
+# graph + unloads brcmfmac_wcc first, then brcmfmac itself; the
+# subsequent `modprobe brcmfmac` re-loads brcmfmac and the kernel's
+# udev/modalias auto-loads brcmfmac_wcc on top via chip detection.
+# Also works transparently on other Pi Zero variants that load
+# different sub-modules (brcmfmac_bca, brcmfmac_cyw, etc.) without
+# hardcoding their names here.
+#
+# stderr from both commands captured + routed through note() so it
+# lands in BOTH $LOG AND journal (per
 # [[feedback_never_swallow_stderr_in_ci]]) — the kernel's
-# explanation of a failed unload ("Module brcmfmac is in use by:
-# cfg80211") is the most diagnostic piece, and forcing it into
-# journal so `journalctl -t wifi-watchdog` shows it is what
-# operators reach for first.
+# explanation of a failed unload is the most diagnostic piece, and
+# forcing it into journal so `journalctl -t wifi-watchdog` shows
+# it is what operators reach for first.
 try_modprobe_cycle() {
-    local rmmod_rc modprobe_rc rmmod_err modprobe_err
-    rmmod_err=$(rmmod brcmfmac 2>&1 >/dev/null)
-    rmmod_rc=$?
-    [ -n "$rmmod_err" ] && note "rmmod brcmfmac stderr: $rmmod_err"
+    local unload_rc modprobe_rc unload_err modprobe_err
+    unload_err=$(modprobe -r brcmfmac 2>&1 >/dev/null)
+    unload_rc=$?
+    [ -n "$unload_err" ] && note "modprobe -r brcmfmac stderr: $unload_err"
     sleep 1
     modprobe_err=$(modprobe brcmfmac 2>&1 >/dev/null)
     modprobe_rc=$?
     [ -n "$modprobe_err" ] && note "modprobe brcmfmac stderr: $modprobe_err"
-    [ "$rmmod_rc" -eq 0 ] && [ "$modprobe_rc" -eq 0 ]
+    [ "$unload_rc" -eq 0 ] && [ "$modprobe_rc" -eq 0 ]
 }
 
 record_nm_restart_and_maybe_reboot() {
@@ -238,11 +253,11 @@ record_nm_restart_and_maybe_reboot() {
     # The modprobe-cycle is recorded whether it succeeds or fails
     # so we don't loop on it — at most one attempt per window.
     if [ "$count" -ge "$MODPROBE_AFTER_N_RESTARTS" ] && ! modprobe_done_in_window; then
-        note "modprobe-cycle: $count NM-restarts in window, trying rmmod+modprobe brcmfmac before reboot escalation"
+        note "modprobe-cycle: $count NM-restarts in window, trying modprobe -r + modprobe brcmfmac before reboot escalation"
         if try_modprobe_cycle; then
-            note "modprobe-cycle: rmmod+modprobe brcmfmac succeeded; next 30s burst-ping will verify"
+            note "modprobe-cycle: modprobe -r + modprobe brcmfmac succeeded; next 30s burst-ping will verify"
         else
-            note "modprobe-cycle: rmmod or modprobe brcmfmac FAILED — continuing toward reboot escalation"
+            note "modprobe-cycle: modprobe -r or modprobe brcmfmac FAILED — continuing toward reboot escalation"
         fi
         echo "$now" >> "$MODPROBE_LEDGER"
     fi

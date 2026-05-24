@@ -677,11 +677,15 @@ def test_modprobe_ledger_path_constant_present() -> None:
 
 
 def test_try_modprobe_cycle_function_present() -> None:
-    """`try_modprobe_cycle` must exist + do exactly rmmod brcmfmac
-    + 1-second sleep + modprobe brcmfmac, returning success only if
-    BOTH commands succeed. The sleep gives the kernel time to
-    release wifi sysfs entries before re-probe — without it the
-    modprobe race-attaches against in-cleanup state."""
+    """`try_modprobe_cycle` must exist + do exactly `modprobe -r
+    brcmfmac` + 1-second sleep + `modprobe brcmfmac`, returning
+    success only if BOTH commands succeed. The sleep gives the
+    kernel time to release wifi sysfs entries before re-probe —
+    without it the modprobe race-attaches against in-cleanup state.
+
+    `modprobe -r` (not bare `rmmod`) is load-bearing — see
+    test_unload_uses_modprobe_r_not_rmmod for the wcc-sub-module
+    rationale."""
     source = _read_script_source()
     match = re.search(
         r"try_modprobe_cycle\(\)\s*\{(.*?)\n\}",
@@ -690,18 +694,60 @@ def test_try_modprobe_cycle_function_present() -> None:
     )
     assert match, "try_modprobe_cycle() function not found"
     body = match.group(1)
-    assert "rmmod brcmfmac" in body, (
-        "try_modprobe_cycle must call `rmmod brcmfmac` — the cycle "
-        "requires unloading the module before re-probing."
+    assert "modprobe -r brcmfmac" in body, (
+        "try_modprobe_cycle must call `modprobe -r brcmfmac` — the "
+        "cycle requires unloading the module (with reverse-deps "
+        "handled, see test_unload_uses_modprobe_r_not_rmmod) before "
+        "re-probing."
     )
     assert "sleep 1" in body, (
-        "try_modprobe_cycle must `sleep 1` between rmmod + modprobe "
+        "try_modprobe_cycle must `sleep 1` between unload + re-probe "
         "to let kernel release wifi sysfs entries before re-probe; "
         "without it, modprobe race-attaches against in-cleanup state."
     )
-    assert "modprobe brcmfmac" in body, (
-        "try_modprobe_cycle must call `modprobe brcmfmac` to re-load "
-        "the driver — that's the entire point of the cycle."
+    # `modprobe brcmfmac` (the re-load) must appear distinct from
+    # the `modprobe -r brcmfmac` (the unload). Match it bare —
+    # not preceded by `-r ` — to avoid false positives.
+    assert re.search(r"(?<!-r )modprobe brcmfmac\b", body), (
+        "try_modprobe_cycle must call `modprobe brcmfmac` (without "
+        "-r) to re-load the driver — that's the entire point of "
+        "the cycle."
+    )
+
+
+def test_unload_uses_modprobe_r_not_rmmod() -> None:
+    """The unload step MUST use `modprobe -r` (which handles
+    reverse-deps) — NOT bare `rmmod` (which does not).
+
+    Live-fire on FYS 2026-05-24 13:21:47 proved this necessary:
+    `rmmod brcmfmac` failed because brcmfmac_wcc is loaded ON TOP
+    of brcmfmac (chip-specific extension for the BCM43430-W
+    variant). The kernel refuses: "Module brcmfmac is in use by:
+    brcmfmac_wcc". `modprobe -r` walks the rdep graph and unloads
+    brcmfmac_wcc first.
+
+    Anti-pattern: `rmmod brcmfmac` anywhere in the script. A
+    future refactor that "simplifies" back to bare rmmod would
+    silently reintroduce the wcc-failure mode on every install
+    that loads a brcmfmac_* sub-module. Catches that regression
+    structurally."""
+    source = _read_script_source()
+    # Bare `rmmod brcmfmac` (with no -r prefix on the verb)
+    # must be ABSENT from the script.
+    assert not re.search(
+        r"(?<!modprobe -)\brmmod brcmfmac\b",
+        source,
+    ), (
+        "found bare `rmmod brcmfmac` — this fails on Pis where "
+        "brcmfmac_wcc (or any other brcmfmac_* sub-module) is "
+        "loaded on top, because rmmod doesn't handle reverse-deps. "
+        "Use `modprobe -r brcmfmac` which walks the rdep graph and "
+        "unloads sub-modules first."
+    )
+    # Positive: `modprobe -r brcmfmac` must be present somewhere.
+    assert "modprobe -r brcmfmac" in source, (
+        "unload step must use `modprobe -r brcmfmac` — see test "
+        "docstring for the wcc-sub-module rationale."
     )
 
 
