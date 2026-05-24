@@ -1260,3 +1260,153 @@ async def test_kick_web_refresh_now_failed_producer_does_not_raise(renderer):
     # The crashed task's done-callback cleared the in-flight id, so a
     # subsequent kick can still proceed — no wedged id, no raise.
     assert web.id not in loop._web_inflight
+
+
+# ---- _wait equivalence tests (QA perf P2 prep, 2026-05-24) ----
+#
+# PlaybackLoop._wait sleeps up to `seconds`, returning early on stop
+# or pause. Originally implemented by racing two asyncio.create_task
+# wrappers via asyncio.wait(); per QA's perf-resweep v2 P1 finding,
+# the per-tick 2-Task allocation cost ~0.45% of one core. These tests
+# pin the observable contract (sleep cadence, early-wake on stop, early-
+# wake on pause, race-on-entry, zero-second short-circuit, cancellation
+# propagation) so a refactor can be verified behaviorally-equivalent.
+
+
+def _wait_test_loop(renderer):
+    """Construct a PlaybackLoop and manually initialize the events
+    that start() would normally create. This lets us exercise _wait
+    in isolation without spinning the full loop body."""
+    loop = PlaybackLoop(renderer, fetch_items=lambda: [], read_asset=lambda _i: b"")
+    loop._stop_event = asyncio.Event()
+    loop._pause_event = asyncio.Event()
+    loop._resume_event = asyncio.Event()
+    loop._wake_event = asyncio.Event()
+    loop._resume_event.set()
+    return loop
+
+
+def _fake_stop(loop):
+    """Model what production stop() does to the events that _wait
+    races against. We can't call the real stop() in these tests
+    because it short-circuits on `not is_running` (we never started
+    the loop's task)."""
+    loop._stop_event.set()
+    loop._wake_event.set()
+
+
+def _fake_pause(loop):
+    """Model what production pause() does to the events that _wait
+    races against. Same `not is_running` short-circuit reason as
+    `_fake_stop`."""
+    loop._pause_event.set()
+    loop._wake_event.set()
+
+
+@pytest.mark.asyncio
+async def test_wait_sleeps_full_duration_when_no_signal(renderer):
+    """Neither stop nor pause is set → _wait sleeps for ~seconds.
+    Allow a generous tolerance (50%) so a slow CI runner doesn't
+    flake; the contract is "approximately the requested duration",
+    not "to the millisecond"."""
+    loop = _wait_test_loop(renderer)
+    t0 = asyncio.get_running_loop().time()
+    await loop._wait(0.10)
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert 0.08 <= elapsed <= 0.20, f"_wait(0.10) took {elapsed:.3f}s; expected ~0.10s ± tolerance"
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_when_stop_set_during_wait(renderer):
+    """stop() fires mid-wait → _wait returns shortly after the set,
+    not after the full timeout. The pre-set asyncio scheduling jitter
+    is bounded by the event loop's tick."""
+    loop = _wait_test_loop(renderer)
+
+    async def set_stop_after(delay):
+        await asyncio.sleep(delay)
+        _fake_stop(loop)
+
+    t0 = asyncio.get_running_loop().time()
+    waiter = asyncio.create_task(loop._wait(1.0))
+    setter = asyncio.create_task(set_stop_after(0.05))
+    await asyncio.gather(waiter, setter)
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert elapsed < 0.20, f"_wait(1.0) with mid-wait stop took {elapsed:.3f}s; expected <0.20s"
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_when_pause_set_during_wait(renderer):
+    """pause() fires mid-wait → _wait returns shortly after the set.
+    Same shape as the stop case. Live-takeover responsiveness contract:
+    when an operator hits Take Over, the playlist's current sleep must
+    wake quickly rather than draining the full slide duration."""
+    loop = _wait_test_loop(renderer)
+
+    async def set_pause_after(delay):
+        await asyncio.sleep(delay)
+        _fake_pause(loop)
+
+    t0 = asyncio.get_running_loop().time()
+    waiter = asyncio.create_task(loop._wait(1.0))
+    setter = asyncio.create_task(set_pause_after(0.05))
+    await asyncio.gather(waiter, setter)
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert elapsed < 0.20, f"_wait(1.0) with mid-wait pause took {elapsed:.3f}s; expected <0.20s"
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_when_stop_set_before_call(renderer):
+    """stop() was set BEFORE _wait was invoked → _wait must short-
+    circuit at entry, not sleep for the full duration. Race-on-entry
+    contract: a stop racing with a slide-end transition should not
+    introduce up-to-`seconds` of latency."""
+    loop = _wait_test_loop(renderer)
+    loop._stop_event.set()
+    t0 = asyncio.get_running_loop().time()
+    await loop._wait(1.0)
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert elapsed < 0.05, f"_wait(1.0) with pre-set stop took {elapsed:.3f}s; expected <0.05s"
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_immediately_when_pause_set_before_call(renderer):
+    """pause() was set BEFORE _wait was invoked → same race-on-entry
+    short-circuit as stop. Without this, an operator-pause racing
+    with a slide-end transition would still incur up to `seconds`
+    of playlist render."""
+    loop = _wait_test_loop(renderer)
+    loop._pause_event.set()
+    t0 = asyncio.get_running_loop().time()
+    await loop._wait(1.0)
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert elapsed < 0.05, f"_wait(1.0) with pre-set pause took {elapsed:.3f}s; expected <0.05s"
+
+
+@pytest.mark.asyncio
+async def test_wait_with_zero_seconds_returns_quickly(renderer):
+    """_wait(0) is occasionally invoked as a yield-to-event-loop with
+    no actual sleep. Must return promptly (within asyncio scheduler
+    jitter) rather than blocking indefinitely."""
+    loop = _wait_test_loop(renderer)
+    t0 = asyncio.get_running_loop().time()
+    await loop._wait(0)
+    elapsed = asyncio.get_running_loop().time() - t0
+    assert elapsed < 0.05, f"_wait(0) took {elapsed:.3f}s; expected <0.05s"
+
+
+@pytest.mark.asyncio
+async def test_wait_propagates_cancellation(renderer):
+    """If the awaiting task is cancelled (e.g. the outer loop is
+    teardown'd via stop() → task.cancel() from outside), the cancel
+    must propagate through _wait — not be swallowed by the internal
+    suppress(CancelledError, Exception) cleanup. Otherwise a teardown
+    could hang waiting for _wait to drain its full timeout."""
+    loop = _wait_test_loop(renderer)
+
+    waiter = asyncio.create_task(loop._wait(5.0))
+    # Yield once so waiter actually enters the await inside _wait.
+    await asyncio.sleep(0.01)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter

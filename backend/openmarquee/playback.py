@@ -147,6 +147,15 @@ class PlaybackLoop:
         # and resume() flip them as a pair.
         self._pause_event: asyncio.Event | None = None
         self._resume_event: asyncio.Event | None = None
+        # QA perf-resweep v2 P2 (2026-05-24): single wake signal that
+        # _wait races against, set by both stop() and pause(). Replaces
+        # the prior 2-Task-per-call pattern (asyncio.create_task on each
+        # of _stop_event.wait() + _pause_event.wait(), then
+        # asyncio.wait + cleanup) -- per-tick allocation cost ~0.45% of
+        # one core during active playback. With wake_event we wrap a
+        # single coroutine in asyncio.wait_for (1 Task wrap per call,
+        # not 2) and drop the cancel/await cleanup entirely.
+        self._wake_event: asyncio.Event | None = None
         # Index in the current items[] where the loop was when pause
         # took effect. None when not paused; set so the loop resumes
         # at the same slide rather than restarting the playlist from 0.
@@ -279,6 +288,7 @@ class PlaybackLoop:
         self._stop_event = asyncio.Event()
         self._pause_event = asyncio.Event()
         self._resume_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
         # Initial state: not paused, so resume_event is set so any caller
         # that checks "are we allowed to run?" sees true. _pause_event is
         # the inverse signal — set means "yield."
@@ -321,12 +331,17 @@ class PlaybackLoop:
         task = self._task
         self._task = None
         self._stop_event.set()
+        # Wake any in-flight _wait so the loop coroutine exits promptly
+        # rather than draining its current sleep.
+        if self._wake_event is not None:
+            self._wake_event.set()
         try:
             await task
         finally:
             self._stop_event = None
             self._pause_event = None
             self._resume_event = None
+            self._wake_event = None
             self._resume_at_index = None
             self._current_id = None
             self._current_type = None
@@ -608,24 +623,28 @@ class PlaybackLoop:
         Pause-awareness keeps live takeover responsive: without it, a
         5-second slide on screen would mean up to 5s of playlist render
         before the live session's pause() actually yields the renderer.
+
+        QA perf-resweep v2 P2 (2026-05-24): single wake_event race instead
+        of the prior 2-Task asyncio.wait pattern. Single-threaded asyncio
+        means clear()-then-is_set() runs atomically (no await between);
+        a set() that lands during the wait_for's await resolves it
+        immediately because wake_event is set by stop() and pause().
+        Allocation cost drops from 2 Tasks + cleanup to 1 Task wrap
+        (inside wait_for's ensure_future on wake_event.wait()).
         """
         assert self._stop_event is not None
         assert self._pause_event is not None
-        stop_task = asyncio.create_task(self._stop_event.wait())
-        pause_task = asyncio.create_task(self._pause_event.wait())
-        try:
-            await asyncio.wait(
-                [stop_task, pause_task],
-                timeout=seconds,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            for t in (stop_task, pause_task):
-                t.cancel()
-                # Suppress the swallow-the-cancel exception if a task
-                # already completed before we tried to cancel it.
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await t
+        assert self._wake_event is not None
+        # Clear the wake signal before checking entry state. The single-
+        # threaded asyncio model guarantees clear() + is_set() run as
+        # one atomic block (no scheduler yield between them) so a stop()
+        # or pause() that already fired is observed; a set() that lands
+        # after the await begins resolves wait_for immediately.
+        self._wake_event.clear()
+        if self._stop_event.is_set() or self._pause_event.is_set():
+            return
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._wake_event.wait(), timeout=seconds)
 
     async def _wait_for_resume(self) -> None:
         """Block until resume_event is set OR stop_event is set.
@@ -661,6 +680,10 @@ class PlaybackLoop:
             return
         self._resume_event.clear()
         self._pause_event.set()
+        # Wake any in-flight _wait so live takeover yields promptly
+        # rather than waiting for the current sleep to drain.
+        if self._wake_event is not None:
+            self._wake_event.set()
 
     async def resume(self) -> None:
         """Resume after pause. No-op if not paused or not running.
