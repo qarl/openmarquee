@@ -34,7 +34,7 @@ const TEMPLATE = `
             </div>
             <div class="om-card">
                 <label class="om-field">
-                    <span>Video file (any format ffmpeg can decode)</span>
+                    <span>Choose a video file (any format ffmpeg can decode)</span>
                     <input type="file" accept="video/*" class="om-input field-file">
                 </label>
             </div>

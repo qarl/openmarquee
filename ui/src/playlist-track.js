@@ -65,6 +65,24 @@ function isModeLockedVideo() {
     return false;
 }
 
+// The default playlist's name is fixed (the rename API rejects it).
+// Disabling the input alone left operators wondering if the field was
+// broken; surface the reason via title + a descriptive aria-label, and
+// clear them when switching back to a renamable playlist so stale
+// attributes don't linger. Both refresh()'s memo-fast-path and slow-path
+// call this so the hints stay in sync regardless of which branch ran.
+function applyDefaultPlaylistNameHints(nameEl, activeName) {
+    const isDefault = activeName === "default";
+    nameEl.disabled = isDefault;
+    if (isDefault) {
+        nameEl.title = "Cannot rename the default playlist.";
+        nameEl.setAttribute("aria-label", "Default playlist (immutable)");
+    } else {
+        nameEl.title = "";
+        nameEl.removeAttribute("aria-label");
+    }
+}
+
 const TEMPLATE = `
     <section class="playlist-track">
         <div class="om-page-head">
@@ -318,7 +336,7 @@ export function mountPlaylistTrack(container, options) {
                 // still need to happen (refresh is a "loaded fresh from
                 // server" reset signal, not just a render trigger).
                 nameEl.value = activeName;
-                nameEl.disabled = activeName === "default";
+                applyDefaultPlaylistNameHints(nameEl, activeName);
                 autoSave.cancel();
                 statusEl.dataset.state = "idle";
                 return;
@@ -359,7 +377,7 @@ export function mountPlaylistTrack(container, options) {
             // is not an edit, so cancel any pending auto-save and clear
             // the status pill.
             nameEl.value = activeName;
-            nameEl.disabled = activeName === "default";
+            applyDefaultPlaylistNameHints(nameEl, activeName);
             autoSave.cancel();
             statusEl.textContent = "";
             statusEl.dataset.state = "idle";
@@ -625,7 +643,8 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
             <img class="pallet-tile-thumb" alt="" draggable="false"
                  src="${mediaSrc(`/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || cacheBust)}`)}">
             ${lockedBadge}
-            <button type="button" class="pallet-tile-edit" title="Edit this slide">✎</button>
+            <button type="button" class="pallet-tile-edit"
+                    aria-label="Edit ${safeName}" title="Edit ${safeName}">✎</button>
             <button type="button" class="pallet-tile-delete"
                     aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
         </div>

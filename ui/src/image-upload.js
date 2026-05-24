@@ -29,7 +29,7 @@ const TEMPLATE = `
             </div>
             <div class="om-card">
                 <label class="om-field">
-                    <span>Image file (JPG or PNG)</span>
+                    <span>Choose an image file (JPG or PNG)</span>
                     <input type="file" accept="image/jpeg,image/png" class="om-input field-file">
                 </label>
             </div>
