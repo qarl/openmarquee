@@ -208,6 +208,16 @@
             border-color: var(--accent);
         }
 
+        /* WCAG 2.4.7 — keyboard-only operators need a visible focus
+           ring. `:focus-visible` fires on keyboard navigation only, so
+           mouse clicks don't trigger a stray outline. */
+        button:focus-visible,
+        .copy-btn:focus-visible,
+        .welcome-continue:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
         /* Primary "I'm ready, take me to set-password" CTA. Styled to
            match set-password.html's submit button so the operator sees
            the same affordance across both pages. Plain <a href> means
