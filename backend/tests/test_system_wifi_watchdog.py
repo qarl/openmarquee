@@ -557,7 +557,7 @@ def test_ping_burst_function_uses_burst_pattern() -> None:
     )
     body = match.group(1)
     assert re.search(r'ping\s+-c\s+"\$PING_BURST_COUNT"', body), (
-        "ping_burst_ok must pass `-c \"$PING_BURST_COUNT\"` so the "
+        'ping_burst_ok must pass `-c "$PING_BURST_COUNT"` so the '
         "5-packet count stays driven by the constant, not a literal."
     )
     assert "-i 0.2" in body, (
@@ -588,8 +588,8 @@ def test_ping_burst_function_uses_ok_min_threshold() -> None:
         r'\[\s*"\$PING_RECEIVED"\s*-ge\s*"\$PING_BURST_OK_MIN"\s*\]',
         body,
     ), (
-        "ping_burst_ok must gate on `[ \"$PING_RECEIVED\" -ge "
-        "\"$PING_BURST_OK_MIN\" ]` — anything else (e.g. -gt 0, "
+        'ping_burst_ok must gate on `[ "$PING_RECEIVED" -ge '
+        '"$PING_BURST_OK_MIN" ]` — anything else (e.g. -gt 0, '
         "-eq COUNT) breaks the 'tolerate ~40% loss before alarm' "
         "semantic the FYS investigation pinned the constants to."
     )
@@ -606,7 +606,7 @@ def test_main_branch_calls_ping_burst_ok_not_raw_ping() -> None:
         source,
         flags=re.MULTILINE,
     ), (
-        "main control flow must `elif ping_burst_ok \"$gw\"; then` "
+        'main control flow must `elif ping_burst_ok "$gw"; then` '
         "— the burst-check function exists but the dispatch is "
         "still hitting raw `ping -c 1`."
     )
@@ -779,8 +779,7 @@ def test_dual_mode_known_limitation_documented() -> None:
         "extending the function. See test docstring for context."
     )
     assert "dual-mode" in source.lower() or "ap0" in source.lower(), (
-        "dual-mode (STA + AP) framing missing — without it, the "
-        "no-op-on-FYS rationale is unclear."
+        "dual-mode (STA + AP) framing missing — without it, the no-op-on-FYS rationale is unclear."
     )
     assert "hostapd" in source.lower(), (
         "hostapd dependency on brcmfmac (via ap0) not mentioned "
@@ -809,8 +808,8 @@ def test_modprobe_done_in_window_function_present() -> None:
         r'\[\s*"\$ts"\s*-ge\s*"\$cutoff"\s*\]',
         body,
     ), (
-        "modprobe_done_in_window must gate on `[ \"$ts\" -ge "
-        "\"$cutoff\" ]` keep-criterion — same shape as the main "
+        'modprobe_done_in_window must gate on `[ "$ts" -ge '
+        '"$cutoff" ]` keep-criterion — same shape as the main '
         "ledger prune, NTP-backward-jump safe."
     )
 
@@ -828,11 +827,11 @@ def test_modprobe_tier_fires_below_reboot_threshold() -> None:
     # record_nm_restart_and_maybe_reboot's body.
     assert re.search(
         r'\[\s*"\$count"\s*-ge\s*"\$MODPROBE_AFTER_N_RESTARTS"\s*\]'
-        r'\s*&&\s*!\s*modprobe_done_in_window',
+        r"\s*&&\s*!\s*modprobe_done_in_window",
         source,
     ), (
-        "modprobe-tier branch must gate on BOTH `[ \"$count\" -ge "
-        "\"$MODPROBE_AFTER_N_RESTARTS\" ]` AND "
+        'modprobe-tier branch must gate on BOTH `[ "$count" -ge '
+        '"$MODPROBE_AFTER_N_RESTARTS" ]` AND '
         "`! modprobe_done_in_window` — see test docstring for the "
         "consequence of dropping either gate."
     )
@@ -903,8 +902,7 @@ def test_modprobe_ledger_recorded_unconditionally() -> None:
     )
     try_cycle_pos = body.find("try_modprobe_cycle")
     assert try_cycle_pos != -1 and try_cycle_pos < ledger_append_pos, (
-        "ledger append must follow `try_modprobe_cycle` invocation "
-        "in source order."
+        "ledger append must follow `try_modprobe_cycle` invocation in source order."
     )
     # And the ledger append must NOT be inside the `then` arm —
     # check by ensuring no `then` keyword appears between the LAST
@@ -916,7 +914,7 @@ def test_modprobe_ledger_recorded_unconditionally() -> None:
     # in `between`. If a `then` appears after the `fi`, the append
     # is in a different branch.
     last_fi = between.rfind("\n        fi\n")
-    after_fi = between[last_fi + 1:] if last_fi != -1 else between
+    after_fi = between[last_fi + 1 :] if last_fi != -1 else between
     assert "then" not in after_fi, (
         "ledger append appears AFTER an unclosed `then` — it's "
         "inside a success-only branch. Loop hazard: a persistent "
@@ -946,7 +944,7 @@ def test_modprobe_ledger_wiped_before_reboot() -> None:
         body,
     ), (
         "reboot tier must wipe MODPROBE_LEDGER with `: > "
-        "\"$MODPROBE_LEDGER\"` symmetric to RESTARTS_FILE wipe. "
+        '"$MODPROBE_LEDGER"` symmetric to RESTARTS_FILE wipe. '
         "Defensive: tmpfs clears it on reboot, but explicit wipe "
         "covers the edge case where /var/run is ever moved to a "
         "persistent fs."

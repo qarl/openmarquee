@@ -71,9 +71,7 @@ class CSPMiddleware:
         # Pre-encode once at construction so per-request hot path
         # only does a list-append, no string work.
         self._header_name: bytes = (
-            b"content-security-policy-report-only"
-            if report_only
-            else b"content-security-policy"
+            b"content-security-policy-report-only" if report_only else b"content-security-policy"
         )
         self._header_value: bytes = policy.encode("ascii")
 

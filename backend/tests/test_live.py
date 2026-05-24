@@ -979,9 +979,7 @@ async def test_session_pause_skips_render_frame(tmp_path, monkeypatch):
     await loop.start()
     manager = LiveManager(loop)
     try:
-        session_id, _answer = await manager.start(
-            StreamStartRequest(url="rtsp://laptop:8554/live")
-        )
+        session_id, _answer = await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
         session = manager._session
         assert session is not None and session.id == session_id
 
@@ -1043,9 +1041,7 @@ async def test_pause_before_first_frame_does_not_trip_watchdog(tmp_path, monkeyp
     await loop.start()
     manager = LiveManager(loop)
     try:
-        session_id, _ = await manager.start(
-            StreamStartRequest(url="rtsp://laptop:8554/live")
-        )
+        session_id, _ = await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
         session = manager._session
         assert session is not None
         # Pause immediately — within the watchdog's first-frame
@@ -1062,9 +1058,7 @@ async def test_pause_before_first_frame_does_not_trip_watchdog(tmp_path, monkeyp
         assert session._watchdog_task is not None
         assert await _wait_until(lambda: session._watchdog_task.done())
         await asyncio.sleep(0.3)
-        assert manager.is_active, (
-            "first-frame watchdog wrongly closed a paused-but-alive session"
-        )
+        assert manager.is_active, "first-frame watchdog wrongly closed a paused-but-alive session"
         assert session.paused
     finally:
         await manager.stop_all()

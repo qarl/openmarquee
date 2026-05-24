@@ -16,7 +16,6 @@ from fastapi.testclient import TestClient
 
 from openmarquee.csp_middleware import DEFAULT_CSP_POLICY, CSPMiddleware
 
-
 # ---------- Unit tests: ASGI middleware in isolation ----------
 
 
@@ -81,9 +80,7 @@ def test_default_policy_contains_required_directives():
 def test_default_policy_does_not_grant_unsafe_eval_to_scripts():
     """`'wasm-unsafe-eval'` is fine (wasm-bindgen needs it). Plain
     `'unsafe-eval'` would re-open the script-eval attack surface."""
-    assert "'unsafe-eval'" not in DEFAULT_CSP_POLICY.replace(
-        "'wasm-unsafe-eval'", ""
-    )
+    assert "'unsafe-eval'" not in DEFAULT_CSP_POLICY.replace("'wasm-unsafe-eval'", "")
 
 
 def test_default_policy_does_not_grant_unsafe_inline_to_scripts():
@@ -149,9 +146,7 @@ def test_middleware_report_only_flips_header_name():
 
     headers = dict(messages[0]["headers"])
     assert b"content-security-policy" not in headers
-    assert headers[b"content-security-policy-report-only"] == DEFAULT_CSP_POLICY.encode(
-        "ascii"
-    )
+    assert headers[b"content-security-policy-report-only"] == DEFAULT_CSP_POLICY.encode("ascii")
 
 
 def test_middleware_passes_lifespan_through_unmodified():
@@ -242,10 +237,7 @@ def test_csp_header_uses_report_only_when_env_set(monkeypatch):
         resp = client.get("/healthz")
         assert resp.status_code == 200
         assert resp.headers.get("content-security-policy") is None
-        assert (
-            resp.headers.get("content-security-policy-report-only")
-            == DEFAULT_CSP_POLICY
-        )
+        assert resp.headers.get("content-security-policy-report-only") == DEFAULT_CSP_POLICY
     finally:
         # Restore the un-report-only app for any test that imports app
         # later in the run.
