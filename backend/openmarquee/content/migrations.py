@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def migrate_050608_bg_to_000000(storage: "ContentStorage") -> int:
+def migrate_050608_bg_to_000000(storage: ContentStorage) -> int:
     """One-shot: rewrite text-slide `background_color == "#050608"`
     to `"#000000"`.
 
