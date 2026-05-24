@@ -3255,14 +3255,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   100% { transform: translateX(-100%); }
 }
 
-/* Slide background palette — used both inside the LED stage and as
- * card thumbnails. Kept in sync with the data file's bg keys.  */
-.bg-teal   { background: radial-gradient(120% 90% at 30% 20%, #0d4a52, #06222a 70%); color: #f4ecd8; }
-.bg-amber  { background: linear-gradient(180deg,#ffb43c,#ff7a3c); color: #1a0f00; }
-.bg-cream  { background: linear-gradient(180deg,#fbf3dc,#e9d8a0); color: #1a1610; }
-.bg-ink    { background: linear-gradient(180deg,#0d0e10,#000); color: #ffb43c; }
-.bg-pink   { background: linear-gradient(180deg,#ff5fa7,#7a1d4a); color: #fff; }
-
 /* — Image-slide placeholder treatments — */
 .om-slide-img {
   width: 100%; height: 100%;
