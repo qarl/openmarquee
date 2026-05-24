@@ -751,6 +751,44 @@ def test_unload_uses_modprobe_r_not_rmmod() -> None:
     )
 
 
+def test_dual_mode_known_limitation_documented() -> None:
+    """Path 2's modprobe-cycle is a no-op on FYS and on any other
+    dual-mode (STA + AP) install because `ap0` (the captive-portal
+    AP virtual interface) holds a reference to brcmfmac that a
+    simple modprobe-cycle can't release. Live-fire on FYS
+    2026-05-24 14:00 confirmed; qarl decided to accept it as a
+    known no-op rather than extend the function to tear down
+    hostapd + ap0 (approaches reboot cost without reboot's clean
+    state).
+
+    Pin the documentation so a future Jimmy doesn't try to "fix"
+    the no-op tier on FYS without understanding why it's
+    intentionally a no-op. If the rationale comment gets stripped,
+    this test fires — operator should read the surrounding
+    comment block + dispatch QA before extending the function."""
+    # _read_script_source() strips `#` comments so the rationale
+    # docstring wouldn't survive — read the raw file for this test.
+    source = _SCRIPT.read_text(encoding="utf-8")
+    # Three key phrases that together encode the intent: the
+    # limitation label, the dual-mode framing, and the explicit
+    # don't-extend warning. All three must survive any future
+    # cleanup of the function docstring.
+    assert "KNOWN LIMITATION" in source, (
+        "dual-mode limitation label missing from try_modprobe_cycle "
+        "docstring — future Jimmy may not see the warning before "
+        "extending the function. See test docstring for context."
+    )
+    assert "dual-mode" in source.lower() or "ap0" in source.lower(), (
+        "dual-mode (STA + AP) framing missing — without it, the "
+        "no-op-on-FYS rationale is unclear."
+    )
+    assert "hostapd" in source.lower(), (
+        "hostapd dependency on brcmfmac (via ap0) not mentioned "
+        "in the script — that's the actual ref-holder blocking "
+        "modprobe -r on dual-mode setups."
+    )
+
+
 def test_modprobe_done_in_window_function_present() -> None:
     """`modprobe_done_in_window` gates the cycle to at most once per
     REBOOT_WINDOW_SECONDS — without it we'd retry modprobe on every

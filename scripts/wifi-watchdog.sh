@@ -190,6 +190,25 @@ modprobe_done_in_window() {
 # explanation of a failed unload is the most diagnostic piece, and
 # forcing it into journal so `journalctl -t wifi-watchdog` shows
 # it is what operators reach for first.
+#
+# KNOWN LIMITATION — dual-mode (STA + AP) Pis: openMarquee runs a
+# captive-portal AP on the virtual `ap0` interface which shares
+# the same brcmfmac driver as the `wlan0` STA. `modprobe -r
+# brcmfmac` then fails with "Module brcmfmac is in use" because
+# the ap0 reference held by hostapd is never released by a simple
+# unload. Releasing it would require stopping hostapd, downing
+# ap0 + wlan0, AND coordinating with NetworkManager — a sequence
+# that approaches reboot cost without reboot's clean state. Live-
+# fire on FYS 2026-05-24 14:00 confirmed the dual-mode failure
+# mode; QA decided (qarl 2026-05-24) to ACCEPT this as a known no-
+# op on dual-mode setups and let the failure fall through to the
+# reboot tier as designed. Path 1 widen-envelope + flock + burst-
+# ping already deliver the ~3x reboot-rate improvement; modprobe-
+# cycle is preserved as a working tier for any future STA-only
+# deploys (no ap0, no hostapd → no extra refs → modprobe -r works
+# as intended). Don't extend this function to teardown ap0 +
+# hostapd without explicit dispatch — it's intentionally a no-op
+# on FYS, not a bug.
 try_modprobe_cycle() {
     local unload_rc modprobe_rc unload_err modprobe_err
     unload_err=$(modprobe -r brcmfmac 2>&1 >/dev/null)
