@@ -62,7 +62,7 @@ def test_default_policy_contains_required_directives():
     -- regressing one of these is how an XSS would escape."""
     for directive in (
         "default-src 'self'",
-        "script-src 'self' 'wasm-unsafe-eval'",
+        "script-src 'self' 'wasm-unsafe-eval' blob:",
         "style-src 'self' 'unsafe-inline'",
         "img-src 'self' data: blob:",
         "media-src 'self' blob:",

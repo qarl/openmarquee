@@ -40,7 +40,7 @@ from typing import Any
 # place to update.
 DEFAULT_CSP_POLICY = (
     "default-src 'self'; "
-    "script-src 'self' 'wasm-unsafe-eval'; "
+    "script-src 'self' 'wasm-unsafe-eval' blob:; "
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob:; "
     "media-src 'self' blob:; "
