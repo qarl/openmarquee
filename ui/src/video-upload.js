@@ -39,7 +39,7 @@ const TEMPLATE = `
                 </label>
             </div>
             <p class="om-save-status video-upload-status" role="status" aria-live="polite" data-state="idle"></p>
-            <progress class="video-upload-progress" value="0" max="100" hidden style="width: 100%; margin-top: 6px;"></progress>
+            <progress class="video-upload-progress" value="0" max="100" hidden></progress>
         </form>
     </section>
 `;
