@@ -211,42 +211,55 @@ app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
 # front of user_middleware, then build_middleware_stack wraps in
 # reversed() order -- net effect is the LAST add_middleware call
 # becomes the OUTERMOST wrapper. With the order below the runtime
-# stack is (outer -> inner): CSP -> Auth -> Perf -> app.
+# stack is (outer -> inner):
+#
+#   CSP -> Perf -> Fqdn -> Auth -> routes
 #
 # CSP outer-most so it stamps headers on every response, including
-# Auth's 401s. Auth wraps Perf so the auth gate runs first; Perf
-# only records requests that pass the gate (a pre-existing
-# limitation of this ordering, tracked separately).
+# Auth's 401s + Fqdn's 301s (proves out via
+# test_csp_header_present_on_401_when_auth_enabled).
+#
+# Perf NEXT OUT so it times + records EVERY HTTP request including
+# Auth-rejected 401s + Fqdn-redirected 301s ("are we 401-ing a
+# lot?" / "how often is the FQDN short-name hit?" observability).
+# 2026-05-24: re-positioned from innermost; earlier placement
+# inside Auth meant 401s never reached the perf ring, which
+# undermined the in-memory-ring's purpose for high-loss
+# diagnostics.
+#
+# Fqdn wraps Auth so the 301 is timestamped by Perf but the
+# bearer-token compare doesn't run on a request we're about to
+# throw away.
+#
+# Auth innermost — fails closed for any non-whitelisted route.
 
-# Perf middleware -- timestamps each HTTP request, logs slow ones,
-# and pushes records into the in-memory ring exposed at
-# /api/system/perf-stats.
-app.add_middleware(PerfMiddleware)
+# Batch 20.1 / phase A.1: bearer-token gate. AuthMiddleware fails
+# closed: requests not on the whitelist need a valid token. Pass a
+# callable resolver -- the middleware looks up the storage
+# per-request so the singleton's lru_cache can be cleared between
+# tests (tests point OPENMARQUEE_AUTH_PATH at a tmp dir).
+app.add_middleware(AuthMiddleware, auth_storage_resolver=get_auth_storage)
 
 # HTTPS Phase 1: 301-redirect non-FQDN requests to the canonical
-# Tailscale HTTPS URL. Added AFTER PerfMiddleware so the 301 is still
-# timestamped (observability on "how often is the short-name hit?")
-# but BEFORE AuthMiddleware so we don't waste a bearer-token compare
-# on a request we're about to throw away. Skip-list inside the
-# middleware passes loopback / RFC1918 / CGNAT / FQDN / settings-
-# disabled / Tailscale-down through unmodified. Resolvers are
-# injected so tests fake the FQDN + settings without touching real
-# subprocess / settings files.
+# Tailscale HTTPS URL. Sits above Auth so we don't waste a bearer-
+# token compare on a request we're about to throw away. Skip-list
+# inside the middleware passes loopback / RFC1918 / CGNAT / FQDN /
+# settings-disabled / Tailscale-down through unmodified. Resolvers
+# are injected so tests fake the FQDN + settings without touching
+# real subprocess / settings files.
 app.add_middleware(
     FqdnRedirectMiddleware,
     fqdn_resolver=get_self_fqdn,
     settings_resolver=lambda: get_settings_storage().load(),
 )
 
-# Batch 20.1 / phase A.1: bearer-token gate. add_middleware stacks
-# outer-most-first, so PerfMiddleware (added first) wraps
-# AuthMiddleware -- perf records still cover auth-rejected 401s
-# (useful for "are we 401-ing a lot?" observability). AuthMiddleware
-# fails closed: requests not on the whitelist need a valid token.
-# Pass a callable resolver -- the middleware looks up the storage
-# per-request so the singleton's lru_cache can be cleared between
-# tests (tests point OPENMARQUEE_AUTH_PATH at a tmp dir).
-app.add_middleware(AuthMiddleware, auth_storage_resolver=get_auth_storage)
+# Perf middleware -- timestamps each HTTP request, logs slow ones,
+# and pushes records into the in-memory ring exposed at
+# /api/system/perf-stats. Positioned OUTSIDE Auth + Fqdn so the
+# ring records EVERY request the device sees (auth-rejected 401s,
+# fqdn-redirected 301s, healthz 200s) -- the in-memory ring's
+# value for high-loss diagnostics depends on it seeing everything.
+app.add_middleware(PerfMiddleware)
 
 # Content-Security-Policy header stamper. Outer-most middleware so
 # the header is added to EVERY response, including AuthMiddleware's

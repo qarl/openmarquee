@@ -788,6 +788,48 @@ def test_dual_mode_known_limitation_documented() -> None:
     )
 
 
+def test_power_save_warning_check_present() -> None:
+    """Tier-zero observability check (2026-05-24): the watchdog must
+    query `iw dev wlan0 get power_save` at tick start and log a
+    WARN if it reports ON. Defense against a future NM-conf clobber
+    that silently re-enables power-save — without this fence, a
+    regression would require operators to re-discover the FYS
+    2026-05-24 11:00 finding (PS-on creates burst-loss patterns
+    that mimic genuine RF degradation) from scratch.
+
+    Pin the iw query + the WARN-style note() call so a future
+    "clean up the unused iw call" refactor surfaces this test
+    before quietly removing the defense."""
+    source = _read_script_source()
+    # The iw query must be present + must extract power_save state.
+    assert re.search(
+        r"iw\s+dev\s+wlan0\s+get\s+power_save",
+        source,
+    ), (
+        "watchdog must query `iw dev wlan0 get power_save` at tick "
+        "start to surface a silent NM-conf clobber re-enabling PS. "
+        "See test docstring for the discovery rationale."
+    )
+    # The WARN note() must fire when state == "on".
+    assert re.search(
+        r'\[\s*"\$ps_state"\s*=\s*"on"\s*\]',
+        source,
+    ), (
+        "watchdog must check `[ \"$ps_state\" = \"on\" ]` and "
+        "note() a WARN — anything else (always-log, only-on-fails, "
+        "etc.) misses the silent-clobber detection."
+    )
+    # The note() must mention "power_save" so journalctl-grep finds it.
+    assert re.search(
+        r'note\s+["\'].*power_save\s+is\s+ON',
+        source,
+    ), (
+        "PS-warning note() must include `power_save is ON` so "
+        "operators searching `journalctl -t wifi-watchdog | grep "
+        "power_save` find it during a future investigation."
+    )
+
+
 def test_modprobe_done_in_window_function_present() -> None:
     """`modprobe_done_in_window` gates the cycle to at most once per
     REBOOT_WINDOW_SECONDS — without it we'd retry modprobe on every

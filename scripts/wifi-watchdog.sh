@@ -306,6 +306,25 @@ ping_burst_ok() {
     [ "$PING_RECEIVED" -ge "$PING_BURST_OK_MIN" ]
 }
 
+# Tier-zero observability (2026-05-24): if `iw dev wlan0 get
+# power_save` reports ON, log a one-shot warning. Pi Zero 2 W
+# brcmfmac defaults power-save ON; openMarquee deploys explicitly
+# disable it via `/etc/NetworkManager/conf.d/wifi-no-powersave.conf`
+# because PS-on creates burst-loss patterns that look identical to
+# the rate-dependent loss pattern the watchdog already de-noises
+# via the 5-of-5 burst-ping. If an NM conf clobber (firmware update,
+# operator edit, hand-rolled deploy) re-enables PS silently, the
+# watchdog otherwise has no way to surface it — defense against a
+# future "why is wifi degraded again" investigation having to
+# rediscover the FYS 2026-05-24 11:00 finding from scratch. Cheap:
+# `iw get` is a ~1ms ioctl, no escalation, just a journal note().
+# Failure-tolerant: missing `iw` / wlan0-down / driver-not-loaded
+# just skips the check silently rather than spamming the journal.
+ps_state=$(iw dev wlan0 get power_save 2>/dev/null | awk -F': ' '/Power save/ {print $2}')
+if [ "$ps_state" = "on" ]; then
+    note "WARN — wlan0 power_save is ON; expected OFF (NM conf clobber? check /etc/NetworkManager/conf.d/)"
+fi
+
 fails=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
 gw=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
 

@@ -317,3 +317,48 @@ def test_playlist_storage_cache_skips_json_parse(client: TestClient):
     assert after["load_all_calls"] - cold_load_alls == 10
     # json_parses doesn't move -- the cache hit returns without parse.
     assert after["json_parses"] == cold_parses
+
+
+# --- 2026-05-24: Perf-outside-Auth (records 401s) ---
+
+
+def test_perf_ring_records_auth_rejected_401s(monkeypatch, tmp_path):
+    """Stack-order regression: PerfMiddleware must wrap AuthMiddleware
+    so that 401-rejected requests still land in the in-memory perf
+    ring. Pre-2026-05-24, Perf was innermost and Auth's short-circuit
+    on un-authorized requests meant Perf never saw them — undermined
+    the ring's value for high-loss / 401-flood diagnostics.
+
+    This test re-enables auth (default conftest disables it via
+    OPENMARQUEE_DISABLE_AUTH=1 to avoid mass token-minting in
+    suites that don't care), points the storage at an empty tmp dir
+    so the bearer-token gate fails closed, then verifies a request
+    that gets 401-ed STILL appears in the recent_requests() ring."""
+    # Re-enable auth for this test only.
+    monkeypatch.delenv("OPENMARQUEE_DISABLE_AUTH", raising=False)
+    monkeypatch.setenv("OPENMARQUEE_AUTH_PATH", str(tmp_path / "auth.json"))
+    # Clear the auth-storage singleton's lru_cache so the new env var
+    # is observed (same pattern as test_auth.py / test_csp_middleware).
+    from openmarquee.dependencies import _auth_storage_singleton
+
+    _auth_storage_singleton.cache_clear()
+    try:
+        with TestClient(app) as client:
+            # /api/system/info requires a token; with no AuthState
+            # configured, it 401s with "password not configured".
+            resp = client.get("/api/system/info")
+            assert resp.status_code == 401, "expected auth-gate 401"
+            # Now the smoking gun: the 401'd request MUST appear in the
+            # perf ring. Pre-fix this assertion would have failed
+            # because Perf was inside Auth and never saw the request.
+            log = recent_requests()
+            paths_and_statuses = [(e["path"], e["status"]) for e in log]
+            assert ("/api/system/info", 401) in paths_and_statuses, (
+                "401-rejected request didn't reach the perf ring — "
+                "PerfMiddleware is likely positioned INSIDE "
+                "AuthMiddleware again. Check app.py add_middleware "
+                "order; Perf must be outer (last-added-or-near-last) "
+                "so Auth's short-circuit doesn't bypass it."
+            )
+    finally:
+        _auth_storage_singleton.cache_clear()

@@ -93,7 +93,7 @@ typing-inspection==0.4.2
     # via
     #   fastapi
     #   pydantic
-uvicorn==0.47.0
+uvicorn==0.48.0
     # via openmarquee (pyproject.toml)
 uvloop==0.22.1
     # via uvicorn
