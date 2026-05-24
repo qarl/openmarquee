@@ -484,3 +484,128 @@ def test_pruning_uses_keep_criterion_not_delta_math() -> None:
         "behaves surprisingly under NTP backward-jumps on an "
         "RTC-less Pi — future-dated entries produce negative deltas."
     )
+
+
+# ---- 2026-05-24: burst-ping check (false-positive mitigation) ----
+
+
+def test_ping_burst_constants_present() -> None:
+    """Burst-ping uses 5-of-5 with a 3-of-5 minimum to OK.
+
+    Measured on FYS 2026-05-24 during the wedge investigation: a
+    single ping every 30s showed ~55% loss to the gateway while a
+    burst of 5 pings at 0.2s spacing showed 0% loss against the SAME
+    target. The single-ping cadence false-positive-ed heavily,
+    driving the auto-reboot loop. The 5/3 numbers are load-bearing
+    enough to pin in the source so a 'tighten this further' refactor
+    can't silently re-introduce the single-ping shape.
+    """
+    source = _read_script_source()
+    assert re.search(r"^\s*PING_BURST_COUNT=5\s*$", source, flags=re.MULTILINE), (
+        "PING_BURST_COUNT must be 5 — single-ping or smaller bursts "
+        "re-introduce the rate-dependent false-positive shape we "
+        "shipped this fix to escape."
+    )
+    assert re.search(r"^\s*PING_BURST_OK_MIN=3\s*$", source, flags=re.MULTILINE), (
+        "PING_BURST_OK_MIN must be 3 — anything stricter rolls back "
+        "to false-positive territory; anything looser misses real "
+        "outages."
+    )
+
+
+def test_ping_burst_function_uses_burst_pattern() -> None:
+    """`ping_burst_ok` must call ping with the 5-packet, 0.2s-spacing,
+    1s-per-packet-timeout pattern. These flags are what defines the
+    'coherent ~1-second probe' shape — losing any one of them turns
+    the function into something else (-c 1 = single ping, -i >0.5 =
+    rate-dependent again, -W >2 = slow probe stalls the cron run).
+    """
+    source = _read_script_source()
+    match = re.search(
+        r"ping_burst_ok\(\)\s*\{(.*?)\n\}",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match, (
+        "ping_burst_ok() function not found — the burst-check was "
+        "removed or renamed. Re-add or update this test."
+    )
+    body = match.group(1)
+    assert re.search(r'ping\s+-c\s+"\$PING_BURST_COUNT"', body), (
+        "ping_burst_ok must pass `-c \"$PING_BURST_COUNT\"` so the "
+        "5-packet count stays driven by the constant, not a literal."
+    )
+    assert "-i 0.2" in body, (
+        "ping_burst_ok must use `-i 0.2` interval — wider spacing "
+        "re-introduces the rate-dependent false-positive pattern."
+    )
+    assert "-W 1" in body, (
+        "ping_burst_ok must use `-W 1` per-packet timeout so the "
+        "whole burst caps at ~1s wallclock; -W 2 or more makes the "
+        "cron run drag and risks watchdog overlap."
+    )
+
+
+def test_ping_burst_function_uses_ok_min_threshold() -> None:
+    """The function's accept/reject decision must compare PING_RECEIVED
+    against PING_BURST_OK_MIN — pinning the >=3 of 5 rule into the
+    source so a refactor can't silently change it to e.g. '>= 1' (=
+    same as single-ping) or '== PING_BURST_COUNT' (= no tolerance)."""
+    source = _read_script_source()
+    match = re.search(
+        r"ping_burst_ok\(\)\s*\{(.*?)\n\}",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match, "ping_burst_ok() not found"
+    body = match.group(1)
+    assert re.search(
+        r'\[\s*"\$PING_RECEIVED"\s*-ge\s*"\$PING_BURST_OK_MIN"\s*\]',
+        body,
+    ), (
+        "ping_burst_ok must gate on `[ \"$PING_RECEIVED\" -ge "
+        "\"$PING_BURST_OK_MIN\" ]` — anything else (e.g. -gt 0, "
+        "-eq COUNT) breaks the 'tolerate ~40% loss before alarm' "
+        "semantic the FYS investigation pinned the constants to."
+    )
+
+
+def test_main_branch_calls_ping_burst_ok_not_raw_ping() -> None:
+    """The main `elif` arm must call `ping_burst_ok` — NOT raw
+    `ping -c 1` (the pre-2026-05-24 single-ping shape we're moving
+    away from). Pins the call-site against a refactor that defines
+    the function but forgets to switch the dispatch over."""
+    source = _read_script_source()
+    assert re.search(
+        r'^\s*elif\s+ping_burst_ok\s+"\$gw"\s*;\s*then\s*$',
+        source,
+        flags=re.MULTILINE,
+    ), (
+        "main control flow must `elif ping_burst_ok \"$gw\"; then` "
+        "— the burst-check function exists but the dispatch is "
+        "still hitting raw `ping -c 1`."
+    )
+    # Anti-pattern: the only `ping -c 1` left in the source should
+    # be NONE (the burst check uses -c "$PING_BURST_COUNT"). Catches
+    # the case where someone leaves the old call site in.
+    assert "ping -c 1 -W 2" not in source, (
+        "found a `ping -c 1 -W 2` literal — that was the pre-burst "
+        "single-ping shape. Anti-pattern: it would silently re-enable "
+        "the false-positive cadence the burst check exists to fix."
+    )
+
+
+def test_degraded_log_message_includes_fraction() -> None:
+    """The degraded-link note() message must include the X/N received
+    fraction (`($PING_RECEIVED/$PING_BURST_COUNT received)`). This is
+    the most useful piece of forensic data the watchdog emits — a
+    raw 'ping failed' line forces an SSH-and-re-probe to figure out
+    how bad the link is. The fraction lets a journal-grep tell the
+    difference between 0/5 (true outage) and 2/5 (degraded but
+    still mostly working). FYS wedge-investigation cost ~5 min of
+    re-probing because the prior log line was opaque."""
+    source = _read_script_source()
+    assert "($PING_RECEIVED/$PING_BURST_COUNT received)" in source, (
+        "degraded-link note() must include the (X/N received) "
+        "fraction for forensics — see test docstring for why."
+    )

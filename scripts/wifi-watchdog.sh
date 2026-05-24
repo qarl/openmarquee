@@ -63,6 +63,21 @@ STATE_FILE=/var/run/wifi-watchdog.fails
 RESTARTS_FILE=/var/run/wifi-watchdog.restarts
 LOG=/var/log/wifi-watchdog.log
 THRESHOLD=2
+# Burst-ping check (2026-05-24): instead of a single ping per
+# invocation, send 5 pings spaced 0.2s apart and consider the link
+# OK if at least 3 of 5 land. Rationale: live measurement on FYS
+# during the 11:00 wedge investigation showed a SAME-WIFI rate-
+# dependent loss pattern — sustained 1.0s-interval pings averaged
+# ~55% loss while 0.2s-interval burst pings averaged 0% loss against
+# the same gateway. A single-ping-per-30s check (the prior shape)
+# matched the worst-case loss-prone cadence and false-positive-ed
+# heavily, driving NM restarts and ultimately auto-reboot cycles on
+# a link that was actually fine for short-burst traffic. The burst
+# check costs ~1s of script wallclock per invocation (negligible)
+# and turns the watchdog into a coherent "is the link working" probe
+# rather than "did one random packet land".
+PING_BURST_COUNT=5
+PING_BURST_OK_MIN=3
 # Postmortem mitigation #4 (2026-05-23): when this many NM-restarts
 # accumulate inside REBOOT_WINDOW_SECONDS, the chip is presumed
 # firmware-wedged and a clean reboot is the only path forward. The
@@ -145,6 +160,30 @@ record_nm_restart_and_maybe_reboot() {
     fi
 }
 
+# Send a burst of pings and return 0 iff at least PING_BURST_OK_MIN
+# of PING_BURST_COUNT packets were received. Designed to coalesce
+# within one ~1-second RF window so a rate-dependent-loss link (see
+# constant block above) doesn't produce false alarms. PING_RECEIVED
+# is set as a side-effect so the caller can log the X/N fraction
+# for forensics.
+ping_burst_ok() {
+    local target=$1
+    local out
+    # ping stderr → $LOG (not /dev/null) per [[feedback_never_swallow_
+    # stderr_in_ci]]: a missing /bin/ping, sudo policy change, or
+    # netlink hiccup would otherwise silently produce "0 received"
+    # and look like a real outage. Route it to the watchdog log so
+    # spawn-side failures are visible in the same forensic stream as
+    # the link-side ones.
+    out=$(ping -c "$PING_BURST_COUNT" -W 1 -i 0.2 "$target" 2>>"$LOG")
+    PING_RECEIVED=$(echo "$out" | awk '/packets transmitted/ { print $4 }')
+    # Use := (assign), not :- (substitute), so the subsequent -ge
+    # sees a real integer instead of an empty expansion that would
+    # trip `set -u` indirectly via the comparison.
+    : "${PING_RECEIVED:=0}"
+    [ "$PING_RECEIVED" -ge "$PING_BURST_OK_MIN" ]
+}
+
 fails=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
 gw=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
 
@@ -158,17 +197,17 @@ if [ -z "$gw" ]; then
         echo 0 > "$STATE_FILE"
         record_nm_restart_and_maybe_reboot
     fi
-elif ping -c 1 -W 2 "$gw" >/dev/null 2>&1; then
+elif ping_burst_ok "$gw"; then
     if [ "$fails" -gt 0 ]; then
-        note "ping to $gw OK; resetting fails=$fails -> 0"
+        note "ping to $gw OK ($PING_RECEIVED/$PING_BURST_COUNT); resetting fails=$fails -> 0"
     fi
     echo 0 > "$STATE_FILE"
 else
     fails=$((fails + 1))
-    note "ping to $gw failed (fails=$fails)"
+    note "ping to $gw degraded ($PING_RECEIVED/$PING_BURST_COUNT received) (fails=$fails)"
     echo "$fails" > "$STATE_FILE"
     if [ "$fails" -ge "$THRESHOLD" ]; then
-        note "restarting NetworkManager after $fails consecutive failures"
+        note "restarting NetworkManager after $fails consecutive ping-burst failures"
         systemctl restart NetworkManager
         echo 0 > "$STATE_FILE"
         record_nm_restart_and_maybe_reboot
