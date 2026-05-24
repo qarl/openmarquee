@@ -1810,6 +1810,35 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     background: #000;
 }
 
+/* Transcode progress bar. Operator-visible signal during ffmpeg.wasm
+   transcode (~few seconds for short clips, ~tens of seconds for long
+   ones). Without explicit styling the native <progress> renders near-
+   invisible against the dark panel bg. Per FYS bug 6 boundary (qarl
+   2026-05-24): bar is allowed, text "Saving…" is not — progress is a
+   distinct affordance category from save-confirmation copy. */
+.video-upload-progress {
+    display: block;
+    width: 100%;
+    height: 6px;
+    margin-top: 6px;
+    border: 1px solid var(--panel-border);
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--panel);
+    /* `accent-color` is the modern unified-color property for native
+       <progress> + <input range>. Supported in Chrome 93+ / Safari 15.4+
+       / Firefox 92+ — covers every browser this app targets. The two
+       pseudo-element rules below provide parity for any older webview
+       that lands in front of the app. */
+    accent-color: var(--accent);
+}
+.video-upload-progress::-webkit-progress-bar { background: var(--panel); }
+.video-upload-progress::-webkit-progress-value {
+    background: var(--accent);
+    transition: width 0.15s ease;
+}
+.video-upload-progress::-moz-progress-bar { background: var(--accent); }
+
 .image-upload-canvas {
     /* Canvas bitmap dims are device W×H; the inline style.aspectRatio
        set by the mount fn drives the rendered shape. The CSS var is a
