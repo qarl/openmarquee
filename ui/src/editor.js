@@ -1017,7 +1017,12 @@ export function mountEditor(
 
         const visible = layer.visible !== false;
         groupEl.classList.toggle("editor-layer-hidden", !visible);
-        groupEl.querySelector(".editor-layer-eye-glyph").textContent = visible ? "●" : "○";
+        const eyeEl = groupEl.querySelector(".editor-layer-eye");
+        eyeEl.querySelector(".editor-layer-eye-glyph").textContent = visible ? "●" : "○";
+        // Toggle-button semantics: aria-pressed="true" when the layer is
+        // visible (the toggle is "on"). Without this, screen readers
+        // announce a toggle button with no pressed state.
+        eyeEl.setAttribute("aria-pressed", visible ? "true" : "false");
     }
 
     function layerIndexOfGroup(groupEl) {

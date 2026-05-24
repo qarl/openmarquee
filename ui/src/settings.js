@@ -769,12 +769,35 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // reports BackendState=="Running" (authenticated). State pill
     // updates throughout.
     let tsPollTimer = null;
+    let tsPollStartedAt = null;
+    // 5 minutes. Empirically, operators who haven't opened the auth URL
+    // within this window are unlikely to do so soon — the poll keeps
+    // hitting the backend forever otherwise. The retry path is just
+    // clicking "Enable Tailscale" again, which restarts the timer.
+    const TAILSCALE_AUTH_TIMEOUT_MS = 5 * 60 * 1000;
+    function stopTsPoll() {
+        if (tsPollTimer) clearInterval(tsPollTimer);
+        tsPollTimer = null;
+        tsPollStartedAt = null;
+    }
     function setTsState(label, color) {
         if (!tsStateEl) return;
         tsStateEl.textContent = label;
         tsStateEl.style.color = color || "var(--om-text-dim)";
     }
     async function pollTailscaleStatus() {
+        // Bound the poll lifetime — without this the interval ran
+        // forever if the operator never opened the auth URL.
+        if (
+            tsPollStartedAt !== null
+            && Date.now() - tsPollStartedAt > TAILSCALE_AUTH_TIMEOUT_MS
+        ) {
+            stopTsPoll();
+            setTsState("Sign-in timed out");
+            tsAuthPollEl.textContent =
+                "Sign-in took too long — click \"Enable Tailscale\" again to retry.";
+            return;
+        }
         try {
             const res = await apiFetch("/api/system/tailscale/status");
             const data = await res.json();
@@ -784,8 +807,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                     : "Authenticated";
                 setTsState(label, "#7dd87a");
                 tsAuthBox.hidden = true;
-                if (tsPollTimer) clearInterval(tsPollTimer);
-                tsPollTimer = null;
+                stopTsPoll();
             } else if (data.state === "error") {
                 setTsState("Error", "#ff6b6b");
                 tsAuthPollEl.textContent =
@@ -793,14 +815,12 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 // Stop polling — the error is unlikely to clear
                 // without operator action; let them click Enable
                 // again to restart.
-                if (tsPollTimer) clearInterval(tsPollTimer);
-                tsPollTimer = null;
+                stopTsPoll();
             } else if (data.state === "disabled") {
                 setTsState("Disabled");
                 // Operator declined or `tailscale up` exited before
                 // sign-in. Stop polling; the auth URL is stale anyway.
-                if (tsPollTimer) clearInterval(tsPollTimer);
-                tsPollTimer = null;
+                stopTsPoll();
             } else {
                 setTsState("Waiting for sign-in…");
             }
@@ -822,7 +842,8 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 tsAuthUrlEl.href = data.auth_url;
                 tsAuthBox.hidden = false;
                 setTsState("Waiting for sign-in…");
-                if (tsPollTimer) clearInterval(tsPollTimer);
+                stopTsPoll();
+                tsPollStartedAt = Date.now();
                 tsPollTimer = setInterval(pollTailscaleStatus, 3000);
             } else if (data.state === "authenticated") {
                 setTsState("Authenticated", "#7dd87a");

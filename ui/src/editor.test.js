@@ -1437,6 +1437,31 @@ describe("mountEditor — submit flow", () => {
         expect(onSave.mock.calls[0][0].text_layers[0].visible).toBe(false);
     });
 
+    it("eye toggle button reflects visibility via aria-pressed", async () => {
+        // Toggle-button semantics: aria-pressed="true" while the layer is
+        // visible ("on" state), "false" while hidden. Without this a
+        // screen reader announces the button without its toggle state.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "x" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+        const list = container.querySelector(".editor-layers-list");
+
+        container.querySelector(".field-text").value = "ARIA";
+        container.querySelector(".field-text").dispatchEvent(new Event("input", { bubbles: true }));
+
+        const eye = list.children[0].querySelector(".editor-layer-eye");
+        // Initial state: layer defaults to visible -> pressed.
+        expect(eye.getAttribute("aria-pressed")).toBe("true");
+        eye.click();
+        expect(eye.getAttribute("aria-pressed")).toBe("false");
+        eye.click();
+        expect(eye.getAttribute("aria-pressed")).toBe("true");
+
+        // Drain pending autosave to keep teardown clean.
+        await handle.flushAutoSave();
+    });
+
     it("motion select rides through to the save payload", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");

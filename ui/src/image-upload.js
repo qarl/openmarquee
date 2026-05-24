@@ -120,6 +120,10 @@ export function mountImageUploader(
             if (!state.editingId) clearCanvas();
             return;
         }
+        // Disable the picker while we decode + paint so a fast operator
+        // can't queue a second file before the first one settles. Re-
+        // enabled in finally so an error path doesn't leave a dead input.
+        fileEl.disabled = true;
         try {
             // Preview is just visual feedback; the bytes we upload come
             // straight from the source file (FileReader at save time).
@@ -137,6 +141,8 @@ export function mountImageUploader(
             clearCanvas();
             statusEl.textContent = `Could not load image: ${err.message}`;
             statusEl.dataset.state = "error";
+        } finally {
+            fileEl.disabled = false;
         }
     });
 
