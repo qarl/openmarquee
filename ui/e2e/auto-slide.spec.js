@@ -23,8 +23,14 @@ test("auto-mode time slide ticks in the live preview overlay", async ({ page }) 
     await expect(page.locator(".editor .field-name")).toHaveValue(/Text Slide \d+/);
     await page.locator(".editor .field-name").fill("Clock");
     await page.locator(".editor .field-text").fill("--:--:--");
-    const autoMode = page.locator(".editor .field-auto-mode");
-    await autoMode.selectOption("time");
+    // `.field-auto-mode` was a <select> originally; it was refactored into
+    // a segmented-button control + a hidden state-of-record input. Click
+    // the Time button (editor.js:806 wires the click handler that mirrors
+    // the old select's change event — sets hidden input, populates the
+    // format options, kicks autosave).
+    await page
+        .locator('.editor .field-auto-mode-segmented button[data-value="time"]')
+        .click();
     await expect(page.locator(".field-auto-format-wrap")).toBeVisible();
     await page.locator(".editor .field-auto-format").selectOption("time_hms");
     // Keep slide short so the e2e runs fast; 3s is plenty for two ticks.
