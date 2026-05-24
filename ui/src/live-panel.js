@@ -145,18 +145,27 @@ function writeRtspUrlPref(value) {
 //    handoff). Real-elapsed ticks against state.startedAt. Phase B
 //    will wire RTCPeerConnection.getStats() polling for the rest.
 
-// Safari restricts navigator.mediaDevices to secure contexts (HTTPS,
-// localhost, 127.0.0.1, *.local) — private IPv4 literals like 192.168.x.x
-// over plain HTTP are NOT secure contexts. Chrome is more permissive
-// for private-network IPs, so this trap only fires on Safari (qarl-
-// reported 2026-05-23 on http://192.168.1.67/#/live). The raw TypeError
-// the default getUserMedia factory throws is cryptic; we detect the
-// missing API at mount + click time and surface this actionable message
-// instead. Stream source remains usable — it doesn't touch the media-
-// devices API.
-const CAMERA_API_UNAVAILABLE_MSG =
-    "Camera unavailable — your browser blocks camera access on plain HTTP. " +
-    "Try HTTPS or use a Stream URL instead.";
+// Browsers restrict `navigator.mediaDevices` to "secure contexts"
+// (HTTPS, localhost, *.local on Safari, IP literals on Chrome). Plain
+// HTTP on a non-IP hostname is NOT a secure context — the API is
+// undefined and the default factory throws a cryptic TypeError.
+// Originally surfaced 2026-05-23 by qarl on Safari at
+// http://192.168.1.67/#/live (Safari is strict even on IP literals);
+// later 2026-05-24 by qarl on Chrome at http://fireplacesign/#/live
+// (Tailscale MagicDNS — Chrome accepts IP literals but not arbitrary
+// hostnames). The builder is called at message-display time (not
+// module load) so the hostname reflects the actual page URL at the
+// moment the banner fires — a remount after client-side route changes
+// still gets a correct host. Stream source remains usable — it
+// doesn't touch the mediaDevices API.
+function buildCameraUnavailableMessage(hostname = "") {
+    const host = hostname || "this site";
+    return (
+        `Camera unavailable on "${host}". ` +
+        "Chrome blocks camera access on plain HTTP for non-IP hostnames. " +
+        "Try the LAN IP or Tailscale IP, switch to HTTPS, or use a Stream URL instead."
+    );
+}
 
 const SECTION_TEMPLATE = `
     <section class="live">
@@ -288,6 +297,10 @@ const SECTION_TEMPLATE = `
  *   predicate; returns true iff navigator.mediaDevices.getUserMedia
  *   is callable. Defaults to a real-navigator probe; tests override
  *   to simulate Safari's missing-API behavior on plain-HTTP origins.
+ * @param {() => string} [options.getHostname] — reads
+ *   window.location.hostname for the hostname-aware banner. Tests
+ *   override to simulate IP-literal vs MagicDNS vs *.local origins
+ *   without juggling jsdom's read-only window.location.
  * @param {() => RTCPeerConnection} [options.createPeerConnection]
  * @param {boolean} [options.simulateOnly] — when true, skip the
  *   WebRTC negotiation and the /api/live/{start,stop,takeover}
@@ -320,6 +333,10 @@ export function mountLivePanel(container, options = {}) {
             typeof navigator !== "undefined" &&
             !!navigator.mediaDevices &&
             typeof navigator.mediaDevices.getUserMedia === "function",
+        getHostname = () =>
+            typeof window !== "undefined" && window.location
+                ? window.location.hostname
+                : "",
         createPeerConnection = () => new RTCPeerConnection(),
         simulateOnly = false,
     } = options;
@@ -872,7 +889,7 @@ export function mountLivePanel(container, options = {}) {
         // actionable message rather than emit the raw TypeError
         // through failTo. No API call, no transient state churn.
         if (state.localStream === null && !hasGetUserMedia()) {
-            failWith(CAMERA_API_UNAVAILABLE_MSG);
+            failWith(buildCameraUnavailableMessage(getHostname()));
             return;
         }
 
@@ -952,7 +969,7 @@ export function mountLivePanel(container, options = {}) {
         // mediaDevices case as an actionable banner instead of a raw
         // TypeError through failTo.
         if (!hasGetUserMedia()) {
-            failWith(CAMERA_API_UNAVAILABLE_MSG);
+            failWith(buildCameraUnavailableMessage(getHostname()));
             return;
         }
         try {
@@ -1220,7 +1237,7 @@ export function mountLivePanel(container, options = {}) {
         // of a silent fall-back to empty-message idle. Stay in idle
         // phase so the source toggle still works (VLC remains usable).
         if (!hasGetUserMedia()) {
-            setMessage(CAMERA_API_UNAVAILABLE_MSG);
+            setMessage(buildCameraUnavailableMessage(getHostname()));
             return;
         }
         try {
