@@ -92,23 +92,6 @@ header h1 {
     letter-spacing: 0.02em;
 }
 
-.brand-sign-name {
-    display: inline;
-    margin-left: 0.5rem;
-    color: var(--accent);
-    font-weight: 500;
-}
-
-.brand-sign-name:empty {
-    display: none;
-}
-
-.brand-sign-name::before {
-    content: "— ";
-    color: var(--muted);
-    font-weight: 400;
-}
-
 .shell {
     display: flex;
     align-items: stretch;
@@ -125,15 +108,6 @@ header h1 {
     align-self: flex-start;
     height: calc(100vh - 3.25rem);
     overflow-y: auto;
-}
-
-.nav-list {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
 }
 
 .nav-link {
@@ -159,23 +133,6 @@ header h1 {
     font-weight: 600;
 }
 
-.nav-group-heading {
-    padding: 0.6rem 0.75rem 0.2rem;
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: var(--muted);
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-}
-
-.nav-child {
-    padding-left: 1.5rem;
-    font-size: 0.9rem;
-}
-.nav-child.active {
-    padding-left: calc(1.5rem - 2px);
-}
-
 /* Legacy `main` rule retired: it set max-width: 720px + margin: 0 auto,
    which collided with the new `.om-main` shell from the Claude Design
    redesign. The om-* shell handles its own sizing via flex: 1 +
@@ -191,9 +148,7 @@ header h1 {
    component a top border + spacing to separate it from the one above.
    When a component is the top of its section, that separator is a
    stray rule. Reach through the slot wrapper to the component itself. */
-.panel > :first-child > .playlists,
-.panel > :first-child > .schedule,
-.panel > :first-child > .settings-view {
+.panel > :first-child > .schedule {
     margin-top: 0;
     padding-top: 0;
     border-top: none;
@@ -213,7 +168,6 @@ header h1 {
         border-bottom: 1px solid var(--panel-border);
         padding: 0.25rem 0.5rem;
     }
-    .nav-list { flex-direction: row; gap: 0.25rem; overflow-x: auto; }
     .nav-link { white-space: nowrap; padding: 0.5rem 0.75rem; }
     .nav-link.active { border-left: none; border-bottom: 2px solid var(--accent); padding-left: 0.75rem; padding-bottom: calc(0.5rem - 2px); }
 }
@@ -905,11 +859,6 @@ header h1 {
 
 /* --- settings view --- */
 
-.settings-view {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-}
 .settings-form {
     display: flex;
     flex-direction: column;
@@ -918,17 +867,7 @@ header h1 {
 .settings-save {
     width: 100%;
 }
-.settings-heading { margin: 0; font-size: 0.9rem; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
 .settings-hint { margin: 0; color: var(--muted); font-size: 0.8rem; opacity: 0.85; }
-.settings-dl {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 0.35rem 1rem;
-    margin: 0;
-    font-size: 0.9rem;
-}
-.settings-dl dt { color: var(--muted); }
-.settings-dl dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .settings-status { margin: 0; color: var(--muted); font-size: 0.85rem; min-height: 1.2em; }
 
 .settings-wifi-ap,
@@ -1301,16 +1240,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     overflow: hidden;
 }
 
-/* Subpage title ("Text Slides" / "Image Slides" / "Video Slides") +
-   horizontal slide browser that sits below it. */
-.subpage-title {
-    margin: 0 0 0.75rem;
-    font-size: 1.05rem;
-    font-weight: 600;
-    letter-spacing: 0.01em;
-    color: var(--text);
-}
-
+/* Horizontal slide browser that sits below the page header. */
 .slide-browser {
     margin-bottom: 1rem;
 }
@@ -1358,19 +1288,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     transition: opacity 0.15s ease;
 }
 .slide-browser-tile-delete:hover { background: var(--danger); color: #1a1a1d; }
-/* Type badge in the browser strip. Delete × at top-right stays the
-   focus visually; this sits top-left. */
-.slide-browser-tile-type {
-    position: absolute;
-    top: 0.35rem;
-    left: 0.45rem;
-    font-size: 0.65rem;
-    color: #fff;
-    background: rgba(0, 0, 0, 0.5);
-    border-radius: 999px;
-    padding: 0 0.3rem;
-    pointer-events: none;
-}
 .slide-browser-tile-action {
     display: flex;
     flex-direction: column;
@@ -1516,10 +1433,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     width: -webkit-fill-available;
     width: stretch;
     min-width: 0;
-}
-
-.field-duration-wrap {
-    flex: 0 1 7rem;
 }
 
 /* `display: block` trumps the UA's inline-block default — Safari was
@@ -1890,8 +1803,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     background: #000;
 }
 
-.image-upload-canvas,
-.video-upload-canvas {
+.image-upload-canvas {
     /* Canvas bitmap dims are device W×H; the inline style.aspectRatio
        set by the mount fn drives the rendered shape. The CSS var is a
        fallback so first-paint (before JS runs) still uses the right
@@ -2220,12 +2132,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     gap: 1rem;
     padding: 1.25rem 1.5rem;
     max-width: 48rem;
-}
-
-.flock-hint {
-    margin: 0;
-    color: var(--muted);
-    font-size: 0.9rem;
 }
 
 .flock-status {
@@ -2593,23 +2499,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   display: flex; align-items: center; justify-content: center;
   color: inherit;
 }
-.om-side-sub {
-  padding-left: 26px;
-  font-size: 13px;
-  font-weight: 400;
-}
-.om-side-item .om-badge {
-  margin-left: auto;
-  font-family: var(--om-display);
-  font-size: 10px;
-  background: var(--om-line);
-  color: var(--om-text-dim);
-  padding: 2px 6px;
-  border-radius: 4px;
-  letter-spacing: 0.05em;
-}
-.om-side-item.active .om-badge { background: var(--om-accent); color: var(--om-accent-ink); }
-
 /* The flock entry gets extra love — live status dots */
 .om-side-item.om-flock {
   margin-top: 10px;
@@ -2643,43 +2532,9 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   letter-spacing: 0.02em;
 }
 
-/* ─── Bottom tab bar (mobile alt nav) ───────────────────── */
-.om-tabbar {
-  display: flex;
-  background: var(--om-surface);
-  border-top: 1px solid var(--om-line);
-  padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0px));
-  position: relative;
-  z-index: 3;
-}
-.om-tab {
-  flex: 1;
-  display: flex; flex-direction: column; align-items: center; gap: 3px;
-  padding: 8px 0 6px;
-  font-family: var(--om-display);
-  font-size: 9.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--om-text-fade);
-  border: none; background: transparent;
-  cursor: pointer;
-  border-radius: 8px;
-  position: relative;
-  -webkit-tap-highlight-color: transparent;
-  min-height: 48px;
-}
-.om-tab svg { width: 20px; height: 20px; }
-.om-tab.active { color: var(--om-accent); }
-.om-tab.active::after {
-  content: ""; position: absolute; top: 0; left: 30%; right: 30%; height: 2px;
-  background: var(--om-accent); border-radius: 0 0 2px 2px;
-  box-shadow: 0 0 6px var(--om-accent-glow);
-}
-
 /* ─── Main scroll region ────────────────────────── */
 .om-main { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 .om-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--om-pad); }
-.om-scroll-tight { padding: 0; }
 
 .om-page-head {
   display: flex; align-items: end; justify-content: space-between; gap: 12px;
@@ -2813,25 +2668,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   padding-right: 32px;
 }
 
-/* Switch */
-.om-switch {
-  appearance: none; border: 0;
-  width: 38px; height: 22px; border-radius: 999px;
-  background: var(--om-line-2);
-  position: relative; flex-shrink: 0;
-  transition: background .15s;
-  cursor: pointer;
-}
-.om-switch::after {
-  content: ""; position: absolute; top: 2px; left: 2px;
-  width: 18px; height: 18px; border-radius: 50%;
-  background: #fff;
-  transition: transform .15s;
-  box-shadow: 0 1px 3px rgba(0,0,0,.3);
-}
-.om-switch[data-on="1"] { background: var(--om-accent); }
-.om-switch[data-on="1"]::after { transform: translateX(16px); }
-
 /* Range */
 .om-range {
   -webkit-appearance: none; appearance: none;
@@ -2879,70 +2715,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   50% { opacity: .35; transform: scale(.7); }
 }
 
-/* ─── LED preview canvas ─────────────────────────────────
- * The pixel grid that shows what the device will draw. Sits on
- * --om-led-bg (near-black) with a subtle "off-pixel" pattern so the
- * panel structure is visible even on dark slides. --aspect-w/h are
- * set inline by the React component.
- */
-.om-led-frame {
-  position: relative;
-  background: var(--om-led-bg);
-  border-radius: 12px;
-  border: 1px solid var(--om-line-2);
-  padding: 10px;
-  box-shadow: var(--om-shadow), inset 0 0 0 1px rgba(0,0,0,.5);
-}
-.om-led-stage {
-  width: 100%;
-  aspect-ratio: var(--om-aspect-w, 2) / var(--om-aspect-h, 1);
-  background: var(--om-slide-bg, #0a0a0a);
-  border-radius: 4px;
-  position: relative;
-  overflow: hidden;
-  display: flex; align-items: center; justify-content: center;
-  isolation: isolate;
-  container-type: size;
-  container-name: ledstage;
-  /* Subtle dot-matrix overlay so panels look like panels */
-}
-.om-led-stage[data-pixel="1"]::after {
-  content: "";
-  position: absolute; inset: 0;
-  background-image:
-    radial-gradient(circle, rgba(0,0,0,.55) 30%, transparent 32%);
-  background-size: var(--om-pixel, 4px) var(--om-pixel, 4px);
-  pointer-events: none;
-  mix-blend-mode: multiply;
-}
-.om-led-stage > * { position: relative; z-index: 1; }
-.om-led-meta {
-  display: flex; justify-content: space-between; align-items: center;
-  margin-top: 8px;
-  font-family: var(--om-mono);
-  font-size: 10.5px;
-  color: var(--om-text-fade);
-  letter-spacing: 0.02em;
-}
-.om-led-meta .om-led-aspect-pick {
-  display: flex; gap: 2px;
-  background: var(--om-surface-2);
-  border-radius: 6px;
-  padding: 2px;
-  border: 1px solid var(--om-line);
-}
-.om-led-meta .om-led-aspect-pick button {
-  appearance: none; border: 0; background: transparent;
-  color: var(--om-text-fade);
-  font: inherit;
-  padding: 4px 7px;
-  border-radius: 5px;
-  cursor: pointer;
-}
-.om-led-meta .om-led-aspect-pick button.active {
-  background: var(--om-bg); color: var(--om-accent);
-}
-
 /* Slide-content rendering inside the LED stage */
 .om-slide-text {
   width: 100%; height: 100%;
@@ -2964,64 +2736,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 @keyframes om-scroll {
   0% { transform: translateX(100%); }
   100% { transform: translateX(-100%); }
-}
-
-/* ─── Slide list (cards) ────────────────────────── */
-.om-slide-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 10px;
-}
-.om-slide-card {
-  background: var(--om-surface);
-  border: 1px solid var(--om-line);
-  border-radius: var(--om-radius);
-  overflow: hidden;
-  cursor: pointer;
-  position: relative;
-  transition: transform .12s, border-color .12s, box-shadow .12s;
-}
-.om-slide-card:hover {
-  border-color: var(--om-line-2);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 20px rgba(0,0,0,.25);
-}
-.om-slide-card.selected {
-  border-color: var(--om-accent);
-  box-shadow: 0 0 0 1px var(--om-accent), 0 0 16px var(--om-accent-glow);
-}
-.om-slide-card .om-thumb {
-  aspect-ratio: 2/1;
-  position: relative;
-  background: var(--om-led-bg);
-}
-.om-slide-card .om-thumb > .om-led-stage {
-  border-radius: 0;
-  height: 100%;
-}
-.om-slide-card .om-meta {
-  padding: 8px 10px;
-  display: flex; align-items: center; justify-content: space-between; gap: 6px;
-}
-.om-slide-card .om-meta b {
-  font-size: 12.5px;
-  font-weight: 600;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.om-slide-card .om-meta .om-dur {
-  font-family: var(--om-mono);
-  font-size: 10.5px;
-  color: var(--om-text-fade);
-  letter-spacing: 0.05em;
-}
-.om-slide-card .om-kind {
-  position: absolute; top: 6px; left: 6px;
-  font-family: var(--om-display);
-  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
-  background: rgba(0,0,0,.5);
-  color: #fff;
-  padding: 2px 5px; border-radius: 3px;
-  backdrop-filter: blur(4px);
 }
 
 /* ─── Pallet (saved slides drawer) ─── */
@@ -3115,15 +2829,6 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 .om-row { display: flex; align-items: center; gap: 10px; }
 .om-row.between { justify-content: space-between; }
 .om-stack { display: flex; flex-direction: column; gap: var(--om-gap); }
-.om-empty {
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  padding: 40px 20px;
-  text-align: center;
-  color: var(--om-text-dim);
-  border: 1px dashed var(--om-line);
-  border-radius: var(--om-radius);
-  gap: 10px;
-}
 
 /* ─── Sheet (mobile modal) ─── */
 .om-sheet-back {
