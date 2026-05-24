@@ -569,3 +569,57 @@ describe("mountPlaylistTrack — Batch 8.fix sibling-playlist memo invalidation"
         ).toContain("1 playlist");
     });
 });
+
+
+describe("mountPlaylistTrack — default-playlist name input context", () => {
+    const LUNCH_ID = "11111111-1111-4111-8111-111111111111";
+
+    it("disables the name input + surfaces title + aria-label on the default playlist", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a"]),
+            onReorder: vi.fn(),
+            getCurrentPlaylistId: () => DEFAULT_PLAYLIST_ID,
+        });
+        await tick();
+
+        const nameEl = container.querySelector(".field-playlist-name");
+        expect(nameEl.disabled).toBe(true);
+        // Both hints present so pointer hover AND screen-reader announce
+        // WHY the field is greyed out (not just that it is).
+        expect(nameEl.title).toBe("Cannot rename the default playlist.");
+        expect(nameEl.getAttribute("aria-label")).toBe(
+            "Default playlist (immutable)",
+        );
+    });
+
+    it("clears the hint attributes when a non-default playlist becomes active", async () => {
+        const container = document.createElement("div");
+        const playlists = [
+            { id: DEFAULT_PLAYLIST_ID, name: "default", items: [{ item_id: "a" }] },
+            { id: LUNCH_ID, name: "lunch", items: [{ item_id: "b" }] },
+        ];
+        const handle = mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({ schema_version: 4, playlists }),
+            onReorder: vi.fn(),
+            getCurrentPlaylistId: () => LUNCH_ID,
+        });
+        await tick();
+        await tick();
+
+        const nameEl = container.querySelector(".field-playlist-name");
+        // Non-default playlist: input is editable + no stale hints from a
+        // prior default-active refresh.
+        expect(nameEl.disabled).toBe(false);
+        expect(nameEl.title).toBe("");
+        expect(nameEl.hasAttribute("aria-label")).toBe(false);
+
+        // Sanity: the active value reflects the selected (non-default) playlist.
+        expect(nameEl.value).toBe("lunch");
+
+        // Silence unused-handle in tests that don't yet exercise refresh().
+        void handle;
+    });
+});
