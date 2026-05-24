@@ -171,10 +171,41 @@ class LiveSession:
         # the stream URL was dead/unreachable and the watchdog auto-
         # closes — symmetric to the WebRTC phantom-track watchdog.
         self._first_frame_event = asyncio.Event()
+        # Operator-driven pause: when True the pump drains the source
+        # but does NOT call render_frame, so DRM scanout holds the
+        # last painted frame on glass while the upstream source (VLC
+        # publisher, phone camera) keeps producing. Resume = clear the
+        # flag; the pump picks up at the *current* live frame (we do
+        # not buffer + replay paused frames — operator expects "now",
+        # not a delayed replay). Idempotent under repeat pause/resume.
+        self._paused = False
 
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    async def pause(self) -> None:
+        """Freeze the on-glass frame; keep the upstream source alive.
+
+        Sets the pump-side gate so subsequent frames are drained but
+        not rendered. DRM scanout retains the last painted frame —
+        no clear-to-black, no flicker. Idempotent: pausing an already-
+        paused session is a no-op. Raises nothing; the LiveManager
+        guards the session-id lookup."""
+        self._paused = True
+
+    async def resume(self) -> None:
+        """Un-freeze: subsequent pump frames render as normal.
+
+        Idempotent: resuming a non-paused session is a no-op.
+        Operator picks up at the current live frame; we deliberately
+        do not buffer + replay paused frames (latency over a multi-
+        minute pause would be unbounded)."""
+        self._paused = False
 
     async def start_webrtc(self, sdp_offer: str) -> str:
         """WebRTC takeover: set the remote offer, create an answer,
@@ -346,6 +377,22 @@ class LiveSession:
         pixel_format = getattr(source, "pixel_format", "rgb888")
         try:
             async for frame_bytes in source.frames():
+                # Disarm the first-frame watchdog as PROOF-OF-LIFE the
+                # moment the source yields ANY frame — even one we
+                # immediately discard for an operator pause. Otherwise
+                # the watchdog would fire 10s into a pause-immediately-
+                # after-start sequence and tear down a healthy session.
+                # set() is idempotent so doing this every frame is
+                # cheap and keeps the pump branch-free. (Moved above
+                # the pause gate 2026-05-24 per subagent review.)
+                self._first_frame_event.set()
+                # Operator pause gate: drain the frame so the upstream
+                # source (ffmpeg / WebRTC track) doesn't backpressure,
+                # but skip the render call so DRM scanout holds the
+                # last painted frame on glass. Resume = the flag flips
+                # and the next iteration renders as normal.
+                if self._paused:
+                    continue
                 frame_w = frame_h = None
                 if pixel_format == "nv12":
                     # frame_dims() is known once the consumer's ffprobe
@@ -374,11 +421,6 @@ class LiveSession:
                         "the frame pump."
                     )
                     return
-                # Stream hardening C2: a frame rendered cleanly —
-                # disarm the first-frame watchdog. set() is idempotent
-                # so doing it every frame (rather than guarding on the
-                # first) is cheap and keeps the pump branch-free.
-                self._first_frame_event.set()
         except asyncio.CancelledError:
             raise
         finally:
@@ -506,6 +548,14 @@ class LiveManager:
         """
         return self._session.started_at if self.is_active else None
 
+    @property
+    def is_active_and_paused(self) -> bool:
+        """True when there's an active session AND it's currently
+        paused. Surfaced through /api/live/status.paused so the UI can
+        reconcile a Pause/Resume button's state across panel
+        re-mounts and reload. False when nothing is active."""
+        return self.is_active and self._session is not None and self._session.paused
+
     @staticmethod
     async def _start_session(session: LiveSession, request: LiveStartBody) -> str | None:
         """Run the transport-specific start for `request`'s kind.
@@ -563,6 +613,28 @@ class LiveManager:
             if self._session is None or self._session.id != session_id:
                 raise LiveNotActive(session_id)
             await self._stop_locked()
+
+    async def pause(self, session_id: UUID) -> None:
+        """Pause the named session — DRM scanout holds the last
+        rendered frame; the upstream source stays alive (so resume
+        picks up at the current live frame, not a delayed buffer).
+        Raises LiveNotActive if `session_id` doesn't match the
+        currently-active session. Idempotent."""
+        # No lock needed: we don't mutate self._session, only the
+        # session's own flag. start/stop/takeover hold the lock for
+        # session-creation atomicity; pause/resume don't touch that.
+        if self._session is None or self._session.id != session_id:
+            raise LiveNotActive(session_id)
+        await self._session.pause()
+
+    async def resume(self, session_id: UUID) -> None:
+        """Resume the named session — pump renders the next frame
+        from the upstream source. Idempotent: resuming a non-paused
+        session is a no-op. Raises LiveNotActive on session-id
+        mismatch — symmetric to pause()."""
+        if self._session is None or self._session.id != session_id:
+            raise LiveNotActive(session_id)
+        await self._session.resume()
 
     async def stop_all(self) -> None:
         """Tear down whatever's active. Used at app shutdown so the

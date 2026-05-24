@@ -942,4 +942,203 @@ async def test_stream_takeover_healthy_stream_stays_active(tmp_path, monkeypatch
         assert not loop.is_paused
     finally:
         await manager.stop_all()
+
+
+# ---- Fork B: pause/resume behavioral coverage ----
+
+
+@pytest.mark.asyncio
+async def test_session_pause_skips_render_frame(tmp_path, monkeypatch):
+    """When pause() is set, the pump drains frames from the source
+    but skips renderer.render_frame — DRM scanout holds the last
+    painted frame, but ffmpeg keeps flowing so it doesn't backpressure
+    and resume can pick up at the current live frame."""
+    import functools
+
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
+
+    frame_size = 8 * 8 * 3 // 2  # NV12: 1.5 bytes/pixel
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=0, continuous=True
+    )
+    monkeypatch.setattr(
+        "openmarquee.stream_source.StreamConsumer",
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=(8, 8)),
+    )
+
+    loop, renderer = _empty_loop(tmp_path)
+    captured: list[bytes] = []
+    original_render = renderer.render_frame
+
+    def _record(data, **kwargs):
+        captured.append(data)
+        return original_render(data, **kwargs)
+
+    renderer.render_frame = _record
+    await loop.start()
+    manager = LiveManager(loop)
+    try:
+        session_id, _answer = await manager.start(
+            StreamStartRequest(url="rtsp://laptop:8554/live")
+        )
+        session = manager._session
+        assert session is not None and session.id == session_id
+
+        # Wait until the pump is actually rendering frames.
+        assert await _wait_until(lambda: len(captured) >= 2)
+        baseline_count = len(captured)
+
+        # Pause — subsequent ffmpeg frames must NOT reach the renderer.
+        await manager.pause(session_id)
+        assert session.paused
+        # Wait long enough for several mock-ffmpeg frames to have been
+        # yielded; the renderer count must NOT grow.
+        await asyncio.sleep(0.4)
+        assert len(captured) == baseline_count, (
+            f"pause leaked render calls: {len(captured) - baseline_count}"
+        )
+        # Pin "pump is alive + draining" so the no-render-growth check
+        # above isn't satisfied by a pump that silently crashed during
+        # pause (subagent review nit — without this, the assertion
+        # would falsely pass on a regression that crashed the loop).
+        assert not session.closed, "session closed during pause"
+        assert session._pump_task is not None
+        assert not session._pump_task.done(), "pump task ended during pause"
+
+        # Resume — the pump starts rendering again. New frames arrive
+        # at the renderer (we picked up at "now", not a replay of the
+        # paused-window frames).
+        await manager.resume(session_id)
+        assert not session.paused
+        assert await _wait_until(lambda: len(captured) > baseline_count)
+    finally:
+        await manager.stop_all()
+
+
+@pytest.mark.asyncio
+async def test_pause_before_first_frame_does_not_trip_watchdog(tmp_path, monkeypatch):
+    """Regression: pausing within the 10s first-frame watchdog window
+    on a stream-transport takeover MUST NOT auto-close the session.
+    The watchdog measures source-side proof-of-life; a drained-but-
+    paused frame still proves the source is alive. (Subagent review
+    flagged: prior version of the pump set _first_frame_event AFTER
+    the pause gate, so a Pause click before the first render would
+    silently tear down a healthy session 10s later.)"""
+    import functools
+
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
+
+    frame_size = 8 * 8 * 3 // 2
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=0, continuous=True
+    )
+    monkeypatch.setattr(
+        "openmarquee.stream_source.StreamConsumer",
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=(8, 8)),
+    )
+
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    manager = LiveManager(loop)
+    try:
+        session_id, _ = await manager.start(
+            StreamStartRequest(url="rtsp://laptop:8554/live")
+        )
+        session = manager._session
+        assert session is not None
+        # Pause immediately — within the watchdog's first-frame
+        # measurement window. The source is producing frames (mock
+        # ffmpeg yields continuously) but the pump skips render_frame
+        # so _first_frame_event could go unset on the OLD code path.
+        # With the fix, set() now happens at the TOP of the loop so
+        # any drained frame counts as proof-of-life.
+        await manager.pause(session_id)
+        assert await _wait_until(lambda: session._first_frame_event.is_set())
+        # Wait past the watchdog's typical timeout — the session must
+        # remain open. Even though no render is happening, the watchdog
+        # has been disarmed by the source-side proof-of-life.
+        assert session._watchdog_task is not None
+        assert await _wait_until(lambda: session._watchdog_task.done())
+        await asyncio.sleep(0.3)
+        assert manager.is_active, (
+            "first-frame watchdog wrongly closed a paused-but-alive session"
+        )
+        assert session.paused
+    finally:
+        await manager.stop_all()
+
+
+@pytest.mark.asyncio
+async def test_session_pause_resume_are_idempotent(tmp_path):
+    """Repeated pause/resume on the same session is a no-op without
+    error. Tests against a fresh session without a started transport
+    (no source needed — pause/resume only flip a flag)."""
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    manager = LiveManager(loop)
+    try:
+        from openmarquee.live import LiveSession
+
+        # Build a session directly so we don't need a transport for
+        # this pure-flag test. The flag's existence + idempotency is
+        # what we're pinning here.
+        session = LiveSession(loop)
+        assert not session.paused
+        await session.pause()
+        assert session.paused
+        await session.pause()  # idempotent
+        assert session.paused
+        await session.resume()
+        assert not session.paused
+        await session.resume()  # idempotent
+        assert not session.paused
+    finally:
+        await manager.stop_all()
+
+
+@pytest.mark.asyncio
+async def test_manager_pause_raises_live_not_active_on_wrong_id(tmp_path):
+    """Wrong session_id MUST raise LiveNotActive — prevents one
+    phone from pausing another phone's session by guessing an id."""
+    from uuid import uuid4
+
+    from openmarquee.live import LiveNotActive
+
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    manager = LiveManager(loop)
+    try:
+        # No session active.
+        with pytest.raises(LiveNotActive):
+            await manager.pause(uuid4())
+        with pytest.raises(LiveNotActive):
+            await manager.resume(uuid4())
+    finally:
+        await manager.stop_all()
+
+
+@pytest.mark.asyncio
+async def test_manager_is_active_and_paused_property(tmp_path):
+    """The `is_active_and_paused` property combines session-presence
+    and paused-flag for /api/live/status.paused. Idle → False;
+    active+unpaused → False; active+paused → True."""
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    manager = LiveManager(loop)
+    try:
+        assert manager.is_active_and_paused is False
+
+        from openmarquee.live import LiveSession
+
+        session = LiveSession(loop)
+        manager._session = session  # bypass the lock for this pure-flag test
+        assert manager.is_active_and_paused is False  # active but not paused
+        await session.pause()
+        assert manager.is_active_and_paused is True
+        await session.resume()
+        assert manager.is_active_and_paused is False
+    finally:
+        await manager.stop_all()
         await loop.stop()

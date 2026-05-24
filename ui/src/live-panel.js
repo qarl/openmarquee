@@ -32,6 +32,8 @@ import {
     effectiveDisplayDims,
     getSettings,
     getLiveStatus,
+    pauseLive,
+    resumeLive,
     startRtspLive,
     startLive,
     stopLive,
@@ -188,6 +190,11 @@ const SECTION_TEMPLATE = `
                     <span class="live-go-live-dot" aria-hidden="true"></span>
                     Start streaming
                 </button>
+                <button type="button" class="om-btn live-pause" hidden
+                        data-action="pause">
+                    <span class="live-pause-icon" aria-hidden="true"></span>
+                    <span class="live-pause-label">Pause</span>
+                </button>
                 <button type="button" class="om-btn live-stop" hidden>
                     <span class="live-stop-square" aria-hidden="true"></span>
                     Stop
@@ -322,6 +329,8 @@ export function mountLivePanel(container, options = {}) {
         apiTakeoverLive = takeoverLive,
         apiTakeoverRtspLive = takeoverRtspLive,
         apiStopLive = stopLive,
+        apiPauseLive = pauseLive,
+        apiResumeLive = resumeLive,
         fetchSettings = getSettings,
         getUserMedia = (constraints) =>
             navigator.mediaDevices.getUserMedia(constraints),
@@ -354,6 +363,8 @@ export function mountLivePanel(container, options = {}) {
     const vlcPanelEl = container.querySelector(".live-vlc-panel");
     const vlcUrlEl = container.querySelector(".live-vlc-url");
     const stopBtn = container.querySelector(".live-stop");
+    const pauseBtn = container.querySelector(".live-pause");
+    const pauseLabelEl = pauseBtn.querySelector(".live-pause-label");
     const takeOverBtn = container.querySelector(".live-take-over");
     const cancelTakeoverBtn = container.querySelector(".live-cancel-takeover");
     const flipCameraBtn = container.querySelector(".live-flip-camera");
@@ -432,6 +443,16 @@ export function mountLivePanel(container, options = {}) {
         // Active RTCPeerConnection. Null between sessions, and always
         // null in VLC mode (RTSP has no peer connection).
         pc: null,
+        // Operator-driven pause toggle. True after the Pause button is
+        // clicked + ack'd by /api/live/pause; cleared by Resume or by
+        // any stop/teardown path. Only meaningful when phase === "live".
+        // NOT reconciled from /api/live/status.paused on a panel re-
+        // mount today: mountInit's "active session → take-over-prompt"
+        // path means a re-mounting browser never resumes the prior
+        // operator's session, so the local paused flag always starts
+        // false on a fresh mount. If we later widen mountInit to
+        // continue-the-same-session, read status.paused there too.
+        paused: false,
         // User-facing message rendered into .live-status. Reset when
         // a transition clears it.
         message: "",
@@ -596,6 +617,16 @@ export function mountLivePanel(container, options = {}) {
         goLiveBtn.hidden = !(isCamera && ready);
         startVlcBtn.hidden = !(isVlc && vlcReady);
         stopBtn.hidden = phase !== "live";
+        // Pause button rides next to Stop whenever a session is live.
+        // Label flips between "Pause" and "Resume" off state.paused so
+        // the operator can toggle the freeze without leaving the panel.
+        pauseBtn.hidden = phase !== "live";
+        pauseBtn.dataset.action = state.paused ? "resume" : "pause";
+        pauseLabelEl.textContent = state.paused ? "Resume" : "Pause";
+        pauseBtn.setAttribute(
+            "aria-pressed",
+            state.paused ? "true" : "false",
+        );
         takeOverBtn.hidden = phase !== "take-over-prompt";
         cancelTakeoverBtn.hidden = phase !== "take-over-prompt";
 
@@ -774,6 +805,11 @@ export function mountLivePanel(container, options = {}) {
             state.localStream = null;
             previewEl.srcObject = null;
         }
+        // Pause is a per-session flag — a teardown ends the session,
+        // so the pause state is meaningless once we exit "live". Clear
+        // it here so a Stop-then-restart cycle starts unpaused (and so
+        // any /status poll between stop + next-start reads paused=false).
+        state.paused = false;
     }
 
     async function negotiate({ takeover = false } = {}) {
@@ -1293,6 +1329,34 @@ export function mountLivePanel(container, options = {}) {
     });
     stopBtn.addEventListener("click", () => {
         stopLive();
+    });
+    // Pause/Resume toggle. Optimistic: flip state.paused + re-render
+    // immediately so the button text doesn't lag the click; the API
+    // call confirms server-side. On API failure we revert + surface a
+    // message rather than leave the UI lying about the sign state.
+    let pauseInFlight = false;
+    pauseBtn.addEventListener("click", async () => {
+        if (pauseInFlight) return;
+        if (state.phase !== "live" || state.sessionId === null) return;
+        pauseInFlight = true;
+        const wasPaused = state.paused;
+        state.paused = !wasPaused;
+        render();
+        try {
+            if (wasPaused) {
+                await apiResumeLive(state.sessionId);
+            } else {
+                await apiPauseLive(state.sessionId);
+            }
+        } catch (err) {
+            // Revert the optimistic flip so the button doesn't
+            // misrepresent the sign state on transient failure.
+            state.paused = wasPaused;
+            setMessage(`Couldn't ${wasPaused ? "resume" : "pause"} · ${err?.message || err}`);
+            render();
+        } finally {
+            pauseInFlight = false;
+        }
     });
     takeOverBtn.addEventListener("click", () => {
         takeOver();

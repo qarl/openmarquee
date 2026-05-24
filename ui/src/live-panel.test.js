@@ -171,6 +171,8 @@ function defaultMounts(overrides = {}) {
             started_at: "2026-05-20T00:00:00+00:00",
         })),
         apiStopLive: vi.fn(async () => undefined),
+        apiPauseLive: vi.fn(async () => undefined),
+        apiResumeLive: vi.fn(async () => undefined),
         fetchSettings: vi.fn(async () => ({
             display_width: 1920,
             display_height: 1080,
@@ -1596,5 +1598,154 @@ describe("mountLivePanel", () => {
 
         expect(track.stopped).toBe(true);
         expect(container.querySelector(".live-vlc-panel").hidden).toBe(false);
+    });
+
+    // ---- Fork B: pause / resume toggle ----
+
+    it("pause button is hidden when no session is live", () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        mountLivePanel(container, opts);
+        expect(container.querySelector(".live-pause").hidden).toBe(true);
+    });
+
+    it("pause button surfaces once live: Pause label, aria-pressed=false", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        const btn = container.querySelector(".live-pause");
+        expect(btn.hidden).toBe(false);
+        expect(btn.querySelector(".live-pause-label").textContent).toBe("Pause");
+        expect(btn.getAttribute("aria-pressed")).toBe("false");
+        expect(btn.dataset.action).toBe("pause");
+    });
+
+    it("click Pause flips label to Resume + calls apiPauseLive with session_id", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        const btn = container.querySelector(".live-pause");
+        btn.click();
+        // Optimistic: label flips before the awaited API call resolves.
+        expect(btn.querySelector(".live-pause-label").textContent).toBe("Resume");
+        expect(btn.dataset.action).toBe("resume");
+        expect(btn.getAttribute("aria-pressed")).toBe("true");
+
+        await waitFor(() => opts.apiPauseLive.mock.calls.length === 1);
+        expect(opts.apiPauseLive).toHaveBeenCalledWith(
+            "11111111-1111-1111-1111-111111111111",
+        );
+    });
+
+    it("click Resume from a paused state calls apiResumeLive + flips label back", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        const btn = container.querySelector(".live-pause");
+        btn.click();
+        await waitFor(() => opts.apiPauseLive.mock.calls.length === 1);
+        // The in-flight guard short-circuits a second click until the
+        // first call's `finally` runs. Flush the microtask queue so the
+        // first API call's resolution lands before the next click —
+        // this is what production timing looks like (the apiPauseLive
+        // mock resolves immediately, so the operator's next click in
+        // the real UI doesn't race).
+        await Promise.resolve();
+        await Promise.resolve();
+        btn.click();
+        expect(btn.querySelector(".live-pause-label").textContent).toBe("Pause");
+        expect(btn.dataset.action).toBe("pause");
+        expect(btn.getAttribute("aria-pressed")).toBe("false");
+
+        await waitFor(() => opts.apiResumeLive.mock.calls.length === 1);
+        expect(opts.apiResumeLive).toHaveBeenCalledWith(
+            "11111111-1111-1111-1111-111111111111",
+        );
+    });
+
+    it("pause API failure reverts the optimistic flip + surfaces a message", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts({
+            apiPauseLive: vi.fn(async () => {
+                throw new Error("network down");
+            }),
+        });
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        const btn = container.querySelector(".live-pause");
+        btn.click();
+        // After the failed API call, the optimistic Resume label must
+        // revert back to Pause so the button doesn't lie about the sign.
+        await waitFor(
+            () => btn.querySelector(".live-pause-label").textContent === "Pause",
+        );
+        expect(btn.dataset.action).toBe("pause");
+        expect(btn.getAttribute("aria-pressed")).toBe("false");
+        // Status message reflects the failure for the operator.
+        expect(container.querySelector(".live-status").textContent).toMatch(
+            /Couldn't pause/,
+        );
+    });
+
+    it("Stop while paused returns the button to unpaused state on next live cycle", async () => {
+        const container = document.createElement("div");
+        const opts = defaultMounts();
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        container.querySelector(".live-pause").click();
+        await waitFor(() => opts.apiPauseLive.mock.calls.length === 1);
+
+        container.querySelector(".live-stop").click();
+        await waitFor(() => handle.getState() === "preview");
+
+        // Re-go-live: button must surface as "Pause" (not the stale
+        // "Resume" from the previous session).
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+        const btn = container.querySelector(".live-pause");
+        expect(btn.querySelector(".live-pause-label").textContent).toBe("Pause");
+        expect(btn.dataset.action).toBe("pause");
+    });
+
+    it("rapid double-click on pause is debounced (only one apiPauseLive call)", async () => {
+        const container = document.createElement("div");
+        // Block the apiPauseLive resolution so we can verify the
+        // in-flight guard prevents a second concurrent call.
+        let resolveLatch;
+        const opts = defaultMounts({
+            apiPauseLive: vi.fn(
+                () =>
+                    new Promise((r) => {
+                        resolveLatch = r;
+                    }),
+            ),
+        });
+        const handle = mountLivePanel(container, opts);
+        container.querySelector(".live-go-live").click();
+        await waitFor(() => handle.getState() === "live");
+
+        const btn = container.querySelector(".live-pause");
+        btn.click();
+        btn.click();  // second click while the first is in flight
+        btn.click();  // and a third for good measure
+
+        // Only one API call should have fired.
+        expect(opts.apiPauseLive).toHaveBeenCalledTimes(1);
+
+        resolveLatch();
+        await waitFor(() => opts.apiPauseLive.mock.calls.length === 1);
     });
 });

@@ -564,3 +564,129 @@ def test_start_stream_returns_session_without_sdp_answer(client: TestClient, mon
     # no subprocess to clean up).
     stop = client.post("/api/live/stop", json={"session_id": body["session_id"]})
     assert stop.status_code == 204
+
+
+# ---- Fork B: pause/resume endpoint contract ----
+
+
+def test_status_paused_false_when_idle(client: TestClient):
+    """`paused` is always False when no session is active."""
+    body = client.get("/api/live/status").json()
+    assert body["state"] == "idle"
+    assert body["paused"] is False
+
+
+def test_pause_sets_status_paused_true(client: TestClient):
+    """Happy path: start → pause → /status reports paused=True."""
+    start = client.post(
+        "/api/live/start",
+        json={"sdp_offer": "v=0\r\noffer\r\n"},
+    ).json()
+
+    pause = client.post(
+        "/api/live/pause",
+        json={"session_id": start["session_id"]},
+    )
+    assert pause.status_code == 204
+
+    status = client.get("/api/live/status").json()
+    assert status["paused"] is True
+    assert status["state"] == "active"  # session still alive, just frozen
+
+
+def test_resume_clears_paused(client: TestClient):
+    start = client.post(
+        "/api/live/start",
+        json={"sdp_offer": "v=0\r\noffer\r\n"},
+    ).json()
+    client.post("/api/live/pause", json={"session_id": start["session_id"]})
+    resume = client.post(
+        "/api/live/resume",
+        json={"session_id": start["session_id"]},
+    )
+    assert resume.status_code == 204
+
+    status = client.get("/api/live/status").json()
+    assert status["paused"] is False
+    assert status["state"] == "active"
+
+
+def test_pause_is_idempotent(client: TestClient):
+    """Pausing twice in a row returns 204 both times; status stays paused."""
+    start = client.post(
+        "/api/live/start",
+        json={"sdp_offer": "v=0\r\noffer\r\n"},
+    ).json()
+    first = client.post("/api/live/pause", json={"session_id": start["session_id"]})
+    second = client.post("/api/live/pause", json={"session_id": start["session_id"]})
+    assert first.status_code == 204
+    assert second.status_code == 204
+    assert client.get("/api/live/status").json()["paused"] is True
+
+
+def test_resume_is_idempotent(client: TestClient):
+    """Resuming an already-running session returns 204; status stays unpaused."""
+    start = client.post(
+        "/api/live/start",
+        json={"sdp_offer": "v=0\r\noffer\r\n"},
+    ).json()
+    resume = client.post(
+        "/api/live/resume",
+        json={"session_id": start["session_id"]},
+    )
+    assert resume.status_code == 204
+    assert client.get("/api/live/status").json()["paused"] is False
+
+
+def test_pause_404_when_no_active_session(client: TestClient):
+    from uuid import uuid4
+
+    fake_id = uuid4()
+    resp = client.post("/api/live/pause", json={"session_id": str(fake_id)})
+    assert resp.status_code == 404
+    assert str(fake_id) in resp.json()["detail"]
+
+
+def test_resume_404_when_no_active_session(client: TestClient):
+    from uuid import uuid4
+
+    fake_id = uuid4()
+    resp = client.post("/api/live/resume", json={"session_id": str(fake_id)})
+    assert resp.status_code == 404
+    assert str(fake_id) in resp.json()["detail"]
+
+
+def test_pause_404_on_stale_session_id(client: TestClient):
+    """An old session_id that no longer matches the active session
+    must 404 — the phone shouldn't be able to pause some OTHER
+    phone's session by reusing its own old id."""
+    from uuid import uuid4
+
+    start = client.post(
+        "/api/live/start",
+        json={"sdp_offer": "v=0\r\noffer\r\n"},
+    ).json()
+    client.post("/api/live/stop", json={"session_id": start["session_id"]})
+    # Old session is gone; any session_id pause attempt 404s.
+    resp = client.post(
+        "/api/live/pause",
+        json={"session_id": start["session_id"]},
+    )
+    assert resp.status_code == 404
+    # And a totally bogus id 404s too.
+    bogus = client.post("/api/live/pause", json={"session_id": str(uuid4())})
+    assert bogus.status_code == 404
+
+
+def test_stop_clears_paused_state(client: TestClient):
+    """A stopped session reports paused=False (state=idle wins;
+    paused is meaningless without an active session)."""
+    start = client.post(
+        "/api/live/start",
+        json={"sdp_offer": "v=0\r\noffer\r\n"},
+    ).json()
+    client.post("/api/live/pause", json={"session_id": start["session_id"]})
+    client.post("/api/live/stop", json={"session_id": start["session_id"]})
+    body = client.get("/api/live/status").json()
+    assert body["state"] == "idle"
+    assert body["paused"] is False

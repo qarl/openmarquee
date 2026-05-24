@@ -92,12 +92,17 @@ class LiveStatus(BaseModel):
     session's creation, or None when idle. Lets a panel that mounts
     mid-session pick up the Elapsed counter from /status without
     needing to have observed the original /start response (Phase A.2).
+
+    `paused` is True when the operator has paused the session — DRM
+    scanout is holding the last rendered frame while the upstream
+    source stays alive. Always False when state == "idle".
     """
 
     state: Literal["idle", "active"]
     session_id: UUID | None
     started_at: datetime | None
     tier: HardwareTier
+    paused: bool = False
 
 
 # Live-takeover hardware tiers (SYSTEM_SPEC §5.11 + STREAM_VLC_PROPOSAL §7).
@@ -207,6 +212,40 @@ async def takeover_live(
     return LiveStartResponse(session_id=session_id, sdp_answer=answer, started_at=started_at)
 
 
+@router.post("/pause", status_code=204)
+async def pause_live(
+    payload: LiveStopRequest,
+    live: LiveDep,
+) -> None:
+    """Pause the active session — DRM scanout holds the last rendered
+    frame; the upstream source stays alive. Idempotent. 404 if the
+    session_id doesn't match the currently-active session."""
+    try:
+        await live.pause(payload.session_id)
+    except LiveNotActive as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no active session {exc.session_id}",
+        ) from exc
+
+
+@router.post("/resume", status_code=204)
+async def resume_live(
+    payload: LiveStopRequest,
+    live: LiveDep,
+) -> None:
+    """Resume a paused session — pump renders the next live frame from
+    the upstream source. Idempotent. 404 if the session_id doesn't
+    match the currently-active session."""
+    try:
+        await live.resume(payload.session_id)
+    except LiveNotActive as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no active session {exc.session_id}",
+        ) from exc
+
+
 @router.get("/status", response_model=LiveStatus)
 async def live_status(live: LiveDep) -> LiveStatus:
     return LiveStatus(
@@ -216,4 +255,5 @@ async def live_status(live: LiveDep) -> LiveStatus:
         # /status is polled by the phone before Go Live, so it reports
         # the webrtc (phone-camera) source's tier.
         tier=_SOURCE_TIERS["webrtc"],
+        paused=live.is_active_and_paused,
     )
