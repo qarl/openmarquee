@@ -403,7 +403,7 @@ class _DemoFrame:
     name: str  # display name in the slide list (numbered for ordering)
     layers: tuple[_DemoLayer, ...]
     duration_ms: int = 1000
-    background_color: str = "#050608"
+    background_color: str = "#000000"
     background_pattern: BackgroundPattern | None = None
     transition_out: str = "cut"
     transition_ms: int = 1000
@@ -460,7 +460,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="01 · FREE",
         duration_ms=1500,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="FREE",
@@ -477,7 +477,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="02 · YOUR",
         duration_ms=1500,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="YOUR",
@@ -495,7 +495,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="03 · SIGN",
         duration_ms=2000,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="SIGN",
@@ -619,7 +619,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="07a · Typo (oops)",
         duration_ms=800,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="FREE YOUR SGIN!!",
@@ -644,7 +644,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="07b · Typo (mid-fix)",
         duration_ms=350,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="FREE YOUR S?IN!!",  # placeholder while letters swap
@@ -672,7 +672,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="07c · Typo (fixed)",
         duration_ms=1200,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="FREE YOUR SIGN.",
@@ -700,7 +700,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="08 · Tile Chaos",
         duration_ms=1500,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             # Top-left, slightly offset down-right
             _DemoLayer(
@@ -774,7 +774,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="09 · Chant Wall",
         duration_ms=2000,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text=_CHANT_TEXT,
@@ -888,7 +888,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="12 · Stadium",
         duration_ms=2100,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="> chant.start()",
@@ -928,7 +928,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="13a · Panic 1",
         duration_ms=130,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="FREE YOUR SIGN!!!",
@@ -947,7 +947,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="13b · Panic 2",
         duration_ms=130,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="FREE YOUR SIGN!!!",
@@ -967,7 +967,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="13c · Panic 3",
         duration_ms=500,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="FREE YOUR SIGN!!!",
@@ -988,7 +988,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="14 · Cooldown",
         duration_ms=2400,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 text="// openMarquee",
@@ -1028,7 +1028,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     _DemoFrame(
         name="15 · Boot",
         duration_ms=2000,
-        background_color="#050608",
+        background_color="#000000",
         layers=(
             _DemoLayer(
                 # qarl 2026-05-19: boot-log refreshed (extra blank

@@ -24,6 +24,7 @@ from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
 from openmarquee.api_system import router as system_router
 from openmarquee.auth_middleware import AuthMiddleware
+from openmarquee.content.migrations import migrate_050608_bg_to_000000
 from openmarquee.csp_middleware import CSPMiddleware
 from openmarquee.dependencies import (
     get_auth_storage,
@@ -108,6 +109,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             # Seeding is nice-to-have; never block startup on it.
             log.exception("startup seed failed")
+
+    # One-shot, env-gated content migration: rewrite text-slide
+    # `background_color == "#050608"` to `"#000000"`. The seed defaults
+    # baked #050608 (an aesthetic near-black) pre-2026-05-24; that value
+    # pre-dated the Bug 7 Broadcast-RGB-Full fix which now makes the
+    # off-by-three visible on full-range HDMI. Operator opts in by
+    # setting OPENMARQUEE_MIGRATE_050608_BG=1 on the next boot of a
+    # device whose content was seeded pre-fix, then drops the env var
+    # once the migration has run.
+    if os.environ.get("OPENMARQUEE_MIGRATE_050608_BG") == "1":
+        try:
+            n = migrate_050608_bg_to_000000(get_content_storage())
+            log.info("startup: migrated %d item(s) #050608 -> #000000", n)
+        except Exception:
+            log.exception("startup #050608 migration failed")
 
     # Prune playlist refs that no longer resolve to stored content. Catches
     # the "dev-wiped content/ but left playlist.json intact" class of bug

@@ -37,7 +37,7 @@ from pathlib import Path
 
 # Project root resolves from this file: backend/tests/X.py → repo/
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_PARITY_HARNESS = _REPO_ROOT / "ui" / "parity-harness.html"
+_PARITY_HARNESS = _REPO_ROOT / "ui" / "parity-harness.entry.js"
 _PARITY_FIXTURES = _REPO_ROOT / "scripts" / "parity" / "fixtures.json"
 
 # Rust transitions that EXIST as shaders (per
