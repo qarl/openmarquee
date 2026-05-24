@@ -80,12 +80,22 @@ PING_BURST_COUNT=5
 PING_BURST_OK_MIN=3
 # Postmortem mitigation #4 (2026-05-23): when this many NM-restarts
 # accumulate inside REBOOT_WINDOW_SECONDS, the chip is presumed
-# firmware-wedged and a clean reboot is the only path forward. The
-# 3-in-600s envelope spans ~6 min (THRESHOLD=2 × 30s cadence ×
-# 3 restarts) — enough cycles to rule out a single-event flap, fast
-# enough to recover before customer-facing impact.
-REBOOT_AFTER_N_RESTARTS=3
-REBOOT_WINDOW_SECONDS=600
+# firmware-wedged and a clean reboot is the only path forward.
+#
+# 2026-05-24 widen-envelope tune (Path 1 of the wifi-wedge dispatch):
+# the original 3-in-600s envelope was tight enough to trigger reboots
+# every ~7-10 minutes when the link genuinely degrades for sustained
+# 60-120s windows (measured live on FYS during the 11:00-11:50 wedge
+# investigation: real catastrophic 0/5-received bursts oscillating
+# with brief 4/5 recoveries). With qarl chasing the physical/RF root
+# cause separately, the watchdog's job here is to recover via NM-
+# restart cycles WITHOUT prematurely escalating to a full reboot
+# the operator sees as "the sign blanked again". 5-in-1800s spans
+# ~30 minutes — enough room for 5 NM-restart attempts (each takes
+# ~15s + the 30s cron cadence + transient recovery windows) to ride
+# out a degraded RF window before triggering a kernel-level reset.
+REBOOT_AFTER_N_RESTARTS=5
+REBOOT_WINDOW_SECONDS=1800
 
 ts() { date -u -Iseconds; }
 
@@ -116,8 +126,9 @@ note() {
 #
 # Anti-reboot-loop: the ledger is wiped BEFORE the reboot call,
 # and /var/run is tmpfs so a reboot also wipes it by side-effect.
-# The minimum theoretical reboot interval is ~3 min (3 strikes ×
-# 30s × 2 restart-cycles), enough for ops to intervene.
+# Minimum theoretical reboot interval under the 2026-05-24 widen-
+# envelope (5 strikes × ~75s per strike) is ~6 min, enough for ops
+# to intervene and for transient bad-RF pockets to clear.
 record_nm_restart_and_maybe_reboot() {
     local now cutoff ts_line kept count
     now=$(date +%s)

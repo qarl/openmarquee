@@ -31,8 +31,9 @@ Mitigation #4 (auto-reboot on watchdog escalation):
 7. NM-restarts are recorded in `/var/run/wifi-watchdog.restarts`
    (tmpfs ledger, one epoch ts per line).
 8. After each NM-restart, the ledger is pruned to entries inside
-   REBOOT_WINDOW_SECONDS (default 600s); if the remaining count
-   meets REBOOT_AFTER_N_RESTARTS (default 3), the script issues
+   REBOOT_WINDOW_SECONDS (default 1800s, widened from 600s on
+   2026-05-24); if the remaining count meets
+   REBOOT_AFTER_N_RESTARTS (default 5, widened from 3), the script issues
    `systemctl reboot` — kernel-level firmware re-init for the
    brcmfmac wedge case where NM restart alone CAN'T recover.
 9. The ledger is wiped BEFORE the reboot call (anti-reboot-loop;
@@ -327,38 +328,56 @@ def test_restarts_file_constant_present() -> None:
     )
 
 
-def test_reboot_threshold_is_three() -> None:
-    """REBOOT_AFTER_N_RESTARTS == 3 per the postmortem. A bump
-    higher delays recovery from a real firmware wedge; a bump lower
-    risks rebooting on a single flap."""
+def test_reboot_threshold_is_five() -> None:
+    """REBOOT_AFTER_N_RESTARTS == 5 (Path 1 widen-envelope, 2026-05-24).
+
+    Original value was 3 (postmortem #4) but live measurement on FYS
+    during the 11:00-11:50 wedge investigation showed real
+    catastrophic 0/5-burst windows lasting 60-120s. 3 NM-restarts
+    in 600s tripped on every degraded RF window, producing reboots
+    every ~7-10 min. 5 NM-restarts in 1800s (paired with the new
+    window) gives the system room to ride out a transient bad-RF
+    pocket without the operator seeing the sign blank.
+
+    Below 5 re-introduces the pre-fix reboot rate; above 5 risks
+    sitting on a genuinely-wedged chip for too long. Pin to 5 so a
+    future "tighten this back" refactor surfaces this trade-off
+    instead of silently undoing it."""
     source = _read_script_source()
     assert re.search(
-        r"^\s*REBOOT_AFTER_N_RESTARTS=3\s*$",
+        r"^\s*REBOOT_AFTER_N_RESTARTS=5\s*$",
         source,
         flags=re.MULTILINE,
     ), (
-        "REBOOT_AFTER_N_RESTARTS must be 3 (the postmortem value). "
-        "Higher delays brcmfmac wedge recovery; lower risks "
-        "rebooting on a single transient flap."
+        "REBOOT_AFTER_N_RESTARTS must be 5 (the Path 1 widen-envelope "
+        "value, 2026-05-24). Lower values re-introduce the every-7-"
+        "10-min reboot rate measured on FYS; higher values sit on a "
+        "genuinely-wedged chip for too long."
     )
 
 
-def test_reboot_window_is_600s() -> None:
-    """REBOOT_WINDOW_SECONDS == 600 per the postmortem (10 min).
-    Combined with THRESHOLD=2 × 30s cadence × 3 restarts, this
-    spans ~6 min of real activity — enough to confirm a sustained
-    wedge, fast enough to recover before customer-facing impact."""
+def test_reboot_window_is_1800s() -> None:
+    """REBOOT_WINDOW_SECONDS == 1800 (Path 1 widen-envelope, 2026-05-24).
+
+    Original value was 600 (10 min). Widened to 1800 (30 min) so a
+    sustained-but-transient bad-RF period can absorb 5 NM-restart
+    attempts before triggering the kernel-level reboot. Paired with
+    REBOOT_AFTER_N_RESTARTS=5: 5 restarts in 30 min = ~6 min apart,
+    which is the natural cadence of the THRESHOLD=2-failures-then-
+    NM-restart pattern under sustained loss. Above 1800 starts to
+    accumulate stale restart events that no longer reflect current
+    chip health."""
     source = _read_script_source()
     assert re.search(
-        r"^\s*REBOOT_WINDOW_SECONDS=600\s*$",
+        r"^\s*REBOOT_WINDOW_SECONDS=1800\s*$",
         source,
         flags=re.MULTILINE,
     ), (
-        "REBOOT_WINDOW_SECONDS must be 600 (the postmortem value). "
-        "A larger window means an old restart from before a healthy "
-        "spell could still trip the reboot threshold; a smaller "
-        "window means a genuine wedge might not accumulate enough "
-        "restart events to trigger recovery."
+        "REBOOT_WINDOW_SECONDS must be 1800 (the Path 1 widen-"
+        "envelope value, 2026-05-24). Smaller windows re-trigger "
+        "reboots too quickly under sustained-but-transient loss; "
+        "larger windows accumulate stale restart events that no "
+        "longer reflect current chip health."
     )
 
 
